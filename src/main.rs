@@ -3,6 +3,7 @@ use color_eyre::eyre::Result;
 use hound::{SampleFormat, WavSpec, WavWriter};
 use indicatif::{ProgressBar, ProgressStyle};
 use inquire::{Select, Text};
+use rsac::audio::ProcessAudioCapture;
 use std::fs::File;
 use std::io::{self, IsTerminal, Write};
 use std::path::PathBuf;
@@ -138,7 +139,7 @@ fn main() -> Result<()> {
     if args.verbose {
         eprintln!("Creating audio capture instance...");
     }
-    let mut capture = rsac::ProcessAudioCapture::new().map_err(|e| color_eyre::eyre::eyre!(e))?;
+    let mut capture = ProcessAudioCapture::new().map_err(|e| color_eyre::eyre::eyre!(e))?;
     capture.set_verbose(args.verbose);
 
     // Get process name either from args or interactive selection
@@ -416,7 +417,7 @@ fn main() -> Result<()> {
 fn select_process(filter: Option<&str>) -> Result<String> {
     eprintln!("📋 Listing running processes...");
     let mut processes =
-        rsac::ProcessAudioCapture::list_processes().map_err(|e| color_eyre::eyre::eyre!(e))?;
+        ProcessAudioCapture::list_processes().map_err(|e| color_eyre::eyre::eyre!(e))?;
 
     // Apply filter if provided
     if let Some(filter) = filter {
