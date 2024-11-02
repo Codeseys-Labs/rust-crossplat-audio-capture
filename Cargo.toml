@@ -7,3 +7,8 @@ edition = "2021"
 wasapi = "0.15.0"
 hound = "3.5.1"
 sysinfo = "0.32.0"
+clap = { version = "4.5.20", features = ["derive"] }
+inquire = "0.7.5"
+indicatif = "0.17.8"
+color-eyre = "0.6.3"
+ctrlc = "3.4.5"

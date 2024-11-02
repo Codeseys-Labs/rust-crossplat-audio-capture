@@ -1,17 +1,46 @@
 use std::collections::VecDeque;
 use std::ffi::OsString;
+use std::fmt;
 use sysinfo::{ProcessRefreshKind, RefreshKind, System};
 use wasapi::*;
+
+#[derive(Debug)]
+pub enum AudioCaptureError {
+    ProcessNotFound(String),
+    WasapiError(String),
+    InitializationError(String),
+}
+
+impl std::error::Error for AudioCaptureError {}
+
+impl fmt::Display for AudioCaptureError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            AudioCaptureError::ProcessNotFound(msg) => write!(f, "Process not found: {}", msg),
+            AudioCaptureError::WasapiError(msg) => write!(f, "WASAPI error: {}", msg),
+            AudioCaptureError::InitializationError(msg) => {
+                write!(f, "Initialization error: {}", msg)
+            }
+        }
+    }
+}
+
+impl From<Box<dyn std::error::Error>> for AudioCaptureError {
+    fn from(error: Box<dyn std::error::Error>) -> Self {
+        AudioCaptureError::WasapiError(error.to_string())
+    }
+}
 
 pub struct ProcessAudioCapture {
     audio_client: Option<AudioClient>,
     capture_client: Option<AudioCaptureClient>,
     format: WaveFormat,
     target_pid: u32,
+    verbose: bool,
 }
 
 impl ProcessAudioCapture {
-    pub fn new() -> Result<Self, Box<dyn std::error::Error>> {
+    pub fn new() -> Result<Self, AudioCaptureError> {
         initialize_mta().ok().unwrap();
 
         Ok(Self {
@@ -19,10 +48,15 @@ impl ProcessAudioCapture {
             capture_client: None,
             format: WaveFormat::new(32, 32, &SampleType::Float, 48000, 2, None),
             target_pid: 0,
+            verbose: false,
         })
     }
 
-    pub fn list_processes() -> Result<Vec<String>, Box<dyn std::error::Error>> {
+    pub fn set_verbose(&mut self, verbose: bool) {
+        self.verbose = verbose;
+    }
+
+    pub fn list_processes() -> Result<Vec<String>, AudioCaptureError> {
         let refreshes = RefreshKind::new().with_processes(ProcessRefreshKind::everything());
         let system = System::new_with_specifics(refreshes);
         let mut processes = Vec::new();
@@ -38,10 +72,7 @@ impl ProcessAudioCapture {
             .collect())
     }
 
-    pub fn init_for_process(
-        &mut self,
-        process_name: &str,
-    ) -> Result<(), Box<dyn std::error::Error>> {
+    pub fn init_for_process(&mut self, process_name: &str) -> Result<(), AudioCaptureError> {
         let refreshes = RefreshKind::new().with_processes(ProcessRefreshKind::everything());
         let system = System::new_with_specifics(refreshes);
         let mut target_pid = 0;
@@ -55,63 +86,81 @@ impl ProcessAudioCapture {
         }
 
         if target_pid == 0 {
-            return Err(format!("Process {} not found", process_name.to_string_lossy()).into());
+            return Err(AudioCaptureError::ProcessNotFound(
+                process_name.to_string_lossy().into_owned(),
+            ));
         }
 
-        println!(
-            "Found process {} with PID: {}",
-            process_name.to_string_lossy(),
-            target_pid
-        );
+        if self.verbose {
+            println!(
+                "Found process {} with PID: {}",
+                process_name.to_string_lossy(),
+                target_pid
+            );
+        }
         self.target_pid = target_pid;
         self.initialize()
     }
 
-    fn initialize(&mut self) -> Result<(), Box<dyn std::error::Error>> {
+    fn initialize(&mut self) -> Result<(), AudioCaptureError> {
         let include_tree = true;
         let autoconvert = true;
 
         // Create audio client for process-specific capture
         let mut audio_client =
-            AudioClient::new_application_loopback_client(self.target_pid, include_tree)?;
+            AudioClient::new_application_loopback_client(self.target_pid, include_tree)
+                .map_err(|e| AudioCaptureError::InitializationError(e.to_string()))?;
 
         // Initialize audio client
-        audio_client.initialize_client(
-            &self.format,
-            0,
-            &Direction::Capture,
-            &ShareMode::Shared,
-            autoconvert,
-        )?;
+        audio_client
+            .initialize_client(
+                &self.format,
+                0,
+                &Direction::Capture,
+                &ShareMode::Shared,
+                autoconvert,
+            )
+            .map_err(|e| AudioCaptureError::InitializationError(e.to_string()))?;
 
         // Get capture client
-        let capture_client = audio_client.get_audiocaptureclient()?;
+        let capture_client = audio_client
+            .get_audiocaptureclient()
+            .map_err(|e| AudioCaptureError::InitializationError(e.to_string()))?;
 
         self.audio_client = Some(audio_client);
         self.capture_client = Some(capture_client);
 
-        println!("Audio capture initialized successfully");
-        Ok(())
-    }
-
-    pub fn start(&self) -> Result<(), Box<dyn std::error::Error>> {
-        if let Some(client) = &self.audio_client {
-            client.start_stream()?;
+        if self.verbose {
+            println!("Audio capture initialized successfully");
         }
         Ok(())
     }
 
-    pub fn stop(&self) -> Result<(), Box<dyn std::error::Error>> {
+    pub fn start(&self) -> Result<(), AudioCaptureError> {
         if let Some(client) = &self.audio_client {
-            client.stop_stream()?;
+            client
+                .start_stream()
+                .map_err(|e| AudioCaptureError::WasapiError(e.to_string()))?;
         }
         Ok(())
     }
 
-    pub fn get_data(&self) -> Result<Vec<u8>, Box<dyn std::error::Error>> {
+    pub fn stop(&self) -> Result<(), AudioCaptureError> {
+        if let Some(client) = &self.audio_client {
+            client
+                .stop_stream()
+                .map_err(|e| AudioCaptureError::WasapiError(e.to_string()))?;
+        }
+        Ok(())
+    }
+
+    pub fn get_data(&self) -> Result<Vec<u8>, AudioCaptureError> {
         if let Some(capture_client) = &self.capture_client {
             let mut sample_queue: VecDeque<u8> = VecDeque::new();
-            let new_frames = capture_client.get_next_nbr_frames()?.unwrap_or(0);
+            let new_frames = capture_client
+                .get_next_nbr_frames()
+                .map_err(|e| AudioCaptureError::WasapiError(e.to_string()))?
+                .unwrap_or(0);
 
             if new_frames > 0 {
                 let block_align = self.format.get_blockalign() as usize;
@@ -119,10 +168,12 @@ impl ProcessAudioCapture {
                     .saturating_sub(sample_queue.capacity() - sample_queue.len());
                 sample_queue.reserve(additional);
 
-                capture_client.read_from_device_to_deque(&mut sample_queue)?;
+                capture_client
+                    .read_from_device_to_deque(&mut sample_queue)
+                    .map_err(|e| AudioCaptureError::WasapiError(e.to_string()))?;
 
                 let data: Vec<u8> = sample_queue.into_iter().collect();
-                if !data.is_empty() {
+                if !data.is_empty() && self.verbose {
                     println!("Got {} bytes of audio data", data.len());
                 }
                 return Ok(data);
