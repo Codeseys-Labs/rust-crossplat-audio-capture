@@ -1,0 +1,9 @@
+[package]
+name = "rsac"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+wasapi = "0.15.0"
+hound = "3.5.1"
+sysinfo = "0.32.0"
