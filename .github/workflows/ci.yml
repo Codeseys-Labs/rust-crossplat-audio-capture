@@ -86,45 +86,55 @@ jobs:
         env:
           WINAPI_NO_BUNDLED_LIBRARIES: 1
         
-      - name: Test audio file processing
+      - name: Test audio capture from playback
         run: |
-          # Test WAV file reading
-          cargo run --example wav_demo -- test_audio/sample.wav
+          # Start playing audio in background
+          Start-Process -NoNewWindow -FilePath "ffplay" -ArgumentList "-nodisp", "-autoexit", "-volume", "50", "test_audio/sample.mp3"
           
-          # Test audio format conversion
-          cargo run --example test_windows -- --file test_audio/sample.wav --format s16le --output converted.raw
+          # Wait a bit for playback to start
+          Start-Sleep -Seconds 2
           
-          # Verify output
-          if (!(Test-Path "converted.raw")) {
-              Write-Error "Conversion failed - output file not created"
+          # List audio devices to see the playback
+          Write-Host "Available audio devices:"
+          cargo run --example test_windows -- --list-devices
+          
+          # Start capturing while audio is playing
+          Write-Host "Starting audio capture..."
+          cargo run --example test_windows -- --duration 10 --output captured_audio.wav --to-wav
+          
+          # Verify the captured audio
+          if (!(Test-Path "captured_audio.wav")) {
+              Write-Error "Capture failed - no output file created"
               exit 1
           }
           
-          $size = (Get-Item "converted.raw").Length
-          if ($size -eq 0) {
-              Write-Error "Conversion failed - output file is empty"
+          $capturedSize = (Get-Item "captured_audio.wav").Length
+          if ($capturedSize -eq 0) {
+              Write-Error "Capture failed - output file is empty"
               exit 1
           }
           
-          Write-Host "Successfully processed $size bytes of audio"
-          
-          # Test format conversion back to WAV
-          cargo run --example test_windows -- --file converted.raw --format s16le --output final.wav --to-wav
-          
-          # Verify final WAV
-          if (!(Test-Path "final.wav")) {
-              Write-Error "WAV conversion failed - output file not created"
-              exit 1
-          }
+          Write-Host "Successfully captured $capturedSize bytes of audio"
           
           # Compare audio characteristics
-          $originalInfo = ffprobe -v quiet -print_format json -show_streams test_audio/sample.wav
-          $finalInfo = ffprobe -v quiet -print_format json -show_streams final.wav
-          
           Write-Host "Original audio info:"
-          Write-Host $originalInfo
-          Write-Host "Converted audio info:"
-          Write-Host $finalInfo
+          ffprobe -v quiet -print_format json -show_streams "test_audio/sample.mp3"
+          Write-Host "Captured audio info:"
+          ffprobe -v quiet -print_format json -show_streams "captured_audio.wav"
+          
+          # Optional: Compare audio waveforms
+          ffmpeg -i "test_audio/sample.mp3" -filter_complex "showwavespic=s=640x120" -frames:v 1 "original_waveform.png"
+          ffmpeg -i "captured_audio.wav" -filter_complex "showwavespic=s=640x120" -frames:v 1 "captured_waveform.png"
+          
+      - name: Upload test artifacts
+        uses: actions/upload-artifact@v3
+        with:
+          name: audio-test-results
+          path: |
+            original_waveform.png
+            captured_waveform.png
+            captured_audio.wav
+            test_audio/sample.mp3
         shell: pwsh
         env:
           WINAPI_NO_BUNDLED_LIBRARIES: 1
@@ -175,10 +185,55 @@ jobs:
       - name: Build examples
         run: cargo build --examples
         
-      - name: Test PulseAudio functionality
+      - name: Test PulseAudio capture from playback
         run: |
-          cargo run --example test_pulseaudio -- --help
-          # Note: Actual audio capture tests require audio playback
+          # Start PulseAudio server
+          pulseaudio --start --exit-idle-time=-1
+          sleep 2
+          
+          # Start playing audio in background
+          ffplay -nodisp -autoexit -volume 50 test_audio/sample.mp3 &
+          PLAYER_PID=$!
+          
+          # Wait for playback to start
+          sleep 2
+          
+          # List audio sources
+          echo "Available audio sources:"
+          cargo run --example test_pulseaudio -- --list-devices
+          
+          # Start capturing
+          echo "Starting audio capture..."
+          cargo run --example test_pulseaudio -- --duration 10 --output captured_audio.wav --to-wav
+          
+          # Wait for player to finish
+          wait $PLAYER_PID
+          
+          # Verify capture
+          if [ ! -f "captured_audio.wav" ]; then
+              echo "Capture failed - no output file created"
+              exit 1
+          fi
+          
+          # Compare audio characteristics
+          echo "Original audio info:"
+          ffprobe -v quiet -print_format json -show_streams test_audio/sample.mp3
+          echo "Captured audio info:"
+          ffprobe -v quiet -print_format json -show_streams captured_audio.wav
+          
+          # Generate waveforms
+          ffmpeg -i test_audio/sample.mp3 -filter_complex "showwavespic=s=640x120" -frames:v 1 original_waveform.png
+          ffmpeg -i captured_audio.wav -filter_complex "showwavespic=s=640x120" -frames:v 1 captured_waveform.png
+          
+      - name: Upload Linux test artifacts
+        uses: actions/upload-artifact@v3
+        with:
+          name: linux-audio-test-results
+          path: |
+            original_waveform.png
+            captured_waveform.png
+            captured_audio.wav
+            test_audio/sample.mp3
 
   test-macos:
     if: github.event.inputs.platform == 'macos' || github.event.inputs.platform == 'all'
@@ -216,10 +271,51 @@ jobs:
       - name: Build examples
         run: cargo build --examples
         
-      - name: Test CoreAudio functionality
+      - name: Test CoreAudio capture from playback
         run: |
-          cargo run --example test_coreaudio -- --help
-          # Note: Actual audio capture tests require screen recording permission
+          # Start playing audio in background
+          ffplay -nodisp -autoexit -volume 50 test_audio/sample.mp3 &
+          PLAYER_PID=$!
+          
+          # Wait for playback to start
+          sleep 2
+          
+          # List audio sources
+          echo "Available audio sources:"
+          cargo run --example test_coreaudio -- --list-devices
+          
+          # Start capturing
+          echo "Starting audio capture..."
+          cargo run --example test_coreaudio -- --duration 10 --output captured_audio.wav --to-wav
+          
+          # Wait for player to finish
+          wait $PLAYER_PID
+          
+          # Verify capture
+          if [ ! -f "captured_audio.wav" ]; then
+              echo "Capture failed - no output file created"
+              exit 1
+          fi
+          
+          # Compare audio characteristics
+          echo "Original audio info:"
+          ffprobe -v quiet -print_format json -show_streams test_audio/sample.mp3
+          echo "Captured audio info:"
+          ffprobe -v quiet -print_format json -show_streams captured_audio.wav
+          
+          # Generate waveforms
+          ffmpeg -i test_audio/sample.mp3 -filter_complex "showwavespic=s=640x120" -frames:v 1 original_waveform.png
+          ffmpeg -i captured_audio.wav -filter_complex "showwavespic=s=640x120" -frames:v 1 captured_waveform.png
+          
+      - name: Upload macOS test artifacts
+        uses: actions/upload-artifact@v3
+        with:
+          name: macos-audio-test-results
+          path: |
+            original_waveform.png
+            captured_waveform.png
+            captured_audio.wav
+            test_audio/sample.mp3
 
   clippy:
     if: github.event.inputs.platform == 'all'
