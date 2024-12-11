@@ -125,6 +125,9 @@ jobs:
           # Optional: Compare audio waveforms
           ffmpeg -i "test_audio/sample.mp3" -filter_complex "showwavespic=s=640x120" -frames:v 1 "original_waveform.png"
           ffmpeg -i "captured_audio.wav" -filter_complex "showwavespic=s=640x120" -frames:v 1 "captured_waveform.png"
+        shell: pwsh
+        env:
+          WINAPI_NO_BUNDLED_LIBRARIES: 1
           
       - name: Upload test artifacts
         uses: actions/upload-artifact@v3
@@ -135,9 +138,6 @@ jobs:
             captured_waveform.png
             captured_audio.wav
             test_audio/sample.mp3
-        shell: pwsh
-        env:
-          WINAPI_NO_BUNDLED_LIBRARIES: 1
 
   test-linux:
     if: github.event.inputs.platform == 'linux' || github.event.inputs.platform == 'all'
