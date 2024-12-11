@@ -4,7 +4,7 @@ version = "0.1.0"
 edition = "2021"
 
 [dependencies]
-wasapi = "0.15.0"
+# Core dependencies
 hound = "3.5.1"
 sysinfo = "0.33.0"
 clap = { version = "4.5.23", features = ["derive"] }
@@ -13,34 +13,20 @@ indicatif = "0.17.9"
 color-eyre = "0.6.3"
 ctrlc = "3.4.5"
 
-# ML/Audio Processing
-burn = { version = "0.15.0", features = ["train", "wgpu", "ndarray"] }
-burn-autodiff = "0.15.0"
-burn-tensor = "0.15.0"
-burn-tch = "0.15.0"
-ndarray = { version = "0.16.1", features = ["serde"] }
-rustfft = "6.2.0"                                                      # FFT for audio processing
-rand = "0.8.5"                                                         # Random number generation
-rayon = "1.10.0"                                                       # Parallel processing
-thiserror = "2.0.6"                                                    # Error handling
-rubato = "0.16.1"                                                      # Audio resampling
+# Platform-specific audio capture
+[target.'cfg(target_os = "windows")'.dependencies]
+wasapi = "0.15.0"
 
-# Speech Processing
-sherpa-rs = "0.5.1"
-whisper-rs = "0.13.2"
+[target.'cfg(target_os = "linux")'.dependencies]
+libpulse-binding = "2.28.1"
+libpulse-simple-binding = "2.28.1"
+pipewire = "0.7.2"
 
-# Async/Concurrent
-tokio = { version = "1.42.0", features = ["full"] }
-async-trait = "0.1.83"
+[target.'cfg(target_os = "macos")'.dependencies]
+coreaudio-rs = "0.11.3"
 
-# HuggingFace Hub
-reqwest = { version = "0.12.9", features = ["json"] }
-dirs = "5.0.1"                                        # For finding home directory for cache
-
-# Serialization
-serde = { version = "1.0.216", features = ["derive"] }
-serde_json = "1.0.133"
-sha256 = "1.5.0"
+# Error handling
+thiserror = "2.0.6"
 
 [dev-dependencies]
 criterion = "0.5.1" # Benchmarking
@@ -51,20 +37,20 @@ name = "wav_demo"
 path = "examples/wav_demo.rs"
 
 [[example]]
-name = "test_whisper"
-path = "examples/test_whisper.rs"
+name = "test_windows"
+path = "examples/test_windows.rs"
 
 [[example]]
-name = "test_transcription"
-path = "examples/test_transcription.rs"
+name = "test_pulseaudio"
+path = "examples/test_pulseaudio.rs"
 
 [[example]]
-name = "test_whisper_minimal"
-path = "examples/test_whisper_minimal.rs"
+name = "test_coreaudio"
+path = "examples/test_coreaudio.rs"
 
-[[bin]]
-name = "download-test-files"
-path = "scripts/download_test_files.rs"
+[[example]]
+name = "test_coreaudio_app"
+path = "examples/test_coreaudio_app.rs"
 
 [workspace]
 members = []
