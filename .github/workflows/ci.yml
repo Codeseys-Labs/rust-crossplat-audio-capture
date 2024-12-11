@@ -49,23 +49,15 @@ jobs:
           Get-AudioDevice -List
         shell: pwsh
           
-      - name: Install Virtual Audio Device
+      - name: Install FFmpeg
+        uses: FedericoCarboni/setup-ffmpeg@v2
+        
+      - name: Download test audio
         run: |
-          # Download VB-CABLE driver
-          Invoke-WebRequest -Uri "https://download.vb-audio.com/Download_CABLE/VBCABLE_Driver_Pack43.zip" -OutFile "VBCABLE.zip"
-          Expand-Archive -Path "VBCABLE.zip" -DestinationPath "VBCABLE"
-          
-          # Install the driver (requires elevation)
-          $cert = Get-ChildItem -Path "VBCABLE" -Recurse -Filter "*.cer"
-          if ($cert) {
-              certutil -addstore "TrustedPublisher" $cert.FullName
-          }
-          
-          $inf = Get-ChildItem -Path "VBCABLE" -Recurse -Filter "*.inf"
-          if ($inf) {
-              pnputil /add-driver $inf.FullName /install
-          }
-        shell: pwsh
+          mkdir -p test_audio
+          curl -L "https://archive.org/download/gd70-02-14.early-late.sbd.cotsman.18115.sbeok.shnf/gd70-02-14d1t01.shn" -o "test_audio/sample.shn"
+          ffmpeg -i "test_audio/sample.shn" -ar 48000 -ac 2 -acodec pcm_f32le -t 30 "test_audio/sample.wav"
+        shell: bash
         
       - name: Cache dependencies
         uses: actions/cache@v3
@@ -92,34 +84,45 @@ jobs:
         env:
           WINAPI_NO_BUNDLED_LIBRARIES: 1
         
-      - name: Generate test audio
+      - name: Test audio file processing
         run: |
-          Add-Type -AssemblyName System.Speech
-          $speak = New-Object System.Speech.Synthesis.SpeechSynthesizer
-          $speak.SetOutputToDefaultAudioDevice()
-          $speak.Speak("This is a test audio for WASAPI capture")
-        shell: pwsh
-        
-      - name: Test WASAPI functionality
-        run: |
-          # List available audio endpoints
-          cargo run --example test_windows -- --list-devices
+          # Test WAV file reading
+          cargo run --example wav_demo -- test_audio/sample.wav
           
-          # Try to capture from the virtual audio device
-          cargo run --example test_windows -- --device "CABLE Input" --duration 5
+          # Test audio format conversion
+          cargo run --example test_windows -- --file test_audio/sample.wav --format s16le --output converted.raw
           
-          # Check if we captured any audio
-          if (Test-Path "audio_capture.raw") {
-              $size = (Get-Item "audio_capture.raw").Length
-              if ($size -eq 0) {
-                  Write-Error "No audio was captured"
-                  exit 1
-              }
-              Write-Host "Successfully captured $size bytes of audio"
-          } else {
-              Write-Error "Audio capture file was not created"
+          # Verify output
+          if (!(Test-Path "converted.raw")) {
+              Write-Error "Conversion failed - output file not created"
               exit 1
           }
+          
+          $size = (Get-Item "converted.raw").Length
+          if ($size -eq 0) {
+              Write-Error "Conversion failed - output file is empty"
+              exit 1
+          }
+          
+          Write-Host "Successfully processed $size bytes of audio"
+          
+          # Test format conversion back to WAV
+          cargo run --example test_windows -- --file converted.raw --format s16le --output final.wav --to-wav
+          
+          # Verify final WAV
+          if (!(Test-Path "final.wav")) {
+              Write-Error "WAV conversion failed - output file not created"
+              exit 1
+          }
+          
+          # Compare audio characteristics
+          $originalInfo = ffprobe -v quiet -print_format json -show_streams test_audio/sample.wav
+          $finalInfo = ffprobe -v quiet -print_format json -show_streams final.wav
+          
+          Write-Host "Original audio info:"
+          Write-Host $originalInfo
+          Write-Host "Converted audio info:"
+          Write-Host $finalInfo
         shell: pwsh
         env:
           WINAPI_NO_BUNDLED_LIBRARIES: 1
