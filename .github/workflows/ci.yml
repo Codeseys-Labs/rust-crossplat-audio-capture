@@ -34,13 +34,39 @@ jobs:
       - name: Install Rust
         uses: dtolnay/rust-toolchain@stable
         
+      - name: Setup Windows SDK
+        uses: GuillaumeFalourd/setup-windows10-sdk-action@v1.11
+        with:
+          sdk-version: 18362
+        
       - name: Debug Info
         if: env.DEBUG == 'true'
         run: |
           rustc --version --verbose
           cargo --version --verbose
           cargo tree
+          Get-CimInstance Win32_SoundDevice | Format-List *
+          Get-AudioDevice -List
+        shell: pwsh
           
+      - name: Install Virtual Audio Device
+        run: |
+          # Download VB-CABLE driver
+          Invoke-WebRequest -Uri "https://download.vb-audio.com/Download_CABLE/VBCABLE_Driver_Pack43.zip" -OutFile "VBCABLE.zip"
+          Expand-Archive -Path "VBCABLE.zip" -DestinationPath "VBCABLE"
+          
+          # Install the driver (requires elevation)
+          $cert = Get-ChildItem -Path "VBCABLE" -Recurse -Filter "*.cer"
+          if ($cert) {
+              certutil -addstore "TrustedPublisher" $cert.FullName
+          }
+          
+          $inf = Get-ChildItem -Path "VBCABLE" -Recurse -Filter "*.inf"
+          if ($inf) {
+              pnputil /add-driver $inf.FullName /install
+          }
+        shell: pwsh
+        
       - name: Cache dependencies
         uses: actions/cache@v3
         with:
@@ -52,17 +78,51 @@ jobs:
           
       - name: Build
         run: cargo build --verbose
+        env:
+          # Ensure we use the right Windows SDK
+          WINAPI_NO_BUNDLED_LIBRARIES: 1
         
       - name: Run tests
         run: cargo test --verbose
+        env:
+          WINAPI_NO_BUNDLED_LIBRARIES: 1
         
       - name: Build examples
         run: cargo build --examples
+        env:
+          WINAPI_NO_BUNDLED_LIBRARIES: 1
+        
+      - name: Generate test audio
+        run: |
+          Add-Type -AssemblyName System.Speech
+          $speak = New-Object System.Speech.Synthesis.SpeechSynthesizer
+          $speak.SetOutputToDefaultAudioDevice()
+          $speak.Speak("This is a test audio for WASAPI capture")
+        shell: pwsh
         
       - name: Test WASAPI functionality
         run: |
-          cargo run --example test_windows -- --help
-          # Note: Actual audio capture tests require audio playback
+          # List available audio endpoints
+          cargo run --example test_windows -- --list-devices
+          
+          # Try to capture from the virtual audio device
+          cargo run --example test_windows -- --device "CABLE Input" --duration 5
+          
+          # Check if we captured any audio
+          if (Test-Path "audio_capture.raw") {
+              $size = (Get-Item "audio_capture.raw").Length
+              if ($size -eq 0) {
+                  Write-Error "No audio was captured"
+                  exit 1
+              }
+              Write-Host "Successfully captured $size bytes of audio"
+          } else {
+              Write-Error "Audio capture file was not created"
+              exit 1
+          }
+        shell: pwsh
+        env:
+          WINAPI_NO_BUNDLED_LIBRARIES: 1
 
   test-linux:
     if: github.event.inputs.platform == 'linux' || github.event.inputs.platform == 'all'
