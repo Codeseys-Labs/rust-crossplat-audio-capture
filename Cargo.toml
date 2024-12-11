@@ -4,7 +4,7 @@ version = "0.1.0"
 edition = "2021"
 
 [dependencies]
-wasapi = "0.15.0"
+# Core dependencies
 hound = "3.5.1"
 sysinfo = "0.33.0"
 clap = { version = "4.5.23", features = ["derive"] }
@@ -12,6 +12,18 @@ inquire = "0.7.5"
 indicatif = "0.17.9"
 color-eyre = "0.6.3"
 ctrlc = "3.4.5"
+
+# Platform-specific audio capture
+[target.'cfg(target_os = "windows")'.dependencies]
+wasapi = "0.15.0"
+
+[target.'cfg(target_os = "linux")'.dependencies]
+libpulse-binding = "2.28.1"
+libpulse-simple-binding = "2.28.1"
+pipewire = "0.7.2"
+
+[target.'cfg(target_os = "macos")'.dependencies]
+coreaudio-rs = "0.11.3"
 
 # ML/Audio Processing
 burn = { version = "0.15.0", features = ["train", "wgpu", "ndarray"] }
