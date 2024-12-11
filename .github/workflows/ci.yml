@@ -55,8 +55,10 @@ jobs:
       - name: Download test audio
         run: |
           mkdir -p test_audio
-          curl -L "https://archive.org/download/gd70-02-14.early-late.sbd.cotsman.18115.sbeok.shnf/gd70-02-14d1t01.shn" -o "test_audio/sample.shn"
-          ffmpeg -i "test_audio/sample.shn" -ar 48000 -ac 2 -acodec pcm_f32le -t 30 "test_audio/sample.wav"
+          curl -L "https://ia800901.us.archive.org/23/items/gd70-02-14.early-late.sbd.cotsman.18115.sbeok.shnf/gd70-02-14d1t02.mp3" -o "test_audio/sample.mp3"
+          ffmpeg -i "test_audio/sample.mp3" -ar 48000 -ac 2 -acodec pcm_f32le -t 30 "test_audio/sample.wav"
+          # Print audio info
+          ffprobe -v quiet -print_format json -show_streams "test_audio/sample.mp3"
         shell: bash
         
       - name: Cache dependencies
