@@ -1,0 +1,185 @@
+name: Cross-Platform Tests
+
+on:
+  workflow_dispatch:
+    inputs:
+      platform:
+        description: 'Platform to test'
+        required: true
+        default: 'all'
+        type: choice
+        options:
+          - all
+          - windows
+          - linux
+          - macos
+      debug_enabled:
+        description: 'Enable debug output'
+        required: false
+        type: boolean
+        default: false
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  test-windows:
+    if: github.event.inputs.platform == 'windows' || github.event.inputs.platform == 'all'
+    runs-on: windows-latest
+    env:
+      DEBUG: ${{ github.event.inputs.debug_enabled }}
+    steps:
+      - uses: actions/checkout@v3
+      
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+        
+      - name: Debug Info
+        if: env.DEBUG == 'true'
+        run: |
+          rustc --version --verbose
+          cargo --version --verbose
+          cargo tree
+          
+      - name: Cache dependencies
+        uses: actions/cache@v3
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.lock') }}
+          
+      - name: Build
+        run: cargo build --verbose
+        
+      - name: Run tests
+        run: cargo test --verbose
+        
+      - name: Build examples
+        run: cargo build --examples
+        
+      - name: Test WASAPI functionality
+        run: |
+          cargo run --example test_windows -- --help
+          # Note: Actual audio capture tests require audio playback
+
+  test-linux:
+    if: github.event.inputs.platform == 'linux' || github.event.inputs.platform == 'all'
+    runs-on: ubuntu-latest
+    env:
+      DEBUG: ${{ github.event.inputs.debug_enabled }}
+    steps:
+      - uses: actions/checkout@v3
+      
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+        
+      - name: Debug Info
+        if: env.DEBUG == 'true'
+        run: |
+          rustc --version --verbose
+          cargo --version --verbose
+          cargo tree
+          
+      - name: Install PulseAudio
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y pulseaudio libpulse-dev
+          
+      - name: Start PulseAudio
+        run: |
+          pulseaudio --start --exit-idle-time=-1
+          sleep 2
+          
+      - name: Cache dependencies
+        uses: actions/cache@v3
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.lock') }}
+          
+      - name: Build
+        run: cargo build --verbose
+        
+      - name: Run tests
+        run: cargo test --verbose
+        
+      - name: Build examples
+        run: cargo build --examples
+        
+      - name: Test PulseAudio functionality
+        run: |
+          cargo run --example test_pulseaudio -- --help
+          # Note: Actual audio capture tests require audio playback
+
+  test-macos:
+    if: github.event.inputs.platform == 'macos' || github.event.inputs.platform == 'all'
+    runs-on: macos-latest
+    env:
+      DEBUG: ${{ github.event.inputs.debug_enabled }}
+    steps:
+      - uses: actions/checkout@v3
+      
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+        
+      - name: Debug Info
+        if: env.DEBUG == 'true'
+        run: |
+          rustc --version --verbose
+          cargo --version --verbose
+          cargo tree
+          
+      - name: Cache dependencies
+        uses: actions/cache@v3
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.lock') }}
+          
+      - name: Build
+        run: cargo build --verbose
+        
+      - name: Run tests
+        run: cargo test --verbose
+        
+      - name: Build examples
+        run: cargo build --examples
+        
+      - name: Test CoreAudio functionality
+        run: |
+          cargo run --example test_coreaudio -- --help
+          # Note: Actual audio capture tests require screen recording permission
+
+  clippy:
+    if: github.event.inputs.platform == 'all'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v3
+      
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+          
+      - name: Clippy check
+        run: cargo clippy -- -D warnings
+
+  format:
+    if: github.event.inputs.platform == 'all'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v3
+      
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt
+          
+      - name: Check formatting
+        run: cargo fmt -- --check
