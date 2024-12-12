@@ -1,5 +1,4 @@
 use std::collections::VecDeque;
-use std::sync::{Arc, Mutex};
 use wasapi::{
     self,
     AudioClient,
@@ -8,29 +7,25 @@ use wasapi::{
     ShareMode,
     WaveFormat,
     SampleType,
-    DeviceCollection,
-    Role,
 };
-use windows::Win32::System::Com;
-use sysinfo::{ProcessRefreshKind, RefreshKind, System};
+use sysinfo::{System, SystemExt, ProcessExt};
 use super::core::{
     AudioApplication, AudioCaptureBackend, AudioCaptureStream, AudioConfig,
-    AudioError, AudioFormat,
+    AudioError,
 };
 
 pub struct WasapiBackend {
-    device_enumerator: wasapi::Enumerator,
+    system: System,
 }
 
 impl WasapiBackend {
     pub fn new() -> Result<Self, AudioError> {
-        wasapi::initialize_mta()
-            .map_err(|e| AudioError::InitializationFailed(e.to_string()))?;
+        if let Err(e) = wasapi::initialize_mta() {
+            return Err(AudioError::InitializationFailed(e.to_string()));
+        }
         
-        let device_enumerator = wasapi::Enumerator::new()
-            .map_err(|e| AudioError::InitializationFailed(e.to_string()))?;
-        
-        Ok(Self { device_enumerator })
+        let system = System::new_all();
+        Ok(Self { system })
     }
 }
 
@@ -46,19 +41,17 @@ impl AudioCaptureBackend for WasapiBackend {
     }
 
     fn list_applications(&self) -> Result<Vec<AudioApplication>, AudioError> {
-        let refreshes = RefreshKind::new().with_processes(ProcessRefreshKind::everything());
-        let system = System::new_with_specifics(refreshes);
+        self.system.refresh_processes();
         
         let mut apps = Vec::new();
-        for process in system.processes_by_name("") {
-            if let Ok(name) = process.name() {
-                apps.push(AudioApplication {
-                    name: name.to_string(),
-                    id: process.pid().to_string(),
-                    executable_name: format!("{}.exe", name),
-                    pid: process.pid().as_u32(),
-                });
-            }
+        for (pid, process) in self.system.processes() {
+            let name = process.name().to_string();
+            apps.push(AudioApplication {
+                name: name.clone(),
+                id: pid.to_string(),
+                executable_name: format!("{}.exe", name),
+                pid: pid.as_u32(),
+            });
         }
 
         Ok(apps)
@@ -104,21 +97,29 @@ pub struct WasapiCaptureStream {
     event_handle: Option<wasapi::Handle>,
 }
 
+// Make WasapiCaptureStream Send-safe
+unsafe impl Send for WasapiCaptureStream {}
+
 impl WasapiCaptureStream {
     fn new(client: AudioClient, config: AudioConfig) -> Result<Self, AudioError> {
-        let event_handle = client.set_get_eventhandle()
-            .map_err(|e| AudioError::InitializationFailed(e.to_string()))?;
+        let event_handle = if let Err(e) = client.set_get_eventhandle() {
+            return Err(AudioError::InitializationFailed(e.to_string()));
+        } else {
+            None
+        };
 
-        let capture_client = client
-            .get_audiocaptureclient()
-            .map_err(|e| AudioError::InitializationFailed(e.to_string()))?;
+        let capture_client = if let Err(e) = client.get_audiocaptureclient() {
+            return Err(AudioError::InitializationFailed(e.to_string()));
+        } else {
+            client.get_audiocaptureclient().unwrap()
+        };
 
         Ok(Self {
             client,
             capture_client,
             buffer: VecDeque::new(),
             config,
-            event_handle: Some(event_handle),
+            event_handle,
         })
     }
 }
@@ -147,21 +148,25 @@ impl AudioCaptureStream for WasapiCaptureStream {
         }
 
         // Get new frames
-        let new_frames = self.capture_client
-            .get_next_nbr_frames()?
-            .unwrap_or(0);
+        let new_frames = match self.capture_client.get_next_packet_size() {
+            Ok(frames) => frames,
+            Err(e) => return Err(AudioError::CaptureError(e.to_string())),
+        };
 
         if new_frames > 0 {
-            // Calculate additional buffer space needed
-            let blockalign = (self.config.channels * 4) as usize; // 4 bytes per sample (32-bit float)
-            let additional = (new_frames as usize * blockalign)
-                .saturating_sub(self.buffer.capacity() - self.buffer.len());
-            self.buffer.reserve(additional);
+            // Get the data
+            let data = match self.capture_client.get_buffer(new_frames) {
+                Ok(data) => data,
+                Err(e) => return Err(AudioError::CaptureError(e.to_string())),
+            };
 
-            // Read data into our buffer
-            self.capture_client
-                .read_from_device_to_deque(&mut self.buffer)
-                .map_err(|e| AudioError::CaptureError(e.to_string()))?;
+            // Copy data to our buffer
+            self.buffer.extend(data.iter().copied());
+
+            // Release the buffer
+            if let Err(e) = self.capture_client.release_buffer(new_frames) {
+                return Err(AudioError::CaptureError(e.to_string()));
+            }
         }
 
         // Wait for more data if needed
