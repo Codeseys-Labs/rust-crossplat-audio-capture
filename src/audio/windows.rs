@@ -1,7 +1,12 @@
 use std::sync::Arc;
 use wasapi::{
-    AudioClient, AudioClientProperties, AudioClientShareMode, AudioCaptureClient, Device,
-    DeviceCollection, Direction, Role, WaveFormat,
+    self,
+    AudioClient,
+    Device,
+    DeviceCollection,
+    Direction,
+    Role,
+    WaveFormat,
 };
 use super::core::{
     AudioApplication, AudioCaptureBackend, AudioCaptureStream, AudioConfig,
@@ -96,16 +101,6 @@ impl WasapiCaptureStream {
             .get_iaudioclient()
             .map_err(|e| AudioError::InitializationFailed(e.to_string()))?;
 
-        // Set low-latency mode
-        client
-            .set_client_properties(&AudioClientProperties {
-                cbsize: std::mem::size_of::<AudioClientProperties>() as u32,
-                bIsOffload: false,
-                eCategory: Role::Console,
-                Options: 0,
-            })
-            .map_err(|e| AudioError::InitializationFailed(e.to_string()))?;
-
         let wave_format = WaveFormat::new(
             config.channels as u16,
             config.sample_rate as u32,
@@ -117,10 +112,11 @@ impl WasapiCaptureStream {
         );
 
         client
-            .initialize_client(
+            .initialize(
                 &wave_format,
                 100_000, // 100ms buffer
-                AudioClientShareMode::Shared,
+                wasapi::Direction::Render,
+                wasapi::ShareMode::Shared,
                 true,
             )
             .map_err(|e| AudioError::InitializationFailed(e.to_string()))?;
@@ -152,23 +148,15 @@ impl AudioCaptureStream for WasapiCaptureStream {
 
     fn read(&mut self, buffer: &mut [u8]) -> Result<usize, AudioError> {
         let next_packet = self.capture_client
-            .get_next_packet_size()
+            .get_buffer()
             .map_err(|e| AudioError::CaptureError(e.to_string()))?;
 
-        if next_packet == 0 {
+        if next_packet.is_empty() {
             return Ok(0);
         }
 
-        let data = self.capture_client
-            .get_buffer(next_packet)
-            .map_err(|e| AudioError::CaptureError(e.to_string()))?;
-
-        let bytes_to_copy = std::cmp::min(buffer.len(), data.len());
-        buffer[..bytes_to_copy].copy_from_slice(&data[..bytes_to_copy]);
-
-        self.capture_client
-            .release_buffer(next_packet)
-            .map_err(|e| AudioError::CaptureError(e.to_string()))?;
+        let bytes_to_copy = std::cmp::min(buffer.len(), next_packet.len());
+        buffer[..bytes_to_copy].copy_from_slice(&next_packet[..bytes_to_copy]);
 
         Ok(bytes_to_copy)
     }
