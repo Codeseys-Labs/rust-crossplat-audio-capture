@@ -8,37 +8,33 @@ use wasapi::{
     ShareMode,
     WaveFormat,
     SampleType,
+    DeviceCollection,
+    Role,
 };
-use windows::Win32::System::Com;
-use sysinfo::{System, SystemExt, ProcessExt};
 use super::core::{
     AudioApplication, AudioCaptureBackend, AudioCaptureStream, AudioConfig,
     AudioError, AudioFormat,
 };
 
 pub struct WasapiBackend {
-    initialized: bool,
+    device_enumerator: wasapi::Enumerator,
 }
 
 impl WasapiBackend {
     pub fn new() -> Result<Self, AudioError> {
-        unsafe {
-            if let Err(e) = Com::CoInitializeEx(None, Com::COINIT_MULTITHREADED) {
-                return Err(AudioError::InitializationFailed(format!("Failed to initialize COM: {:?}", e)));
-            }
-        }
+        wasapi::initialize_mta()
+            .map_err(|e| AudioError::InitializationFailed(e.to_string()))?;
         
-        Ok(Self { initialized: true })
+        let device_enumerator = wasapi::Enumerator::new()
+            .map_err(|e| AudioError::InitializationFailed(e.to_string()))?;
+        
+        Ok(Self { device_enumerator })
     }
 }
 
 impl Drop for WasapiBackend {
     fn drop(&mut self) {
-        if self.initialized {
-            unsafe {
-                Com::CoUninitialize();
-            }
-        }
+        wasapi::deinitialize();
     }
 }
 
@@ -48,18 +44,22 @@ impl AudioCaptureBackend for WasapiBackend {
     }
 
     fn list_applications(&self) -> Result<Vec<AudioApplication>, AudioError> {
-        let mut system = System::new();
-        system.refresh_processes();
-        
+        let devices = self.device_enumerator
+            .get_device_collection::<DeviceCollection>()
+            .map_err(|e| AudioError::InitializationFailed(e.to_string()))?;
+
         let mut apps = Vec::new();
-        for (pid, process) in system.processes() {
-            // Only include processes that might produce audio
-            apps.push(AudioApplication {
-                name: process.name().to_owned(),
-                id: pid.to_string(),
-                executable_name: process.name().to_owned(),
-                pid: pid.as_u32(),
-            });
+        for device in devices {
+            if let Ok(device) = device {
+                if let Ok(name) = device.get_friendlyname() {
+                    apps.push(AudioApplication {
+                        name: name.clone(),
+                        id: name.clone(),
+                        executable_name: format!("{}.exe", name),
+                        pid: 0,  // We'll get this when capturing
+                    });
+                }
+            }
         }
 
         Ok(apps)
@@ -70,56 +70,67 @@ impl AudioCaptureBackend for WasapiBackend {
         app: &AudioApplication,
         config: AudioConfig,
     ) -> Result<Box<dyn AudioCaptureStream>, AudioError> {
-        let stream = WasapiCaptureStream::new(app.pid, config)?;
-        Ok(Box::new(stream))
+        let devices = self.device_enumerator
+            .get_device_collection::<DeviceCollection>()
+            .map_err(|e| AudioError::DeviceNotFound(e.to_string()))?;
+
+        for device in devices {
+            if let Ok(device) = device {
+                if let Ok(name) = device.get_friendlyname() {
+                    if name.contains(&app.name) {
+                        let stream = WasapiCaptureStream::new(device, config)?;
+                        return Ok(Box::new(stream));
+                    }
+                }
+            }
+        }
+
+        Err(AudioError::DeviceNotFound(format!(
+            "No audio device found for application: {}", app.name
+        )))
     }
 }
 
 pub struct WasapiCaptureStream {
-    client: Arc<Mutex<AudioClient>>,
-    capture_client: Arc<Mutex<AudioCaptureClient>>,
-    event_handle: Arc<wasapi::Handle>,
-    buffer: Arc<Mutex<VecDeque<u8>>>,
+    client: AudioClient,
+    capture_client: AudioCaptureClient,
+    buffer: VecDeque<u8>,
     config: AudioConfig,
 }
 
-// SAFETY: The Arc<Mutex<...>> makes the stream Send-safe
-unsafe impl Send for WasapiCaptureStream {}
-
 impl WasapiCaptureStream {
-    fn new(process_id: u32, config: AudioConfig) -> Result<Self, AudioError> {
-        let desired_format = WaveFormat::new(
-            config.channels.into(),
-            config.sample_rate.try_into().unwrap(),
-            &match config.format {
-                AudioFormat::F32LE => SampleType::Float,
-                AudioFormat::S16LE | AudioFormat::S32LE => SampleType::Int,
-            },
+    fn new(device: wasapi::Device, config: AudioConfig) -> Result<Self, AudioError> {
+        let client = device
+            .get_iaudioclient()
+            .map_err(|e| AudioError::InitializationFailed(e.to_string()))?;
+
+        let wave_format = WaveFormat::new(
+            32,  // bits per sample
+            32,  // valid bits per sample
+            &SampleType::Float,
+            config.sample_rate,
+            config.channels,
+            None,
         );
 
-        let include_process_tree = true;
-        let mut client = AudioClient::new_application_loopback_client(process_id, include_process_tree)
-            .map_err(|e| AudioError::InitializationFailed(format!("Failed to create audio client: {:?}", e)))?;
+        client
+            .initialize_client(
+                &wave_format,
+                100_000, // 100ms buffer
+                &Direction::Capture,
+                &ShareMode::Shared,
+                true,  // Allow format conversion
+            )
+            .map_err(|e| AudioError::InitializationFailed(e.to_string()))?;
 
-        client.initialize_client(
-            &desired_format,
-            0,  // Use default buffer duration
-            &Direction::Capture,
-            &ShareMode::Shared,
-            true,  // Allow format conversion
-        ).map_err(|e| AudioError::InitializationFailed(format!("Failed to initialize client: {:?}", e)))?;
-
-        let event_handle = client.set_get_eventhandle()
-            .map_err(|e| AudioError::InitializationFailed(format!("Failed to get event handle: {:?}", e)))?;
-
-        let capture_client = client.get_audiocaptureclient()
-            .map_err(|e| AudioError::InitializationFailed(format!("Failed to get capture client: {:?}", e)))?;
+        let capture_client = client
+            .get_audiocaptureclient()
+            .map_err(|e| AudioError::InitializationFailed(e.to_string()))?;
 
         Ok(Self {
-            client: Arc::new(Mutex::new(client)),
-            capture_client: Arc::new(Mutex::new(capture_client)),
-            event_handle: Arc::new(event_handle),
-            buffer: Arc::new(Mutex::new(VecDeque::new())),
+            client,
+            capture_client,
+            buffer: VecDeque::new(),
             config,
         })
     }
@@ -127,59 +138,48 @@ impl WasapiCaptureStream {
 
 impl AudioCaptureStream for WasapiCaptureStream {
     fn start(&mut self) -> Result<(), AudioError> {
-        let mut client = self.client.lock()
-            .map_err(|e| AudioError::CaptureError(format!("Failed to lock client: {:?}", e)))?;
-        client.start_stream()
-            .map_err(|e| AudioError::CaptureError(format!("Failed to start stream: {:?}", e)))
+        self.client
+            .start_stream()
+            .map_err(|e| AudioError::CaptureError(e.to_string()))
     }
 
     fn stop(&mut self) -> Result<(), AudioError> {
-        let mut client = self.client.lock()
-            .map_err(|e| AudioError::CaptureError(format!("Failed to lock client: {:?}", e)))?;
-        client.stop_stream()
-            .map_err(|e| AudioError::CaptureError(format!("Failed to stop stream: {:?}", e)))
+        self.client
+            .stop_stream()
+            .map_err(|e| AudioError::CaptureError(e.to_string()))
     }
 
     fn read(&mut self, buffer: &mut [u8]) -> Result<usize, AudioError> {
         // If we have enough data in the buffer, return it
-        {
-            let mut internal_buffer = self.buffer.lock()
-                .map_err(|e| AudioError::CaptureError(format!("Failed to lock buffer: {:?}", e)))?;
-            if !internal_buffer.is_empty() {
-                let bytes_to_copy = std::cmp::min(buffer.len(), internal_buffer.len());
-                for i in 0..bytes_to_copy {
-                    buffer[i] = internal_buffer.pop_front().unwrap();
-                }
-                return Ok(bytes_to_copy);
+        if !self.buffer.is_empty() {
+            let bytes_to_copy = std::cmp::min(buffer.len(), self.buffer.len());
+            for i in 0..bytes_to_copy {
+                buffer[i] = self.buffer.pop_front().unwrap();
             }
-        }
-
-        // Wait for new data
-        if self.event_handle.wait_for_event(100).is_err() {
-            return Ok(0);  // No data available
+            return Ok(bytes_to_copy);
         }
 
         // Get new frames
-        let mut capture_client = self.capture_client.lock()
-            .map_err(|e| AudioError::CaptureError(format!("Failed to lock capture client: {:?}", e)))?;
+        let next_packet = self.capture_client
+            .get_next_packet_size()
+            .map_err(|e| AudioError::CaptureError(e.to_string()))?;
 
-        if let Ok(Some(frames)) = capture_client.get_next_nbr_frames() {
-            if frames > 0 {
-                let mut internal_buffer = self.buffer.lock()
-                    .map_err(|e| AudioError::CaptureError(format!("Failed to lock buffer: {:?}", e)))?;
-                
-                capture_client.read_from_device_to_deque(&mut internal_buffer)
-                    .map_err(|e| AudioError::CaptureError(format!("Failed to read from device: {:?}", e)))?;
-                
-                let bytes_to_copy = std::cmp::min(buffer.len(), internal_buffer.len());
-                for i in 0..bytes_to_copy {
-                    buffer[i] = internal_buffer.pop_front().unwrap();
-                }
-                return Ok(bytes_to_copy);
-            }
+        if next_packet == 0 {
+            return Ok(0);
         }
 
-        Ok(0)
+        let data = self.capture_client
+            .get_buffer(next_packet)
+            .map_err(|e| AudioError::CaptureError(e.to_string()))?;
+
+        let bytes_to_copy = std::cmp::min(buffer.len(), data.len());
+        buffer[..bytes_to_copy].copy_from_slice(&data[..bytes_to_copy]);
+
+        self.capture_client
+            .release_buffer(next_packet)
+            .map_err(|e| AudioError::CaptureError(e.to_string()))?;
+
+        Ok(bytes_to_copy)
     }
 
     fn config(&self) -> &AudioConfig {
