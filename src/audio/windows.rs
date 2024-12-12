@@ -11,6 +11,7 @@ use wasapi::{
     DeviceCollection,
     Role,
 };
+use windows::Win32::System::Com;
 use super::core::{
     AudioApplication, AudioCaptureBackend, AudioCaptureStream, AudioConfig,
     AudioError, AudioFormat,
