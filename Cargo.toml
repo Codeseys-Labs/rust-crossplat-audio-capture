@@ -16,6 +16,7 @@ ctrlc = "3.4.5"
 # Platform-specific audio capture
 [target.'cfg(target_os = "windows")'.dependencies]
 wasapi = "0.15.0"
+windows = { version = "0.52.0", features = ["Win32_System_Com"] }
 
 [target.'cfg(target_os = "linux")'.dependencies]
 libpulse-binding = "2.28.1"
