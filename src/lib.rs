@@ -1,32 +1,9 @@
-//! Real-time Speech Analysis and Capture (RSAC)
+//! Cross-platform Audio Capture Library
 //!
-//! This library provides functionality for real-time audio processing,
-//! including speaker diarization and speech transcription.
+//! This library provides functionality for capturing audio from specific applications
+//! across different platforms (Windows, Linux, and macOS).
 
 pub mod audio;
-pub mod models;
-pub mod pipeline;
-
-// Re-export main types for easier access
-pub use pipeline::{
-    create_diarization_transcription_pipeline,
-    // Diarization types
-    diarization::{DiarizationComponent, DiarizationConfig, SpeakerSegment},
-
-    process_audio,
-    // Transcription types
-    transcription::{TranscribedSegment, TranscriptionComponent, TranscriptionConfig},
-
-    // Core pipeline types
-    AudioChunk,
-    // Combined types and utilities
-    CombinedSegment,
-    ComponentConfig,
-    Pipeline,
-    PipelineComponent,
-};
-
-pub use models::ModelHub;
 
 /// Error type for the library
 pub type Error = color_eyre::Report;
