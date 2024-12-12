@@ -1,137 +1,57 @@
-use color_eyre::Result;
-use rsac::{
-    pipeline::{
-        AudioChunk, DiarizationComponent, DiarizationConfig, PipelineComponent,
-        TranscriptionComponent, TranscriptionConfig,
-    },
-    process_audio,
-};
-use std::fs;
+use rsac::{get_audio_backend, AudioConfig, AudioFormat};
+use std::{fs::File, io::Write, time::Duration};
 
-const TARGET_SAMPLE_RATE: u32 = 16000;
-const CHUNK_DURATION: usize = 10; // 10 seconds
+fn main() -> Result<(), Box<dyn std::error::Error>> {
+    // Get the default audio backend
+    let backend = get_audio_backend()?;
+    println!("Using audio backend: {}", backend.name());
 
-#[tokio::main]
-async fn main() -> Result<()> {
-    // Initialize error handling
-    color_eyre::install()?;
-
-    // First verify the models exist
-    println!("Checking model files...");
-    let segment_model = "models/sherpa-onnx-pyannote-segmentation-3-0/model.onnx";
-    let embedding_model = "models/3dspeaker_speech_eres2net_base_sv_zh-cn_3dspeaker_16k.onnx";
-    let whisper_model = "models\\whisper-base.bin";
-
-    assert!(
-        fs::metadata(segment_model).is_ok(),
-        "Segmentation model not found"
-    );
-    assert!(
-        fs::metadata(embedding_model).is_ok(),
-        "Embedding model not found"
-    );
-    assert!(
-        fs::metadata(whisper_model).is_ok(),
-        "Whisper model not found"
-    );
-
-    println!("All model files present.");
-
-    // Read audio file
-    println!("Reading audio file...");
-    let (samples, sample_rate) = sherpa_rs::read_audio_file("podcast_16k.wav")?;
-    println!("Read {} samples at {} Hz", samples.len(), sample_rate);
-
-    // Test transcription component first
-    println!("\nTesting transcription component...");
-    let transcription_config = TranscriptionConfig {
-        model_path: whisper_model.to_string(),
-        language: "en".to_string(),
-        translate: false,
-        min_segment_duration: 0.1,
-        timestamp_enabled: true,
-        sample_rate: TARGET_SAMPLE_RATE,
-    };
-
-    println!("Initializing transcriber...");
-    let mut transcriber = TranscriptionComponent::initialize(transcription_config).await?;
-    println!("Transcriber initialized.");
-
-    // Process first chunk through transcriber
-    println!("Testing transcriber with first chunk...");
-    let chunk_size = TARGET_SAMPLE_RATE as usize * CHUNK_DURATION;
-    if let Some(chunk) = samples.chunks(chunk_size).next() {
-        let audio_chunk = AudioChunk::new(chunk.to_vec(), 0.0, TARGET_SAMPLE_RATE);
-
-        let result = transcriber.process(audio_chunk).await?;
+    // List available applications
+    let apps = backend.list_applications()?;
+    println!("\nAvailable audio sources:");
+    for (i, app) in apps.iter().enumerate() {
         println!(
-            "Transcriber test successful: {} segments",
-            result.segments.len()
+            "{}: {} (ID: {}, Process: {})",
+            i, app.name, app.id, app.executable_name
         );
-        for segment in result.segments {
-            println!(
-                "  [{}s - {}s]: {}",
-                segment.start_time, segment.end_time, segment.text
-            );
-        }
     }
 
-    // Test diarization component
-    println!("\nTesting diarization component...");
-    let diarization_config = DiarizationConfig {
-        segment_model_path: segment_model.to_string(),
-        embedding_model_path: embedding_model.to_string(),
-        max_speakers: 2,
-        min_segment_duration: 0.5,
-        overlap_threshold: 0.5,
-        sample_rate: TARGET_SAMPLE_RATE,
-    };
+    if let Some(app) = apps.first() {
+        println!("\nCapturing audio from: {}", app.name);
 
-    println!("Initializing diarizer...");
-    let mut diarizer = DiarizationComponent::initialize(diarization_config).await?;
-    println!("Diarizer initialized.");
+        // Create audio configuration
+        let config = AudioConfig {
+            sample_rate: 48000,
+            channels: 2,
+            format: AudioFormat::F32LE,
+        };
 
-    // Process first chunk through diarizer
-    println!("Testing diarizer with first chunk...");
-    if let Some(chunk) = samples.chunks(chunk_size).next() {
-        let audio_chunk = AudioChunk::new(chunk.to_vec(), 0.0, TARGET_SAMPLE_RATE);
+        // Create capture stream
+        let mut stream = backend.capture_application(app, config)?;
 
-        let result = diarizer.process(audio_chunk).await?;
-        println!(
-            "Diarizer test successful: {} segments",
-            result.segments.len()
-        );
-        for segment in result.segments {
-            println!(
-                "  [{}s - {}s] Speaker {}",
-                segment.start_time, segment.end_time, segment.speaker_id
-            );
-        }
-    }
+        // Start capturing
+        stream.start()?;
+        println!("Started capturing...");
 
-    // If both components work individually, try processing through pipeline
-    println!("\nTesting full pipeline...");
-    for (i, chunk) in samples.chunks(chunk_size).enumerate() {
-        println!("\nProcessing chunk {} ({} samples)...", i + 1, chunk.len());
+        // Create output file
+        let mut file = File::create("demo_capture.raw")?;
+        let mut buffer = vec![0u8; 4096];
+        let start = std::time::Instant::now();
+        let duration = Duration::from_secs(5);
 
-        let audio_chunk = AudioChunk::new(
-            chunk.to_vec(),
-            (i * CHUNK_DURATION) as f64,
-            TARGET_SAMPLE_RATE,
-        );
-
-        match process_audio(audio_chunk, &mut diarizer, &mut transcriber).await {
-            Ok(segments) => {
-                println!("  Segments: {}", segments.len());
-                for segment in segments {
-                    println!(
-                        "  [{}s - {}s] Speaker {}: {}",
-                        segment.start_time, segment.end_time, segment.speaker_id, segment.text
-                    );
-                }
+        // Capture for 5 seconds
+        while start.elapsed() < duration {
+            let bytes_read = stream.read(&mut buffer)?;
+            if bytes_read > 0 {
+                file.write_all(&buffer[..bytes_read])?;
+                print!("\rCaptured {} bytes", bytes_read);
             }
-            Err(e) => eprintln!("Error processing chunk: {}", e),
         }
+        println!();
+
+        // Stop capturing
+        stream.stop()?;
+        println!("Capture complete! Saved to demo_capture.raw");
     }
 
     Ok(())

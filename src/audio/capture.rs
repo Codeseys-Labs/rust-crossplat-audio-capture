@@ -1,7 +1,7 @@
 use std::collections::VecDeque;
 use std::ffi::OsString;
 use std::fmt;
-use sysinfo::{ProcessRefreshKind, RefreshKind, System};
+use sysinfo::{ProcessRefreshKind, ProcessesToUpdate, RefreshKind, System};
 use wasapi::*;
 
 #[derive(Debug)]
@@ -41,7 +41,7 @@ pub struct ProcessAudioCapture {
 
 impl ProcessAudioCapture {
     pub fn new() -> Result<Self, AudioCaptureError> {
-        initialize_mta().ok().unwrap();
+        let _ = initialize_mta();
 
         Ok(Self {
             audio_client: None,
@@ -57,8 +57,10 @@ impl ProcessAudioCapture {
     }
 
     pub fn list_processes() -> Result<Vec<String>, AudioCaptureError> {
-        let refreshes = RefreshKind::new().with_processes(ProcessRefreshKind::everything());
-        let system = System::new_with_specifics(refreshes);
+        let mut system = System::new_with_specifics(
+            RefreshKind::everything().with_processes(ProcessRefreshKind::everything()),
+        );
+        system.refresh_processes(ProcessesToUpdate::All, true);
         let mut processes = Vec::new();
 
         for (_, process) in system.processes() {
@@ -73,8 +75,10 @@ impl ProcessAudioCapture {
     }
 
     pub fn init_for_process(&mut self, process_name: &str) -> Result<(), AudioCaptureError> {
-        let refreshes = RefreshKind::new().with_processes(ProcessRefreshKind::everything());
-        let system = System::new_with_specifics(refreshes);
+        let mut system = System::new_with_specifics(
+            RefreshKind::everything().with_processes(ProcessRefreshKind::everything()),
+        );
+        system.refresh_processes(ProcessesToUpdate::All, true);
         let mut target_pid = 0;
 
         let process_name = OsString::from(process_name);

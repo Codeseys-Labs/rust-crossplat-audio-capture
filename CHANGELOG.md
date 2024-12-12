@@ -9,64 +9,27 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
-- Implemented modular pipeline architecture:
-
-  - Base pipeline traits and types for component composition
-  - Diarization module with speaker segmentation
-  - Transcription module using whisper-rs
-  - Flexible pipeline configuration system
-  - Component validation and error handling
-  - Async processing support
-  - Test coverage for components
-
-- Model management system:
-
-  - Model download and caching
-  - Configuration validation
-  - Version tracking
-  - Checksum verification
-
-- Pipeline Features:
-
-  - Real-time audio processing
-  - Speaker diarization with configurable parameters
-  - Transcription with language support
-  - Timestamp synchronization
-  - Result merging and confidence scoring
-  - Music detection
-  - Multi-language support
-  - Foreign language detection
-
-- Example Implementation:
-  - WAV file processing demo
-  - Automatic model downloading
-  - Progress indicators for downloads
-  - Chunk-based audio processing
+- Cross-platform audio capture system:
+  - Trait-based API for platform-specific backends
+  - Windows WASAPI implementation
+  - Legacy ProcessAudioCapture API support
+  - Process enumeration and selection
+  - Audio format configuration
+  - Real-time audio capture
+  - Example implementations:
+    - Windows API comparison (trait vs legacy)
+    - WAV file processing
+    - Basic audio capture demo
 
 ### Changed
 
-- Enhanced project analysis:
-
-  - Detailed implementation strategy
-  - Component integration plan
-  - Performance considerations
-  - Technical requirements
-
-- Restructured pipeline implementation:
-  - Separated diarization and transcription components
-  - Added proper configuration management
-  - Improved error handling
-  - Added component testing
-  - Selected sherpa-rs for diarization implementation
-  - Will use torchaudio's forced_alignment with PyO3 for forced alignment
+- Restructured audio capture:
+  - Added trait-based abstraction for cross-platform support
+  - Maintained legacy ProcessAudioCapture API for compatibility
+  - Improved error handling and type safety
+  - Better buffer management and synchronization
+  - Platform-specific optimizations
 
 ### Technical Debt
 
-- Need to implement:
-  - Integration tests for full pipeline
-  - Performance benchmarks
-  - Memory usage optimization
-  - Better error messages and debugging support
-  - Documentation for API and usage examples
-  - Real-time audio capture integration
-  - Streaming support for long audio files
+- Linux and macOS audio capture backends
