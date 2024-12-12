@@ -11,6 +11,8 @@ use wasapi::{
     DeviceCollection,
     Role,
 };
+use windows::Win32::System::Com;
+use sysinfo::{ProcessRefreshKind, RefreshKind, System};
 use super::core::{
     AudioApplication, AudioCaptureBackend, AudioCaptureStream, AudioConfig,
     AudioError, AudioFormat,
@@ -44,21 +46,18 @@ impl AudioCaptureBackend for WasapiBackend {
     }
 
     fn list_applications(&self) -> Result<Vec<AudioApplication>, AudioError> {
-        let devices = self.device_enumerator
-            .get_device_collection::<DeviceCollection>()
-            .map_err(|e| AudioError::InitializationFailed(e.to_string()))?;
-
+        let refreshes = RefreshKind::new().with_processes(ProcessRefreshKind::everything());
+        let system = System::new_with_specifics(refreshes);
+        
         let mut apps = Vec::new();
-        for device in devices {
-            if let Ok(device) = device {
-                if let Ok(name) = device.get_friendlyname() {
-                    apps.push(AudioApplication {
-                        name: name.clone(),
-                        id: name.clone(),
-                        executable_name: format!("{}.exe", name),
-                        pid: 0,  // We'll get this when capturing
-                    });
-                }
+        for process in system.processes_by_name("") {
+            if let Ok(name) = process.name() {
+                apps.push(AudioApplication {
+                    name: name.to_string(),
+                    id: process.pid().to_string(),
+                    executable_name: format!("{}.exe", name),
+                    pid: process.pid().as_u32(),
+                });
             }
         }
 
@@ -70,40 +69,6 @@ impl AudioCaptureBackend for WasapiBackend {
         app: &AudioApplication,
         config: AudioConfig,
     ) -> Result<Box<dyn AudioCaptureStream>, AudioError> {
-        let devices = self.device_enumerator
-            .get_device_collection::<DeviceCollection>()
-            .map_err(|e| AudioError::DeviceNotFound(e.to_string()))?;
-
-        for device in devices {
-            if let Ok(device) = device {
-                if let Ok(name) = device.get_friendlyname() {
-                    if name.contains(&app.name) {
-                        let stream = WasapiCaptureStream::new(device, config)?;
-                        return Ok(Box::new(stream));
-                    }
-                }
-            }
-        }
-
-        Err(AudioError::DeviceNotFound(format!(
-            "No audio device found for application: {}", app.name
-        )))
-    }
-}
-
-pub struct WasapiCaptureStream {
-    client: AudioClient,
-    capture_client: AudioCaptureClient,
-    buffer: VecDeque<u8>,
-    config: AudioConfig,
-}
-
-impl WasapiCaptureStream {
-    fn new(device: wasapi::Device, config: AudioConfig) -> Result<Self, AudioError> {
-        let client = device
-            .get_iaudioclient()
-            .map_err(|e| AudioError::InitializationFailed(e.to_string()))?;
-
         let wave_format = WaveFormat::new(
             32,  // bits per sample
             32,  // valid bits per sample
@@ -113,14 +78,35 @@ impl WasapiCaptureStream {
             None,
         );
 
-        client
-            .initialize_client(
-                &wave_format,
-                100_000, // 100ms buffer
-                &Direction::Capture,
-                &ShareMode::Shared,
-                true,  // Allow format conversion
-            )
+        let audio_client = AudioClient::new_application_loopback_client(
+            app.pid,
+            true, // include_tree - capture audio from child processes too
+        ).map_err(|e| AudioError::DeviceNotFound(e.to_string()))?;
+
+        audio_client.initialize_client(
+            &wave_format,
+            0, // buffer duration in 100ns units, 0 for default
+            &Direction::Capture,
+            &ShareMode::Shared,
+            true, // allow format conversion
+        ).map_err(|e| AudioError::InitializationFailed(e.to_string()))?;
+
+        let stream = WasapiCaptureStream::new(audio_client, config)?;
+        Ok(Box::new(stream))
+    }
+}
+
+pub struct WasapiCaptureStream {
+    client: AudioClient,
+    capture_client: AudioCaptureClient,
+    buffer: VecDeque<u8>,
+    config: AudioConfig,
+    event_handle: Option<wasapi::Handle>,
+}
+
+impl WasapiCaptureStream {
+    fn new(client: AudioClient, config: AudioConfig) -> Result<Self, AudioError> {
+        let event_handle = client.set_get_eventhandle()
             .map_err(|e| AudioError::InitializationFailed(e.to_string()))?;
 
         let capture_client = client
@@ -132,6 +118,7 @@ impl WasapiCaptureStream {
             capture_client,
             buffer: VecDeque::new(),
             config,
+            event_handle: Some(event_handle),
         })
     }
 }
@@ -160,25 +147,35 @@ impl AudioCaptureStream for WasapiCaptureStream {
         }
 
         // Get new frames
-        let next_packet = self.capture_client
-            .get_next_packet_size()
-            .map_err(|e| AudioError::CaptureError(e.to_string()))?;
+        let new_frames = self.capture_client
+            .get_next_nbr_frames()?
+            .unwrap_or(0);
 
-        if next_packet == 0 {
-            return Ok(0);
+        if new_frames > 0 {
+            // Calculate additional buffer space needed
+            let blockalign = (self.config.channels * 4) as usize; // 4 bytes per sample (32-bit float)
+            let additional = (new_frames as usize * blockalign)
+                .saturating_sub(self.buffer.capacity() - self.buffer.len());
+            self.buffer.reserve(additional);
+
+            // Read data into our buffer
+            self.capture_client
+                .read_from_device_to_deque(&mut self.buffer)
+                .map_err(|e| AudioError::CaptureError(e.to_string()))?;
         }
 
-        let data = self.capture_client
-            .get_buffer(next_packet)
-            .map_err(|e| AudioError::CaptureError(e.to_string()))?;
+        // Wait for more data if needed
+        if let Some(event_handle) = &self.event_handle {
+            if event_handle.wait_for_event(3000).is_err() {
+                return Err(AudioError::CaptureError("Timeout waiting for audio data".to_string()));
+            }
+        }
 
-        let bytes_to_copy = std::cmp::min(buffer.len(), data.len());
-        buffer[..bytes_to_copy].copy_from_slice(&data[..bytes_to_copy]);
-
-        self.capture_client
-            .release_buffer(next_packet)
-            .map_err(|e| AudioError::CaptureError(e.to_string()))?;
-
+        // Try to fill the output buffer again
+        let bytes_to_copy = std::cmp::min(buffer.len(), self.buffer.len());
+        for i in 0..bytes_to_copy {
+            buffer[i] = self.buffer.pop_front().unwrap();
+        }
         Ok(bytes_to_copy)
     }
 
