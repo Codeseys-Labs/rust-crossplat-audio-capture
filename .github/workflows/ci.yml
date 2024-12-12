@@ -46,7 +46,6 @@ jobs:
           cargo --version --verbose
           cargo tree
           Get-CimInstance Win32_SoundDevice | Format-List *
-          Get-AudioDevice -List
         shell: pwsh
           
       - name: Install FFmpeg
