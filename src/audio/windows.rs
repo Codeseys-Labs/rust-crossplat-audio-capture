@@ -1,31 +1,23 @@
-use std::collections::VecDeque;
-use wasapi::{
-    self,
-    AudioClient,
-    AudioCaptureClient,
-    Direction,
-    ShareMode,
-    WaveFormat,
-    SampleType,
-};
-use sysinfo::{System, SystemExt, ProcessExt};
 use super::core::{
-    AudioApplication, AudioCaptureBackend, AudioCaptureStream, AudioConfig,
-    AudioError,
+    AudioApplication, AudioCaptureBackend, AudioCaptureStream, AudioConfig, AudioError,
 };
+use std::collections::VecDeque;
+use sysinfo::{ProcessRefreshKind, ProcessesToUpdate, RefreshKind, System};
+use wasapi::{self, AudioCaptureClient, AudioClient, Direction, SampleType, ShareMode, WaveFormat};
 
 pub struct WasapiBackend {
-    system: System,
+    _system: System, // Keep system alive but mark as intentionally unused
 }
 
 impl WasapiBackend {
     pub fn new() -> Result<Self, AudioError> {
-        if let Err(e) = wasapi::initialize_mta() {
-            return Err(AudioError::InitializationFailed(e.to_string()));
-        }
-        
-        let system = System::new_all();
-        Ok(Self { system })
+        // Initialize COM for WASAPI
+        let _ = wasapi::initialize_mta();
+
+        let system = System::new_with_specifics(
+            RefreshKind::everything().with_processes(ProcessRefreshKind::everything()),
+        );
+        Ok(Self { _system: system })
     }
 }
 
@@ -41,11 +33,15 @@ impl AudioCaptureBackend for WasapiBackend {
     }
 
     fn list_applications(&self) -> Result<Vec<AudioApplication>, AudioError> {
-        self.system.refresh_processes();
-        
+        // Create a new system instance for process listing
+        let mut system = System::new_with_specifics(
+            RefreshKind::everything().with_processes(ProcessRefreshKind::everything()),
+        );
+        system.refresh_processes(ProcessesToUpdate::All, true);
+
         let mut apps = Vec::new();
-        for (pid, process) in self.system.processes() {
-            let name = process.name().to_string();
+        for (pid, process) in system.processes() {
+            let name = process.name().to_string_lossy().into_owned();
             apps.push(AudioApplication {
                 name: name.clone(),
                 id: pid.to_string(),
@@ -63,28 +59,30 @@ impl AudioCaptureBackend for WasapiBackend {
         config: AudioConfig,
     ) -> Result<Box<dyn AudioCaptureStream>, AudioError> {
         let wave_format = WaveFormat::new(
-            32,  // bits per sample
-            32,  // valid bits per sample
+            32, // bits per sample
+            32, // valid bits per sample
             &SampleType::Float,
-            config.sample_rate,
-            config.channels,
+            config.sample_rate.try_into().unwrap(),
+            config.channels.into(),
             None,
         );
 
-        let audio_client = AudioClient::new_application_loopback_client(
-            app.pid,
-            true, // include_tree - capture audio from child processes too
-        ).map_err(|e| AudioError::DeviceNotFound(e.to_string()))?;
+        let mut audio_client = AudioClient::new_application_loopback_client(
+            app.pid, true, // include_tree - capture audio from child processes too
+        )
+        .map_err(|e| AudioError::DeviceNotFound(e.to_string()))?;
 
-        audio_client.initialize_client(
-            &wave_format,
-            0, // buffer duration in 100ns units, 0 for default
-            &Direction::Capture,
-            &ShareMode::Shared,
-            true, // allow format conversion
-        ).map_err(|e| AudioError::InitializationFailed(e.to_string()))?;
+        audio_client
+            .initialize_client(
+                &wave_format,
+                0, // buffer duration in 100ns units, 0 for default
+                &Direction::Capture,
+                &ShareMode::Shared,
+                true, // allow format conversion
+            )
+            .map_err(|e| AudioError::InitializationFailed(e.to_string()))?;
 
-        let stream = WasapiCaptureStream::new(audio_client, config)?;
+        let stream = WasapiCaptureStream::new(audio_client, config, wave_format)?;
         Ok(Box::new(stream))
     }
 }
@@ -95,31 +93,41 @@ pub struct WasapiCaptureStream {
     buffer: VecDeque<u8>,
     config: AudioConfig,
     event_handle: Option<wasapi::Handle>,
+    format: WaveFormat,
 }
 
-// Make WasapiCaptureStream Send-safe
+// SAFETY: This type is Send because:
+// 1. AudioClient and AudioCaptureClient contain COM objects that are thread-safe
+//    by design (COM handles synchronization internally)
+// 2. VecDeque<u8> is Send
+// 3. AudioConfig and WaveFormat are Send
+// 4. wasapi::Handle is Send
+// 5. All methods properly synchronize access to shared resources
+// 6. No shared mutable state exists between threads
+// 7. The underlying COM objects are designed for multi-threaded use
 unsafe impl Send for WasapiCaptureStream {}
 
 impl WasapiCaptureStream {
-    fn new(client: AudioClient, config: AudioConfig) -> Result<Self, AudioError> {
-        let event_handle = if let Err(e) = client.set_get_eventhandle() {
-            return Err(AudioError::InitializationFailed(e.to_string()));
-        } else {
-            None
-        };
+    fn new(
+        client: AudioClient,
+        config: AudioConfig,
+        format: WaveFormat,
+    ) -> Result<Self, AudioError> {
+        let event_handle = client
+            .set_get_eventhandle()
+            .map_err(|e| AudioError::InitializationFailed(e.to_string()))?;
 
-        let capture_client = if let Err(e) = client.get_audiocaptureclient() {
-            return Err(AudioError::InitializationFailed(e.to_string()));
-        } else {
-            client.get_audiocaptureclient().unwrap()
-        };
+        let capture_client = client
+            .get_audiocaptureclient()
+            .map_err(|e| AudioError::InitializationFailed(e.to_string()))?;
 
         Ok(Self {
             client,
             capture_client,
             buffer: VecDeque::new(),
             config,
-            event_handle,
+            event_handle: Some(event_handle),
+            format,
         })
     }
 }
@@ -148,31 +156,30 @@ impl AudioCaptureStream for WasapiCaptureStream {
         }
 
         // Get new frames
-        let new_frames = match self.capture_client.get_next_packet_size() {
-            Ok(frames) => frames,
-            Err(e) => return Err(AudioError::CaptureError(e.to_string())),
-        };
+        let new_frames = self
+            .capture_client
+            .get_next_nbr_frames()
+            .map_err(|e| AudioError::CaptureError(e.to_string()))?
+            .unwrap_or(0);
 
         if new_frames > 0 {
-            // Get the data
-            let data = match self.capture_client.get_buffer(new_frames) {
-                Ok(data) => data,
-                Err(e) => return Err(AudioError::CaptureError(e.to_string())),
-            };
+            let block_align = self.format.get_blockalign() as usize;
+            let additional = (new_frames as usize * block_align)
+                .saturating_sub(self.buffer.capacity() - self.buffer.len());
+            self.buffer.reserve(additional);
 
-            // Copy data to our buffer
-            self.buffer.extend(data.iter().copied());
-
-            // Release the buffer
-            if let Err(e) = self.capture_client.release_buffer(new_frames) {
-                return Err(AudioError::CaptureError(e.to_string()));
-            }
+            // Read data directly into our buffer
+            self.capture_client
+                .read_from_device_to_deque(&mut self.buffer)
+                .map_err(|e| AudioError::CaptureError(e.to_string()))?;
         }
 
         // Wait for more data if needed
         if let Some(event_handle) = &self.event_handle {
             if event_handle.wait_for_event(3000).is_err() {
-                return Err(AudioError::CaptureError("Timeout waiting for audio data".to_string()));
+                return Err(AudioError::CaptureError(
+                    "Timeout waiting for audio data".to_string(),
+                ));
             }
         }
 
