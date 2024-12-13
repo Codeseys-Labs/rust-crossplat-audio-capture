@@ -4,9 +4,9 @@ on:
   workflow_dispatch:
     inputs:
       platform:
-        description: 'Platform to test'
+        description: "Platform to test"
         required: true
-        default: 'all'
+        default: "all"
         type: choice
         options:
           - all
@@ -14,7 +14,7 @@ on:
           - linux
           - macos
       debug_enabled:
-        description: 'Enable debug output'
+        description: "Enable debug output"
         required: false
         type: boolean
         default: false
@@ -30,15 +30,15 @@ jobs:
       DEBUG: ${{ github.event.inputs.debug_enabled }}
     steps:
       - uses: actions/checkout@v3
-      
+
       - name: Install Rust
         uses: dtolnay/rust-toolchain@stable
-        
+
       - name: Setup Windows SDK
         uses: GuillaumeFalourd/setup-windows10-sdk-action@v1.11
         with:
           sdk-version: 18362
-        
+
       - name: Debug Info
         if: env.DEBUG == 'true'
         run: |
@@ -47,19 +47,16 @@ jobs:
           cargo tree
           Get-CimInstance Win32_SoundDevice | Format-List *
         shell: pwsh
-          
+
       - name: Install FFmpeg
         uses: FedericoCarboni/setup-ffmpeg@v2
-        
+
       - name: Download test audio
         run: |
           mkdir -p test_audio
           curl -L "https://ia800901.us.archive.org/23/items/gd70-02-14.early-late.sbd.cotsman.18115.sbeok.shnf/gd70-02-14d1t02.mp3" -o "test_audio/sample.mp3"
-          ffmpeg -i "test_audio/sample.mp3" -ar 48000 -ac 2 -acodec pcm_f32le -t 30 "test_audio/sample.wav"
-          # Print audio info
-          ffprobe -v quiet -print_format json -show_streams "test_audio/sample.mp3"
         shell: bash
-        
+
       - name: Cache dependencies
         uses: actions/cache@v3
         with:
@@ -68,74 +65,65 @@ jobs:
             ~/.cargo/git
             target
           key: ${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.lock') }}
-          
+
       - name: Build
         run: cargo build --verbose
         env:
-          # Ensure we use the right Windows SDK
           WINAPI_NO_BUNDLED_LIBRARIES: 1
-        
+
       - name: Run tests
         run: cargo test --verbose
         env:
           WINAPI_NO_BUNDLED_LIBRARIES: 1
-        
+
       - name: Build examples
         run: cargo build --examples
         env:
           WINAPI_NO_BUNDLED_LIBRARIES: 1
-        
-      - name: Test audio capture from playback
+
+      - name: Test audio capture
         run: |
-          # Start playing audio in background
-          Start-Process -NoNewWindow -FilePath "ffplay" -ArgumentList "-nodisp", "-autoexit", "-volume", "50", "test_audio/sample.mp3"
-          
+          # Start test tone in background
+          Start-Process -NoNewWindow cargo -ArgumentList "run", "--example", "test_tone"
+
           # Wait a bit for playback to start
           Start-Sleep -Seconds 2
-          
-          # List audio devices to see the playback
-          Write-Host "Available audio devices:"
-          cargo run --example test_windows -- --list-devices
-          
-          # Start capturing while audio is playing
+
+          # Start capturing
           Write-Host "Starting audio capture..."
-          cargo run --example test_windows -- --duration 10 --output captured_audio.wav --to-wav
-          
+          cargo run --example test_windows -- --duration 10
+
           # Verify the captured audio
-          if (!(Test-Path "captured_audio.wav")) {
+          if (!(Test-Path "test_capture.wav")) {
               Write-Error "Capture failed - no output file created"
               exit 1
           }
-          
-          $capturedSize = (Get-Item "captured_audio.wav").Length
+
+          $capturedSize = (Get-Item "test_capture.wav").Length
           if ($capturedSize -eq 0) {
               Write-Error "Capture failed - output file is empty"
               exit 1
           }
-          
+
           Write-Host "Successfully captured $capturedSize bytes of audio"
-          
+
           # Compare audio characteristics
-          Write-Host "Original audio info:"
-          ffprobe -v quiet -print_format json -show_streams "test_audio/sample.mp3"
           Write-Host "Captured audio info:"
-          ffprobe -v quiet -print_format json -show_streams "captured_audio.wav"
-          
-          # Optional: Compare audio waveforms
-          ffmpeg -i "test_audio/sample.mp3" -filter_complex "showwavespic=s=640x120" -frames:v 1 "original_waveform.png"
-          ffmpeg -i "captured_audio.wav" -filter_complex "showwavespic=s=640x120" -frames:v 1 "captured_waveform.png"
+          ffprobe -v quiet -print_format json -show_streams "test_capture.wav"
+
+          # Generate waveform
+          ffmpeg -i "test_capture.wav" -filter_complex "showwavespic=s=640x120" -frames:v 1 "captured_waveform.png"
         shell: pwsh
         env:
           WINAPI_NO_BUNDLED_LIBRARIES: 1
-          
+
       - name: Upload test artifacts
         uses: actions/upload-artifact@v3
         with:
           name: audio-test-results
           path: |
-            original_waveform.png
             captured_waveform.png
-            captured_audio.wav
+            test_capture.wav
             test_audio/sample.mp3
 
   test-linux:
@@ -145,27 +133,27 @@ jobs:
       DEBUG: ${{ github.event.inputs.debug_enabled }}
     steps:
       - uses: actions/checkout@v3
-      
+
       - name: Install Rust
         uses: dtolnay/rust-toolchain@stable
-        
+
       - name: Debug Info
         if: env.DEBUG == 'true'
         run: |
           rustc --version --verbose
           cargo --version --verbose
           cargo tree
-          
+
       - name: Install PulseAudio
         run: |
           sudo apt-get update
-          sudo apt-get install -y pulseaudio libpulse-dev
-          
+          sudo apt-get install -y pulseaudio libpulse-dev libasound2-dev
+
       - name: Start PulseAudio
         run: |
           pulseaudio --start --exit-idle-time=-1
           sleep 2
-          
+
       - name: Cache dependencies
         uses: actions/cache@v3
         with:
@@ -174,64 +162,56 @@ jobs:
             ~/.cargo/git
             target
           key: ${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.lock') }}
-          
+
       - name: Build
         run: cargo build --verbose
-        
+
       - name: Run tests
         run: cargo test --verbose
-        
+
       - name: Build examples
         run: cargo build --examples
-        
+
       - name: Test PulseAudio capture from playback
         run: |
-          # Start PulseAudio server
-          pulseaudio --start --exit-idle-time=-1
-          sleep 2
-          
-          # Start playing audio in background
-          ffplay -nodisp -autoexit -volume 50 test_audio/sample.mp3 &
+          # Start test tone in background
+          cargo run --example test_tone &
           PLAYER_PID=$!
-          
+
           # Wait for playback to start
           sleep 2
-          
+
           # List audio sources
           echo "Available audio sources:"
           cargo run --example test_pulseaudio -- --list-devices
-          
+
           # Start capturing
           echo "Starting audio capture..."
-          cargo run --example test_pulseaudio -- --duration 10 --output captured_audio.wav --to-wav
-          
+          cargo run --example test_pulseaudio -- --duration 10
+
           # Wait for player to finish
           wait $PLAYER_PID
-          
+
           # Verify capture
-          if [ ! -f "captured_audio.wav" ]; then
+          if [ ! -f "test_capture.wav" ]; then
               echo "Capture failed - no output file created"
               exit 1
           fi
-          
+
           # Compare audio characteristics
-          echo "Original audio info:"
-          ffprobe -v quiet -print_format json -show_streams test_audio/sample.mp3
           echo "Captured audio info:"
-          ffprobe -v quiet -print_format json -show_streams captured_audio.wav
-          
-          # Generate waveforms
-          ffmpeg -i test_audio/sample.mp3 -filter_complex "showwavespic=s=640x120" -frames:v 1 original_waveform.png
-          ffmpeg -i captured_audio.wav -filter_complex "showwavespic=s=640x120" -frames:v 1 captured_waveform.png
-          
+          ffprobe -v quiet -print_format json -show_streams test_capture.wav
+
+          # Generate waveform
+          ffmpeg -i test_capture.wav -filter_complex "showwavespic=s=640x120" -frames:v 1 captured_waveform.png
+
       - name: Upload Linux test artifacts
         uses: actions/upload-artifact@v3
         with:
           name: linux-audio-test-results
           path: |
-            original_waveform.png
             captured_waveform.png
-            captured_audio.wav
+            test_capture.wav
             test_audio/sample.mp3
 
   test-macos:
@@ -241,17 +221,17 @@ jobs:
       DEBUG: ${{ github.event.inputs.debug_enabled }}
     steps:
       - uses: actions/checkout@v3
-      
+
       - name: Install Rust
         uses: dtolnay/rust-toolchain@stable
-        
+
       - name: Debug Info
         if: env.DEBUG == 'true'
         run: |
           rustc --version --verbose
           cargo --version --verbose
           cargo tree
-          
+
       - name: Cache dependencies
         uses: actions/cache@v3
         with:
@@ -260,60 +240,56 @@ jobs:
             ~/.cargo/git
             target
           key: ${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.lock') }}
-          
+
       - name: Build
         run: cargo build --verbose
-        
+
       - name: Run tests
         run: cargo test --verbose
-        
+
       - name: Build examples
         run: cargo build --examples
-        
+
       - name: Test CoreAudio capture from playback
         run: |
-          # Start playing audio in background
-          ffplay -nodisp -autoexit -volume 50 test_audio/sample.mp3 &
+          # Start test tone in background
+          cargo run --example test_tone &
           PLAYER_PID=$!
-          
+
           # Wait for playback to start
           sleep 2
-          
+
           # List audio sources
           echo "Available audio sources:"
           cargo run --example test_coreaudio -- --list-devices
-          
+
           # Start capturing
           echo "Starting audio capture..."
-          cargo run --example test_coreaudio -- --duration 10 --output captured_audio.wav --to-wav
-          
+          cargo run --example test_coreaudio -- --duration 10
+
           # Wait for player to finish
           wait $PLAYER_PID
-          
+
           # Verify capture
-          if [ ! -f "captured_audio.wav" ]; then
+          if [ ! -f "test_capture.wav" ]; then
               echo "Capture failed - no output file created"
               exit 1
           fi
-          
+
           # Compare audio characteristics
-          echo "Original audio info:"
-          ffprobe -v quiet -print_format json -show_streams test_audio/sample.mp3
           echo "Captured audio info:"
-          ffprobe -v quiet -print_format json -show_streams captured_audio.wav
-          
-          # Generate waveforms
-          ffmpeg -i test_audio/sample.mp3 -filter_complex "showwavespic=s=640x120" -frames:v 1 original_waveform.png
-          ffmpeg -i captured_audio.wav -filter_complex "showwavespic=s=640x120" -frames:v 1 captured_waveform.png
-          
+          ffprobe -v quiet -print_format json -show_streams test_capture.wav
+
+          # Generate waveform
+          ffmpeg -i test_capture.wav -filter_complex "showwavespic=s=640x120" -frames:v 1 captured_waveform.png
+
       - name: Upload macOS test artifacts
         uses: actions/upload-artifact@v3
         with:
           name: macos-audio-test-results
           path: |
-            original_waveform.png
             captured_waveform.png
-            captured_audio.wav
+            test_capture.wav
             test_audio/sample.mp3
 
   clippy:
@@ -321,12 +297,12 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v3
-      
+
       - name: Install Rust
         uses: dtolnay/rust-toolchain@stable
         with:
           components: clippy
-          
+
       - name: Clippy check
         run: cargo clippy -- -D warnings
 
@@ -335,11 +311,11 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v3
-      
+
       - name: Install Rust
         uses: dtolnay/rust-toolchain@stable
         with:
           components: rustfmt
-          
+
       - name: Check formatting
         run: cargo fmt -- --check
