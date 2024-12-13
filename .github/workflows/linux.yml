@@ -1,0 +1,217 @@
+name: Linux Audio Tests
+
+on:
+  workflow_call:
+    inputs:
+      debug_enabled:
+        description: "Enable debug output"
+        required: false
+        type: boolean
+        default: false
+
+env:
+  CARGO_TERM_COLOR: always
+  DEBIAN_FRONTEND: noninteractive
+
+jobs:
+  test-linux:
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        audio_system: [pipewire, pulseaudio]
+    env:
+      DEBUG: ${{ inputs.debug_enabled }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Debug Info
+        if: env.DEBUG == true
+        run: |
+          rustc --version --verbose
+          cargo --version --verbose
+          cargo tree
+
+      - name: Configure System
+        if: matrix.audio_system == 'pipewire'
+        run: |
+          # Prevent needrestart prompts
+          sudo sed -i 's/#$nrconf{restart} = '"'"'i'"'"';/$nrconf{restart} = '"'"'a'"'"';/g' /etc/needrestart/needrestart.conf
+
+      - name: Add Audio PPAs
+        if: matrix.audio_system == 'pipewire'
+        run: |
+          sudo apt-get update
+
+          # Check if PipeWire is already installed
+          if ! dpkg -l | grep -q pipewire; then
+            # Add PipeWire PPA and update
+            echo "Adding PipeWire PPA..."
+            sudo add-apt-repository ppa:pipewire-debian/pipewire-upstream -y
+            sudo apt-get update
+
+            # Install base PipeWire
+            echo "Installing base PipeWire..."
+            sudo apt-get install -y pipewire
+          else
+            echo "PipeWire is already installed"
+          fi
+
+          # Add WirePlumber PPA
+          echo "Adding WirePlumber PPA..."
+          sudo add-apt-repository ppa:pipewire-debian/wireplumber-upstream -y
+          sudo apt-get update
+
+      - name: Install Audio Packages
+        if: matrix.audio_system == 'pipewire'
+        run: |
+          # Check and install PipeWire packages if needed
+          if ! dpkg -l | grep -q pipewire-audio-client-libraries; then
+            echo "Installing PipeWire packages..."
+            sudo apt-get install -y pipewire-audio-client-libraries
+          fi
+
+          if ! dpkg -l | grep -q pipewire-pulse; then
+            echo "Installing PipeWire Pulse..."
+            sudo apt-get install -y pipewire-pulse
+          fi
+
+          # Check and install WirePlumber if needed
+          if ! dpkg -l | grep -q wireplumber; then
+            echo "Installing WirePlumber..."
+            sudo apt-get install -y wireplumber
+          fi
+
+      - name: Disable PulseAudio
+        if: matrix.audio_system == 'pipewire'
+        run: |
+          systemctl --user --now disable pulseaudio.service pulseaudio.socket || true
+          pulseaudio --kill || true
+
+      - name: Start Audio Services
+        if: matrix.audio_system == 'pipewire'
+        run: |
+          # Reload systemd daemon
+          systemctl --user daemon-reload
+
+          # Start services in order
+          echo "Starting WirePlumber..."
+          systemctl --user --now enable wireplumber.service
+          sleep 2
+
+          echo "Starting PipeWire..."
+          systemctl --user --now enable pipewire.service
+          sleep 2
+
+          echo "Starting PipeWire PulseAudio..."
+          systemctl --user --now enable pipewire-pulse.service
+          sleep 2
+
+      - name: Verify Audio Setup
+        if: matrix.audio_system == 'pipewire'
+        run: |
+          echo "=== WirePlumber Status ==="
+          systemctl --user status wireplumber || true
+
+          echo "=== PipeWire Status ==="
+          systemctl --user status pipewire || true
+
+          echo "=== PipeWire-Pulse Status ==="
+          systemctl --user status pipewire-pulse || true
+
+          echo "=== PipeWire Info ==="
+          pw-cli info || true
+
+          echo "=== Audio Info ==="
+          pactl info || true
+
+      - name: Setup PulseAudio
+        if: matrix.audio_system == 'pulseaudio'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y pulseaudio libpulse-dev libasound2-dev
+
+          # Stop any existing audio services
+          systemctl --user stop pipewire pipewire-pulse || true
+          pulseaudio --kill || true
+
+          # Configure PulseAudio
+          mkdir -p ~/.config/pulse
+          echo "default-sample-rate = 44100
+          default-fragments = 4
+          default-fragment-size-msec = 25
+          exit-idle-time = -1
+          load-module module-native-protocol-tcp auth-anonymous=1
+          load-module module-null-sink sink_name=test_sink" > ~/.config/pulse/daemon.conf
+
+          # Start PulseAudio
+          pulseaudio --start --exit-idle-time=-1 --daemon
+
+          # Wait for system to initialize
+          sleep 5
+
+          # Verify PulseAudio is running
+          pactl info
+
+      - name: Download test audio
+        run: |
+          mkdir -p test_audio
+          curl -L "https://ia800901.us.archive.org/23/items/gd70-02-14.early-late.sbd.cotsman.18115.sbeok.shnf/gd70-02-14d1t02.mp3" -o "test_audio/sample.mp3"
+
+      - name: Cache dependencies
+        uses: actions/cache@v3
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.lock') }}
+
+      - name: Build
+        run: cargo build --verbose
+
+      - name: Run tests
+        run: cargo test --verbose
+
+      - name: Build examples
+        run: cargo build --examples
+
+      - name: Test Audio Capture
+        run: |
+          # Start test tone in background
+          cargo run --example test_tone &
+          PLAYER_PID=$!
+
+          # Ensure cleanup on exit
+          trap "kill $PLAYER_PID 2>/dev/null || true" EXIT
+
+          # Wait for playback to start
+          sleep 2
+
+          # Start capturing
+          echo "Starting audio capture with ${{ matrix.audio_system }}..."
+          cargo run --example test_pulseaudio -- --duration 10
+
+          # Verify capture
+          if [ ! -f "test_capture.wav" ]; then
+              echo "Capture failed - no output file created"
+              exit 1
+          fi
+
+          FILESIZE=$(stat --format="%s" "test_capture.wav")
+          if [ "$FILESIZE" -eq 0 ]; then
+              echo "Capture failed - output file is empty"
+              exit 1
+          fi
+
+          echo "Successfully captured $FILESIZE bytes of audio using ${{ matrix.audio_system }}"
+
+      - name: Upload Linux test artifacts
+        uses: actions/upload-artifact@v3
+        with:
+          name: linux-${{ matrix.audio_system }}-test-results
+          path: |
+            test_capture.wav
+            test_audio/sample.mp3

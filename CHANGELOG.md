@@ -11,10 +11,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
-- Fixed PipeWire installation in Linux CI:
-  - Added PipeWire PPA repository
-  - Updated package names based on Ubuntu package requirements
-  - Added proper systemd service management
-  - Added explicit error handling for audio system verification
+- Reorganized CI workflows:
+  - Split into platform-specific files:
+    - windows.yml for Windows audio tests
+    - linux.yml for Linux audio tests (PipeWire/PulseAudio)
+    - macos.yml for macOS audio tests
+    - code-quality.yml for shared checks
+  - Improved maintainability with modular structure
+  - Added reusable workflow components
+  - Fixed PipeWire setup in Linux workflow
 
 ### Technical Debt
