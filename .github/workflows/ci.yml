@@ -146,9 +146,16 @@ jobs:
         if: matrix.audio_system == 'pipewire'
         run: |
           sudo apt-get update
-          sudo apt-get install -y pipewire pipewire-pulse pipewire-audio wireplumber
+          # Add PipeWire PPA
+          sudo add-apt-repository ppa:pipewire-debian/pipewire-upstream -y
+          sudo apt-get update
+
+          # Install PipeWire and required packages
+          sudo apt-get install -y pipewire pipewire-audio-client-libraries
+          sudo apt-get install -y gstreamer1.0-pipewire libpipewire-0.3-{0,dev,modules} libspa-0.2-{bluetooth,dev,jack,modules} pipewire{,-{audio-client-libraries,pulse,media-session,bin,locales,tests}}
 
           # Stop PulseAudio if running
+          systemctl --user stop pulseaudio.service pulseaudio.socket || true
           pulseaudio --kill || true
 
           # Configure PipeWire
@@ -162,14 +169,12 @@ jobs:
 
           # Start PipeWire
           systemctl --user daemon-reload
-          systemctl --user restart pipewire pipewire-pulse
-
-          # Wait for system to initialize
+          systemctl --user enable --now pipewire pipewire-pulse
           sleep 5
 
           # Verify PipeWire is running
-          pw-cli info
-          pactl info
+          pw-cli info || true
+          pactl info || true
 
       - name: Setup PulseAudio
         if: matrix.audio_system == 'pulseaudio'

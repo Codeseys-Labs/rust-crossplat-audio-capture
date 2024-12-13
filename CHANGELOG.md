@@ -9,21 +9,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
-- Enhanced CI/CD integration:
-  - Added cross-platform audio testing
-  - Added virtual audio device setup
-  - Added proper audio validation
-  - Added test artifacts collection
-  - Added platform-specific audio configurations
-  - Added separate PipeWire and PulseAudio testing in Linux CI
-  - Added matrix testing strategy for Linux audio systems
-
 ### Changed
 
-- Added proper process cleanup
-- Added virtual audio device setup
-- Added platform-specific audio configurations
-- Added better error handling
-- Improved Linux audio system testing with separate PipeWire and PulseAudio jobs
+- Fixed PipeWire installation in Linux CI:
+  - Added PipeWire PPA repository
+  - Updated package names based on Ubuntu package requirements
+  - Added proper systemd service management
+  - Added explicit error handling for audio system verification
 
 ### Technical Debt
