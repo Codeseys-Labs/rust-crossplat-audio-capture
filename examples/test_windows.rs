@@ -1,75 +1,123 @@
 use clap::Parser;
+use hound::{WavSpec, WavWriter};
 use rsac::{get_audio_backend, AudioConfig, AudioFormat};
-use std::{fs::File, io::Write, time::Duration};
+use std::{
+    process::Command,
+    thread,
+    time::{Duration, Instant},
+};
+
+const SAMPLE_RATE: u32 = 48000;
+const CHANNELS: u16 = 2;
 
 #[derive(Parser, Debug)]
-#[command(author, version, about, long_about = None)]
+#[command(about = "Test Windows audio capture functionality")]
 struct Args {
-    /// List available audio sources
-    #[arg(long)]
-    list_sources: bool,
-
-    /// Audio source to capture from
-    #[arg(long)]
-    source: Option<String>,
-
     /// Duration in seconds to capture
-    #[arg(long)]
-    duration: Option<u64>,
+    #[arg(long, default_value = "5")]
+    duration: u64,
 
-    /// Output file (default: audio_capture.raw)
-    #[arg(long)]
-    output: Option<String>,
+    /// Output WAV file path
+    #[arg(long, default_value = "test_capture.wav")]
+    output: String,
 
-    /// Audio format (f32le, s16le, s32le)
+    /// Skip audio validation
     #[arg(long)]
-    format: Option<String>,
+    skip_validation: bool,
+}
+
+fn validate_wav_file(
+    path: &str,
+    expected_duration: Duration,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let reader = hound::WavReader::open(path)?;
+    let spec = reader.spec();
+
+    // Validate format
+    if spec.channels != CHANNELS {
+        return Err(format!(
+            "Invalid channel count: got {}, expected {}",
+            spec.channels, CHANNELS
+        )
+        .into());
+    }
+    if spec.sample_rate != SAMPLE_RATE {
+        return Err(format!(
+            "Invalid sample rate: got {}, expected {}",
+            spec.sample_rate, SAMPLE_RATE
+        )
+        .into());
+    }
+
+    // Validate duration
+    let samples = reader.duration();
+    let actual_duration = Duration::from_secs_f64(samples as f64 / spec.sample_rate as f64);
+    let duration_diff = (actual_duration.as_secs_f64() - expected_duration.as_secs_f64()).abs();
+
+    if duration_diff > 1.0 {
+        return Err(format!(
+            "Capture duration mismatch: got {:.2}s, expected {:.2}s",
+            actual_duration.as_secs_f64(),
+            expected_duration.as_secs_f64()
+        )
+        .into());
+    }
+
+    // Validate there is actual audio data
+    let samples: Vec<f32> = reader.into_samples().filter_map(Result::ok).collect();
+    if samples.is_empty() {
+        return Err("No audio samples found in WAV file".into());
+    }
+
+    // Check for non-zero audio data
+    let has_audio = samples.iter().any(|&s| s != 0.0);
+    if !has_audio {
+        return Err("WAV file contains only silence".into());
+    }
+
+    Ok(())
 }
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     let args = Args::parse();
+    println!("Starting Windows audio capture test...");
 
-    // Get the default audio backend
+    // Start the test tone generator
+    println!("Starting test tone...");
+    let _test_process = Command::new("cargo")
+        .args(["run", "--example", "test_tone"])
+        .spawn()?;
+
+    // Give the process a moment to start
+    thread::sleep(Duration::from_secs(1));
+
+    // Get the audio backend
     let backend = get_audio_backend()?;
     println!("Using audio backend: {}", backend.name());
 
-    // List available applications
+    // List and find our test process
     let apps = backend.list_applications()?;
-
-    if args.list_sources {
-        println!("\nAvailable audio sources:");
-        for (i, app) in apps.iter().enumerate() {
-            println!(
-                "{}: {} (ID: {}, Process: {})",
-                i, app.name, app.id, app.executable_name
-            );
-        }
-        return Ok(());
+    println!("\nAvailable audio sources:");
+    for (i, app) in apps.iter().enumerate() {
+        println!(
+            "{}: {} (ID: {}, Process: {})",
+            i, app.name, app.id, app.executable_name
+        );
     }
 
-    // Find the requested source or use the first one
-    let app = if let Some(source_name) = args.source {
-        apps.iter()
-            .find(|app| app.name.contains(&source_name))
-            .ok_or_else(|| format!("No source found matching '{}'", source_name))?
-    } else if !apps.is_empty() {
-        &apps[0]
-    } else {
-        return Err("No audio sources found".into());
-    };
+    // Look for test_tone process
+    let app = apps
+        .iter()
+        .find(|app| app.executable_name.to_lowercase().contains("test_tone"))
+        .ok_or("Could not find test tone process")?;
 
     println!("\nCapturing audio from: {}", app.name);
 
     // Create audio configuration
     let config = AudioConfig {
-        sample_rate: 48000,
-        channels: 2,
-        format: match args.format.as_deref() {
-            Some("f32le") => AudioFormat::F32LE,
-            Some("s16le") => AudioFormat::S16LE,
-            Some("s32le") => AudioFormat::S32LE,
-            _ => AudioFormat::F32LE,
-        },
+        sample_rate: SAMPLE_RATE,
+        channels: CHANNELS,
+        format: AudioFormat::F32LE,
     };
 
     // Create capture stream
@@ -79,28 +127,62 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     stream.start()?;
     println!("Started capturing...");
 
-    // Create output file
-    let output = args
-        .output
-        .unwrap_or_else(|| "audio_capture.raw".to_string());
-    let mut file = File::create(output)?;
+    // Create WAV writer
+    let spec = WavSpec {
+        channels: CHANNELS,
+        sample_rate: SAMPLE_RATE,
+        bits_per_sample: 32,
+        sample_format: hound::SampleFormat::Float,
+    };
+    let mut wav_writer = WavWriter::create(&args.output, spec)?;
+
     let mut buffer = vec![0u8; 4096];
-    let start = std::time::Instant::now();
-    let duration = Duration::from_secs(args.duration.unwrap_or(5));
+    let start = Instant::now();
+    let duration = Duration::from_secs(args.duration);
+    let mut total_bytes = 0u32;
 
     // Capture for the specified duration
     while start.elapsed() < duration {
         let bytes_read = stream.read(&mut buffer)?;
         if bytes_read > 0 {
-            file.write_all(&buffer[..bytes_read])?;
-            print!("\rCaptured {} bytes", bytes_read);
+            // Convert bytes to f32 samples and write to WAV
+            let samples = unsafe {
+                std::slice::from_raw_parts(
+                    buffer[..bytes_read].as_ptr() as *const f32,
+                    bytes_read / 4,
+                )
+            };
+            for &sample in samples {
+                wav_writer.write_sample(sample)?;
+            }
+            total_bytes += bytes_read as u32;
+            print!("\rCaptured {} bytes", total_bytes);
         }
     }
     println!();
 
-    // Stop capturing
+    // Stop capturing and finalize WAV file
     stream.stop()?;
-    println!("Capture complete!");
+    wav_writer.finalize()?;
 
+    println!("Capture complete! Saved to {}", args.output);
+    println!("Total bytes captured: {}", total_bytes);
+
+    // Validate the captured audio
+    if !args.skip_validation {
+        println!("Validating captured audio...");
+        validate_wav_file(&args.output, duration)?;
+        println!("Audio validation passed!");
+    }
+
+    // Clean up test process
+    if let Ok(mut child) = Command::new("taskkill")
+        .args(["/F", "/IM", "test_tone.exe"])
+        .spawn()
+    {
+        let _ = child.wait();
+    }
+
+    println!("Test completed successfully!");
     Ok(())
 }

@@ -12,11 +12,23 @@ inquire = "0.7.5"
 indicatif = "0.17.9"
 color-eyre = "0.6.3"
 ctrlc = "3.4.5"
+rodio = "0.20.1"
 
 # Platform-specific audio capture
 [target.'cfg(target_os = "windows")'.dependencies]
 wasapi = "0.15.0"
-windows = { version = "0.58.0", features = ["Win32_System_Com"] }
+windows = { version = "0.58.0", features = [
+    "Win32_System_Com",
+    "Win32_Media_Audio",
+    "Win32_Media_Audio_Endpoints",
+    "Win32_Media_MediaFoundation",
+    "Win32_Foundation",
+    "Win32_System_Threading",
+    "Win32_Devices_FunctionDiscovery",
+    "Win32_UI_Shell_PropertiesSystem",
+    "Win32_System_Com_StructuredStorage",
+    "implement",
+] }
 
 [target.'cfg(target_os = "linux")'.dependencies]
 libpulse-binding = "2.28.2"
@@ -52,6 +64,10 @@ path = "examples/test_coreaudio.rs"
 [[example]]
 name = "test_coreaudio_app"
 path = "examples/test_coreaudio_app.rs"
+
+[[example]]
+name = "test_tone"
+path = "examples/test_tone.rs"
 
 [workspace]
 members = []
