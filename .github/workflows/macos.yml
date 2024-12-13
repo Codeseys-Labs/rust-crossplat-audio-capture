@@ -1,0 +1,100 @@
+name: macOS Audio Tests
+
+on:
+  workflow_call:
+    inputs:
+      debug_enabled:
+        description: "Enable debug output"
+        required: false
+        type: boolean
+        default: false
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  test-macos:
+    runs-on: macos-latest
+    env:
+      DEBUG: ${{ inputs.debug_enabled }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Debug Info
+        if: env.DEBUG == true
+        run: |
+          rustc --version --verbose
+          cargo --version --verbose
+          cargo tree
+
+      - name: Setup Audio
+        run: |
+          # Create virtual audio device
+          brew install blackhole-2ch
+
+          # List audio devices
+          system_profiler SPAudioDataType
+
+      - name: Download test audio
+        run: |
+          mkdir -p test_audio
+          curl -L "https://ia800901.us.archive.org/23/items/gd70-02-14.early-late.sbd.cotsman.18115.sbeok.shnf/gd70-02-14d1t02.mp3" -o "test_audio/sample.mp3"
+
+      - name: Cache dependencies
+        uses: actions/cache@v3
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.lock') }}
+
+      - name: Build
+        run: cargo build --verbose
+
+      - name: Run tests
+        run: cargo test --verbose
+
+      - name: Build examples
+        run: cargo build --examples
+
+      - name: Test CoreAudio capture
+        run: |
+          # Start test tone in background
+          cargo run --example test_tone &
+          PLAYER_PID=$!
+
+          # Ensure cleanup on exit
+          trap "kill $PLAYER_PID 2>/dev/null || true" EXIT
+
+          # Wait for playback to start
+          sleep 2
+
+          # Start capturing
+          echo "Starting audio capture..."
+          cargo run --example test_coreaudio -- --duration 10
+
+          # Verify capture
+          if [ ! -f "test_capture.wav" ]; then
+              echo "Capture failed - no output file created"
+              exit 1
+          fi
+
+          FILESIZE=$(stat -f%z "test_capture.wav")
+          if [ "$FILESIZE" -eq 0 ]; then
+              echo "Capture failed - output file is empty"
+              exit 1
+          fi
+
+          echo "Successfully captured $FILESIZE bytes of audio"
+
+      - name: Upload macOS test artifacts
+        uses: actions/upload-artifact@v3
+        with:
+          name: macos-audio-test-results
+          path: |
+            test_capture.wav
+            test_audio/sample.mp3
