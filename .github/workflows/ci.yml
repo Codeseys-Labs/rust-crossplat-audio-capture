@@ -124,6 +124,9 @@ jobs:
   test-linux:
     if: github.event.inputs.platform == 'linux' || github.event.inputs.platform == 'all'
     runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        audio_system: [pipewire, pulseaudio]
     env:
       DEBUG: ${{ github.event.inputs.debug_enabled }}
     steps:
@@ -139,23 +142,59 @@ jobs:
           cargo --version --verbose
           cargo tree
 
-      - name: Install PulseAudio and ALSA
+      - name: Setup PipeWire
+        if: matrix.audio_system == 'pipewire'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y pipewire pipewire-pulse pipewire-audio wireplumber
+
+          # Stop PulseAudio if running
+          pulseaudio --kill || true
+
+          # Configure PipeWire
+          mkdir -p ~/.config/pipewire
+          echo "context.properties = {
+            default.clock.rate = 44100
+            default.clock.quantum = 1024
+            default.clock.min-quantum = 32
+            default.clock.max-quantum = 8192
+          }" > ~/.config/pipewire/pipewire.conf
+
+          # Start PipeWire
+          systemctl --user daemon-reload
+          systemctl --user restart pipewire pipewire-pulse
+
+          # Wait for system to initialize
+          sleep 5
+
+          # Verify PipeWire is running
+          pw-cli info
+          pactl info
+
+      - name: Setup PulseAudio
+        if: matrix.audio_system == 'pulseaudio'
         run: |
           sudo apt-get update
           sudo apt-get install -y pulseaudio libpulse-dev libasound2-dev
 
-      - name: Configure PulseAudio
-        run: |
-          # Create PulseAudio config directory
+          # Stop any existing audio services
+          systemctl --user stop pipewire pipewire-pulse || true
+          pulseaudio --kill || true
+
+          # Configure PulseAudio
           mkdir -p ~/.config/pulse
+          echo "default-sample-rate = 44100
+          default-fragments = 4
+          default-fragment-size-msec = 25
+          exit-idle-time = -1
+          load-module module-native-protocol-tcp auth-anonymous=1
+          load-module module-null-sink sink_name=test_sink" > ~/.config/pulse/daemon.conf
 
-          # Configure PulseAudio to allow anonymous auth and network access
-          echo "load-module module-native-protocol-tcp auth-anonymous=1" > ~/.config/pulse/default.pa
-          echo "load-module module-null-sink sink_name=test_sink" >> ~/.config/pulse/default.pa
-
-          # Start PulseAudio in daemon mode
+          # Start PulseAudio
           pulseaudio --start --exit-idle-time=-1 --daemon
-          sleep 2
+
+          # Wait for system to initialize
+          sleep 5
 
           # Verify PulseAudio is running
           pactl info
@@ -183,7 +222,7 @@ jobs:
       - name: Build examples
         run: cargo build --examples
 
-      - name: Test PulseAudio capture
+      - name: Test Audio Capture
         run: |
           # Start test tone in background
           cargo run --example test_tone &
@@ -196,7 +235,7 @@ jobs:
           sleep 2
 
           # Start capturing
-          echo "Starting audio capture..."
+          echo "Starting audio capture with ${{ matrix.audio_system }}..."
           cargo run --example test_pulseaudio -- --duration 10
 
           # Verify capture
@@ -211,12 +250,12 @@ jobs:
               exit 1
           fi
 
-          echo "Successfully captured $FILESIZE bytes of audio"
+          echo "Successfully captured $FILESIZE bytes of audio using ${{ matrix.audio_system }}"
 
       - name: Upload Linux test artifacts
         uses: actions/upload-artifact@v3
         with:
-          name: linux-audio-test-results
+          name: linux-${{ matrix.audio_system }}-test-results
           path: |
             test_capture.wav
             test_audio/sample.mp3
