@@ -1,0 +1,124 @@
+name: Cross-Platform Audio Tests
+
+on:
+  push:
+    branches: [ master, main ]
+  pull_request:
+    branches: [ master, main ]
+  workflow_dispatch:
+
+env:
+  CARGO_TERM_COLOR: always
+  RUST_BACKTRACE: 1
+
+jobs:
+  linux-tests:
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        audio_backend: [pipewire, pulseaudio]
+      fail-fast: false
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Build and run Linux tests
+        uses: docker/build-push-action@v5
+        with:
+          context: .
+          file: .docker/linux.Dockerfile
+          load: true
+          tags: audio-test:linux
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+      - name: Run tests in container
+        run: |
+          docker run --rm \
+            -e AUDIO_BACKEND=${{ matrix.audio_backend }} \
+            -e RUST_BACKTRACE=1 \
+            -v ${{ github.workspace }}:/workspace \
+            audio-test:linux \
+            cargo test --verbose
+
+      - name: Upload test artifacts
+        if: always()
+        uses: actions/upload-artifact@v3
+        with:
+          name: linux-${{ matrix.audio_backend }}-test-results
+          path: |
+            test_capture_robust.wav
+            test_tone.log
+
+  macos-tests:
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Docker
+        uses: docker/setup-buildx-action@v3
+
+      - name: Build and run macOS tests
+        uses: docker/build-push-action@v5
+        with:
+          context: .
+          file: .docker/macos.Dockerfile
+          load: true
+          tags: audio-test:macos
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+      - name: Run tests in container
+        run: |
+          docker run --rm \
+            -e RUST_BACKTRACE=1 \
+            -v ${{ github.workspace }}:/workspace \
+            audio-test:macos \
+            cargo test --verbose
+
+      - name: Upload test artifacts
+        if: always()
+        uses: actions/upload-artifact@v3
+        with:
+          name: macos-test-results
+          path: |
+            test_capture_robust.wav
+            test_tone.log
+
+  windows-tests:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Docker
+        uses: docker/setup-buildx-action@v3
+
+      - name: Build and run Windows tests
+        uses: docker/build-push-action@v5
+        with:
+          context: .
+          file: .docker/windows.Dockerfile
+          load: true
+          tags: audio-test:windows
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+      - name: Run tests in container
+        run: |
+          docker run --rm `
+            -e RUST_BACKTRACE=1 `
+            -v ${PWD}:/workspace `
+            audio-test:windows `
+            cargo test --verbose
+
+      - name: Upload test artifacts
+        if: always()
+        uses: actions/upload-artifact@v3
+        with:
+          name: windows-test-results
+          path: |
+            test_capture_robust.wav
+            test_tone.log
