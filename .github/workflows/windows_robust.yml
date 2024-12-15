@@ -70,13 +70,13 @@ jobs:
           }
           
           # Check for output devices using NAudio
-          Add-Type -TypeDefinition @"
+          Add-Type -TypeDefinition @'
           using System.Runtime.InteropServices;
           public class AudioUtils {
               [DllImport("winmm.dll")]
               public static extern uint waveOutGetNumDevs();
           }
-"@
+'@
           $numDevices = [AudioUtils]::waveOutGetNumDevs()
           Write-Host "Number of audio output devices: $numDevices"
           
