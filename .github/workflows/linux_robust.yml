@@ -1,0 +1,260 @@
+name: Linux Audio Tests
+
+on:
+  workflow_call:
+    inputs:
+      debug_enabled:
+        description: "Enable debug output"
+        required: false
+        type: boolean
+        default: false
+      audio_backend:
+        description: "Audio backend to use (pipewire or pulseaudio)"
+        required: false
+        type: string
+        default: "pipewire"
+
+env:
+  CARGO_TERM_COLOR: always
+  RUST_BACKTRACE: 1
+
+jobs:
+  test-linux:
+    runs-on: ubuntu-latest
+    env:
+      DEBUG: ${{ inputs.debug_enabled }}
+    
+    strategy:
+      matrix:
+        audio_backend: [pipewire, pulseaudio]
+      fail-fast: false
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Install Audio Dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            alsa-utils \
+            libasound2-dev \
+            pulseaudio \
+            pulseaudio-utils \
+            pipewire \
+            pipewire-pulse \
+            pipewire-alsa \
+            pipewire-audio \
+            wireplumber
+
+      - name: Configure Audio Backend
+        run: |
+          # Stop any existing audio services
+          systemctl --user stop pipewire pipewire-pulse pulseaudio || true
+          killall -9 pulseaudio pipewire pipewire-pulse 2>/dev/null || true
+          
+          if [ "${{ matrix.audio_backend }}" = "pipewire" ]; then
+            echo "Configuring PipeWire..."
+            
+            # Create PipeWire config directory
+            mkdir -p ~/.config/pipewire
+            
+            # Configure PipeWire for CI environment
+            cat > ~/.config/pipewire/pipewire.conf << EOF
+            context.properties = {
+                default.clock.rate = 48000
+                default.clock.quantum = 1024
+                default.clock.min-quantum = 32
+                default.clock.max-quantum = 8192
+            }
+            context.modules = [
+                { name = libpipewire-module-protocol-native }
+                { name = libpipewire-module-profiler }
+                { name = libpipewire-module-metadata }
+                { name = libpipewire-module-spa-device-factory }
+                { name = libpipewire-module-spa-node-factory }
+                { name = libpipewire-module-client-node }
+                { name = libpipewire-module-client-device }
+                { name = libpipewire-module-portal }
+                { name = libpipewire-module-access }
+                { name = libpipewire-module-adapter }
+                { name = libpipewire-module-link-factory }
+                { name = libpipewire-module-session-manager }
+            ]
+            EOF
+            
+            # Start PipeWire and related services
+            systemctl --user daemon-reload
+            systemctl --user start pipewire wireplumber pipewire-pulse
+            
+            # Wait for services to start
+            sleep 5
+            
+            # Create virtual sink
+            pw-cli create-node adapter { factory.name=support.null-audio-sink node.name=virtual-sink media.class=Audio/Sink }
+            
+            # Set as default sink
+            wpctl set-default $(wpctl status | grep "virtual-sink" | cut -d "." -f1)
+            
+            # Verify PipeWire is running and sink is created
+            if ! pw-cli info; then
+              echo "PipeWire failed to start"
+              exit 1
+            fi
+            
+            echo "PipeWire Audio Devices:"
+            pw-cli list-objects | grep -E "node.(description|name)"
+            
+            echo "PipeWire Status:"
+            wpctl status
+            
+          else
+            echo "Configuring PulseAudio..."
+            
+            # Configure PulseAudio for CI environment
+            mkdir -p ~/.config/pulse
+            cat > ~/.config/pulse/daemon.conf << EOF
+            exit-idle-time = -1
+            anonymous-enable = yes
+            default-sample-rate = 48000
+            default-sample-channels = 2
+            default-sample-format = float32le
+            realtime-scheduling = yes
+            realtime-priority = 9
+            rlimit-rtprio = 9
+            daemonize = yes
+            allow-module-loading = yes
+            EOF
+            
+            cat > ~/.config/pulse/client.conf << EOF
+            autospawn = yes
+            daemon-binary = /usr/bin/pulseaudio
+            enable-shm = yes
+            EOF
+            
+            # Start PulseAudio in daemon mode
+            pulseaudio --start --exit-idle-time=-1 --load="module-null-sink sink_name=virtual-sink" --load="module-virtual-source source_name=virtual-source"
+            sleep 3
+            
+            # Set virtual sink as default
+            pacmd set-default-sink virtual-sink
+            pacmd set-default-source virtual-source
+            
+            # Verify PulseAudio is running
+            if ! pactl info; then
+              echo "PulseAudio failed to start"
+              exit 1
+            fi
+            
+            echo "PulseAudio Sinks:"
+            pactl list sinks short
+            
+            echo "PulseAudio Sources:"
+            pactl list sources short
+            
+            echo "PulseAudio Modules:"
+            pactl list modules short
+          fi
+          
+          # Final verification of audio setup
+          echo "Testing audio pipeline..."
+          if [ "${{ matrix.audio_backend }}" = "pipewire" ]; then
+            pw-record --target virtual-sink --playback /dev/null -d 2 || (echo "Audio pipeline test failed" && exit 1)
+          else
+            pacat -r --device=virtual-source --record /dev/null -d 2 || (echo "Audio pipeline test failed" && exit 1)
+          fi
+        shell: bash
+
+      - name: Debug Audio Setup
+        if: inputs.debug_enabled
+        run: |
+          echo "Audio Backend: ${{ matrix.audio_backend }}"
+          echo "Environment Variables:"
+          env | grep -i "pulse\|audio\|pipewire"
+          
+          echo "Process Status:"
+          ps aux | grep -E "pulse|pipewire"
+          
+          if [ "${{ matrix.audio_backend }}" = "pipewire" ]; then
+            pw-cli info
+            pw-cli list-objects
+          else
+            pactl info
+            pactl list
+          fi
+        shell: bash
+
+      - name: Cache dependencies
+        uses: actions/cache@v3
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ${{ runner.os }}-${{ matrix.audio_backend }}-cargo-${{ hashFiles('**/Cargo.lock') }}
+
+      - name: Build
+        run: cargo build --verbose
+
+      - name: Run tests
+        run: cargo test --verbose -- --nocapture
+
+      - name: Test Audio System
+        run: |
+          # Start test tone in background
+          cargo run --example test_tone_robust > test_tone.log 2>&1 &
+          TONE_PID=$!
+          
+          # Wait for tone to start
+          sleep 3
+          
+          # Verify test tone is running
+          if ! kill -0 $TONE_PID 2>/dev/null; then
+            echo "Test tone failed to start"
+            cat test_tone.log
+            exit 1
+          fi
+          
+          # Start audio capture
+          cargo run --example test_capture_robust
+          CAPTURE_EXIT=$?
+          
+          # Stop test tone
+          kill $TONE_PID || true
+          wait $TONE_PID || true
+          
+          # Check capture results
+          if [ $CAPTURE_EXIT -ne 0 ]; then
+            echo "Audio capture failed"
+            exit 1
+          fi
+          
+          # Verify capture file
+          if [ ! -f "test_capture_robust.wav" ]; then
+            echo "Capture file not found"
+            exit 1
+          fi
+          
+          # Check file size
+          CAPTURE_SIZE=$(stat -f%z "test_capture_robust.wav" 2>/dev/null || stat -c%s "test_capture_robust.wav")
+          if [ "$CAPTURE_SIZE" -eq 0 ]; then
+            echo "Capture file is empty"
+            exit 1
+          fi
+          
+          echo "Audio capture test completed successfully"
+          echo "Capture file size: $CAPTURE_SIZE bytes"
+        shell: bash
+
+      - name: Upload test artifacts
+        if: always()
+        uses: actions/upload-artifact@v3
+        with:
+          name: linux-${{ matrix.audio_backend }}-audio-test-results
+          path: |
+            test_capture_robust.wav
+            test_tone.log
+            ~/.config/pulse/*.log
+            /tmp/pipewire.log

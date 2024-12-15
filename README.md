@@ -1,23 +1,39 @@
-# RSAC (Rust System Audio Capture)
+# Cross-Platform Audio Capture Library
 
-A cross-platform command-line tool for capturing audio from specific applications, supporting Windows, Linux, and macOS.
+A robust, high-performance audio capture library for Rust, supporting Windows, macOS, and Linux platforms. This library provides a unified interface for capturing audio across different operating systems, with support for both system-wide and application-specific capture.
 
 ## Features
 
-- Cross-platform support:
-  - Windows: Application-specific capture using WASAPI
-  - Linux: Application-specific capture using PulseAudio (PipeWire support coming soon)
-  - macOS: System audio capture using CoreAudio
-- Process-specific audio capture (where supported)
-- Interactive process/source selection with filtering
-- Multiple output formats (RAW/WAV)
-- Real-time progress visualization
-- Detailed capture logs
-- Configurable capture duration
-- Unbounded recording mode
-- Custom output paths
-- Multiple audio formats (F32LE, S16LE, S32LE)
-- Configurable sample rate and channel count
+### Core Features
+- **Cross-Platform Support**
+  - Windows: WASAPI-based capture with application-specific support
+  - Linux: PipeWire (preferred) and PulseAudio support
+  - macOS: CoreAudio implementation with system and app-specific capture
+
+### Audio Capabilities
+- System-wide audio capture
+- Application-specific capture (Windows, Linux)
+- Multiple output formats (WAV, RAW PCM)
+- Configurable audio parameters:
+  - Sample rates: 44.1kHz, 48kHz, 96kHz
+  - Bit depths: 16-bit, 24-bit, 32-bit
+  - Channel configurations: Mono, Stereo
+  - Format types: F32LE, S16LE, S32LE
+
+### Advanced Features
+- Async support with Tokio
+- Lock-free audio buffers
+- SIMD optimizations
+- Zero-copy audio processing
+- Comprehensive error handling
+- Detailed logging and diagnostics
+
+### Development Features
+- Trait-based API design
+- Extensive test coverage
+- Mock implementations for testing
+- Comprehensive documentation
+- Performance benchmarks
 
 ## Installation
 
