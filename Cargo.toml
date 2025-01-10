@@ -4,6 +4,7 @@ version = "0.1.0"
 edition = "2021"
 
 [dependencies]
+wasapi = "0.1"
 # Core dependencies
 hound = "3.5.1"
 sysinfo = "0.33.0"

@@ -34,7 +34,7 @@ impl PulseAudioBackend {
                 pulse::proplist::properties::APPLICATION_NAME,
                 "Rust Audio Capture",
             )
-            .map_err(|e| AudioError::InitializationFailed(e.to_string()))?;
+            .map_err(|e| AudioError::InitializationFailed(e.to_string().expect("Failed to convert error to string")))?;
 
         // Create a mainloop
         let mainloop = Mainloop::new().ok_or_else(|| {
@@ -50,12 +50,12 @@ impl PulseAudioBackend {
         // Connect the context
         context
             .connect(None, ContextFlagSet::NOFLAGS, None)
-            .map_err(|e| AudioError::InitializationFailed(e.to_string()))?;
+            .map_err(|e| AudioError::InitializationFailed(e.to_string().expect("Failed to convert error to string")))?;
 
         // Start the mainloop
         mainloop
             .start()
-            .map_err(|e| AudioError::InitializationFailed(e.to_string()))?;
+            .map_err(|e| AudioError::InitializationFailed(e.to_string().expect("Failed to convert error to string")))?;
 
         // Wait for context to be ready
         loop {
@@ -173,9 +173,9 @@ impl PulseAudioStream {
     ) -> Result<Self, AudioError> {
         let ss = pulse::sample::Spec {
             format: match config.format {
-                AudioFormat::F32LE => pulse::sample::Format::FLOAT32LE,
-                AudioFormat::S16LE => pulse::sample::Format::S16LE,
-                AudioFormat::S32LE => pulse::sample::Format::S32LE,
+                AudioFormat::F32LE => pulse::sample::Format::FLOAT32NE,
+                AudioFormat::S16LE => pulse::sample::Format::S16NE,
+                AudioFormat::S32LE => pulse::sample::Format::S32NE,
             },
             channels: config.channels,
             rate: config.sample_rate,
@@ -186,7 +186,7 @@ impl PulseAudioStream {
         }
 
         let stream_name = CString::new(format!("capture_{}", app.name))
-            .map_err(|e| AudioError::InitializationFailed(e.to_string()))?;
+            .map_err(|e| AudioError::InitializationFailed(e.to_string().expect("Failed to convert error to string")))?;
 
         let stream = Stream::new(
             &context,
@@ -211,7 +211,7 @@ impl PulseAudioStream {
                 Some(&attr),
                 stream::FlagSet::ADJUST_LATENCY,
             )
-            .map_err(|e| AudioError::CaptureError(e.to_string()))?;
+            .map_err(|e| AudioError::CaptureError(e.to_string().expect("Failed to convert error to string")))?;
 
         Ok(Self {
             stream,
@@ -225,14 +225,14 @@ impl PulseAudioStream {
 impl AudioCaptureStream for PulseAudioStream {
     fn start(&mut self) -> Result<(), AudioError> {
         self.stream
-            .cork(false, None)
-            .map_err(|e| AudioError::CaptureError(e.to_string()))
+            .cork(None)
+            .map_err(|e| AudioError::CaptureError(e.to_string().expect("Failed to convert error to string")))
     }
 
     fn stop(&mut self) -> Result<(), AudioError> {
         self.stream
-            .cork(true, None)
-            .map_err(|e| AudioError::CaptureError(e.to_string()))
+            .cork(None)
+            .map_err(|e| AudioError::CaptureError(e.to_string().expect("Failed to convert error to string")))
     }
 
     fn read(&mut self, buffer: &mut [u8]) -> Result<usize, AudioError> {
@@ -249,9 +249,9 @@ impl AudioCaptureStream for PulseAudioStream {
                     bytes_read += to_copy;
                     self.stream
                         .discard()
-                        .map_err(|e| AudioError::CaptureError(e.to_string()))?;
+                        .map_err(|e| AudioError::CaptureError(e.to_string().expect("Failed to convert error to string")))?;
                 }
-                Err(e) => return Err(AudioError::CaptureError(e.to_string())),
+                Err(e) => return Err(AudioError::CaptureError(e.to_string().expect("Failed to convert error to string"))),
             }
         }
         Ok(bytes_read)
@@ -275,5 +275,23 @@ impl PipeWireBackend {
     pub fn is_available() -> bool {
         // TODO: Check if PipeWire is available
         false
+    }
+}
+
+impl AudioCaptureBackend for PipeWireBackend {
+    fn name(&self) -> &'static str {
+        "PipeWire"
+    }
+
+    fn list_applications(&self) -> Result<Vec<AudioApplication>, AudioError> {
+        Err(AudioError::BackendUnavailable("PipeWire support not yet implemented"))
+    }
+
+    fn capture_application(
+        &self,
+        app: &AudioApplication,
+        config: AudioConfig,
+    ) -> Result<Box<dyn AudioCaptureStream>, AudioError> {
+        Err(AudioError::BackendUnavailable("PipeWire support not yet implemented"))
     }
 }
