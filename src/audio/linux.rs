@@ -472,37 +472,84 @@ impl AudioCaptureBackend for PipeWireBackend {
     }
 
     fn list_applications(&self) -> Result<Vec<AudioApplication>, AudioError> {
-        let mut apps = Vec::new();
+        let apps = Arc::new(Mutex::new(Vec::new()));
+        let apps_clone = Arc::clone(&apps);
         
         // Listen for nodes in the PipeWire graph
-        self.registry.add_listener_local()
-            .global(move |global: GlobalObject| {
-                if global.type_ == "PipeWire:Interface:Node" {
+        let _listener = self.registry.add_listener_local()
+            .global({
+                move |global: GlobalObject| {
                     if let Some(props) = global.props.as_ref() {
-                        // Check if this is an application stream
-                        if props.get("media.class") == Some("Stream/Input/Audio") {
-                            let app = AudioApplication {
-                                name: props.get("application.name")
-                                    .unwrap_or("Unknown")
-                                    .to_string(),
-                                id: global.id.to_string(),
-                                executable_name: props.get("application.process.binary")
-                                    .unwrap_or("unknown")
-                                    .to_string(),
-                                pid: props.get("application.process.id")
-                                    .and_then(|pid| pid.parse().ok())
-                                    .unwrap_or(0),
-                            };
-                            apps.push(app);
+                        let media_class = props.get("media.class").unwrap_or("");
+                        
+                        // Add system audio capture option
+                        if media_class == "Audio/Sink" {
+                            let mut apps = apps_clone.lock().unwrap();
+                            if !apps.iter().any(|app| app.name == "System") {
+                                apps.push(AudioApplication {
+                                    name: "System".to_string(),
+                                    id: "system".to_string(),
+                                    executable_name: "system".to_string(),
+                                    pid: 0,
+                                });
+                            }
+                        }
+                        
+                        // Add application-specific streams
+                        if media_class == "Stream/Input/Audio" || media_class == "Stream/Output/Audio" {
+                            let app_name = props.get("application.name")
+                                .or_else(|| props.get("media.name"))
+                                .unwrap_or("Unknown")
+                                .to_string();
+                                
+                            let pid = props.get("application.process.id")
+                                .and_then(|pid| pid.parse().ok())
+                                .unwrap_or(0);
+                                
+                            // Only add if we have a valid PID (except for system audio)
+                            if pid > 0 || app_name == "System" {
+                                let app = AudioApplication {
+                                    name: app_name,
+                                    id: global.id.to_string(),
+                                    executable_name: props.get("application.process.binary")
+                                        .unwrap_or("unknown")
+                                        .to_string(),
+                                    pid,
+                                };
+                                
+                                let mut apps = apps_clone.lock().unwrap();
+                                // Avoid duplicates
+                                if !apps.iter().any(|existing| existing.pid == app.pid && existing.pid != 0) {
+                                    apps.push(app);
+                                }
+                            }
                         }
                     }
                 }
             });
 
         // Process events to populate the applications list
-        self.main_loop.iterate(Duration::from_millis(100));
+        for _ in 0..10 {  // Give some time for events to arrive
+            self.main_loop.iterate(Duration::from_millis(100));
+        }
         
-        Ok(apps)
+        let mut final_apps = Arc::try_unwrap(apps)
+            .unwrap()
+            .into_inner()
+            .unwrap_or_default();
+            
+        // Sort applications: System first, then by name
+        final_apps.sort_by(|a, b| {
+            if a.name == "System" {
+                std::cmp::Ordering::Less
+            } else if b.name == "System" {
+                std::cmp::Ordering::Greater
+            } else {
+                a.name.cmp(&b.name)
+            }
+        });
+        
+        Ok(final_apps)
     }
 
     fn capture_application(
@@ -510,29 +557,48 @@ impl AudioCaptureBackend for PipeWireBackend {
         app: &AudioApplication,
         config: AudioConfig,
     ) -> Result<Box<dyn AudioCaptureStream>, AudioError> {
+        // Check if this is a system-wide capture request
+        let is_system_capture = app.name == "System" || app.name == "Monitor";
+
         // Create stream properties
-        let props = properties! {
-            "media.class" => "Audio/Source",
-            "audio.capture.app" => &app.name,
-            "target.object" => &app.id,
-            "stream.capture.sink" => "true",
-            "audio.position" => if config.channels == 1 { "MONO" } else { "FL,FR" },
+        let props = if is_system_capture {
+            properties! {
+                "media.class" => "Audio/Source",
+                "stream.capture.sink" => "true",
+                "audio.position" => if config.channels == 1 { "MONO" } else { "FL,FR" },
+                // Target the default monitor/sink for system-wide capture
+                "target.object" => "default.monitor",
+                "stream.is_monitor" => "true",
+            }
+        } else {
+            // Process-specific capture
+            properties! {
+                "media.class" => "Audio/Source",
+                "audio.capture.app" => &app.name,
+                "target.object" => &app.id,
+                "stream.capture.sink" => "true",
+                "audio.position" => if config.channels == 1 { "MONO" } else { "FL,FR" },
+                "application.process.id" => app.pid.to_string(),
+                "application.name" => &app.name,
+                "stream.capture.pid" => app.pid.to_string(),
+            }
         };
 
         // Create the stream
         let stream = PwStream::new(
             &self.core,
-            "audio-capture",
+            if is_system_capture { "system-audio-capture" } else { "application-audio-capture" },
             props,
         ).map_err(|e| AudioError::CaptureError(format!("Failed to create PipeWire stream: {}", e)))?;
 
         // Set up stream listener for state changes
         let stream_clone = stream.clone();
+        let app_name = app.name.clone();
         stream.add_listener_local()
             .state_changed(move |old, new| {
-                println!("PipeWire stream state changed: {:?} -> {:?}", old, new);
+                println!("PipeWire stream state changed for {}: {:?} -> {:?}", app_name, old, new);
                 if new == StreamState::Error {
-                    eprintln!("PipeWire stream entered error state!");
+                    eprintln!("PipeWire stream entered error state for {}!", app_name);
                 }
             });
 
