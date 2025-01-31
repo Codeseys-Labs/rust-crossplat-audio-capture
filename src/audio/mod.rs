@@ -31,13 +31,14 @@ pub fn get_audio_backend() -> Result<Box<dyn AudioCaptureBackend>, AudioError> {
     }
     #[cfg(target_os = "linux")]
     {
-        if linux::PulseAudioBackend::is_available() {
-            Ok(Box::new(linux::PulseAudioBackend::new()?))
-        } else if linux::PipeWireBackend::is_available() {
+        if linux::PipeWireBackend::is_available() {
             Ok(Box::new(linux::PipeWireBackend::new()?))
+        } else if linux::PulseAudioBackend::is_available() {
+            println!("Warning: PipeWire not available, falling back to PulseAudio");
+            Ok(Box::new(linux::PulseAudioBackend::new()?))
         } else {
             Err(AudioError::BackendUnavailable(
-                "No supported audio backend available",
+                "No supported audio backend (PipeWire or PulseAudio) available",
             ))
         }
     }

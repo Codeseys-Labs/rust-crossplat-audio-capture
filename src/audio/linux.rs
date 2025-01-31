@@ -13,6 +13,18 @@ use libpulse_binding::{
     stream::{self, Stream},
 };
 
+use pipewire::{
+    self,
+    context::Context as PwContext,
+    core::Core,
+    main_loop::MainLoop,
+    properties::properties,
+    registry::{GlobalObject, Registry},
+    spa::{Direction, Pod, ReadableDict, Format},
+    stream::{Stream as PwStream, StreamFlags, StreamState},
+    buffer::{Buffer, BufferFlags},
+};
+
 use super::core::{
     AudioApplication, AudioCaptureBackend, AudioCaptureStream, AudioConfig,
     AudioError, AudioFormat,
@@ -262,19 +274,195 @@ impl AudioCaptureStream for PulseAudioStream {
     }
 }
 
+use pipewire::{
+    self,
+    context::Context,
+    core::Core,
+    main_loop::MainLoop,
+    properties::properties,
+    registry::{GlobalObject, Registry},
+    spa::{Direction, Pod},
+    stream::{Stream, StreamFlags},
+};
+
 pub struct PipeWireBackend {
-    // TODO: Add PipeWire context and other required fields
+    context: PwContext,
+    core: Core,
+    main_loop: MainLoop,
+    registry: Registry,
 }
 
 impl PipeWireBackend {
     pub fn new() -> Result<Self, AudioError> {
-        // TODO: Initialize PipeWire connection
-        Err(AudioError::BackendUnavailable("PipeWire support not yet implemented"))
+        pipewire::init();
+        
+        let main_loop = MainLoop::new()
+            .map_err(|e| AudioError::InitializationFailed(format!("Failed to create PipeWire main loop: {}", e)))?;
+            
+        let context = PwContext::new(&main_loop)
+            .map_err(|e| AudioError::InitializationFailed(format!("Failed to create PipeWire context: {}", e)))?;
+            
+        let core = context.connect(None)
+            .map_err(|e| AudioError::InitializationFailed(format!("Failed to connect to PipeWire: {}", e)))?;
+            
+        let registry = core.get_registry()
+            .map_err(|e| AudioError::InitializationFailed(format!("Failed to get PipeWire registry: {}", e)))?;
+
+        Ok(Self {
+            context,
+            core,
+            main_loop,
+            registry,
+        })
     }
 
     pub fn is_available() -> bool {
-        // TODO: Check if PipeWire is available
+        // Try to initialize PipeWire and create a connection
+        pipewire::init();
+        if let Ok(main_loop) = MainLoop::new() {
+            if let Ok(context) = PwContext::new(&main_loop) {
+                if let Ok(_) = context.connect(None) {
+                    return true;
+                }
+            }
+        }
         false
+    }
+}
+
+pub struct PipeWireStream {
+    stream: PwStream,
+    config: AudioConfig,
+    buffer: Vec<u8>,
+    shared_buffer: Arc<Mutex<Vec<u8>>>,
+}
+
+impl PipeWireStream {
+    fn new(stream: PwStream, config: AudioConfig) -> Self {
+        Self {
+            stream,
+            config,
+            buffer: Vec::with_capacity(16384),
+            shared_buffer: Arc::new(Mutex::new(Vec::with_capacity(16384))),
+        }
+    }
+}
+
+impl AudioCaptureStream for PipeWireStream {
+    fn start(&mut self) -> Result<(), AudioError> {
+        // Configure the stream format based on AudioConfig
+        let stream_flags = StreamFlags::AUTOCONNECT | StreamFlags::RT_PROCESS;
+        
+        // Set up stream parameters based on config
+        let params = Pod::builder()
+            .object(
+                "Format",
+                "audio/raw",
+                properties! {
+                    "format" => match self.config.format {
+                        AudioFormat::F32LE => "F32LE",
+                        AudioFormat::S16LE => "S16LE",
+                        AudioFormat::S32LE => "S32LE",
+                    },
+                    "rate" => self.config.sample_rate,
+                    "channels" => self.config.channels,
+                    "layout" => if self.config.channels == 1 { "mono" } else { "interleaved" },
+                },
+            )
+            .build();
+
+        // Set up process callback
+        let buffer_clone = self.shared_buffer.clone();
+
+        self.stream.add_listener_local()
+            .process(move |stream| {
+                if let Some(mut buffer_guard) = buffer_clone.try_lock() {
+                    if let Some(input) = stream.input_buffer() {
+                        for data in input.datas() {
+                            if data.chunk().is_valid() {
+                                if let Some(ptr) = data.data() {
+                                    // Ensure we don't accumulate too much data
+                                    if buffer_guard.len() > 1_048_576 { // 1MB limit
+                                        buffer_guard.clear();
+                                    }
+                                    buffer_guard.extend_from_slice(ptr);
+                                }
+                            }
+                        }
+                    }
+                }
+                Ok(())
+            });
+
+        // Connect the stream
+        self.stream.connect(Direction::Input, None, stream_flags, &[params])
+            .map_err(|e| AudioError::CaptureError(format!("Failed to start PipeWire stream: {}", e)))?;
+
+        // Wait for stream to be ready
+        let mut retries = 0;
+        while retries < 10 {
+            if self.stream.state() == StreamState::Streaming {
+                return Ok(());
+            }
+            std::thread::sleep(Duration::from_millis(100));
+            retries += 1;
+        }
+
+        if self.stream.state() != StreamState::Streaming {
+            Err(AudioError::CaptureError("Stream failed to start streaming".into()))
+        } else {
+            Ok(())
+        }
+    }
+
+    fn stop(&mut self) -> Result<(), AudioError> {
+        self.stream.disconnect()
+            .map_err(|e| AudioError::CaptureError(format!("Failed to stop PipeWire stream: {}", e)))
+    }
+
+    fn read(&mut self, buffer: &mut [u8]) -> Result<usize, AudioError> {
+        let mut bytes_read = 0;
+
+        // Process any pending data in our internal buffer first
+        if !self.buffer.is_empty() {
+            let copy_size = std::cmp::min(buffer.len(), self.buffer.len());
+            buffer[..copy_size].copy_from_slice(&self.buffer[..copy_size]);
+            self.buffer.drain(..copy_size);
+            bytes_read = copy_size;
+        }
+
+        // Try to get data from the shared buffer
+        if bytes_read < buffer.len() {
+            if let Ok(mut shared_buf) = self.shared_buffer.try_lock() {
+                if !shared_buf.is_empty() {
+                    let remaining_space = buffer.len() - bytes_read;
+                    let copy_size = std::cmp::min(remaining_space, shared_buf.len());
+                    
+                    buffer[bytes_read..bytes_read + copy_size]
+                        .copy_from_slice(&shared_buf[..copy_size]);
+                    
+                    // Remove the copied data from shared buffer
+                    shared_buf.drain(..copy_size);
+                    bytes_read += copy_size;
+
+                    // If we still have data, store it in our local buffer
+                    if !shared_buf.is_empty() {
+                        self.buffer.extend(shared_buf.drain(..));
+                    }
+                }
+            }
+        }
+
+        // If we got no data, wait a bit to avoid busy-waiting
+        if bytes_read == 0 {
+            std::thread::sleep(Duration::from_millis(1));
+        }
+
+        Ok(bytes_read)
+    }
+
+    fn config(&self) -> &AudioConfig {
+        &self.config
     }
 }
 
@@ -284,7 +472,37 @@ impl AudioCaptureBackend for PipeWireBackend {
     }
 
     fn list_applications(&self) -> Result<Vec<AudioApplication>, AudioError> {
-        Err(AudioError::BackendUnavailable("PipeWire support not yet implemented"))
+        let mut apps = Vec::new();
+        
+        // Listen for nodes in the PipeWire graph
+        self.registry.add_listener_local()
+            .global(move |global: GlobalObject| {
+                if global.type_ == "PipeWire:Interface:Node" {
+                    if let Some(props) = global.props.as_ref() {
+                        // Check if this is an application stream
+                        if props.get("media.class") == Some("Stream/Input/Audio") {
+                            let app = AudioApplication {
+                                name: props.get("application.name")
+                                    .unwrap_or("Unknown")
+                                    .to_string(),
+                                id: global.id.to_string(),
+                                executable_name: props.get("application.process.binary")
+                                    .unwrap_or("unknown")
+                                    .to_string(),
+                                pid: props.get("application.process.id")
+                                    .and_then(|pid| pid.parse().ok())
+                                    .unwrap_or(0),
+                            };
+                            apps.push(app);
+                        }
+                    }
+                }
+            });
+
+        // Process events to populate the applications list
+        self.main_loop.iterate(Duration::from_millis(100));
+        
+        Ok(apps)
     }
 
     fn capture_application(
@@ -292,6 +510,32 @@ impl AudioCaptureBackend for PipeWireBackend {
         app: &AudioApplication,
         config: AudioConfig,
     ) -> Result<Box<dyn AudioCaptureStream>, AudioError> {
-        Err(AudioError::BackendUnavailable("PipeWire support not yet implemented"))
+        // Create stream properties
+        let props = properties! {
+            "media.class" => "Audio/Source",
+            "audio.capture.app" => &app.name,
+            "target.object" => &app.id,
+            "stream.capture.sink" => "true",
+            "audio.position" => if config.channels == 1 { "MONO" } else { "FL,FR" },
+        };
+
+        // Create the stream
+        let stream = PwStream::new(
+            &self.core,
+            "audio-capture",
+            props,
+        ).map_err(|e| AudioError::CaptureError(format!("Failed to create PipeWire stream: {}", e)))?;
+
+        // Set up stream listener for state changes
+        let stream_clone = stream.clone();
+        stream.add_listener_local()
+            .state_changed(move |old, new| {
+                println!("PipeWire stream state changed: {:?} -> {:?}", old, new);
+                if new == StreamState::Error {
+                    eprintln!("PipeWire stream entered error state!");
+                }
+            });
+
+        Ok(Box::new(PipeWireStream::new(stream, config)))
     }
 }
