@@ -33,22 +33,46 @@ impl AudioCaptureBackend for WasapiBackend {
     }
 
     fn list_applications(&self) -> Result<Vec<AudioApplication>, AudioError> {
+        let mut apps = Vec::new();
+
+        // Add system-wide audio capture option
+        apps.push(AudioApplication {
+            name: "System".to_string(),
+            id: "system".to_string(),
+            executable_name: "system".to_string(),
+            pid: 0,
+        });
+
         // Create a new system instance for process listing
         let mut system = System::new_with_specifics(
             RefreshKind::everything().with_processes(ProcessRefreshKind::everything()),
         );
         system.refresh_processes(ProcessesToUpdate::All, true);
 
-        let mut apps = Vec::new();
+        // Add running processes
         for (pid, process) in system.processes() {
             let name = process.name().to_string_lossy().into_owned();
-            apps.push(AudioApplication {
-                name: name.clone(),
-                id: pid.to_string(),
-                executable_name: format!("{}.exe", name),
-                pid: pid.as_u32(),
-            });
+            // Skip system processes and processes without audio
+            if !name.is_empty() && pid.as_u32() > 4 {  // Skip system processes (PIDs 0-4)
+                apps.push(AudioApplication {
+                    name: name.clone(),
+                    id: pid.to_string(),
+                    executable_name: format!("{}.exe", name),
+                    pid: pid.as_u32(),
+                });
+            }
         }
+
+        // Sort applications: System first, then by name
+        apps.sort_by(|a, b| {
+            if a.name == "System" {
+                std::cmp::Ordering::Less
+            } else if b.name == "System" {
+                std::cmp::Ordering::Greater
+            } else {
+                a.name.cmp(&b.name)
+            }
+        });
 
         Ok(apps)
     }
@@ -67,10 +91,18 @@ impl AudioCaptureBackend for WasapiBackend {
             None,
         );
 
-        let mut audio_client = AudioClient::new_application_loopback_client(
-            app.pid, true, // include_tree - capture audio from child processes too
-        )
-        .map_err(|e| AudioError::DeviceNotFound(e.to_string()))?;
+        let mut audio_client = if app.name == "System" {
+            // System-wide audio capture
+            AudioClient::new_default_device(Direction::Capture)
+                .map_err(|e| AudioError::DeviceNotFound(e.to_string()))?
+        } else {
+            // Process-specific audio capture
+            AudioClient::new_application_loopback_client(
+                app.pid,
+                true, // include_tree - capture audio from child processes too
+            )
+            .map_err(|e| AudioError::DeviceNotFound(e.to_string()))?
+        };
 
         audio_client
             .initialize_client(
