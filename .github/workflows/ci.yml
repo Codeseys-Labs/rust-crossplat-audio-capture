@@ -13,35 +13,87 @@ on:
           - windows
           - linux
           - macos
+      test_mode:
+        description: "Test mode"
+        required: true
+        default: "robust"
+        type: choice
+        options:
+          - robust
+          - basic
+      audio_backend:
+        description: "Linux audio backend"
+        required: false
+        type: choice
+        options:
+          - auto
+          - pipewire
+          - pulseaudio
+        default: "auto"
       debug_enabled:
         description: "Enable debug output"
         required: false
         type: boolean
         default: false
 
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
 jobs:
-  windows:
-    if: github.event.inputs.platform == 'windows' || github.event.inputs.platform == 'all'
-    uses: ./.github/workflows/windows.yml
-    secrets: inherit
-    with:
-      debug_enabled: ${{ fromJSON(github.event.inputs.debug_enabled) }}
+  setup:
+    runs-on: ubuntu-latest
+    outputs:
+      matrix: ${{ steps.set-matrix.outputs.matrix }}
+    steps:
+      - id: set-matrix
+        run: |
+          if [ "${{ github.event.inputs.platform }}" = "all" ]; then
+            echo "matrix={\"platform\":[\"windows\",\"linux\",\"macos\"]}" >> $GITHUB_OUTPUT
+          else
+            echo "matrix={\"platform\":[\"${{ github.event.inputs.platform }}\"]}" >> $GITHUB_OUTPUT
+          fi
 
-  linux:
-    if: github.event.inputs.platform == 'linux' || github.event.inputs.platform == 'all'
-    uses: ./.github/workflows/linux.yml
+  platform-tests:
+    needs: setup
+    strategy:
+      matrix: ${{ fromJson(needs.setup.outputs.matrix) }}
+      fail-fast: false
+    uses: ./.github/workflows/${{ matrix.platform }}.yml
     secrets: inherit
     with:
       debug_enabled: ${{ fromJSON(github.event.inputs.debug_enabled) }}
-
-  macos:
-    if: github.event.inputs.platform == 'macos' || github.event.inputs.platform == 'all'
-    uses: ./.github/workflows/macos.yml
-    secrets: inherit
-    with:
-      debug_enabled: ${{ fromJSON(github.event.inputs.debug_enabled) }}
+      test_mode: ${{ github.event.inputs.test_mode }}
+      audio_backend: ${{ matrix.platform == 'linux' && github.event.inputs.audio_backend || 'auto' }}
 
   code-quality:
     if: github.event.inputs.platform == 'all'
     uses: ./.github/workflows/code-quality.yml
     secrets: inherit
+
+  tests:
+    if: github.event.inputs.platform == 'all'
+    uses: ./.github/workflows/tests.yml
+    secrets: inherit
+    with:
+      debug_enabled: ${{ fromJSON(github.event.inputs.debug_enabled) }}
+
+  summary:
+    needs: [platform-tests, code-quality, tests]
+    if: always()
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check workflow status
+        run: |
+          if [[ "${{ needs.platform-tests.result }}" == "success" ]] && \
+             [[ "${{ needs.code-quality.result }}" == "success" || "${{ needs.code-quality.result }}" == "skipped" ]] && \
+             [[ "${{ needs.tests.result }}" == "success" || "${{ needs.tests.result }}" == "skipped" ]]; then
+            echo "All required jobs completed successfully"
+            exit 0
+          else
+            echo "Some jobs failed:"
+            echo "Platform Tests: ${{ needs.platform-tests.result }}"
+            echo "Code Quality: ${{ needs.code-quality.result }}"
+            echo "Tests: ${{ needs.tests.result }}"
+            exit 1
+          fi
