@@ -6,10 +6,10 @@ edition = "2021"
 [dependencies]
 # Core dependencies
 hound = "3.5.1"
-sysinfo = "0.33.0"
-clap = { version = "4.5.23", features = ["derive"] }
+sysinfo = "0.33.1"
+clap = { version = "4.5.27", features = ["derive"] }
 inquire = "0.7.5"
-indicatif = "0.17.9"
+indicatif = "0.17.11"
 color-eyre = "0.6.3"
 ctrlc = "3.4.5"
 rodio = "0.20.1"
@@ -17,7 +17,7 @@ rodio = "0.20.1"
 # Platform-specific audio capture
 [target.'cfg(target_os = "windows")'.dependencies]
 wasapi = "0.15.0"
-windows = { version = "0.58.0", features = [
+windows = { version = "0.59", features = [
     "Win32_System_Com",
     "Win32_Media_Audio",
     "Win32_Media_Audio_Endpoints",
@@ -27,7 +27,6 @@ windows = { version = "0.58.0", features = [
     "Win32_Devices_FunctionDiscovery",
     "Win32_UI_Shell_PropertiesSystem",
     "Win32_System_Com_StructuredStorage",
-    "implement",
 ] }
 
 [target.'cfg(target_os = "linux")'.dependencies]
@@ -39,11 +38,11 @@ pipewire = "0.8.0"
 coreaudio-rs = "0.12.1"
 
 # Error handling
-thiserror = "2.0.6"
+thiserror = "2.0.11"
 
 [dev-dependencies]
 criterion = "0.5.1" # Benchmarking
-tempfile = "3.14.0" # Temporary files for tests
+tempfile = "3.16.0" # Temporary files for tests
 
 [[example]]
 name = "wav_demo"

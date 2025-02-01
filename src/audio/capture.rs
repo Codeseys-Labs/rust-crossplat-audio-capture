@@ -2,6 +2,8 @@ use std::collections::VecDeque;
 use std::ffi::OsString;
 use std::fmt;
 use sysinfo::{ProcessRefreshKind, ProcessesToUpdate, RefreshKind, System};
+
+#[cfg(target_os = "windows")]
 use wasapi::*;
 
 #[derive(Debug)]
@@ -31,6 +33,7 @@ impl From<Box<dyn std::error::Error>> for AudioCaptureError {
     }
 }
 
+#[cfg(target_os = "windows")]
 pub struct ProcessAudioCapture {
     audio_client: Option<AudioClient>,
     capture_client: Option<AudioCaptureClient>,
@@ -39,6 +42,7 @@ pub struct ProcessAudioCapture {
     verbose: bool,
 }
 
+#[cfg(target_os = "windows")]
 impl ProcessAudioCapture {
     pub fn new() -> Result<Self, AudioCaptureError> {
         let _ = initialize_mta();
@@ -196,5 +200,61 @@ impl ProcessAudioCapture {
 
     pub fn bits_per_sample(&self) -> Option<i32> {
         Some(self.format.get_bitspersample() as i32)
+    }
+}
+
+#[cfg(not(target_os = "windows"))]
+pub struct ProcessAudioCapture {
+    verbose: bool,
+}
+
+#[cfg(not(target_os = "windows"))]
+impl ProcessAudioCapture {
+    pub fn new() -> Result<Self, AudioCaptureError> {
+        Ok(Self { verbose: false })
+    }
+
+    pub fn set_verbose(&mut self, verbose: bool) {
+        self.verbose = verbose;
+    }
+
+    pub fn list_processes() -> Result<Vec<String>, AudioCaptureError> {
+        Ok(Vec::new())
+    }
+
+    pub fn init_for_process(&mut self, _process_name: &str) -> Result<(), AudioCaptureError> {
+        Err(AudioCaptureError::InitializationError(
+            "WASAPI is only available on Windows".to_string(),
+        ))
+    }
+
+    pub fn start(&self) -> Result<(), AudioCaptureError> {
+        Err(AudioCaptureError::InitializationError(
+            "WASAPI is only available on Windows".to_string(),
+        ))
+    }
+
+    pub fn stop(&self) -> Result<(), AudioCaptureError> {
+        Err(AudioCaptureError::InitializationError(
+            "WASAPI is only available on Windows".to_string(),
+        ))
+    }
+
+    pub fn get_data(&self) -> Result<Vec<u8>, AudioCaptureError> {
+        Err(AudioCaptureError::InitializationError(
+            "WASAPI is only available on Windows".to_string(),
+        ))
+    }
+
+    pub fn channels(&self) -> Option<i32> {
+        None
+    }
+
+    pub fn sample_rate(&self) -> Option<i32> {
+        None
+    }
+
+    pub fn bits_per_sample(&self) -> Option<i32> {
+        None
     }
 }

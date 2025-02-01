@@ -20,8 +20,7 @@ use pipewire::{
     main_loop::MainLoop,
     properties::properties,
     registry::{GlobalObject, Registry},
-    spa::pod::Pod,
-    spa::type_info::Direction,
+    spa::{pod::Pod, utils::Direction},
     stream::{Stream as PwStream, StreamFlags, StreamState},
 };
 
@@ -37,19 +36,14 @@ pub struct PulseAudioBackend {
 impl PulseAudioBackend {
     pub fn new() -> Result<Self, AudioError> {
         // Create a new property list
-        let mut proplist = Proplist::new().map_err(|e| {
-            AudioError::InitializationFailed(format!("Failed to create proplist: {}", e))
-        })?;
+        let mut proplist = Proplist::new()
+            .ok_or_else(|| AudioError::InitializationFailed("Failed to create proplist".into()))?;
         proplist
             .set_str(
                 pulse::proplist::properties::APPLICATION_NAME,
                 "Rust Audio Capture",
             )
-            .map_err(|e| {
-                AudioError::InitializationFailed(
-                    e.to_string().expect("Failed to convert error to string"),
-                )
-            })?;
+            .map_err(|e| AudioError::InitializationFailed(e.to_string()))?;
 
         // Create a mainloop
         let mainloop = Mainloop::new().ok_or_else(|| {
@@ -65,18 +59,12 @@ impl PulseAudioBackend {
         // Connect the context
         context
             .connect(None, ContextFlagSet::NOFLAGS, None)
-            .map_err(|e| {
-                AudioError::InitializationFailed(
-                    e.to_string().expect("Failed to convert error to string"),
-                )
-            })?;
+            .map_err(|e| AudioError::InitializationFailed(e.to_string()))?;
 
         // Start the mainloop
-        mainloop.start().map_err(|e| {
-            AudioError::InitializationFailed(
-                e.to_string().expect("Failed to convert error to string"),
-            )
-        })?;
+        mainloop
+            .start()
+            .map_err(|e| AudioError::InitializationFailed(e.to_string()))?;
 
         // Wait for context to be ready
         loop {
@@ -99,7 +87,7 @@ impl PulseAudioBackend {
 
     pub fn is_available() -> bool {
         // Try to create a simple connection to check availability
-        if let Ok(mainloop) = Mainloop::new() {
+        if let Some(mainloop) = Mainloop::new() {
             if let Some(context) = Context::new(&mainloop, "TestConnection") {
                 if context.connect(None, ContextFlagSet::NOFLAGS, None).is_ok() {
                     return true;
@@ -134,7 +122,7 @@ impl AudioCaptureBackend for PulseAudioBackend {
             .context
             .introspect()
             .get_sink_input_info_list(move |list| {
-                if let Some(info) = list {
+                if let Ok(info) = list {
                     let proplist = info.proplist();
                     let app_name = proplist
                         .get_str(pulse::proplist::properties::APPLICATION_NAME)
@@ -236,11 +224,8 @@ impl PulseAudioStream {
             return Err(AudioError::InvalidFormat("Invalid sample format".into()));
         }
 
-        let stream_name = CString::new(format!("capture_{}", app.name)).map_err(|e| {
-            AudioError::InitializationFailed(
-                e.to_string().expect("Failed to convert error to string"),
-            )
-        })?;
+        let stream_name = CString::new(format!("capture_{}", app.name))
+            .map_err(|e| AudioError::InitializationFailed(e.to_string()))?;
 
         let stream = Stream::new(
             &context,
@@ -267,9 +252,7 @@ impl PulseAudioStream {
 
         stream
             .connect_record(Some(&target), Some(&attr), stream::FlagSet::ADJUST_LATENCY)
-            .map_err(|e| {
-                AudioError::CaptureError(e.to_string().expect("Failed to convert error to string"))
-            })?;
+            .map_err(|e| AudioError::CaptureError(e.to_string()))?;
 
         Ok(Self {
             stream,
@@ -282,15 +265,15 @@ impl PulseAudioStream {
 
 impl AudioCaptureStream for PulseAudioStream {
     fn start(&mut self) -> Result<(), AudioError> {
-        self.stream.cork(None).map_err(|e| {
-            AudioError::CaptureError(e.to_string().expect("Failed to convert error to string"))
-        })
+        self.stream
+            .cork(None)
+            .map_err(|e| AudioError::CaptureError(e.to_string()))
     }
 
     fn stop(&mut self) -> Result<(), AudioError> {
-        self.stream.cork(None).map_err(|e| {
-            AudioError::CaptureError(e.to_string().expect("Failed to convert error to string"))
-        })
+        self.stream
+            .cork(None)
+            .map_err(|e| AudioError::CaptureError(e.to_string()))
     }
 
     fn read(&mut self, buffer: &mut [u8]) -> Result<usize, AudioError> {
@@ -304,17 +287,11 @@ impl AudioCaptureStream for PulseAudioStream {
                     let to_copy = std::cmp::min(buffer.len() - bytes_read, data.len());
                     buffer[bytes_read..bytes_read + to_copy].copy_from_slice(&data[..to_copy]);
                     bytes_read += to_copy;
-                    self.stream.discard().map_err(|e| {
-                        AudioError::CaptureError(
-                            e.to_string().expect("Failed to convert error to string"),
-                        )
-                    })?;
+                    self.stream
+                        .discard()
+                        .map_err(|e| AudioError::CaptureError(e.to_string()))?;
                 }
-                Err(e) => {
-                    return Err(AudioError::CaptureError(
-                        e.to_string().expect("Failed to convert error to string"),
-                    ))
-                }
+                Err(e) => return Err(AudioError::CaptureError(e.to_string())),
             }
         }
         Ok(bytes_read)
@@ -326,9 +303,9 @@ impl AudioCaptureStream for PulseAudioStream {
 }
 
 pub struct PipeWireBackend {
-    context: PwContext,
-    core: Core,
-    main_loop: MainLoop,
+    context: Arc<PwContext>,
+    core: Arc<Core>,
+    main_loop: Arc<MainLoop>,
     registry: Registry,
 }
 
@@ -336,7 +313,7 @@ impl PipeWireBackend {
     pub fn new() -> Result<Self, AudioError> {
         pipewire::init();
 
-        let main_loop = MainLoop::new().map_err(|e| {
+        let main_loop = MainLoop::new(None).map_err(|e| {
             AudioError::InitializationFailed(format!("Failed to create PipeWire main loop: {}", e))
         })?;
 
@@ -353,9 +330,9 @@ impl PipeWireBackend {
         })?;
 
         Ok(Self {
-            context,
-            core,
-            main_loop,
+            context: Arc::new(context),
+            core: Arc::new(core),
+            main_loop: Arc::new(main_loop),
             registry,
         })
     }
@@ -363,7 +340,7 @@ impl PipeWireBackend {
     pub fn is_available() -> bool {
         // Try to initialize PipeWire and create a connection
         pipewire::init();
-        if let Ok(main_loop) = MainLoop::new() {
+        if let Ok(main_loop) = MainLoop::new(None) {
             if let Ok(context) = PwContext::new(&main_loop) {
                 if let Ok(_) = context.connect(None) {
                     return true;
@@ -394,8 +371,8 @@ impl AudioCaptureBackend for PipeWireBackend {
         let apps_clone = Arc::new(Mutex::new(&mut apps));
         self.registry.add_listener_local().global({
             let apps_clone = Arc::clone(&apps_clone);
-            move |global: GlobalObject| {
-                if let Some(props) = global.props.as_ref() {
+            move |global: GlobalObject<_>| {
+                if let Some(props) = global.props {
                     let media_class = props.get("media.class").unwrap_or("");
 
                     // Add application-specific streams
@@ -476,13 +453,13 @@ impl AudioCaptureBackend for PipeWireBackend {
             // Process-specific capture
             properties! {
                 "media.class" => "Audio/Source",
-                "audio.capture.app" => &app.name,
-                "target.object" => &app.id,
+                "audio.capture.app" => app.name.as_str(),
+                "target.object" => app.id.as_str(),
                 "stream.capture.sink" => "true",
                 "audio.position" => if config.channels == 1 { "MONO" } else { "FL,FR" },
-                "application.process.id" => app.pid.to_string(),
-                "application.name" => &app.name,
-                "stream.capture.pid" => app.pid.to_string(),
+                "application.process.id" => app.pid.to_string().as_str(),
+                "application.name" => app.name.as_str(),
+                "stream.capture.pid" => app.pid.to_string().as_str(),
             }
         };
 
@@ -528,7 +505,7 @@ impl AudioCaptureStream for PipeWireStream {
         let stream_flags = StreamFlags::AUTOCONNECT | StreamFlags::RT_PROCESS;
 
         // Set up stream parameters based on config
-        let params = Pod::builder()
+        let params = pipewire::spa::pod::builder()
             .object(
                 "Format",
                 "audio/raw",
@@ -538,8 +515,8 @@ impl AudioCaptureStream for PipeWireStream {
                         AudioFormat::S16LE => "S16LE",
                         AudioFormat::S32LE => "S32LE",
                     },
-                    "rate" => self.config.sample_rate,
-                    "channels" => self.config.channels,
+                    "rate" => self.config.sample_rate.to_string().as_str(),
+                    "channels" => self.config.channels.to_string().as_str(),
                     "layout" => if self.config.channels == 1 { "mono" } else { "interleaved" },
                 },
             )
@@ -548,7 +525,7 @@ impl AudioCaptureStream for PipeWireStream {
         // Set up process callback
         let buffer_clone = self.shared_buffer.clone();
 
-        self.stream.add_listener_local().process(move |stream| {
+        self.stream.add_listener().process(move |stream| {
             if let Some(mut buffer_guard) = buffer_clone.try_lock() {
                 if let Some(input) = stream.input_buffer() {
                     for data in input.datas() {
