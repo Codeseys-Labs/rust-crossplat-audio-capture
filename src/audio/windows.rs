@@ -3,7 +3,10 @@ use super::core::{
 };
 use std::collections::VecDeque;
 use sysinfo::{ProcessRefreshKind, ProcessesToUpdate, RefreshKind, System};
-use wasapi::{self, AudioCaptureClient, AudioClient, Direction, SampleType, ShareMode, WaveFormat};
+use wasapi::{
+    self, get_default_device, AudioCaptureClient, AudioClient, Direction, SampleType, ShareMode,
+    WaveFormat,
+};
 
 pub struct WasapiBackend {
     _system: System, // Keep system alive but mark as intentionally unused
@@ -53,7 +56,8 @@ impl AudioCaptureBackend for WasapiBackend {
         for (pid, process) in system.processes() {
             let name = process.name().to_string_lossy().into_owned();
             // Skip system processes and processes without audio
-            if !name.is_empty() && pid.as_u32() > 4 {  // Skip system processes (PIDs 0-4)
+            if !name.is_empty() && pid.as_u32() > 4 {
+                // Skip system processes (PIDs 0-4)
                 apps.push(AudioApplication {
                     name: name.clone(),
                     id: pid.to_string(),
@@ -93,15 +97,25 @@ impl AudioCaptureBackend for WasapiBackend {
 
         let mut audio_client = if app.name == "System" {
             // System-wide audio capture using default render device in loopback mode
-            AudioClient::new_default_render_device_loopback()
-                .map_err(|e| AudioError::DeviceNotFound(format!("Failed to create system audio capture: {}", e)))?
+            get_default_device(&Direction::Render)
+                .map_err(|e| {
+                    AudioError::DeviceNotFound(format!("Failed to get default device: {}", e))
+                })?
+                .get_iaudioclient()
+                .map_err(|e| {
+                    AudioError::DeviceNotFound(format!(
+                        "Failed to create system audio capture: {}",
+                        e
+                    ))
+                })?
         } else {
             // Process-specific audio capture
             AudioClient::new_application_loopback_client(
-                app.pid,
-                true, // include_tree - capture audio from child processes too
+                app.pid, true, // include_tree - capture audio from child processes too
             )
-            .map_err(|e| AudioError::DeviceNotFound(format!("Failed to create process audio capture: {}", e)))?
+            .map_err(|e| {
+                AudioError::DeviceNotFound(format!("Failed to create process audio capture: {}", e))
+            })?
         };
 
         audio_client
@@ -128,16 +142,25 @@ pub struct WasapiCaptureStream {
     format: WaveFormat,
 }
 
-// SAFETY: This type is Send because:
-// 1. AudioClient and AudioCaptureClient contain COM objects that are thread-safe
-//    by design (COM handles synchronization internally)
-// 2. VecDeque<u8> is Send
-// 3. AudioConfig and WaveFormat are Send
-// 4. wasapi::Handle is Send
-// 5. All methods properly synchronize access to shared resources
-// 6. No shared mutable state exists between threads
-// 7. The underlying COM objects are designed for multi-threaded use
+// SAFETY: This implementation is sound because:
+// 1. While AudioClient and AudioCaptureClient contain NonNull<c_void> pointers to COM objects,
+//    these objects are thread-safe in MTA mode which we ensure by calling initialize_mta()
+//    in WasapiBackend::new(). The COM threading model guarantees thread safety for these
+//    objects when used in MTA mode.
+// 2. All other fields are Send:
+//    - VecDeque<u8> is Send (standard library guarantee)
+//    - AudioConfig and WaveFormat are Send (plain data)
+//    - wasapi::Handle is Send (documented in wasapi crate)
+// 3. All methods take &mut self, ensuring exclusive access to internal state
+// 4. No interior mutability or shared mutable state exists between threads
+// 5. COM objects provide their own thread synchronization in MTA mode
+// 6. Buffer access is protected by the &mut self receiver
 unsafe impl Send for WasapiCaptureStream {}
+
+// SAFETY: This implementation is sound because:
+// 1. System (from sysinfo) is Send
+// 2. No interior mutability or shared state
+unsafe impl Send for WasapiBackend {}
 
 impl WasapiCaptureStream {
     fn new(

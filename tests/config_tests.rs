@@ -1,69 +1,52 @@
-use audio_capture::{AudioCaptureConfig, AudioDevice, DeviceType, AudioBackend};
+use rsac::{AudioConfig, AudioFormat};
 
 #[test]
-fn test_config_builder_defaults() {
-    let config = AudioCaptureConfig::new();
-    
-    assert_eq!(config.sample_rate(), 48000);
-    assert_eq!(config.channels(), 2);
-    assert_eq!(config.buffer_size(), 1024);
-    assert!(config.device().is_none());
-    assert!(config.app_name().is_none());
+fn test_config_defaults() {
+    let config = AudioConfig::default();
+
+    assert_eq!(config.sample_rate, 48000);
+    assert_eq!(config.channels, 2);
+    assert_eq!(config.format, AudioFormat::F32LE);
 }
 
 #[test]
-fn test_config_builder_customization() {
-    let device = AudioDevice {
-        id: "test".to_string(),
-        name: "Test Device".to_string(),
-        device_type: DeviceType::Input,
-        channels: 1,
+fn test_config_custom() {
+    let config = AudioConfig {
         sample_rate: 44100,
-        backend: AudioBackend::Wasapi,
+        channels: 1,
+        format: AudioFormat::S16LE,
     };
-    
-    let config = AudioCaptureConfig::new()
-        .device(device.clone())
-        .sample_rate(44100)
-        .channels(1)
-        .buffer_size(2048)
-        .app_name("TestApp".to_string());
-    
-    assert_eq!(config.sample_rate(), 44100);
-    assert_eq!(config.channels(), 1);
-    assert_eq!(config.buffer_size(), 2048);
-    assert_eq!(config.device().unwrap().id, "test");
-    assert_eq!(config.app_name().unwrap(), "TestApp");
-}
 
-#[test]
-fn test_config_validation() {
-    let config = AudioCaptureConfig::new()
-        .sample_rate(192000)
-        .channels(8);
-    
-    assert!(config.validate().is_err());
+    assert_eq!(config.sample_rate, 44100);
+    assert_eq!(config.channels, 1);
+    assert_eq!(config.format, AudioFormat::S16LE);
 }
 
 #[test]
 fn test_config_clone() {
-    let original = AudioCaptureConfig::new()
-        .sample_rate(44100)
-        .channels(2);
-    
+    let original = AudioConfig {
+        sample_rate: 44100,
+        channels: 2,
+        format: AudioFormat::S32LE,
+    };
+
     let cloned = original.clone();
-    
-    assert_eq!(original.sample_rate(), cloned.sample_rate());
-    assert_eq!(original.channels(), cloned.channels());
+
+    assert_eq!(original.sample_rate, cloned.sample_rate);
+    assert_eq!(original.channels, cloned.channels);
+    assert_eq!(original.format, cloned.format);
 }
 
 #[test]
-fn test_config_debug_format() {
-    let config = AudioCaptureConfig::new()
-        .sample_rate(44100)
-        .channels(2);
-    
+fn test_config_debug() {
+    let config = AudioConfig {
+        sample_rate: 44100,
+        channels: 2,
+        format: AudioFormat::F32LE,
+    };
+
     let debug_str = format!("{:?}", config);
     assert!(debug_str.contains("44100"));
     assert!(debug_str.contains("2"));
+    assert!(debug_str.contains("F32LE"));
 }
