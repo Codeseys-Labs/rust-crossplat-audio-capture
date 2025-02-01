@@ -92,16 +92,16 @@ impl AudioCaptureBackend for WasapiBackend {
         );
 
         let mut audio_client = if app.name == "System" {
-            // System-wide audio capture
-            AudioClient::new_default_device(Direction::Capture)
-                .map_err(|e| AudioError::DeviceNotFound(e.to_string()))?
+            // System-wide audio capture using default render device in loopback mode
+            AudioClient::new_default_render_device_loopback()
+                .map_err(|e| AudioError::DeviceNotFound(format!("Failed to create system audio capture: {}", e)))?
         } else {
             // Process-specific audio capture
             AudioClient::new_application_loopback_client(
                 app.pid,
                 true, // include_tree - capture audio from child processes too
             )
-            .map_err(|e| AudioError::DeviceNotFound(e.to_string()))?
+            .map_err(|e| AudioError::DeviceNotFound(format!("Failed to create process audio capture: {}", e)))?
         };
 
         audio_client

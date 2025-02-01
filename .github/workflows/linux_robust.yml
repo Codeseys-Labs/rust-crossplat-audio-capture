@@ -66,25 +66,54 @@ jobs:
       - name: Install PipeWire Dependencies
         timeout-minutes: 15
         run: |
+          echo "Adding PipeWire PPA..."
+          sudo add-apt-repository ppa:pipewire-debian/pipewire-upstream -y || true
+          
+          echo "Updating package lists..."
           sudo apt-get update
+          
+          echo "Installing base dependencies..."
           sudo apt-get install -y \
             alsa-utils \
-            libasound2-dev \
-            pipewire \
-            pipewire-pulse \
-            pipewire-alsa \
-            pipewire-audio \
-            wireplumber
+            libasound2-dev
+            
+          echo "Installing PipeWire core..."
+          sudo apt-get install -y pipewire || true
+          
+          echo "Installing PipeWire components..."
+          for pkg in pipewire-bin pipewire-audio-client-libraries pipewire-alsa pipewire-pulse; do
+            echo "Installing $pkg..."
+            sudo apt-get install -y $pkg || true
+          done
+          
+          echo "Installing WirePlumber..."
+          sudo apt-get install -y wireplumber || true
+          
+          echo "Verifying installations..."
+          dpkg -l | grep -E "pipewire|wireplumber"
+          
+          echo "Checking PipeWire version..."
+          pw-cli --version || true
 
       - name: Configure PipeWire
         timeout-minutes: 10
         run: |
-          # Stop any existing audio services
+          echo "Stopping existing audio services..."
           systemctl --user stop pipewire pipewire-pulse pulseaudio || true
-          killall -9 pulseaudio pipewire pipewire-pulse 2>/dev/null || true
+          killall -9 pulseaudio pipewire pipewire-pulse wireplumber 2>/dev/null || true
+          sleep 2
           
-          # Create PipeWire config directory
+          echo "Setting up PipeWire configuration..."
           mkdir -p ~/.config/pipewire
+          mkdir -p ~/.config/systemd/user
+          
+          # Enable PipeWire services
+          systemctl --user enable pipewire.socket || true
+          systemctl --user enable pipewire-pulse.socket || true
+          systemctl --user enable wireplumber.service || true
+          
+          echo "Current service status before configuration:"
+          systemctl --user status pipewire pipewire-pulse wireplumber || true
           
           # Configure PipeWire for CI environment
           cat > ~/.config/pipewire/pipewire.conf << EOF
@@ -111,27 +140,65 @@ jobs:
           EOF
           
           # Start PipeWire and related services in order
+          echo "Reloading systemd daemon..."
           systemctl --user daemon-reload
           
-          echo "Starting PipeWire..."
+          echo "Starting PipeWire socket..."
+          systemctl --user start pipewire.socket || true
+          sleep 2
+          
+          echo "Starting PipeWire service..."
           systemctl --user start pipewire.service || true
+          sleep 2
+          
+          echo "Starting PipeWire PulseAudio socket..."
+          systemctl --user start pipewire-pulse.socket || true
+          sleep 2
+          
+          echo "Starting PipeWire PulseAudio service..."
+          systemctl --user start pipewire-pulse.service || true
           sleep 2
           
           echo "Starting WirePlumber..."
           systemctl --user start wireplumber.service || true
           sleep 2
           
-          echo "Starting PipeWire PulseAudio..."
-          systemctl --user start pipewire-pulse.service || true
-          sleep 2
+          echo "Verifying service status..."
+          systemctl --user status pipewire.socket pipewire.service \
+                                 pipewire-pulse.socket pipewire-pulse.service \
+                                 wireplumber.service || true
           
-          # Verify services are running
-          echo "Checking service status..."
-          systemctl --user status pipewire wireplumber pipewire-pulse || true
+          echo "Checking for running processes..."
+          ps aux | grep -E "pipewire|wireplumber" || true
           
-          # Additional verification
+          echo "Checking PipeWire daemon status..."
           pw-cli info || true
+          
+          echo "Checking audio devices..."
+          pw-cli list-objects | grep -E "node.(description|name)" || true
+          
+          echo "Checking PulseAudio compatibility..."
           pactl info || true
+          pactl list short sinks || true
+          
+          echo "Performing final service verification..."
+          SERVICES_OK=true
+          for service in pipewire.service pipewire-pulse.service wireplumber.service; do
+            if ! systemctl --user is-active $service >/dev/null 2>&1; then
+              echo "Warning: $service is not running"
+              SERVICES_OK=false
+            fi
+          done
+          
+          if [ "$SERVICES_OK" = "false" ]; then
+            echo "Some audio services failed to start. Attempting recovery..."
+            systemctl --user restart pipewire.service pipewire-pulse.service wireplumber.service || true
+            sleep 5
+            # Final check
+            systemctl --user status pipewire.service pipewire-pulse.service wireplumber.service || true
+          else
+            echo "All audio services are running correctly"
+          fi
           
           # Create and verify virtual sink
           echo "Creating virtual sink..."
