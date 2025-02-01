@@ -66,6 +66,11 @@ jobs:
       - name: Install PipeWire Dependencies
         timeout-minutes: 15
         run: |
+          echo "Making sure PulseAudio is not running..."
+          systemctl --user stop pulseaudio.service pulseaudio.socket || true
+          systemctl --user mask pulseaudio.service pulseaudio.socket || true
+          killall -9 pulseaudio || true
+          
           echo "Adding PipeWire PPA..."
           sudo add-apt-repository ppa:pipewire-debian/pipewire-upstream -y || true
           
@@ -76,6 +81,10 @@ jobs:
           sudo apt-get install -y \
             alsa-utils \
             libasound2-dev
+            
+          echo "Removing any existing PulseAudio installation..."
+          sudo apt-get remove -y pulseaudio pulseaudio-utils || true
+          sudo apt-get autoremove -y || true
             
           echo "Installing PipeWire core..."
           sudo apt-get install -y pipewire || true
@@ -94,6 +103,10 @@ jobs:
           
           echo "Checking PipeWire version..."
           pw-cli --version || true
+          
+          echo "Ensuring clean environment..."
+          rm -rf ~/.config/pulse ~/.config/pipewire || true
+          mkdir -p ~/.config/pipewire
 
       - name: Configure PipeWire
         timeout-minutes: 10
@@ -342,18 +355,45 @@ jobs:
       - name: Install PulseAudio Dependencies
         timeout-minutes: 15
         run: |
+          echo "Making sure PipeWire is not running..."
+          systemctl --user stop pipewire pipewire-pulse wireplumber || true
+          systemctl --user mask pipewire pipewire-pulse wireplumber || true
+          killall -9 pipewire pipewire-pulse wireplumber || true
+          
+          echo "Removing any existing PipeWire installation..."
+          sudo apt-get remove -y pipewire pipewire-pulse wireplumber || true
+          sudo apt-get autoremove -y || true
+          
+          echo "Updating package lists..."
           sudo apt-get update
+          
+          echo "Installing base dependencies..."
           sudo apt-get install -y \
             alsa-utils \
-            libasound2-dev \
+            libasound2-dev
+          
+          echo "Installing PulseAudio..."
+          sudo apt-get install -y \
             pulseaudio \
             pulseaudio-utils
+            
+          echo "Verifying installations..."
+          dpkg -l | grep -E "pulse"
+          
+          echo "Ensuring clean environment..."
+          rm -rf ~/.config/pulse ~/.config/pipewire || true
+          mkdir -p ~/.config/pulse
+          
+          echo "Checking PulseAudio version..."
+          pulseaudio --version || true
 
       - name: Configure PulseAudio
         timeout-minutes: 10
         run: |
-          # Configure PulseAudio for CI environment
+          echo "Configuring PulseAudio..."
           mkdir -p ~/.config/pulse
+          
+          echo "Writing daemon configuration..."
           cat > ~/.config/pulse/daemon.conf << EOF
           exit-idle-time = -1
           anonymous-enable = yes
@@ -365,14 +405,43 @@ jobs:
           rlimit-rtprio = 9
           daemonize = yes
           allow-module-loading = yes
+          log-level = debug
           EOF
           
-          # Start PulseAudio
-          pulseaudio --start --exit-idle-time=-1 --load="module-null-sink sink_name=virtual-sink"
-          sleep 3
+          echo "Writing client configuration..."
+          cat > ~/.config/pulse/client.conf << EOF
+          autospawn = yes
+          daemon-binary = /usr/bin/pulseaudio
+          enable-shm = yes
+          EOF
           
-          # Set virtual sink as default
+          echo "Killing any existing PulseAudio processes..."
+          pulseaudio --kill || true
+          killall -9 pulseaudio || true
+          sleep 2
+          
+          echo "Starting PulseAudio with null sink..."
+          pulseaudio --start --exit-idle-time=-1 \
+            --load="module-null-sink sink_name=virtual-sink" \
+            --log-level=debug \
+            -vvv
+          sleep 5
+          
+          echo "Verifying PulseAudio startup..."
+          if ! pulseaudio --check; then
+            echo "PulseAudio failed to start"
+            cat ~/.config/pulse/daemon.conf
+            cat ~/.pulse/daemon.log || true
+            exit 1
+          fi
+          
+          echo "Setting up audio routing..."
           pacmd set-default-sink virtual-sink
+          
+          echo "Verifying audio setup..."
+          pacmd list-sinks
+          pacmd list-sources
+          pactl info
 
       - name: Run Audio Tests
         timeout-minutes: 20
