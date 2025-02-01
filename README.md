@@ -6,19 +6,28 @@ A robust, high-performance audio capture library for Rust, supporting Windows, m
 
 ### Core Features
 - **Cross-Platform Support**
-  - Windows: WASAPI-based capture with application-specific support
-  - Linux: PipeWire (preferred) and PulseAudio support
-  - macOS: CoreAudio implementation with system and app-specific capture
+  - Windows: WASAPI-based capture with both system-wide and application-specific support
+  - Linux: Modern PipeWire backend (preferred) with PulseAudio fallback, supporting both system-wide and application-specific capture
+  - macOS: CoreAudio implementation with system-wide capture
 
 ### Audio Capabilities
-- System-wide audio capture
-- Application-specific capture (Windows, Linux)
-- Multiple output formats (WAV, RAW PCM)
-- Configurable audio parameters:
-  - Sample rates: 44.1kHz, 48kHz, 96kHz
-  - Bit depths: 16-bit, 24-bit, 32-bit
-  - Channel configurations: Mono, Stereo
-  - Format types: F32LE, S16LE, S32LE
+- **System-wide Audio Capture**
+  - Supported on all platforms (Windows, Linux, macOS)
+  - High-quality audio capture from system output
+  - Zero-configuration setup on most systems
+
+- **Application-specific Capture**
+  - Windows: WASAPI-based per-application capture
+  - Linux: PipeWire/PulseAudio process-specific capture
+  - Capture from multiple applications simultaneously
+
+- **Flexible Output Formats**
+  - Multiple formats: WAV, RAW PCM
+  - Configurable parameters:
+    - Sample rates: 44.1kHz, 48kHz, 96kHz
+    - Bit depths: 16-bit, 24-bit, 32-bit
+    - Channel configurations: Mono, Stereo
+    - Format types: F32LE, S16LE, S32LE
 
 ### Advanced Features
 - Async support with Tokio
@@ -54,13 +63,17 @@ RSAC supports both interactive and command-line modes, with bounded or unbounded
 ### Platform-Specific Notes
 
 #### Windows
-- Full application-specific audio capture support
-- Process names should include the `.exe` extension
+- Supports both system-wide and application-specific audio capture
+- Uses WASAPI for high-quality audio capture
+- Process names should include the `.exe` extension for app-specific capture
+- Use "System" as the process name for system-wide capture
 - Administrative privileges may be required for some applications
 
 #### Linux
-- Application-specific capture through PulseAudio
-- Process names should match the application name in PulseAudio
+- Primary support through PipeWire (modern audio system)
+- Fallback to PulseAudio when PipeWire is not available
+- Supports both system-wide and application-specific capture
+- Process names should match the application name in PipeWire/PulseAudio
 - No special privileges required for most applications
 
 #### macOS
@@ -134,7 +147,20 @@ rsac -p "System Audio"
 
 ### Examples
 
-1. Record 30 seconds of application audio:
+1. Record 30 seconds of system-wide audio:
+
+```bash
+# Windows
+rsac -p System -d 30
+
+# Linux
+rsac -p System -d 30
+
+# macOS
+rsac -p "System Audio" -d 30
+```
+
+2. Record 30 seconds of application-specific audio:
 
 ```bash
 # Windows
@@ -143,17 +169,17 @@ rsac -p Spotify.exe -d 30
 # Linux
 rsac -p firefox -d 30
 
-# macOS
+# macOS (system audio only)
 rsac -p "System Audio" -d 30
 ```
 
-2. Record with custom audio format:
+3. Record with custom audio format:
 
 ```bash
 rsac -p firefox --format-type s16le -r 44100 -c 1
 ```
 
-3. Record in WAV format only with high quality:
+4. Record in WAV format only with high quality:
 
 ```bash
 rsac -p chrome -f wav --format-type f32le -r 96000
@@ -215,8 +241,10 @@ The captured audio supports the following configurations:
 - Administrative privileges may be required for some applications
 
 ### Linux
-- PulseAudio sound server (default on most distributions)
-- PulseAudio development libraries (`libpulse-dev` on Ubuntu/Debian)
+- PipeWire (recommended) or PulseAudio sound server
+- Development libraries:
+  - For PipeWire: `libpipewire-dev`
+  - For PulseAudio: `libpulse-dev`
 - Rust toolchain
 
 ### macOS
@@ -227,7 +255,40 @@ The captured audio supports the following configurations:
 
 ## Contributing
 
-Contributions are welcome! Please feel free to submit a Pull Request.
+Contributions are welcome! Here's how you can help:
+
+### Development Workflow
+1. Fork the repository
+2. Create a feature branch
+3. Make your changes
+4. Run the test suite locally
+5. Submit a Pull Request
+
+### Running Tests
+The project includes comprehensive test suites for each platform:
+
+```bash
+# Run basic tests
+cargo test
+
+# Run platform-specific audio tests (requires audio setup)
+cargo test --features audio-tests
+```
+
+### CI/CD
+- GitHub Actions workflows are configured for each platform
+- Tests can be triggered manually through GitHub Actions UI
+- Available workflows:
+  - Windows Audio Tests
+  - Linux Audio Tests (PipeWire and PulseAudio)
+  - macOS Audio Tests
+  - Code Quality Checks
+
+### Best Practices
+- Write tests for new features
+- Update documentation for API changes
+- Follow Rust coding guidelines
+- Include both system-wide and app-specific tests where applicable
 
 ## License
 
