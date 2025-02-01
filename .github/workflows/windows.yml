@@ -24,9 +24,7 @@ jobs:
         uses: dtolnay/rust-toolchain@stable
 
       - name: Setup Windows SDK
-        uses: GuillaumeFalourd/setup-windows10-sdk-action@v1.11
-        with:
-          sdk-version: 18362
+        uses: microsoft/setup-msbuild@v1.3
 
       - name: Debug Info
         if: env.DEBUG == true
