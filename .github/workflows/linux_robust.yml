@@ -1,0 +1,536 @@
+name: Linux Audio Tests
+
+on:
+  workflow_call:
+    inputs:
+      debug_enabled:
+        description: "Enable debug output"
+        required: false
+        type: boolean
+        default: false
+
+env:
+  CARGO_TERM_COLOR: always
+  RUST_BACKTRACE: 1
+
+jobs:
+  setup:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    outputs:
+      cache-key: ${{ steps.cache-key.outputs.value }}
+    steps:
+      - uses: actions/checkout@v4
+      
+      - id: cache-key
+        run: echo "value=${{ hashFiles('**/Cargo.lock') }}" >> $GITHUB_OUTPUT
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache dependencies
+        uses: actions/cache@v3
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.lock') }}
+
+      - name: Build
+        timeout-minutes: 15
+        run: cargo build --verbose
+
+  test-pipewire:
+    needs: setup
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    env:
+      DEBUG: ${{ inputs.debug_enabled }}
+    
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Restore cached dependencies
+        uses: actions/cache@v3
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ${{ runner.os }}-cargo-${{ needs.setup.outputs.cache-key }}
+
+      - name: Install PipeWire Dependencies
+        timeout-minutes: 15
+        run: |
+          echo "Making sure PulseAudio is not running..."
+          systemctl --user stop pulseaudio.service pulseaudio.socket || true
+          systemctl --user mask pulseaudio.service pulseaudio.socket || true
+          killall -9 pulseaudio || true
+          
+          echo "Adding PipeWire PPA..."
+          sudo add-apt-repository ppa:pipewire-debian/pipewire-upstream -y || true
+          
+          echo "Updating package lists..."
+          sudo apt-get update
+          
+          echo "Installing base dependencies..."
+          sudo apt-get install -y \
+            alsa-utils \
+            libasound2-dev
+            
+          echo "Removing any existing PulseAudio installation..."
+          sudo apt-get remove -y pulseaudio pulseaudio-utils || true
+          sudo apt-get autoremove -y || true
+            
+          echo "Installing PipeWire core..."
+          sudo apt-get install -y pipewire || true
+          
+          echo "Installing PipeWire components..."
+          for pkg in pipewire-bin pipewire-audio-client-libraries pipewire-alsa pipewire-pulse; do
+            echo "Installing $pkg..."
+            sudo apt-get install -y $pkg || true
+          done
+          
+          echo "Installing WirePlumber..."
+          sudo apt-get install -y wireplumber || true
+          
+          echo "Verifying installations..."
+          dpkg -l | grep -E "pipewire|wireplumber"
+          
+          echo "Checking PipeWire version..."
+          pw-cli --version || true
+          
+          echo "Ensuring clean environment..."
+          rm -rf ~/.config/pulse ~/.config/pipewire || true
+          mkdir -p ~/.config/pipewire
+
+      - name: Configure PipeWire
+        timeout-minutes: 10
+        run: |
+          echo "Stopping existing audio services..."
+          systemctl --user stop pipewire pipewire-pulse pulseaudio || true
+          killall -9 pulseaudio pipewire pipewire-pulse wireplumber 2>/dev/null || true
+          sleep 2
+          
+          echo "Setting up PipeWire configuration..."
+          mkdir -p ~/.config/pipewire
+          mkdir -p ~/.config/systemd/user
+          
+          # Enable PipeWire services
+          systemctl --user enable pipewire.socket || true
+          systemctl --user enable pipewire-pulse.socket || true
+          systemctl --user enable wireplumber.service || true
+          
+          echo "Current service status before configuration:"
+          systemctl --user status pipewire pipewire-pulse wireplumber || true
+          
+          # Configure PipeWire for CI environment
+          cat > ~/.config/pipewire/pipewire.conf << EOF
+          context.properties = {
+              default.clock.rate = 48000
+              default.clock.quantum = 1024
+              default.clock.min-quantum = 32
+              default.clock.max-quantum = 8192
+          }
+          context.modules = [
+              { name = libpipewire-module-protocol-native }
+              { name = libpipewire-module-profiler }
+              { name = libpipewire-module-metadata }
+              { name = libpipewire-module-spa-device-factory }
+              { name = libpipewire-module-spa-node-factory }
+              { name = libpipewire-module-client-node }
+              { name = libpipewire-module-client-device }
+              { name = libpipewire-module-portal }
+              { name = libpipewire-module-access }
+              { name = libpipewire-module-adapter }
+              { name = libpipewire-module-link-factory }
+              { name = libpipewire-module-session-manager }
+          ]
+          EOF
+          
+          # Start PipeWire and related services in order
+          echo "Reloading systemd daemon..."
+          systemctl --user daemon-reload
+          
+          echo "Starting PipeWire socket..."
+          systemctl --user start pipewire.socket || true
+          sleep 2
+          
+          echo "Starting PipeWire service..."
+          systemctl --user start pipewire.service || true
+          sleep 2
+          
+          echo "Starting PipeWire PulseAudio socket..."
+          systemctl --user start pipewire-pulse.socket || true
+          sleep 2
+          
+          echo "Starting PipeWire PulseAudio service..."
+          systemctl --user start pipewire-pulse.service || true
+          sleep 2
+          
+          echo "Starting WirePlumber..."
+          systemctl --user start wireplumber.service || true
+          sleep 2
+          
+          echo "Verifying service status..."
+          systemctl --user status pipewire.socket pipewire.service \
+                                 pipewire-pulse.socket pipewire-pulse.service \
+                                 wireplumber.service || true
+          
+          echo "Checking for running processes..."
+          ps aux | grep -E "pipewire|wireplumber" || true
+          
+          echo "Checking PipeWire daemon status..."
+          pw-cli info || true
+          
+          echo "Checking audio devices..."
+          pw-cli list-objects | grep -E "node.(description|name)" || true
+          
+          echo "Checking PulseAudio compatibility..."
+          pactl info || true
+          pactl list short sinks || true
+          
+          echo "Performing final service verification..."
+          SERVICES_OK=true
+          for service in pipewire.service pipewire-pulse.service wireplumber.service; do
+            if ! systemctl --user is-active $service >/dev/null 2>&1; then
+              echo "Warning: $service is not running"
+              SERVICES_OK=false
+            fi
+          done
+          
+          if [ "$SERVICES_OK" = "false" ]; then
+            echo "Some audio services failed to start. Attempting recovery..."
+            systemctl --user restart pipewire.service pipewire-pulse.service wireplumber.service || true
+            sleep 5
+            # Final check
+            systemctl --user status pipewire.service pipewire-pulse.service wireplumber.service || true
+          else
+            echo "All audio services are running correctly"
+          fi
+          
+          # Create and verify virtual sink
+          echo "Creating virtual sink..."
+          pw-cli create-node adapter { factory.name=support.null-audio-sink node.name=virtual-sink media.class=Audio/Sink } || true
+          sleep 2
+          
+          # Verify sink was created
+          echo "Verifying virtual sink..."
+          if pw-cli list-objects | grep -q "virtual-sink"; then
+            echo "Virtual sink created successfully"
+            # Set as default sink
+            echo "Setting as default sink..."
+            wpctl status
+            SINK_ID=$(wpctl status | grep "virtual-sink" | cut -d "." -f1)
+            if [ -n "$SINK_ID" ]; then
+              wpctl set-default "$SINK_ID"
+              echo "Default sink set to: $SINK_ID"
+            else
+              echo "Warning: Could not find virtual sink ID"
+            fi
+          else
+            echo "Warning: Virtual sink creation may have failed"
+            echo "Available nodes:"
+            pw-cli list-objects || true
+          fi
+
+      - name: Run Audio Tests
+        timeout-minutes: 20
+        run: |
+          echo "=== Starting PipeWire Audio Tests ==="
+          
+          # Verify audio system status before starting
+          echo "Checking PipeWire status..."
+          pw-cli info || (echo "PipeWire not running properly" && exit 1)
+          
+          # Start test tone in background
+          echo "Starting test tone..."
+          cargo run --example test_tone_robust > test_tone.log 2>&1 &
+          TONE_PID=$!
+          
+          # Wait for tone to start and verify
+          echo "Waiting for test tone to initialize..."
+          for i in {1..12}; do  # Increased retry attempts
+            if kill -0 $TONE_PID 2>/dev/null; then
+              echo "Test tone process is running (attempt $i)"
+              break
+            elif [ $i -eq 12 ]; then
+              echo "Test tone failed to start after multiple attempts"
+              echo "=== Test Tone Log ==="
+              cat test_tone.log
+              exit 1
+            else
+              echo "Waiting for test tone (attempt $i)..."
+              sleep 2  # Increased sleep time
+            fi
+          done
+          
+          # Verify audio output
+          echo "Verifying audio output..."
+          pw-cli list-objects | grep -E "node.(description|name)" || true
+          pw-top -n 1 || true
+          
+          # Start audio capture
+          echo "Starting audio capture..."
+          cargo run --example test_capture_robust > capture.log 2>&1
+          CAPTURE_EXIT=$?
+          
+          # Stop test tone gracefully
+          echo "Stopping test tone..."
+          if kill -0 $TONE_PID 2>/dev/null; then
+            kill $TONE_PID
+            wait $TONE_PID || true
+            echo "Test tone stopped successfully"
+          else
+            echo "Test tone process was not running"
+          fi
+          
+          # Check capture results
+          if [ $CAPTURE_EXIT -ne 0 ]; then
+            echo "Audio capture failed with exit code: $CAPTURE_EXIT"
+            echo "=== Capture Log ==="
+            cat capture.log
+            echo "=== Test Tone Log ==="
+            cat test_tone.log
+            exit 1
+          fi
+          
+          # Verify capture file
+          if [ ! -f "test_capture_robust.wav" ]; then
+            echo "Error: Capture file not found"
+            exit 1
+          fi
+          
+          # Check file size and content
+          FILESIZE=$(stat -f%z "test_capture_robust.wav" 2>/dev/null || stat -c%s "test_capture_robust.wav")
+          if [ "$FILESIZE" -eq 0 ]; then
+            echo "Error: Capture file is empty"
+            exit 1
+          fi
+          
+          echo "Audio capture successful!"
+          echo "Capture file size: $FILESIZE bytes"
+          
+          # Final audio system check
+          echo "=== Final PipeWire Status ==="
+          pw-cli info || true
+
+      - name: Upload test artifacts
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: pipewire-test-results
+          path: |
+            test_capture_robust.wav
+            test_tone.log
+            capture.log
+            ~/.config/pipewire/*.log
+
+  test-pulseaudio:
+    needs: setup
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    env:
+      DEBUG: ${{ inputs.debug_enabled }}
+    
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Restore cached dependencies
+        uses: actions/cache@v3
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ${{ runner.os }}-cargo-${{ needs.setup.outputs.cache-key }}
+
+      - name: Install PulseAudio Dependencies
+        timeout-minutes: 15
+        run: |
+          echo "Making sure PipeWire is not running..."
+          systemctl --user stop pipewire pipewire-pulse wireplumber || true
+          systemctl --user mask pipewire pipewire-pulse wireplumber || true
+          killall -9 pipewire pipewire-pulse wireplumber || true
+          
+          echo "Removing any existing PipeWire installation..."
+          sudo apt-get remove -y pipewire pipewire-pulse wireplumber || true
+          sudo apt-get autoremove -y || true
+          
+          echo "Updating package lists..."
+          sudo apt-get update
+          
+          echo "Installing base dependencies..."
+          sudo apt-get install -y \
+            alsa-utils \
+            libasound2-dev
+          
+          echo "Installing PulseAudio..."
+          sudo apt-get install -y \
+            pulseaudio \
+            pulseaudio-utils
+            
+          echo "Verifying installations..."
+          dpkg -l | grep -E "pulse"
+          
+          echo "Ensuring clean environment..."
+          rm -rf ~/.config/pulse ~/.config/pipewire || true
+          mkdir -p ~/.config/pulse
+          
+          echo "Checking PulseAudio version..."
+          pulseaudio --version || true
+
+      - name: Configure PulseAudio
+        timeout-minutes: 10
+        run: |
+          echo "Configuring PulseAudio..."
+          mkdir -p ~/.config/pulse
+          
+          echo "Writing daemon configuration..."
+          cat > ~/.config/pulse/daemon.conf << EOF
+          exit-idle-time = -1
+          anonymous-enable = yes
+          default-sample-rate = 48000
+          default-sample-channels = 2
+          default-sample-format = float32le
+          realtime-scheduling = yes
+          realtime-priority = 9
+          rlimit-rtprio = 9
+          daemonize = yes
+          allow-module-loading = yes
+          log-level = debug
+          EOF
+          
+          echo "Writing client configuration..."
+          cat > ~/.config/pulse/client.conf << EOF
+          autospawn = yes
+          daemon-binary = /usr/bin/pulseaudio
+          enable-shm = yes
+          EOF
+          
+          echo "Killing any existing PulseAudio processes..."
+          pulseaudio --kill || true
+          killall -9 pulseaudio || true
+          sleep 2
+          
+          echo "Starting PulseAudio with null sink..."
+          pulseaudio --start --exit-idle-time=-1 \
+            --load="module-null-sink sink_name=virtual-sink" \
+            --log-level=debug \
+            -vvv
+          sleep 5
+          
+          echo "Verifying PulseAudio startup..."
+          if ! pulseaudio --check; then
+            echo "PulseAudio failed to start"
+            cat ~/.config/pulse/daemon.conf
+            cat ~/.pulse/daemon.log || true
+            exit 1
+          fi
+          
+          echo "Setting up audio routing..."
+          pacmd set-default-sink virtual-sink
+          
+          echo "Verifying audio setup..."
+          pacmd list-sinks
+          pacmd list-sources
+          pactl info
+
+      - name: Run Audio Tests
+        timeout-minutes: 20
+        run: |
+          echo "=== Starting PulseAudio Tests ==="
+          
+          # Verify audio system status before starting
+          echo "Checking PulseAudio status..."
+          pactl info || (echo "PulseAudio not running properly" && exit 1)
+          
+          # Start test tone in background
+          echo "Starting test tone..."
+          cargo run --example test_tone_robust > test_tone.log 2>&1 &
+          TONE_PID=$!
+          
+          # Wait for tone to start and verify
+          echo "Waiting for test tone to initialize..."
+          for i in {1..12}; do  # Increased retry attempts
+            if kill -0 $TONE_PID 2>/dev/null; then
+              echo "Test tone process is running (attempt $i)"
+              break
+            elif [ $i -eq 12 ]; then
+              echo "Test tone failed to start after multiple attempts"
+              echo "=== Test Tone Log ==="
+              cat test_tone.log
+              exit 1
+            else
+              echo "Waiting for test tone (attempt $i)..."
+              sleep 2  # Increased sleep time
+            fi
+          done
+          
+          # Verify audio output
+          echo "Verifying audio output..."
+          pactl list short sinks
+          pactl list short sink-inputs
+          
+          # Start audio capture
+          echo "Starting audio capture..."
+          cargo run --example test_capture_robust > capture.log 2>&1
+          CAPTURE_EXIT=$?
+          
+          # Stop test tone gracefully
+          echo "Stopping test tone..."
+          if kill -0 $TONE_PID 2>/dev/null; then
+            kill $TONE_PID
+            wait $TONE_PID || true
+            echo "Test tone stopped successfully"
+          else
+            echo "Test tone process was not running"
+          fi
+          
+          # Check capture results
+          if [ $CAPTURE_EXIT -ne 0 ]; then
+            echo "Audio capture failed with exit code: $CAPTURE_EXIT"
+            echo "=== Capture Log ==="
+            cat capture.log
+            echo "=== Test Tone Log ==="
+            cat test_tone.log
+            exit 1
+          fi
+          
+          # Verify capture file
+          if [ ! -f "test_capture_robust.wav" ]; then
+            echo "Error: Capture file not found"
+            exit 1
+          fi
+          
+          # Check file size and content
+          FILESIZE=$(stat -f%z "test_capture_robust.wav" 2>/dev/null || stat -c%s "test_capture_robust.wav")
+          if [ "$FILESIZE" -eq 0 ]; then
+            echo "Error: Capture file is empty"
+            exit 1
+          fi
+          
+          echo "Audio capture successful!"
+          echo "Capture file size: $FILESIZE bytes"
+          
+          # Final audio system check
+          echo "=== Final PulseAudio Status ==="
+          pactl info || true
+
+      - name: Upload test artifacts
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: pulseaudio-test-results
+          path: |
+            test_capture_robust.wav
+            test_tone.log
+            capture.log
+            ~/.config/pulse/*.log
