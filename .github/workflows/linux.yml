@@ -139,15 +139,47 @@ jobs:
 
           # Configure PulseAudio
           mkdir -p ~/.config/pulse
-          echo "default-sample-rate = 44100
-          default-fragments = 4
-          default-fragment-size-msec = 25
-          exit-idle-time = -1
-          load-module module-native-protocol-tcp auth-anonymous=1
-          load-module module-null-sink sink_name=test_sink" > ~/.config/pulse/daemon.conf
+          cat > ~/.config/pulse/daemon.conf << EOF
+default-sample-rate = 44100
+default-fragments = 4
+default-fragment-size-msec = 25
+exit-idle-time = -1
+EOF
 
-          # Start PulseAudio
-          pulseaudio --start --exit-idle-time=-1 --daemon
+          # Create client configuration
+          mkdir -p ~/.config/pulse
+          cat > ~/.config/pulse/client.conf << EOF
+autospawn = yes
+daemon-binary = /usr/bin/pulseaudio
+enable-shm = yes
+EOF
+
+          # Create separate file for module loading
+          mkdir -p ~/.config/pulse/default.pa.d
+          cat > ~/.config/pulse/default.pa.d/ci-setup.pa << EOF
+.include /etc/pulse/default.pa
+load-module module-native-protocol-tcp auth-anonymous=1
+load-module module-null-sink sink_name=test_sink
+EOF
+
+          # Start PulseAudio with our custom configuration
+          pulseaudio --start --exit-idle-time=-1 --daemon \
+            -F ~/.config/pulse/default.pa.d/ci-setup.pa \
+            --log-level=debug \
+            --verbose
+          
+          # Wait for PulseAudio to fully initialize
+          sleep 5
+          
+          # Verify PulseAudio is running and configured correctly
+          echo "=== PulseAudio Status ==="
+          pulseaudio --check && echo "PulseAudio is running" || echo "PulseAudio failed to start"
+          echo "=== PulseAudio Configuration ==="
+          cat ~/.config/pulse/daemon.conf
+          echo "=== PulseAudio Modules ==="
+          pactl list modules || true
+          echo "=== PulseAudio Sinks ==="
+          pactl list sinks || true
 
           # Wait for system to initialize
           sleep 5
@@ -180,38 +212,100 @@ jobs:
 
       - name: Test Audio Capture
         run: |
-          # Start test tone in background
-          cargo run --example test_tone &
+          echo "=== Starting Audio Test ==="
+          
+          # Verify audio system is ready
+          if ! pactl info; then
+            echo "Audio system is not ready"
+            exit 1
+          fi
+          
+          # Start test tone in background with logging
+          echo "Starting test tone..."
+          cargo run --example test_tone > test_tone.log 2>&1 &
           PLAYER_PID=$!
-
+          
           # Ensure cleanup on exit
-          trap "kill $PLAYER_PID 2>/dev/null || true" EXIT
-
-          # Wait for playback to start
-          sleep 2
-
+          cleanup() {
+            echo "Cleaning up processes..."
+            if [ -n "$PLAYER_PID" ] && kill -0 $PLAYER_PID 2>/dev/null; then
+              echo "Stopping test tone (PID: $PLAYER_PID)"
+              kill $PLAYER_PID
+              wait $PLAYER_PID 2>/dev/null || true
+            fi
+            # Collect audio debug info
+            echo "=== Final Audio State ==="
+            pactl info || true
+            pactl list short sinks || true
+            echo "=== Test Tone Log ==="
+            cat test_tone.log || true
+          }
+          trap cleanup EXIT
+          
+          # Wait for playback to start and verify
+          echo "Waiting for test tone to initialize..."
+          for i in {1..10}; do
+            if kill -0 $PLAYER_PID 2>/dev/null; then
+              echo "Test tone process is running (attempt $i)"
+              break
+            elif [ $i -eq 10 ]; then
+              echo "Test tone failed to start after multiple attempts"
+              cat test_tone.log
+              exit 1
+            else
+              echo "Waiting for test tone (attempt $i)..."
+              sleep 1
+            fi
+          done
+          
           # Start capturing
           echo "Starting audio capture with ${{ matrix.audio_system }}..."
-          cargo run --example test_pulseaudio -- --duration 10
-
-          # Verify capture
-          if [ ! -f "test_capture.wav" ]; then
-              echo "Capture failed - no output file created"
-              exit 1
+          cargo run --example test_pulseaudio -- --duration 10 > capture.log 2>&1
+          CAPTURE_EXIT=$?
+          
+          # Check capture result
+          if [ $CAPTURE_EXIT -ne 0 ]; then
+            echo "Audio capture failed with exit code: $CAPTURE_EXIT"
+            echo "=== Capture Log ==="
+            cat capture.log
+            exit 1
           fi
-
+          
+          # Verify capture file
+          if [ ! -f "test_capture.wav" ]; then
+            echo "Capture failed - no output file created"
+            exit 1
+          fi
+          
           FILESIZE=$(stat --format="%s" "test_capture.wav")
           if [ "$FILESIZE" -eq 0 ]; then
-              echo "Capture failed - output file is empty"
-              exit 1
+            echo "Capture failed - output file is empty"
+            exit 1
           fi
-
+          
           echo "Successfully captured $FILESIZE bytes of audio using ${{ matrix.audio_system }}"
+          
+          # Basic audio file validation
+          echo "Validating audio file..."
+          file test_capture.wav
+          
+          # Print summary
+          echo "=== Test Summary ==="
+          echo "Audio System: ${{ matrix.audio_system }}"
+          echo "Capture File Size: $FILESIZE bytes"
+          echo "Test Duration: 10 seconds"
 
       - name: Upload Linux test artifacts
+        if: always()
         uses: actions/upload-artifact@v4
         with:
           name: linux-${{ matrix.audio_system }}-test-results
           path: |
             test_capture.wav
             test_audio/sample.mp3
+            test_tone.log
+            capture.log
+            ~/.config/pulse/*.log
+            ~/.config/pulse/daemon.conf
+            ~/.config/pulse/client.conf
+            ~/.config/pulse/default.pa.d/*.pa
