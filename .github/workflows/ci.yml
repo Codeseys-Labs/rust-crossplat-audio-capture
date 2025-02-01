@@ -13,6 +13,23 @@ on:
           - windows
           - linux
           - macos
+      test_mode:
+        description: "Test mode"
+        required: true
+        default: "robust"
+        type: choice
+        options:
+          - robust
+          - basic
+      audio_backend:
+        description: "Linux audio backend"
+        required: false
+        type: choice
+        options:
+          - auto
+          - pipewire
+          - pulseaudio
+        default: "auto"
       debug_enabled:
         description: "Enable debug output"
         required: false
@@ -22,21 +39,22 @@ on:
 jobs:
   windows:
     if: github.event.inputs.platform == 'windows' || github.event.inputs.platform == 'all'
-    uses: ./.github/workflows/windows.yml
+    uses: ./.github/workflows/${{ github.event.inputs.test_mode == 'robust' && 'windows_robust.yml' || 'windows.yml' }}
     secrets: inherit
     with:
       debug_enabled: ${{ fromJSON(github.event.inputs.debug_enabled) }}
 
   linux:
     if: github.event.inputs.platform == 'linux' || github.event.inputs.platform == 'all'
-    uses: ./.github/workflows/linux.yml
+    uses: ./.github/workflows/${{ github.event.inputs.test_mode == 'robust' && 'linux_robust.yml' || 'linux.yml' }}
     secrets: inherit
     with:
       debug_enabled: ${{ fromJSON(github.event.inputs.debug_enabled) }}
+      audio_backend: ${{ github.event.inputs.audio_backend }}
 
   macos:
     if: github.event.inputs.platform == 'macos' || github.event.inputs.platform == 'all'
-    uses: ./.github/workflows/macos.yml
+    uses: ./.github/workflows/${{ github.event.inputs.test_mode == 'robust' && 'macos_robust.yml' || 'macos.yml' }}
     secrets: inherit
     with:
       debug_enabled: ${{ fromJSON(github.event.inputs.debug_enabled) }}
@@ -45,3 +63,10 @@ jobs:
     if: github.event.inputs.platform == 'all'
     uses: ./.github/workflows/code-quality.yml
     secrets: inherit
+
+  tests:
+    if: github.event.inputs.platform == 'all'
+    uses: ./.github/workflows/tests.yml
+    secrets: inherit
+    with:
+      debug_enabled: ${{ fromJSON(github.event.inputs.debug_enabled) }}

@@ -8,6 +8,11 @@ on:
         required: false
         type: boolean
         default: false
+      audio_backend:
+        description: "Audio backend to use"
+        required: false
+        type: string
+        default: "auto"
 
 env:
   CARGO_TERM_COLOR: always
@@ -18,7 +23,8 @@ jobs:
     runs-on: ubuntu-latest
     strategy:
       matrix:
-        audio_system: [pipewire, pulseaudio]
+        audio_system: ${{ inputs.audio_backend == 'auto' && fromJSON('["pipewire", "pulseaudio"]') || fromJSON(format('["{0}"]', inputs.audio_backend)) }}
+      fail-fast: false
     env:
       DEBUG: ${{ inputs.debug_enabled }}
     steps:
