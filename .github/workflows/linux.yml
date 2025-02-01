@@ -23,81 +23,76 @@ jobs:
     runs-on: ubuntu-latest
     strategy:
       matrix:
-        audio_system: ${{ inputs.audio_backend == 'auto' && fromJSON('["pipewire", "pulseaudio"]') || fromJSON(format('["{0}"]', inputs.audio_backend)) }}
+        audio_system: [pipewire, pulseaudio]
       fail-fast: false
     env:
       DEBUG: ${{ inputs.debug_enabled }}
     steps:
+      - name: Check if backend should run
+        id: check_backend
+        run: |
+          if [[ "${{ inputs.audio_backend }}" == "auto" || "${{ inputs.audio_backend }}" == "${{ matrix.audio_system }}" ]]; then
+            echo "should_run=true" >> $GITHUB_OUTPUT
+          else
+            echo "should_run=false" >> $GITHUB_OUTPUT
+          fi
+
       - uses: actions/checkout@v4
+        if: steps.check_backend.outputs.should_run == 'true'
 
       - name: Install Rust
+        if: steps.check_backend.outputs.should_run == 'true'
         uses: dtolnay/rust-toolchain@stable
 
       - name: Debug Info
-        if: env.DEBUG == true
+        if: steps.check_backend.outputs.should_run == 'true' && env.DEBUG == true
         run: |
           rustc --version --verbose
           cargo --version --verbose
           cargo tree
 
       - name: Configure System
-        if: matrix.audio_system == 'pipewire'
+        if: steps.check_backend.outputs.should_run == 'true' && matrix.audio_system == 'pipewire'
         run: |
           # Prevent needrestart prompts
           sudo sed -i 's/#$nrconf{restart} = '"'"'i'"'"';/$nrconf{restart} = '"'"'a'"'"';/g' /etc/needrestart/needrestart.conf
 
       - name: Add Audio PPAs
-        if: matrix.audio_system == 'pipewire'
+        if: steps.check_backend.outputs.should_run == 'true' && matrix.audio_system == 'pipewire'
         run: |
           sudo apt-get update
 
-          # Check if PipeWire is already installed
-          if ! dpkg -l | grep -q pipewire; then
-            # Add PipeWire PPA and update
-            echo "Adding PipeWire PPA..."
-            sudo add-apt-repository ppa:pipewire-debian/pipewire-upstream -y
-            sudo apt-get update
-
-            # Install base PipeWire
-            echo "Installing base PipeWire..."
-            sudo apt-get install -y pipewire
-          else
-            echo "PipeWire is already installed"
-          fi
+          # Add PipeWire PPA and update
+          echo "Adding PipeWire PPA..."
+          sudo add-apt-repository ppa:pipewire-debian/pipewire-upstream -y
+          sudo apt-get update
 
           # Add WirePlumber PPA
           echo "Adding WirePlumber PPA..."
           sudo add-apt-repository ppa:pipewire-debian/wireplumber-upstream -y
           sudo apt-get update
 
-      - name: Install Audio Packages
-        if: matrix.audio_system == 'pipewire'
-        run: |
-          # Check and install PipeWire packages if needed
-          if ! dpkg -l | grep -q pipewire-audio-client-libraries; then
-            echo "Installing PipeWire packages..."
-            sudo apt-get install -y pipewire-audio-client-libraries
-          fi
-
-          if ! dpkg -l | grep -q pipewire-pulse; then
-            echo "Installing PipeWire Pulse..."
-            sudo apt-get install -y pipewire-pulse
-          fi
-
-          # Check and install WirePlumber if needed
-          if ! dpkg -l | grep -q wireplumber; then
-            echo "Installing WirePlumber..."
-            sudo apt-get install -y wireplumber
-          fi
+          # Install base PipeWire and development packages
+          echo "Installing PipeWire packages..."
+          sudo apt-get install -y \
+            pipewire \
+            pipewire-audio-client-libraries \
+            pipewire-pulse \
+            libpipewire-0.3-dev \
+            libpipewire-0.3-modules \
+            libspa-0.2-dev \
+            wireplumber \
+            libasound2-dev \
+            pkg-config
 
       - name: Disable PulseAudio
-        if: matrix.audio_system == 'pipewire'
+        if: steps.check_backend.outputs.should_run == 'true' && matrix.audio_system == 'pipewire'
         run: |
           systemctl --user --now disable pulseaudio.service pulseaudio.socket || true
           pulseaudio --kill || true
 
       - name: Start Audio Services
-        if: matrix.audio_system == 'pipewire'
+        if: steps.check_backend.outputs.should_run == 'true' && matrix.audio_system == 'pipewire'
         run: |
           # Reload systemd daemon
           systemctl --user daemon-reload
@@ -116,7 +111,7 @@ jobs:
           sleep 2
 
       - name: Verify Audio Setup
-        if: matrix.audio_system == 'pipewire'
+        if: steps.check_backend.outputs.should_run == 'true' && matrix.audio_system == 'pipewire'
         run: |
           echo "=== WirePlumber Status ==="
           systemctl --user status wireplumber || true
@@ -134,10 +129,14 @@ jobs:
           pactl info || true
 
       - name: Setup PulseAudio
-        if: matrix.audio_system == 'pulseaudio'
+        if: steps.check_backend.outputs.should_run == 'true' && matrix.audio_system == 'pulseaudio'
         run: |
           sudo apt-get update
-          sudo apt-get install -y pulseaudio libpulse-dev libasound2-dev
+          sudo apt-get install -y \
+            pulseaudio \
+            libpulse-dev \
+            libasound2-dev \
+            pkg-config
 
           # Stop any existing audio services
           systemctl --user stop pipewire pipewire-pulse || true
@@ -145,38 +144,38 @@ jobs:
 
           # Configure PulseAudio
           mkdir -p ~/.config/pulse
-          cat > ~/.config/pulse/daemon.conf << EOF
-default-sample-rate = 44100
-default-fragments = 4
-default-fragment-size-msec = 25
-exit-idle-time = -1
-EOF
+          cat > ~/.config/pulse/daemon.conf << 'EOF'
+          default-sample-rate = 44100
+          default-fragments = 4
+          default-fragment-size-msec = 25
+          exit-idle-time = -1
+          EOF
 
           # Create client configuration
           mkdir -p ~/.config/pulse
           cat > ~/.config/pulse/client.conf << EOF
-autospawn = yes
-daemon-binary = /usr/bin/pulseaudio
-enable-shm = yes
-EOF
+          autospawn = yes
+          daemon-binary = /usr/bin/pulseaudio
+          enable-shm = yes
+          EOF
 
           # Create separate file for module loading
           mkdir -p ~/.config/pulse/default.pa.d
           cat > ~/.config/pulse/default.pa.d/ci-setup.pa << EOF
-.include /etc/pulse/default.pa
-load-module module-native-protocol-tcp auth-anonymous=1
-load-module module-null-sink sink_name=test_sink
-EOF
+          .include /etc/pulse/default.pa
+          load-module module-native-protocol-tcp auth-anonymous=1
+          load-module module-null-sink sink_name=test_sink
+          EOF
 
           # Start PulseAudio with our custom configuration
           pulseaudio --start --exit-idle-time=-1 --daemon \
             -F ~/.config/pulse/default.pa.d/ci-setup.pa \
             --log-level=debug \
             --verbose
-          
+
           # Wait for PulseAudio to fully initialize
           sleep 5
-          
+
           # Verify PulseAudio is running and configured correctly
           echo "=== PulseAudio Status ==="
           pulseaudio --check && echo "PulseAudio is running" || echo "PulseAudio failed to start"
@@ -194,11 +193,13 @@ EOF
           pactl info
 
       - name: Download test audio
+        if: steps.check_backend.outputs.should_run == 'true'
         run: |
           mkdir -p test_audio
           curl -L "https://ia800901.us.archive.org/23/items/gd70-02-14.early-late.sbd.cotsman.18115.sbeok.shnf/gd70-02-14d1t02.mp3" -o "test_audio/sample.mp3"
 
       - name: Cache dependencies
+        if: steps.check_backend.outputs.should_run == 'true'
         uses: actions/cache@v3
         with:
           path: |
@@ -208,29 +209,33 @@ EOF
           key: ${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.lock') }}
 
       - name: Build
+        if: steps.check_backend.outputs.should_run == 'true'
         run: cargo build --verbose
 
       - name: Run tests
+        if: steps.check_backend.outputs.should_run == 'true'
         run: cargo test --verbose
 
       - name: Build examples
+        if: steps.check_backend.outputs.should_run == 'true'
         run: cargo build --examples
 
       - name: Test Audio Capture
+        if: steps.check_backend.outputs.should_run == 'true'
         run: |
           echo "=== Starting Audio Test ==="
-          
+
           # Verify audio system is ready
           if ! pactl info; then
             echo "Audio system is not ready"
             exit 1
           fi
-          
+
           # Start test tone in background with logging
           echo "Starting test tone..."
           cargo run --example test_tone > test_tone.log 2>&1 &
           PLAYER_PID=$!
-          
+
           # Ensure cleanup on exit
           cleanup() {
             echo "Cleaning up processes..."
@@ -247,7 +252,7 @@ EOF
             cat test_tone.log || true
           }
           trap cleanup EXIT
-          
+
           # Wait for playback to start and verify
           echo "Waiting for test tone to initialize..."
           for i in {1..10}; do
@@ -263,12 +268,12 @@ EOF
               sleep 1
             fi
           done
-          
+
           # Start capturing
           echo "Starting audio capture with ${{ matrix.audio_system }}..."
           cargo run --example test_pulseaudio -- --duration 10 > capture.log 2>&1
           CAPTURE_EXIT=$?
-          
+
           # Check capture result
           if [ $CAPTURE_EXIT -ne 0 ]; then
             echo "Audio capture failed with exit code: $CAPTURE_EXIT"
@@ -276,25 +281,25 @@ EOF
             cat capture.log
             exit 1
           fi
-          
+
           # Verify capture file
           if [ ! -f "test_capture.wav" ]; then
             echo "Capture failed - no output file created"
             exit 1
           fi
-          
+
           FILESIZE=$(stat --format="%s" "test_capture.wav")
           if [ "$FILESIZE" -eq 0 ]; then
             echo "Capture failed - output file is empty"
             exit 1
           fi
-          
+
           echo "Successfully captured $FILESIZE bytes of audio using ${{ matrix.audio_system }}"
-          
+
           # Basic audio file validation
           echo "Validating audio file..."
           file test_capture.wav
-          
+
           # Print summary
           echo "=== Test Summary ==="
           echo "Audio System: ${{ matrix.audio_system }}"
@@ -302,7 +307,7 @@ EOF
           echo "Test Duration: 10 seconds"
 
       - name: Upload Linux test artifacts
-        if: always()
+        if: steps.check_backend.outputs.should_run == 'true' && always()
         uses: actions/upload-artifact@v4
         with:
           name: linux-${{ matrix.audio_system }}-test-results
