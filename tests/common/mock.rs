@@ -2,23 +2,42 @@ use rsac::{AudioConfig, AudioError, AudioFormat};
 use std::sync::Arc;
 
 // Local trait that we can implement
-pub trait MockCapture {
+pub trait MockCapture: Send {
     fn start(&mut self) -> Result<(), AudioError>;
     fn stop(&mut self) -> Result<(), AudioError>;
     fn read(&mut self, buffer: &mut [u8]) -> Result<usize, AudioError>;
     fn config(&self) -> &AudioConfig;
+    fn is_capturing(&self) -> bool;
+    fn get_captured_data(&self) -> Vec<f32>;
 }
 
 // Wrapper type that implements AudioCaptureStream
 pub struct MockCaptureWrapper<T: MockCapture>(T);
 
-impl<T: MockCapture> MockCaptureWrapper<T> {
+impl<T: MockCapture + 'static> MockCaptureWrapper<T> {
     pub fn new(inner: T) -> Self {
         Self(inner)
     }
+
+    pub fn is_capturing(&self) -> bool {
+        self.0.is_capturing()
+    }
+
+    pub fn get_captured_data(&self) -> Vec<f32> {
+        self.0.get_captured_data()
+    }
 }
 
-impl<T: MockCapture> rsac::AudioCaptureStream for MockCaptureWrapper<T> {
+// Create a new type to implement AudioCaptureStream
+pub struct AudioCaptureStreamWrapper<T: MockCapture>(MockCaptureWrapper<T>);
+
+impl<T: MockCapture + 'static> AudioCaptureStreamWrapper<T> {
+    pub fn new(inner: T) -> Self {
+        Self(MockCaptureWrapper::new(inner))
+    }
+}
+
+impl<T: MockCapture + 'static> rsac::AudioCaptureStream for AudioCaptureStreamWrapper<T> {
     fn start(&mut self) -> Result<(), AudioError> {
         self.0.start()
     }

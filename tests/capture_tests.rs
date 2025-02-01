@@ -1,12 +1,14 @@
 mod common;
 
-use common::{create_test_signal, verify_audio_similarity, MockAudioCapture, MockAudioDevice};
+use common::mock::{MockAudioCapture, MockAudioDevice, MockCapture, MockCaptureWrapper};
+use common::{create_test_signal, verify_audio_similarity};
+use rsac::AudioCaptureStream;
 use rsac::{AudioCaptureStream, AudioConfig, AudioError};
 use std::time::Duration;
 
 #[test]
 fn test_basic_capture_lifecycle() {
-    let mut capture = MockAudioCapture::new();
+    let mut capture = MockCaptureWrapper::new(MockAudioCapture::new());
 
     assert!(!capture.is_capturing());
 
@@ -26,7 +28,7 @@ fn test_capture_with_custom_config() {
     };
 
     let test_data = create_test_signal(440.0, 1000, 44100);
-    let mut capture = MockAudioCapture::with_test_data(test_data.clone());
+    let mut capture = MockCaptureWrapper::new(MockAudioCapture::with_test_data(test_data.clone()));
 
     capture.start().expect("Failed to start capture");
 
@@ -52,7 +54,7 @@ fn test_device_enumeration() {
 
 #[test]
 fn test_device_selection() {
-    let mut capture = MockAudioCapture::new();
+    let capture = MockAudioCapture::new();
     let devices = capture.get_available_devices();
 
     capture.set_device(devices[1].clone());
@@ -78,7 +80,7 @@ fn test_invalid_device_selection() {
 
 #[test]
 fn test_capture_error_handling() {
-    let mut capture = MockAudioCapture::new();
+    let mut capture = MockCaptureWrapper::new(MockAudioCapture::new());
 
     // Try to stop before starting
     let result = capture.stop();
@@ -93,7 +95,7 @@ fn test_capture_error_handling() {
 #[test]
 fn test_capture_with_zero_data() {
     let test_data = vec![0.0f32; 48000];
-    let mut capture = MockAudioCapture::with_test_data(test_data);
+    let mut capture = MockCaptureWrapper::new(MockAudioCapture::with_test_data(test_data));
 
     capture.start().expect("Failed to start capture");
     std::thread::sleep(Duration::from_secs(1));
