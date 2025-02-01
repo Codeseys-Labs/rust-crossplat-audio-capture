@@ -1,0 +1,182 @@
+name: Windows Audio Tests
+
+on:
+  workflow_call:
+    inputs:
+      debug_enabled:
+        description: "Enable debug output"
+        required: false
+        type: boolean
+        default: false
+
+env:
+  CARGO_TERM_COLOR: always
+  RUST_BACKTRACE: 1
+
+jobs:
+  test-windows:
+    runs-on: windows-latest
+    env:
+      DEBUG: ${{ inputs.debug_enabled }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Setup Windows SDK
+        uses: GuillaumeFalourd/setup-windows10-sdk-action@v1.11
+        with:
+          sdk-version: 18362
+
+      - name: Configure Audio Service
+        run: |
+          Write-Host "Configuring Windows Audio service..."
+          
+          # Enable and start Windows Audio service
+          Set-Service -Name Audiosrv -StartupType Automatic
+          Start-Service Audiosrv
+          
+          # Wait for service to be ready
+          $retries = 5
+          $serviceReady = $false
+          
+          for ($i = 0; $i -lt $retries; $i++) {
+              $audioService = Get-Service Audiosrv
+              if ($audioService.Status -eq 'Running') {
+                  $serviceReady = $true
+                  break
+              }
+              Write-Host "Waiting for Audio service to start... Attempt $($i + 1)"
+              Start-Sleep -Seconds 2
+          }
+          
+          if (-not $serviceReady) {
+              throw "Failed to start Audio service after $retries attempts"
+          }
+          
+          Write-Host "Audio service successfully configured"
+        shell: pwsh
+
+      - name: Verify Audio Devices
+        run: |
+          Write-Host "Checking audio devices..."
+          
+          # List all audio devices
+          Get-CimInstance Win32_SoundDevice | ForEach-Object {
+              Write-Host "Found audio device: $($_.Name)"
+              Write-Host "Status: $($_.Status)"
+              Write-Host "Device ID: $($_.DeviceID)"
+          }
+          
+          # Check for output devices using NAudio
+          Add-Type -TypeDefinition @'
+          using System.Runtime.InteropServices;
+          public class AudioUtils {
+              [DllImport("winmm.dll")]
+              public static extern uint waveOutGetNumDevs();
+          }
+'@
+          $numDevices = [AudioUtils]::waveOutGetNumDevs()
+          Write-Host "Number of audio output devices: $numDevices"
+          
+          if ($numDevices -eq 0) {
+              throw "No audio output devices found"
+          }
+        shell: pwsh
+
+      - name: Cache dependencies
+        uses: actions/cache@v3
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.lock') }}
+
+      - name: Build
+        run: |
+          Write-Host "Building project..."
+          $env:RUST_BACKTRACE = "1"
+          cargo build --verbose
+        shell: pwsh
+        env:
+          WINAPI_NO_BUNDLED_LIBRARIES: 1
+
+      - name: Run tests
+        run: |
+          Write-Host "Running tests..."
+          $env:RUST_BACKTRACE = "1"
+          cargo test --verbose -- --nocapture
+        shell: pwsh
+        env:
+          WINAPI_NO_BUNDLED_LIBRARIES: 1
+
+      - name: Test Audio System
+        run: |
+          Write-Host "Starting audio system test..."
+          
+          # Start test tone in background with retry logic
+          $maxRetries = 3
+          $attempt = 0
+          $testToneSuccess = $false
+          
+          while ($attempt -lt $maxRetries -and -not $testToneSuccess) {
+              try {
+                  $testTone = Start-Process -NoNewWindow cargo -ArgumentList "run", "--example", "test_tone_robust" -PassThru
+                  Start-Sleep -Seconds 3
+                  
+                  if (-not $testTone.HasExited) {
+                      $testToneSuccess = $true
+                      Write-Host "Test tone started successfully"
+                  } else {
+                      Write-Host "Test tone process exited unexpectedly on attempt $($attempt + 1)"
+                      $attempt++
+                  }
+              } catch {
+                  Write-Host "Failed to start test tone on attempt $($attempt + 1): $_"
+                  $attempt++
+              }
+          }
+          
+          if (-not $testToneSuccess) {
+              throw "Failed to start test tone after $maxRetries attempts"
+          }
+          
+          try {
+              # Start capturing
+              Write-Host "Starting audio capture..."
+              cargo run --example test_capture_robust
+              
+              # Validate capture
+              if (Test-Path "test_capture_robust.wav") {
+                  $capturedSize = (Get-Item "test_capture_robust.wav").Length
+                  Write-Host "Captured audio file size: $capturedSize bytes"
+                  
+                  if ($capturedSize -eq 0) {
+                      throw "Capture failed - output file is empty"
+                  }
+              } else {
+                  throw "Capture failed - no output file created"
+              }
+          }
+          finally {
+              # Clean up test processes
+              if ($testTone) {
+                  Stop-Process -Id $testTone.Id -Force -ErrorAction SilentlyContinue
+              }
+              Get-Process | Where-Object { $_.Name -like "*cargo*" -or $_.Name -like "*test_tone*" } | 
+                  Stop-Process -Force -ErrorAction SilentlyContinue
+          }
+        shell: pwsh
+        env:
+          WINAPI_NO_BUNDLED_LIBRARIES: 1
+
+      - name: Upload test artifacts
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: windows-audio-test-results
+          path: |
+            test_capture_robust.wav
+            target/debug/examples/*.log
