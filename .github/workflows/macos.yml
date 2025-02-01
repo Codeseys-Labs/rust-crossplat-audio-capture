@@ -92,7 +92,7 @@ jobs:
           echo "Successfully captured $FILESIZE bytes of audio"
 
       - name: Upload macOS test artifacts
-        uses: actions/upload-artifact@v3
+        uses: actions/upload-artifact@v4
         with:
           name: macos-audio-test-results
           path: |

@@ -103,7 +103,7 @@ jobs:
           WINAPI_NO_BUNDLED_LIBRARIES: 1
 
       - name: Upload test artifacts
-        uses: actions/upload-artifact@v3
+        uses: actions/upload-artifact@v4
         with:
           name: windows-audio-test-results
           path: |
