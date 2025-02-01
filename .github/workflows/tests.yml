@@ -1,11 +1,13 @@
 name: Cross-Platform Audio Tests
 
 on:
-  push:
-    branches: [ master, main ]
-  pull_request:
-    branches: [ master, main ]
   workflow_dispatch:
+    inputs:
+      debug_enabled:
+        description: "Enable debug output"
+        required: false
+        type: boolean
+        default: false
 
 env:
   CARGO_TERM_COLOR: always
