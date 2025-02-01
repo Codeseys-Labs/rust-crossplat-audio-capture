@@ -156,33 +156,83 @@ jobs:
 
       - name: Run Audio Tests
         run: |
+          echo "=== Starting PipeWire Audio Tests ==="
+          
+          # Verify audio system status before starting
+          echo "Checking PipeWire status..."
+          pw-cli info || (echo "PipeWire not running properly" && exit 1)
+          
           # Start test tone in background
+          echo "Starting test tone..."
           cargo run --example test_tone_robust > test_tone.log 2>&1 &
           TONE_PID=$!
           
-          # Wait for tone to start
-          sleep 3
+          # Wait for tone to start and verify
+          echo "Waiting for test tone to initialize..."
+          for i in {1..6}; do
+            if kill -0 $TONE_PID 2>/dev/null; then
+              echo "Test tone process is running (attempt $i)"
+              break
+            elif [ $i -eq 6 ]; then
+              echo "Test tone failed to start after multiple attempts"
+              echo "=== Test Tone Log ==="
+              cat test_tone.log
+              exit 1
+            else
+              echo "Waiting for test tone (attempt $i)..."
+              sleep 1
+            fi
+          done
           
-          # Verify test tone is running
-          if ! kill -0 $TONE_PID 2>/dev/null; then
-            echo "Test tone failed to start"
+          # Verify audio output
+          echo "Verifying audio output..."
+          pw-cli list-objects | grep -E "node.(description|name)" || true
+          pw-top -n 1 || true
+          
+          # Start audio capture
+          echo "Starting audio capture..."
+          cargo run --example test_capture_robust > capture.log 2>&1
+          CAPTURE_EXIT=$?
+          
+          # Stop test tone gracefully
+          echo "Stopping test tone..."
+          if kill -0 $TONE_PID 2>/dev/null; then
+            kill $TONE_PID
+            wait $TONE_PID || true
+            echo "Test tone stopped successfully"
+          else
+            echo "Test tone process was not running"
+          fi
+          
+          # Check capture results
+          if [ $CAPTURE_EXIT -ne 0 ]; then
+            echo "Audio capture failed with exit code: $CAPTURE_EXIT"
+            echo "=== Capture Log ==="
+            cat capture.log
+            echo "=== Test Tone Log ==="
             cat test_tone.log
             exit 1
           fi
           
-          # Start audio capture
-          cargo run --example test_capture_robust
-          CAPTURE_EXIT=$?
-          
-          # Stop test tone
-          kill $TONE_PID || true
-          wait $TONE_PID || true
-          
-          # Check capture results
-          if [ $CAPTURE_EXIT -ne 0 ]; then
-            echo "Audio capture failed"
+          # Verify capture file
+          if [ ! -f "test_capture_robust.wav" ]; then
+            echo "Error: Capture file not found"
             exit 1
           fi
+          
+          # Check file size and content
+          FILESIZE=$(stat -f%z "test_capture_robust.wav" 2>/dev/null || stat -c%s "test_capture_robust.wav")
+          if [ "$FILESIZE" -eq 0 ]; then
+            echo "Error: Capture file is empty"
+            exit 1
+          fi
+          
+          echo "Audio capture successful!"
+          echo "Capture file size: $FILESIZE bytes"
+          
+          # Final audio system check
+          echo "=== Final PipeWire Status ==="
+          pw-cli info || true
 
       - name: Upload test artifacts
         if: always()
@@ -192,6 +242,7 @@ jobs:
           path: |
             test_capture_robust.wav
             test_tone.log
+            capture.log
             ~/.config/pipewire/*.log
 
   test-pulseaudio:
@@ -251,33 +302,83 @@ jobs:
 
       - name: Run Audio Tests
         run: |
+          echo "=== Starting PulseAudio Tests ==="
+          
+          # Verify audio system status before starting
+          echo "Checking PulseAudio status..."
+          pactl info || (echo "PulseAudio not running properly" && exit 1)
+          
           # Start test tone in background
+          echo "Starting test tone..."
           cargo run --example test_tone_robust > test_tone.log 2>&1 &
           TONE_PID=$!
           
-          # Wait for tone to start
-          sleep 3
+          # Wait for tone to start and verify
+          echo "Waiting for test tone to initialize..."
+          for i in {1..6}; do
+            if kill -0 $TONE_PID 2>/dev/null; then
+              echo "Test tone process is running (attempt $i)"
+              break
+            elif [ $i -eq 6 ]; then
+              echo "Test tone failed to start after multiple attempts"
+              echo "=== Test Tone Log ==="
+              cat test_tone.log
+              exit 1
+            else
+              echo "Waiting for test tone (attempt $i)..."
+              sleep 1
+            fi
+          done
           
-          # Verify test tone is running
-          if ! kill -0 $TONE_PID 2>/dev/null; then
-            echo "Test tone failed to start"
+          # Verify audio output
+          echo "Verifying audio output..."
+          pactl list short sinks
+          pactl list short sink-inputs
+          
+          # Start audio capture
+          echo "Starting audio capture..."
+          cargo run --example test_capture_robust > capture.log 2>&1
+          CAPTURE_EXIT=$?
+          
+          # Stop test tone gracefully
+          echo "Stopping test tone..."
+          if kill -0 $TONE_PID 2>/dev/null; then
+            kill $TONE_PID
+            wait $TONE_PID || true
+            echo "Test tone stopped successfully"
+          else
+            echo "Test tone process was not running"
+          fi
+          
+          # Check capture results
+          if [ $CAPTURE_EXIT -ne 0 ]; then
+            echo "Audio capture failed with exit code: $CAPTURE_EXIT"
+            echo "=== Capture Log ==="
+            cat capture.log
+            echo "=== Test Tone Log ==="
             cat test_tone.log
             exit 1
           fi
           
-          # Start audio capture
-          cargo run --example test_capture_robust
-          CAPTURE_EXIT=$?
-          
-          # Stop test tone
-          kill $TONE_PID || true
-          wait $TONE_PID || true
-          
-          # Check capture results
-          if [ $CAPTURE_EXIT -ne 0 ]; then
-            echo "Audio capture failed"
+          # Verify capture file
+          if [ ! -f "test_capture_robust.wav" ]; then
+            echo "Error: Capture file not found"
             exit 1
           fi
+          
+          # Check file size and content
+          FILESIZE=$(stat -f%z "test_capture_robust.wav" 2>/dev/null || stat -c%s "test_capture_robust.wav")
+          if [ "$FILESIZE" -eq 0 ]; then
+            echo "Error: Capture file is empty"
+            exit 1
+          fi
+          
+          echo "Audio capture successful!"
+          echo "Capture file size: $FILESIZE bytes"
+          
+          # Final audio system check
+          echo "=== Final PulseAudio Status ==="
+          pactl info || true
 
       - name: Upload test artifacts
         if: always()
@@ -287,4 +388,5 @@ jobs:
           path: |
             test_capture_robust.wav
             test_tone.log
+            capture.log
             ~/.config/pulse/*.log
