@@ -106,18 +106,53 @@ jobs:
           ]
           EOF
           
-          # Start PipeWire and related services
+          # Start PipeWire and related services in order
           systemctl --user daemon-reload
-          systemctl --user start pipewire wireplumber pipewire-pulse
           
-          # Wait for services to start
-          sleep 5
+          echo "Starting PipeWire..."
+          systemctl --user start pipewire.service || true
+          sleep 2
           
-          # Create virtual sink
-          pw-cli create-node adapter { factory.name=support.null-audio-sink node.name=virtual-sink media.class=Audio/Sink }
+          echo "Starting WirePlumber..."
+          systemctl --user start wireplumber.service || true
+          sleep 2
           
-          # Set as default sink
-          wpctl set-default $(wpctl status | grep "virtual-sink" | cut -d "." -f1)
+          echo "Starting PipeWire PulseAudio..."
+          systemctl --user start pipewire-pulse.service || true
+          sleep 2
+          
+          # Verify services are running
+          echo "Checking service status..."
+          systemctl --user status pipewire wireplumber pipewire-pulse || true
+          
+          # Additional verification
+          pw-cli info || true
+          pactl info || true
+          
+          # Create and verify virtual sink
+          echo "Creating virtual sink..."
+          pw-cli create-node adapter { factory.name=support.null-audio-sink node.name=virtual-sink media.class=Audio/Sink } || true
+          sleep 2
+          
+          # Verify sink was created
+          echo "Verifying virtual sink..."
+          if pw-cli list-objects | grep -q "virtual-sink"; then
+            echo "Virtual sink created successfully"
+            # Set as default sink
+            echo "Setting as default sink..."
+            wpctl status
+            SINK_ID=$(wpctl status | grep "virtual-sink" | cut -d "." -f1)
+            if [ -n "$SINK_ID" ]; then
+              wpctl set-default "$SINK_ID"
+              echo "Default sink set to: $SINK_ID"
+            else
+              echo "Warning: Could not find virtual sink ID"
+            fi
+          else
+            echo "Warning: Virtual sink creation may have failed"
+            echo "Available nodes:"
+            pw-cli list-objects || true
+          fi
 
       - name: Run Audio Tests
         run: |
