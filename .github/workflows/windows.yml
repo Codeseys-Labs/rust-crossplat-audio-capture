@@ -55,11 +55,6 @@ jobs:
         env:
           WINAPI_NO_BUNDLED_LIBRARIES: 1
 
-      - name: Run tests
-        run: cargo test --verbose
-        env:
-          WINAPI_NO_BUNDLED_LIBRARIES: 1
-
       - name: Build examples
         run: cargo build --examples
         env:

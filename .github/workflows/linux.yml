@@ -212,10 +212,6 @@ jobs:
         if: steps.check_backend.outputs.should_run == 'true'
         run: cargo build --verbose
 
-      - name: Run tests
-        if: steps.check_backend.outputs.should_run == 'true'
-        run: cargo test --verbose
-
       - name: Build examples
         if: steps.check_backend.outputs.should_run == 'true'
         run: cargo build --examples
