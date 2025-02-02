@@ -84,7 +84,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     // Start the test tone generator
     println!("Starting test tone...");
-    let _test_process = Command::new("cargo")
+    let mut test_process = Command::new("cargo")
         .args(["run", "--example", "test_tone"])
         .spawn()?;
 
@@ -175,13 +175,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         println!("Audio validation passed!");
     }
 
-    // Clean up test process
-    if let Ok(mut child) = Command::new("taskkill")
-        .args(["/F", "/IM", "test_tone.exe"])
-        .spawn()
-    {
-        let _ = child.wait();
-    }
+    // Clean up test process quietly
+    let _ = test_process.kill();
 
     println!("Test completed successfully!");
     Ok(())
