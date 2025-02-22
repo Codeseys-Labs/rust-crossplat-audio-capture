@@ -26,6 +26,12 @@ jobs:
       - name: Setup Windows SDK
         uses: microsoft/setup-msbuild@v1.3
 
+      - name: Install test applications
+        run: |
+          # Install VLC using Chocolatey
+          choco install vlc -y
+        shell: pwsh
+
       - name: Debug Info
         if: env.DEBUG == true
         run: |
@@ -62,33 +68,75 @@ jobs:
 
       - name: Test audio capture
         run: |
+          # Start test applications
+          Write-Host "Starting VLC with test audio..."
+          $vlcProcess = Start-Process -NoNewWindow "C:\Program Files\VideoLAN\VLC\vlc.exe" -ArgumentList "--intf", "dummy", "--no-video", "test_audio/sample.mp3" -PassThru
+
           # Start test tone in background
           $testTone = Start-Process -NoNewWindow cargo -ArgumentList "run", "--example", "test_tone" -PassThru
 
           try {
-              # Wait a bit for playback to start
-              Start-Sleep -Seconds 2
+              # Wait for processes to initialize
+              Start-Sleep -Seconds 5
 
-              # Start capturing
-              Write-Host "Starting audio capture..."
-              cargo run --example test_windows -- --duration 10
+              # Test system-wide capture
+              Write-Host "Testing system-wide capture..."
+              cargo run --example test_windows -- --duration 5 --output system_capture.wav
 
-              # Verify the captured audio
-              if (!(Test-Path "test_capture.wav")) {
-                  throw "Capture failed - no output file created"
+              # Test application-specific capture (VLC)
+              Write-Host "Testing application-specific capture..."
+              cargo run --example test_windows -- --duration 5 --output vlc_capture.wav --application vlc
+
+              # Test exclusive mode capture
+              Write-Host "Testing exclusive mode capture..."
+              cargo run --example test_windows -- --duration 5 --output exclusive_capture.wav --exclusive-mode
+
+              # Test concurrent capture
+              Write-Host "Testing concurrent capture..."
+              $concurrentSys = Start-Process -NoNewWindow cargo -ArgumentList "run", "--example", "test_windows", "--", "--duration", "5", "--output", "concurrent_system.wav" -PassThru
+              $concurrentApp = Start-Process -NoNewWindow cargo -ArgumentList "run", "--example", "test_windows", "--", "--duration", "5", "--output", "concurrent_app.wav", "--application", "vlc" -PassThru
+
+              Wait-Process -Id $concurrentSys.Id
+              Wait-Process -Id $concurrentApp.Id
+
+              # Test different audio formats
+              foreach ($format in @("f32le", "s16le", "s32le")) {
+                  Write-Host "Testing $format format capture..."
+                  cargo run --example test_windows -- --duration 5 --output "format_${format}_capture.wav" --format $format
               }
 
-              $capturedSize = (Get-Item "test_capture.wav").Length
-              if ($capturedSize -eq 0) {
-                  throw "Capture failed - output file is empty"
-              }
+              # Verify captures
+              $captureFiles = @(
+                  "system_capture.wav",
+                  "vlc_capture.wav",
+                  "exclusive_capture.wav",
+                  "concurrent_system.wav",
+                  "concurrent_app.wav",
+                  "format_f32le_capture.wav",
+                  "format_s16le_capture.wav",
+                  "format_s32le_capture.wav"
+              )
 
-              Write-Host "Successfully captured $capturedSize bytes of audio"
+              foreach ($file in $captureFiles) {
+                  if (!(Test-Path $file)) {
+                      throw "Capture failed - $file not created"
+                  }
+
+                  $capturedSize = (Get-Item $file).Length
+                  if ($capturedSize -eq 0) {
+                      throw "Capture failed - $file is empty"
+                  }
+
+                  Write-Host "Successfully captured $capturedSize bytes of audio in $file"
+              }
           }
           finally {
-              # Clean up test process
-              if ($testTone) {
-                  Stop-Process -Id $testTone.Id -Force -ErrorAction SilentlyContinue
+              # Clean up test processes
+              $processes = @($testTone, $vlcProcess)
+              foreach ($proc in $processes) {
+                  if ($proc) {
+                      Stop-Process -Id $proc.Id -Force -ErrorAction SilentlyContinue
+                  }
               }
           }
         shell: pwsh
@@ -100,5 +148,10 @@ jobs:
         with:
           name: windows-audio-test-results
           path: |
-            test_capture.wav
+            system_capture.wav
+            vlc_capture.wav
+            exclusive_capture.wav
+            concurrent_system.wav
+            concurrent_app.wav
+            format_*.wav
             test_audio/sample.mp3
