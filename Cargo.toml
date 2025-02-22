@@ -16,8 +16,8 @@ rodio = "0.20.1"
 
 # Platform-specific audio capture
 [target.'cfg(target_os = "windows")'.dependencies]
-wasapi = "0.15.0"
-windows = { version = "0.59", features = [
+wasapi = "0.16.0"
+windows = { version = "0.60.0", features = [
     "Win32_System_Com",
     "Win32_Media_Audio",
     "Win32_Media_Audio_Endpoints",
@@ -30,6 +30,7 @@ windows = { version = "0.59", features = [
 ] }
 
 [target.'cfg(target_os = "linux")'.dependencies]
+# libasound2-dev && libpipewire-0.3-dev && pkg-config && build-essential && clang && libclang-dev && llvm-dev
 libpulse-binding = "2.28.2"
 libpulse-simple-binding = "2.28.1"
 pipewire = "0.8.0"

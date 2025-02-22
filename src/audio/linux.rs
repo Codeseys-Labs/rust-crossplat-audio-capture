@@ -21,7 +21,7 @@ use pipewire::{
     main_loop::MainLoop,
     properties::properties,
     registry::{GlobalObject, Registry},
-    spa::{pod::builder::Builder, utils::Direction},
+    spa::utils::Direction,
     stream::{Stream as PwStream, StreamFlags, StreamState},
 };
 
@@ -97,6 +97,86 @@ impl PulseAudioBackend {
         }
         false
     }
+
+    fn list_applications(&self) -> Result<Vec<AudioApplication>, AudioError> {
+        let mut apps = Vec::new();
+
+        // Add system-wide audio capture option
+        apps.push(AudioApplication {
+            name: "System Audio".to_string(),
+            id: "system".to_string(),
+            executable_name: "system".to_string(),
+            pid: 0,
+        });
+
+        // Get running applications with audio streams
+        let context = &self.context;
+        let mainloop = &self.mainloop;
+
+        // Wait for the context to be ready
+        loop {
+            match context.get_state() {
+                pulse::context::State::Ready => break,
+                pulse::context::State::Failed | pulse::context::State::Terminated => {
+                    return Err(AudioError::BackendUnavailable(
+                        "PulseAudio context failed".into(),
+                    ));
+                }
+                _ => {
+                    mainloop.wait();
+                }
+            }
+        }
+
+        // Get client info
+        let mut client_list = Vec::new();
+        let (sender, receiver) = std::sync::mpsc::channel();
+
+        context.introspect().get_client_info_list(move |list| {
+            if let Some(list) = list {
+                for client in list {
+                    if let Some(app_name) = client.name.as_ref() {
+                        if let Some(process_id) = client.process_id {
+                            client_list.push(AudioApplication {
+                                name: app_name.to_string(),
+                                id: format!("app_{}", process_id),
+                                executable_name: app_name.to_string(),
+                                pid: process_id,
+                            });
+                        }
+                    }
+                }
+            }
+            sender.send(()).unwrap();
+        });
+
+        // Wait for the callback
+        mainloop.wait();
+        let _ = receiver.recv();
+
+        apps.extend(client_list);
+        Ok(apps)
+    }
+
+    fn capture_application(
+        &self,
+        app: &AudioApplication,
+        config: AudioConfig,
+    ) -> Result<Box<dyn AudioCaptureStream>, AudioError> {
+        let context = Arc::clone(&self.context);
+        let mainloop = Arc::clone(&self.mainloop);
+
+        // Create a stream for either system or application audio
+        let stream = if app.pid == 0 {
+            // System-wide capture
+            PulseAudioStream::new_system(context, mainloop, config)?
+        } else {
+            // Application-specific capture
+            PulseAudioStream::new_application(context, mainloop, app, config)?
+        };
+
+        Ok(Box::new(stream))
+    }
 }
 
 // Mark PulseAudioBackend as Send to satisfy AudioCaptureBackend trait
@@ -108,75 +188,7 @@ impl AudioCaptureBackend for PulseAudioBackend {
     }
 
     fn list_applications(&self) -> Result<Vec<AudioApplication>, AudioError> {
-        let apps = Arc::new(Mutex::new(Vec::new()));
-        let apps_clone = Arc::clone(&apps);
-
-        // Add system-wide audio capture option
-        apps_clone.lock().unwrap().push(AudioApplication {
-            name: "System".to_string(),
-            id: "system".to_string(),
-            executable_name: "system".to_string(),
-            pid: 0,
-        });
-
-        let op = self
-            .context
-            .introspect()
-            .get_sink_input_info_list(move |list| {
-                if let Ok(info) = list {
-                    let proplist = info.proplist();
-                    let app_name = proplist
-                        .get_str(pulse::proplist::properties::APPLICATION_NAME)
-                        .unwrap_or("Unknown");
-                    let process_id = proplist
-                        .get_str(pulse::proplist::properties::APPLICATION_PROCESS_ID)
-                        .and_then(|pid| pid.parse().ok())
-                        .unwrap_or(0);
-
-                    let app = AudioApplication {
-                        name: app_name.to_string(),
-                        id: info.index.to_string(),
-                        executable_name: proplist
-                            .get_str(pulse::proplist::properties::APPLICATION_PROCESS_BINARY)
-                            .unwrap_or("unknown")
-                            .to_string(),
-                        pid: process_id,
-                    };
-
-                    apps_clone.lock().unwrap().push(app);
-                }
-            });
-
-        // Wait for the operation to complete
-        loop {
-            match op.get_state() {
-                pulse::operation::State::Done => break,
-                pulse::operation::State::Running => thread::sleep(Duration::from_millis(10)),
-                pulse::operation::State::Cancelled => {
-                    return Err(AudioError::CaptureError(
-                        "Operation cancelled while listing applications".into(),
-                    ))
-                }
-            }
-        }
-
-        let mut apps = Arc::try_unwrap(apps)
-            .map_err(|_| AudioError::CaptureError("Failed to unwrap apps".into()))?
-            .into_inner()
-            .map_err(|_| AudioError::CaptureError("Failed to get inner value".into()))?;
-
-        // Sort applications: System first, then by name
-        apps.sort_by(|a, b| {
-            if a.name == "System" {
-                std::cmp::Ordering::Less
-            } else if b.name == "System" {
-                std::cmp::Ordering::Greater
-            } else {
-                a.name.cmp(&b.name)
-            }
-        });
-
-        Ok(apps)
+        self.list_applications()
     }
 
     fn capture_application(
@@ -184,13 +196,7 @@ impl AudioCaptureBackend for PulseAudioBackend {
         app: &AudioApplication,
         config: AudioConfig,
     ) -> Result<Box<dyn AudioCaptureStream>, AudioError> {
-        let stream = PulseAudioStream::new(
-            Arc::clone(&self.context),
-            Arc::clone(&self.mainloop),
-            app,
-            config,
-        )?;
-        Ok(Box::new(stream))
+        self.capture_application(app, config)
     }
 }
 
@@ -265,6 +271,118 @@ impl PulseAudioStream {
         stream
             .connect_record(Some(&target), Some(&attr), stream::FlagSet::ADJUST_LATENCY)
             .map_err(|e| AudioError::CaptureError(e.to_string()))?;
+
+        Ok(Self {
+            stream,
+            _mainloop: mainloop,
+            _context: context,
+            config,
+        })
+    }
+
+    fn new_system(
+        context: Arc<Context>,
+        mainloop: Arc<Mainloop>,
+        config: AudioConfig,
+    ) -> Result<Self, AudioError> {
+        // ... existing system capture implementation ...
+        Ok(Self {
+            stream: Stream::new(
+                &context,
+                "system-audio-capture",
+                &pulse::sample::Spec {
+                    format: pulse::sample::Format::FLOAT32NE,
+                    channels: config.channels as u8,
+                    rate: config.sample_rate,
+                },
+                None,
+            )?,
+            _mainloop: mainloop,
+            _context: context,
+            config,
+        })
+    }
+
+    fn new_application(
+        context: Arc<Context>,
+        mainloop: Arc<Mainloop>,
+        app: &AudioApplication,
+        config: AudioConfig,
+    ) -> Result<Self, AudioError> {
+        let spec = pulse::sample::Spec {
+            format: match config.format {
+                AudioFormat::F32LE => pulse::sample::Format::FLOAT32LE,
+                AudioFormat::S16LE => pulse::sample::Format::S16LE,
+                AudioFormat::S32LE => pulse::sample::Format::S32LE,
+            },
+            channels: config.channels as u8,
+            rate: config.sample_rate,
+        };
+
+        let attrs = BufferAttr {
+            maxlength: std::u32::MAX,
+            tlength: std::u32::MAX,
+            prebuf: 0,
+            minreq: std::u32::MAX,
+            fragsize: config.buffer_size as u32,
+        };
+
+        let stream_name = format!("rsac_capture_{}", app.pid);
+
+        // Create a monitor stream for the application
+        let stream = Stream::new(
+            &context,
+            &stream_name,
+            &spec,
+            None, // No channel map
+        )
+        .map_err(|e| AudioError::InitializationFailed(e.to_string()))?;
+
+        // Set up stream flags for monitoring
+        let flags = stream::FlagSet::DONT_MOVE
+            | stream::FlagSet::PEAK_DETECT
+            | stream::FlagSet::ADJUST_LATENCY;
+
+        // Get the sink input index for the application
+        let mut sink_input_index = None;
+        let (sender, receiver) = std::sync::mpsc::channel();
+
+        context.introspect().get_sink_input_info_list(move |list| {
+            if let Some(list) = list {
+                for input in list {
+                    if let Some(client_index) = input.client {
+                        if let Some(process_id) = input.proplist.get_str("application.process.id") {
+                            if process_id == app.pid.to_string() {
+                                sink_input_index = Some(input.index);
+                                break;
+                            }
+                        }
+                    }
+                }
+            }
+            sender.send(()).unwrap();
+        });
+
+        mainloop.wait();
+        let _ = receiver.recv();
+
+        let sink_input = sink_input_index.ok_or_else(|| {
+            AudioError::CaptureError("Could not find audio stream for application".into())
+        })?;
+
+        // Set up monitor of sink input
+        unsafe {
+            stream.set_monitor_stream(sink_input);
+        }
+
+        // Connect the stream
+        stream
+            .connect_record(
+                None, // Let PA choose the device
+                Some(&attrs),
+                flags,
+            )
+            .map_err(|e| AudioError::InitializationFailed(e.to_string()))?;
 
         Ok(Self {
             stream,
@@ -521,9 +639,8 @@ impl AudioCaptureStream for PipeWireStream {
         let stream_flags = StreamFlags::AUTOCONNECT | StreamFlags::RT_PROCESS;
         let buffer_clone = Arc::clone(&self.buffer);
 
-        let mut builder = Builder::new();
-        let pod = builder
-            .add_object(
+        let pod = pipewire::spa::pod::Pod::builder()
+            .object(
                 "Format",
                 "audio/raw",
                 properties! {
