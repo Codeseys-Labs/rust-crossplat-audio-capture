@@ -20,7 +20,7 @@ use pipewire::{
     core::Core,
     main_loop::MainLoop,
     properties::properties,
-    registry::{GlobalObject, Registry},
+    registry::Registry,
     spa::utils::Direction,
     stream::{Stream as PwStream, StreamFlags, StreamState},
 };
@@ -49,12 +49,12 @@ impl PulseAudioBackend {
             })?;
 
         // Create a mainloop
-        let mainloop = Mainloop::new().ok_or_else(|| {
+        let mut mainloop = Mainloop::new().ok_or_else(|| {
             AudioError::InitializationFailed("Failed to create PulseAudio mainloop".into())
         })?;
 
         // Create a new context
-        let context = Context::new_with_proplist(&mainloop, "RustAudioCapture", &proplist)
+        let mut context = Context::new_with_proplist(&mainloop, "RustAudioCapture", &proplist)
             .ok_or_else(|| {
                 AudioError::InitializationFailed("Failed to create PulseAudio context".into())
             })?;
@@ -114,8 +114,8 @@ impl PulseAudioBackend {
         });
 
         // Get running applications with audio streams
-        let context = &self.context;
-        let mainloop = &self.mainloop;
+        let context = Arc::clone(&self.context);
+        let mainloop = Arc::clone(&self.mainloop);
 
         // Wait for the context to be ready
         loop {
@@ -127,7 +127,7 @@ impl PulseAudioBackend {
                     ));
                 }
                 _ => {
-                    mainloop.wait();
+                    thread::sleep(Duration::from_millis(10));
                 }
             }
         }
@@ -140,16 +140,20 @@ impl PulseAudioBackend {
             let apps = Arc::clone(&apps_clone);
             move |result| {
                 if let pulse::callbacks::ListResult::Item(client) = result {
-                    if let (Some(app_name), Some(process_id)) =
-                        (client.name.as_ref(), client.process_id)
-                    {
-                        let mut apps = apps.lock().unwrap();
-                        apps.push(AudioApplication {
-                            name: app_name.to_string(),
-                            id: format!("app_{}", process_id),
-                            executable_name: app_name.to_string(),
-                            pid: process_id,
-                        });
+                    if let Some(app_name) = client.name.as_ref() {
+                        if let Some(process_id) = client
+                            .proplist
+                            .get_str("application.process.id")
+                            .and_then(|pid| pid.parse().ok())
+                        {
+                            let mut apps = apps.lock().unwrap();
+                            apps.push(AudioApplication {
+                                name: app_name.to_string(),
+                                id: format!("app_{}", process_id),
+                                executable_name: app_name.to_string(),
+                                pid: process_id,
+                            });
+                        }
                     }
                 }
                 if let pulse::callbacks::ListResult::End = result {
@@ -415,14 +419,14 @@ impl PulseAudioStream {
 impl AudioCaptureStream for PulseAudioStream {
     fn start(&mut self) -> Result<(), AudioError> {
         self.stream
-            .uncork()
+            .uncork(None)
             .map_err(|_| AudioError::CaptureError("Failed to start stream".into()))?;
         Ok(())
     }
 
     fn stop(&mut self) -> Result<(), AudioError> {
         self.stream
-            .cork()
+            .cork(None)
             .map_err(|_| AudioError::CaptureError("Failed to stop stream".into()))?;
         Ok(())
     }
@@ -432,19 +436,25 @@ impl AudioCaptureStream for PulseAudioStream {
         while bytes_read < buffer.len() {
             match self.stream.peek() {
                 Ok(data) => {
-                    let data_slice = data.data();
-                    if data_slice.is_empty() {
-                        break;
+                    if let pulse::stream::PeekResult::Data(data_slice) = data {
+                        if data_slice.is_empty() {
+                            break;
+                        }
+                        let to_copy = std::cmp::min(buffer.len() - bytes_read, data_slice.len());
+                        buffer[bytes_read..bytes_read + to_copy]
+                            .copy_from_slice(&data_slice[..to_copy]);
+                        bytes_read += to_copy;
+                        self.stream.discard().map_err(|e| {
+                            AudioError::CaptureError(format!("Failed to discard data: {}", e))
+                        })?;
                     }
-                    let to_copy = std::cmp::min(buffer.len() - bytes_read, data_slice.len());
-                    buffer[bytes_read..bytes_read + to_copy]
-                        .copy_from_slice(&data_slice[..to_copy]);
-                    bytes_read += to_copy;
-                    self.stream
-                        .discard()
-                        .map_err(|_| AudioError::CaptureError("Failed to discard data".into()))?;
                 }
-                Err(e) => return Err(AudioError::CaptureError(e.to_string())),
+                Err(e) => {
+                    return Err(AudioError::CaptureError(format!(
+                        "Failed to peek data: {}",
+                        e
+                    )))
+                }
             }
         }
         Ok(bytes_read)
@@ -498,23 +508,13 @@ impl PipeWireBackend {
             .and_then(|main_loop| {
                 PwContext::new(&main_loop)
                     .and_then(|context| context.connect(None))
-                    .is_ok()
+                    .map(|_| true)
             })
-            .is_ok()
-    }
-}
-
-// Implement Send for PipeWireBackend since we manage thread safety ourselves
-unsafe impl Send for PipeWireBackend {}
-
-impl AudioCaptureBackend for PipeWireBackend {
-    fn name(&self) -> &'static str {
-        "PipeWire"
+            .unwrap_or(false)
     }
 
     fn list_applications(&self) -> Result<Vec<AudioApplication>, AudioError> {
         let mut apps = Vec::new();
-        let apps_mutex = Arc::new(Mutex::new(&mut apps));
 
         // Add system-wide audio capture option
         apps.push(AudioApplication {
@@ -527,9 +527,10 @@ impl AudioCaptureBackend for PipeWireBackend {
         // Create a channel to signal when we're done collecting apps
         let (tx, rx) = std::sync::mpsc::channel();
         let tx = Arc::new(Mutex::new(tx));
+        let apps = Arc::new(Mutex::new(apps));
 
         let _listener = self.registry.add_listener_local().global({
-            let apps = Arc::clone(&apps_mutex);
+            let apps = Arc::clone(&apps);
             let tx = Arc::clone(&tx);
             move |global| {
                 if let Some(props) = &global.props {
@@ -563,7 +564,10 @@ impl AudioCaptureBackend for PipeWireBackend {
         let timeout = Duration::from_millis(100);
         let _ = rx.recv_timeout(timeout);
 
-        Ok(apps)
+        Ok(Arc::try_unwrap(apps)
+            .map_err(|_| AudioError::CaptureError("Failed to unwrap apps".into()))?
+            .into_inner()
+            .map_err(|_| AudioError::CaptureError("Failed to get inner value".into()))?)
     }
 
     fn capture_application(
@@ -578,8 +582,29 @@ impl AudioCaptureBackend for PipeWireBackend {
     }
 }
 
+// Implement Send for PipeWireBackend since we manage thread safety ourselves
+unsafe impl Send for PipeWireBackend {}
+
+impl AudioCaptureBackend for PipeWireBackend {
+    fn name(&self) -> &'static str {
+        "PipeWire"
+    }
+
+    fn list_applications(&self) -> Result<Vec<AudioApplication>, AudioError> {
+        self.list_applications()
+    }
+
+    fn capture_application(
+        &self,
+        app: &AudioApplication,
+        config: AudioConfig,
+    ) -> Result<Box<dyn AudioCaptureStream>, AudioError> {
+        self.capture_application(app, config)
+    }
+}
+
 pub struct PipeWireStream {
-    stream: Arc<Mutex<Option<pw::Stream>>>,
+    stream: Arc<Mutex<Option<PwStream>>>,
     config: AudioConfig,
     buffer: Arc<Mutex<Vec<u8>>>,
     _stream_thread: Option<thread::JoinHandle<()>>,
@@ -604,7 +629,7 @@ impl PipeWireStream {
             let context = PwContext::new(&main_loop).unwrap();
             let core = context.connect(None).unwrap();
 
-            let mut stream = pw::Stream::new(
+            let mut stream = PwStream::new(
                 &core,
                 if app.pid == 0 {
                     "system-audio-capture"
@@ -626,14 +651,14 @@ impl PipeWireStream {
             main_loop.run();
         });
 
-        // Store thread handle
-        threads.lock().unwrap().push(thread_handle.clone());
+        // Store thread handle without cloning
+        threads.lock().unwrap().push(thread_handle);
 
         Ok(Self {
             stream,
             config,
             buffer,
-            _stream_thread: Some(thread_handle),
+            _stream_thread: None,
         })
     }
 }
