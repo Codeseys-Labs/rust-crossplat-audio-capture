@@ -1,44 +1,67 @@
-version: '3.8'
+version: '3'
 
 services:
-  linux-pipewire:
+  rsac-linux:
     build:
       context: .
-      dockerfile: .docker/linux.Dockerfile
-    environment:
-      - AUDIO_BACKEND=pipewire
-      - RUST_BACKTRACE=1
-    volumes:
-      - .:/home/testuser/app
-    command: cargo test --verbose
-
-  linux-pulseaudio:
-    build:
-      context: .
-      dockerfile: .docker/linux.Dockerfile
-    environment:
-      - AUDIO_BACKEND=pulseaudio
-      - RUST_BACKTRACE=1
-    volumes:
-      - .:/home/testuser/app
-    command: cargo test --verbose
-
-  macos:
-    build:
-      context: .
-      dockerfile: .docker/macos.Dockerfile
-    environment:
-      - RUST_BACKTRACE=1
-    volumes:
-      - .:/home/testuser/app
-    command: cargo test --verbose
-
-  windows:
-    build:
-      context: .
-      dockerfile: .docker/windows.Dockerfile
-    environment:
-      - RUST_BACKTRACE=1
+      dockerfile: docker/linux/Dockerfile
     volumes:
       - .:/app
-    command: cargo test --verbose
+      - ./test-results:/test-results
+    # Give necessary permissions for audio
+    privileged: true
+    devices:
+      - /dev/snd:/dev/snd
+    environment:
+      - XDG_RUNTIME_DIR=/run/user/0
+      - PIPEWIRE_RUNTIME_DIR=/run/user/0
+      - RUST_BACKTRACE=1
+      - RUST_LOG=debug
+    # Keep the container running for debugging if needed
+    tty: true
+    stdin_open: true
+
+  rsac-windows:
+    build:
+      context: .
+      dockerfile: docker/windows/Dockerfile
+    container_name: windows-audio-test
+    environment:
+      - VERSION=11
+      - RAM_SIZE=4G
+      - CPU_CORES=2
+      - DISK_SIZE=64G
+      - USERNAME=TestUser
+      - PASSWORD=TestPass123
+      - AUDIO_ALLOW_INSECURE=1
+      - WASAPI_ALLOW_EXCLUSIVE=1
+      - AUDIO_DEVICE_PERIOD=50
+      - AUDIO_DEVICE_BUFFER_FRAMES=1024
+      - RUST_BACKTRACE=1
+      - RUST_LOG=debug
+    volumes:
+      - .:/app
+      - test_results:C:\test_results
+      - test_audio:C:\test_audio
+    isolation: process
+    deploy:
+      resources:
+        limits:
+          memory: 6G
+        reservations:
+          memory: 4G
+
+  rsac-macos:
+    build:
+      context: .
+      dockerfile: docker/macos/Dockerfile
+    volumes:
+      - .:/app
+      - test_audio:/test_audio
+    privileged: true
+    devices:
+      - /dev/snd:/dev/snd
+
+volumes:
+  test_results:
+  test_audio:
