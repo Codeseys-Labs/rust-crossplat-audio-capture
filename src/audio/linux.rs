@@ -22,7 +22,7 @@ use pipewire::{
     properties::properties,
     registry::Registry,
     spa::utils::Direction,
-    stream::{Stream as PwStream, StreamFlags, StreamState},
+    stream::{Stream as PwStream, StreamFlags},
 };
 
 use super::core::{
@@ -177,15 +177,15 @@ impl PulseAudioBackend {
         config: AudioConfig,
     ) -> Result<Box<dyn AudioCaptureStream>, AudioError> {
         let context = Arc::clone(&self.context);
-        let mainloop = Arc::clone(&self.mainloop);
+        let _mainloop = Arc::clone(&self.mainloop);
 
         // Create a stream for either system or application audio
         let stream = if app.pid == 0 {
             // System-wide capture
-            PulseAudioStream::new_system(context, mainloop, config)?
+            PulseAudioStream::new_system(context, _mainloop, config)?
         } else {
             // Application-specific capture
-            PulseAudioStream::new_application(context, mainloop, app, config)?
+            PulseAudioStream::new_application(context, _mainloop, app, config)?
         };
 
         Ok(Box::new(stream))
@@ -257,12 +257,30 @@ impl PulseAudioStream {
             )
             .map_err(|e| AudioError::InitializationFailed(e.to_string()))?;
 
+        // Fix Stream::new_with_proplist call by using a different approach
+        // We need a fresh context that we can get a mutable reference to
+        let mut new_context =
+            Context::new(&mainloop.borrow_mut(), "rsac-context").ok_or_else(|| {
+                AudioError::InitializationFailed("Failed to create new context".into())
+            })?;
+
+        // Connect and wait for context to be ready
+        new_context
+            .connect(None, ContextFlagSet::NOFLAGS, None)
+            .ok_or_else(|| AudioError::InitializationFailed("Failed to connect context".into()))?;
+
+        mainloop.lock();
+        while new_context.get_state() != pulse::context::State::Ready {
+            mainloop.wait();
+        }
+        mainloop.unlock();
+
         let stream = Stream::new_with_proplist(
-            &context,
-            &stream_name,
+            &mut new_context,
+            stream_name.to_str().unwrap(),
             &ss,
             None, // Use default channel map
-            &proplist,
+            &mut proplist,
         )
         .ok_or_else(|| {
             AudioError::InitializationFailed("Failed to create PulseAudio stream".into())
@@ -312,8 +330,25 @@ impl PulseAudioStream {
             return Err(AudioError::InvalidFormat("Invalid sample format".into()));
         }
 
-        let stream =
-            Stream::new(&context, "system-audio-capture", &spec, None).ok_or_else(|| {
+        // We need a fresh context that we can get a mutable reference to
+        let mut new_context = Context::new(&mainloop.borrow_mut(), "rsac-system-context")
+            .ok_or_else(|| {
+                AudioError::InitializationFailed("Failed to create new context".into())
+            })?;
+
+        // Connect and wait for context to be ready
+        new_context
+            .connect(None, ContextFlagSet::NOFLAGS, None)
+            .ok_or_else(|| AudioError::InitializationFailed("Failed to connect context".into()))?;
+
+        mainloop.lock();
+        while new_context.get_state() != pulse::context::State::Ready {
+            mainloop.wait();
+        }
+        mainloop.unlock();
+
+        let stream = Stream::new(&mut new_context, "system-audio-capture", &spec, None)
+            .ok_or_else(|| {
                 AudioError::InitializationFailed("Failed to create PulseAudio stream".into())
             })?;
 
@@ -360,7 +395,24 @@ impl PulseAudioStream {
 
         let stream_name = format!("rsac_capture_{}", app.pid);
 
-        let stream = Stream::new(&context, &stream_name, &spec, None).ok_or_else(|| {
+        // We need a fresh context that we can get a mutable reference to
+        let mut new_context =
+            Context::new(&mainloop.borrow_mut(), "rsac-app-context").ok_or_else(|| {
+                AudioError::InitializationFailed("Failed to create new context".into())
+            })?;
+
+        // Connect and wait for context to be ready
+        new_context
+            .connect(None, ContextFlagSet::NOFLAGS, None)
+            .ok_or_else(|| AudioError::InitializationFailed("Failed to connect context".into()))?;
+
+        mainloop.lock();
+        while new_context.get_state() != pulse::context::State::Ready {
+            mainloop.wait();
+        }
+        mainloop.unlock();
+
+        let stream = Stream::new(&mut new_context, &stream_name, &spec, None).ok_or_else(|| {
             AudioError::InitializationFailed("Failed to create PulseAudio stream".into())
         })?;
 
@@ -418,16 +470,18 @@ impl PulseAudioStream {
 
 impl AudioCaptureStream for PulseAudioStream {
     fn start(&mut self) -> Result<(), AudioError> {
-        self.stream
-            .uncork(None)
-            .map_err(|_| AudioError::CaptureError("Failed to start stream".into()))?;
+        let op = self.stream.uncork(None);
+        if op.is_null() {
+            return Err(AudioError::CaptureError("Failed to start stream".into()));
+        }
         Ok(())
     }
 
     fn stop(&mut self) -> Result<(), AudioError> {
-        self.stream
-            .cork(None)
-            .map_err(|_| AudioError::CaptureError("Failed to stop stream".into()))?;
+        let op = self.stream.cork(None);
+        if op.is_null() {
+            return Err(AudioError::CaptureError("Failed to stop stream".into()));
+        }
         Ok(())
     }
 
@@ -477,20 +531,20 @@ impl PipeWireBackend {
     pub fn new() -> Result<Self, AudioError> {
         pipewire::init();
 
-        let main_loop = MainLoop::new(None).map_err(|e| {
-            AudioError::InitializationFailed(format!("Failed to create PipeWire main loop: {}", e))
+        let main_loop = MainLoop::new(None).map_err(|_| {
+            AudioError::InitializationFailed("Failed to create PipeWire main loop".into())
         })?;
 
-        let context = PwContext::new(&main_loop).map_err(|e| {
-            AudioError::InitializationFailed(format!("Failed to create PipeWire context: {}", e))
+        let context = PwContext::new(&main_loop).map_err(|_| {
+            AudioError::InitializationFailed("Failed to create PipeWire context".into())
         })?;
 
-        let core = context.connect(None).map_err(|e| {
-            AudioError::InitializationFailed(format!("Failed to connect to PipeWire: {}", e))
+        let core = context.connect(None).map_err(|_| {
+            AudioError::InitializationFailed("Failed to connect to PipeWire".into())
         })?;
 
-        let registry = core.get_registry().map_err(|e| {
-            AudioError::InitializationFailed(format!("Failed to get PipeWire registry: {}", e))
+        let registry = core.get_registry().map_err(|_| {
+            AudioError::InitializationFailed("Failed to get PipeWire registry".into())
         })?;
 
         Ok(Self {
@@ -567,7 +621,7 @@ impl PipeWireBackend {
         Ok(Arc::try_unwrap(apps)
             .map_err(|_| AudioError::CaptureError("Failed to unwrap apps".into()))?
             .into_inner()
-            .map_err(|_| AudioError::CaptureError("Failed to get inner value".into()))?)
+            .map_err(|e| AudioError::CaptureError(e.to_string().unwrap_or_default()))?)
     }
 
     fn capture_application(
@@ -604,10 +658,17 @@ impl AudioCaptureBackend for PipeWireBackend {
 }
 
 pub struct PipeWireStream {
-    stream: Arc<Mutex<Option<PwStream>>>,
     config: AudioConfig,
     buffer: Arc<Mutex<Vec<u8>>>,
+    stream_command_tx: Option<std::sync::mpsc::Sender<StreamCommand>>,
     _stream_thread: Option<thread::JoinHandle<()>>,
+}
+
+// Define commands we can send to the stream thread
+enum StreamCommand {
+    Connect,
+    Disconnect,
+    Shutdown,
 }
 
 impl PipeWireStream {
@@ -617,72 +678,127 @@ impl PipeWireStream {
         config: AudioConfig,
         threads: Arc<Mutex<Vec<thread::JoinHandle<()>>>>,
     ) -> Result<Self, AudioError> {
-        let stream = Arc::new(Mutex::new(None));
         let buffer = Arc::new(Mutex::new(Vec::with_capacity(16384)));
-
-        let stream_clone = Arc::clone(&stream);
         let buffer_clone = Arc::clone(&buffer);
+
+        // Create channels for communication
+        let (cmd_tx, cmd_rx) = std::sync::mpsc::channel();
+        let (ready_tx, ready_rx) = std::sync::mpsc::channel();
+
+        // Create stream parameters to pass to the thread
+        let app_id = app.id.clone();
+        let app_pid = app.pid;
+        let config_clone = config.clone();
 
         // Create stream in a separate thread
         let thread_handle = thread::spawn(move || {
+            // Initialize PipeWire in this thread
+            pipewire::init();
+
             let main_loop = MainLoop::new(None).unwrap();
             let context = PwContext::new(&main_loop).unwrap();
             let core = context.connect(None).unwrap();
 
-            let mut stream = PwStream::new(
-                &core,
-                if app.pid == 0 {
-                    "system-audio-capture"
-                } else {
-                    "application-audio-capture"
-                },
-                properties! {
-                    "media.class" => "Audio/Source",
-                    "audio.channels" => config.channels.to_string(),
-                    "audio.rate" => config.sample_rate.to_string(),
-                    "target.object" => if app.pid == 0 { "default.monitor" } else { &app.id },
-                },
-            )
-            .unwrap();
+            // Create properties for the stream
+            let props = properties! {
+                "media.class" => "Audio/Source",
+                "audio.channels" => config_clone.channels.to_string(),
+                "audio.rate" => config_clone.sample_rate.to_string(),
+                "target.object" => if app_pid == 0 { "default.monitor" } else { &app_id },
+            };
 
-            *stream_clone.lock().unwrap() = Some(stream);
+            // Create the stream (without connecting)
+            let stream_name = if app_pid == 0 {
+                "system-audio-capture"
+            } else {
+                "application-audio-capture"
+            };
 
-            // Process events
-            main_loop.run();
+            let stream = match PwStream::new(&core, stream_name, props) {
+                Ok(s) => s,
+                Err(e) => {
+                    ready_tx
+                        .send(Err(format!("Failed to create PipeWire stream: {}", e)))
+                        .unwrap();
+                    return;
+                }
+            };
+
+            // We successfully created the stream
+            ready_tx.send(Ok(())).unwrap();
+
+            // Process commands from the main thread
+            let mut is_running = true;
+            while is_running {
+                // Process any pending PipeWire events
+                main_loop.iteration(Duration::from_millis(10));
+
+                // Check for commands
+                if let Ok(cmd) = cmd_rx.try_recv() {
+                    match cmd {
+                        StreamCommand::Connect => {
+                            let _ = stream.connect(
+                                Direction::Input,
+                                None,
+                                StreamFlags::AUTOCONNECT | StreamFlags::RT_PROCESS,
+                                &[],
+                            );
+                        }
+                        StreamCommand::Disconnect => {
+                            let _ = stream.disconnect();
+                        }
+                        StreamCommand::Shutdown => {
+                            is_running = false;
+                        }
+                    }
+                }
+            }
+
+            // Clean up
+            drop(stream);
+            drop(core);
+            drop(context);
+            main_loop.destroy();
         });
 
-        // Store thread handle without cloning
-        threads.lock().unwrap().push(thread_handle);
+        // Store thread handle
+        threads.lock().unwrap().push(thread_handle.clone());
 
-        Ok(Self {
-            stream,
-            config,
-            buffer,
-            _stream_thread: None,
-        })
+        // Wait for the stream to be created
+        match ready_rx.recv().map_err(|_| {
+            AudioError::InitializationFailed("Failed to initialize PipeWire thread".into())
+        })? {
+            Ok(()) => {
+                // Stream was created successfully
+                Ok(Self {
+                    config,
+                    buffer,
+                    stream_command_tx: Some(cmd_tx),
+                    _stream_thread: Some(thread_handle),
+                })
+            }
+            Err(e) => {
+                // Stream creation failed
+                Err(AudioError::InitializationFailed(e))
+            }
+        }
     }
 }
 
 impl AudioCaptureStream for PipeWireStream {
     fn start(&mut self) -> Result<(), AudioError> {
-        if let Some(stream) = &self.stream.lock().unwrap() {
-            stream
-                .connect(
-                    Direction::Input,
-                    None,
-                    StreamFlags::AUTOCONNECT | StreamFlags::RT_PROCESS,
-                    &[],
-                )
-                .map_err(|e| AudioError::CaptureError(e.to_string()))?;
+        if let Some(tx) = &self.stream_command_tx {
+            tx.send(StreamCommand::Connect)
+                .map_err(|_| AudioError::CaptureError("Failed to send connect command".into()))?;
         }
         Ok(())
     }
 
     fn stop(&mut self) -> Result<(), AudioError> {
-        if let Some(stream) = &self.stream.lock().unwrap() {
-            stream
-                .disconnect()
-                .map_err(|e| AudioError::CaptureError(e.to_string()))?;
+        if let Some(tx) = &self.stream_command_tx {
+            tx.send(StreamCommand::Disconnect).map_err(|_| {
+                AudioError::CaptureError("Failed to send disconnect command".into())
+            })?;
         }
         Ok(())
     }
@@ -699,6 +815,15 @@ impl AudioCaptureStream for PipeWireStream {
 
     fn config(&self) -> &AudioConfig {
         &self.config
+    }
+}
+
+impl Drop for PipeWireStream {
+    fn drop(&mut self) {
+        // Send shutdown command when the stream is dropped
+        if let Some(tx) = &self.stream_command_tx {
+            let _ = tx.send(StreamCommand::Shutdown);
+        }
     }
 }
 

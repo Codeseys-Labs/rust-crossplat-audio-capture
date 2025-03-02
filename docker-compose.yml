@@ -1,10 +1,11 @@
 version: '3'
 
 services:
-  rsac-linux:
+  # PipeWire - Application Capture
+  rsac-linux-pipewire-app:
     build:
       context: .
-      dockerfile: docker/linux/Dockerfile
+      dockerfile: docker/linux/Dockerfile.pipewire
     volumes:
       - .:/app
       - ./test-results:/test-results
@@ -20,7 +21,71 @@ services:
     # Keep the container running for debugging if needed
     tty: true
     stdin_open: true
+    command: bash -c "/app/docker/linux/test_pipewire_app.sh"
 
+  # PipeWire - System Capture
+  rsac-linux-pipewire-system:
+    build:
+      context: .
+      dockerfile: docker/linux/Dockerfile.pipewire
+    volumes:
+      - .:/app
+      - ./test-results:/test-results
+    # Give necessary permissions for audio
+    privileged: true
+    devices:
+      - /dev/snd:/dev/snd
+    environment:
+      - XDG_RUNTIME_DIR=/run/user/0
+      - PIPEWIRE_RUNTIME_DIR=/run/user/0
+      - RUST_BACKTRACE=1
+      - RUST_LOG=debug
+    # Keep the container running for debugging if needed
+    tty: true
+    stdin_open: true
+    command: bash -c "/app/docker/linux/test_pipewire_system.sh"
+
+  # PulseAudio - Application Capture
+  rsac-linux-pulseaudio-app:
+    build:
+      context: .
+      dockerfile: docker/linux/Dockerfile.pulseaudio
+    volumes:
+      - .:/app
+      - ./test-results:/test-results
+    # Give necessary permissions for audio
+    privileged: true
+    devices:
+      - /dev/snd:/dev/snd
+    environment:
+      - RUST_BACKTRACE=1
+      - RUST_LOG=debug
+    # Keep the container running for debugging if needed
+    tty: true
+    stdin_open: true
+    command: bash -c "/app/docker/linux/test_pulseaudio_app.sh"
+
+  # PulseAudio - System Capture
+  rsac-linux-pulseaudio-system:
+    build:
+      context: .
+      dockerfile: docker/linux/Dockerfile.pulseaudio
+    volumes:
+      - .:/app
+      - ./test-results:/test-results
+    # Give necessary permissions for audio
+    privileged: true
+    devices:
+      - /dev/snd:/dev/snd
+    environment:
+      - RUST_BACKTRACE=1
+      - RUST_LOG=debug
+    # Keep the container running for debugging if needed
+    tty: true
+    stdin_open: true
+    command: bash -c "/app/docker/linux/test_pulseaudio_system.sh"
+
+  # Keeping other platforms for reference
   rsac-windows:
     build:
       context: .

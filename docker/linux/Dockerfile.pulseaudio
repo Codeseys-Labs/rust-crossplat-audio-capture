@@ -1,0 +1,44 @@
+FROM ubuntu:22.04
+
+# Set environment variables
+ENV DEBIAN_FRONTEND=noninteractive
+ENV DISPLAY=:99
+ENV LIBCLANG_PATH=/usr/lib/llvm-14/lib
+
+# Install dependencies
+RUN apt-get update && apt-get install -y \
+    curl wget build-essential pkg-config \
+    libclang-dev llvm-14 clang-14 \
+    xvfb dbus \
+    pulseaudio pulseaudio-utils libpulse-dev \
+    && mkdir -p /run/dbus
+
+# Install Rust
+RUN curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y
+ENV PATH="/root/.cargo/bin:${PATH}"
+
+# Create app directory
+RUN mkdir -p /app
+WORKDIR /app
+
+# Create test results directory
+RUN mkdir -p /test-results
+
+# Copy project files
+COPY . /app/
+
+# Copy pulse configuration files
+COPY docker/linux/pulse-client.conf /etc/pulse/client.conf
+COPY docker/linux/pulse-daemon.conf /etc/pulse/daemon.conf
+
+# Make test scripts executable
+RUN chmod +x /app/docker/linux/test_pulseaudio_app.sh
+RUN chmod +x /app/docker/linux/test_pulseaudio_system.sh
+
+# Start Xvfb, D-Bus, PulseAudio
+CMD /usr/bin/dbus-daemon --system --nofork --nopidfile & \
+    Xvfb :99 -screen 0 1024x768x24 & \
+    sleep 2 && \
+    pulseaudio --start & \
+    sleep 2 && \
+    /bin/bash 

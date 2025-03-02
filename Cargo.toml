@@ -7,7 +7,7 @@ edition = "2021"
 # Core dependencies
 hound = "3.5.1"
 sysinfo = "0.33.1"
-clap = { version = "4.5.27", features = ["derive"] }
+clap = { version = "4.5.31", features = ["derive"] }
 inquire = "0.7.5"
 indicatif = "0.17.11"
 color-eyre = "0.6.3"
@@ -43,7 +43,7 @@ thiserror = "2.0.11"
 
 [dev-dependencies]
 criterion = "0.5.1" # Benchmarking
-tempfile = "3.16.0" # Temporary files for tests
+tempfile = "3.17.1" # Temporary files for tests
 
 [[example]]
 name = "wav_demo"
@@ -68,6 +68,10 @@ path = "examples/test_coreaudio_app.rs"
 [[example]]
 name = "test_tone"
 path = "examples/test_tone.rs"
+
+[[example]]
+name = "test_pipewire"
+path = "examples/test_pipewire.rs"
 
 [workspace]
 members = []
