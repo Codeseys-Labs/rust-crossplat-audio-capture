@@ -307,28 +307,28 @@ impl AudioDevice for MacosAudioDevice {
         // 7. Convert capture_config.stream_config.format to an AudioStreamBasicDescription (ASBD)
         let asbd = audio_format_to_asbd(&capture_config.stream_config.format);
 
-        // 8. Set stream format on AU's input scope, input bus (for the captured audio)
-        // Note: Some examples set this on the OUTPUT scope of the INPUT bus.
-        // For AUHAL capture, it's typically the input scope of the input bus, or output scope of input bus.
-        // Let's try input scope of input bus first.
+        // 8. Set stream format for the captured audio.
+        // This is set on the OUTPUT scope of the INPUT bus (Element 1).
+        // This defines the format of the audio data that the AudioUnit will make available
+        // *from* its input bus (i.e., the captured audio stream from the device).
         audio_unit
             .set_property(
                 kAudioUnitProperty_StreamFormat,
-                Scope::Output, // Output scope of the input bus for capture format
-                audio_unit_element::INPUT_BUS,
+                Scope::Output,                 // Data flowing OUT of the INPUT bus
+                audio_unit_element::INPUT_BUS, // The bus providing captured audio
                 Some(&asbd),
             )
             .map_err(MacosDeviceEnumerator::map_ca_error)?;
 
-        // Also set the client format on the input scope of the output bus if needed,
-        // but for capture, the above should define what we get from the input bus.
-        // Let's also set it on the input scope of the output bus as per some examples for client format.
-        // This defines the format the AudioUnit expects from its input side (which is our capture source).
+        // Set the "client" format on the INPUT scope of the OUTPUT bus (Element 0).
+        // This defines the format that the AudioUnit's output bus would expect on its input side
+        // if it were rendering audio (which it isn't, as output IO is disabled).
+        // For loopback capture, it's common to set this to the same format as the capture format.
         audio_unit
             .set_property(
                 kAudioUnitProperty_StreamFormat,
-                Scope::Input, // Input scope of the output bus for client data format
-                audio_unit_element::OUTPUT_BUS, // This is where the AUHAL *outputs* captured data
+                Scope::Input,                   // Data flowing INTO the OUTPUT bus
+                audio_unit_element::OUTPUT_BUS, // The bus that would normally render to speakers
                 Some(&asbd),
             )
             .map_err(MacosDeviceEnumerator::map_ca_error)?;
