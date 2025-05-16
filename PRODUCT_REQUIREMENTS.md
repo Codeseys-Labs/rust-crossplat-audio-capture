@@ -121,8 +121,18 @@ The library must allow users to configure:
 ### 5.4. Maintainability
 
 - **Modular Design:** Code should be well-structured and modular to facilitate maintenance and future enhancements.
-- **Testability:** Implement comprehensive unit and integration tests for all supported platforms and backends.
-- **CI/CD:** Utilize continuous integration and continuous deployment practices to ensure code quality and automate releases.
+- **Comprehensive Testing and CI/CD Strategy:** To ensure code quality, maintain reliability across platforms, and catch regressions early in the development cycle, the following practices and infrastructure are required:
+  - **Comprehensive Docker-based Testing:**
+    - Establish and maintain Docker environments for each supported platform (Windows, Linux, macOS) to run automated tests.
+    - Ensure tests cover various configurations, including different audio backends (WASAPI, PipeWire, PulseAudio, CoreAudio), and, where feasible within a Dockerized environment, different audio parameters (e.g., sample rates, formats).
+    - The existing Dockerfiles in the [`docker/`](docker/) directory should be leveraged, maintained, and expanded as necessary to support this testing strategy.
+  - **Continuous Integration/Continuous Deployment (CI/CD):**
+    - Implement and maintain a robust CI/CD pipeline (e.g., using GitHub Actions or a similar service).
+    - The pipeline must automatically build the library and execute the full suite of Dockerized tests on every push to the main development branch and for every pull request submitted.
+    - The pipeline should provide clear feedback on build status and test results.
+  - **Test Coverage:**
+    - Aim for and maintain a high level of test coverage for the library's core functionalities, platform-specific implementations, and critical audio processing paths.
+    - Coverage metrics should be tracked, and efforts made to improve coverage for new and existing code.
 
 ### 5.5. Compatibility
 
