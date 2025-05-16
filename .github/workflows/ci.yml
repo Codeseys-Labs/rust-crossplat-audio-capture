@@ -54,3 +54,32 @@ jobs:
 
       - name: Build Docker image and run tests (Linux)
         run: docker build --file docker/linux/Dockerfile --tag rust-audio-capture-linux-test:latest .
+  coverage:
+    name: Code Coverage
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Install Rust stable
+        uses: actions-rs/toolchain@v1
+        with:
+          toolchain: stable
+          profile: minimal
+          override: true
+
+      - name: Cache Cargo dependencies
+        uses: Swatinem/rust-cache@v2
+
+      - name: Install cargo-tarpaulin
+        run: cargo install cargo-tarpaulin --version 0.27.3 # Pinned version
+
+      - name: Generate code coverage
+        run: cargo tarpaulin --all-features --workspace --out Lcov --output-dir coverage/ --run-types Tests Lib # Focus on library and test code
+
+      - name: Upload coverage to Codecov
+        uses: codecov/codecov-action@v4
+        with:
+          # token: ${{ secrets.CODECOV_TOKEN }} # Only if needed for private repo
+          files: ./coverage/lcov.info
+          fail_ci_if_error: true
