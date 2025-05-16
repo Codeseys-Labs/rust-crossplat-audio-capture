@@ -38,6 +38,7 @@ use std::sync::{
 };
 use std::pin::Pin; // Required for Pin<Box<...>> in to_async_stream
 
+pub mod tap;
 // Imports for application enumeration
 use cocoa::base::{id, nil};
 use cocoa::foundation::{NSArray, NSString};
