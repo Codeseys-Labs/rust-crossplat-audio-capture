@@ -123,3 +123,93 @@ Tests generate reports in JSON format that can be combined into an HTML report u
 
 - Individual JSON reports: `./test-results/{backend}_{test}_*.json`
 - HTML report: `./test-results/test_report.html`
+
+---
+
+## Running Tests
+
+This section details how to execute the various test suites for the `rust-crossplat-audio-capture` project.
+
+### Local Testing
+
+To run tests locally on your machine:
+
+**Prerequisites:**
+
+- Ensure Rust stable is installed.
+- Platform-specific audio backends (e.g., PulseAudio/PipeWire on Linux, WASAPI on Windows, CoreAudio on macOS) should be available for full test coverage on respective OSes.
+
+**Command:**
+
+```bash
+cargo test --all-features --all-targets
+```
+
+This command will compile and run all tests defined in the project, including unit and integration tests, across all available features and target configurations.
+
+### Dockerized Linux Testing
+
+For a consistent Linux testing environment, tests can be run within a Docker container.
+
+**Command:**
+To build the Docker image and run tests:
+
+```bash
+docker build --file docker/linux/Dockerfile --tag rust-audio-capture-linux-test:latest .
+```
+
+**Explanation:**
+The [`docker/linux/Dockerfile`](docker/linux/Dockerfile:1) is configured to run `cargo test --all-features --all-targets` as part of the image build process. A successful build of this Docker image indicates that all tests passed within the defined Linux container environment.
+
+### CI/CD Pipeline Overview
+
+Our Continuous Integration and Continuous Delivery (CI/CD) pipeline is managed using GitHub Actions. The workflow is defined in [`.github/workflows/ci.yml`](.github/workflows/ci.yml:1).
+
+**Triggers:**
+The CI pipeline is automatically triggered on:
+
+- Push events to the `main` or `master` branch.
+- Pull request events targeting the `main` or `master` branch.
+
+**Jobs:**
+The pipeline consists of the following key jobs:
+
+1.  **`build_and_test`**:
+
+    - Runs on: Linux, Windows, and macOS native runners.
+    - Tasks:
+      - Checks code formatting using `cargo fmt --all -- --check`.
+      - Lints the code using `cargo clippy --all-targets --all-features -- -D warnings`.
+      - Builds the project.
+      - Runs tests using `cargo test --all-features --all-targets`.
+
+2.  **`docker_linux_test`**:
+
+    - Runs on: Linux runner.
+    - Tasks: Builds the Linux Docker image defined in [`docker/linux/Dockerfile`](docker/linux/Dockerfile:1). This process includes running `cargo test --all-features --all-targets` inside the container.
+
+3.  **`coverage`**:
+    - Runs on: Linux runner.
+    - Tasks:
+      - Generates a code coverage report using `cargo-tarpaulin`.
+      - Uploads the coverage report to Codecov.io.
+
+**Interpreting Results:**
+
+- CI run statuses can be monitored on the "Actions" tab of the GitHub repository.
+- For pull requests, these checks (formatting, linting, tests on all platforms, Dockerized Linux tests, coverage) will be reported directly on the pull request page.
+- Code coverage reports are available on Codecov.io. A link to the report is usually posted as a comment in pull requests by the Codecov bot, or can be found by navigating to the project's page on Codecov.
+
+### Troubleshooting
+
+Here are a few common issues and their solutions:
+
+- **Dockerized tests fail:**
+  - Ensure Docker daemon is running on your system.
+  - Check for sufficient disk space for Docker images.
+- **Local build/test errors:**
+  - Update your Rust toolchain: `rustup update stable`.
+  - Ensure all necessary platform-specific development libraries for audio backends are installed.
+- **Coverage report not appearing:**
+  - Verify the Codecov token is correctly configured in GitHub Actions secrets (for maintainers).
+  - Check the `coverage` job logs in GitHub Actions for any errors during report generation or upload.
