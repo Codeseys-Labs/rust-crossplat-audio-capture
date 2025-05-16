@@ -25,19 +25,27 @@ use wasapi::{
 
 // --- New Skeleton Implementations ---
 
+use crate::core::config::SampleFormat;
 use crate::core::interface::DeviceId;
 use std::ffi::OsStr;
 use std::os::windows::ffi::OsStrExt;
-use windows::core::{HRESULT, PWSTR};
-use windows::Win32::Foundation::E_NOTFOUND;
+use std::ptr;
+use std::sync::Arc;
+use windows::core::{GUID, HRESULT, PWSTR};
+use windows::Win32::Foundation::{E_NOTFOUND, S_FALSE, S_OK};
 use windows::Win32::Media::Audio::{
-    eAll, eCapture, eConsole, eRender, IMMDevice, IMMDeviceCollection, IMMDeviceEnumerator,
-    MMDeviceEnumerator, DEVICE_STATE_ACTIVE,
+    eAll, eCapture, eConsole, eRender, IAudioCaptureClient, IAudioClient, IMMDevice,
+    IMMDeviceCollection, IMMDeviceEnumerator, IMMEndpoint, MMDeviceEnumerator,
+    AUDCLNT_SHAREMODE_SHARED, AUDCLNT_STREAMFLAGS_LOOPBACK, CLSCTX_ALL, DEVICE_STATE_ACTIVE,
+    WAVEFORMATEX, WAVE_FORMAT_IEEE_FLOAT, WAVE_FORMAT_PCM,
 };
 use windows::Win32::System::Com::{
-    CoCreateInstance, CoInitializeEx, CoUninitialize, CLSCTX_ALL, COINIT_MULTITHREADED,
-    RPC_E_CHANGED_MODE,
-}; // Assuming DeviceId is String or similar
+    CoCreateInstance, CoInitializeEx, CoTaskMemFree, CoUninitialize, IPropertyStore, CLSCTX_ALL,
+    COINIT_MULTITHREADED, RPC_E_CHANGED_MODE, STGM_READ,
+};
+use windows::Win32::System::Propsystem::PropVariantClear;
+use windows::Win32::System::Variant::{PROPVARIANT, VT_EMPTY, VT_LPWSTR};
+use windows::Win32::UI::Shell::PropertiesSystem::PKEY_Device_FriendlyName;
 
 /// Ensures COM is initialized for the current thread and uninitializes it when dropped.
 ///
@@ -96,67 +104,357 @@ impl Drop for ComInitializer {
 #[derive(Debug)] // IMMDevice itself is a COM interface pointer, Debug should be fine.
 pub(crate) struct WindowsAudioDevice {
     device: IMMDevice,
-    // _com_initializer: Arc<ComInitializer>, // Potentially needed if IMMDevice methods require COM to be alive
-    // and this struct outlives the enumerator. For now, assume not.
+    com_initializer: Arc<ComInitializer>,
 }
 
 impl WindowsAudioDevice {
     /// Creates a new `WindowsAudioDevice` from an `IMMDevice`.
-    fn new(device: IMMDevice) -> Self {
-        Self { device }
+    /// Creates a new `WindowsAudioDevice` from an `IMMDevice` and a `ComInitializer`.
+    fn new(device: IMMDevice, com_initializer: Arc<ComInitializer>) -> Self {
+        Self {
+            device,
+            com_initializer,
+        }
+    }
+
+    /// Helper function to convert a PWSTR to a String.
+    /// Assumes the PWSTR is null-terminated.
+    unsafe fn pwstr_to_string(pwstr: PWSTR) -> AudioResult<String> {
+        if pwstr.is_null() {
+            return Err(AudioError::BackendSpecificError(
+                "PWSTR pointer was null".into(),
+            ));
+        }
+        pwstr.to_string().map_err(|e| {
+            AudioError::BackendSpecificError(format!("Failed to convert PWSTR to string: {:?}", e))
+        })
+    }
+
+    /// Helper function to convert an `AudioFormat` to a `WAVEFORMATEX`.
+    fn audio_format_to_waveformat_ex(format: &AudioFormat) -> AudioResult<WAVEFORMATEX> {
+        let w_format_tag = match format.sample_format {
+            SampleFormat::S16LE | SampleFormat::S32LE | SampleFormat::S8 | SampleFormat::U8 => {
+                WAVE_FORMAT_PCM
+            }
+            SampleFormat::F32LE => WAVE_FORMAT_IEEE_FLOAT,
+            // TODO: Add other sample format mappings if necessary
+            _ => {
+                return Err(AudioError::UnsupportedFormat(format!(
+                    "Unsupported sample format for WAVEFORMATEX conversion: {:?}",
+                    format.sample_format
+                )))
+            }
+        };
+
+        if format.bits_per_sample == 0 || format.channels == 0 {
+            return Err(AudioError::InvalidParameter(
+                "Bits per sample and channels must be non-zero".to_string(),
+            ));
+        }
+        let block_align = format.channels * (format.bits_per_sample / 8);
+        if block_align == 0 {
+            return Err(AudioError::InvalidParameter(
+                "Calculated block_align is zero, check bits_per_sample and channels".to_string(),
+            ));
+        }
+
+        Ok(WAVEFORMATEX {
+            wFormatTag: w_format_tag.0 as u16, // WAVE_FORMAT_PCM or WAVE_FORMAT_IEEE_FLOAT
+            nChannels: format.channels,
+            nSamplesPerSec: format.sample_rate,
+            nAvgBytesPerSec: format.sample_rate * block_align as u32,
+            nBlockAlign: block_align,
+            wBitsPerSample: format.bits_per_sample,
+            cbSize: 0, // Typically 0 for PCM and IEEE_FLOAT
+        })
+    }
+
+    /// Helper function to convert a `*mut WAVEFORMATEX` to an `AudioFormat`.
+    /// The caller is responsible for freeing the `WAVEFORMATEX` memory.
+    unsafe fn waveformat_ex_to_audio_format(
+        wave_format_ptr: *const WAVEFORMATEX,
+    ) -> AudioResult<AudioFormat> {
+        if wave_format_ptr.is_null() {
+            return Err(AudioError::BackendSpecificError(
+                "WAVEFORMATEX pointer was null".into(),
+            ));
+        }
+        let wf = &*wave_format_ptr;
+
+        let sample_format = match wf.wFormatTag as u32 {
+            WAVE_FORMAT_PCM => match wf.wBitsPerSample {
+                8 => SampleFormat::U8, // Or S8, common for PCM 8-bit to be U8
+                16 => SampleFormat::S16LE,
+                32 => SampleFormat::S32LE,
+                _ => {
+                    return Err(AudioError::UnsupportedFormat(format!(
+                        "Unsupported bits per sample for PCM: {}",
+                        wf.wBitsPerSample
+                    )))
+                }
+            },
+            WAVE_FORMAT_IEEE_FLOAT => match wf.wBitsPerSample {
+                32 => SampleFormat::F32LE,
+                _ => {
+                    return Err(AudioError::UnsupportedFormat(format!(
+                        "Unsupported bits per sample for IEEE FLOAT: {}",
+                        wf.wBitsPerSample
+                    )))
+                }
+            },
+            _ => {
+                return Err(AudioError::UnsupportedFormat(format!(
+                    "Unsupported wFormatTag: {}",
+                    wf.wFormatTag
+                )))
+            }
+        };
+
+        Ok(AudioFormat {
+            sample_rate: wf.nSamplesPerSec,
+            channels: wf.nChannels,
+            bits_per_sample: wf.wBitsPerSample,
+            sample_format,
+        })
     }
 }
 
 impl AudioDevice for WindowsAudioDevice {
-    type DeviceId = DeviceId; // This is String as per crate::core::interface::DeviceId
-
-    fn get_id(&self) -> Self::DeviceId {
-        // TODO: Implement in subtask 4.3: Get device ID string from self.device
-        // For example, using IPropertyStore to get PKEY_Device_FriendlyName or PKEY_Device_InstanceId
-        // For now, as per task 4.2, this is todo.
-        todo!("WindowsAudioDevice::get_id()")
+    /// Gets the unique identifier for this audio device.
+    /// This ID is typically a string provided by the underlying OS audio backend.
+    fn get_id(&self) -> AudioResult<DeviceId> {
+        unsafe {
+            let mut id_pwstr: PWSTR = PWSTR::null();
+            self.device.GetId(&mut id_pwstr).map_err(|hr| {
+                AudioError::BackendSpecificError(format!(
+                    "IMMDevice::GetId failed (HRESULT: {:?})",
+                    hr
+                ))
+            })?;
+            let id_str = Self::pwstr_to_string(id_pwstr)?;
+            CoTaskMemFree(Some(id_pwstr.as_ptr().cast()));
+            Ok(id_str)
+        }
     }
 
-    fn get_name(&self) -> String {
-        // TODO: Implement in subtask 4.3: Get device friendly name from self.device
-        todo!("WindowsAudioDevice::get_name()")
+    /// Gets the human-readable friendly name of this audio device.
+    fn get_name(&self) -> AudioResult<String> {
+        unsafe {
+            let property_store: IPropertyStore =
+                self.device.OpenPropertyStore(STGM_READ).map_err(|hr| {
+                    AudioError::BackendSpecificError(format!(
+                        "IMMDevice::OpenPropertyStore failed (HRESULT: {:?})",
+                        hr
+                    ))
+                })?;
+
+            let mut prop_variant = PROPVARIANT::default();
+            property_store
+                .GetValue(&PKEY_Device_FriendlyName, &mut prop_variant)
+                .map_err(|hr| AudioError::BackendSpecificError(format!("IPropertyStore::GetValue for PKEY_Device_FriendlyName failed (HRESULT: {:?})", hr)))?;
+
+            let name = if prop_variant.vt == VT_LPWSTR {
+                let name_pwstr = prop_variant.data.pwszVal;
+                Self::pwstr_to_string(name_pwstr)
+            } else {
+                Err(AudioError::BackendSpecificError(format!(
+                    "PKEY_Device_FriendlyName was not a string (VT: {:?})",
+                    prop_variant.vt
+                )))
+            };
+            PropVariantClear(&mut prop_variant).map_err(|hr| {
+                AudioError::BackendSpecificError(format!(
+                    "PropVariantClear failed (HRESULT: {:?})",
+                    hr
+                ))
+            })?;
+            name
+        }
     }
 
+    /// Determines the kind of device (Input or Output).
+    fn kind(&self) -> AudioResult<DeviceKind> {
+        // QueryInterface for IMMEndpoint
+        let endpoint: IMMEndpoint = self.device.cast().map_err(|hr| {
+            AudioError::BackendSpecificError(format!(
+                "Failed to cast IMMDevice to IMMEndpoint (HRESULT: {:?})",
+                hr
+            ))
+        })?;
+
+        unsafe {
+            let mut data_flow_val = Default::default();
+            endpoint.GetDataFlow(&mut data_flow_val).map_err(|hr| {
+                AudioError::BackendSpecificError(format!(
+                    "IMMEndpoint::GetDataFlow failed (HRESULT: {:?})",
+                    hr
+                ))
+            })?;
+
+            match data_flow_val {
+                eRender => Ok(DeviceKind::Output),
+                eCapture => Ok(DeviceKind::Input),
+                _ => Err(AudioError::BackendSpecificError(format!(
+                    "Unknown data flow value: {:?}",
+                    data_flow_val
+                ))),
+            }
+        }
+    }
+
+    /// Gets the default audio format for this device in shared mode.
+    /// Returns `Ok(None)` if the device does not have a default mix format.
+    fn get_default_format(&self) -> AudioResult<Option<AudioFormat>> {
+        unsafe {
+            let audio_client: IAudioClient =
+                self.device.Activate(CLSCTX_ALL, None).map_err(|hr| {
+                    AudioError::BackendSpecificError(format!(
+                        "IMMDevice::Activate(IAudioClient) failed (HRESULT: {:?})",
+                        hr
+                    ))
+                })?;
+
+            let wave_format_ptr = audio_client.GetMixFormat().map_err(|hr| {
+                AudioError::BackendSpecificError(format!(
+                    "IAudioClient::GetMixFormat failed (HRESULT: {:?})",
+                    hr
+                ))
+            })?;
+
+            if wave_format_ptr.is_null() {
+                // This case might indicate no mix format is available or an error,
+                // but GetMixFormat returning S_OK with null is unlikely.
+                // More likely an error HRESULT would be returned.
+                // However, to be safe, handle null.
+                return Ok(None);
+            }
+
+            let audio_format = Self::waveformat_ex_to_audio_format(wave_format_ptr)?;
+            CoTaskMemFree(Some(wave_format_ptr.cast()));
+            Ok(Some(audio_format))
+        }
+    }
+
+    /// Gets a list of supported audio formats for this device.
+    /// For WASAPI, this can be complex. This implementation currently returns
+    /// only the default format if available.
     fn get_supported_formats(&self) -> AudioResult<Vec<AudioFormat>> {
-        // TODO: Implement in subtask 4.3
-        todo!("WindowsAudioDevice::get_supported_formats()")
+        // TODO: Implement more thorough format enumeration by trying various formats
+        // with IAudioClient::IsFormatSupported in shared and exclusive modes.
+        match self.get_default_format()? {
+            Some(format) => Ok(vec![format]),
+            None => Ok(Vec::new()),
+        }
     }
 
-    fn get_default_format(&self) -> AudioResult<AudioFormat> {
-        // TODO: Implement in subtask 4.3
-        todo!("WindowsAudioDevice::get_default_format()")
+    /// Checks if a specific audio format is supported by this device in shared mode.
+    fn is_format_supported(&self, format_to_check: &AudioFormat) -> AudioResult<bool> {
+        unsafe {
+            let audio_client: IAudioClient =
+                self.device.Activate(CLSCTX_ALL, None).map_err(|hr| {
+                    AudioError::BackendSpecificError(format!(
+                        "IMMDevice::Activate(IAudioClient) failed (HRESULT: {:?})",
+                        hr
+                    ))
+                })?;
+
+            let native_format_to_check = Self::audio_format_to_waveformat_ex(format_to_check)?;
+            let mut closest_match_ptr: *mut WAVEFORMATEX = ptr::null_mut();
+
+            let hr = audio_client.IsFormatSupported(
+                AUDCLNT_SHAREMODE_SHARED,
+                &native_format_to_check,
+                Some(&mut closest_match_ptr),
+            );
+
+            if !closest_match_ptr.is_null() {
+                CoTaskMemFree(Some(closest_match_ptr.cast()));
+            }
+
+            if hr == S_OK {
+                Ok(true)
+            } else if hr == S_FALSE {
+                Ok(false) // Format not supported, closest_match_ptr might point to a suggestion
+            } else if hr == E_NOTFOUND {
+                // AUDCLNT_E_UNSUPPORTED_FORMAT
+                Ok(false)
+            } else {
+                Err(AudioError::BackendSpecificError(format!(
+                    "IAudioClient::IsFormatSupported failed (HRESULT: {:?})",
+                    hr
+                )))
+            }
+        }
     }
 
-    fn is_input(&self) -> bool {
-        // TODO: Implement in subtask 4.3: Determine if it's an input device
-        todo!("WindowsAudioDevice::is_input()")
-    }
+    /// Creates a new capturing audio stream for this device.
+    ///
+    /// # Arguments
+    /// * `config` - The desired stream configuration (sample rate, channels, etc.).
+    ///
+    /// For this subtask (4.3), this method initializes the required WASAPI clients
+    /// (`IAudioClient`, `IAudioCaptureClient`) and constructs a `WindowsAudioStream`
+    /// instance. The actual streaming methods (`start`, `read_chunk`, etc.) on
+    /// `WindowsAudioStream` will be implemented in a subsequent subtask (4.4).
+    fn create_stream(&mut self, config: StreamConfig) -> AudioResult<Box<dyn CapturingStream>> {
+        unsafe {
+            let audio_client: IAudioClient =
+                self.device.Activate(CLSCTX_ALL, None).map_err(|hr| {
+                    AudioError::BackendSpecificError(format!(
+                        "IMMDevice::Activate(IAudioClient) failed (HRESULT: {:?})",
+                        hr
+                    ))
+                })?;
 
-    fn is_output(&self) -> bool {
-        // TODO: Implement in subtask 4.3: Determine if it's an output device
-        todo!("WindowsAudioDevice::is_output()")
-    }
+            let wave_format_ex =
+                Self::audio_format_to_waveformat_ex(&config.format).map_err(|e| {
+                    AudioError::InvalidParameter(format!(
+                        "Failed to convert AudioFormat to WAVEFORMATEX for stream creation: {}",
+                        e
+                    ))
+                })?;
 
-    fn is_active(&self) -> bool {
-        // TODO: Implement in subtask 4.3: Check device state
-        todo!("WindowsAudioDevice::is_active()")
-    }
+            // For loopback capture, buffer duration and periodicity are often set to 0 for event-driven mode.
+            // These might need to be configurable or calculated based on needs later.
+            // AUDCLNT_STREAMFLAGS_LOOPBACK is key for capturing system audio.
+            audio_client
+                .Initialize(
+                    AUDCLNT_SHAREMODE_SHARED,
+                    AUDCLNT_STREAMFLAGS_LOOPBACK, // For capturing output
+                    0,                            // hnsBufferDuration (0 for default/event-driven)
+                    0,                            // hnsPeriodicity (0 for default)
+                    &wave_format_ex,
+                    None, // AudioSessionGuid (None for default)
+                )
+                .map_err(|hr| {
+                    AudioError::BackendSpecificError(format!(
+                        "IAudioClient::Initialize failed (HRESULT: {:?})",
+                        hr
+                    ))
+                })?;
 
-    fn is_format_supported(&self, _format: &AudioFormat) -> AudioResult<bool> {
-        // TODO: Implement in subtask 4.3
-        todo!("WindowsAudioDevice::is_format_supported()")
+            let capture_client: IAudioCaptureClient = audio_client.GetService().map_err(|hr| {
+                AudioError::BackendSpecificError(format!(
+                    "IAudioClient::GetService(IAudioCaptureClient) failed (HRESULT: {:?})",
+                    hr
+                ))
+            })?;
+
+            // As per task 4.3, WindowsAudioStream methods are todo!(), but the struct is created.
+            Ok(Box::new(WindowsAudioStream::new(
+                audio_client,
+                capture_client,
+                wave_format_ex, // Store the format it was initialized with
+                self.com_initializer.clone(),
+            )))
+        }
     }
 }
 
 /// Enumerates audio devices available on a Windows system using WASAPI.
 #[derive(Debug)]
 pub struct WindowsDeviceEnumerator {
-    _com_initializer: ComInitializer,
+    com_initializer: Arc<ComInitializer>, // Changed to Arc
     enumerator: IMMDeviceEnumerator,
 }
 
@@ -166,7 +464,7 @@ impl WindowsDeviceEnumerator {
     /// This will initialize COM for the lifetime of the enumerator and
     /// create an `IMMDeviceEnumerator` instance.
     pub fn new() -> AudioResult<Self> {
-        let com_initializer = ComInitializer::new()?;
+        let com_initializer = Arc::new(ComInitializer::new()?);
         // SAFETY: CoCreateInstance is called to create a COM object.
         // The HRESULT is checked for errors.
         let enumerator: IMMDeviceEnumerator =
@@ -180,7 +478,7 @@ impl WindowsDeviceEnumerator {
             )?;
 
         Ok(Self {
-            _com_initializer: com_initializer,
+            com_initializer, // Store Arc
             enumerator,
         })
     }
@@ -224,7 +522,10 @@ impl DeviceEnumerator for WindowsDeviceEnumerator {
                     i, hr
                 ))
             })?;
-            devices.push(Box::new(WindowsAudioDevice::new(imm_device)));
+            devices.push(Box::new(WindowsAudioDevice::new(
+                imm_device,
+                self.com_initializer.clone(),
+            )));
         }
         Ok(devices)
     }
@@ -246,7 +547,10 @@ impl DeviceEnumerator for WindowsDeviceEnumerator {
 
         // SAFETY: Calling GetDefaultAudioEndpoint on a valid IMMDeviceEnumerator. HRESULT is checked.
         match unsafe { self.enumerator.GetDefaultAudioEndpoint(data_flow, eConsole) } {
-            Ok(imm_device) => Ok(Some(Box::new(WindowsAudioDevice::new(imm_device)))),
+            Ok(imm_device) => Ok(Some(Box::new(WindowsAudioDevice::new(
+                imm_device,
+                self.com_initializer.clone(),
+            )))),
             Err(hr) if hr == E_NOTFOUND => Ok(None), // Device not found is not an error, but absence.
             Err(hr) => Err(AudioError::BackendSpecificError(format!(
                 "Failed to get default audio endpoint (HRESULT: {:?})",
@@ -275,7 +579,10 @@ impl DeviceEnumerator for WindowsDeviceEnumerator {
 
         // SAFETY: Calling GetDevice on a valid IMMDeviceEnumerator with a null-terminated PWSTR. HRESULT is checked.
         match unsafe { self.enumerator.GetDevice(pwstr_id) } {
-            Ok(imm_device) => Ok(Some(Box::new(WindowsAudioDevice::new(imm_device)))),
+            Ok(imm_device) => Ok(Some(Box::new(WindowsAudioAudioDevice::new(
+                imm_device,
+                self.com_initializer.clone(),
+            )))),
             Err(hr) if hr == E_NOTFOUND => Ok(None),
             Err(hr) => Err(AudioError::DeviceNotFound(format!(
                 "Failed to get device by ID '{}' (HRESULT: {:?})",
@@ -285,124 +592,131 @@ impl DeviceEnumerator for WindowsDeviceEnumerator {
     }
 }
 
-pub struct WindowsAudioStream {
-    // TODO: Add fields specific to a Windows audio stream (e.g., WASAPI client, buffer, config)
-    config: Option<StreamConfig>, // Store the config
+/// Represents an active audio capture stream on Windows using WASAPI.
+///
+/// This struct holds the necessary WASAPI client interfaces (`IAudioClient`, `IAudioCaptureClient`)
+/// to manage and read data from an audio capture stream. It also holds an `Arc<ComInitializer>`
+/// to ensure COM remains initialized for the lifetime of the stream.
+#[derive(Debug)] // IAudioClient and IAudioCaptureClient are COM interface pointers.
+pub(crate) struct WindowsAudioStream {
+    audio_client: IAudioClient,
+    capture_client: IAudioCaptureClient,
+    #[allow(dead_code)] // Will be used when implementing read_chunk, etc.
+    wave_format: WAVEFORMATEX, // Store the format it was initialized with
+    _com_initializer: Arc<ComInitializer>, // Ensures COM is alive for the stream
 }
 
-impl AudioStream for WindowsAudioStream {
-    type Config = StreamConfig;
-    type Device = WindowsAudioDevice;
-
-    fn open(&mut self, device: &Self::Device, config: Self::Config) -> AudioResult<()> {
-        println!(
-            "TODO: WindowsAudioStream::open(device_id: {:?}, config: {:?})",
-            device.get_id(),
-            config
-        );
-        self.config = Some(config);
-        todo!()
-    }
-
-    fn start(&mut self) -> AudioResult<()> {
-        println!("TODO: WindowsAudioStream::start()");
-        todo!()
-    }
-
-    fn pause(&mut self) -> AudioResult<()> {
-        println!("TODO: WindowsAudioStream::pause()");
-        todo!()
-    }
-
-    fn resume(&mut self) -> AudioResult<()> {
-        println!("TODO: WindowsAudioStream::resume()");
-        todo!()
-    }
-
-    fn stop(&mut self) -> AudioResult<()> {
-        println!("TODO: WindowsAudioStream::stop()");
-        todo!()
-    }
-
-    fn close(&mut self) -> AudioResult<()> {
-        println!("TODO: WindowsAudioStream::close()");
-        self.config = None;
-        todo!()
-    }
-
-    fn set_format(&mut self, format: &AudioFormat) -> AudioResult<()> {
-        println!("TODO: WindowsAudioStream::set_format({:?})", format);
-        todo!()
-    }
-
-    fn set_callback(&mut self, _callback: StreamDataCallback) -> AudioResult<()> {
-        println!("TODO: WindowsAudioStream::set_callback()");
-        todo!()
-    }
-
-    fn is_running(&self) -> bool {
-        println!("TODO: WindowsAudioStream::is_running()");
-        false
-    }
-
-    fn get_latency_frames(&self) -> AudioResult<u64> {
-        println!("TODO: WindowsAudioStream::get_latency_frames()");
-        todo!()
-    }
-
-    fn get_current_format(&self) -> AudioResult<AudioFormat> {
-        println!("TODO: WindowsAudioStream::get_current_format()");
-        todo!()
+impl WindowsAudioStream {
+    /// Creates a new `WindowsAudioStream`.
+    ///
+    /// This is typically called by `WindowsAudioDevice::create_stream` after
+    /// successfully initializing the `IAudioClient` and obtaining the `IAudioCaptureClient`.
+    fn new(
+        audio_client: IAudioClient,
+        capture_client: IAudioCaptureClient,
+        wave_format: WAVEFORMATEX,
+        com_initializer: Arc<ComInitializer>,
+    ) -> Self {
+        Self {
+            audio_client,
+            capture_client,
+            wave_format,
+            _com_initializer: com_initializer,
+        }
     }
 }
 
 impl CapturingStream for WindowsAudioStream {
+    /// Starts the audio capture stream.
+    /// After this call, the system will begin buffering audio data.
     fn start(&mut self) -> AudioResult<()> {
-        println!("TODO: WindowsAudioStream (CapturingStream)::start()");
-        // This would typically call self.start() from the AudioStream impl,
-        // but for a skeleton, todo!() is fine.
-        todo!()
+        // TODO: Implement in subtask 4.4: Call IAudioClient::Start()
+        // unsafe { self.audio_client.Start().map_err(|hr| AudioError::StreamStartFailed(format!("IAudioClient::Start failed (HRESULT: {:?})", hr)))? };
+        // Ok(())
+        todo!("WindowsAudioStream::start()")
     }
 
+    /// Stops the audio capture stream.
+    /// After this call, the system will stop buffering audio data.
     fn stop(&mut self) -> AudioResult<()> {
-        println!("TODO: WindowsAudioStream (CapturingStream)::stop()");
-        todo!()
+        // TODO: Implement in subtask 4.4: Call IAudioClient::Stop()
+        // unsafe { self.audio_client.Stop().map_err(|hr| AudioError::StreamStopFailed(format!("IAudioClient::Stop failed (HRESULT: {:?})", hr)))? };
+        // Ok(())
+        todo!("WindowsAudioStream::stop()")
     }
 
+    /// Closes the audio stream, releasing any system resources.
+    /// This method should be called when the stream is no longer needed.
+    /// Note: `IAudioClient` and `IAudioCaptureClient` are COM objects and will be released
+    /// when `WindowsAudioStream` is dropped. Explicit cleanup might involve stopping
+    /// the stream if it's running.
     fn close(&mut self) -> AudioResult<()> {
-        println!("TODO: WindowsAudioStream (CapturingStream)::close()");
-        todo!()
+        // TODO: Implement in subtask 4.4: Ensure stream is stopped. Resources are auto-released on drop.
+        // if self.is_running() { self.stop()?; }
+        // Ok(())
+        todo!("WindowsAudioStream::close()")
     }
 
+    /// Checks if the audio stream is currently capturing data.
     fn is_running(&self) -> bool {
-        println!("TODO: WindowsAudioStream (CapturingStream)::is_running()");
-        false
+        // TODO: Implement in subtask 4.4: Check stream state (e.g., internal flag set by start/stop)
+        todo!("WindowsAudioStream::is_running()")
     }
 
-    fn read_chunk(&mut self, timeout_ms: Option<u32>) -> AudioResult<Option<Box<dyn AudioBuffer>>> {
-        println!(
-            "TODO: WindowsAudioStream (CapturingStream)::read_chunk(timeout_ms: {:?})",
-            timeout_ms
-        );
-        todo!()
+    /// Reads a chunk of audio data from the stream.
+    ///
+    /// # Arguments
+    /// * `timeout_ms` - An optional timeout in milliseconds to wait for data.
+    ///                  If `None`, the call may block indefinitely or return immediately
+    ///                  depending on the backend implementation.
+    ///
+    /// Returns `Ok(Some(buffer))` with audio data, `Ok(None)` if no data is
+    /// available (e.g., on timeout or if the stream is not producing data),
+    /// or an `AudioError` on failure.
+    fn read_chunk(
+        &mut self,
+        _timeout_ms: Option<u32>,
+    ) -> AudioResult<Option<Box<dyn AudioBuffer>>> {
+        // TODO: Implement in subtask 4.4:
+        // 1. Get packet size: unsafe { self.capture_client.GetNextPacketSize()? }
+        // 2. If packet_size > 0:
+        //    - Get buffer: unsafe { self.capture_client.GetBuffer(...) }
+        //    - Create AudioBuffer from the data.
+        //    - Release buffer: unsafe { self.capture_client.ReleaseBuffer(...) }
+        // 3. Handle flags (e.g., AUDCLNT_BUFFERFLAGS_SILENT, AUDCLNT_BUFFERFLAGS_DATA_DISCONTINUITY)
+        // 4. Handle timeouts if event-driven mechanism is used.
+        todo!("WindowsAudioStream::read_chunk()")
     }
 
+    /// Converts this synchronous stream into an asynchronous stream.
+    ///
+    /// This allows the stream to be used in `async` contexts, typically by
+    /// polling `read_chunk` in a separate task or thread.
     fn to_async_stream<'a>(
         &'a mut self,
     ) -> AudioResult<
         std::pin::Pin<
             Box<
                 dyn futures_core::Stream<Item = AudioResult<Box<dyn AudioBuffer<Sample = f32>>>>
+                    // Assuming f32 for now
                     + Send
                     + Sync
                     + 'a,
             >,
         >,
     > {
-        println!("TODO: WindowsAudioStream (CapturingStream)::to_async_stream()");
-        todo!()
+        // TODO: Implement in subtask 4.4 or later if async support is prioritized.
+        // This would involve wrapping the synchronous read_chunk logic in a way
+        // that conforms to the futures::Stream trait, possibly using a helper
+        // struct and a channel or a dedicated thread for polling.
+        todo!("WindowsAudioStream::to_async_stream()")
     }
 }
+
+// The AudioStream trait implementation for WindowsAudioStream is removed as per task focus on CapturingStream.
+// If AudioStream methods (open, pause, resume etc.) are needed for CapturingStream,
+// they would typically be part of the CapturingStream trait or called internally.
+// For now, the CapturingStream methods (start, stop, close, is_running, read_chunk) are the focus.
 
 // --- Old WASAPI Backend (To be refactored/removed) ---
 // This section contains the previous implementation and will be gradually
