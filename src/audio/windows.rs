@@ -30,6 +30,7 @@ use crate::core::interface::DeviceId;
 use std::ffi::OsStr;
 use std::os::windows::ffi::OsStrExt;
 use std::ptr;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use windows::core::{GUID, HRESULT, PWSTR};
 use windows::Win32::Foundation::{E_NOTFOUND, S_FALSE, S_OK};
@@ -601,9 +602,9 @@ impl DeviceEnumerator for WindowsDeviceEnumerator {
 pub(crate) struct WindowsAudioStream {
     audio_client: IAudioClient,
     capture_client: IAudioCaptureClient,
-    #[allow(dead_code)] // Will be used when implementing read_chunk, etc.
     wave_format: WAVEFORMATEX, // Store the format it was initialized with
     _com_initializer: Arc<ComInitializer>, // Ensures COM is alive for the stream
+    is_started: Arc<AtomicBool>, // Tracks if Start() has been called
 }
 
 impl WindowsAudioStream {
@@ -622,48 +623,97 @@ impl WindowsAudioStream {
             capture_client,
             wave_format,
             _com_initializer: com_initializer,
+            is_started: Arc::new(AtomicBool::new(false)),
         }
     }
 }
 
 impl CapturingStream for WindowsAudioStream {
-    /// Starts the audio capture stream.
-    /// After this call, the system will begin buffering audio data.
+    /// Starts the WASAPI audio capture stream.
+    ///
+    /// This method calls `IAudioClient::Start()`. If the stream is already started,
+    /// it returns `Ok(())` without taking further action.
+    /// Errors from `IAudioClient::Start()` are mapped to `AudioError::BackendSpecificError`.
     fn start(&mut self) -> AudioResult<()> {
-        // TODO: Implement in subtask 4.4: Call IAudioClient::Start()
-        // unsafe { self.audio_client.Start().map_err(|hr| AudioError::StreamStartFailed(format!("IAudioClient::Start failed (HRESULT: {:?})", hr)))? };
-        // Ok(())
-        todo!("WindowsAudioStream::start()")
+        if self
+            .is_started
+            .compare_exchange(false, true, Ordering::Acquire, Ordering::Relaxed)
+            .is_ok()
+        {
+            // Successfully changed from false to true, so proceed to start.
+            unsafe {
+                self.audio_client.Start().map_err(|hr| {
+                    // If Start fails, revert the state.
+                    self.is_started.store(false, Ordering::Relaxed);
+                    AudioError::BackendSpecificError(format!(
+                        "IAudioClient::Start failed (HRESULT: {:?})",
+                        hr
+                    ))
+                })?;
+            }
+            Ok(())
+        } else {
+            // Stream was already started (or another thread started it).
+            // Depending on desired strictness, this could be an error or Ok.
+            // For idempotency, Ok(()) is often preferred.
+            // If strict "call start only once" is needed, return an error:
+            // Err(AudioError::InvalidOperation("Stream already started".to_string()))
+            Ok(())
+        }
     }
 
-    /// Stops the audio capture stream.
-    /// After this call, the system will stop buffering audio data.
+    /// Stops the WASAPI audio capture stream.
+    ///
+    /// This method calls `IAudioClient::Stop()`. If the stream is already stopped,
+    /// it returns `Ok(())` without taking further action (idempotent).
+    /// Errors from `IAudioClient::Stop()` are mapped to `AudioError::BackendSpecificError`.
+    /// The internal `is_started` flag is set to `false` regardless of the `Stop()` call's success,
+    /// as the intention is to stop.
     fn stop(&mut self) -> AudioResult<()> {
-        // TODO: Implement in subtask 4.4: Call IAudioClient::Stop()
-        // unsafe { self.audio_client.Stop().map_err(|hr| AudioError::StreamStopFailed(format!("IAudioClient::Stop failed (HRESULT: {:?})", hr)))? };
-        // Ok(())
-        todo!("WindowsAudioStream::stop()")
+        if self
+            .is_started
+            .compare_exchange(true, false, Ordering::Acquire, Ordering::Relaxed)
+            .is_ok()
+        {
+            // Successfully changed from true to false, so proceed to stop.
+            unsafe {
+                self.audio_client.Stop().map_err(|hr| {
+                    // Even if Stop fails, we consider the stream logically stopped from our side.
+                    // The flag is already set to false by compare_exchange.
+                    AudioError::BackendSpecificError(format!(
+                        "IAudioClient::Stop failed (HRESULT: {:?})",
+                        hr
+                    ))
+                })?;
+            }
+        }
+        // If it was already false, or if Stop failed, we still return Ok(())
+        // as the stream is considered stopped from an API perspective.
+        Ok(())
     }
 
-    /// Closes the audio stream, releasing any system resources.
-    /// This method should be called when the stream is no longer needed.
-    /// Note: `IAudioClient` and `IAudioCaptureClient` are COM objects and will be released
-    /// when `WindowsAudioStream` is dropped. Explicit cleanup might involve stopping
-    /// the stream if it's running.
+    /// Closes the audio stream.
+    ///
+    /// For WASAPI, this primarily ensures the stream is stopped by calling `self.stop()`.
+    /// COM resources (`IAudioClient`, `IAudioCaptureClient`) are released when
+    /// `WindowsAudioStream` is dropped.
     fn close(&mut self) -> AudioResult<()> {
-        // TODO: Implement in subtask 4.4: Ensure stream is stopped. Resources are auto-released on drop.
-        // if self.is_running() { self.stop()?; }
-        // Ok(())
-        todo!("WindowsAudioStream::close()")
+        if self.is_started.load(Ordering::Relaxed) {
+            self.stop()?;
+        }
+        Ok(())
     }
 
-    /// Checks if the audio stream is currently capturing data.
-    fn is_running(&self) -> bool {
-        // TODO: Implement in subtask 4.4: Check stream state (e.g., internal flag set by start/stop)
-        todo!("WindowsAudioStream::is_running()")
+    /// Checks if the WASAPI audio stream is currently considered running.
+    ///
+    /// Returns `Ok(true)` if `start()` has been successfully called and `stop()` or `close()`
+    /// has not yet been called to change its state. Otherwise, returns `Ok(false)`.
+    fn is_running(&self) -> AudioResult<bool> {
+        Ok(self.is_started.load(Ordering::Relaxed))
     }
 
     /// Reads a chunk of audio data from the stream.
+    /// **NOTE: This method is not yet implemented for `WindowsAudioStream`.**
     ///
     /// # Arguments
     /// * `timeout_ms` - An optional timeout in milliseconds to wait for data.
@@ -705,11 +755,25 @@ impl CapturingStream for WindowsAudioStream {
             >,
         >,
     > {
-        // TODO: Implement in subtask 4.4 or later if async support is prioritized.
-        // This would involve wrapping the synchronous read_chunk logic in a way
-        // that conforms to the futures::Stream trait, possibly using a helper
-        // struct and a channel or a dedicated thread for polling.
-        todo!("WindowsAudioStream::to_async_stream()")
+        // To be implemented in subtask 4.6
+        Err(AudioError::NotImplemented(
+            "WindowsAudioStream::to_async_stream".to_string(),
+        ))
+    }
+}
+
+impl Drop for WindowsAudioStream {
+    /// Ensures the audio stream is stopped when `WindowsAudioStream` is dropped.
+    ///
+    /// This calls `IAudioClient::Stop()` as a best-effort cleanup. Errors are ignored
+    /// as `drop` should not panic.
+    fn drop(&mut self) {
+        if self.is_started.load(Ordering::Relaxed) {
+            // Best effort to stop the client.
+            // Errors are ignored in drop.
+            let _ = unsafe { self.audio_client.Stop() };
+            self.is_started.store(false, Ordering::Relaxed);
+        }
     }
 }
 
