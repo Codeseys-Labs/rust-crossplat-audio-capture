@@ -68,6 +68,16 @@ impl AudioDevice for WindowsAudioDevice {
         // TODO: Implement actual status check
         false
     }
+
+    fn is_format_supported(&self, format: &AudioFormat) -> AudioResult<bool> {
+        println!(
+            "TODO: WindowsAudioDevice::is_format_supported({:?})",
+            format
+        );
+        // For now, assume all formats are supported or let the actual stream creation fail.
+        // Later tasks will implement actual format checking.
+        Ok(true)
+    }
 }
 
 pub struct WindowsDeviceEnumerator;
@@ -206,6 +216,22 @@ impl CapturingStream for WindowsAudioStream {
             "TODO: WindowsAudioStream (CapturingStream)::read_chunk(timeout_ms: {:?})",
             timeout_ms
         );
+        todo!()
+    }
+
+    fn to_async_stream<'a>(
+        &'a mut self,
+    ) -> AudioResult<
+        std::pin::Pin<
+            Box<
+                dyn futures_core::Stream<Item = AudioResult<Box<dyn AudioBuffer<Sample = f32>>>>
+                    + Send
+                    + Sync
+                    + 'a,
+            >,
+        >,
+    > {
+        println!("TODO: WindowsAudioStream (CapturingStream)::to_async_stream()");
         todo!()
     }
 }

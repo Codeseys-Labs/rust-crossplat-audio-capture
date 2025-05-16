@@ -153,6 +153,8 @@ impl AudioCaptureBuilder {
     /// - [`AudioError::UnsupportedSampleRate`]: If the provided `sample_rate` is not in the
     ///   predefined list of supported rates.
     /// - Other `AudioError` variants if device enumeration or selection fails.
+    /// - [`AudioError::UnsupportedFormat`]: If the selected device does not support the
+    ///   requested audio format (sample rate, channels, sample format, bits per sample).
     // The return type uses `impl AudioDevice` to represent the opaque concrete device type.
     pub fn build(self) -> AudioResult<AudioCapture<impl AudioDevice + 'static>> {
         // --- Configuration Validation ---
@@ -341,6 +343,33 @@ impl AudioCaptureBuilder {
                 "Selected device '{}' is not an input device.",
                 selected_device.get_name()
             )));
+        }
+
+        // Step 4: Validate if the selected device supports the requested format
+        match selected_device.is_format_supported(&capture_config.stream_config.format) {
+            Ok(true) => {
+                // Format is supported, proceed
+            }
+            Ok(false) => {
+                return Err(AudioError::UnsupportedFormat(format!(
+                    "The selected device '{}' does not support the requested audio format: {:?}",
+                    selected_device
+                        .get_name()
+                        .unwrap_or_else(|_| "Unknown Device".to_string()),
+                    capture_config.stream_config.format
+                )));
+            }
+            Err(e) => {
+                // An error occurred during format support check, treat as unsupported or propagate
+                return Err(AudioError::UnsupportedFormat(format!(
+                    "Error checking format support for device '{}': {}. Format: {:?}",
+                    selected_device
+                        .get_name()
+                        .unwrap_or_else(|_| "Unknown Device".to_string()),
+                    e,
+                    capture_config.stream_config.format
+                )));
+            }
         }
 
         // Step 5: Instantiate and return AudioCapture

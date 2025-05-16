@@ -1,13 +1,14 @@
 //! Linux-specific audio capture backend using PipeWire.
 #![cfg(target_os = "linux")]
 
+use crate::core::config::AudioConfig; // Corrected import path
 use crate::core::config::StreamConfig;
 use crate::core::error::{AudioError, Result as AudioResult};
 use crate::core::interface::{
     AudioBuffer, AudioDevice, AudioStream, CapturingStream, DeviceEnumerator, DeviceKind,
     StreamDataCallback,
 };
-use crate::{AudioConfig, AudioFormat}; // AudioConfig & AudioFormat are re-exported from lib.rs
+use crate::AudioFormat; // AudioFormat is re-exported from lib.rs
 
 // TODO: Remove these once the actual PipeWire logic is integrated with the new traits.
 // These are placeholders from the old structure.
@@ -84,6 +85,13 @@ impl AudioDevice for LinuxAudioDevice {
         println!("TODO: LinuxAudioDevice::is_active()");
         // TODO: Implement actual status check
         false
+    }
+
+    fn is_format_supported(&self, format: &AudioFormat) -> AudioResult<bool> {
+        println!("TODO: LinuxAudioDevice::is_format_supported({:?})", format);
+        // For now, assume all formats are supported or let the actual stream creation fail.
+        // Later tasks will implement actual format checking.
+        Ok(true)
     }
 
     fn create_stream(
@@ -236,6 +244,22 @@ impl CapturingStream for LinuxAudioStream {
             "TODO: LinuxAudioStream (CapturingStream)::read_chunk(timeout_ms: {:?})",
             timeout_ms
         );
+        todo!()
+    }
+
+    fn to_async_stream<'a>(
+        &'a mut self,
+    ) -> AudioResult<
+        std::pin::Pin<
+            Box<
+                dyn futures_core::Stream<Item = AudioResult<Box<dyn AudioBuffer<Sample = f32>>>>
+                    + Send
+                    + Sync
+                    + 'a,
+            >,
+        >,
+    > {
+        println!("TODO: LinuxAudioStream (CapturingStream)::to_async_stream()");
         todo!()
     }
 }

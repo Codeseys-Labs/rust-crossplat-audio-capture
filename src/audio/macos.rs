@@ -65,6 +65,13 @@ impl AudioDevice for MacosAudioDevice {
         false
     }
 
+    fn is_format_supported(&self, format: &AudioFormat) -> AudioResult<bool> {
+        println!("TODO: MacosAudioDevice::is_format_supported({:?})", format);
+        // For now, assume all formats are supported or let the actual stream creation fail.
+        // Later tasks will implement actual format checking.
+        Ok(true)
+    }
+
     fn create_stream(
         &self,
         config: StreamConfig,
@@ -213,6 +220,22 @@ impl CapturingStream for MacosAudioStream {
             "TODO: MacosAudioStream (CapturingStream)::read_chunk(timeout_ms: {:?})",
             timeout_ms
         );
+        todo!()
+    }
+
+    fn to_async_stream<'a>(
+        &'a mut self,
+    ) -> AudioResult<
+        std::pin::Pin<
+            Box<
+                dyn futures_core::Stream<Item = AudioResult<Box<dyn AudioBuffer<Sample = f32>>>>
+                    + Send
+                    + Sync
+                    + 'a,
+            >,
+        >,
+    > {
+        println!("TODO: MacosAudioStream (CapturingStream)::to_async_stream()");
         todo!()
     }
 }

@@ -63,6 +63,16 @@ pub trait AudioDevice {
     /// or simply enabled.
     fn is_active(&self) -> bool;
 
+    /// Checks if the device supports the given audio format.
+    ///
+    /// # Parameters
+    /// * `format`: A reference to the `AudioFormat` to check.
+    ///
+    /// # Returns
+    /// `Ok(true)` if the format is supported, `Ok(false)` if not,
+    /// or an `AudioError` if the check fails or is not possible.
+    fn is_format_supported(&self, format: &AudioFormat) -> AudioResult<bool>;
+
     /// Creates a new audio stream associated with this device.
     ///
     /// # Parameters
@@ -138,6 +148,75 @@ pub trait CapturingStream: Send + Sync {
         &mut self,
         timeout_ms: Option<u32>,
     ) -> AudioResult<Option<Box<dyn AudioBuffer<Sample = f32>>>>;
+
+    /// Converts the synchronous capturing stream into an asynchronous stream.
+    ///
+    /// This method allows consuming audio data using asynchronous patterns,
+    /// integrating with Rust's async ecosystem (e.g., `tokio`, `async-std`).
+    /// The returned stream will yield `AudioResult<Box<dyn AudioBuffer<Sample = f32>>>` items.
+    ///
+    /// The lifetime `'a` ties the returned stream to the lifetime of the `CapturingStream` instance.
+    /// The stream items are `AudioResult` to allow for error propagation from the underlying
+    /// audio capture mechanism. Each successful item is a `Box<dyn AudioBuffer<Sample = f32>>`.
+    ///
+    /// # Returns
+    /// An `AudioResult` containing a pinned, boxed, dynamic `futures_core::Stream`.
+    /// The stream yields `AudioResult<Box<dyn AudioBuffer<Sample = f32>>>`.
+    /// Returns an `AudioError` if the asynchronous stream cannot be created.
+    ///
+    /// # Example
+    ///
+    /// ```rust,ignore
+    /// use futures_util::stream::StreamExt; // For `next()`
+    ///
+    /// async fn process_audio(mut capturing_stream: Box<dyn CapturingStream>) {
+    ///     match capturing_stream.to_async_stream() {
+    ///         Ok(mut async_stream) => {
+    ///             println!("Successfully created async audio stream. Waiting for data...");
+    ///             while let Some(audio_result) = async_stream.next().await {
+    ///                 match audio_result {
+    ///                     Ok(audio_buffer) => {
+    ///                         println!(
+    ///                             "Async: Received audio buffer with {} frames, format: {:?}",
+    ///                             audio_buffer.get_length_frames(),
+    ///                             audio_buffer.get_format()
+    ///                         );
+    ///                         // Process the audio_buffer...
+    ///                     }
+    ///                     Err(e) => {
+    ///                         eprintln!("Error receiving audio data from async stream: {:?}", e);
+    ///                         // Optionally, break or handle the error
+    ///                     }
+    ///                 }
+    ///             }
+    ///             println!("Async audio stream finished.");
+    ///         }
+    ///         Err(e) => {
+    ///             eprintln!("Failed to create async audio stream: {:?}", e);
+    ///         }
+    ///     }
+    /// }
+    ///
+    /// // To run this example, you would typically use an async runtime like tokio:
+    /// // #[tokio::main]
+    /// // async fn main() {
+    /// //     // ... setup code to get a `capturing_stream` ...
+    /// //     let my_capturing_stream: Box<dyn CapturingStream> = ...;
+    /// //     process_audio(my_capturing_stream).await;
+    /// // }
+    /// ```
+    fn to_async_stream<'a>(
+        &'a mut self,
+    ) -> AudioResult<
+        std::pin::Pin<
+            Box<
+                dyn futures_core::Stream<Item = AudioResult<Box<dyn AudioBuffer<Sample = f32>>>>
+                    + Send
+                    + Sync
+                    + 'a,
+            >,
+        >,
+    >;
 
     // /// Sets the callback function that will be invoked with audio data.
     // /// (To be implemented/used in later subtasks)
