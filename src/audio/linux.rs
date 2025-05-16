@@ -262,7 +262,7 @@ impl AudioDevice for LinuxAudioDevice {
     /// Sets up basic PipeWire stream properties.
     fn create_stream(
         &mut self,
-        _capture_config: &AudioCaptureConfig, // capture_config will be used in LinuxAudioStream setup
+        capture_config: &AudioCaptureConfig, // capture_config will be used in LinuxAudioStream setup
     ) -> AudioResult<Box<dyn CapturingStream>> {
         // log::debug!("LinuxAudioDevice::create_stream for device ID: {}", self.id);
 
@@ -273,16 +273,30 @@ impl AudioDevice for LinuxAudioDevice {
             .set(pw_keys::MEDIA_TYPE, "Audio")
             .set(pw_keys::MEDIA_CATEGORY, "Capture") // For capture streams
             .set(pw_keys::MEDIA_ROLE, "Music") // Or a more generic role like "Generic" or "System"
-            .set(pw_keys::NODE_ID, &self.id.to_string()) // Target this specific node for capture
+            // .set(pw_keys::NODE_ID, &self.id.to_string()) // Target node is set during connect for capture
             // For capturing from a monitor source, we usually don't set STREAM_CAPTURE_SINK.
             // STREAM_CAPTURE_SINK = true is for capturing the output of a *sink* application.
             // If self.id refers to a monitor node directly, this is not needed.
             // If self.id refers to a sink and we want its monitor, then it might be,
             // but device enumeration should give us the monitor node ID directly.
             // .set(pw_keys::STREAM_CAPTURE_SINK, "true") // Only if capturing from a sink's monitor port explicitly
-            .set(pw_keys::STREAM_WANT_FORMAT, "F32LE") // Request a common format, negotiation happens later
-            .set("audio.channels", "2") // Example, should come from capture_config or negotiation
-            .set("audio.rate", "48000"); // Example
+            .set(
+                pw_keys::STREAM_WANT_FORMAT,
+                match capture_config.stream_config.format.sample_format {
+                    SampleFormat::F32LE => "F32LE",
+                    SampleFormat::S16LE => "S16LE",
+                    // Add other formats if common, otherwise rely on negotiation
+                    _ => "F32LE", // Default to F32LE if not specified or uncommon
+                },
+            ) // Request a common format, negotiation happens later
+            .set(
+                "audio.channels",
+                &capture_config.stream_config.format.channels.to_string(),
+            )
+            .set(
+                "audio.rate",
+                &capture_config.stream_config.format.sample_rate.to_string(),
+            );
 
         let stream = PwStream::new_with_properties(
             core,
@@ -297,6 +311,8 @@ impl AudioDevice for LinuxAudioDevice {
         Ok(Box::new(LinuxAudioStream::new(
             stream,
             Arc::clone(&self.core_context),
+            capture_config.stream_config.format.clone(),
+            self.id,
         )))
     }
 }
@@ -554,15 +570,20 @@ impl DeviceEnumerator for LinuxDeviceEnumerator {
 /// in subtask 6.4.
 #[derive(Debug)]
 pub(crate) struct LinuxAudioStream {
-    stream: PwStream, // The underlying PipeWire stream object
+    stream: PwStream,                       // The underlying PipeWire stream object
     core_context: Arc<PipewireCoreContext>, // Keeps MainLoop, Context, Core alive and accessible
-                      // TODO (Subtask 6.4): Add fields for:
-                      // - AudioCaptureConfig
-                      // - Actual AudioFormat negotiated
-                      // - Buffer for incoming data (e.g., Arc<Mutex<VecDeque<u8>>> or similar)
-                      // - State (e.g., Idle, Capturing, Paused, Stopped, Error)
-                      // - Listeners for stream events (state changes, data ready, errors)
-                      // - Callback for delivering data (StreamDataCallback)
+    /// Handle to the stream listener to keep it alive.
+    listener_handle: Option<StreamListener>,
+    /// Indicates if the stream has been started and is (or attempting to be) streaming.
+    is_started: Arc<AtomicBool>,
+    /// Stores the audio format negotiated with PipeWire.
+    current_format: Arc<Mutex<Option<AudioFormat>>>,
+    // /// Queue for audio data received from PipeWire, for subtasks 6.5/6.6.
+    // data_queue: Arc<Mutex<VecDeque<AudioResult<Box<dyn AudioBuffer<Sample = f32>>>>>>,
+    /// The initial audio format requested for the stream.
+    initial_config_format: AudioFormat,
+    /// The PipeWire node ID to connect to for capture.
+    target_node_id: u32,
 }
 
 impl LinuxAudioStream {
@@ -571,68 +592,273 @@ impl LinuxAudioStream {
     /// # Arguments
     /// * `stream` - The `pipewire::Stream` object already created and configured with basic properties.
     /// * `core_context` - An `Arc` to the `PipewireCoreContext` to keep it alive.
-    fn new(stream: PwStream, core_context: Arc<PipewireCoreContext>) -> Self {
+    /// * `initial_config_format` - The audio format requested for capture.
+    /// * `target_node_id` - The PipeWire node ID to capture from.
+    fn new(
+        stream: PwStream,
+        core_context: Arc<PipewireCoreContext>,
+        initial_config_format: AudioFormat,
+        target_node_id: u32,
+    ) -> Self {
         Self {
             stream,
             core_context,
-            // Initialize other fields here in subtask 6.4
+            listener_handle: None,
+            is_started: Arc::new(AtomicBool::new(false)),
+            current_format: Arc::new(Mutex::new(None)),
+            // data_queue: Arc::new(Mutex::new(VecDeque::new())), // For 6.5/6.6
+            initial_config_format,
+            target_node_id,
         }
+    }
+
+    /// Converts our internal `AudioFormat` to a `pipewire::spa::param::audio::AudioFormat`.
+    fn to_spa_audio_format(format: SampleFormat) -> Option<SpaAudioFormat> {
+        match format {
+            SampleFormat::F32LE => Some(SpaAudioFormat::F32LE),
+            SampleFormat::S16LE => Some(SpaAudioFormat::S16LE),
+            SampleFormat::S24LE => Some(SpaAudioFormat::S24LE),
+            SampleFormat::S32LE => Some(SpaAudioFormat::S32LE),
+            // TODO: Add more mappings as needed (e.g., F32BE, S16BE, etc.)
+            _ => None,
+        }
+    }
+
+    /// Converts a `pipewire::spa::param::audio::AudioFormat` and other SPA properties
+    /// back to our internal `AudioFormat`.
+    fn from_spa_format_properties(
+        parsed_format: &spa::param::format_utils::ParsedSpaFormat,
+    ) -> Option<AudioFormat> {
+        let spa_audio_fmt = parsed_format.format_properties.as_ref()?.format?;
+        let sample_format = match spa_audio_fmt {
+            SpaAudioFormat::F32LE => SampleFormat::F32LE,
+            SpaAudioFormat::S16LE => SampleFormat::S16LE,
+            SpaAudioFormat::S24LE => SampleFormat::S24LE,
+            SpaAudioFormat::S32LE => SampleFormat::S32LE,
+            _ => return None, // Unsupported format
+        };
+        let bits_per_sample = match sample_format {
+            SampleFormat::F32LE | SampleFormat::S32LE => 32,
+            SampleFormat::S24LE => 24,
+            SampleFormat::S16LE => 16,
+            _ => return None, // Should not happen if mapped above
+        };
+
+        Some(AudioFormat {
+            sample_rate: parsed_format.format_properties.as_ref()?.rate?,
+            channels: parsed_format.format_properties.as_ref()?.channels? as u16,
+            bits_per_sample,
+            sample_format,
+        })
     }
 }
 
 impl CapturingStream for LinuxAudioStream {
     /// Starts the audio capture stream.
-    /// This will involve connecting the PipeWire stream and setting up parameters.
+    ///
+    /// This method performs the following steps:
+    /// 1. Checks if the stream is already started.
+    /// 2. Converts the `initial_config_format` into PipeWire SPA (Simple Plugin API) Pods
+    ///    to describe the desired audio format (e.g., F32LE, 48kHz, stereo).
+    ///    Currently, it offers a single format based on `initial_config_format`.
+    /// 3. Sets up listeners for stream events:
+    ///    - `state_changed`: Updates the `is_started` flag based on the stream's state (e.g., `Streaming`).
+    ///    - `param_changed`: When PipeWire negotiates or confirms the format, this callback
+    ///      is triggered. It's responsible for parsing the confirmed format (SPA Pod) and
+    ///      updating `current_format`. (Parsing logic is a TODO).
+    ///    - `process`: This callback is invoked by PipeWire when new audio data is available.
+    ///      It should dequeue the buffer from PipeWire. (Actual data handling and queuing
+    ///      is for subtask 6.5).
+    /// 4. Connects the stream to the specified `target_node_id` (e.g., a monitor source)
+    ///    for input, using the format parameters built in step 2. Flags like `AUTOCONNECT`
+    ///    and `RT_PROCESS` are used.
+    ///
+    /// The PipeWire `MainLoop` (managed by `PipewireCoreContext`) is assumed to be running
+    /// in a separate thread, allowing these callbacks to be processed.
     fn start(&mut self) -> AudioResult<()> {
         // log::debug!("LinuxAudioStream::start() for stream: {:?}", self.stream.name());
-        // TODO (Subtask 6.4):
-        // 1. Define parameters for the stream (e.g., format, buffer size).
-        //    - This might involve using self.capture_config.format or negotiating.
-        //    - Build SPA Pods for format parameters (e.g., using spa::param::format_utils).
-        // 2. Connect the stream: self.stream.connect(...)
-        //    - Specify Direction::Input.
-        //    - Provide format parameters.
-        //    - Use flags like StreamFlags::AUTOCONNECT | StreamFlags::MAP_BUFFERS.
-        // 3. Set up listeners for stream events:
-        //    - `state_changed`: To know when the stream is active, paused, etc.
-        //    - `param_changed`: To get the negotiated format.
-        //    - `process`: To receive audio data.
-        //    - `error`: To handle stream errors.
-        // 4. Update internal state to Capturing.
-        // 5. Potentially run the main_loop in a dedicated thread if blocking, or use iterate.
-        //    The core_context.main_loop() can be used.
-        todo!("LinuxAudioStream::start - Subtask 6.4: Connect stream, set params, handle events.")
+        if self.is_started.load(Ordering::SeqCst) {
+            // log::warn!("Stream already started or start attempt in progress.");
+            return Ok(()); // Or return an error like AudioError::InvalidOperation
+        }
+
+        // 1. Convert AudioFormat to PipeWire SPA Pods
+        let mut pod_buffer = Vec::new();
+        let mut builder = PodBuilder::from_buffer(&mut pod_buffer);
+
+        let spa_audio_format = Self::to_spa_audio_format(self.initial_config_format.sample_format)
+            .ok_or_else(|| {
+                AudioError::FormatNotSupported(format!(
+                    "Unsupported sample format for PipeWire: {:?}",
+                    self.initial_config_format.sample_format
+                ))
+            })?;
+
+        let props_builder = spa::param::format_utils::PropsBuilder::new()
+            .media_type(MediaType::Audio)
+            .media_subtype(MediaSubtype::Raw) // Common for PCM
+            .audio_format(spa_audio_format)
+            .audio_rate(self.initial_config_format.sample_rate)
+            .audio_channels(self.initial_config_format.channels as u32);
+
+        // Add channel positions for common layouts
+        let positions: Vec<SpaChannel> = match self.initial_config_format.channels {
+            1 => vec![SpaChannel::Mono],
+            2 => vec![SpaChannel::FL, SpaChannel::FR],
+            // TODO: Add more channel layouts (e.g., 4.0, 5.1) if needed
+            _ => vec![], // No specific layout for >2 channels for now, PipeWire might default
+        };
+        let props_builder = if !positions.is_empty() {
+            props_builder.audio_position(&positions)
+        } else {
+            props_builder
+        };
+
+        let built_props = props_builder.build();
+
+        let (enum_format_pod, _len) = spa::param::format_utils::encode_format(
+            &mut builder,
+            ParamType::EnumFormat.to_u32(), // ID for the EnumFormat parameter
+            &[built_props],                 // Slice of formats to offer (just one for now)
+        )
+        .map_err(|e| {
+            AudioError::BackendSpecificError(format!("Failed to encode format properties: {:?}", e))
+        })?;
+
+        let format_pod_array: &[Pod] = std::slice::from_ref(&enum_format_pod);
+
+        // 2. Set up Stream Listeners
+        let is_started_clone = self.is_started.clone();
+        let current_format_clone = self.current_format.clone();
+        // let data_queue_clone = self.data_queue.clone(); // For 6.5
+
+        let listener = self
+            .stream
+            .add_listener_local()
+            .state_changed(move |old, new_state| {
+                // log::debug!("Stream state changed: {:?} -> {:?}", old, new_state);
+                is_started_clone.store(new_state == StreamState::Streaming, Ordering::SeqCst);
+            })
+            .param_changed(move |_stream, id, pod_option| {
+                // log::debug!("Stream param changed: id={:?}, pod_option is some: {}", id, pod_option.is_some());
+                if id == ParamType::Format.to_u32() {
+                    if let Some(pod) = pod_option {
+                        match spa::param::format_utils::parse_format(pod) {
+                            Ok(parsed_format) => {
+                                // log::debug!("Negotiated format parsed: {:?}", parsed_format);
+                                if let Some(audio_fmt) =
+                                    Self::from_spa_format_properties(&parsed_format)
+                                {
+                                    // log::info!("Negotiated audio format: {:?}", audio_fmt);
+                                    *current_format_clone.lock().unwrap() = Some(audio_fmt);
+                                } else {
+                                    // log::error!("Failed to convert parsed SPA format to internal AudioFormat.");
+                                }
+                            }
+                            Err(e) => {
+                                // log::error!("Failed to parse negotiated format pod: {:?}", e);
+                            }
+                        }
+                    } else {
+                        // log::warn!("Format param changed, but pod_option is None. Format might have been removed.");
+                        *current_format_clone.lock().unwrap() = None;
+                    }
+                }
+            })
+            .process(move |stream| {
+                // log::trace!("Stream process callback triggered");
+                // TODO for 6.5: Dequeue buffer, process data, enqueue to data_queue_clone
+                if let Some(_buffer) = stream.dequeue_buffer() {
+                    // log::debug!("Dequeued buffer of size: {}", _buffer.size());
+                    // For 6.5:
+                    // let data = buffer.data(0).unwrap(); // Assuming single plane
+                    // let audio_buffer = ConcreteAudioBuffer::from_raw_f32(data, num_channels, num_frames);
+                    // data_queue_clone.lock().unwrap().push_back(Ok(Box::new(audio_buffer)));
+                } else {
+                    // log::trace!("No buffer dequeued in process callback.");
+                }
+                // Ok(()) // The process callback in pipewire-rs does not return Result
+            })
+            .register()
+            .map_err(|e| {
+                AudioError::BackendSpecificError(format!(
+                    "Failed to register stream listener: {}",
+                    e
+                ))
+            })?;
+
+        self.listener_handle = Some(listener);
+
+        // 3. Connect the Stream
+        // log::debug!(
+        //     "Connecting stream to target_node_id: {}, with format_pod_array: {:?}",
+        //     self.target_node_id,
+        //     format_pod_array
+        // );
+        self.stream
+            .connect(
+                Direction::Input, // Capturing input from the node
+                Some(self.target_node_id),
+                StreamFlags::AUTOCONNECT | StreamFlags::RT_PROCESS | StreamFlags::MAP_BUFFERS,
+                format_pod_array,
+            )
+            .map_err(|e| {
+                AudioError::BackendSpecificError(format!(
+                    "Failed to connect PipeWire stream: {}",
+                    e
+                ))
+            })?;
+
+        // is_started will be set by the state_changed callback.
+        // For an immediate check or if connection is synchronous and successful:
+        // self.is_started.store(true, Ordering::SeqCst);
+        // However, relying on state_changed is more robust for async nature.
+        // log::info!("PipeWire stream connection initiated for target node ID: {}", self.target_node_id);
+        Ok(())
     }
 
     /// Stops the audio capture stream.
     /// This will involve disconnecting the PipeWire stream.
     fn stop(&mut self) -> AudioResult<()> {
         // log::debug!("LinuxAudioStream::stop() for stream: {:?}", self.stream.name());
-        // TODO (Subtask 6.4):
-        // 1. Disconnect the stream: self.stream.disconnect()?;
-        // 2. Update internal state to Stopped.
-        // 3. Clean up any resources if necessary.
-        todo!("LinuxAudioStream::stop - Subtask 6.4: Disconnect stream.")
+        if !self.is_started.load(Ordering::SeqCst) && self.stream.state() != StreamState::Streaming
+        {
+            // log::warn!("Stream is not running or already stopped.");
+            // return Ok(()); // Or allow disconnect attempt anyway
+        }
+
+        self.stream.disconnect().map_err(|e| {
+            AudioError::BackendSpecificError(format!("Failed to disconnect PipeWire stream: {}", e))
+        })?;
+        self.is_started.store(false, Ordering::SeqCst);
+        // The listener_handle will be dropped when LinuxAudioStream is dropped,
+        // or can be explicitly removed/cleared here if needed.
+        // self.listener_handle.take(); // This would unregister the listener.
+        // log::info!("PipeWire stream disconnected.");
+        Ok(())
     }
 
     /// Closes the audio capture stream, releasing all resources.
     fn close(&mut self) -> AudioResult<()> {
         // log::debug!("LinuxAudioStream::close() for stream: {:?}", self.stream.name());
-        // TODO (Subtask 6.4):
-        // 1. Ensure the stream is stopped.
-        // 2. Explicitly drop or clean up the self.stream object if needed (usually handled by Drop trait).
-        // 3. Clear listeners.
-        // 4. Update internal state.
-        todo!("LinuxAudioStream::close - Subtask 6.4: Release all stream resources.")
+        if self.is_started.load(Ordering::SeqCst) || self.stream.state() != StreamState::Unconnected
+        {
+            self.stop()?; // Ensure stream is stopped and disconnected
+        }
+        // Drop the listener handle to unregister callbacks
+        self.listener_handle.take();
+
+        // PipeWire stream itself will be cleaned up when `LinuxAudioStream` is dropped.
+        // Additional cleanup if any specific resources were allocated by the stream
+        // that are not handled by PwStream's Drop.
+        // log::info!("PipeWire stream closed and listener removed.");
+        todo!("LinuxAudioStream::close - Subtask 6.4: Finalize resource release if any beyond stop().")
     }
 
-    /// Checks if the stream is currently capturing audio.
+    /// Checks if the stream is currently capturing audio (i.e., in Streaming state).
     fn is_running(&self) -> bool {
-        // log::trace!("LinuxAudioStream::is_running() check");
-        // TODO (Subtask 6.4):
-        // Return true if the internal state is Capturing and stream state is Streaming.
-        // Check self.stream.state() or an internal state variable.
-        false // Placeholder
+        // log::trace!("LinuxAudioStream::is_running() check, is_started: {}", self.is_started.load(Ordering::SeqCst));
+        self.is_started.load(Ordering::SeqCst) && self.stream.state() == StreamState::Streaming
     }
 
     /// Reads a chunk of audio data from the stream.
@@ -642,13 +868,14 @@ impl CapturingStream for LinuxAudioStream {
         _timeout_ms: Option<u32>,
     ) -> AudioResult<Option<Box<dyn AudioBuffer>>> {
         // log::trace!("LinuxAudioStream::read_chunk(timeout_ms: {:?})", _timeout_ms);
-        // TODO (Subtask 6.4):
-        // 1. Check if data is available in the internal buffer (filled by the `process` callback).
-        // 2. If not, wait for data (potentially using a condition variable or by iterating the main loop).
-        // 3. Dequeue data from PipeWire buffers if not using an intermediate buffer.
+        // TODO (Subtask 6.5):
+        // 1. Check if data is available in the internal buffer (self.data_queue).
+        // 2. If not, wait for data (potentially using a condition variable or by iterating the main loop,
+        //    or if async, by awaiting the next item from the async stream).
+        // 3. Dequeue data from PipeWire buffers if not using an intermediate buffer (current process cb does this).
         // 4. Package data into an AudioBuffer.
         // 5. Handle timeouts.
-        todo!("LinuxAudioStream::read_chunk - Subtask 6.4: Read data from internal buffer or PipeWire.")
+        todo!("LinuxAudioStream::read_chunk - Subtask 6.5: Read data from internal buffer.")
     }
 
     /// Provides an asynchronous stream of audio buffers.
@@ -666,13 +893,12 @@ impl CapturingStream for LinuxAudioStream {
         >,
     > {
         // log::debug!("LinuxAudioStream::to_async_stream()");
-        // TODO (Subtask 6.4 or later):
+        // TODO (Subtask 6.6 or later):
         // Implement an async wrapper around the data capture mechanism.
-        // This might involve a channel or a custom Future/Stream implementation
-        // that integrates with the PipeWire event loop and data callbacks.
-        Err(AudioError::NotImplemented(
-            "Async stream for PipeWire not yet implemented.".to_string(),
-        ))
+        // This might involve a channel (e.g., futures::channel::mpsc) populated by the
+        // `process` callback and consumed by the returned Stream.
+        // The Stream implementation would poll this channel.
+        todo!("LinuxAudioStream::to_async_stream - Subtask 6.6: Implement async stream.")
     }
 }
 
