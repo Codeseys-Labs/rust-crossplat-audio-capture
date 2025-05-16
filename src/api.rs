@@ -1,4 +1,5 @@
 use crate::audio::get_device_enumerator; // For selecting the actual device
+use crate::core::config::AudioFileFormat;
 use crate::core::config::{AudioFormat, DeviceSelector, LatencyMode, SampleFormat, StreamConfig};
 use crate::core::error::{AudioError, Result as AudioResult};
 use crate::core::interface::{
@@ -22,7 +23,20 @@ pub struct AudioCaptureConfig {
 ///
 /// This builder allows for a flexible and clear way to specify audio capture parameters.
 /// Once all desired parameters are set, call the [`build`](AudioCaptureBuilder::build)
-/// method to validate the configuration and create an [`AudioCaptureConfig`] instance.
+/// method to validate the configuration, select an audio device, and create an
+/// [`AudioCapture`] instance ready to start capturing.
+///
+/// ## Defaults
+/// - `latency_mode`: If not set, defaults to `LatencyMode::default()`.
+/// - `buffer_size_frames`: If not set, remains `None`, allowing the system or backend to choose.
+///
+/// ## Validation
+/// - **Mandatory Fields**: `device_selector`, `sample_rate`, `channels`, `sample_format`,
+///   and `bits_per_sample` must be provided.
+/// - **Sample Rate**: Must be one of the common rates (e.g., 44100, 48000).
+/// - **Channels**: Must be greater than 0 and typically within a reasonable limit (e.g., <= 32).
+/// - **Format/Bits Consistency**: `sample_format` and `bits_per_sample` must be consistent
+///   (e.g., `SampleFormat::F32LE` requires `bits_per_sample` to be 32).
 ///
 /// # Examples
 ///
@@ -98,7 +112,9 @@ impl AudioCaptureBuilder {
 
     /// Sets the desired buffer size in frames.
     ///
-    /// If `None`, the system might choose a default.
+    /// If `None` is provided (or the method is not called), the `buffer_size_frames` field
+    /// in the resulting `StreamConfig` will be `None`, allowing the underlying audio backend
+    /// or system to choose a default buffer size.
     pub fn buffer_size_frames(mut self, size: Option<u32>) -> Self {
         self.buffer_size_frames = size;
         self
@@ -106,7 +122,8 @@ impl AudioCaptureBuilder {
 
     /// Sets the desired latency mode.
     ///
-    /// If `None`, the system might choose a default.
+    /// If `None` is provided (or the method is not called), this will default to
+    /// `LatencyMode::default()` when the `AudioCapture` session is built.
     pub fn latency(mut self, mode: Option<LatencyMode>) -> Self {
         self.latency_mode = mode;
         self
@@ -130,12 +147,15 @@ impl AudioCaptureBuilder {
     ///
     /// # Errors
     ///
-    /// Returns an [`AudioError::ConfigurationError`] if any required fields are missing
-    /// or if the configuration is invalid.
-    /// It now returns an [`AudioCapture`] instance on success.
+    /// Returns:
+    /// - [`AudioError::ConfigurationError`]: If any required fields are missing,
+    ///   if channel count is invalid, or if `sample_format` and `bits_per_sample` are inconsistent.
+    /// - [`AudioError::UnsupportedSampleRate`]: If the provided `sample_rate` is not in the
+    ///   predefined list of supported rates.
+    /// - Other `AudioError` variants if device enumeration or selection fails.
     // The return type uses `impl AudioDevice` to represent the opaque concrete device type.
     pub fn build(self) -> AudioResult<AudioCapture<impl AudioDevice + 'static>> {
-        // Step 1: Perform existing config validation to get AudioCaptureConfig
+        // --- Configuration Validation ---
         let device_selector_val = self.device_selector.clone().ok_or_else(|| {
             AudioError::ConfigurationError(
                 "Missing required field: device_selector. Use .device() or .system_audio()."
@@ -149,15 +169,32 @@ impl AudioCaptureBuilder {
             )
         })?;
 
+        // Validate sample rate
+        const SUPPORTED_SAMPLE_RATES: [u32; 6] = [22050, 32000, 44100, 48000, 88200, 96000];
+        if !SUPPORTED_SAMPLE_RATES.contains(&sample_rate) {
+            return Err(AudioError::UnsupportedSampleRate(sample_rate));
+        }
+
         let channels = self.channels.ok_or_else(|| {
             AudioError::ConfigurationError(
                 "Missing required field: channels. Use .channels().".to_string(),
             )
         })?;
+
+        // Validate channels
         if channels == 0 {
             return Err(AudioError::ConfigurationError(
                 "Channels must be greater than 0.".to_string(),
             ));
+        }
+        // Define a reasonable maximum, e.g., 32 channels.
+        // This can be adjusted based on typical use cases or backend limitations.
+        const MAX_CHANNELS: u16 = 32;
+        if channels > MAX_CHANNELS {
+            return Err(AudioError::ConfigurationError(format!(
+                "Number of channels ({}) exceeds the maximum supported ({}).",
+                channels, MAX_CHANNELS
+            )));
         }
 
         let sample_format_opt = self.sample_format.ok_or_else(|| {
@@ -172,6 +209,7 @@ impl AudioCaptureBuilder {
             )
         })?;
 
+        // Validate sample_format vs bits_per_sample
         match sample_format_opt {
             SampleFormat::S8 | SampleFormat::U8 => {
                 if bits_per_sample_opt != 8 {
@@ -263,7 +301,8 @@ impl AudioCaptureBuilder {
                         "DefaultOutput device selector is not directly supported for capture. Use DefaultInput or specify by ID/name.".to_string()
                     ));
             }
-            DeviceSelector::Id(id_str) => {
+            DeviceSelector::ById(id_str) => {
+                // Corrected from Id to ById
                 // We need to call enumerate_devices() on the boxed enumerator.
                 // The items in the Vec will be of type `enumerator.Device`.
                 let devices = enumerator.enumerate_devices()?;
@@ -277,7 +316,8 @@ impl AudioCaptureBuilder {
                         ))
                     })?
             }
-            DeviceSelector::Name(name_pattern) => {
+            DeviceSelector::ByName(name_pattern) => {
+                // Corrected from Name to ByName
                 let devices = enumerator.enumerate_devices()?;
                 devices
                     .into_iter()
@@ -667,6 +707,259 @@ impl<D: AudioDevice + 'static> AudioCapture<D> {
     /// ```
     pub fn buffers_iter(&mut self) -> AudioBufferIterator<'_, D> {
         AudioBufferIterator { capture: self }
+    }
+
+    /// Returns an asynchronous stream of audio data buffers.
+    ///
+    /// This method provides a way to consume captured audio data using asynchronous
+    /// patterns, integrating with Rust's async ecosystem (e.g., `tokio`, `async-std`).
+    /// The stream yields `AudioResult<Box<dyn AudioBuffer<Sample = f32>>>` items.
+    ///
+    /// The stream must be started by calling [`start()`](AudioCapture::start) before
+    /// attempting to retrieve the data stream.
+    ///
+    /// The lifetime `'_` ties the returned stream to the lifetime of `&mut self`.
+    ///
+    /// # Returns
+    ///
+    /// * `Ok(impl Stream)`: If the stream is running and the asynchronous stream can be created.
+    ///   The `impl Stream` yields `AudioResult<Box<dyn AudioBuffer<Sample = f32>>>`.
+    /// * `Err(AudioError::InvalidOperation)`: If the capture stream is not currently running
+    ///   or not initialized.
+    /// * `Err(AudioError)`: If there's an error creating the asynchronous stream from the
+    ///   underlying `CapturingStream`.
+    ///
+    /// # Example
+    ///
+    /// ```rust,no_run
+    /// # use rust_crossplat_audio_capture::api::AudioCaptureBuilder;
+    /// # use rust_crossplat_audio_capture::core::config::{DeviceSelector, SampleFormat};
+    /// # use rust_crossplat_audio_capture::core::error::AudioError;
+    /// # use rust_crossplat_audio_capture::core::interface::AudioBuffer;
+    /// use futures_util::stream::StreamExt; // For `next()`
+    ///
+    /// // This example assumes an async runtime like tokio or async-std.
+    /// // #[tokio::main]
+    /// async fn main_async() -> Result<(), AudioError> {
+    ///     let mut capture = AudioCaptureBuilder::new()
+    ///         .device(DeviceSelector::DefaultInput)
+    ///         .sample_rate(44100)
+    ///         .channels(1)
+    ///         .sample_format(SampleFormat::F32LE)
+    ///         .bits_per_sample(32)
+    ///         .build()?;
+    ///
+    ///     capture.start()?;
+    ///     println!("Audio capture started for async streaming.");
+    ///
+    ///     if let Ok(mut data_stream) = capture.audio_data_stream() {
+    ///         println!("Asynchronous audio data stream created. Waiting for data...");
+    ///         while let Some(audio_result) = data_stream.next().await {
+    ///             match audio_result {
+    ///                 Ok(audio_buffer) => {
+    ///                     println!(
+    ///                         "Async Stream: Received buffer with {} f32 samples. Format: {:?}.",
+    ///                         audio_buffer.as_slice().len(),
+    ///                         audio_buffer.get_format()
+    ///                     );
+    ///                     // Process audio_buffer.as_slice()...
+    ///                 }
+    ///                 Err(e) => {
+    ///                     eprintln!("Error receiving audio data from async stream: {:?}", e);
+    ///                     // Optionally, break or handle the error
+    ///                     break;
+    ///                 }
+    ///             }
+    ///         }
+    ///         println!("Async audio data stream finished or encountered an error.");
+    ///     } else {
+    ///         eprintln!("Failed to get audio data stream.");
+    ///     }
+    ///
+    ///     if capture.is_running() {
+    ///         capture.stop()?;
+    ///     }
+    ///     println!("Audio capture stopped.");
+    ///     Ok(())
+    /// }
+    /// # Ok(())
+    /// # }
+    /// ```
+    pub fn audio_data_stream(
+        &mut self,
+    ) -> AudioResult<
+        impl futures_core::Stream<Item = AudioResult<Box<dyn AudioBuffer<Sample = f32>>>>
+            + Send
+            + Sync
+            + '_,
+    > {
+        if !self.is_running.load(Ordering::SeqCst) || self.stream.is_none() {
+            return Err(AudioError::InvalidOperation(
+                "Stream is not running or not initialized. Call start() first.".to_string(),
+            ));
+        }
+
+        // self.stream is Some and is_running is true.
+        // The unwrap is safe due to the check above.
+        self.stream.as_mut().unwrap().to_async_stream()
+        // The to_async_stream already returns AudioResult<Pin<Box<dyn Stream...>>>
+        // So, no further mapping is needed if the types align.
+        // The return type of this function is `AudioResult<impl Stream...>`,
+        // and `to_async_stream` returns `AudioResult<Pin<Box<dyn Stream...>>>`.
+        // A `Pin<Box<dyn Stream>>` can be implicitly converted to `impl Stream`.
+    }
+}
+
+impl<D: AudioDevice + 'static> AudioCapture<D> {
+    /// Records audio to a file for a specified duration using a blocking approach.
+    ///
+    /// This method will:
+    /// 1. Ensure the capture stream is started. If not, it attempts to start it.
+    /// 2. Create and configure a file writer (e.g., `hound::WavWriter` for WAV format).
+    /// 3. Enter a loop that reads audio buffers from the stream and writes them to the file.
+    ///    - The loop continues until the specified `record_for_duration` has elapsed or an error occurs.
+    ///    - Audio samples in `f32` format are converted to `i16` for WAV file compatibility.
+    /// 4. Finalize the file writer to ensure all data is flushed and the file is properly closed.
+    ///
+    /// # Arguments
+    ///
+    /// * `path`: The file system path where the audio will be saved.
+    /// * `file_format`: The desired [`AudioFileFormat`] for the recording (currently only `Wav` is supported).
+    /// * `record_for_duration`: The [`std::time::Duration`] for which to record audio.
+    ///
+    /// # Errors
+    ///
+    /// Returns an [`AudioError`] if:
+    /// - The capture stream cannot be started.
+    /// - The specified `file_format` is not supported (currently, only `Wav`).
+    /// - There are errors creating or writing to the file (e.g., path invalid, disk full).
+    /// - An error occurs while reading audio buffers from the stream.
+    /// - An error occurs during sample conversion or writing to the audio file.
+    ///
+    /// # Example
+    ///
+    /// ```rust,no_run
+    /// # use rust_crossplat_audio_capture::api::AudioCaptureBuilder;
+    /// # use rust_crossplat_audio_capture::core::config::{DeviceSelector, SampleFormat, AudioFileFormat};
+    /// # use rust_crossplat_audio_capture::core::error::AudioError;
+    /// # use std::time::Duration;
+    /// # use std::path::Path;
+    /// #
+    /// # fn main() -> Result<(), AudioError> {
+    /// let mut capture = AudioCaptureBuilder::new()
+    ///     .device(DeviceSelector::DefaultInput)
+    ///     .sample_rate(44100)
+    ///     .channels(1)
+    ///     .sample_format(SampleFormat::F32LE) // Ensure f32 for internal processing
+    ///     .bits_per_sample(32)
+    ///     .build()?;
+    ///
+    /// // Start capture if not already running (record_to_file_blocking will also try)
+    /// // capture.start()?;
+    ///
+    /// println!("Starting recording for 5 seconds to 'output.wav'...");
+    /// capture.record_to_file_blocking(
+    ///     Path::new("output.wav"),
+    ///     AudioFileFormat::Wav,
+    ///     Duration::from_secs(5)
+    /// )?;
+    ///
+    /// println!("Recording finished.");
+    ///
+    /// // Stop capture if it was started and is still running
+    /// if capture.is_running() {
+    ///     capture.stop()?;
+    /// }
+    /// # Ok(())
+    /// # }
+    /// ```
+    pub fn record_to_file_blocking(
+        &mut self,
+        path: impl AsRef<std::path::Path>,
+        file_format: AudioFileFormat,
+        record_for_duration: std::time::Duration,
+    ) -> AudioResult<()> {
+        // 1. Ensure capture is started
+        if !self.is_running() {
+            self.start().map_err(|e| {
+                AudioError::RecordingError(format!("Failed to start capture for recording: {}", e))
+            })?;
+        }
+
+        match file_format {
+            AudioFileFormat::Wav => {
+                // 2. Setup WavWriter
+                let spec = hound::WavSpec {
+                    channels: self.config.stream_config.format.channels,
+                    sample_rate: self.config.stream_config.format.sample_rate,
+                    bits_per_sample: 16, // Standard for WAV, f32 will be converted
+                    sample_format: hound::SampleFormat::Int,
+                };
+
+                let mut writer = hound::WavWriter::create(path, spec).map_err(|e| {
+                    AudioError::RecordingError(format!("Failed to create WAV writer: {}", e))
+                })?;
+
+                let start_time = std::time::Instant::now();
+                let mut total_samples_written: usize = 0;
+
+                // 3. Loop for `duration` or until error
+                while start_time.elapsed() < record_for_duration {
+                    // Use a small timeout to allow checking duration and avoid blocking indefinitely
+                    // if the stream has issues but doesn't error immediately.
+                    match self.read_buffer(Some(100)) {
+                        Ok(Some(buffer)) => {
+                            // Convert f32 samples to i16 and write
+                            for sample_f32 in buffer.as_slice() {
+                                let sample_i16 = (sample_f32 * i16::MAX as f32) as i16;
+                                writer.write_sample(sample_i16).map_err(|e| {
+                                    AudioError::RecordingError(format!(
+                                        "Failed to write sample to WAV file: {}",
+                                        e
+                                    ))
+                                })?;
+                                total_samples_written += 1;
+                            }
+                        }
+                        Ok(None) => {
+                            // Timeout, continue loop to check duration
+                            if start_time.elapsed() >= record_for_duration {
+                                break;
+                            }
+                            // Optional: Add a small sleep here if timeouts are frequent and CPU usage is a concern
+                            // std::thread::sleep(std::time::Duration::from_millis(10));
+                            continue;
+                        }
+                        Err(AudioError::TimeoutError) => {
+                            // Timeout, continue loop to check duration
+                            if start_time.elapsed() >= record_for_duration {
+                                break;
+                            }
+                            continue;
+                        }
+                        Err(e) => {
+                            // For other errors, finalize and return
+                            writer.finalize().map_err(|fin_err| AudioError::RecordingError(format!("Failed to finalize WAV writer after error: {}, original error: {}", fin_err, e)))?;
+                            return Err(AudioError::RecordingError(format!(
+                                "Error reading buffer during recording: {}",
+                                e
+                            )));
+                        }
+                    }
+                }
+
+                // 4. Finalize WavWriter
+                writer.finalize().map_err(|e| {
+                    AudioError::RecordingError(format!("Failed to finalize WAV writer: {}", e))
+                })?;
+
+                println!(
+                    "Successfully wrote {} samples to WAV file.",
+                    total_samples_written
+                );
+                Ok(())
+            } // _ => Err(AudioError::UnsupportedError("Unsupported audio file format for recording.".to_string())),
+        }
     }
 }
 

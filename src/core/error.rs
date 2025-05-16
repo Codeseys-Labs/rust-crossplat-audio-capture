@@ -77,6 +77,10 @@ pub enum AudioError {
     InvalidOperation(String),
     /// A generic error related to stream operations not covered by more specific variants.
     StreamError(String),
+    /// An error specific to capture operations.
+    CaptureError(String),
+    /// The provided sample rate is not supported.
+    UnsupportedSampleRate(u32),
 }
 
 impl std::fmt::Display for AudioError {
@@ -137,6 +141,12 @@ impl std::fmt::Display for AudioError {
             }
             AudioError::StreamError(details) => {
                 write!(f, "Stream error: {}", details)
+            }
+            AudioError::CaptureError(details) => {
+                write!(f, "Capture error: {}", details)
+            }
+            AudioError::UnsupportedSampleRate(rate) => {
+                write!(f, "Unsupported sample rate: {} Hz", rate)
             }
         }
     }
