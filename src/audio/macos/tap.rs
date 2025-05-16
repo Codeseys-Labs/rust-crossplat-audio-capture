@@ -5,23 +5,25 @@ use crate::core::error::{AudioError, AudioResult};
 use cocoa::base::{id, nil};
 use cocoa::foundation::{NSArray, NSAutoreleasePool, NSNumber, NSString};
 use core_foundation_sys::base::OSStatus;
-use core_foundation_sys::string::CFStringRef;
+// use core_foundation_sys::string::CFStringRef; // Not directly used after removing local map_osstatus
+use crate::audio::macos::map_ca_error; // Import the refined error mapper
+use coreaudio_rs::Error as CAError; // To wrap OSStatus for map_ca_error
 use coreaudio_sys as sys;
 use objc::runtime::{Class, Object, Sel, BOOL, NO, YES};
 use objc::{class, msg_send, sel, sel_impl};
 use std::ffi::{c_void, CString}; // For tap name if needed by CATapDescription directly
 
-// Helper to map OSStatus to AudioResult
-fn map_osstatus_to_audio_result(status: OSStatus, context: &str) -> AudioResult<()> {
-    if status == sys::noErr as OSStatus {
-        Ok(())
-    } else {
-        Err(AudioError::BackendSpecificError(format!(
-            "CoreAudio error in {}: OSStatus code {}",
-            context, status
-        )))
-    }
-}
+// Local map_osstatus_to_audio_result is no longer needed, will use super::map_ca_error.
+// fn map_osstatus_to_audio_result(status: OSStatus, context: &str) -> AudioResult<()> {
+//     if status == sys::noErr as OSStatus {
+//         Ok(())
+//     } else {
+//         Err(AudioError::BackendSpecificError(format!(
+//             "CoreAudio error in {}: OSStatus code {}",
+//             context, status
+//         )))
+//     }
+// }
 
 /// Represents a Core Audio Tap targeting a specific process.
 ///
@@ -150,10 +152,15 @@ impl CoreAudioProcessTap {
             let mut tap_id: sys::AudioObjectID = 0;
             let status: OSStatus = AudioHardwareCreateProcessTap(tap_desc_obj, &mut tap_id);
 
-            map_osstatus_to_audio_result(status, "AudioHardwareCreateProcessTap")?;
+            if status != sys::noErr as OSStatus {
+                // Use the refined map_ca_error. It returns AudioError, not AudioResult<()>.
+                // So we directly return its result if it's an error.
+                return Err(map_ca_error(CAError(status)));
+            }
+            // If status is noErr, proceed.
 
             if tap_id == 0 {
-                // This case should ideally be covered by a non-noErr status from the function.
+                // This case indicates an issue even if noErr was returned, which is unusual.
                 return Err(AudioError::SystemError(
                     "AudioHardwareCreateProcessTap succeeded but returned an invalid tap_id (0)"
                         .to_string(),
@@ -197,7 +204,9 @@ impl CoreAudioProcessTap {
             )
         };
 
-        map_osstatus_to_audio_result(status, "AudioObjectGetPropertyData (VirtualFormat)")?;
+        if status != sys::noErr as OSStatus {
+            return Err(map_ca_error(CAError(status)));
+        }
         Ok(asbd)
     }
 }

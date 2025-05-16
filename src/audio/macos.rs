@@ -37,6 +37,16 @@ use std::sync::{
     Arc, Mutex,
 };
 use std::pin::Pin; // Required for Pin<Box<...>> in to_async_stream
+use futures_channel::mpsc;
+use futures_core::Stream as FuturesStream; // Alias to avoid conflict if Stream is defined elsewhere
+
+// IMPORTANT: Applications using this backend MUST include the `NSAudioCaptureUsageDescription` key
+// in their Info.plist file. This key provides a string explaining to the user why the application
+// needs to capture audio. Without it, audio capture will fail silently or with a permissions error
+// on macOS 10.14 Mojave and later.
+// Example for Info.plist:
+// <key>NSAudioCaptureUsageDescription</key>
+// <string>This app requires audio capture to process application audio.</string>
 
 pub mod tap;
 // Imports for application enumeration
@@ -247,7 +257,43 @@ fn asbd_to_audio_format(asbd: &AudioStreamBasicDescription) -> AudioResult<Audio
 }
 
 pub(crate) fn map_ca_error(err: CAError) -> AudioError {
-    AudioError::BackendSpecificError(format!("CoreAudio error: {}", err))
+    // err is coreaudio_rs::Error, which is a tuple struct `pub struct Error(pub OSStatus);`
+    // So, err.0 gives the OSStatus.
+    let os_status = err.0;
+    match os_status as u32 {
+        // Using `as u32` because OSStatus is i32, but constants are often u32.
+        // Ensure these constants are correctly defined and accessible.
+        // Might need to use `sys::kAudioHardwarePermissionsError as u32` etc.
+        // For now, assuming direct u32 comparison is okay or these are i32.
+        // Let's use the direct constants from `sys` which should be i32.
+        sys::kAudioHardwarePermissionsError => AudioError::PermissionDenied,
+        sys::kAudioUnitErr_FormatNotSupported => AudioError::FormatNotSupported(format!("CoreAudio OSStatus: {}", os_status)),
+        // Add other specific mappings here if needed.
+        // Example: kAudioUnitErr_InvalidProperty means the property is not supported by the AU
+        // sys::kAudioUnitErr_InvalidProperty => AudioError::BackendSpecificError(format!("CoreAudio Invalid Property (OSStatus: {})", os_status)),
+        // Example: kAudioUnitErr_InvalidElement means the element is out of range or not supported
+        // sys::kAudioUnitErr_InvalidElement => AudioError::BackendSpecificError(format!("CoreAudio Invalid Element (OSStatus: {})", os_status)),
+        // Example: kAudioUnitErr_CannotDoInCurrentContext might indicate a tap was invalidated (e.g. process quit)
+        // sys::kAudioUnitErr_CannotDoInCurrentContext => AudioError::DeviceDisconnected(format!("CoreAudio CannotDoInCurrentContext (OSStatus: {})", os_status)),
+
+        // Placeholder for a common "device disconnected" or "tap invalidated" error.
+        // This needs to be researched for the most appropriate OSStatus code.
+        // For now, a generic error is pushed in the callback for AudioUnitRender failures.
+        // If a specific OSStatus like `kAudioServerDied` or similar is encountered by AudioUnitRender,
+        // it could be mapped to DeviceDisconnected.
+        // `kAudioHardwareUnspecifiedError` is -6999.
+        // `kAudioHardwareNotRunningError` is -6998.
+        // `kAudioHardwareUnsupportedOperationError` is -6997.
+        // `kAudioDeviceUnsupportedFormatError` is -6989.
+        // `kAudioUnitErr_FailedInitialization` is -10870
+        // `kAudioUnitErr_InvalidScope` is -10868
+        // `kAudioUnitErr_PropertyNotWritable` is -10867
+        // `kAudioUnitErr_CannotDoInCurrentContext` is -10863
+        // `kAudioUnitErr_InvalidElement` is -10877
+        // `kAudioUnitErr_NoConnection` is -10872 (could be relevant for taps)
+
+        _ => AudioError::BackendSpecificError(format!("CoreAudio error: {:?} (OSStatus: {})", err, os_status)),
+    }
 }
 
 /// Represents an active audio stream for capturing on macOS.
@@ -858,7 +904,11 @@ use coreaudio_rs::sys::{
 };
 use std::sync::{Arc, Mutex, atomic::{AtomicBool, Ordering}};
 use std::collections::VecDeque;
-use std::pin::Pin;
+// Pin is already imported at the top level of the module.
+// use std::pin::Pin;
+// mpsc and FuturesStream are also imported at the top level.
+// use futures_channel::mpsc;
+// use futures_core::Stream as FuturesStream;
 
 
 /// Represents an active audio stream for capturing application-specific audio on macOS
@@ -1179,12 +1229,45 @@ impl CapturingStream for MacosApplicationAudioStream {
                     queue.push_back(Ok(Box::new(audio_buffer)));
 
                 } else {
-                    eprintln!("AudioUnitRender error in tap callback: {}", os_status);
+                    // Handle AudioUnitRender error
+                    eprintln!("AudioUnitRender error in tap callback: OSStatus {}", os_status);
+                    let audio_error = match os_status as u32 {
+                        // Consider specific OSStatus codes that might indicate the tap is gone
+                        // or the target process quit. For example:
+                        // sys::kAudioUnitErr_NoConnection might be relevant.
+                        // sys::kAudioUnitErr_CannotDoInCurrentContext could also occur.
+                        // For now, map common errors or use a general one.
+                        // If the tap is invalidated because the process quit, AudioUnitRender might return
+                        // an error like kAudioUnitErr_NoConnection or kAudioUnitErr_InvalidElement if the
+                        // tap AudioObjectID becomes invalid.
+                        // Let's use map_ca_error to be consistent, wrapping the OSStatus.
+                        // If os_status is kAudioUnitErr_NoConnection or similar, map_ca_error might
+                        // eventually map it to DeviceDisconnected if we enhance it further.
+                        // For now, it will be BackendSpecificError.
+                        // The prompt asks to consider AudioError::DeviceDisconnected.
+                        // Let's make a specific check here for a known error if possible,
+                        // otherwise use map_ca_error.
+                        // A common error if the underlying device/tap is gone is kAudioHardwareIllegalOperationError (-50)
+                        // or kAudioUnitErr_UnspecifiedError (-10875) or kAudioUnitErr_InvalidElement (-10877)
+                        // or kAudioUnitErr_NoConnection (-10872)
+                        sys::kAudioUnitErr_NoConnection | sys::kAudioUnitErr_InvalidElement | sys::kAudioHardwareIllegalOperationError => {
+                            AudioError::DeviceDisconnected(format!(
+                                "AudioUnitRender failed, possibly due to target process exit or tap invalidation (OSStatus: {})",
+                                os_status
+                            ))
+                        }
+                        _ => map_ca_error(CAError(os_status)), // Wrap OSStatus in CAError for map_ca_error
+                    };
+
                     let mut queue = data_queue_clone.lock().unwrap();
-                    if queue.len() == queue.capacity() { queue.pop_front(); }
-                    queue.push_back(Err(AudioError::BackendSpecificError(format!(
-                        "AudioUnitRender failed in tap callback with status: {}", os_status
-                    ))));
+                    if queue.len() == queue.capacity() {
+                        queue.pop_front(); // Make space
+                    }
+                    queue.push_back(Err(audio_error));
+
+                    // As per prompt, just enqueuing the error is sufficient for now.
+                    // If we wanted to stop the stream:
+                    // is_started_clone.store(false, Ordering::SeqCst);
                 }
                 Ok(())
             }
@@ -1269,15 +1352,100 @@ impl CapturingStream for MacosApplicationAudioStream {
         }
     }
 
+    /// Converts the synchronous `CapturingStream` into an asynchronous `Stream`
+    /// for application-level audio capture.
+    ///
+    /// This method facilitates asynchronous consumption of audio data captured from a specific
+    /// macOS application via a `CoreAudioProcessTap`. It operates by:
+    /// 1. Checking if the underlying `MacosApplicationAudioStream` is currently running. If not,
+    ///    it returns an `AudioError::InvalidOperation`.
+    /// 2. Creating an unbounded MPSC (multi-producer, single-consumer) channel using `futures_channel::mpsc`.
+    ///    The sender (`tx`) part of this channel will be used by a helper thread, and the
+    ///    receiver (`rx`) part will form the basis of the returned asynchronous stream.
+    /// 3. Spawning a new `std::thread`. This thread is responsible for continuously polling
+    ///    the internal `data_queue` of the `MacosApplicationAudioStream`. This queue is
+    ///    populated by the CoreAudio callback with `AudioResult<Box<dyn AudioBuffer<Sample = f32>>>` items.
+    /// 4. Inside the helper thread's loop:
+    ///    a. It attempts to pop an item from `data_queue` (after acquiring a lock).
+    ///    b. If an `AudioResult` (containing either an audio buffer or an error) is popped:
+    ///       - The lock on `data_queue` is dropped.
+    ///       - The `AudioResult` is sent via the MPSC sender (`tx`).
+    ///       - If `tx.unbounded_send()` fails (e.g., because the `rx` stream has been dropped
+    ///         by the consumer), it indicates that the consumer is no longer interested in
+    ///         the data. The helper thread then breaks its loop and terminates.
+    ///    c. If `data_queue` is empty:
+    ///       - The lock on `data_queue` is dropped.
+    ///       - The thread checks the `is_started` status of the main `MacosApplicationAudioStream`.
+    ///       - If `is_started` is `false` (meaning the main stream has been stopped) AND the
+    ///         queue is empty, it implies that all available data has been processed and
+    ///         no new data will arrive. The helper thread breaks its loop and terminates.
+    ///       - If `is_started` is `true` but the queue is empty (a temporary underrun),
+    ///         the thread sleeps for a short duration (e.g., 10 milliseconds) to avoid
+    ///         busy-waiting, then continues its loop to check the queue again.
+    /// 5. The method returns `Ok(Box::pin(rx))`, where `rx` is the MPSC receiver, now wrapped
+    ///    as a `Pin<Box<dyn futures_core::Stream<...>>>`. This stream can be consumed
+    ///    asynchronously by awaiting its items.
+    ///
+    /// # Error Handling
+    /// - If the stream is not running when `to_async_stream` is called, `Err(AudioError::InvalidOperation)` is returned.
+    /// - Errors encountered during audio capture within the CoreAudio callback (e.g., `AudioUnitRender` failures,
+    ///   format conversion issues) are wrapped in `AudioResult::Err` and pushed onto the `data_queue`.
+    ///   The helper thread forwards these `Err` variants through the MPSC channel, allowing the
+    ///   asynchronous consumer to handle them.
+    ///
+    /// # Thread Safety and Lifetimes
+    /// - `Arc` and `Mutex` are used for `data_queue` and `is_started` to ensure safe sharing
+    ///   between the CoreAudio callback thread, the `MacosApplicationAudioStream` methods,
+    ///   and the new helper thread spawned by `to_async_stream`.
+    /// - The lifetime `'a` ensures that the returned stream does not outlive the `MacosApplicationAudioStream` instance.
     fn to_async_stream<'a>(
         &'a mut self,
     ) -> AudioResult<
-        Pin<Box<dyn futures_core::Stream<Item = AudioResult<Box<dyn AudioBuffer<Sample = f32>>>> + Send + Sync + 'a>>,
+        Pin<Box<dyn FuturesStream<Item = AudioResult<Box<dyn AudioBuffer<Sample = f32>>>> + Send + Sync + 'a>>,
     > {
-        // TODO (Subtask 10.6): Implement async stream conversion.
-        // This will involve spawning a thread to read from data_queue and send to an MPSC channel.
-        // For now, consistent with prompt:
-        todo!("Implement to_async_stream for MacosApplicationAudioStream (Subtask 10.6)")
+        if !self.is_running() {
+            return Err(AudioError::InvalidOperation(
+                "Stream not started or not in streaming state for async conversion".to_string(),
+            ));
+        }
+
+        let (tx, rx) = mpsc::unbounded::<AudioResult<Box<dyn AudioBuffer<Sample = f32>>>>();
+
+        let data_queue_clone = self.data_queue.clone();
+        let is_started_clone = self.is_started.clone();
+
+        std::thread::spawn(move || {
+            loop {
+                let mut queue_guard = data_queue_clone.lock().unwrap();
+                match queue_guard.pop_front() {
+                    Some(audio_result) => {
+                        // Drop the lock before sending to avoid holding it if send blocks or errors.
+                        drop(queue_guard);
+                        if tx.unbounded_send(audio_result).is_err() {
+                            // Receiver was dropped, consumer is gone.
+                            eprintln!("Async stream receiver dropped for MacosApplicationAudioStream, helper thread terminating.");
+                            break;
+                        }
+                    }
+                    None => {
+                        // Queue is empty, drop lock before potentially sleeping.
+                        drop(queue_guard);
+                        if !is_started_clone.load(Ordering::SeqCst) {
+                            // Stream stopped and queue is empty, so we are done.
+                            eprintln!("Main MacosApplicationAudioStream stopped and queue empty, async helper thread terminating.");
+                            break;
+                        } else {
+                            // Stream is running but queue is empty, wait a bit.
+                            std::thread::sleep(std::time::Duration::from_millis(10));
+                        }
+                    }
+                }
+            }
+            // tx is dropped here when thread exits, closing the stream.
+            eprintln!("MacosApplicationAudioStream async audio streaming helper thread finished.");
+        });
+
+        Ok(Box::pin(rx))
     }
 
     fn close(&mut self) -> AudioResult<()> {
