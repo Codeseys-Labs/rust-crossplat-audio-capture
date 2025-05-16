@@ -1,3 +1,9 @@
+// macOS CoreAudio backend implementation.
+// CoreAudio OSStatus errors, typically wrapped in `coreaudio_rs::Error`,
+// are consistently mapped to this crate's `AudioError::BackendSpecificError`
+// using the `map_ca_error` utility function within this module. This ensures
+// uniform error reporting from the CoreAudio backend.
+
 use crate::audio::core::{
     AudioCaptureConfig, AudioDevice, AudioError, AudioFormat, AudioResult, CapturingStream,
     DeviceEnumerator, DeviceId, DeviceKind, SampleFormat, AudioBuffer,
@@ -127,7 +133,11 @@ fn asbd_to_audio_format(asbd: &AudioStreamBasicDescription) -> AudioResult<Audio
         channels: asbd.mChannelsPerFrame as u16,
         bits_per_sample: asbd.mBitsPerChannel as u16,
         sample_format,
-    })
+    });
+}
+
+pub(crate) fn map_ca_error(err: CAError) -> AudioError {
+    AudioError::BackendSpecificError(format!("CoreAudio error: {}", err))
 }
 
 /// Represents an active audio stream for capturing on macOS.
@@ -203,7 +213,7 @@ impl CapturingStream for MacosAudioStream {
                 Scope::Output, // Data flowing OUT of the INPUT bus
                 Element::INPUT_BUS, // The bus providing captured audio (Element 1)
             )
-            .map_err(MacosDeviceEnumerator::map_ca_error)?;
+            .map_err(map_ca_error)?;
         *self.current_asbd.lock().unwrap() = Some(asbd);
 
         // 2. Clone Arcs for the callback closure.
@@ -242,16 +252,25 @@ impl CapturingStream for MacosAudioStream {
                 
                 // `coreaudio_rs::audio_buffer::AudioBufferList::allocate` creates a Box<sys::AudioBufferList>
                 // and allocates mData for each buffer if the last param is true.
-                let mut captured_abl_boxed = CAAudioBufferList::allocate(
+                let captured_abl_boxed_result = CAAudioBufferList::allocate(
                     input_asbd.mChannelsPerFrame, // Number of channels in the ASBD
                     num_frames,                   // Number of frames to render
                     is_input_interleaved,         // Whether the format is interleaved
                     true,                         // True to allocate mData pointers
-                )
-                .map_err(|e| {
-                    eprintln!("Failed to allocate AudioBufferList: {:?}", e);
-                    sys::kAudio_MemFullError as OSStatus // Or another appropriate error
-                })?;
+                );
+
+                let mut captured_abl_boxed = match captured_abl_boxed_result.map_err(map_ca_error) {
+                    Ok(abl) => abl,
+                    Err(audio_err) => {
+                        eprintln!("Callback Error: Failed to allocate AudioBufferList for capture: {:?}", audio_err);
+                        let mut queue = data_queue_clone.lock().unwrap();
+                        if queue.len() == queue.capacity() {
+                            queue.pop_front(); // Make space if full
+                        }
+                        queue.push_back(Err(audio_err));
+                        return Ok(()); // Error pushed to queue, callback returns OK to CoreAudio
+                    }
+                };
                 
                 let captured_abl_ptr: *mut sys::AudioBufferList = &mut *captured_abl_boxed;
 
@@ -358,12 +377,12 @@ impl CapturingStream for MacosAudioStream {
                 }
                 Ok(())
             })
-            .map_err(MacosDeviceEnumerator::map_ca_error)?;
+            .map_err(map_ca_error)?;
 
         // 4. Start the AudioUnit
         self.audio_unit
             .start()
-            .map_err(MacosDeviceEnumerator::map_ca_error)?;
+            .map_err(map_ca_error)?;
         self.is_started.store(true, Ordering::SeqCst);
 
         Ok(())
@@ -378,7 +397,7 @@ impl CapturingStream for MacosAudioStream {
         }
         self.audio_unit
             .stop()
-            .map_err(MacosDeviceEnumerator::map_ca_error)?;
+            .map_err(map_ca_error)?;
         self.is_started.store(false, Ordering::SeqCst);
         // Optionally, clear the callback? Or clear the queue?
         // For now, just stop. The callback checks `is_started`.
@@ -539,7 +558,7 @@ impl AudioDevice for MacosAudioDevice {
     ///
     /// This queries `kAudioDevicePropertyDeviceNameCFString`.
     fn get_name(&self) -> AudioResult<String> {
-        AudioObject::name(&self.device_id).map_err(MacosDeviceEnumerator::map_ca_error)
+        AudioObject::name(&self.device_id).map_err(map_ca_error)
     }
 
     /// Gets a human-readable description of the audio device.
@@ -570,7 +589,7 @@ impl AudioDevice for MacosAudioDevice {
     fn is_active(&self) -> AudioResult<bool> {
         // kAudioDevicePropertyDeviceIsAlive is a standard property.
         // The `AudioObject::alive()` method directly queries this.
-        AudioObject::is_alive(&self.device_id).map_err(MacosDeviceEnumerator::map_ca_error)
+        AudioObject::is_alive(&self.device_id).map_err(map_ca_error)
     }
 
     /// Gets the default audio format for the device.
@@ -583,7 +602,7 @@ impl AudioDevice for MacosAudioDevice {
             mElement: kAudioObjectPropertyElementMaster,
         };
         let asbd: AudioStreamBasicDescription = AudioObject::get_property(&self.device_id, address)
-            .map_err(MacosDeviceEnumerator::map_ca_error)?;
+            .map_err(map_ca_error)?;
         asbd_to_audio_format(&asbd)
     }
 
@@ -637,7 +656,7 @@ impl AudioDevice for MacosAudioDevice {
         // 3. Create AudioUnit instance
         let mut audio_unit = component
             .new_instance()
-            .map_err(MacosDeviceEnumerator::map_ca_error)?;
+            .map_err(map_ca_error)?;
 
         // 4. Set current device on AUHAL
         audio_unit
@@ -647,7 +666,7 @@ impl AudioDevice for MacosAudioDevice {
                 audio_unit_element::OUTPUT_BUS, // Global scope usually uses output bus for device selection
                 Some(&self.device_id),
             )
-            .map_err(MacosDeviceEnumerator::map_ca_error)?;
+            .map_err(map_ca_error)?;
 
         // 5. Enable IO for input (capture) on the output unit's input bus
         let enable_io: u32 = 1;
@@ -658,7 +677,7 @@ impl AudioDevice for MacosAudioDevice {
                 audio_unit_element::INPUT_BUS, // Element is the input bus (capture side)
                 Some(&enable_io),
             )
-            .map_err(MacosDeviceEnumerator::map_ca_error)?;
+            .map_err(map_ca_error)?;
 
         // 6. Disable IO for output (to prevent sound passthrough from this AU instance)
         let disable_io: u32 = 0;
@@ -669,7 +688,7 @@ impl AudioDevice for MacosAudioDevice {
                 audio_unit_element::OUTPUT_BUS, // Element is the output bus (playback side)
                 Some(&disable_io),
             )
-            .map_err(MacosDeviceEnumerator::map_ca_error)?;
+            .map_err(map_ca_error)?;
 
         // 7. Convert capture_config.stream_config.format to an AudioStreamBasicDescription (ASBD)
         let asbd = audio_format_to_asbd(&capture_config.stream_config.format);
@@ -685,7 +704,7 @@ impl AudioDevice for MacosAudioDevice {
                 audio_unit_element::INPUT_BUS, // The bus providing captured audio
                 Some(&asbd),
             )
-            .map_err(MacosDeviceEnumerator::map_ca_error)?;
+            .map_err(map_ca_error)?;
 
         // Set the "client" format on the INPUT scope of the OUTPUT bus (Element 0).
         // This defines the format that the AudioUnit's output bus would expect on its input side
@@ -698,12 +717,12 @@ impl AudioDevice for MacosAudioDevice {
                 audio_unit_element::OUTPUT_BUS, // The bus that would normally render to speakers
                 Some(&asbd),
             )
-            .map_err(MacosDeviceEnumerator::map_ca_error)?;
+            .map_err(map_ca_error)?;
 
         // 9. Initialize AudioUnit
         audio_unit
             .initialize()
-            .map_err(MacosDeviceEnumerator::map_ca_error)?;
+            .map_err(map_ca_error)?;
 
         // 10. Define MacosAudioStream struct skeleton (done above)
         // 11. Return Ok(Box::new(MacosAudioStream::new(audio_unit)))
@@ -718,12 +737,6 @@ impl AudioDevice for MacosAudioDevice {
 pub(crate) struct MacosDeviceEnumerator;
 
 impl MacosDeviceEnumerator {
-    // Renamed from map_ca_error to avoid conflict if we make it public,
-    // though it's fine as a private static method.
-    // Keeping it as is since it's used by MacosAudioDevice impl.
-    pub(crate) fn map_ca_error(err: CAError) -> AudioError {
-        AudioError::BackendSpecificError(format!("CoreAudio error: {}", err))
-    }
 }
 
 impl DeviceEnumerator for MacosDeviceEnumerator {
@@ -741,7 +754,7 @@ impl DeviceEnumerator for MacosDeviceEnumerator {
                         let macos_audio_device = MacosAudioDevice { device_id };
                         Ok(Some(Box::new(macos_audio_device)))
                     }
-                    Err(err) => Err(Self::map_ca_error(err)),
+                    Err(err) => Err(map_ca_error(err)),
                 }
             }
             DeviceKind::Output => Ok(None), // Not implemented for output selection yet.
