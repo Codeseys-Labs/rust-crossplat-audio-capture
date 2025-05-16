@@ -8,6 +8,8 @@ use crate::core::interface::{
     StreamDataCallback,
 };
 use crate::AudioFormat; // AudioFormat is re-exported from lib.rs
+use pipewire::{keys as pw_keys, types as pw_types}; // Added for PipeWire keys and types
+use std::fmt::Display; // Added for DeviceId Display trait
 
 // TODO: Remove these once the actual PipeWire logic is integrated with the new traits.
 // These are placeholders from the old structure.
@@ -26,14 +28,15 @@ use pipewire::{
     // context::Context as PwContext, // Keep PwContext for old code if needed
     // core::Core as PwCore, // Keep PwCore for old code if needed
     // main_loop::MainLoop as PwMainLoop, // Keep PwMainLoop for old code if needed
-    properties::properties,
-    registry::Registry,
+    properties::properties, // This is fine
+    registry::Registry,     // This is fine
     spa,
     spa::pod::{Object, Pod},
     stream::{Stream as PwStream, StreamFlags},
-    Context,  // For PipewireCoreContext
-    Core,     // For PipewireCoreContext
-    MainLoop, // For PipewireCoreContext
+    Context,    // For PipewireCoreContext
+    Core,       // For PipewireCoreContext
+    MainLoop,   // For PipewireCoreContext
+    Properties, // Explicitly import Properties
 };
 
 use super::core::{AudioApplication, AudioCaptureBackend, AudioCaptureStream};
@@ -104,82 +107,108 @@ impl PipewireCoreContext {
 //     }
 // }
 
-#[derive(Debug, Clone, PartialEq, Eq, Hash)]
-pub struct LinuxDeviceId(String); // Example: Use a String for now
+/// Device ID for PipeWire devices, represented as a String (typically a node ID).
+pub type LinuxPipeWireDeviceId = String;
 
-pub struct LinuxAudioDevice {
-    id: LinuxDeviceId,
-    name: String,
-    kind: DeviceKind,
-    // TODO: Add other necessary fields, e.g., PipeWire node ID, reference to PipewireCoreContext if needed
+/// Represents a PipeWire audio device.
+/// For subtask 6.2, this is a basic struct holding node information.
+/// Full implementation will be in subtask 6.3.
+#[derive(Debug, Clone)]
+pub(crate) struct LinuxAudioDevice {
+    id: u32, // PipeWire node ID
+    props: Option<Properties>, // Store node properties
+             // core_context: Arc<PipewireCoreContext>, // If needed for device operations
+}
+
+impl LinuxAudioDevice {
+    /// Creates a new LinuxAudioDevice.
+    fn new(id: u32, props: Option<Properties>) -> Self {
+        Self { id, props }
+    }
 }
 
 impl AudioDevice for LinuxAudioDevice {
-    type DeviceId = LinuxDeviceId;
+    type DeviceId = LinuxPipeWireDeviceId;
 
+    /// Gets the unique identifier of the audio device.
+    /// For PipeWire, this is the node ID converted to a String.
     fn get_id(&self) -> Self::DeviceId {
-        println!("TODO: LinuxAudioDevice::get_id()");
-        self.id.clone()
+        self.id.to_string()
     }
 
+    /// Gets the human-readable name of the audio device.
     fn get_name(&self) -> String {
-        println!("TODO: LinuxAudioDevice::get_name()");
-        self.name.clone()
+        self.props
+            .as_ref()
+            .and_then(|p| {
+                p.get(pw_keys::NODE_DESCRIPTION)
+                    .or_else(|| p.get(pw_keys::NODE_NAME))
+            })
+            .unwrap_or_else(|| format!("PipeWire Node {}", self.id))
+            .to_string()
     }
 
+    /// Gets a list of supported audio formats for this device.
+    /// TODO: Implement in subtask 6.3.
     fn get_supported_formats(&self) -> AudioResult<Vec<AudioFormat>> {
-        println!("TODO: LinuxAudioDevice::get_supported_formats()");
-        todo!()
+        // log::debug!("LinuxAudioDevice::get_supported_formats() - props: {:?}", self.props);
+        todo!("LinuxAudioDevice::get_supported_formats - Subtask 6.3")
     }
 
+    /// Gets the default audio format for this device.
+    /// TODO: Implement in subtask 6.3.
     fn get_default_format(&self) -> AudioResult<AudioFormat> {
-        println!("TODO: LinuxAudioDevice::get_default_format()");
-        todo!()
+        // log::debug!("LinuxAudioDevice::get_default_format() - props: {:?}", self.props);
+        todo!("LinuxAudioDevice::get_default_format - Subtask 6.3")
     }
 
+    /// Returns `true` if this device is an input device (e.g., microphone, system audio monitor).
     fn is_input(&self) -> bool {
-        println!("TODO: LinuxAudioDevice::is_input()");
-        self.kind == DeviceKind::Input
+        // Monitor sources are considered inputs from the application's perspective.
+        // PipeWire nodes with "Audio/Source" are sources of audio data.
+        if let Some(props) = &self.props {
+            if props.get(pw_keys::MEDIA_CLASS) == Some("Audio/Source") {
+                return true;
+            }
+        }
+        // Fallback or further checks if needed
+        true // Assuming for now that devices enumerated are capture-capable
     }
 
+    /// Returns `true` if this device is an output device (e.g., speakers).
     fn is_output(&self) -> bool {
-        println!("TODO: LinuxAudioDevice::is_output()");
-        self.kind == DeviceKind::Output
-    }
-
-    fn is_active(&self) -> bool {
-        println!("TODO: LinuxAudioDevice::is_active()");
-        // TODO: Implement actual status check
+        // This enumerator focuses on capture sources.
         false
     }
 
-    fn is_format_supported(&self, format: &AudioFormat) -> AudioResult<bool> {
-        println!("TODO: LinuxAudioDevice::is_format_supported({:?})", format);
-        // For now, assume all formats are supported or let the actual stream creation fail.
-        // Later tasks will implement actual format checking.
-        Ok(true)
+    /// Checks if the device is currently active or available.
+    /// TODO: Implement in subtask 6.3.
+    fn is_active(&self) -> bool {
+        // log::debug!("LinuxAudioDevice::is_active() - props: {:?}", self.props);
+        todo!("LinuxAudioDevice::is_active - Subtask 6.3")
     }
 
+    /// Checks if the specified audio format is supported by this device.
+    /// TODO: Implement in subtask 6.3.
+    fn is_format_supported(&self, _format: &AudioFormat) -> AudioResult<bool> {
+        // log::debug!("LinuxAudioDevice::is_format_supported({:?}) - props: {:?}", _format, self.props);
+        todo!("LinuxAudioDevice::is_format_supported - Subtask 6.3")
+    }
+
+    /// Creates an audio stream for capturing data from this device.
+    /// TODO: Implement in subtask 6.3.
     fn create_stream(
         &mut self,
-        capture_config: &AudioCaptureConfig,
+        _capture_config: &AudioCaptureConfig,
     ) -> AudioResult<Box<dyn CapturingStream + 'static>> {
-        println!(
-            "TODO: LinuxAudioDevice::create_stream(capture_config: {:?})",
-            capture_config
-        );
-        // For now, let's return a new, unconfigured LinuxAudioStream.
-        // In a real implementation, this would be configured based on `self` and `capture_config`.
-        // The actual stream config is nested within capture_config.
-        Ok(Box::new(LinuxAudioStream {
-            config: Some(capture_config.stream_config.clone()), // Or however LinuxAudioStream stores its config
-                                                                // Potentially store target_pid and target_session_identifier if Linux needs them
-        }))
+        // log::debug!("LinuxAudioDevice::create_stream(capture_config: {:?})", _capture_config);
+        todo!("LinuxAudioDevice::create_stream - Subtask 6.3")
     }
 }
 
+/// Enumerates PipeWire audio devices.
 pub struct LinuxDeviceEnumerator {
-    core_context: PipewireCoreContext, // Or Arc<PipewireCoreContext> if shared
+    core_context: Arc<PipewireCoreContext>, // Use Arc for potential sharing
 }
 
 impl LinuxDeviceEnumerator {
@@ -193,7 +222,7 @@ impl LinuxDeviceEnumerator {
         // TODO: Move pipewire::init() to a global, once-per-application call.
         pipewire::init();
 
-        let core_context = PipewireCoreContext::new()?;
+        let core_context = Arc::new(PipewireCoreContext::new()?);
         Ok(Self { core_context })
     }
 }
@@ -209,151 +238,321 @@ impl LinuxDeviceEnumerator {
 //     }
 // }
 
+struct DefaultDeviceSearchState {
+    default_sink_name: Option<String>,
+    default_sink_id: Option<u32>,
+    monitor_device: Option<Box<dyn AudioDevice>>,
+    main_loop_quit_handle: MainLoop, // To call quit
+}
+
 impl DeviceEnumerator for LinuxDeviceEnumerator {
     type Device = LinuxAudioDevice;
 
-    fn enumerate_devices(&self) -> AudioResult<Vec<Self::Device>> {
-        println!(
-            "TODO: LinuxDeviceEnumerator::enumerate_devices() using self.core_context: {:?}",
-            self.core_context
-        );
-        todo!()
+    /// Enumerates available audio capture devices (monitor sources).
+    ///
+    /// For subtask 6.2, this is a simplified implementation that attempts to find
+    /// the monitor source of the default audio sink.
+    ///
+    /// TODO: Implement full enumeration of all available monitor sources in a later subtask.
+    fn enumerate_devices(&self) -> AudioResult<Vec<Box<dyn AudioDevice>>> {
+        // log::debug!("LinuxDeviceEnumerator::enumerate_devices()");
+        // TODO: Implement full enumeration of all available monitor sources.
+        // For now, it calls get_default_device for DeviceKind::Input.
+        match self.get_default_device(DeviceKind::Input) {
+            Ok(Some(device)) => Ok(vec![device]),
+            Ok(None) => Ok(Vec::new()),
+            Err(e) => Err(e),
+        }
     }
 
-    fn get_default_device(&self, kind: DeviceKind) -> AudioResult<Self::Device> {
-        println!(
-            "TODO: LinuxDeviceEnumerator::get_default_device({:?}) using self.core_context: {:?}",
-            kind, self.core_context
-        );
-        todo!()
+    /// Gets the default audio device of the specified kind.
+    ///
+    /// For `DeviceKind::Input`, this attempts to find the monitor source of the
+    /// default audio sink. For `DeviceKind::Output`, it returns `Ok(None)`.
+    fn get_default_device(&self, kind: DeviceKind) -> AudioResult<Option<Box<dyn AudioDevice>>> {
+        // log::debug!("LinuxDeviceEnumerator::get_default_device(kind: {:?})", kind);
+        if kind == DeviceKind::Output {
+            return Ok(None); // This enumerator is for capture (input) devices
+        }
+
+        let core = self.core_context.core();
+        let registry = core.get_registry().map_err(|e| {
+            AudioError::BackendSpecificError(format!("Failed to get PipeWire registry: {}", e))
+        })?;
+
+        let search_state = Arc::new(Mutex::new(DefaultDeviceSearchState {
+            default_sink_name: None,
+            default_sink_id: None,
+            monitor_device: None,
+            main_loop_quit_handle: self.core_context.main_loop().clone(),
+        }));
+
+        // Keep the listener alive until the main loop finishes.
+        let _listener = registry
+            .add_listener_local()
+            .global({
+                let state_clone = Arc::clone(&search_state);
+                move |global| {
+                    let mut state = state_clone.lock().unwrap();
+                    if state.monitor_device.is_some() {
+                        return; // Already found
+                    }
+
+                    if global.type_ == pw_types::Metadata::type_() {
+                        if let Some(props) = &global.props {
+                            if props.get(pw_keys::METADATA_NAME) == Some("default") {
+                                if let Some(name) = props.get("default.audio.sink") {
+                                    // log::debug!("Found default metadata, default.audio.sink name: {}", name);
+                                    state.default_sink_name = Some(name.to_string());
+                                }
+                            }
+                        }
+                    } else if global.type_ == pw_types::Node::type_() {
+                        if let Some(props) = &global.props {
+                            // Step 1: Identify the default sink node by name
+                            if state.default_sink_id.is_none() {
+                                if let Some(ref target_sink_name) = state.default_sink_name {
+                                    let node_name =
+                                        props.get(pw_keys::NODE_NAME).unwrap_or_default();
+                                    let node_desc =
+                                        props.get(pw_keys::NODE_DESCRIPTION).unwrap_or_default();
+                                    if (node_name == target_sink_name
+                                        || node_desc == target_sink_name)
+                                        && props.get(pw_keys::MEDIA_CLASS) == Some("Audio/Sink")
+                                    {
+                                        // log::debug!("Found default sink node: id={}, name='{}', desc='{}'", global.id, node_name, node_desc);
+                                        state.default_sink_id = Some(global.id);
+                                    }
+                                }
+                            }
+
+                            // Step 2: Identify the monitor of the (now known) default sink
+                            if let Some(sink_id) = state.default_sink_id {
+                                if props.get(pw_keys::MEDIA_CLASS) == Some("Audio/Source") {
+                                    let node_name =
+                                        props.get(pw_keys::NODE_NAME).unwrap_or_default();
+                                    let node_description =
+                                        props.get(pw_keys::NODE_DESCRIPTION).unwrap_or_default();
+
+                                    // Heuristic: Monitor node name often contains "Monitor of <Sink Name/Description>"
+                                    // Or, it might have a "node.target" property pointing to the sink_id (less common for implicit monitors)
+                                    let mut is_monitor_of_default = false;
+                                    if let Some(ref sink_name_from_meta) = state.default_sink_name {
+                                        if node_name.contains(&format!(
+                                            "Monitor of {}",
+                                            sink_name_from_meta
+                                        )) || node_description.contains(&format!(
+                                            "Monitor of {}",
+                                            sink_name_from_meta
+                                        )) {
+                                            is_monitor_of_default = true;
+                                        }
+                                    }
+                                    // Fallback: if node.target points to the sink_id (might not always be set for implicit monitors)
+                                    if !is_monitor_of_default {
+                                        if let Some(target_str) = props.get("node.target") {
+                                            // "node.target" is not in pw_keys
+                                            if target_str.parse::<u32>().ok() == Some(sink_id) {
+                                                is_monitor_of_default = true;
+                                            }
+                                        }
+                                    }
+                                    // General "Monitor" check if specific link not found
+                                    if !is_monitor_of_default
+                                        && (node_name.contains("Monitor")
+                                            || node_description.contains("Monitor"))
+                                    {
+                                        // This is a weaker heuristic, might pick a non-default monitor if the default sink/monitor naming is unusual.
+                                        // For this simplified subtask, if we have a default_sink_id, any "Audio/Source" named "Monitor" is a candidate.
+                                        // log::warn!("Found a generic monitor source (id: {}) after identifying default sink (id: {}). Assuming it's the one.", global.id, sink_id);
+                                        is_monitor_of_default = true;
+                                    }
+
+                                    if is_monitor_of_default {
+                                        // log::debug!("Found monitor source for default sink: id={}, name='{}', desc='{}'", global.id, node_name, node_desc);
+                                        let device =
+                                            LinuxAudioDevice::new(global.id, props.cloned());
+                                        state.monitor_device = Some(Box::new(device));
+                                        state.main_loop_quit_handle.quit();
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            })
+            .register()
+            .map_err(|e| {
+                AudioError::BackendSpecificError(format!(
+                    "Failed to register registry listener: {}",
+                    e
+                ))
+            })?;
+
+        // Run the main loop. It will be stopped by the callback when the device is found or implicitly times out.
+        // For a more robust solution, MainLoop::iterate with a timeout loop would be better if quit is not guaranteed.
+        self.core_context.main_loop().run();
+
+        // Extract the device from the state
+        let mut state_guard = search_state.lock().unwrap();
+        Ok(state_guard.monitor_device.take())
     }
 
-    fn get_input_devices(&self) -> AudioResult<Vec<Self::Device>> {
-        println!(
-            "TODO: LinuxDeviceEnumerator::get_input_devices() using self.core_context: {:?}",
-            self.core_context
-        );
-        todo!()
-    }
-
-    fn get_output_devices(&self) -> AudioResult<Vec<Self::Device>> {
-        println!(
-            "TODO: LinuxDeviceEnumerator::get_output_devices() using self.core_context: {:?}",
-            self.core_context
-        );
-        todo!()
-    }
-
+    /// Gets a specific audio device by its ID.
+    ///
+    /// The `id_str` is the string representation of the PipeWire node ID.
+    /// `kind` can be used to filter, but is ignored for this simplified implementation.
+    ///
+    /// TODO: Implement actual device lookup and validation in a later subtask.
     fn get_device_by_id(
         &self,
-        id: &<Self::Device as AudioDevice>::DeviceId,
-    ) -> AudioResult<Self::Device> {
-        println!(
-            "TODO: LinuxDeviceEnumerator::get_device_by_id({:?}) using self.core_context: {:?}",
-            id, self.core_context
-        );
-        todo!()
+        id_str: &LinuxPipeWireDeviceId,
+        _kind: Option<DeviceKind>,
+    ) -> AudioResult<Option<Box<dyn AudioDevice>>> {
+        // log::debug!("LinuxDeviceEnumerator::get_device_by_id(id_str: {:?}, kind: {:?})", id_str, _kind);
+        // The DeviceId (String) needs to be parsed to a u32 if it represents a PipeWire node ID.
+        // Use the registry to get information about the node with this ID.
+        // Check if it's a suitable capture node (monitor source). If so, create and return LinuxAudioDevice.
+
+        // Attempt to parse the ID string to u32.
+        let _node_id = match id_str.parse::<u32>() {
+            Ok(id) => id,
+            Err(_) => {
+                return Err(AudioError::InvalidDeviceId(format!(
+                    "Invalid PipeWire node ID string: {}",
+                    id_str
+                )))
+            }
+        };
+
+        // TODO: Implement actual device lookup by ID using the PipeWire registry
+        // and verify it's a suitable monitor source. For subtask 6.2, this is not implemented.
+        // log::warn!("get_device_by_id for PipeWire is not fully implemented yet. Returning Ok(None). ID requested: {}", id_str);
+        Ok(None)
+        // Alternatively, to strictly follow the prompt's allowance for NotImplemented:
+        // Err(AudioError::NotImplemented("Device lookup by ID for PipeWire is not yet implemented.".to_string()))
+    }
+
+    /// Gets a list of available input audio devices.
+    /// For PipeWire, these are typically monitor sources.
+    fn get_input_devices(&self) -> AudioResult<Vec<Box<dyn AudioDevice>>> {
+        // log::debug!("LinuxDeviceEnumerator::get_input_devices()");
+        // For now, this is consistent with enumerate_devices which focuses on the default input.
+        // A full implementation would list all suitable input (monitor) nodes.
+        self.enumerate_devices()
+    }
+
+    /// Gets a list of available output audio devices.
+    /// This enumerator focuses on capture sources, so this will return an empty list.
+    fn get_output_devices(&self) -> AudioResult<Vec<Box<dyn AudioDevice>>> {
+        // log::debug!("LinuxDeviceEnumerator::get_output_devices()");
+        Ok(Vec::new())
     }
 }
 
 pub struct LinuxAudioStream {
     // TODO: Add fields specific to a Linux audio stream (e.g., PipeWire stream, buffer, config)
+    // This struct will be properly defined and implemented in subtask 6.4.
+    #[allow(dead_code)] // Will be used in subtask 6.4
     config: Option<StreamConfig>,
 }
 
 impl AudioStream for LinuxAudioStream {
     type Config = StreamConfig;
-    type Device = LinuxAudioDevice;
+    type Device = LinuxAudioDevice; // This now refers to the new LinuxAudioDevice
 
     fn open(&mut self, device: &Self::Device, config: Self::Config) -> AudioResult<()> {
-        println!(
-            "TODO: LinuxAudioStream::open(device_id: {:?}, config: {:?})",
-            device.get_id(),
-            config
-        );
+        // log::debug!(
+        //     "TODO: LinuxAudioStream::open(device_id: {:?}, config: {:?})",
+        //     device.get_id(),
+        //     config
+        // );
         self.config = Some(config);
-        todo!()
+        todo!("LinuxAudioStream::open - Subtask 6.4")
     }
 
     fn start(&mut self) -> AudioResult<()> {
-        println!("TODO: LinuxAudioStream::start()");
-        todo!()
+        // log::debug!("TODO: LinuxAudioStream::start()");
+        todo!("LinuxAudioStream::start - Subtask 6.4")
     }
 
     fn pause(&mut self) -> AudioResult<()> {
-        println!("TODO: LinuxAudioStream::pause()");
-        todo!()
+        // log::debug!("TODO: LinuxAudioStream::pause()");
+        todo!("LinuxAudioStream::pause - Subtask 6.4")
     }
 
     fn resume(&mut self) -> AudioResult<()> {
-        println!("TODO: LinuxAudioStream::resume()");
-        todo!()
+        // log::debug!("TODO: LinuxAudioStream::resume()");
+        todo!("LinuxAudioStream::resume - Subtask 6.4")
     }
 
     fn stop(&mut self) -> AudioResult<()> {
-        println!("TODO: LinuxAudioStream::stop()");
-        todo!()
+        // log::debug!("TODO: LinuxAudioStream::stop()");
+        todo!("LinuxAudioStream::stop - Subtask 6.4")
     }
 
     fn close(&mut self) -> AudioResult<()> {
-        println!("TODO: LinuxAudioStream::close()");
+        // log::debug!("TODO: LinuxAudioStream::close()");
         self.config = None;
-        todo!()
+        todo!("LinuxAudioStream::close - Subtask 6.4")
     }
 
-    fn set_format(&mut self, format: &AudioFormat) -> AudioResult<()> {
-        println!("TODO: LinuxAudioStream::set_format({:?})", format);
-        todo!()
+    fn set_format(&mut self, _format: &AudioFormat) -> AudioResult<()> {
+        // log::debug!("TODO: LinuxAudioStream::set_format({:?})", _format);
+        todo!("LinuxAudioStream::set_format - Subtask 6.4")
     }
 
     fn set_callback(&mut self, _callback: StreamDataCallback) -> AudioResult<()> {
-        println!("TODO: LinuxAudioStream::set_callback()");
-        todo!()
+        // log::debug!("TODO: LinuxAudioStream::set_callback()");
+        todo!("LinuxAudioStream::set_callback - Subtask 6.4")
     }
 
     fn is_running(&self) -> bool {
-        println!("TODO: LinuxAudioStream::is_running()");
+        // log::debug!("TODO: LinuxAudioStream::is_running()");
         false
     }
 
     fn get_latency_frames(&self) -> AudioResult<u64> {
-        println!("TODO: LinuxAudioStream::get_latency_frames()");
-        todo!()
+        // log::debug!("TODO: LinuxAudioStream::get_latency_frames()");
+        todo!("LinuxAudioStream::get_latency_frames - Subtask 6.4")
     }
 
     fn get_current_format(&self) -> AudioResult<AudioFormat> {
-        println!("TODO: LinuxAudioStream::get_current_format()");
-        todo!()
+        // log::debug!("TODO: LinuxAudioStream::get_current_format()");
+        todo!("LinuxAudioStream::get_current_format - Subtask 6.4")
     }
 }
 
 impl CapturingStream for LinuxAudioStream {
     fn start(&mut self) -> AudioResult<()> {
-        println!("TODO: LinuxAudioStream (CapturingStream)::start()");
-        todo!()
+        // log::debug!("TODO: LinuxAudioStream (CapturingStream)::start()");
+        todo!("LinuxAudioStream (CapturingStream)::start - Subtask 6.4")
     }
 
     fn stop(&mut self) -> AudioResult<()> {
-        println!("TODO: LinuxAudioStream (CapturingStream)::stop()");
-        todo!()
+        // log::debug!("TODO: LinuxAudioStream (CapturingStream)::stop()");
+        todo!("LinuxAudioStream (CapturingStream)::stop - Subtask 6.4")
     }
 
     fn close(&mut self) -> AudioResult<()> {
-        println!("TODO: LinuxAudioStream (CapturingStream)::close()");
-        todo!()
+        // log::debug!("TODO: LinuxAudioStream (CapturingStream)::close()");
+        todo!("LinuxAudioStream (CapturingStream)::close - Subtask 6.4")
     }
 
     fn is_running(&self) -> bool {
-        println!("TODO: LinuxAudioStream (CapturingStream)::is_running()");
+        // log::debug!("TODO: LinuxAudioStream (CapturingStream)::is_running()");
         false
     }
 
-    fn read_chunk(&mut self, timeout_ms: Option<u32>) -> AudioResult<Option<Box<dyn AudioBuffer>>> {
-        println!(
-            "TODO: LinuxAudioStream (CapturingStream)::read_chunk(timeout_ms: {:?})",
-            timeout_ms
-        );
-        todo!()
+    fn read_chunk(
+        &mut self,
+        _timeout_ms: Option<u32>,
+    ) -> AudioResult<Option<Box<dyn AudioBuffer>>> {
+        // log::debug!(
+        //     "TODO: LinuxAudioStream (CapturingStream)::read_chunk(timeout_ms: {:?})",
+        //     _timeout_ms
+        // );
+        todo!("LinuxAudioStream (CapturingStream)::read_chunk - Subtask 6.4")
     }
 
     fn to_async_stream<'a>(
@@ -368,8 +567,8 @@ impl CapturingStream for LinuxAudioStream {
             >,
         >,
     > {
-        println!("TODO: LinuxAudioStream (CapturingStream)::to_async_stream()");
-        todo!()
+        // log::debug!("TODO: LinuxAudioStream (CapturingStream)::to_async_stream()");
+        todo!("LinuxAudioStream (CapturingStream)::to_async_stream - Subtask 6.4")
     }
 }
 
