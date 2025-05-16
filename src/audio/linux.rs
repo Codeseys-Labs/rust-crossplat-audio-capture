@@ -22,8 +22,10 @@ use pipewire::{
 }; // Added for PipeWire keys and types
 use std::fmt::Display; // Added for DeviceId Display trait
 use std::sync::Arc; // Added for Arc
-
-// TODO: Remove these once the actual PipeWire logic is integrated with the new traits.
+use std::collections::VecDeque; // For data_queue
+use std::sync::atomic::{AtomicBool, Ordering as AtomicOrdering}; // Renamed Ordering to avoid conflict if any
+ 
+ // TODO: Remove these once the actual PipeWire logic is integrated with the new traits.
 // These are placeholders from the old structure.
 use std::{process::Command, sync::Mutex, thread, time::Duration};
 
@@ -43,8 +45,10 @@ use pipewire::{
     Core,       // For PipewireCoreContext
     MainLoop,   // For PipewireCoreContext
     Properties, // Explicitly import Properties
+    stream::Listener as StreamListener, // For listener_handle type
 };
-
+use crate::core::buffer::VecAudioBuffer; // For creating AudioBuffer objects
+ 
 use super::core::{AudioApplication, AudioCaptureBackend, AudioCaptureStream};
 
 // --- New Skeleton Implementations ---
@@ -573,13 +577,13 @@ pub(crate) struct LinuxAudioStream {
     stream: PwStream,                       // The underlying PipeWire stream object
     core_context: Arc<PipewireCoreContext>, // Keeps MainLoop, Context, Core alive and accessible
     /// Handle to the stream listener to keep it alive.
-    listener_handle: Option<StreamListener>,
+    listener_handle: Option<StreamListener>, // Changed from pipewire::stream::Listener for consistency with prompt
     /// Indicates if the stream has been started and is (or attempting to be) streaming.
     is_started: Arc<AtomicBool>,
     /// Stores the audio format negotiated with PipeWire.
     current_format: Arc<Mutex<Option<AudioFormat>>>,
-    // /// Queue for audio data received from PipeWire, for subtasks 6.5/6.6.
-    // data_queue: Arc<Mutex<VecDeque<AudioResult<Box<dyn AudioBuffer<Sample = f32>>>>>>,
+    /// Queue for audio data received from PipeWire, for subtasks 6.5/6.6.
+    data_queue: Arc<Mutex<VecDeque<AudioResult<Box<dyn AudioBuffer<Sample = f32>>>>>>,
     /// The initial audio format requested for the stream.
     initial_config_format: AudioFormat,
     /// The PipeWire node ID to connect to for capture.
@@ -606,7 +610,7 @@ impl LinuxAudioStream {
             listener_handle: None,
             is_started: Arc::new(AtomicBool::new(false)),
             current_format: Arc::new(Mutex::new(None)),
-            // data_queue: Arc::new(Mutex::new(VecDeque::new())), // For 6.5/6.6
+            data_queue: Arc::new(Mutex::new(VecDeque::with_capacity(10))), // Initialize data_queue
             initial_config_format,
             target_node_id,
         }
@@ -675,9 +679,12 @@ impl CapturingStream for LinuxAudioStream {
     ///
     /// The PipeWire `MainLoop` (managed by `PipewireCoreContext`) is assumed to be running
     /// in a separate thread, allowing these callbacks to be processed.
+    /// TODO: The PipeWire MainLoop in `core_context` must be iterated (e.g., in a dedicated thread)
+    /// for the `process` callback to fire and data to be queued. Ensure this is handled by the
+    /// application or a higher-level manager.
     fn start(&mut self) -> AudioResult<()> {
         // log::debug!("LinuxAudioStream::start() for stream: {:?}", self.stream.name());
-        if self.is_started.load(Ordering::SeqCst) {
+        if self.is_started.load(AtomicOrdering::SeqCst) {
             // log::warn!("Stream already started or start attempt in progress.");
             return Ok(()); // Or return an error like AudioError::InvalidOperation
         }
@@ -730,14 +737,14 @@ impl CapturingStream for LinuxAudioStream {
         // 2. Set up Stream Listeners
         let is_started_clone = self.is_started.clone();
         let current_format_clone = self.current_format.clone();
-        // let data_queue_clone = self.data_queue.clone(); // For 6.5
-
+        let data_queue_clone = self.data_queue.clone(); // For 6.5
+ 
         let listener = self
             .stream
             .add_listener_local()
             .state_changed(move |old, new_state| {
                 // log::debug!("Stream state changed: {:?} -> {:?}", old, new_state);
-                is_started_clone.store(new_state == StreamState::Streaming, Ordering::SeqCst);
+                is_started_clone.store(new_state == StreamState::Streaming, AtomicOrdering::SeqCst);
             })
             .param_changed(move |_stream, id, pod_option| {
                 // log::debug!("Stream param changed: id={:?}, pod_option is some: {}", id, pod_option.is_some());
@@ -753,31 +760,137 @@ impl CapturingStream for LinuxAudioStream {
                                     *current_format_clone.lock().unwrap() = Some(audio_fmt);
                                 } else {
                                     // log::error!("Failed to convert parsed SPA format to internal AudioFormat.");
+                                     let err = AudioError::BackendSpecificError("Failed to convert parsed SPA format to internal AudioFormat".to_string());
+                                     data_queue_clone.lock().unwrap().push_back(Err(err));
                                 }
                             }
                             Err(e) => {
                                 // log::error!("Failed to parse negotiated format pod: {:?}", e);
+                                let err = AudioError::BackendSpecificError(format!("Failed to parse negotiated format pod: {:?}", e));
+                                data_queue_clone.lock().unwrap().push_back(Err(err));
                             }
                         }
                     } else {
                         // log::warn!("Format param changed, but pod_option is None. Format might have been removed.");
                         *current_format_clone.lock().unwrap() = None;
+                        // Potentially push an error or a specific marker if format becomes None during streaming
+                        let err = AudioError::BackendSpecificError("PipeWire stream format became None".to_string());
+                        data_queue_clone.lock().unwrap().push_back(Err(err));
                     }
                 }
             })
-            .process(move |stream| {
-                // log::trace!("Stream process callback triggered");
-                // TODO for 6.5: Dequeue buffer, process data, enqueue to data_queue_clone
-                if let Some(_buffer) = stream.dequeue_buffer() {
-                    // log::debug!("Dequeued buffer of size: {}", _buffer.size());
-                    // For 6.5:
-                    // let data = buffer.data(0).unwrap(); // Assuming single plane
-                    // let audio_buffer = ConcreteAudioBuffer::from_raw_f32(data, num_channels, num_frames);
-                    // data_queue_clone.lock().unwrap().push_back(Ok(Box::new(audio_buffer)));
-                } else {
-                    // log::trace!("No buffer dequeued in process callback.");
+            .process(move |stream_ref| {
+                // This callback is invoked by PipeWire when new audio data is available.
+                // It dequeues the buffer, converts data to f32, and pushes to data_queue_clone.
+                let negotiated_format_opt = current_format_clone.lock().unwrap().clone();
+                let mut data_queue_locked = data_queue_clone.lock().unwrap();
+
+                let pw_buffer = match stream_ref.dequeue_buffer() {
+                    Some(b) => b,
+                    None => {
+                        // log::trace!("No buffer dequeued in process callback.");
+                        return; // No data to process
+                    }
+                };
+
+                let negotiated_audio_format = match negotiated_format_opt {
+                    Some(fmt) => fmt,
+                    None => {
+                        // log::error!("Process callback: No negotiated format available.");
+                        data_queue_locked.push_back(Err(AudioError::BackendSpecificError(
+                            "No negotiated audio format available in process callback".to_string(),
+                        )));
+                        return;
+                    }
+                };
+
+                let data_ptr_opt = pw_buffer.data(0); // Assuming interleaved audio, single data plane
+                let data_ptr = match data_ptr_opt {
+                    Some(ptr) if !ptr.is_empty() => ptr,
+                    _ => {
+                        // log::warn!("Process callback: PipeWire buffer has no data plane or is empty.");
+                        // It's possible to get empty buffers, especially at stream start/end.
+                        // Depending on requirements, this might not be an error to push to queue.
+                        // For now, we'll skip pushing anything for an empty data plane.
+                        return;
+                    }
+                };
+                
+                let chunk_size_bytes = data_ptr.len();
+                let channels = negotiated_audio_format.channels as usize;
+                let bytes_per_sample_source = negotiated_audio_format.bits_per_sample as usize / 8;
+
+                if channels == 0 || bytes_per_sample_source == 0 {
+                    data_queue_locked.push_back(Err(AudioError::BackendSpecificError(
+                        "Invalid channel count or bytes_per_sample from negotiated format".to_string()
+                    )));
+                    return;
                 }
-                // Ok(()) // The process callback in pipewire-rs does not return Result
+
+                let num_frames = chunk_size_bytes / (channels * bytes_per_sample_source);
+                if num_frames == 0 && chunk_size_bytes > 0 {
+                     // This case means incomplete frame data, which is unusual for full buffers.
+                    data_queue_locked.push_back(Err(AudioError::BackendSpecificError(
+                        "Incomplete frame data received from PipeWire".to_string()
+                    )));
+                    return;
+                }
+                if num_frames == 0 { // No data to process
+                    return;
+                }
+
+
+                let mut converted_samples_vec: Vec<f32> = Vec::with_capacity(num_frames * channels);
+
+                match negotiated_audio_format.sample_format {
+                    SampleFormat::F32LE => {
+                        if chunk_size_bytes % 4 != 0 {
+                            data_queue_locked.push_back(Err(AudioError::BackendSpecificError(
+                                "F32LE data size not multiple of 4".to_string()
+                            )));
+                            return;
+                        }
+                        for chunk in data_ptr.chunks_exact(4) {
+                            converted_samples_vec.push(f32::from_le_bytes([chunk[0], chunk[1], chunk[2], chunk[3]]));
+                        }
+                    }
+                    SampleFormat::S16LE => {
+                        if chunk_size_bytes % 2 != 0 {
+                             data_queue_locked.push_back(Err(AudioError::BackendSpecificError(
+                                "S16LE data size not multiple of 2".to_string()
+                            )));
+                            return;
+                        }
+                        for chunk in data_ptr.chunks_exact(2) {
+                            let sample_i16 = i16::from_le_bytes([chunk[0], chunk[1]]);
+                            converted_samples_vec.push(sample_i16 as f32 / 32768.0); // Normalize to [-1.0, 1.0)
+                        }
+                    }
+                    // TODO: Add other format conversions (S24LE, S32LE, etc.) as needed
+                    unsupported_format => {
+                        // log::error!("Process callback: Unsupported source sample format: {:?}", unsupported_format);
+                        data_queue_locked.push_back(Err(AudioError::FormatNotSupported(format!(
+                            "Unsupported source sample format for conversion: {:?}",
+                            unsupported_format
+                        ))));
+                        return;
+                    }
+                }
+                
+                // Create an AudioFormat for the VecAudioBuffer (which is always F32LE after conversion)
+                let output_buffer_format = AudioFormat {
+                    sample_rate: negotiated_audio_format.sample_rate,
+                    channels: negotiated_audio_format.channels,
+                    bits_per_sample: 32, // f32
+                    sample_format: SampleFormat::F32LE,
+                };
+
+                let audio_buffer_obj = VecAudioBuffer::new(
+                    converted_samples_vec,
+                    output_buffer_format,
+                    num_frames,
+                );
+                data_queue_locked.push_back(Ok(Box::new(audio_buffer_obj)));
             })
             .register()
             .map_err(|e| {
@@ -811,7 +924,7 @@ impl CapturingStream for LinuxAudioStream {
 
         // is_started will be set by the state_changed callback.
         // For an immediate check or if connection is synchronous and successful:
-        // self.is_started.store(true, Ordering::SeqCst);
+        // self.is_started.store(true, AtomicOrdering::SeqCst);
         // However, relying on state_changed is more robust for async nature.
         // log::info!("PipeWire stream connection initiated for target node ID: {}", self.target_node_id);
         Ok(())
@@ -821,16 +934,16 @@ impl CapturingStream for LinuxAudioStream {
     /// This will involve disconnecting the PipeWire stream.
     fn stop(&mut self) -> AudioResult<()> {
         // log::debug!("LinuxAudioStream::stop() for stream: {:?}", self.stream.name());
-        if !self.is_started.load(Ordering::SeqCst) && self.stream.state() != StreamState::Streaming
+        if !self.is_started.load(AtomicOrdering::SeqCst) && self.stream.state() != StreamState::Streaming
         {
             // log::warn!("Stream is not running or already stopped.");
             // return Ok(()); // Or allow disconnect attempt anyway
         }
-
+ 
         self.stream.disconnect().map_err(|e| {
             AudioError::BackendSpecificError(format!("Failed to disconnect PipeWire stream: {}", e))
         })?;
-        self.is_started.store(false, Ordering::SeqCst);
+        self.is_started.store(false, AtomicOrdering::SeqCst);
         // The listener_handle will be dropped when LinuxAudioStream is dropped,
         // or can be explicitly removed/cleared here if needed.
         // self.listener_handle.take(); // This would unregister the listener.
@@ -841,7 +954,7 @@ impl CapturingStream for LinuxAudioStream {
     /// Closes the audio capture stream, releasing all resources.
     fn close(&mut self) -> AudioResult<()> {
         // log::debug!("LinuxAudioStream::close() for stream: {:?}", self.stream.name());
-        if self.is_started.load(Ordering::SeqCst) || self.stream.state() != StreamState::Unconnected
+        if self.is_started.load(AtomicOrdering::SeqCst) || self.stream.state() != StreamState::Unconnected
         {
             self.stop()?; // Ensure stream is stopped and disconnected
         }
@@ -857,27 +970,41 @@ impl CapturingStream for LinuxAudioStream {
 
     /// Checks if the stream is currently capturing audio (i.e., in Streaming state).
     fn is_running(&self) -> bool {
-        // log::trace!("LinuxAudioStream::is_running() check, is_started: {}", self.is_started.load(Ordering::SeqCst));
-        self.is_started.load(Ordering::SeqCst) && self.stream.state() == StreamState::Streaming
+        // log::trace!("LinuxAudioStream::is_running() check, is_started: {}", self.is_started.load(AtomicOrdering::SeqCst));
+        self.is_started.load(AtomicOrdering::SeqCst) && self.stream.state() == StreamState::Streaming
     }
-
+ 
     /// Reads a chunk of audio data from the stream.
-    /// This method might block until data is available or a timeout occurs.
+    ///
+    /// This method attempts to retrieve an `AudioBuffer` from an internal queue populated
+    /// by the PipeWire `process` callback. The `process` callback handles dequeuing raw
+    /// data from PipeWire, converting it to `f32` samples, and packaging it.
+    ///
+    /// If the queue is empty, this method returns `Ok(None)` immediately (non-blocking).
+    /// The `_timeout_ms` parameter is currently ignored.
+    ///
+    /// # Returns
+    /// - `Ok(Some(Box<dyn AudioBuffer<Sample = f32>>))`: If an audio buffer was successfully read.
+    /// - `Ok(None)`: If the internal queue is empty (no data currently available).
+    /// - `Err(AudioError)`: If the stream is not running, or if an error was dequeued from
+    ///   the `process` callback (e.g., format conversion error).
     fn read_chunk(
         &mut self,
         _timeout_ms: Option<u32>,
-    ) -> AudioResult<Option<Box<dyn AudioBuffer>>> {
+    ) -> AudioResult<Option<Box<dyn AudioBuffer<Sample = f32>>>> {
         // log::trace!("LinuxAudioStream::read_chunk(timeout_ms: {:?})", _timeout_ms);
-        // TODO (Subtask 6.5):
-        // 1. Check if data is available in the internal buffer (self.data_queue).
-        // 2. If not, wait for data (potentially using a condition variable or by iterating the main loop,
-        //    or if async, by awaiting the next item from the async stream).
-        // 3. Dequeue data from PipeWire buffers if not using an intermediate buffer (current process cb does this).
-        // 4. Package data into an AudioBuffer.
-        // 5. Handle timeouts.
-        todo!("LinuxAudioStream::read_chunk - Subtask 6.5: Read data from internal buffer.")
+        if !self.is_running() {
+            return Err(AudioError::InvalidOperation(
+                "Stream not started or not in streaming state".to_string(),
+            ));
+        }
+ 
+        match self.data_queue.lock().unwrap().pop_front() {
+            Some(audio_result) => audio_result.map(Some), // Propagates Err or wraps Ok(Box<...>) in Some
+            None => Ok(None), // Queue is empty
+        }
     }
-
+ 
     /// Provides an asynchronous stream of audio buffers.
     fn to_async_stream<'a>(
         &'a mut self,
