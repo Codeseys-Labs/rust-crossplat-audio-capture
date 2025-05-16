@@ -15,8 +15,8 @@ pub use audio::{
 };
 // Core type re-exports
 pub use crate::core::config::{
-    AudioFormat, DeviceSelector, LatencyMode, SampleFormat, StreamConfig,
-}; // Explicitly re-export StreamConfig
+    AudioFileFormat, AudioFormat, DeviceSelector, LatencyMode, SampleFormat, StreamConfig,
+}; // Explicitly re-export StreamConfig and AudioFileFormat
 pub use crate::core::error::{AudioError, Result as CoreAudioResult}; // Alias core::error::Result
 pub use crate::core::interface::{
     AudioBuffer,

@@ -155,3 +155,13 @@ impl Default for DeviceSelector {
         DeviceSelector::DefaultInput
     }
 }
+/// Specifies the audio file format for recording.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum AudioFileFormat {
+    /// Waveform Audio File Format.
+    #[default]
+    Wav,
+    // Placeholder for future formats like Mp3, Ogg, etc.
+    // Mp3,
+    // Ogg,
+}

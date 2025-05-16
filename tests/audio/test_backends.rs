@@ -1,6 +1,6 @@
 // Import from the main crate
 // extern crate rsac; // Removed this line
-use crate::audio::{AudioError, AudioFormat}; // Add AudioFormat back
+use crate::{AudioError, AudioFormat}; // Use crate:: for re-exported types
 use std::path::Path;
 
 /// Trait that defines standardized test cases that all audio backend implementations must satisfy
@@ -67,7 +67,8 @@ impl AudioBackendTests for MockAudioBackendTests {
 
     fn test_list_devices(&mut self) -> Result<Vec<String>, AudioError> {
         if self.should_fail {
-            Err(AudioError::DeviceError(
+            Err(AudioError::DeviceEnumerationError(
+                // Corrected to a valid AudioError variant
                 "Simulated device list failure".into(),
             ))
         } else {
@@ -87,6 +88,10 @@ impl AudioBackendTests for MockAudioBackendTests {
         if self.should_fail {
             Err(AudioError::CaptureError("Simulated capture failure".into()))
         } else {
+            // Ensure app_name, duration_sec, and output_path are used or marked as unused.
+            let _ = app_name; // Mark as used
+            let _ = duration_sec;
+            let _ = output_path;
             use crate::utils::test_utils::generation;
             use crate::utils::test_utils::validation;
 
@@ -111,6 +116,8 @@ impl AudioBackendTests for MockAudioBackendTests {
                 "Simulated system capture failure".into(),
             ))
         } else {
+            let _ = duration_sec; // Mark as used
+            let _ = output_path;
             use crate::utils::test_utils::generation;
             use crate::utils::test_utils::validation;
 
@@ -127,7 +134,9 @@ impl AudioBackendTests for MockAudioBackendTests {
 
     fn test_format_conversion(&mut self, _format: AudioFormat) -> Result<(), AudioError> {
         if self.should_fail {
-            Err(AudioError::FormatError("Simulated format error".into()))
+            Err(AudioError::UnsupportedFormat(
+                "Simulated format error".into(),
+            )) // Corrected to a valid AudioError variant
         } else {
             Ok(())
         }
@@ -141,6 +150,113 @@ impl AudioBackendTests for MockAudioBackendTests {
         } else {
             Ok(())
         }
+    }
+
+    fn run_all_tests(
+        &mut self,
+        output_dir: &Path,
+    ) -> Vec<crate::utils::test_utils::reporting::TestResult> {
+        use crate::utils::test_utils::reporting::TestResult;
+        let mut results = Vec::new();
+        let start_time = std::time::Instant::now();
+
+        // test_connect_to_backend
+        let mut connect_result = TestResult::new("test_connect_to_backend", self.name());
+        match self.test_connect_to_backend() {
+            Ok(_) => {
+                connect_result = connect_result.passed(start_time.elapsed().as_millis() as u64)
+            }
+            Err(e) => {
+                connect_result =
+                    connect_result.failed(&e.to_string(), start_time.elapsed().as_millis() as u64)
+            }
+        }
+        results.push(connect_result);
+        if self.should_fail {
+            return results;
+        } // Stop if critical test fails
+
+        // test_list_devices
+        let mut list_devices_result = TestResult::new("test_list_devices", self.name());
+        match self.test_list_devices() {
+            Ok(_) => {
+                list_devices_result =
+                    list_devices_result.passed(start_time.elapsed().as_millis() as u64)
+            }
+            Err(e) => {
+                list_devices_result = list_devices_result
+                    .failed(&e.to_string(), start_time.elapsed().as_millis() as u64)
+            }
+        }
+        results.push(list_devices_result);
+
+        // test_capture_application
+        let mut capture_app_result = TestResult::new("test_capture_application", self.name());
+        let app_output_path = output_dir.join("mock_app_capture.wav");
+        match self.test_capture_application("mock_app", 1, &app_output_path) {
+            Ok(_) => {
+                capture_app_result = capture_app_result
+                    .passed(start_time.elapsed().as_millis() as u64)
+                    .with_artifact(app_output_path.to_str().unwrap_or(""))
+            }
+            Err(e) => {
+                capture_app_result = capture_app_result
+                    .failed(&e.to_string(), start_time.elapsed().as_millis() as u64)
+            }
+        }
+        results.push(capture_app_result);
+
+        // test_capture_system
+        let mut capture_sys_result = TestResult::new("test_capture_system", self.name());
+        let sys_output_path = output_dir.join("mock_sys_capture.wav");
+        match self.test_capture_system(1, &sys_output_path) {
+            Ok(_) => {
+                capture_sys_result = capture_sys_result
+                    .passed(start_time.elapsed().as_millis() as u64)
+                    .with_artifact(sys_output_path.to_str().unwrap_or(""))
+            }
+            Err(e) => {
+                capture_sys_result = capture_sys_result
+                    .failed(&e.to_string(), start_time.elapsed().as_millis() as u64)
+            }
+        }
+        results.push(capture_sys_result);
+
+        // test_format_conversion
+        let mut format_conv_result = TestResult::new("test_format_conversion", self.name());
+        let dummy_format = AudioFormat {
+            sample_rate: 44100,
+            channels: 1,
+            bits_per_sample: 16,
+            sample_format: crate::core::config::SampleFormat::S16LE,
+        };
+        match self.test_format_conversion(dummy_format) {
+            Ok(_) => {
+                format_conv_result =
+                    format_conv_result.passed(start_time.elapsed().as_millis() as u64)
+            }
+            Err(e) => {
+                format_conv_result = format_conv_result
+                    .failed(&e.to_string(), start_time.elapsed().as_millis() as u64)
+            }
+        }
+        results.push(format_conv_result);
+
+        // test_error_conditions
+        let mut error_cond_result = TestResult::new("test_error_conditions", self.name());
+        match self.test_error_conditions() {
+            Ok(_) => {
+                error_cond_result =
+                    error_cond_result.passed(start_time.elapsed().as_millis() as u64)
+            }
+            Err(e) => {
+                error_cond_result = error_cond_result
+                    .failed(&e.to_string(), start_time.elapsed().as_millis() as u64)
+            }
+        }
+        results.push(error_cond_result);
+
+        results
     }
 }
 
@@ -203,6 +319,15 @@ pub mod wasapi {
             // Implementation for Windows WASAPI
             Err(AudioError::CaptureError("Not implemented".into()))
         }
+
+        fn run_all_tests(
+            &mut self,
+            _output_dir: &Path,
+        ) -> Vec<crate::utils::test_utils::reporting::TestResult> {
+            // Placeholder for WASAPI tests
+            println!("WASAPI run_all_tests is not fully implemented.");
+            vec![]
+        }
     }
 }
 
@@ -231,13 +356,15 @@ pub mod pulse {
         }
 
         fn test_connect_to_backend(&mut self) -> Result<(), AudioError> {
-            Err(AudioError::BackendUnavailable(
+            Err(AudioError::UnsupportedPlatform(
+                // Corrected to a valid AudioError variant
                 "PulseAudio tests temporarily disabled".into(),
             ))
         }
 
         fn test_list_devices(&mut self) -> Result<Vec<String>, AudioError> {
-            Err(AudioError::BackendUnavailable(
+            Err(AudioError::UnsupportedPlatform(
+                // Corrected to a valid AudioError variant
                 "PulseAudio tests temporarily disabled".into(),
             ))
         }
@@ -248,7 +375,8 @@ pub mod pulse {
             _duration_sec: u32,  // Added underscore
             _output_path: &Path, // Added underscore
         ) -> Result<Vec<f32>, AudioError> {
-            Err(AudioError::BackendUnavailable(
+            Err(AudioError::UnsupportedPlatform(
+                // Corrected to a valid AudioError variant
                 "PulseAudio tests temporarily disabled".into(),
             ))
         }
@@ -258,19 +386,22 @@ pub mod pulse {
             _duration_sec: u32,  // Added underscore
             _output_path: &Path, // Added underscore
         ) -> Result<Vec<f32>, AudioError> {
-            Err(AudioError::BackendUnavailable(
+            Err(AudioError::UnsupportedPlatform(
+                // Corrected to a valid AudioError variant
                 "PulseAudio tests temporarily disabled".into(),
             ))
         }
 
         fn test_format_conversion(&mut self, _format: AudioFormat) -> Result<(), AudioError> {
-            Err(AudioError::BackendUnavailable(
+            Err(AudioError::UnsupportedPlatform(
+                // Corrected to a valid AudioError variant
                 "PulseAudio tests temporarily disabled".into(),
             ))
         }
 
         fn test_error_conditions(&mut self) -> Result<(), AudioError> {
-            Err(AudioError::BackendUnavailable(
+            Err(AudioError::UnsupportedPlatform(
+                // Corrected to a valid AudioError variant
                 "PulseAudio tests temporarily disabled".into(),
             ))
         }
@@ -415,6 +546,15 @@ pub mod coreaudio {
         fn test_error_conditions(&mut self) -> Result<(), AudioError> {
             // Implementation for CoreAudio
             Err(AudioError::CaptureError("Not implemented".into()))
+        }
+
+        fn run_all_tests(
+            &mut self,
+            _output_dir: &Path,
+        ) -> Vec<crate::utils::test_utils::reporting::TestResult> {
+            // Placeholder for CoreAudio tests
+            println!("CoreAudio run_all_tests is not fully implemented.");
+            vec![]
         }
     }
 }

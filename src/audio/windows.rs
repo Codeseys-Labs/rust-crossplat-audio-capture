@@ -10,20 +10,34 @@ use crate::core::interface::{
 
 // TODO: Remove these once the actual WASAPI logic is integrated with the new traits.
 // These are placeholders from the old structure.
-use super::core::{AudioApplication, AudioCaptureBackend, AudioCaptureStream};
-use std::collections::VecDeque;
-use sysinfo::{ProcessRefreshKind, ProcessesToUpdate, RefreshKind, System};
+use super::core::{AudioApplication, AudioCaptureBackend, AudioCaptureStream}; // Keep for old backend
+use std::collections::VecDeque; // Keep for old backend
+use sysinfo::{ProcessRefreshKind, ProcessesToUpdate, RefreshKind, System}; // Keep for old backend
 use wasapi::{
-    self, get_default_device, AudioCaptureClient, AudioClient, Direction, SampleType, ShareMode,
-    WaveFormat,
-};
+    self,
+    AudioCaptureClient as WasapiAudioCaptureClient,
+    AudioClient as WasapiAudioClient, // Renamed to avoid conflict
+    Direction as WasapiDirection,
+    SampleType as WasapiSampleType,
+    ShareMode as WasapiShareMode,
+    WaveFormat as WasapiWaveFormat,
+}; // Keep for old backend, note: wasapi::get_default_device is different from IMMDeviceEnumerator::GetDefaultAudioEndpoint
 
 // --- New Skeleton Implementations ---
 
-use windows::core::HRESULT;
-use windows::Win32::System::Com::{
-    CoInitializeEx, CoUninitialize, COINIT_MULTITHREADED, RPC_E_CHANGED_MODE,
+use crate::core::interface::DeviceId;
+use std::ffi::OsStr;
+use std::os::windows::ffi::OsStrExt;
+use windows::core::{HRESULT, PWSTR};
+use windows::Win32::Foundation::E_NOTFOUND;
+use windows::Win32::Media::Audio::{
+    eAll, eCapture, eConsole, eRender, IMMDevice, IMMDeviceCollection, IMMDeviceEnumerator,
+    MMDeviceEnumerator, DEVICE_STATE_ACTIVE,
 };
+use windows::Win32::System::Com::{
+    CoCreateInstance, CoInitializeEx, CoUninitialize, CLSCTX_ALL, COINIT_MULTITHREADED,
+    RPC_E_CHANGED_MODE,
+}; // Assuming DeviceId is String or similar
 
 /// Ensures COM is initialized for the current thread and uninitializes it when dropped.
 ///
@@ -73,115 +87,201 @@ impl Drop for ComInitializer {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Hash)]
-pub struct WindowsDeviceId(String); // Example: Use a String for now
+// Removed WindowsDeviceId struct as DeviceId will be String
 
-pub struct WindowsAudioDevice {
-    id: WindowsDeviceId,
-    name: String,
-    kind: DeviceKind, // To determine if it's input or output
-                      // TODO: Add other necessary fields, e.g., WASAPI device reference
+/// Represents a Windows audio device using WASAPI.
+///
+/// This struct holds an `IMMDevice` instance, which is the core representation
+/// of an audio endpoint in WASAPI.
+#[derive(Debug)] // IMMDevice itself is a COM interface pointer, Debug should be fine.
+pub(crate) struct WindowsAudioDevice {
+    device: IMMDevice,
+    // _com_initializer: Arc<ComInitializer>, // Potentially needed if IMMDevice methods require COM to be alive
+    // and this struct outlives the enumerator. For now, assume not.
+}
+
+impl WindowsAudioDevice {
+    /// Creates a new `WindowsAudioDevice` from an `IMMDevice`.
+    fn new(device: IMMDevice) -> Self {
+        Self { device }
+    }
 }
 
 impl AudioDevice for WindowsAudioDevice {
-    type DeviceId = WindowsDeviceId;
+    type DeviceId = DeviceId; // This is String as per crate::core::interface::DeviceId
 
     fn get_id(&self) -> Self::DeviceId {
-        println!("TODO: WindowsAudioDevice::get_id()");
-        self.id.clone()
+        // TODO: Implement in subtask 4.3: Get device ID string from self.device
+        // For example, using IPropertyStore to get PKEY_Device_FriendlyName or PKEY_Device_InstanceId
+        // For now, as per task 4.2, this is todo.
+        todo!("WindowsAudioDevice::get_id()")
     }
 
     fn get_name(&self) -> String {
-        println!("TODO: WindowsAudioDevice::get_name()");
-        self.name.clone()
+        // TODO: Implement in subtask 4.3: Get device friendly name from self.device
+        todo!("WindowsAudioDevice::get_name()")
     }
 
     fn get_supported_formats(&self) -> AudioResult<Vec<AudioFormat>> {
-        println!("TODO: WindowsAudioDevice::get_supported_formats()");
-        todo!()
+        // TODO: Implement in subtask 4.3
+        todo!("WindowsAudioDevice::get_supported_formats()")
     }
 
     fn get_default_format(&self) -> AudioResult<AudioFormat> {
-        println!("TODO: WindowsAudioDevice::get_default_format()");
-        todo!()
+        // TODO: Implement in subtask 4.3
+        todo!("WindowsAudioDevice::get_default_format()")
     }
 
     fn is_input(&self) -> bool {
-        println!("TODO: WindowsAudioDevice::is_input()");
-        self.kind == DeviceKind::Input
+        // TODO: Implement in subtask 4.3: Determine if it's an input device
+        todo!("WindowsAudioDevice::is_input()")
     }
 
     fn is_output(&self) -> bool {
-        println!("TODO: WindowsAudioDevice::is_output()");
-        self.kind == DeviceKind::Output
+        // TODO: Implement in subtask 4.3: Determine if it's an output device
+        todo!("WindowsAudioDevice::is_output()")
     }
 
     fn is_active(&self) -> bool {
-        println!("TODO: WindowsAudioDevice::is_active()");
-        // TODO: Implement actual status check
-        false
+        // TODO: Implement in subtask 4.3: Check device state
+        todo!("WindowsAudioDevice::is_active()")
     }
 
-    fn is_format_supported(&self, format: &AudioFormat) -> AudioResult<bool> {
-        println!(
-            "TODO: WindowsAudioDevice::is_format_supported({:?})",
-            format
-        );
-        // For now, assume all formats are supported or let the actual stream creation fail.
-        // Later tasks will implement actual format checking.
-        Ok(true)
+    fn is_format_supported(&self, _format: &AudioFormat) -> AudioResult<bool> {
+        // TODO: Implement in subtask 4.3
+        todo!("WindowsAudioDevice::is_format_supported()")
     }
 }
 
+/// Enumerates audio devices available on a Windows system using WASAPI.
+#[derive(Debug)]
 pub struct WindowsDeviceEnumerator {
     _com_initializer: ComInitializer,
-    // TODO: Add other necessary fields, e.g., IMMDeviceEnumerator instance
+    enumerator: IMMDeviceEnumerator,
 }
 
 impl WindowsDeviceEnumerator {
     /// Creates a new Windows device enumerator.
     ///
-    /// This will initialize COM for the lifetime of the enumerator.
+    /// This will initialize COM for the lifetime of the enumerator and
+    /// create an `IMMDeviceEnumerator` instance.
     pub fn new() -> AudioResult<Self> {
         let com_initializer = ComInitializer::new()?;
+        // SAFETY: CoCreateInstance is called to create a COM object.
+        // The HRESULT is checked for errors.
+        let enumerator: IMMDeviceEnumerator =
+            unsafe { CoCreateInstance(&MMDeviceEnumerator, None, CLSCTX_ALL) }.map_err(
+                |hr: HRESULT| {
+                    AudioError::BackendSpecificError(format!(
+                        "Failed to create IMMDeviceEnumerator (HRESULT: {:?})",
+                        hr
+                    ))
+                },
+            )?;
+
         Ok(Self {
             _com_initializer: com_initializer,
+            enumerator,
         })
     }
 }
 
 impl DeviceEnumerator for WindowsDeviceEnumerator {
-    type Device = WindowsAudioDevice;
+    // Note: The task specifies Box<dyn AudioDevice>, so Self::Device is WindowsAudioDevice,
+    // but methods return Box<dyn AudioDevice>.
 
-    fn enumerate_devices(&self) -> AudioResult<Vec<Self::Device>> {
-        println!("TODO: WindowsDeviceEnumerator::enumerate_devices()");
-        todo!()
+    /// Enumerates all active audio endpoint devices.
+    ///
+    /// This method retrieves a collection of all active audio rendering and capture
+    /// devices on the system.
+    fn enumerate_devices(&self) -> AudioResult<Vec<Box<dyn AudioDevice>>> {
+        // SAFETY: Calling EnumAudioEndpoints on a valid IMMDeviceEnumerator. HRESULT is checked.
+        let collection: IMMDeviceCollection = unsafe {
+            self.enumerator
+                .EnumAudioEndpoints(eAll, DEVICE_STATE_ACTIVE)
+        }
+        .map_err(|hr: HRESULT| {
+            AudioError::BackendSpecificError(format!(
+                "Failed to enumerate audio endpoints (HRESULT: {:?})",
+                hr
+            ))
+        })?;
+
+        // SAFETY: Calling GetCount on a valid IMMDeviceCollection. HRESULT is checked.
+        let count = unsafe { collection.GetCount() }.map_err(|hr: HRESULT| {
+            AudioError::BackendSpecificError(format!(
+                "Failed to get device count from collection (HRESULT: {:?})",
+                hr
+            ))
+        })?;
+
+        let mut devices: Vec<Box<dyn AudioDevice>> = Vec::with_capacity(count as usize);
+        for i in 0..count {
+            // SAFETY: Calling Item on a valid IMMDeviceCollection with a valid index. HRESULT is checked.
+            let imm_device: IMMDevice = unsafe { collection.Item(i) }.map_err(|hr: HRESULT| {
+                AudioError::BackendSpecificError(format!(
+                    "Failed to get device item {} from collection (HRESULT: {:?})",
+                    i, hr
+                ))
+            })?;
+            devices.push(Box::new(WindowsAudioDevice::new(imm_device)));
+        }
+        Ok(devices)
     }
 
-    fn get_default_device(&self, kind: DeviceKind) -> AudioResult<Self::Device> {
-        println!(
-            "TODO: WindowsDeviceEnumerator::get_default_device({:?})",
-            kind
-        );
-        todo!()
+    /// Gets the default audio endpoint device for the specified kind (input/output).
+    ///
+    /// # Arguments
+    /// * `kind` - The [`DeviceKind`] (input/capture or output/render) for which
+    ///            to get the default device.
+    ///
+    /// Returns `Ok(Some(device))` if a default device is found, `Ok(None)` if no
+    /// default device is available for the specified kind (e.g., `E_NOTFOUND`),
+    /// or an `AudioError` on other failures.
+    fn get_default_device(&self, kind: DeviceKind) -> AudioResult<Option<Box<dyn AudioDevice>>> {
+        let data_flow = match kind {
+            DeviceKind::Input => eCapture,
+            DeviceKind::Output => eRender,
+        };
+
+        // SAFETY: Calling GetDefaultAudioEndpoint on a valid IMMDeviceEnumerator. HRESULT is checked.
+        match unsafe { self.enumerator.GetDefaultAudioEndpoint(data_flow, eConsole) } {
+            Ok(imm_device) => Ok(Some(Box::new(WindowsAudioDevice::new(imm_device)))),
+            Err(hr) if hr == E_NOTFOUND => Ok(None), // Device not found is not an error, but absence.
+            Err(hr) => Err(AudioError::BackendSpecificError(format!(
+                "Failed to get default audio endpoint (HRESULT: {:?})",
+                hr
+            ))),
+        }
     }
 
-    fn get_input_devices(&self) -> AudioResult<Vec<Self::Device>> {
-        println!("TODO: WindowsDeviceEnumerator::get_input_devices()");
-        todo!()
-    }
-
-    fn get_output_devices(&self) -> AudioResult<Vec<Self::Device>> {
-        println!("TODO: WindowsDeviceEnumerator::get_output_devices()");
-        todo!()
-    }
-
+    /// Gets an audio endpoint device by its ID string.
+    ///
+    /// # Arguments
+    /// * `id` - The string ID of the device to retrieve. This ID is typically obtained
+    ///          from a previous enumeration or from `AudioDevice::get_id()`.
+    /// * `_kind` - Currently unused, but reserved for future use if device kind needs
+    ///             to be validated against the ID.
+    ///
+    /// Returns `Ok(Some(device))` if a device with the given ID is found, `Ok(None)`
+    /// if no such device exists (e.g., `E_NOTFOUND`), or an `AudioError` on other failures.
     fn get_device_by_id(
         &self,
-        id: &<Self::Device as AudioDevice>::DeviceId,
-    ) -> AudioResult<Self::Device> {
-        println!("TODO: WindowsDeviceEnumerator::get_device_by_id({:?})", id);
-        todo!()
+        id: &DeviceId,
+        _kind: Option<DeviceKind>,
+    ) -> AudioResult<Option<Box<dyn AudioDevice>>> {
+        let wide_id: Vec<u16> = OsStr::new(id).encode_wide().chain(Some(0)).collect();
+        let pwstr_id = PWSTR(wide_id.as_ptr() as *mut _); // Cast to *mut _ as PWSTR is *mut u16
+
+        // SAFETY: Calling GetDevice on a valid IMMDeviceEnumerator with a null-terminated PWSTR. HRESULT is checked.
+        match unsafe { self.enumerator.GetDevice(pwstr_id) } {
+            Ok(imm_device) => Ok(Some(Box::new(WindowsAudioDevice::new(imm_device)))),
+            Err(hr) if hr == E_NOTFOUND => Ok(None),
+            Err(hr) => Err(AudioError::DeviceNotFound(format!(
+                "Failed to get device by ID '{}' (HRESULT: {:?})",
+                id, hr
+            ))),
+        }
     }
 }
 

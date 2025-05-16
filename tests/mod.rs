@@ -19,26 +19,31 @@ mod tests {
             let results = backend_tests.run_all_tests(output_dir);
             assert!(results
                 .iter()
-                .all(|r| r.status == super::audio::test_utils::reporting::TestStatus::Passed));
+                .all(|r| r.status == crate::utils::test_utils::reporting::TestStatus::Passed));
+            // Corrected path
         }
 
         #[cfg(target_os = "linux")]
         {
             // Try PipeWire first
-            if let Ok(mut backend_tests) =
-                super::audio::test_backends::pipewire::PipeWireTests::new()
-            {
+            // Assuming PipeWireTests::new() returns Self, not Result
+            let mut backend_tests = super::audio::test_backends::pipewire::PipeWireTests::new();
+            // A check like `is_available()` should be used if construction can fail or if it's conditional
+            if super::audio::test_backends::pipewire::PipeWireTests::is_available() {
                 let results = backend_tests.run_all_tests(output_dir);
                 assert!(results
                     .iter()
-                    .all(|r| r.status == super::audio::test_utils::reporting::TestStatus::Passed));
+                    .all(|r| r.status == crate::utils::test_utils::reporting::TestStatus::Passed));
+            // Corrected path
             } else {
                 // Fallback to PulseAudio
-                let mut backend_tests = super::audio::test_backends::pulse::PulseAudioTests::new();
-                let results = backend_tests.run_all_tests(output_dir);
+                let mut backend_tests_pulse =
+                    super::audio::test_backends::pulse::PulseAudioTests::new();
+                let results = backend_tests_pulse.run_all_tests(output_dir);
                 assert!(results
                     .iter()
-                    .all(|r| r.status == super::audio::test_utils::reporting::TestStatus::Passed));
+                    .all(|r| r.status == crate::utils::test_utils::reporting::TestStatus::Passed));
+                // Corrected path
             }
         }
 
@@ -48,7 +53,8 @@ mod tests {
             let results = backend_tests.run_all_tests(output_dir);
             assert!(results
                 .iter()
-                .all(|r| r.status == super::audio::test_utils::reporting::TestStatus::Passed));
+                .all(|r| r.status == crate::utils::test_utils::reporting::TestStatus::Passed));
+            // Corrected path
         }
     }
 }

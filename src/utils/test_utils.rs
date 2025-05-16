@@ -1,4 +1,6 @@
-use crate::{AudioCaptureStream, AudioConfig, AudioError};
+use crate::core::config::AudioConfig; // Corrected import path
+use crate::core::config::SampleFormat as CoreSampleFormat; // Alias to avoid conflict if crate::SampleFormat is different
+use crate::{AudioCaptureStream, AudioError};
 use std::sync::Arc;
 
 /// Test utilities for audio generation, validation, and mock implementations
@@ -482,10 +484,21 @@ impl MockCapture for MockAudioCapture {
     }
 
     fn config(&self) -> &AudioConfig {
+        // Construct a full AudioFormat struct as required by AudioConfig
+        static DEFAULT_AUDIO_FORMAT: crate::core::config::AudioFormat =
+            crate::core::config::AudioFormat {
+                sample_rate: 48000,
+                channels: 2,
+                bits_per_sample: 32,                    // Assuming f32 is 32 bits
+                sample_format: CoreSampleFormat::F32LE, // Use aliased SampleFormat
+            };
         static DEFAULT_CONFIG: AudioConfig = AudioConfig {
-            sample_rate: 48000,
-            channels: 2,
-            format: crate::AudioFormat::F32LE,
+            format: DEFAULT_AUDIO_FORMAT, // Assign the constructed AudioFormat
+                                          // Add other fields of AudioConfig if they exist, e.g., application_name
+                                          // For now, assuming AudioConfig only has 'format'.
+                                          // If AudioConfig has more fields, this mock needs to be updated.
+                                          // Example if it had application_name:
+                                          // application_name: Some("MockApp".to_string()),
         };
         &DEFAULT_CONFIG
     }
