@@ -384,21 +384,44 @@ impl CapturingStream for MacosAudioStream {
         Ok(())
     }
 
-    /// Reads a chunk of audio data from the stream.
-    /// This is a placeholder and needs to be implemented to pull from `data_queue`.
-    fn read_chunk(&mut self, _timeout_ms: u32) -> AudioResult<Option<Box<dyn AudioBuffer<Sample = f32>>>> {
-        // TODO: Implement audio data reading from data_queue.
-        // This should pop from self.data_queue, handle timeout, etc.
-        // The return type in the trait is Option<Vec<u8>>, but task asks for Box<dyn AudioBuffer>
-        // For now, let's align with the task's implied type for data_queue.
-        // The trait might need an update or this method needs to convert.
-        // For now, returning what would come from the queue.
-        if let Some(audio_result) = self.data_queue.lock().unwrap().pop_front() {
-            audio_result.map(Some)
-        } else {
-            Ok(None)
+    /// Reads a chunk of captured audio data from the stream synchronously.
+    ///
+    /// This method attempts to retrieve one audio buffer from an internal queue
+    /// populated by the CoreAudio input callback.
+    ///
+    /// # Behavior
+    /// - If the stream is not running, it returns `Err(AudioError::InvalidOperation)`.
+    /// - If a buffer is available in the queue, it returns `Ok(Some(buffer))`.
+    ///   The `buffer` itself is an `AudioResult<Box<dyn AudioBuffer<Sample = f32>>>`
+    ///   from the queue, so if an error occurred during capture in the callback
+    ///   (e.g., `AudioUnitRender` failure), this method will propagate that error
+    ///   by returning `Err(AudioError::...)`.
+    /// - If the queue is empty (buffer underrun), it returns `Ok(None)`. This indicates
+    ///   that no data is currently available.
+    /// - If the internal data queue's mutex is poisoned, it returns
+    ///   `Err(AudioError::MutexLockError)`.
+    ///
+    /// # Timeout
+    /// The `_timeout_ms` parameter is currently **ignored**. This method performs a
+    /// non-blocking check of the queue. Future implementations may use this
+    /// parameter to enable blocking reads with a timeout.
+    ///
+    /// # Returns
+    /// - `Ok(Some(Box<dyn AudioBuffer<Sample = f32>>))`: A buffer of audio data.
+    /// - `Ok(None)`: No data currently available in the queue (non-blocking behavior).
+    /// - `Err(AudioError)`: An error occurred, such as the stream not running,
+    ///   an error propagated from the audio callback, or a mutex lock failure.
+    fn read_chunk(&mut self, _timeout_ms: Option<u32>) -> AudioResult<Option<Box<dyn AudioBuffer<Sample = f32>>>> {
+        if !self.is_running() {
+            return Err(AudioError::InvalidOperation("Stream is not running or not started.".to_string()));
         }
-        // todo!("Implement read_chunk for MacosAudioStream by reading from data_queue")
+
+        // TODO: Implement proper timeout logic if _timeout_ms is Some.
+        // For now, this is a non-blocking pop.
+        match self.data_queue.lock().map_err(|_| AudioError::MutexLockError("data_queue".to_string()))?.pop_front() {
+            Some(audio_result) => audio_result.map(Some), // Propagates Ok(buffer) or Err(error_from_callback)
+            None => Ok(None), // Queue is empty, no data available
+        }
     }
 
     /// Gets the format of the audio stream as delivered by `read_chunk`.
