@@ -1,0 +1,33 @@
+Source: rsac
+Section: sound
+Priority: optional
+Maintainer: Your Name <your.email@example.com>
+Build-Depends: debhelper-compat (= 13),
+               cargo,
+               libpipewire-0.3-dev,
+               pkg-config,
+               build-essential,
+               clang,
+               libclang-dev,
+               llvm-dev,
+               rustc
+Standards-Version: 4.5.1
+Homepage: https://github.com/yourusername/rust-crossplat-audio-capture
+Rules-Requires-Root: no
+
+Package: rsac
+Architecture: any
+Depends: ${shlibs:Depends},
+         ${misc:Depends},
+         libpipewire-0.3-0
+Description: Cross-platform audio capture tool
+ A robust, high-performance audio capture tool for recording
+ system and application-specific audio on Windows, macOS, and Linux.
+ .
+ Features:
+  * Cross-platform support (Windows, macOS, Linux)
+  * System-wide audio capture
+  * Application-specific audio capture (Windows and Linux)
+  * Multiple output formats (WAV, RAW PCM)
+  * Configurable audio quality parameters
+  * Interactive and command-line modes 

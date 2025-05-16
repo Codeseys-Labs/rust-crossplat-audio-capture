@@ -1,4 +1,7 @@
 pub mod audio;
+#[path = "../tests/mod.rs"]
+pub mod tests;
+pub mod utils;
 
 // Re-export trait-based API
 pub use audio::{
@@ -9,14 +12,18 @@ pub use audio::{
 // Re-export platform-specific backends
 #[cfg(target_os = "macos")]
 pub use audio::CoreAudioBackend;
+#[cfg(target_os = "linux")]
+pub use audio::PipeWireBackend;
 #[cfg(target_os = "windows")]
 pub use audio::WasapiBackend;
-#[cfg(target_os = "linux")]
-pub use audio::{PipeWireBackend, PulseAudioBackend};
 
 // Re-export ProcessAudioCapture API (Windows-only)
 #[cfg(target_os = "windows")]
 pub use audio::{AudioCaptureError, ProcessAudioCapture};
+
+// Re-export test utils if the feature is enabled
+#[cfg(feature = "test-utils")]
+pub use utils::test_utils;
 
 /// Error type for the library
 pub type Error = color_eyre::Report;
@@ -27,14 +34,4 @@ pub type Result<T> = std::result::Result<T, Error>;
 pub fn init() -> Result<()> {
     color_eyre::install()?;
     Ok(())
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn test_library_initialization() {
-        assert!(init().is_ok());
-    }
 }

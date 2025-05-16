@@ -1,0 +1,49 @@
+FROM ubuntu:22.04 as rsac-test-base
+
+# Install common dependencies
+RUN apt-get update && apt-get install -y \
+    curl wget build-essential pkg-config \
+    libclang-dev llvm-14 clang-14 \
+    xvfb dbus ffmpeg \
+    && curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y
+
+# Set up common environment
+ENV PATH="/root/.cargo/bin:${PATH}"
+ENV DEBIAN_FRONTEND=noninteractive
+ENV DISPLAY=:99
+ENV RUST_BACKTRACE=1
+ENV RUST_LOG=debug
+
+# Create directories
+RUN mkdir -p /app /test-results
+
+WORKDIR /app
+
+# Copy common test utilities
+COPY scripts/run_audio_tests.sh /app/scripts/
+COPY test_audio.wav /app/test_audio.wav
+
+# PulseAudio specific layer
+FROM rsac-test-base as rsac-pulseaudio
+
+# Install PulseAudio
+RUN apt-get update && apt-get install -y \
+    pulseaudio pulseaudio-utils libpulse-dev
+
+# Copy PulseAudio configuration
+COPY docker/linux/pulse-client.conf /etc/pulse/client.conf
+COPY docker/linux/pulse-daemon.conf /etc/pulse/daemon.conf
+
+# PipeWire specific layer
+FROM rsac-test-base as rsac-pipewire
+
+# Install PipeWire
+RUN apt-get update && apt-get install -y \
+    pipewire pipewire-bin pipewire-pulse \
+    libpipewire-0.3-dev libspa-0.2-dev \
+    pulseaudio-utils
+
+# Set up runtime directory for PipeWire
+ENV XDG_RUNTIME_DIR=/run/user/0
+ENV PIPEWIRE_RUNTIME_DIR=/run/user/0
+RUN mkdir -p /run/user/0 && chmod 700 /run/user/0

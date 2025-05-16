@@ -3,21 +3,31 @@ name = "rsac"
 version = "0.1.0"
 edition = "2021"
 
+[features]
+test-utils = []  # Feature to enable test utilities
+
 [dependencies]
 # Core dependencies
 hound = "3.5.1"
-sysinfo = "0.33.1"
-clap = { version = "4.5.31", features = ["derive"] }
+sysinfo = "0.34.1"
+clap = { version = "4.5.34", features = ["derive"] }
 inquire = "0.7.5"
 indicatif = "0.17.11"
 color-eyre = "0.6.3"
 ctrlc = "3.4.5"
 rodio = "0.20.1"
+reqwest = { version = "0.12.15", features = ["blocking"] }
+
+# For testing
+serde = { version = "1.0.219", features = ["derive"] }
+serde_json = "1.0.140"
+rand = "0.9.0"
+rand_pcg = "0.9.0"
 
 # Platform-specific audio capture
 [target.'cfg(target_os = "windows")'.dependencies]
 wasapi = "0.16.0"
-windows = { version = "0.60.0", features = [
+windows = { version = "0.61.1", features = [
     "Win32_System_Com",
     "Win32_Media_Audio",
     "Win32_Media_Audio_Endpoints",
@@ -30,48 +40,39 @@ windows = { version = "0.60.0", features = [
 ] }
 
 [target.'cfg(target_os = "linux")'.dependencies]
-# libasound2-dev && libpipewire-0.3-dev && pkg-config && build-essential && clang && libclang-dev && llvm-dev
-libpulse-binding = "2.28.2"
-libpulse-simple-binding = "2.28.1"
+# libpipewire-0.3-dev && pkg-config && build-essential && clang && libclang-dev && llvm-dev
 pipewire = "0.8.0"
 
 [target.'cfg(target_os = "macos")'.dependencies]
 coreaudio-rs = "0.12.1"
 
 # Error handling
-thiserror = "2.0.11"
+thiserror = "2.0.12"
 
 [dev-dependencies]
 criterion = "0.5.1" # Benchmarking
-tempfile = "3.17.1" # Temporary files for tests
+tempfile = "3.19.1" # Temporary files for tests
+serde = { version = "1.0.219", features = ["derive"] } # For serialization in test reports
+serde_json = "1.0.140" # For test report serialization
+rand = "0.9.0" # For generating test data
+rand_pcg = "0.9.0" # For deterministic random numbers in tests
 
 [[example]]
-name = "wav_demo"
-path = "examples/wav_demo.rs"
+name = "unified_platform_test"
+path = "examples/unified_platform_test.rs"
 
 [[example]]
-name = "test_windows"
-path = "examples/test_windows.rs"
+name = "standardized_test"
+path = "examples/standardized_test.rs"
 
 [[example]]
-name = "test_pulseaudio"
-path = "examples/test_pulseaudio.rs"
+name = "audio_player"
+path = "examples/audio_player.rs"
+required-features = ["test-utils"]
 
 [[example]]
-name = "test_coreaudio"
-path = "examples/test_coreaudio.rs"
-
-[[example]]
-name = "test_coreaudio_app"
-path = "examples/test_coreaudio_app.rs"
-
-[[example]]
-name = "test_tone"
-path = "examples/test_tone.rs"
-
-[[example]]
-name = "test_pipewire"
-path = "examples/test_pipewire.rs"
+name = "windows_apis"
+path = "examples/windows_apis.rs"
 
 [workspace]
 members = []

@@ -1,5 +1,5 @@
 mod capture;
-mod core;
+pub mod core;
 #[cfg(target_os = "linux")]
 mod linux;
 #[cfg(target_os = "macos")]
@@ -14,7 +14,7 @@ pub use core::{
 
 // Re-export platform-specific backends
 #[cfg(target_os = "linux")]
-pub use linux::{PipeWireBackend, PulseAudioBackend};
+pub use linux::PipeWireBackend;
 #[cfg(target_os = "macos")]
 pub use macos::CoreAudioBackend;
 #[cfg(target_os = "windows")]
@@ -33,12 +33,9 @@ pub fn get_audio_backend() -> Result<Box<dyn AudioCaptureBackend>, AudioError> {
     {
         if linux::PipeWireBackend::is_available() {
             Ok(Box::new(linux::PipeWireBackend::new()?))
-        } else if linux::PulseAudioBackend::is_available() {
-            println!("Warning: PipeWire not available, falling back to PulseAudio");
-            Ok(Box::new(linux::PulseAudioBackend::new()?))
         } else {
             Err(AudioError::BackendUnavailable(
-                "No supported audio backend (PipeWire or PulseAudio) available",
+                "PipeWire is not available. Audio capture is not supported on this system.",
             ))
         }
     }

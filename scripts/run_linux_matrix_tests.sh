@@ -5,6 +5,7 @@ set -e
 RED='\033[0;31m'
 GREEN='\033[0;32m'
 YELLOW='\033[1;33m'
+BLUE='\033[0;34m'
 NC='\033[0m' # No Color
 
 echo -e "${YELLOW}=== RUST CROSS-PLATFORM AUDIO CAPTURE - LINUX TEST MATRIX ===${NC}"
@@ -17,47 +18,31 @@ echo
 RESULTS_DIR="./test-results"
 mkdir -p $RESULTS_DIR
 
-# Run all tests in the matrix
-echo -e "${YELLOW}[1/4] Running PipeWire Application Capture Test${NC}"
-docker-compose up --build rsac-linux-pipewire-app
+# Run PipeWire tests
+echo -e "${BLUE}Running PipeWire tests...${NC}"
+docker compose up --build rsac-linux-pipewire
 
-echo -e "${YELLOW}[2/4] Running PipeWire System Capture Test${NC}"
-docker-compose up --build rsac-linux-pipewire-system
+# Run PulseAudio tests
+echo -e "${BLUE}Running PulseAudio tests...${NC}"
+docker compose up --build rsac-linux-pulseaudio
 
-echo -e "${YELLOW}[3/4] Running PulseAudio Application Capture Test${NC}"
-docker-compose up --build rsac-linux-pulseaudio-app
+# Generate consolidated report
+echo -e "${BLUE}Generating test report...${NC}"
+docker compose up --build rsac-report
 
-echo -e "${YELLOW}[4/4] Running PulseAudio System Capture Test${NC}"
-docker-compose up --build rsac-linux-pulseaudio-system
+# Display report location
+echo -e "${GREEN}\nTest matrix completed!${NC}"
+echo "Results are available in: ${RESULTS_DIR}/test_report.html"
 
-# Check test results
-echo -e "${YELLOW}\nVerifying test results...${NC}"
-SUCCESS=true
-
-# Check for result files
-EXPECTED_FILES=(
-    "pipewire_app_capture"
-    "pipewire_system_capture"
-    "pulseaudio_app_capture"
-    "pulseaudio_system_capture"
-)
-
-for TEST in "${EXPECTED_FILES[@]}"; do
-    COUNT=$(find $RESULTS_DIR -name "${TEST}*" | wc -l)
-    
-    if [ $COUNT -gt 0 ]; then
-        echo -e "✅ ${TEST}: ${GREEN}PASSED${NC} ($COUNT result files found)"
-    else
-        echo -e "❌ ${TEST}: ${RED}FAILED${NC} (No result files found)"
-        SUCCESS=false
+# Check if test report exists
+if [ -f "${RESULTS_DIR}/test_report.html" ]; then
+    echo -e "${GREEN}Test report generated successfully!${NC}"
+    if command -v xdg-open > /dev/null; then
+        echo "Opening test report in browser..."
+        xdg-open "${RESULTS_DIR}/test_report.html" || true
     fi
-done
-
-echo
-if $SUCCESS; then
-    echo -e "${GREEN}All tests completed successfully!${NC}"
     exit 0
 else
-    echo -e "${RED}Some tests failed. Check logs for details.${NC}"
+    echo -e "${RED}Failed to generate test report.${NC}"
     exit 1
-fi 
+fi
