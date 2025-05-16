@@ -52,8 +52,9 @@ windows = { version = "0.56.0", features = [
 ] }
 
 [target.'cfg(target_os = "linux")'.dependencies]
-# libpipewire-0.3-dev && pkg-config && build-essential && clang && libclang-dev && llvm-dev
-pipewire = "0.8.0"
+# libpipewire-0.3-dev, pkg-config, build-essential, clang, libclang-dev, and llvm-dev are required for building.
+# This crate provides bindings to the PipeWire multimedia framework.
+pipewire = "0.9.1"
 
 [target.'cfg(target_os = "macos")'.dependencies]
 coreaudio-rs = "0.12.1"

@@ -19,23 +19,90 @@ use std::{
 };
 
 use pipewire::spa::utils::Direction as PwDirection;
+// Adjusted imports for PipewireCoreContext
 use pipewire::{
     self,
     channel,
-    context::Context as PwContext,
-    core::Core,
-    main_loop::MainLoop,
+    // context::Context as PwContext, // Keep PwContext for old code if needed
+    // core::Core as PwCore, // Keep PwCore for old code if needed
+    // main_loop::MainLoop as PwMainLoop, // Keep PwMainLoop for old code if needed
     properties::properties,
     registry::Registry,
     spa,
     spa::pod::{Object, Pod},
-    // spa::utils::Direction, // This might conflict with a new Direction if defined
     stream::{Stream as PwStream, StreamFlags},
-}; // Alias to avoid conflict
+    Context,  // For PipewireCoreContext
+    Core,     // For PipewireCoreContext
+    MainLoop, // For PipewireCoreContext
+};
 
 use super::core::{AudioApplication, AudioCaptureBackend, AudioCaptureStream};
 
 // --- New Skeleton Implementations ---
+
+/// Manages the core PipeWire objects like MainLoop, Context, and Core.
+/// This struct is responsible for initializing and holding the essential PipeWire state
+/// required for device enumeration and stream creation.
+#[derive(Debug)] // derive Debug, or implement manually if fields are not Debug
+pub(crate) struct PipewireCoreContext {
+    // TODO: Manage pipewire::init() and pipewire::deinit() globally,
+    // possibly with std::sync::Once when the first context is created.
+    // For now, init/deinit are omitted as per subtask instructions.
+    // _init_token: pipewire::InitGuard, // If pipewire::init() returns a guard
+    main_loop: MainLoop,
+    context: Context,
+    core: Core,
+}
+
+impl PipewireCoreContext {
+    /// Creates a new `PipewireCoreContext`.
+    /// Initializes the PipeWire main loop, context, and connects to the core.
+    pub fn new() -> AudioResult<Self> {
+        // pipewire::init(); // Call once globally if not using an InitGuard.
+        // Or, if pipewire::init() returns a guard:
+        // let _init_token = pipewire::init().map_err(|()| AudioError::BackendSpecificError("Failed to initialize global PipeWire state".to_string()))?;
+
+        let main_loop = MainLoop::new(None).map_err(|e| {
+            AudioError::BackendSpecificError(format!("Failed to create PipeWire MainLoop: {}", e))
+        })?;
+        let context = Context::new(&main_loop).map_err(|e| {
+            AudioError::BackendSpecificError(format!("Failed to create PipeWire Context: {}", e))
+        })?;
+        let core = context.connect(None).map_err(|e| {
+            AudioError::BackendSpecificError(format!("Failed to connect to PipeWire Core: {}", e))
+        })?;
+
+        Ok(Self {
+            // _init_token,
+            main_loop,
+            context,
+            core,
+        })
+    }
+
+    /// Returns a reference to the PipeWire Core.
+    pub fn core(&self) -> &Core {
+        &self.core
+    }
+
+    /// Returns a reference to the PipeWire MainLoop.
+    pub fn main_loop(&self) -> &MainLoop {
+        &self.main_loop
+    }
+
+    /// Returns a reference to the PipeWire Context.
+    pub fn context(&self) -> &Context {
+        &self.context
+    }
+}
+
+// impl Drop for PipewireCoreContext {
+//     fn drop(&mut self) {
+//         // Core, Context, MainLoop should clean up on drop.
+//         // If pipewire::init() was called without a guard, call pipewire::deinit();
+//         // pipewire::deinit(); // If init was called manually
+//     }
+// }
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct LinuxDeviceId(String); // Example: Use a String for now
@@ -44,7 +111,7 @@ pub struct LinuxAudioDevice {
     id: LinuxDeviceId,
     name: String,
     kind: DeviceKind,
-    // TODO: Add other necessary fields, e.g., PipeWire node ID
+    // TODO: Add other necessary fields, e.g., PipeWire node ID, reference to PipewireCoreContext if needed
 }
 
 impl AudioDevice for LinuxAudioDevice {
@@ -111,31 +178,69 @@ impl AudioDevice for LinuxAudioDevice {
     }
 }
 
-pub struct LinuxDeviceEnumerator;
+pub struct LinuxDeviceEnumerator {
+    core_context: PipewireCoreContext, // Or Arc<PipewireCoreContext> if shared
+}
+
+impl LinuxDeviceEnumerator {
+    /// Creates a new `LinuxDeviceEnumerator`.
+    /// Initializes the PipeWire core context.
+    pub(crate) fn new() -> AudioResult<Self> {
+        // Initialize pipewire globally once.
+        // This should ideally be done using std::sync::Once or similar.
+        // For this subtask, we'll call it here directly.
+        // A more robust solution would manage this globally.
+        // TODO: Move pipewire::init() to a global, once-per-application call.
+        pipewire::init();
+
+        let core_context = PipewireCoreContext::new()?;
+        Ok(Self { core_context })
+    }
+}
+
+// TODO: Implement Drop for LinuxDeviceEnumerator if pipewire::init() needs a corresponding pipewire::deinit()
+// and it's managed here.
+// impl Drop for LinuxDeviceEnumerator {
+//     fn drop(&mut self) {
+//         // TODO: Call pipewire::deinit() if init was called in new() and not managed by a guard.
+//         // This depends on the pipewire crate's init/deinit mechanism.
+//         // For now, assuming Core/Context/MainLoop handle their cleanup.
+//         // pipewire::deinit();
+//     }
+// }
 
 impl DeviceEnumerator for LinuxDeviceEnumerator {
     type Device = LinuxAudioDevice;
 
     fn enumerate_devices(&self) -> AudioResult<Vec<Self::Device>> {
-        println!("TODO: LinuxDeviceEnumerator::enumerate_devices()");
+        println!(
+            "TODO: LinuxDeviceEnumerator::enumerate_devices() using self.core_context: {:?}",
+            self.core_context
+        );
         todo!()
     }
 
     fn get_default_device(&self, kind: DeviceKind) -> AudioResult<Self::Device> {
         println!(
-            "TODO: LinuxDeviceEnumerator::get_default_device({:?})",
-            kind
+            "TODO: LinuxDeviceEnumerator::get_default_device({:?}) using self.core_context: {:?}",
+            kind, self.core_context
         );
         todo!()
     }
 
     fn get_input_devices(&self) -> AudioResult<Vec<Self::Device>> {
-        println!("TODO: LinuxDeviceEnumerator::get_input_devices()");
+        println!(
+            "TODO: LinuxDeviceEnumerator::get_input_devices() using self.core_context: {:?}",
+            self.core_context
+        );
         todo!()
     }
 
     fn get_output_devices(&self) -> AudioResult<Vec<Self::Device>> {
-        println!("TODO: LinuxDeviceEnumerator::get_output_devices()");
+        println!(
+            "TODO: LinuxDeviceEnumerator::get_output_devices() using self.core_context: {:?}",
+            self.core_context
+        );
         todo!()
     }
 
@@ -143,7 +248,10 @@ impl DeviceEnumerator for LinuxDeviceEnumerator {
         &self,
         id: &<Self::Device as AudioDevice>::DeviceId,
     ) -> AudioResult<Self::Device> {
-        println!("TODO: LinuxDeviceEnumerator::get_device_by_id({:?})", id);
+        println!(
+            "TODO: LinuxDeviceEnumerator::get_device_by_id({:?}) using self.core_context: {:?}",
+            id, self.core_context
+        );
         todo!()
     }
 }
