@@ -1,4 +1,10 @@
 //! Linux-specific audio capture backend using PipeWire.
+//!
+//! ## Error Handling
+//! Errors originating from the `pipewire` crate or related SPA (Simple Plugin API)
+//! operations are generally mapped to `AudioError::BackendError(String)`.
+//! The string payload provides context about the failed PipeWire operation
+//! and includes the original error message for detailed diagnostics.
 #![cfg(target_os = "linux")]
 
 use crate::core::config::{AudioCaptureConfig, AudioConfig, StreamConfig}; // Corrected import path
@@ -76,16 +82,16 @@ impl PipewireCoreContext {
     pub fn new() -> AudioResult<Self> {
         // pipewire::init(); // Call once globally if not using an InitGuard.
         // Or, if pipewire::init() returns a guard:
-        // let _init_token = pipewire::init().map_err(|()| AudioError::BackendSpecificError("Failed to initialize global PipeWire state".to_string()))?;
+        // let _init_token = pipewire::init().map_err(|()| AudioError::BackendError("Failed to initialize global PipeWire state".to_string()))?;
 
         let main_loop = MainLoop::new(None).map_err(|e| {
-            AudioError::BackendSpecificError(format!("Failed to create PipeWire MainLoop: {}", e))
+            AudioError::BackendError(format!("Failed to create PipeWire MainLoop: {}", e))
         })?;
         let context = Context::new(&main_loop).map_err(|e| {
-            AudioError::BackendSpecificError(format!("Failed to create PipeWire Context: {}", e))
+            AudioError::BackendError(format!("Failed to create PipeWire Context: {}", e))
         })?;
         let core = context.connect(None).map_err(|e| {
-            AudioError::BackendSpecificError(format!("Failed to connect to PipeWire Core: {}", e))
+            AudioError::BackendError(format!("Failed to connect to PipeWire Core: {}", e))
         })?;
 
         Ok(Self {
@@ -311,7 +317,7 @@ impl AudioDevice for LinuxAudioDevice {
             stream_props,
         )
         .map_err(|e| {
-            AudioError::BackendSpecificError(format!("Failed to create PipeWire stream: {}", e))
+            AudioError::BackendError(format!("Failed to create PipeWire stream: {}", e))
         })?;
 
         // log::info!("PipeWire stream created for device ID: {}", self.id);
@@ -395,7 +401,7 @@ impl DeviceEnumerator for LinuxDeviceEnumerator {
 
         let core = self.core_context.core();
         let registry = core.get_registry().map_err(|e| {
-            AudioError::BackendSpecificError(format!("Failed to get PipeWire registry: {}", e))
+            AudioError::BackendError(format!("Failed to get PipeWire registry: {}", e))
         })?;
 
         let search_state = Arc::new(Mutex::new(DefaultDeviceSearchState {
@@ -504,7 +510,7 @@ impl DeviceEnumerator for LinuxDeviceEnumerator {
             })
             .register()
             .map_err(|e| {
-                AudioError::BackendSpecificError(format!(
+                AudioError::BackendError(format!(
                     "Failed to register registry listener: {}",
                     e
                 ))
@@ -732,7 +738,7 @@ impl CapturingStream for LinuxAudioStream {
             &[built_props],                 // Slice of formats to offer (just one for now)
         )
         .map_err(|e| {
-            AudioError::BackendSpecificError(format!("Failed to encode format properties: {:?}", e))
+            AudioError::BackendError(format!("Failed to encode format properties: {:?}", e))
         })?;
 
         let format_pod_array: &[Pod] = std::slice::from_ref(&enum_format_pod);
@@ -763,13 +769,13 @@ impl CapturingStream for LinuxAudioStream {
                                     *current_format_clone.lock().unwrap() = Some(audio_fmt);
                                 } else {
                                     // log::error!("Failed to convert parsed SPA format to internal AudioFormat.");
-                                     let err = AudioError::BackendSpecificError("Failed to convert parsed SPA format to internal AudioFormat".to_string());
+                                     let err = AudioError::BackendError("Failed to convert parsed SPA format to internal AudioFormat".to_string());
                                      data_queue_clone.lock().unwrap().push_back(Err(err));
                                 }
                             }
                             Err(e) => {
                                 // log::error!("Failed to parse negotiated format pod: {:?}", e);
-                                let err = AudioError::BackendSpecificError(format!("Failed to parse negotiated format pod: {:?}", e));
+                                let err = AudioError::BackendError(format!("Failed to parse negotiated format pod: {:?}", e));
                                 data_queue_clone.lock().unwrap().push_back(Err(err));
                             }
                         }
@@ -777,7 +783,7 @@ impl CapturingStream for LinuxAudioStream {
                         // log::warn!("Format param changed, but pod_option is None. Format might have been removed.");
                         *current_format_clone.lock().unwrap() = None;
                         // Potentially push an error or a specific marker if format becomes None during streaming
-                        let err = AudioError::BackendSpecificError("PipeWire stream format became None".to_string());
+                        let err = AudioError::BackendError("PipeWire stream format became None".to_string());
                         data_queue_clone.lock().unwrap().push_back(Err(err));
                     }
                 }
@@ -800,7 +806,7 @@ impl CapturingStream for LinuxAudioStream {
                     Some(fmt) => fmt,
                     None => {
                         // log::error!("Process callback: No negotiated format available.");
-                        data_queue_locked.push_back(Err(AudioError::BackendSpecificError(
+                        data_queue_locked.push_back(Err(AudioError::BackendError(
                             "No negotiated audio format available in process callback".to_string(),
                         )));
                         return;
@@ -824,7 +830,7 @@ impl CapturingStream for LinuxAudioStream {
                 let bytes_per_sample_source = negotiated_audio_format.bits_per_sample as usize / 8;
 
                 if channels == 0 || bytes_per_sample_source == 0 {
-                    data_queue_locked.push_back(Err(AudioError::BackendSpecificError(
+                    data_queue_locked.push_back(Err(AudioError::BackendError(
                         "Invalid channel count or bytes_per_sample from negotiated format".to_string()
                     )));
                     return;
@@ -833,7 +839,7 @@ impl CapturingStream for LinuxAudioStream {
                 let num_frames = chunk_size_bytes / (channels * bytes_per_sample_source);
                 if num_frames == 0 && chunk_size_bytes > 0 {
                      // This case means incomplete frame data, which is unusual for full buffers.
-                    data_queue_locked.push_back(Err(AudioError::BackendSpecificError(
+                    data_queue_locked.push_back(Err(AudioError::BackendError(
                         "Incomplete frame data received from PipeWire".to_string()
                     )));
                     return;
@@ -848,7 +854,7 @@ impl CapturingStream for LinuxAudioStream {
                 match negotiated_audio_format.sample_format {
                     SampleFormat::F32LE => {
                         if chunk_size_bytes % 4 != 0 {
-                            data_queue_locked.push_back(Err(AudioError::BackendSpecificError(
+                            data_queue_locked.push_back(Err(AudioError::BackendError(
                                 "F32LE data size not multiple of 4".to_string()
                             )));
                             return;
@@ -859,7 +865,7 @@ impl CapturingStream for LinuxAudioStream {
                     }
                     SampleFormat::S16LE => {
                         if chunk_size_bytes % 2 != 0 {
-                             data_queue_locked.push_back(Err(AudioError::BackendSpecificError(
+                             data_queue_locked.push_back(Err(AudioError::BackendError(
                                 "S16LE data size not multiple of 2".to_string()
                             )));
                             return;
@@ -897,7 +903,7 @@ impl CapturingStream for LinuxAudioStream {
             })
             .register()
             .map_err(|e| {
-                AudioError::BackendSpecificError(format!(
+                AudioError::BackendError(format!(
                     "Failed to register stream listener: {}",
                     e
                 ))
@@ -919,7 +925,7 @@ impl CapturingStream for LinuxAudioStream {
                 format_pod_array,
             )
             .map_err(|e| {
-                AudioError::BackendSpecificError(format!(
+                AudioError::BackendError(format!(
                     "Failed to connect PipeWire stream: {}",
                     e
                 ))
@@ -944,7 +950,7 @@ impl CapturingStream for LinuxAudioStream {
         }
  
         self.stream.disconnect().map_err(|e| {
-            AudioError::BackendSpecificError(format!("Failed to disconnect PipeWire stream: {}", e))
+            AudioError::BackendError(format!("Failed to disconnect PipeWire stream: {}", e))
         })?;
         self.is_started.store(false, AtomicOrdering::SeqCst);
         // The listener_handle will be dropped when LinuxAudioStream is dropped,
@@ -1271,9 +1277,27 @@ impl PipeWireStream {
 
         let thread_handle = thread::spawn(move || {
             pipewire::init();
-            let main_loop = MainLoop::new(None).unwrap();
-            let context = PwContext::new(&main_loop).unwrap();
-            let core = context.connect(None).unwrap();
+            let main_loop = match MainLoop::new(None) {
+                Ok(ml) => ml,
+                Err(e) => {
+                    ready_tx.send(Err(format!("Old Backend: Failed to create MainLoop: {}", e))).unwrap();
+                    return;
+                }
+            };
+            let context = match PwContext::new(&main_loop) {
+                Ok(ctx) => ctx,
+                Err(e) => {
+                    ready_tx.send(Err(format!("Old Backend: Failed to create Context: {}", e))).unwrap();
+                    return;
+                }
+            };
+            let core = match context.connect(None) {
+                Ok(c) => c,
+                Err(e) => {
+                    ready_tx.send(Err(format!("Old Backend: Failed to connect to Core: {}", e))).unwrap();
+                    return;
+                }
+            };
             let props = properties! {
                 "media.class" => "Audio/Source",
                 // Access channels and sample_rate through the 'format' field of StreamConfig
@@ -1366,8 +1390,7 @@ impl AudioCaptureStream for PipeWireStream {
     fn start(&mut self) -> Result<(), AudioError> {
         if let Some(tx) = &self.stream_command_tx {
             tx.send(StreamCommand::Connect).map_err(|e| {
-                AudioError::Unknown(format!("Failed to send connect command: {:?}", e))
-                // Use {:?} for Debug
+                AudioError::BackendError(format!("Old Backend: Failed to send connect command: {:?}", e))
             })?;
         }
         Ok(())
@@ -1375,14 +1398,13 @@ impl AudioCaptureStream for PipeWireStream {
     fn stop(&mut self) -> Result<(), AudioError> {
         if let Some(tx) = &self.stream_command_tx {
             tx.send(StreamCommand::Disconnect).map_err(|e| {
-                AudioError::Unknown(format!("Failed to send disconnect command: {:?}", e))
-                // Use {:?} for Debug
+                AudioError::BackendError(format!("Old Backend: Failed to send disconnect command: {:?}", e))
             })?;
         }
         Ok(())
     }
     fn read(&mut self, buffer: &mut [u8]) -> Result<usize, AudioError> {
-        let mut shared_buf = self.buffer.lock().unwrap();
+        let mut shared_buf = self.buffer.lock().map_err(|_| AudioError::BackendError("Old Backend: Mutex poisoned in read".to_string()))?;
         let copy_size = std::cmp::min(buffer.len(), shared_buf.len());
         if copy_size > 0 {
             buffer[..copy_size].copy_from_slice(&shared_buf[..copy_size]);
