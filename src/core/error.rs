@@ -81,6 +81,8 @@ pub enum AudioError {
     CaptureError(String),
     /// The provided sample rate is not supported.
     UnsupportedSampleRate(u32),
+    /// The target application for capture could not be found or monitored.
+    ApplicationNotFound(String),
 }
 
 impl std::fmt::Display for AudioError {
@@ -147,6 +149,13 @@ impl std::fmt::Display for AudioError {
             }
             AudioError::UnsupportedSampleRate(rate) => {
                 write!(f, "Unsupported sample rate: {} Hz", rate)
+            }
+            AudioError::ApplicationNotFound(details) => {
+                write!(
+                    f,
+                    "Target application not found or could not be monitored: {}",
+                    details
+                )
             }
         }
     }

@@ -40,6 +40,7 @@ use std::ptr;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use windows::core::{GUID, HRESULT, PWSTR};
+use windows::Win32::Foundation::HANDLE; // For process handle
 use windows::Win32::Foundation::{E_NOTFOUND, S_FALSE, S_OK};
 use windows::Win32::Media::Audio::{
     eAll, eCapture, eConsole, eRender, IAudioCaptureClient, IAudioClient, IMMDevice,
@@ -52,8 +53,38 @@ use windows::Win32::System::Com::{
     COINIT_MULTITHREADED, RPC_E_CHANGED_MODE, STGM_READ,
 };
 use windows::Win32::System::Propsystem::PropVariantClear;
+use windows::Win32::System::Threading::{
+    CloseHandle, OpenProcess, WaitForSingleObject, PROCESS_SYNCHRONIZE, WAIT_OBJECT_0,
+};
 use windows::Win32::System::Variant::{PROPVARIANT, VT_EMPTY, VT_LPWSTR};
 use windows::Win32::UI::Shell::PropertiesSystem::PKEY_Device_FriendlyName;
+
+/// RAII wrapper for a Windows HANDLE to ensure it's closed on drop.
+#[derive(Debug)]
+struct ProcessHandle(Option<HANDLE>);
+
+impl ProcessHandle {
+    fn new(handle: Option<HANDLE>) -> Self {
+        Self(handle)
+    }
+
+    fn get(&self) -> Option<HANDLE> {
+        self.0
+    }
+}
+
+impl Drop for ProcessHandle {
+    fn drop(&mut self) {
+        if let Some(h) = self.0.take() {
+            if !h.is_invalid() {
+                // Ensure we don't try to close an invalid handle like INVALID_HANDLE_VALUE
+                unsafe {
+                    let _ = CloseHandle(h);
+                }
+            }
+        }
+    }
+}
 
 /// Ensures COM is initialized for the current thread and uninitializes it when dropped.
 ///
@@ -953,10 +984,16 @@ impl CapturingStream for WindowsAudioStream {
     ///   send an `AudioError::StreamClosed` message, and then terminate.
     /// - If the returned async stream is dropped, the polling thread will detect that the
     ///   channel is closed and will also terminate.
+    /// - If a `target_pid` is specified, the thread will monitor the target application.
+    ///   If the application terminates, an `AudioError::StreamClosed` is sent, and the
+    ///   polling thread stops. If the application cannot be monitored (e.g., `OpenProcess` fails),
+    ///   an `AudioError::ApplicationNotFound` is sent, and the thread terminates.
     ///
     /// # Errors
     /// - Returns `AudioError::InvalidOperation` if the stream has not been started via `start()`.
     /// - Returns `AudioError::BackendSpecificError` if the polling thread fails to initialize COM.
+    /// - Returns `AudioError::ApplicationNotFound` if a `target_pid` is given but the process
+    ///   cannot be opened for monitoring at the start of the polling thread.
     fn to_async_stream<'a>(
         &'a mut self,
     ) -> AudioResult<
@@ -980,6 +1017,7 @@ impl CapturingStream for WindowsAudioStream {
         let capture_client_clone = self.capture_client.clone();
         let wave_format_clone = self.wave_format;
         let stream_is_started_clone = self.is_started.clone();
+        let target_pid_clone = self.target_pid; // Clone Option<u32>
 
         thread::spawn(move || {
             let _com_thread_initializer = match ComInitializer::new() {
@@ -993,6 +1031,36 @@ impl CapturingStream for WindowsAudioStream {
                 }
             };
 
+            // Process monitoring setup
+            let process_monitor_handle = if let Some(pid_val) = target_pid_clone {
+                match unsafe { OpenProcess(PROCESS_SYNCHRONIZE, false, pid_val) } {
+                    Ok(handle) if !handle.is_invalid() => ProcessHandle::new(Some(handle)),
+                    Ok(invalid_handle) => {
+                        if !invalid_handle.is_invalid() {
+                            unsafe {
+                                CloseHandle(invalid_handle);
+                            }
+                        }
+                        let _ = tx.unbounded_send(Err(AudioError::ApplicationNotFound(format!(
+                            "Target application with PID {} could not be monitored (OpenProcess returned invalid handle).",
+                            pid_val
+                        ))));
+                        return;
+                    }
+                    Err(e) => {
+                        let _ = tx.unbounded_send(Err(AudioError::ApplicationNotFound(format!(
+                            "Target application with PID {} could not be monitored (OpenProcess failed: {:?}).",
+                            pid_val, e
+                        ))));
+                        return;
+                    }
+                }
+            } else {
+                ProcessHandle::new(None)
+            };
+
+            let mut check_process_counter = 0;
+
             loop {
                 if !stream_is_started_clone.load(Ordering::Relaxed) {
                     let _ = tx.unbounded_send(Err(AudioError::StreamClosed(
@@ -1001,8 +1069,21 @@ impl CapturingStream for WindowsAudioStream {
                     break;
                 }
 
+                if let Some(h) = process_monitor_handle.get() {
+                    check_process_counter += 1;
+                    if check_process_counter >= 10 {
+                        check_process_counter = 0;
+                        let wait_result = unsafe { WaitForSingleObject(h, 0) };
+                        if wait_result == WAIT_OBJECT_0 {
+                            let _ = tx.unbounded_send(Err(AudioError::StreamClosed(
+                                "Target application terminated.".to_string(),
+                            )));
+                            stream_is_started_clone.store(false, Ordering::Relaxed);
+                        }
+                    }
+                }
+
                 let mut num_frames_in_packet: u32 = 0;
-                // SAFETY: COM call on a cloned interface pointer, COM initialized for this thread.
                 let hr_packet_size =
                     unsafe { capture_client_clone.GetNextPacketSize(&mut num_frames_in_packet) };
 
@@ -1024,13 +1105,10 @@ impl CapturingStream for WindowsAudioStream {
                     continue;
                 }
 
-                // Data acquisition logic starts here
                 let mut p_data: *mut u8 = ptr::null_mut();
                 let mut num_frames_read_from_buffer: u32 = 0;
                 let mut flags: u32 = 0;
 
-                // Step 1: GetBuffer
-                // SAFETY: COM call
                 let hr_get_buffer = unsafe {
                     capture_client_clone.GetBuffer(
                         &mut p_data,
@@ -1049,12 +1127,10 @@ impl CapturingStream for WindowsAudioStream {
                         ))))
                         .is_err()
                     { /* Receiver dropped */ }
-                    break; // Critical error
+                    break;
                 }
 
-                // GetBuffer Succeeded (hr_get_buffer is Ok)
                 if num_frames_read_from_buffer == 0 {
-                    // SAFETY: COM call
                     let hr_release_empty = unsafe { capture_client_clone.ReleaseBuffer(0) };
                     if hr_release_empty.is_err() {
                         if tx
@@ -1064,27 +1140,22 @@ impl CapturingStream for WindowsAudioStream {
                             ))))
                             .is_err()
                         { /* Receiver dropped */ }
-                        break; // Critical error
+                        break;
                     }
-                    thread::sleep(Duration::from_millis(10)); // Small sleep and continue
+                    thread::sleep(Duration::from_millis(10));
                     continue;
                 }
 
-                // GetBuffer Succeeded and num_frames_read_from_buffer > 0
-                // Step 2: Data Conversion
                 let conversion_result = WindowsAudioStream::process_wasapi_packet_data(
                     p_data as *const u8,
                     num_frames_read_from_buffer,
                     &wave_format_clone,
                 );
 
-                // Step 3: ReleaseBuffer (must be called regardless of conversion success)
-                // SAFETY: COM call
                 let hr_release_data =
                     unsafe { capture_client_clone.ReleaseBuffer(num_frames_read_from_buffer) };
 
                 if hr_release_data.is_err() {
-                    // ReleaseBuffer failed. Send this error.
                     if tx
                         .unbounded_send(Err(AudioError::BackendSpecificError(format!(
                             "Polling thread: ReleaseBuffer (with data) failed (HRESULT: {:?})",
@@ -1092,23 +1163,19 @@ impl CapturingStream for WindowsAudioStream {
                         ))))
                         .is_err()
                     { /* Receiver dropped */ }
-                    break; // Critical error
+                    break;
                 }
 
-                // ReleaseBuffer succeeded. Now send the conversion_result.
                 match conversion_result {
                     Ok(audio_buffer) => {
                         if tx.unbounded_send(Ok(audio_buffer)).is_err() {
-                            break; // Receiver dropped
+                            break;
                         }
                     }
                     Err(e) => {
                         if tx.unbounded_send(Err(e)).is_err() {
-                            break; // Receiver dropped
+                            break;
                         }
-                        // If conversion error, break the loop as per "if any step results in an error"
-                        // This ensures that if process_wasapi_packet_data returns an error (e.g. UnsupportedFormat)
-                        // the thread stops sending further data, as it cannot process it.
                         break;
                     }
                 }
