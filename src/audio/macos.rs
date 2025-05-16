@@ -840,6 +840,424 @@ impl AudioDevice for MacosAudioDevice {
     }
 }
 
+// --- MacosApplicationAudioStream ---
+// Struct and implementations for application-level audio capture using CoreAudioProcessTap.
+
+use crate::audio::macos::tap::CoreAudioProcessTap;
+// Note: Other necessary imports like AudioUnit, Element, Scope, sys, Arc, Mutex, etc.,
+// are assumed to be covered by existing imports at the top of the file.
+// Explicitly listing some that are definitely needed for clarity in this block:
+use crate::core::buffer::VecAudioBuffer; // Already imported, but good to note
+use crate::audio::core::{AudioFormat, AudioResult, CapturingStream, SampleFormat, AudioBuffer}; // Already imported
+use coreaudio_rs::audio_unit::{AudioUnit, Element, Scope, RenderArgs};
+use coreaudio_rs::sys::{
+    self, kAudioUnitType_Output, kAudioUnitSubType_HALOutput, kAudioUnitManufacturer_Apple,
+    kAudioOutputUnitProperty_CurrentDevice, kAudioOutputUnitProperty_EnableIO,
+    kAudioUnitProperty_StreamFormat, AudioStreamBasicDescription, OSStatus,
+    AudioUnitRenderActionFlags, kAudioFormatFlagIsNonInterleaved, kAudioFormatFlagIsFloat,
+};
+use std::sync::{Arc, Mutex, atomic::{AtomicBool, Ordering}};
+use std::collections::VecDeque;
+use std::pin::Pin;
+
+
+/// Represents an active audio stream for capturing application-specific audio on macOS
+/// using a `CoreAudioProcessTap`.
+///
+/// This struct manages an `AudioUnit` (AUHAL) instance configured to receive audio
+/// from a specific application process via its tap. It handles the input callback,
+/// data buffering, and format conversion from the tap's native format to the
+/// library's standard interleaved F32LE format.
+pub struct MacosApplicationAudioStream {
+    audio_unit: AudioUnit,
+    /// The `CoreAudioProcessTap` providing the audio data. This stream takes ownership.
+    #[allow(dead_code)] // May be used later for tap management or info
+    process_tap: CoreAudioProcessTap,
+    /// Indicates if the stream has been started and the callback is active.
+    is_started: Arc<AtomicBool>,
+    /// The native `AudioStreamBasicDescription` (ASBD) of the tap.
+    /// The `AudioUnit` is configured to read data in this format from the tap.
+    native_tap_asbd: Arc<Mutex<Option<sys::AudioStreamBasicDescription>>>,
+    /// A queue to store captured audio data, converted to the library's
+    /// standard `AudioFormat` (interleaved `f32` samples). Each element is
+    /// an `AudioResult` wrapping a boxed `AudioBuffer`.
+    data_queue: Arc<Mutex<VecDeque<AudioResult<Box<dyn AudioBuffer<Sample = f32>>>>>>,
+    // _input_callback_handle: Option<Box<dyn std::any::Any + Send + Sync>>, // If needed for callback lifetime
+}
+
+impl std::fmt::Debug for MacosApplicationAudioStream {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("MacosApplicationAudioStream")
+            .field("process_tap_id", &self.process_tap.id())
+            .field("is_started", &self.is_started.load(Ordering::Relaxed))
+            .field("native_tap_asbd", &self.native_tap_asbd.lock().unwrap())
+            .field("data_queue_len", &self.data_queue.lock().unwrap().len())
+            .field("audio_unit", &"<AudioUnit instance>")
+            .finish()
+    }
+}
+
+impl MacosApplicationAudioStream {
+    /// Creates a new `MacosApplicationAudioStream` for capturing audio from a specific application process.
+    ///
+    /// This function configures an `AudioUnit` (AUHAL) to connect to the provided `CoreAudioProcessTap`.
+    /// The AUHAL is set up to:
+    /// 1. Use the tap's `AudioObjectID` as its current device.
+    /// 2. Enable input IO on its input bus (Element 1) and disable output IO on its output bus (Element 0).
+    /// 3. Expect audio data from the tap in the tap's native `AudioStreamBasicDescription` (ASBD).
+    ///    Both the input bus's output scope and the output bus's input scope are configured with this ASBD.
+    ///
+    /// # Arguments
+    ///
+    /// * `process_tap`: The `CoreAudioProcessTap` instance representing the connection to the target application's audio.
+    ///                  This stream will take ownership of the tap.
+    /// * `_desired_output_format`: The audio format desired by the library user. Currently, this parameter is noted
+    ///                             but the stream internally converts to interleaved F32LE based on the tap's native
+    ///                             channel count and sample rate. Future enhancements might use this for more complex
+    ///                             format negotiations or direct output format settings if supported by CoreAudio.
+    ///
+    /// # Returns
+    ///
+    /// An `AudioResult` containing the new `MacosApplicationAudioStream` on success, or an `AudioError` on failure.
+    pub fn new(
+        process_tap: CoreAudioProcessTap,
+        _desired_output_format: &AudioFormat, // Marked as unused for now as per current logic
+    ) -> AudioResult<Self> {
+        // 1. Create AudioComponentDescription for an Output Unit (AUHAL)
+        let desc = AudioComponentDescription {
+            component_type: kAudioUnitType_Output,
+            component_sub_type: kAudioUnitSubType_HALOutput,
+            component_manufacturer: kAudioUnitManufacturer_Apple,
+            component_flags: 0,
+            component_flags_mask: 0,
+        };
+
+        // 2. Find component
+        let component = AudioComponent::find(Some(&desc), None)
+            .ok_or_else(|| {
+                AudioError::BackendSpecificError("Failed to find AUHAL component for tap stream".into())
+            })?
+            .into_owned();
+
+        // 3. Create AudioUnit instance
+        let mut audio_unit = component.new_instance().map_err(map_ca_error)?;
+
+        // 4. Set current device on AUHAL to the tap's AudioObjectID
+        let tap_device_id = process_tap.id();
+        audio_unit
+            .set_property(
+                kAudioOutputUnitProperty_CurrentDevice,
+                Scope::Global,
+                Element::OUTPUT_BUS, // Global device selection typically uses output bus
+                Some(&tap_device_id),
+            )
+            .map_err(map_ca_error)?;
+
+        // 5. Enable IO for input (capture) and disable for output
+        let enable_io: u32 = 1;
+        audio_unit
+            .set_property(
+                kAudioOutputUnitProperty_EnableIO,
+                Scope::Input,      // Scope for enabling input
+                Element::INPUT_BUS, // Element is the input bus (capture side from tap)
+                Some(&enable_io),
+            )
+            .map_err(map_ca_error)?;
+
+        let disable_io: u32 = 0;
+        audio_unit
+            .set_property(
+                kAudioOutputUnitProperty_EnableIO,
+                Scope::Output,      // Scope for enabling output
+                Element::OUTPUT_BUS, // Element is the output bus (playback side, disabled)
+                Some(&disable_io),
+            )
+            .map_err(map_ca_error)?;
+
+        // 6. Get the tap's native stream format (ASBD)
+        let tap_asbd = process_tap.get_stream_format()?;
+
+        // 7. Set stream format for the captured audio from the tap.
+        // This is set on the OUTPUT scope of the INPUT bus (Element 1).
+        // It defines the format of audio data the AUHAL provides from the tap.
+        audio_unit
+            .set_property(
+                kAudioUnitProperty_StreamFormat,
+                Scope::Output,     // Data flowing OUT of the INPUT bus
+                Element::INPUT_BUS, // The bus providing captured audio from the tap
+                Some(&tap_asbd),
+            )
+            .map_err(map_ca_error)?;
+
+        // 8. Set the "client" stream format on the INPUT scope of the OUTPUT bus (Element 0).
+        // This defines the format the AUHAL's output bus would expect if it were rendering.
+        // For tap capture, this is often set to the same ASBD as the tap's output.
+        audio_unit
+            .set_property(
+                kAudioUnitProperty_StreamFormat,
+                Scope::Input,       // Data flowing INTO the OUTPUT bus
+                Element::OUTPUT_BUS, // The bus that would normally render to speakers
+                Some(&tap_asbd),
+            )
+            .map_err(map_ca_error)?;
+
+        // 9. Initialize AudioUnit
+        audio_unit.initialize().map_err(map_ca_error)?;
+
+        Ok(Self {
+            audio_unit,
+            process_tap,
+            is_started: Arc::new(AtomicBool::new(false)),
+            native_tap_asbd: Arc::new(Mutex::new(Some(tap_asbd))),
+            data_queue: Arc::new(Mutex::new(VecDeque::with_capacity(10))), // Default capacity
+        })
+    }
+}
+
+impl CapturingStream for MacosApplicationAudioStream {
+    /// Starts the audio capture stream from the application tap.
+    ///
+    /// This method performs the following key operations:
+    /// 1. Checks if the stream is already started.
+    /// 2. Sets up an input callback on the `AudioUnit`. This callback is associated with the
+    ///    output of the `AudioUnit`'s input bus (`Element::INPUT_BUS`, `Scope::Output`),
+    ///    which is where data from the `CoreAudioProcessTap` arrives.
+    /// 3. Inside the callback:
+    ///    a. It checks if the stream is marked as started.
+    ///    b. It calls `AudioUnitRender` on the input bus (`Element::INPUT_BUS`) to pull
+    ///       audio data from the tap into a temporary `AudioBufferList`.
+    ///    c. It retrieves the native `AudioStreamBasicDescription` (ASBD) of the tap.
+    ///    d. It converts the raw audio data from the `AudioBufferList` (which is in the
+    ///       tap's native format) into an interleaved `Vec<f32>`. This primarily handles
+    ///       non-interleaved float data from the tap, converting it to interleaved.
+    ///    e. It creates a `VecAudioBuffer` with the converted data and an `AudioFormat`
+    ///       reflecting F32LE, with channel count and sample rate from the tap's ASBD.
+    ///    f. This `AudioResult<Box<dyn AudioBuffer>>` is then pushed to an internal queue.
+    /// 4. Starts the `AudioUnit` to begin invoking the callback.
+    /// 5. Marks the stream as started.
+    ///
+    /// # Returns
+    /// `Ok(())` on success, or an `AudioError` if starting fails (e.g., callback setup error, AU start error).
+    fn start(&mut self) -> AudioResult<()> {
+        if self.is_started.load(Ordering::SeqCst) {
+            return Ok(());
+        }
+
+        let data_queue_clone = self.data_queue.clone();
+        let native_tap_asbd_clone = self.native_tap_asbd.clone();
+        let is_started_clone = self.is_started.clone();
+        // AudioUnit is not Clone, will be accessed via RenderArgs.audio_unit_ref
+
+        self.audio_unit.set_input_callback(
+            Element::INPUT_BUS, // Callback for the input bus
+            Scope::Output,      // Specifically, for data being output by the input bus (from the tap)
+            move |mut args: RenderArgs| -> Result<(), OSStatus> {
+                if !is_started_clone.load(Ordering::Relaxed) {
+                    return Ok(()); // Stream stopped
+                }
+
+                let au_instance = args.audio_unit_ref.instance(); // Get the AudioUnit instance
+                let num_frames = args.num_frames;
+                let timestamp = args.timestamp; // *const sys::AudioTimeStamp
+
+                let locked_asbd_opt = native_tap_asbd_clone.lock().unwrap();
+                let tap_asbd = match locked_asbd_opt.as_ref() {
+                    Some(val) => val,
+                    None => {
+                        eprintln!("MacosApplicationAudioStream Error: Native tap ASBD not available in callback.");
+                        // Push error to queue? For now, return error to CoreAudio.
+                        return Err(sys::kAudio_ParamError as OSStatus);
+                    }
+                };
+
+                // Allocate AudioBufferList for capturing data from the tap via Element 1
+                let is_tap_data_non_interleaved = (tap_asbd.mFormatFlags & kAudioFormatFlagIsNonInterleaved) != 0;
+                
+                let captured_abl_boxed_result = CAAudioBufferList::allocate(
+                    tap_asbd.mChannelsPerFrame,
+                    num_frames,
+                    !is_tap_data_non_interleaved, // `allocate` wants `is_interleaved`
+                    true, // allocate mData pointers
+                );
+
+                let mut captured_abl_boxed = match captured_abl_boxed_result.map_err(map_ca_error) {
+                    Ok(abl) => abl,
+                    Err(audio_err) => {
+                        eprintln!("Callback Error: Failed to allocate AudioBufferList for tap capture: {:?}", audio_err);
+                        let mut queue = data_queue_clone.lock().unwrap();
+                        if queue.len() == queue.capacity() { queue.pop_front(); }
+                        queue.push_back(Err(audio_err));
+                        return Ok(()); // Error pushed, callback returns OK
+                    }
+                };
+                let captured_abl_ptr: *mut sys::AudioBufferList = &mut *captured_abl_boxed;
+                let mut render_action_flags: AudioUnitRenderActionFlags = 0;
+
+                // Call AudioUnitRender on the INPUT BUS (Element 1) to get captured data from the tap.
+                let os_status = unsafe {
+                    sys::AudioUnitRender(
+                        au_instance,
+                        &mut render_action_flags,
+                        timestamp,
+                        Element::INPUT_BUS, // Render data from the input bus
+                        num_frames,
+                        captured_abl_ptr,
+                    )
+                };
+
+                if os_status == sys::noErr {
+                    // Ensure tap data is 32-bit float as expected by current conversion logic
+                    if (tap_asbd.mFormatFlags & kAudioFormatFlagIsFloat) == 0 || tap_asbd.mBitsPerChannel != 32 {
+                        let err_msg = format!(
+                            "Tap data is not 32-bit float. Flags: {}, Bits: {}",
+                            tap_asbd.mFormatFlags, tap_asbd.mBitsPerChannel
+                        );
+                        eprintln!("Callback Error: {}", err_msg);
+                        let mut queue = data_queue_clone.lock().unwrap();
+                        if queue.len() == queue.capacity() { queue.pop_front(); }
+                        queue.push_back(Err(AudioError::FormatNotSupported(err_msg)));
+                        return Ok(());
+                    }
+
+                    let num_channels = tap_asbd.mChannelsPerFrame as usize;
+                    let num_frames_usize = num_frames as usize;
+                    let mut interleaved_f32: Vec<f32> = vec![0.0f32; num_frames_usize * num_channels];
+
+                    let buffers_slice = unsafe {
+                        std::slice::from_raw_parts(
+                            (*captured_abl_ptr).mBuffers.as_ptr(),
+                            (*captured_abl_ptr).mNumberBuffers as usize,
+                        )
+                    };
+
+                    if !is_tap_data_non_interleaved { // Data is interleaved
+                        if !buffers_slice.is_empty() {
+                            let source_buffer = &buffers_slice[0];
+                            let samples_in_buffer = source_buffer.mDataByteSize as usize / std::mem::size_of::<f32>();
+                            if samples_in_buffer == interleaved_f32.len() {
+                                let source_slice = unsafe {
+                                    std::slice::from_raw_parts(source_buffer.mData as *const f32, samples_in_buffer)
+                                };
+                                interleaved_f32.copy_from_slice(source_slice);
+                            } else {
+                                eprintln!("Callback Error: Interleaved tap buffer size mismatch. Expected {}, got {}", interleaved_f32.len(), samples_in_buffer);
+                                // Push error or fill with silence
+                            }
+                        }
+                    } else { // Data is non-interleaved
+                        if buffers_slice.len() == num_channels {
+                            for frame_idx in 0..num_frames_usize {
+                                for ch_idx in 0..num_channels {
+                                    let source_buffer = &buffers_slice[ch_idx];
+                                    if !source_buffer.mData.is_null() && source_buffer.mDataByteSize >= ((frame_idx + 1) * std::mem::size_of::<f32>()) as u32 {
+                                        let sample_ptr = source_buffer.mData as *const f32;
+                                        interleaved_f32[frame_idx * num_channels + ch_idx] =
+                                            unsafe { *sample_ptr.add(frame_idx) };
+                                    } else {
+                                        eprintln!("Callback Error: Non-interleaved tap buffer access issue at frame {}, channel {}.", frame_idx, ch_idx);
+                                        // Fill with silence or push error
+                                        interleaved_f32[frame_idx * num_channels + ch_idx] = 0.0;
+                                    }
+                                }
+                            }
+                        } else {
+                             eprintln!("Callback Error: Non-interleaved tap buffer count mismatch. Expected {}, got {}.", num_channels, buffers_slice.len());
+                             // Push error or fill with silence
+                        }
+                    }
+                    
+                    let output_audio_format = AudioFormat {
+                        sample_rate: tap_asbd.mSampleRate as u32,
+                        channels: tap_asbd.mChannelsPerFrame as u16,
+                        bits_per_sample: 32, // We converted to f32
+                        sample_format: SampleFormat::F32LE,
+                    };
+                    let audio_buffer = VecAudioBuffer::new(interleaved_f32, output_audio_format);
+                    
+                    let mut queue = data_queue_clone.lock().unwrap();
+                    if queue.len() == queue.capacity() { queue.pop_front(); }
+                    queue.push_back(Ok(Box::new(audio_buffer)));
+
+                } else {
+                    eprintln!("AudioUnitRender error in tap callback: {}", os_status);
+                    let mut queue = data_queue_clone.lock().unwrap();
+                    if queue.len() == queue.capacity() { queue.pop_front(); }
+                    queue.push_back(Err(AudioError::BackendSpecificError(format!(
+                        "AudioUnitRender failed in tap callback with status: {}", os_status
+                    ))));
+                }
+                Ok(())
+            }
+        ).map_err(map_ca_error)?;
+
+        self.audio_unit.start().map_err(map_ca_error)?;
+        self.is_started.store(true, Ordering::SeqCst);
+        Ok(())
+    }
+
+    fn stop(&mut self) -> AudioResult<()> {
+        if !self.is_started.load(Ordering::SeqCst) {
+            return Ok(());
+        }
+        self.audio_unit.stop().map_err(map_ca_error)?;
+        self.is_started.store(false, Ordering::SeqCst);
+        Ok(())
+    }
+
+    fn is_running(&self) -> bool {
+        self.is_started.load(Ordering::SeqCst)
+    }
+
+    fn get_format(&self) -> AudioResult<AudioFormat> {
+        let locked_asbd = self.native_tap_asbd.lock().unwrap();
+        if let Some(asbd) = locked_asbd.as_ref() {
+            Ok(AudioFormat {
+                sample_rate: asbd.mSampleRate as u32,
+                channels: asbd.mChannelsPerFrame as u16,
+                bits_per_sample: 32, // Output is f32
+                sample_format: SampleFormat::F32LE,
+            })
+        } else {
+            Err(AudioError::NotInitialized(
+                "Tap stream not started or native ASBD not available".into(),
+            ))
+        }
+    }
+
+    fn read_chunk(&mut self, _timeout_ms: Option<u32>) -> AudioResult<Option<Box<dyn AudioBuffer<Sample = f32>>>> {
+        // TODO (Subtask 10.5): Implement chunk reading logic.
+        // This will involve popping from self.data_queue.
+        // For now, consistent with prompt:
+        if !self.is_running() {
+            return Err(AudioError::InvalidOperation("Stream is not running.".to_string()));
+        }
+        match self.data_queue.lock().map_err(|_| AudioError::MutexLockError("data_queue".to_string()))?.pop_front() {
+            Some(audio_result) => audio_result.map(Some),
+            None => Ok(None),
+        }
+        // todo!("Implement read_chunk for MacosApplicationAudioStream (Subtask 10.5)")
+    }
+
+    fn to_async_stream<'a>(
+        &'a mut self,
+    ) -> AudioResult<
+        Pin<Box<dyn futures_core::Stream<Item = AudioResult<Box<dyn AudioBuffer<Sample = f32>>>> + Send + Sync + 'a>>,
+    > {
+        // TODO (Subtask 10.6): Implement async stream conversion.
+        // This will involve spawning a thread to read from data_queue and send to an MPSC channel.
+        // For now, consistent with prompt:
+        todo!("Implement to_async_stream for MacosApplicationAudioStream (Subtask 10.6)")
+    }
+
+    fn close(&mut self) -> AudioResult<()> {
+        self.stop()?;
+        // AudioUnit resources (uninitialize, dispose) are managed by its Drop implementation.
+        // If explicit error handling for uninitialize/dispose is needed,
+        // self.audio_unit would need to be Option<AudioUnit> to take() and dispose,
+        // or MacosApplicationAudioStream would need its own Drop impl.
+        Ok(())
+    }
+}
 /// Device enumerator for macOS using CoreAudio.
 ///
 /// This enumerator is responsible for listing available audio devices
