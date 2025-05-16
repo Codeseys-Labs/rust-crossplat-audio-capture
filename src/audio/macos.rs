@@ -1224,18 +1224,49 @@ impl CapturingStream for MacosApplicationAudioStream {
         }
     }
 
+    /// Reads a chunk of captured audio data from the application tap stream synchronously.
+    ///
+    /// This method attempts to retrieve one audio buffer from an internal queue
+    /// (`self.data_queue`) which is populated by the CoreAudio input callback connected
+    /// to the application's process tap.
+    ///
+    /// # Behavior
+    /// - If the stream is not running (i.e., `start()` has not been called or `stop()` has been called),
+    ///   it returns `Err(AudioError::InvalidOperation("Stream not started or not in streaming state".to_string()))`.
+    /// - If a buffer is available in the queue, it pops the `AudioResult<Box<dyn AudioBuffer<Sample = f32>>>`.
+    ///   - If the popped item is `Ok(buffer)`, it returns `Ok(Some(buffer))`.
+    ///   - If the popped item is `Err(error_from_callback)`, this method propagates that error
+    ///     by returning `Err(error_from_callback)`. This allows errors occurring during
+    ///     audio capture or processing within the callback (e.g., `AudioUnitRender` failure,
+    ///     format conversion issues) to be communicated to the caller of `read_chunk`.
+    /// - If the queue is empty (meaning no new audio data has been processed by the callback
+    ///   since the last call, or the callback is not producing data fast enough), it returns
+    ///   `Ok(None)`. This signifies a non-blocking read attempt where no data is immediately available.
+    /// - If the internal data queue's mutex is poisoned (which is unlikely but possible if a
+    ///   thread panics while holding the lock), it returns `Err(AudioError::MutexLockError)`.
+    ///
+    /// # Timeout
+    /// The `_timeout_ms` parameter is currently **ignored**. This method always performs a
+    /// non-blocking check of the queue. Future implementations might utilize this parameter
+    /// to enable blocking reads with a specified timeout.
+    ///
+    /// # Returns
+    /// - `Ok(Some(Box<dyn AudioBuffer<Sample = f32>>))`: A buffer containing the captured audio data.
+    /// - `Ok(None)`: No data is currently available in the queue (non-blocking behavior).
+    /// - `Err(AudioError)`: An error occurred. This could be due to the stream not running,
+    ///   an error propagated from the audio callback (e.g., capture or processing error),
+    ///   or a mutex lock failure.
     fn read_chunk(&mut self, _timeout_ms: Option<u32>) -> AudioResult<Option<Box<dyn AudioBuffer<Sample = f32>>>> {
-        // TODO (Subtask 10.5): Implement chunk reading logic.
-        // This will involve popping from self.data_queue.
-        // For now, consistent with prompt:
         if !self.is_running() {
-            return Err(AudioError::InvalidOperation("Stream is not running.".to_string()));
+            return Err(AudioError::InvalidOperation("Stream not started or not in streaming state".to_string()));
         }
+
+        // TODO: Implement timeout logic if _timeout_ms is Some.
+        // For now, this is a non-blocking pop.
         match self.data_queue.lock().map_err(|_| AudioError::MutexLockError("data_queue".to_string()))?.pop_front() {
-            Some(audio_result) => audio_result.map(Some),
-            None => Ok(None),
+            Some(audio_result) => audio_result.map(Some), // Propagates Ok(buffer) or Err(error_from_callback)
+            None => Ok(None), // Queue is empty, no data available
         }
-        // todo!("Implement read_chunk for MacosApplicationAudioStream (Subtask 10.5)")
     }
 
     fn to_async_stream<'a>(
