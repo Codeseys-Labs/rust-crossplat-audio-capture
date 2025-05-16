@@ -40,13 +40,21 @@ use std::pin::Pin; // Required for Pin<Box<...>> in to_async_stream
 use futures_channel::mpsc;
 use futures_core::Stream as FuturesStream; // Alias to avoid conflict if Stream is defined elsewhere
 
-// IMPORTANT: Applications using this backend MUST include the `NSAudioCaptureUsageDescription` key
-// in their Info.plist file. This key provides a string explaining to the user why the application
-// needs to capture audio. Without it, audio capture will fail silently or with a permissions error
-// on macOS 10.14 Mojave and later.
-// Example for Info.plist:
+// IMPORTANT: Applications using this library for audio capture on macOS MUST include the
+// `NSAudioCaptureUsageDescription` key in their `Info.plist` file. This key provides a
+// string explaining to the user why the application needs to capture audio. Without it,
+// audio capture will fail silently or with a permissions error on macOS 10.14 Mojave and later.
+//
+// For application-level audio capture using Core Audio Taps (via `CoreAudioProcessTap`
+// and `AudioCaptureBuilder::target_application_pid()`), macOS 14.4 or newer is required.
+// The system will prompt the user for permission to record the screen and system audio
+// for the specific application being targeted.
+//
+// Example for `Info.plist`:
+// ```xml
 // <key>NSAudioCaptureUsageDescription</key>
-// <string>This app requires audio capture to process application audio.</string>
+// <string>This app requires audio capture to process system or application audio.</string>
+// ```
 
 pub mod tap;
 // Imports for application enumeration
@@ -55,34 +63,77 @@ use cocoa::foundation::{NSArray, NSString};
 use objc::runtime::{Class, Object, Sel, YES};
 use objc::{class, msg_send, sel, sel_impl};
 
-/// Information about a running application on macOS.
+/// Information about a running application on macOS, relevant for audio capture.
 ///
-/// This struct provides details such as the process ID, localized name,
-/// and bundle identifier of an application.
+/// This struct provides details such as the process ID (PID), localized name,
+/// and bundle identifier of an application. This information is crucial for
+/// identifying and targeting specific applications for audio capture using
+/// Core Audio Taps on macOS.
+///
+/// Instances of `ApplicationInfo` are returned by [`enumerate_audio_applications()`].
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ApplicationInfo {
     /// The process identifier (PID) of the application.
+    /// This PID is used with [`crate::api::AudioCaptureBuilder::target_application_pid()`]
+    /// to specify the application from which to capture audio on macOS.
     pub process_id: u32, // pid_t is i32 on macOS, but u32 is fine for positive PIDs
-    /// The localized name of the application (e.g., "Safari", "Terminal").
+    /// The localized name of the application as displayed to the user (e.g., "Safari", "Music").
     pub name: String,
-    /// The bundle identifier of the application (e.g., "com.apple.Safari").
-    /// This can be `None` if the application doesn't have a bundle identifier.
+    /// The bundle identifier of the application (e.g., "com.apple.Safari", "com.apple.Music").
+    /// This can be `None` if the application does not have a bundle identifier (e.g., some command-line tools).
     pub bundle_id: Option<String>,
 }
 
-/// Enumerates running applications on macOS that are potential audio sources.
+/// Enumerates running applications on macOS that are potential audio sources for application-level capture.
 ///
-/// This function lists applications currently running on the system.
-/// It provides their process ID, name, and bundle identifier.
+/// This function queries the system for a list of currently running applications
+/// and returns a vector of [`ApplicationInfo`] structs. Each struct contains the
+/// application's process ID (PID), localized name, and bundle identifier.
 ///
-/// Note: This function identifies *running* applications. It does not guarantee
-/// that these applications are currently producing or capturing audio. Determining
-/// active audio output without tapping is complex on macOS.
+/// The PID obtained from `ApplicationInfo` can be used with
+/// [`crate::api::AudioCaptureBuilder::target_application_pid()`] to attempt to capture
+/// audio specifically from that application using Core Audio Taps.
+///
+/// # Platform Requirements
+/// - **macOS**: This function is specific to macOS.
+/// - For application audio capture to succeed, macOS 14.4+ is generally required,
+///   and the application using this library must have the `NSAudioCaptureUsageDescription`
+///   key in its `Info.plist`.
+///
+/// # Notes
+/// - This function lists *running* applications. It does not guarantee that these
+///   applications are currently producing audio.
+/// - The list of applications can change as applications are launched or quit.
+/// - PIDs can be reused by the operating system. If an application quits and another
+///   starts, the new application might have the same PID.
 ///
 /// # Returns
 ///
-/// An `AudioResult` containing a `Vec<ApplicationInfo>` on success,
-/// or an `AudioError` if an issue occurs during enumeration.
+/// An `AudioResult` containing a `Vec<ApplicationInfo>` on success.
+/// Returns `AudioError::BackendSpecificError` if an issue occurs during enumeration
+/// (e.g., failure to communicate with system services).
+///
+/// # Example
+///
+/// ```rust,no_run
+/// # use rust_crossplat_audio_capture::audio::macos::{enumerate_audio_applications, ApplicationInfo};
+/// # use rust_crossplat_audio_capture::core::error::AudioResult;
+/// fn list_apps() -> AudioResult<()> {
+///     println!("Available running applications on macOS:");
+///     let apps = enumerate_audio_applications()?;
+///     if apps.is_empty() {
+///         println!("No running applications found.");
+///     } else {
+///         for app_info in apps {
+///             println!(
+///                 "  PID: {}, Name: {}, Bundle ID: {:?}",
+///                 app_info.process_id, app_info.name, app_info.bundle_id
+///             );
+///         }
+///     }
+///     Ok(())
+/// }
+/// ```
 pub fn enumerate_audio_applications() -> AudioResult<Vec<ApplicationInfo>> {
     let mut app_infos: Vec<ApplicationInfo> = Vec::new();
 

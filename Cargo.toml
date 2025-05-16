@@ -93,5 +93,10 @@ required-features = ["test-utils"]
 name = "windows_apis"
 path = "examples/windows_apis.rs"
 
+[[example]]
+name = "macos_application_capture"
+path = "examples/macos_application_capture.rs"
+required-features = ["feat_macos"]
+
 [workspace]
 members = []

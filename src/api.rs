@@ -192,8 +192,15 @@ impl AudioCaptureBuilder {
     /// Sets the target application for audio capture by its Process ID (PID).
     ///
     /// If set, audio capture will attempt to target the audio stream of the application
-    /// with the specified PID. This is typically used for application-specific audio capture
-    /// on platforms like Windows (WASAPI).
+    /// with the specified PID.
+    ///
+    /// ## Platform-Specific Behavior:
+    /// - **Windows (WASAPI):** Enables application-specific audio capture.
+    /// - **macOS (Core Audio):** Enables application-specific audio capture using Core Audio Taps.
+    ///   The PID identifies the target application. Use
+    ///   [`crate::audio::macos::enumerate_audio_applications()`] to discover running applications
+    ///   and their PIDs on macOS. Requires macOS 14.4+ and `NSAudioCaptureUsageDescription`
+    ///   in the app's `Info.plist`.
     ///
     /// Setting a PID will clear any previously set session identifier.
     ///
@@ -227,6 +234,9 @@ impl AudioCaptureBuilder {
 
     /// Validates the current builder settings and constructs an [`AudioCapture`] instance.
     ///
+    /// On macOS, if [`target_application_pid()`] was called, this method will attempt
+    /// to create an application-specific audio capture stream targeting the specified application.
+    ///
     /// # Errors
     ///
     /// Returns:
@@ -237,6 +247,8 @@ impl AudioCaptureBuilder {
     /// - Other `AudioError` variants if device enumeration or selection fails.
     /// - [`AudioError::UnsupportedFormat`]: If the selected device does not support the
     ///   requested audio format (sample rate, channels, sample format, bits per sample).
+    /// - [`AudioError::ApplicationCaptureError`] (macOS): If setting up the application-specific
+    ///   capture fails (e.g., invalid PID, permission issues, OS version too old).
     // The return type uses `impl AudioDevice` to represent the opaque concrete device type.
     pub fn build(self) -> AudioResult<AudioCapture<impl AudioDevice + 'static>> {
         // --- Configuration Validation ---
