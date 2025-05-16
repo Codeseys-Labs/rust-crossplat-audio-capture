@@ -30,6 +30,7 @@ use std::sync::{
     atomic::{AtomicBool, Ordering},
     Arc, Mutex,
 };
+use std::pin::Pin; // Required for Pin<Box<...>> in to_async_stream
 
 /// A representation of a CoreAudio audio device.
 ///
@@ -446,6 +447,85 @@ impl CapturingStream for MacosAudioStream {
     /// Checks if the stream is currently started and attempting to capture.
     fn is_running(&self) -> bool {
         self.is_started.load(Ordering::SeqCst)
+    }
+
+    /// Converts the synchronous `CapturingStream` into an asynchronous `Stream`.
+    ///
+    /// This method sets up an MPSC (multi-producer, single-consumer) channel.
+    /// A new helper thread is spawned which continuously attempts to read audio data
+    /// chunks from the internal `data_queue` (populated by the CoreAudio callback).
+    /// These chunks (or errors) are then sent through the MPSC channel's sender.
+    ///
+    /// The returned `Stream` is the receiver part of this MPSC channel. Consumers
+    /// can await items from this stream to get audio data asynchronously.
+    ///
+    /// # Helper Thread Logic
+    /// The helper thread performs the following actions in a loop:
+    /// 1. Tries to pop an `AudioResult<Box<dyn AudioBuffer<Sample = f32>>>` from `data_queue`.
+    /// 2. If data is popped:
+    ///    - It sends the data via the MPSC sender (`tx`).
+    ///    - If sending fails (e.g., the receiver `rx` is dropped), the thread assumes
+    ///      the consumer is no longer interested and terminates its loop.
+    /// 3. If `data_queue` is empty:
+    ///    - It checks if the main CoreAudio stream (`self.is_started`) is still active.
+    ///    - If the main stream is stopped AND the queue is empty, it means all data has
+    ///      been drained, so the helper thread terminates its loop.
+    ///    - If the main stream is still active but the queue is empty (temporary underrun),
+    ///      the thread sleeps for a short duration (10ms) to avoid busy-waiting before
+    ///      checking the queue again.
+    ///
+    /// # Returns
+    /// - `Ok(Pin<Box<dyn futures_core::Stream<Item = AudioResult<Box<dyn AudioBuffer<Sample = f32>>>> + Send + Sync + 'a>>)`:
+    ///   An asynchronous stream of audio buffers.
+    /// - `Err(AudioError::InvalidOperation)`: If the stream has not been started.
+    fn to_async_stream<'a>(
+        &'a mut self,
+    ) -> AudioResult<
+        Pin<Box<dyn futures_core::Stream<Item = AudioResult<Box<dyn AudioBuffer<Sample = f32>>>> + Send + Sync + 'a>>,
+    > {
+        if !self.is_running() {
+            return Err(AudioError::InvalidOperation(
+                "Stream not started or not in streaming state".to_string(),
+            ));
+        }
+
+        let (tx, rx) = futures_channel::mpsc::unbounded::<AudioResult<Box<dyn AudioBuffer<Sample = f32>>>>();
+
+        let data_queue_clone = self.data_queue.clone();
+        let is_started_clone = self.is_started.clone();
+
+        std::thread::spawn(move || {
+            loop {
+                let mut queue_guard = data_queue_clone.lock().unwrap();
+                match queue_guard.pop_front() {
+                    Some(audio_result) => {
+                        // Drop the lock before sending to avoid holding it if send blocks or errors.
+                        drop(queue_guard);
+                        if tx.unbounded_send(audio_result).is_err() {
+                            // Receiver was dropped, consumer is gone.
+                            eprintln!("Async stream receiver dropped, helper thread terminating.");
+                            break;
+                        }
+                    }
+                    None => {
+                        // Queue is empty, drop lock before potentially sleeping.
+                        drop(queue_guard);
+                        if !is_started_clone.load(Ordering::SeqCst) {
+                            // Stream stopped and queue is empty, so we are done.
+                            eprintln!("Main stream stopped and queue empty, async helper thread terminating.");
+                            break;
+                        } else {
+                            // Stream is running but queue is empty, wait a bit.
+                            std::thread::sleep(std::time::Duration::from_millis(10));
+                        }
+                    }
+                }
+            }
+            // tx is dropped here when thread exits, closing the stream.
+            eprintln!("Async audio streaming helper thread finished.");
+        });
+
+        Ok(Box::pin(rx))
     }
 }
 
