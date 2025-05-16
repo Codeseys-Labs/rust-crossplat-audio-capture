@@ -41,16 +41,11 @@ rand_pcg = "0.9.0"
 # Platform-specific audio capture
 [target.'cfg(target_os = "windows")'.dependencies]
 wasapi = "0.17.0"
-windows = { version = "0.61.1", features = [
-    "Win32_System_Com",
-    "Win32_Media_Audio",
-    "Win32_Media_Audio_Endpoints",
-    "Win32_Media_MediaFoundation",
-    "Win32_Foundation",
-    "Win32_System_Threading",
-    "Win32_Devices_FunctionDiscovery",
-    "Win32_UI_Shell_PropertiesSystem",
-    "Win32_System_Com_StructuredStorage",
+windows = { version = "0.56.0", features = [
+    "Win32_Foundation",  # For basic Windows types like HRESULT, BOOL, HANDLE
+    "Win32_System_Com",  # For COM initialization (CoInitializeEx, CoUninitialize) and operations (CoCreateInstance, CLSCTX_ALL)
+    "Win32_Media_Audio", # For WASAPI interfaces (IMMDeviceEnumerator, MMDeviceEnumerator, IMMDevice, IAudioClient, IAudioCaptureClient, WAVEFORMATEX)
+    # and constants (eRender, eConsole, AUDCLNT_SHAREMODE_SHARED, AUDCLNT_STREAMFLAGS_LOOPBACK)
 ] }
 
 [target.'cfg(target_os = "linux")'.dependencies]

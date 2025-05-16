@@ -20,6 +20,59 @@ use wasapi::{
 
 // --- New Skeleton Implementations ---
 
+use windows::core::HRESULT;
+use windows::Win32::System::Com::{
+    CoInitializeEx, CoUninitialize, COINIT_MULTITHREADED, RPC_E_CHANGED_MODE,
+};
+
+/// Ensures COM is initialized for the current thread and uninitializes it when dropped.
+///
+/// This RAII guard should be held by any type that makes COM calls, such as
+/// device enumerators or audio streams that interact directly with WASAPI.
+#[derive(Debug)]
+struct ComInitializer;
+
+impl ComInitializer {
+    /// Initializes COM for the current thread using `COINIT_MULTITHREADED`.
+    ///
+    /// Returns `Ok(Self)` on success, or an `AudioError::BackendSpecificError`
+    /// if COM initialization fails.
+    pub fn new() -> AudioResult<Self> {
+        // SAFETY: CoInitializeEx is safe to call. We check the HRESULT.
+        let hr = unsafe { CoInitializeEx(None, COINIT_MULTITHREADED) };
+        if hr.is_ok() {
+            Ok(ComInitializer)
+        } else if hr == RPC_E_CHANGED_MODE {
+            // COM was already initialized with a different concurrency model.
+            // This is generally okay for our purposes if it's already initialized.
+            // However, for strictness, one might treat this as an error or log it.
+            // For now, we'll consider it a success if it's already initialized,
+            // as long as it's not a clear failure.
+            // If CoInitializeEx returns S_FALSE, it means COM was already initialized.
+            // If it returns RPC_E_CHANGED_MODE, it means it was initialized with a different model.
+            // We are aiming for MTA, if it's already STA and we try MTA, it's an issue.
+            // Let's treat RPC_E_CHANGED_MODE as an error for now to be safe.
+            Err(AudioError::BackendSpecificError(format!(
+                "Failed to initialize COM: Already initialized with a different concurrency model (HRESULT: {:?})",
+                hr
+            )))
+        } else {
+            Err(AudioError::BackendSpecificError(format!(
+                "Failed to initialize COM (HRESULT: {:?})",
+                hr
+            )))
+        }
+    }
+}
+
+impl Drop for ComInitializer {
+    fn drop(&mut self) {
+        // SAFETY: CoUninitialize is safe to call if CoInitializeEx was successful.
+        // This is ensured by the RAII pattern.
+        unsafe { CoUninitialize() };
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct WindowsDeviceId(String); // Example: Use a String for now
 
@@ -80,7 +133,22 @@ impl AudioDevice for WindowsAudioDevice {
     }
 }
 
-pub struct WindowsDeviceEnumerator;
+pub struct WindowsDeviceEnumerator {
+    _com_initializer: ComInitializer,
+    // TODO: Add other necessary fields, e.g., IMMDeviceEnumerator instance
+}
+
+impl WindowsDeviceEnumerator {
+    /// Creates a new Windows device enumerator.
+    ///
+    /// This will initialize COM for the lifetime of the enumerator.
+    pub fn new() -> AudioResult<Self> {
+        let com_initializer = ComInitializer::new()?;
+        Ok(Self {
+            _com_initializer: com_initializer,
+        })
+    }
+}
 
 impl DeviceEnumerator for WindowsDeviceEnumerator {
     type Device = WindowsAudioDevice;
