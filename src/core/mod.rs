@@ -7,6 +7,9 @@
 //! formats, and error handling, allowing backend implementations to plug
 //! into a common framework.
 
+pub mod buffer;
 pub mod config;
 pub mod error;
 pub mod interface;
+
+pub use buffer::VecAudioBuffer;

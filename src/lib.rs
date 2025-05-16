@@ -14,6 +14,7 @@ pub use audio::{
     AudioCaptureStream,    // Old API
 };
 // Core type re-exports
+pub use crate::core::buffer::VecAudioBuffer; // Added re-export for VecAudioBuffer
 pub use crate::core::config::{
     AudioFileFormat, AudioFormat, DeviceSelector, LatencyMode, SampleFormat, StreamConfig,
 }; // Explicitly re-export StreamConfig and AudioFileFormat
