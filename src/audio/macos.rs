@@ -1,242 +1,131 @@
-//! macOS-specific audio capture backend using CoreAudio.
-#![cfg(target_os = "macos")]
-
-use crate::core::config::{AudioCaptureConfig, AudioFormat, StreamConfig};
-use crate::core::error::{AudioError, Result as AudioResult};
-use crate::core::interface::{
-    AudioBuffer, AudioDevice, AudioStream, CapturingStream, DeviceEnumerator, DeviceKind,
-    StreamDataCallback,
+use crate::audio::core::{
+    AudioDevice, AudioError, AudioResult, DeviceEnumerator, DeviceId, DeviceKind,
 };
+use coreaudio_rs::audio_unit::audio_device::{AudioDevice as CAAudioDevice, AudioDeviceID};
+use coreaudio_rs::Error as CAError;
 
-// TODO: Remove these once the actual CoreAudio logic is integrated with the new traits.
-// These are placeholders from a potential old structure or for future use.
-// use coreaudio_rs::audio_unit::{AudioUnit, IOType, SampleFormat as CASampleFormat};
-// use coreaudio_rs::device::AudioDevice as CADevice;
-// use coreaudio_rs::stream_format::StreamFormat;
-
-// --- New Skeleton Implementations ---
-
-#[derive(Debug, Clone, PartialEq, Eq, Hash)]
-pub struct MacosDeviceId(String); // Example: Use a String for now, could be u32 for CoreAudio
-
-pub struct MacosAudioDevice {
-    id: MacosDeviceId,
-    name: String,
-    kind: DeviceKind,
-    // TODO: Add other necessary fields, e.g., CoreAudio device ID
+/// A representation of a CoreAudio audio device.
+///
+/// This struct holds the `AudioDeviceID` and potentially other information
+/// like the device name or UID if fetched.
+pub(crate) struct MacosAudioDevice {
+    device_id: AudioDeviceID,
+    // TODO: Potentially store name/UID if fetched during enumeration or lookup.
 }
 
 impl AudioDevice for MacosAudioDevice {
-    type DeviceId = MacosDeviceId;
-
-    fn get_id(&self) -> Self::DeviceId {
-        println!("TODO: MacosAudioDevice::get_id()");
-        self.id.clone()
+    fn get_id(&self) -> DeviceId {
+        self.device_id.to_string()
     }
 
-    fn get_name(&self) -> String {
-        println!("TODO: MacosAudioDevice::get_name()");
-        self.name.clone()
+    fn get_name(&self) -> AudioResult<String> {
+        todo!("Implement get_name for MacosAudioDevice")
     }
 
-    fn get_supported_formats(&self) -> AudioResult<Vec<AudioFormat>> {
-        println!("TODO: MacosAudioDevice::get_supported_formats()");
-        todo!()
+    fn get_description(&self) -> AudioResult<String> {
+        todo!("Implement get_description for MacosAudioDevice")
     }
 
-    fn get_default_format(&self) -> AudioResult<AudioFormat> {
-        println!("TODO: MacosAudioDevice::get_default_format()");
-        todo!()
+    fn get_kind(&self) -> AudioResult<DeviceKind> {
+        todo!("Implement get_kind for MacosAudioDevice")
     }
 
-    fn is_input(&self) -> bool {
-        println!("TODO: MacosAudioDevice::is_input()");
-        self.kind == DeviceKind::Input
+    fn is_default(&self, kind: DeviceKind) -> AudioResult<bool> {
+        todo!("Implement is_default for MacosAudioDevice")
     }
 
-    fn is_output(&self) -> bool {
-        println!("TODO: MacosAudioDevice::is_output()");
-        self.kind == DeviceKind::Output
+    fn get_supported_formats(&self) -> AudioResult<Vec<crate::audio::core::AudioFormat>> {
+        todo!("Implement get_supported_formats for MacosAudioDevice")
     }
 
-    fn is_active(&self) -> bool {
-        println!("TODO: MacosAudioDevice::is_active()");
-        // TODO: Implement actual status check
-        false
-    }
-
-    fn is_format_supported(&self, format: &AudioFormat) -> AudioResult<bool> {
-        println!("TODO: MacosAudioDevice::is_format_supported({:?})", format);
-        // For now, assume all formats are supported or let the actual stream creation fail.
-        // Later tasks will implement actual format checking.
-        Ok(true)
-    }
-
-    fn create_stream(
-        &mut self,
-        capture_config: &AudioCaptureConfig,
-    ) -> AudioResult<Box<dyn CapturingStream + 'static>> {
-        println!(
-            "TODO: MacosAudioDevice::create_stream(capture_config: {:?})",
-            capture_config
-        );
-        Ok(Box::new(MacosAudioStream {
-            config: Some(capture_config.stream_config.clone()), // Or however MacosAudioStream stores its config
-                                                                // Potentially store target_pid and target_session_identifier if macOS needs them
-        }))
+    fn get_default_format(&self) -> AudioResult<crate::audio::core::AudioFormat> {
+        todo!("Implement get_default_format for MacosAudioDevice")
     }
 }
 
-pub struct MacosDeviceEnumerator;
+/// Device enumerator for macOS using CoreAudio.
+///
+/// This enumerator is responsible for listing available audio devices
+/// and providing access to the default system output device for loopback capture.
+pub(crate) struct MacosDeviceEnumerator;
+
+impl MacosDeviceEnumerator {
+    fn map_ca_error(err: CAError) -> AudioError {
+        AudioError::BackendSpecificError(format!("CoreAudio error: {}", err))
+    }
+}
 
 impl DeviceEnumerator for MacosDeviceEnumerator {
-    type Device = MacosAudioDevice;
-
-    fn enumerate_devices(&self) -> AudioResult<Vec<Self::Device>> {
-        println!("TODO: MacosDeviceEnumerator::enumerate_devices()");
-        todo!()
+    /// Gets the default audio device for the specified kind.
+    ///
+    /// For `DeviceKind::Input` (system audio capture), this attempts to get the
+    /// default *output* device, as that's the target for loopback.
+    /// For `DeviceKind::Output`, this currently returns `Ok(None)`.
+    fn get_default_device(&self, kind: DeviceKind) -> AudioResult<Option<Box<dyn AudioDevice>>> {
+        match kind {
+            DeviceKind::Input => {
+                // For system capture, we target the default output device for loopback.
+                match CAAudioDevice::default_output_device() {
+                    Ok(device_id) => {
+                        let macos_audio_device = MacosAudioDevice { device_id };
+                        Ok(Some(Box::new(macos_audio_device)))
+                    }
+                    Err(err) => Err(Self::map_ca_error(err)),
+                }
+            }
+            DeviceKind::Output => Ok(None), // Not implemented for output selection yet.
+        }
     }
 
-    fn get_default_device(&self, kind: DeviceKind) -> AudioResult<Self::Device> {
-        println!(
-            "TODO: MacosDeviceEnumerator::get_default_device({:?})",
-            kind
-        );
-        todo!()
+    /// Enumerates available audio devices.
+    ///
+    /// Currently, this only returns the default output device (if available)
+    /// as a stand-in for full enumeration.
+    /// TODO: Implement full enumeration of all output devices suitable for loopback capture.
+    fn enumerate_devices(&self) -> AudioResult<Vec<Box<dyn AudioDevice>>> {
+        // TODO: Implement full enumeration of all output devices suitable for loopback capture.
+        match self.get_default_device(DeviceKind::Input)? {
+            Some(device) => Ok(vec![device]),
+            None => Ok(vec![]),
+        }
     }
 
-    fn get_input_devices(&self) -> AudioResult<Vec<Self::Device>> {
-        println!("TODO: MacosDeviceEnumerator::get_input_devices()");
-        todo!()
-    }
-
-    fn get_output_devices(&self) -> AudioResult<Vec<Self::Device>> {
-        println!("TODO: MacosDeviceEnumerator::get_output_devices()");
-        todo!()
-    }
-
+    /// Gets a specific audio device by its ID.
+    ///
+    /// Currently, this only checks if the provided ID matches the default output device's ID.
+    /// TODO: Implement lookup for arbitrary device IDs.
     fn get_device_by_id(
         &self,
-        id: &<Self::Device as AudioDevice>::DeviceId,
-    ) -> AudioResult<Self::Device> {
-        println!("TODO: MacosDeviceEnumerator::get_device_by_id({:?})", id);
-        todo!()
-    }
-}
+        id_str: &DeviceId,
+        _kind: Option<DeviceKind>,
+    ) -> AudioResult<Option<Box<dyn AudioDevice>>> {
+        // TODO: Implement lookup for arbitrary device IDs.
+        let target_id = match id_str.parse::<u32>() {
+            Ok(id) => id,
+            Err(_) => return Ok(None), // Invalid ID format
+        };
 
-pub struct MacosAudioStream {
-    // TODO: Add fields specific to a macOS audio stream (e.g., CoreAudio AudioUnit, buffer, config)
-    config: Option<StreamConfig>,
-}
-
-impl AudioStream for MacosAudioStream {
-    type Config = StreamConfig;
-    type Device = MacosAudioDevice;
-
-    fn open(&mut self, device: &Self::Device, config: Self::Config) -> AudioResult<()> {
-        println!(
-            "TODO: MacosAudioStream::open(device_id: {:?}, config: {:?})",
-            device.get_id(),
-            config
-        );
-        self.config = Some(config);
-        todo!()
+        if let Some(default_dev_boxed) = self.get_default_device(DeviceKind::Input)? {
+            if let Ok(default_id_u32) = default_dev_boxed.get_id().parse::<u32>() {
+                if default_id_u32 == target_id {
+                    return Ok(Some(default_dev_boxed));
+                }
+            }
+        }
+        Ok(None)
     }
 
-    fn start(&mut self) -> AudioResult<()> {
-        println!("TODO: MacosAudioStream::start()");
-        todo!()
+    /// Gets a list of available input audio devices.
+    ///
+    /// This currently calls `enumerate_devices` which, for now, only returns the default output device.
+    fn get_input_devices(&self) -> AudioResult<Vec<Box<dyn AudioDevice>>> {
+        self.enumerate_devices() // For loopback, the "input" is the system's output.
     }
 
-    fn pause(&mut self) -> AudioResult<()> {
-        println!("TODO: MacosAudioStream::pause()");
-        todo!()
-    }
-
-    fn resume(&mut self) -> AudioResult<()> {
-        println!("TODO: MacosAudioStream::resume()");
-        todo!()
-    }
-
-    fn stop(&mut self) -> AudioResult<()> {
-        println!("TODO: MacosAudioStream::stop()");
-        todo!()
-    }
-
-    fn close(&mut self) -> AudioResult<()> {
-        println!("TODO: MacosAudioStream::close()");
-        self.config = None;
-        todo!()
-    }
-
-    fn set_format(&mut self, format: &AudioFormat) -> AudioResult<()> {
-        println!("TODO: MacosAudioStream::set_format({:?})", format);
-        todo!()
-    }
-
-    fn set_callback(&mut self, _callback: StreamDataCallback) -> AudioResult<()> {
-        println!("TODO: MacosAudioStream::set_callback()");
-        todo!()
-    }
-
-    fn is_running(&self) -> bool {
-        println!("TODO: MacosAudioStream::is_running()");
-        false
-    }
-
-    fn get_latency_frames(&self) -> AudioResult<u64> {
-        println!("TODO: MacosAudioStream::get_latency_frames()");
-        todo!()
-    }
-
-    fn get_current_format(&self) -> AudioResult<AudioFormat> {
-        println!("TODO: MacosAudioStream::get_current_format()");
-        todo!()
-    }
-}
-
-impl CapturingStream for MacosAudioStream {
-    fn start(&mut self) -> AudioResult<()> {
-        println!("TODO: MacosAudioStream (CapturingStream)::start()");
-        todo!()
-    }
-
-    fn stop(&mut self) -> AudioResult<()> {
-        println!("TODO: MacosAudioStream (CapturingStream)::stop()");
-        todo!()
-    }
-
-    fn close(&mut self) -> AudioResult<()> {
-        println!("TODO: MacosAudioStream (CapturingStream)::close()");
-        todo!()
-    }
-
-    fn is_running(&self) -> bool {
-        println!("TODO: MacosAudioStream (CapturingStream)::is_running()");
-        false
-    }
-
-    fn read_chunk(&mut self, timeout_ms: Option<u32>) -> AudioResult<Option<Box<dyn AudioBuffer>>> {
-        println!(
-            "TODO: MacosAudioStream (CapturingStream)::read_chunk(timeout_ms: {:?})",
-            timeout_ms
-        );
-        todo!()
-    }
-
-    fn to_async_stream<'a>(
-        &'a mut self,
-    ) -> AudioResult<
-        std::pin::Pin<
-            Box<
-                dyn futures_core::Stream<Item = AudioResult<Box<dyn AudioBuffer<Sample = f32>>>>
-                    + Send
-                    + Sync
-                    + 'a,
-            >,
-        >,
-    > {
-        println!("TODO: MacosAudioStream (CapturingStream)::to_async_stream()");
-        todo!()
+    /// Gets a list of available output audio devices.
+    ///
+    /// This currently returns an empty vector.
+    fn get_output_devices(&self) -> AudioResult<Vec<Box<dyn AudioDevice>>> {
+        Ok(vec![]) // Not focused on output device enumeration for capture.
     }
 }

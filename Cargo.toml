@@ -57,7 +57,7 @@ windows = { version = "0.56.0", features = [
 pipewire = "0.9.1"
 
 [target.'cfg(target_os = "macos")'.dependencies]
-coreaudio-rs = "0.12.1"
+coreaudio-rs = "0.10.0"
 
 # Error handling
 thiserror = "2.0.12"
