@@ -23,9 +23,12 @@ use pipewire::{
 use std::fmt::Display; // Added for DeviceId Display trait
 use std::sync::Arc; // Added for Arc
 use std::collections::VecDeque; // For data_queue
+use std::pin::Pin; // For Pin<Box<dyn Stream>>
 use std::sync::atomic::{AtomicBool, Ordering as AtomicOrdering}; // Renamed Ordering to avoid conflict if any
- 
- // TODO: Remove these once the actual PipeWire logic is integrated with the new traits.
+use futures_channel::mpsc; // For MPSC channel
+use futures_core::Stream; // For the Stream trait
+
+// TODO: Remove these once the actual PipeWire logic is integrated with the new traits.
 // These are placeholders from the old structure.
 use std::{process::Command, sync::Mutex, thread, time::Duration};
 
@@ -1006,13 +1009,26 @@ impl CapturingStream for LinuxAudioStream {
     }
  
     /// Provides an asynchronous stream of audio buffers.
+    ///
+    /// This method sets up a helper thread that continuously reads from an internal
+    /// `data_queue` (populated by the PipeWire `process` callback) and sends the
+    /// `AudioResult<Box<dyn AudioBuffer<Sample = f32>>>` items to an MPSC (multi-producer,
+    /// single-consumer) channel. The receiver end of this channel is returned as a
+    /// `Stream`.
+    ///
+    /// The helper thread monitors the stream's running state (`is_started`) and the
+    /// MPSC channel's health. It terminates if the stream is stopped and the queue
+    /// is empty, or if the receiver end of the MPSC channel is dropped.
+    ///
+    /// # Returns
+    /// - `Ok(Pin<Box<dyn Stream>>)`: An asynchronous stream of audio buffers.
+    /// - `Err(AudioError::InvalidOperation)`: If the stream is not currently running.
     fn to_async_stream<'a>(
         &'a mut self,
     ) -> AudioResult<
-        std::pin::Pin<
+        Pin<
             Box<
-                dyn futures_core::Stream<Item = AudioResult<Box<dyn AudioBuffer<Sample = f32>>>>
-                    // Assuming f32 for now
+                dyn Stream<Item = AudioResult<Box<dyn AudioBuffer<Sample = f32>>>>
                     + Send
                     + Sync
                     + 'a,
@@ -1020,12 +1036,46 @@ impl CapturingStream for LinuxAudioStream {
         >,
     > {
         // log::debug!("LinuxAudioStream::to_async_stream()");
-        // TODO (Subtask 6.6 or later):
-        // Implement an async wrapper around the data capture mechanism.
-        // This might involve a channel (e.g., futures::channel::mpsc) populated by the
-        // `process` callback and consumed by the returned Stream.
-        // The Stream implementation would poll this channel.
-        todo!("LinuxAudioStream::to_async_stream - Subtask 6.6: Implement async stream.")
+
+        if !self.is_running() {
+            return Err(AudioError::InvalidOperation(
+                "Stream not started or not in streaming state".to_string(),
+            ));
+        }
+
+        let (tx, rx) = mpsc::unbounded::<AudioResult<Box<dyn AudioBuffer<Sample = f32>>>>();
+        let data_queue_clone = Arc::clone(&self.data_queue);
+        let is_started_clone = Arc::clone(&self.is_started);
+
+        std::thread::spawn(move || {
+            // log::debug!("Async stream helper thread started.");
+            loop {
+                let audio_result_option = { // Limit scope of data_queue_locked
+                    let mut data_queue_locked = data_queue_clone.lock().unwrap();
+                    data_queue_locked.pop_front()
+                };
+
+                if let Some(audio_result) = audio_result_option {
+                    if tx.unbounded_send(audio_result).is_err() {
+                        // Receiver has been dropped, meaning the stream is no longer being consumed.
+                        // log::info!("Async stream helper thread: MPSC receiver dropped. Terminating.");
+                        break;
+                    }
+                } else {
+                    // Queue is empty
+                    if !is_started_clone.load(AtomicOrdering::SeqCst) {
+                        // Stream is stopped and queue is empty, so we can terminate.
+                        // log::info!("Async stream helper thread: Stream stopped and queue empty. Terminating.");
+                        break;
+                    }
+                    // Stream is still running but queue is empty, wait a bit.
+                    std::thread::sleep(std::time::Duration::from_millis(10));
+                }
+            }
+            // log::debug!("Async stream helper thread finished.");
+        });
+
+        Ok(Box::pin(rx))
     }
 }
 
