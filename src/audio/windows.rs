@@ -9,6 +9,12 @@ use crate::core::interface::{
     StreamDataCallback,
 }; // Added for VecAudioBuffer
 
+use futures_channel::mpsc;
+use futures_core::Stream as FuturesStreamTrait; // Alias to avoid conflict if Stream is used elsewhere
+use std::pin::Pin;
+use std::thread;
+use std::time::Duration;
+
 // TODO: Remove these once the actual WASAPI logic is integrated with the new traits.
 // These are placeholders from the old structure.
 use super::core::{AudioApplication, AudioCaptureBackend, AudioCaptureStream}; // Keep for old backend
@@ -884,27 +890,123 @@ impl CapturingStream for WindowsAudioStream {
         }
     }
 
-    /// Converts this synchronous stream into an asynchronous stream.
+    /// Converts this synchronous stream into an asynchronous stream of audio data.
     ///
-    /// This allows the stream to be used in `async` contexts, typically by
-    /// polling `read_chunk` in a separate task or thread.
+    /// This method sets up a dedicated polling thread that continuously attempts to read
+    /// audio data from the WASAPI capture client. The data (or errors) are then sent
+    /// over an MPSC channel to the returned stream.
+    ///
+    /// The returned stream is a `Pin<Box<dyn FuturesStreamTrait<Item = AudioResult<Box<dyn AudioBuffer<Sample = f32>>>> + Send + Sync + 'a>>`.
+    /// Each item in the stream is an `AudioResult` which can either be an `Ok(Box<dyn AudioBuffer<Sample = f32>>)`
+    /// containing the audio data, or an `Err(AudioError)` if an issue occurred during capture or
+    /// if the stream was closed.
+    ///
+    /// **Important:**
+    /// - Calling this method "consumes" the stream for asynchronous operation. The polling thread
+    ///   will attempt to read data. Mixing with synchronous `read_chunk` calls is not recommended
+    ///   and may lead to contention or missed data.
+    /// - The underlying polling thread will continue to run as long as the `WindowsAudioStream`
+    ///   is active (i.e., `is_started` is true) and the receiver end of the MPSC channel (the returned stream)
+    ///   has not been dropped.
+    /// - If the `WindowsAudioStream` is stopped (via `stop()` or `close()`), the polling thread
+    ///   will detect this, send an `AudioError::StreamClosed` message, and then terminate.
+    /// - If the returned async stream is dropped, the polling thread will detect that the
+    ///   channel is closed and will also terminate.
+    ///
+    /// # Errors
+    /// - Returns `AudioError::InvalidOperation` if the stream has not been started via `start()`.
+    /// - Returns `AudioError::BackendSpecificError` if the polling thread fails to initialize COM.
     fn to_async_stream<'a>(
         &'a mut self,
     ) -> AudioResult<
-        std::pin::Pin<
+        Pin<
             Box<
-                dyn futures_core::Stream<Item = AudioResult<Box<dyn AudioBuffer<Sample = f32>>>>
-                    // Assuming f32 for now
+                dyn FuturesStreamTrait<Item = AudioResult<Box<dyn AudioBuffer<Sample = f32>>>>
                     + Send
                     + Sync
                     + 'a,
             >,
         >,
     > {
-        // To be implemented in subtask 4.6
-        Err(AudioError::NotImplemented(
-            "WindowsAudioStream::to_async_stream".to_string(),
-        ))
+        if !self.is_started.load(Ordering::Relaxed) {
+            return Err(AudioError::InvalidOperation(
+                "Stream not started".to_string(),
+            ));
+        }
+
+        let (mut tx, rx) = mpsc::unbounded::<AudioResult<Box<dyn AudioBuffer<Sample = f32>>>>();
+
+        // Clone necessary parts for the thread.
+        // IAudioCaptureClient is a COM interface pointer; cloning it AddRefs.
+        // It can be used across threads if COM is initialized appropriately (MTA).
+        let capture_client_clone = self.capture_client.clone();
+        let wave_format_clone = self.wave_format; // WAVEFORMATEX is Copy
+        let stream_is_started_clone = self.is_started.clone(); // Arc<AtomicBool>
+
+        thread::spawn(move || {
+            // Initialize COM for this polling thread.
+            // The _com_thread_initializer will call CoUninitialize when dropped (thread exits).
+            let _com_thread_initializer = match ComInitializer::new() {
+                Ok(init) => Some(init),
+                Err(e) => {
+                    let _ = tx.unbounded_send(Err(AudioError::BackendSpecificError(format!(
+                        "Polling thread failed to initialize COM: {}",
+                        e
+                    ))));
+                    return; // Exit thread
+                }
+            };
+
+            loop {
+                if !stream_is_started_clone.load(Ordering::Relaxed) {
+                    // Stream was stopped externally.
+                    let _ = tx.unbounded_send(Err(AudioError::StreamClosed(
+                        "Capture stream was stopped.".to_string(),
+                    )));
+                    break;
+                }
+
+                // Simplified GetNextPacketSize logic
+                let mut num_frames_in_packet: u32 = 0;
+                // SAFETY: COM call on a cloned interface pointer, COM initialized for this thread.
+                let hr_packet_size =
+                    unsafe { capture_client_clone.GetNextPacketSize(&mut num_frames_in_packet) };
+
+                if hr_packet_size.is_err() {
+                    let _ = tx.unbounded_send(Err(AudioError::BackendSpecificError(format!(
+                        "Polling thread: GetNextPacketSize failed (HRESULT: {:?})",
+                        hr_packet_size
+                    ))));
+                    break; // Critical error, stop polling.
+                }
+
+                if num_frames_in_packet == 0 {
+                    thread::sleep(Duration::from_millis(10)); // Poll interval
+                    continue;
+                }
+
+                // Placeholder for actual data reading logic (GetBuffer, conversion, ReleaseBuffer)
+                // As per subtask instructions, sending NotImplemented error for now.
+                // The full data reading logic would be similar to `read_chunk`.
+                // It would involve:
+                // 1. unsafe { capture_client_clone.GetBuffer(...) }
+                // 2. Data conversion (e.g., i16/f32 to Vec<f32>)
+                // 3. unsafe { capture_client_clone.ReleaseBuffer(...) }
+                // 4. Constructing Ok(Box::new(VecAudioBuffer::new(...)))
+
+                let buffer_result: AudioResult<Box<dyn AudioBuffer<Sample = f32>>> = Err(
+                    AudioError::NotImplemented("Async data polling in thread".to_string()),
+                );
+
+                if tx.unbounded_send(buffer_result).is_err() {
+                    // Receiver was dropped, stream is no longer needed.
+                    break;
+                }
+            }
+            // Thread terminates, _com_thread_initializer is dropped, CoUninitialize is called.
+        });
+
+        Ok(Box::pin(rx))
     }
 }
 
