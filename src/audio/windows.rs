@@ -1,12 +1,218 @@
-use super::core::{
-    AudioApplication, AudioCaptureBackend, AudioCaptureStream, AudioConfig, AudioError,
+//! Windows-specific audio capture backend using WASAPI.
+#![cfg(target_os = "windows")]
+
+use crate::core::config::{AudioFormat, StreamConfig};
+use crate::core::error::{AudioError, Result as AudioResult};
+use crate::core::interface::{
+    AudioBuffer, AudioDevice, AudioStream, CapturingStream, DeviceEnumerator, DeviceKind,
+    StreamDataCallback,
 };
+
+// TODO: Remove these once the actual WASAPI logic is integrated with the new traits.
+// These are placeholders from the old structure.
+use super::core::{AudioApplication, AudioCaptureBackend, AudioCaptureStream};
 use std::collections::VecDeque;
 use sysinfo::{ProcessRefreshKind, ProcessesToUpdate, RefreshKind, System};
 use wasapi::{
     self, get_default_device, AudioCaptureClient, AudioClient, Direction, SampleType, ShareMode,
     WaveFormat,
 };
+
+// --- New Skeleton Implementations ---
+
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub struct WindowsDeviceId(String); // Example: Use a String for now
+
+pub struct WindowsAudioDevice {
+    id: WindowsDeviceId,
+    name: String,
+    kind: DeviceKind, // To determine if it's input or output
+                      // TODO: Add other necessary fields, e.g., WASAPI device reference
+}
+
+impl AudioDevice for WindowsAudioDevice {
+    type DeviceId = WindowsDeviceId;
+
+    fn get_id(&self) -> Self::DeviceId {
+        println!("TODO: WindowsAudioDevice::get_id()");
+        self.id.clone()
+    }
+
+    fn get_name(&self) -> String {
+        println!("TODO: WindowsAudioDevice::get_name()");
+        self.name.clone()
+    }
+
+    fn get_supported_formats(&self) -> AudioResult<Vec<AudioFormat>> {
+        println!("TODO: WindowsAudioDevice::get_supported_formats()");
+        todo!()
+    }
+
+    fn get_default_format(&self) -> AudioResult<AudioFormat> {
+        println!("TODO: WindowsAudioDevice::get_default_format()");
+        todo!()
+    }
+
+    fn is_input(&self) -> bool {
+        println!("TODO: WindowsAudioDevice::is_input()");
+        self.kind == DeviceKind::Input
+    }
+
+    fn is_output(&self) -> bool {
+        println!("TODO: WindowsAudioDevice::is_output()");
+        self.kind == DeviceKind::Output
+    }
+
+    fn is_active(&self) -> bool {
+        println!("TODO: WindowsAudioDevice::is_active()");
+        // TODO: Implement actual status check
+        false
+    }
+}
+
+pub struct WindowsDeviceEnumerator;
+
+impl DeviceEnumerator for WindowsDeviceEnumerator {
+    type Device = WindowsAudioDevice;
+
+    fn enumerate_devices(&self) -> AudioResult<Vec<Self::Device>> {
+        println!("TODO: WindowsDeviceEnumerator::enumerate_devices()");
+        todo!()
+    }
+
+    fn get_default_device(&self, kind: DeviceKind) -> AudioResult<Self::Device> {
+        println!(
+            "TODO: WindowsDeviceEnumerator::get_default_device({:?})",
+            kind
+        );
+        todo!()
+    }
+
+    fn get_input_devices(&self) -> AudioResult<Vec<Self::Device>> {
+        println!("TODO: WindowsDeviceEnumerator::get_input_devices()");
+        todo!()
+    }
+
+    fn get_output_devices(&self) -> AudioResult<Vec<Self::Device>> {
+        println!("TODO: WindowsDeviceEnumerator::get_output_devices()");
+        todo!()
+    }
+
+    fn get_device_by_id(
+        &self,
+        id: &<Self::Device as AudioDevice>::DeviceId,
+    ) -> AudioResult<Self::Device> {
+        println!("TODO: WindowsDeviceEnumerator::get_device_by_id({:?})", id);
+        todo!()
+    }
+}
+
+pub struct WindowsAudioStream {
+    // TODO: Add fields specific to a Windows audio stream (e.g., WASAPI client, buffer, config)
+    config: Option<StreamConfig>, // Store the config
+}
+
+impl AudioStream for WindowsAudioStream {
+    type Config = StreamConfig;
+    type Device = WindowsAudioDevice;
+
+    fn open(&mut self, device: &Self::Device, config: Self::Config) -> AudioResult<()> {
+        println!(
+            "TODO: WindowsAudioStream::open(device_id: {:?}, config: {:?})",
+            device.get_id(),
+            config
+        );
+        self.config = Some(config);
+        todo!()
+    }
+
+    fn start(&mut self) -> AudioResult<()> {
+        println!("TODO: WindowsAudioStream::start()");
+        todo!()
+    }
+
+    fn pause(&mut self) -> AudioResult<()> {
+        println!("TODO: WindowsAudioStream::pause()");
+        todo!()
+    }
+
+    fn resume(&mut self) -> AudioResult<()> {
+        println!("TODO: WindowsAudioStream::resume()");
+        todo!()
+    }
+
+    fn stop(&mut self) -> AudioResult<()> {
+        println!("TODO: WindowsAudioStream::stop()");
+        todo!()
+    }
+
+    fn close(&mut self) -> AudioResult<()> {
+        println!("TODO: WindowsAudioStream::close()");
+        self.config = None;
+        todo!()
+    }
+
+    fn set_format(&mut self, format: &AudioFormat) -> AudioResult<()> {
+        println!("TODO: WindowsAudioStream::set_format({:?})", format);
+        todo!()
+    }
+
+    fn set_callback(&mut self, _callback: StreamDataCallback) -> AudioResult<()> {
+        println!("TODO: WindowsAudioStream::set_callback()");
+        todo!()
+    }
+
+    fn is_running(&self) -> bool {
+        println!("TODO: WindowsAudioStream::is_running()");
+        false
+    }
+
+    fn get_latency_frames(&self) -> AudioResult<u64> {
+        println!("TODO: WindowsAudioStream::get_latency_frames()");
+        todo!()
+    }
+
+    fn get_current_format(&self) -> AudioResult<AudioFormat> {
+        println!("TODO: WindowsAudioStream::get_current_format()");
+        todo!()
+    }
+}
+
+impl CapturingStream for WindowsAudioStream {
+    fn start(&mut self) -> AudioResult<()> {
+        println!("TODO: WindowsAudioStream (CapturingStream)::start()");
+        // This would typically call self.start() from the AudioStream impl,
+        // but for a skeleton, todo!() is fine.
+        todo!()
+    }
+
+    fn stop(&mut self) -> AudioResult<()> {
+        println!("TODO: WindowsAudioStream (CapturingStream)::stop()");
+        todo!()
+    }
+
+    fn close(&mut self) -> AudioResult<()> {
+        println!("TODO: WindowsAudioStream (CapturingStream)::close()");
+        todo!()
+    }
+
+    fn is_running(&self) -> bool {
+        println!("TODO: WindowsAudioStream (CapturingStream)::is_running()");
+        false
+    }
+
+    fn read_chunk(&mut self, timeout_ms: Option<u32>) -> AudioResult<Option<Box<dyn AudioBuffer>>> {
+        println!(
+            "TODO: WindowsAudioStream (CapturingStream)::read_chunk(timeout_ms: {:?})",
+            timeout_ms
+        );
+        todo!()
+    }
+}
+
+// --- Old WASAPI Backend (To be refactored/removed) ---
+// This section contains the previous implementation and will be gradually
+// replaced or integrated into the new trait-based structure.
 
 pub struct WasapiBackend {
     _system: System, // Keep system alive but mark as intentionally unused
@@ -84,7 +290,7 @@ impl AudioCaptureBackend for WasapiBackend {
     fn capture_application(
         &self,
         app: &AudioApplication,
-        config: AudioConfig,
+        config: crate::core::config::AudioConfig,
     ) -> Result<Box<dyn AudioCaptureStream>, AudioError> {
         let wave_format = WaveFormat::new(
             32, // bits per sample
@@ -96,7 +302,6 @@ impl AudioCaptureBackend for WasapiBackend {
         );
 
         let mut audio_client = if app.name == "System" {
-            // System-wide audio capture using default render device in loopback mode
             get_default_device(&Direction::Render)
                 .map_err(|e| {
                     AudioError::DeviceNotFound(format!("Failed to get default device: {}", e))
@@ -109,11 +314,7 @@ impl AudioCaptureBackend for WasapiBackend {
                     ))
                 })?
         } else {
-            // Process-specific audio capture
-            AudioClient::new_application_loopback_client(
-                app.pid, true, // include_tree - capture audio from child processes too
-            )
-            .map_err(|e| {
+            AudioClient::new_application_loopback_client(app.pid, true).map_err(|e| {
                 AudioError::DeviceNotFound(format!("Failed to create process audio capture: {}", e))
             })?
         };
@@ -121,10 +322,10 @@ impl AudioCaptureBackend for WasapiBackend {
         audio_client
             .initialize_client(
                 &wave_format,
-                0, // buffer duration in 100ns units, 0 for default
+                0,
                 &Direction::Capture,
                 &ShareMode::Shared,
-                true, // allow format conversion
+                true,
             )
             .map_err(|e| AudioError::InitializationFailed(e.to_string()))?;
 
@@ -137,35 +338,18 @@ pub struct WasapiCaptureStream {
     client: AudioClient,
     capture_client: AudioCaptureClient,
     buffer: VecDeque<u8>,
-    config: AudioConfig,
+    config: crate::core::config::AudioConfig,
     event_handle: Option<wasapi::Handle>,
     format: WaveFormat,
 }
 
-// SAFETY: This implementation is sound because:
-// 1. While AudioClient and AudioCaptureClient contain NonNull<c_void> pointers to COM objects,
-//    these objects are thread-safe in MTA mode which we ensure by calling initialize_mta()
-//    in WasapiBackend::new(). The COM threading model guarantees thread safety for these
-//    objects when used in MTA mode.
-// 2. All other fields are Send:
-//    - VecDeque<u8> is Send (standard library guarantee)
-//    - AudioConfig and WaveFormat are Send (plain data)
-//    - wasapi::Handle is Send (documented in wasapi crate)
-// 3. All methods take &mut self, ensuring exclusive access to internal state
-// 4. No interior mutability or shared mutable state exists between threads
-// 5. COM objects provide their own thread synchronization in MTA mode
-// 6. Buffer access is protected by the &mut self receiver
 unsafe impl Send for WasapiCaptureStream {}
-
-// SAFETY: This implementation is sound because:
-// 1. System (from sysinfo) is Send
-// 2. No interior mutability or shared state
 unsafe impl Send for WasapiBackend {}
 
 impl WasapiCaptureStream {
     fn new(
         client: AudioClient,
-        config: AudioConfig,
+        config: crate::core::config::AudioConfig,
         format: WaveFormat,
     ) -> Result<Self, AudioError> {
         let event_handle = client
@@ -201,7 +385,6 @@ impl AudioCaptureStream for WasapiCaptureStream {
     }
 
     fn read(&mut self, buffer: &mut [u8]) -> Result<usize, AudioError> {
-        // If we have enough data in the buffer, return it
         if !self.buffer.is_empty() {
             let bytes_to_copy = std::cmp::min(buffer.len(), self.buffer.len());
             for i in 0..bytes_to_copy {
@@ -210,7 +393,6 @@ impl AudioCaptureStream for WasapiCaptureStream {
             return Ok(bytes_to_copy);
         }
 
-        // Get new frames
         let new_frames = self
             .capture_client
             .get_next_nbr_frames()
@@ -223,13 +405,11 @@ impl AudioCaptureStream for WasapiCaptureStream {
                 .saturating_sub(self.buffer.capacity() - self.buffer.len());
             self.buffer.reserve(additional);
 
-            // Read data directly into our buffer
             self.capture_client
                 .read_from_device_to_deque(&mut self.buffer)
                 .map_err(|e| AudioError::CaptureError(e.to_string()))?;
         }
 
-        // Wait for more data if needed
         if let Some(event_handle) = &self.event_handle {
             if event_handle.wait_for_event(3000).is_err() {
                 return Err(AudioError::CaptureError(
@@ -238,7 +418,6 @@ impl AudioCaptureStream for WasapiCaptureStream {
             }
         }
 
-        // Try to fill the output buffer again
         let bytes_to_copy = std::cmp::min(buffer.len(), self.buffer.len());
         for i in 0..bytes_to_copy {
             buffer[i] = self.buffer.pop_front().unwrap();
@@ -246,7 +425,7 @@ impl AudioCaptureStream for WasapiCaptureStream {
         Ok(bytes_to_copy)
     }
 
-    fn config(&self) -> &AudioConfig {
+    fn config(&self) -> &crate::core::config::AudioConfig {
         &self.config
     }
 }

@@ -1,4 +1,8 @@
-use std::fmt;
+// use std::fmt; // No longer needed directly as AudioError handles its own Display
+
+// Import types from the new core modules
+use crate::core::config::StreamConfig; // Renamed from AudioConfig
+use crate::core::error::{AudioError, Result as CoreResult}; // Using the aliased Result
 
 #[derive(Debug, Clone)]
 pub struct AudioApplication {
@@ -8,85 +12,29 @@ pub struct AudioApplication {
     pub pid: u32,
 }
 
-#[derive(Debug, Clone, Copy)]
-pub struct AudioConfig {
-    pub sample_rate: u32,
-    pub channels: u16,
-    pub format: AudioFormat,
-}
-
-impl Default for AudioConfig {
-    fn default() -> Self {
-        Self {
-            sample_rate: 48000,
-            channels: 2,
-            format: AudioFormat::F32LE,
-        }
-    }
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum AudioFormat {
-    F32LE,  // 32-bit float, little endian
-    S16LE,  // 16-bit signed integer, little endian
-    S32LE,  // 32-bit signed integer, little endian
-}
-
-#[derive(Debug)]
-pub enum AudioError {
-    BackendUnavailable(&'static str),
-    InitializationFailed(String),
-    DeviceNotFound(String),
-    ApplicationNotFound(String),
-    CaptureError(String),
-    InvalidFormat(String),
-    IoError(std::io::Error),
-}
-
-impl fmt::Display for AudioError {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            AudioError::BackendUnavailable(backend) => 
-                write!(f, "Audio backend '{}' is not available", backend),
-            AudioError::InitializationFailed(msg) => 
-                write!(f, "Failed to initialize audio backend: {}", msg),
-            AudioError::DeviceNotFound(msg) => 
-                write!(f, "Audio device not found: {}", msg),
-            AudioError::ApplicationNotFound(msg) => 
-                write!(f, "Application not found: {}", msg),
-            AudioError::CaptureError(msg) => 
-                write!(f, "Audio capture error: {}", msg),
-            AudioError::InvalidFormat(msg) => 
-                write!(f, "Invalid audio format: {}", msg),
-            AudioError::IoError(err) => 
-                write!(f, "IO error: {}", err),
-        }
-    }
-}
-
-impl std::error::Error for AudioError {}
-
-impl From<std::io::Error> for AudioError {
-    fn from(err: std::io::Error) -> Self {
-        AudioError::IoError(err)
-    }
-}
+// AudioConfig struct has been removed (now StreamConfig from core::config)
+// AudioFormat enum has been removed (now part of AudioFormat struct in core::config)
+// AudioError enum has been removed (now in core::error)
+// Display and Error impls for local AudioError have been removed.
+// From<std::io::Error> for local AudioError has been removed.
+// Consider adding From<std::io::Error> for crate::core::error::AudioError if needed globally,
+// or handle it at the call sites. For now, we'll assume call sites will map errors.
 
 pub trait AudioCaptureBackend: Send {
     fn name(&self) -> &'static str;
-    
-    fn list_applications(&self) -> Result<Vec<AudioApplication>, AudioError>;
-    
+
+    fn list_applications(&self) -> CoreResult<Vec<AudioApplication>>;
+
     fn capture_application(
         &self,
         app: &AudioApplication,
-        config: AudioConfig,
-    ) -> Result<Box<dyn AudioCaptureStream>, AudioError>;
+        config: StreamConfig, // Updated to use StreamConfig
+    ) -> CoreResult<Box<dyn AudioCaptureStream>>;
 }
 
 pub trait AudioCaptureStream: Send {
-    fn start(&mut self) -> Result<(), AudioError>;
-    fn stop(&mut self) -> Result<(), AudioError>;
-    fn read(&mut self, buffer: &mut [u8]) -> Result<usize, AudioError>;
-    fn config(&self) -> &AudioConfig;
+    fn start(&mut self) -> CoreResult<()>;
+    fn stop(&mut self) -> CoreResult<()>;
+    fn read(&mut self, buffer: &mut [u8]) -> CoreResult<usize>;
+    fn config(&self) -> &StreamConfig; // Updated to use StreamConfig
 }
