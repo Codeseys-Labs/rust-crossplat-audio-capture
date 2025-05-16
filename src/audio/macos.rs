@@ -1,7 +1,7 @@
 //! macOS-specific audio capture backend using CoreAudio.
 #![cfg(target_os = "macos")]
 
-use crate::core::config::{AudioFormat, StreamConfig};
+use crate::core::config::{AudioCaptureConfig, AudioFormat, StreamConfig};
 use crate::core::error::{AudioError, Result as AudioResult};
 use crate::core::interface::{
     AudioBuffer, AudioDevice, AudioStream, CapturingStream, DeviceEnumerator, DeviceKind,
@@ -73,15 +73,16 @@ impl AudioDevice for MacosAudioDevice {
     }
 
     fn create_stream(
-        &self,
-        config: StreamConfig,
+        &mut self,
+        capture_config: &AudioCaptureConfig,
     ) -> AudioResult<Box<dyn CapturingStream + 'static>> {
         println!(
-            "TODO: MacosAudioDevice::create_stream(config: {:?})",
-            config
+            "TODO: MacosAudioDevice::create_stream(capture_config: {:?})",
+            capture_config
         );
         Ok(Box::new(MacosAudioStream {
-            config: Some(config),
+            config: Some(capture_config.stream_config.clone()), // Or however MacosAudioStream stores its config
+                                                                // Potentially store target_pid and target_session_identifier if macOS needs them
         }))
     }
 }

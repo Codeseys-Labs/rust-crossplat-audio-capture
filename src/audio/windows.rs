@@ -2,7 +2,7 @@
 #![cfg(target_os = "windows")]
 
 use crate::core::buffer::VecAudioBuffer;
-use crate::core::config::{AudioFormat, StreamConfig};
+use crate::core::config::{AudioCaptureConfig, AudioFormat, StreamConfig};
 use crate::core::error::{AudioError, Result as AudioResult};
 use crate::core::interface::{
     AudioBuffer, AudioDevice, AudioStream, CapturingStream, DeviceEnumerator, DeviceKind,
@@ -398,13 +398,18 @@ impl AudioDevice for WindowsAudioDevice {
     /// Creates a new capturing audio stream for this device.
     ///
     /// # Arguments
-    /// * `config` - The desired stream configuration (sample rate, channels, etc.).
+    /// * `capture_config` - The complete audio capture configuration, including stream
+    ///   parameters and optional application targeting information.
     ///
-    /// For this subtask (4.3), this method initializes the required WASAPI clients
-    /// (`IAudioClient`, `IAudioCaptureClient`) and constructs a `WindowsAudioStream`
-    /// instance. The actual streaming methods (`start`, `read_chunk`, etc.) on
-    /// `WindowsAudioStream` will be implemented in a subsequent subtask (4.4).
-    fn create_stream(&mut self, config: StreamConfig) -> AudioResult<Box<dyn CapturingStream>> {
+    /// This method initializes the required WASAPI clients (`IAudioClient`, `IAudioCaptureClient`)
+    /// and constructs a `WindowsAudioStream` instance. If application targeting information
+    /// (PID or session identifier) is provided in `capture_config`, it is passed to the
+    /// `WindowsAudioStream`. The `IAudioClient` is initialized for loopback capture on the
+    /// `IMMDevice` held by this `WindowsAudioDevice`.
+    fn create_stream(
+        &mut self,
+        capture_config: &AudioCaptureConfig,
+    ) -> AudioResult<Box<dyn CapturingStream>> {
         unsafe {
             let audio_client: IAudioClient =
                 self.device.Activate(CLSCTX_ALL, None).map_err(|hr| {
@@ -414,17 +419,20 @@ impl AudioDevice for WindowsAudioDevice {
                     ))
                 })?;
 
-            let wave_format_ex =
-                Self::audio_format_to_waveformat_ex(&config.format).map_err(|e| {
-                    AudioError::InvalidParameter(format!(
-                        "Failed to convert AudioFormat to WAVEFORMATEX for stream creation: {}",
-                        e
-                    ))
-                })?;
+            let wave_format_ex = Self::audio_format_to_waveformat_ex(
+                &capture_config.stream_config.format,
+            )
+            .map_err(|e| {
+                AudioError::InvalidParameter(format!(
+                    "Failed to convert AudioFormat to WAVEFORMATEX for stream creation: {}",
+                    e
+                ))
+            })?;
 
             // For loopback capture, buffer duration and periodicity are often set to 0 for event-driven mode.
-            // These might need to be configurable or calculated based on needs later.
-            // AUDCLNT_STREAMFLAGS_LOOPBACK is key for capturing system audio.
+            // AUDCLNT_STREAMFLAGS_LOOPBACK is key for capturing system/application audio.
+            // The device self.device should be the default render device if app capture is intended,
+            // as per builder logic in subtask 5.2.
             audio_client
                 .Initialize(
                     AUDCLNT_SHAREMODE_SHARED,
@@ -448,12 +456,13 @@ impl AudioDevice for WindowsAudioDevice {
                 ))
             })?;
 
-            // As per task 4.3, WindowsAudioStream methods are todo!(), but the struct is created.
             Ok(Box::new(WindowsAudioStream::new(
                 audio_client,
                 capture_client,
                 wave_format_ex, // Store the format it was initialized with
                 self.com_initializer.clone(),
+                capture_config.target_application_pid,
+                capture_config.target_application_session_identifier.clone(),
             )))
         }
     }
@@ -605,6 +614,9 @@ impl DeviceEnumerator for WindowsDeviceEnumerator {
 /// This struct holds the necessary WASAPI client interfaces (`IAudioClient`, `IAudioCaptureClient`)
 /// to manage and read data from an audio capture stream. It also holds an `Arc<ComInitializer>`
 /// to ensure COM remains initialized for the lifetime of the stream.
+///
+/// For application-level audio capture, it can store the target application's
+/// Process ID (PID) or session identifier.
 #[derive(Debug)] // IAudioClient and IAudioCaptureClient are COM interface pointers.
 pub(crate) struct WindowsAudioStream {
     audio_client: IAudioClient,
@@ -612,6 +624,10 @@ pub(crate) struct WindowsAudioStream {
     wave_format: WAVEFORMATEX, // Store the format it was initialized with
     _com_initializer: Arc<ComInitializer>, // Ensures COM is alive for the stream
     is_started: Arc<AtomicBool>, // Tracks if Start() has been called
+    /// Optional Process ID of the application to target for audio capture.
+    pub target_pid: Option<u32>,
+    /// Optional session identifier of the application to target for audio capture.
+    pub target_session_identifier: Option<String>,
 }
 
 impl WindowsAudioStream {
@@ -619,11 +635,22 @@ impl WindowsAudioStream {
     ///
     /// This is typically called by `WindowsAudioDevice::create_stream` after
     /// successfully initializing the `IAudioClient` and obtaining the `IAudioCaptureClient`.
+    /// It also accepts optional application targeting information.
+    ///
+    /// # Arguments
+    /// * `audio_client` - The initialized `IAudioClient` for the stream.
+    /// * `capture_client` - The `IAudioCaptureClient` obtained from the `audio_client`.
+    /// * `wave_format` - The `WAVEFORMATEX` with which the `audio_client` was initialized.
+    /// * `com_initializer` - An `Arc<ComInitializer>` to keep COM alive.
+    /// * `target_pid` - Optional PID of the application to capture audio from.
+    /// * `target_session_identifier` - Optional session identifier for application audio capture.
     fn new(
         audio_client: IAudioClient,
         capture_client: IAudioCaptureClient,
         wave_format: WAVEFORMATEX,
         com_initializer: Arc<ComInitializer>,
+        target_pid: Option<u32>,
+        target_session_identifier: Option<String>,
     ) -> Self {
         Self {
             audio_client,
@@ -631,6 +658,8 @@ impl WindowsAudioStream {
             wave_format,
             _com_initializer: com_initializer,
             is_started: Arc::new(AtomicBool::new(false)),
+            target_pid,
+            target_session_identifier,
         }
     }
 }

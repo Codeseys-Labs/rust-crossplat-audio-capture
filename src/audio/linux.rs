@@ -1,8 +1,7 @@
 //! Linux-specific audio capture backend using PipeWire.
 #![cfg(target_os = "linux")]
 
-use crate::core::config::AudioConfig; // Corrected import path
-use crate::core::config::StreamConfig;
+use crate::core::config::{AudioCaptureConfig, AudioConfig, StreamConfig}; // Corrected import path
 use crate::core::error::{AudioError, Result as AudioResult};
 use crate::core::interface::{
     AudioBuffer, AudioDevice, AudioStream, CapturingStream, DeviceEnumerator, DeviceKind,
@@ -95,17 +94,19 @@ impl AudioDevice for LinuxAudioDevice {
     }
 
     fn create_stream(
-        &self,
-        config: StreamConfig,
+        &mut self,
+        capture_config: &AudioCaptureConfig,
     ) -> AudioResult<Box<dyn CapturingStream + 'static>> {
         println!(
-            "TODO: LinuxAudioDevice::create_stream(config: {:?})",
-            config
+            "TODO: LinuxAudioDevice::create_stream(capture_config: {:?})",
+            capture_config
         );
         // For now, let's return a new, unconfigured LinuxAudioStream.
-        // In a real implementation, this would be configured based on `self` and `config`.
+        // In a real implementation, this would be configured based on `self` and `capture_config`.
+        // The actual stream config is nested within capture_config.
         Ok(Box::new(LinuxAudioStream {
-            config: Some(config),
+            config: Some(capture_config.stream_config.clone()), // Or however LinuxAudioStream stores its config
+                                                                // Potentially store target_pid and target_session_identifier if Linux needs them
         }))
     }
 }

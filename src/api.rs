@@ -660,8 +660,8 @@ impl<D: AudioDevice + 'static> AudioCapture<D> {
             })?;
 
             // Use the create_stream method from the AudioDevice trait (on type D)
-            let capturing_stream_obj =
-                device_ref.create_stream(self.config.stream_config.clone())?;
+            // Pass the full AudioCaptureConfig
+            let capturing_stream_obj = device_ref.create_stream(&self.config)?;
 
             // The callback setup will be handled in a later subtask (2.4).
             // For now, we assume the stream can be started without a callback,

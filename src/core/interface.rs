@@ -1,6 +1,6 @@
 // src/core/interface.rs
 
-use super::config::{AudioFormat, StreamConfig};
+use super::config::{AudioCaptureConfig, AudioFormat, StreamConfig};
 use super::error::{AudioError, Result as AudioResult}; // Renamed to avoid conflict
 
 /// Represents the kind of an audio device.
@@ -73,18 +73,25 @@ pub trait AudioDevice {
     /// or an `AudioError` if the check fails or is not possible.
     fn is_format_supported(&self, format: &AudioFormat) -> AudioResult<bool>;
 
-    /// Creates a new audio stream associated with this device.
+    /// Creates a new audio stream associated with this device using the provided capture configuration.
+    ///
+    /// This method allows for detailed configuration of the audio stream, including
+    /// parameters like sample rate, channels, format, and potentially application-specific
+    /// targeting for capture (e.g., capturing audio from a specific process).
     ///
     /// # Parameters
-    /// * `config`: The desired `StreamConfig` for the new stream.
+    /// * `capture_config`: A reference to the `AudioCaptureConfig` specifying all
+    ///   parameters for the stream to be created. This includes the basic `StreamConfig`
+    ///   as well as any application-level targeting information.
     ///
     /// # Returns
-    /// A `Result` containing a boxed `AudioStream` trait object, or an `AudioError`.
-    /// The `AudioStream`'s `Device` associated type will be `dyn AudioDevice`,
-    /// and its `Config` associated type will be `StreamConfig`.
+    /// A `Result` containing a boxed `CapturingStream` trait object if successful,
+    /// or an `AudioError` if the stream cannot be created with the given configuration.
+    /// The returned stream is dynamically dispatched and suitable for use across
+    /// different audio backends.
     fn create_stream(
-        &self,
-        config: StreamConfig,
+        &mut self,
+        capture_config: &AudioCaptureConfig,
     ) -> AudioResult<Box<dyn CapturingStream + 'static>>;
 }
 
