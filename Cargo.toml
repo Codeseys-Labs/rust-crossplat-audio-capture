@@ -45,8 +45,10 @@ wasapi = "0.17.0"
 windows = { version = "0.56.0", features = [
     "Win32_Foundation",  # For basic Windows types like HRESULT, BOOL, HANDLE
     "Win32_System_Com",  # For COM initialization (CoInitializeEx, CoUninitialize) and operations (CoCreateInstance, CLSCTX_ALL)
-    "Win32_Media_Audio", # For WASAPI interfaces (IMMDeviceEnumerator, MMDeviceEnumerator, IMMDevice, IAudioClient, IAudioCaptureClient, WAVEFORMATEX)
+    "Win32_Media_Audio", # For WASAPI interfaces (IMMDeviceEnumerator, MMDeviceEnumerator, IMMDevice, IAudioClient, IAudioCaptureClient, WAVEFORMATEX, IAudioSessionManager2, IAudioSessionEnumerator, IAudioSessionControl, IAudioSessionControl2)
     # and constants (eRender, eConsole, AUDCLNT_SHAREMODE_SHARED, AUDCLNT_STREAMFLAGS_LOOPBACK)
+    "Win32_System_Threading",     # For OpenProcess, GetCurrentProcessId, QueryFullProcessImageNameW
+    "Win32_System_ProcessStatus", # For K32GetModuleFileNameExW
 ] }
 
 [target.'cfg(target_os = "linux")'.dependencies]

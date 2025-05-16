@@ -43,7 +43,9 @@ pub use audio::LinuxDeviceEnumerator;
 #[cfg(target_os = "macos")]
 pub use audio::MacosDeviceEnumerator;
 #[cfg(target_os = "windows")]
-pub use audio::WindowsDeviceEnumerator;
+pub use audio::{
+    enumerate_application_audio_sessions, ApplicationAudioSessionInfo, WindowsDeviceEnumerator,
+};
 
 // Re-export old platform-specific backends (to be deprecated)
 #[cfg(target_os = "macos")]

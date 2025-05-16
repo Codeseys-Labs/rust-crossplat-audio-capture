@@ -41,7 +41,10 @@ pub use linux::{LinuxAudioDevice, LinuxAudioStream};
 #[cfg(target_os = "macos")]
 pub use macos::{MacosAudioDevice, MacosAudioStream};
 #[cfg(target_os = "windows")]
-pub use windows::{WindowsAudioDevice, WindowsAudioStream};
+pub use windows::{
+    enumerate_application_audio_sessions, ApplicationAudioSessionInfo, WindowsAudioDevice,
+    WindowsAudioStream,
+};
 
 // --- Factory function for the new DeviceEnumerator ---
 

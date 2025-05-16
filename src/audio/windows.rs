@@ -1030,6 +1030,243 @@ impl Drop for WindowsAudioStream {
 // they would typically be part of the CapturingStream trait or called internally.
 // For now, the CapturingStream methods (start, stop, close, is_running, read_chunk) are the focus.
 
+/// Information about an active audio session associated with an application.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ApplicationAudioSessionInfo {
+    /// The process ID of the application owning the audio session.
+    pub process_id: u32,
+    /// The display name of the audio session. This is often the application name.
+    pub display_name: String,
+    /// A unique identifier for the audio session.
+    pub session_identifier: String,
+    /// The full path to the executable file of the application owning the session.
+    /// This can be `None` if the path cannot be retrieved (e.g., due to permissions).
+    pub executable_path: Option<String>,
+    // pub icon_path: Option<String>, // TODO: Consider adding icon path if easily obtainable
+}
+
+/// Enumerates all active application audio sessions on the system.
+///
+/// This function queries WASAPI for audio sessions that are currently active and
+/// associated with a running process. It attempts to retrieve identifying information
+/// for each session, including its process ID, display name, session identifier,
+/// and the executable path of the owning application.
+///
+/// Sessions with a process ID of 0 (often system sounds or non-application sessions)
+/// are typically filtered out.
+///
+/// # Returns
+///
+/// * `Ok(Vec<ApplicationAudioSessionInfo>)` - A vector of structs, each containing
+///   information about an active application audio session.
+/// * `Err(AudioError)` - If an error occurs during COM initialization, device enumeration,
+///   session enumeration, or while retrieving session details. This can include
+///   `AudioError::BackendSpecificError` for WASAPI HRESULT failures or
+///   `AudioError::DeviceNotFound` if the default audio device cannot be accessed.
+///
+/// # Errors
+///
+/// This function can return `AudioError` for various reasons:
+/// - COM initialization failure.
+/// - Failure to get the default audio rendering device.
+/// - Failure to activate `IAudioSessionManager2`.
+/// - Errors during session enumeration or when querying session properties.
+/// - Errors when trying to open a process or query its executable path (e.g., access denied).
+///
+/// # Example
+///
+/// ```no_run
+/// # use rsac::audio::windows::enumerate_application_audio_sessions;
+/// # use rsac::core::error::AudioResult;
+/// fn main() -> AudioResult<()> {
+///     match enumerate_application_audio_sessions() {
+///         Ok(sessions) => {
+///             if sessions.is_empty() {
+///                 println!("No active application audio sessions found.");
+///             } else {
+///                 println!("Active application audio sessions:");
+///                 for session in sessions {
+///                     println!(
+///                         "  PID: {}, Name: \"{}\", Path: {:?}",
+///                         session.process_id,
+///                         session.display_name,
+///                         session.executable_path.as_deref().unwrap_or("N/A")
+///                     );
+///                 }
+///             }
+///         }
+///         Err(e) => {
+///             eprintln!("Error enumerating audio sessions: {}", e);
+///         }
+///     }
+///     Ok(())
+/// }
+/// ```
+pub fn enumerate_application_audio_sessions() -> AudioResult<Vec<ApplicationAudioSessionInfo>> {
+    use windows::Win32::Foundation::{CloseHandle, HANDLE, INVALID_HANDLE_VALUE};
+    use windows::Win32::Media::Audio::{
+        IAudioSessionControl, IAudioSessionControl2, IAudioSessionEnumerator, IAudioSessionManager2,
+    };
+    use windows::Win32::System::ProcessStatus::K32GetModuleFileNameExW; // Or QueryFullProcessImageNameW from Win32_System_Threading
+    use windows::Win32::System::SystemServices::HMODULE;
+    use windows::Win32::System::Threading::{OpenProcess, PROCESS_QUERY_LIMITED_INFORMATION};
+
+    let _com_initializer = ComInitializer::new()?;
+
+    let mut sessions_info: Vec<ApplicationAudioSessionInfo> = Vec::new();
+
+    unsafe {
+        let device_enumerator: IMMDeviceEnumerator =
+            CoCreateInstance(&MMDeviceEnumerator, None, CLSCTX_ALL).map_err(|hr| {
+                AudioError::BackendSpecificError(format!(
+                    "CoCreateInstance(MMDeviceEnumerator) failed (HRESULT: {:?})",
+                    hr
+                ))
+            })?;
+
+        let default_device: IMMDevice = device_enumerator
+            .GetDefaultAudioEndpoint(eRender, eConsole)
+            .map_err(|hr| {
+                if hr == E_NOTFOUND {
+                    AudioError::DeviceNotFound("Default rendering device not found.".to_string())
+                } else {
+                    AudioError::BackendSpecificError(format!(
+                        "GetDefaultAudioEndpoint failed (HRESULT: {:?})",
+                        hr
+                    ))
+                }
+            })?;
+
+        let session_manager: IAudioSessionManager2 =
+            default_device.Activate(CLSCTX_ALL, None).map_err(|hr| {
+                AudioError::BackendSpecificError(format!(
+                    "IMMDevice::Activate(IAudioSessionManager2) failed (HRESULT: {:?})",
+                    hr
+                ))
+            })?;
+
+        let session_enumerator: IAudioSessionEnumerator =
+            session_manager.GetSessionEnumerator().map_err(|hr| {
+                AudioError::BackendSpecificError(format!(
+                    "IAudioSessionManager2::GetSessionEnumerator failed (HRESULT: {:?})",
+                    hr
+                ))
+            })?;
+
+        let count = session_enumerator.GetCount().map_err(|hr| {
+            AudioError::BackendSpecificError(format!(
+                "IAudioSessionEnumerator::GetCount failed (HRESULT: {:?})",
+                hr
+            ))
+        })?;
+
+        for i in 0..count {
+            let session_control: IAudioSessionControl =
+                session_enumerator.GetSession(i).map_err(|hr| {
+                    AudioError::BackendSpecificError(format!(
+                        "IAudioSessionEnumerator::GetSession({}) failed (HRESULT: {:?})",
+                        i, hr
+                    ))
+                })?;
+
+            let session_control2: IAudioSessionControl2 = match session_control.cast() {
+                Ok(sc2) => sc2,
+                Err(hr) => {
+                    // Log or skip if IAudioSessionControl2 is not available for this session
+                    eprintln!(
+                        "Warning: Could not cast IAudioSessionControl to IAudioSessionControl2 for session {}: {:?}",
+                        i, hr
+                    );
+                    continue;
+                }
+            };
+
+            let pid = session_control2.GetProcessId().map_err(|hr| {
+                AudioError::BackendSpecificError(format!(
+                    "IAudioSessionControl2::GetProcessId for session {} failed (HRESULT: {:?})",
+                    i, hr
+                ))
+            })?;
+
+            if pid == 0 {
+                // Skip system sounds or non-application sessions
+                continue;
+            }
+
+            let display_name_pwstr = session_control2.GetDisplayName().unwrap_or(PWSTR::null());
+            let mut display_name = if !display_name_pwstr.is_null() {
+                let dn = WindowsAudioDevice::pwstr_to_string(display_name_pwstr)
+                    .unwrap_or_else(|_| String::new());
+                CoTaskMemFree(Some(display_name_pwstr.as_ptr().cast()));
+                dn
+            } else {
+                String::new()
+            };
+
+            let session_identifier_pwstr = session_control2
+                .GetSessionIdentifier()
+                .unwrap_or(PWSTR::null());
+            let session_identifier = if !session_identifier_pwstr.is_null() {
+                let si = WindowsAudioDevice::pwstr_to_string(session_identifier_pwstr)
+                    .unwrap_or_else(|_| String::new());
+                CoTaskMemFree(Some(session_identifier_pwstr.as_ptr().cast()));
+                si
+            } else {
+                String::new()
+            };
+
+            if display_name.is_empty() && !session_identifier.is_empty() {
+                // Fallback to session identifier if display name is empty
+                let parts: Vec<&str> = session_identifier.split('|').collect();
+                if let Some(name_part) = parts.get(0) {
+                    if let Some(exe_name) = name_part.split('\\').last() {
+                        display_name = exe_name.trim_end_matches(".exe").to_string();
+                    }
+                }
+                if display_name.is_empty() {
+                    // if still empty after trying to parse session_identifier
+                    display_name = format!("PID: {}", pid); // Fallback further
+                }
+            } else if display_name.is_empty() {
+                display_name = format!("Unknown App (PID: {})", pid); // Ultimate fallback
+            }
+
+            let mut executable_path: Option<String> = None;
+            let process_handle_result = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, false, pid);
+
+            match process_handle_result {
+                Ok(process_handle) if process_handle != INVALID_HANDLE_VALUE => {
+                    let mut path_buf: [u16; 1024] = [0; 1024];
+                    // Using HMODULE(0) for the main executable module of the process.
+                    let len = K32GetModuleFileNameExW(process_handle, HMODULE(0), &mut path_buf);
+                    if len > 0 {
+                        executable_path = Some(String::from_utf16_lossy(&path_buf[..len as usize]));
+                    } else {
+                        // K32GetModuleFileNameExW failed, could log GetLastError()
+                        // eprintln!("K32GetModuleFileNameExW failed for PID {}: {:?}", pid, std::io::Error::last_os_error());
+                    }
+                    let _ = CloseHandle(process_handle);
+                }
+                Ok(_) => { // INVALID_HANDLE_VALUE
+                     // eprintln!("OpenProcess returned INVALID_HANDLE_VALUE for PID {}: {:?}", pid, std::io::Error::last_os_error());
+                }
+                Err(e) => {
+                    // OpenProcess failed
+                    // eprintln!("OpenProcess failed for PID {}: {:?}", pid, e);
+                }
+            }
+
+            sessions_info.push(ApplicationAudioSessionInfo {
+                process_id: pid,
+                display_name,
+                session_identifier,
+                executable_path,
+            });
+        }
+    }
+
+    Ok(sessions_info)
+}
 // --- Old WASAPI Backend (To be refactored/removed) ---
 // This section contains the previous implementation and will be gradually
 // replaced or integrated into the new trait-based structure.
