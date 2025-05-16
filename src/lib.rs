@@ -40,12 +40,12 @@ pub use crate::api::{AudioCapture, AudioCaptureBuilder, AudioCaptureConfig};
 // Re-export platform-specific components for the new API
 #[cfg(target_os = "linux")]
 pub use audio::LinuxDeviceEnumerator;
-#[cfg(target_os = "macos")]
-pub use audio::MacosDeviceEnumerator;
 #[cfg(target_os = "windows")]
 pub use audio::{
     enumerate_application_audio_sessions, ApplicationAudioSessionInfo, WindowsDeviceEnumerator,
 };
+#[cfg(target_os = "macos")]
+pub use audio::{enumerate_audio_applications, ApplicationInfo, MacosDeviceEnumerator};
 
 // Re-export old platform-specific backends (to be deprecated)
 #[cfg(target_os = "macos")]

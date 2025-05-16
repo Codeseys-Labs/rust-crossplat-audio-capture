@@ -38,6 +38,115 @@ use std::sync::{
 };
 use std::pin::Pin; // Required for Pin<Box<...>> in to_async_stream
 
+// Imports for application enumeration
+use cocoa::base::{id, nil};
+use cocoa::foundation::{NSArray, NSString};
+use objc::runtime::{Class, Object, Sel, YES};
+use objc::{class, msg_send, sel, sel_impl};
+
+/// Information about a running application on macOS.
+///
+/// This struct provides details such as the process ID, localized name,
+/// and bundle identifier of an application.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ApplicationInfo {
+    /// The process identifier (PID) of the application.
+    pub process_id: u32, // pid_t is i32 on macOS, but u32 is fine for positive PIDs
+    /// The localized name of the application (e.g., "Safari", "Terminal").
+    pub name: String,
+    /// The bundle identifier of the application (e.g., "com.apple.Safari").
+    /// This can be `None` if the application doesn't have a bundle identifier.
+    pub bundle_id: Option<String>,
+}
+
+/// Enumerates running applications on macOS that are potential audio sources.
+///
+/// This function lists applications currently running on the system.
+/// It provides their process ID, name, and bundle identifier.
+///
+/// Note: This function identifies *running* applications. It does not guarantee
+/// that these applications are currently producing or capturing audio. Determining
+/// active audio output without tapping is complex on macOS.
+///
+/// # Returns
+///
+/// An `AudioResult` containing a `Vec<ApplicationInfo>` on success,
+/// or an `AudioError` if an issue occurs during enumeration.
+pub fn enumerate_audio_applications() -> AudioResult<Vec<ApplicationInfo>> {
+    let mut app_infos: Vec<ApplicationInfo> = Vec::new();
+
+    unsafe {
+        // Get the shared NSWorkspace instance
+        let workspace_class = class!(NSWorkspace);
+        let shared_workspace: id = msg_send![workspace_class, sharedWorkspace];
+
+        // Get the array of running applications
+        // runningApplications returns an NSArray<NSRunningApplication *>
+        let running_apps_nsarray: id = msg_send![shared_workspace, runningApplications];
+
+        if running_apps_nsarray == nil {
+            // This would be unusual, but good to check.
+            return Err(AudioError::BackendSpecificError(
+                "Failed to get running applications array from NSWorkspace (nil returned)".to_string(),
+            ));
+        }
+
+        let count: usize = msg_send![running_apps_nsarray, count];
+
+        for i in 0..count {
+            let app: id = msg_send![running_apps_nsarray, objectAtIndex: i]; // app is an NSRunningApplication
+
+            if app == nil {
+                // Skip if somehow a nil object is in the array
+                continue;
+            }
+
+            // Get processIdentifier (pid_t, which is i32 on macOS)
+            let pid: i32 = msg_send![app, processIdentifier];
+
+            // Get localizedName (NSString *)
+            let name_nsstring: id = msg_send![app, localizedName];
+            let name_str: String = if name_nsstring != nil {
+                let c_str_name_ptr = NSString::UTF8String(name_nsstring);
+                if !c_str_name_ptr.is_null() {
+                    std::ffi::CStr::from_ptr(c_str_name_ptr).to_string_lossy().into_owned()
+                } else {
+                    // Fallback if UTF8String returns null (e.g., invalid UTF-8 or empty)
+                    String::from("<Invalid Name>")
+                }
+            } else {
+                String::from("<Unknown Name>") // Should not happen for localizedName if app object is valid
+            };
+
+            // Get bundleIdentifier (NSString *)
+            let bundle_id_nsstring: id = msg_send![app, bundleIdentifier];
+            let bundle_id: Option<String> = if bundle_id_nsstring != nil {
+                let c_str_bundle_ptr = NSString::UTF8String(bundle_id_nsstring);
+                if !c_str_bundle_ptr.is_null() {
+                    let bundle_str = std::ffi::CStr::from_ptr(c_str_bundle_ptr).to_string_lossy().into_owned();
+                    if bundle_str.is_empty() { // Treat empty string as None for bundle_id
+                        None
+                    } else {
+                        Some(bundle_str)
+                    }
+                } else {
+                     // Fallback if UTF8String returns null
+                    None // Or Some("<Invalid Bundle ID>".to_string()) if explicit error string is preferred
+                }
+            } else {
+                None // bundleIdentifier can legitimately be nil
+            };
+
+            app_infos.push(ApplicationInfo {
+                process_id: pid as u32, // pid_t is i32, casting to u32 for positive PIDs
+                name: name_str,
+                bundle_id,
+            });
+        }
+    } // unsafe block ends
+
+    Ok(app_infos)
+}
 /// A representation of a CoreAudio audio device.
 ///
 /// This struct holds the `AudioDeviceID` and potentially other information
