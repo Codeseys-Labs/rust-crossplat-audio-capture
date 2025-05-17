@@ -6,16 +6,121 @@
 //! The string payload provides context about the failed PipeWire operation
 //! and includes the original error message for detailed diagnostics.
 #![cfg(target_os = "linux")]
+/// Represents the detected status of PipeWire on the system.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PipewireStatus {
+    /// PipeWire is active, and `pipewire-pulse` (or equivalent) is managing PulseAudio clients.
+    ActiveAndPrimary,
+    /// Only the core PipeWire daemon is detected; `pipewire-pulse` might not be active.
+    OnlyPipeWireCore,
+    /// PipeWire does not appear to be available or active.
+    NotAvailable,
+}
+
+/// Checks the availability and status of PipeWire on the system.
+///
+/// This function uses a combination of environment variable checks and socket file
+/// existence to determine if PipeWire is running and if it's managing PulseAudio
+/// clients (via `pipewire-pulse` or a similar mechanism).
+///
+/// Detection Logic:
+/// 1. Environment Variables:
+///    - `PIPEWIRE_RUNTIME_DIR`: Its presence suggests PipeWire is active.
+///    - `PULSE_SERVER`: If set and points to a PipeWire socket, indicates `pipewire-pulse` is active.
+/// 2. Socket Files:
+///    - Main PipeWire socket (e.g., `$XDG_RUNTIME_DIR/pipewire-0`): Existence indicates PipeWire core is running.
+///    - PipeWire PulseAudio emulation socket (e.g., `$XDG_RUNTIME_DIR/pulse/native`): Existence indicates `pipewire-pulse` is active.
+///
+/// The function prioritizes `ActiveAndPrimary` if `pipewire-pulse` indicators are found.
+/// If only core PipeWire indicators are found, it returns `OnlyPipeWireCore`.
+/// Otherwise, it returns `NotAvailable`.
+///
+/// The function is designed to be robust and avoid panicking, returning `NotAvailable`
+/// on errors like permission issues when checking paths (though these should be rare
+/// for standard runtime directories).
+pub fn check_pipewire_availability() -> PipewireStatus {
+    let xdg_runtime_dir = std::env::var("XDG_RUNTIME_DIR").ok();
+    let pipewire_runtime_dir_env = std::env::var("PIPEWIRE_RUNTIME_DIR").ok();
+
+    let mut pipewire_core_present = false;
+    let mut pipewire_pulse_present = false;
+
+    // Check PIPEWIRE_RUNTIME_DIR environment variable
+    if pipewire_runtime_dir_env.is_some() {
+        pipewire_core_present = true;
+    }
+
+    // Check PULSE_SERVER environment variable
+    if let Ok(pulse_server_var) = std::env::var("PULSE_SERVER") {
+        if pulse_server_var.contains("pipewire") {
+            pipewire_pulse_present = true;
+            pipewire_core_present = true; // pipewire-pulse implies pipewire is also running
+        }
+    }
+
+    // Check for PipeWire sockets
+    let check_socket = |base_dir: &Option<String>, path_suffix: &str| -> bool {
+        base_dir.as_ref().map_or(false, |dir| {
+            let socket_path = std::path::Path::new(dir).join(path_suffix);
+            socket_path.exists()
+        })
+    };
+
+    // Check main PipeWire socket (e.g., pipewire-0)
+    if !pipewire_core_present { // Only check if not already confirmed by env var
+        if check_socket(&xdg_runtime_dir, "pipewire-0") ||
+           check_socket(&pipewire_runtime_dir_env, "pipewire-0") {
+            pipewire_core_present = true;
+        }
+    }
+    
+    // Check PipeWire PulseAudio emulation socket (e.g., pulse/native)
+    if !pipewire_pulse_present { // Only check if not already confirmed by PULSE_SERVER
+        if check_socket(&xdg_runtime_dir, "pulse/native") ||
+           check_socket(&pipewire_runtime_dir_env, "pulse/native") {
+            pipewire_pulse_present = true;
+            pipewire_core_present = true; // Finding pulse/native implies core is also there
+        }
+    }
+
+    // Determine status based on findings
+    if pipewire_pulse_present {
+        PipewireStatus::ActiveAndPrimary
+    } else if pipewire_core_present {
+        PipewireStatus::OnlyPipeWireCore
+    } else {
+        // As a last resort, try to check if 'pipewire' process is running.
+        // This is a weaker check and might require more permissions or be less reliable.
+        // For simplicity and to avoid external crates for this subtask, we'll skip direct process checking.
+        // If the user wants more robust process checking, it can be added later with a crate like `sysinfo`.
+        PipewireStatus::NotAvailable
+    }
+}
+
+#[cfg(target_os = "linux")]
+pub mod pulseaudio;
+#[cfg(target_os = "linux")]
+pub mod pipewire; // Added pipewire module
+
+// Re-export items for application-level capture if needed by other modules
+#[cfg(target_os = "linux")]
+pub use pipewire::{enumerate_audio_applications_pipewire, LinuxApplicationInfo};
+
 
 use crate::core::config::{AudioCaptureConfig, AudioConfig, StreamConfig}; // Corrected import path
-use crate::core::error::{AudioError, Result as AudioResult};
+use crate::core::error::{AudioError, CaptureError, Result as AudioResult}; // Added CaptureError
 use crate::core::interface::{
-    AudioDevice, AudioStream, CapturingStream, DeviceEnumerator, DeviceKind,
+    AudioBackend, AudioDevice, CapturingStream, DeviceEnumerator, DeviceKind, // Added AudioBackend
     StreamDataCallback,
     // AudioBuffer trait is removed, struct will be imported from crate::core::buffer
 };
 use crate::core::buffer::AudioBuffer; // This is the new AudioBuffer struct
 use crate::{AudioFormat, SampleFormat}; // AudioFormat is re-exported from lib.rs
+use log::{debug, error, info, warn}; // Added for logging
+use std::sync::Once; // For one-time initialization of PipeWire
+
+// Ensure pulseaudio module is accessible
+use self::pulseaudio::{PulseAudioBackend as PaBackend, PulseAudioCaptureStream as PaCaptureStream};
 use pipewire::{
     keys as pw_keys,
     spa::{
@@ -62,6 +167,193 @@ use pipewire::{
 // Removed: use crate::core::buffer::VecAudioBuffer; // Will use AudioBuffer struct directly
  
 use super::core::{AudioApplication, AudioCaptureBackend, AudioCaptureStream};
+
+// --- Linux Backend Abstraction ---
+
+/// Represents the available audio backends on Linux.
+/// It will try PipeWire first, then fall back to PulseAudio.
+#[derive(Debug)]
+pub enum LinuxAudioBackend {
+    PipeWire(Arc<PipewireCoreContext>),
+    PulseAudio(Box<PaBackend>),
+}
+
+/// Represents an active audio capturing stream on Linux, abstracting over PipeWire and PulseAudio.
+#[derive(Debug)]
+pub enum LinuxCapturingStream {
+    PipeWire(Box<LinuxAudioStream>), // This is Box<dyn CapturingStream> which is Box<LinuxAudioStream>
+    PulseAudio(Box<PaCaptureStream>),
+}
+
+static PIPEWIRE_INIT: Once = Once::new();
+
+impl LinuxAudioBackend {
+    /// Creates a new `LinuxAudioBackend`.
+    ///
+    /// It attempts to initialize PipeWire first. If PipeWire initialization fails
+    /// or is not available, it falls back to attempting to initialize PulseAudio.
+    /// If both backends fail to initialize, an error is returned.
+    pub fn new() -> AudioResult<Self> {
+        debug!("Attempting to initialize Linux audio backend...");
+
+        match check_pipewire_availability() {
+            PipewireStatus::ActiveAndPrimary | PipewireStatus::OnlyPipeWireCore => {
+                debug!("PipeWire detected. Attempting to initialize PipeWire backend.");
+                // Ensure pipewire::init() is called only once.
+                PIPEWIRE_INIT.call_once(|| {
+                    pipewire::init();
+                    debug!("Global PipeWire initialized.");
+                });
+
+                match PipewireCoreContext::new() {
+                    Ok(pw_core_ctx) => {
+                        info!("PipeWire backend initialized successfully.");
+                        return Ok(LinuxAudioBackend::PipeWire(Arc::new(pw_core_ctx)));
+                    }
+                    Err(e) => {
+                        warn!("PipeWire backend initialization failed: {:?}. Attempting PulseAudio fallback.", e);
+                        // Proceed to PulseAudio fallback
+                    }
+                }
+            }
+            PipewireStatus::NotAvailable => {
+                info!("PipeWire not available. Attempting PulseAudio fallback.");
+                // Proceed to PulseAudio fallback
+            }
+        }
+
+        // PulseAudio Fallback
+        debug!("Attempting to initialize PulseAudio backend.");
+        match PaBackend::new() {
+            Ok(pa_backend) => {
+                info!("PulseAudio backend initialized successfully as fallback.");
+                Ok(LinuxAudioBackend::PulseAudio(Box::new(pa_backend)))
+            }
+            Err(e) => {
+                error!("PulseAudio backend initialization failed: {:?}", e);
+                Err(AudioError::BackendInitializationFailed("Both PipeWire and PulseAudio backends failed to initialize.".into()))
+            }
+        }
+    }
+}
+
+impl AudioBackend for LinuxAudioBackend {
+    fn create_stream(&mut self, config: &AudioCaptureConfig) -> AudioResult<Box<dyn CapturingStream + 'static>> {
+        match self {
+            LinuxAudioBackend::PipeWire(ref core_ctx) => {
+                debug!("LinuxAudioBackend (PipeWire): Creating stream with config: {:?}", config);
+                // Create a temporary enumerator to get a device.
+                // This assumes LinuxDeviceEnumerator doesn't have significant side effects on creation beyond init.
+                let enumerator = LinuxDeviceEnumerator { core_context: Arc::clone(core_ctx) };
+                
+                let mut device_to_use: LinuxAudioDevice = if let Some(id_str) = &config.device_name {
+                    enumerator.get_device_by_id(&id_str.to_string())?
+                } else {
+                    enumerator.get_default_device(DeviceKind::Input)?
+                };
+                
+                // device_to_use is LinuxAudioDevice. Its create_stream method must adhere to AudioDevice trait.
+                // AudioDevice::create_stream returns AudioResult<Box<dyn CapturingStream + 'static>>
+                // So, device_to_use.create_stream(config) will return the correctly boxed stream.
+                let pw_dyn_capturing_stream = device_to_use.create_stream(config)?;
+                // pw_dyn_capturing_stream is already Box<dyn CapturingStream + 'static>
+                // which in this case is Box<LinuxCapturingStream::PipeWire(...)>
+                Ok(pw_dyn_capturing_stream)
+            }
+            LinuxAudioBackend::PulseAudio(ref mut pa_backend) => {
+                debug!("LinuxAudioBackend (PulseAudio): Creating stream with config: {:?}", config);
+                let pa_stream = pa_backend.create_capture_stream(&config.stream_config, config.device_name.as_deref())?;
+                Ok(Box::new(LinuxCapturingStream::PulseAudio(Box::new(pa_stream))))
+            }
+        }
+    }
+
+    fn default_capture_device(&self) -> AudioResult<Option<Box<dyn AudioDevice + 'static>>> {
+        match self {
+            LinuxAudioBackend::PipeWire(ref core_ctx) => {
+                debug!("LinuxAudioBackend (PipeWire): Getting default capture device.");
+                let enumerator = LinuxDeviceEnumerator { core_context: Arc::clone(core_ctx) };
+                match enumerator.get_default_device(DeviceKind::Input) { // Returns AudioResult<LinuxAudioDevice>
+                    Ok(device) => Ok(Some(Box::new(device) as Box<dyn AudioDevice + 'static>)),
+                    Err(AudioError::DeviceNotFound) => Ok(None), // Corrected: DeviceNotFound is unit-like
+                    Err(e) => Err(e), // Propagate other errors
+                }
+            }
+            LinuxAudioBackend::PulseAudio(_) => {
+                debug!("LinuxAudioBackend (PulseAudio): Default capture device - returning None (NotImplemented).");
+                // As per instructions, PulseAudio device enumeration is not yet implemented.
+                Ok(None)
+            }
+        }
+    }
+
+    fn enumerate_capture_devices(&self) -> AudioResult<Vec<Box<dyn AudioDevice + 'static>>> {
+        match self {
+            LinuxAudioBackend::PipeWire(ref core_ctx) => {
+                debug!("LinuxAudioBackend (PipeWire): Enumerating capture devices.");
+                let enumerator = LinuxDeviceEnumerator { core_context: Arc::clone(core_ctx) };
+                let devices = enumerator.get_input_devices()?; // get_input_devices now returns AudioResult<Vec<LinuxAudioDevice>>
+                Ok(devices.into_iter().map(|d| Box::new(d) as Box<dyn AudioDevice + 'static>).collect())
+            }
+            LinuxAudioBackend::PulseAudio(_) => {
+                debug!("LinuxAudioBackend (PulseAudio): Enumerate capture devices - returning empty list (NotImplemented).");
+                // As per instructions, PulseAudio device enumeration is not yet implemented.
+                Ok(Vec::new())
+            }
+        }
+    }
+}
+
+impl CapturingStream for LinuxCapturingStream {
+    fn start(&mut self) -> AudioResult<()> {
+        match self {
+            LinuxCapturingStream::PipeWire(ref mut pw_stream) => pw_stream.start(),
+            LinuxCapturingStream::PulseAudio(ref mut pa_stream) => pa_stream.start().map_err(AudioError::from),
+        }
+    }
+
+    fn stop(&mut self) -> AudioResult<()> {
+        match self {
+            LinuxCapturingStream::PipeWire(ref mut pw_stream) => pw_stream.stop(),
+            LinuxCapturingStream::PulseAudio(ref mut pa_stream) => pa_stream.stop().map_err(AudioError::from),
+        }
+    }
+
+    fn close(&mut self) -> AudioResult<()> {
+        match self {
+            LinuxCapturingStream::PipeWire(ref mut pw_stream) => pw_stream.close(),
+            LinuxCapturingStream::PulseAudio(ref mut pa_stream) => pa_stream.close().map_err(AudioError::from),
+        }
+    }
+
+    fn is_running(&self) -> bool {
+        match self {
+            LinuxCapturingStream::PipeWire(ref pw_stream) => pw_stream.is_running(),
+            LinuxCapturingStream::PulseAudio(ref pa_stream) => pa_stream.is_running(),
+        }
+    }
+
+    fn read_chunk(&mut self, timeout_ms: Option<u32>) -> AudioResult<Option<AudioBuffer>> {
+        match self {
+            LinuxCapturingStream::PipeWire(ref mut pw_stream) => pw_stream.read_chunk(timeout_ms),
+            LinuxCapturingStream::PulseAudio(ref mut pa_stream) => pa_stream.read_chunk(timeout_ms).map_err(AudioError::from),
+        }
+    }
+
+    fn to_async_stream<'a>(
+        &'a mut self,
+    ) -> AudioResult<
+        std::pin::Pin<
+            Box<dyn futures_core::Stream<Item = AudioResult<AudioBuffer>> + Send + Sync + 'a>,
+        >,
+    > {
+        match self {
+            LinuxCapturingStream::PipeWire(ref mut pw_stream) => pw_stream.to_async_stream(),
+            LinuxCapturingStream::PulseAudio(ref mut pa_stream) => pa_stream.to_async_stream().map_err(AudioError::from),
+        }
+    }
+}
+
 
 // --- New Skeleton Implementations ---
 
@@ -278,9 +570,9 @@ impl AudioDevice for LinuxAudioDevice {
     /// Sets up basic PipeWire stream properties.
     fn create_stream(
         &mut self,
-        capture_config: &AudioCaptureConfig, // capture_config will be used in LinuxAudioStream setup
-    ) -> AudioResult<Box<dyn CapturingStream>> {
-        // log::debug!("LinuxAudioDevice::create_stream for device ID: {}", self.id);
+        capture_config: &AudioCaptureConfig,
+    ) -> AudioResult<Box<dyn CapturingStream + 'static>> { // Corrected return type to match trait
+        debug!("LinuxAudioDevice::create_stream for device ID: {}", self.id);
 
         let core = self.core_context.core();
         // MainLoop is managed by PipewireCoreContext, stream will use it.
@@ -323,13 +615,15 @@ impl AudioDevice for LinuxAudioDevice {
             AudioError::BackendError(format!("Failed to create PipeWire stream: {}", e))
         })?;
 
-        // log::info!("PipeWire stream created for device ID: {}", self.id);
-        Ok(Box::new(LinuxAudioStream::new(
+        info!("PipeWire stream created for device ID: {}", self.id);
+        let concrete_stream = LinuxAudioStream::new(
             stream,
             Arc::clone(&self.core_context),
             capture_config.stream_config.format.clone(),
             self.id,
-        )))
+        );
+        // Wrap the concrete LinuxAudioStream in LinuxCapturingStream::PipeWire and then Box it.
+        Ok(Box::new(LinuxCapturingStream::PipeWire(Box::new(concrete_stream))))
     }
 }
 
@@ -346,12 +640,13 @@ impl LinuxDeviceEnumerator {
         // This should ideally be done using std::sync::Once or similar.
         // For this subtask, we'll call it here directly.
         // A more robust solution would manage this globally.
-        // TODO: Move pipewire::init() to a global, once-per-application call.
-        pipewire::init();
+        // pipewire::init(); // Moved to LinuxAudioBackend::new with Once guard
 
         let core_context = Arc::new(PipewireCoreContext::new()?);
         Ok(Self { core_context })
     }
+
+    // Removed get_device_by_id_str as it's not needed if get_device_by_id is correctly used.
 }
 
 // TODO: Implement Drop for LinuxDeviceEnumerator if pipewire::init() needs a corresponding pipewire::deinit()
@@ -368,7 +663,7 @@ impl LinuxDeviceEnumerator {
 struct DefaultDeviceSearchState {
     default_sink_name: Option<String>,
     default_sink_id: Option<u32>,
-    monitor_device: Option<Box<dyn AudioDevice>>,
+    monitor_device: Option<LinuxAudioDevice>, // Changed type
     main_loop_quit_handle: MainLoop, // To call quit
 }
 
@@ -376,30 +671,22 @@ impl DeviceEnumerator for LinuxDeviceEnumerator {
     type Device = LinuxAudioDevice;
 
     /// Enumerates available audio capture devices (monitor sources).
-    ///
-    /// For subtask 6.2, this is a simplified implementation that attempts to find
-    /// the monitor source of the default audio sink.
-    ///
-    /// TODO: Implement full enumeration of all available monitor sources in a later subtask.
-    fn enumerate_devices(&self) -> AudioResult<Vec<Box<dyn AudioDevice>>> {
-        // log::debug!("LinuxDeviceEnumerator::enumerate_devices()");
-        // TODO: Implement full enumeration of all available monitor sources.
-        // For now, it calls get_default_device for DeviceKind::Input.
-        match self.get_default_device(DeviceKind::Input) {
-            Ok(Some(device)) => Ok(vec![device]),
-            Ok(None) => Ok(Vec::new()),
+    fn enumerate_devices(&self) -> AudioResult<Vec<LinuxAudioDevice>> { // Changed return type
+        debug!("LinuxDeviceEnumerator::enumerate_devices()");
+        match self.get_default_device(DeviceKind::Input) { // Returns AudioResult<LinuxAudioDevice>
+            Ok(device) => Ok(vec![device]),
+            Err(AudioError::DeviceNotFound) => Ok(Vec::new()), // If no default, return empty list
             Err(e) => Err(e),
         }
     }
 
     /// Gets the default audio device of the specified kind.
-    ///
-    /// For `DeviceKind::Input`, this attempts to find the monitor source of the
-    /// default audio sink. For `DeviceKind::Output`, it returns `Ok(None)`.
-    fn get_default_device(&self, kind: DeviceKind) -> AudioResult<Option<Box<dyn AudioDevice>>> {
-        // log::debug!("LinuxDeviceEnumerator::get_default_device(kind: {:?})", kind);
+    fn get_default_device(&self, kind: DeviceKind) -> AudioResult<LinuxAudioDevice> { // Changed return type
+        debug!("LinuxDeviceEnumerator::get_default_device(kind: {:?})", kind);
         if kind == DeviceKind::Output {
-            return Ok(None); // This enumerator is for capture (input) devices
+            // This enumerator is for capture (input) devices.
+            // The trait expects Self::Device, so we must return an error if it's not an input.
+            return Err(AudioError::DeviceNotFound); // Corrected: DeviceNotFound is unit-like
         }
 
         let core = self.core_context.core();
@@ -502,7 +789,7 @@ impl DeviceEnumerator for LinuxDeviceEnumerator {
                                             props.cloned(),
                                             Arc::clone(&self.core_context),
                                         );
-                                        state.monitor_device = Some(Box::new(device));
+                                        state.monitor_device = Some(device); // Store concrete type
                                         state.main_loop_quit_handle.quit();
                                     }
                                 }
@@ -525,57 +812,48 @@ impl DeviceEnumerator for LinuxDeviceEnumerator {
 
         // Extract the device from the state
         let mut state_guard = search_state.lock().unwrap();
-        Ok(state_guard.monitor_device.take())
+        state_guard.monitor_device.take().ok_or_else(|| {
+            AudioError::DeviceNotFound // Corrected: DeviceNotFound is unit-like
+        })
     }
 
     /// Gets a specific audio device by its ID.
-    ///
-    /// The `id_str` is the string representation of the PipeWire node ID.
-    /// `kind` can be used to filter, but is ignored for this simplified implementation.
-    ///
-    /// TODO: Implement actual device lookup and validation in a later subtask.
     fn get_device_by_id(
         &self,
-        id_str: &LinuxPipeWireDeviceId,
-        _kind: Option<DeviceKind>,
-    ) -> AudioResult<Option<Box<dyn AudioDevice>>> {
-        // log::debug!("LinuxDeviceEnumerator::get_device_by_id(id_str: {:?}, kind: {:?})", id_str, _kind);
-        // The DeviceId (String) needs to be parsed to a u32 if it represents a PipeWire node ID.
-        // Use the registry to get information about the node with this ID.
-        // Check if it's a suitable capture node (monitor source). If so, create and return LinuxAudioDevice.
-
-        // Attempt to parse the ID string to u32.
-        let _node_id = match id_str.parse::<u32>() {
+        id_str: &LinuxPipeWireDeviceId, // This is &String, as per Self::Device::DeviceId
+    ) -> AudioResult<LinuxAudioDevice> { // Changed return type
+        debug!("LinuxDeviceEnumerator::get_device_by_id(id_str: {:?})", id_str);
+        
+        let _node_id_u32 = match id_str.parse::<u32>() {
             Ok(id) => id,
             Err(_) => {
-                return Err(AudioError::InvalidDeviceId(format!(
-                    "Invalid PipeWire node ID string: {}",
+                return Err(AudioError::InvalidParameter(format!( // Changed to InvalidParameter for clarity
+                    "Invalid PipeWire node ID string: {}. Expected a u32.",
                     id_str
-                )))
+                )));
             }
         };
 
-        // TODO: Implement actual device lookup by ID using the PipeWire registry
-        // and verify it's a suitable monitor source. For subtask 6.2, this is not implemented.
-        // log::warn!("get_device_by_id for PipeWire is not fully implemented yet. Returning Ok(None). ID requested: {}", id_str);
-        Ok(None)
-        // Alternatively, to strictly follow the prompt's allowance for NotImplemented:
-        // Err(AudioError::NotImplemented("Device lookup by ID for PipeWire is not yet implemented.".to_string()))
+        // TODO: Implement actual device lookup by ID using the PipeWire registry.
+        // For now, per subtask instructions and to satisfy trait, return DeviceNotFound.
+        warn!(
+            "get_device_by_id for PipeWire is not fully implemented. ID requested: {}",
+            id_str
+        );
+        Err(AudioError::DeviceNotFound) // Corrected: DeviceNotFound is unit-like
     }
 
     /// Gets a list of available input audio devices.
-    /// For PipeWire, these are typically monitor sources.
-    fn get_input_devices(&self) -> AudioResult<Vec<Box<dyn AudioDevice>>> {
-        // log::debug!("LinuxDeviceEnumerator::get_input_devices()");
-        // For now, this is consistent with enumerate_devices which focuses on the default input.
-        // A full implementation would list all suitable input (monitor) nodes.
+    fn get_input_devices(&self) -> AudioResult<Vec<LinuxAudioDevice>> { // Changed return type
+        debug!("LinuxDeviceEnumerator::get_input_devices()");
+        // This should ideally perform a full enumeration. For now, it relies on enumerate_devices.
         self.enumerate_devices()
     }
 
     /// Gets a list of available output audio devices.
-    /// This enumerator focuses on capture sources, so this will return an empty list.
-    fn get_output_devices(&self) -> AudioResult<Vec<Box<dyn AudioDevice>>> {
-        // log::debug!("LinuxDeviceEnumerator::get_output_devices()");
+    fn get_output_devices(&self) -> AudioResult<Vec<LinuxAudioDevice>> { // Changed return type
+        debug!("LinuxDeviceEnumerator::get_output_devices()");
+        // This enumerator focuses on capture sources.
         Ok(Vec::new())
     }
 }

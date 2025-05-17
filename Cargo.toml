@@ -22,7 +22,7 @@ test-utils = [] # Feature to enable test utilities
 [dependencies]
 # Core dependencies
 futures-core = "0.3.31"
-futures-channel = "0.3"                                    # For MPSC channel for async stream
+futures-channel = "0.3.31"                                 # For MPSC channel for async stream
 hound = "3.5.1"
 sysinfo = "0.35.1"
 clap = { version = "4.5.38", features = ["derive"] }
@@ -42,7 +42,7 @@ rand_pcg = "0.9.0"
 # Platform-specific audio capture
 [target.'cfg(target_os = "windows")'.dependencies]
 wasapi = "0.17.0"
-windows = { version = "0.56.0", features = [
+windows = { version = "0.61.1", features = [
     "Win32_Foundation",  # For basic Windows types like HRESULT, BOOL, HANDLE
     "Win32_System_Com",  # For COM initialization (CoInitializeEx, CoUninitialize) and operations (CoCreateInstance, CLSCTX_ALL)
     "Win32_Media_Audio", # For WASAPI interfaces (IMMDeviceEnumerator, MMDeviceEnumerator, IMMDevice, IAudioClient, IAudioCaptureClient, WAVEFORMATEX, IAudioSessionManager2, IAudioSessionEnumerator, IAudioSessionControl, IAudioSessionControl2)
@@ -54,14 +54,15 @@ windows = { version = "0.56.0", features = [
 [target.'cfg(target_os = "linux")'.dependencies]
 # libpipewire-0.3-dev, pkg-config, build-essential, clang, libclang-dev, and llvm-dev are required for building.
 # This crate provides bindings to the PipeWire multimedia framework.
-pipewire = "0.9.1"
+pipewire = "0.8.0"
+libpulse-binding = "2.30.1"
 
 [target.'cfg(target_os = "macos")'.dependencies]
-coreaudio-rs = "0.10.0"
-coreaudio-sys = "0.2.2"
+coreaudio-rs = "0.12.1"
+coreaudio-sys = "0.2.16"
 objc = "0.2.7"
-cocoa = "0.25.0"
-core-foundation-sys = "0.8.6"
+cocoa = "0.26.0"
+core-foundation-sys = "0.8.7"
 
 # Error handling
 thiserror = "2.0.12"
