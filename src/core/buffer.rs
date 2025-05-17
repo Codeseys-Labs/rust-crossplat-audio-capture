@@ -1,24 +1,25 @@
 use crate::core::config::AudioFormat;
-// Removed: use crate::core::error::AudioResult;
-// Removed: use crate::core::interface::AudioBuffer; // This trait is being replaced by the struct below
-use std::time::Instant;
+use std::time::Duration;
 
 /// Represents a buffer of audio data.
 ///
 /// This struct holds raw audio samples along with metadata such as the number of channels,
-/// sample rate, audio format, and a timestamp indicating when the buffer was captured or created.
-#[derive(Debug, Clone)]
+/// sample rate, audio format, and a timestamp indicating when the buffer was captured or created
+/// (relative to an epoch).
+#[derive(Debug, Clone, Send, Sync)]
 pub struct AudioBuffer {
     /// The raw audio data, typically interleaved if multi-channel.
+    /// Using `f32` as the default data type for samples.
     pub data: Vec<f32>,
     /// The number of audio channels (e.g., 1 for mono, 2 for stereo).
     pub channels: u16,
     /// The sample rate of the audio data in Hz (e.g., 44100, 48000).
     pub sample_rate: u32,
-    /// The format of the audio samples (e.g., F32, S16).
+    /// The format of the audio samples.
     pub format: AudioFormat,
-    /// The timestamp indicating when this buffer was captured or generated.
-    pub timestamp: Instant,
+    /// The timestamp indicating when this buffer was captured or generated,
+    /// relative to a consistent epoch (e.g., application start time or stream start time).
+    pub timestamp: Duration,
 }
 
 impl AudioBuffer {
@@ -30,13 +31,13 @@ impl AudioBuffer {
     /// * `channels` - The number of audio channels.
     /// * `sample_rate` - The sample rate in Hz.
     /// * `format` - The `AudioFormat` of the samples.
-    /// * `timestamp` - The `Instant` the buffer was created/captured.
+    /// * `timestamp` - The `Duration` representing the capture time relative to an epoch.
     pub fn new(
         data: Vec<f32>,
         channels: u16,
         sample_rate: u32,
         format: AudioFormat,
-        timestamp: Instant,
+        timestamp: Duration,
     ) -> Self {
         AudioBuffer {
             data,
@@ -47,9 +48,29 @@ impl AudioBuffer {
         }
     }
 
-    /// Returns a slice view of the audio data.
-    pub fn as_slice(&self) -> &[f32] {
+    /// Returns a slice view of the raw audio data.
+    pub fn data(&self) -> &[f32] {
         &self.data
+    }
+
+    /// Returns the number of audio channels.
+    pub fn channels(&self) -> u16 {
+        self.channels
+    }
+
+    /// Returns the sample rate in Hz.
+    pub fn sample_rate(&self) -> u32 {
+        self.sample_rate
+    }
+
+    /// Returns the audio format.
+    pub fn format(&self) -> &AudioFormat {
+        &self.format
+    }
+
+    /// Returns the timestamp of the buffer.
+    pub fn timestamp(&self) -> Duration {
+        self.timestamp
     }
 
     /// Returns the number of audio frames in the buffer.
@@ -65,8 +86,7 @@ impl AudioBuffer {
     }
 
     // Placeholder for future methods if needed, e.g., to_interleaved, to_planar, etc.
-    // Or methods to get duration, etc.
 }
 
-// VecAudioBuffer and its impl AudioBuffer for VecAudioBuffer have been removed
-// as AudioBuffer is now a concrete struct.
+// Comments indicate that VecAudioBuffer and the old AudioBuffer trait
+// were already removed or planned for removal, aligning with this refactoring.

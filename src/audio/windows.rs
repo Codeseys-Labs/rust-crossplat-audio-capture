@@ -655,6 +655,7 @@ pub(crate) struct WindowsAudioStream {
     wave_format: WAVEFORMATEX, // Store the format it was initialized with
     _com_initializer: Arc<ComInitializer>, // Ensures COM is alive for the stream
     is_started: Arc<AtomicBool>, // Tracks if Start() has been called
+    stream_start_time: Instant, // Epoch for timestamping audio buffers
     /// Optional Process ID of the application to target for audio capture.
     pub target_pid: Option<u32>,
     /// Optional session identifier of the application to target for audio capture.
@@ -667,6 +668,7 @@ impl WindowsAudioStream {
     /// This is typically called by `WindowsAudioDevice::create_stream` after
     /// successfully initializing the `IAudioClient` and obtaining the `IAudioCaptureClient`.
     /// It also accepts optional application targeting information.
+    /// It records the stream creation time to be used as an epoch for `AudioBuffer` timestamps.
     ///
     /// # Arguments
     /// * `audio_client` - The initialized `IAudioClient` for the stream.
@@ -689,17 +691,20 @@ impl WindowsAudioStream {
             wave_format,
             _com_initializer: com_initializer,
             is_started: Arc::new(AtomicBool::new(false)),
+            stream_start_time: Instant::now(), // Record stream start time as epoch
             target_pid,
             target_session_identifier,
         }
     }
 
     /// Processes raw WASAPI packet data into an `AudioBuffer`.
+    /// Timestamps are generated relative to the provided `stream_start_time`.
     ///
     /// # Arguments
     /// * `p_data` - Pointer to the raw buffer data from `IAudioCaptureClient::GetBuffer`.
     /// * `num_frames_read` - Number of audio frames read into `p_data`.
     /// * `source_wave_format` - The `WAVEFORMATEX` describing the format of `p_data`.
+    /// * `stream_start_time` - The `Instant` the stream was started, used as epoch for timestamps.
     ///
     /// # Returns
     /// An `AudioResult` containing an `AudioBuffer` struct on success,
@@ -708,6 +713,7 @@ impl WindowsAudioStream {
         p_data: *const u8, // Changed from *mut u8 as we only read
         num_frames_read: u32,
         source_wave_format: &WAVEFORMATEX,
+        stream_start_time: Instant,
     ) -> AudioResult<AudioBuffer> {
         // Return concrete AudioBuffer struct
         if num_frames_read == 0 {
@@ -775,12 +781,15 @@ impl WindowsAudioStream {
             sample_format: SampleFormat::F32LE, // Standard for f32
         };
 
+        // Timestamp is duration since stream start.
+        let timestamp = Instant::now().duration_since(stream_start_time);
+
         Ok(AudioBuffer {
             data: converted_samples_vec,
             channels, // u16
             sample_rate: source_wave_format.nSamplesPerSec,
             format: output_audio_format_struct,
-            timestamp: Instant::now(), // Placeholder timestamp for subtask 11.1
+            timestamp,
         })
     }
 }
@@ -953,6 +962,7 @@ impl CapturingStream for WindowsAudioStream {
                 p_data as *const u8, // Cast to *const u8 for the helper
                 num_frames_read,
                 &self.wave_format,
+                self.stream_start_time, // Pass the stream start time
             ); // This now returns AudioResult<AudioBuffer>
 
             // Release the buffer regardless of conversion success/failure
@@ -1022,6 +1032,7 @@ impl CapturingStream for WindowsAudioStream {
         let capture_client_clone = self.capture_client.clone();
         let wave_format_clone = self.wave_format;
         let stream_is_started_clone = self.is_started.clone();
+        let stream_start_time_clone = self.stream_start_time; // Clone the start time
         let target_pid_clone = self.target_pid; // Clone Option<u32>
 
         thread::spawn(move || {
@@ -1155,6 +1166,7 @@ impl CapturingStream for WindowsAudioStream {
                     p_data as *const u8,
                     num_frames_read_from_buffer,
                     &wave_format_clone,
+                    stream_start_time_clone, // Pass the cloned start time
                 );
 
                 let hr_release_data =

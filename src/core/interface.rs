@@ -127,7 +127,7 @@ pub trait CapturingStream: Send + Sync {
     ///
     /// # Returns
     /// * `Ok(Some(buffer))`: If a chunk of audio data was successfully read. The `buffer`
-    ///   is a `Box<dyn AudioBuffer>` containing the audio samples.
+    ///   is an `AudioBuffer` struct containing the audio samples.
     /// * `Ok(None)`: If the timeout occurred before any data was available. This is only
     ///   returned if `timeout_ms` was `Some`. If `timeout_ms` was `None` and the backend
     ///   waits indefinitely, this variant typically wouldn't be returned unless the stream
@@ -138,10 +138,9 @@ pub trait CapturingStream: Send + Sync {
     /// # Example
     /// ```rust,ignore
     /// // Assuming `stream` is a mutable reference to a type implementing `CapturingStream`
-    /// // and `AudioBuffer` is a trait for audio data.
     /// match stream.read_chunk(Some(100)) { // Timeout after 100ms
     ///     Ok(Some(audio_buffer)) => {
-    ///         println!("Read {} frames of audio.", audio_buffer.get_length_frames());
+    ///         println!("Read {} frames of audio.", audio_buffer.num_frames());
     ///         // Process the audio_buffer...
     ///     }
     ///     Ok(None) => {
@@ -158,15 +157,15 @@ pub trait CapturingStream: Send + Sync {
     ///
     /// This method allows consuming audio data using asynchronous patterns,
     /// integrating with Rust's async ecosystem (e.g., `tokio`, `async-std`).
-    /// The returned stream will yield `AudioResult<Box<dyn AudioBuffer<Sample = f32>>>` items.
+    /// The returned stream will yield `AudioResult<AudioBuffer>` items.
     ///
     /// The lifetime `'a` ties the returned stream to the lifetime of the `CapturingStream` instance.
     /// The stream items are `AudioResult` to allow for error propagation from the underlying
-    /// audio capture mechanism. Each successful item is a `Box<dyn AudioBuffer<Sample = f32>>`.
+    /// audio capture mechanism. Each successful item is an `AudioBuffer` struct.
     ///
     /// # Returns
     /// An `AudioResult` containing a pinned, boxed, dynamic `futures_core::Stream`.
-    /// The stream yields `AudioResult<Box<dyn AudioBuffer<Sample = f32>>>`.
+    /// The stream yields `AudioResult<AudioBuffer>`.
     /// Returns an `AudioError` if the asynchronous stream cannot be created.
     ///
     /// # Example
@@ -183,8 +182,8 @@ pub trait CapturingStream: Send + Sync {
     ///                     Ok(audio_buffer) => {
     ///                         println!(
     ///                             "Async: Received audio buffer with {} frames, format: {:?}",
-    ///                             audio_buffer.get_length_frames(),
-    ///                             audio_buffer.get_format()
+    ///                             audio_buffer.num_frames(),
+    ///                             audio_buffer.format()
     ///                         );
     ///                         // Process the audio_buffer...
     ///                     }

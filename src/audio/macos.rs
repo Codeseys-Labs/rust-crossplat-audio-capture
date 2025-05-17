@@ -365,6 +365,7 @@ pub(crate) struct MacosAudioStream {
     /// standard `AudioFormat` (interleaved `f32` samples). Each element is
     /// an `AudioResult` wrapping an `AudioBuffer` struct.
     data_queue: Arc<Mutex<VecDeque<AudioResult<AudioBuffer>>>>, // Changed to AudioBuffer struct
+    stream_start_time: Instant, // Epoch for timestamping audio buffers
     // _input_callback_handle: Option<Box<dyn Any + Send + Sync>>, // Not strictly needed if closure is 'static
 }
 
@@ -394,6 +395,7 @@ impl MacosAudioStream {
             current_asbd: Arc::new(Mutex::new(None)),
             // TODO: Consider making queue capacity configurable.
             data_queue: Arc::new(Mutex::new(VecDeque::with_capacity(10))),
+            stream_start_time: Instant::now(), // Record stream start time as epoch
             // _input_callback_handle: None,
         }
     }
@@ -429,6 +431,7 @@ impl CapturingStream for MacosAudioStream {
         let data_queue_clone = self.data_queue.clone();
         let current_asbd_clone = self.current_asbd.clone();
         let is_started_clone = self.is_started.clone();
+        let stream_start_time_clone = self.stream_start_time; // Clone for the closure
         // let audio_unit_instance_clone = self.audio_unit.clone(); // AudioUnit is not Clone
 
         // 3. Set the input callback.
@@ -573,7 +576,7 @@ impl CapturingStream for MacosAudioStream {
                         channels: target_format.channels,
                         sample_rate: target_format.sample_rate,
                         format: target_format,
-                        timestamp: Instant::now(), // Placeholder timestamp
+                        timestamp: Instant::now().duration_since(stream_start_time_clone), // Timestamp relative to stream start
                     };
                     
                     let mut queue = data_queue_clone.lock().unwrap();
@@ -992,6 +995,7 @@ pub struct MacosApplicationAudioStream {
     /// standard `AudioFormat` (interleaved `f32` samples). Each element is
     /// an `AudioResult` wrapping an `AudioBuffer` struct.
     data_queue: Arc<Mutex<VecDeque<AudioResult<AudioBuffer>>>>, // Changed to AudioBuffer struct
+    stream_start_time: Instant, // Epoch for timestamping audio buffers
     // _input_callback_handle: Option<Box<dyn std::any::Any + Send + Sync>>, // If needed for callback lifetime
 }
 
@@ -1120,6 +1124,7 @@ impl MacosApplicationAudioStream {
             is_started: Arc::new(AtomicBool::new(false)),
             native_tap_asbd: Arc::new(Mutex::new(Some(tap_asbd))),
             data_queue: Arc::new(Mutex::new(VecDeque::with_capacity(10))), // Default capacity
+            stream_start_time: Instant::now(), // Record stream start time as epoch
         })
     }
 }
@@ -1157,6 +1162,7 @@ impl CapturingStream for MacosApplicationAudioStream {
         let data_queue_clone = self.data_queue.clone();
         let native_tap_asbd_clone = self.native_tap_asbd.clone();
         let is_started_clone = self.is_started.clone();
+        let stream_start_time_clone = self.stream_start_time; // Clone for the closure
         // AudioUnit is not Clone, will be accessed via RenderArgs.audio_unit_ref
 
         self.audio_unit.set_input_callback(
@@ -1288,7 +1294,7 @@ impl CapturingStream for MacosApplicationAudioStream {
                         channels: output_audio_format.channels,
                         sample_rate: output_audio_format.sample_rate,
                         format: output_audio_format,
-                        timestamp: Instant::now(), // Placeholder timestamp
+                        timestamp: Instant::now().duration_since(stream_start_time_clone), // Timestamp relative to stream start
                     };
                     
                     let mut queue = data_queue_clone.lock().unwrap();

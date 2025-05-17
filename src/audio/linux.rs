@@ -600,10 +600,12 @@ pub(crate) struct LinuxAudioStream {
     initial_config_format: AudioFormat,
     /// The PipeWire node ID to connect to for capture.
     target_node_id: u32,
+    stream_start_time: Instant, // Epoch for timestamping audio buffers
 }
 
 impl LinuxAudioStream {
     /// Creates a new `LinuxAudioStream`.
+    /// Records the stream creation time to be used as an epoch for `AudioBuffer` timestamps.
     ///
     /// # Arguments
     /// * `stream` - The `pipewire::Stream` object already created and configured with basic properties.
@@ -625,6 +627,7 @@ impl LinuxAudioStream {
             data_queue: Arc::new(Mutex::new(VecDeque::with_capacity(10))), // Initialize data_queue
             initial_config_format,
             target_node_id,
+            stream_start_time: Instant::now(), // Record stream start time as epoch
         }
     }
 
@@ -750,6 +753,7 @@ impl CapturingStream for LinuxAudioStream {
         let is_started_clone = self.is_started.clone();
         let current_format_clone = self.current_format.clone();
         let data_queue_clone = self.data_queue.clone(); // For 6.5
+        let stream_start_time_clone = self.stream_start_time; // Clone for the closure
  
         let listener = self
             .stream
@@ -793,7 +797,8 @@ impl CapturingStream for LinuxAudioStream {
             })
             .process(move |stream_ref| {
                 // This callback is invoked by PipeWire when new audio data is available.
-                // It dequeues the buffer, converts data to f32, and pushes to data_queue_clone.
+                // It dequeues the buffer, converts data to f32, generates a timestamp,
+                // and pushes to data_queue_clone.
                 let negotiated_format_opt = current_format_clone.lock().unwrap().clone();
                 let mut data_queue_locked = data_queue_clone.lock().unwrap();
 
@@ -902,7 +907,7 @@ impl CapturingStream for LinuxAudioStream {
                     channels: output_buffer_format.channels,
                     sample_rate: output_buffer_format.sample_rate,
                     format: output_buffer_format,
-                    timestamp: Instant::now(), // Placeholder timestamp
+                    timestamp: Instant::now().duration_since(stream_start_time_clone), // Timestamp relative to stream start
                 };
                 data_queue_locked.push_back(Ok(audio_buffer_struct)); // Changed to AudioBuffer struct
             })

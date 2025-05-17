@@ -1,4 +1,5 @@
 pub mod audio;
+pub mod realtime_processing_tests;
 
 #[cfg(test)]
 mod tests {
