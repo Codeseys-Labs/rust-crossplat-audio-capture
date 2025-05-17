@@ -2,6 +2,7 @@
 
 use super::config::{AudioCaptureConfig, AudioFormat, StreamConfig};
 use super::error::{AudioError, Result as AudioResult}; // Renamed to avoid conflict
+use crate::core::buffer::AudioBuffer; // Added for the new AudioBuffer struct
 
 /// Represents the kind of an audio device.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -151,10 +152,7 @@ pub trait CapturingStream: Send + Sync {
     ///     }
     /// }
     /// ```
-    fn read_chunk(
-        &mut self,
-        timeout_ms: Option<u32>,
-    ) -> AudioResult<Option<Box<dyn AudioBuffer<Sample = f32>>>>;
+    fn read_chunk(&mut self, timeout_ms: Option<u32>) -> AudioResult<Option<AudioBuffer>>;
 
     /// Converts the synchronous capturing stream into an asynchronous stream.
     ///
@@ -216,12 +214,7 @@ pub trait CapturingStream: Send + Sync {
         &'a mut self,
     ) -> AudioResult<
         std::pin::Pin<
-            Box<
-                dyn futures_core::Stream<Item = AudioResult<Box<dyn AudioBuffer<Sample = f32>>>>
-                    + Send
-                    + Sync
-                    + 'a,
-            >,
+            Box<dyn futures_core::Stream<Item = AudioResult<AudioBuffer>> + Send + Sync + 'a>,
         >,
     >;
 
@@ -434,111 +427,5 @@ pub enum SampleType {
     // Add other common formats like U16, S24, F64 etc.
 }
 
-/// A trait for handling and manipulating buffers of audio data.
-///
-/// This trait provides methods for accessing, modifying, and converting
-/// audio data within a buffer.
-pub trait AudioBuffer {
-    /// The type of samples stored in this buffer (e.g., `f32`, `i16`).
-    type Sample: Clone + Copy + std::fmt::Debug + Send + Sync; // Should align with SampleType
-
-    /// Returns a slice providing read-only access to the raw sample data.
-    ///
-    /// # Returns
-    /// A slice of `Self::Sample` representing the buffer's content.
-    fn as_slice(&self) -> &[Self::Sample];
-
-    /// Returns a mutable slice providing read-write access to the raw sample data.
-    ///
-    /// # Returns
-    /// A mutable slice of `Self::Sample` representing the buffer's content.
-    fn as_mut_slice(&mut self) -> &mut [Self::Sample];
-
-    /// Reads data from the buffer into a provided slice.
-    ///
-    /// # Parameters
-    /// * `offset_frames`: The starting frame offset within this `AudioBuffer` to read from.
-    /// * `destination`: The slice to read the audio frames into.
-    /// * `frames_to_read`: The number of frames to read.
-    ///
-    /// # Returns
-    /// The number of frames actually read, or an `AudioError` if the read operation failed
-    /// (e.g., out of bounds). The number of frames read can be less than `frames_to_read`
-    /// if the end of the buffer is reached.
-    fn read_frames(
-        &self,
-        offset_frames: usize,
-        destination: &mut [Self::Sample],
-        frames_to_read: usize,
-    ) -> AudioResult<usize>;
-
-    /// Writes data from a slice into the buffer.
-    ///
-    /// # Parameters
-    /// * `offset_frames`: The starting frame offset within this `AudioBuffer` to write to.
-    /// * `source`: The slice containing audio frames to write into the buffer.
-    /// * `frames_to_write`: The number of frames to write from the source.
-    ///
-    /// # Returns
-    /// The number of frames actually written, or an `AudioError` if the write operation failed
-    /// (e.g., buffer overflow, out of bounds). The number of frames written can be less than
-    /// `frames_to_write` if the buffer's capacity is reached.
-    fn write_frames(
-        &mut self,
-        offset_frames: usize,
-        source: &[Self::Sample],
-        frames_to_write: usize,
-    ) -> AudioResult<usize>;
-
-    /// Returns the current number of valid audio frames in the buffer.
-    /// This is the amount of data that has been written or is considered "filled".
-    fn get_length_frames(&self) -> usize;
-
-    /// Returns the total capacity of the buffer in audio frames.
-    /// This is the maximum amount of data the buffer can hold.
-    fn get_capacity_frames(&self) -> usize;
-
-    /// Returns the `AudioFormat` of the data stored in this buffer.
-    fn get_format(&self) -> AudioFormat;
-
-    /// Converts the audio data in this buffer to a different `AudioFormat`.
-    ///
-    /// This operation might create a new buffer or modify the existing one in place,
-    /// depending on the implementation.
-    ///
-    /// # Parameters
-    /// * `target_format`: The `AudioFormat` to convert the data to.
-    ///
-    /// # Returns
-    /// A new `AudioBuffer` (or a modified self, TBD by implementor choice) containing
-    /// the converted data, or an `AudioError` if conversion failed.
-    /// For simplicity, let's assume it returns a new buffer for now.
-    fn convert_to_format(
-        &self,
-        target_format: &AudioFormat,
-    ) -> AudioResult<Box<dyn AudioBuffer<Sample = Self::Sample>>>;
-    // TODO: The Sample type might need to change based on target_format, making this more complex.
-    // For now, Self::Sample is kept, implying conversion between sample rates/channels but not bit depth/type.
-    // A more robust solution might involve an associated type for the converted buffer or generic parameters.
-
-    /// Clears the buffer, effectively setting its length to zero.
-    /// The capacity remains unchanged. Data may or may not be zeroed out.
-    fn clear(&mut self);
-
-    /// Resizes the buffer's current length.
-    ///
-    /// If the new length is greater than the current length, the new elements
-    /// are uninitialized (or filled with a default value like zero, depending on implementation).
-    /// If the new length is greater than capacity, this might reallocate or return an error.
-    /// For simplicity, let's assume it can fail if new_length_frames > capacity.
-    ///
-    /// # Parameters
-    /// * `new_length_frames`: The new length of the buffer in frames.
-    ///
-    /// # Returns
-    /// `Ok(())` if successful, or an `AudioError` if resizing failed (e.g. new length exceeds capacity).
-    fn resize_length(&mut self, new_length_frames: usize) -> AudioResult<()>;
-
-    // Potentially add methods for changing capacity if buffers are dynamically sizable.
-    // fn set_capacity_frames(&mut self, new_capacity_frames: usize) -> Result<(), AudioError>;
-}
+// The AudioBuffer trait has been removed from this file.
+// It is now a concrete struct defined in src/core/buffer.rs.

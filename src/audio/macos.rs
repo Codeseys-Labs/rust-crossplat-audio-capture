@@ -6,9 +6,10 @@
 
 use crate::audio::core::{
     AudioCaptureConfig, AudioDevice, AudioError, AudioFormat, AudioResult, CapturingStream,
-    DeviceEnumerator, DeviceId, DeviceKind, SampleFormat, AudioBuffer,
+    DeviceEnumerator, DeviceId, DeviceKind, SampleFormat,
+    // AudioBuffer trait is removed, struct will be imported from crate::core::buffer
 };
-use crate::core::buffer::VecAudioBuffer; // For creating AudioBuffer instances
+use crate::core::buffer::AudioBuffer; // This is the new AudioBuffer struct
 use coreaudio_rs::audio_buffer::AudioBufferList as CAAudioBufferList;
 use coreaudio_rs::audio_object::{
     AudioObject, AudioObjectPropertyAddress, AudioObjectPropertyElement, AudioObjectPropertyScope,
@@ -37,6 +38,7 @@ use std::sync::{
     Arc, Mutex,
 };
 use std::pin::Pin; // Required for Pin<Box<...>> in to_async_stream
+use std::time::Instant; // Added for timestamping
 use futures_channel::mpsc;
 use futures_core::Stream as FuturesStream; // Alias to avoid conflict if Stream is defined elsewhere
 
@@ -361,8 +363,8 @@ pub(crate) struct MacosAudioStream {
     current_asbd: Arc<Mutex<Option<sys::AudioStreamBasicDescription>>>,
     /// A queue to store captured audio data, converted to the library's
     /// standard `AudioFormat` (interleaved `f32` samples). Each element is
-    /// an `AudioResult` wrapping a boxed `AudioBuffer`.
-    data_queue: Arc<Mutex<VecDeque<AudioResult<Box<dyn AudioBuffer<Sample = f32>>>>>>,
+    /// an `AudioResult` wrapping an `AudioBuffer` struct.
+    data_queue: Arc<Mutex<VecDeque<AudioResult<AudioBuffer>>>>, // Changed to AudioBuffer struct
     // _input_callback_handle: Option<Box<dyn Any + Send + Sync>>, // Not strictly needed if closure is 'static
 }
 
@@ -566,13 +568,19 @@ impl CapturingStream for MacosAudioStream {
                         bits_per_sample: 32, // We converted to f32
                         sample_format: SampleFormat::F32LE,
                     };
-                    let audio_buffer = VecAudioBuffer::new(interleaved_f32, target_format);
+                    let audio_buffer_struct = AudioBuffer {
+                        data: interleaved_f32,
+                        channels: target_format.channels,
+                        sample_rate: target_format.sample_rate,
+                        format: target_format,
+                        timestamp: Instant::now(), // Placeholder timestamp
+                    };
                     
                     let mut queue = data_queue_clone.lock().unwrap();
                     if queue.len() == queue.capacity() {
                         queue.pop_front(); // Make space if full (simple strategy)
                     }
-                    queue.push_back(Ok(Box::new(audio_buffer)));
+                    queue.push_back(Ok(audio_buffer_struct)); // Changed to AudioBuffer struct
 
                 } else {
                     eprintln!("AudioUnitRender error in callback: {}", os_status);
@@ -619,7 +627,7 @@ impl CapturingStream for MacosAudioStream {
     /// # Behavior
     /// - If the stream is not running, it returns `Err(AudioError::InvalidOperation)`.
     /// - If a buffer is available in the queue, it returns `Ok(Some(buffer))`.
-    ///   The `buffer` itself is an `AudioResult<Box<dyn AudioBuffer<Sample = f32>>>`
+    ///   The `buffer` itself is an `AudioResult<AudioBuffer>` (the struct)
     ///   from the queue, so if an error occurred during capture in the callback
     ///   (e.g., `AudioUnitRender` failure), this method will propagate that error
     ///   by returning `Err(AudioError::...)`.
@@ -634,11 +642,11 @@ impl CapturingStream for MacosAudioStream {
     /// parameter to enable blocking reads with a timeout.
     ///
     /// # Returns
-    /// - `Ok(Some(Box<dyn AudioBuffer<Sample = f32>>))`: A buffer of audio data.
+    /// - `Ok(Some(AudioBuffer))`: A buffer of audio data (the struct).
     /// - `Ok(None)`: No data currently available in the queue (non-blocking behavior).
     /// - `Err(AudioError)`: An error occurred, such as the stream not running,
     ///   an error propagated from the audio callback, or a mutex lock failure.
-    fn read_chunk(&mut self, _timeout_ms: Option<u32>) -> AudioResult<Option<Box<dyn AudioBuffer<Sample = f32>>>> {
+    fn read_chunk(&mut self, _timeout_ms: Option<u32>) -> AudioResult<Option<AudioBuffer>> { // Changed return type
         if !self.is_running() {
             return Err(AudioError::InvalidOperation("Stream is not running or not started.".to_string()));
         }
@@ -687,7 +695,7 @@ impl CapturingStream for MacosAudioStream {
     ///
     /// # Helper Thread Logic
     /// The helper thread performs the following actions in a loop:
-    /// 1. Tries to pop an `AudioResult<Box<dyn AudioBuffer<Sample = f32>>>` from `data_queue`.
+    /// 1. Tries to pop an `AudioResult<AudioBuffer>` from `data_queue`.
     /// 2. If data is popped:
     ///    - It sends the data via the MPSC sender (`tx`).
     ///    - If sending fails (e.g., the receiver `rx` is dropped), the thread assumes
@@ -701,13 +709,13 @@ impl CapturingStream for MacosAudioStream {
     ///      checking the queue again.
     ///
     /// # Returns
-    /// - `Ok(Pin<Box<dyn futures_core::Stream<Item = AudioResult<Box<dyn AudioBuffer<Sample = f32>>>> + Send + Sync + 'a>>)`:
-    ///   An asynchronous stream of audio buffers.
+    /// - `Ok(Pin<Box<dyn futures_core::Stream<Item = AudioResult<AudioBuffer>> + Send + Sync + 'a>>)`:
+    ///   An asynchronous stream of audio buffers (structs).
     /// - `Err(AudioError::InvalidOperation)`: If the stream has not been started.
     fn to_async_stream<'a>(
         &'a mut self,
     ) -> AudioResult<
-        Pin<Box<dyn futures_core::Stream<Item = AudioResult<Box<dyn AudioBuffer<Sample = f32>>>> + Send + Sync + 'a>>,
+        Pin<Box<dyn futures_core::Stream<Item = AudioResult<AudioBuffer>> + Send + Sync + 'a>>, // Changed to AudioBuffer struct
     > {
         if !self.is_running() {
             return Err(AudioError::InvalidOperation(
@@ -715,7 +723,7 @@ impl CapturingStream for MacosAudioStream {
             ));
         }
 
-        let (tx, rx) = futures_channel::mpsc::unbounded::<AudioResult<Box<dyn AudioBuffer<Sample = f32>>>>();
+        let (tx, rx) = futures_channel::mpsc::unbounded::<AudioResult<AudioBuffer>>(); // Changed to AudioBuffer struct
 
         let data_queue_clone = self.data_queue.clone();
         let is_started_clone = self.is_started.clone();
@@ -944,8 +952,9 @@ use crate::audio::macos::tap::CoreAudioProcessTap;
 // Note: Other necessary imports like AudioUnit, Element, Scope, sys, Arc, Mutex, etc.,
 // are assumed to be covered by existing imports at the top of the file.
 // Explicitly listing some that are definitely needed for clarity in this block:
-use crate::core::buffer::VecAudioBuffer; // Already imported, but good to note
-use crate::audio::core::{AudioFormat, AudioResult, CapturingStream, SampleFormat, AudioBuffer}; // Already imported
+// use crate::core::buffer::VecAudioBuffer; // This will be removed or unused
+use crate::audio::core::{AudioFormat, AudioResult, CapturingStream, SampleFormat}; // AudioBuffer trait removed from here
+// AudioBuffer struct is already imported at the top of the module.
 use coreaudio_rs::audio_unit::{AudioUnit, Element, Scope, RenderArgs};
 use coreaudio_rs::sys::{
     self, kAudioUnitType_Output, kAudioUnitSubType_HALOutput, kAudioUnitManufacturer_Apple,
@@ -981,8 +990,8 @@ pub struct MacosApplicationAudioStream {
     native_tap_asbd: Arc<Mutex<Option<sys::AudioStreamBasicDescription>>>,
     /// A queue to store captured audio data, converted to the library's
     /// standard `AudioFormat` (interleaved `f32` samples). Each element is
-    /// an `AudioResult` wrapping a boxed `AudioBuffer`.
-    data_queue: Arc<Mutex<VecDeque<AudioResult<Box<dyn AudioBuffer<Sample = f32>>>>>>,
+    /// an `AudioResult` wrapping an `AudioBuffer` struct.
+    data_queue: Arc<Mutex<VecDeque<AudioResult<AudioBuffer>>>>, // Changed to AudioBuffer struct
     // _input_callback_handle: Option<Box<dyn std::any::Any + Send + Sync>>, // If needed for callback lifetime
 }
 
@@ -1131,9 +1140,10 @@ impl CapturingStream for MacosApplicationAudioStream {
     ///    d. It converts the raw audio data from the `AudioBufferList` (which is in the
     ///       tap's native format) into an interleaved `Vec<f32>`. This primarily handles
     ///       non-interleaved float data from the tap, converting it to interleaved.
-    ///    e. It creates a `VecAudioBuffer` with the converted data and an `AudioFormat`
-    ///       reflecting F32LE, with channel count and sample rate from the tap's ASBD.
-    ///    f. This `AudioResult<Box<dyn AudioBuffer>>` is then pushed to an internal queue.
+    ///    e. It creates an `AudioBuffer` struct with the converted data, an `AudioFormat`
+    ///       reflecting F32LE (with channel count and sample rate from the tap's ASBD),
+    ///       and a current `Instant::now()` timestamp.
+    ///    f. This `AudioResult<AudioBuffer>` is then pushed to an internal queue.
     /// 4. Starts the `AudioUnit` to begin invoking the callback.
     /// 5. Marks the stream as started.
     ///
@@ -1273,11 +1283,17 @@ impl CapturingStream for MacosApplicationAudioStream {
                         bits_per_sample: 32, // We converted to f32
                         sample_format: SampleFormat::F32LE,
                     };
-                    let audio_buffer = VecAudioBuffer::new(interleaved_f32, output_audio_format);
+                    let audio_buffer_struct = AudioBuffer {
+                        data: interleaved_f32,
+                        channels: output_audio_format.channels,
+                        sample_rate: output_audio_format.sample_rate,
+                        format: output_audio_format,
+                        timestamp: Instant::now(), // Placeholder timestamp
+                    };
                     
                     let mut queue = data_queue_clone.lock().unwrap();
                     if queue.len() == queue.capacity() { queue.pop_front(); }
-                    queue.push_back(Ok(Box::new(audio_buffer)));
+                    queue.push_back(Ok(audio_buffer_struct)); // Changed to AudioBuffer struct
 
                 } else {
                     // Handle AudioUnitRender error
@@ -1367,7 +1383,7 @@ impl CapturingStream for MacosApplicationAudioStream {
     /// # Behavior
     /// - If the stream is not running (i.e., `start()` has not been called or `stop()` has been called),
     ///   it returns `Err(AudioError::InvalidOperation("Stream not started or not in streaming state".to_string()))`.
-    /// - If a buffer is available in the queue, it pops the `AudioResult<Box<dyn AudioBuffer<Sample = f32>>>`.
+    /// - If a buffer is available in the queue, it pops the `AudioResult<AudioBuffer>`.
     ///   - If the popped item is `Ok(buffer)`, it returns `Ok(Some(buffer))`.
     ///   - If the popped item is `Err(error_from_callback)`, this method propagates that error
     ///     by returning `Err(error_from_callback)`. This allows errors occurring during
@@ -1385,12 +1401,12 @@ impl CapturingStream for MacosApplicationAudioStream {
     /// to enable blocking reads with a specified timeout.
     ///
     /// # Returns
-    /// - `Ok(Some(Box<dyn AudioBuffer<Sample = f32>>))`: A buffer containing the captured audio data.
+    /// - `Ok(Some(AudioBuffer))`: A buffer containing the captured audio data (the struct).
     /// - `Ok(None)`: No data is currently available in the queue (non-blocking behavior).
     /// - `Err(AudioError)`: An error occurred. This could be due to the stream not running,
     ///   an error propagated from the audio callback (e.g., capture or processing error),
     ///   or a mutex lock failure.
-    fn read_chunk(&mut self, _timeout_ms: Option<u32>) -> AudioResult<Option<Box<dyn AudioBuffer<Sample = f32>>>> {
+    fn read_chunk(&mut self, _timeout_ms: Option<u32>) -> AudioResult<Option<AudioBuffer>> { // Changed return type
         if !self.is_running() {
             return Err(AudioError::InvalidOperation("Stream not started or not in streaming state".to_string()));
         }
@@ -1415,7 +1431,7 @@ impl CapturingStream for MacosApplicationAudioStream {
     ///    receiver (`rx`) part will form the basis of the returned asynchronous stream.
     /// 3. Spawning a new `std::thread`. This thread is responsible for continuously polling
     ///    the internal `data_queue` of the `MacosApplicationAudioStream`. This queue is
-    ///    populated by the CoreAudio callback with `AudioResult<Box<dyn AudioBuffer<Sample = f32>>>` items.
+    ///    populated by the CoreAudio callback with `AudioResult<AudioBuffer>` items.
     /// 4. Inside the helper thread's loop:
     ///    a. It attempts to pop an item from `data_queue` (after acquiring a lock).
     ///    b. If an `AudioResult` (containing either an audio buffer or an error) is popped:
@@ -1452,7 +1468,7 @@ impl CapturingStream for MacosApplicationAudioStream {
     fn to_async_stream<'a>(
         &'a mut self,
     ) -> AudioResult<
-        Pin<Box<dyn FuturesStream<Item = AudioResult<Box<dyn AudioBuffer<Sample = f32>>>> + Send + Sync + 'a>>,
+        Pin<Box<dyn FuturesStream<Item = AudioResult<AudioBuffer>> + Send + Sync + 'a>>, // Changed to AudioBuffer struct
     > {
         if !self.is_running() {
             return Err(AudioError::InvalidOperation(
@@ -1460,7 +1476,7 @@ impl CapturingStream for MacosApplicationAudioStream {
             ));
         }
 
-        let (tx, rx) = mpsc::unbounded::<AudioResult<Box<dyn AudioBuffer<Sample = f32>>>>();
+        let (tx, rx) = mpsc::unbounded::<AudioResult<AudioBuffer>>(); // Changed to AudioBuffer struct
 
         let data_queue_clone = self.data_queue.clone();
         let is_started_clone = self.is_started.clone();

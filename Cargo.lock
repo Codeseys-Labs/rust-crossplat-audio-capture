@@ -2070,6 +2070,7 @@ dependencies = [
  "coreaudio-rs 0.12.1",
  "criterion",
  "ctrlc",
+ "futures-channel",
  "futures-core",
  "hound",
  "indicatif",

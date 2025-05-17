@@ -11,5 +11,8 @@ pub mod buffer;
 pub mod config;
 pub mod error;
 pub mod interface;
+pub mod processing; // Added processing module
 
-pub use buffer::VecAudioBuffer;
+pub use buffer::AudioBuffer; // Changed from VecAudioBuffer to the new AudioBuffer struct
+pub use error::ProcessError; // Added ProcessError export
+pub use processing::AudioProcessor; // Added AudioProcessor export

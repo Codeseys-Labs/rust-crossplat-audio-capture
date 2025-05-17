@@ -14,25 +14,22 @@ pub use audio::{
     AudioCaptureStream,    // Old API
 };
 // Core type re-exports
-pub use crate::core::buffer::VecAudioBuffer; // Added re-export for VecAudioBuffer
+pub use crate::core::buffer::AudioBuffer; // Changed to re-export the new AudioBuffer struct
 pub use crate::core::config::{
     AudioFileFormat, AudioFormat, DeviceSelector, LatencyMode, SampleFormat, StreamConfig,
 }; // Explicitly re-export StreamConfig and AudioFileFormat
-pub use crate::core::error::{AudioError, Result as CoreAudioResult}; // Alias core::error::Result
+pub use crate::core::error::{AudioError, ProcessError, Result as CoreAudioResult}; // Added ProcessError, Alias core::error::Result
 pub use crate::core::interface::{
-    AudioBuffer,
+    // AudioBuffer trait removed from interface, struct is re-exported from core::buffer
     AudioDevice,
     AudioStream,
+    CapturingStream, // Added CapturingStream
     DeviceEnumerator,
     DeviceKind,
+    SampleType, // SampleType is still relevant for some generic contexts if used
     StreamDataCallback,
-    // SampleType is in core::interface but also SampleFormat in core::config. Clarify if needed.
-    // For now, keeping SampleType from interface as it's used by AudioBuffer trait.
-    // SampleFormat from config is more detailed for format specification.
 };
-// Re-exporting SampleType from interface.rs as it's used by AudioBuffer.
-// SampleFormat from config.rs is for detailed format specification.
-pub use crate::core::interface::SampleType;
+pub use crate::core::processing::AudioProcessor; // Added AudioProcessor re-export
 
 // Re-export new API types
 pub use crate::api::{AudioCapture, AudioCaptureBuilder, AudioCaptureConfig};
@@ -62,6 +59,9 @@ pub use audio::{AudioCaptureError, ProcessAudioCapture};
 // Re-export test utils if the feature is enabled
 #[cfg(feature = "test-utils")]
 pub use utils::test_utils;
+
+// Re-export CapturingStream from core::interface directly for convenience
+pub use crate::core::interface::CapturingStream;
 
 /// Error type for the library
 pub type Error = color_eyre::Report;

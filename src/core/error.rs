@@ -170,5 +170,21 @@ impl std::error::Error for AudioError {
     }
 }
 
+/// Represents errors specific to audio processing operations.
+#[derive(thiserror::Error, Debug, Clone, PartialEq, Eq, Hash)]
+pub enum ProcessError {
+    /// An internal error occurred within the processor.
+    #[error("Internal processing error: {0}")]
+    Internal(String),
+    /// A configuration error prevented processing.
+    #[error("Processing configuration error: {0}")]
+    Configuration(String),
+    /// Required audio data was unavailable for processing.
+    #[error("Audio data unavailable for processing")]
+    DataUnavailable,
+    /// The processing operation failed for an unspecified reason.
+    #[error("Audio processing failed")]
+    Failed,
+}
 /// A convenient Result type alias for operations within this crate.
 pub type Result<T> = std::result::Result<T, AudioError>;

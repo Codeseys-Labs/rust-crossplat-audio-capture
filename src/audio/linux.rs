@@ -10,9 +10,11 @@
 use crate::core::config::{AudioCaptureConfig, AudioConfig, StreamConfig}; // Corrected import path
 use crate::core::error::{AudioError, Result as AudioResult};
 use crate::core::interface::{
-    AudioBuffer, AudioDevice, AudioStream, CapturingStream, DeviceEnumerator, DeviceKind,
+    AudioDevice, AudioStream, CapturingStream, DeviceEnumerator, DeviceKind,
     StreamDataCallback,
+    // AudioBuffer trait is removed, struct will be imported from crate::core::buffer
 };
+use crate::core::buffer::AudioBuffer; // This is the new AudioBuffer struct
 use crate::{AudioFormat, SampleFormat}; // AudioFormat is re-exported from lib.rs
 use pipewire::{
     keys as pw_keys,
@@ -31,6 +33,7 @@ use std::sync::Arc; // Added for Arc
 use std::collections::VecDeque; // For data_queue
 use std::pin::Pin; // For Pin<Box<dyn Stream>>
 use std::sync::atomic::{AtomicBool, Ordering as AtomicOrdering}; // Renamed Ordering to avoid conflict if any
+use std::time::Instant; // Added for timestamping
 use futures_channel::mpsc; // For MPSC channel
 use futures_core::Stream; // For the Stream trait
 
@@ -56,7 +59,7 @@ use pipewire::{
     Properties, // Explicitly import Properties
     stream::Listener as StreamListener, // For listener_handle type
 };
-use crate::core::buffer::VecAudioBuffer; // For creating AudioBuffer objects
+// Removed: use crate::core::buffer::VecAudioBuffer; // Will use AudioBuffer struct directly
  
 use super::core::{AudioApplication, AudioCaptureBackend, AudioCaptureStream};
 
@@ -592,7 +595,7 @@ pub(crate) struct LinuxAudioStream {
     /// Stores the audio format negotiated with PipeWire.
     current_format: Arc<Mutex<Option<AudioFormat>>>,
     /// Queue for audio data received from PipeWire, for subtasks 6.5/6.6.
-    data_queue: Arc<Mutex<VecDeque<AudioResult<Box<dyn AudioBuffer<Sample = f32>>>>>>,
+    data_queue: Arc<Mutex<VecDeque<AudioResult<AudioBuffer>>>>, // Changed to AudioBuffer struct
     /// The initial audio format requested for the stream.
     initial_config_format: AudioFormat,
     /// The PipeWire node ID to connect to for capture.
@@ -894,12 +897,14 @@ impl CapturingStream for LinuxAudioStream {
                     sample_format: SampleFormat::F32LE,
                 };
 
-                let audio_buffer_obj = VecAudioBuffer::new(
-                    converted_samples_vec,
-                    output_buffer_format,
-                    num_frames,
-                );
-                data_queue_locked.push_back(Ok(Box::new(audio_buffer_obj)));
+                let audio_buffer_struct = AudioBuffer {
+                    data: converted_samples_vec,
+                    channels: output_buffer_format.channels,
+                    sample_rate: output_buffer_format.sample_rate,
+                    format: output_buffer_format,
+                    timestamp: Instant::now(), // Placeholder timestamp
+                };
+                data_queue_locked.push_back(Ok(audio_buffer_struct)); // Changed to AudioBuffer struct
             })
             .register()
             .map_err(|e| {
@@ -993,14 +998,14 @@ impl CapturingStream for LinuxAudioStream {
     /// The `_timeout_ms` parameter is currently ignored.
     ///
     /// # Returns
-    /// - `Ok(Some(Box<dyn AudioBuffer<Sample = f32>>))`: If an audio buffer was successfully read.
+    /// - `Ok(Some(AudioBuffer))`: If an audio buffer was successfully read (the struct).
     /// - `Ok(None)`: If the internal queue is empty (no data currently available).
     /// - `Err(AudioError)`: If the stream is not running, or if an error was dequeued from
     ///   the `process` callback (e.g., format conversion error).
     fn read_chunk(
         &mut self,
         _timeout_ms: Option<u32>,
-    ) -> AudioResult<Option<Box<dyn AudioBuffer<Sample = f32>>>> {
+    ) -> AudioResult<Option<AudioBuffer>> { // Changed return type
         // log::trace!("LinuxAudioStream::read_chunk(timeout_ms: {:?})", _timeout_ms);
         if !self.is_running() {
             return Err(AudioError::InvalidOperation(
@@ -1009,7 +1014,7 @@ impl CapturingStream for LinuxAudioStream {
         }
  
         match self.data_queue.lock().unwrap().pop_front() {
-            Some(audio_result) => audio_result.map(Some), // Propagates Err or wraps Ok(Box<...>) in Some
+            Some(audio_result) => audio_result.map(Some), // Propagates Err or wraps Ok(AudioBuffer) in Some
             None => Ok(None), // Queue is empty
         }
     }
@@ -1018,7 +1023,7 @@ impl CapturingStream for LinuxAudioStream {
     ///
     /// This method sets up a helper thread that continuously reads from an internal
     /// `data_queue` (populated by the PipeWire `process` callback) and sends the
-    /// `AudioResult<Box<dyn AudioBuffer<Sample = f32>>>` items to an MPSC (multi-producer,
+    /// `AudioResult<AudioBuffer>` items to an MPSC (multi-producer,
     /// single-consumer) channel. The receiver end of this channel is returned as a
     /// `Stream`.
     ///
@@ -1027,14 +1032,14 @@ impl CapturingStream for LinuxAudioStream {
     /// is empty, or if the receiver end of the MPSC channel is dropped.
     ///
     /// # Returns
-    /// - `Ok(Pin<Box<dyn Stream>>)`: An asynchronous stream of audio buffers.
+    /// - `Ok(Pin<Box<dyn Stream>>)`: An asynchronous stream of audio buffers (structs).
     /// - `Err(AudioError::InvalidOperation)`: If the stream is not currently running.
     fn to_async_stream<'a>(
         &'a mut self,
     ) -> AudioResult<
         Pin<
             Box<
-                dyn Stream<Item = AudioResult<Box<dyn AudioBuffer<Sample = f32>>>>
+                dyn Stream<Item = AudioResult<AudioBuffer>> // Changed to AudioBuffer struct
                     + Send
                     + Sync
                     + 'a,
@@ -1049,7 +1054,7 @@ impl CapturingStream for LinuxAudioStream {
             ));
         }
 
-        let (tx, rx) = mpsc::unbounded::<AudioResult<Box<dyn AudioBuffer<Sample = f32>>>>();
+        let (tx, rx) = mpsc::unbounded::<AudioResult<AudioBuffer>>(); // Changed to AudioBuffer struct
         let data_queue_clone = Arc::clone(&self.data_queue);
         let is_started_clone = Arc::clone(&self.is_started);
 

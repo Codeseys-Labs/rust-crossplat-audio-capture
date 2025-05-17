@@ -1,19 +1,19 @@
 //! Windows-specific audio capture backend using WASAPI.
 #![cfg(target_os = "windows")]
 
-use crate::core::buffer::VecAudioBuffer;
 use crate::core::config::{AudioCaptureConfig, AudioFormat, StreamConfig};
 use crate::core::error::{AudioError, Result as AudioResult};
 use crate::core::interface::{
-    AudioBuffer, AudioDevice, AudioStream, CapturingStream, DeviceEnumerator, DeviceKind,
-    StreamDataCallback,
-}; // Added for VecAudioBuffer
+    AudioDevice, AudioStream, CapturingStream, DeviceEnumerator, DeviceKind, StreamDataCallback,
+};
+// Removed VecAudioBuffer import, will use the new AudioBuffer struct
+use crate::core::buffer::AudioBuffer; // Ensure this is the new struct
 
 use futures_channel::mpsc;
 use futures_core::Stream as FuturesStreamTrait; // Alias to avoid conflict if Stream is used elsewhere
 use std::pin::Pin;
 use std::thread;
-use std::time::Duration;
+use std::time::{Duration, Instant}; // Added Instant
 
 // TODO: Remove these once the actual WASAPI logic is integrated with the new traits.
 // These are placeholders from the old structure.
@@ -702,29 +702,29 @@ impl WindowsAudioStream {
     /// * `source_wave_format` - The `WAVEFORMATEX` describing the format of `p_data`.
     ///
     /// # Returns
-    /// An `AudioResult` containing a `Box<dyn AudioBuffer<Sample = f32>>` on success,
+    /// An `AudioResult` containing an `AudioBuffer` struct on success,
     /// or an `AudioError` if conversion fails or formats are unsupported.
     fn process_wasapi_packet_data(
         p_data: *const u8, // Changed from *mut u8 as we only read
         num_frames_read: u32,
         source_wave_format: &WAVEFORMATEX,
-    ) -> AudioResult<Box<dyn AudioBuffer<Sample = f32>>> {
+    ) -> AudioResult<AudioBuffer> {
+        // Return concrete AudioBuffer struct
         if num_frames_read == 0 {
-            // This should ideally be caught by the caller, but as a safeguard.
             return Err(AudioError::InvalidParameter(
                 "num_frames_read cannot be zero for processing.".to_string(),
             ));
         }
 
         let mut converted_samples_vec: Vec<f32> = Vec::new();
-        let channels = source_wave_format.nChannels as usize;
+        let channels = source_wave_format.nChannels; // u16
         if channels == 0 {
             return Err(AudioError::BackendSpecificError(
                 "Wave format has 0 channels.".to_string(),
             ));
         }
 
-        let total_samples_to_convert = num_frames_read as usize * channels;
+        let total_samples_to_convert = num_frames_read as usize * channels as usize;
         converted_samples_vec.reserve(total_samples_to_convert);
 
         // SAFETY: p_data is assumed valid for num_frames_read based on GetBuffer success.
@@ -767,21 +767,21 @@ impl WindowsAudioStream {
             }
         } // end unsafe
 
-        // Create output AudioFormat
-        let output_audio_format = AudioFormat {
+        // Create output AudioFormat for the new AudioBuffer struct
+        let output_audio_format_struct = AudioFormat {
             sample_rate: source_wave_format.nSamplesPerSec,
-            channels: source_wave_format.nChannels,
+            channels,                           // u16
             bits_per_sample: 32,                // We converted to f32
             sample_format: SampleFormat::F32LE, // Standard for f32
         };
 
-        let audio_buffer = VecAudioBuffer::new(
-            converted_samples_vec,
-            output_audio_format,
-            num_frames_read as usize,
-        );
-
-        Ok(Box::new(audio_buffer))
+        Ok(AudioBuffer {
+            data: converted_samples_vec,
+            channels, // u16
+            sample_rate: source_wave_format.nSamplesPerSec,
+            format: output_audio_format_struct,
+            timestamp: Instant::now(), // Placeholder timestamp for subtask 11.1
+        })
     }
 }
 
@@ -886,7 +886,7 @@ impl CapturingStream for WindowsAudioStream {
     ///
     /// # Returns
     /// * `Ok(Some(buffer))`: If a chunk of audio data was successfully read and converted.
-    ///   The `buffer` is a `Box<dyn AudioBuffer<Sample = f32>>`.
+    ///   The `buffer` is an `AudioBuffer` struct.
     /// * `Ok(None)`: If no audio packet is currently available, or if `GetBuffer` indicates
     ///   no frames were read (e.g., `AUDCLNT_S_BUFFER_EMPTY`).
     /// * `Err(AudioError::InvalidOperation)`: If the stream has not been started.
@@ -895,7 +895,8 @@ impl CapturingStream for WindowsAudioStream {
     fn read_chunk(
         &mut self,
         _timeout_ms: Option<u32>, // Timeout is not used in this synchronous polling implementation
-    ) -> AudioResult<Option<Box<dyn AudioBuffer<Sample = f32>>>> {
+    ) -> AudioResult<Option<AudioBuffer>> {
+        // Ensure this returns the concrete AudioBuffer struct
         if !self.is_started.load(Ordering::Relaxed) {
             return Err(AudioError::InvalidOperation(
                 "Stream not started".to_string(),
@@ -934,8 +935,10 @@ impl CapturingStream for WindowsAudioStream {
             }
 
             if num_frames_read == 0 {
+                // It's important to release the buffer even if no frames were read,
+                // if GetBuffer returned S_OK.
                 self.capture_client
-                    .ReleaseBuffer(num_frames_read) // num_frames_read is 0
+                    .ReleaseBuffer(num_frames_read)
                     .map_err(|hr| {
                         AudioError::BackendSpecificError(format!(
                             "IAudioCaptureClient::ReleaseBuffer (after 0 frames read) failed (HRESULT: {:?})",
@@ -950,7 +953,7 @@ impl CapturingStream for WindowsAudioStream {
                 p_data as *const u8, // Cast to *const u8 for the helper
                 num_frames_read,
                 &self.wave_format,
-            );
+            ); // This now returns AudioResult<AudioBuffer>
 
             // Release the buffer regardless of conversion success/failure
             self.capture_client
@@ -963,6 +966,7 @@ impl CapturingStream for WindowsAudioStream {
                 })?;
 
             // Return the conversion result (which might be an error)
+            // conversion_result is AudioResult<AudioBuffer>, map to AudioResult<Option<AudioBuffer>>
             conversion_result.map(Some)
         }
     }
@@ -973,8 +977,8 @@ impl CapturingStream for WindowsAudioStream {
     /// from the WASAPI capture client using logic similar to `read_chunk`. The data
     /// (or errors) are then sent over an MPSC channel to the returned stream.
     ///
-    /// The returned stream is a `Pin<Box<dyn FuturesStreamTrait<Item = AudioResult<Box<dyn AudioBuffer<Sample = f32>>>> + Send + Sync + 'a>>`.
-    /// Each item in the stream is an `AudioResult` which can either be an `Ok(Box<dyn AudioBuffer<Sample = f32>>)`
+    /// The returned stream is a `Pin<Box<dyn FuturesStreamTrait<Item = AudioResult<AudioBuffer>> + Send + Sync + 'a>>`.
+    /// Each item in the stream is an `AudioResult` which can either be an `Ok(AudioBuffer)`
     /// containing the audio data, or an `Err(AudioError)` if an issue occurred during capture.
     ///
     /// **Important:**
@@ -999,7 +1003,8 @@ impl CapturingStream for WindowsAudioStream {
     ) -> AudioResult<
         Pin<
             Box<
-                dyn FuturesStreamTrait<Item = AudioResult<Box<dyn AudioBuffer<Sample = f32>>>>
+                dyn FuturesStreamTrait<Item = AudioResult<AudioBuffer>>
+                    // Ensure this uses the concrete AudioBuffer struct
                     + Send
                     + Sync
                     + 'a,
@@ -1012,7 +1017,7 @@ impl CapturingStream for WindowsAudioStream {
             ));
         }
 
-        let (mut tx, rx) = mpsc::unbounded::<AudioResult<Box<dyn AudioBuffer<Sample = f32>>>>();
+        let (mut tx, rx) = mpsc::unbounded::<AudioResult<AudioBuffer>>(); // Ensure this uses the concrete AudioBuffer struct
 
         let capture_client_clone = self.capture_client.clone();
         let wave_format_clone = self.wave_format;
@@ -1180,125 +1185,6 @@ impl CapturingStream for WindowsAudioStream {
                     }
                 }
             }
-        });
-
-        Ok(Box::pin(rx))
-    }
-}
-
-impl Drop for WindowsAudioStream {
-    /// This method sets up a dedicated polling thread that continuously attempts to read
-    /// audio data from the WASAPI capture client. The data (or errors) are then sent
-    /// over an MPSC channel to the returned stream.
-    ///
-    /// The returned stream is a `Pin<Box<dyn FuturesStreamTrait<Item = AudioResult<Box<dyn AudioBuffer<Sample = f32>>>> + Send + Sync + 'a>>`.
-    /// Each item in the stream is an `AudioResult` which can either be an `Ok(Box<dyn AudioBuffer<Sample = f32>>)`
-    /// containing the audio data, or an `Err(AudioError)` if an issue occurred during capture or
-    /// if the stream was closed.
-    ///
-    /// **Important:**
-    /// - Calling this method "consumes" the stream for asynchronous operation. The polling thread
-    ///   will attempt to read data. Mixing with synchronous `read_chunk` calls is not recommended
-    ///   and may lead to contention or missed data.
-    /// - The underlying polling thread will continue to run as long as the `WindowsAudioStream`
-    ///   is active (i.e., `is_started` is true) and the receiver end of the MPSC channel (the returned stream)
-    ///   has not been dropped.
-    /// - If the `WindowsAudioStream` is stopped (via `stop()` or `close()`), the polling thread
-    ///   will detect this, send an `AudioError::StreamClosed` message, and then terminate.
-    /// - If the returned async stream is dropped, the polling thread will detect that the
-    ///   channel is closed and will also terminate.
-    ///
-    /// # Errors
-    /// - Returns `AudioError::InvalidOperation` if the stream has not been started via `start()`.
-    /// - Returns `AudioError::BackendSpecificError` if the polling thread fails to initialize COM.
-    fn to_async_stream<'a>(
-        &'a mut self,
-    ) -> AudioResult<
-        Pin<
-            Box<
-                dyn FuturesStreamTrait<Item = AudioResult<Box<dyn AudioBuffer<Sample = f32>>>>
-                    + Send
-                    + Sync
-                    + 'a,
-            >,
-        >,
-    > {
-        if !self.is_started.load(Ordering::Relaxed) {
-            return Err(AudioError::InvalidOperation(
-                "Stream not started".to_string(),
-            ));
-        }
-
-        let (mut tx, rx) = mpsc::unbounded::<AudioResult<Box<dyn AudioBuffer<Sample = f32>>>>();
-
-        // Clone necessary parts for the thread.
-        // IAudioCaptureClient is a COM interface pointer; cloning it AddRefs.
-        // It can be used across threads if COM is initialized appropriately (MTA).
-        let capture_client_clone = self.capture_client.clone();
-        let wave_format_clone = self.wave_format; // WAVEFORMATEX is Copy
-        let stream_is_started_clone = self.is_started.clone(); // Arc<AtomicBool>
-
-        thread::spawn(move || {
-            // Initialize COM for this polling thread.
-            // The _com_thread_initializer will call CoUninitialize when dropped (thread exits).
-            let _com_thread_initializer = match ComInitializer::new() {
-                Ok(init) => Some(init),
-                Err(e) => {
-                    let _ = tx.unbounded_send(Err(AudioError::BackendSpecificError(format!(
-                        "Polling thread failed to initialize COM: {}",
-                        e
-                    ))));
-                    return; // Exit thread
-                }
-            };
-
-            loop {
-                if !stream_is_started_clone.load(Ordering::Relaxed) {
-                    // Stream was stopped externally.
-                    let _ = tx.unbounded_send(Err(AudioError::StreamClosed(
-                        "Capture stream was stopped.".to_string(),
-                    )));
-                    break;
-                }
-
-                // Simplified GetNextPacketSize logic
-                let mut num_frames_in_packet: u32 = 0;
-                // SAFETY: COM call on a cloned interface pointer, COM initialized for this thread.
-                let hr_packet_size =
-                    unsafe { capture_client_clone.GetNextPacketSize(&mut num_frames_in_packet) };
-
-                if hr_packet_size.is_err() {
-                    let _ = tx.unbounded_send(Err(AudioError::BackendSpecificError(format!(
-                        "Polling thread: GetNextPacketSize failed (HRESULT: {:?})",
-                        hr_packet_size
-                    ))));
-                    break; // Critical error, stop polling.
-                }
-
-                if num_frames_in_packet == 0 {
-                    thread::sleep(Duration::from_millis(10)); // Poll interval
-                    continue;
-                }
-
-                // Placeholder for actual data reading logic (GetBuffer, conversion, ReleaseBuffer)
-                // As per subtask instructions, sending NotImplemented error for now.
-                // The full data reading logic would be similar to `read_chunk`.
-                // It would involve:
-                // 1. unsafe { capture_client_clone.GetBuffer(...) }
-                // 2. Data conversion (e.g., i16/f32 to Vec<f32>)
-                // 3. unsafe { capture_client_clone.ReleaseBuffer(...) }
-                // 4. Constructing Ok(Box::new(VecAudioBuffer::new(...)))
-
-                let buffer_result: AudioResult<Box<dyn AudioBuffer<Sample = f32>>> = Err(
-                    AudioError::NotImplemented("Async data polling in thread".to_string()),
-                );
-
-                if tx.unbounded_send(buffer_result).is_err() {
-                    // Receiver was dropped, stream is no longer needed.
-                    break;
-                }
-            }
-            // Thread terminates, _com_thread_initializer is dropped, CoUninitialize is called.
         });
 
         Ok(Box::pin(rx))

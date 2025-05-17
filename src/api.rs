@@ -3,8 +3,10 @@ use crate::core::config::AudioFileFormat;
 use crate::core::config::{AudioFormat, DeviceSelector, LatencyMode, SampleFormat, StreamConfig};
 use crate::core::error::{AudioError, Result as AudioResult};
 use crate::core::interface::{
-    AudioBuffer, AudioDevice, AudioStream, CapturingStream, DeviceEnumerator, DeviceKind,
-}; // Added AudioBuffer, CapturingStream, DeviceKind
+    AudioDevice, AudioStream, CapturingStream, DeviceEnumerator, DeviceKind,
+};
+// AudioBuffer trait is removed from interface, struct is imported from core::buffer
+use crate::core::buffer::AudioBuffer; // This is the new AudioBuffer struct
 use std::fmt;
 use std::sync::atomic::{AtomicBool, Ordering};
 
@@ -782,7 +784,7 @@ impl<D: AudioDevice + 'static> AudioCapture<D> {
     /// # Returns
     ///
     /// * `Ok(Some(buffer))`: If a chunk of audio data was successfully read. The `buffer`
-    ///   is a `Box<dyn AudioBuffer<Sample = f32>>` containing `f32` audio samples.
+    ///   is an `AudioBuffer` struct containing `f32` audio samples.
     /// * `Ok(None)`: If the timeout occurred (and `timeout_ms` was `Some`) before any
     ///   data was available from the stream.
     /// * `Err(AudioError::InvalidOperation)`: If the stream is not currently running
@@ -797,7 +799,7 @@ impl<D: AudioDevice + 'static> AudioCapture<D> {
     /// # use rust_crossplat_audio_capture::api::AudioCaptureBuilder;
     /// # use rust_crossplat_audio_capture::core::config::{DeviceSelector, SampleFormat};
     /// # use rust_crossplat_audio_capture::core::error::AudioError;
-    /// # use rust_crossplat_audio_capture::core::interface::AudioBuffer; // For trait methods
+    /// # use rust_crossplat_audio_capture::core::buffer::AudioBuffer; // For struct methods
     /// # fn main() -> Result<(), AudioError> {
     /// let mut capture = AudioCaptureBuilder::new()
     ///     .device(DeviceSelector::DefaultInput)
@@ -826,10 +828,8 @@ impl<D: AudioDevice + 'static> AudioCapture<D> {
     /// # Ok(())
     /// # }
     /// ```
-    pub fn read_buffer(
-        &mut self,
-        timeout_ms: Option<u32>,
-    ) -> AudioResult<Option<Box<dyn AudioBuffer<Sample = f32>>>> {
+    pub fn read_buffer(&mut self, timeout_ms: Option<u32>) -> AudioResult<Option<AudioBuffer>> {
+        // Changed return type
         if !self.is_running.load(Ordering::SeqCst) {
             return Err(AudioError::InvalidOperation(
                 "Stream is not running. Call start() first.".to_string(),
@@ -837,8 +837,6 @@ impl<D: AudioDevice + 'static> AudioCapture<D> {
         }
 
         let stream = self.stream.as_mut().ok_or_else(|| {
-            // This should ideally not happen if is_running is true,
-            // but as a safeguard:
             AudioError::InvalidOperation(
                 "Stream is not initialized, though is_running was true.".to_string(),
             )
@@ -853,7 +851,7 @@ impl<D: AudioDevice + 'static> AudioCapture<D> {
     /// by calling [`read_buffer(None)`](AudioCapture::read_buffer), blocking
     /// indefinitely until data is available or an error occurs.
     ///
-    /// The iterator yields `AudioResult<Box<dyn AudioBuffer<Sample = f32>>>`.
+    /// The iterator yields `AudioResult<AudioBuffer>`.
     /// It is the responsibility of the caller to handle potential errors for each item.
     ///
     /// The iterator will stop (return `None`) if:
@@ -868,7 +866,7 @@ impl<D: AudioDevice + 'static> AudioCapture<D> {
     /// # use rust_crossplat_audio_capture::api::AudioCaptureBuilder;
     /// # use rust_crossplat_audio_capture::core::config::{DeviceSelector, SampleFormat};
     /// # use rust_crossplat_audio_capture::core::error::AudioError;
-    /// # use rust_crossplat_audio_capture::core::interface::AudioBuffer; // For trait methods
+    /// # use rust_crossplat_audio_capture::core::buffer::AudioBuffer; // For struct methods
     /// # fn main() -> Result<(), AudioError> {
     /// let mut capture = AudioCaptureBuilder::new()
     ///     .device(DeviceSelector::DefaultInput)
@@ -897,14 +895,8 @@ impl<D: AudioDevice + 'static> AudioCapture<D> {
     ///         println!("Stopping capture after 3 buffers.");
     ///         // To stop the iterator, stop the main capture session.
     ///         // The iterator will then yield None on the next iteration.
-    ///         // Note: `capture.stop()` takes `&mut self`, so direct call here is tricky
-    ///         // if `capture` is still borrowed by `buffers_iter()`.
-    ///         // This example implies `stop` would be called from another context
-    ///         // or the iterator is dropped.
-    ///         // For a simple loop like this, you might control it externally.
     ///     }
     /// }
-    /// // Ensure capture is stopped if not done by iterator logic
     /// if capture.is_running() {
     ///     capture.stop()?;
     /// }
@@ -919,7 +911,7 @@ impl<D: AudioDevice + 'static> AudioCapture<D> {
     ///
     /// This method provides a way to consume captured audio data using asynchronous
     /// patterns, integrating with Rust's async ecosystem (e.g., `tokio`, `async-std`).
-    /// The stream yields `AudioResult<Box<dyn AudioBuffer<Sample = f32>>>` items.
+    /// The stream yields `AudioResult<AudioBuffer>` items.
     ///
     /// The stream must be started by calling [`start()`](AudioCapture::start) before
     /// attempting to retrieve the data stream.
@@ -929,7 +921,7 @@ impl<D: AudioDevice + 'static> AudioCapture<D> {
     /// # Returns
     ///
     /// * `Ok(impl Stream)`: If the stream is running and the asynchronous stream can be created.
-    ///   The `impl Stream` yields `AudioResult<Box<dyn AudioBuffer<Sample = f32>>>`.
+    ///   The `impl Stream` yields `AudioResult<AudioBuffer>`.
     /// * `Err(AudioError::InvalidOperation)`: If the capture stream is not currently running
     ///   or not initialized.
     /// * `Err(AudioError)`: If there's an error creating the asynchronous stream from the
@@ -941,10 +933,9 @@ impl<D: AudioDevice + 'static> AudioCapture<D> {
     /// # use rust_crossplat_audio_capture::api::AudioCaptureBuilder;
     /// # use rust_crossplat_audio_capture::core::config::{DeviceSelector, SampleFormat};
     /// # use rust_crossplat_audio_capture::core::error::AudioError;
-    /// # use rust_crossplat_audio_capture::core::interface::AudioBuffer;
+    /// # use rust_crossplat_audio_capture::core::buffer::AudioBuffer; // For struct methods
     /// use futures_util::stream::StreamExt; // For `next()`
     ///
-    /// // This example assumes an async runtime like tokio or async-std.
     /// // #[tokio::main]
     /// async fn main_async() -> Result<(), AudioError> {
     ///     let mut capture = AudioCaptureBuilder::new()
@@ -966,13 +957,12 @@ impl<D: AudioDevice + 'static> AudioCapture<D> {
     ///                     println!(
     ///                         "Async Stream: Received buffer with {} f32 samples. Format: {:?}.",
     ///                         audio_buffer.as_slice().len(),
-    ///                         audio_buffer.get_format()
+    ///                         audio_buffer.format // Use struct field
     ///                     );
     ///                     // Process audio_buffer.as_slice()...
     ///                 }
     ///                 Err(e) => {
     ///                     eprintln!("Error receiving audio data from async stream: {:?}", e);
-    ///                     // Optionally, break or handle the error
     ///                     break;
     ///                 }
     ///             }
@@ -994,7 +984,7 @@ impl<D: AudioDevice + 'static> AudioCapture<D> {
     pub fn audio_data_stream(
         &mut self,
     ) -> AudioResult<
-        impl futures_core::Stream<Item = AudioResult<Box<dyn AudioBuffer<Sample = f32>>>>
+        impl futures_core::Stream<Item = AudioResult<AudioBuffer>> // Changed to AudioBuffer struct
             + Send
             + Sync
             + '_,
@@ -1004,15 +994,7 @@ impl<D: AudioDevice + 'static> AudioCapture<D> {
                 "Stream is not running or not initialized. Call start() first.".to_string(),
             ));
         }
-
-        // self.stream is Some and is_running is true.
-        // The unwrap is safe due to the check above.
         self.stream.as_mut().unwrap().to_async_stream()
-        // The to_async_stream already returns AudioResult<Pin<Box<dyn Stream...>>>
-        // So, no further mapping is needed if the types align.
-        // The return type of this function is `AudioResult<impl Stream...>`,
-        // and `to_async_stream` returns `AudioResult<Pin<Box<dyn Stream...>>>`.
-        // A `Pin<Box<dyn Stream>>` can be implicitly converted to `impl Stream`.
     }
 }
 
@@ -1178,7 +1160,7 @@ pub struct AudioBufferIterator<'a, D: AudioDevice + 'static> {
 }
 
 impl<'a, D: AudioDevice + 'static> Iterator for AudioBufferIterator<'a, D> {
-    type Item = AudioResult<Box<dyn AudioBuffer<Sample = f32>>>;
+    type Item = AudioResult<AudioBuffer>; // Changed to AudioBuffer struct
 
     fn next(&mut self) -> Option<Self::Item> {
         if !self.capture.is_running() {
