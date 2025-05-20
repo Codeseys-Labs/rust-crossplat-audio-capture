@@ -154,14 +154,14 @@ run_test_app() {
     local output_dir=$4
     
     # Build test app example using our standardized test runner
-    echo -e "${YELLOW}Building test application...${NC}"
-    cargo build --bin test-runner
+    echo -e "${YELLOW}Building test application (run_tests)...${NC}"
+    cargo build --bin run_tests
     
     # Run the application test
     echo -e "${YELLOW}Running $backend $test_type test...${NC}"
     TEST_RESULT_FILE="${output_dir}/${backend}_${test_type}_$(date +%Y%m%d_%H%M%S).json"
     
-    cargo run --bin test-runner -- \
+    cargo run --bin run_tests -- \
         --backend $backend \
         --test-type $test_type \
         --duration $duration \
@@ -176,11 +176,8 @@ run_test_app() {
     fi
 }
 
-# Download test audio if needed
-if [ ! -f "./test_audio.wav" ]; then
-    echo -e "${YELLOW}Downloading test audio...${NC}"
-    ./scripts/download_test_audio.sh
-fi
+# Test audio (test_audio.wav) is expected to be present in /app/ within the Docker image.
+# It's copied and converted from test_audio.mp3 during the image build.
 
 # Set up the test environment
 setup_environment

@@ -22,7 +22,7 @@ services:
     # Keep the container running for debugging if needed
     tty: true
     stdin_open: true
-    command: bash -c "/app/scripts/run_audio_tests.sh --backend pipewire --type all --output-dir /test-results"
+    command: ["/app/scripts/run_audio_tests.sh", "--backend", "pipewire", "--type", "all", "--output-dir", "/test-results"]
 
   # Unified Linux test service with PulseAudio
   rsac-linux-pulseaudio:
@@ -66,8 +66,12 @@ services:
       - RUST_LOG=debug
     volumes:
       - .:/app
-      - test_results:C:\test_results
-      - test_audio:C:\test_audio
+      - type: volume
+        source: test_results
+        target: C:\test_results
+      - type: volume
+        source: test_audio
+        target: C:\test_audio
     isolation: process
     deploy:
       resources:

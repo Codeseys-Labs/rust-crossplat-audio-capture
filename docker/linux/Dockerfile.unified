@@ -1,9 +1,10 @@
 FROM ubuntu:22.04 as rsac-test-base
 
 # Install common dependencies
-RUN apt-get update && apt-get install -y \
+RUN apt-get update && apt-get upgrade -y && apt-get install -y \
     curl wget build-essential pkg-config \
     libclang-dev llvm-14 clang-14 \
+    libssl-dev \
     xvfb dbus ffmpeg \
     && curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y
 
@@ -21,7 +22,9 @@ WORKDIR /app
 
 # Copy common test utilities
 COPY scripts/run_audio_tests.sh /app/scripts/
-COPY test_audio.wav /app/test_audio.wav
+COPY test_audio.mp3 /app/test_audio.mp3
+RUN ffmpeg -i /app/test_audio.mp3 -acodec pcm_s16le -ar 44100 -ac 2 /app/test_audio.wav -y && \
+    rm /app/test_audio.mp3
 
 # PulseAudio specific layer
 FROM rsac-test-base as rsac-pulseaudio

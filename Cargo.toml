@@ -68,7 +68,7 @@ core-foundation-sys = "0.8.7"
 thiserror = "2.0.12"
 
 [dev-dependencies]
-criterion = "0.5.1" # Benchmarking
+criterion = "0.6.0" # Benchmarking
 tempfile = "3.20.0" # Temporary files for tests
 serde = { version = "1.0.219", features = [
     "derive",

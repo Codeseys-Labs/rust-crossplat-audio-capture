@@ -10,7 +10,31 @@ env:
   CARGO_TERM_COLOR: always
 
 jobs:
+  lint_and_format_checks:
+    name: Lint and Format Checks
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Install Rust stable
+        uses: actions-rs/toolchain@v1
+        with:
+          toolchain: stable
+          profile: minimal # Minimal profile is sufficient for linting
+          override: true
+
+      - name: Cache Cargo registry and build outputs
+        uses: Swatinem/rust-cache@v2 # Cache for clippy if it resolves dependencies
+
+      - name: Check formatting
+        run: cargo fmt --all -- --check
+
+      - name: Run Clippy
+        run: cargo clippy --all-targets --all-features -- -D warnings
+
   build_and_test:
+    needs: lint_and_format_checks # Depends on the lint job
     runs-on: ${{ matrix.os }}
     strategy:
       matrix:
@@ -19,6 +43,12 @@ jobs:
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
+
+      - name: Install audio dev libraries (Linux)
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libpipewire-0.3-dev libspa-0.2-dev libpulse-dev pkg-config
 
       - name: Install Rust stable
         uses: actions-rs/toolchain@v1
@@ -30,12 +60,6 @@ jobs:
       - name: Cache Cargo registry and build outputs
         uses: Swatinem/rust-cache@v2
 
-      - name: Check formatting
-        run: cargo fmt --all -- --check
-
-      - name: Run Clippy
-        run: cargo clippy --all-targets --all-features -- -D warnings
-
       - name: Build
         run: cargo build --all-features --all-targets --verbose
 
@@ -44,6 +68,7 @@ jobs:
 
   docker_linux_test:
     name: Dockerized Linux Tests
+    needs: lint_and_format_checks # Depends on the lint job
     runs-on: ubuntu-latest
     steps:
       - name: Checkout code
@@ -56,6 +81,7 @@ jobs:
         run: docker build --file docker/linux/Dockerfile --tag rust-audio-capture-linux-test:latest .
   coverage:
     name: Code Coverage
+    needs: lint_and_format_checks # Depends on the lint job
     runs-on: ubuntu-latest
     steps:
       - name: Checkout code
