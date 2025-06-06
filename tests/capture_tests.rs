@@ -1,6 +1,6 @@
 mod common;
 
-use common::mock::{MockAudioCapture, MockAudioDevice, MockCapture, MockCaptureWrapper};
+use common::mock::{MockAudioCapture, MockAudioDevice, MockCaptureWrapper};
 use common::{create_test_signal, verify_audio_similarity};
 use rsac::{AudioCaptureStream, AudioConfig, AudioError};
 use std::time::Duration;

@@ -1,13 +1,6 @@
 use hound::Error as HoundError;
-use std::io::{Error as IoError, ErrorKind};
 
 pub mod mock;
-
-impl From<HoundError> for IoError {
-    fn from(err: HoundError) -> Self {
-        IoError::new(ErrorKind::Other, err.to_string())
-    }
-}
 
 /// Creates a test sine wave for audio validation
 pub fn create_test_signal(frequency: f32, duration_ms: u32, sample_rate: u32) -> Vec<f32> {
@@ -41,7 +34,7 @@ pub fn create_test_wav_file(
     samples: &[f32],
     channels: u16,
     sample_rate: u32,
-) -> std::io::Result<()> {
+) -> Result<(), Box<dyn std::error::Error>> {
     use hound::{WavSpec, WavWriter};
 
     let spec = WavSpec {
@@ -61,7 +54,7 @@ pub fn create_test_wav_file(
 }
 
 /// Helper function to read a WAV file for testing
-pub fn read_wav_file(path: &str) -> std::io::Result<(Vec<f32>, hound::WavSpec)> {
+pub fn read_wav_file(path: &str) -> Result<(Vec<f32>, hound::WavSpec), Box<dyn std::error::Error>> {
     use hound::WavReader;
 
     let mut reader = WavReader::open(path)?;

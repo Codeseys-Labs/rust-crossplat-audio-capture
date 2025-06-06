@@ -319,6 +319,9 @@ docker build -f docker/windows/Dockerfile -t rsac-windows .
 docker build -f docker/macos/Dockerfile -t rsac-macos .
 ```
 
+For more details on how each container is configured and how the example tests
+are executed see [docs/DOCKER_TESTING.md](docs/DOCKER_TESTING.md).
+
 ## License
 
 This project is licensed under the MIT License - see the LICENSE file for details.

@@ -32,8 +32,8 @@ windows = { version = "0.61.1", features = [
 
 [target.'cfg(target_os = "linux")'.dependencies]
 # libasound2-dev && libpipewire-0.3-dev && pkg-config && build-essential && clang && libclang-dev && llvm-dev
-libpulse-binding = "2.30.1"
-libpulse-simple-binding = "2.29.0"
+libpulse-binding = "2.28.2"
+libpulse-simple-binding = "2.28.1"
 pipewire = "0.8.0"
 
 [target.'cfg(target_os = "macos")'.dependencies]
@@ -45,6 +45,9 @@ thiserror = "2.0.12"
 [dev-dependencies]
 criterion = "0.6.0" # Benchmarking
 tempfile = "3.20.0" # Temporary files for tests
+
+[build-dependencies]
+pkg-config = "0.3"
 
 [[example]]
 name = "wav_demo"
