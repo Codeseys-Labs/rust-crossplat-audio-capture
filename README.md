@@ -239,7 +239,16 @@ The captured audio supports the following configurations:
 - Development libraries:
   - For PipeWire: `libpipewire-dev`
   - For PulseAudio: `libpulse-dev`
-- Rust toolchain
+- Verify dependencies using `pkg-config`:
+  ```bash
+  ./scripts/check_deps.sh
+  ```
+  If libraries are installed in non-standard locations, set `PKG_CONFIG_PATH` accordingly.
+  To let the build script attempt automatic installation via `apt-get`, set:
+  ```bash
+  export RSAC_AUTO_INSTALL=1
+  ```
+  - Rust toolchain
 
 ### macOS
 - macOS 10.13 or later
@@ -283,6 +292,32 @@ cargo test --features audio-tests
 - Update documentation for API changes
 - Follow Rust coding guidelines
 - Include both system-wide and app-specific tests where applicable
+
+### Docker-Based Testing
+The repository includes Docker configurations for Linux, Windows, and macOS
+under the `docker/` directory. Each Dockerfile provisions the necessary audio
+services and tooling to run the example programs and automated tests on that
+platform. The easiest way to spin up all environments is via
+`docker-compose`:
+
+```bash
+docker-compose up --build
+```
+
+This command builds the platform images and runs the bundled test scripts.
+Individual Dockerfiles can also be built separately if you only need a single
+platform:
+
+```bash
+# Linux
+docker build -f docker/linux/Dockerfile -t rsac-linux .
+
+# Windows
+docker build -f docker/windows/Dockerfile -t rsac-windows .
+
+# macOS (requires virtualization support)
+docker build -f docker/macos/Dockerfile -t rsac-macos .
+```
 
 ## License
 
