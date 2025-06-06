@@ -1,57 +1,48 @@
 use rsac::{AudioConfig, AudioError, AudioFormat};
 use std::sync::Arc;
 
-// Local trait that we can implement
-pub trait MockCapture: Send {
-    fn start(&mut self) -> Result<(), AudioError>;
-    fn stop(&mut self) -> Result<(), AudioError>;
-    fn read(&mut self, buffer: &mut [u8]) -> Result<usize, AudioError>;
-    fn config(&self) -> &AudioConfig;
-    fn is_capturing(&self) -> bool;
-    fn get_captured_data(&self) -> Vec<f32>;
+// Simplified wrapper that directly implements AudioCaptureStream
+pub struct MockCaptureWrapper {
+    inner: MockAudioCapture,
 }
 
-// Wrapper type that implements AudioCaptureStream
-pub struct MockCaptureWrapper<T: MockCapture>(T);
-
-impl<T: MockCapture + 'static> MockCaptureWrapper<T> {
-    pub fn new(inner: T) -> Self {
-        Self(inner)
+impl MockCaptureWrapper {
+    pub fn new(inner: MockAudioCapture) -> Self {
+        Self { inner }
     }
 
     pub fn is_capturing(&self) -> bool {
-        self.0.is_capturing()
+        self.inner.is_capturing()
     }
 
     pub fn get_captured_data(&self) -> Vec<f32> {
-        self.0.get_captured_data()
+        self.inner.get_captured_data()
+    }
+
+    pub fn start(&mut self) -> Result<(), AudioError> {
+        self.inner.start()
+    }
+
+    pub fn stop(&mut self) -> Result<(), AudioError> {
+        self.inner.stop()
     }
 }
 
-// Create a new type to implement AudioCaptureStream
-pub struct AudioCaptureStreamWrapper<T: MockCapture>(MockCaptureWrapper<T>);
-
-impl<T: MockCapture + 'static> AudioCaptureStreamWrapper<T> {
-    pub fn new(inner: T) -> Self {
-        Self(MockCaptureWrapper::new(inner))
-    }
-}
-
-impl<T: MockCapture + 'static> rsac::AudioCaptureStream for AudioCaptureStreamWrapper<T> {
+impl rsac::AudioCaptureStream for MockCaptureWrapper {
     fn start(&mut self) -> Result<(), AudioError> {
-        self.0.start()
+        self.inner.start()
     }
 
     fn stop(&mut self) -> Result<(), AudioError> {
-        self.0.stop()
+        self.inner.stop()
     }
 
     fn read(&mut self, buffer: &mut [u8]) -> Result<usize, AudioError> {
-        self.0.read(buffer)
+        self.inner.read(buffer)
     }
 
     fn config(&self) -> &AudioConfig {
-        self.0.config()
+        self.inner.config()
     }
 }
 
@@ -140,8 +131,8 @@ impl MockAudioCapture {
     }
 }
 
-impl MockCapture for MockAudioCapture {
-    fn start(&mut self) -> Result<(), AudioError> {
+impl MockAudioCapture {
+    pub fn start(&mut self) -> Result<(), AudioError> {
         if self.0.is_capturing {
             return Err(AudioError::CaptureError("Already capturing".into()));
         }
@@ -149,7 +140,7 @@ impl MockCapture for MockAudioCapture {
         Ok(())
     }
 
-    fn stop(&mut self) -> Result<(), AudioError> {
+    pub fn stop(&mut self) -> Result<(), AudioError> {
         if !self.0.is_capturing {
             return Err(AudioError::CaptureError("Not capturing".into()));
         }
@@ -157,7 +148,7 @@ impl MockCapture for MockAudioCapture {
         Ok(())
     }
 
-    fn read(&mut self, buffer: &mut [u8]) -> Result<usize, AudioError> {
+    pub fn read(&mut self, buffer: &mut [u8]) -> Result<usize, AudioError> {
         if !self.0.is_capturing {
             return Ok(0);
         }
@@ -184,7 +175,7 @@ impl MockCapture for MockAudioCapture {
         Ok(samples_to_copy * bytes_per_sample)
     }
 
-    fn config(&self) -> &AudioConfig {
+    pub fn config(&self) -> &AudioConfig {
         static DEFAULT_CONFIG: AudioConfig = AudioConfig {
             sample_rate: 48000,
             channels: 2,

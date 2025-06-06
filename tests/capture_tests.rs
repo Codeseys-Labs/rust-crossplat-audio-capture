@@ -2,7 +2,6 @@ mod common;
 
 use common::mock::{MockAudioCapture, MockAudioDevice, MockCapture, MockCaptureWrapper};
 use common::{create_test_signal, verify_audio_similarity};
-use rsac::AudioCaptureStream;
 use rsac::{AudioCaptureStream, AudioConfig, AudioError};
 use std::time::Duration;
 
@@ -54,7 +53,7 @@ fn test_device_enumeration() {
 
 #[test]
 fn test_device_selection() {
-    let capture = MockAudioCapture::new();
+    let mut capture = MockAudioCapture::new();
     let devices = capture.get_available_devices();
 
     capture.set_device(devices[1].clone());

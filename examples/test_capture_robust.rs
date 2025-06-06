@@ -1,4 +1,4 @@
-use hound::{WavReader, WavWriter, WavSpec};
+use hound::WavReader;
 use std::time::Duration;
 use std::thread;
 use std::path::Path;

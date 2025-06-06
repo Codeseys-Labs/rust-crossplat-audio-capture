@@ -1,6 +1,5 @@
 use hound::Error as HoundError;
 use std::io::{Error as IoError, ErrorKind};
-use std::time::Duration;
 
 pub mod mock;
 
