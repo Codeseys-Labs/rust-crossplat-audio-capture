@@ -99,5 +99,33 @@ name = "macos_application_capture"
 path = "examples/macos_application_capture.rs"
 required-features = ["feat_macos"]
 
+[[example]]
+name = "test_tone"
+path = "examples/test_tone.rs"
+required-features = ["test-utils"]
+
+[[example]]
+name = "test_capture"
+path = "examples/test_capture.rs"
+required-features = ["feat_linux"]
+
+[[example]]
+name = "test_coreaudio"
+path = "examples/test_coreaudio.rs"
+required-features = ["feat_macos"]
+
+[[example]]
+name = "test_windows"
+path = "examples/test_windows.rs"
+required-features = ["feat_windows"]
+
+[[example]]
+name = "verify_audio"
+path = "examples/verify_audio.rs"
+
+[[example]]
+name = "demo_library"
+path = "examples/demo_library.rs"
+
 [workspace]
 members = []
