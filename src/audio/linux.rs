@@ -128,6 +128,11 @@ impl PipeWireBackend {
     pub fn new() -> AudioResult<Self> {
         Ok(PipeWireBackend)
     }
+
+    pub fn is_available() -> bool {
+        // Stub implementation - always return false since this is not implemented
+        false
+    }
 }
 
 // Implement the old AudioCaptureBackend trait for compatibility
