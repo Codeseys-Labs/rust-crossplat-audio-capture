@@ -153,21 +153,10 @@ use std::time::Instant; // Added for timestamping // For the Stream trait
 // These are placeholders from the old structure.
 use std::{process::Command, sync::Mutex, thread, time::Duration};
 
-// Adjusted imports for PipewireCoreContext
+// Simplified PipeWire imports for 0.8.0 compatibility
 use pipewire::{
-    channel,
-    context::Context as PwContext, // Import PwContext for old backend compatibility
-    core::Core as PwCore,          // Import PwCore for old backend compatibility
-    main_loop::MainLoop as PwMainLoop, // Import PwMainLoop for old backend compatibility
-    properties::properties,        // This is fine
-    registry::Registry,            // This is fine
+    Context, Core, MainLoop, Properties,
     spa,
-    stream::Listener as StreamListener, // For listener_handle type
-    stream::{Stream as PwStream, StreamFlags},
-    Context,    // For PipewireCoreContext
-    Core,       // For PipewireCoreContext
-    MainLoop,   // For PipewireCoreContext
-    Properties, // Explicitly import Properties
 };
 // Removed: use crate::core::buffer::VecAudioBuffer; // Will use AudioBuffer struct directly
 
