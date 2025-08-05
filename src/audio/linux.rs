@@ -109,7 +109,7 @@ pub mod pipewire;
 pub use pipewire::{enumerate_audio_applications_pipewire, LinuxApplicationInfo};
 
 use crate::core::buffer::AudioBuffer; // This is the new AudioBuffer struct
-use crate::core::config::{AudioCaptureConfig, AudioConfig, StreamConfig}; // Corrected import path
+use crate::core::config::{AudioCaptureConfig, StreamConfig}; // Corrected import path
 use crate::core::error::{AudioError, CaptureError, Result as AudioResult}; // Added CaptureError
 use crate::core::interface::{
     AudioBackend,
@@ -117,8 +117,7 @@ use crate::core::interface::{
     CapturingStream,
     DeviceEnumerator,
     DeviceKind, // Added AudioBackend
-    StreamDataCallback,
-    // AudioBuffer trait is removed, struct will be imported from crate::core::buffer
+                // AudioBuffer trait is removed, struct will be imported from crate::core::buffer
 };
 use crate::{AudioFormat, SampleFormat}; // AudioFormat is re-exported from lib.rs
 use log::{debug, error, info, warn}; // Added for logging
