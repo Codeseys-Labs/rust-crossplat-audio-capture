@@ -11,7 +11,7 @@ use std::fmt;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex}; // Added Arc and Mutex
 use std::thread;
-use std::time::Duration;
+// Removed unused import: use std::time::Duration;
 
 /// Configuration for an audio capture session, fully validated and consolidated.
 ///
