@@ -129,19 +129,19 @@ use futures_channel::mpsc; // For MPSC channel
 use futures_core::Stream;
 use pipewire::{
     keys as pw_keys,
+    pod::pod::PodBuilder, // Added PodBuilder
     spa::{
+        param::audio::AudioFormat as SpaAudioFormat, // Added SpaAudioFormat
         param::format::{FormatProperties, SpaFormat},
         param::format_utils,
         param::ParamType,
-        pod::{Pod, Object}, // Added Object for type compatibility
-        utils::{Direction, SpaChannel}, // Added Direction and SpaChannel
-        param::audio::{AudioFormat as SpaAudioFormat}, // Added SpaAudioFormat
-        param::{MediaType, MediaSubtype}, // Added MediaType, MediaSubtype
+        param::{MediaSubtype, MediaType}, // Added MediaType, MediaSubtype
+        pod::{Object, Pod},               // Added Object for type compatibility
+        utils::{Direction, SpaChannel},   // Added Direction and SpaChannel
         Id,
     },
-    types as pw_types,
     stream::StreamState, // Added StreamState
-    pod::pod::PodBuilder, // Added PodBuilder
+    types as pw_types,
 }; // Added for PipeWire keys and types
 use std::collections::VecDeque; // For data_queue
 use std::fmt::Display; // Added for DeviceId Display trait
@@ -159,10 +159,10 @@ use pipewire::{
     self,
     channel,
     context::Context as PwContext, // Import PwContext for old backend compatibility
-    core::Core as PwCore,           // Import PwCore for old backend compatibility  
+    core::Core as PwCore,          // Import PwCore for old backend compatibility
     main_loop::MainLoop as PwMainLoop, // Import PwMainLoop for old backend compatibility
-    properties::properties, // This is fine
-    registry::Registry,     // This is fine
+    properties::properties,        // This is fine
+    registry::Registry,            // This is fine
     spa,
     stream::Listener as StreamListener, // For listener_handle type
     stream::{Stream as PwStream, StreamFlags},
