@@ -42,26 +42,26 @@ use std::ptr;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use windows::core::{GUID, HRESULT, PWSTR};
+use windows::Win32::Foundation::CloseHandle;
 use windows::Win32::Foundation::HANDLE; // For process handle
 use windows::Win32::Foundation::{S_FALSE, S_OK};
 use windows::Win32::Media::Audio::{
     eAll, eCapture, eConsole, eRender, IAudioCaptureClient, IAudioClient, IMMDevice,
     IMMDeviceCollection, IMMDeviceEnumerator, IMMEndpoint, MMDeviceEnumerator,
-    AUDCLNT_SHAREMODE_SHARED, AUDCLNT_STREAMFLAGS_LOOPBACK, DEVICE_STATE_ACTIVE,
-    WAVEFORMATEX, WAVE_FORMAT_PCM,
+    AUDCLNT_SHAREMODE_SHARED, AUDCLNT_STREAMFLAGS_LOOPBACK, DEVICE_STATE_ACTIVE, WAVEFORMATEX,
+    WAVE_FORMAT_PCM,
 };
 use windows::Win32::Multimedia::WAVE_FORMAT_IEEE_FLOAT;
 use windows::Win32::System::Com::{
-    CoCreateInstance, CoInitializeEx, CoTaskMemFree, CoUninitialize,
-    COINIT_MULTITHREADED, STGM_READ, CLSCTX_ALL,
+    CoCreateInstance, CoInitializeEx, CoTaskMemFree, CoUninitialize, CLSCTX_ALL,
+    COINIT_MULTITHREADED, STGM_READ,
 };
 use windows::Win32::System::PropsystemTypes::PropVariantClear;
-use windows::Win32::Foundation::CloseHandle;
 use windows::Win32::System::Threading::{
     OpenProcess, WaitForSingleObject, PROCESS_SYNCHRONIZE, WAIT_OBJECT_0,
 };
 use windows::Win32::System::Variant::{PROPVARIANT, VT_EMPTY, VT_LPWSTR};
-use windows::Win32::UI::Shell::PropertiesSystem::{PKEY_Device_FriendlyName, IPropertyStore};
+use windows::Win32::UI::Shell::PropertiesSystem::{IPropertyStore, PKEY_Device_FriendlyName};
 
 /// RAII wrapper for a Windows HANDLE to ensure it's closed on drop.
 #[derive(Debug)]
