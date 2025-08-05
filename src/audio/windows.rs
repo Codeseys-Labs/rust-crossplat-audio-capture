@@ -63,10 +63,13 @@ use windows::Win32::System::Com::{
     CoCreateInstance, CoInitializeEx, CoTaskMemFree, CoUninitialize, CLSCTX_ALL,
     COINIT_MULTITHREADED, STGM_READ,
 };
-use windows::Win32::System::Ole::PropVariantClear;
+// PropVariantClear will be called through COM interface methods
 // Define RPC_E_CHANGED_MODE constant
 const RPC_E_CHANGED_MODE: windows::core::HRESULT = windows::core::HRESULT(-2147417850i32); // 0x80010106
-use windows::Win32::System::Com::StructuredStorage::{PROPVARIANT, VT_EMPTY, VT_LPWSTR};
+use windows::Win32::System::Com::StructuredStorage::PROPVARIANT;
+// Define VT constants since they're not easily accessible
+const VT_EMPTY: u16 = 0;
+const VT_LPWSTR: u16 = 31;
 use windows::Win32::System::Threading::{OpenProcess, WaitForSingleObject, PROCESS_SYNCHRONIZE};
 use windows::Win32::UI::Shell::PropertiesSystem::IPropertyStore;
 
@@ -312,7 +315,7 @@ impl AudioDevice for WindowsAudioDevice {
                     prop_variant.vt
                 )))
             };
-            PropVariantClear(&mut prop_variant).map_err(|hr| {
+            unsafe { windows::Win32::System::Ole::PropVariantClear(&mut prop_variant) }.map_err(|hr| {
                 AudioError::BackendSpecificError(format!(
                     "PropVariantClear failed (HRESULT: {:?})",
                     hr
@@ -1676,8 +1679,8 @@ impl AudioCaptureBackend for WasapiBackend {
 }
 
 pub struct WasapiCaptureStream {
-    client: AudioClient,
-    capture_client: AudioCaptureClient,
+    client: IAudioClient,
+    capture_client: IAudioCaptureClient,
     buffer: VecDeque<u8>,
     config: StreamConfig,
     event_handle: Option<wasapi::Handle>,
