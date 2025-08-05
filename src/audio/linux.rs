@@ -1645,7 +1645,7 @@ impl PipeWireStream {
                     StreamCommand::Connect => {
                         let mut params_slice: Vec<&Pod> = Vec::new();
                         match stream.connect(
-                            PwDirection::Input, // Use aliased PwDirection
+                            Direction::Input, // Use Direction
                             None,
                             StreamFlags::AUTOCONNECT | StreamFlags::MAP_BUFFERS,
                             &mut params_slice,

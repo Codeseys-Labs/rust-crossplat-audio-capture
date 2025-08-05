@@ -301,13 +301,13 @@ impl AudioCaptureBuilder {
                         // If user selected an input device or specific device by ID/name (which might be input),
                         // and we are targeting an app, switch to default output.
                         // This interpretation aligns with "ensure the device used is the default render/output device".
-                        actual_device_selector = Some(DeviceSelector::DefaultOutputDevice);
+                        actual_device_selector = Some(DeviceSelector::DefaultOutput);
                     }
-                    Some(DeviceSelector::DefaultOutputDevice) => {
+                    Some(DeviceSelector::DefaultOutput) => {
                         // User already selected default output, which is fine for app capture.
                     }
                     None => {
-                        actual_device_selector = Some(DeviceSelector::DefaultOutputDevice);
+                        actual_device_selector = Some(DeviceSelector::DefaultOutput);
                     }
                 }
             }
@@ -512,7 +512,7 @@ impl AudioCaptureBuilder {
             if !selected_device.is_output() {
                 return Err(AudioError::ConfigurationError(format!(
                     "Selected device '{}' is not an output device, which is required for application-specific capture.",
-                    selected_device.get_name().unwrap_or_else(|_| "Unknown Device".to_string())
+                    selected_device.get_name()
                 )));
             }
         } else {
@@ -522,7 +522,6 @@ impl AudioCaptureBuilder {
                     "Selected device '{}' is not an input device.",
                     selected_device
                         .get_name()
-                        .unwrap_or_else(|_| "Unknown Device".to_string())
                 )));
             }
         }
