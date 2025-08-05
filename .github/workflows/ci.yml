@@ -30,16 +30,13 @@ jobs:
       - name: Check formatting
         run: cargo fmt --all -- --check
 
-      - name: Install PipeWire dev libraries for linting
+      - name: Install dependencies for linting
         run: |
           sudo apt-get update
-          sudo apt-get install -y libpipewire-0.3-dev libspa-0.2-dev pkg-config
+          sudo apt-get install -y libpipewire-0.3-dev libspa-0.2-dev libasound2-dev pkg-config
 
-      - name: Run Clippy on all platforms
-        run: |
-          cargo clippy --features feat_linux --all-targets -- -D warnings
-          cargo clippy --features feat_windows --all-targets -- -D warnings  
-          cargo clippy --features feat_macos --all-targets -- -D warnings
+      - name: Run Clippy (Linux only on Ubuntu)
+        run: cargo clippy --features feat_linux --all-targets -- -D warnings
 
   build_and_test:
     needs: lint_and_format_checks # Depends on the lint job
