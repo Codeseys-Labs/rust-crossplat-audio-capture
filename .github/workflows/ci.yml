@@ -79,6 +79,40 @@ jobs:
 
       - name: Build Docker image and run tests (Linux)
         run: docker build --file docker/linux/Dockerfile --tag rust-audio-capture-linux-test:latest .
+
+  enhanced_windows_tests:
+    name: Enhanced Windows WASAPI Tests
+    needs: lint_and_format_checks
+    runs-on: windows-latest
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache dependencies
+        uses: actions/cache@v3
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.lock') }}
+
+      - name: Build Windows-only features
+        run: cargo build --no-default-features --features feat_windows --verbose
+        env:
+          WINAPI_NO_BUNDLED_LIBRARIES: 1
+
+      - name: Test Enhanced WASAPI Device Enumeration
+        run: |
+          Write-Host "Testing enhanced WASAPI device enumeration with wasapi-rs optimizations..."
+          Write-Host "VecDeque buffering, process tree support, and improved error handling"
+          cargo run --example windows_device_test --features feat_windows
+        shell: pwsh
+        env:
+          WINAPI_NO_BUNDLED_LIBRARIES: 1
   coverage:
     name: Code Coverage
     needs: lint_and_format_checks # Depends on the lint job

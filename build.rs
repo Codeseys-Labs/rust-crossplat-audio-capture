@@ -5,12 +5,25 @@ fn main() {
         process::{self, Command},
     };
 
-    let libs = ["alsa", "libpulse", "libpipewire-0.3"];
-    let missing: Vec<&str> = libs
+    // Use PipeWire as primary backend, PulseAudio as optional fallback
+    let required_libs = ["alsa", "libpipewire-0.3"];
+    let optional_libs = ["libpulse"];
+    let missing: Vec<&str> = required_libs
         .iter()
         .copied()
         .filter(|lib| pkg_config::Config::new().probe(lib).is_err())
         .collect();
+    
+    // Check optional libs but don't fail if missing
+    let missing_optional: Vec<&str> = optional_libs
+        .iter()
+        .copied()
+        .filter(|lib| pkg_config::Config::new().probe(lib).is_err())
+        .collect();
+    
+    if !missing_optional.is_empty() {
+        eprintln!("Optional libraries not found (PipeWire will be used instead): {}", missing_optional.join(", "));
+    }
 
     if missing.is_empty() {
         return;
@@ -28,7 +41,6 @@ fn main() {
                 .iter()
                 .map(|lib| match *lib {
                     "alsa" => "libasound2-dev",
-                    "libpulse" => "libpulse-dev",
                     "libpipewire-0.3" => "libpipewire-0.3-dev",
                     _ => *lib,
                 })
@@ -44,7 +56,7 @@ fn main() {
                 .status();
 
             if status.map_or(false, |s| s.success()) {
-                let still_missing: Vec<&str> = libs
+                let still_missing: Vec<&str> = required_libs
                     .iter()
                     .copied()
                     .filter(|lib| pkg_config::Config::new().probe(lib).is_err())

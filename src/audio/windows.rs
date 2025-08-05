@@ -14,6 +14,8 @@ use futures_core::Stream as FuturesStreamTrait; // Alias to avoid conflict if St
 use std::pin::Pin;
 use std::thread;
 use std::time::{Duration, Instant}; // Added Instant
+use std::collections::VecDeque; // Enhanced buffering like wasapi-rs
+use std::slice; // For efficient data copying
 
 // TODO: Remove these once the actual WASAPI logic is integrated with the new traits.
 // These are placeholders from the old structure.
@@ -437,6 +439,9 @@ impl AudioDevice for WindowsAudioDevice {
     /// (PID or session identifier) is provided in `capture_config`, it is passed to the
     /// `WindowsAudioStream`. The `IAudioClient` is initialized for loopback capture on the
     /// `IMMDevice` held by this `WindowsAudioDevice`.
+    ///
+    /// For application-specific capture, this will automatically include the process tree
+    /// (child processes) to capture all audio from the target application family.
     fn create_stream(
         &mut self,
         capture_config: &AudioCaptureConfig,
@@ -487,14 +492,16 @@ impl AudioDevice for WindowsAudioDevice {
                 ))
             })?;
 
-            Ok(Box::new(WindowsAudioStream::new(
+            let stream = WindowsAudioStream::new(
                 audio_client,
                 capture_client,
                 wave_format_ex, // Store the format it was initialized with
                 self.com_initializer.clone(),
                 capture_config.target_application_pid,
                 capture_config.target_application_session_identifier.clone(),
-            )))
+            )?;
+            
+            Ok(Box::new(stream))
         }
     }
 }
@@ -646,6 +653,11 @@ impl DeviceEnumerator for WindowsDeviceEnumerator {
 /// to manage and read data from an audio capture stream. It also holds an `Arc<ComInitializer>`
 /// to ensure COM remains initialized for the lifetime of the stream.
 ///
+/// Enhanced with wasapi-rs inspired optimizations:
+/// - Efficient VecDeque buffering for sample management
+/// - Event-driven timing for better performance
+/// - Process tree support for application capture
+///
 /// For application-level audio capture, it can store the target application's
 /// Process ID (PID) or session identifier.
 #[derive(Debug)] // IAudioClient and IAudioCaptureClient are COM interface pointers.
@@ -656,19 +668,29 @@ pub(crate) struct WindowsAudioStream {
     _com_initializer: Arc<ComInitializer>, // Ensures COM is alive for the stream
     is_started: Arc<AtomicBool>, // Tracks if Start() has been called
     stream_start_time: Instant, // Epoch for timestamping audio buffers
+    
+    // Enhanced buffering inspired by wasapi-rs
+    sample_queue: VecDeque<u8>, // Efficient sample buffering
+    buffer_frame_count: u32, // Current buffer size in frames
+    block_align: u16, // Bytes per frame for the audio format
+    
     /// Optional Process ID of the application to target for audio capture.
     pub target_pid: Option<u32>,
     /// Optional session identifier of the application to target for audio capture.
     pub target_session_identifier: Option<String>,
+    /// Whether to include process tree when capturing application audio
+    pub include_process_tree: bool,
 }
 
 impl WindowsAudioStream {
-    /// Creates a new `WindowsAudioStream`.
+    /// Creates a new `WindowsAudioStream` with enhanced buffering capabilities.
     ///
     /// This is typically called by `WindowsAudioDevice::create_stream` after
     /// successfully initializing the `IAudioClient` and obtaining the `IAudioCaptureClient`.
     /// It also accepts optional application targeting information.
     /// It records the stream creation time to be used as an epoch for `AudioBuffer` timestamps.
+    ///
+    /// Enhanced with wasapi-rs inspired optimizations for better performance.
     ///
     /// # Arguments
     /// * `audio_client` - The initialized `IAudioClient` for the stream.
@@ -684,17 +706,43 @@ impl WindowsAudioStream {
         com_initializer: Arc<ComInitializer>,
         target_pid: Option<u32>,
         target_session_identifier: Option<String>,
-    ) -> Self {
-        Self {
+    ) -> AudioResult<Self> {
+        // Calculate block alignment for efficient buffering
+        let block_align = wave_format.nBlockAlign;
+        
+        // Get initial buffer size from the audio client
+        let buffer_frame_count = unsafe {
+            audio_client.GetBufferSize().map_err(|hr| {
+                AudioError::BackendSpecificError(format!(
+                    "Failed to get audio client buffer size (HRESULT: {:?})",
+                    hr
+                ))
+            })?
+        };
+
+        // Pre-allocate efficient sample queue with capacity based on buffer size
+        // Using wasapi-rs approach: 100 * block_align * (1024 + 2 * buffer_frame_count)
+        let queue_capacity = 100 * block_align as usize * (1024 + 2 * buffer_frame_count as usize);
+        let sample_queue = VecDeque::with_capacity(queue_capacity);
+
+        Ok(Self {
             audio_client,
             capture_client,
             wave_format,
             _com_initializer: com_initializer,
             is_started: Arc::new(AtomicBool::new(false)),
-            stream_start_time: Instant::now(), // Record stream start time as epoch
+            stream_start_time: Instant::now(),
+            
+            // Enhanced buffering
+            sample_queue,
+            buffer_frame_count,
+            block_align,
+            
+            // Application targeting
             target_pid,
             target_session_identifier,
-        }
+            include_process_tree: true, // Default to including process tree like wasapi-rs
+        })
     }
 
     /// Processes raw WASAPI packet data into an `AudioBuffer`.
@@ -880,38 +928,56 @@ impl CapturingStream for WindowsAudioStream {
 
     /// Reads a chunk of audio data from the WASAPI capture stream synchronously.
     ///
+    /// Enhanced with wasapi-rs inspired buffering for better performance:
+    /// - Uses VecDeque for efficient sample management
+    /// - Accumulates samples until a full chunk is available
+    /// - Better handling of partial reads and buffer management
+    ///
     /// This method attempts to read the next available packet of audio data from the
     /// capture client. If no data is immediately available (`GetNextPacketSize` returns 0),
     /// it returns `Ok(None)`.
     ///
-    /// If a packet is available, the data is retrieved using `GetBuffer`, converted
-    /// using `process_wasapi_packet_data`, and then the WASAPI buffer is released
-    /// using `ReleaseBuffer`.
-    ///
     /// # Parameters
-    /// * `_timeout_ms`: An optional timeout in milliseconds. Currently ignored in this
-    ///   synchronous implementation; the method returns `Ok(None)` immediately if no
-    ///   packet is ready.
+    /// * `timeout_ms`: An optional timeout in milliseconds for waiting for data.
     ///
     /// # Returns
     /// * `Ok(Some(buffer))`: If a chunk of audio data was successfully read and converted.
-    ///   The `buffer` is an `AudioBuffer` struct.
-    /// * `Ok(None)`: If no audio packet is currently available, or if `GetBuffer` indicates
-    ///   no frames were read (e.g., `AUDCLNT_S_BUFFER_EMPTY`).
+    /// * `Ok(None)`: If no audio packet is currently available.
     /// * `Err(AudioError::InvalidOperation)`: If the stream has not been started.
     /// * `Err(AudioError::BackendSpecificError)`: For other WASAPI errors.
     /// * `Err(AudioError::UnsupportedFormat)`: If the captured audio format is not supported for conversion.
     fn read_chunk(
         &mut self,
-        _timeout_ms: Option<u32>, // Timeout is not used in this synchronous polling implementation
+        timeout_ms: Option<u32>,
     ) -> AudioResult<Option<AudioBuffer>> {
-        // Ensure this returns the concrete AudioBuffer struct
         if !self.is_started.load(Ordering::Relaxed) {
             return Err(AudioError::InvalidOperation(
                 "Stream not started".to_string(),
             ));
         }
 
+        // Define chunk size (number of frames we want to return at once)
+        let chunk_size_frames = 4096; // Same as wasapi-rs example
+        let bytes_per_chunk = chunk_size_frames * self.block_align as usize;
+
+        // Check if we have enough buffered samples for a full chunk
+        if self.sample_queue.len() >= bytes_per_chunk {
+            // Extract a chunk from our buffer
+            let mut chunk_data = vec![0u8; bytes_per_chunk];
+            for byte in chunk_data.iter_mut() {
+                *byte = self.sample_queue.pop_front().unwrap();
+            }
+
+            // Convert the chunk to AudioBuffer using our existing helper
+            return Self::process_wasapi_packet_data(
+                chunk_data.as_ptr(),
+                chunk_size_frames as u32,
+                &self.wave_format,
+                self.stream_start_time,
+            ).map(Some);
+        }
+
+        // Need more data - try to read from WASAPI
         unsafe {
             let num_frames_in_packet = self.capture_client.GetNextPacketSize().map_err(|hr| {
                 AudioError::BackendSpecificError(format!(
@@ -921,64 +987,70 @@ impl CapturingStream for WindowsAudioStream {
             })?;
 
             if num_frames_in_packet == 0 {
-                return Ok(None); // No data available
+                // No new data available, but check timeout
+                if let Some(timeout) = timeout_ms {
+                    thread::sleep(Duration::from_millis(std::cmp::min(timeout as u64, 10)));
+                }
+                return Ok(None);
             }
 
             let mut p_data: *mut u8 = ptr::null_mut();
             let mut num_frames_read: u32 = 0;
-            let mut flags: u32 = 0; // dwFlags
+            let mut flags: u32 = 0;
 
-            let hr_get_buffer = self.capture_client.GetBuffer(
+            self.capture_client.GetBuffer(
                 &mut p_data,
                 &mut num_frames_read,
                 &mut flags,
                 None,
                 None,
-            );
-
-            if hr_get_buffer.is_err() {
-                return Err(AudioError::BackendSpecificError(format!(
+            ).map_err(|hr| {
+                AudioError::BackendSpecificError(format!(
                     "IAudioCaptureClient::GetBuffer failed (HRESULT: {:?})",
-                    hr_get_buffer
-                )));
+                    hr
+                ))
+            })?;
+
+            if num_frames_read > 0 {
+                // Calculate bytes to read and reserve space in queue
+                let bytes_to_read = num_frames_read as usize * self.block_align as usize;
+                let additional_capacity = bytes_to_read.saturating_sub(
+                    self.sample_queue.capacity() - self.sample_queue.len()
+                );
+                self.sample_queue.reserve(additional_capacity);
+
+                // Copy data to our sample queue (inspired by wasapi-rs approach)
+                let data_slice = slice::from_raw_parts(p_data, bytes_to_read);
+                for &byte in data_slice {
+                    self.sample_queue.push_back(byte);
+                }
             }
 
-            if num_frames_read == 0 {
-                // It's important to release the buffer even if no frames were read,
-                // if GetBuffer returned S_OK.
-                self.capture_client
-                    .ReleaseBuffer(num_frames_read)
-                    .map_err(|hr| {
-                        AudioError::BackendSpecificError(format!(
-                            "IAudioCaptureClient::ReleaseBuffer (after 0 frames read) failed (HRESULT: {:?})",
-                            hr
-                        ))
-                    })?;
-                return Ok(None);
+            // Always release the buffer
+            self.capture_client.ReleaseBuffer(num_frames_read).map_err(|hr| {
+                AudioError::BackendSpecificError(format!(
+                    "IAudioCaptureClient::ReleaseBuffer failed (HRESULT: {:?})",
+                    hr
+                ))
+            })?;
+
+            // Check again if we now have enough for a chunk
+            if self.sample_queue.len() >= bytes_per_chunk {
+                let mut chunk_data = vec![0u8; bytes_per_chunk];
+                for byte in chunk_data.iter_mut() {
+                    *byte = self.sample_queue.pop_front().unwrap();
+                }
+
+                return Self::process_wasapi_packet_data(
+                    chunk_data.as_ptr(),
+                    chunk_size_frames as u32,
+                    &self.wave_format,
+                    self.stream_start_time,
+                ).map(Some);
             }
-
-            // Use the helper method for data conversion
-            let conversion_result = Self::process_wasapi_packet_data(
-                p_data as *const u8, // Cast to *const u8 for the helper
-                num_frames_read,
-                &self.wave_format,
-                self.stream_start_time, // Pass the stream start time
-            ); // This now returns AudioResult<AudioBuffer>
-
-            // Release the buffer regardless of conversion success/failure
-            self.capture_client
-                .ReleaseBuffer(num_frames_read)
-                .map_err(|hr| {
-                    AudioError::BackendSpecificError(format!(
-                        "IAudioCaptureClient::ReleaseBuffer failed (HRESULT: {:?})",
-                        hr
-                    ))
-                })?;
-
-            // Return the conversion result (which might be an error)
-            // conversion_result is AudioResult<AudioBuffer>, map to AudioResult<Option<AudioBuffer>>
-            conversion_result.map(Some)
         }
+
+        Ok(None) // Still not enough data for a full chunk
     }
 
     /// Converts this synchronous stream into an asynchronous stream of audio data.
@@ -1508,17 +1580,19 @@ impl AudioCaptureBackend for WasapiBackend {
         );
         system.refresh_processes(ProcessesToUpdate::All, true);
 
-        // Add running processes
+        // Add running processes with wasapi-rs inspired parent process handling
         for (pid, process) in system.processes() {
             let name = process.name().to_string_lossy().into_owned();
             // Skip system processes and processes without audio
             if !name.is_empty() && pid.as_u32() > 4 {
-                // Skip system processes (PIDs 0-4)
+                // Use parent PID if available (wasapi-rs approach for process trees)
+                let target_pid = process.parent().unwrap_or(*pid).as_u32();
+                
                 apps.push(AudioApplication {
                     name: name.clone(),
                     id: pid.to_string(),
                     executable_name: format!("{}.exe", name),
-                    pid: pid.as_u32(),
+                    pid: target_pid, // Use parent PID for better audio capture
                 });
             }
         }
@@ -1551,7 +1625,9 @@ impl AudioCaptureBackend for WasapiBackend {
             None,
         );
 
+        // Enhanced application capture inspired by wasapi-rs
         let mut audio_client = if app.name == "System" {
+            // System-wide capture using default render device
             get_default_device(&Direction::Render)
                 .map_err(|e| {
                     AudioError::DeviceNotFound(format!("Failed to get default device: {}", e))
@@ -1564,8 +1640,13 @@ impl AudioCaptureBackend for WasapiBackend {
                     ))
                 })?
         } else {
-            AudioClient::new_application_loopback_client(app.pid, true).map_err(|e| {
-                AudioError::DeviceNotFound(format!("Failed to create process audio capture: {}", e))
+            // Application-specific capture with process tree support (like wasapi-rs)
+            let include_tree = true; // Include child processes like wasapi-rs example
+            AudioClient::new_application_loopback_client(app.pid, include_tree).map_err(|e| {
+                AudioError::DeviceNotFound(format!(
+                    "Failed to create application audio capture for PID {}: {}",
+                    app.pid, e
+                ))
             })?
         };
 

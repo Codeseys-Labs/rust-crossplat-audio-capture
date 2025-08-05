@@ -66,6 +66,14 @@ jobs:
         env:
           WINAPI_NO_BUNDLED_LIBRARIES: 1
 
+      - name: Test Enhanced WASAPI Device Enumeration
+        run: |
+          Write-Host "Testing enhanced WASAPI device enumeration with wasapi-rs optimizations..."
+          cargo run --example windows_device_test --features feat_windows
+        shell: pwsh
+        env:
+          WINAPI_NO_BUNDLED_LIBRARIES: 1
+
       - name: Test audio capture
         run: |
           # Start test applications

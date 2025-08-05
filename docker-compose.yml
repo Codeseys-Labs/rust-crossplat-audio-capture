@@ -47,38 +47,29 @@ services:
 
   # Keeping other platforms for reference
   rsac-windows:
-    build:
-      context: .
-      dockerfile: docker/windows/Dockerfile
+    image: dockurr/windows
     container_name: windows-audio-test
     environment:
       - VERSION=11
       - RAM_SIZE=4G
       - CPU_CORES=2
-      - DISK_SIZE=64G
-      - USERNAME=TestUser
-      - PASSWORD=TestPass123
-      - AUDIO_ALLOW_INSECURE=1
-      - WASAPI_ALLOW_EXCLUSIVE=1
-      - AUDIO_DEVICE_PERIOD=50
-      - AUDIO_DEVICE_BUFFER_FRAMES=1024
-      - RUST_BACKTRACE=1
-      - RUST_LOG=debug
+      - DISK_SIZE=32G
+      - USERNAME=RustDev
+      - PASSWORD=AudioTest123
+      - LANGUAGE=English
+    devices:
+      - /dev/kvm
+      - /dev/net/tun
+    cap_add:
+      - NET_ADMIN
+    ports:
+      - "8006:8006"  # Web interface
+      - "3389:3389"  # RDP
     volumes:
-      - .:/app
-      - type: volume
-        source: test_results
-        target: C:\test_results
-      - type: volume
-        source: test_audio
-        target: C:\test_audio
-    isolation: process
-    deploy:
-      resources:
-        limits:
-          memory: 6G
-        reservations:
-          memory: 4G
+      - ./windows-storage:/storage  # Windows disk storage
+      - .:/data  # Project files accessible as \\host.lan\Data
+    restart: unless-stopped
+    stop_grace_period: 2m
 
   rsac-macos:
     build:

@@ -40,10 +40,11 @@ COPY docker/linux/pulse-daemon.conf /etc/pulse/daemon.conf
 # PipeWire specific layer
 FROM rsac-test-base as rsac-pipewire
 
-# Install PipeWire
+# Install PipeWire and ALSA
 RUN apt-get update && apt-get install -y \
     pipewire pipewire-bin pipewire-pulse \
     libpipewire-0.3-dev libspa-0.2-dev \
+    libasound2-dev \
     pulseaudio-utils
 
 # Set up runtime directory for PipeWire
