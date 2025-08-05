@@ -67,17 +67,21 @@ pub fn check_pipewire_availability() -> PipewireStatus {
     };
 
     // Check main PipeWire socket (e.g., pipewire-0)
-    if !pipewire_core_present { // Only check if not already confirmed by env var
-        if check_socket(&xdg_runtime_dir, "pipewire-0") ||
-           check_socket(&pipewire_runtime_dir_env, "pipewire-0") {
+    if !pipewire_core_present {
+        // Only check if not already confirmed by env var
+        if check_socket(&xdg_runtime_dir, "pipewire-0")
+            || check_socket(&pipewire_runtime_dir_env, "pipewire-0")
+        {
             pipewire_core_present = true;
         }
     }
-    
+
     // Check PipeWire PulseAudio emulation socket (e.g., pulse/native)
-    if !pipewire_pulse_present { // Only check if not already confirmed by PULSE_SERVER
-        if check_socket(&xdg_runtime_dir, "pulse/native") ||
-           check_socket(&pipewire_runtime_dir_env, "pulse/native") {
+    if !pipewire_pulse_present {
+        // Only check if not already confirmed by PULSE_SERVER
+        if check_socket(&xdg_runtime_dir, "pulse/native")
+            || check_socket(&pipewire_runtime_dir_env, "pulse/native")
+        {
             pipewire_pulse_present = true;
             pipewire_core_present = true; // Finding pulse/native implies core is also there
         }
@@ -98,29 +102,36 @@ pub fn check_pipewire_availability() -> PipewireStatus {
 }
 
 #[cfg(target_os = "linux")]
-pub mod pulseaudio;
+pub mod pipewire;
 #[cfg(target_os = "linux")]
-pub mod pipewire; // Added pipewire module
+pub mod pulseaudio; // Added pipewire module
 
 // Re-export items for application-level capture if needed by other modules
 #[cfg(target_os = "linux")]
 pub use pipewire::{enumerate_audio_applications_pipewire, LinuxApplicationInfo};
 
-
+use crate::core::buffer::AudioBuffer; // This is the new AudioBuffer struct
 use crate::core::config::{AudioCaptureConfig, AudioConfig, StreamConfig}; // Corrected import path
 use crate::core::error::{AudioError, CaptureError, Result as AudioResult}; // Added CaptureError
 use crate::core::interface::{
-    AudioBackend, AudioDevice, CapturingStream, DeviceEnumerator, DeviceKind, // Added AudioBackend
+    AudioBackend,
+    AudioDevice,
+    CapturingStream,
+    DeviceEnumerator,
+    DeviceKind, // Added AudioBackend
     StreamDataCallback,
     // AudioBuffer trait is removed, struct will be imported from crate::core::buffer
 };
-use crate::core::buffer::AudioBuffer; // This is the new AudioBuffer struct
 use crate::{AudioFormat, SampleFormat}; // AudioFormat is re-exported from lib.rs
 use log::{debug, error, info, warn}; // Added for logging
 use std::sync::Once; // For one-time initialization of PipeWire
 
 // Ensure pulseaudio module is accessible
-use self::pulseaudio::{PulseAudioBackend as PaBackend, PulseAudioCaptureStream as PaCaptureStream};
+use self::pulseaudio::{
+    PulseAudioBackend as PaBackend, PulseAudioCaptureStream as PaCaptureStream,
+};
+use futures_channel::mpsc; // For MPSC channel
+use futures_core::Stream;
 use pipewire::{
     keys as pw_keys,
     spa::{
@@ -133,14 +144,12 @@ use pipewire::{
     },
     types as pw_types,
 }; // Added for PipeWire keys and types
-use std::fmt::Display; // Added for DeviceId Display trait
-use std::sync::Arc; // Added for Arc
 use std::collections::VecDeque; // For data_queue
+use std::fmt::Display; // Added for DeviceId Display trait
 use std::pin::Pin; // For Pin<Box<dyn Stream>>
 use std::sync::atomic::{AtomicBool, Ordering as AtomicOrdering}; // Renamed Ordering to avoid conflict if any
-use std::time::Instant; // Added for timestamping
-use futures_channel::mpsc; // For MPSC channel
-use futures_core::Stream; // For the Stream trait
+use std::sync::Arc; // Added for Arc
+use std::time::Instant; // Added for timestamping // For the Stream trait
 
 // TODO: Remove these once the actual PipeWire logic is integrated with the new traits.
 // These are placeholders from the old structure.
@@ -156,16 +165,16 @@ use pipewire::{
     properties::properties, // This is fine
     registry::Registry,     // This is fine
     spa,
+    stream::Listener as StreamListener, // For listener_handle type
     // spa::pod::{Object, Pod}, // Pod is used directly from spa::pod::Pod
     stream::{Stream as PwStream, StreamFlags},
     Context,    // For PipewireCoreContext
     Core,       // For PipewireCoreContext
     MainLoop,   // For PipewireCoreContext
     Properties, // Explicitly import Properties
-    stream::Listener as StreamListener, // For listener_handle type
 };
 // Removed: use crate::core::buffer::VecAudioBuffer; // Will use AudioBuffer struct directly
- 
+
 use super::core::{AudioApplication, AudioCaptureBackend, AudioCaptureStream};
 
 // --- Linux Backend Abstraction ---
@@ -231,27 +240,38 @@ impl LinuxAudioBackend {
             }
             Err(e) => {
                 error!("PulseAudio backend initialization failed: {:?}", e);
-                Err(AudioError::BackendInitializationFailed("Both PipeWire and PulseAudio backends failed to initialize.".into()))
+                Err(AudioError::BackendInitializationFailed(
+                    "Both PipeWire and PulseAudio backends failed to initialize.".into(),
+                ))
             }
         }
     }
 }
 
 impl AudioBackend for LinuxAudioBackend {
-    fn create_stream(&mut self, config: &AudioCaptureConfig) -> AudioResult<Box<dyn CapturingStream + 'static>> {
+    fn create_stream(
+        &mut self,
+        config: &AudioCaptureConfig,
+    ) -> AudioResult<Box<dyn CapturingStream + 'static>> {
         match self {
             LinuxAudioBackend::PipeWire(ref core_ctx) => {
-                debug!("LinuxAudioBackend (PipeWire): Creating stream with config: {:?}", config);
+                debug!(
+                    "LinuxAudioBackend (PipeWire): Creating stream with config: {:?}",
+                    config
+                );
                 // Create a temporary enumerator to get a device.
                 // This assumes LinuxDeviceEnumerator doesn't have significant side effects on creation beyond init.
-                let enumerator = LinuxDeviceEnumerator { core_context: Arc::clone(core_ctx) };
-                
-                let mut device_to_use: LinuxAudioDevice = if let Some(id_str) = &config.device_name {
+                let enumerator = LinuxDeviceEnumerator {
+                    core_context: Arc::clone(core_ctx),
+                };
+
+                let mut device_to_use: LinuxAudioDevice = if let Some(id_str) = &config.device_name
+                {
                     enumerator.get_device_by_id(&id_str.to_string())?
                 } else {
                     enumerator.get_default_device(DeviceKind::Input)?
                 };
-                
+
                 // device_to_use is LinuxAudioDevice. Its create_stream method must adhere to AudioDevice trait.
                 // AudioDevice::create_stream returns AudioResult<Box<dyn CapturingStream + 'static>>
                 // So, device_to_use.create_stream(config) will return the correctly boxed stream.
@@ -261,9 +281,15 @@ impl AudioBackend for LinuxAudioBackend {
                 Ok(pw_dyn_capturing_stream)
             }
             LinuxAudioBackend::PulseAudio(ref mut pa_backend) => {
-                debug!("LinuxAudioBackend (PulseAudio): Creating stream with config: {:?}", config);
-                let pa_stream = pa_backend.create_capture_stream(&config.stream_config, config.device_name.as_deref())?;
-                Ok(Box::new(LinuxCapturingStream::PulseAudio(Box::new(pa_stream))))
+                debug!(
+                    "LinuxAudioBackend (PulseAudio): Creating stream with config: {:?}",
+                    config
+                );
+                let pa_stream = pa_backend
+                    .create_capture_stream(&config.stream_config, config.device_name.as_deref())?;
+                Ok(Box::new(LinuxCapturingStream::PulseAudio(Box::new(
+                    pa_stream,
+                ))))
             }
         }
     }
@@ -272,11 +298,14 @@ impl AudioBackend for LinuxAudioBackend {
         match self {
             LinuxAudioBackend::PipeWire(ref core_ctx) => {
                 debug!("LinuxAudioBackend (PipeWire): Getting default capture device.");
-                let enumerator = LinuxDeviceEnumerator { core_context: Arc::clone(core_ctx) };
-                match enumerator.get_default_device(DeviceKind::Input) { // Returns AudioResult<LinuxAudioDevice>
+                let enumerator = LinuxDeviceEnumerator {
+                    core_context: Arc::clone(core_ctx),
+                };
+                match enumerator.get_default_device(DeviceKind::Input) {
+                    // Returns AudioResult<LinuxAudioDevice>
                     Ok(device) => Ok(Some(Box::new(device) as Box<dyn AudioDevice + 'static>)),
                     Err(AudioError::DeviceNotFound) => Ok(None), // Corrected: DeviceNotFound is unit-like
-                    Err(e) => Err(e), // Propagate other errors
+                    Err(e) => Err(e),                            // Propagate other errors
                 }
             }
             LinuxAudioBackend::PulseAudio(_) => {
@@ -291,9 +320,14 @@ impl AudioBackend for LinuxAudioBackend {
         match self {
             LinuxAudioBackend::PipeWire(ref core_ctx) => {
                 debug!("LinuxAudioBackend (PipeWire): Enumerating capture devices.");
-                let enumerator = LinuxDeviceEnumerator { core_context: Arc::clone(core_ctx) };
+                let enumerator = LinuxDeviceEnumerator {
+                    core_context: Arc::clone(core_ctx),
+                };
                 let devices = enumerator.get_input_devices()?; // get_input_devices now returns AudioResult<Vec<LinuxAudioDevice>>
-                Ok(devices.into_iter().map(|d| Box::new(d) as Box<dyn AudioDevice + 'static>).collect())
+                Ok(devices
+                    .into_iter()
+                    .map(|d| Box::new(d) as Box<dyn AudioDevice + 'static>)
+                    .collect())
             }
             LinuxAudioBackend::PulseAudio(_) => {
                 debug!("LinuxAudioBackend (PulseAudio): Enumerate capture devices - returning empty list (NotImplemented).");
@@ -308,21 +342,27 @@ impl CapturingStream for LinuxCapturingStream {
     fn start(&mut self) -> AudioResult<()> {
         match self {
             LinuxCapturingStream::PipeWire(ref mut pw_stream) => pw_stream.start(),
-            LinuxCapturingStream::PulseAudio(ref mut pa_stream) => pa_stream.start().map_err(AudioError::from),
+            LinuxCapturingStream::PulseAudio(ref mut pa_stream) => {
+                pa_stream.start().map_err(AudioError::from)
+            }
         }
     }
 
     fn stop(&mut self) -> AudioResult<()> {
         match self {
             LinuxCapturingStream::PipeWire(ref mut pw_stream) => pw_stream.stop(),
-            LinuxCapturingStream::PulseAudio(ref mut pa_stream) => pa_stream.stop().map_err(AudioError::from),
+            LinuxCapturingStream::PulseAudio(ref mut pa_stream) => {
+                pa_stream.stop().map_err(AudioError::from)
+            }
         }
     }
 
     fn close(&mut self) -> AudioResult<()> {
         match self {
             LinuxCapturingStream::PipeWire(ref mut pw_stream) => pw_stream.close(),
-            LinuxCapturingStream::PulseAudio(ref mut pa_stream) => pa_stream.close().map_err(AudioError::from),
+            LinuxCapturingStream::PulseAudio(ref mut pa_stream) => {
+                pa_stream.close().map_err(AudioError::from)
+            }
         }
     }
 
@@ -336,7 +376,9 @@ impl CapturingStream for LinuxCapturingStream {
     fn read_chunk(&mut self, timeout_ms: Option<u32>) -> AudioResult<Option<AudioBuffer>> {
         match self {
             LinuxCapturingStream::PipeWire(ref mut pw_stream) => pw_stream.read_chunk(timeout_ms),
-            LinuxCapturingStream::PulseAudio(ref mut pa_stream) => pa_stream.read_chunk(timeout_ms).map_err(AudioError::from),
+            LinuxCapturingStream::PulseAudio(ref mut pa_stream) => {
+                pa_stream.read_chunk(timeout_ms).map_err(AudioError::from)
+            }
         }
     }
 
@@ -349,11 +391,12 @@ impl CapturingStream for LinuxCapturingStream {
     > {
         match self {
             LinuxCapturingStream::PipeWire(ref mut pw_stream) => pw_stream.to_async_stream(),
-            LinuxCapturingStream::PulseAudio(ref mut pa_stream) => pa_stream.to_async_stream().map_err(AudioError::from),
+            LinuxCapturingStream::PulseAudio(ref mut pa_stream) => {
+                pa_stream.to_async_stream().map_err(AudioError::from)
+            }
         }
     }
 }
-
 
 // --- New Skeleton Implementations ---
 
@@ -571,7 +614,8 @@ impl AudioDevice for LinuxAudioDevice {
     fn create_stream(
         &mut self,
         capture_config: &AudioCaptureConfig,
-    ) -> AudioResult<Box<dyn CapturingStream + 'static>> { // Corrected return type to match trait
+    ) -> AudioResult<Box<dyn CapturingStream + 'static>> {
+        // Corrected return type to match trait
         debug!("LinuxAudioDevice::create_stream for device ID: {}", self.id);
 
         let core = self.core_context.core();
@@ -623,7 +667,9 @@ impl AudioDevice for LinuxAudioDevice {
             self.id,
         );
         // Wrap the concrete LinuxAudioStream in LinuxCapturingStream::PipeWire and then Box it.
-        Ok(Box::new(LinuxCapturingStream::PipeWire(Box::new(concrete_stream))))
+        Ok(Box::new(LinuxCapturingStream::PipeWire(Box::new(
+            concrete_stream,
+        ))))
     }
 }
 
@@ -664,16 +710,18 @@ struct DefaultDeviceSearchState {
     default_sink_name: Option<String>,
     default_sink_id: Option<u32>,
     monitor_device: Option<LinuxAudioDevice>, // Changed type
-    main_loop_quit_handle: MainLoop, // To call quit
+    main_loop_quit_handle: MainLoop,          // To call quit
 }
 
 impl DeviceEnumerator for LinuxDeviceEnumerator {
     type Device = LinuxAudioDevice;
 
     /// Enumerates available audio capture devices (monitor sources).
-    fn enumerate_devices(&self) -> AudioResult<Vec<LinuxAudioDevice>> { // Changed return type
+    fn enumerate_devices(&self) -> AudioResult<Vec<LinuxAudioDevice>> {
+        // Changed return type
         debug!("LinuxDeviceEnumerator::enumerate_devices()");
-        match self.get_default_device(DeviceKind::Input) { // Returns AudioResult<LinuxAudioDevice>
+        match self.get_default_device(DeviceKind::Input) {
+            // Returns AudioResult<LinuxAudioDevice>
             Ok(device) => Ok(vec![device]),
             Err(AudioError::DeviceNotFound) => Ok(Vec::new()), // If no default, return empty list
             Err(e) => Err(e),
@@ -681,8 +729,12 @@ impl DeviceEnumerator for LinuxDeviceEnumerator {
     }
 
     /// Gets the default audio device of the specified kind.
-    fn get_default_device(&self, kind: DeviceKind) -> AudioResult<LinuxAudioDevice> { // Changed return type
-        debug!("LinuxDeviceEnumerator::get_default_device(kind: {:?})", kind);
+    fn get_default_device(&self, kind: DeviceKind) -> AudioResult<LinuxAudioDevice> {
+        // Changed return type
+        debug!(
+            "LinuxDeviceEnumerator::get_default_device(kind: {:?})",
+            kind
+        );
         if kind == DeviceKind::Output {
             // This enumerator is for capture (input) devices.
             // The trait expects Self::Device, so we must return an error if it's not an input.
@@ -800,10 +852,7 @@ impl DeviceEnumerator for LinuxDeviceEnumerator {
             })
             .register()
             .map_err(|e| {
-                AudioError::BackendError(format!(
-                    "Failed to register registry listener: {}",
-                    e
-                ))
+                AudioError::BackendError(format!("Failed to register registry listener: {}", e))
             })?;
 
         // Run the main loop. It will be stopped by the callback when the device is found or implicitly times out.
@@ -821,13 +870,18 @@ impl DeviceEnumerator for LinuxDeviceEnumerator {
     fn get_device_by_id(
         &self,
         id_str: &LinuxPipeWireDeviceId, // This is &String, as per Self::Device::DeviceId
-    ) -> AudioResult<LinuxAudioDevice> { // Changed return type
-        debug!("LinuxDeviceEnumerator::get_device_by_id(id_str: {:?})", id_str);
-        
+    ) -> AudioResult<LinuxAudioDevice> {
+        // Changed return type
+        debug!(
+            "LinuxDeviceEnumerator::get_device_by_id(id_str: {:?})",
+            id_str
+        );
+
         let _node_id_u32 = match id_str.parse::<u32>() {
             Ok(id) => id,
             Err(_) => {
-                return Err(AudioError::InvalidParameter(format!( // Changed to InvalidParameter for clarity
+                return Err(AudioError::InvalidParameter(format!(
+                    // Changed to InvalidParameter for clarity
                     "Invalid PipeWire node ID string: {}. Expected a u32.",
                     id_str
                 )));
@@ -844,14 +898,16 @@ impl DeviceEnumerator for LinuxDeviceEnumerator {
     }
 
     /// Gets a list of available input audio devices.
-    fn get_input_devices(&self) -> AudioResult<Vec<LinuxAudioDevice>> { // Changed return type
+    fn get_input_devices(&self) -> AudioResult<Vec<LinuxAudioDevice>> {
+        // Changed return type
         debug!("LinuxDeviceEnumerator::get_input_devices()");
         // This should ideally perform a full enumeration. For now, it relies on enumerate_devices.
         self.enumerate_devices()
     }
 
     /// Gets a list of available output audio devices.
-    fn get_output_devices(&self) -> AudioResult<Vec<LinuxAudioDevice>> { // Changed return type
+    fn get_output_devices(&self) -> AudioResult<Vec<LinuxAudioDevice>> {
+        // Changed return type
         debug!("LinuxDeviceEnumerator::get_output_devices()");
         // This enumerator focuses on capture sources.
         Ok(Vec::new())
@@ -1032,7 +1088,7 @@ impl CapturingStream for LinuxAudioStream {
         let current_format_clone = self.current_format.clone();
         let data_queue_clone = self.data_queue.clone(); // For 6.5
         let stream_start_time_clone = self.stream_start_time; // Clone for the closure
- 
+
         let listener = self
             .stream
             .add_listener_local()
@@ -1110,7 +1166,7 @@ impl CapturingStream for LinuxAudioStream {
                         return;
                     }
                 };
-                
+
                 let chunk_size_bytes = data_ptr.len();
                 let channels = negotiated_audio_format.channels as usize;
                 let bytes_per_sample_source = negotiated_audio_format.bits_per_sample as usize / 8;
@@ -1171,7 +1227,7 @@ impl CapturingStream for LinuxAudioStream {
                         return;
                     }
                 }
-                
+
                 // Create an AudioFormat for the VecAudioBuffer (which is always F32LE after conversion)
                 let output_buffer_format = AudioFormat {
                     sample_rate: negotiated_audio_format.sample_rate,
@@ -1213,10 +1269,7 @@ impl CapturingStream for LinuxAudioStream {
                 format_pod_array,
             )
             .map_err(|e| {
-                AudioError::BackendError(format!(
-                    "Failed to connect PipeWire stream: {}",
-                    e
-                ))
+                AudioError::BackendError(format!("Failed to connect PipeWire stream: {}", e))
             })?;
 
         // is_started will be set by the state_changed callback.
@@ -1231,12 +1284,13 @@ impl CapturingStream for LinuxAudioStream {
     /// This will involve disconnecting the PipeWire stream.
     fn stop(&mut self) -> AudioResult<()> {
         // log::debug!("LinuxAudioStream::stop() for stream: {:?}", self.stream.name());
-        if !self.is_started.load(AtomicOrdering::SeqCst) && self.stream.state() != StreamState::Streaming
+        if !self.is_started.load(AtomicOrdering::SeqCst)
+            && self.stream.state() != StreamState::Streaming
         {
             // log::warn!("Stream is not running or already stopped.");
             // return Ok(()); // Or allow disconnect attempt anyway
         }
- 
+
         self.stream.disconnect().map_err(|e| {
             AudioError::BackendError(format!("Failed to disconnect PipeWire stream: {}", e))
         })?;
@@ -1251,7 +1305,8 @@ impl CapturingStream for LinuxAudioStream {
     /// Closes the audio capture stream, releasing all resources.
     fn close(&mut self) -> AudioResult<()> {
         // log::debug!("LinuxAudioStream::close() for stream: {:?}", self.stream.name());
-        if self.is_started.load(AtomicOrdering::SeqCst) || self.stream.state() != StreamState::Unconnected
+        if self.is_started.load(AtomicOrdering::SeqCst)
+            || self.stream.state() != StreamState::Unconnected
         {
             self.stop()?; // Ensure stream is stopped and disconnected
         }
@@ -1268,9 +1323,10 @@ impl CapturingStream for LinuxAudioStream {
     /// Checks if the stream is currently capturing audio (i.e., in Streaming state).
     fn is_running(&self) -> bool {
         // log::trace!("LinuxAudioStream::is_running() check, is_started: {}", self.is_started.load(AtomicOrdering::SeqCst));
-        self.is_started.load(AtomicOrdering::SeqCst) && self.stream.state() == StreamState::Streaming
+        self.is_started.load(AtomicOrdering::SeqCst)
+            && self.stream.state() == StreamState::Streaming
     }
- 
+
     /// Reads a chunk of audio data from the stream.
     ///
     /// This method attempts to retrieve an `AudioBuffer` from an internal queue populated
@@ -1285,23 +1341,21 @@ impl CapturingStream for LinuxAudioStream {
     /// - `Ok(None)`: If the internal queue is empty (no data currently available).
     /// - `Err(AudioError)`: If the stream is not running, or if an error was dequeued from
     ///   the `process` callback (e.g., format conversion error).
-    fn read_chunk(
-        &mut self,
-        _timeout_ms: Option<u32>,
-    ) -> AudioResult<Option<AudioBuffer>> { // Changed return type
+    fn read_chunk(&mut self, _timeout_ms: Option<u32>) -> AudioResult<Option<AudioBuffer>> {
+        // Changed return type
         // log::trace!("LinuxAudioStream::read_chunk(timeout_ms: {:?})", _timeout_ms);
         if !self.is_running() {
             return Err(AudioError::InvalidOperation(
                 "Stream not started or not in streaming state".to_string(),
             ));
         }
- 
+
         match self.data_queue.lock().unwrap().pop_front() {
             Some(audio_result) => audio_result.map(Some), // Propagates Err or wraps Ok(AudioBuffer) in Some
-            None => Ok(None), // Queue is empty
+            None => Ok(None),                             // Queue is empty
         }
     }
- 
+
     /// Provides an asynchronous stream of audio buffers.
     ///
     /// This method sets up a helper thread that continuously reads from an internal
@@ -1344,7 +1398,8 @@ impl CapturingStream for LinuxAudioStream {
         std::thread::spawn(move || {
             // log::debug!("Async stream helper thread started.");
             loop {
-                let audio_result_option = { // Limit scope of data_queue_locked
+                let audio_result_option = {
+                    // Limit scope of data_queue_locked
                     let mut data_queue_locked = data_queue_clone.lock().unwrap();
                     data_queue_locked.pop_front()
                 };
@@ -1568,21 +1623,33 @@ impl PipeWireStream {
             let main_loop = match MainLoop::new(None) {
                 Ok(ml) => ml,
                 Err(e) => {
-                    ready_tx.send(Err(format!("Old Backend: Failed to create MainLoop: {}", e))).unwrap();
+                    ready_tx
+                        .send(Err(format!(
+                            "Old Backend: Failed to create MainLoop: {}",
+                            e
+                        )))
+                        .unwrap();
                     return;
                 }
             };
             let context = match PwContext::new(&main_loop) {
                 Ok(ctx) => ctx,
                 Err(e) => {
-                    ready_tx.send(Err(format!("Old Backend: Failed to create Context: {}", e))).unwrap();
+                    ready_tx
+                        .send(Err(format!("Old Backend: Failed to create Context: {}", e)))
+                        .unwrap();
                     return;
                 }
             };
             let core = match context.connect(None) {
                 Ok(c) => c,
                 Err(e) => {
-                    ready_tx.send(Err(format!("Old Backend: Failed to connect to Core: {}", e))).unwrap();
+                    ready_tx
+                        .send(Err(format!(
+                            "Old Backend: Failed to connect to Core: {}",
+                            e
+                        )))
+                        .unwrap();
                     return;
                 }
             };
@@ -1678,7 +1745,10 @@ impl AudioCaptureStream for PipeWireStream {
     fn start(&mut self) -> Result<(), AudioError> {
         if let Some(tx) = &self.stream_command_tx {
             tx.send(StreamCommand::Connect).map_err(|e| {
-                AudioError::BackendError(format!("Old Backend: Failed to send connect command: {:?}", e))
+                AudioError::BackendError(format!(
+                    "Old Backend: Failed to send connect command: {:?}",
+                    e
+                ))
             })?;
         }
         Ok(())
@@ -1686,13 +1756,18 @@ impl AudioCaptureStream for PipeWireStream {
     fn stop(&mut self) -> Result<(), AudioError> {
         if let Some(tx) = &self.stream_command_tx {
             tx.send(StreamCommand::Disconnect).map_err(|e| {
-                AudioError::BackendError(format!("Old Backend: Failed to send disconnect command: {:?}", e))
+                AudioError::BackendError(format!(
+                    "Old Backend: Failed to send disconnect command: {:?}",
+                    e
+                ))
             })?;
         }
         Ok(())
     }
     fn read(&mut self, buffer: &mut [u8]) -> Result<usize, AudioError> {
-        let mut shared_buf = self.buffer.lock().map_err(|_| AudioError::BackendError("Old Backend: Mutex poisoned in read".to_string()))?;
+        let mut shared_buf = self.buffer.lock().map_err(|_| {
+            AudioError::BackendError("Old Backend: Mutex poisoned in read".to_string())
+        })?;
         let copy_size = std::cmp::min(buffer.len(), shared_buf.len());
         if copy_size > 0 {
             buffer[..copy_size].copy_from_slice(&shared_buf[..copy_size]);

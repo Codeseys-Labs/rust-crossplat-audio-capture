@@ -11,11 +11,11 @@ use crate::core::buffer::AudioBuffer; // Ensure this is the new struct
 
 use futures_channel::mpsc;
 use futures_core::Stream as FuturesStreamTrait; // Alias to avoid conflict if Stream is used elsewhere
-use std::pin::Pin;
-use std::thread;
-use std::time::{Duration, Instant}; // Added Instant
 use std::collections::VecDeque; // Enhanced buffering like wasapi-rs
-use std::slice; // For efficient data copying
+use std::pin::Pin;
+use std::slice;
+use std::thread;
+use std::time::{Duration, Instant}; // Added Instant // For efficient data copying
 
 // TODO: Remove these once the actual WASAPI logic is integrated with the new traits.
 // These are placeholders from the old structure.
@@ -500,7 +500,7 @@ impl AudioDevice for WindowsAudioDevice {
                 capture_config.target_application_pid,
                 capture_config.target_application_session_identifier.clone(),
             )?;
-            
+
             Ok(Box::new(stream))
         }
     }
@@ -668,12 +668,12 @@ pub(crate) struct WindowsAudioStream {
     _com_initializer: Arc<ComInitializer>, // Ensures COM is alive for the stream
     is_started: Arc<AtomicBool>, // Tracks if Start() has been called
     stream_start_time: Instant, // Epoch for timestamping audio buffers
-    
+
     // Enhanced buffering inspired by wasapi-rs
     sample_queue: VecDeque<u8>, // Efficient sample buffering
-    buffer_frame_count: u32, // Current buffer size in frames
-    block_align: u16, // Bytes per frame for the audio format
-    
+    buffer_frame_count: u32,    // Current buffer size in frames
+    block_align: u16,           // Bytes per frame for the audio format
+
     /// Optional Process ID of the application to target for audio capture.
     pub target_pid: Option<u32>,
     /// Optional session identifier of the application to target for audio capture.
@@ -709,7 +709,7 @@ impl WindowsAudioStream {
     ) -> AudioResult<Self> {
         // Calculate block alignment for efficient buffering
         let block_align = wave_format.nBlockAlign;
-        
+
         // Get initial buffer size from the audio client
         let buffer_frame_count = unsafe {
             audio_client.GetBufferSize().map_err(|hr| {
@@ -732,12 +732,12 @@ impl WindowsAudioStream {
             _com_initializer: com_initializer,
             is_started: Arc::new(AtomicBool::new(false)),
             stream_start_time: Instant::now(),
-            
+
             // Enhanced buffering
             sample_queue,
             buffer_frame_count,
             block_align,
-            
+
             // Application targeting
             target_pid,
             target_session_identifier,
@@ -946,10 +946,7 @@ impl CapturingStream for WindowsAudioStream {
     /// * `Err(AudioError::InvalidOperation)`: If the stream has not been started.
     /// * `Err(AudioError::BackendSpecificError)`: For other WASAPI errors.
     /// * `Err(AudioError::UnsupportedFormat)`: If the captured audio format is not supported for conversion.
-    fn read_chunk(
-        &mut self,
-        timeout_ms: Option<u32>,
-    ) -> AudioResult<Option<AudioBuffer>> {
+    fn read_chunk(&mut self, timeout_ms: Option<u32>) -> AudioResult<Option<AudioBuffer>> {
         if !self.is_started.load(Ordering::Relaxed) {
             return Err(AudioError::InvalidOperation(
                 "Stream not started".to_string(),
@@ -974,7 +971,8 @@ impl CapturingStream for WindowsAudioStream {
                 chunk_size_frames as u32,
                 &self.wave_format,
                 self.stream_start_time,
-            ).map(Some);
+            )
+            .map(Some);
         }
 
         // Need more data - try to read from WASAPI
@@ -998,25 +996,20 @@ impl CapturingStream for WindowsAudioStream {
             let mut num_frames_read: u32 = 0;
             let mut flags: u32 = 0;
 
-            self.capture_client.GetBuffer(
-                &mut p_data,
-                &mut num_frames_read,
-                &mut flags,
-                None,
-                None,
-            ).map_err(|hr| {
-                AudioError::BackendSpecificError(format!(
-                    "IAudioCaptureClient::GetBuffer failed (HRESULT: {:?})",
-                    hr
-                ))
-            })?;
+            self.capture_client
+                .GetBuffer(&mut p_data, &mut num_frames_read, &mut flags, None, None)
+                .map_err(|hr| {
+                    AudioError::BackendSpecificError(format!(
+                        "IAudioCaptureClient::GetBuffer failed (HRESULT: {:?})",
+                        hr
+                    ))
+                })?;
 
             if num_frames_read > 0 {
                 // Calculate bytes to read and reserve space in queue
                 let bytes_to_read = num_frames_read as usize * self.block_align as usize;
-                let additional_capacity = bytes_to_read.saturating_sub(
-                    self.sample_queue.capacity() - self.sample_queue.len()
-                );
+                let additional_capacity = bytes_to_read
+                    .saturating_sub(self.sample_queue.capacity() - self.sample_queue.len());
                 self.sample_queue.reserve(additional_capacity);
 
                 // Copy data to our sample queue (inspired by wasapi-rs approach)
@@ -1027,12 +1020,14 @@ impl CapturingStream for WindowsAudioStream {
             }
 
             // Always release the buffer
-            self.capture_client.ReleaseBuffer(num_frames_read).map_err(|hr| {
-                AudioError::BackendSpecificError(format!(
-                    "IAudioCaptureClient::ReleaseBuffer failed (HRESULT: {:?})",
-                    hr
-                ))
-            })?;
+            self.capture_client
+                .ReleaseBuffer(num_frames_read)
+                .map_err(|hr| {
+                    AudioError::BackendSpecificError(format!(
+                        "IAudioCaptureClient::ReleaseBuffer failed (HRESULT: {:?})",
+                        hr
+                    ))
+                })?;
 
             // Check again if we now have enough for a chunk
             if self.sample_queue.len() >= bytes_per_chunk {
@@ -1046,7 +1041,8 @@ impl CapturingStream for WindowsAudioStream {
                     chunk_size_frames as u32,
                     &self.wave_format,
                     self.stream_start_time,
-                ).map(Some);
+                )
+                .map(Some);
             }
         }
 
@@ -1587,7 +1583,7 @@ impl AudioCaptureBackend for WasapiBackend {
             if !name.is_empty() && pid.as_u32() > 4 {
                 // Use parent PID if available (wasapi-rs approach for process trees)
                 let target_pid = process.parent().unwrap_or(*pid).as_u32();
-                
+
                 apps.push(AudioApplication {
                     name: name.clone(),
                     id: pid.to_string(),

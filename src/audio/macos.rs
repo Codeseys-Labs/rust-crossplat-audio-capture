@@ -5,8 +5,16 @@
 // uniform error reporting from the CoreAudio backend.
 
 use crate::audio::core::{
-    AudioCaptureConfig, AudioDevice, AudioError, AudioFormat, AudioResult, CapturingStream,
-    DeviceEnumerator, DeviceId, DeviceKind, SampleFormat,
+    AudioCaptureConfig,
+    AudioDevice,
+    AudioError,
+    AudioFormat,
+    AudioResult,
+    CapturingStream,
+    DeviceEnumerator,
+    DeviceId,
+    DeviceKind,
+    SampleFormat,
     // AudioBuffer trait is removed, struct will be imported from crate::core::buffer
 };
 use crate::core::buffer::AudioBuffer; // This is the new AudioBuffer struct
@@ -31,16 +39,16 @@ use coreaudio_rs::sys::{
     AudioStreamBasicDescription, AudioUnitRenderActionFlags, OSStatus,
 };
 use coreaudio_rs::Error as CAError;
+use futures_channel::mpsc;
+use futures_core::Stream as FuturesStream;
 use std::collections::VecDeque;
 use std::os::raw::c_void;
+use std::pin::Pin; // Required for Pin<Box<...>> in to_async_stream
 use std::sync::{
     atomic::{AtomicBool, Ordering},
     Arc, Mutex,
 };
-use std::pin::Pin; // Required for Pin<Box<...>> in to_async_stream
-use std::time::Instant; // Added for timestamping
-use futures_channel::mpsc;
-use futures_core::Stream as FuturesStream; // Alias to avoid conflict if Stream is defined elsewhere
+use std::time::Instant; // Added for timestamping // Alias to avoid conflict if Stream is defined elsewhere
 
 // IMPORTANT: Applications using this library for audio capture on macOS MUST include the
 // `NSAudioCaptureUsageDescription` key in their `Info.plist` file. This key provides a
@@ -151,7 +159,8 @@ pub fn enumerate_audio_applications() -> AudioResult<Vec<ApplicationInfo>> {
         if running_apps_nsarray == nil {
             // This would be unusual, but good to check.
             return Err(AudioError::BackendSpecificError(
-                "Failed to get running applications array from NSWorkspace (nil returned)".to_string(),
+                "Failed to get running applications array from NSWorkspace (nil returned)"
+                    .to_string(),
             ));
         }
 
@@ -173,7 +182,9 @@ pub fn enumerate_audio_applications() -> AudioResult<Vec<ApplicationInfo>> {
             let name_str: String = if name_nsstring != nil {
                 let c_str_name_ptr = NSString::UTF8String(name_nsstring);
                 if !c_str_name_ptr.is_null() {
-                    std::ffi::CStr::from_ptr(c_str_name_ptr).to_string_lossy().into_owned()
+                    std::ffi::CStr::from_ptr(c_str_name_ptr)
+                        .to_string_lossy()
+                        .into_owned()
                 } else {
                     // Fallback if UTF8String returns null (e.g., invalid UTF-8 or empty)
                     String::from("<Invalid Name>")
@@ -187,14 +198,17 @@ pub fn enumerate_audio_applications() -> AudioResult<Vec<ApplicationInfo>> {
             let bundle_id: Option<String> = if bundle_id_nsstring != nil {
                 let c_str_bundle_ptr = NSString::UTF8String(bundle_id_nsstring);
                 if !c_str_bundle_ptr.is_null() {
-                    let bundle_str = std::ffi::CStr::from_ptr(c_str_bundle_ptr).to_string_lossy().into_owned();
-                    if bundle_str.is_empty() { // Treat empty string as None for bundle_id
+                    let bundle_str = std::ffi::CStr::from_ptr(c_str_bundle_ptr)
+                        .to_string_lossy()
+                        .into_owned();
+                    if bundle_str.is_empty() {
+                        // Treat empty string as None for bundle_id
                         None
                     } else {
                         Some(bundle_str)
                     }
                 } else {
-                     // Fallback if UTF8String returns null
+                    // Fallback if UTF8String returns null
                     None // Or Some("<Invalid Bundle ID>".to_string()) if explicit error string is preferred
                 }
             } else {
@@ -320,7 +334,9 @@ pub(crate) fn map_ca_error(err: CAError) -> AudioError {
         // For now, assuming direct u32 comparison is okay or these are i32.
         // Let's use the direct constants from `sys` which should be i32.
         sys::kAudioHardwarePermissionsError => AudioError::PermissionDenied,
-        sys::kAudioUnitErr_FormatNotSupported => AudioError::FormatNotSupported(format!("CoreAudio OSStatus: {}", os_status)),
+        sys::kAudioUnitErr_FormatNotSupported => {
+            AudioError::FormatNotSupported(format!("CoreAudio OSStatus: {}", os_status))
+        }
         // Add other specific mappings here if needed.
         // Example: kAudioUnitErr_InvalidProperty means the property is not supported by the AU
         // sys::kAudioUnitErr_InvalidProperty => AudioError::BackendSpecificError(format!("CoreAudio Invalid Property (OSStatus: {})", os_status)),
@@ -344,8 +360,10 @@ pub(crate) fn map_ca_error(err: CAError) -> AudioError {
         // `kAudioUnitErr_CannotDoInCurrentContext` is -10863
         // `kAudioUnitErr_InvalidElement` is -10877
         // `kAudioUnitErr_NoConnection` is -10872 (could be relevant for taps)
-
-        _ => AudioError::BackendSpecificError(format!("CoreAudio error: {:?} (OSStatus: {})", err, os_status)),
+        _ => AudioError::BackendSpecificError(format!(
+            "CoreAudio error: {:?} (OSStatus: {})",
+            err, os_status
+        )),
     }
 }
 
@@ -366,7 +384,7 @@ pub(crate) struct MacosAudioStream {
     /// an `AudioResult` wrapping an `AudioBuffer` struct.
     data_queue: Arc<Mutex<VecDeque<AudioResult<AudioBuffer>>>>, // Changed to AudioBuffer struct
     stream_start_time: Instant, // Epoch for timestamping audio buffers
-    // _input_callback_handle: Option<Box<dyn Any + Send + Sync>>, // Not strictly needed if closure is 'static
+                                // _input_callback_handle: Option<Box<dyn Any + Send + Sync>>, // Not strictly needed if closure is 'static
 }
 
 // Custom Debug implementation because AudioUnit might not be Debug.
@@ -396,7 +414,7 @@ impl MacosAudioStream {
             // TODO: Consider making queue capacity configurable.
             data_queue: Arc::new(Mutex::new(VecDeque::with_capacity(10))),
             stream_start_time: Instant::now(), // Record stream start time as epoch
-            // _input_callback_handle: None,
+                                               // _input_callback_handle: None,
         }
     }
 }
@@ -421,7 +439,7 @@ impl CapturingStream for MacosAudioStream {
             .audio_unit
             .get_property(
                 sys::kAudioUnitProperty_StreamFormat,
-                Scope::Output, // Data flowing OUT of the INPUT bus
+                Scope::Output,      // Data flowing OUT of the INPUT bus
                 Element::INPUT_BUS, // The bus providing captured audio (Element 1)
             )
             .map_err(map_ca_error)?;
@@ -432,7 +450,7 @@ impl CapturingStream for MacosAudioStream {
         let current_asbd_clone = self.current_asbd.clone();
         let is_started_clone = self.is_started.clone();
         let stream_start_time_clone = self.stream_start_time; // Clone for the closure
-        // let audio_unit_instance_clone = self.audio_unit.clone(); // AudioUnit is not Clone
+                                                              // let audio_unit_instance_clone = self.audio_unit.clone(); // AudioUnit is not Clone
 
         // 3. Set the input callback.
         // This callback is set on the output bus (Element 0), input scope.
@@ -461,7 +479,7 @@ impl CapturingStream for MacosAudioStream {
                 // Allocate AudioBufferList for capturing data from Element 1
                 let is_input_interleaved =
                     (input_asbd.mFormatFlags & sys::kAudioFormatFlagIsNonInterleaved) == 0;
-                
+
                 // `coreaudio_rs::audio_buffer::AudioBufferList::allocate` creates a Box<sys::AudioBufferList>
                 // and allocates mData for each buffer if the last param is true.
                 let captured_abl_boxed_result = CAAudioBufferList::allocate(
@@ -483,7 +501,7 @@ impl CapturingStream for MacosAudioStream {
                         return Ok(()); // Error pushed to queue, callback returns OK to CoreAudio
                     }
                 };
-                
+
                 let captured_abl_ptr: *mut sys::AudioBufferList = &mut *captured_abl_boxed;
 
                 let mut render_action_flags: AudioUnitRenderActionFlags = 0;
@@ -564,7 +582,7 @@ impl CapturingStream for MacosAudioStream {
                              // Push error to queue
                         }
                     }
-                    
+
                     let target_format = AudioFormat {
                         sample_rate: input_asbd.mSampleRate as u32,
                         channels: input_asbd.mChannelsPerFrame as u16,
@@ -578,7 +596,7 @@ impl CapturingStream for MacosAudioStream {
                         format: target_format,
                         timestamp: Instant::now().duration_since(stream_start_time_clone), // Timestamp relative to stream start
                     };
-                    
+
                     let mut queue = data_queue_clone.lock().unwrap();
                     if queue.len() == queue.capacity() {
                         queue.pop_front(); // Make space if full (simple strategy)
@@ -598,9 +616,7 @@ impl CapturingStream for MacosAudioStream {
             .map_err(map_ca_error)?;
 
         // 4. Start the AudioUnit
-        self.audio_unit
-            .start()
-            .map_err(map_ca_error)?;
+        self.audio_unit.start().map_err(map_ca_error)?;
         self.is_started.store(true, Ordering::SeqCst);
 
         Ok(())
@@ -613,9 +629,7 @@ impl CapturingStream for MacosAudioStream {
         if !self.is_started.load(Ordering::SeqCst) {
             return Ok(());
         }
-        self.audio_unit
-            .stop()
-            .map_err(map_ca_error)?;
+        self.audio_unit.stop().map_err(map_ca_error)?;
         self.is_started.store(false, Ordering::SeqCst);
         // Optionally, clear the callback? Or clear the queue?
         // For now, just stop. The callback checks `is_started`.
@@ -649,16 +663,24 @@ impl CapturingStream for MacosAudioStream {
     /// - `Ok(None)`: No data currently available in the queue (non-blocking behavior).
     /// - `Err(AudioError)`: An error occurred, such as the stream not running,
     ///   an error propagated from the audio callback, or a mutex lock failure.
-    fn read_chunk(&mut self, _timeout_ms: Option<u32>) -> AudioResult<Option<AudioBuffer>> { // Changed return type
+    fn read_chunk(&mut self, _timeout_ms: Option<u32>) -> AudioResult<Option<AudioBuffer>> {
+        // Changed return type
         if !self.is_running() {
-            return Err(AudioError::InvalidOperation("Stream is not running or not started.".to_string()));
+            return Err(AudioError::InvalidOperation(
+                "Stream is not running or not started.".to_string(),
+            ));
         }
 
         // TODO: Implement proper timeout logic if _timeout_ms is Some.
         // For now, this is a non-blocking pop.
-        match self.data_queue.lock().map_err(|_| AudioError::MutexLockError("data_queue".to_string()))?.pop_front() {
+        match self
+            .data_queue
+            .lock()
+            .map_err(|_| AudioError::MutexLockError("data_queue".to_string()))?
+            .pop_front()
+        {
             Some(audio_result) => audio_result.map(Some), // Propagates Ok(buffer) or Err(error_from_callback)
-            None => Ok(None), // Queue is empty, no data available
+            None => Ok(None),                             // Queue is empty, no data available
         }
     }
 
@@ -819,8 +841,8 @@ impl AudioDevice for MacosAudioDevice {
             mScope: kAudioObjectPropertyScopeOutput, // For loopback, we inspect the output device's format
             mElement: kAudioObjectPropertyElementMaster,
         };
-        let asbd: AudioStreamBasicDescription = AudioObject::get_property(&self.device_id, address)
-            .map_err(map_ca_error)?;
+        let asbd: AudioStreamBasicDescription =
+            AudioObject::get_property(&self.device_id, address).map_err(map_ca_error)?;
         asbd_to_audio_format(&asbd)
     }
 
@@ -872,9 +894,7 @@ impl AudioDevice for MacosAudioDevice {
             .into_owned(); // into_owned is important if AudioComponent is a Cow
 
         // 3. Create AudioUnit instance
-        let mut audio_unit = component
-            .new_instance()
-            .map_err(map_ca_error)?;
+        let mut audio_unit = component.new_instance().map_err(map_ca_error)?;
 
         // 4. Set current device on AUHAL
         audio_unit
@@ -938,9 +958,7 @@ impl AudioDevice for MacosAudioDevice {
             .map_err(map_ca_error)?;
 
         // 9. Initialize AudioUnit
-        audio_unit
-            .initialize()
-            .map_err(map_ca_error)?;
+        audio_unit.initialize().map_err(map_ca_error)?;
 
         // 10. Define MacosAudioStream struct skeleton (done above)
         // 11. Return Ok(Box::new(MacosAudioStream::new(audio_unit)))
@@ -957,22 +975,24 @@ use crate::audio::macos::tap::CoreAudioProcessTap;
 // Explicitly listing some that are definitely needed for clarity in this block:
 // use crate::core::buffer::VecAudioBuffer; // This will be removed or unused
 use crate::audio::core::{AudioFormat, AudioResult, CapturingStream, SampleFormat}; // AudioBuffer trait removed from here
-// AudioBuffer struct is already imported at the top of the module.
-use coreaudio_rs::audio_unit::{AudioUnit, Element, Scope, RenderArgs};
+                                                                                   // AudioBuffer struct is already imported at the top of the module.
+use coreaudio_rs::audio_unit::{AudioUnit, Element, RenderArgs, Scope};
 use coreaudio_rs::sys::{
-    self, kAudioUnitType_Output, kAudioUnitSubType_HALOutput, kAudioUnitManufacturer_Apple,
+    self, kAudioFormatFlagIsFloat, kAudioFormatFlagIsNonInterleaved,
     kAudioOutputUnitProperty_CurrentDevice, kAudioOutputUnitProperty_EnableIO,
-    kAudioUnitProperty_StreamFormat, AudioStreamBasicDescription, OSStatus,
-    AudioUnitRenderActionFlags, kAudioFormatFlagIsNonInterleaved, kAudioFormatFlagIsFloat,
+    kAudioUnitManufacturer_Apple, kAudioUnitProperty_StreamFormat, kAudioUnitSubType_HALOutput,
+    kAudioUnitType_Output, AudioStreamBasicDescription, AudioUnitRenderActionFlags, OSStatus,
 };
-use std::sync::{Arc, Mutex, atomic::{AtomicBool, Ordering}};
 use std::collections::VecDeque;
+use std::sync::{
+    atomic::{AtomicBool, Ordering},
+    Arc, Mutex,
+};
 // Pin is already imported at the top level of the module.
 // use std::pin::Pin;
 // mpsc and FuturesStream are also imported at the top level.
 // use futures_channel::mpsc;
 // use futures_core::Stream as FuturesStream;
-
 
 /// Represents an active audio stream for capturing application-specific audio on macOS
 /// using a `CoreAudioProcessTap`.
@@ -996,7 +1016,7 @@ pub struct MacosApplicationAudioStream {
     /// an `AudioResult` wrapping an `AudioBuffer` struct.
     data_queue: Arc<Mutex<VecDeque<AudioResult<AudioBuffer>>>>, // Changed to AudioBuffer struct
     stream_start_time: Instant, // Epoch for timestamping audio buffers
-    // _input_callback_handle: Option<Box<dyn std::any::Any + Send + Sync>>, // If needed for callback lifetime
+                                // _input_callback_handle: Option<Box<dyn std::any::Any + Send + Sync>>, // If needed for callback lifetime
 }
 
 impl std::fmt::Debug for MacosApplicationAudioStream {
@@ -1049,7 +1069,9 @@ impl MacosApplicationAudioStream {
         // 2. Find component
         let component = AudioComponent::find(Some(&desc), None)
             .ok_or_else(|| {
-                AudioError::BackendSpecificError("Failed to find AUHAL component for tap stream".into())
+                AudioError::BackendSpecificError(
+                    "Failed to find AUHAL component for tap stream".into(),
+                )
             })?
             .into_owned();
 
@@ -1072,7 +1094,7 @@ impl MacosApplicationAudioStream {
         audio_unit
             .set_property(
                 kAudioOutputUnitProperty_EnableIO,
-                Scope::Input,      // Scope for enabling input
+                Scope::Input,       // Scope for enabling input
                 Element::INPUT_BUS, // Element is the input bus (capture side from tap)
                 Some(&enable_io),
             )
@@ -1082,7 +1104,7 @@ impl MacosApplicationAudioStream {
         audio_unit
             .set_property(
                 kAudioOutputUnitProperty_EnableIO,
-                Scope::Output,      // Scope for enabling output
+                Scope::Output,       // Scope for enabling output
                 Element::OUTPUT_BUS, // Element is the output bus (playback side, disabled)
                 Some(&disable_io),
             )
@@ -1097,7 +1119,7 @@ impl MacosApplicationAudioStream {
         audio_unit
             .set_property(
                 kAudioUnitProperty_StreamFormat,
-                Scope::Output,     // Data flowing OUT of the INPUT bus
+                Scope::Output,      // Data flowing OUT of the INPUT bus
                 Element::INPUT_BUS, // The bus providing captured audio from the tap
                 Some(&tap_asbd),
             )
@@ -1109,7 +1131,7 @@ impl MacosApplicationAudioStream {
         audio_unit
             .set_property(
                 kAudioUnitProperty_StreamFormat,
-                Scope::Input,       // Data flowing INTO the OUTPUT bus
+                Scope::Input,        // Data flowing INTO the OUTPUT bus
                 Element::OUTPUT_BUS, // The bus that would normally render to speakers
                 Some(&tap_asbd),
             )
@@ -1163,7 +1185,7 @@ impl CapturingStream for MacosApplicationAudioStream {
         let native_tap_asbd_clone = self.native_tap_asbd.clone();
         let is_started_clone = self.is_started.clone();
         let stream_start_time_clone = self.stream_start_time; // Clone for the closure
-        // AudioUnit is not Clone, will be accessed via RenderArgs.audio_unit_ref
+                                                              // AudioUnit is not Clone, will be accessed via RenderArgs.audio_unit_ref
 
         self.audio_unit.set_input_callback(
             Element::INPUT_BUS, // Callback for the input bus
@@ -1189,7 +1211,7 @@ impl CapturingStream for MacosApplicationAudioStream {
 
                 // Allocate AudioBufferList for capturing data from the tap via Element 1
                 let is_tap_data_non_interleaved = (tap_asbd.mFormatFlags & kAudioFormatFlagIsNonInterleaved) != 0;
-                
+
                 let captured_abl_boxed_result = CAAudioBufferList::allocate(
                     tap_asbd.mChannelsPerFrame,
                     num_frames,
@@ -1282,7 +1304,7 @@ impl CapturingStream for MacosApplicationAudioStream {
                              // Push error or fill with silence
                         }
                     }
-                    
+
                     let output_audio_format = AudioFormat {
                         sample_rate: tap_asbd.mSampleRate as u32,
                         channels: tap_asbd.mChannelsPerFrame as u16,
@@ -1296,7 +1318,7 @@ impl CapturingStream for MacosApplicationAudioStream {
                         format: output_audio_format,
                         timestamp: Instant::now().duration_since(stream_start_time_clone), // Timestamp relative to stream start
                     };
-                    
+
                     let mut queue = data_queue_clone.lock().unwrap();
                     if queue.len() == queue.capacity() { queue.pop_front(); }
                     queue.push_back(Ok(audio_buffer_struct)); // Changed to AudioBuffer struct
@@ -1412,16 +1434,24 @@ impl CapturingStream for MacosApplicationAudioStream {
     /// - `Err(AudioError)`: An error occurred. This could be due to the stream not running,
     ///   an error propagated from the audio callback (e.g., capture or processing error),
     ///   or a mutex lock failure.
-    fn read_chunk(&mut self, _timeout_ms: Option<u32>) -> AudioResult<Option<AudioBuffer>> { // Changed return type
+    fn read_chunk(&mut self, _timeout_ms: Option<u32>) -> AudioResult<Option<AudioBuffer>> {
+        // Changed return type
         if !self.is_running() {
-            return Err(AudioError::InvalidOperation("Stream not started or not in streaming state".to_string()));
+            return Err(AudioError::InvalidOperation(
+                "Stream not started or not in streaming state".to_string(),
+            ));
         }
 
         // TODO: Implement timeout logic if _timeout_ms is Some.
         // For now, this is a non-blocking pop.
-        match self.data_queue.lock().map_err(|_| AudioError::MutexLockError("data_queue".to_string()))?.pop_front() {
+        match self
+            .data_queue
+            .lock()
+            .map_err(|_| AudioError::MutexLockError("data_queue".to_string()))?
+            .pop_front()
+        {
             Some(audio_result) => audio_result.map(Some), // Propagates Ok(buffer) or Err(error_from_callback)
-            None => Ok(None), // Queue is empty, no data available
+            None => Ok(None),                             // Queue is empty, no data available
         }
     }
 
@@ -1536,8 +1566,7 @@ impl CapturingStream for MacosApplicationAudioStream {
 /// and providing access to the default system output device for loopback capture.
 pub(crate) struct MacosDeviceEnumerator;
 
-impl MacosDeviceEnumerator {
-}
+impl MacosDeviceEnumerator {}
 
 impl DeviceEnumerator for MacosDeviceEnumerator {
     /// Gets the default audio device for the specified kind.

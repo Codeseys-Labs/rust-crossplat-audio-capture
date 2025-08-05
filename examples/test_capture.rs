@@ -1,12 +1,12 @@
 use clap::Parser;
 use hound::{WavSpec, WavWriter};
-use rsac::api::{AudioCaptureBuilder};
+use rsac::api::AudioCaptureBuilder;
 use rsac::core::config::{DeviceSelector, SampleFormat};
 use rsac::core::error::AudioError;
-use rsac::{get_device_enumerator, AudioApplication, get_audio_backend};
+use rsac::{get_audio_backend, get_device_enumerator, AudioApplication};
 use std::path::PathBuf;
-use std::time::Duration;
 use std::thread;
+use std::time::Duration;
 
 #[derive(Parser)]
 #[command(name = "test_capture")]
@@ -15,15 +15,15 @@ struct Args {
     /// Duration in seconds to capture
     #[arg(short, long, default_value = "5")]
     duration: u64,
-    
+
     /// Output file path
     #[arg(short, long, default_value = "test_capture.wav")]
     output: PathBuf,
-    
+
     /// Application name to capture (optional, captures system audio if not specified)
     #[arg(short, long)]
     application: Option<String>,
-    
+
     /// Enable verbose output
     #[arg(short, long)]
     verbose: bool,
@@ -99,7 +99,10 @@ fn capture_with_new_api(args: &Args) -> Result<(), AudioError> {
     capture_session.start()?;
 
     if args.verbose {
-        println!("Started audio capture, recording for {} seconds...", args.duration);
+        println!(
+            "Started audio capture, recording for {} seconds...",
+            args.duration
+        );
     }
 
     // Record for specified duration
@@ -135,9 +138,10 @@ fn capture_with_old_api(args: &Args) -> Result<(), Box<dyn std::error::Error>> {
         }
 
         // Find the target application
-        if let Some(target_app) = applications.iter().find(|app|
-            app.name.to_lowercase().contains(&app_name.to_lowercase())
-        ) {
+        if let Some(target_app) = applications
+            .iter()
+            .find(|app| app.name.to_lowercase().contains(&app_name.to_lowercase()))
+        {
             if args.verbose {
                 println!("Found target application: {}", target_app.name);
             }
@@ -153,7 +157,10 @@ fn capture_with_old_api(args: &Args) -> Result<(), Box<dyn std::error::Error>> {
             stream.start()?;
 
             if args.verbose {
-                println!("Started application capture, recording for {} seconds...", args.duration);
+                println!(
+                    "Started application capture, recording for {} seconds...",
+                    args.duration
+                );
             }
 
             thread::sleep(Duration::from_secs(args.duration));
@@ -190,7 +197,7 @@ fn create_placeholder_wav(output_path: &PathBuf) -> Result<(), Box<dyn std::erro
 
         // Create a test signal that simulates captured audio
         let signal = 0.3 * (2.0 * std::f32::consts::PI * 440.0 * t).sin() +  // A4
-                    0.2 * (2.0 * std::f32::consts::PI * 880.0 * t).sin();     // A5
+                    0.2 * (2.0 * std::f32::consts::PI * 880.0 * t).sin(); // A5
 
         let sample = (signal * 16384.0) as i16; // Convert to 16-bit
 

@@ -1,12 +1,15 @@
 use clap::Parser;
 use hound::{WavSpec, WavWriter};
-use rsac::api::{AudioCaptureBuilder};
+use rsac::api::AudioCaptureBuilder;
 use rsac::core::config::{DeviceSelector, SampleFormat};
 use rsac::core::error::AudioError;
-use rsac::{get_device_enumerator, enumerate_application_audio_sessions, ApplicationAudioSessionInfo, ProcessAudioCapture};
+use rsac::{
+    enumerate_application_audio_sessions, get_device_enumerator, ApplicationAudioSessionInfo,
+    ProcessAudioCapture,
+};
 use std::path::PathBuf;
-use std::time::Duration;
 use std::thread;
+use std::time::Duration;
 
 #[derive(Parser)]
 #[command(name = "test_windows")]
@@ -15,23 +18,23 @@ struct Args {
     /// Duration in seconds to capture
     #[arg(short, long, default_value = "5")]
     duration: u64,
-    
+
     /// Output file path
     #[arg(short, long, default_value = "test_capture.wav")]
     output: PathBuf,
-    
+
     /// Application name to capture (optional, captures system audio if not specified)
     #[arg(short, long)]
     application: Option<String>,
-    
+
     /// Use exclusive mode
     #[arg(long)]
     exclusive_mode: bool,
-    
+
     /// Audio format to test
     #[arg(long, default_value = "f32le")]
     format: String,
-    
+
     /// Enable verbose output
     #[arg(short, long)]
     verbose: bool,
@@ -113,26 +116,37 @@ fn capture_with_wasapi(args: &Args) -> Result<(), AudioError> {
                 }
 
                 // Find target application
-                if let Some(target_session) = sessions.iter().find(|session|
-                    session.display_name.to_lowercase().contains(&app_name.to_lowercase())
-                ) {
+                if let Some(target_session) = sessions.iter().find(|session| {
+                    session
+                        .display_name
+                        .to_lowercase()
+                        .contains(&app_name.to_lowercase())
+                }) {
                     if args.verbose {
-                        println!("Found target application: {} (PID: {})",
-                                target_session.display_name, target_session.process_id);
+                        println!(
+                            "Found target application: {} (PID: {})",
+                            target_session.display_name, target_session.process_id
+                        );
                     }
 
                     // Try to use ProcessAudioCapture for application-specific capture
                     match ProcessAudioCapture::new(target_session.process_id) {
                         Ok(mut process_capture) => {
                             if args.verbose {
-                                println!("Created ProcessAudioCapture for PID {}", target_session.process_id);
+                                println!(
+                                    "Created ProcessAudioCapture for PID {}",
+                                    target_session.process_id
+                                );
                             }
 
                             // Start capture
                             process_capture.start_capture()?;
 
                             if args.verbose {
-                                println!("Started process capture, recording for {} seconds...", args.duration);
+                                println!(
+                                    "Started process capture, recording for {} seconds...",
+                                    args.duration
+                                );
                             }
 
                             thread::sleep(Duration::from_secs(args.duration));
@@ -141,7 +155,11 @@ fn capture_with_wasapi(args: &Args) -> Result<(), AudioError> {
                             process_capture.stop_capture()?;
 
                             // Create placeholder WAV file (until we implement actual data collection)
-                            create_placeholder_wav(&args.output, &args.format, args.exclusive_mode)?;
+                            create_placeholder_wav(
+                                &args.output,
+                                &args.format,
+                                args.exclusive_mode,
+                            )?;
                             return Ok(());
                         }
                         Err(e) => {
@@ -184,14 +202,20 @@ fn capture_with_wasapi(args: &Args) -> Result<(), AudioError> {
         .build()?;
 
     if args.verbose {
-        println!("Created WASAPI capture session with format: {}", args.format);
+        println!(
+            "Created WASAPI capture session with format: {}",
+            args.format
+        );
     }
 
     // Start capturing
     capture_session.start()?;
 
     if args.verbose {
-        println!("Started WASAPI capture, recording for {} seconds...", args.duration);
+        println!(
+            "Started WASAPI capture, recording for {} seconds...",
+            args.duration
+        );
     }
 
     // Record for specified duration
@@ -206,7 +230,11 @@ fn capture_with_wasapi(args: &Args) -> Result<(), AudioError> {
     Ok(())
 }
 
-fn create_placeholder_wav(output_path: &PathBuf, format: &str, exclusive_mode: bool) -> Result<(), Box<dyn std::error::Error>> {
+fn create_placeholder_wav(
+    output_path: &PathBuf,
+    format: &str,
+    exclusive_mode: bool,
+) -> Result<(), Box<dyn std::error::Error>> {
     // Create a WAV file with test audio data
     let spec = WavSpec {
         channels: 2,
@@ -237,11 +265,11 @@ fn create_placeholder_wav(output_path: &PathBuf, format: &str, exclusive_mode: b
             // Different pattern for exclusive mode test
             0.5 * (2.0 * std::f32::consts::PI * 261.63 * t).sin() +  // C4
             0.3 * (2.0 * std::f32::consts::PI * 329.63 * t).sin() +  // E4
-            0.2 * (2.0 * std::f32::consts::PI * 392.00 * t).sin()    // G4
+            0.2 * (2.0 * std::f32::consts::PI * 392.00 * t).sin() // G4
         } else {
             // Standard test pattern
             0.3 * (2.0 * std::f32::consts::PI * 440.0 * t).sin() +   // A4
-            0.2 * (2.0 * std::f32::consts::PI * 880.0 * t).sin()     // A5
+            0.2 * (2.0 * std::f32::consts::PI * 880.0 * t).sin() // A5
         };
 
         // Write samples based on format
@@ -255,7 +283,8 @@ fn create_placeholder_wav(output_path: &PathBuf, format: &str, exclusive_mode: b
                 writer.write_sample(sample)?;
                 writer.write_sample(sample)?;
             }
-            _ => { // s16le
+            _ => {
+                // s16le
                 let sample = (signal * 16384.0) as i16;
                 writer.write_sample(sample)?;
                 writer.write_sample(sample)?;

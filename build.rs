@@ -13,16 +13,19 @@ fn main() {
         .copied()
         .filter(|lib| pkg_config::Config::new().probe(lib).is_err())
         .collect();
-    
+
     // Check optional libs but don't fail if missing
     let missing_optional: Vec<&str> = optional_libs
         .iter()
         .copied()
         .filter(|lib| pkg_config::Config::new().probe(lib).is_err())
         .collect();
-    
+
     if !missing_optional.is_empty() {
-        eprintln!("Optional libraries not found (PipeWire will be used instead): {}", missing_optional.join(", "));
+        eprintln!(
+            "Optional libraries not found (PipeWire will be used instead): {}",
+            missing_optional.join(", ")
+        );
     }
 
     if missing.is_empty() {
