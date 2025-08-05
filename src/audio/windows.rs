@@ -315,12 +315,14 @@ impl AudioDevice for WindowsAudioDevice {
                     prop_variant.vt
                 )))
             };
-            unsafe { windows::Win32::System::Ole::PropVariantClear(&mut prop_variant) }.map_err(|hr| {
-                AudioError::BackendSpecificError(format!(
-                    "PropVariantClear failed (HRESULT: {:?})",
-                    hr
-                ))
-            })?;
+            unsafe { windows::Win32::System::Ole::PropVariantClear(&mut prop_variant) }.map_err(
+                |hr| {
+                    AudioError::BackendSpecificError(format!(
+                        "PropVariantClear failed (HRESULT: {:?})",
+                        hr
+                    ))
+                },
+            )?;
             name
         }
     }
