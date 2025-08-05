@@ -1,4 +1,4 @@
-use crate::core::config::AudioConfig; // Corrected import path
+use crate::core::config::StreamConfig; // Corrected import path - AudioConfig doesn't exist, use StreamConfig
 use crate::core::config::SampleFormat as CoreSampleFormat; // Alias to avoid conflict if crate::SampleFormat is different
 use crate::{AudioCaptureStream, AudioError};
 use std::sync::Arc;

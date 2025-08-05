@@ -6,7 +6,7 @@ use std::time::Duration;
 /// This struct holds raw audio samples along with metadata such as the number of channels,
 /// sample rate, audio format, and a timestamp indicating when the buffer was captured or created
 /// (relative to an epoch).
-#[derive(Debug, Clone, Send, Sync)]
+#[derive(Debug, Clone)]
 pub struct AudioBuffer {
     /// The raw audio data, typically interleaved if multi-channel.
     /// Using `f32` as the default data type for samples.
@@ -90,3 +90,7 @@ impl AudioBuffer {
 
 // Comments indicate that VecAudioBuffer and the old AudioBuffer trait
 // were already removed or planned for removal, aligning with this refactoring.
+
+// Manual implementation of Send and Sync since they can't be derived
+unsafe impl Send for AudioBuffer {}
+unsafe impl Sync for AudioBuffer {}

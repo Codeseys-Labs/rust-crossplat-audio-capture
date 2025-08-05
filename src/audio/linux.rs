@@ -109,8 +109,9 @@ pub mod pipewire;
 pub use pipewire::{enumerate_audio_applications_pipewire, LinuxApplicationInfo};
 
 use crate::core::buffer::AudioBuffer; // This is the new AudioBuffer struct
-use crate::core::config::{AudioCaptureConfig, StreamConfig}; // Corrected import path
-use crate::core::error::{AudioError, CaptureError, Result as AudioResult}; // Added CaptureError
+use crate::api::AudioCaptureConfig; // AudioCaptureConfig is in api.rs
+use crate::core::config::StreamConfig; // StreamConfig is in core::config
+use crate::core::error::{AudioError, Result as AudioResult}; // Removed CaptureError as it doesn't exist
 use crate::core::interface::{
     AudioBackend,
     AudioDevice,

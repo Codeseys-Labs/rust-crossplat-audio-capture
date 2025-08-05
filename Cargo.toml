@@ -23,7 +23,9 @@ test-utils = [] # Feature to enable test utilities
 [dependencies]
 # Core dependencies
 futures-core = "0.3.31"
+futures-util = "0.3.31"                                    # For stream utilities
 futures-channel = "0.3.31"                                 # For MPSC channel for async stream
+thiserror = "1.0.69"                                       # For error handling
 hound = "3.5.1"
 sysinfo = "0.36.1"
 clap = { version = "4.5.42", features = ["derive"] }
