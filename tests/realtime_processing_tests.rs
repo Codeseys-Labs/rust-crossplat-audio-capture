@@ -1,10 +1,9 @@
 // tests/realtime_processing_tests.rs
 use rsac::api::AudioCapture;
-use rsac::core::buffer::AudioBuffer;
 use rsac::api::AudioCaptureConfig;
+use rsac::core::buffer::AudioBuffer;
 use rsac::core::config::{
-    ApiConfig, BitsPerSample, CaptureAPI, ChannelConfig, Channels,
-    SampleFormat, SampleRate,
+    ApiConfig, BitsPerSample, CaptureAPI, ChannelConfig, Channels, SampleFormat, SampleRate,
 };
 use rsac::core::error::AudioError;
 use rsac::core::interface::{AudioProcessor, CapturingStream};

@@ -154,10 +154,7 @@ use std::time::Instant; // Added for timestamping // For the Stream trait
 use std::{process::Command, sync::Mutex, thread, time::Duration};
 
 // Simplified PipeWire imports for 0.8.0 compatibility
-use pipewire::{
-    Context, Core, MainLoop, Properties,
-    spa,
-};
+use pipewire::{spa, Context, Core, MainLoop, Properties};
 // Removed: use crate::core::buffer::VecAudioBuffer; // Will use AudioBuffer struct directly
 
 use super::core::{AudioApplication, AudioCaptureBackend, AudioCaptureStream};
