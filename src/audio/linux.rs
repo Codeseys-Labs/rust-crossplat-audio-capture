@@ -130,7 +130,26 @@ impl PipeWireBackend {
     }
 }
 
-// AudioBackend trait doesn't exist in core::interface, so no implementation needed
+// Implement the old AudioCaptureBackend trait for compatibility
+impl super::core::AudioCaptureBackend for PipeWireBackend {
+    fn name(&self) -> &'static str {
+        "PipeWire (stub)"
+    }
+
+    fn list_applications(&self) -> super::core::Result<Vec<super::core::AudioApplication>> {
+        Ok(vec![])
+    }
+
+    fn capture_application(
+        &self,
+        _app: &super::core::AudioApplication,
+        _config: crate::core::config::StreamConfig,
+    ) -> super::core::Result<Box<dyn super::core::AudioCaptureStream>> {
+        Err(super::core::Error::NotSupported(
+            "PipeWire backend not yet implemented".to_string(),
+        ))
+    }
+}
 
 /// Stub implementation for Linux application info
 #[derive(Debug, Clone)]

@@ -2,9 +2,7 @@ use crate::audio::get_device_enumerator; // For selecting the actual device
 use crate::core::config::AudioFileFormat;
 use crate::core::config::{AudioFormat, DeviceSelector, LatencyMode, SampleFormat, StreamConfig};
 use crate::core::error::{AudioError, Result as AudioResult};
-use crate::core::interface::{
-    AudioDevice, AudioStream, CapturingStream, DeviceEnumerator, DeviceKind,
-};
+use crate::core::interface::{AudioDevice, DeviceKind};
 // AudioBuffer trait is removed from interface, struct is imported from core::buffer
 use crate::core::buffer::AudioBuffer; // This is the new AudioBuffer struct
 use std::fmt;
