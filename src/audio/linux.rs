@@ -2,19 +2,13 @@
 //!
 //! NOTE: This is currently a stub implementation to allow compilation.
 //! Full PipeWire integration is being worked on.
-#![cfg(target_os = "linux")]
 
 use crate::api::AudioCaptureConfig;
-use crate::core::buffer::AudioBuffer;
-use crate::core::config::StreamConfig;
 use crate::core::error::{AudioError, Result as AudioResult};
 use crate::core::interface::{
     AudioBackend, AudioDevice, CapturingStream, DeviceEnumerator, DeviceKind,
 };
-use crate::{AudioFormat, SampleFormat};
-use futures_channel::mpsc;
-use futures_core::Stream;
-use std::{pin::Pin, sync::Arc, time::Instant};
+use crate::AudioFormat;
 
 /// Represents the detected status of PipeWire on the system.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -81,6 +75,19 @@ impl AudioDevice for LinuxAudioDevice {
 
     fn supports_format(&self, _format: &AudioFormat) -> AudioResult<bool> {
         Ok(false)
+    }
+
+    fn is_format_supported(&self, _format: &AudioFormat) -> AudioResult<bool> {
+        Ok(false)
+    }
+
+    fn create_stream(
+        &mut self,
+        _config: &AudioCaptureConfig,
+    ) -> AudioResult<Box<dyn CapturingStream + 'static>> {
+        Err(AudioError::BackendError(
+            "Linux audio stream creation not yet implemented".to_string(),
+        ))
     }
 }
 
