@@ -33,6 +33,57 @@ pub fn check_pipewire_availability() -> PipewireStatus {
     PipewireStatus::NotAvailable
 }
 
+/// Stub Linux audio device ID
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub struct LinuxDeviceId(String);
+
+/// Stub Linux audio device
+#[derive(Debug, Clone)]
+pub struct LinuxAudioDevice {
+    id: LinuxDeviceId,
+    name: String,
+    is_input: bool,
+}
+
+impl AudioDevice for LinuxAudioDevice {
+    type DeviceId = LinuxDeviceId;
+
+    fn get_id(&self) -> Self::DeviceId {
+        self.id.clone()
+    }
+
+    fn get_name(&self) -> String {
+        self.name.clone()
+    }
+
+    fn get_supported_formats(&self) -> AudioResult<Vec<AudioFormat>> {
+        // Stub implementation
+        Ok(vec![])
+    }
+
+    fn get_default_format(&self) -> AudioResult<AudioFormat> {
+        Err(AudioError::BackendError(
+            "Linux audio device not yet implemented".to_string(),
+        ))
+    }
+
+    fn is_input(&self) -> bool {
+        self.is_input
+    }
+
+    fn is_output(&self) -> bool {
+        !self.is_input
+    }
+
+    fn is_active(&self) -> bool {
+        false
+    }
+
+    fn supports_format(&self, _format: &AudioFormat) -> AudioResult<bool> {
+        Ok(false)
+    }
+}
+
 /// Linux device enumerator (stub implementation)
 pub struct LinuxDeviceEnumerator;
 
@@ -43,14 +94,31 @@ impl LinuxDeviceEnumerator {
 }
 
 impl DeviceEnumerator for LinuxDeviceEnumerator {
-    fn enumerate_devices(&self) -> AudioResult<Vec<AudioDevice>> {
+    type Device = LinuxAudioDevice;
+
+    fn enumerate_devices(&self) -> AudioResult<Vec<Self::Device>> {
         // Stub implementation
         Ok(vec![])
     }
 
-    fn get_default_device(&self, _kind: DeviceKind) -> AudioResult<Option<AudioDevice>> {
-        // Stub implementation
-        Ok(None)
+    fn get_default_device(&self, _kind: DeviceKind) -> AudioResult<Self::Device> {
+        Err(AudioError::BackendError(
+            "No default device available".to_string(),
+        ))
+    }
+
+    fn get_input_devices(&self) -> AudioResult<Vec<Self::Device>> {
+        Ok(vec![])
+    }
+
+    fn get_output_devices(&self) -> AudioResult<Vec<Self::Device>> {
+        Ok(vec![])
+    }
+
+    fn get_device_by_id(&self, _id: &LinuxDeviceId) -> AudioResult<Self::Device> {
+        Err(AudioError::BackendError(
+            "Device not found".to_string(),
+        ))
     }
 }
 
@@ -66,7 +134,7 @@ impl PipeWireBackend {
 impl AudioBackend for PipeWireBackend {
     fn create_capturing_stream(
         &self,
-        _device: &AudioDevice,
+        _device: &dyn AudioDevice,
         _config: &AudioCaptureConfig,
     ) -> AudioResult<Box<dyn CapturingStream>> {
         Err(AudioError::BackendError(
@@ -74,11 +142,11 @@ impl AudioBackend for PipeWireBackend {
         ))
     }
 
-    fn enumerate_devices(&self) -> AudioResult<Vec<AudioDevice>> {
+    fn enumerate_devices(&self) -> AudioResult<Vec<Box<dyn AudioDevice>>> {
         Ok(vec![])
     }
 
-    fn get_default_device(&self, _kind: DeviceKind) -> AudioResult<Option<AudioDevice>> {
+    fn get_default_device(&self, _kind: DeviceKind) -> AudioResult<Option<Box<dyn AudioDevice>>> {
         Ok(None)
     }
 }
