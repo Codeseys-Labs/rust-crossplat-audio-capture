@@ -2,7 +2,8 @@
 //! Testing Windows compilation in GitHub Actions.
 #![cfg(target_os = "windows")]
 
-use crate::core::config::{AudioCaptureConfig, AudioFormat, StreamConfig};
+use crate::api::AudioCaptureConfig;
+use crate::core::config::{AudioFormat, StreamConfig};
 use crate::core::error::{AudioError, Result as AudioResult};
 use crate::core::interface::{
     AudioDevice, AudioStream, CapturingStream, DeviceEnumerator, DeviceKind, StreamDataCallback,
@@ -29,39 +30,39 @@ use wasapi::{
     Direction as WasapiDirection,
     SampleType as WasapiSampleType,
     ShareMode as WasapiShareMode,
-    WaveFormat as WasapiWaveFormat,
+    WasapiWaveFormat as WasapiWasapiWaveFormat,
 }; // Keep for old backend, note: wasapi::get_default_device is different from IMMDeviceEnumerator::GetDefaultAudioEndpoint
 
 // --- New Skeleton Implementations ---
 
 use crate::core::config::SampleFormat;
-use crate::core::interface::DeviceId;
+// DeviceId is now defined locally as WindowsDeviceId
 use std::ffi::OsStr;
 use std::os::windows::ffi::OsStrExt;
 use std::ptr;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use windows::core::{GUID, HRESULT, PWSTR};
+use windows::Win32::Devices::Properties::PKEY_Device_FriendlyName;
 use windows::Win32::Foundation::CloseHandle;
 use windows::Win32::Foundation::HANDLE; // For process handle
-use windows::Win32::Foundation::{S_FALSE, S_OK};
+use windows::Win32::Foundation::WAIT_OBJECT_0;
+use windows::Win32::Foundation::{E_NOTFOUND, S_FALSE, S_OK};
+use windows::Win32::Media::Audio::WAVE_FORMAT_IEEE_FLOAT;
 use windows::Win32::Media::Audio::{
     eAll, eCapture, eConsole, eRender, IAudioCaptureClient, IAudioClient, IMMDevice,
     IMMDeviceCollection, IMMDeviceEnumerator, IMMEndpoint, MMDeviceEnumerator,
     AUDCLNT_SHAREMODE_SHARED, AUDCLNT_STREAMFLAGS_LOOPBACK, DEVICE_STATE_ACTIVE, WAVEFORMATEX,
     WAVE_FORMAT_PCM,
 };
-use windows::Win32::Multimedia::WAVE_FORMAT_IEEE_FLOAT;
+use windows::Win32::System::Com::StructuredStorage::{PROPVARIANT, VT_EMPTY, VT_LPWSTR};
 use windows::Win32::System::Com::{
     CoCreateInstance, CoInitializeEx, CoTaskMemFree, CoUninitialize, CLSCTX_ALL,
-    COINIT_MULTITHREADED, STGM_READ,
+    COINIT_MULTITHREADED, RPC_E_CHANGED_MODE, STGM_READ,
 };
-use windows::Win32::System::PropsystemTypes::PropVariantClear;
-use windows::Win32::System::Threading::{
-    OpenProcess, WaitForSingleObject, PROCESS_SYNCHRONIZE, WAIT_OBJECT_0,
-};
-use windows::Win32::System::Variant::{PROPVARIANT, VT_EMPTY, VT_LPWSTR};
-use windows::Win32::UI::Shell::PropertiesSystem::{IPropertyStore, PKEY_Device_FriendlyName};
+use windows::Win32::System::Ole::PropVariantClear;
+use windows::Win32::System::Threading::{OpenProcess, WaitForSingleObject, PROCESS_SYNCHRONIZE};
+use windows::Win32::UI::Shell::PropertiesSystem::IPropertyStore;
 
 /// RAII wrapper for a Windows HANDLE to ensure it's closed on drop.
 #[derive(Debug)]
@@ -145,7 +146,7 @@ impl Drop for ComInitializer {
 /// This struct holds an `IMMDevice` instance, which is the core representation
 /// of an audio endpoint in WASAPI.
 #[derive(Debug)] // IMMDevice itself is a COM interface pointer, Debug should be fine.
-pub(crate) struct WindowsAudioDevice {
+pub struct WindowsAudioDevice {
     device: IMMDevice,
     com_initializer: Arc<ComInitializer>,
 }
@@ -316,7 +317,8 @@ impl AudioDevice for WindowsAudioDevice {
     }
 
     /// Determines the kind of device (Input or Output).
-    fn kind(&self) -> AudioResult<DeviceKind> {
+    /// This is a helper method, not part of the AudioDevice trait.
+    pub fn kind(&self) -> AudioResult<DeviceKind> {
         // QueryInterface for IMMEndpoint
         let endpoint: IMMEndpoint = self.device.cast().map_err(|hr| {
             AudioError::BackendSpecificError(format!(
@@ -663,7 +665,7 @@ impl DeviceEnumerator for WindowsDeviceEnumerator {
 /// For application-level audio capture, it can store the target application's
 /// Process ID (PID) or session identifier.
 #[derive(Debug)] // IAudioClient and IAudioCaptureClient are COM interface pointers.
-pub(crate) struct WindowsAudioStream {
+pub struct WindowsAudioStream {
     audio_client: IAudioClient,
     capture_client: IAudioCaptureClient,
     wave_format: WAVEFORMATEX, // Store the format it was initialized with
@@ -1366,12 +1368,12 @@ pub struct ApplicationAudioSessionInfo {
 /// }
 /// ```
 pub fn enumerate_application_audio_sessions() -> AudioResult<Vec<ApplicationAudioSessionInfo>> {
+    use windows::Win32::Foundation::HMODULE;
     use windows::Win32::Foundation::{CloseHandle, HANDLE, INVALID_HANDLE_VALUE};
     use windows::Win32::Media::Audio::{
         IAudioSessionControl, IAudioSessionControl2, IAudioSessionEnumerator, IAudioSessionManager2,
     };
     use windows::Win32::System::ProcessStatus::K32GetModuleFileNameExW; // Or QueryFullProcessImageNameW from Win32_System_Threading
-    use windows::Win32::System::SystemServices::HMODULE;
     use windows::Win32::System::Threading::{OpenProcess, PROCESS_QUERY_LIMITED_INFORMATION};
 
     let _com_initializer = ComInitializer::new()?;
@@ -1612,12 +1614,12 @@ impl AudioCaptureBackend for WasapiBackend {
     fn capture_application(
         &self,
         app: &AudioApplication,
-        config: crate::core::config::AudioConfig,
+        config: StreamConfig,
     ) -> Result<Box<dyn AudioCaptureStream>, AudioError> {
-        let wave_format = WaveFormat::new(
+        let wave_format = WasapiWaveFormat::new(
             32, // bits per sample
             32, // valid bits per sample
-            &SampleType::Float,
+            &WasapiSampleType::Float,
             config.sample_rate.try_into().unwrap(),
             config.channels.into(),
             None,
@@ -1667,9 +1669,9 @@ pub struct WasapiCaptureStream {
     client: AudioClient,
     capture_client: AudioCaptureClient,
     buffer: VecDeque<u8>,
-    config: crate::core::config::AudioConfig,
+    config: StreamConfig,
     event_handle: Option<wasapi::Handle>,
-    format: WaveFormat,
+    format: WasapiWaveFormat,
 }
 
 unsafe impl Send for WasapiCaptureStream {}
@@ -1678,8 +1680,8 @@ unsafe impl Send for WasapiBackend {}
 impl WasapiCaptureStream {
     fn new(
         client: AudioClient,
-        config: crate::core::config::AudioConfig,
-        format: WaveFormat,
+        config: StreamConfig,
+        format: WasapiWaveFormat,
     ) -> Result<Self, AudioError> {
         let event_handle = client
             .set_get_eventhandle()
@@ -1754,7 +1756,7 @@ impl AudioCaptureStream for WasapiCaptureStream {
         Ok(bytes_to_copy)
     }
 
-    fn config(&self) -> &crate::core::config::AudioConfig {
+    fn config(&self) -> &StreamConfig {
         &self.config
     }
 }
