@@ -5,9 +5,7 @@
 
 use crate::api::AudioCaptureConfig;
 use crate::core::error::{AudioError, Result as AudioResult};
-use crate::core::interface::{
-    AudioDevice, CapturingStream, DeviceEnumerator, DeviceKind,
-};
+use crate::core::interface::{AudioDevice, CapturingStream, DeviceEnumerator, DeviceKind};
 use crate::AudioFormat;
 
 /// Represents the detected status of PipeWire on the system.
