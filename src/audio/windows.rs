@@ -1,4 +1,5 @@
 //! Windows-specific audio capture backend using WASAPI.
+//! Testing Windows compilation in GitHub Actions.
 #![cfg(target_os = "windows")]
 
 use crate::core::config::{AudioCaptureConfig, AudioFormat, StreamConfig};
