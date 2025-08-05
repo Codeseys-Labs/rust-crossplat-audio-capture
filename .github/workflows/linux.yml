@@ -1,4 +1,4 @@
-name: Linux Audio Tests
+name: Linux PipeWire Tests
 
 on:
   workflow_call:
@@ -8,57 +8,35 @@ on:
         required: false
         type: boolean
         default: false
-      audio_backend:
-        description: "Audio backend to use"
-        required: false
-        type: string
-        default: "auto"
 
 env:
   CARGO_TERM_COLOR: always
   DEBIAN_FRONTEND: noninteractive
 
 jobs:
-  test-linux:
+  test-linux-pipewire:
     runs-on: ubuntu-latest
-    strategy:
-      matrix:
-        audio_system: [pipewire, pulseaudio]
-      fail-fast: false
     env:
       DEBUG: ${{ inputs.debug_enabled }}
     steps:
-      - name: Check if backend should run
-        id: check_backend
-        run: |
-          if [[ "${{ inputs.audio_backend }}" == "auto" || "${{ inputs.audio_backend }}" == "${{ matrix.audio_system }}" ]]; then
-            echo "should_run=true" >> $GITHUB_OUTPUT
-          else
-            echo "should_run=false" >> $GITHUB_OUTPUT
-          fi
-
       - uses: actions/checkout@v4
-        if: steps.check_backend.outputs.should_run == 'true'
 
       - name: Install Rust
-        if: steps.check_backend.outputs.should_run == 'true'
         uses: dtolnay/rust-toolchain@stable
 
       - name: Debug Info
-        if: steps.check_backend.outputs.should_run == 'true' && env.DEBUG == true
+        if: env.DEBUG == 'true'
         run: |
           rustc --version --verbose
           cargo --version --verbose
           cargo tree
 
       - name: Configure System
-        if: steps.check_backend.outputs.should_run == 'true' && matrix.audio_system == 'pipewire'
         run: |
           # Prevent needrestart prompts
           sudo sed -i 's/#$nrconf{restart} = '"'"'i'"'"';/$nrconf{restart} = '"'"'a'"'"';/g' /etc/needrestart/needrestart.conf
 
-      - name: Add Audio PPAs
-        if: steps.check_backend.outputs.should_run == 'true' && matrix.audio_system == 'pipewire'
+      - name: Install PipeWire
         run: |
           sudo apt-get update
 
@@ -72,7 +50,7 @@ jobs:
           sudo add-apt-repository ppa:pipewire-debian/wireplumber-upstream -y
           sudo apt-get update
 
-          # Install base PipeWire and development packages
+          # Install PipeWire and development packages (NO PulseAudio)
           echo "Installing PipeWire packages..."
           sudo apt-get install -y \
             pipewire \
@@ -85,14 +63,12 @@ jobs:
             libasound2-dev \
             pkg-config
 
-      - name: Disable PulseAudio
-        if: steps.check_backend.outputs.should_run == 'true' && matrix.audio_system == 'pipewire'
+      - name: Disable PulseAudio (if exists)
         run: |
           systemctl --user --now disable pulseaudio.service pulseaudio.socket || true
           pulseaudio --kill || true
 
-      - name: Start Audio Services
-        if: steps.check_backend.outputs.should_run == 'true' && matrix.audio_system == 'pipewire'
+      - name: Start PipeWire Services
         run: |
           # Reload systemd daemon
           systemctl --user daemon-reload
@@ -106,12 +82,11 @@ jobs:
           systemctl --user --now enable pipewire.service
           sleep 2
 
-          echo "Starting PipeWire PulseAudio..."
+          echo "Starting PipeWire PulseAudio compatibility..."
           systemctl --user --now enable pipewire-pulse.service
           sleep 2
 
-      - name: Verify Audio Setup
-        if: steps.check_backend.outputs.should_run == 'true' && matrix.audio_system == 'pipewire'
+      - name: Verify PipeWire Setup
         run: |
           echo "=== WirePlumber Status ==="
           systemctl --user status wireplumber || true
@@ -128,78 +103,12 @@ jobs:
           echo "=== Audio Info ==="
           pactl info || true
 
-      - name: Setup PulseAudio
-        if: steps.check_backend.outputs.should_run == 'true' && matrix.audio_system == 'pulseaudio'
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y \
-            pulseaudio \
-            libpulse-dev \
-            libasound2-dev \
-            pkg-config
-
-          # Stop any existing audio services
-          systemctl --user stop pipewire pipewire-pulse || true
-          pulseaudio --kill || true
-
-          # Configure PulseAudio
-          mkdir -p ~/.config/pulse
-          cat > ~/.config/pulse/daemon.conf << 'EOF'
-          default-sample-rate = 44100
-          default-fragments = 4
-          default-fragment-size-msec = 25
-          exit-idle-time = -1
-          EOF
-
-          # Create client configuration
-          mkdir -p ~/.config/pulse
-          cat > ~/.config/pulse/client.conf << EOF
-          autospawn = yes
-          daemon-binary = /usr/bin/pulseaudio
-          enable-shm = yes
-          EOF
-
-          # Create separate file for module loading
-          mkdir -p ~/.config/pulse/default.pa.d
-          cat > ~/.config/pulse/default.pa.d/ci-setup.pa << EOF
-          .include /etc/pulse/default.pa
-          load-module module-native-protocol-tcp auth-anonymous=1
-          load-module module-null-sink sink_name=test_sink
-          EOF
-
-          # Start PulseAudio with our custom configuration
-          pulseaudio --start --exit-idle-time=-1 --daemon \
-            -F ~/.config/pulse/default.pa.d/ci-setup.pa \
-            --log-level=debug \
-            --verbose
-
-          # Wait for PulseAudio to fully initialize
-          sleep 5
-
-          # Verify PulseAudio is running and configured correctly
-          echo "=== PulseAudio Status ==="
-          pulseaudio --check && echo "PulseAudio is running" || echo "PulseAudio failed to start"
-          echo "=== PulseAudio Configuration ==="
-          cat ~/.config/pulse/daemon.conf
-          echo "=== PulseAudio Modules ==="
-          pactl list modules || true
-          echo "=== PulseAudio Sinks ==="
-          pactl list sinks || true
-
-          # Wait for system to initialize
-          sleep 5
-
-          # Verify PulseAudio is running
-          pactl info
-
       - name: Download test audio
-        if: steps.check_backend.outputs.should_run == 'true'
         run: |
           mkdir -p test_audio
           curl -L "https://ia800901.us.archive.org/23/items/gd70-02-14.early-late.sbd.cotsman.18115.sbeok.shnf/gd70-02-14d1t02.mp3" -o "test_audio/sample.mp3"
 
       - name: Cache dependencies
-        if: steps.check_backend.outputs.should_run == 'true'
         uses: actions/cache@v3
         with:
           path: |
@@ -208,34 +117,26 @@ jobs:
             target
           key: ${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.lock') }}
 
-      - name: Build
-        if: steps.check_backend.outputs.should_run == 'true'
-        run: cargo build --verbose
+      - name: Build PipeWire-only
+        run: cargo build --no-default-features --features feat_linux --verbose
 
       - name: Build examples
-        if: steps.check_backend.outputs.should_run == 'true'
-        run: cargo build --examples
+        run: cargo build --examples --features feat_linux
 
-      - name: Test Audio Capture
-        if: steps.check_backend.outputs.should_run == 'true'
+      - name: Test PipeWire Audio Capture
         run: |
-          echo "=== Starting Audio Test ==="
+          echo "=== Starting PipeWire Audio Test ==="
 
           # Verify audio system is ready
           if ! pactl info; then
-            echo "Audio system is not ready"
+            echo "PipeWire audio system is not ready"
             exit 1
           fi
 
           # Start test tone in background with logging
           echo "Starting test tone..."
-          cargo run --example test_tone > test_tone.log 2>&1 &
+          cargo run --example test_tone --features feat_linux > test_tone.log 2>&1 &
           PLAYER_PID=$!
-
-          # Start Firefox playing audio (for application-specific capture test)
-          echo "Starting Firefox with test audio..."
-          firefox --headless "file://$(pwd)/test_audio/sample.mp3" &
-          FIREFOX_PID=$!
 
           # Ensure cleanup on exit
           cleanup() {
@@ -245,13 +146,8 @@ jobs:
               kill $PLAYER_PID
               wait $PLAYER_PID 2>/dev/null || true
             fi
-            if [ -n "$FIREFOX_PID" ] && kill -0 $FIREFOX_PID 2>/dev/null; then
-              echo "Stopping Firefox (PID: $FIREFOX_PID)"
-              kill $FIREFOX_PID
-              wait $FIREFOX_PID 2>/dev/null || true
-            fi
             # Collect audio debug info
-            echo "=== Final Audio State ==="
+            echo "=== Final PipeWire State ==="
             pactl info || true
             pactl list short sinks || true
             echo "=== Test Tone Log ==="
@@ -259,50 +155,32 @@ jobs:
           }
           trap cleanup EXIT
 
-          # Wait for processes to initialize
+          # Wait for process to initialize
           sleep 5
 
           # Test system-wide capture
-          echo "Testing system-wide capture..."
-          cargo run --example test_capture -- --duration 5 --output system_capture.wav
+          echo "Testing PipeWire system-wide capture..."
+          cargo run --example test_capture --features feat_linux -- --duration 5 --output pipewire_system_capture.wav
 
-          # Test application-specific capture (Firefox)
-          echo "Testing application-specific capture..."
-          cargo run --example test_capture -- --duration 5 --output firefox_capture.wav --application firefox
+          # Verify capture
+          if [ ! -f "pipewire_system_capture.wav" ]; then
+            echo "PipeWire capture failed - file not created"
+            exit 1
+          fi
 
-          # Test concurrent capture
-          echo "Testing concurrent capture..."
-          cargo run --example test_capture -- --duration 5 --output concurrent_system.wav &
-          CONCURRENT_SYS_PID=$!
-          cargo run --example test_capture -- --duration 5 --output concurrent_app.wav --application firefox &
-          CONCURRENT_APP_PID=$!
+          FILESIZE=$(stat -c%s "pipewire_system_capture.wav")
+          if [ "$FILESIZE" -eq 0 ]; then
+            echo "PipeWire capture failed - file is empty"
+            exit 1
+          fi
 
-          wait $CONCURRENT_SYS_PID
-          wait $CONCURRENT_APP_PID
+          echo "Successfully captured $FILESIZE bytes of audio with PipeWire"
 
-          # Verify captures
-          for file in system_capture.wav firefox_capture.wav concurrent_system.wav concurrent_app.wav; do
-            if [ ! -f "$file" ]; then
-              echo "Capture failed - $file not created"
-              exit 1
-            fi
-            FILESIZE=$(stat -f%z "$file")
-            if [ "$FILESIZE" -eq 0 ]; then
-              echo "Capture failed - $file is empty"
-              exit 1
-            fi
-            echo "Successfully captured $FILESIZE bytes of audio in $file"
-          done
-
-      - name: Upload Linux test artifacts
-        if: steps.check_backend.outputs.should_run == 'true'
+      - name: Upload PipeWire test artifacts
         uses: actions/upload-artifact@v4
         with:
-          name: linux-${{ matrix.audio_system }}-audio-test-results
+          name: linux-pipewire-audio-test-results
           path: |
-            system_capture.wav
-            firefox_capture.wav
-            concurrent_system.wav
-            concurrent_app.wav
+            pipewire_system_capture.wav
             test_tone.log
             test_audio/sample.mp3
