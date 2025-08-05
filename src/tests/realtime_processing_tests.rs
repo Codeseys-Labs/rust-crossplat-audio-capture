@@ -1,4 +1,4 @@
-// tests/realtime_processing_tests.rs
+// src/tests/realtime_processing_tests.rs
 use crate::api::{AudioCapture, AudioCaptureConfig};
 use crate::core::buffer::AudioBuffer;
 use crate::core::config::{

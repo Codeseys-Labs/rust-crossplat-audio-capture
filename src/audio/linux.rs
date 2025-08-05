@@ -129,10 +129,7 @@ use std::sync::Once; // For one-time initialization of PipeWire
 use futures_channel::mpsc; // For MPSC channel
 use futures_core::Stream;
 // Simplified PipeWire imports - only import what exists in 0.8.0
-use pipewire::{
-    keys,
-    types,
-};
+use pipewire::{keys, types};
 use std::collections::VecDeque; // For data_queue
 use std::pin::Pin; // For Pin<Box<dyn Stream>>
 use std::sync::atomic::{AtomicBool, Ordering as AtomicOrdering}; // Renamed Ordering to avoid conflict if any
@@ -144,13 +141,7 @@ use std::time::Instant; // Added for timestamping // For the Stream trait
 use std::{process::Command, sync::Mutex, thread, time::Duration};
 
 // Corrected PipeWire imports for 0.8.0 compatibility based on error messages
-use pipewire::{
-    spa,
-    context::Context,
-    core::Core,
-    main_loop::MainLoop,
-    properties::Properties,
-};
+use pipewire::{context::Context, core::Core, main_loop::MainLoop, properties::Properties, spa};
 // Removed: use crate::core::buffer::VecAudioBuffer; // Will use AudioBuffer struct directly
 
 use super::core::{AudioApplication, AudioCaptureBackend, AudioCaptureStream};
