@@ -38,7 +38,7 @@ fn main() {
         if Command::new("which")
             .arg("apt-get")
             .output()
-            .map_or(false, |o| o.status.success())
+            .is_ok_and(|o| o.status.success())
         {
             let packages: Vec<&str> = missing
                 .iter()
@@ -58,7 +58,7 @@ fn main() {
                 .args(&packages)
                 .status();
 
-            if status.map_or(false, |s| s.success()) {
+            if status.is_ok_and(|s| s.success()) {
                 let still_missing: Vec<&str> = required_libs
                     .iter()
                     .copied()
