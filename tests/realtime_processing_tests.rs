@@ -8,8 +8,7 @@ use rust_crossplat_audio_capture::core::config::{
 use rust_crossplat_audio_capture::core::error::AudioError;
 use rust_crossplat_audio_capture::core::interface::{AudioProcessor, CapturingStream};
 use std::sync::{Arc, Mutex};
-use std::thread;
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::{SystemTime, UNIX_EPOCH};
 
 // --- Mock Implementations ---
 

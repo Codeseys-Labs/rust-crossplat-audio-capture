@@ -37,7 +37,7 @@ pub use windows::WindowsDeviceEnumerator;
 // Re-export platform-specific AudioDevice and AudioStream types if they need to be named directly.
 // Usually, interaction will be through the traits.
 #[cfg(target_os = "linux")]
-pub use linux::{LinuxAudioDevice, LinuxAudioStream};
+pub use linux::LinuxAudioBackend;
 #[cfg(target_os = "macos")]
 pub use macos::{
     enumerate_audio_applications, ApplicationInfo, MacosAudioDevice, MacosAudioStream,

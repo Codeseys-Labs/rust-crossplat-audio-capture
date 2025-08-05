@@ -2,7 +2,7 @@
 
 // Import types from the new core modules
 use crate::core::config::StreamConfig; // Renamed from AudioConfig
-use crate::core::error::{AudioError, Result as CoreResult}; // Using the aliased Result
+use crate::core::error::Result as CoreResult; // Using the aliased Result
 
 #[derive(Debug, Clone)]
 pub struct AudioApplication {
