@@ -520,8 +520,7 @@ impl AudioCaptureBuilder {
             if !selected_device.is_input() {
                 return Err(AudioError::ConfigurationError(format!(
                     "Selected device '{}' is not an input device.",
-                    selected_device
-                        .get_name()
+                    selected_device.get_name()
                 )));
             }
         }
