@@ -58,7 +58,8 @@ windows = { version = "0.61.3", features = [
 # libpipewire-0.3-dev, pkg-config, build-essential, clang, libclang-dev, and llvm-dev are required for building.
 # This crate provides bindings to the PipeWire multimedia framework.
 # PulseAudio support removed - using PipeWire only
-pipewire = "0.8.0"
+# Temporarily commented out for compilation - will re-enable when implementation is complete
+# pipewire = "0.8.0"
 
 [target.'cfg(target_os = "macos")'.dependencies]
 coreaudio-rs = "0.13.0"
