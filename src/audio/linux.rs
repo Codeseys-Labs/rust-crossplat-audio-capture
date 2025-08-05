@@ -103,8 +103,6 @@ pub fn check_pipewire_availability() -> PipewireStatus {
 
 #[cfg(target_os = "linux")]
 pub mod pipewire;
-#[cfg(target_os = "linux")]
-pub mod pulseaudio; // Added pipewire module
 
 // Re-export items for application-level capture if needed by other modules
 #[cfg(target_os = "linux")]
@@ -126,10 +124,7 @@ use crate::{AudioFormat, SampleFormat}; // AudioFormat is re-exported from lib.r
 use log::{debug, error, info, warn}; // Added for logging
 use std::sync::Once; // For one-time initialization of PipeWire
 
-// Ensure pulseaudio module is accessible
-use self::pulseaudio::{
-    PulseAudioBackend as PaBackend, PulseAudioCaptureStream as PaCaptureStream,
-};
+// PulseAudio support removed - using PipeWire only
 use futures_channel::mpsc; // For MPSC channel
 use futures_core::Stream;
 use pipewire::{
@@ -138,11 +133,15 @@ use pipewire::{
         param::format::{FormatProperties, SpaFormat},
         param::format_utils,
         param::ParamType,
-        pod::Pod, // Keep this if Pod is used directly, otherwise remove if only through spa::Pod
-        utils::Direction as PwDirection,
+        pod::{Pod, Object}, // Added Object for type compatibility
+        utils::{Direction, SpaChannel}, // Added Direction and SpaChannel
+        param::audio::{AudioFormat as SpaAudioFormat}, // Added SpaAudioFormat
+        param::{MediaType, MediaSubtype}, // Added MediaType, MediaSubtype
         Id,
     },
     types as pw_types,
+    stream::StreamState, // Added StreamState
+    pod::pod::PodBuilder, // Added PodBuilder
 }; // Added for PipeWire keys and types
 use std::collections::VecDeque; // For data_queue
 use std::fmt::Display; // Added for DeviceId Display trait
@@ -159,14 +158,13 @@ use std::{process::Command, sync::Mutex, thread, time::Duration};
 use pipewire::{
     self,
     channel,
-    // context::Context as PwContext, // Keep PwContext for old code if needed
-    // core::Core as PwCore, // Keep PwCore for old code if needed
-    // main_loop::MainLoop as PwMainLoop, // Keep PwMainLoop for old code if needed
+    context::Context as PwContext, // Import PwContext for old backend compatibility
+    core::Core as PwCore,           // Import PwCore for old backend compatibility  
+    main_loop::MainLoop as PwMainLoop, // Import PwMainLoop for old backend compatibility
     properties::properties, // This is fine
     registry::Registry,     // This is fine
     spa,
     stream::Listener as StreamListener, // For listener_handle type
-    // spa::pod::{Object, Pod}, // Pod is used directly from spa::pod::Pod
     stream::{Stream as PwStream, StreamFlags},
     Context,    // For PipewireCoreContext
     Core,       // For PipewireCoreContext
@@ -180,18 +178,16 @@ use super::core::{AudioApplication, AudioCaptureBackend, AudioCaptureStream};
 // --- Linux Backend Abstraction ---
 
 /// Represents the available audio backends on Linux.
-/// It will try PipeWire first, then fall back to PulseAudio.
+/// Uses PipeWire only.
 #[derive(Debug)]
 pub enum LinuxAudioBackend {
     PipeWire(Arc<PipewireCoreContext>),
-    PulseAudio(Box<PaBackend>),
 }
 
-/// Represents an active audio capturing stream on Linux, abstracting over PipeWire and PulseAudio.
+/// Represents an active audio capturing stream on Linux, using PipeWire only.
 #[derive(Debug)]
 pub enum LinuxCapturingStream {
     PipeWire(Box<LinuxAudioStream>), // This is Box<dyn CapturingStream> which is Box<LinuxAudioStream>
-    PulseAudio(Box<PaCaptureStream>),
 }
 
 static PIPEWIRE_INIT: Once = Once::new();
@@ -199,9 +195,8 @@ static PIPEWIRE_INIT: Once = Once::new();
 impl LinuxAudioBackend {
     /// Creates a new `LinuxAudioBackend`.
     ///
-    /// It attempts to initialize PipeWire first. If PipeWire initialization fails
-    /// or is not available, it falls back to attempting to initialize PulseAudio.
-    /// If both backends fail to initialize, an error is returned.
+    /// It attempts to initialize PipeWire. If PipeWire initialization fails
+    /// or is not available, an error is returned.
     pub fn new() -> AudioResult<Self> {
         debug!("Attempting to initialize Linux audio backend...");
 
@@ -220,29 +215,16 @@ impl LinuxAudioBackend {
                         return Ok(LinuxAudioBackend::PipeWire(Arc::new(pw_core_ctx)));
                     }
                     Err(e) => {
-                        warn!("PipeWire backend initialization failed: {:?}. Attempting PulseAudio fallback.", e);
-                        // Proceed to PulseAudio fallback
+                        error!("PipeWire backend initialization failed: {:?}", e);
+                        return Err(e);
                     }
                 }
             }
             PipewireStatus::NotAvailable => {
-                info!("PipeWire not available. Attempting PulseAudio fallback.");
-                // Proceed to PulseAudio fallback
-            }
-        }
-
-        // PulseAudio Fallback
-        debug!("Attempting to initialize PulseAudio backend.");
-        match PaBackend::new() {
-            Ok(pa_backend) => {
-                info!("PulseAudio backend initialized successfully as fallback.");
-                Ok(LinuxAudioBackend::PulseAudio(Box::new(pa_backend)))
-            }
-            Err(e) => {
-                error!("PulseAudio backend initialization failed: {:?}", e);
-                Err(AudioError::BackendInitializationFailed(
-                    "Both PipeWire and PulseAudio backends failed to initialize.".into(),
-                ))
+                error!("PipeWire not available on system.");
+                return Err(AudioError::BackendInitializationFailed(
+                    "PipeWire is not available on the system.".into(),
+                ));
             }
         }
     }
@@ -280,17 +262,6 @@ impl AudioBackend for LinuxAudioBackend {
                 // which in this case is Box<LinuxCapturingStream::PipeWire(...)>
                 Ok(pw_dyn_capturing_stream)
             }
-            LinuxAudioBackend::PulseAudio(ref mut pa_backend) => {
-                debug!(
-                    "LinuxAudioBackend (PulseAudio): Creating stream with config: {:?}",
-                    config
-                );
-                let pa_stream = pa_backend
-                    .create_capture_stream(&config.stream_config, config.device_name.as_deref())?;
-                Ok(Box::new(LinuxCapturingStream::PulseAudio(Box::new(
-                    pa_stream,
-                ))))
-            }
         }
     }
 
@@ -308,11 +279,6 @@ impl AudioBackend for LinuxAudioBackend {
                     Err(e) => Err(e),                            // Propagate other errors
                 }
             }
-            LinuxAudioBackend::PulseAudio(_) => {
-                debug!("LinuxAudioBackend (PulseAudio): Default capture device - returning None (NotImplemented).");
-                // As per instructions, PulseAudio device enumeration is not yet implemented.
-                Ok(None)
-            }
         }
     }
 
@@ -329,11 +295,6 @@ impl AudioBackend for LinuxAudioBackend {
                     .map(|d| Box::new(d) as Box<dyn AudioDevice + 'static>)
                     .collect())
             }
-            LinuxAudioBackend::PulseAudio(_) => {
-                debug!("LinuxAudioBackend (PulseAudio): Enumerate capture devices - returning empty list (NotImplemented).");
-                // As per instructions, PulseAudio device enumeration is not yet implemented.
-                Ok(Vec::new())
-            }
         }
     }
 }
@@ -342,43 +303,30 @@ impl CapturingStream for LinuxCapturingStream {
     fn start(&mut self) -> AudioResult<()> {
         match self {
             LinuxCapturingStream::PipeWire(ref mut pw_stream) => pw_stream.start(),
-            LinuxCapturingStream::PulseAudio(ref mut pa_stream) => {
-                pa_stream.start().map_err(AudioError::from)
-            }
         }
     }
 
     fn stop(&mut self) -> AudioResult<()> {
         match self {
             LinuxCapturingStream::PipeWire(ref mut pw_stream) => pw_stream.stop(),
-            LinuxCapturingStream::PulseAudio(ref mut pa_stream) => {
-                pa_stream.stop().map_err(AudioError::from)
-            }
         }
     }
 
     fn close(&mut self) -> AudioResult<()> {
         match self {
             LinuxCapturingStream::PipeWire(ref mut pw_stream) => pw_stream.close(),
-            LinuxCapturingStream::PulseAudio(ref mut pa_stream) => {
-                pa_stream.close().map_err(AudioError::from)
-            }
         }
     }
 
     fn is_running(&self) -> bool {
         match self {
             LinuxCapturingStream::PipeWire(ref pw_stream) => pw_stream.is_running(),
-            LinuxCapturingStream::PulseAudio(ref pa_stream) => pa_stream.is_running(),
         }
     }
 
     fn read_chunk(&mut self, timeout_ms: Option<u32>) -> AudioResult<Option<AudioBuffer>> {
         match self {
             LinuxCapturingStream::PipeWire(ref mut pw_stream) => pw_stream.read_chunk(timeout_ms),
-            LinuxCapturingStream::PulseAudio(ref mut pa_stream) => {
-                pa_stream.read_chunk(timeout_ms).map_err(AudioError::from)
-            }
         }
     }
 
@@ -391,9 +339,6 @@ impl CapturingStream for LinuxCapturingStream {
     > {
         match self {
             LinuxCapturingStream::PipeWire(ref mut pw_stream) => pw_stream.to_async_stream(),
-            LinuxCapturingStream::PulseAudio(ref mut pa_stream) => {
-                pa_stream.to_async_stream().map_err(AudioError::from)
-            }
         }
     }
 }

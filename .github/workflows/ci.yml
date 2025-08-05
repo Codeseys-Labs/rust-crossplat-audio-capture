@@ -33,6 +33,8 @@ jobs:
       - name: Install dependencies for linting
         run: |
           sudo apt-get update
+          sudo add-apt-repository ppa:pipewire-debian/pipewire-upstream -y
+          sudo apt-get update
           sudo apt-get install -y libpipewire-0.3-dev libspa-0.2-dev libasound2-dev pkg-config
 
       - name: Run Clippy (Linux only on Ubuntu)
@@ -52,6 +54,8 @@ jobs:
       - name: Install PipeWire dev libraries (Linux)
         if: runner.os == 'Linux'
         run: |
+          sudo apt-get update
+          sudo add-apt-repository ppa:pipewire-debian/pipewire-upstream -y
           sudo apt-get update
           sudo apt-get install -y libpipewire-0.3-dev libspa-0.2-dev pkg-config
 
@@ -166,6 +170,8 @@ jobs:
 
       - name: Install PipeWire dev libraries
         run: |
+          sudo apt-get update
+          sudo add-apt-repository ppa:pipewire-debian/pipewire-upstream -y
           sudo apt-get update
           sudo apt-get install -y libpipewire-0.3-dev libspa-0.2-dev pkg-config
 

@@ -1398,33 +1398,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "libpulse-binding"
-version = "2.30.1"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "909eb3049e16e373680fe65afe6e2a722ace06b671250cc4849557bc57d6a397"
-dependencies = [
- "bitflags 2.9.1",
- "libc",
- "libpulse-sys",
- "num-derive",
- "num-traits",
- "winapi",
-]
-
-[[package]]
-name = "libpulse-sys"
-version = "1.23.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "d74371848b22e989f829cc1621d2ebd74960711557d8b45cfe740f60d0a05e61"
-dependencies = [
- "libc",
- "num-derive",
- "num-traits",
- "pkg-config",
- "winapi",
-]
-
-[[package]]
 name = "libspa"
 version = "0.8.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1503,6 +1476,15 @@ name = "memchr"
 version = "2.7.5"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "32a282da65faaf38286cf3be983213fcf1d2e2a58700e808f83f4ea9a4804bc0"
+
+[[package]]
+name = "memoffset"
+version = "0.7.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "5de893c32cde5f383baa4c04c5d6dbdd735cfd4a794b0debdb2bb1b421da5ff4"
+dependencies = [
+ "autocfg",
+]
 
 [[package]]
 name = "mime"
@@ -1601,6 +1583,19 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "47b6b097ecb1cbfed438542d16e84fd7ad9b0c76c8a65b7f9039212a3d14dc7f"
 dependencies = [
  "unicode-segmentation",
+]
+
+[[package]]
+name = "nix"
+version = "0.26.4"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "598beaf3cc6fdd9a5dfb1630c2800c7acd31df7aaf0f565796fba2b53ca1af1b"
+dependencies = [
+ "bitflags 1.3.2",
+ "cfg-if",
+ "libc",
+ "memoffset",
+ "pin-utils",
 ]
 
 [[package]]
@@ -1928,16 +1923,16 @@ checksum = "8b870d8c151b6f2fb93e84a13146138f05d02ed11c7e7c54f8826aaaf7c9f184"
 
 [[package]]
 name = "pipewire"
-version = "0.8.0"
+version = "0.7.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "08e645ba5c45109106d56610b3ee60eb13a6f2beb8b74f8dc8186cf261788dda"
+checksum = "a2d009c8dd65e890b515a71950f7e4c801523b8894ff33863a40830bf762e9e9"
 dependencies = [
  "anyhow",
  "bitflags 2.9.1",
  "libc",
  "libspa",
  "libspa-sys",
- "nix 0.27.1",
+ "nix 0.26.4",
  "once_cell",
  "pipewire-sys",
  "thiserror 1.0.69",
@@ -2226,7 +2221,6 @@ dependencies = [
  "hound",
  "indicatif",
  "inquire",
- "libpulse-binding",
  "objc",
  "pipewire",
  "pkg-config",
