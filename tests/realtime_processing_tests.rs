@@ -1,12 +1,13 @@
 // tests/realtime_processing_tests.rs
-use rust_crossplat_audio_capture::api::AudioCapture;
-use rust_crossplat_audio_capture::core::buffer::AudioBuffer;
-use rust_crossplat_audio_capture::core::config::{
-    ApiConfig, AudioCaptureConfig, BitsPerSample, CaptureAPI, ChannelConfig, Channels,
+use rsac::api::AudioCapture;
+use rsac::core::buffer::AudioBuffer;
+use rsac::api::AudioCaptureConfig;
+use rsac::core::config::{
+    ApiConfig, BitsPerSample, CaptureAPI, ChannelConfig, Channels,
     SampleFormat, SampleRate,
 };
-use rust_crossplat_audio_capture::core::error::AudioError;
-use rust_crossplat_audio_capture::core::interface::{AudioProcessor, CapturingStream};
+use rsac::core::error::AudioError;
+use rsac::core::interface::{AudioProcessor, CapturingStream};
 use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
@@ -252,7 +253,7 @@ mod processor_callback_management_tests {
 #[cfg(test)]
 mod mutual_exclusivity_tests {
     use super::*;
-    use rust_crossplat_audio_capture::core::interface::AudioCaptureStream; // For external streaming methods
+    use rsac::core::interface::AudioCaptureStream; // For external streaming methods
 
     // Mock for external streaming
     struct MockExternalStream {
