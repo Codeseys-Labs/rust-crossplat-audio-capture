@@ -5,18 +5,22 @@ A robust, high-performance audio capture library for Rust, supporting Windows, m
 ## Features
 
 ### Core Features
+
 - **Cross-Platform Support**
   - Windows: WASAPI-based capture with both system-wide and application-specific support
   - Linux: Modern PipeWire backend (preferred) with PulseAudio fallback, supporting both system-wide and application-specific capture
   - macOS: CoreAudio implementation with system-wide capture
 
 ### Audio Capabilities
+
 - **System-wide Audio Capture**
+
   - Supported on all platforms (Windows, Linux, macOS)
   - High-quality audio capture from system output
   - Zero-configuration setup on most systems
 
 - **Application-specific Capture**
+
   - Windows: WASAPI-based per-application capture
   - Linux: PipeWire/PulseAudio process-specific capture
   - Capture from multiple applications simultaneously
@@ -30,6 +34,7 @@ A robust, high-performance audio capture library for Rust, supporting Windows, m
     - Format types: F32LE, S16LE, S32LE
 
 ### Advanced Features
+
 - Async support with Tokio
 - Lock-free audio buffers
 - SIMD optimizations
@@ -38,6 +43,7 @@ A robust, high-performance audio capture library for Rust, supporting Windows, m
 - Detailed logging and diagnostics
 
 ### Development Features
+
 - Trait-based API design
 - Extensive test coverage
 - Mock implementations for testing
@@ -63,6 +69,7 @@ RSAC supports both interactive and command-line modes, with bounded or unbounded
 ### Platform-Specific Notes
 
 #### Windows
+
 - Supports both system-wide and application-specific audio capture
 - Uses WASAPI for high-quality audio capture
 - Process names should include the `.exe` extension for app-specific capture
@@ -70,6 +77,7 @@ RSAC supports both interactive and command-line modes, with bounded or unbounded
 - Administrative privileges may be required for some applications
 
 #### Linux
+
 - Primary support through PipeWire (modern audio system)
 - Fallback to PulseAudio when PipeWire is not available
 - Supports both system-wide and application-specific capture
@@ -77,6 +85,7 @@ RSAC supports both interactive and command-line modes, with bounded or unbounded
 - No special privileges required for most applications
 
 #### macOS
+
 - System-wide audio capture only (application-specific capture not supported)
 - Requires Screen Recording permission to be granted
 - Process selection is limited to system audio
@@ -230,6 +239,7 @@ The captured audio supports the following configurations:
 ## Requirements
 
 ### Windows
+
 - Windows 7 or later
 - Rust toolchain
 - Administrative privileges may be required for some applications
@@ -248,9 +258,46 @@ The captured audio supports the following configurations:
   ```bash
   export RSAC_AUTO_INSTALL=1
   ```
-  - Rust toolchain
+- Rust toolchain
+
+#### Installing PipeWire Dependencies
+
+**Debian/Ubuntu:**
+
+```bash
+# Runtime dependencies
+sudo apt install libpipewire-0.3-0
+
+# Development dependencies (only needed for building)
+sudo apt install libpipewire-0.3-dev pkg-config build-essential clang libclang-dev llvm-dev
+```
+
+**Fedora:**
+
+```bash
+# Runtime dependencies
+sudo dnf install pipewire-libs
+
+# Development dependencies
+sudo dnf install pipewire-devel pkg-config gcc clang clang-devel llvm-devel
+```
+
+**Arch Linux:**
+
+```bash
+# Both runtime and development dependencies
+sudo pacman -S pipewire pkgconf base-devel clang llvm
+```
+
+**Automated Installation:**
+This repository includes an installation script to help you set up all required dependencies:
+
+```bash
+sudo ./install-dependencies.sh
+```
 
 ### macOS
+
 - macOS 10.13 or later
 - Rust toolchain
 - Xcode Command Line Tools
@@ -261,6 +308,7 @@ The captured audio supports the following configurations:
 Contributions are welcome! Here's how you can help:
 
 ### Development Workflow
+
 1. Fork the repository
 2. Create a feature branch
 3. Make your changes
@@ -268,6 +316,7 @@ Contributions are welcome! Here's how you can help:
 5. Submit a Pull Request
 
 ### Running Tests
+
 The project includes comprehensive test suites for each platform:
 
 ```bash
@@ -278,16 +327,59 @@ cargo test
 cargo test --features audio-tests
 ```
 
+### Docker-based Testing
+
+For reliable testing across environments, Docker containers are provided:
+
+#### Linux PipeWire Tests
+
+The preferred way to test PipeWire functionality is using the provided Docker setup:
+
+```bash
+# Build and run PipeWire tests
+cd docker/linux
+docker-compose build
+docker-compose run pipewire-test
+
+# Or for interactive exploration
+docker-compose run --entrypoint /bin/bash pipewire-test
+```
+
+This Docker setup:
+
+1. Installs all PipeWire dependencies automatically
+2. Sets up PipeWire with proper environment
+3. Performs validation to ensure PipeWire is working correctly
+4. Runs the test suite in an isolated environment
+
+#### Advanced Docker Options
+
+There are two ways to run PipeWire in Docker:
+
+1. **Self-contained mode** (default): PipeWire runs entirely inside the container
+
+   ```bash
+   docker-compose run pipewire-test
+   ```
+
+2. **Host socket mode**: Container uses host's PipeWire server (uncomment socket mount in docker-compose.yml)
+   ```bash
+   # Edit docker-compose.yml first to uncomment socket mount
+   docker-compose run pipewire-test
+   ```
+
 ### CI/CD
+
 - GitHub Actions workflows are configured for each platform
 - Tests can be triggered manually through GitHub Actions UI
 - Available workflows:
   - Windows Audio Tests
-  - Linux Audio Tests (PipeWire and PulseAudio)
+  - Linux Audio Tests (PipeWire)
   - macOS Audio Tests
   - Code Quality Checks
 
 ### Best Practices
+
 - Write tests for new features
 - Update documentation for API changes
 - Follow Rust coding guidelines

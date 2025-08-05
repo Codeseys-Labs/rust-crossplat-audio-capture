@@ -1,64 +1,111 @@
-name: Cross-Platform Tests
+name: Rust CI
 
 on:
-  workflow_dispatch:
-    inputs:
-      platform:
-        description: "Platform to test"
-        required: true
-        default: "all"
-        type: choice
-        options:
-          - all
-          - windows
-          - linux
-          - macos
-      audio_backend:
-        description: "Linux audio backend"
-        required: false
-        type: choice
-        options:
-          - auto
-          - pipewire
-          - pulseaudio
-        default: "auto"
-      debug_enabled:
-        description: "Enable debug output"
-        required: false
-        type: boolean
-        default: false
+  push:
+    branches: ["main", "master"]
+  pull_request:
+    branches: ["main", "master"]
+
+env:
+  CARGO_TERM_COLOR: always
 
 jobs:
-  windows:
-    if: github.event.inputs.platform == 'windows' || github.event.inputs.platform == 'all'
-    uses: ./.github/workflows/windows.yml
-    secrets: inherit
-    with:
-      debug_enabled: ${{ fromJSON(github.event.inputs.debug_enabled) }}
+  lint_and_format_checks:
+    name: Lint and Format Checks
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
 
-  linux:
-    if: github.event.inputs.platform == 'linux' || github.event.inputs.platform == 'all'
-    uses: ./.github/workflows/linux.yml
-    secrets: inherit
-    with:
-      debug_enabled: ${{ fromJSON(github.event.inputs.debug_enabled) }}
-      audio_backend: ${{ github.event.inputs.audio_backend }}
+      - name: Install Rust stable
+        uses: actions-rs/toolchain@v1
+        with:
+          toolchain: stable
+          profile: minimal # Minimal profile is sufficient for linting
+          override: true
 
-  macos:
-    if: github.event.inputs.platform == 'macos' || github.event.inputs.platform == 'all'
-    uses: ./.github/workflows/macos.yml
-    secrets: inherit
-    with:
-      debug_enabled: ${{ fromJSON(github.event.inputs.debug_enabled) }}
+      - name: Cache Cargo registry and build outputs
+        uses: Swatinem/rust-cache@v2 # Cache for clippy if it resolves dependencies
 
-  code-quality:
-    if: github.event.inputs.platform == 'all'
-    uses: ./.github/workflows/code-quality.yml
-    secrets: inherit
+      - name: Check formatting
+        run: cargo fmt --all -- --check
 
-  tests:
-    if: github.event.inputs.platform == 'all'
-    uses: ./.github/workflows/tests.yml
-    secrets: inherit
-    with:
-      debug_enabled: ${{ fromJSON(github.event.inputs.debug_enabled) }}
+      - name: Run Clippy
+        run: cargo clippy --all-targets --all-features -- -D warnings
+
+  build_and_test:
+    needs: lint_and_format_checks # Depends on the lint job
+    runs-on: ${{ matrix.os }}
+    strategy:
+      matrix:
+        os: [ubuntu-latest, windows-latest, macos-latest]
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Install audio dev libraries (Linux)
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libpipewire-0.3-dev libspa-0.2-dev libpulse-dev pkg-config
+
+      - name: Install Rust stable
+        uses: actions-rs/toolchain@v1
+        with:
+          toolchain: stable
+          profile: minimal
+          override: true
+
+      - name: Cache Cargo registry and build outputs
+        uses: Swatinem/rust-cache@v2
+
+      - name: Build
+        run: cargo build --all-features --all-targets --verbose
+
+      - name: Run tests
+        run: cargo test --all-features --all-targets --verbose
+
+  docker_linux_test:
+    name: Dockerized Linux Tests
+    needs: lint_and_format_checks # Depends on the lint job
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Build Docker image and run tests (Linux)
+        run: docker build --file docker/linux/Dockerfile --tag rust-audio-capture-linux-test:latest .
+  coverage:
+    name: Code Coverage
+    needs: lint_and_format_checks # Depends on the lint job
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Install Rust stable
+        uses: actions-rs/toolchain@v1
+        with:
+          toolchain: stable
+          profile: minimal
+          override: true
+
+      - name: Cache Cargo dependencies
+        uses: Swatinem/rust-cache@v2
+
+      - name: Install cargo-tarpaulin
+        run: cargo install cargo-tarpaulin --version 0.27.3 # Pinned version
+
+      - name: Generate code coverage
+        run: cargo tarpaulin --all-features --workspace --out Lcov --output-dir coverage/ --run-types Tests Lib # Focus on library and test code
+
+      - name: Upload coverage to Codecov
+        uses: codecov/codecov-action@v4
+        with:
+          # token: ${{ secrets.CODECOV_TOKEN }} # Only if needed for private repo
+          files: ./coverage/lcov.info
+          fail_ci_if_error: true

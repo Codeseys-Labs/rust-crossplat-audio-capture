@@ -1,32 +1,51 @@
-use rodio::{Decoder, OutputStream, Sink};
-use std::fs::File;
-use std::io::BufReader;
+use clap::Parser;
+use rsac::test_utils::playback::{AudioPlayer, PlaybackError};
 use std::time::Duration;
 
-fn main() {
-    // Get a handle to the default output stream
-    let (_stream, stream_handle) =
-        OutputStream::try_default().expect("Failed to get default output stream");
+#[derive(Parser)]
+#[command(name = "test_tone")]
+#[command(about = "Generate a test tone for audio capture testing")]
+struct Args {
+    /// Duration in seconds to play the tone
+    #[arg(short, long, default_value = "10")]
+    duration: u64,
+    
+    /// Frequency of the test tone in Hz
+    #[arg(short, long, default_value = "440.0")]
+    frequency: f32,
+    
+    /// Volume (0.0 to 1.0)
+    #[arg(short, long, default_value = "0.5")]
+    volume: f32,
+    
+    /// Enable verbose output
+    #[arg(short, long)]
+    verbose: bool,
+}
 
-    // Create a sink to control the playback
-    let sink = Sink::try_new(&stream_handle).expect("Failed to create sink");
-
-    // Load the audio file
-    let file =
-        BufReader::new(File::open("test_audio/sample.mp3").expect("Failed to open audio file"));
-
-    // Decode the audio file
-    let source = Decoder::new(file).expect("Failed to decode audio file");
-
-    println!("Playing audio file...");
-    println!("Press Ctrl+C to stop");
-
-    // Append the audio source to the sink for playback
-    sink.append(source);
-
-    // Set volume to 50%
-    sink.set_volume(0.5);
-
-    // Keep playing until interrupted
-    sink.sleep_until_end();
+fn main() -> Result<(), PlaybackError> {
+    let args = Args::parse();
+    
+    if args.verbose {
+        println!("Starting test tone generator...");
+        println!("Frequency: {} Hz", args.frequency);
+        println!("Duration: {} seconds", args.duration);
+        println!("Volume: {}", args.volume);
+    }
+    
+    // Create test tone player
+    let player = AudioPlayer::new_test_tone()?;
+    
+    if args.verbose {
+        println!("Test tone started. Playing for {} seconds...", args.duration);
+    }
+    
+    // Play for specified duration
+    std::thread::sleep(Duration::from_secs(args.duration));
+    
+    if args.verbose {
+        println!("Test tone completed.");
+    }
+    
+    Ok(())
 }

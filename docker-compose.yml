@@ -1,10 +1,12 @@
 version: '3'
 
 services:
-  rsac-linux:
+  # Unified Linux test service with PipeWire
+  rsac-linux-pipewire:
     build:
       context: .
-      dockerfile: docker/linux/Dockerfile
+      dockerfile: docker/linux/Dockerfile.unified
+      target: rsac-pipewire
     volumes:
       - .:/app
       - ./test-results:/test-results
@@ -20,7 +22,30 @@ services:
     # Keep the container running for debugging if needed
     tty: true
     stdin_open: true
+    command: ["/app/scripts/run_audio_tests.sh", "--backend", "pipewire", "--type", "all", "--output-dir", "/test-results"]
 
+  # Unified Linux test service with PulseAudio
+  rsac-linux-pulseaudio:
+    build:
+      context: .
+      dockerfile: docker/linux/Dockerfile.unified
+      target: rsac-pulseaudio
+    volumes:
+      - .:/app
+      - ./test-results:/test-results
+    # Give necessary permissions for audio
+    privileged: true
+    devices:
+      - /dev/snd:/dev/snd
+    environment:
+      - RUST_BACKTRACE=1
+      - RUST_LOG=debug
+    # Keep the container running for debugging if needed
+    tty: true
+    stdin_open: true
+    command: bash -c "/app/scripts/run_audio_tests.sh --backend pulseaudio --type all --output-dir /test-results"
+
+  # Keeping other platforms for reference
   rsac-windows:
     build:
       context: .
@@ -41,8 +66,12 @@ services:
       - RUST_LOG=debug
     volumes:
       - .:/app
-      - test_results:C:\test_results
-      - test_audio:C:\test_audio
+      - type: volume
+        source: test_results
+        target: C:\test_results
+      - type: volume
+        source: test_audio
+        target: C:\test_audio
     isolation: process
     deploy:
       resources:
@@ -61,6 +90,21 @@ services:
     privileged: true
     devices:
       - /dev/snd:/dev/snd
+    command: bash -c "/app/scripts/run_audio_tests.sh --backend coreaudio --type all --output-dir /test-results"
+
+  # Generate HTML report from all test results
+  rsac-report:
+    build:
+      context: .
+      dockerfile: docker/linux/Dockerfile.unified
+      target: rsac-test-base
+    volumes:
+      - .:/app
+      - ./test-results:/test-results
+    command: bash -c "cargo run --bin test-report-generator -- --input-dir /test-results --output-file /test-results/test_report.html"
+    depends_on:
+      - rsac-linux-pipewire
+      - rsac-linux-pulseaudio
 
 volumes:
   test_results:

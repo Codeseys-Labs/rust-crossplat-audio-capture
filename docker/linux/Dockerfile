@@ -1,44 +1,56 @@
+# Base image
 FROM ubuntu:22.04
 
-# Set environment variables
+# Set DEBIAN_FRONTEND to noninteractive to avoid prompts during apt-get install
 ENV DEBIAN_FRONTEND=noninteractive
-ENV XDG_RUNTIME_DIR=/run/user/0
-ENV PIPEWIRE_RUNTIME_DIR=/run/user/0
-ENV DISPLAY=:99
-ENV LIBCLANG_PATH=/usr/lib/llvm-14/lib
 
-# Install dependencies
+# Install essential build tools, curl, pkg-config, and audio development libraries
+# build-essential: Common build tools (make, gcc, g++, etc.)
+# curl: Tool for transferring data with URLs (used for rustup)
+# pkg-config: Helper tool used when compiling applications and libraries
+# libpipewire-0.3-dev: Development files for PipeWire
+# libpulse-dev: Development files for PulseAudio
+# libasound2-dev: Development files for ALSA (Advanced Linux Sound Architecture)
+# libclang-dev: Development files for libclang, often needed for Rust crates with C bindings
 RUN apt-get update && apt-get install -y \
-    curl wget build-essential pkg-config \
-    libclang-dev llvm-14 clang-14 \
-    xvfb dbus \
-    software-properties-common \
-    && add-apt-repository ppa:pipewire-debian/pipewire-upstream \
-    && apt-get update \
-    && apt-get install -y pipewire=0.3.65-1 pipewire-bin=0.3.65-1 libpipewire-0.3-dev=0.3.65-1 \
-    && mkdir -p /run/dbus \
-    && mkdir -p /run/user/0 \
-    && chmod 700 /run/user/0
+    build-essential \
+    curl \
+    pkg-config \
+    libpipewire-0.3-dev \
+    libspa-0.2-dev \
+    libpulse-dev \
+    libasound2-dev \
+    libclang-dev \
+    pipewire \
+    pipewire-audio-client-libraries \
+    pulseaudio \
+    alsa-utils \
+    && rm -rf /var/lib/apt/lists/*
 
-# Install Rust
-RUN curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y
+# Install Rust via rustup
+# -y: Disable confirmation prompts
+# --default-toolchain stable: Install the stable toolchain and set it as default
+RUN curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --default-toolchain stable
+
+# Add Cargo to PATH
 ENV PATH="/root/.cargo/bin:${PATH}"
 
-# Create app directory
-RUN mkdir -p /app
+# Set RUST_BACKTRACE for better debugging of test failures
+ENV RUST_BACKTRACE=1
+
+# Set working directory
 WORKDIR /app
 
-# Copy project files
-COPY . /app/
+# Copy the entire project context to the working directory
+COPY . .
 
-# Make test script executable
-RUN chmod +x /docker/linux/test.sh
+# Build the project with all features and all targets
+# --all-features: Activate all features
+# --all-targets: Build for all targets (binaries, libraries, examples, tests, benchmarks)
+RUN cargo build --all-features --all-targets
 
-# Start Xvfb, D-Bus, Pipewire, and run test script
-CMD /usr/bin/dbus-daemon --system --nofork --nopidfile & \
-    Xvfb :99 -screen 0 1024x768x24 & \
-    sleep 2 && \
-    pipewire & \
-    pipewire-pulse & \
-    sleep 2 && \
-    /docker/linux/test.sh 
+# Build examples specifically
+RUN cargo build --examples --all-features
+
+# Note: Tests are not run in Docker build to avoid audio system issues
+# Use docker run with proper audio setup to run tests

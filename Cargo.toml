@@ -4,8 +4,26 @@ version = "0.1.0"
 edition = "2021"
 build = "build.rs"
 
+[features]
+# Platform-specific features
+# These features enable the compilation of platform-specific audio backend code.
+# By default, all platforms are enabled to provide broad compatibility.
+# Users can choose to compile only for specific platforms by disabling default features
+# and enabling only the desired platform features.
+# Example: `cargo build --no-default-features --features feat_windows`
+feat_windows = []
+feat_linux = []
+feat_macos = []
+
+# Default features - enables all platform backends
+default = ["feat_windows", "feat_linux", "feat_macos"]
+
+test-utils = [] # Feature to enable test utilities
+
 [dependencies]
 # Core dependencies
+futures-core = "0.3.31"
+futures-channel = "0.3.31"                                 # For MPSC channel for async stream
 hound = "3.5.1"
 sysinfo = "0.35.2"
 clap = { version = "4.5.39", features = ["derive"] }
@@ -14,30 +32,38 @@ indicatif = "0.17.11"
 color-eyre = "0.6.5"
 ctrlc = "3.4.7"
 rodio = "0.20.1"
+reqwest = { version = "0.12.15", features = ["blocking"] }
+
+# For testing
+serde = { version = "1.0.219", features = ["derive"] }
+serde_json = "1.0.140"
+rand = "0.9.1"
+rand_pcg = "0.9.0"
 
 # Platform-specific audio capture
 [target.'cfg(target_os = "windows")'.dependencies]
 wasapi = "0.18.0"
 windows = { version = "0.61.1", features = [
-    "Win32_System_Com",
-    "Win32_Media_Audio",
-    "Win32_Media_Audio_Endpoints",
-    "Win32_Media_MediaFoundation",
-    "Win32_Foundation",
-    "Win32_System_Threading",
-    "Win32_Devices_FunctionDiscovery",
-    "Win32_UI_Shell_PropertiesSystem",
-    "Win32_System_Com_StructuredStorage",
+    "Win32_Foundation",  # For basic Windows types like HRESULT, BOOL, HANDLE
+    "Win32_System_Com",  # For COM initialization (CoInitializeEx, CoUninitialize) and operations (CoCreateInstance, CLSCTX_ALL)
+    "Win32_Media_Audio", # For WASAPI interfaces (IMMDeviceEnumerator, MMDeviceEnumerator, IMMDevice, IAudioClient, IAudioCaptureClient, WAVEFORMATEX, IAudioSessionManager2, IAudioSessionEnumerator, IAudioSessionControl, IAudioSessionControl2)
+    # and constants (eRender, eConsole, AUDCLNT_SHAREMODE_SHARED, AUDCLNT_STREAMFLAGS_LOOPBACK)
+    "Win32_System_Threading",     # For OpenProcess, GetCurrentProcessId, QueryFullProcessImageNameW
+    "Win32_System_ProcessStatus", # For K32GetModuleFileNameExW
 ] }
 
 [target.'cfg(target_os = "linux")'.dependencies]
-# libasound2-dev && libpipewire-0.3-dev && pkg-config && build-essential && clang && libclang-dev && llvm-dev
-libpulse-binding = "2.30.1"
-libpulse-simple-binding = "2.29.0"
+# libpipewire-0.3-dev, pkg-config, build-essential, clang, libclang-dev, and llvm-dev are required for building.
+# This crate provides bindings to the PipeWire multimedia framework.
 pipewire = "0.8.0"
+libpulse-binding = "2.30.1"
 
 [target.'cfg(target_os = "macos")'.dependencies]
 coreaudio-rs = "0.13.0"
+coreaudio-sys = "0.2.16"
+objc = "0.2.7"
+cocoa = "0.26.0"
+core-foundation-sys = "0.8.7"
 
 # Error handling
 thiserror = "2.0.12"
@@ -45,30 +71,62 @@ thiserror = "2.0.12"
 [dev-dependencies]
 criterion = "0.6.0" # Benchmarking
 tempfile = "3.20.0" # Temporary files for tests
+serde = { version = "1.0.219", features = [
+    "derive",
+] } # For serialization in test reports
+serde_json = "1.0.140" # For test report serialization
+rand = "0.9.1" # For generating test data
+rand_pcg = "0.9.0" # For deterministic random numbers in tests
 
 [[example]]
-name = "wav_demo"
-path = "examples/wav_demo.rs"
+name = "unified_platform_test"
+path = "examples/unified_platform_test.rs"
 
 [[example]]
-name = "test_windows"
-path = "examples/test_windows.rs"
+name = "standardized_test"
+path = "examples/standardized_test.rs"
 
 [[example]]
-name = "test_pulseaudio"
-path = "examples/test_pulseaudio.rs"
+name = "audio_player"
+path = "examples/audio_player.rs"
+required-features = ["test-utils"]
 
 [[example]]
-name = "test_coreaudio"
-path = "examples/test_coreaudio.rs"
+name = "windows_apis"
+path = "examples/windows_apis.rs"
 
 [[example]]
-name = "test_coreaudio_app"
-path = "examples/test_coreaudio_app.rs"
+name = "macos_application_capture"
+path = "examples/macos_application_capture.rs"
+required-features = ["feat_macos"]
 
 [[example]]
 name = "test_tone"
 path = "examples/test_tone.rs"
+required-features = ["test-utils"]
+
+[[example]]
+name = "test_capture"
+path = "examples/test_capture.rs"
+required-features = ["feat_linux"]
+
+[[example]]
+name = "test_coreaudio"
+path = "examples/test_coreaudio.rs"
+required-features = ["feat_macos"]
+
+[[example]]
+name = "test_windows"
+path = "examples/test_windows.rs"
+required-features = ["feat_windows"]
+
+[[example]]
+name = "verify_audio"
+path = "examples/verify_audio.rs"
+
+[[example]]
+name = "demo_library"
+path = "examples/demo_library.rs"
 
 [workspace]
 members = []
