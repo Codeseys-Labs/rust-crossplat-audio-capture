@@ -61,7 +61,6 @@ pub use audio::{AudioCaptureError, ProcessAudioCapture};
 pub use utils::test_utils;
 
 // Re-export CapturingStream from core::interface directly for convenience
-pub use crate::core::interface::CapturingStream;
 
 /// Error type for the library
 pub type Error = color_eyre::Report;

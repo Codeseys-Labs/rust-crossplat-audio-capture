@@ -264,7 +264,7 @@ impl AudioCaptureBuilder {
         {
             // If an application target is set, we typically capture from the default render device.
             if actual_device_selector.is_none() {
-                actual_device_selector = Some(DeviceSelector::DefaultOutputDevice);
+                actual_device_selector = Some(DeviceSelector::DefaultOutput);
             } else {
                 // If a device selector is already set, and it's an input device,
                 // this might be problematic for application capture.
@@ -533,9 +533,7 @@ impl AudioCaptureBuilder {
             Ok(false) => {
                 return Err(AudioError::UnsupportedFormat(format!(
                     "The selected device '{}' does not support the requested audio format: {:?}",
-                    selected_device
-                        .get_name()
-                        .unwrap_or_else(|_| "Unknown Device".to_string()),
+                    selected_device.get_name(),
                     capture_config.stream_config.format
                 )));
             }
@@ -543,9 +541,7 @@ impl AudioCaptureBuilder {
                 // An error occurred during format support check, treat as unsupported or propagate
                 return Err(AudioError::UnsupportedFormat(format!(
                     "Error checking format support for device '{}': {}. Format: {:?}",
-                    selected_device
-                        .get_name()
-                        .unwrap_or_else(|_| "Unknown Device".to_string()),
+                    selected_device.get_name(),
                     e,
                     capture_config.stream_config.format
                 )));

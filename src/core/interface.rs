@@ -1,7 +1,7 @@
 // src/core/interface.rs
 
 use super::config::{AudioCaptureConfig, AudioFormat, StreamConfig};
-use super::error::{AudioError, Result as AudioResult}; // Renamed to avoid conflict
+use super::error::Result as AudioResult; // Renamed to avoid conflict
 use crate::core::buffer::AudioBuffer; // Added for the new AudioBuffer struct
 
 /// Represents the kind of an audio device.
