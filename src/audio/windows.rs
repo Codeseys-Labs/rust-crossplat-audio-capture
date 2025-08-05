@@ -25,12 +25,13 @@ use super::core::{AudioApplication, AudioCaptureBackend, AudioCaptureStream}; //
 use sysinfo::{ProcessRefreshKind, ProcessesToUpdate, RefreshKind, System}; // Keep for old backend
 use wasapi::{
     self,
+    get_default_device,
     AudioCaptureClient as WasapiAudioCaptureClient,
     AudioClient as WasapiAudioClient, // Renamed to avoid conflict
     Direction as WasapiDirection,
     SampleType as WasapiSampleType,
     ShareMode as WasapiShareMode,
-    WasapiWaveFormat as WasapiWasapiWaveFormat,
+    WaveFormat as WasapiWaveFormat,
 }; // Keep for old backend, note: wasapi::get_default_device is different from IMMDeviceEnumerator::GetDefaultAudioEndpoint
 
 // --- New Skeleton Implementations ---
@@ -43,25 +44,28 @@ use std::ptr;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use windows::core::{GUID, HRESULT, PWSTR};
-use windows::Win32::Devices::Properties::PKEY_Device_FriendlyName;
+use windows::Win32::Devices::Properties::DEVPKEY_Device_FriendlyName as PKEY_Device_FriendlyName;
 use windows::Win32::Foundation::CloseHandle;
 use windows::Win32::Foundation::HANDLE; // For process handle
 use windows::Win32::Foundation::WAIT_OBJECT_0;
-use windows::Win32::Foundation::{E_NOTFOUND, S_FALSE, S_OK};
-use windows::Win32::Media::Audio::WAVE_FORMAT_IEEE_FLOAT;
+use windows::Win32::Foundation::{S_FALSE, S_OK};
+use windows::Win32::System::WinRT::HCS_E_OPERATION_NOT_FOUND as E_NOTFOUND;
+// WAVE_FORMAT_IEEE_FLOAT constant
+const WAVE_FORMAT_IEEE_FLOAT: u16 = 3;
 use windows::Win32::Media::Audio::{
     eAll, eCapture, eConsole, eRender, IAudioCaptureClient, IAudioClient, IMMDevice,
     IMMDeviceCollection, IMMDeviceEnumerator, IMMEndpoint, MMDeviceEnumerator,
     AUDCLNT_SHAREMODE_SHARED, AUDCLNT_STREAMFLAGS_LOOPBACK, DEVICE_STATE_ACTIVE, WAVEFORMATEX,
     WAVE_FORMAT_PCM,
 };
-use windows::Win32::System::Com::StructuredStorage::{PROPVARIANT, VT_EMPTY, VT_LPWSTR};
+use windows::Win32::System::Com::PropVariantClear;
 use windows::Win32::System::Com::{
     CoCreateInstance, CoInitializeEx, CoTaskMemFree, CoUninitialize, CLSCTX_ALL,
-    COINIT_MULTITHREADED, RPC_E_CHANGED_MODE, STGM_READ,
+    COINIT_MULTITHREADED, STGM_READ,
 };
-use windows::Win32::System::Ole::PropVariantClear;
+use windows::Win32::System::Rpc::RPC_E_CHANGED_MODE;
 use windows::Win32::System::Threading::{OpenProcess, WaitForSingleObject, PROCESS_SYNCHRONIZE};
+use windows::Win32::System::Variant::{PROPVARIANT, VT_EMPTY, VT_LPWSTR};
 use windows::Win32::UI::Shell::PropertiesSystem::IPropertyStore;
 
 /// RAII wrapper for a Windows HANDLE to ensure it's closed on drop.
@@ -266,7 +270,7 @@ impl WindowsAudioDevice {
 impl AudioDevice for WindowsAudioDevice {
     /// Gets the unique identifier for this audio device.
     /// This ID is typically a string provided by the underlying OS audio backend.
-    fn get_id(&self) -> AudioResult<DeviceId> {
+    fn get_id(&self) -> AudioResult<Self::DeviceId> {
         unsafe {
             let mut id_pwstr: PWSTR = PWSTR::null();
             self.device.GetId(&mut id_pwstr).map_err(|hr| {
@@ -318,7 +322,7 @@ impl AudioDevice for WindowsAudioDevice {
 
     /// Determines the kind of device (Input or Output).
     /// This is a helper method, not part of the AudioDevice trait.
-    pub fn kind(&self) -> AudioResult<DeviceKind> {
+    fn kind(&self) -> AudioResult<DeviceKind> {
         // QueryInterface for IMMEndpoint
         let endpoint: IMMEndpoint = self.device.cast().map_err(|hr| {
             AudioError::BackendSpecificError(format!(
@@ -630,7 +634,7 @@ impl DeviceEnumerator for WindowsDeviceEnumerator {
     /// if no such device exists (e.g., `E_NOTFOUND`), or an `AudioError` on other failures.
     fn get_device_by_id(
         &self,
-        id: &DeviceId,
+        id: &Self::DeviceId,
         _kind: Option<DeviceKind>,
     ) -> AudioResult<Option<Box<dyn AudioDevice>>> {
         let wide_id: Vec<u16> = OsStr::new(id).encode_wide().chain(Some(0)).collect();
@@ -1628,7 +1632,7 @@ impl AudioCaptureBackend for WasapiBackend {
         // Enhanced application capture inspired by wasapi-rs
         let mut audio_client = if app.name == "System" {
             // System-wide capture using default render device
-            get_default_device(&Direction::Render)
+            get_default_device(&WasapiDirection::Render)
                 .map_err(|e| {
                     AudioError::DeviceNotFound(format!("Failed to get default device: {}", e))
                 })?
@@ -1642,20 +1646,22 @@ impl AudioCaptureBackend for WasapiBackend {
         } else {
             // Application-specific capture with process tree support (like wasapi-rs)
             let include_tree = true; // Include child processes like wasapi-rs example
-            AudioClient::new_application_loopback_client(app.pid, include_tree).map_err(|e| {
-                AudioError::DeviceNotFound(format!(
-                    "Failed to create application audio capture for PID {}: {}",
-                    app.pid, e
-                ))
-            })?
+            WasapiAudioClient::new_application_loopback_client(app.pid, include_tree).map_err(
+                |e| {
+                    AudioError::DeviceNotFound(format!(
+                        "Failed to create application audio capture for PID {}: {}",
+                        app.pid, e
+                    ))
+                },
+            )?
         };
 
         audio_client
             .initialize_client(
                 &wave_format,
                 0,
-                &Direction::Capture,
-                &ShareMode::Shared,
+                &WasapiDirection::Capture,
+                &WasapiShareMode::Shared,
                 true,
             )
             .map_err(|e| AudioError::InitializationFailed(e.to_string()))?;
