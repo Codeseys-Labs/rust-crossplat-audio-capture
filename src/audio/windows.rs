@@ -49,8 +49,9 @@ use windows::Win32::Foundation::CloseHandle;
 use windows::Win32::Foundation::HANDLE; // For process handle
 use windows::Win32::Foundation::WAIT_OBJECT_0;
 use windows::Win32::Foundation::{S_FALSE, S_OK};
-use windows::Win32::System::WinRT::HCS_E_OPERATION_NOT_FOUND as E_NOTFOUND;
-// WAVE_FORMAT_IEEE_FLOAT constant
+// Define E_NOTFOUND constant since it's not easily accessible
+const E_NOTFOUND: windows::core::HRESULT = windows::core::HRESULT(-2147024894i32); // 0x80070002
+                                                                                   // WAVE_FORMAT_IEEE_FLOAT constant
 const WAVE_FORMAT_IEEE_FLOAT: u16 = 3;
 use windows::Win32::Media::Audio::{
     eAll, eCapture, eConsole, eRender, IAudioCaptureClient, IAudioClient, IMMDevice,
@@ -58,14 +59,15 @@ use windows::Win32::Media::Audio::{
     AUDCLNT_SHAREMODE_SHARED, AUDCLNT_STREAMFLAGS_LOOPBACK, DEVICE_STATE_ACTIVE, WAVEFORMATEX,
     WAVE_FORMAT_PCM,
 };
-use windows::Win32::System::Com::PropVariantClear;
 use windows::Win32::System::Com::{
     CoCreateInstance, CoInitializeEx, CoTaskMemFree, CoUninitialize, CLSCTX_ALL,
     COINIT_MULTITHREADED, STGM_READ,
 };
-use windows::Win32::System::Rpc::RPC_E_CHANGED_MODE;
+use windows::Win32::System::Ole::PropVariantClear;
+// Define RPC_E_CHANGED_MODE constant
+const RPC_E_CHANGED_MODE: windows::core::HRESULT = windows::core::HRESULT(-2147417850i32); // 0x80010106
+use windows::Win32::System::Com::StructuredStorage::{PROPVARIANT, VT_EMPTY, VT_LPWSTR};
 use windows::Win32::System::Threading::{OpenProcess, WaitForSingleObject, PROCESS_SYNCHRONIZE};
-use windows::Win32::System::Variant::{PROPVARIANT, VT_EMPTY, VT_LPWSTR};
 use windows::Win32::UI::Shell::PropertiesSystem::IPropertyStore;
 
 /// RAII wrapper for a Windows HANDLE to ensure it's closed on drop.
@@ -319,10 +321,12 @@ impl AudioDevice for WindowsAudioDevice {
             name
         }
     }
+}
 
+impl WindowsAudioDevice {
     /// Determines the kind of device (Input or Output).
     /// This is a helper method, not part of the AudioDevice trait.
-    fn kind(&self) -> AudioResult<DeviceKind> {
+    pub fn kind(&self) -> AudioResult<DeviceKind> {
         // QueryInterface for IMMEndpoint
         let endpoint: IMMEndpoint = self.device.cast().map_err(|hr| {
             AudioError::BackendSpecificError(format!(
