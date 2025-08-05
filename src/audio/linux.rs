@@ -6,7 +6,7 @@
 use crate::api::AudioCaptureConfig;
 use crate::core::error::{AudioError, Result as AudioResult};
 use crate::core::interface::{
-    AudioBackend, AudioDevice, CapturingStream, DeviceEnumerator, DeviceKind,
+    AudioDevice, CapturingStream, DeviceEnumerator, DeviceKind,
 };
 use crate::AudioFormat;
 
@@ -73,10 +73,6 @@ impl AudioDevice for LinuxAudioDevice {
         false
     }
 
-    fn supports_format(&self, _format: &AudioFormat) -> AudioResult<bool> {
-        Ok(false)
-    }
-
     fn is_format_supported(&self, _format: &AudioFormat) -> AudioResult<bool> {
         Ok(false)
     }
@@ -136,25 +132,7 @@ impl PipeWireBackend {
     }
 }
 
-impl AudioBackend for PipeWireBackend {
-    fn create_capturing_stream(
-        &self,
-        _device: &dyn AudioDevice,
-        _config: &AudioCaptureConfig,
-    ) -> AudioResult<Box<dyn CapturingStream>> {
-        Err(AudioError::BackendError(
-            "PipeWire backend not yet implemented".to_string(),
-        ))
-    }
-
-    fn enumerate_devices(&self) -> AudioResult<Vec<Box<dyn AudioDevice>>> {
-        Ok(vec![])
-    }
-
-    fn get_default_device(&self, _kind: DeviceKind) -> AudioResult<Option<Box<dyn AudioDevice>>> {
-        Ok(None)
-    }
-}
+// AudioBackend trait doesn't exist in core::interface, so no implementation needed
 
 /// Stub implementation for Linux application info
 #[derive(Debug, Clone)]
