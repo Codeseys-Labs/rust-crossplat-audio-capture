@@ -1,7 +1,7 @@
 pub mod api; // Added api module
 pub mod audio;
 pub mod core; // Added core module
-#[path = "../tests/mod.rs"]
+#[cfg(test)]
 pub mod tests;
 pub mod utils;
 

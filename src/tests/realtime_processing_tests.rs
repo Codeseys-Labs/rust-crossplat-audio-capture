@@ -1,12 +1,11 @@
 // tests/realtime_processing_tests.rs
-use rsac::api::AudioCapture;
-use rsac::api::AudioCaptureConfig;
-use rsac::core::buffer::AudioBuffer;
-use rsac::core::config::{
+use crate::api::{AudioCapture, AudioCaptureConfig};
+use crate::core::buffer::AudioBuffer;
+use crate::core::config::{
     ApiConfig, BitsPerSample, CaptureAPI, ChannelConfig, Channels, SampleFormat, SampleRate,
 };
-use rsac::core::error::AudioError;
-use rsac::core::interface::{AudioProcessor, CapturingStream};
+use crate::core::error::AudioError;
+use crate::core::interface::{AudioProcessor, CapturingStream};
 use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
@@ -252,7 +251,7 @@ mod processor_callback_management_tests {
 #[cfg(test)]
 mod mutual_exclusivity_tests {
     use super::*;
-    use rsac::core::interface::AudioCaptureStream; // For external streaming methods
+    use crate::core::interface::AudioCaptureStream; // For external streaming methods
 
     // Mock for external streaming
     struct MockExternalStream {
