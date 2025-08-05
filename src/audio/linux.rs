@@ -144,7 +144,6 @@ use pipewire::{
     types as pw_types,
 }; // Added for PipeWire keys and types
 use std::collections::VecDeque; // For data_queue
-use std::fmt::Display; // Added for DeviceId Display trait
 use std::pin::Pin; // For Pin<Box<dyn Stream>>
 use std::sync::atomic::{AtomicBool, Ordering as AtomicOrdering}; // Renamed Ordering to avoid conflict if any
 use std::sync::Arc; // Added for Arc
@@ -156,7 +155,6 @@ use std::{process::Command, sync::Mutex, thread, time::Duration};
 
 // Adjusted imports for PipewireCoreContext
 use pipewire::{
-    self,
     channel,
     context::Context as PwContext, // Import PwContext for old backend compatibility
     core::Core as PwCore,          // Import PwCore for old backend compatibility
