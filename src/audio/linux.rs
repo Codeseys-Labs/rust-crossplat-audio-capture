@@ -116,9 +116,7 @@ impl DeviceEnumerator for LinuxDeviceEnumerator {
     }
 
     fn get_device_by_id(&self, _id: &LinuxDeviceId) -> AudioResult<Self::Device> {
-        Err(AudioError::BackendError(
-            "Device not found".to_string(),
-        ))
+        Err(AudioError::BackendError("Device not found".to_string()))
     }
 }
 
