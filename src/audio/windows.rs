@@ -21,7 +21,6 @@ use std::time::{Duration, Instant}; // Added Instant // For efficient data copyi
 // TODO: Remove these once the actual WASAPI logic is integrated with the new traits.
 // These are placeholders from the old structure.
 use super::core::{AudioApplication, AudioCaptureBackend, AudioCaptureStream}; // Keep for old backend
-use std::collections::VecDeque; // Keep for old backend
 use sysinfo::{ProcessRefreshKind, ProcessesToUpdate, RefreshKind, System}; // Keep for old backend
 use wasapi::{
     self,
@@ -44,23 +43,25 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use windows::core::{GUID, HRESULT, PWSTR};
 use windows::Win32::Foundation::HANDLE; // For process handle
-use windows::Win32::Foundation::{E_NOTFOUND, S_FALSE, S_OK};
+use windows::Win32::Foundation::{S_FALSE, S_OK};
 use windows::Win32::Media::Audio::{
     eAll, eCapture, eConsole, eRender, IAudioCaptureClient, IAudioClient, IMMDevice,
     IMMDeviceCollection, IMMDeviceEnumerator, IMMEndpoint, MMDeviceEnumerator,
-    AUDCLNT_SHAREMODE_SHARED, AUDCLNT_STREAMFLAGS_LOOPBACK, CLSCTX_ALL, DEVICE_STATE_ACTIVE,
-    WAVEFORMATEX, WAVE_FORMAT_IEEE_FLOAT, WAVE_FORMAT_PCM,
+    AUDCLNT_SHAREMODE_SHARED, AUDCLNT_STREAMFLAGS_LOOPBACK, DEVICE_STATE_ACTIVE,
+    WAVEFORMATEX, WAVE_FORMAT_PCM,
 };
+use windows::Win32::Multimedia::WAVE_FORMAT_IEEE_FLOAT;
 use windows::Win32::System::Com::{
-    CoCreateInstance, CoInitializeEx, CoTaskMemFree, CoUninitialize, IPropertyStore, CLSCTX_ALL,
-    COINIT_MULTITHREADED, RPC_E_CHANGED_MODE, STGM_READ,
+    CoCreateInstance, CoInitializeEx, CoTaskMemFree, CoUninitialize,
+    COINIT_MULTITHREADED, STGM_READ, CLSCTX_ALL,
 };
-use windows::Win32::System::Propsystem::PropVariantClear;
+use windows::Win32::System::PropsystemTypes::PropVariantClear;
+use windows::Win32::Foundation::CloseHandle;
 use windows::Win32::System::Threading::{
-    CloseHandle, OpenProcess, WaitForSingleObject, PROCESS_SYNCHRONIZE, WAIT_OBJECT_0,
+    OpenProcess, WaitForSingleObject, PROCESS_SYNCHRONIZE, WAIT_OBJECT_0,
 };
 use windows::Win32::System::Variant::{PROPVARIANT, VT_EMPTY, VT_LPWSTR};
-use windows::Win32::UI::Shell::PropertiesSystem::PKEY_Device_FriendlyName;
+use windows::Win32::UI::Shell::PropertiesSystem::{PKEY_Device_FriendlyName, IPropertyStore};
 
 /// RAII wrapper for a Windows HANDLE to ensure it's closed on drop.
 #[derive(Debug)]
