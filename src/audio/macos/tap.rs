@@ -252,3 +252,260 @@ unsafe fn msg_send_responds_to(obj: id, sel: Sel) -> bool {
     let responds: BOOL = msg_send![obj, respondsToSelector: sel];
     responds == YES
 }
+
+// --- Enhanced Application-Specific Capture (Process Tap + Aggregate Device) ---
+
+/// Enhanced macOS application capture using CoreAudio Process Tap with Aggregate Device
+/// Based on research from insidegui/AudioCap ProcessTap.swift
+pub struct MacOSApplicationCapture {
+    target_pid: i32,
+    mute_when_running: bool,
+    process_tap_id: Option<sys::AudioObjectID>,
+    aggregate_device_id: Option<sys::AudioObjectID>,
+    io_proc_id: Option<sys::AudioDeviceIOProcID>,
+    is_capturing: std::sync::atomic::AtomicBool,
+}
+
+impl MacOSApplicationCapture {
+    /// Create a new application capture instance for the specified process
+    ///
+    /// # Arguments
+    /// * `target_pid` - PID of the target process
+    /// * `mute_when_running` - Whether to mute the original audio when tap is active
+    ///
+    /// # Example
+    /// ```rust,no_run
+    /// use rust_crossplat_audio_capture::audio::macos::tap::MacOSApplicationCapture;
+    ///
+    /// let capture = MacOSApplicationCapture::new(1234, false);
+    /// ```
+    ///
+    /// # Requirements
+    /// - macOS 14.4 or later
+    /// - NSAudioCaptureUsageDescription in Info.plist
+    /// - Audio capture permission granted by user
+    pub fn new(target_pid: i32, mute_when_running: bool) -> Self {
+        Self {
+            target_pid,
+            mute_when_running,
+            process_tap_id: None,
+            aggregate_device_id: None,
+            io_proc_id: None,
+            is_capturing: std::sync::atomic::AtomicBool::new(false),
+        }
+    }
+
+    /// Check if the current macOS version supports Process Tap (14.4+)
+    ///
+    /// # Returns
+    /// true if Process Tap APIs are available, false otherwise
+    ///
+    /// # TODO
+    /// - Implement runtime macOS version check
+    /// - Use NSProcessInfo or similar to check version
+    pub fn is_process_tap_available() -> bool {
+        // TODO: Implement version check
+        // if #available(macOS 14.4, *) { true } else { false }
+        // In Rust, this would be a runtime check using system APIs
+        false
+    }
+
+    /// Translate PID to AudioObjectID for the target process
+    ///
+    /// # Implementation Notes
+    /// - Uses kAudioHardwarePropertyTranslatePIDToProcessObject
+    /// - Called on the system audio object (kAudioObjectSystemObject)
+    /// - Returns AudioObjectID representing the process for tap creation
+    ///
+    /// # TODO
+    /// - Implement AudioObjectGetPropertyData call
+    /// - Handle process not found or not audio-capable
+    /// - Add proper error handling for invalid PIDs
+    pub fn translate_pid_to_process_object(&self) -> AudioResult<sys::AudioObjectID> {
+        // TODO: Implement PID to AudioObjectID translation
+        //
+        // Key steps based on research:
+        // 1. Set up AudioObjectPropertyAddress with:
+        //    - mSelector: kAudioHardwarePropertyTranslatePIDToProcessObject
+        //    - mScope: kAudioObjectPropertyScopeGlobal
+        //    - mElement: kAudioObjectPropertyElementMain
+        // 2. Call AudioObjectGetPropertyData with:
+        //    - inObjectID: kAudioObjectSystemObject
+        //    - inQualifierData: &target_pid (as qualifier)
+        //    - outData: &mut process_object_id
+        // 3. Return the resulting AudioObjectID
+
+        Err(AudioError::NotImplemented("PID to AudioObjectID translation not yet implemented".to_string()))
+    }
+
+    /// Create a Process Tap for the target process
+    ///
+    /// # Implementation Notes
+    /// - Creates CATapDescription with stereoMixdownOfProcesses
+    /// - Sets UUID for later reference in aggregate device
+    /// - Configures mute behavior (mutedWhenTapped vs unmuted)
+    /// - Calls AudioHardwareCreateProcessTap
+    ///
+    /// # TODO
+    /// - Implement CATapDescription creation and configuration
+    /// - Add proper UUID generation and storage
+    /// - Handle tap creation errors (process not found, permission denied)
+    pub fn create_process_tap(&mut self) -> AudioResult<sys::AudioObjectID> {
+        // TODO: Implement process tap creation
+        //
+        // Key steps based on research:
+        // 1. Get process AudioObjectID via translate_pid_to_process_object
+        // 2. Create CATapDescription:
+        //    - stereoMixdownOfProcesses: [process_object_id]
+        //    - uuid: generate new UUID
+        //    - muteBehavior: .mutedWhenTapped or .unmuted
+        // 3. Call AudioHardwareCreateProcessTap(tapDescription, &tapID)
+        // 4. Store tap ID and return it
+
+        Err(AudioError::NotImplemented("Process tap creation not yet implemented".to_string()))
+    }
+
+    /// Create an Aggregate Device that includes the process tap
+    ///
+    /// # Implementation Notes
+    /// - Creates CFDictionary with aggregate device configuration
+    /// - Includes system output as main subdevice
+    /// - Adds process tap to kAudioAggregateDeviceTapListKey
+    /// - Sets device as private (kAudioAggregateDeviceIsPrivateKey: true)
+    ///
+    /// # TODO
+    /// - Implement aggregate device dictionary creation
+    /// - Add system output device discovery
+    /// - Configure tap list with UUID and drift compensation
+    /// - Handle aggregate device creation errors
+    pub fn create_aggregate_device(&mut self) -> AudioResult<sys::AudioObjectID> {
+        // TODO: Implement aggregate device creation
+        //
+        // Key steps based on research:
+        // 1. Get default system output device UID
+        // 2. Create aggregate device description dictionary:
+        //    - kAudioAggregateDeviceNameKey: "Tap-{pid}"
+        //    - kAudioAggregateDeviceUIDKey: generated UUID
+        //    - kAudioAggregateDeviceMainSubDeviceKey: system output UID
+        //    - kAudioAggregateDeviceIsPrivateKey: true
+        //    - kAudioAggregateDeviceIsStackedKey: false
+        //    - kAudioAggregateDeviceTapAutoStartKey: true
+        //    - kAudioAggregateDeviceSubDeviceListKey: [system output]
+        //    - kAudioAggregateDeviceTapListKey: [tap with UUID and drift compensation]
+        // 3. Call AudioHardwareCreateAggregateDevice(description, &deviceID)
+        // 4. Store device ID and return it
+
+        Err(AudioError::NotImplemented("Aggregate device creation not yet implemented".to_string()))
+    }
+
+    /// Read the audio format from the process tap
+    ///
+    /// # Implementation Notes
+    /// - Uses kAudioTapPropertyFormat to get AudioStreamBasicDescription
+    /// - This describes the format of audio coming from the tap
+    /// - Needed for creating compatible audio buffers and files
+    ///
+    /// # TODO
+    /// - Implement AudioObjectGetPropertyData for kAudioTapPropertyFormat
+    /// - Parse AudioStreamBasicDescription
+    /// - Convert to our internal AudioFormat representation
+    pub fn read_tap_format(&self) -> AudioResult<sys::AudioStreamBasicDescription> {
+        // TODO: Implement tap format reading
+        //
+        // Key steps based on research:
+        // 1. Set up AudioObjectPropertyAddress with kAudioTapPropertyFormat
+        // 2. Call AudioObjectGetPropertyData on process tap ID
+        // 3. Return AudioStreamBasicDescription
+
+        Err(AudioError::NotImplemented("Tap format reading not yet implemented".to_string()))
+    }
+
+    /// Start capturing audio using I/O proc
+    ///
+    /// # Implementation Notes
+    /// - Creates AudioDeviceIOProcID with block-based callback
+    /// - Starts the aggregate device to begin audio flow
+    /// - I/O proc receives AudioBufferList with captured audio
+    /// - Converts buffers to user-friendly format and calls callback
+    ///
+    /// # TODO
+    /// - Implement AudioDeviceCreateIOProcIDWithBlock
+    /// - Add proper AudioBufferList processing
+    /// - Handle device start/stop and error conditions
+    /// - Convert audio data to f32 samples for callback
+    pub fn start_capture<F>(&mut self, callback: F) -> AudioResult<()>
+    where
+        F: Fn(&[f32]) + Send + 'static,
+    {
+        // TODO: Implement capture start
+        //
+        // Key steps based on research:
+        // 1. Ensure process tap and aggregate device are created
+        // 2. Create I/O proc with AudioDeviceCreateIOProcIDWithBlock:
+        //    - Use aggregate device ID
+        //    - Provide dispatch queue for callback
+        //    - Implement ioBlock to process AudioBufferList
+        // 3. Start device with AudioDeviceStart(aggregateDeviceID, procID)
+        // 4. In I/O block:
+        //    - Extract audio data from inInputData AudioBufferList
+        //    - Convert to f32 samples
+        //    - Call user callback with samples
+
+        self.is_capturing.store(true, std::sync::atomic::Ordering::SeqCst);
+        Err(AudioError::NotImplemented("macOS capture start not yet implemented".to_string()))
+    }
+
+    /// Stop capturing audio and clean up resources
+    ///
+    /// # Implementation Notes
+    /// - Stops the aggregate device
+    /// - Destroys I/O proc ID
+    /// - Destroys aggregate device
+    /// - Destroys process tap
+    /// - Order is important to avoid resource leaks
+    ///
+    /// # TODO
+    /// - Implement proper cleanup sequence
+    /// - Add error handling for cleanup failures
+    /// - Ensure all resources are released even if some steps fail
+    pub fn stop_capture(&mut self) -> AudioResult<()> {
+        self.is_capturing.store(false, std::sync::atomic::Ordering::SeqCst);
+
+        // TODO: Implement proper cleanup sequence
+        //
+        // Key steps based on research:
+        // 1. Stop aggregate device: AudioDeviceStop(aggregateDeviceID, procID)
+        // 2. Destroy I/O proc: AudioDeviceDestroyIOProcID(aggregateDeviceID, procID)
+        // 3. Destroy aggregate device: AudioHardwareDestroyAggregateDevice(aggregateDeviceID)
+        // 4. Destroy process tap: AudioHardwareDestroyProcessTap(processTapID)
+        // 5. Clear stored IDs
+
+        Ok(())
+    }
+
+    /// Check if currently capturing
+    pub fn is_capturing(&self) -> bool {
+        self.is_capturing.load(std::sync::atomic::Ordering::SeqCst)
+    }
+
+    /// List running applications that can be captured
+    ///
+    /// # Returns
+    /// Vector of (PID, app_name) tuples for running applications
+    ///
+    /// # TODO
+    /// - Implement NSRunningApplication enumeration
+    /// - Filter for applications that produce audio
+    /// - Extract PID and localized name
+    pub fn list_capturable_applications() -> AudioResult<Vec<(i32, String)>> {
+        // TODO: Implement application listing
+        //
+        // Key steps:
+        // 1. Use NSWorkspace.shared.runningApplications
+        // 2. Filter applications (exclude system processes if desired)
+        // 3. Extract processIdentifier and localizedName
+        // 4. Return list of (PID, name) tuples
+
+        Err(AudioError::NotImplemented("Application listing not yet implemented".to_string()))
+    }
+}

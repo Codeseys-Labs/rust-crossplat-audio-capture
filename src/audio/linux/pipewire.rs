@@ -307,3 +307,178 @@ mod tests {
         // pipewire::deinit(); // If init was called manually
     }
 }
+
+// --- Application-Specific Capture (PipeWire Monitor Stream) ---
+
+/// PipeWire-specific application capture using monitor streams
+/// Based on research from tsowell/wiremix src/wirehose/stream.rs
+pub struct PipeWireApplicationCapture {
+    node_id: Option<u32>,
+    node_serial: Option<String>,
+    app_selector: ApplicationSelector,
+    stream: Option<pipewire::stream::Stream>,
+    is_capturing: std::sync::atomic::AtomicBool,
+}
+
+/// Selector for targeting specific applications in PipeWire
+#[derive(Debug, Clone)]
+pub enum ApplicationSelector {
+    /// Target by process ID
+    ProcessId(u32),
+    /// Target by application name (application.name property)
+    ApplicationName(String),
+    /// Target by PipeWire node ID/serial
+    NodeId(u32),
+    /// Target by node serial string
+    NodeSerial(String),
+}
+
+impl PipeWireApplicationCapture {
+    /// Create a new application capture instance
+    ///
+    /// # Arguments
+    /// * `selector` - How to identify the target application
+    ///
+    /// # Example
+    /// ```rust,no_run
+    /// use rust_crossplat_audio_capture::audio::linux::pipewire::{PipeWireApplicationCapture, ApplicationSelector};
+    ///
+    /// let capture = PipeWireApplicationCapture::new(ApplicationSelector::ProcessId(1234));
+    /// ```
+    pub fn new(selector: ApplicationSelector) -> Self {
+        Self {
+            node_id: None,
+            node_serial: None,
+            app_selector: selector,
+            stream: None,
+            is_capturing: std::sync::atomic::AtomicBool::new(false),
+        }
+    }
+
+    /// Discover and resolve the target application to a PipeWire node
+    ///
+    /// # Implementation Notes
+    /// - Enumerates PipeWire nodes and matches against selector criteria
+    /// - Looks for media.class = "Stream/Output/Audio" (playback) or "Stream/Input/Audio" (recording)
+    /// - Matches application.name, application.process.id, or node properties
+    ///
+    /// # TODO
+    /// - Implement PipeWire registry enumeration
+    /// - Add robust property matching logic
+    /// - Handle multiple matching nodes (return list or pick first)
+    pub fn discover_target_node(&mut self) -> Result<u32, AudioError> {
+        // TODO: Implement node discovery
+        //
+        // Key steps based on research:
+        // 1. Connect to PipeWire core
+        // 2. Create registry and add listener
+        // 3. Enumerate nodes with media.class = "Stream/Output/Audio" or "Stream/Input/Audio"
+        // 4. Match against selector criteria:
+        //    - ProcessId: application.process.id property
+        //    - ApplicationName: application.name property
+        //    - NodeId: direct node ID match
+        //    - NodeSerial: object.serial property
+        // 5. Return matching node ID and store serial
+
+        Err(AudioError::NotImplemented("PipeWire node discovery not yet implemented".to_string()))
+    }
+
+    /// Create a monitor stream targeting the discovered node
+    ///
+    /// # Implementation Notes
+    /// - Creates Stream with TARGET_OBJECT = node serial
+    /// - Sets STREAM_MONITOR = "true" for non-invasive monitoring
+    /// - Optionally sets STREAM_CAPTURE_SINK = "true" for sink monitoring
+    /// - Negotiates format (prefer F32LE interleaved)
+    ///
+    /// # TODO
+    /// - Implement Stream creation with proper properties
+    /// - Set up format negotiation (AudioInfoRaw with F32LE)
+    /// - Add stream listeners for param_changed and process callbacks
+    pub fn create_monitor_stream(&mut self) -> Result<(), AudioError> {
+        // TODO: Implement monitor stream creation
+        //
+        // Key steps based on research:
+        // 1. Create Stream with properties:
+        //    - TARGET_OBJECT = node serial string
+        //    - STREAM_MONITOR = "true"
+        //    - NODE_NAME = "app-capture-monitor"
+        //    - Optional: STREAM_CAPTURE_SINK = "true"
+        // 2. Add listeners:
+        //    - param_changed: handle format negotiation
+        //    - process: dequeue buffers and read PCM data
+        // 3. Set up format parameters (AudioInfoRaw with F32LE)
+        // 4. Connect stream with AUTOCONNECT | MAP_BUFFERS flags
+
+        Err(AudioError::NotImplemented("PipeWire monitor stream creation not yet implemented".to_string()))
+    }
+
+    /// Start capturing audio from the target application
+    ///
+    /// # Implementation Notes
+    /// - Sets up process callback to dequeue buffers
+    /// - Reads interleaved f32 samples from buffer data
+    /// - Calls user callback with PCM frames
+    ///
+    /// # TODO
+    /// - Implement process callback with buffer dequeue
+    /// - Add proper sample format handling (channels, sample rate)
+    /// - Handle stream state changes and disconnection
+    pub fn start_capture<F>(&mut self, callback: F) -> Result<(), AudioError>
+    where
+        F: Fn(&[f32]) + Send + 'static,
+    {
+        // TODO: Implement capture start
+        //
+        // Key steps based on research:
+        // 1. Ensure monitor stream is created
+        // 2. Set up process callback:
+        //    - stream.dequeue_buffer()
+        //    - Read buffer.datas_mut()[0].data()
+        //    - Parse interleaved f32 samples
+        //    - Call user callback with samples
+        // 3. Start PipeWire main loop or integrate with existing event loop
+
+        self.is_capturing.store(true, std::sync::atomic::Ordering::SeqCst);
+        Err(AudioError::NotImplemented("PipeWire capture start not yet implemented".to_string()))
+    }
+
+    /// Stop capturing audio
+    pub fn stop_capture(&mut self) -> Result<(), AudioError> {
+        self.is_capturing.store(false, std::sync::atomic::Ordering::SeqCst);
+
+        // TODO: Implement proper cleanup
+        // - Disconnect stream
+        // - Release stream resources
+        // - Stop main loop if owned
+
+        Ok(())
+    }
+
+    /// Check if currently capturing
+    pub fn is_capturing(&self) -> bool {
+        self.is_capturing.load(std::sync::atomic::Ordering::SeqCst)
+    }
+
+    /// List available applications with audio streams
+    ///
+    /// # Returns
+    /// Vector of LinuxApplicationInfo for apps currently producing audio
+    ///
+    /// # TODO
+    /// - Implement application enumeration
+    /// - Extract application properties from PipeWire nodes
+    /// - Filter for active audio streams only
+    pub fn list_audio_applications() -> Result<Vec<LinuxApplicationInfo>, AudioError> {
+        // TODO: Implement application listing
+        //
+        // Key steps:
+        // 1. Enumerate all PipeWire nodes
+        // 2. Filter for media.class = "Stream/Output/Audio" (playback apps)
+        // 3. Extract application.* properties
+        // 4. Build LinuxApplicationInfo structs
+        // 5. Return list of active applications
+
+        Err(AudioError::NotImplemented("PipeWire application listing not yet implemented".to_string()))
+    }
+}

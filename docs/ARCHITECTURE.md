@@ -22,6 +22,15 @@ pub trait AudioCapture: Send {
 - macOS: CoreAudio-based implementation
 - Linux: PipeWire and PulseAudio implementations with automatic backend selection
 
+### Application-Specific Audio Capture
+The library supports capturing audio from specific applications on all platforms:
+
+- **Windows**: Uses WASAPI Process Loopback to capture audio from a target process by PID
+- **Linux**: Uses PipeWire monitor streams targeted at application nodes
+- **macOS**: Uses CoreAudio Process Tap (macOS 14.4+) with Aggregate Device setup
+
+For detailed technical information about application-specific capture implementations, see [Application-Specific Audio Capture Research](app_specific_capture_research.md).
+
 ## Audio Pipeline
 
 ```mermaid

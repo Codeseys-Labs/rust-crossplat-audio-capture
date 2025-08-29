@@ -37,6 +37,143 @@ use wasapi::{
 // --- New Skeleton Implementations ---
 
 use crate::core::config::SampleFormat;
+
+// --- Application-Specific Capture (Process Loopback) ---
+
+/// Windows-specific application capture using WASAPI Process Loopback
+/// Based on research from HEnquist/wasapi-rs examples/record_application.rs
+pub struct WindowsApplicationCapture {
+    process_id: u32,
+    include_tree: bool,
+    audio_client: Option<WasapiAudioClient>,
+    capture_client: Option<WasapiAudioCaptureClient>,
+    is_capturing: AtomicBool,
+}
+
+impl WindowsApplicationCapture {
+    /// Create a new application capture instance for the specified process
+    ///
+    /// # Arguments
+    /// * `process_id` - PID of the target process
+    /// * `include_tree` - Whether to include child processes in capture
+    ///
+    /// # Example
+    /// ```rust,no_run
+    /// use rust_crossplat_audio_capture::audio::windows::WindowsApplicationCapture;
+    ///
+    /// let capture = WindowsApplicationCapture::new(1234, true);
+    /// ```
+    pub fn new(process_id: u32, include_tree: bool) -> Self {
+        Self {
+            process_id,
+            include_tree,
+            audio_client: None,
+            capture_client: None,
+            is_capturing: AtomicBool::new(false),
+        }
+    }
+
+    /// Initialize the process loopback client
+    ///
+    /// This uses WASAPI's AUDIOCLIENT_ACTIVATION_TYPE_PROCESS_LOOPBACK
+    /// with AUDIOCLIENT_PROCESS_LOOPBACK_PARAMS to target a specific process.
+    ///
+    /// # Implementation Notes
+    /// - Uses ActivateAudioInterfaceAsync with VIRTUAL_AUDIO_DEVICE_PROCESS_LOOPBACK
+    /// - Requires AUDIOCLIENT_ACTIVATION_PARAMS with ProcessLoopbackParams
+    /// - Many AudioClient query methods are non-functional in loopback mode
+    ///
+    /// # TODO
+    /// - Implement actual WASAPI Process Loopback activation
+    /// - Handle async activation with completion handler
+    /// - Set up proper error handling for activation failures
+    pub fn initialize(&mut self, format: &AudioFormat) -> AudioResult<()> {
+        // TODO: Implement WASAPI Process Loopback initialization
+        //
+        // Key steps based on research:
+        // 1. Initialize COM (MTA)
+        // 2. Create AUDIOCLIENT_ACTIVATION_PARAMS with:
+        //    - ActivationType = AUDIOCLIENT_ACTIVATION_TYPE_PROCESS_LOOPBACK
+        //    - ProcessLoopbackParams { TargetProcessId, ProcessLoopbackMode }
+        // 3. Wrap in PROPVARIANT with VT_BLOB
+        // 4. Call ActivateAudioInterfaceAsync with VIRTUAL_AUDIO_DEVICE_PROCESS_LOOPBACK
+        // 5. Wait for completion handler
+        // 6. Initialize client in shared/event mode with autoconvert
+
+        Err(AudioError::NotImplemented("Windows application capture not yet implemented".to_string()))
+    }
+
+    /// Start capturing audio from the target process
+    ///
+    /// # Implementation Notes
+    /// - Uses event-driven capture with IAudioCaptureClient
+    /// - Implements resilient buffering (VecDeque) due to unreliable buffer size queries
+    /// - Handles timeout on event waits (typically 3000ms)
+    ///
+    /// # TODO
+    /// - Implement event handle setup and capture loop
+    /// - Add proper buffer management with VecDeque
+    /// - Handle process disconnection gracefully
+    pub fn start_capture<F>(&mut self, callback: F) -> AudioResult<()>
+    where
+        F: Fn(&[f32]) + Send + 'static,
+    {
+        // TODO: Implement capture loop
+        //
+        // Key steps based on research:
+        // 1. Get event handle from audio client
+        // 2. Get IAudioCaptureClient
+        // 3. Start stream
+        // 4. Loop:
+        //    - Wait on event handle (with timeout)
+        //    - Get next packet size
+        //    - Read samples to VecDeque
+        //    - Process chunks and call callback
+        //    - Handle timeout/error conditions
+
+        self.is_capturing.store(true, Ordering::SeqCst);
+        Err(AudioError::NotImplemented("Windows application capture start not yet implemented".to_string()))
+    }
+
+    /// Stop capturing audio
+    pub fn stop_capture(&mut self) -> AudioResult<()> {
+        self.is_capturing.store(false, Ordering::SeqCst);
+
+        // TODO: Implement proper cleanup
+        // - Stop audio stream
+        // - Release capture client
+        // - Release audio client
+
+        Ok(())
+    }
+
+    /// Check if currently capturing
+    pub fn is_capturing(&self) -> bool {
+        self.is_capturing.load(Ordering::SeqCst)
+    }
+
+    /// Find process ID by name (convenience helper)
+    ///
+    /// # Arguments
+    /// * `process_name` - Name of the process to find (e.g., "firefox.exe")
+    ///
+    /// # Returns
+    /// Parent PID if include_tree is desired, otherwise the first matching PID
+    ///
+    /// # TODO
+    /// - Implement process discovery using sysinfo
+    /// - Handle multiple processes with same name
+    /// - Return parent PID for process tree capture
+    pub fn find_process_by_name(process_name: &str) -> Option<u32> {
+        // TODO: Implement process discovery
+        // Based on wasapi-rs example:
+        // let system = System::new_with_specifics(refreshes);
+        // let process_ids = system.processes_by_name(OsStr::new(process_name));
+        // For tree capture, use process.parent().unwrap_or(process.pid())
+
+        None
+    }
+}
 // DeviceId is now defined locally as WindowsDeviceId
 use std::ffi::OsStr;
 use std::os::windows::ffi::OsStrExt;
