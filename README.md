@@ -86,8 +86,10 @@ RSAC supports both interactive and command-line modes, with bounded or unbounded
 
 #### macOS
 
-- System-wide audio capture only (application-specific capture not supported)
+- System-wide audio capture supported
+- **NEW**: Application-specific capture via CoreAudio Process Tap (macOS 14.4+)
 - Requires Screen Recording permission to be granted
+- Process Tap requires additional permissions for application audio access
 - Process selection is limited to system audio
 
 ### Interactive Mode
@@ -410,6 +412,34 @@ docker build -f docker/windows/Dockerfile -t rsac-windows .
 # macOS (requires virtualization support)
 docker build -f docker/macos/Dockerfile -t rsac-macos .
 ```
+
+## Testing Application Capture
+
+A dedicated test binary is available for CI/CD and manual testing:
+
+```bash
+# Quick functionality test (ideal for CI)
+cargo run --bin app_capture_test -- --quick-test
+
+# List all capturable applications
+cargo run --bin app_capture_test -- --list
+
+# Test error handling
+cargo run --bin app_capture_test -- --test-invalid
+
+# Test platform-specific features
+cargo run --bin app_capture_test -- --test-platform
+
+# Test capture lifecycle
+cargo run --bin app_capture_test -- --test-lifecycle
+
+# Show version and platform info
+cargo run --bin app_capture_test -- --version
+```
+
+### CI/CD Integration
+
+The project includes GitHub Actions workflows that automatically test application capture functionality across Windows, Linux, and macOS. See `.github/workflows/application_capture_ci.yml` for the complete CI configuration.
 
 ## License
 
