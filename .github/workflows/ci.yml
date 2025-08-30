@@ -91,72 +91,28 @@ jobs:
           fi
         shell: bash
 
-  pipewire_linux_test:
-    name: PipeWire Linux Tests
+  enhanced_linux_tests:
+    name: Enhanced Linux PipeWire Tests
     needs: lint_and_format_checks
-    runs-on: ubuntu-latest
-    steps:
-      - name: Checkout code
-        uses: actions/checkout@v4
+    uses: ./.github/workflows/linux.yml
+    with:
+      debug_enabled: false
 
-      - name: Install Rust
-        uses: dtolnay/rust-toolchain@stable
-
-      - name: Install PipeWire
-        run: |
-          sudo apt-get update
-          sudo add-apt-repository ppa:pipewire-debian/pipewire-upstream -y
-          sudo apt-get update
-          sudo apt-get install -y \
-            pipewire \
-            pipewire-audio-client-libraries \
-            pipewire-pulse \
-            libpipewire-0.3-dev \
-            libspa-0.2-dev \
-            pkg-config
-
-      - name: Build PipeWire-only features
-        run: cargo build --no-default-features --features feat_linux --verbose
-
-      - name: Test PipeWire audio capture
-        run: |
-          systemctl --user --now enable pipewire.service
-          sleep 2
-          cargo run --example test_capture --features feat_linux -- --duration 3 --output pipewire_test.wav || echo "Test completed"
-
-  enhanced_windows_tests:
-    name: Enhanced Windows WASAPI Tests
+  windows_tests:
+    name: Windows WASAPI Tests
     needs: lint_and_format_checks
-    runs-on: windows-latest
-    steps:
-      - name: Checkout code
-        uses: actions/checkout@v4
+    uses: ./.github/workflows/windows.yml
+    with:
+      debug_enabled: false
 
-      - name: Install Rust
-        uses: dtolnay/rust-toolchain@stable
+  macos_tests:
+    name: macOS CoreAudio Tests
+    needs: lint_and_format_checks
+    uses: ./.github/workflows/macos.yml
+    with:
+      debug_enabled: false
 
-      - name: Cache dependencies
-        uses: actions/cache@v3
-        with:
-          path: |
-            ~/.cargo/registry
-            ~/.cargo/git
-            target
-          key: ${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.lock') }}
 
-      - name: Build Windows-only features
-        run: cargo build --no-default-features --features feat_windows --verbose
-        env:
-          WINAPI_NO_BUNDLED_LIBRARIES: 1
-
-      - name: Test Enhanced WASAPI Device Enumeration
-        run: |
-          Write-Host "Testing enhanced WASAPI device enumeration with wasapi-rs optimizations..."
-          Write-Host "VecDeque buffering, process tree support, and improved error handling"
-          cargo run --example windows_device_test --features feat_windows
-        shell: pwsh
-        env:
-          WINAPI_NO_BUNDLED_LIBRARIES: 1
   coverage:
     name: Code Coverage
     needs: lint_and_format_checks
@@ -170,10 +126,16 @@ jobs:
 
       - name: Install PipeWire dev libraries
         run: |
-          sudo apt-get update
-          sudo add-apt-repository ppa:pipewire-debian/pipewire-upstream -y
-          sudo apt-get update
-          sudo apt-get install -y libpipewire-0.3-dev libspa-0.2-dev pkg-config
+          # Check if development libraries are available
+          if pkg-config --exists libpipewire-0.3; then
+            echo "✅ PipeWire development libraries already available"
+          else
+            echo "Installing PipeWire development libraries..."
+            sudo apt-get update
+            sudo add-apt-repository ppa:pipewire-debian/pipewire-upstream -y
+            sudo apt-get update
+            sudo apt-get install -y libpipewire-0.3-dev libspa-0.2-dev pkg-config
+          fi
 
       - name: Cache Cargo dependencies
         uses: Swatinem/rust-cache@v2
