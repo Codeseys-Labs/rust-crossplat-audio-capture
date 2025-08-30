@@ -545,46 +545,123 @@ impl PipeWireApplicationCapture {
     /// Run the PipeWire main loop for a specified duration (simplified approach)
     #[cfg(feature = "pipewire")]
     pub fn run_main_loop(&self, duration: Duration) -> Result<(), Box<dyn std::error::Error>> {
+        self.run_main_loop_with_options(Some(duration), false)
+    }
+
+    /// Run the PipeWire main loop with flexible options
+    ///
+    /// # Arguments
+    /// * `duration` - Optional duration to run for. If None, runs indefinitely until stop_capture() is called
+    /// * `verbose` - Whether to print progress information
+    #[cfg(feature = "pipewire")]
+    pub fn run_main_loop_with_options(
+        &self,
+        duration: Option<Duration>,
+        verbose: bool
+    ) -> Result<(), Box<dyn std::error::Error>> {
         if let Some(context) = &self.context {
             let start_time = std::time::Instant::now();
 
-            println!("🔄 Running PipeWire main loop for {:?}...", duration);
-            println!("    (This is CRITICAL for stream connection and process callbacks)");
+            if let Some(dur) = duration {
+                if verbose {
+                    println!("🔄 Running PipeWire main loop for {:?}...", dur);
+                    println!("    (This is CRITICAL for stream connection and process callbacks)");
+                }
+            } else {
+                if verbose {
+                    println!("🔄 Running PipeWire main loop indefinitely...");
+                    println!("    (Call stop_capture() to stop)");
+                }
+            }
 
-            // For now, let's use a simple approach: run the main loop in small iterations
+            // Run the main loop in small iterations
             // This allows the stream to connect and process callbacks
             let mut iteration_count = 0;
-            while start_time.elapsed() < duration && self.is_capturing.load(Ordering::SeqCst) {
-                // Run one iteration of the main loop to process events
-                // This is what allows the stream to connect and receive callbacks
-                let loop_result = context.main_loop.loop_().iterate(Duration::from_millis(100));
+            let mut last_progress_time = start_time;
 
+            loop {
+                // Check if we should stop due to duration
+                if let Some(dur) = duration {
+                    if start_time.elapsed() >= dur {
+                        break;
+                    }
+                }
+
+                // Check if capture was stopped
+                if !self.is_capturing.load(Ordering::SeqCst) {
+                    if verbose {
+                        println!("🛑 Main loop stopped by stop_capture()");
+                    }
+                    break;
+                }
+
+                // Run one iteration of the main loop to process events
+                let loop_result = context.main_loop.loop_().iterate(Duration::from_millis(100));
                 iteration_count += 1;
 
-                // Print progress every 10 iterations (roughly every second)
-                if iteration_count % 10 == 0 {
-                    let elapsed = start_time.elapsed();
-                    let remaining = duration.saturating_sub(elapsed);
-                    if remaining > Duration::from_millis(200) {
-                        println!("    ⏱️  {:.1}s remaining... (loop iterations: {})",
-                                 remaining.as_secs_f32(), iteration_count);
+                // Print progress if verbose and duration is set
+                if verbose && duration.is_some() && iteration_count % 10 == 0 {
+                    let now = std::time::Instant::now();
+                    if now.duration_since(last_progress_time) >= Duration::from_secs(1) {
+                        let elapsed = start_time.elapsed();
+                        if let Some(dur) = duration {
+                            let remaining = dur.saturating_sub(elapsed);
+                            if remaining > Duration::from_millis(200) {
+                                println!("    ⏱️  {:.1}s remaining... (loop iterations: {})",
+                                         remaining.as_secs_f32(), iteration_count);
+                            }
+                        }
+                        last_progress_time = now;
                     }
                 }
 
                 // Check if loop iteration failed
                 if loop_result < 0 {
-                    println!("⚠️  Main loop iteration failed: {}", loop_result);
+                    if verbose {
+                        println!("⚠️  Main loop iteration failed: {}", loop_result);
+                    }
                     break;
                 }
             }
 
             let actual_duration = start_time.elapsed();
-            println!("⏹️  Main loop completed after {:.2}s ({} iterations)",
-                     actual_duration.as_secs_f32(), iteration_count);
+            if verbose {
+                println!("⏹️  Main loop completed after {:.2}s ({} iterations)",
+                         actual_duration.as_secs_f32(), iteration_count);
+            }
         } else {
-            println!("⚠️  No PipeWire context available");
+            return Err("No PipeWire context available".into());
         }
         Ok(())
+    }
+
+    /// Start capturing and run the main loop indefinitely
+    ///
+    /// This is a convenience method that combines start_capture() and run_main_loop_with_options()
+    /// The capture will run until stop_capture() is called from another thread.
+    #[cfg(feature = "pipewire")]
+    pub fn start_capture_indefinitely<F>(&mut self, callback: F) -> Result<(), Box<dyn std::error::Error>>
+    where
+        F: Fn(&[f32]) + Send + 'static,
+    {
+        self.start_capture(callback)?;
+        self.run_main_loop_with_options(None, false)
+    }
+
+    /// Start capturing and run for a specific duration
+    ///
+    /// This is a convenience method that combines start_capture() and run_main_loop()
+    #[cfg(feature = "pipewire")]
+    pub fn start_capture_for_duration<F>(
+        &mut self,
+        callback: F,
+        duration: Duration
+    ) -> Result<(), Box<dyn std::error::Error>>
+    where
+        F: Fn(&[f32]) + Send + 'static,
+    {
+        self.start_capture(callback)?;
+        self.run_main_loop(duration)
     }
 
     /// Stop capturing audio
@@ -600,6 +677,26 @@ impl PipeWireApplicationCapture {
     /// Check if currently capturing
     pub fn is_capturing(&self) -> bool {
         self.is_capturing.load(Ordering::SeqCst)
+    }
+
+    /// Get the discovered node ID (if any)
+    pub fn get_node_id(&self) -> Option<u32> {
+        self.node_id
+    }
+
+    /// Get the discovered node serial (if any)
+    pub fn get_discovered_node_serial(&self) -> Option<&str> {
+        self.node_serial.as_deref()
+    }
+
+    /// Check if the stream is ready for capture
+    pub fn is_stream_ready(&self) -> bool {
+        self.stream.is_some() && self.context.is_some()
+    }
+
+    /// Get the application selector being used
+    pub fn get_application_selector(&self) -> &ApplicationSelector {
+        &self.app_selector
     }
 
     /// List available applications with audio streams

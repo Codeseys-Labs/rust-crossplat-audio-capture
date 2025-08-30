@@ -191,5 +191,10 @@ path = "src/bin/firefox_capture_test.rs"
 name = "real_pipewire_test"
 path = "src/bin/real_pipewire_test.rs"
 
+[[bin]]
+name = "flexible_pipewire_example"
+path = "src/bin/flexible_pipewire_example.rs"
+required-features = ["feat_linux"]
+
 [workspace]
 members = []
