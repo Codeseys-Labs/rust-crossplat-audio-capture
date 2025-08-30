@@ -36,7 +36,7 @@ jobs:
           # Prevent needrestart prompts
           sudo sed -i 's/#$nrconf{restart} = '"'"'i'"'"';/$nrconf{restart} = '"'"'a'"'"';/g' /etc/needrestart/needrestart.conf
 
-      - name: Install PipeWire
+      - name: Install PipeWire and Audio Tools
         run: |
           sudo apt-get update
 
@@ -63,6 +63,15 @@ jobs:
             libasound2-dev \
             pkg-config
 
+          # Install VLC and audio tools for testing
+          echo "Installing VLC and audio testing tools..."
+          sudo apt-get install -y \
+            vlc \
+            vlc-plugin-base \
+            ffmpeg \
+            sox \
+            pulseaudio-utils
+
       - name: Disable PulseAudio (if exists)
         run: |
           systemctl --user --now disable pulseaudio.service pulseaudio.socket || true
@@ -86,6 +95,12 @@ jobs:
           systemctl --user --now enable pipewire-pulse.service
           sleep 2
 
+      - name: Check PipeWire CLI Tools
+        run: |
+          # Make test script executable and run comprehensive test
+          chmod +x scripts/test-pipewire-setup.sh
+          ./scripts/test-pipewire-setup.sh
+
       - name: Verify PipeWire Setup
         run: |
           echo "=== WirePlumber Status ==="
@@ -97,11 +112,24 @@ jobs:
           echo "=== PipeWire-Pulse Status ==="
           systemctl --user status pipewire-pulse || true
 
-          echo "=== PipeWire Info ==="
+          echo "=== PipeWire CLI Info ==="
           pw-cli info || true
+
+          echo "=== PipeWire Nodes ==="
+          pw-cli list-objects Node || true
+
+          echo "=== PipeWire Dump (if available) ==="
+          if command -v pw-dump >/dev/null 2>&1; then
+            pw-dump | head -50 || true
+          else
+            echo "pw-dump not available"
+          fi
 
           echo "=== Audio Info ==="
           pactl info || true
+
+          echo "=== Available Sinks ==="
+          pactl list short sinks || true
 
       - name: Download test audio
         run: |

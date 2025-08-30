@@ -20,6 +20,9 @@ mod windows;
 // Application-specific capture module
 pub mod application_capture;
 
+// Audio source discovery module
+pub mod discovery;
+
 // Deprecated/Old API components - to be removed or refactored
 mod capture; // Keep for now if ProcessAudioCapture is still used
 pub mod core; // This seems to be the old core, distinct from crate::core

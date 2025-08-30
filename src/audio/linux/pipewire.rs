@@ -4,6 +4,7 @@
 //! application-specific audio capture using monitor streams.
 //! Based on the wiremix approach for robust PipeWire integration.
 
+use log::{debug, info, warn, error, trace};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::collections::HashMap;
@@ -133,7 +134,7 @@ impl PipeWireApplicationCapture {
                     self.node_serial = Some(serial);
                 }
                 Err(e) => {
-                    println!("⚠️  Failed to get object.serial for node {}: {}", node_id, e);
+                    warn!("Failed to get object.serial for node {}: {}", node_id, e);
                     println!("🔧 Falling back to node ID as serial");
                     self.node_serial = Some(node_id.to_string());
                 }
@@ -187,7 +188,7 @@ impl PipeWireApplicationCapture {
                         self.node_serial = Some(serial);
                     }
                     Err(e) => {
-                        println!("⚠️  Failed to get object.serial for node {}: {}", node_id, e);
+                        warn!("Failed to get object.serial for node {}: {}", node_id, e);
                         println!("🔧 Falling back to node ID as serial");
                         self.node_serial = Some(node_id.to_string());
                     }
@@ -376,7 +377,7 @@ impl PipeWireApplicationCapture {
 
                 // NULL means to clear the format (wiremix comment)
                 let Some(param) = param else {
-                    println!("⚠️  param_changed: param is None (format cleared)");
+                    warn!("param_changed: param is None (format cleared)");
                     return;
                 };
 
@@ -399,7 +400,7 @@ impl PipeWireApplicationCapture {
 
                 // only accept raw audio (wiremix comment)
                 if media_type != MediaType::Audio || media_subtype != MediaSubtype::Raw {
-                    println!("⚠️  Rejecting non-raw audio format: {:?}/{:?}", media_type, media_subtype);
+                    warn!("Rejecting non-raw audio format: {:?}/{:?}", media_type, media_subtype);
                     return;
                 }
 
@@ -409,17 +410,17 @@ impl PipeWireApplicationCapture {
                          user_data.format.channels(), user_data.format.rate());
             })
             .process(move |stream, user_data| {
-                println!("🎵 Stream process callback triggered! (format: {}ch @ {}Hz)",
+                trace!("Stream process callback triggered! (format: {}ch @ {}Hz)",
                          user_data.format.channels(), user_data.format.rate());
 
                 let Some(mut buffer) = stream.dequeue_buffer() else {
-                    println!("⚠️  No buffer available in process callback");
+                    warn!("No buffer available in process callback");
                     return;
                 };
 
                 let datas = buffer.datas_mut();
                 if datas.is_empty() {
-                    println!("⚠️  Buffer has no data chunks");
+                    warn!("Buffer has no data chunks");
                     return;
                 }
 
@@ -427,7 +428,7 @@ impl PipeWireApplicationCapture {
                 let n_channels = user_data.format.channels();
                 let n_samples = data.chunk().size() / (mem::size_of::<f32>() as u32);
 
-                println!("📊 Processing {} samples from buffer ({} channels)", n_samples, n_channels);
+                trace!("Processing {} samples from buffer ({} channels)", n_samples, n_channels);
 
                 if let Some(samples) = data.data() {
                     // Convert raw bytes to f32 samples (following wiremix pattern)
@@ -443,7 +444,7 @@ impl PipeWireApplicationCapture {
                         }
                     }
 
-                    println!("🎵 Calling user callback with {} samples", audio_samples.len());
+                    trace!("Calling user callback with {} samples", audio_samples.len());
                     // Call the user callback with the audio samples
                     if let Ok(callback) = callback_clone.lock() {
                         callback(&audio_samples);
@@ -451,7 +452,7 @@ impl PipeWireApplicationCapture {
                         println!("❌ Failed to lock callback mutex");
                     }
                 } else {
-                    println!("⚠️  Buffer data is None");
+                    warn!("Buffer data is None");
                 }
             })
             .register()?;
@@ -618,7 +619,7 @@ impl PipeWireApplicationCapture {
                 // Check if loop iteration failed
                 if loop_result < 0 {
                     if verbose {
-                        println!("⚠️  Main loop iteration failed: {}", loop_result);
+                        warn!("Main loop iteration failed: {}", loop_result);
                     }
                     break;
                 }
@@ -759,7 +760,7 @@ impl PipeWireApplicationCapture {
 
         // For now, return empty and let it fall back to CLI tools
         // In a full implementation, this would use proper async/threaded registry monitoring
-        println!("⚠️  Full PipeWire crate enumeration not yet implemented, falling back to CLI tools");
+        warn!("Full PipeWire crate enumeration not yet implemented, falling back to CLI tools");
         Ok(vec![])
     }
 
