@@ -17,6 +17,9 @@ mod macos;
 #[cfg(target_os = "windows")]
 mod windows;
 
+// Application-specific capture module
+pub mod application_capture;
+
 // Deprecated/Old API components - to be removed or refactored
 mod capture; // Keep for now if ProcessAudioCapture is still used
 pub mod core; // This seems to be the old core, distinct from crate::core
@@ -25,6 +28,13 @@ pub use self::core::{AudioApplication, AudioCaptureBackend, AudioCaptureStream};
 pub use capture::{AudioCaptureError, ProcessAudioCapture};
 
 // --- New Trait-Based API Exports ---
+
+// Re-export the unified application capture API
+pub use application_capture::{
+    ApplicationCapture, CrossPlatformApplicationCapture, ApplicationInfo,
+    ApplicationCaptureFactory, capture_application_by_pid, capture_application_by_name,
+    list_capturable_applications,
+};
 
 // Re-export platform-specific DeviceEnumerators
 #[cfg(target_os = "linux")]

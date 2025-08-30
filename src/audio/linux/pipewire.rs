@@ -361,26 +361,103 @@ impl PipeWireApplicationCapture {
     /// - Enumerates PipeWire nodes and matches against selector criteria
     /// - Looks for media.class = "Stream/Output/Audio" (playback) or "Stream/Input/Audio" (recording)
     /// - Matches application.name, application.process.id, or node properties
-    ///
-    /// # TODO
-    /// - Implement PipeWire registry enumeration
-    /// - Add robust property matching logic
-    /// - Handle multiple matching nodes (return list or pick first)
-    pub fn discover_target_node(&mut self) -> Result<u32, AudioError> {
-        // TODO: Implement node discovery
-        //
-        // Key steps based on research:
-        // 1. Connect to PipeWire core
-        // 2. Create registry and add listener
-        // 3. Enumerate nodes with media.class = "Stream/Output/Audio" or "Stream/Input/Audio"
-        // 4. Match against selector criteria:
-        //    - ProcessId: application.process.id property
-        //    - ApplicationName: application.name property
-        //    - NodeId: direct node ID match
-        //    - NodeSerial: object.serial property
-        // 5. Return matching node ID and store serial
+    pub fn discover_target_node(&mut self) -> Result<u32, Box<dyn std::error::Error>> {
+        use pipewire::{MainLoop, Context, Core, Registry};
+        use std::sync::{Arc, Mutex};
+        use std::collections::HashMap;
 
-        Err(AudioError::NotImplemented("PipeWire node discovery not yet implemented".to_string()))
+        let mainloop = MainLoop::new()?;
+        let context = Context::new(&mainloop)?;
+        let core = context.connect(None)?;
+        let registry = core.get_registry()?;
+
+        // Shared state for collecting nodes
+        let found_nodes = Arc::new(Mutex::new(HashMap::<u32, NodeInfo>::new()));
+        let found_nodes_clone = found_nodes.clone();
+
+        // Node information structure
+        #[derive(Debug, Clone)]
+        struct NodeInfo {
+            id: u32,
+            media_class: Option<String>,
+            app_name: Option<String>,
+            app_pid: Option<u32>,
+            node_name: Option<String>,
+        }
+
+        // Registry listener to collect node information
+        let _listener = registry
+            .add_listener_local()
+            .global(move |global| {
+                if global.type_ == pipewire::types::ObjectType::Node {
+                    if let Some(props) = &global.props {
+                        let mut node_info = NodeInfo {
+                            id: global.id,
+                            media_class: props.get("media.class").map(|s| s.to_string()),
+                            app_name: props.get("application.name").map(|s| s.to_string()),
+                            app_pid: props.get("application.process.id")
+                                .and_then(|s| s.parse().ok()),
+                            node_name: props.get("node.name").map(|s| s.to_string()),
+                        };
+
+                        // Only interested in audio stream nodes
+                        if let Some(ref media_class) = node_info.media_class {
+                            if media_class == "Stream/Output/Audio" || media_class == "Stream/Input/Audio" {
+                                found_nodes_clone.lock().unwrap().insert(global.id, node_info);
+                            }
+                        }
+                    }
+                }
+            })
+            .register();
+
+        // Run the main loop briefly to collect nodes
+        for _ in 0..10 {
+            mainloop.iterate(std::time::Duration::from_millis(10));
+        }
+
+        // Find matching node based on selector
+        let nodes = found_nodes.lock().unwrap();
+        let target_node_id = match &self.app_selector {
+            ApplicationSelector::ProcessId(pid) => {
+                nodes.values()
+                    .find(|node| node.app_pid == Some(*pid))
+                    .map(|node| node.id)
+            }
+            ApplicationSelector::ApplicationName(name) => {
+                nodes.values()
+                    .find(|node| {
+                        node.app_name.as_ref()
+                            .map_or(false, |app_name| app_name.contains(name))
+                    })
+                    .map(|node| node.id)
+            }
+            ApplicationSelector::NodeId(id) => {
+                if nodes.contains_key(id) {
+                    Some(*id)
+                } else {
+                    None
+                }
+            }
+            ApplicationSelector::NodeSerial(serial) => {
+                // For now, treat serial as node ID
+                serial.parse().ok().and_then(|id| {
+                    if nodes.contains_key(&id) {
+                        Some(id)
+                    } else {
+                        None
+                    }
+                })
+            }
+        };
+
+        if let Some(node_id) = target_node_id {
+            self.node_id = Some(node_id);
+            self.node_serial = Some(node_id.to_string());
+            Ok(node_id)
+        } else {
+            Err("Target application node not found".into())
+        }
     }
 
     /// Create a monitor stream targeting the discovered node
@@ -390,27 +467,52 @@ impl PipeWireApplicationCapture {
     /// - Sets STREAM_MONITOR = "true" for non-invasive monitoring
     /// - Optionally sets STREAM_CAPTURE_SINK = "true" for sink monitoring
     /// - Negotiates format (prefer F32LE interleaved)
-    ///
-    /// # TODO
-    /// - Implement Stream creation with proper properties
-    /// - Set up format negotiation (AudioInfoRaw with F32LE)
-    /// - Add stream listeners for param_changed and process callbacks
-    pub fn create_monitor_stream(&mut self) -> Result<(), AudioError> {
-        // TODO: Implement monitor stream creation
-        //
-        // Key steps based on research:
-        // 1. Create Stream with properties:
-        //    - TARGET_OBJECT = node serial string
-        //    - STREAM_MONITOR = "true"
-        //    - NODE_NAME = "app-capture-monitor"
-        //    - Optional: STREAM_CAPTURE_SINK = "true"
-        // 2. Add listeners:
-        //    - param_changed: handle format negotiation
-        //    - process: dequeue buffers and read PCM data
-        // 3. Set up format parameters (AudioInfoRaw with F32LE)
-        // 4. Connect stream with AUTOCONNECT | MAP_BUFFERS flags
+    pub fn create_monitor_stream(&mut self) -> Result<(), Box<dyn std::error::Error>> {
+        use pipewire::{MainLoop, Context, Core, Stream, stream::StreamFlags};
+        use pipewire::keys;
+        use libspa::{param::ParamType, utils::Direction, pod::Pod};
+        use std::collections::HashMap;
 
-        Err(AudioError::NotImplemented("PipeWire monitor stream creation not yet implemented".to_string()))
+        let node_serial = self.node_serial.as_ref()
+            .ok_or("Node serial not set - call discover_target_node first")?;
+
+        let mainloop = MainLoop::new()?;
+        let context = Context::new(&mainloop)?;
+        let core = context.connect(None)?;
+
+        // Create stream properties for monitoring
+        let mut props = HashMap::new();
+        props.insert(keys::TARGET_OBJECT.to_string(), node_serial.clone());
+        props.insert(keys::STREAM_MONITOR.to_string(), "true".to_string());
+        props.insert(keys::NODE_NAME.to_string(), "app-capture-monitor".to_string());
+
+        // Create the stream
+        let stream = Stream::new(&core, "app-capture-monitor", props)?;
+
+        // Set up format parameters (Float32 LE, stereo, 48kHz)
+        let mut audio_info = libspa::param::audio::AudioInfoRaw::new();
+        audio_info.set_format(libspa::param::audio::AudioFormat::F32LE);
+        audio_info.set_channels(2);
+        audio_info.set_rate(48000);
+
+        let obj = libspa::pod::object!(
+            libspa::utils::SpaTypes::ObjectParamFormat,
+            ParamType::EnumFormat,
+            audio_info
+        );
+
+        let mut params = [Pod::from_bytes(&obj.serialize()?)?];
+
+        // Connect the stream with monitor flags
+        stream.connect(
+            Direction::Input,
+            None,
+            StreamFlags::AUTOCONNECT | StreamFlags::MAP_BUFFERS,
+            &mut params,
+        )?;
+
+        self.stream = Some(stream);
+        Ok(())
     }
 
     /// Start capturing audio from the target application
@@ -419,38 +521,84 @@ impl PipeWireApplicationCapture {
     /// - Sets up process callback to dequeue buffers
     /// - Reads interleaved f32 samples from buffer data
     /// - Calls user callback with PCM frames
-    ///
-    /// # TODO
-    /// - Implement process callback with buffer dequeue
-    /// - Add proper sample format handling (channels, sample rate)
-    /// - Handle stream state changes and disconnection
-    pub fn start_capture<F>(&mut self, callback: F) -> Result<(), AudioError>
+    pub fn start_capture<F>(&mut self, callback: F) -> Result<(), Box<dyn std::error::Error>>
     where
         F: Fn(&[f32]) + Send + 'static,
     {
-        // TODO: Implement capture start
-        //
-        // Key steps based on research:
-        // 1. Ensure monitor stream is created
-        // 2. Set up process callback:
-        //    - stream.dequeue_buffer()
-        //    - Read buffer.datas_mut()[0].data()
-        //    - Parse interleaved f32 samples
-        //    - Call user callback with samples
-        // 3. Start PipeWire main loop or integrate with existing event loop
+        use pipewire::MainLoop;
+        use std::sync::{Arc, Mutex};
+        use std::thread;
+        use std::time::Duration;
+
+        let stream = self.stream.as_ref()
+            .ok_or("Monitor stream not created - call create_monitor_stream first")?;
 
         self.is_capturing.store(true, std::sync::atomic::Ordering::SeqCst);
-        Err(AudioError::NotImplemented("PipeWire capture start not yet implemented".to_string()))
+
+        let callback = Arc::new(Mutex::new(callback));
+        let is_capturing = self.is_capturing.clone();
+
+        // Set up stream listeners
+        let callback_clone = callback.clone();
+        let _listener = stream
+            .add_listener_local()
+            .process(move |stream| {
+                // Dequeue buffer and process audio data
+                if let Some(mut buffer) = stream.dequeue_buffer() {
+                    let datas = buffer.datas_mut();
+                    if !datas.is_empty() {
+                        let data = &mut datas[0];
+
+                        if let Some(chunk) = data.chunk() {
+                            let size = chunk.size() as usize;
+                            if size > 0 {
+                                if let Some(raw_data) = data.data() {
+                                    // Assume F32LE format, 2 channels
+                                    let sample_count = size / std::mem::size_of::<f32>();
+                                    let samples = unsafe {
+                                        std::slice::from_raw_parts(
+                                            raw_data.as_ptr() as *const f32,
+                                            sample_count,
+                                        )
+                                    };
+
+                                    // Call the user callback with the samples
+                                    if let Ok(cb) = callback_clone.lock() {
+                                        cb(samples);
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            })
+            .register();
+
+        // Run the main loop in a separate thread
+        let mainloop = MainLoop::new()?;
+        let mainloop_clone = mainloop.clone();
+
+        thread::spawn(move || {
+            while is_capturing.load(std::sync::atomic::Ordering::SeqCst) {
+                mainloop_clone.iterate(Duration::from_millis(10));
+            }
+        });
+
+        Ok(())
     }
 
     /// Stop capturing audio
-    pub fn stop_capture(&mut self) -> Result<(), AudioError> {
+    pub fn stop_capture(&mut self) -> Result<(), Box<dyn std::error::Error>> {
         self.is_capturing.store(false, std::sync::atomic::Ordering::SeqCst);
 
-        // TODO: Implement proper cleanup
-        // - Disconnect stream
-        // - Release stream resources
-        // - Stop main loop if owned
+        // Disconnect and clean up the stream
+        if let Some(stream) = self.stream.take() {
+            stream.disconnect()?;
+        }
+
+        // Clear node information
+        self.node_id = None;
+        self.node_serial = None;
 
         Ok(())
     }
@@ -464,21 +612,60 @@ impl PipeWireApplicationCapture {
     ///
     /// # Returns
     /// Vector of LinuxApplicationInfo for apps currently producing audio
-    ///
-    /// # TODO
-    /// - Implement application enumeration
-    /// - Extract application properties from PipeWire nodes
-    /// - Filter for active audio streams only
-    pub fn list_audio_applications() -> Result<Vec<LinuxApplicationInfo>, AudioError> {
-        // TODO: Implement application listing
-        //
-        // Key steps:
-        // 1. Enumerate all PipeWire nodes
-        // 2. Filter for media.class = "Stream/Output/Audio" (playback apps)
-        // 3. Extract application.* properties
-        // 4. Build LinuxApplicationInfo structs
-        // 5. Return list of active applications
+    pub fn list_audio_applications() -> Result<Vec<LinuxApplicationInfo>, Box<dyn std::error::Error>> {
+        use pipewire::{MainLoop, Context, Core, Registry};
+        use std::sync::{Arc, Mutex};
+        use std::collections::HashMap;
 
-        Err(AudioError::NotImplemented("PipeWire application listing not yet implemented".to_string()))
+        #[derive(Debug, Clone)]
+        pub struct LinuxApplicationInfo {
+            pub node_id: u32,
+            pub app_name: Option<String>,
+            pub process_id: Option<u32>,
+            pub media_class: String,
+            pub node_name: Option<String>,
+        }
+
+        let mainloop = MainLoop::new()?;
+        let context = Context::new(&mainloop)?;
+        let core = context.connect(None)?;
+        let registry = core.get_registry()?;
+
+        let applications = Arc::new(Mutex::new(Vec::<LinuxApplicationInfo>::new()));
+        let applications_clone = applications.clone();
+
+        // Registry listener to collect application nodes
+        let _listener = registry
+            .add_listener_local()
+            .global(move |global| {
+                if global.type_ == pipewire::types::ObjectType::Node {
+                    if let Some(props) = &global.props {
+                        if let Some(media_class) = props.get("media.class") {
+                            // Only include audio stream nodes
+                            if media_class == "Stream/Output/Audio" || media_class == "Stream/Input/Audio" {
+                                let app_info = LinuxApplicationInfo {
+                                    node_id: global.id,
+                                    app_name: props.get("application.name").map(|s| s.to_string()),
+                                    process_id: props.get("application.process.id")
+                                        .and_then(|s| s.parse().ok()),
+                                    media_class: media_class.to_string(),
+                                    node_name: props.get("node.name").map(|s| s.to_string()),
+                                };
+
+                                applications_clone.lock().unwrap().push(app_info);
+                            }
+                        }
+                    }
+                }
+            })
+            .register();
+
+        // Run the main loop briefly to collect applications
+        for _ in 0..20 {
+            mainloop.iterate(std::time::Duration::from_millis(10));
+        }
+
+        let apps = applications.lock().unwrap().clone();
+        Ok(apps)
     }
 }
