@@ -1,28 +1,29 @@
 #!/bin/bash
 set -e
 
-# Start PulseAudio in the background
-pulseaudio --start --exit-idle-time=-1 --load="module-null-sink sink_name=virtual-sink" &
-sleep 2
-
-# Start PipeWire if available
+# Start PipeWire (preferred audio system)
 if command -v pipewire >/dev/null; then
+    echo "Starting PipeWire audio system..."
     # Start PipeWire and related services
     pipewire &
     sleep 1
-    pipewire-pulse &
+    pipewire-pulse &  # PulseAudio compatibility layer
     sleep 1
-fi
 
-# Verify audio setup
-echo "Checking audio setup..."
-if command -v pactl >/dev/null; then
-    pactl info
-    pactl list short sinks
-fi
+    # Verify PipeWire setup
+    echo "Checking PipeWire setup..."
+    if command -v pw-cli >/dev/null; then
+        pw-cli info
+    fi
 
-if command -v pw-cli >/dev/null; then
-    pw-cli info
+    # Check PulseAudio compatibility if available
+    if command -v pactl >/dev/null; then
+        pactl info
+        pactl list short sinks
+    fi
+else
+    echo "PipeWire not available"
+    exit 1
 fi
 
 # Run the provided command

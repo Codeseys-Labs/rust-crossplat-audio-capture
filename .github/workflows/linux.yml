@@ -36,41 +36,69 @@ jobs:
           # Prevent needrestart prompts
           sudo sed -i 's/#$nrconf{restart} = '"'"'i'"'"';/$nrconf{restart} = '"'"'a'"'"';/g' /etc/needrestart/needrestart.conf
 
-      - name: Install PipeWire and Audio Tools
+      - name: Check and Install PipeWire
         run: |
+          echo "=== Checking for existing PipeWire installation ==="
+
+          # Check if PipeWire is already installed
+          if command -v pw-cli >/dev/null 2>&1; then
+            echo "✅ PipeWire already installed: $(pw-cli --version)"
+            PIPEWIRE_INSTALLED=true
+          else
+            echo "❌ PipeWire not found, will install"
+            PIPEWIRE_INSTALLED=false
+          fi
+
+          # Check if development libraries are available
+          if pkg-config --exists libpipewire-0.3; then
+            echo "✅ PipeWire development libraries already available"
+            DEV_LIBS_INSTALLED=true
+          else
+            echo "❌ PipeWire development libraries not found"
+            DEV_LIBS_INSTALLED=false
+          fi
+
+          # Only install if needed
+          if [ "$PIPEWIRE_INSTALLED" = false ] || [ "$DEV_LIBS_INSTALLED" = false ]; then
+            echo "=== Installing PipeWire and dependencies ==="
+            sudo apt-get update
+
+            # Add PipeWire PPA and update
+            echo "Adding PipeWire PPA..."
+            sudo add-apt-repository ppa:pipewire-debian/pipewire-upstream -y
+            sudo apt-get update
+
+            # Add WirePlumber PPA
+            echo "Adding WirePlumber PPA..."
+            sudo add-apt-repository ppa:pipewire-debian/wireplumber-upstream -y
+            sudo apt-get update
+
+            # Install PipeWire and development packages
+            echo "Installing PipeWire packages..."
+            sudo apt-get install -y \
+              pipewire \
+              pipewire-audio-client-libraries \
+              pipewire-pulse \
+              libpipewire-0.3-dev \
+              libpipewire-0.3-modules \
+              libspa-0.2-dev \
+              wireplumber \
+              libasound2-dev \
+              pkg-config
+          else
+            echo "=== PipeWire already installed, skipping installation ==="
+          fi
+
+          # Always install VLC and audio tools for testing
+          echo "=== Installing VLC and audio testing tools ==="
           sudo apt-get update
-
-          # Add PipeWire PPA and update
-          echo "Adding PipeWire PPA..."
-          sudo add-apt-repository ppa:pipewire-debian/pipewire-upstream -y
-          sudo apt-get update
-
-          # Add WirePlumber PPA
-          echo "Adding WirePlumber PPA..."
-          sudo add-apt-repository ppa:pipewire-debian/wireplumber-upstream -y
-          sudo apt-get update
-
-          # Install PipeWire and development packages (NO PulseAudio)
-          echo "Installing PipeWire packages..."
-          sudo apt-get install -y \
-            pipewire \
-            pipewire-audio-client-libraries \
-            pipewire-pulse \
-            libpipewire-0.3-dev \
-            libpipewire-0.3-modules \
-            libspa-0.2-dev \
-            wireplumber \
-            libasound2-dev \
-            pkg-config
-
-          # Install VLC and audio tools for testing
-          echo "Installing VLC and audio testing tools..."
           sudo apt-get install -y \
             vlc \
             vlc-plugin-base \
             ffmpeg \
             sox \
-            pulseaudio-utils
+            curl \
+            wget
 
       - name: Disable PulseAudio (if exists)
         run: |
@@ -125,11 +153,14 @@ jobs:
             echo "pw-dump not available"
           fi
 
-          echo "=== Audio Info ==="
-          pactl info || true
-
-          echo "=== Available Sinks ==="
-          pactl list short sinks || true
+          echo "=== PipeWire Audio Info ==="
+          if command -v pactl >/dev/null 2>&1; then
+            pactl info || true
+            echo "=== Available Sinks ==="
+            pactl list short sinks || true
+          else
+            echo "pactl not available (PulseAudio compatibility not installed)"
+          fi
 
       - name: Download test audio
         run: |
@@ -155,8 +186,8 @@ jobs:
         run: |
           echo "=== Starting PipeWire Audio Test ==="
 
-          # Verify audio system is ready
-          if ! pactl info; then
+          # Verify PipeWire audio system is ready
+          if ! pw-cli info; then
             echo "PipeWire audio system is not ready"
             exit 1
           fi
@@ -176,8 +207,8 @@ jobs:
             fi
             # Collect audio debug info
             echo "=== Final PipeWire State ==="
-            pactl info || true
-            pactl list short sinks || true
+            pw-cli info || true
+            pw-cli list-objects Node || true
             echo "=== Test Tone Log ==="
             cat test_tone.log || true
           }
@@ -204,11 +235,25 @@ jobs:
 
           echo "Successfully captured $FILESIZE bytes of audio with PipeWire"
 
+      - name: Test VLC URL Streaming with Audio Capture
+        run: |
+          echo "=== Testing VLC URL Streaming with Real Audio Capture ==="
+
+          # Use our comprehensive VLC capture test script
+          chmod +x scripts/test-vlc-capture.sh
+          ./scripts/test-vlc-capture.sh
+
       - name: Upload PipeWire test artifacts
         uses: actions/upload-artifact@v4
         with:
           name: linux-pipewire-audio-test-results
           path: |
             pipewire_system_capture.wav
+            vlc_system_capture.wav
+            vlc_test_audio.wav
             test_tone.log
+            vlc_capture_test.log
+            flexible_test.log
+            capture_test.log
             test_audio/sample.mp3
+        if: always()

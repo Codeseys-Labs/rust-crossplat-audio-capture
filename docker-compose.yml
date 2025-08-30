@@ -24,7 +24,28 @@ services:
     stdin_open: true
     command: ["/app/scripts/run_audio_tests.sh", "--backend", "pipewire", "--type", "all", "--output-dir", "/test-results"]
 
-  # Unified Linux test service with PulseAudio
+  # Primary Linux test service with PipeWire
+  rsac-linux-pipewire:
+    build:
+      context: .
+      dockerfile: docker/linux/Dockerfile.unified
+      target: rsac-pipewire
+    volumes:
+      - .:/app
+      - ./test-results:/test-results
+    # Give necessary permissions for audio
+    privileged: true
+    devices:
+      - /dev/snd:/dev/snd
+    environment:
+      - RUST_BACKTRACE=1
+      - RUST_LOG=debug
+    # Keep the container running for debugging if needed
+    tty: true
+    stdin_open: true
+    command: bash -c "/app/scripts/run_audio_tests.sh --backend pipewire --type all --output-dir /test-results"
+
+  # Legacy PulseAudio test service (for compatibility testing)
   rsac-linux-pulseaudio:
     build:
       context: .

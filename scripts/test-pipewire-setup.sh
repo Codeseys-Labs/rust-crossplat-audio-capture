@@ -68,11 +68,11 @@ else
     print_status "WARN" "pw-link not found"
 fi
 
-# Check pactl (PulseAudio compatibility)
+# Check pactl (PulseAudio compatibility - optional)
 if command -v pactl >/dev/null 2>&1; then
-    print_status "OK" "pactl found: $(which pactl)"
+    print_status "OK" "pactl found: $(which pactl) - PulseAudio compatibility available"
 else
-    print_status "WARN" "pactl not found"
+    print_status "INFO" "pactl not found - PulseAudio compatibility not installed (optional)"
 fi
 
 # Test PipeWire functionality
@@ -101,14 +101,16 @@ else
     print_status "WARN" "pw-cli list-objects failed"
 fi
 
-# Test pactl if available
+# Test pactl if available (optional PulseAudio compatibility)
 if command -v pactl >/dev/null 2>&1; then
     echo "Testing pactl info..."
     if pactl info >/dev/null 2>&1; then
-        print_status "OK" "pactl info works"
+        print_status "OK" "pactl info works - PulseAudio compatibility functional"
     else
-        print_status "WARN" "pactl info failed"
+        print_status "WARN" "pactl info failed - PulseAudio compatibility issues"
     fi
+else
+    print_status "INFO" "Skipping pactl test - not installed"
 fi
 
 # Test pw-dump if available

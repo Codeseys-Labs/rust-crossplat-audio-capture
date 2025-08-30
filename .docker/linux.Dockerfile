@@ -1,16 +1,15 @@
 # Base image with Rust
 FROM rust:1.74-slim-bullseye as builder
 
-# Install system dependencies
+# Install system dependencies (PipeWire-focused)
 RUN apt-get update && apt-get install -y \
     pkg-config \
     libasound2-dev \
-    libpulse-dev \
     pipewire \
     pipewire-pulse \
-    pipewire-audio \
-    pulseaudio \
-    pulseaudio-utils \
+    pipewire-audio-client-libraries \
+    libpipewire-0.3-dev \
+    libspa-0.2-dev \
     dbus \
     && rm -rf /var/lib/apt/lists/*
 

@@ -26,26 +26,27 @@ COPY test_audio.mp3 /app/test_audio.mp3
 RUN ffmpeg -i /app/test_audio.mp3 -acodec pcm_s16le -ar 44100 -ac 2 /app/test_audio.wav -y && \
     rm /app/test_audio.mp3
 
-# PulseAudio specific layer
+# PipeWire specific layer (primary audio system)
+FROM rsac-test-base as rsac-pipewire
+
+# Install PipeWire and development libraries
+RUN apt-get update && apt-get install -y \
+    pipewire pipewire-bin pipewire-pulse \
+    pipewire-audio-client-libraries \
+    libpipewire-0.3-dev libspa-0.2-dev \
+    libasound2-dev \
+    wireplumber
+
+# Legacy PulseAudio layer (for compatibility testing only)
 FROM rsac-test-base as rsac-pulseaudio
 
-# Install PulseAudio
+# Install minimal PulseAudio for legacy compatibility testing
 RUN apt-get update && apt-get install -y \
     pulseaudio pulseaudio-utils libpulse-dev
 
 # Copy PulseAudio configuration
 COPY docker/linux/pulse-client.conf /etc/pulse/client.conf
 COPY docker/linux/pulse-daemon.conf /etc/pulse/daemon.conf
-
-# PipeWire specific layer
-FROM rsac-test-base as rsac-pipewire
-
-# Install PipeWire and ALSA
-RUN apt-get update && apt-get install -y \
-    pipewire pipewire-bin pipewire-pulse \
-    libpipewire-0.3-dev libspa-0.2-dev \
-    libasound2-dev \
-    pulseaudio-utils
 
 # Set up runtime directory for PipeWire
 ENV XDG_RUNTIME_DIR=/run/user/0
