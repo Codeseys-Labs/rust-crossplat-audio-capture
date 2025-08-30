@@ -4,14 +4,11 @@
 //! across Windows (WASAPI Process Loopback), Linux (PipeWire monitor streams), and 
 //! macOS (CoreAudio Process Tap).
 
-use std::sync::Arc;
-use std::sync::atomic::AtomicBool;
-
 #[cfg(target_os = "windows")]
 use crate::audio::windows::WindowsApplicationCapture;
 
 #[cfg(target_os = "linux")]
-use crate::audio::linux::pipewire::{PipeWireApplicationCapture, ApplicationSelector};
+use crate::audio::linux::{PipeWireApplicationCapture, ApplicationSelector};
 
 #[cfg(target_os = "macos")]
 use crate::audio::macos::tap::MacOSApplicationCapture;
@@ -198,9 +195,9 @@ impl ApplicationCaptureFactory {
             let applications = PipeWireApplicationCapture::list_audio_applications()?;
             Ok(applications.into_iter().map(|app| ApplicationInfo {
                 process_id: app.process_id.unwrap_or(0),
-                name: app.app_name.unwrap_or_else(|| app.node_name.unwrap_or_else(|| format!("Node {}", app.node_id))),
+                name: app.name.unwrap_or_else(|| app.node_name.unwrap_or_else(|| format!("Node {}", app.pipewire_node_id.unwrap_or(0)))),
                 platform_specific: PlatformSpecificInfo::Linux {
-                    node_id: Some(app.node_id),
+                    node_id: app.pipewire_node_id,
                     media_class: Some(app.media_class),
                 },
             }).collect())

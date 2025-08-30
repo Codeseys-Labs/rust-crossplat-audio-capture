@@ -85,6 +85,16 @@ impl AudioBuffer {
         }
     }
 
+    /// Returns a slice view of the audio data.
+    pub fn as_slice(&self) -> &[f32] {
+        &self.data
+    }
+
+    /// Returns a mutable slice view of the audio data.
+    pub fn as_mut_slice(&mut self) -> &mut [f32] {
+        &mut self.data
+    }
+
     // Placeholder for future methods if needed, e.g., to_interleaved, to_planar, etc.
 }
 

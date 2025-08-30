@@ -700,7 +700,7 @@ impl<D: AudioDevice + 'static> AudioCapture<D> {
 
         // Ensure stream is initialized if it's None
         if self.stream.is_none() {
-            let device_ref = self.device.as_ref().ok_or_else(|| {
+            let device_ref = self.device.as_mut().ok_or_else(|| {
                 AudioError::InvalidOperation(
                     "Audio device not available to create stream (was None).".to_string(),
                 )
@@ -1293,12 +1293,10 @@ impl<D: AudioDevice + 'static> AudioCapture<D> {
         }
 
         if self.is_internally_processing.load(Ordering::SeqCst) {
-            // Return a stream that immediately yields the error.
-            return Ok(Box::pin(futures_util::stream::once(async {
-                Err(AudioError::InvalidOperation(
-                    "Cannot use audio_data_stream while internal audio processing (processors/callback) is active.".into()
-                ))
-            })));
+            // Return an error instead of a stream
+            return Err(AudioError::InvalidOperation(
+                "Cannot use audio_data_stream while internal audio processing (processors/callback) is active.".into()
+            ));
         }
 
         self.is_externally_streaming.store(true, Ordering::SeqCst);

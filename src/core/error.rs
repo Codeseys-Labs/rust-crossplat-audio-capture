@@ -83,6 +83,10 @@ pub enum AudioError {
     UnsupportedSampleRate(u32),
     /// The target application for capture could not be found or monitored.
     ApplicationNotFound(String),
+    /// An error occurred during recording operations.
+    RecordingError(String),
+    /// An operation timed out.
+    TimeoutError,
 }
 
 impl std::fmt::Display for AudioError {
@@ -156,6 +160,12 @@ impl std::fmt::Display for AudioError {
                     "Target application not found or could not be monitored: {}",
                     details
                 )
+            }
+            AudioError::RecordingError(details) => {
+                write!(f, "Recording error: {}", details)
+            }
+            AudioError::TimeoutError => {
+                write!(f, "Operation timed out")
             }
         }
     }

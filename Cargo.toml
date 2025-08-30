@@ -12,7 +12,7 @@ build = "build.rs"
 # and enabling only the desired platform features.
 # Example: `cargo build --no-default-features --features feat_windows`
 feat_windows = []
-feat_linux = []
+feat_linux = ["pipewire", "libspa"]
 feat_macos = []
 
 # Default features - enables all platform backends
@@ -25,20 +25,24 @@ test-utils = [] # Feature to enable test utilities
 futures-core = "0.3.31"
 futures-util = "0.3.31"                                    # For stream utilities
 futures-channel = "0.3.31"                                 # For MPSC channel for async stream
-thiserror = "1.0.69"                                       # For error handling
+thiserror = "2.0.16"                                       # For error handling
+
+# Linux PipeWire dependencies (conditional)
+pipewire = { version = "0.8.0", features = ["v0_3_44"], optional = true }
+libspa = { version = "0.8.0", optional = true }
 hound = "3.5.1"
-sysinfo = "0.36.1"
-clap = { version = "4.5.42", features = ["derive"] }
+sysinfo = "0.37.0"
+clap = { version = "4.5.46", features = ["derive"] }
 inquire = "0.7.5"
 indicatif = "0.18.0"
 color-eyre = "0.6.5"
 ctrlc = "3.4.7"
 rodio = "0.21.1"
-reqwest = { version = "0.12.22", features = ["blocking"] }
+reqwest = { version = "0.12.23", features = ["blocking"] }
 
 # For testing
 serde = { version = "1.0.219", features = ["derive"] }
-serde_json = "1.0.142"
+serde_json = "1.0.143"
 rand = "0.9.2"
 rand_pcg = "0.9.0"
 
@@ -63,9 +67,9 @@ windows = { version = "0.61.3", features = [
     "Win32_System_Variant",             # For PROPVARIANT used in Process Loopback activation
     "Win32_Security",                   # For security APIs
 ] }
-windows-core = "0.61"  # Core Windows types
-widestring = "1.1.0"   # For wide string conversion
-sysinfo = "0.35.2"     # For process discovery by name
+windows-core = "0.61.2"  # Core Windows types
+widestring = "1.2.0"   # For wide string conversion
+sysinfo = "0.37.0"     # For process discovery by name
 
 [target.'cfg(target_os = "linux")'.dependencies]
 # PipeWire dependencies for application-specific capture
@@ -77,38 +81,38 @@ libspa-sys = "0.8.0"  # Low-level SPA bindings for direct parameter access
 [target.'cfg(target_os = "macos")'.dependencies]
 # CoreAudio dependencies for Process Tap (macOS 14.4+)
 coreaudio-rs = { version = "0.13.0", features = ["core_audio"] }  # High-level CoreAudio bindings
-objc2-core-audio = { version = "0.3", features = [
+objc2-core-audio = { version = "0.3.1", features = [
     "std",
     "AudioHardware",              # For AudioHardwareCreateProcessTap, AudioHardwareCreateAggregateDevice
     "AudioHardwareDeprecated",    # For additional hardware APIs
 ] }
-objc2-core-audio-types = { version = "0.3", features = [
+objc2-core-audio-types = { version = "0.3.1", features = [
     "std",
     "bitflags",
     "CoreAudioBaseTypes",         # For AudioStreamBasicDescription, AudioObjectID
 ] }
-objc2-core-foundation = { version = "0.3", features = [
+objc2-core-foundation = { version = "0.3.1", features = [
     "std",
     "CFString",                   # For CFString handling in device UIDs
 ] }
-core-foundation = "0.10"          # For CFDictionary creation (aggregate device description)
+core-foundation = "0.10.1"          # For CFDictionary creation (aggregate device description)
 # Note: Process Tap APIs (AudioHardwareCreateProcessTap, CATapDescription) may require
 # custom FFI bindings as they are very new (macOS 14.4+) and may not be in objc2 yet
 
 # Error handling
-thiserror = "2.0.12"
+thiserror = "2.0.16"
 
 [build-dependencies]
 pkg-config = "0.3.32"
 
 [dev-dependencies]
 criterion = "0.7.0" # Benchmarking
-tempfile = "3.20.0" # Temporary files for tests
+tempfile = "3.21.0" # Temporary files for tests
 serde = { version = "1.0.219", features = [
     "derive",
 ] } # For serialization in test reports
-serde_json = "1.0.142" # For test report serialization
-ctrlc = "3.4.5"  # For graceful shutdown in examples
+serde_json = "1.0.143" # For test report serialization
+ctrlc = "3.4.7"  # For graceful shutdown in examples
 rand = "0.9.2" # For generating test data
 rand_pcg = "0.9.0" # For deterministic random numbers in tests
 
@@ -162,6 +166,30 @@ path = "examples/demo_library.rs"
 name = "windows_device_test"
 path = "examples/windows_device_test.rs"
 required-features = ["feat_windows"]
+
+[[bin]]
+name = "app_capture_test"
+path = "src/bin/app_capture_test.rs"
+
+[[bin]]
+name = "pipewire_test"
+path = "src/bin/pipewire_test.rs"
+
+[[bin]]
+name = "run_tests"
+path = "src/bin/run_tests.rs"
+
+[[bin]]
+name = "test_report_generator"
+path = "src/bin/test_report_generator.rs"
+
+[[bin]]
+name = "firefox_capture_test"
+path = "src/bin/firefox_capture_test.rs"
+
+[[bin]]
+name = "real_pipewire_test"
+path = "src/bin/real_pipewire_test.rs"
 
 [workspace]
 members = []
