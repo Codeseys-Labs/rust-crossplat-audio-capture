@@ -157,6 +157,16 @@ name = "audio_recorder_example"
 path = "examples/audio_recorder_example.rs"
 required-features = ["feat_linux"]
 
+[[example]]
+name = "windows_application_capture"
+path = "examples/windows_application_capture.rs"
+required-features = ["feat_windows"]
+
+[[example]]
+name = "macos_application_capture"
+path = "examples/macos_application_capture.rs"
+required-features = ["feat_macos"]
+
 [[bin]]
 name = "app_capture_test"
 path = "src/bin/app_capture_test.rs"

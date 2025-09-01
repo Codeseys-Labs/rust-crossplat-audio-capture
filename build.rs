@@ -2,18 +2,19 @@ fn main() {
     println!("cargo:rerun-if-changed=build.rs");
 
     // Platform-specific build configuration for application capture
+    // Only configure if the corresponding feature is enabled
 
-    #[cfg(target_os = "windows")]
+    #[cfg(all(target_os = "windows", feature = "feat_windows"))]
     configure_windows_build();
 
-    #[cfg(target_os = "linux")]
+    #[cfg(all(target_os = "linux", feature = "feat_linux"))]
     configure_linux_build();
 
-    #[cfg(target_os = "macos")]
+    #[cfg(all(target_os = "macos", feature = "feat_macos"))]
     configure_macos_build();
 }
 
-#[cfg(target_os = "windows")]
+#[cfg(all(target_os = "windows", feature = "feat_windows"))]
 fn configure_windows_build() {
     // Windows-specific build configuration for WASAPI Process Loopback
     println!("cargo:rustc-link-lib=ole32");      // For COM operations
@@ -27,7 +28,7 @@ fn configure_windows_build() {
     println!("cargo:rustc-link-lib=winmm");      // For multimedia operations
 }
 
-#[cfg(target_os = "linux")]
+#[cfg(all(target_os = "linux", feature = "feat_linux"))]
 fn configure_linux_build() {
     use std::{
         env,
@@ -130,7 +131,7 @@ fn configure_linux_build() {
     process::exit(1);
 }
 
-#[cfg(target_os = "macos")]
+#[cfg(all(target_os = "macos", feature = "feat_macos"))]
 fn configure_macos_build() {
     // macOS-specific build configuration for CoreAudio Process Tap
 
@@ -162,7 +163,7 @@ fn configure_macos_build() {
     }
 }
 
-#[cfg(target_os = "macos")]
+#[cfg(all(target_os = "macos", feature = "feat_macos"))]
 fn parse_macos_version(version_str: &str) -> Option<(u32, u32)> {
     let parts: Vec<&str> = version_str.split('.').collect();
     if parts.len() >= 2 {

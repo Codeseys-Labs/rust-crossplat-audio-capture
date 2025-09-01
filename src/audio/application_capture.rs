@@ -4,13 +4,13 @@
 //! across Windows (WASAPI Process Loopback), Linux (PipeWire monitor streams), and 
 //! macOS (CoreAudio Process Tap).
 
-#[cfg(target_os = "windows")]
+#[cfg(all(target_os = "windows", feature = "feat_windows"))]
 use crate::audio::windows::WindowsApplicationCapture;
 
-#[cfg(target_os = "linux")]
+#[cfg(all(target_os = "linux", feature = "feat_linux"))]
 use crate::audio::linux::{PipeWireApplicationCapture, ApplicationSelector};
 
-#[cfg(target_os = "macos")]
+#[cfg(all(target_os = "macos", feature = "feat_macos"))]
 use crate::audio::macos::tap::MacOSApplicationCapture;
 
 /// Unified application capture interface
@@ -29,13 +29,13 @@ pub trait ApplicationCapture {
 
 /// Cross-platform application capture implementation
 pub enum CrossPlatformApplicationCapture {
-    #[cfg(target_os = "windows")]
+    #[cfg(all(target_os = "windows", feature = "feat_windows"))]
     Windows(WindowsApplicationCapture),
-    
-    #[cfg(target_os = "linux")]
+
+    #[cfg(all(target_os = "linux", feature = "feat_linux"))]
     Linux(PipeWireApplicationCapture),
-    
-    #[cfg(target_os = "macos")]
+
+    #[cfg(all(target_os = "macos", feature = "feat_macos"))]
     MacOS(MacOSApplicationCapture),
 }
 
@@ -45,39 +45,46 @@ impl ApplicationCapture for CrossPlatformApplicationCapture {
         F: Fn(&[f32]) + Send + 'static,
     {
         match self {
-            #[cfg(target_os = "windows")]
+            #[cfg(all(target_os = "windows", feature = "feat_windows"))]
             CrossPlatformApplicationCapture::Windows(capture) => capture.start_capture(callback),
-            
-            #[cfg(target_os = "linux")]
+
+            #[cfg(all(target_os = "linux", feature = "feat_linux"))]
             CrossPlatformApplicationCapture::Linux(capture) => capture.start_capture(callback),
-            
-            #[cfg(target_os = "macos")]
+
+            #[cfg(all(target_os = "macos", feature = "feat_macos"))]
             CrossPlatformApplicationCapture::MacOS(capture) => capture.start_capture(callback),
+
+            #[cfg(not(any(
+                all(target_os = "windows", feature = "feat_windows"),
+                all(target_os = "linux", feature = "feat_linux"),
+                all(target_os = "macos", feature = "feat_macos")
+            )))]
+            _ => unreachable!("No platform features enabled"),
         }
     }
     
     fn stop_capture(&mut self) -> Result<(), Box<dyn std::error::Error>> {
         match self {
-            #[cfg(target_os = "windows")]
+            #[cfg(all(target_os = "windows", feature = "feat_windows"))]
             CrossPlatformApplicationCapture::Windows(capture) => capture.stop_capture(),
-            
-            #[cfg(target_os = "linux")]
+
+            #[cfg(all(target_os = "linux", feature = "feat_linux"))]
             CrossPlatformApplicationCapture::Linux(capture) => capture.stop_capture(),
-            
-            #[cfg(target_os = "macos")]
+
+            #[cfg(all(target_os = "macos", feature = "feat_macos"))]
             CrossPlatformApplicationCapture::MacOS(capture) => capture.stop_capture(),
         }
     }
     
     fn is_capturing(&self) -> bool {
         match self {
-            #[cfg(target_os = "windows")]
+            #[cfg(all(target_os = "windows", feature = "feat_windows"))]
             CrossPlatformApplicationCapture::Windows(capture) => capture.is_capturing(),
-            
-            #[cfg(target_os = "linux")]
+
+            #[cfg(all(target_os = "linux", feature = "feat_linux"))]
             CrossPlatformApplicationCapture::Linux(capture) => capture.is_capturing(),
-            
-            #[cfg(target_os = "macos")]
+
+            #[cfg(all(target_os = "macos", feature = "feat_macos"))]
             CrossPlatformApplicationCapture::MacOS(capture) => capture.is_capturing(),
         }
     }
@@ -93,18 +100,18 @@ pub struct ApplicationInfo {
 
 #[derive(Debug, Clone)]
 pub enum PlatformSpecificInfo {
-    #[cfg(target_os = "windows")]
+    #[cfg(all(target_os = "windows", feature = "feat_windows"))]
     Windows {
         executable_path: Option<String>,
     },
     
-    #[cfg(target_os = "linux")]
+    #[cfg(all(target_os = "linux", feature = "feat_linux"))]
     Linux {
         node_id: Option<u32>,
         media_class: Option<String>,
     },
     
-    #[cfg(target_os = "macos")]
+    #[cfg(all(target_os = "macos", feature = "feat_macos"))]
     MacOS {
         bundle_id: Option<String>,
     },
@@ -116,22 +123,22 @@ pub struct ApplicationCaptureFactory;
 impl ApplicationCaptureFactory {
     /// Create a new application capture instance for the specified process ID
     pub fn create_for_process_id(process_id: u32) -> Result<CrossPlatformApplicationCapture, Box<dyn std::error::Error>> {
-        #[cfg(target_os = "windows")]
+        #[cfg(all(target_os = "windows", feature = "feat_windows"))]
         {
             let mut capture = WindowsApplicationCapture::new(process_id, false);
             capture.initialize()?;
             Ok(CrossPlatformApplicationCapture::Windows(capture))
         }
-        
-        #[cfg(target_os = "linux")]
+
+        #[cfg(all(target_os = "linux", feature = "feat_linux"))]
         {
             let mut capture = PipeWireApplicationCapture::new(ApplicationSelector::ProcessId(process_id));
             capture.discover_target_node()?;
             capture.create_monitor_stream()?;
             Ok(CrossPlatformApplicationCapture::Linux(capture))
         }
-        
-        #[cfg(target_os = "macos")]
+
+        #[cfg(all(target_os = "macos", feature = "feat_macos"))]
         {
             if !MacOSApplicationCapture::is_process_tap_available() {
                 return Err("Process Tap APIs require macOS 14.4 or later".into());
@@ -139,11 +146,20 @@ impl ApplicationCaptureFactory {
             let capture = MacOSApplicationCapture::new(process_id, false);
             Ok(CrossPlatformApplicationCapture::MacOS(capture))
         }
+
+        #[cfg(not(any(
+            all(target_os = "windows", feature = "feat_windows"),
+            all(target_os = "linux", feature = "feat_linux"),
+            all(target_os = "macos", feature = "feat_macos")
+        )))]
+        {
+            Err("No supported platform features enabled".into())
+        }
     }
     
     /// Create a new application capture instance for the specified application name
     pub fn create_for_application_name(app_name: &str) -> Result<CrossPlatformApplicationCapture, Box<dyn std::error::Error>> {
-        #[cfg(target_os = "windows")]
+        #[cfg(all(target_os = "windows", feature = "feat_windows"))]
         {
             if let Some(process_id) = WindowsApplicationCapture::find_process_by_name(app_name, false) {
                 Self::create_for_process_id(process_id)
@@ -152,7 +168,7 @@ impl ApplicationCaptureFactory {
             }
         }
         
-        #[cfg(target_os = "linux")]
+        #[cfg(all(target_os = "linux", feature = "feat_linux"))]
         {
             let mut capture = PipeWireApplicationCapture::new(ApplicationSelector::ApplicationName(app_name.to_string()));
             capture.discover_target_node()?;
@@ -160,12 +176,12 @@ impl ApplicationCaptureFactory {
             Ok(CrossPlatformApplicationCapture::Linux(capture))
         }
         
-        #[cfg(target_os = "macos")]
+        #[cfg(all(target_os = "macos", feature = "feat_macos"))]
         {
             if !MacOSApplicationCapture::is_process_tap_available() {
                 return Err("Process Tap APIs require macOS 14.4 or later".into());
             }
-            
+
             let applications = MacOSApplicationCapture::list_capturable_applications()?;
             if let Some((pid, _)) = applications.iter().find(|(_, name)| name.contains(app_name)) {
                 let capture = MacOSApplicationCapture::new(*pid, false);
@@ -174,11 +190,20 @@ impl ApplicationCaptureFactory {
                 Err(format!("Application '{}' not found", app_name).into())
             }
         }
+
+        #[cfg(not(any(
+            all(target_os = "windows", feature = "feat_windows"),
+            all(target_os = "linux", feature = "feat_linux"),
+            all(target_os = "macos", feature = "feat_macos")
+        )))]
+        {
+            Err("No supported platform features enabled".into())
+        }
     }
     
     /// List all available applications that can be captured
     pub fn list_capturable_applications() -> Result<Vec<ApplicationInfo>, Box<dyn std::error::Error>> {
-        #[cfg(target_os = "windows")]
+        #[cfg(all(target_os = "windows", feature = "feat_windows"))]
         {
             let processes = WindowsApplicationCapture::list_audio_processes();
             Ok(processes.into_iter().map(|(pid, name)| ApplicationInfo {
@@ -190,7 +215,7 @@ impl ApplicationCaptureFactory {
             }).collect())
         }
         
-        #[cfg(target_os = "linux")]
+        #[cfg(all(target_os = "linux", feature = "feat_linux"))]
         {
             let applications = PipeWireApplicationCapture::list_audio_applications()?;
             Ok(applications.into_iter().map(|app| ApplicationInfo {
@@ -203,7 +228,7 @@ impl ApplicationCaptureFactory {
             }).collect())
         }
         
-        #[cfg(target_os = "macos")]
+        #[cfg(all(target_os = "macos", feature = "feat_macos"))]
         {
             let applications = MacOSApplicationCapture::list_capturable_applications()?;
             Ok(applications.into_iter().map(|(pid, name)| ApplicationInfo {
@@ -213,6 +238,15 @@ impl ApplicationCaptureFactory {
                     bundle_id: None,
                 },
             }).collect())
+        }
+
+        #[cfg(not(any(
+            all(target_os = "windows", feature = "feat_windows"),
+            all(target_os = "linux", feature = "feat_linux"),
+            all(target_os = "macos", feature = "feat_macos")
+        )))]
+        {
+            Err("No supported platform features enabled".into())
         }
     }
 }

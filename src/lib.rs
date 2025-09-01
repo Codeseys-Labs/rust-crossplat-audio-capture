@@ -35,25 +35,25 @@ pub use crate::core::processing::AudioProcessor; // Added AudioProcessor re-expo
 pub use crate::api::{AudioCapture, AudioCaptureBuilder, AudioCaptureConfig};
 
 // Re-export platform-specific components for the new API
-#[cfg(target_os = "linux")]
+#[cfg(all(target_os = "linux", feature = "feat_linux"))]
 pub use audio::LinuxDeviceEnumerator;
-#[cfg(target_os = "windows")]
+#[cfg(all(target_os = "windows", feature = "feat_windows"))]
 pub use audio::{
     enumerate_application_audio_sessions, ApplicationAudioSessionInfo, WindowsDeviceEnumerator,
 };
-#[cfg(target_os = "macos")]
+#[cfg(all(target_os = "macos", feature = "feat_macos"))]
 pub use audio::{enumerate_audio_applications, ApplicationInfo, MacosDeviceEnumerator};
 
 // Re-export old platform-specific backends (to be deprecated)
-#[cfg(target_os = "macos")]
+#[cfg(all(target_os = "macos", feature = "feat_macos"))]
 pub use audio::CoreAudioBackend; // Assuming this was the old name
-#[cfg(target_os = "linux")]
+#[cfg(all(target_os = "linux", feature = "feat_linux"))]
 pub use audio::PipeWireBackend;
-#[cfg(target_os = "windows")]
+#[cfg(all(target_os = "windows", feature = "feat_windows"))]
 pub use audio::WasapiBackend;
 
 // Re-export ProcessAudioCapture API (Windows-only)
-#[cfg(target_os = "windows")]
+#[cfg(all(target_os = "windows", feature = "feat_windows"))]
 pub use audio::{AudioCaptureError, ProcessAudioCapture};
 
 // Re-export test utils if the feature is enabled

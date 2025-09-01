@@ -10,12 +10,12 @@
 //! obtaining a `DeviceEnumerator` through the `get_device_enumerator()` function.
 
 // Conditional module declarations
-#[cfg(target_os = "linux")]
+#[cfg(all(target_os = "linux", feature = "feat_linux"))]
 pub mod linux;
-#[cfg(target_os = "macos")]
-mod macos;
-#[cfg(target_os = "windows")]
-mod windows;
+#[cfg(all(target_os = "macos", feature = "feat_macos"))]
+pub mod macos;
+#[cfg(all(target_os = "windows", feature = "feat_windows"))]
+pub mod windows;
 
 // Application-specific capture module
 pub mod application_capture;
@@ -40,22 +40,22 @@ pub use application_capture::{
 };
 
 // Re-export platform-specific DeviceEnumerators
-#[cfg(target_os = "linux")]
+#[cfg(all(target_os = "linux", feature = "feat_linux"))]
 pub use linux::LinuxDeviceEnumerator;
-#[cfg(target_os = "macos")]
+#[cfg(all(target_os = "macos", feature = "feat_macos"))]
 pub use macos::MacosDeviceEnumerator;
-#[cfg(target_os = "windows")]
+#[cfg(all(target_os = "windows", feature = "feat_windows"))]
 pub use windows::WindowsDeviceEnumerator;
 
 // Re-export platform-specific AudioDevice and AudioStream types if they need to be named directly.
 // Usually, interaction will be through the traits.
-#[cfg(target_os = "linux")]
+#[cfg(all(target_os = "linux", feature = "feat_linux"))]
 // LinuxAudioBackend doesn't exist - removed export
-#[cfg(target_os = "macos")]
+#[cfg(all(target_os = "macos", feature = "feat_macos"))]
 pub use macos::{
     enumerate_audio_applications, ApplicationInfo, MacosAudioDevice, MacosAudioStream,
 };
-#[cfg(target_os = "windows")]
+#[cfg(all(target_os = "windows", feature = "feat_windows"))]
 pub use windows::{
     enumerate_application_audio_sessions, ApplicationAudioSessionInfo, WindowsAudioDevice,
     WindowsAudioStream,
@@ -78,26 +78,30 @@ pub fn get_device_enumerator() -> Result<
     Box<dyn DeviceEnumerator<Device = impl crate::core::interface::AudioDevice + 'static>>,
     AudioError,
 > {
-    #[cfg(target_os = "windows")]
+    #[cfg(all(target_os = "windows", feature = "feat_windows"))]
     {
         // WindowsDeviceEnumerator itself is the concrete type.
         // If it needs initialization that can fail, it should have a `new()` method returning Result.
-        Ok(Box::new(windows::WindowsDeviceEnumerator))
+        Ok(Box::new(windows::WindowsDeviceEnumerator::new()?))
     }
-    #[cfg(target_os = "linux")]
+    #[cfg(all(target_os = "linux", feature = "feat_linux"))]
     {
         // LinuxDeviceEnumerator itself is the concrete type.
-        Ok(Box::new(linux::LinuxDeviceEnumerator))
+        Ok(Box::new(linux::LinuxDeviceEnumerator::new()))
     }
-    #[cfg(target_os = "macos")]
+    #[cfg(all(target_os = "macos", feature = "feat_macos"))]
     {
         // MacosDeviceEnumerator itself is the concrete type.
-        Ok(Box::new(macos::MacosDeviceEnumerator))
+        Ok(Box::new(macos::MacosDeviceEnumerator::new()))
     }
-    #[cfg(not(any(target_os = "windows", target_os = "linux", target_os = "macos")))]
+    #[cfg(not(any(
+        all(target_os = "windows", feature = "feat_windows"),
+        all(target_os = "linux", feature = "feat_linux"),
+        all(target_os = "macos", feature = "feat_macos")
+    )))]
     {
         Err(AudioError::UnsupportedPlatform(
-            "This operating system is not supported for audio capture.".to_string(),
+            "This operating system is not supported for audio capture or the required feature is not enabled.".to_string(),
         ))
     }
 }
@@ -105,22 +109,22 @@ pub fn get_device_enumerator() -> Result<
 // --- Old Backend Factory (to be deprecated/removed) ---
 
 // Re-export old platform-specific backends (for now)
-#[cfg(target_os = "linux")]
+#[cfg(all(target_os = "linux", feature = "feat_linux"))]
 pub use linux::PipeWireBackend; // Old backend
-#[cfg(target_os = "macos")]
+#[cfg(all(target_os = "macos", feature = "feat_macos"))]
 pub use macos::CoreAudioBackend; // Assuming this was the old macOS backend name
-#[cfg(target_os = "windows")]
+#[cfg(all(target_os = "windows", feature = "feat_windows"))]
 pub use windows::WasapiBackend; // Old backend
 
 /// Returns a platform-specific implementation of the (old) `AudioCaptureBackend`.
 /// **Note:** This function is part of the older API and will be deprecated.
 /// Use `get_device_enumerator()` for the new trait-based API.
 pub fn get_audio_backend() -> crate::core::error::Result<Box<dyn AudioCaptureBackend>> {
-    #[cfg(target_os = "windows")]
+    #[cfg(all(target_os = "windows", feature = "feat_windows"))]
     {
-        Ok(Box::new(windows::WasapiBackend::new()?))
+        Ok(Box::new(windows::WasapiBackend::new(1234, true)?))
     }
-    #[cfg(target_os = "linux")]
+    #[cfg(all(target_os = "linux", feature = "feat_linux"))]
     {
         // Assuming PipeWireBackend::is_available() and new() are part of the old API
         if linux::PipeWireBackend::is_available() {
@@ -133,7 +137,7 @@ pub fn get_audio_backend() -> crate::core::error::Result<Box<dyn AudioCaptureBac
             ))
         }
     }
-    #[cfg(target_os = "macos")]
+    #[cfg(all(target_os = "macos", feature = "feat_macos"))]
     {
         // Assuming CoreAudioBackend::new() was the old way
         // This will likely cause an error if CoreAudioBackend doesn't exist or have a `new` method.
@@ -144,11 +148,15 @@ pub fn get_audio_backend() -> crate::core::error::Result<Box<dyn AudioCaptureBac
             "Old macOS backend not yet adapted for this example.".to_string(),
         ))
     }
-    #[cfg(not(any(target_os = "windows", target_os = "linux", target_os = "macos")))]
+    #[cfg(not(any(
+        all(target_os = "windows", feature = "feat_windows"),
+        all(target_os = "linux", feature = "feat_linux"),
+        all(target_os = "macos", feature = "feat_macos")
+    )))]
     {
         Err(AudioError::BackendError(
             // Corrected error variant
-            "Unsupported operating system".to_string(),
+            "Unsupported operating system or required feature not enabled".to_string(),
         ))
     }
 }
