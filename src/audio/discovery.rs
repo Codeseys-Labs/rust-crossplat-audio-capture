@@ -3,7 +3,7 @@ use std::collections::HashMap;
 use std::process::Command;
 
 #[cfg(target_os = "linux")]
-use sysinfo::{System, Process};
+use sysinfo::System;
 
 #[derive(Debug, Clone)]
 struct ProcessInfo {

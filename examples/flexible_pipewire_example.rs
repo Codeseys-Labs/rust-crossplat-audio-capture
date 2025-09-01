@@ -10,9 +10,8 @@
 
 use rsac::audio::linux::pipewire::{PipeWireApplicationCapture, ApplicationSelector};
 use std::sync::{Arc, Mutex};
-use std::sync::atomic::{AtomicUsize, AtomicBool, Ordering};
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Duration;
-use std::thread;
 
 fn main() {
     println!("🎵 Flexible PipeWire Audio Capture Examples");

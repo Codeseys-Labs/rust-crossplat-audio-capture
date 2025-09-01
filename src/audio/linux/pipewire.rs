@@ -4,12 +4,11 @@
 //! application-specific audio capture using monitor streams.
 //! Based on the wiremix approach for robust PipeWire integration.
 
-use log::{debug, info, warn, error, trace};
+use log::{warn, trace};
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
 use std::collections::HashMap;
 use std::time::Duration;
-use std::thread;
 use std::rc::Rc;
 use std::mem;
 
@@ -21,9 +20,7 @@ use pipewire::{
     stream::{Stream, StreamListener},
     main_loop::MainLoop,
     context::Context,
-    registry::{GlobalObject, Registry},
-    node::Node,
-    proxy::Listener,
+    registry::Registry,
 };
 
 #[cfg(feature = "libspa")]
@@ -32,7 +29,6 @@ use libspa::{
     param::format::{MediaSubtype, MediaType},
     param::{format_utils, ParamType},
     pod::{Object, Pod},
-    utils::dict::DictRef,
 };
 
 /// Holds information about a Linux application providing an audio stream.
