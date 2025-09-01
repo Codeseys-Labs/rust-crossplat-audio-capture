@@ -58,7 +58,20 @@ fn main() {
                 process::exit(0);
             }
             Err(e) => {
-                eprintln!("❌ VLC capture failed: {}", e);
+                let error_msg = e.to_string();
+                if error_msg.contains("0x88890010") || error_msg.contains("AUDCLNT_E_DEVICE_IN_USE")
+                {
+                    eprintln!(
+                        "[ERROR] VLC capture failed: Audio device in use or no audio output from VLC"
+                    );
+                    eprintln!("[INFO] This often happens when:");
+                    eprintln!("   - VLC cannot access audio devices (common in CI environments)");
+                    eprintln!("   - VLC is not actually playing audio");
+                    eprintln!("   - No audio devices are available");
+                    eprintln!("[DEBUG] Original error: {}", e);
+                } else {
+                    eprintln!("[ERROR] VLC capture failed: {}", e);
+                }
                 process::exit(1);
             }
         }
@@ -467,11 +480,18 @@ fn run_windows_vlc_capture(
 
             // Look for VLC in the list
             let mut vlc_apps = Vec::new();
+            let current_process_id = std::process::id();
+
             for app in &apps {
                 let name_lower = app.name.to_lowercase();
-                if name_lower.contains("vlc") {
+                if name_lower.contains("vlc") && app.process_id != current_process_id {
                     vlc_apps.push(app);
                     println!("🎯 Found VLC app: {} (PID: {})", app.name, app.process_id);
+                } else if name_lower.contains("vlc") && app.process_id == current_process_id {
+                    println!(
+                        "⚠️  Skipping our own process: {} (PID: {})",
+                        app.name, app.process_id
+                    );
                 }
             }
 
@@ -480,8 +500,11 @@ fn run_windows_vlc_capture(
                 return try_windows_vlc_by_process_name(duration, output_file);
             }
 
-            // Use the first VLC app found
-            let vlc_app = vlc_apps[0];
+            // Prioritize actual vlc.exe over other processes containing "vlc"
+            let vlc_app = vlc_apps
+                .iter()
+                .find(|app| app.name.to_lowercase() == "vlc.exe")
+                .unwrap_or(vlc_apps[0]);
             let process_id = vlc_app.process_id;
 
             println!(
