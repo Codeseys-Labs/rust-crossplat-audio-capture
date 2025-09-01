@@ -50,10 +50,10 @@ function Write-Status {
         [string]$Message
     )
     switch ($Status) {
-        "OK" { Write-Host "✅ $Message" -ForegroundColor Green }
-        "WARN" { Write-Host "⚠️  $Message" -ForegroundColor Yellow }
-        "ERROR" { Write-Host "❌ $Message" -ForegroundColor Red }
-        "INFO" { Write-Host "ℹ️  $Message" -ForegroundColor Blue }
+        "OK" { Write-Host "[OK] $Message" -ForegroundColor Green }
+        "WARN" { Write-Host "[WARN] $Message" -ForegroundColor Yellow }
+        "ERROR" { Write-Host "[ERROR] $Message" -ForegroundColor Red }
+        "INFO" { Write-Host "[INFO] $Message" -ForegroundColor Blue }
         default { Write-Host $Message }
     }
 }

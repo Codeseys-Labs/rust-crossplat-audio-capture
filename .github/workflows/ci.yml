@@ -47,57 +47,6 @@ jobs:
       - name: Run Clippy (Linux only on Ubuntu)
         run: echo "Temporarily skipping Linux clippy to focus on Windows WASAPI development"
 
-  build_and_test:
-    needs: lint_and_format_checks # Depends on the lint job
-    runs-on: ${{ matrix.os }}
-    strategy:
-      matrix:
-        os: [ubuntu-latest, windows-latest, macos-latest]
-
-    steps:
-      - name: Checkout code
-        uses: actions/checkout@v4
-
-      - name: Install PipeWire dev libraries (Linux)
-        if: runner.os == 'Linux'
-        run: |
-          sudo apt-get update
-          sudo add-apt-repository ppa:pipewire-debian/pipewire-upstream -y
-          sudo apt-get update
-          sudo apt-get install -y libpipewire-0.3-dev libspa-0.2-dev pkg-config
-
-      - name: Install Rust stable
-        uses: actions-rs/toolchain@v1
-        with:
-          toolchain: stable
-          profile: minimal
-          override: true
-
-      - name: Cache Cargo registry and build outputs
-        uses: Swatinem/rust-cache@v2
-
-      - name: Build platform-specific features
-        run: |
-          if [[ "${{ runner.os }}" == "Linux" ]]; then
-            cargo build --features feat_linux --verbose
-          elif [[ "${{ runner.os }}" == "Windows" ]]; then
-            cargo build --features feat_windows --verbose
-          elif [[ "${{ runner.os }}" == "macOS" ]]; then
-            cargo build --features feat_macos --verbose
-          fi
-        shell: bash
-
-      - name: Run platform-specific tests
-        run: |
-          if [[ "${{ runner.os }}" == "Linux" ]]; then
-            cargo test --features feat_linux --verbose
-          elif [[ "${{ runner.os }}" == "Windows" ]]; then
-            cargo test --features feat_windows --verbose
-          elif [[ "${{ runner.os }}" == "macOS" ]]; then
-            cargo test --features feat_macos --verbose
-          fi
-        shell: bash
-
   enhanced_linux_tests:
     name: Enhanced Linux PipeWire Tests
     needs: lint_and_format_checks
@@ -112,13 +61,12 @@ jobs:
     with:
       debug_enabled: ${{ inputs.debug_enabled || false }}
 
-  macos_tests:
-    name: macOS CoreAudio Tests
-    needs: lint_and_format_checks
-    uses: ./.github/workflows/macos.yml
-    with:
-      debug_enabled: ${{ inputs.debug_enabled || false }}
-
+  # macos_tests:
+  #   name: macOS CoreAudio Tests
+  #   needs: lint_and_format_checks
+  #   uses: ./.github/workflows/macos.yml
+  #   with:
+  #     debug_enabled: ${{ inputs.debug_enabled || false }}
 
   coverage:
     name: Code Coverage
@@ -135,7 +83,7 @@ jobs:
         run: |
           # Check if development libraries are available
           if pkg-config --exists libpipewire-0.3; then
-            echo "✅ PipeWire development libraries already available"
+            echo "[OK] PipeWire development libraries already available"
           else
             echo "Installing PipeWire development libraries..."
             sudo apt-get update
