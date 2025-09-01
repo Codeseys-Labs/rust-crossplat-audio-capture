@@ -640,7 +640,6 @@ fn run_windows_capture_loop(
 
                         // For Windows: Signal the shared stop flag so the capture loop will exit
                         shared_stop_flag_for_callback.store(true, Ordering::SeqCst);
-                        println!("🔧 [DEBUG] Set shared stop flag to true from callback");
                     }
                 },
                 Some(shared_stop_flag),
@@ -706,7 +705,6 @@ fn run_windows_capture_loop(
     };
 
     // Handle capture result
-    println!("🔧 [DEBUG] Capture method returned, processing result...");
     match result {
         Ok(_) => {
             println!("✅ Capture completed successfully");
@@ -718,11 +716,8 @@ fn run_windows_capture_loop(
     }
 
     // Stop capture
-    println!("🔧 [DEBUG] Calling stop_capture()...");
     if let Err(e) = capture.stop_capture() {
         println!("⚠️  Warning: Failed to stop capture cleanly: {}", e);
-    } else {
-        println!("🔧 [DEBUG] stop_capture() completed successfully");
     }
 
     // Save audio data to WAV file (same as Linux version)

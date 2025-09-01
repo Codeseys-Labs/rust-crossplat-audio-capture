@@ -1,12 +1,11 @@
-# DISABLED - Focusing on Linux PipeWire workflow only
-# name: Rust CI
+name: Rust CI
 
-# on:
-#   push:
-#     branches: ["main", "master"]
-#   pull_request:
-#     branches: ["main", "master"]
-#   workflow_dispatch:
+on:
+  push:
+    branches: ["main", "master"]
+  pull_request:
+    branches: ["main", "master"]
+  workflow_dispatch:
     inputs:
       debug_enabled:
         description: "Enable debug output for all workflows"

@@ -66,6 +66,113 @@ pub use windows::{
 use crate::core::error::AudioError;
 use crate::core::interface::DeviceEnumerator; // Import the trait itself // For error handling
 
+/// Cross-platform device enumerator that wraps platform-specific implementations.
+pub enum CrossPlatformDeviceEnumerator {
+    #[cfg(all(target_os = "windows", feature = "feat_windows"))]
+    Windows(windows::WindowsDeviceEnumerator),
+
+    #[cfg(all(target_os = "linux", feature = "feat_linux"))]
+    Linux(linux::LinuxDeviceEnumerator),
+
+    #[cfg(all(target_os = "macos", feature = "feat_macos"))]
+    MacOS(macos::MacOSDeviceEnumerator),
+}
+
+impl CrossPlatformDeviceEnumerator {
+    /// Enumerate all available audio devices
+    pub fn enumerate_devices(
+        &self,
+    ) -> crate::core::error::Result<
+        Vec<Box<dyn crate::core::interface::AudioDevice<DeviceId = String>>>,
+    > {
+        match self {
+            #[cfg(all(target_os = "windows", feature = "feat_windows"))]
+            CrossPlatformDeviceEnumerator::Windows(enumerator) => {
+                let devices = enumerator.enumerate_devices()?;
+                Ok(devices
+                    .into_iter()
+                    .map(|d| {
+                        Box::new(d)
+                            as Box<dyn crate::core::interface::AudioDevice<DeviceId = String>>
+                    })
+                    .collect())
+            }
+            #[cfg(all(target_os = "linux", feature = "feat_linux"))]
+            CrossPlatformDeviceEnumerator::Linux(enumerator) => {
+                let devices = enumerator.enumerate_devices()?;
+                Ok(devices
+                    .into_iter()
+                    .map(|d| {
+                        Box::new(d)
+                            as Box<dyn crate::core::interface::AudioDevice<DeviceId = String>>
+                    })
+                    .collect())
+            }
+            #[cfg(all(target_os = "macos", feature = "feat_macos"))]
+            CrossPlatformDeviceEnumerator::MacOS(enumerator) => {
+                let devices = enumerator.enumerate_devices()?;
+                Ok(devices
+                    .into_iter()
+                    .map(|d| {
+                        Box::new(d)
+                            as Box<dyn crate::core::interface::AudioDevice<DeviceId = String>>
+                    })
+                    .collect())
+            }
+            #[cfg(not(any(
+                all(target_os = "windows", feature = "feat_windows"),
+                all(target_os = "linux", feature = "feat_linux"),
+                all(target_os = "macos", feature = "feat_macos")
+            )))]
+            _ => Err(crate::core::error::AudioError::UnsupportedPlatform(
+                "Platform not supported".to_string(),
+            )),
+        }
+    }
+
+    /// Get the default device of the specified kind
+    pub fn get_default_device(
+        &self,
+        kind: crate::core::interface::DeviceKind,
+    ) -> crate::core::error::Result<Box<dyn crate::core::interface::AudioDevice<DeviceId = String>>>
+    {
+        match self {
+            #[cfg(all(target_os = "windows", feature = "feat_windows"))]
+            CrossPlatformDeviceEnumerator::Windows(enumerator) => {
+                let device = enumerator.get_default_device(kind)?;
+                Ok(Box::new(device)
+                    as Box<
+                        dyn crate::core::interface::AudioDevice<DeviceId = String>,
+                    >)
+            }
+            #[cfg(all(target_os = "linux", feature = "feat_linux"))]
+            CrossPlatformDeviceEnumerator::Linux(enumerator) => {
+                let device = enumerator.get_default_device(kind)?;
+                Ok(Box::new(device)
+                    as Box<
+                        dyn crate::core::interface::AudioDevice<DeviceId = String>,
+                    >)
+            }
+            #[cfg(all(target_os = "macos", feature = "feat_macos"))]
+            CrossPlatformDeviceEnumerator::MacOS(enumerator) => {
+                let device = enumerator.get_default_device(kind)?;
+                Ok(Box::new(device)
+                    as Box<
+                        dyn crate::core::interface::AudioDevice<DeviceId = String>,
+                    >)
+            }
+            #[cfg(not(any(
+                all(target_os = "windows", feature = "feat_windows"),
+                all(target_os = "linux", feature = "feat_linux"),
+                all(target_os = "macos", feature = "feat_macos")
+            )))]
+            _ => Err(crate::core::error::AudioError::UnsupportedPlatform(
+                "Platform not supported".to_string(),
+            )),
+        }
+    }
+}
+
 /// Returns a platform-specific implementation of `DeviceEnumerator`.
 ///
 /// This function inspects the `target_os` at compile time and provides the
@@ -74,25 +181,24 @@ use crate::core::interface::DeviceEnumerator; // Import the trait itself // For 
 /// # Returns
 /// A `Result` containing a boxed `DeviceEnumerator` for the current platform,
 /// or an `AudioError::UnsupportedPlatform` if the OS is not supported.
-pub fn get_device_enumerator() -> Result<
-    Box<dyn DeviceEnumerator<Device = impl crate::core::interface::AudioDevice + 'static>>,
-    AudioError,
-> {
+pub fn get_device_enumerator() -> Result<CrossPlatformDeviceEnumerator, AudioError> {
     #[cfg(all(target_os = "windows", feature = "feat_windows"))]
     {
-        // WindowsDeviceEnumerator itself is the concrete type.
-        // If it needs initialization that can fail, it should have a `new()` method returning Result.
-        Ok(Box::new(windows::WindowsDeviceEnumerator::new()?))
+        Ok(CrossPlatformDeviceEnumerator::Windows(
+            windows::WindowsDeviceEnumerator::new()?,
+        ))
     }
     #[cfg(all(target_os = "linux", feature = "feat_linux"))]
     {
-        // LinuxDeviceEnumerator itself is the concrete type.
-        Ok(Box::new(linux::LinuxDeviceEnumerator::new()))
+        Ok(CrossPlatformDeviceEnumerator::Linux(
+            linux::LinuxDeviceEnumerator::new(),
+        ))
     }
     #[cfg(all(target_os = "macos", feature = "feat_macos"))]
     {
-        // MacosDeviceEnumerator itself is the concrete type.
-        Ok(Box::new(macos::MacosDeviceEnumerator::new()))
+        Ok(CrossPlatformDeviceEnumerator::MacOS(
+            macos::MacOSDeviceEnumerator::new(),
+        ))
     }
     #[cfg(not(any(
         all(target_os = "windows", feature = "feat_windows"),
@@ -100,7 +206,7 @@ pub fn get_device_enumerator() -> Result<
         all(target_os = "macos", feature = "feat_macos")
     )))]
     {
-        Err(AudioError::UnsupportedPlatform(
+        Err::<Box<dyn DeviceEnumerator<Device = Box<dyn crate::core::interface::AudioDevice>>>, AudioError>(AudioError::UnsupportedPlatform(
             "This operating system is not supported for audio capture or the required feature is not enabled.".to_string(),
         ))
     }

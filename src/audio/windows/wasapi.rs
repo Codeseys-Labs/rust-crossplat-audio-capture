@@ -158,24 +158,15 @@ impl WindowsApplicationCapture {
         self.should_stop.store(false, Ordering::SeqCst);
 
         // Simple capture loop based on wasapi-rs examples
-        println!("🔧 [DEBUG] Starting Windows capture loop...");
-        let mut loop_count = 0;
         loop {
-            loop_count += 1;
-            if loop_count % 100 == 0 {
-                println!("🔧 [DEBUG] Capture loop iteration: {}", loop_count);
-            }
-
             // Check if we should stop capture (internal flag)
             if self.should_stop.load(Ordering::SeqCst) {
-                println!("🔧 [DEBUG] Internal stop flag detected, breaking loop");
                 break; // Stop requested
             }
 
             // Check external stop flag if provided
             if let Some(ref external_flag) = external_stop_flag {
                 if external_flag.load(Ordering::SeqCst) {
-                    println!("🔧 [DEBUG] External stop flag detected, breaking loop");
                     break; // External stop requested
                 }
             }
@@ -184,12 +175,10 @@ impl WindowsApplicationCapture {
             if h_event.wait_for_event(100).is_err() {
                 // Check stop flags on timeout too
                 if self.should_stop.load(Ordering::SeqCst) {
-                    println!("🔧 [DEBUG] Internal stop flag detected on timeout, breaking");
                     break;
                 }
                 if let Some(ref external_flag) = external_stop_flag {
                     if external_flag.load(Ordering::SeqCst) {
-                        println!("🔧 [DEBUG] External stop flag detected on timeout, breaking");
                         break;
                     }
                 }
@@ -226,32 +215,20 @@ impl WindowsApplicationCapture {
             }
         }
 
-        println!(
-            "🔧 [DEBUG] Windows capture loop exited after {} iterations",
-            loop_count
-        );
-        println!("🔧 [DEBUG] Cleaning up Windows capture resources...");
-
         Ok(())
     }
 
     /// Stop capturing audio
     pub fn stop_capture(&mut self) -> std::result::Result<(), Box<dyn std::error::Error>> {
-        println!("🔧 [DEBUG] stop_capture() called");
-
         // Signal the capture loop to stop
         self.should_stop.store(true, Ordering::SeqCst);
-        println!("🔧 [DEBUG] Set internal stop flag to true");
 
         if let Some(audio_client) = &mut self.audio_client {
-            println!("🔧 [DEBUG] Stopping audio stream...");
             audio_client.stop_stream()?;
-            println!("🔧 [DEBUG] Audio stream stopped");
         }
 
         // Clear the audio client
         self.audio_client = None;
-        println!("🔧 [DEBUG] Audio client cleared");
 
         Ok(())
     }

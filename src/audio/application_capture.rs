@@ -1,14 +1,14 @@
 //! Unified cross-platform application-specific audio capture API
-//! 
+//!
 //! This module provides a unified interface for capturing audio from specific applications
-//! across Windows (WASAPI Process Loopback), Linux (PipeWire monitor streams), and 
+//! across Windows (WASAPI Process Loopback), Linux (PipeWire monitor streams), and
 //! macOS (CoreAudio Process Tap).
 
 #[cfg(all(target_os = "windows", feature = "feat_windows"))]
 use crate::audio::windows::WindowsApplicationCapture;
 
 #[cfg(all(target_os = "linux", feature = "feat_linux"))]
-use crate::audio::linux::{PipeWireApplicationCapture, ApplicationSelector};
+use crate::audio::linux::{ApplicationSelector, PipeWireApplicationCapture};
 
 #[cfg(all(target_os = "macos", feature = "feat_macos"))]
 use crate::audio::macos::tap::MacOSApplicationCapture;
@@ -19,10 +19,10 @@ pub trait ApplicationCapture {
     fn start_capture<F>(&mut self, callback: F) -> Result<(), Box<dyn std::error::Error>>
     where
         F: Fn(&[f32]) + Send + 'static;
-    
+
     /// Stop capturing audio
     fn stop_capture(&mut self) -> Result<(), Box<dyn std::error::Error>>;
-    
+
     /// Check if currently capturing
     fn is_capturing(&self) -> bool;
 }
@@ -62,7 +62,7 @@ impl ApplicationCapture for CrossPlatformApplicationCapture {
             _ => unreachable!("No platform features enabled"),
         }
     }
-    
+
     fn stop_capture(&mut self) -> Result<(), Box<dyn std::error::Error>> {
         match self {
             #[cfg(all(target_os = "windows", feature = "feat_windows"))]
@@ -73,9 +73,16 @@ impl ApplicationCapture for CrossPlatformApplicationCapture {
 
             #[cfg(all(target_os = "macos", feature = "feat_macos"))]
             CrossPlatformApplicationCapture::MacOS(capture) => capture.stop_capture(),
+
+            #[cfg(not(any(
+                all(target_os = "windows", feature = "feat_windows"),
+                all(target_os = "linux", feature = "feat_linux"),
+                all(target_os = "macos", feature = "feat_macos")
+            )))]
+            _ => Err("Platform not supported".into()),
         }
     }
-    
+
     fn is_capturing(&self) -> bool {
         match self {
             #[cfg(all(target_os = "windows", feature = "feat_windows"))]
@@ -86,6 +93,13 @@ impl ApplicationCapture for CrossPlatformApplicationCapture {
 
             #[cfg(all(target_os = "macos", feature = "feat_macos"))]
             CrossPlatformApplicationCapture::MacOS(capture) => capture.is_capturing(),
+
+            #[cfg(not(any(
+                all(target_os = "windows", feature = "feat_windows"),
+                all(target_os = "linux", feature = "feat_linux"),
+                all(target_os = "macos", feature = "feat_macos")
+            )))]
+            _ => false,
         }
     }
 }
@@ -101,20 +115,16 @@ pub struct ApplicationInfo {
 #[derive(Debug, Clone)]
 pub enum PlatformSpecificInfo {
     #[cfg(all(target_os = "windows", feature = "feat_windows"))]
-    Windows {
-        executable_path: Option<String>,
-    },
-    
+    Windows { executable_path: Option<String> },
+
     #[cfg(all(target_os = "linux", feature = "feat_linux"))]
     Linux {
         node_id: Option<u32>,
         media_class: Option<String>,
     },
-    
+
     #[cfg(all(target_os = "macos", feature = "feat_macos"))]
-    MacOS {
-        bundle_id: Option<String>,
-    },
+    MacOS { bundle_id: Option<String> },
 }
 
 /// Factory for creating application capture instances
@@ -122,7 +132,9 @@ pub struct ApplicationCaptureFactory;
 
 impl ApplicationCaptureFactory {
     /// Create a new application capture instance for the specified process ID
-    pub fn create_for_process_id(process_id: u32) -> Result<CrossPlatformApplicationCapture, Box<dyn std::error::Error>> {
+    pub fn create_for_process_id(
+        process_id: u32,
+    ) -> Result<CrossPlatformApplicationCapture, Box<dyn std::error::Error>> {
         #[cfg(all(target_os = "windows", feature = "feat_windows"))]
         {
             let mut capture = WindowsApplicationCapture::new(process_id, false)?;
@@ -132,7 +144,8 @@ impl ApplicationCaptureFactory {
 
         #[cfg(all(target_os = "linux", feature = "feat_linux"))]
         {
-            let mut capture = PipeWireApplicationCapture::new(ApplicationSelector::ProcessId(process_id));
+            let mut capture =
+                PipeWireApplicationCapture::new(ApplicationSelector::ProcessId(process_id));
             capture.discover_target_node()?;
             capture.create_monitor_stream()?;
             Ok(CrossPlatformApplicationCapture::Linux(capture))
@@ -156,26 +169,32 @@ impl ApplicationCaptureFactory {
             Err("No supported platform features enabled".into())
         }
     }
-    
+
     /// Create a new application capture instance for the specified application name
-    pub fn create_for_application_name(app_name: &str) -> Result<CrossPlatformApplicationCapture, Box<dyn std::error::Error>> {
+    pub fn create_for_application_name(
+        app_name: &str,
+    ) -> Result<CrossPlatformApplicationCapture, Box<dyn std::error::Error>> {
         #[cfg(all(target_os = "windows", feature = "feat_windows"))]
         {
-            if let Some(process_id) = WindowsApplicationCapture::find_process_by_name(app_name, false) {
+            if let Some(process_id) =
+                WindowsApplicationCapture::find_process_by_name(app_name, false)
+            {
                 Self::create_for_process_id(process_id)
             } else {
                 Err(format!("Application '{}' not found", app_name).into())
             }
         }
-        
+
         #[cfg(all(target_os = "linux", feature = "feat_linux"))]
         {
-            let mut capture = PipeWireApplicationCapture::new(ApplicationSelector::ApplicationName(app_name.to_string()));
+            let mut capture = PipeWireApplicationCapture::new(
+                ApplicationSelector::ApplicationName(app_name.to_string()),
+            );
             capture.discover_target_node()?;
             capture.create_monitor_stream()?;
             Ok(CrossPlatformApplicationCapture::Linux(capture))
         }
-        
+
         #[cfg(all(target_os = "macos", feature = "feat_macos"))]
         {
             if !MacOSApplicationCapture::is_process_tap_available() {
@@ -183,7 +202,10 @@ impl ApplicationCaptureFactory {
             }
 
             let applications = MacOSApplicationCapture::list_capturable_applications()?;
-            if let Some((pid, _)) = applications.iter().find(|(_, name)| name.contains(app_name)) {
+            if let Some((pid, _)) = applications
+                .iter()
+                .find(|(_, name)| name.contains(app_name))
+            {
                 let capture = MacOSApplicationCapture::new(*pid, false);
                 Ok(CrossPlatformApplicationCapture::MacOS(capture))
             } else {
@@ -200,44 +222,56 @@ impl ApplicationCaptureFactory {
             Err("No supported platform features enabled".into())
         }
     }
-    
+
     /// List all available applications that can be captured
-    pub fn list_capturable_applications() -> Result<Vec<ApplicationInfo>, Box<dyn std::error::Error>> {
+    pub fn list_capturable_applications() -> Result<Vec<ApplicationInfo>, Box<dyn std::error::Error>>
+    {
         #[cfg(all(target_os = "windows", feature = "feat_windows"))]
         {
             let processes = WindowsApplicationCapture::list_audio_processes();
-            Ok(processes.into_iter().map(|(pid, name)| ApplicationInfo {
-                process_id: pid,
-                name,
-                platform_specific: PlatformSpecificInfo::Windows {
-                    executable_path: None,
-                },
-            }).collect())
+            Ok(processes
+                .into_iter()
+                .map(|(pid, name)| ApplicationInfo {
+                    process_id: pid,
+                    name,
+                    platform_specific: PlatformSpecificInfo::Windows {
+                        executable_path: None,
+                    },
+                })
+                .collect())
         }
-        
+
         #[cfg(all(target_os = "linux", feature = "feat_linux"))]
         {
             let applications = PipeWireApplicationCapture::list_audio_applications()?;
-            Ok(applications.into_iter().map(|app| ApplicationInfo {
-                process_id: app.process_id.unwrap_or(0),
-                name: app.name.unwrap_or_else(|| app.node_name.unwrap_or_else(|| format!("Node {}", app.pipewire_node_id.unwrap_or(0)))),
-                platform_specific: PlatformSpecificInfo::Linux {
-                    node_id: app.pipewire_node_id,
-                    media_class: Some(app.media_class),
-                },
-            }).collect())
+            Ok(applications
+                .into_iter()
+                .map(|app| ApplicationInfo {
+                    process_id: app.process_id.unwrap_or(0),
+                    name: app.name.unwrap_or_else(|| {
+                        app.node_name.unwrap_or_else(|| {
+                            format!("Node {}", app.pipewire_node_id.unwrap_or(0))
+                        })
+                    }),
+                    platform_specific: PlatformSpecificInfo::Linux {
+                        node_id: app.pipewire_node_id,
+                        media_class: Some(app.media_class),
+                    },
+                })
+                .collect())
         }
-        
+
         #[cfg(all(target_os = "macos", feature = "feat_macos"))]
         {
             let applications = MacOSApplicationCapture::list_capturable_applications()?;
-            Ok(applications.into_iter().map(|(pid, name)| ApplicationInfo {
-                process_id: pid,
-                name,
-                platform_specific: PlatformSpecificInfo::MacOS {
-                    bundle_id: None,
-                },
-            }).collect())
+            Ok(applications
+                .into_iter()
+                .map(|(pid, name)| ApplicationInfo {
+                    process_id: pid,
+                    name,
+                    platform_specific: PlatformSpecificInfo::MacOS { bundle_id: None },
+                })
+                .collect())
         }
 
         #[cfg(not(any(
@@ -252,12 +286,16 @@ impl ApplicationCaptureFactory {
 }
 
 /// Convenience function to create application capture for a process ID
-pub fn capture_application_by_pid(process_id: u32) -> Result<CrossPlatformApplicationCapture, Box<dyn std::error::Error>> {
+pub fn capture_application_by_pid(
+    process_id: u32,
+) -> Result<CrossPlatformApplicationCapture, Box<dyn std::error::Error>> {
     ApplicationCaptureFactory::create_for_process_id(process_id)
 }
 
 /// Convenience function to create application capture for an application name
-pub fn capture_application_by_name(app_name: &str) -> Result<CrossPlatformApplicationCapture, Box<dyn std::error::Error>> {
+pub fn capture_application_by_name(
+    app_name: &str,
+) -> Result<CrossPlatformApplicationCapture, Box<dyn std::error::Error>> {
     ApplicationCaptureFactory::create_for_application_name(app_name)
 }
 

@@ -253,7 +253,7 @@ impl AudioCaptureBuilder {
     /// - [`AudioError::ApplicationCaptureError`] (macOS): If setting up the application-specific
     ///   capture fails (e.g., invalid PID, permission issues, OS version too old).
     // The return type uses `impl AudioDevice` to represent the opaque concrete device type.
-    pub fn build(self) -> AudioResult<AudioCapture<impl AudioDevice + 'static>> {
+    pub fn build(self) -> AudioResult<AudioCapture> {
         // --- Configuration Validation ---
         let mut actual_device_selector = self.device_selector.clone();
 
@@ -619,7 +619,7 @@ impl AudioCaptureBuilder {
 ///
 /// Note: The actual audio data handling (e.g., callbacks) is managed by the
 /// underlying stream created from the device and will be configured in subsequent development stages.
-pub struct AudioCapture<D: AudioDevice + 'static> {
+pub struct AudioCapture {
     /// The validated configuration for this audio capture session.
     /// This includes device selection criteria and stream parameters.
     config: AudioCaptureConfig,
@@ -627,8 +627,8 @@ pub struct AudioCapture<D: AudioDevice + 'static> {
     /// The actual audio device selected for capture.
     /// This is `Some` after successful `build()` and `None` if device selection failed
     /// (though `build` would return an error before `AudioCapture` is created in such a case).
-    /// It's stored as a concrete (but potentially opaque if from `impl Trait`) device type `D`.
-    device: Option<D>,
+    /// It's stored as a trait object for cross-platform compatibility.
+    device: Option<Box<dyn crate::core::interface::AudioDevice<DeviceId = String>>>,
 
     /// The active audio stream used for capturing data.
     /// This is `None` initially and becomes `Some` after `start()` is successfully called.
@@ -667,7 +667,7 @@ pub struct AudioCapture<D: AudioDevice + 'static> {
     processing_thread_handle: Option<thread::JoinHandle<()>>,
 }
 
-impl<D: AudioDevice + 'static> AudioCapture<D> {
+impl AudioCapture {
     /// Starts the audio capture stream.
     ///
     /// If the stream is already running (as indicated by [`is_running()`](AudioCapture::is_running)),
@@ -1066,7 +1066,7 @@ impl<D: AudioDevice + 'static> AudioCapture<D> {
     /// # Ok(())
     /// # }
     /// ```
-    pub fn buffers_iter(&mut self) -> AudioBufferIterator<'_, D> {
+    pub fn buffers_iter(&mut self) -> AudioBufferIterator<'_> {
         AudioBufferIterator { capture: self }
     }
 
@@ -1374,7 +1374,7 @@ where
 // Assuming it's there or will be added if this part is fully implemented.
 // For now, the Box::pin approach for error is fine.
 
-impl<D: AudioDevice + 'static> AudioCapture<D> {
+impl AudioCapture {
     /// Records audio to a file for a specified duration using a blocking approach.
     ///
     /// This method will:
@@ -1531,11 +1531,11 @@ impl<D: AudioDevice + 'static> AudioCapture<D> {
 ///
 /// This struct is created by the [`buffers_iter()`](AudioCapture::buffers_iter) method on [`AudioCapture`].
 /// See its documentation for more details.
-pub struct AudioBufferIterator<'a, D: AudioDevice + 'static> {
-    capture: &'a mut AudioCapture<D>,
+pub struct AudioBufferIterator<'a> {
+    capture: &'a mut AudioCapture,
 }
 
-impl<'a, D: AudioDevice + 'static> Iterator for AudioBufferIterator<'a, D> {
+impl<'a> Iterator for AudioBufferIterator<'a> {
     type Item = AudioResult<AudioBuffer>; // Changed to AudioBuffer struct
 
     fn next(&mut self) -> Option<Self::Item> {
@@ -1577,7 +1577,7 @@ impl<'a, D: AudioDevice + 'static> Iterator for AudioBufferIterator<'a, D> {
 ///
 /// Errors encountered during these operations in `drop` are logged to `stderr`
 /// (as panicking in `drop` is generally discouraged).
-impl<D: AudioDevice + 'static> Drop for AudioCapture<D> {
+impl Drop for AudioCapture {
     fn drop(&mut self) {
         if self.is_running.load(Ordering::SeqCst) {
             if let Err(e) = self.stop() {
@@ -1596,7 +1596,7 @@ impl<D: AudioDevice + 'static> Drop for AudioCapture<D> {
 // Manual implementation of Debug for AudioCapture.
 // This is necessary because `AtomicBool` does not implement `Debug`,
 // and to provide a meaningful representation of the device without requiring `D: Debug`.
-impl<D: AudioDevice + 'static> fmt::Debug for AudioCapture<D> {
+impl fmt::Debug for AudioCapture {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         let device_name = self
             .device

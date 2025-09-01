@@ -1,8 +1,7 @@
-# DISABLED - Focusing on Linux PipeWire workflow only
-# name: Windows Audio Tests
+name: Windows Audio Tests
 
-# on:
-#   workflow_call:
+on:
+  workflow_call:
     inputs:
       debug_enabled:
         description: "Enable debug output"
@@ -27,26 +26,28 @@ jobs:
       - name: Setup Windows SDK
         uses: microsoft/setup-msbuild@v1.3
 
-      - name: Install test applications
+      - name: Install VLC
         run: |
-          # Install VLC using Chocolatey
+          Write-Host "Installing VLC using Chocolatey..."
           choco install vlc -y
+          Write-Host "VLC installation completed"
         shell: pwsh
 
       - name: Debug Info
-        if: env.DEBUG == true
+        if: env.DEBUG == 'true'
         run: |
+          Write-Host "=== System Information ==="
           rustc --version --verbose
           cargo --version --verbose
-          cargo tree
-          Get-CimInstance Win32_SoundDevice | Format-List *
+          Write-Host "=== Audio Devices ==="
+          Get-CimInstance Win32_SoundDevice | Format-List Name, Status, Manufacturer
+          Write-Host "=== VLC Installation ==="
+          if (Test-Path "${env:ProgramFiles}\VideoLAN\VLC\vlc.exe") {
+            Write-Host "VLC found at: ${env:ProgramFiles}\VideoLAN\VLC\vlc.exe"
+          } else {
+            Write-Host "VLC not found in standard location"
+          }
         shell: pwsh
-
-      - name: Download test audio
-        run: |
-          mkdir -p test_audio
-          curl -L "https://ia800901.us.archive.org/23/items/gd70-02-14.early-late.sbd.cotsman.18115.sbeok.shnf/gd70-02-14d1t02.mp3" -o "test_audio/sample.mp3"
-        shell: bash
 
       - name: Cache dependencies
         uses: actions/cache@v3
@@ -57,110 +58,38 @@ jobs:
             target
           key: ${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.lock') }}
 
-      - name: Build
-        run: cargo build --verbose
-        env:
-          WINAPI_NO_BUNDLED_LIBRARIES: 1
-
-      - name: Build examples
-        run: cargo build --examples
-        env:
-          WINAPI_NO_BUNDLED_LIBRARIES: 1
-
-      - name: Test Enhanced WASAPI Device Enumeration
+      - name: Build Windows features
         run: |
-          Write-Host "Testing enhanced WASAPI device enumeration with wasapi-rs optimizations..."
-          cargo run --example windows_device_test --features feat_windows
+          Write-Host "Building Windows audio capture with WASAPI support..."
+          cargo build --no-default-features --features feat_windows --verbose
         shell: pwsh
-        env:
-          WINAPI_NO_BUNDLED_LIBRARIES: 1
 
-      - name: Test audio capture
+      - name: Build dynamic VLC capture
         run: |
-          # Start test applications
-          Write-Host "Starting VLC with test audio..."
-          $vlcProcess = Start-Process -NoNewWindow "C:\Program Files\VideoLAN\VLC\vlc.exe" -ArgumentList "--intf", "dummy", "--no-video", "test_audio/sample.mp3" -PassThru
-
-          # Start test tone in background
-          $testTone = Start-Process -NoNewWindow cargo -ArgumentList "run", "--example", "test_tone" -PassThru
-
-          try {
-              # Wait for processes to initialize
-              Start-Sleep -Seconds 5
-
-              # Test system-wide capture
-              Write-Host "Testing system-wide capture..."
-              cargo run --example test_windows -- --duration 5 --output system_capture.wav
-
-              # Test application-specific capture (VLC)
-              Write-Host "Testing application-specific capture..."
-              cargo run --example test_windows -- --duration 5 --output vlc_capture.wav --application vlc
-
-              # Test exclusive mode capture
-              Write-Host "Testing exclusive mode capture..."
-              cargo run --example test_windows -- --duration 5 --output exclusive_capture.wav --exclusive-mode
-
-              # Test concurrent capture
-              Write-Host "Testing concurrent capture..."
-              $concurrentSys = Start-Process -NoNewWindow cargo -ArgumentList "run", "--example", "test_windows", "--", "--duration", "5", "--output", "concurrent_system.wav" -PassThru
-              $concurrentApp = Start-Process -NoNewWindow cargo -ArgumentList "run", "--example", "test_windows", "--", "--duration", "5", "--output", "concurrent_app.wav", "--application", "vlc" -PassThru
-
-              Wait-Process -Id $concurrentSys.Id
-              Wait-Process -Id $concurrentApp.Id
-
-              # Test different audio formats
-              foreach ($format in @("f32le", "s16le", "s32le")) {
-                  Write-Host "Testing $format format capture..."
-                  cargo run --example test_windows -- --duration 5 --output "format_${format}_capture.wav" --format $format
-              }
-
-              # Verify captures
-              $captureFiles = @(
-                  "system_capture.wav",
-                  "vlc_capture.wav",
-                  "exclusive_capture.wav",
-                  "concurrent_system.wav",
-                  "concurrent_app.wav",
-                  "format_f32le_capture.wav",
-                  "format_s16le_capture.wav",
-                  "format_s32le_capture.wav"
-              )
-
-              foreach ($file in $captureFiles) {
-                  if (!(Test-Path $file)) {
-                      throw "Capture failed - $file not created"
-                  }
-
-                  $capturedSize = (Get-Item $file).Length
-                  if ($capturedSize -eq 0) {
-                      throw "Capture failed - $file is empty"
-                  }
-
-                  Write-Host "Successfully captured $capturedSize bytes of audio in $file"
-              }
-          }
-          finally {
-              # Clean up test processes
-              $processes = @($testTone, $vlcProcess)
-              foreach ($proc in $processes) {
-                  if ($proc) {
-                      Stop-Process -Id $proc.Id -Force -ErrorAction SilentlyContinue
-                  }
-              }
-          }
+          Write-Host "Building dynamic VLC capture binary..."
+          cargo build --bin dynamic_vlc_capture --no-default-features --features feat_windows --verbose
         shell: pwsh
-        env:
-          WINAPI_NO_BUNDLED_LIBRARIES: 1
+
+      - name: Test Windows device enumeration
+        run: |
+          Write-Host "Testing Windows audio device enumeration..."
+          cargo run --example windows_device_test --no-default-features --features feat_windows
+        shell: pwsh
+
+      - name: Test VLC audio capture
+        run: |
+          Write-Host "Running Windows VLC audio capture test..."
+          powershell -ExecutionPolicy Bypass -File "scripts/test-vlc-capture-windows.ps1"
+        shell: pwsh
 
       - name: Upload test artifacts
         uses: actions/upload-artifact@v4
         with:
           name: windows-audio-test-results
           path: |
-            system_capture.wav
-            vlc_capture.wav
-            exclusive_capture.wav
-            concurrent_system.wav
-            concurrent_app.wav
-            format_*.wav
-            test_audio/sample.mp3
+            dynamic_vlc_capture.wav
+            flexible_test.log
+            vlc_capture_test.log
+            vlc_capture_test_error.log
+            process_tracking.log
+        if: always()
