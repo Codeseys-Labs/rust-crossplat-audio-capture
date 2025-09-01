@@ -1,4 +1,7 @@
 use std::fmt;
+use std::ffi::OsString;
+use std::collections::VecDeque;
+use sysinfo::{ProcessRefreshKind, ProcessesToUpdate, RefreshKind, System};
 
 #[cfg(target_os = "windows")]
 use wasapi::*;

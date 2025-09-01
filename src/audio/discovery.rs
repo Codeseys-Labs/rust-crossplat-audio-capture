@@ -1,9 +1,9 @@
-use log::{debug, info, warn};
+use log::{debug, info};
 use std::collections::HashMap;
-use std::process::Command;
+use sysinfo::System;
 
 #[cfg(target_os = "linux")]
-use sysinfo::System;
+use std::process::Command;
 
 #[derive(Debug, Clone)]
 struct ProcessInfo {
