@@ -2,10 +2,13 @@
 use rsac::{
     // Trait-based API
     get_audio_backend,
-    AudioConfig,
+    // Core types (re-exported from lib.rs)
     AudioFormat,
+    LatencyMode,
     // Legacy ProcessAudioCapture API
     ProcessAudioCapture,
+    SampleFormat,
+    StreamConfig,
 };
 use std::{fs::File, io::Write, process::Command, thread, time::Duration};
 
@@ -59,10 +62,15 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         println!("\nCapturing audio from: {}", app.name);
 
         // Create audio configuration
-        let config = AudioConfig {
-            sample_rate: 48000,
-            channels: 2,
-            format: AudioFormat::F32LE,
+        let config = StreamConfig {
+            format: AudioFormat {
+                sample_rate: 48000,
+                channels: 2,
+                bits_per_sample: 32,
+                sample_format: SampleFormat::F32LE,
+            },
+            buffer_size_frames: None,             // Use default buffer size
+            latency_mode: LatencyMode::default(), // Use default latency mode
         };
 
         // Create capture stream

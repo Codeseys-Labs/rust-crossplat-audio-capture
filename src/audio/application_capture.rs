@@ -125,7 +125,7 @@ impl ApplicationCaptureFactory {
     pub fn create_for_process_id(process_id: u32) -> Result<CrossPlatformApplicationCapture, Box<dyn std::error::Error>> {
         #[cfg(all(target_os = "windows", feature = "feat_windows"))]
         {
-            let mut capture = WindowsApplicationCapture::new(process_id, false);
+            let mut capture = WindowsApplicationCapture::new(process_id, false)?;
             capture.initialize()?;
             Ok(CrossPlatformApplicationCapture::Windows(capture))
         }

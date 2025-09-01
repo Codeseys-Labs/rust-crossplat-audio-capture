@@ -1,6 +1,6 @@
-use std::fmt;
-use std::ffi::OsString;
 use std::collections::VecDeque;
+use std::ffi::OsString;
+use std::fmt;
 use sysinfo::{ProcessRefreshKind, ProcessesToUpdate, RefreshKind, System};
 
 #[cfg(target_os = "windows")]
@@ -119,15 +119,13 @@ impl ProcessAudioCapture {
             AudioClient::new_application_loopback_client(self.target_pid, include_tree)
                 .map_err(|e| AudioCaptureError::InitializationError(e.to_string()))?;
 
-        // Initialize audio client
+        // Initialize audio client with correct wasapi-rs signature
+        let stream_mode = wasapi::StreamMode::EventsShared {
+            autoconvert,
+            buffer_duration_hns: 0,
+        };
         audio_client
-            .initialize_client(
-                &self.format,
-                0,
-                &Direction::Capture,
-                &ShareMode::Shared,
-                autoconvert,
-            )
+            .initialize_client(&self.format, &Direction::Capture, &stream_mode)
             .map_err(|e| AudioCaptureError::InitializationError(e.to_string()))?;
 
         // Get capture client
@@ -166,7 +164,7 @@ impl ProcessAudioCapture {
         if let Some(capture_client) = &self.capture_client {
             let mut sample_queue: VecDeque<u8> = VecDeque::new();
             let new_frames = capture_client
-                .get_next_nbr_frames()
+                .get_next_packet_size()
                 .map_err(|e| AudioCaptureError::WasapiError(e.to_string()))?
                 .unwrap_or(0);
 

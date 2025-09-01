@@ -18,8 +18,7 @@ use std::error::Error;
 use std::ffi::OsStr;
 use std::fs::File;
 use std::io::Write;
-use std::sync::mpsc;
-use std::thread;
+// Removed unused imports: std::sync::mpsc, std::thread
 use std::time::{Duration, Instant};
 
 #[cfg(target_os = "windows")]
@@ -35,7 +34,7 @@ fn find_process_by_name(process_name: &str) -> Option<u32> {
     let refreshes = RefreshKind::nothing().with_processes(ProcessRefreshKind::everything());
     let system = System::new_with_specifics(refreshes);
     let process_ids = system.processes_by_name(OsStr::new(process_name));
-    
+
     for process in process_ids {
         // Use parent process ID if available for better capture coverage
         let pid = process.parent().unwrap_or(process.pid()).as_u32();
@@ -46,18 +45,17 @@ fn find_process_by_name(process_name: &str) -> Option<u32> {
 }
 
 #[cfg(target_os = "windows")]
-fn capture_application_audio(
-    process_id: u32,
-    duration_secs: u64,
-    output_file: &str,
-) -> Result<()> {
+fn capture_application_audio(process_id: u32, duration_secs: u64, output_file: &str) -> Result<()> {
     println!("🎵 Starting Windows application audio capture");
     println!("Target Process ID: {}", process_id);
     println!("Duration: {} seconds", duration_secs);
     println!("Output file: {}", output_file);
 
     // Initialize COM for WASAPI
-    initialize_mta()?;
+    let hr = initialize_mta();
+    if hr.is_err() {
+        return Err(format!("Failed to initialize COM: {:?}", hr).into());
+    }
 
     // Configure audio format - 48kHz, 32-bit float, stereo
     let desired_format = WaveFormat::new(32, 32, &SampleType::Float, 48000, 2, None);
@@ -67,14 +65,14 @@ fn capture_application_audio(
     // Create application loopback client
     let include_tree = true; // Capture entire process tree
     let mut audio_client = AudioClient::new_application_loopback_client(process_id, include_tree)?;
-    
+
     // Initialize client with event-driven shared mode
     let autoconvert = true;
     let mode = StreamMode::EventsShared {
         autoconvert,
         buffer_duration_hns: 0, // Use default buffer size
     };
-    
+
     audio_client.initialize_client(&desired_format, &Direction::Capture, &mode)?;
     println!("✅ Audio client initialized");
 
@@ -107,26 +105,28 @@ fn capture_application_audio(
             for element in chunk.iter_mut() {
                 *element = sample_queue.pop_front().unwrap();
             }
-            
+
             // Calculate peak level for monitoring
-            if desired_format.get_sampletype() == SampleType::Float {
+            // Note: Assuming float format based on our configuration above
+            if true {
+                // desired_format uses SampleType::Float as configured
                 let float_samples: &[f32] = unsafe {
-                    std::slice::from_raw_parts(
-                        chunk.as_ptr() as *const f32,
-                        chunk.len() / 4,
-                    )
+                    std::slice::from_raw_parts(chunk.as_ptr() as *const f32, chunk.len() / 4)
                 };
                 let chunk_peak = float_samples.iter().map(|s| s.abs()).fold(0.0f32, f32::max);
                 peak_level = peak_level.max(chunk_peak);
             }
-            
+
             outfile.write_all(&chunk)?;
             total_samples += chunksize as u64;
-            
+
             // Progress update every 50k samples (~1 second at 48kHz)
             if total_samples % 50000 == 0 {
                 let elapsed = start_time.elapsed().as_secs_f32();
-                println!("📊 {:.1}s - {} samples, peak: {:.3}", elapsed, total_samples, peak_level);
+                println!(
+                    "📊 {:.1}s - {} samples, peak: {:.3}",
+                    elapsed, total_samples, peak_level
+                );
             }
         }
 
@@ -148,7 +148,7 @@ fn capture_application_audio(
 
     // Stop recording
     audio_client.stop_stream()?;
-    
+
     // Flush remaining samples
     while !sample_queue.is_empty() {
         let chunk_size = std::cmp::min(sample_queue.len(), blockalign as usize * chunksize);
@@ -164,7 +164,7 @@ fn capture_application_audio(
     println!("Total samples captured: {}", total_samples);
     println!("Peak level: {:.3}", peak_level);
     println!("Duration: {:.2}s", start_time.elapsed().as_secs_f32());
-    
+
     Ok(())
 }
 
@@ -214,6 +214,6 @@ fn main() -> Result<()> {
 
     println!("\n🎯 Windows application capture examples completed!");
     println!("Raw audio files saved - use audio software to convert to WAV/MP3");
-    
+
     Ok(())
 }

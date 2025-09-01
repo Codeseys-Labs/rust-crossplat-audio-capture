@@ -34,9 +34,9 @@ pub use capture::{AudioCaptureError, ProcessAudioCapture};
 
 // Re-export the unified application capture API
 pub use application_capture::{
-    ApplicationCapture, CrossPlatformApplicationCapture, ApplicationInfo,
-    ApplicationCaptureFactory, capture_application_by_pid, capture_application_by_name,
-    list_capturable_applications,
+    capture_application_by_name, capture_application_by_pid, list_capturable_applications,
+    ApplicationCapture, ApplicationCaptureFactory, ApplicationInfo,
+    CrossPlatformApplicationCapture,
 };
 
 // Re-export platform-specific DeviceEnumerators
@@ -122,7 +122,11 @@ pub use windows::WasapiBackend; // Old backend
 pub fn get_audio_backend() -> crate::core::error::Result<Box<dyn AudioCaptureBackend>> {
     #[cfg(all(target_os = "windows", feature = "feat_windows"))]
     {
-        Ok(Box::new(windows::WasapiBackend::new(1234, true)?))
+        // WasapiBackend is an alias for WindowsApplicationCapture, which needs parameters
+        // Using default values for legacy compatibility
+        let backend = windows::WasapiBackend::new(0, false)
+            .map_err(|e| crate::core::error::AudioError::BackendError(e.to_string()))?;
+        Ok(Box::new(backend))
     }
     #[cfg(all(target_os = "linux", feature = "feat_linux"))]
     {
