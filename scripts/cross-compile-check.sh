@@ -25,7 +25,7 @@ check_target() {
     echo "Features: $features"
     echo "----------------------------------------"
     
-    if cargo check --target "$target" --no-default-features --features "$features" --examples; then
+    if cross check --target "$target" --no-default-features --features "$features" --examples; then
         echo -e "${GREEN}✅ SUCCESS: $description${NC}"
         return 0
     else
