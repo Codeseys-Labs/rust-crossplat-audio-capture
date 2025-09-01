@@ -8,6 +8,13 @@ on:
         required: false
         type: boolean
         default: false
+  workflow_dispatch:
+    inputs:
+      debug_enabled:
+        description: "Enable debug output"
+        required: false
+        type: boolean
+        default: false
 
 env:
   CARGO_TERM_COLOR: always
