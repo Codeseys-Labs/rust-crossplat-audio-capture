@@ -1,0 +1,358 @@
+name: Windows Audio Simple Debug - No Driver Installation
+
+on:
+  workflow_dispatch:
+    inputs:
+      test_duration:
+        description: 'Test duration in seconds'
+        required: false
+        default: '10'
+        type: string
+
+env:
+  CARGO_TERM_COLOR: always
+  DEBUG: true
+
+jobs:
+  windows_simple_audio_debug:
+    name: Windows Simple Audio Debug (No Driver Install)
+    runs-on: windows-latest
+    
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache cargo registry
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target/
+          key: ${{ runner.os }}-cargo-simple-debug-${{ hashFiles('**/Cargo.lock') }}
+
+      - name: System Audio Analysis
+        shell: powershell
+        run: |
+          Write-Host "[INFO] === WINDOWS AUDIO SYSTEM ANALYSIS ===" -ForegroundColor Cyan
+          
+          Write-Host "[INFO] Windows Version:" -ForegroundColor Blue
+          Get-ComputerInfo | Select-Object WindowsProductName, WindowsVersion | Format-List
+          
+          Write-Host "[INFO] Windows Audio Service Status:" -ForegroundColor Blue
+          $audioService = Get-Service -Name "AudioSrv" -ErrorAction SilentlyContinue
+          if ($audioService) {
+            Write-Host "  Status: $($audioService.Status)" -ForegroundColor Gray
+            Write-Host "  StartType: $($audioService.StartType)" -ForegroundColor Gray
+          } else {
+            Write-Host "  [ERROR] Audio service not found" -ForegroundColor Red
+          }
+          
+          Write-Host "[INFO] Audio Devices (WMI):" -ForegroundColor Blue
+          try {
+            $audioDevices = Get-WmiObject -Class Win32_SoundDevice -ErrorAction Stop
+            if ($audioDevices) {
+              Write-Host "  Found $($audioDevices.Count) audio device(s):" -ForegroundColor Green
+              $audioDevices | ForEach-Object {
+                Write-Host "    - $($_.Name) (Status: $($_.Status))" -ForegroundColor Gray
+              }
+            } else {
+              Write-Host "  [WARN] No audio devices found via WMI" -ForegroundColor Yellow
+            }
+          } catch {
+            Write-Host "  [ERROR] Failed to enumerate audio devices: $_" -ForegroundColor Red
+          }
+          
+          Write-Host "[INFO] PnP Audio Devices:" -ForegroundColor Blue
+          try {
+            $pnpDevices = Get-PnpDevice | Where-Object { 
+              $_.Class -eq "MEDIA" -or 
+              $_.Class -eq "AudioEndpoint" -or 
+              $_.FriendlyName -like "*Audio*" -or 
+              $_.FriendlyName -like "*Sound*"
+            }
+            if ($pnpDevices) {
+              Write-Host "  Found $($pnpDevices.Count) PnP audio device(s):" -ForegroundColor Green
+              $pnpDevices | ForEach-Object {
+                Write-Host "    - $($_.FriendlyName) (Status: $($_.Status))" -ForegroundColor Gray
+              }
+            } else {
+              Write-Host "  [WARN] No PnP audio devices found" -ForegroundColor Yellow
+            }
+          } catch {
+            Write-Host "  [ERROR] Failed to check PnP devices: $_" -ForegroundColor Red
+          }
+
+      - name: Build Rust Components
+        run: |
+          echo "[INFO] Building Rust audio capture components..."
+          cargo build --lib --no-default-features --features feat_windows --verbose
+          cargo build --bin dynamic_vlc_capture --no-default-features --features feat_windows --verbose
+
+      - name: Test Application Discovery (No VLC)
+        shell: powershell
+        run: |
+          Write-Host "[INFO] === APPLICATION DISCOVERY TEST ===" -ForegroundColor Cyan
+          Write-Host "[INFO] Testing our application discovery without VLC..." -ForegroundColor Blue
+          
+          # Test our Rust application discovery
+          try {
+            Write-Host "[INFO] Running application discovery test..." -ForegroundColor Blue
+            $discoveryOutput = & ".\target\debug\dynamic_vlc_capture.exe" "1" 2>&1
+            
+            Write-Host "[INFO] Discovery output:" -ForegroundColor Blue
+            $discoveryOutput | ForEach-Object { 
+              Write-Host "  $_" -ForegroundColor Gray 
+            }
+            
+            # Analyze the output
+            $foundApps = $discoveryOutput | Select-String "Found.*capturable applications"
+            if ($foundApps) {
+              Write-Host "[OK] Application discovery is working" -ForegroundColor Green
+            } else {
+              Write-Host "[WARN] Application discovery may have issues" -ForegroundColor Yellow
+            }
+            
+            # Check for our process exclusion logic
+            $ownProcess = $discoveryOutput | Select-String "Skipping our own process"
+            if ($ownProcess) {
+              Write-Host "[OK] Own process exclusion is working" -ForegroundColor Green
+            } else {
+              Write-Host "[INFO] Own process exclusion not triggered (no VLC-like processes)" -ForegroundColor Blue
+            }
+            
+          } catch {
+            Write-Host "[ERROR] Failed to run discovery test: $_" -ForegroundColor Red
+          }
+
+      - name: Install VLC for Testing
+        shell: powershell
+        timeout-minutes: 5
+        run: |
+          Write-Host "[INFO] === VLC INSTALLATION ===" -ForegroundColor Cyan
+          
+          # Use a smaller, faster VLC download
+          $vlcUrl = "https://get.videolan.org/vlc/3.0.21/win64/vlc-3.0.21-win64.exe"
+          $vlcInstaller = "vlc-installer.exe"
+          
+          Write-Host "[INFO] Downloading VLC (this may take a few minutes)..." -ForegroundColor Blue
+          try {
+            Invoke-WebRequest -Uri $vlcUrl -OutFile $vlcInstaller -TimeoutSec 300
+            Write-Host "[OK] VLC downloaded successfully" -ForegroundColor Green
+            
+            Write-Host "[INFO] Installing VLC silently..." -ForegroundColor Blue
+            $installProcess = Start-Process -FilePath $vlcInstaller -ArgumentList "/S" -PassThru -Wait
+            
+            if ($installProcess.ExitCode -eq 0) {
+              Write-Host "[OK] VLC installation completed" -ForegroundColor Green
+            } else {
+              Write-Host "[WARN] VLC installation may have failed (exit code: $($installProcess.ExitCode))" -ForegroundColor Yellow
+            }
+          } catch {
+            Write-Host "[ERROR] VLC installation failed: $_" -ForegroundColor Red
+            Write-Host "[INFO] Continuing without VLC..." -ForegroundColor Blue
+          }
+
+      - name: Test VLC Audio Capabilities
+        shell: powershell
+        timeout-minutes: 3
+        continue-on-error: true
+        run: |
+          Write-Host "[INFO] === VLC AUDIO CAPABILITIES TEST ===" -ForegroundColor Cyan
+          
+          # Find VLC
+          $vlcPaths = @(
+            "${env:ProgramFiles}\VideoLAN\VLC\vlc.exe",
+            "${env:ProgramFiles(x86)}\VideoLAN\VLC\vlc.exe"
+          )
+          
+          $vlcPath = $null
+          foreach ($path in $vlcPaths) {
+            if (Test-Path $path) {
+              $vlcPath = $path
+              break
+            }
+          }
+          
+          if (-not $vlcPath) {
+            Write-Host "[WARN] VLC not found, skipping VLC tests" -ForegroundColor Yellow
+            return
+          }
+          
+          Write-Host "[OK] Found VLC at: $vlcPath" -ForegroundColor Green
+          
+          # Test VLC audio device detection (without actually playing)
+          Write-Host "[INFO] Testing VLC audio device detection..." -ForegroundColor Blue
+          
+          try {
+            # Run VLC with audio device listing
+            $vlcArgs = @(
+              "--intf", "dummy",
+              "--list", "aout",
+              "--verbose", "1",
+              "vlc://quit"
+            )
+            
+            Write-Host "[INFO] Running VLC audio device detection..." -ForegroundColor Blue
+            $vlcOutput = & $vlcPath $vlcArgs 2>&1
+            
+            Write-Host "[INFO] VLC audio output modules:" -ForegroundColor Blue
+            $vlcOutput | Where-Object { $_ -like "*audio output*" -or $_ -like "*aout*" } | ForEach-Object {
+              Write-Host "  $_" -ForegroundColor Gray
+            }
+            
+            # Check for audio errors
+            $audioErrors = $vlcOutput | Where-Object { $_ -like "*error*" -and $_ -like "*audio*" }
+            if ($audioErrors) {
+              Write-Host "[WARN] VLC audio errors detected:" -ForegroundColor Yellow
+              $audioErrors | ForEach-Object {
+                Write-Host "  $_" -ForegroundColor Gray
+              }
+            } else {
+              Write-Host "[OK] No obvious VLC audio errors detected" -ForegroundColor Green
+            }
+            
+          } catch {
+            Write-Host "[ERROR] VLC audio test failed: $_" -ForegroundColor Red
+          }
+
+      - name: Test Rust Capture with VLC (if available)
+        shell: powershell
+        timeout-minutes: 3
+        continue-on-error: true
+        run: |
+          Write-Host "[INFO] === RUST CAPTURE TEST WITH VLC ===" -ForegroundColor Cyan
+          
+          # Check if VLC is available
+          $vlcPaths = @(
+            "${env:ProgramFiles}\VideoLAN\VLC\vlc.exe",
+            "${env:ProgramFiles(x86)}\VideoLAN\VLC\vlc.exe"
+          )
+          
+          $vlcPath = $null
+          foreach ($path in $vlcPaths) {
+            if (Test-Path $path) {
+              $vlcPath = $path
+              break
+            }
+          }
+          
+          if (-not $vlcPath) {
+            Write-Host "[WARN] VLC not available, skipping capture test" -ForegroundColor Yellow
+            return
+          }
+          
+          Write-Host "[INFO] Starting VLC in background for capture test..." -ForegroundColor Blue
+          
+          try {
+            # Start VLC with a simple audio file (but expect it to fail due to no audio devices)
+            $vlcArgs = @(
+              "--intf", "dummy",
+              "--verbose", "2",
+              "--extraintf", "logger",
+              "--logfile", "vlc_simple_test.log",
+              "https://www.soundjay.com/misc/sounds/bell-ringing-05.wav",
+              "--run-time", "${{ inputs.test_duration || '10' }}"
+            )
+            
+            $vlcProcess = Start-Process -FilePath $vlcPath -ArgumentList $vlcArgs -PassThru
+            Write-Host "[INFO] VLC started with PID: $($vlcProcess.Id)" -ForegroundColor Blue
+            
+            # Wait a moment for VLC to start
+            Start-Sleep -Seconds 2
+            
+            # Test our Rust capture
+            Write-Host "[INFO] Testing Rust audio capture..." -ForegroundColor Blue
+            $captureOutput = & ".\target\debug\dynamic_vlc_capture.exe" "${{ inputs.test_duration || '10' }}" 2>&1
+            
+            Write-Host "[INFO] Capture test output:" -ForegroundColor Blue
+            $captureOutput | ForEach-Object { 
+              Write-Host "  $_" -ForegroundColor Gray 
+            }
+            
+            # Analyze results
+            if ($captureOutput -like "*VLC capture failed*") {
+              Write-Host "[INFO] Capture failed as expected (no audio devices in CI)" -ForegroundColor Blue
+              
+              # Check if our improved error handling is working
+              if ($captureOutput -like "*Audio device in use or no audio output*") {
+                Write-Host "[OK] Improved error handling is working" -ForegroundColor Green
+              }
+              
+              if ($captureOutput -like "*This often happens when*") {
+                Write-Host "[OK] Helpful error messages are being displayed" -ForegroundColor Green
+              }
+            } else {
+              Write-Host "[WARN] Unexpected capture result" -ForegroundColor Yellow
+            }
+            
+            # Stop VLC
+            try {
+              $vlcProcess.Kill()
+              Write-Host "[INFO] VLC process stopped" -ForegroundColor Blue
+            } catch {
+              Write-Host "[WARN] Could not stop VLC: $_" -ForegroundColor Yellow
+            }
+            
+          } catch {
+            Write-Host "[ERROR] Capture test failed: $_" -ForegroundColor Red
+          }
+
+      - name: Upload Test Artifacts
+        uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: windows-simple-audio-debug
+          path: |
+            *.log
+            *.wav
+          retention-days: 3
+
+      - name: Test Summary
+        if: always()
+        shell: powershell
+        run: |
+          Write-Host "[INFO] === WINDOWS SIMPLE AUDIO DEBUG SUMMARY ===" -ForegroundColor Cyan
+          
+          Write-Host "[INFO] Key Findings:" -ForegroundColor Blue
+          
+          # Check audio service
+          $audioService = Get-Service -Name "AudioSrv" -ErrorAction SilentlyContinue
+          if ($audioService -and $audioService.Status -eq "Running") {
+            Write-Host "  [OK] Windows Audio Service is running" -ForegroundColor Green
+          } else {
+            Write-Host "  [WARN] Windows Audio Service issues detected" -ForegroundColor Yellow
+          }
+          
+          # Check if VLC was installed
+          $vlcInstalled = Test-Path "${env:ProgramFiles}\VideoLAN\VLC\vlc.exe"
+          if ($vlcInstalled) {
+            Write-Host "  [OK] VLC Media Player was installed" -ForegroundColor Green
+          } else {
+            Write-Host "  [WARN] VLC Media Player not found" -ForegroundColor Yellow
+          }
+          
+          # Check if our binary was built
+          $binaryExists = Test-Path ".\target\debug\dynamic_vlc_capture.exe"
+          if ($binaryExists) {
+            Write-Host "  [OK] Rust audio capture binary built successfully" -ForegroundColor Green
+          } else {
+            Write-Host "  [ERROR] Rust audio capture binary not found" -ForegroundColor Red
+          }
+          
+          # Check for logs
+          if (Test-Path "vlc_simple_test.log") {
+            $logSize = (Get-Item "vlc_simple_test.log").Length
+            Write-Host "  [OK] VLC test log generated ($logSize bytes)" -ForegroundColor Green
+          }
+          
+          Write-Host "[INFO] This test focused on what we can actually validate in CI:" -ForegroundColor Blue
+          Write-Host "  - Audio system analysis without driver installation" -ForegroundColor Gray
+          Write-Host "  - Application discovery and process detection logic" -ForegroundColor Gray
+          Write-Host "  - VLC installation and basic audio capabilities" -ForegroundColor Gray
+          Write-Host "  - Rust capture error handling in no-audio environments" -ForegroundColor Gray
+          
+          Write-Host "[INFO] Simple debug test completed!" -ForegroundColor Cyan
