@@ -17,13 +17,16 @@ use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::Duration;
 
-#[cfg(target_os = "linux")]
+#[cfg(all(target_os = "linux", feature = "feat_linux"))]
 use rsac::audio::linux::pipewire::{ApplicationSelector, PipeWireApplicationCapture};
 
-#[cfg(target_os = "linux")]
+#[cfg(all(target_os = "linux", feature = "feat_linux"))]
 use rsac::audio::discovery::AudioSourceDiscovery;
 
-#[cfg(target_os = "linux")]
+#[cfg(any(
+    all(target_os = "linux", feature = "feat_linux"),
+    all(target_os = "windows", feature = "feat_windows")
+))]
 use rsac::audio::application_capture::{
     list_capturable_applications, ApplicationCapture, ApplicationCaptureFactory,
 };
@@ -47,7 +50,7 @@ fn main() {
     println!("  Duration: {} seconds", duration);
     println!("  Output file: {}", output_file);
 
-    #[cfg(target_os = "linux")]
+    #[cfg(all(target_os = "linux", feature = "feat_linux"))]
     {
         match run_linux_vlc_capture(duration, &output_file) {
             Ok(_) => {
@@ -61,7 +64,7 @@ fn main() {
         }
     }
 
-    #[cfg(target_os = "windows")]
+    #[cfg(all(target_os = "windows", feature = "feat_windows"))]
     {
         match run_windows_vlc_capture(duration, &output_file) {
             Ok(_) => {
@@ -82,7 +85,7 @@ fn main() {
     }
 }
 
-#[cfg(target_os = "linux")]
+#[cfg(all(target_os = "linux", feature = "feat_linux"))]
 fn run_linux_vlc_capture(
     duration: u64,
     output_file: &str,
@@ -302,7 +305,7 @@ fn run_linux_vlc_capture(
     Ok(())
 }
 
-#[cfg(target_os = "linux")]
+#[cfg(all(target_os = "linux", feature = "feat_linux"))]
 fn try_alternative_vlc_discovery(
     duration: u64,
     output_file: &str,
@@ -444,7 +447,7 @@ fn write_empty_wav_file(output_file: &str) -> Result<(), Box<dyn std::error::Err
     Ok(())
 }
 
-#[cfg(target_os = "windows")]
+#[cfg(all(target_os = "windows", feature = "feat_windows"))]
 fn run_windows_vlc_capture(
     duration: u64,
     output_file: &str,
@@ -500,7 +503,7 @@ fn run_windows_vlc_capture(
     }
 }
 
-#[cfg(target_os = "windows")]
+#[cfg(all(target_os = "windows", feature = "feat_windows"))]
 fn try_windows_vlc_by_process_name(
     duration: u64,
     output_file: &str,
@@ -537,7 +540,7 @@ fn try_windows_vlc_by_process_name(
     Err("Could not find any VLC process to capture from".into())
 }
 
-#[cfg(target_os = "windows")]
+#[cfg(all(target_os = "windows", feature = "feat_windows"))]
 fn run_windows_capture_loop(
     mut capture: rsac::audio::application_capture::CrossPlatformApplicationCapture,
     duration: u64,

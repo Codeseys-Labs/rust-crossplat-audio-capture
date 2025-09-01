@@ -65,10 +65,10 @@ jobs:
             target
           key: ${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.lock') }}
 
-      - name: Build Windows features
+      - name: Build Windows library
         run: |
-          Write-Host "Building Windows audio capture with WASAPI support..."
-          cargo build --no-default-features --features feat_windows --verbose
+          Write-Host "Building Windows audio capture library with WASAPI support..."
+          cargo build --lib --no-default-features --features feat_windows --verbose
         shell: pwsh
 
       - name: Build dynamic VLC capture

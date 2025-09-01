@@ -206,7 +206,7 @@ pub fn get_device_enumerator() -> Result<CrossPlatformDeviceEnumerator, AudioErr
         all(target_os = "macos", feature = "feat_macos")
     )))]
     {
-        Err::<Box<dyn DeviceEnumerator<Device = Box<dyn crate::core::interface::AudioDevice>>>, AudioError>(AudioError::UnsupportedPlatform(
+        Err::<CrossPlatformDeviceEnumerator, AudioError>(AudioError::UnsupportedPlatform(
             "This operating system is not supported for audio capture or the required feature is not enabled.".to_string(),
         ))
     }

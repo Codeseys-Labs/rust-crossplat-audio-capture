@@ -198,10 +198,12 @@ path = "src/bin/dynamic_vlc_capture.rs"
 [[bin]]
 name = "audio_recorder_tui"
 path = "src/bin/audio_recorder_tui.rs"
+required-features = ["feat_linux"]
 
 [[bin]]
 name = "pipewire_diagnostics"
 path = "src/bin/pipewire_diagnostics.rs"
+required-features = ["feat_linux"]
 
 [[example]]
 name = "flexible_pipewire_example"
