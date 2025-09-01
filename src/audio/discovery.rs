@@ -1,4 +1,4 @@
-use log::{debug, info};
+use log::{debug, info, warn};
 use std::collections::HashMap;
 use sysinfo::System;
 
@@ -62,7 +62,9 @@ impl AudioSourceDiscovery {
         })
     }
 
-    pub fn discover_active_audio_sources(&mut self) -> Result<Vec<AudioSource>, Box<dyn std::error::Error>> {
+    pub fn discover_active_audio_sources(
+        &mut self,
+    ) -> Result<Vec<AudioSource>, Box<dyn std::error::Error>> {
         info!("Starting discovery of active audio sources");
 
         // Refresh system information
@@ -109,13 +111,19 @@ impl AudioSourceDiscovery {
         }
 
         info!("Discovered {} audio sources", sources.len());
-        debug!("Audio sources: {:#?}", sources.iter().map(|s| &s.name).collect::<Vec<_>>());
+        debug!(
+            "Audio sources: {:#?}",
+            sources.iter().map(|s| &s.name).collect::<Vec<_>>()
+        );
 
         Ok(sources)
     }
 
     #[cfg(target_os = "linux")]
-    fn discover_linux_audio_sources(&mut self, sources: &mut Vec<AudioSource>) -> Result<(), Box<dyn std::error::Error>> {
+    fn discover_linux_audio_sources(
+        &mut self,
+        sources: &mut Vec<AudioSource>,
+    ) -> Result<(), Box<dyn std::error::Error>> {
         info!("Discovering Linux audio sources via PipeWire");
 
         // Get PipeWire nodes using pw-dump command
@@ -136,13 +144,16 @@ impl AudioSourceDiscovery {
             if let Some(process_info) = audio_processes.iter().find(|p| {
                 // Try to match by application name or process name
                 if let Some(app_name) = &node_info.application_name {
-                    p.name.to_lowercase().contains(&app_name.to_lowercase()) ||
-                    app_name.to_lowercase().contains(&p.name.to_lowercase())
+                    p.name.to_lowercase().contains(&app_name.to_lowercase())
+                        || app_name.to_lowercase().contains(&p.name.to_lowercase())
                 } else {
                     false
                 }
             }) {
-                let source_type = if process_tree.get(&process_info.pid).map_or(false, |children| !children.is_empty()) {
+                let source_type = if process_tree
+                    .get(&process_info.pid)
+                    .map_or(false, |children| !children.is_empty())
+                {
                     AudioSourceType::ProcessTree
                 } else {
                     AudioSourceType::Application
@@ -162,13 +173,18 @@ impl AudioSourceDiscovery {
         }
 
         // Add high-priority audio processes that don't have PipeWire nodes yet
-        let high_priority_apps = vec!["vlc", "firefox", "chrome", "chromium", "spotify", "discord", "obs"];
+        let high_priority_apps = vec![
+            "vlc", "firefox", "chrome", "chromium", "spotify", "discord", "obs",
+        ];
 
         for process in &audio_processes {
-            if !active_sources.iter().any(|s| s.node.process_id == Some(process.pid)) {
-                let is_high_priority = high_priority_apps.iter().any(|&app|
-                    process.name.to_lowercase().contains(app)
-                );
+            if !active_sources
+                .iter()
+                .any(|s| s.node.process_id == Some(process.pid))
+            {
+                let is_high_priority = high_priority_apps
+                    .iter()
+                    .any(|&app| process.name.to_lowercase().contains(app));
 
                 if is_high_priority {
                     let icon = self.get_application_icon(&process.name);
@@ -221,7 +237,10 @@ impl AudioSourceDiscovery {
                     // This would be replaced with actual JSON parsing
                     self.parse_pipewire_dump(&json_str, &mut nodes);
                 } else {
-                    warn!("pw-dump failed: {}", String::from_utf8_lossy(&output.stderr));
+                    warn!(
+                        "pw-dump failed: {}",
+                        String::from_utf8_lossy(&output.stderr)
+                    );
                 }
             }
             Err(e) => {
@@ -250,19 +269,22 @@ impl AudioSourceDiscovery {
         ];
 
         for (id, app_name, description) in common_nodes {
-            nodes.insert(id, AudioNode {
+            nodes.insert(
                 id,
-                name: app_name.to_string(),
-                description: description.to_string(),
-                media_class: "Stream/Output/Audio".to_string(),
-                application_name: Some(app_name.to_string()),
-                process_id: None, // Would be filled from actual parsing
-                is_active: true,
-                channels: Some(2),
-                sample_rate: Some(48000),
-                parent_process: None,
-                children: Vec::new(),
-            });
+                AudioNode {
+                    id,
+                    name: app_name.to_string(),
+                    description: description.to_string(),
+                    media_class: "Stream/Output/Audio".to_string(),
+                    application_name: Some(app_name.to_string()),
+                    process_id: None, // Would be filled from actual parsing
+                    is_active: true,
+                    channels: Some(2),
+                    sample_rate: Some(48000),
+                    parent_process: None,
+                    children: Vec::new(),
+                },
+            );
         }
     }
 
@@ -276,19 +298,22 @@ impl AudioSourceDiscovery {
         ];
 
         for (id, app_name, display_name) in fallback_nodes {
-            nodes.insert(id, AudioNode {
+            nodes.insert(
                 id,
-                name: display_name.to_string(),
-                description: format!("Audio from {}", display_name),
-                media_class: "Stream/Output/Audio".to_string(),
-                application_name: Some(app_name.to_string()),
-                process_id: None,
-                is_active: true,
-                channels: Some(2),
-                sample_rate: Some(48000),
-                parent_process: None,
-                children: Vec::new(),
-            });
+                AudioNode {
+                    id,
+                    name: display_name.to_string(),
+                    description: format!("Audio from {}", display_name),
+                    media_class: "Stream/Output/Audio".to_string(),
+                    application_name: Some(app_name.to_string()),
+                    process_id: None,
+                    is_active: true,
+                    channels: Some(2),
+                    sample_rate: Some(48000),
+                    parent_process: None,
+                    children: Vec::new(),
+                },
+            );
         }
     }
 
@@ -297,25 +322,61 @@ impl AudioSourceDiscovery {
 
         // Common audio applications to look for
         let audio_app_names = vec![
-            "vlc", "firefox", "chrome", "chromium", "spotify", "discord",
-            "obs", "audacity", "pulseaudio", "pipewire", "jack", "alsa",
-            "mpv", "mplayer", "rhythmbox", "totem", "banshee", "clementine",
-            "amarok", "deadbeef", "cmus", "mpd", "ncmpcpp", "pavucontrol",
-            "qpwgraph", "helvum", "carla", "ardour", "reaper", "bitwig",
-            "steam", "lutris", "wine", "zoom", "teams", "skype", "telegram",
+            "vlc",
+            "firefox",
+            "chrome",
+            "chromium",
+            "spotify",
+            "discord",
+            "obs",
+            "audacity",
+            "pulseaudio",
+            "pipewire",
+            "jack",
+            "alsa",
+            "mpv",
+            "mplayer",
+            "rhythmbox",
+            "totem",
+            "banshee",
+            "clementine",
+            "amarok",
+            "deadbeef",
+            "cmus",
+            "mpd",
+            "ncmpcpp",
+            "pavucontrol",
+            "qpwgraph",
+            "helvum",
+            "carla",
+            "ardour",
+            "reaper",
+            "bitwig",
+            "steam",
+            "lutris",
+            "wine",
+            "zoom",
+            "teams",
+            "skype",
+            "telegram",
         ];
 
         for (pid, process) in self.system.processes() {
             let process_name = process.name().to_string_lossy().to_lowercase();
-            let cmd_vec: Vec<String> = process.cmd().iter()
+            let cmd_vec: Vec<String> = process
+                .cmd()
+                .iter()
                 .map(|s| s.to_string_lossy().to_string())
                 .collect();
             let cmd = cmd_vec.join(" ").to_lowercase();
 
             // Check if this process is likely to use audio
-            let is_audio_process = audio_app_names.iter().any(|&app| {
-                process_name.contains(app) || cmd.contains(app)
-            }) || cmd.contains("audio") || cmd.contains("sound") || cmd.contains("music");
+            let is_audio_process = audio_app_names
+                .iter()
+                .any(|&app| process_name.contains(app) || cmd.contains(app))
+                || cmd.contains("audio")
+                || cmd.contains("sound")
+                || cmd.contains("music");
 
             if is_audio_process {
                 audio_processes.push(ProcessInfo {
@@ -336,7 +397,9 @@ impl AudioSourceDiscovery {
 
         for process in processes {
             if let Some(parent_pid) = process.parent_pid {
-                tree.entry(parent_pid).or_insert_with(Vec::new).push(process.pid);
+                tree.entry(parent_pid)
+                    .or_insert_with(Vec::new)
+                    .push(process.pid);
             }
         }
 
@@ -380,7 +443,11 @@ impl AudioSourceDiscovery {
         }
     }
 
-    fn format_process_description(&self, process: &ProcessInfo, tree: &HashMap<u32, Vec<u32>>) -> String {
+    fn format_process_description(
+        &self,
+        process: &ProcessInfo,
+        tree: &HashMap<u32, Vec<u32>>,
+    ) -> String {
         let mut parts = Vec::new();
 
         parts.push(format!("PID: {}", process.pid));
@@ -397,7 +464,10 @@ impl AudioSourceDiscovery {
     }
 
     #[cfg(target_os = "windows")]
-    fn discover_windows_audio_sources(&mut self, sources: &mut Vec<AudioSource>) -> Result<(), Box<dyn std::error::Error>> {
+    fn discover_windows_audio_sources(
+        &mut self,
+        sources: &mut Vec<AudioSource>,
+    ) -> Result<(), Box<dyn std::error::Error>> {
         info!("Discovering Windows audio sources via WASAPI");
 
         // TODO: Implement Windows-specific audio discovery using WASAPI
@@ -405,8 +475,13 @@ impl AudioSourceDiscovery {
 
         // For now, add some common Windows applications
         let windows_apps = vec![
-            "chrome.exe", "firefox.exe", "spotify.exe", "discord.exe",
-            "vlc.exe", "wmplayer.exe", "steam.exe"
+            "chrome.exe",
+            "firefox.exe",
+            "spotify.exe",
+            "discord.exe",
+            "vlc.exe",
+            "wmplayer.exe",
+            "steam.exe",
         ];
 
         for (i, app) in windows_apps.iter().enumerate() {
@@ -438,7 +513,10 @@ impl AudioSourceDiscovery {
     }
 
     #[cfg(target_os = "macos")]
-    fn discover_macos_audio_sources(&mut self, sources: &mut Vec<AudioSource>) -> Result<(), Box<dyn std::error::Error>> {
+    fn discover_macos_audio_sources(
+        &mut self,
+        sources: &mut Vec<AudioSource>,
+    ) -> Result<(), Box<dyn std::error::Error>> {
         info!("Discovering macOS audio sources via Core Audio");
 
         // TODO: Implement macOS-specific audio discovery using Core Audio
@@ -446,8 +524,15 @@ impl AudioSourceDiscovery {
 
         // For now, add some common macOS applications
         let macos_apps = vec![
-            "Safari", "Chrome", "Firefox", "Spotify", "Discord",
-            "VLC", "QuickTime Player", "Music", "Steam"
+            "Safari",
+            "Chrome",
+            "Firefox",
+            "Spotify",
+            "Discord",
+            "VLC",
+            "QuickTime Player",
+            "Music",
+            "Steam",
         ];
 
         for (i, app) in macos_apps.iter().enumerate() {
@@ -523,12 +608,15 @@ mod tests {
     #[test]
     fn test_audio_source_discovery() {
         env_logger::init();
-        
+
         match discover_audio_sources() {
             Ok(sources) => {
                 println!("Discovered {} audio sources:", sources.len());
                 for source in sources {
-                    println!("  - {} ({}): {}", source.name, source.id, source.description);
+                    println!(
+                        "  - {} ({}): {}",
+                        source.name, source.id, source.description
+                    );
                 }
             }
             Err(e) => {

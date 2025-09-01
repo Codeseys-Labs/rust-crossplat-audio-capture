@@ -60,6 +60,8 @@ pub struct WindowsApplicationCapture {
     include_tree: bool,
     // Use wasapi-rs AudioClient for simpler implementation
     audio_client: Option<wasapi::AudioClient>,
+    // Shared flag to signal capture loop to stop
+    should_stop: Arc<AtomicBool>,
 }
 
 impl WindowsApplicationCapture {
@@ -83,6 +85,7 @@ impl WindowsApplicationCapture {
             process_id,
             include_tree,
             audio_client: None,
+            should_stop: Arc::new(AtomicBool::new(false)),
         })
     }
 
@@ -127,6 +130,18 @@ impl WindowsApplicationCapture {
     where
         F: Fn(&[f32]) + Send + 'static,
     {
+        self.start_capture_with_stop_flag(callback, None)
+    }
+
+    /// Start capturing audio with an external stop flag
+    pub fn start_capture_with_stop_flag<F>(
+        &mut self,
+        callback: F,
+        external_stop_flag: Option<Arc<AtomicBool>>,
+    ) -> std::result::Result<(), Box<dyn std::error::Error>>
+    where
+        F: Fn(&[f32]) + Send + 'static,
+    {
         let audio_client = self
             .audio_client
             .as_mut()
@@ -139,11 +154,46 @@ impl WindowsApplicationCapture {
         // Start the audio stream using wasapi-rs
         audio_client.start_stream()?;
 
+        // Reset stop flag at start of capture
+        self.should_stop.store(false, Ordering::SeqCst);
+
         // Simple capture loop based on wasapi-rs examples
+        println!("🔧 [DEBUG] Starting Windows capture loop...");
+        let mut loop_count = 0;
         loop {
-            // Wait for audio data
-            if h_event.wait_for_event(3000).is_err() {
-                break; // Timeout or error
+            loop_count += 1;
+            if loop_count % 100 == 0 {
+                println!("🔧 [DEBUG] Capture loop iteration: {}", loop_count);
+            }
+
+            // Check if we should stop capture (internal flag)
+            if self.should_stop.load(Ordering::SeqCst) {
+                println!("🔧 [DEBUG] Internal stop flag detected, breaking loop");
+                break; // Stop requested
+            }
+
+            // Check external stop flag if provided
+            if let Some(ref external_flag) = external_stop_flag {
+                if external_flag.load(Ordering::SeqCst) {
+                    println!("🔧 [DEBUG] External stop flag detected, breaking loop");
+                    break; // External stop requested
+                }
+            }
+
+            // Wait for audio data (shorter timeout to check stop flag more frequently)
+            if h_event.wait_for_event(100).is_err() {
+                // Check stop flags on timeout too
+                if self.should_stop.load(Ordering::SeqCst) {
+                    println!("🔧 [DEBUG] Internal stop flag detected on timeout, breaking");
+                    break;
+                }
+                if let Some(ref external_flag) = external_stop_flag {
+                    if external_flag.load(Ordering::SeqCst) {
+                        println!("🔧 [DEBUG] External stop flag detected on timeout, breaking");
+                        break;
+                    }
+                }
+                continue; // Continue on timeout, don't break immediately
             }
 
             // Get available packet size
@@ -176,17 +226,32 @@ impl WindowsApplicationCapture {
             }
         }
 
+        println!(
+            "🔧 [DEBUG] Windows capture loop exited after {} iterations",
+            loop_count
+        );
+        println!("🔧 [DEBUG] Cleaning up Windows capture resources...");
+
         Ok(())
     }
 
     /// Stop capturing audio
     pub fn stop_capture(&mut self) -> std::result::Result<(), Box<dyn std::error::Error>> {
+        println!("🔧 [DEBUG] stop_capture() called");
+
+        // Signal the capture loop to stop
+        self.should_stop.store(true, Ordering::SeqCst);
+        println!("🔧 [DEBUG] Set internal stop flag to true");
+
         if let Some(audio_client) = &mut self.audio_client {
+            println!("🔧 [DEBUG] Stopping audio stream...");
             audio_client.stop_stream()?;
+            println!("🔧 [DEBUG] Audio stream stopped");
         }
 
         // Clear the audio client
         self.audio_client = None;
+        println!("🔧 [DEBUG] Audio client cleared");
 
         Ok(())
     }
