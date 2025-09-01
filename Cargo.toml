@@ -125,9 +125,9 @@ ctrlc = "3.4.7"  # For graceful shutdown in examples
 rand = "0.9.2" # For generating test data
 rand_pcg = "0.9.0" # For deterministic random numbers in tests
 
-[[example]]
+[[bin]]
 name = "standardized_test"
-path = "examples/standardized_test.rs"
+path = "src/bin/standardized_test.rs"
 
 [[example]]
 name = "audio_player"
@@ -137,11 +137,6 @@ required-features = ["test-utils"]
 [[example]]
 name = "windows_apis"
 path = "examples/windows_apis.rs"
-
-[[example]]
-name = "macos_application_capture"
-path = "examples/macos_application_capture.rs"
-required-features = ["feat_macos"]
 
 [[example]]
 name = "test_tone"
@@ -154,27 +149,13 @@ path = "examples/test_capture.rs"
 required-features = ["feat_linux"]
 
 [[example]]
-name = "test_coreaudio"
-path = "examples/test_coreaudio.rs"
-required-features = ["feat_macos"]
-
-[[example]]
-name = "test_windows"
-path = "examples/test_windows.rs"
-required-features = ["feat_windows"]
-
-[[example]]
 name = "verify_audio"
 path = "examples/verify_audio.rs"
 
 [[example]]
-name = "demo_library"
-path = "examples/demo_library.rs"
-
-[[example]]
-name = "windows_device_test"
-path = "examples/windows_device_test.rs"
-required-features = ["feat_windows"]
+name = "audio_recorder_example"
+path = "examples/audio_recorder_example.rs"
+required-features = ["feat_linux"]
 
 [[bin]]
 name = "app_capture_test"
@@ -201,8 +182,20 @@ name = "real_pipewire_test"
 path = "src/bin/real_pipewire_test.rs"
 
 [[bin]]
+name = "dynamic_vlc_capture"
+path = "src/bin/dynamic_vlc_capture.rs"
+
+[[bin]]
+name = "audio_recorder_tui"
+path = "src/bin/audio_recorder_tui.rs"
+
+[[bin]]
+name = "pipewire_diagnostics"
+path = "src/bin/pipewire_diagnostics.rs"
+
+[[example]]
 name = "flexible_pipewire_example"
-path = "src/bin/flexible_pipewire_example.rs"
+path = "examples/flexible_pipewire_example.rs"
 required-features = ["feat_linux"]
 
 [workspace]

@@ -1,3 +1,13 @@
+//! Flexible PipeWire Audio Capture Examples
+//!
+//! This example demonstrates various ways to use the PipeWire application capture
+//! functionality with different patterns and configurations.
+//!
+//! Usage:
+//! ```bash
+//! cargo run --example flexible_pipewire_example --features feat_linux
+//! ```
+
 use rsac::audio::linux::pipewire::{PipeWireApplicationCapture, ApplicationSelector};
 use std::sync::{Arc, Mutex};
 use std::sync::atomic::{AtomicUsize, AtomicBool, Ordering};

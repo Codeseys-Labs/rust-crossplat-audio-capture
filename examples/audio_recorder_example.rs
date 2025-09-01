@@ -1,3 +1,13 @@
+//! Audio Recording Examples
+//!
+//! This example demonstrates how to record audio from PipeWire applications
+//! and save it to WAV files with various configurations.
+//!
+//! Usage:
+//! ```bash
+//! cargo run --example audio_recorder_example --features feat_linux
+//! ```
+
 use rsac::audio::linux::pipewire::{PipeWireApplicationCapture, ApplicationSelector};
 use std::sync::{Arc, Mutex};
 use std::sync::atomic::{AtomicUsize, AtomicBool, Ordering};
