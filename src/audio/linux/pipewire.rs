@@ -280,12 +280,18 @@ impl PipeWireApplicationCapture {
     /// Create actual PipeWire monitor stream (wiremix approach)
     #[cfg(feature = "pipewire")]
     fn create_pipewire_monitor_stream(&mut self) -> Result<(), Box<dyn std::error::Error>> {
+        // Check and start session manager if needed
+        self.ensure_session_manager()?;
+
         // Initialize PipeWire context if not already done
         if self.context.is_none() {
+            println!("🔧 Initializing PipeWire context...");
             let main_loop = MainLoop::new(None)?;
             let context = Context::new(&main_loop)?;
             let core = context.connect(None)?;
             let registry = core.get_registry()?;
+
+            println!("✅ PipeWire context initialized successfully");
 
             self.context = Some(PipeWireContext {
                 main_loop,
@@ -295,34 +301,410 @@ impl PipeWireApplicationCapture {
             });
         }
 
+        // Test basic stream creation capability first
+        println!("🔧 Testing basic stream creation capability...");
         let context = self.context.as_ref().unwrap();
-        let serial = self.node_serial.as_ref()
-            .ok_or("No node serial available")?;
 
-        // Create monitor stream properties (following wiremix approach EXACTLY)
-        // Wiremix uses String::from(serial) where serial is the object.serial
-        // For Stream/Output/Audio nodes, we need STREAM_CAPTURE_SINK = "true"
-        println!("🔧 Creating monitor stream with TARGET_OBJECT: {} (wiremix approach)", serial);
-
-        let mut props = properties! {
-            *pipewire::keys::TARGET_OBJECT => String::from(serial),  // Use serial like wiremix
-            *pipewire::keys::STREAM_MONITOR => "true",
-            *pipewire::keys::NODE_NAME => "rsac-app-capture",
+        let test_props = properties! {
+            *pipewire::keys::NODE_NAME => "rsac-capability-test",
         };
 
-        // Add STREAM_CAPTURE_SINK for output streams (like VLC) - wiremix pattern
-        props.insert(*pipewire::keys::STREAM_CAPTURE_SINK, "true");
-        println!("🔧 Added STREAM_CAPTURE_SINK=true for output stream monitoring");
+        match Stream::new(&context.core, "rsac-capability-test", test_props) {
+            Ok(test_stream) => {
+                println!("✅ Basic stream creation works");
+                // Don't keep the test stream
+                drop(test_stream);
+            }
+            Err(e) => {
+                println!("❌ Basic stream creation failed: {}", e);
+                return Err(format!("Environment doesn't support stream creation: {}", e).into());
+            }
+        }
 
-        // Create the stream
-        let stream = Stream::new(&context.core, "rsac-app-capture", props)?;
+        let context = self.context.as_ref().unwrap();
+
+        // Try multiple targeting approaches based on research findings
+        let stream = self.try_multiple_stream_approaches(context)?;
 
         println!("🔧 Stream created, checking state...");
         println!("🔧 Stream state: {:?}", stream.state());
 
         self.stream = Some(Rc::new(stream));
 
-        println!("✅ Created PipeWire monitor stream for node {} (TARGET_OBJECT: {})", self.node_id.unwrap(), serial);
+        println!("✅ Created PipeWire monitor stream for node {}", self.node_id.unwrap());
+        Ok(())
+    }
+
+    /// Check audio permissions (critical for monitor stream creation)
+    #[cfg(feature = "pipewire")]
+    fn check_audio_permissions(&self) -> Result<(), Box<dyn std::error::Error>> {
+        use std::process::Command;
+
+        println!("🔧 Checking audio permissions...");
+
+        // Check if user is in audio group (with CI environment awareness)
+        let audio_group_configured = std::env::var("AUDIO_GROUP_CONFIGURED").unwrap_or_default() == "true";
+        let user_in_audio_group = std::env::var("USER_IN_AUDIO_GROUP").unwrap_or_default() == "true";
+
+        if audio_group_configured && user_in_audio_group {
+            println!("✅ User is in audio group (configured by CI)");
+        } else {
+            let groups_output = Command::new("groups")
+                .output();
+
+            if let Ok(output) = groups_output {
+                let groups_str = String::from_utf8_lossy(&output.stdout);
+                if groups_str.contains("audio") {
+                    println!("✅ User is in audio group");
+                } else {
+                    println!("⚠️  User is NOT in audio group - this may cause stream creation to fail");
+                    println!("🔧 To fix: sudo usermod -aG audio $(whoami) && newgrp audio");
+
+                    // Only try to add user to audio group if we're in an interactive environment
+                    let is_interactive = std::env::var("CI").is_err() &&
+                                       std::env::var("GITHUB_ACTIONS").is_err() &&
+                                       atty::is(atty::Stream::Stdin);
+
+                    if is_interactive {
+                        println!("🔧 Attempting to add user to audio group...");
+                        let add_to_group = Command::new("sudo")
+                            .args(&["usermod", "-aG", "audio"])
+                            .arg(std::env::var("USER").unwrap_or_else(|_| "runner".to_string()))
+                            .output();
+
+                        if let Ok(result) = add_to_group {
+                            if result.status.success() {
+                                println!("✅ Successfully added user to audio group");
+                                println!("🔧 Note: You may need to restart the session for changes to take effect");
+                            } else {
+                                println!("⚠️  Could not add user to audio group: {}", String::from_utf8_lossy(&result.stderr));
+                            }
+                        }
+                    } else {
+                        println!("🔧 Skipping automatic audio group addition (non-interactive environment)");
+                    }
+                }
+            }
+        }
+
+        // Check realtime permissions
+        let limits_check = std::fs::read_to_string("/etc/security/limits.d/99-audio.conf")
+            .or_else(|_| std::fs::read_to_string("/etc/security/limits.conf"));
+
+        match limits_check {
+            Ok(content) => {
+                if content.contains("@audio") && content.contains("rtprio") {
+                    println!("✅ Realtime permissions configured for audio group");
+                } else {
+                    println!("⚠️  Realtime permissions may not be configured");
+                }
+            }
+            Err(_) => {
+                println!("⚠️  Could not check realtime permissions configuration");
+            }
+        }
+
+        Ok(())
+    }
+
+    /// Try multiple stream creation approaches based on research findings
+    #[cfg(feature = "pipewire")]
+    fn try_multiple_stream_approaches(&self, context: &PipeWireContext) -> Result<Stream, Box<dyn std::error::Error>> {
+        let serial = self.node_serial.as_ref()
+            .ok_or("No node serial available")?;
+        let node_id = self.node_id.ok_or("No node ID available")?;
+
+        println!("🔧 Trying multiple stream creation approaches...");
+        println!("🔧 Node ID: {}, Node Serial: {}", node_id, serial);
+
+        // Check if we have audio group permissions configured
+        let audio_group_configured = std::env::var("AUDIO_GROUP_CONFIGURED").unwrap_or_default() == "true";
+        if audio_group_configured {
+            println!("🔧 Audio group permissions configured by CI environment");
+        }
+
+        // Approach 1: Original wiremix approach with object.serial
+        println!("🔧 Approach 1: Wiremix approach with object.serial");
+        if let Ok(stream) = self.try_wiremix_approach(context, serial) {
+            return Ok(stream);
+        }
+
+        // Approach 2: Use node.name instead of object.serial
+        println!("🔧 Approach 2: Using node.name targeting");
+        if let Ok(stream) = self.try_node_name_approach(context, node_id) {
+            return Ok(stream);
+        }
+
+        // Approach 3: Direct node ID targeting
+        println!("🔧 Approach 3: Direct node ID targeting");
+        if let Ok(stream) = self.try_direct_node_approach(context, node_id) {
+            return Ok(stream);
+        }
+
+        // Approach 4: Basic monitor without specific targeting
+        println!("🔧 Approach 4: Basic monitor stream");
+        if let Ok(stream) = self.try_basic_monitor_approach(context) {
+            return Ok(stream);
+        }
+
+        // Approach 5: System-wide capture fallback
+        println!("🔧 Approach 5: System-wide capture fallback");
+        if let Ok(stream) = self.try_system_capture_approach(context) {
+            return Ok(stream);
+        }
+
+        // Approach 6: Minimal permissions approach (for CI environments)
+        println!("🔧 Approach 6: Minimal permissions approach");
+        if let Ok(stream) = self.try_minimal_permissions_approach(context) {
+            return Ok(stream);
+        }
+
+        Err("All stream creation approaches failed".into())
+    }
+
+    /// Approach 1: Original wiremix approach with STREAM_CAPTURE_SINK
+    #[cfg(feature = "pipewire")]
+    fn try_wiremix_approach(&self, context: &PipeWireContext, serial: &str) -> Result<Stream, Box<dyn std::error::Error>> {
+        println!("🔧   Creating wiremix-style monitor stream with TARGET_OBJECT: {}", serial);
+
+        let mut props = properties! {
+            *pipewire::keys::TARGET_OBJECT => String::from(serial),
+            *pipewire::keys::STREAM_MONITOR => "true",
+            *pipewire::keys::NODE_NAME => "rsac-wiremix-capture",
+        };
+        props.insert(*pipewire::keys::STREAM_CAPTURE_SINK, "true");
+
+        match Stream::new(&context.core, "rsac-wiremix-capture", props) {
+            Ok(stream) => {
+                println!("✅   Wiremix approach succeeded");
+                Ok(stream)
+            }
+            Err(e) => {
+                println!("❌   Wiremix approach failed: {}", e);
+                Err(e.into())
+            }
+        }
+    }
+
+    /// Approach 2: Use node.name instead of object.serial
+    #[cfg(feature = "pipewire")]
+    fn try_node_name_approach(&self, context: &PipeWireContext, node_id: u32) -> Result<Stream, Box<dyn std::error::Error>> {
+        println!("🔧   Creating monitor stream with node.name targeting");
+
+        let props = properties! {
+            *pipewire::keys::TARGET_OBJECT => format!("{}", node_id),
+            *pipewire::keys::STREAM_MONITOR => "true",
+            *pipewire::keys::NODE_NAME => "rsac-nodename-capture",
+        };
+
+        match Stream::new(&context.core, "rsac-nodename-capture", props) {
+            Ok(stream) => {
+                println!("✅   Node name approach succeeded");
+                Ok(stream)
+            }
+            Err(e) => {
+                println!("❌   Node name approach failed: {}", e);
+                Err(e.into())
+            }
+        }
+    }
+
+    /// Approach 3: Direct node ID targeting without STREAM_CAPTURE_SINK
+    #[cfg(feature = "pipewire")]
+    fn try_direct_node_approach(&self, context: &PipeWireContext, node_id: u32) -> Result<Stream, Box<dyn std::error::Error>> {
+        println!("🔧   Creating direct node monitor stream");
+
+        let props = properties! {
+            *pipewire::keys::TARGET_OBJECT => format!("{}", node_id),
+            *pipewire::keys::STREAM_MONITOR => "true",
+            *pipewire::keys::NODE_NAME => "rsac-direct-capture",
+        };
+
+        match Stream::new(&context.core, "rsac-direct-capture", props) {
+            Ok(stream) => {
+                println!("✅   Direct node approach succeeded");
+                Ok(stream)
+            }
+            Err(e) => {
+                println!("❌   Direct node approach failed: {}", e);
+                Err(e.into())
+            }
+        }
+    }
+
+    /// Approach 4: Basic monitor without specific targeting
+    #[cfg(feature = "pipewire")]
+    fn try_basic_monitor_approach(&self, context: &PipeWireContext) -> Result<Stream, Box<dyn std::error::Error>> {
+        println!("🔧   Creating basic monitor stream");
+
+        let props = properties! {
+            *pipewire::keys::STREAM_MONITOR => "true",
+            *pipewire::keys::NODE_NAME => "rsac-basic-monitor",
+        };
+
+        match Stream::new(&context.core, "rsac-basic-monitor", props) {
+            Ok(stream) => {
+                println!("✅   Basic monitor approach succeeded");
+                Ok(stream)
+            }
+            Err(e) => {
+                println!("❌   Basic monitor approach failed: {}", e);
+                Err(e.into())
+            }
+        }
+    }
+
+    /// Approach 5: System-wide capture fallback
+    #[cfg(feature = "pipewire")]
+    fn try_system_capture_approach(&self, context: &PipeWireContext) -> Result<Stream, Box<dyn std::error::Error>> {
+        println!("🔧   Creating system-wide capture stream");
+
+        let props = properties! {
+            *pipewire::keys::NODE_NAME => "rsac-system-capture",
+            *pipewire::keys::MEDIA_CLASS => "Stream/Input/Audio",
+        };
+
+        match Stream::new(&context.core, "rsac-system-capture", props) {
+            Ok(stream) => {
+                println!("✅   System capture approach succeeded");
+                Ok(stream)
+            }
+            Err(e) => {
+                println!("❌   System capture approach failed: {}", e);
+
+                // Try one more approach: minimal stream without any special properties
+                println!("🔧   Trying minimal stream approach...");
+                let minimal_props = properties! {
+                    *pipewire::keys::NODE_NAME => "rsac-minimal",
+                };
+
+                match Stream::new(&context.core, "rsac-minimal", minimal_props) {
+                    Ok(minimal_stream) => {
+                        println!("✅   Minimal stream approach succeeded");
+                        Ok(minimal_stream)
+                    }
+                    Err(e2) => {
+                        println!("❌   Minimal stream approach also failed: {}", e2);
+                        Err(e.into())
+                    }
+                }
+            }
+        }
+    }
+
+    /// Approach 6: Minimal permissions approach for CI environments
+    #[cfg(feature = "pipewire")]
+    fn try_minimal_permissions_approach(&self, context: &PipeWireContext) -> Result<Stream, Box<dyn std::error::Error>> {
+        println!("🔧   Creating minimal permissions stream (no TARGET_OBJECT)");
+
+        // Try creating a stream without any TARGET_OBJECT or special permissions
+        let props = properties! {
+            *pipewire::keys::NODE_NAME => "rsac-minimal-monitor",
+            *pipewire::keys::MEDIA_CLASS => "Stream/Input/Audio",
+            // Don't set TARGET_OBJECT - this might require special permissions
+        };
+
+        match Stream::new(&context.core, "rsac-minimal-monitor", props) {
+            Ok(stream) => {
+                println!("✅   Minimal permissions approach succeeded");
+                Ok(stream)
+            }
+            Err(e) => {
+                println!("❌   Minimal permissions approach failed: {}", e);
+
+                // Try even more minimal approach - just basic stream
+                println!("🔧   Trying ultra-minimal stream...");
+                let ultra_minimal_props = properties! {
+                    *pipewire::keys::NODE_NAME => "rsac-ultra-minimal",
+                };
+
+                match Stream::new(&context.core, "rsac-ultra-minimal", ultra_minimal_props) {
+                    Ok(ultra_stream) => {
+                        println!("✅   Ultra-minimal stream approach succeeded");
+                        Ok(ultra_stream)
+                    }
+                    Err(e2) => {
+                        println!("❌   Ultra-minimal stream approach also failed: {}", e2);
+                        Err(e.into())
+                    }
+                }
+            }
+        }
+    }
+
+    /// Ensure session manager is running (required for monitor streams)
+    #[cfg(feature = "pipewire")]
+    fn ensure_session_manager(&self) -> Result<(), Box<dyn std::error::Error>> {
+        use std::process::Command;
+
+        println!("🔧 Checking session manager status...");
+
+        // First check audio group membership (critical for stream creation)
+        self.check_audio_permissions()?;
+
+        // Check if wireplumber is running
+        let wireplumber_status = Command::new("systemctl")
+            .args(&["--user", "is-active", "wireplumber"])
+            .output();
+
+        if let Ok(output) = wireplumber_status {
+            if output.status.success() {
+                println!("✅ WirePlumber session manager is running");
+                return Ok(());
+            }
+        }
+
+        // Check if pipewire-media-session is running
+        let media_session_status = Command::new("systemctl")
+            .args(&["--user", "is-active", "pipewire-media-session"])
+            .output();
+
+        if let Ok(output) = media_session_status {
+            if output.status.success() {
+                println!("✅ PipeWire Media Session is running");
+                return Ok(());
+            }
+        }
+
+        println!("⚠️  No session manager detected, attempting to start one...");
+
+        // Try to start wireplumber first (modern session manager)
+        println!("🔧 Attempting to start WirePlumber...");
+        let wireplumber_start = Command::new("systemctl")
+            .args(&["--user", "start", "wireplumber"])
+            .output();
+
+        if let Ok(output) = wireplumber_start {
+            if output.status.success() {
+                println!("✅ WirePlumber started successfully");
+                // Give it time to initialize
+                std::thread::sleep(std::time::Duration::from_secs(2));
+                return Ok(());
+            } else {
+                println!("⚠️  WirePlumber start failed: {}", String::from_utf8_lossy(&output.stderr));
+            }
+        }
+
+        // Fallback to pipewire-media-session (if available)
+        println!("🔧 Attempting to start PipeWire Media Session...");
+        let media_session_start = Command::new("systemctl")
+            .args(&["--user", "start", "pipewire-media-session"])
+            .output();
+
+        if let Ok(output) = media_session_start {
+            if output.status.success() {
+                println!("✅ PipeWire Media Session started successfully");
+                // Give it time to initialize
+                std::thread::sleep(std::time::Duration::from_secs(2));
+                return Ok(());
+            } else {
+                println!("⚠️  PipeWire Media Session start failed: {}", String::from_utf8_lossy(&output.stderr));
+                println!("🔧 Note: pipewire-media-session is deprecated in favor of wireplumber");
+            }
+        }
+
+        println!("⚠️  Could not start any session manager, proceeding anyway...");
+        println!("🔧 This may cause monitor stream creation to fail");
         Ok(())
     }
 

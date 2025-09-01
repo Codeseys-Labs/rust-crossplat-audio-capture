@@ -524,25 +524,29 @@ impl AudioCaptureBuilder {
         }
 
         // Step 4: Validate if the selected device supports the requested format
-        match selected_device.is_format_supported(&capture_config.stream_config.format) {
-            Ok(true) => {
-                // Format is supported, proceed
-            }
-            Ok(false) => {
-                return Err(AudioError::UnsupportedFormat(format!(
-                    "The selected device '{}' does not support the requested audio format: {:?}",
-                    selected_device.get_name(),
-                    capture_config.stream_config.format
-                )));
-            }
-            Err(e) => {
-                // An error occurred during format support check, treat as unsupported or propagate
-                return Err(AudioError::UnsupportedFormat(format!(
-                    "Error checking format support for device '{}': {}. Format: {:?}",
-                    selected_device.get_name(),
-                    e,
-                    capture_config.stream_config.format
-                )));
+        // On Linux, we defer this check to the stream creation, as PipeWire can handle conversion.
+        #[cfg(not(target_os = "linux"))]
+        {
+            match selected_device.is_format_supported(&capture_config.stream_config.format) {
+                Ok(true) => {
+                    // Format is supported, proceed
+                }
+                Ok(false) => {
+                    return Err(AudioError::UnsupportedFormat(format!(
+                        "The selected device '{}' does not support the requested audio format: {:?}",
+                        selected_device.get_name(),
+                        capture_config.stream_config.format
+                    )));
+                }
+                Err(e) => {
+                    // An error occurred during format support check, treat as unsupported or propagate
+                    return Err(AudioError::UnsupportedFormat(format!(
+                        "Error checking format support for device '{}': {}. Format: {:?}",
+                        selected_device.get_name(),
+                        e,
+                        capture_config.stream_config.format
+                    )));
+                }
             }
         }
 

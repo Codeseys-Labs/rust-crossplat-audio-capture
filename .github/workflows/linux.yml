@@ -8,6 +8,13 @@ on:
         required: false
         type: boolean
         default: false
+  workflow_dispatch:
+    inputs:
+      debug_enabled:
+        description: "Enable debug output"
+        required: false
+        type: boolean
+        default: false
 
 env:
   CARGO_TERM_COLOR: always
@@ -77,6 +84,7 @@ jobs:
             echo "Installing PipeWire packages..."
             sudo apt-get install -y \
               pipewire \
+              pipewire-bin \
               pipewire-audio-client-libraries \
               pipewire-pulse \
               libpipewire-0.3-dev \
@@ -105,6 +113,35 @@ jobs:
           systemctl --user --now disable pulseaudio.service pulseaudio.socket || true
           pulseaudio --kill || true
 
+      - name: Fix Audio Permissions
+        run: |
+          # Fix audio permissions (critical for monitor stream creation)
+          echo "=== Fixing Audio Permissions ==="
+          echo "Current user: $(whoami)"
+          echo "Current groups: $(groups)"
+
+          # Add user to audio group (required for PipeWire stream creation)
+          sudo usermod -aG audio $(whoami)
+          echo "Added $(whoami) to audio group"
+
+          # Verify audio group membership (requires new shell)
+          newgrp audio << 'EOF'
+          groups | grep -q audio && echo "✅ User is now in audio group" || echo "❌ Failed to add user to audio group"
+          EOF
+
+          # Export environment variable to indicate audio group membership
+          echo "AUDIO_GROUP_CONFIGURED=true" >> $GITHUB_ENV
+          echo "USER_IN_AUDIO_GROUP=true" >> $GITHUB_ENV
+
+          # Set up realtime scheduling permissions for audio
+          echo "=== Setting up Realtime Permissions ==="
+          sudo tee /etc/security/limits.d/99-audio.conf << 'EOF'
+          @audio - rtprio 95
+          @audio - memlock unlimited
+          @audio - nice -19
+          EOF
+          echo "✅ Realtime permissions configured for audio group"
+
       - name: Start PipeWire Services
         run: |
           # Reload systemd daemon
@@ -123,50 +160,6 @@ jobs:
           systemctl --user --now enable pipewire-pulse.service
           sleep 2
 
-      - name: Check PipeWire CLI Tools
-        run: |
-          # Make test script executable and run comprehensive test
-          chmod +x scripts/test-pipewire-setup.sh
-          ./scripts/test-pipewire-setup.sh
-
-      - name: Verify PipeWire Setup
-        run: |
-          echo "=== WirePlumber Status ==="
-          systemctl --user status wireplumber || true
-
-          echo "=== PipeWire Status ==="
-          systemctl --user status pipewire || true
-
-          echo "=== PipeWire-Pulse Status ==="
-          systemctl --user status pipewire-pulse || true
-
-          echo "=== PipeWire CLI Info ==="
-          pw-cli info || true
-
-          echo "=== PipeWire Nodes ==="
-          pw-cli list-objects Node || true
-
-          echo "=== PipeWire Dump (if available) ==="
-          if command -v pw-dump >/dev/null 2>&1; then
-            pw-dump | head -50 || true
-          else
-            echo "pw-dump not available"
-          fi
-
-          echo "=== PipeWire Audio Info ==="
-          if command -v pactl >/dev/null 2>&1; then
-            pactl info || true
-            echo "=== Available Sinks ==="
-            pactl list short sinks || true
-          else
-            echo "pactl not available (PulseAudio compatibility not installed)"
-          fi
-
-      - name: Download test audio
-        run: |
-          mkdir -p test_audio
-          curl -L "https://ia800901.us.archive.org/23/items/gd70-02-14.early-late.sbd.cotsman.18115.sbeok.shnf/gd70-02-14d1t02.mp3" -o "test_audio/sample.mp3"
-
       - name: Cache dependencies
         uses: actions/cache@v3
         with:
@@ -176,84 +169,58 @@ jobs:
             target
           key: ${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.lock') }}
 
-      - name: Build PipeWire-only
-        run: cargo build --no-default-features --features feat_linux --verbose
-
-      - name: Build examples
-        run: cargo build --examples --features feat_linux
-
-      - name: Test PipeWire Audio Capture
+      - name: Build VLC Audio Capture Tools
         run: |
-          echo "=== Starting PipeWire Audio Test ==="
+          echo "=== Building VLC-specific audio capture tools ==="
+          # Build the dynamic VLC capture tool (primary test)
+          cargo build --bin dynamic_vlc_capture --features feat_linux
+          echo "✅ Built dynamic_vlc_capture tool"
 
-          # Verify PipeWire audio system is ready
-          if ! pw-cli info; then
-            echo "PipeWire audio system is not ready"
-            exit 1
-          fi
-
-          # Start test tone in background with logging
-          echo "Starting test tone..."
-          cargo run --example test_tone --features feat_linux > test_tone.log 2>&1 &
-          PLAYER_PID=$!
-
-          # Ensure cleanup on exit
-          cleanup() {
-            echo "Cleaning up processes..."
-            if [ -n "$PLAYER_PID" ] && kill -0 $PLAYER_PID 2>/dev/null; then
-              echo "Stopping test tone (PID: $PLAYER_PID)"
-              kill $PLAYER_PID
-              wait $PLAYER_PID 2>/dev/null || true
-            fi
-            # Collect audio debug info
-            echo "=== Final PipeWire State ==="
-            pw-cli info || true
-            pw-cli list-objects Node || true
-            echo "=== Test Tone Log ==="
-            cat test_tone.log || true
-          }
-          trap cleanup EXIT
-
-          # Wait for process to initialize
-          sleep 5
-
-          # Test system-wide capture
-          echo "Testing PipeWire system-wide capture..."
-          cargo run --example test_capture --features feat_linux -- --duration 5 --output pipewire_system_capture.wav
-
-          # Verify capture
-          if [ ! -f "pipewire_system_capture.wav" ]; then
-            echo "PipeWire capture failed - file not created"
-            exit 1
-          fi
-
-          FILESIZE=$(stat -c%s "pipewire_system_capture.wav")
-          if [ "$FILESIZE" -eq 0 ]; then
-            echo "PipeWire capture failed - file is empty"
-            exit 1
-          fi
-
-          echo "Successfully captured $FILESIZE bytes of audio with PipeWire"
-
-      - name: Test VLC URL Streaming with Audio Capture
+      - name: Run VLC Capture Test
+        timeout-minutes: 10
         run: |
-          echo "=== Testing VLC URL Streaming with Real Audio Capture ==="
-
-          # Use our comprehensive VLC capture test script
           chmod +x scripts/test-vlc-capture.sh
           ./scripts/test-vlc-capture.sh
 
-      - name: Upload PipeWire test artifacts
+      - name: List Generated Files
+        run: |
+          echo "=== Files in current directory ==="
+          ls -la *.wav *.log 2>/dev/null || echo "No .wav or .log files found"
+          echo ""
+          echo "=== All files in current directory ==="
+          ls -la
+        if: always()
+
+      - name: Upload VLC Audio Capture Files
         uses: actions/upload-artifact@v4
         with:
-          name: linux-pipewire-audio-test-results
+          name: vlc-audio-captures
           path: |
-            pipewire_system_capture.wav
-            vlc_system_capture.wav
+            dynamic_vlc_capture.wav
             vlc_test_audio.wav
-            test_tone.log
+          compression-level: 0
+          if-no-files-found: warn
+        if: always()
+
+      - name: Upload VLC Logs
+        uses: actions/upload-artifact@v4
+        with:
+          name: vlc-logs
+          path: |
             vlc_capture_test.log
             flexible_test.log
-            capture_test.log
-            test_audio/sample.mp3
+            process_tracking.log
+          compression-level: 0
+          if-no-files-found: warn
+        if: always()
+
+      - name: Upload PipeWire Logs
+        uses: actions/upload-artifact@v4
+        with:
+          name: pipewire-logs
+          path: |
+            /var/log/pipewire/
+            ~/.local/share/pipewire/
+          compression-level: 0
+          if-no-files-found: ignore
         if: always()

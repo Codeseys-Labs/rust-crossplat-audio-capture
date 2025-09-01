@@ -1,0 +1,601 @@
+name: Linux Audio System Debug
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [ master, main ]
+    paths:
+      - '.github/workflows/linux-audio-debug.yml'
+      - 'scripts/debug-audio-system.sh'
+  pull_request:
+    branches: [ master, main ]
+    paths:
+      - '.github/workflows/linux-audio-debug.yml'
+      - 'scripts/debug-audio-system.sh'
+
+jobs:
+  debug-audio-system:
+    runs-on: ubuntu-latest
+    
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: System Information
+        run: |
+          echo "=== System Information ==="
+          uname -a
+          lsb_release -a 2>/dev/null || cat /etc/os-release
+          echo ""
+          echo "=== User Information ==="
+          whoami
+          id
+          echo "XDG_RUNTIME_DIR: ${XDG_RUNTIME_DIR:-not set}"
+          echo "HOME: $HOME"
+
+      - name: Check Audio System Availability
+        run: |
+          echo "=== Audio System Detection ==="
+          
+          # Check for PulseAudio
+          echo "--- PulseAudio Detection ---"
+          if command -v pulseaudio >/dev/null 2>&1; then
+            echo "✅ PulseAudio binary found: $(which pulseaudio)"
+            echo "Version: $(pulseaudio --version 2>/dev/null || echo 'Version check failed')"
+            PULSEAUDIO_AVAILABLE=true
+          else
+            echo "❌ PulseAudio binary not found"
+            PULSEAUDIO_AVAILABLE=false
+          fi
+          
+          if command -v pactl >/dev/null 2>&1; then
+            echo "✅ pactl found: $(which pactl)"
+            PACTL_AVAILABLE=true
+          else
+            echo "❌ pactl not found"
+            PACTL_AVAILABLE=false
+          fi
+          
+          echo ""
+          
+          # Check for PipeWire
+          echo "--- PipeWire Detection ---"
+          if command -v pipewire >/dev/null 2>&1; then
+            echo "✅ PipeWire binary found: $(which pipewire)"
+            echo "Version: $(pipewire --version 2>/dev/null || echo 'Version check failed')"
+            PIPEWIRE_AVAILABLE=true
+          else
+            echo "❌ PipeWire binary not found"
+            PIPEWIRE_AVAILABLE=false
+          fi
+          
+          if command -v pw-cli >/dev/null 2>&1; then
+            echo "✅ pw-cli found: $(which pw-cli)"
+            echo "Version: $(pw-cli --version 2>/dev/null || echo 'Version check failed')"
+            PWCLI_AVAILABLE=true
+          else
+            echo "❌ pw-cli not found"
+            PWCLI_AVAILABLE=false
+          fi
+          
+          if command -v pw-dump >/dev/null 2>&1; then
+            echo "✅ pw-dump found: $(which pw-dump)"
+            PWDUMP_AVAILABLE=true
+          else
+            echo "❌ pw-dump not found"
+            PWDUMP_AVAILABLE=false
+          fi
+          
+          # Export variables for next steps
+          echo "PULSEAUDIO_AVAILABLE=$PULSEAUDIO_AVAILABLE" >> $GITHUB_ENV
+          echo "PACTL_AVAILABLE=$PACTL_AVAILABLE" >> $GITHUB_ENV
+          echo "PIPEWIRE_AVAILABLE=$PIPEWIRE_AVAILABLE" >> $GITHUB_ENV
+          echo "PWCLI_AVAILABLE=$PWCLI_AVAILABLE" >> $GITHUB_ENV
+          echo "PWDUMP_AVAILABLE=$PWDUMP_AVAILABLE" >> $GITHUB_ENV
+
+      - name: Check Running Audio Services
+        run: |
+          echo "=== Running Audio Services ==="
+          
+          echo "--- Process Check ---"
+          echo "PulseAudio processes:"
+          pgrep -f pulseaudio || echo "No PulseAudio processes found"
+          
+          echo ""
+          echo "PipeWire processes:"
+          pgrep -f pipewire || echo "No PipeWire processes found"
+          
+          echo ""
+          echo "WirePlumber processes:"
+          pgrep -f wireplumber || echo "No WirePlumber processes found"
+          
+          echo ""
+          echo "--- Systemd User Services ---"
+          if systemctl --user list-units --type=service | grep -E "(pulse|pipewire|wireplumber)"; then
+            echo "Found audio-related systemd services"
+          else
+            echo "No audio-related systemd services found"
+          fi
+
+      - name: Install and Test PulseAudio
+        if: env.PULSEAUDIO_AVAILABLE == 'false'
+        run: |
+          echo "=== Installing PulseAudio for Testing ==="
+          sudo apt-get update
+          sudo apt-get install -y pulseaudio pulseaudio-utils
+          
+          echo "=== Testing PulseAudio ==="
+          echo "Starting PulseAudio..."
+          pulseaudio --start --verbose || echo "PulseAudio start failed"
+          sleep 2
+          
+          if command -v pactl >/dev/null 2>&1; then
+            echo "Testing pactl info..."
+            pactl info || echo "pactl info failed"
+            
+            echo ""
+            echo "Listing audio devices..."
+            pactl list short sinks || echo "No sinks found"
+            pactl list short sources || echo "No sources found"
+          fi
+
+      - name: Install and Test PipeWire
+        if: env.PIPEWIRE_AVAILABLE == 'false'
+        run: |
+          echo "=== Installing PipeWire for Testing ==="
+          sudo apt-get update
+
+          sudo apt-get install -y \
+            pipewire \
+            pipewire-bin \
+            pipewire-audio-client-libraries \
+            pipewire-pulse \
+            pipewire-alsa \
+            libpipewire-0.3-dev \
+            libpipewire-0.3-modules \
+            libspa-0.2-modules \
+            wireplumber
+
+          echo "=== Testing PipeWire ==="
+          # Set up runtime directory
+          export XDG_RUNTIME_DIR=/run/user/$(id -u)
+          sudo mkdir -p $XDG_RUNTIME_DIR
+          sudo chown $(id -u):$(id -g) $XDG_RUNTIME_DIR
+          sudo chmod 700 $XDG_RUNTIME_DIR
+
+          echo "Starting PipeWire services..."
+          systemctl --user daemon-reload
+          systemctl --user --now enable pipewire.service
+          systemctl --user --now enable wireplumber.service
+          systemctl --user --now enable pipewire-pulse.service
+          sleep 5
+
+          echo "Checking PipeWire status..."
+          systemctl --user status pipewire.service || echo "PipeWire service status check failed"
+          systemctl --user status wireplumber.service || echo "WirePlumber service status check failed"
+          systemctl --user status pipewire-pulse.service || echo "PipeWire-Pulse service status check failed"
+
+          # Update environment variables for subsequent steps
+          echo "PIPEWIRE_AVAILABLE=true" >> $GITHUB_ENV
+          echo "PWCLI_AVAILABLE=true" >> $GITHUB_ENV
+          echo "PWDUMP_AVAILABLE=true" >> $GITHUB_ENV
+
+          echo "=== Verifying PipeWire Installation ==="
+          echo "PipeWire version: $(pipewire --version 2>/dev/null || echo 'Version check failed')"
+          echo "pw-cli version: $(pw-cli --version 2>/dev/null || echo 'Version check failed')"
+
+          # Test basic PipeWire functionality
+          echo "Testing basic PipeWire functionality..."
+          pw-cli info 0 || echo "pw-cli info failed"
+
+      - name: Test Audio Devices
+        run: |
+          echo "=== Audio Device Testing ==="
+          
+          # Test with PulseAudio tools if available
+          if command -v pactl >/dev/null 2>&1; then
+            echo "--- PulseAudio Device Check ---"
+            echo "Server info:"
+            pactl info 2>&1 || echo "pactl info failed"
+            
+            echo ""
+            echo "Available sinks (output devices):"
+            pactl list short sinks 2>&1 || echo "No sinks available"
+            
+            echo ""
+            echo "Available sources (input devices):"
+            pactl list short sources 2>&1 || echo "No sources available"
+            
+            echo ""
+            echo "Default sink:"
+            pactl get-default-sink 2>&1 || echo "No default sink"
+            
+            echo ""
+            echo "Default source:"
+            pactl get-default-source 2>&1 || echo "No default source"
+          fi
+          
+          # Test with PipeWire tools if available
+          if command -v pw-cli >/dev/null 2>&1; then
+            echo ""
+            echo "--- PipeWire Device Check ---"
+            echo "PipeWire info:"
+            pw-cli info 0 2>&1 || echo "pw-cli info failed"
+            
+            echo ""
+            echo "PipeWire nodes:"
+            pw-cli list-objects Node 2>&1 | head -50 || echo "pw-cli list-objects failed"
+            
+            if command -v pw-dump >/dev/null 2>&1; then
+              echo ""
+              echo "Audio nodes (via pw-dump):"
+              pw-dump 2>&1 | jq -r '.[] | select(.info.props."media.class" // "" | test("Audio")) | "\(.info.props."node.name" // "unknown"): \(.info.props."media.class" // "unknown")"' 2>/dev/null || echo "pw-dump parsing failed"
+            fi
+          fi
+          
+          # Check ALSA devices
+          echo ""
+          echo "--- ALSA Device Check ---"
+          if command -v aplay >/dev/null 2>&1; then
+            echo "ALSA playback devices:"
+            aplay -l 2>&1 || echo "No ALSA playback devices"
+            
+            echo ""
+            echo "ALSA capture devices:"
+            arecord -l 2>&1 || echo "No ALSA capture devices"
+          else
+            echo "ALSA tools not available"
+          fi
+
+      - name: Create Virtual Default Audio Devices
+        run: |
+          echo "=== Creating Virtual Default Audio Devices ==="
+
+          # Ensure runtime directory is set
+          export XDG_RUNTIME_DIR=/run/user/$(id -u)
+
+          # Create virtual devices with PipeWire if available
+          if command -v pw-cli >/dev/null 2>&1; then
+            echo "--- Investigating PipeWire Environment ---"
+
+            # Check available factories
+            echo "Available PipeWire factories:"
+            pw-cli list-objects Factory | grep -E "(name|factory)" | head -20 || echo "No factories found"
+
+            echo ""
+            echo "Available factory names:"
+            pw-cli list-objects Factory | grep "factory.name" | head -10 || echo "No factory names found"
+
+            echo ""
+            echo "Current PipeWire nodes:"
+            pw-cli list-objects Node | grep -E "(id|node\.name|media\.class)" | head -20 || echo "No nodes found"
+
+            echo ""
+            echo "--- Creating PipeWire Virtual Devices ---"
+
+            # Try multiple approaches for creating virtual sink
+            echo "Creating virtual audio sink..."
+
+            # Method 1: Try adapter factory with support.null-audio-sink
+            echo "Trying adapter factory with support.null-audio-sink..."
+            SINK_OUTPUT=$(pw-cli create-node adapter '{ factory.name=support.null-audio-sink node.name=virtual-default-sink node.description="Virtual Default Sink" media.class=Audio/Sink audio.channels=2 audio.rate=48000 }' 2>&1)
+            SINK_ID=$(echo "$SINK_OUTPUT" | grep -o 'id:[0-9]*' | cut -d: -f2 || echo "")
+
+            if [ -z "$SINK_ID" ]; then
+              echo "Method 1 failed: $SINK_OUTPUT"
+
+              # Method 2: Try direct factory
+              echo "Trying direct support.null-audio-sink factory..."
+              SINK_OUTPUT=$(pw-cli create-node support.null-audio-sink '{ node.name=virtual-default-sink node.description="Virtual Default Sink" media.class=Audio/Sink audio.channels=2 audio.rate=48000 }' 2>&1)
+              SINK_ID=$(echo "$SINK_OUTPUT" | grep -o 'id:[0-9]*' | cut -d: -f2 || echo "")
+            fi
+
+            if [ -z "$SINK_ID" ]; then
+              echo "Method 2 failed: $SINK_OUTPUT"
+
+              # Method 3: Try spa factory
+              echo "Trying spa-node-factory..."
+              SINK_OUTPUT=$(pw-cli create-node spa-node-factory '{ factory.name=audiotestsrc node.name=virtual-default-sink media.class=Audio/Sink }' 2>&1)
+              SINK_ID=$(echo "$SINK_OUTPUT" | grep -o 'id:[0-9]*' | cut -d: -f2 || echo "")
+            fi
+
+            if [ -n "$SINK_ID" ]; then
+              echo "✅ Created virtual sink with ID: $SINK_ID"
+
+              # Set as default sink
+              echo "Setting as default sink..."
+              pw-metadata -n settings 0 default.audio.sink $SINK_ID || echo "Failed to set default sink"
+            else
+              echo "❌ All methods failed to create virtual sink"
+              echo "Final output: $SINK_OUTPUT"
+            fi
+
+            sleep 1
+
+            # Try creating virtual source
+            echo ""
+            echo "Creating virtual audio source..."
+
+            # Method 1: Try adapter factory with support.null-audio-source
+            echo "Trying adapter factory with support.null-audio-source..."
+            SOURCE_OUTPUT=$(pw-cli create-node adapter '{ factory.name=support.null-audio-source node.name=virtual-default-source node.description="Virtual Default Source" media.class=Audio/Source audio.channels=2 audio.rate=48000 }' 2>&1)
+            SOURCE_ID=$(echo "$SOURCE_OUTPUT" | grep -o 'id:[0-9]*' | cut -d: -f2 || echo "")
+
+            if [ -z "$SOURCE_ID" ]; then
+              echo "Method 1 failed: $SOURCE_OUTPUT"
+
+              # Method 2: Try direct factory
+              echo "Trying direct support.null-audio-source factory..."
+              SOURCE_OUTPUT=$(pw-cli create-node support.null-audio-source '{ node.name=virtual-default-source node.description="Virtual Default Source" media.class=Audio/Source audio.channels=2 audio.rate=48000 }' 2>&1)
+              SOURCE_ID=$(echo "$SOURCE_OUTPUT" | grep -o 'id:[0-9]*' | cut -d: -f2 || echo "")
+            fi
+
+            if [ -n "$SOURCE_ID" ]; then
+              echo "✅ Created virtual source with ID: $SOURCE_ID"
+
+              # Set as default source
+              echo "Setting as default source..."
+              pw-metadata -n settings 0 default.audio.source $SOURCE_ID || echo "Failed to set default source"
+            else
+              echo "❌ Failed to create virtual source"
+              echo "Final output: $SOURCE_OUTPUT"
+            fi
+
+            sleep 2
+
+            # Verify devices were created
+            echo ""
+            echo "--- Verifying Virtual Devices ---"
+            echo "Available nodes after creation:"
+            pw-cli list-objects Node | grep -E "(virtual-default|Audio)" | head -10 || echo "No virtual devices found"
+
+            echo ""
+            echo "Default devices:"
+            pw-metadata -n settings | grep default.audio || echo "No default devices set"
+
+          fi
+
+          # Create virtual devices with PulseAudio if available
+          if command -v pactl >/dev/null 2>&1; then
+            echo ""
+            echo "--- Creating PulseAudio Virtual Devices ---"
+
+            # Check if PulseAudio server is accessible
+            echo "Checking PulseAudio server connection..."
+            if pactl info >/dev/null 2>&1; then
+              echo "✅ PulseAudio server is accessible"
+
+              # Create virtual sink (output device)
+              echo "Creating virtual audio sink..."
+              SINK_MODULE=$(pactl load-module module-null-sink sink_name=virtual_default_sink sink_properties=device.description="Virtual Default Sink" rate=48000 channels=2 2>&1)
+
+              if echo "$SINK_MODULE" | grep -q "^[0-9]*$"; then
+                echo "✅ Created virtual sink (module ID: $SINK_MODULE)"
+
+                # Verify sink was created
+                sleep 1
+                if pactl list short sinks | grep -q virtual_default_sink; then
+                  echo "✅ Virtual sink verified in sink list"
+
+                  # Set as default sink
+                  echo "Setting as default sink..."
+                  pactl set-default-sink virtual_default_sink && echo "✅ Set as default sink" || echo "❌ Failed to set default sink"
+                else
+                  echo "⚠️  Virtual sink not found in sink list"
+                fi
+              else
+                echo "❌ Failed to create virtual sink: $SINK_MODULE"
+              fi
+
+              # Create virtual source (input device)
+              echo ""
+              echo "Creating virtual audio source..."
+              SOURCE_MODULE=$(pactl load-module module-null-source source_name=virtual_default_source source_properties=device.description="Virtual Default Source" rate=48000 channels=2 2>&1)
+
+              if echo "$SOURCE_MODULE" | grep -q "^[0-9]*$"; then
+                echo "✅ Created virtual source (module ID: $SOURCE_MODULE)"
+
+                # Verify source was created
+                sleep 1
+                if pactl list short sources | grep -q virtual_default_source; then
+                  echo "✅ Virtual source verified in source list"
+
+                  # Set as default source
+                  echo "Setting as default source..."
+                  pactl set-default-source virtual_default_source && echo "✅ Set as default source" || echo "❌ Failed to set default source"
+                else
+                  echo "⚠️  Virtual source not found in source list"
+                fi
+              else
+                echo "❌ Failed to create virtual source: $SOURCE_MODULE"
+              fi
+
+              sleep 2
+
+              # Verify devices were created
+              echo ""
+              echo "--- Verifying Virtual Devices ---"
+              echo "Available sinks:"
+              pactl list short sinks 2>/dev/null | grep virtual || echo "No virtual sinks found"
+
+              echo ""
+              echo "Available sources:"
+              pactl list short sources 2>/dev/null | grep virtual || echo "No virtual sources found"
+
+              echo ""
+              echo "Default devices:"
+              echo "Default sink: $(pactl get-default-sink 2>/dev/null || echo 'none')"
+              echo "Default source: $(pactl get-default-source 2>/dev/null || echo 'none')"
+
+            else
+              echo "❌ PulseAudio server is not accessible"
+              echo "This might be because PipeWire-Pulse is not properly configured"
+            fi
+          fi
+
+      - name: Test Audio Capture with Virtual Devices
+        run: |
+          echo "=== Testing Audio Capture with Virtual Devices ==="
+
+          # Ensure runtime directory is set
+          export XDG_RUNTIME_DIR=/run/user/$(id -u)
+
+          # Test with PipeWire if available
+          if command -v pw-cli >/dev/null 2>&1; then
+            echo "--- Testing PipeWire Audio Capture ---"
+
+            # Check if we have any audio nodes
+            NODE_COUNT=$(pw-cli list-objects Node 2>/dev/null | grep -c "Audio" || echo "0")
+            echo "Found $NODE_COUNT audio nodes"
+
+            if [ "$NODE_COUNT" -gt 0 ]; then
+              echo "✅ Audio nodes available for capture testing"
+
+              # Try to find a source node for testing
+              SOURCE_NODE=$(pw-cli list-objects Node 2>/dev/null | grep -A 5 -B 5 "Audio/Source\|virtual-default-source" | grep "id:" | head -1 | grep -o '[0-9]*' || echo "")
+
+              if [ -n "$SOURCE_NODE" ]; then
+                echo "Found source node ID: $SOURCE_NODE"
+                echo "✅ Virtual audio capture should be possible"
+              else
+                echo "⚠️  No source nodes found for capture"
+              fi
+            else
+              echo "❌ No audio nodes available"
+            fi
+          fi
+
+          # Test with PulseAudio if available
+          if command -v pactl >/dev/null 2>&1; then
+            echo ""
+            echo "--- Testing PulseAudio Audio Capture ---"
+
+            # Check if we have any sources
+            SOURCE_COUNT=$(pactl list short sources 2>/dev/null | wc -l || echo "0")
+            echo "Found $SOURCE_COUNT audio sources"
+
+            if [ "$SOURCE_COUNT" -gt 0 ]; then
+              echo "✅ Audio sources available for capture testing"
+
+              # List available sources
+              echo "Available sources:"
+              pactl list short sources | head -5
+
+              # Check if we have a default source
+              DEFAULT_SOURCE=$(pactl get-default-source 2>/dev/null || echo "none")
+              if [ "$DEFAULT_SOURCE" != "none" ]; then
+                echo "✅ Default source available: $DEFAULT_SOURCE"
+                echo "✅ Virtual audio capture should be possible"
+              else
+                echo "⚠️  No default source set"
+              fi
+            else
+              echo "❌ No audio sources available"
+            fi
+          fi
+
+          # Test ALSA devices
+          echo ""
+          echo "--- Testing ALSA Audio Devices ---"
+          if command -v arecord >/dev/null 2>&1; then
+            # Try to list capture devices
+            if arecord -l 2>/dev/null | grep -q "card"; then
+              echo "✅ ALSA capture devices available"
+              arecord -l | head -5
+            else
+              echo "⚠️  No ALSA capture devices found (expected in virtual environment)"
+            fi
+          else
+            echo "❌ ALSA tools not available"
+          fi
+
+      - name: Generate Debug Report
+        run: |
+          echo "=== Audio System Debug Report ==="
+          echo "Generated on: $(date)"
+          echo ""
+
+          echo "## System Summary"
+          echo "- OS: $(lsb_release -d 2>/dev/null | cut -f2 || cat /etc/os-release | grep PRETTY_NAME | cut -d= -f2 | tr -d '\"')"
+          echo "- Kernel: $(uname -r)"
+          echo "- User: $(whoami) (UID: $(id -u))"
+          echo ""
+
+          echo "## Audio System Availability"
+          echo "- PulseAudio: ${PULSEAUDIO_AVAILABLE:-unknown}"
+          echo "- pactl: ${PACTL_AVAILABLE:-unknown}"
+          echo "- PipeWire: ${PIPEWIRE_AVAILABLE:-unknown}"
+          echo "- pw-cli: ${PWCLI_AVAILABLE:-unknown}"
+          echo "- pw-dump: ${PWDUMP_AVAILABLE:-unknown}"
+          echo ""
+
+          echo "## Debug Workflow Status"
+          echo "✅ This is a debug/diagnostic workflow - failures are expected and informational"
+          echo "✅ The goal is to understand the audio environment, not to create a perfect setup"
+          echo ""
+          
+          echo "## Virtual Device Creation Results"
+
+          # Check if virtual devices were created successfully
+          VIRTUAL_DEVICES_CREATED=false
+
+          if command -v pw-cli >/dev/null 2>&1; then
+            if pw-cli list-objects Node 2>/dev/null | grep -q "virtual-default"; then
+              echo "✅ PipeWire virtual devices created successfully"
+              VIRTUAL_DEVICES_CREATED=true
+            else
+              echo "❌ PipeWire virtual device creation failed"
+            fi
+          fi
+
+          if command -v pactl >/dev/null 2>&1; then
+            if pactl list short sinks 2>/dev/null | grep -q "virtual" || pactl list short sources 2>/dev/null | grep -q "virtual"; then
+              echo "✅ PulseAudio virtual devices created successfully"
+              VIRTUAL_DEVICES_CREATED=true
+            else
+              echo "❌ PulseAudio virtual device creation failed"
+            fi
+          fi
+
+          echo ""
+          echo "## Recommendations"
+
+          if [ "${PIPEWIRE_AVAILABLE:-false}" = "true" ] && [ "${PWCLI_AVAILABLE:-false}" = "true" ]; then
+            if [ "$VIRTUAL_DEVICES_CREATED" = true ]; then
+              echo "🎉 EXCELLENT: PipeWire is available and virtual devices created successfully!"
+              echo "   Audio capture should work perfectly in this environment."
+            else
+              echo "✅ PipeWire is available but virtual device creation needs work"
+              echo "   Audio capture may work with existing devices."
+            fi
+          elif [ "${PULSEAUDIO_AVAILABLE:-false}" = "true" ] && [ "${PACTL_AVAILABLE:-false}" = "true" ]; then
+            if [ "$VIRTUAL_DEVICES_CREATED" = true ]; then
+              echo "🎉 EXCELLENT: PulseAudio is available and virtual devices created successfully!"
+              echo "   Audio capture should work perfectly in this environment."
+            else
+              echo "✅ PulseAudio is available but virtual device creation needs work"
+              echo "   Audio capture may work with existing devices."
+            fi
+          else
+            echo "⚠️  Neither PipeWire nor PulseAudio appear to be fully available"
+            echo "   Consider installing one of these audio systems for proper audio capture:"
+            echo "   - For PipeWire: sudo apt-get install pipewire pipewire-audio-client-libraries wireplumber"
+            echo "   - For PulseAudio: sudo apt-get install pulseaudio pulseaudio-utils"
+          fi
+
+      - name: Ensure Workflow Success
+        run: |
+          echo "🎯 WORKFLOW COMPLETE: This debug workflow always succeeds to provide diagnostic information"
+          echo "   Virtual device creation failures are expected in CI environments"
+          echo "   The main Linux workflow has working virtual device setup"
+          echo "   This workflow's purpose is to understand the audio environment"
+          exit 0
+
+      - name: Upload Debug Logs
+        uses: actions/upload-artifact@v4
+        with:
+          name: linux-audio-debug-logs
+          path: |
+            /tmp/*.log
+          compression-level: 0
+        if: always()

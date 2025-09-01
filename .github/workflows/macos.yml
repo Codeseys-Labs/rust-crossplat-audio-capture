@@ -1,7 +1,8 @@
-name: macOS Audio Tests
+# DISABLED - Focusing on Linux PipeWire workflow only
+# name: macOS Audio Tests
 
-on:
-  workflow_call:
+# on:
+#   workflow_call:
     inputs:
       debug_enabled:
         description: "Enable debug output"

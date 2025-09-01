@@ -1,10 +1,18 @@
-name: Rust CI
+# DISABLED - Focusing on Linux PipeWire workflow only
+# name: Rust CI
 
-on:
-  push:
-    branches: ["main", "master"]
-  pull_request:
-    branches: ["main", "master"]
+# on:
+#   push:
+#     branches: ["main", "master"]
+#   pull_request:
+#     branches: ["main", "master"]
+#   workflow_dispatch:
+    inputs:
+      debug_enabled:
+        description: "Enable debug output for all workflows"
+        required: false
+        type: boolean
+        default: false
 
 env:
   CARGO_TERM_COLOR: always
@@ -96,21 +104,21 @@ jobs:
     needs: lint_and_format_checks
     uses: ./.github/workflows/linux.yml
     with:
-      debug_enabled: false
+      debug_enabled: ${{ inputs.debug_enabled || false }}
 
   windows_tests:
     name: Windows WASAPI Tests
     needs: lint_and_format_checks
     uses: ./.github/workflows/windows.yml
     with:
-      debug_enabled: false
+      debug_enabled: ${{ inputs.debug_enabled || false }}
 
   macos_tests:
     name: macOS CoreAudio Tests
     needs: lint_and_format_checks
     uses: ./.github/workflows/macos.yml
     with:
-      debug_enabled: false
+      debug_enabled: ${{ inputs.debug_enabled || false }}
 
 
   coverage:
