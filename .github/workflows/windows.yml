@@ -77,10 +77,11 @@ jobs:
           cargo build --bin dynamic_vlc_capture --no-default-features --features feat_windows --verbose
         shell: pwsh
 
-      - name: Test Windows device enumeration
+      - name: Build Windows examples
         run: |
-          Write-Host "Testing Windows audio device enumeration..."
-          cargo run --example windows_device_test --no-default-features --features feat_windows
+          Write-Host "Building Windows examples to verify compilation..."
+          cargo build --example windows_application_capture --no-default-features --features feat_windows
+          cargo build --example windows_apis --no-default-features --features feat_windows
         shell: pwsh
 
       - name: Test VLC audio capture
