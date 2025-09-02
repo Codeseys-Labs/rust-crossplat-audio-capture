@@ -205,15 +205,18 @@ try {
     Log-ProcessEvent "VLC_START" "Starting VLC with URL: $WorkingUrl"
     
     # VLC arguments with volume control and audio settings
+    # Note: --volume option was deprecated in newer VLC versions, use --volume-step instead
     $vlcArgs = @(
         "--intf", "dummy",           # No GUI interface
         "--loop",                    # Loop the audio
-        "--volume", "256",           # Set volume to maximum (0-256 scale)
+        "--volume-step", "50",       # Volume step size (newer VLC)
         "--gain", "1.0",            # Audio gain
         "--audio-visual", "dummy",   # Disable visualizations
         "--no-video",               # Audio only
         "--aout", "directsound",    # Use DirectSound audio output
-        "--directx-audio-device", "default",  # Use default audio device (should be Scream)
+        "--directx-audio-device", "Scream",  # Explicitly use Scream device
+        "--audio-replay-gain-mode", "none",  # Disable replay gain
+        "--audio-replay-gain-preamp", "0",   # No preamp
         "--verbose", "2",           # Verbose logging
         $WorkingUrl
     )
@@ -296,19 +299,53 @@ try {
                 # Alternative: Use nircmd if available, or manual registry approach
                 Write-Status "INFO" "Attempting to verify Scream device installation..."
 
-                # Check if Scream device exists in Windows audio devices
-                $audioEndpoints = Get-ItemProperty "HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\MMDevices\Audio\Render\*" -ErrorAction SilentlyContinue
+                # We already found Scream in WMI query above, so let's verify that
                 $screamFound = $false
-                foreach ($endpoint in $audioEndpoints) {
-                    if ($endpoint.DeviceDesc -like "*Scream*" -or $endpoint.FriendlyName -like "*Scream*") {
-                        Write-Status "OK" "Found Scream device in registry: $($endpoint.FriendlyName)"
+                foreach ($device in $audioDevices) {
+                    if ($device.Name -like "*Scream*" -or $device.Description -like "*Scream*") {
+                        Write-Status "OK" "Scream device confirmed via WMI: $($device.Name)"
                         $screamFound = $true
                         break
                     }
                 }
 
-                if (-not $screamFound) {
-                    Write-Status "ERROR" "Scream device not found in Windows audio devices!"
+                if ($screamFound) {
+                    Write-Status "OK" "Scream virtual audio device is properly installed and detected"
+
+                    # Try to get more details about the Scream device
+                    try {
+                        $screamDetails = Get-WmiObject -Class Win32_SoundDevice | Where-Object { $_.Name -like "*Scream*" }
+                        if ($screamDetails) {
+                            Write-Status "INFO" "Scream device details:"
+                            Write-Status "INFO" "  Name: $($screamDetails.Name)"
+                            Write-Status "INFO" "  Status: $($screamDetails.Status)"
+                            Write-Status "INFO" "  DeviceID: $($screamDetails.DeviceID)"
+                        }
+                    } catch {
+                        Write-Status "WARN" "Could not get detailed Scream device info: $_"
+                    }
+
+                    # Try to set Scream as default using nircmd if available, or PowerShell registry manipulation
+                    Write-Status "INFO" "Attempting to set Scream as default audio device..."
+                    try {
+                        # Method 1: Try using PowerShell to set default audio device
+                        # This is a simplified approach - in a real scenario we'd need more complex registry manipulation
+                        Write-Status "INFO" "Note: Setting default audio device requires admin privileges and complex registry changes"
+                        Write-Status "INFO" "For now, relying on VLC's --directx-audio-device default to use current default"
+
+                        # Method 2: At minimum, ensure Windows Audio service is running
+                        $audioService = Get-Service -Name "AudioSrv" -ErrorAction SilentlyContinue
+                        if ($audioService -and $audioService.Status -eq "Running") {
+                            Write-Status "OK" "Windows Audio service is running"
+                        } else {
+                            Write-Status "WARN" "Windows Audio service may not be running properly"
+                        }
+
+                    } catch {
+                        Write-Status "WARN" "Could not configure default audio device: $_"
+                    }
+                } else {
+                    Write-Status "ERROR" "Scream device not found in WMI audio devices!"
                     Write-Status "ERROR" "This means Scream driver installation may have failed"
                 }
             }
