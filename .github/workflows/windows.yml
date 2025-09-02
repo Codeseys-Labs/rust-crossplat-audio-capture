@@ -33,82 +33,68 @@ jobs:
       - name: Setup Windows SDK
         uses: microsoft/setup-msbuild@v1.3
 
-      - name: Install Scream Virtual Audio Driver
+      - name: Enable Test Signing
         run: |
-          Write-Host "Installing Scream Virtual Audio Driver for headless audio support..."
+          Write-Host "Enabling test signing for self-signed certificate approach..."
 
-          # Enable test signing for driver installation
-          Write-Host "Configuring system for driver installation..."
-          try {
-            # Enable test signing - required for Scream installation
-            $result = & bcdedit /set testsigning on 2>&1
-            Write-Host "Test signing result: $result"
-            Write-Host "✅ Test signing enabled for driver installation"
-          } catch {
-            Write-Host "⚠️ Could not enable test signing: $_"
-            throw "Test signing is required for Scream installation"
-          }
+          # Enable test signing - required for self-signed certificate approach
+          $result = & bcdedit /set testsigning on 2>&1
+          Write-Host "Test signing result: $result"
+          Write-Host "✅ Test signing enabled for driver installation"
 
-          # Download the latest Scream driver
-          $downloadUrl = "https://github.com/duncanthrax/scream/releases/download/4.0/Scream4.0.zip"
-          $zipPath = "$env:TEMP\Scream.zip"
-          $extractPath = "$env:TEMP\Scream"
-
-          Write-Host "Downloading Scream Virtual Audio Driver..."
-          Invoke-WebRequest -Uri $downloadUrl -OutFile $zipPath -UseBasicParsing
+      - name: Download and Extract Scream
+        run: |
+          Write-Host "Downloading Scream 4.0..."
+          Invoke-WebRequest https://github.com/duncanthrax/scream/releases/download/4.0/Scream4.0.zip -OutFile Scream4.0.zip
 
           Write-Host "Extracting Scream driver..."
-          Expand-Archive -Path $zipPath -DestinationPath $extractPath -Force
+          Expand-Archive -Path Scream4.0.zip -DestinationPath Scream
 
-          # Find the correct architecture folder and INF file
-          $arch = if ([Environment]::Is64BitOperatingSystem) { "x64" } else { "x86" }
-          $driverPath = Join-Path $extractPath "Install\driver\$arch"
-          $infFile = Get-ChildItem -Path $driverPath -Filter "Scream.inf" -ErrorAction SilentlyContinue
+      - name: Create Self-Signed Certificate
+        run: |
+          Write-Host "Creating self-signed certificate for Scream driver..."
 
-          if (-not $infFile) {
-            Write-Host "Available files in extract path:"
-            Get-ChildItem -Path $extractPath -Recurse | ForEach-Object { Write-Host "  $($_.FullName)" }
-            throw "Could not find Scream.inf file in driver package"
-          }
+          # Create self-signed certificate using OpenSSL
+          # -extensions v3_req ensures basic constraint CA:FALSE (required for driver signing)
+          openssl req -batch -verbose -x509 -newkey rsa -keyout ScreamCertificate.pvk -out ScreamCertificate.cer -nodes -extensions v3_req
 
-          Write-Host "Installing Scream driver from: $($infFile.FullName)"
+          Write-Host "Converting certificate to PFX format..."
+          openssl pkcs12 -export -nodes -in ScreamCertificate.cer -inkey ScreamCertificate.pvk -out ScreamCertificate.pfx -passout pass:
 
-          # Install Scream driver using the correct Windows Server method
-          Write-Host "Installing Scream driver using Windows Server headless method..."
+      - name: Setup MSVC Dev Environment
+        uses: ilammy/msvc-dev-cmd@v1
 
-          try {
-            # Change to the driver directory (required for Scream installation)
-            Push-Location $driverPath
+      - name: Re-sign Scream Driver
+        run: |
+          Write-Host "Re-signing Scream driver with self-signed certificate..."
 
-            # Use the NVIDIA-documented method for Windows Server headless environments
-            # The /subdirs and /reboot flags are crucial for headless installation
-            Write-Host "Installing Scream driver with automatic reboot..."
-            Write-Host "Command: pnputil /add-driver .\Scream.inf /subdirs /install /reboot"
+          # Sign the driver catalog with our self-signed certificate
+          signtool sign /v /fd SHA256 /f ScreamCertificate.pfx Scream\Install\driver\x64\Scream.cat
 
-            # Note: This will cause the runner to reboot automatically after installation
-            # The /reboot flag prevents hanging in headless environments
-            $installResult = & pnputil.exe /add-driver ".\Scream.inf" /subdirs /install /reboot 2>&1
+          Write-Host "✅ Driver re-signed successfully"
 
-            Write-Host "Scream installation result:"
-            $installResult | ForEach-Object { Write-Host "  $_" }
+      - name: Install Certificate to Trust Stores
+        run: |
+          Write-Host "Installing self-signed certificate to Windows trust stores..."
 
-            if ($LASTEXITCODE -eq 0) {
-              Write-Host "✅ Scream driver installed successfully - system will reboot"
-            } else {
-              Write-Host "⚠️ PnPUtil returned exit code: $LASTEXITCODE"
-              Write-Host "This may be normal for driver installation requiring reboot"
-            }
+          # Add certificate to both required stores for driver installation
+          Import-Certificate -FilePath ScreamCertificate.cer -CertStoreLocation Cert:\LocalMachine\root
+          Import-Certificate -FilePath ScreamCertificate.cer -CertStoreLocation Cert:\LocalMachine\TrustedPublisher
 
-          } catch {
-            Write-Host "❌ Scream driver installation failed: $_"
-            # Don't throw - the system may still reboot and install correctly
-            Write-Host "⚠️ System may still reboot and complete installation..."
-          } finally {
-            Pop-Location
-          }
+          Write-Host "✅ Certificate installed to trust stores"
 
-          Write-Host "⚠️ Note: If driver installation succeeded, the system will reboot automatically"
-          Write-Host "The workflow will continue after reboot if the driver was installed successfully"
+      - name: Install Scream Driver
+        run: |
+          Write-Host "Installing Scream virtual audio driver..."
+
+          # Install the driver using devcon (with timeout to prevent hanging)
+          Scream\Install\helpers\devcon-x64.exe install Scream\Install\driver\x64\Scream.inf *Scream
+
+          Write-Host "✅ Scream driver installation completed"
+        timeout-minutes: 5
+
+      - name: Start Audio Services
+        run: |
 
           # Start Windows Audio services
           Write-Host "Starting Windows Audio services..."
