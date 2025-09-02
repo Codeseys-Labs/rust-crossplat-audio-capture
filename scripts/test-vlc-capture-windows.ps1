@@ -250,7 +250,8 @@ try {
         "--gain", "1.5",            # Increase audio gain for better capture
         "--audio-visual", "dummy",   # Disable visualizations
         "--no-video",               # Audio only
-        "--aout", "wasapi",         # Use WASAPI audio output (routes to Virtual Audio Driver)
+        "--aout", "waveout",         # Use WaveOut audio output for explicit device selection
+        "--waveout-audio-device", "Virtual Audio Speaker", # Force output to the virtual device
         "--audio-replay-gain-mode", "none",  # Disable replay gain
         "--audio-replay-gain-preamp", "0",   # No preamp
         "--start-time", "0",        # Start from beginning
