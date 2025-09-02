@@ -103,15 +103,6 @@ jobs:
             Write-Host "❌ PnPUtil installation with timeout failed: $_"
           }
 
-          # Method 2: Try just adding to driver store (safer)
-          Write-Host "Trying to add driver to store only..."
-          try {
-            $storeResult = & pnputil.exe /add-driver $infFile.FullName /force 2>&1
-            Write-Host "Driver store result: $storeResult"
-          } catch {
-            Write-Host "Driver store addition failed: $_"
-          }
-
           # Method 3: Try PowerShell DISM method as fallback
           Write-Host "Attempting DISM driver installation as fallback..."
           try {
