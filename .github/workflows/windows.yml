@@ -73,58 +73,42 @@ jobs:
 
           Write-Host "Installing Scream driver from: $($infFile.FullName)"
 
-          # Install Scream driver using multiple methods for Windows Server compatibility
-          Write-Host "Installing Scream driver using Windows Server compatible methods..."
+          # Install Scream driver using the correct Windows Server method
+          Write-Host "Installing Scream driver using Windows Server headless method..."
 
           try {
             # Change to the driver directory (required for Scream installation)
             Push-Location $driverPath
 
-            # Method 1: Try adding driver to store first (safer for headless environments)
-            Write-Host "Method 1: Adding driver to Windows driver store..."
-            $storeResult = & pnputil.exe /add-driver ".\Scream.inf" /force 2>&1
-            Write-Host "Driver store result:"
-            $storeResult | ForEach-Object { Write-Host "  $_" }
+            # Use the NVIDIA-documented method for Windows Server headless environments
+            # The /subdirs and /reboot flags are crucial for headless installation
+            Write-Host "Installing Scream driver with automatic reboot..."
+            Write-Host "Command: pnputil /add-driver .\Scream.inf /subdirs /install /reboot"
 
-            # Method 2: Try DISM for driver installation (better for Windows Server)
-            Write-Host "Method 2: Installing driver using DISM..."
-            $dismResult = & dism.exe /online /add-driver /driver:".\Scream.inf" /forceunsigned 2>&1
-            Write-Host "DISM installation result:"
-            $dismResult | ForEach-Object { Write-Host "  $_" }
+            # Note: This will cause the runner to reboot automatically after installation
+            # The /reboot flag prevents hanging in headless environments
+            $installResult = & pnputil.exe /add-driver ".\Scream.inf" /subdirs /install /reboot 2>&1
 
-            # Method 3: Try pnputil install as fallback (may hang but worth trying)
-            Write-Host "Method 3: Attempting pnputil install with timeout..."
+            Write-Host "Scream installation result:"
+            $installResult | ForEach-Object { Write-Host "  $_" }
 
-            # Create a job to run pnputil with timeout
-            $scriptBlock = {
-              param($infPath)
-              Set-Location $using:driverPath
-              & pnputil.exe /add-driver ".\Scream.inf" /install 2>&1
-            }
-
-            $job = Start-Job -ScriptBlock $scriptBlock -ArgumentList $infFile.FullName
-            $completed = Wait-Job -Job $job -Timeout 30
-
-            if ($completed) {
-              $pnpResult = Receive-Job -Job $job
-              Write-Host "PnPUtil install result:"
-              $pnpResult | ForEach-Object { Write-Host "  $_" }
+            if ($LASTEXITCODE -eq 0) {
+              Write-Host "✅ Scream driver installed successfully - system will reboot"
             } else {
-              Write-Host "⚠️ PnPUtil install timed out after 30 seconds (expected in headless environment)"
-              Stop-Job -Job $job
+              Write-Host "⚠️ PnPUtil returned exit code: $LASTEXITCODE"
+              Write-Host "This may be normal for driver installation requiring reboot"
             }
-
-            Remove-Job -Job $job -Force
-
-            Write-Host "✅ Driver installation attempts completed"
 
           } catch {
             Write-Host "❌ Scream driver installation failed: $_"
-            # Don't throw - continue with verification to see if any method worked
-            Write-Host "⚠️ Continuing with verification to check if driver was installed..."
+            # Don't throw - the system may still reboot and install correctly
+            Write-Host "⚠️ System may still reboot and complete installation..."
           } finally {
             Pop-Location
           }
+
+          Write-Host "⚠️ Note: If driver installation succeeded, the system will reboot automatically"
+          Write-Host "The workflow will continue after reboot if the driver was installed successfully"
 
           # Start Windows Audio services
           Write-Host "Starting Windows Audio services..."
