@@ -204,7 +204,19 @@ try {
     Write-Status "INFO" "Starting VLC with audio stream..."
     Log-ProcessEvent "VLC_START" "Starting VLC with URL: $WorkingUrl"
     
-    $vlcArgs = @("--intf", "dummy", "--loop", $WorkingUrl, "--verbose", "2")
+    # VLC arguments with volume control and audio settings
+    $vlcArgs = @(
+        "--intf", "dummy",           # No GUI interface
+        "--loop",                    # Loop the audio
+        "--volume", "256",           # Set volume to maximum (0-256 scale)
+        "--gain", "1.0",            # Audio gain
+        "--audio-visual", "dummy",   # Disable visualizations
+        "--no-video",               # Audio only
+        "--verbose", "2",           # Verbose logging
+        $WorkingUrl
+    )
+
+    Write-Status "INFO" "VLC arguments: $($vlcArgs -join ' ')"
     $script:VlcProcess = Start-Process -FilePath $vlcPath -ArgumentList $vlcArgs -PassThru -RedirectStandardOutput "vlc_capture_test.log" -RedirectStandardError "vlc_capture_test_error.log"
     
     Log-ProcessEvent "VLC_STARTED" "VLC PID: $($script:VlcProcess.Id)"
@@ -228,19 +240,52 @@ try {
     }
     
     Write-Status "OK" "VLC is running with PID: $($script:VlcProcess.Id)"
-    
+
+    # List all VLC instances for debugging
+    Write-Status "INFO" "Listing all VLC instances..."
+    $allVlcProcesses = Get-Process -Name "vlc" -ErrorAction SilentlyContinue
+    if ($allVlcProcesses) {
+        foreach ($vlc in $allVlcProcesses) {
+            Write-Status "INFO" "VLC Process: PID=$($vlc.Id), CPU=$($vlc.CPU), Memory=$([math]::Round($vlc.WorkingSet64/1MB, 2))MB"
+
+            # Try to get command line for this process
+            try {
+                $cmdLine = Get-WmiObject Win32_Process -Filter "ProcessId = $($vlc.Id)" | Select-Object -ExpandProperty CommandLine
+                Write-Status "INFO" "  Command: $cmdLine"
+            } catch {
+                Write-Status "WARN" "  Could not get command line for PID $($vlc.Id)"
+            }
+        }
+    } else {
+        Write-Status "WARN" "No VLC processes found!"
+    }
+
+    # Wait a bit more for VLC to start playing
+    Write-Status "INFO" "Waiting for VLC to start playing audio..."
+    Start-Sleep -Seconds 5
+
     # Test our audio capture
     Write-Status "INFO" "Testing audio capture with our library..."
     
+    # First, test if we can detect any audio applications
+    Write-Status "INFO" "Testing audio application detection..."
+    try {
+        $testResult = & cargo run --bin dynamic_vlc_capture --no-default-features --features feat_windows 0 2>&1
+        Write-Status "INFO" "Audio detection test output:"
+        $testResult | ForEach-Object { Write-Host "  $_" }
+    } catch {
+        Write-Status "WARN" "Audio detection test failed: $_"
+    }
+
     # Test: Dynamic VLC capture example
     Write-Status "INFO" "Running dynamic_vlc_capture example..."
     Log-ProcessEvent "CARGO_START" "Starting cargo run"
     Log-ChildProcesses $PID "Before cargo run"
-    
+
     # Set environment variables
     $env:CI = "true"
     $env:GITHUB_ACTIONS = "true"
-    
+
     # Run the capture test
     $cargoResult = & cargo run --bin dynamic_vlc_capture --no-default-features --features feat_windows 10 2>&1
     $cargoExitCode = $LASTEXITCODE
@@ -259,9 +304,38 @@ try {
     }
     
     # Show logs for debugging
-    Write-Status "INFO" "=== VLC Logs (first 20 lines) ==="
+    Write-Status "INFO" "=== VLC Logs (first 30 lines) ==="
     if (Test-Path "vlc_capture_test.log") {
-        Get-Content "vlc_capture_test.log" | Select-Object -First 20 | Write-Host
+        Get-Content "vlc_capture_test.log" | Select-Object -First 30 | Write-Host
+    }
+
+    Write-Status "INFO" "=== VLC Error Logs ==="
+    if (Test-Path "vlc_capture_test_error.log") {
+        Get-Content "vlc_capture_test_error.log" | Write-Host
+    }
+
+    # Check if VLC is actually playing audio
+    Write-Status "INFO" "=== VLC Audio Status Check ==="
+    if (Test-Path "vlc_capture_test.log") {
+        $vlcLogs = Get-Content "vlc_capture_test.log" -Raw
+
+        if ($vlcLogs -match "audio output") {
+            Write-Status "OK" "VLC audio output detected in logs"
+        } else {
+            Write-Status "WARN" "No audio output detected in VLC logs"
+        }
+
+        if ($vlcLogs -match "main audio output") {
+            Write-Status "OK" "VLC main audio output initialized"
+        } else {
+            Write-Status "WARN" "VLC main audio output not found in logs"
+        }
+
+        if ($vlcLogs -match "volume") {
+            Write-Status "OK" "VLC volume settings found in logs"
+        } else {
+            Write-Status "WARN" "No volume settings found in VLC logs"
+        }
     }
     
     Write-Status "INFO" "=== Dynamic VLC Capture Logs ==="
