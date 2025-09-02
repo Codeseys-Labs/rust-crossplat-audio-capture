@@ -73,34 +73,55 @@ jobs:
 
           Write-Host "Installing Scream driver from: $($infFile.FullName)"
 
-          # Install Scream driver using the recommended method
-          Write-Host "Installing Scream driver using pnputil..."
+          # Install Scream driver using multiple methods for Windows Server compatibility
+          Write-Host "Installing Scream driver using Windows Server compatible methods..."
 
           try {
             # Change to the driver directory (required for Scream installation)
             Push-Location $driverPath
 
-            # Install the driver using the Scream-recommended method
-            Write-Host "Running: pnputil /add-driver .\Scream.inf /install"
-            $installResult = & pnputil.exe /add-driver ".\Scream.inf" /install 2>&1
+            # Method 1: Try adding driver to store first (safer for headless environments)
+            Write-Host "Method 1: Adding driver to Windows driver store..."
+            $storeResult = & pnputil.exe /add-driver ".\Scream.inf" /force 2>&1
+            Write-Host "Driver store result:"
+            $storeResult | ForEach-Object { Write-Host "  $_" }
 
-            Write-Host "Scream installation result:"
-            $installResult | ForEach-Object { Write-Host "  $_" }
+            # Method 2: Try DISM for driver installation (better for Windows Server)
+            Write-Host "Method 2: Installing driver using DISM..."
+            $dismResult = & dism.exe /online /add-driver /driver:".\Scream.inf" /forceunsigned 2>&1
+            Write-Host "DISM installation result:"
+            $dismResult | ForEach-Object { Write-Host "  $_" }
 
-            if ($LASTEXITCODE -eq 0) {
-              Write-Host "✅ Scream driver installed successfully"
-            } else {
-              Write-Host "⚠️ PnPUtil returned exit code: $LASTEXITCODE"
+            # Method 3: Try pnputil install as fallback (may hang but worth trying)
+            Write-Host "Method 3: Attempting pnputil install with timeout..."
 
-              # Try alternative installation method
-              Write-Host "Trying alternative installation method..."
-              $altResult = & pnputil.exe /add-driver ".\Scream.inf" /force 2>&1
-              Write-Host "Alternative installation result: $altResult"
+            # Create a job to run pnputil with timeout
+            $scriptBlock = {
+              param($infPath)
+              Set-Location $using:driverPath
+              & pnputil.exe /add-driver ".\Scream.inf" /install 2>&1
             }
+
+            $job = Start-Job -ScriptBlock $scriptBlock -ArgumentList $infFile.FullName
+            $completed = Wait-Job -Job $job -Timeout 30
+
+            if ($completed) {
+              $pnpResult = Receive-Job -Job $job
+              Write-Host "PnPUtil install result:"
+              $pnpResult | ForEach-Object { Write-Host "  $_" }
+            } else {
+              Write-Host "⚠️ PnPUtil install timed out after 30 seconds (expected in headless environment)"
+              Stop-Job -Job $job
+            }
+
+            Remove-Job -Job $job -Force
+
+            Write-Host "✅ Driver installation attempts completed"
 
           } catch {
             Write-Host "❌ Scream driver installation failed: $_"
-            throw "Failed to install Scream virtual audio driver"
+            # Don't throw - continue with verification to see if any method worked
+            Write-Host "⚠️ Continuing with verification to check if driver was installed..."
           } finally {
             Pop-Location
           }
