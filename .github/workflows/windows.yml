@@ -69,33 +69,47 @@ jobs:
           # Install the driver using pnputil with timeout to prevent hanging
           Write-Host "Installing driver silently using pnputil with timeout..."
 
-          # Method 1: Try with timeout using Start-Process
+          # Method 1: Try with timeout using job-based approach
           try {
             Write-Host "Attempting pnputil installation with 60-second timeout..."
-            $pnpProcess = Start-Process -FilePath "pnputil.exe" -ArgumentList "/add-driver", $infFile.FullName, "/install", "/force" -Wait -PassThru -NoNewWindow -RedirectStandardOutput "$env:TEMP\pnp_output.txt" -RedirectStandardError "$env:TEMP\pnp_error.txt" -TimeoutSec 60
 
-            $output = Get-Content "$env:TEMP\pnp_output.txt" -ErrorAction SilentlyContinue
-            $errors = Get-Content "$env:TEMP\pnp_error.txt" -ErrorAction SilentlyContinue
-
-            Write-Host "PnPUtil output: $output"
-            if ($errors) { Write-Host "PnPUtil errors: $errors" }
-
-            if ($pnpProcess.ExitCode -eq 0) {
-              Write-Host "✅ Driver installed successfully with pnputil"
-            } else {
-              Write-Host "⚠️ PnPUtil returned exit code: $($pnpProcess.ExitCode)"
+            # Create a script block for the pnputil command
+            $scriptBlock = {
+              param($infPath)
+              & pnputil.exe /add-driver $infPath /install /force 2>&1
             }
+
+            # Start the job with timeout
+            $job = Start-Job -ScriptBlock $scriptBlock -ArgumentList $infFile.FullName
+            $completed = Wait-Job -Job $job -Timeout 60
+
+            if ($completed) {
+              $result = Receive-Job -Job $job
+              Write-Host "PnPUtil result: $result"
+
+              if ($job.State -eq "Completed") {
+                Write-Host "✅ Driver installation completed"
+              } else {
+                Write-Host "⚠️ Driver installation finished with state: $($job.State)"
+              }
+            } else {
+              Write-Host "⚠️ PnPUtil installation timed out after 60 seconds"
+              Stop-Job -Job $job
+            }
+
+            Remove-Job -Job $job -Force
+
           } catch {
             Write-Host "❌ PnPUtil installation with timeout failed: $_"
+          }
 
-            # Method 2: Try just adding to driver store (safer)
-            Write-Host "Trying to add driver to store only..."
-            try {
-              $storeResult = & pnputil.exe /add-driver $infFile.FullName /force 2>&1
-              Write-Host "Driver store result: $storeResult"
-            } catch {
-              Write-Host "Driver store addition failed: $_"
-            }
+          # Method 2: Try just adding to driver store (safer)
+          Write-Host "Trying to add driver to store only..."
+          try {
+            $storeResult = & pnputil.exe /add-driver $infFile.FullName /force 2>&1
+            Write-Host "Driver store result: $storeResult"
+          } catch {
+            Write-Host "Driver store addition failed: $_"
           }
 
           # Method 3: Try PowerShell DISM method as fallback
