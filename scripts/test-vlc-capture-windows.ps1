@@ -215,7 +215,6 @@ try {
         "--audio-visual", "dummy",   # Disable visualizations
         "--no-video",               # Audio only
         "--aout", "wasapi",         # Use WASAPI audio output (may work better with Scream)
-        "--wasapi-audio-device", "default",   # Use default WASAPI device
         "--audio-replay-gain-mode", "none",  # Disable replay gain
         "--audio-replay-gain-preamp", "0",   # No preamp
         "--verbose", "2",           # Verbose logging
