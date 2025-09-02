@@ -212,6 +212,8 @@ try {
         "--gain", "1.0",            # Audio gain
         "--audio-visual", "dummy",   # Disable visualizations
         "--no-video",               # Audio only
+        "--aout", "directsound",    # Use DirectSound audio output
+        "--directx-audio-device", "default",  # Use default audio device (should be Scream)
         "--verbose", "2",           # Verbose logging
         $WorkingUrl
     )
@@ -260,6 +262,63 @@ try {
         Write-Status "WARN" "No VLC processes found!"
     }
 
+    # CRITICAL: Set Scream as default audio device for VLC to use
+    Write-Status "INFO" "Setting up Scream as default audio device..."
+    try {
+        # List all audio devices first
+        Write-Status "INFO" "Available audio devices:"
+        $audioDevices = Get-WmiObject -Class Win32_SoundDevice
+        foreach ($device in $audioDevices) {
+            Write-Status "INFO" "  Audio Device: $($device.Name) - $($device.Description)"
+        }
+
+        # Try to set Scream as default using PowerShell audio cmdlets
+        # Note: This may require Windows 10/11 with audio management features
+        try {
+            # First try the AudioDeviceCmdlets module if available
+            if (Get-Module -ListAvailable -Name AudioDeviceCmdlets) {
+                Import-Module AudioDeviceCmdlets -ErrorAction SilentlyContinue
+                $screamDevice = Get-AudioDevice -List | Where-Object { $_.Name -like "*Scream*" }
+                if ($screamDevice) {
+                    Write-Status "OK" "Found Scream device: $($screamDevice.Name)"
+                    Set-AudioDevice -ID $screamDevice.ID
+                    Write-Status "OK" "Set Scream as default audio device"
+                } else {
+                    Write-Status "WARN" "Scream audio device not found in audio device list"
+                    # List all available audio devices for debugging
+                    Get-AudioDevice -List | ForEach-Object {
+                        Write-Status "INFO" "  Available: $($_.Name) (ID: $($_.ID))"
+                    }
+                }
+            } else {
+                Write-Status "INFO" "AudioDeviceCmdlets module not available, using alternative method"
+
+                # Alternative: Use nircmd if available, or manual registry approach
+                Write-Status "INFO" "Attempting to verify Scream device installation..."
+
+                # Check if Scream device exists in Windows audio devices
+                $audioEndpoints = Get-ItemProperty "HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\MMDevices\Audio\Render\*" -ErrorAction SilentlyContinue
+                $screamFound = $false
+                foreach ($endpoint in $audioEndpoints) {
+                    if ($endpoint.DeviceDesc -like "*Scream*" -or $endpoint.FriendlyName -like "*Scream*") {
+                        Write-Status "OK" "Found Scream device in registry: $($endpoint.FriendlyName)"
+                        $screamFound = $true
+                        break
+                    }
+                }
+
+                if (-not $screamFound) {
+                    Write-Status "ERROR" "Scream device not found in Windows audio devices!"
+                    Write-Status "ERROR" "This means Scream driver installation may have failed"
+                }
+            }
+        } catch {
+            Write-Status "WARN" "Could not set Scream as default using PowerShell: $_"
+        }
+    } catch {
+        Write-Status "WARN" "Audio device configuration failed: $_"
+    }
+
     # Wait a bit more for VLC to start playing
     Write-Status "INFO" "Waiting for VLC to start playing audio..."
     Start-Sleep -Seconds 5
@@ -267,12 +326,28 @@ try {
     # Test our audio capture
     Write-Status "INFO" "Testing audio capture with our library..."
     
-    # First, test if we can detect any audio applications
-    Write-Status "INFO" "Testing audio application detection..."
+    # First, test if we can detect any audio applications and verify Scream
+    Write-Status "INFO" "Testing audio application detection and Scream verification..."
     try {
         $testResult = & cargo run --bin dynamic_vlc_capture --no-default-features --features feat_windows 0 2>&1
         Write-Status "INFO" "Audio detection test output:"
         $testResult | ForEach-Object { Write-Host "  $_" }
+
+        # Check if the output mentions any audio devices or applications
+        $testOutput = $testResult -join "`n"
+        if ($testOutput -match "Found \d+ capturable applications") {
+            Write-Status "OK" "Audio capture system is working - found capturable applications"
+        } else {
+            Write-Status "WARN" "Audio capture system may not be detecting applications properly"
+        }
+
+        # Check for any Scream-related output
+        if ($testOutput -match "Scream") {
+            Write-Status "OK" "Scream device detected by audio capture system"
+        } else {
+            Write-Status "WARN" "Scream device not detected by audio capture system"
+        }
+
     } catch {
         Write-Status "WARN" "Audio detection test failed: $_"
     }
