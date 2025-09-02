@@ -33,83 +33,76 @@ jobs:
       - name: Setup Windows SDK
         uses: microsoft/setup-msbuild@v1.3
 
-      - name: Install Virtual Audio Driver
+      - name: Install Scream Virtual Audio Driver
         run: |
-          Write-Host "Installing Virtual Audio Driver for headless audio support..."
+          Write-Host "Installing Scream Virtual Audio Driver for headless audio support..."
 
-          # Temporarily disable driver signature enforcement for CI
+          # Enable test signing for driver installation
           Write-Host "Configuring system for driver installation..."
           try {
-            # This is safe in CI environments and will be reset on reboot
-            bcdedit /set testsigning on 2>&1 | Out-Null
+            # Enable test signing - required for Scream installation
+            $result = & bcdedit /set testsigning on 2>&1
+            Write-Host "Test signing result: $result"
             Write-Host "✅ Test signing enabled for driver installation"
           } catch {
-            Write-Host "⚠️ Could not enable test signing (may not be needed): $_"
+            Write-Host "⚠️ Could not enable test signing: $_"
+            throw "Test signing is required for Scream installation"
           }
 
-          # Download the latest Virtual Audio Driver
-          $downloadUrl = "https://github.com/VirtualDrivers/Virtual-Audio-Driver/releases/download/25.7.14/Virtual.Audio.Driver.Signed.-.25.7.14.zip"
-          $zipPath = "$env:TEMP\VirtualAudioDriver.zip"
-          $extractPath = "$env:TEMP\VirtualAudioDriver"
+          # Download the latest Scream driver
+          $downloadUrl = "https://github.com/duncanthrax/scream/releases/download/4.0/Scream4.0.zip"
+          $zipPath = "$env:TEMP\Scream.zip"
+          $extractPath = "$env:TEMP\Scream"
 
-          Write-Host "Downloading Virtual Audio Driver..."
+          Write-Host "Downloading Scream Virtual Audio Driver..."
           Invoke-WebRequest -Uri $downloadUrl -OutFile $zipPath -UseBasicParsing
 
-          Write-Host "Extracting Virtual Audio Driver..."
+          Write-Host "Extracting Scream driver..."
           Expand-Archive -Path $zipPath -DestinationPath $extractPath -Force
 
-          # Find the INF file
-          $infFile = Get-ChildItem -Path $extractPath -Filter "*.inf" -Recurse | Select-Object -First 1
+          # Find the correct architecture folder and INF file
+          $arch = if ([Environment]::Is64BitOperatingSystem) { "x64" } else { "x86" }
+          $driverPath = Join-Path $extractPath "Install\driver\$arch"
+          $infFile = Get-ChildItem -Path $driverPath -Filter "Scream.inf" -ErrorAction SilentlyContinue
+
           if (-not $infFile) {
-            throw "Could not find INF file in Virtual Audio Driver package"
+            Write-Host "Available files in extract path:"
+            Get-ChildItem -Path $extractPath -Recurse | ForEach-Object { Write-Host "  $($_.FullName)" }
+            throw "Could not find Scream.inf file in driver package"
           }
 
-          Write-Host "Installing Virtual Audio Driver from: $($infFile.FullName)"
+          Write-Host "Installing Scream driver from: $($infFile.FullName)"
 
-          # Install the driver using pnputil with timeout to prevent hanging
-          Write-Host "Installing driver silently using pnputil with timeout..."
+          # Install Scream driver using the recommended method
+          Write-Host "Installing Scream driver using pnputil..."
 
-          # Method 1: Try with timeout using job-based approach
           try {
-            Write-Host "Attempting pnputil installation with 60-second timeout..."
+            # Change to the driver directory (required for Scream installation)
+            Push-Location $driverPath
 
-            # Create a script block for the pnputil command
-            $scriptBlock = {
-              param($infPath)
-              & pnputil.exe /add-driver $infPath /install /force 2>&1
-            }
+            # Install the driver using the Scream-recommended method
+            Write-Host "Running: pnputil /add-driver .\Scream.inf /install"
+            $installResult = & pnputil.exe /add-driver ".\Scream.inf" /install 2>&1
 
-            # Start the job with timeout
-            $job = Start-Job -ScriptBlock $scriptBlock -ArgumentList $infFile.FullName
-            $completed = Wait-Job -Job $job -Timeout 60
+            Write-Host "Scream installation result:"
+            $installResult | ForEach-Object { Write-Host "  $_" }
 
-            if ($completed) {
-              $result = Receive-Job -Job $job
-              Write-Host "PnPUtil result: $result"
-
-              if ($job.State -eq "Completed") {
-                Write-Host "✅ Driver installation completed"
-              } else {
-                Write-Host "⚠️ Driver installation finished with state: $($job.State)"
-              }
+            if ($LASTEXITCODE -eq 0) {
+              Write-Host "✅ Scream driver installed successfully"
             } else {
-              Write-Host "⚠️ PnPUtil installation timed out after 60 seconds"
-              Stop-Job -Job $job
+              Write-Host "⚠️ PnPUtil returned exit code: $LASTEXITCODE"
+
+              # Try alternative installation method
+              Write-Host "Trying alternative installation method..."
+              $altResult = & pnputil.exe /add-driver ".\Scream.inf" /force 2>&1
+              Write-Host "Alternative installation result: $altResult"
             }
 
-            Remove-Job -Job $job -Force
-
           } catch {
-            Write-Host "❌ PnPUtil installation with timeout failed: $_"
-          }
-
-          # Method 3: Try PowerShell DISM method as fallback
-          Write-Host "Attempting DISM driver installation as fallback..."
-          try {
-            $dismResult = & dism.exe /online /add-driver /driver:$infFile.FullName /force 2>&1
-            Write-Host "DISM result: $dismResult"
-          } catch {
-            Write-Host "DISM installation failed: $_"
+            Write-Host "❌ Scream driver installation failed: $_"
+            throw "Failed to install Scream virtual audio driver"
+          } finally {
+            Pop-Location
           }
 
           # Start Windows Audio services
@@ -131,17 +124,43 @@ jobs:
           # Wait a moment for services to initialize
           Start-Sleep -Seconds 3
 
-          # Verify driver installation
-          Write-Host "Verifying driver installation..."
-          $virtualDevices = Get-PnpDevice | Where-Object { $_.FriendlyName -like "*Virtual*Audio*" -or $_.FriendlyName -like "*Virtual*Mic*" }
-          if ($virtualDevices) {
-            Write-Host "✅ Virtual audio devices detected:"
-            $virtualDevices | ForEach-Object { Write-Host "  - $($_.FriendlyName) ($($_.Status))" }
-          } else {
-            Write-Host "⚠️ No virtual audio devices detected yet (may appear after reboot)"
+          # Verify Scream driver installation
+          Write-Host "Verifying Scream driver installation..."
+
+          # Look for Scream audio devices
+          $screamDevices = Get-PnpDevice | Where-Object {
+            $_.FriendlyName -like "*Scream*" -or
+            $_.FriendlyName -like "*Virtual*Audio*" -or
+            $_.Name -like "*Scream*"
           }
 
-          Write-Host "Virtual Audio Driver installation completed"
+          if ($screamDevices) {
+            Write-Host "✅ Scream audio devices detected:"
+            $screamDevices | ForEach-Object {
+              Write-Host "  - $($_.FriendlyName) ($($_.Status))"
+            }
+          } else {
+            Write-Host "⚠️ No Scream audio devices detected yet"
+
+            # List all audio devices for debugging
+            Write-Host "All audio devices:"
+            Get-PnpDevice | Where-Object { $_.Class -eq "AudioEndpoint" -or $_.Class -eq "MEDIA" } |
+              ForEach-Object { Write-Host "  - $($_.FriendlyName) ($($_.Status))" }
+          }
+
+          # Check Windows Audio services
+          Write-Host "Checking audio services..."
+          $audioServices = @("AudioSrv", "AudioEndpointBuilder")
+          foreach ($service in $audioServices) {
+            $svc = Get-Service -Name $service -ErrorAction SilentlyContinue
+            if ($svc) {
+              Write-Host "  $service: $($svc.Status)"
+            } else {
+              Write-Host "  $service: Not found"
+            }
+          }
+
+          Write-Host "Scream Virtual Audio Driver installation completed"
         shell: pwsh
 
       - name: Install VLC
@@ -161,8 +180,8 @@ jobs:
           Get-CimInstance Win32_SoundDevice | Format-List Name, Status, Manufacturer
           Write-Host "=== Audio Services ==="
           Get-Service -Name "AudioSrv", "AudioEndpointBuilder" | Format-List Name, Status
-          Write-Host "=== Virtual Audio Driver Check ==="
-          Get-CimInstance Win32_PnPEntity | Where-Object { $_.Name -like "*Virtual*Audio*" } | Format-List Name, Status, DeviceID
+          Write-Host "=== Scream Virtual Audio Driver Check ==="
+          Get-CimInstance Win32_PnPEntity | Where-Object { $_.Name -like "*Scream*" -or $_.Name -like "*Virtual*Audio*" } | Format-List Name, Status, DeviceID
           Write-Host "=== VLC Installation ==="
           if (Test-Path "${env:ProgramFiles}\VideoLAN\VLC\vlc.exe") {
             Write-Host "VLC found at: ${env:ProgramFiles}\VideoLAN\VLC\vlc.exe"
@@ -199,17 +218,17 @@ jobs:
           cargo build --example windows_apis --no-default-features --features feat_windows
         shell: pwsh
 
-      - name: Verify Virtual Audio Devices
+      - name: Verify Scream Audio Devices
         run: |
-          Write-Host "Verifying Virtual Audio Driver installation..."
+          Write-Host "Verifying Scream Virtual Audio Driver installation..."
 
-          # Check for virtual audio devices
-          Write-Host "=== Checking for Virtual Audio Devices ==="
-          $virtualDevices = Get-CimInstance Win32_PnPEntity | Where-Object { $_.Name -like "*Virtual*Audio*" -or $_.Name -like "*Virtual*Mic*" }
-          if ($virtualDevices) {
-            $virtualDevices | Format-List Name, Status, DeviceID
+          # Check for Scream audio devices
+          Write-Host "=== Checking for Scream Audio Devices ==="
+          $screamDevices = Get-CimInstance Win32_PnPEntity | Where-Object { $_.Name -like "*Scream*" -or $_.Name -like "*Virtual*Audio*" -or $_.Name -like "*Virtual*Mic*" }
+          if ($screamDevices) {
+            $screamDevices | Format-List Name, Status, DeviceID
           } else {
-            Write-Host "No virtual audio devices found"
+            Write-Host "No Scream audio devices found"
           }
 
           # Check audio endpoints
@@ -230,7 +249,7 @@ jobs:
           if ($audioSrv) { Write-Host "AudioSrv: $($audioSrv.Status)" }
           if ($endpointBuilder) { Write-Host "AudioEndpointBuilder: $($endpointBuilder.Status)" }
 
-          Write-Host "Virtual Audio Device verification completed"
+          Write-Host "Scream Virtual Audio Device verification completed"
         shell: pwsh
 
       - name: Test VLC audio capture
