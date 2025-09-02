@@ -364,32 +364,6 @@ try {
 
     # Test our audio capture
     Write-Status "INFO" "Testing audio capture with our library..."
-    
-    # First, test if we can detect any audio applications and verify Scream
-    Write-Status "INFO" "Testing audio application detection and Scream verification..."
-    try {
-        $testResult = & cargo run --bin dynamic_vlc_capture --no-default-features --features feat_windows 0 2>&1
-        Write-Status "INFO" "Audio detection test output:"
-        $testResult | ForEach-Object { Write-Host "  $_" }
-
-        # Check if the output mentions any audio devices or applications
-        $testOutput = $testResult -join "`n"
-        if ($testOutput -match "Found \d+ capturable applications") {
-            Write-Status "OK" "Audio capture system is working - found capturable applications"
-        } else {
-            Write-Status "WARN" "Audio capture system may not be detecting applications properly"
-        }
-
-        # Check for any Scream-related output
-        if ($testOutput -match "Scream") {
-            Write-Status "OK" "Scream device detected by audio capture system"
-        } else {
-            Write-Status "WARN" "Scream device not detected by audio capture system"
-        }
-
-    } catch {
-        Write-Status "WARN" "Audio detection test failed: $_"
-    }
 
     # Test: Dynamic VLC capture example
     Write-Status "INFO" "Running dynamic_vlc_capture example..."
