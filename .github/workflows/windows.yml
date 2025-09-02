@@ -61,30 +61,62 @@ jobs:
           Write-Host "Found INF files:"
           $infFiles | ForEach-Object { Write-Host "  - $($_.FullName)" }
           
-          # Install using pnputil for headless automation
+          # CRITICAL: Pre-authorize certificate from .cat file for silent installation
+          Write-Host "Pre-authorizing driver certificate for silent installation..."
+          
+          # Find .cat files (catalog files contain the driver certificate)
+          $catFiles = Get-ChildItem VirtualAudioDriver -Recurse -Include "*.cat"
+          if ($catFiles) {
+            foreach ($catFile in $catFiles) {
+              Write-Host "Extracting certificate from: $($catFile.Name)"
+              try {
+                # Extract certificate from .cat file using PowerShell
+                $catCert = Get-AuthenticodeSignature -FilePath $catFile.FullName
+                if ($catCert.SignerCertificate) {
+                  Write-Host "Found certificate: $($catCert.SignerCertificate.Subject)"
+                  
+                  # Export certificate to temporary file
+                  $tempCertPath = "VirtualAudioDriverCert.cer"
+                  [System.IO.File]::WriteAllBytes($tempCertPath, $catCert.SignerCertificate.Export([System.Security.Cryptography.X509Certificates.X509ContentType]::Cert))
+                  
+                  # Install certificate to Root and TrustedPublisher stores for silent driver installation
+                  Write-Host "Installing certificate to Root store..."
+                  Import-Certificate -FilePath $tempCertPath -CertStoreLocation Cert:\LocalMachine\Root
+                  
+                  Write-Host "Installing certificate to TrustedPublisher store..."
+                  Import-Certificate -FilePath $tempCertPath -CertStoreLocation Cert:\LocalMachine\TrustedPublisher
+                  
+                  Write-Host "✅ Certificate pre-authorized for silent installation"
+                } else {
+                  Write-Host "⚠️ No certificate found in $($catFile.Name)"
+                }
+              } catch {
+                Write-Host "⚠️ Failed to extract certificate from $($catFile.Name): $_"
+              }
+            }
+          } else {
+            Write-Host "⚠️ No .cat files found"
+          }
+          
+          # Install using pnputil after certificate pre-authorization
           if ($infFiles) {
             foreach ($inf in $infFiles) {
               Write-Host "Installing driver: $($inf.Name)"
+              
               try {
-                # Use pnputil for modern driver installation
-                $result = & pnputil /add-driver $inf.FullName /install 2>&1
-                Write-Host "pnputil output: $result"
-                Write-Host "✅ Successfully processed $($inf.Name)"
+                # Now pnputil should work silently since certificate is pre-authorized
+                Write-Host "Installing with pre-authorized certificate..."
+                $pnpResult = & pnputil /add-driver $inf.FullName /install 2>&1
+                Write-Host "pnputil result: $pnpResult"
+                
+                if ($LASTEXITCODE -eq 0) {
+                  Write-Host "✅ Successfully installed $($inf.Name)"
+                } else {
+                  Write-Host "⚠️ pnputil returned exit code: $LASTEXITCODE"
+                  Write-Host "Output: $pnpResult"
+                }
               } catch {
-                Write-Host "⚠️ Failed to install $($inf.Name): $_"
-              }
-            }
-            
-            # Alternative: Try devcon installation if available
-            $devconPath = Get-ChildItem VirtualAudioDriver -Recurse -Include "devcon*.exe" | Select-Object -First 1
-            if ($devconPath) {
-              Write-Host "Found devcon tool, attempting alternative installation..."
-              try {
-                # Virtual Audio Driver typically uses Root\VirtualAudioDriver as hardware ID
-                & $devconPath.FullName install "$($infFiles[0].FullName)" "Root\VirtualAudioDriver"
-                Write-Host "✅ devcon installation completed"
-              } catch {
-                Write-Host "⚠️ devcon installation failed: $_"
+                Write-Host "⚠️ pnputil execution failed: $_"
               }
             }
           } else {
