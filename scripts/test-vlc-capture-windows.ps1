@@ -224,21 +224,7 @@ try {
 
     Write-Status "INFO" "VLC arguments: $($vlcArgs -join ' ')"
 
-    # DIAGNOSTIC: Test VLC audio output modules first
-    Write-Status "INFO" "Testing VLC audio output capabilities..."
-    try {
-        # Test what audio output modules VLC supports
-        $vlcModules = & $vlcPath --list 2>&1 | Select-String "audio output"
-        Write-Status "INFO" "VLC audio output modules:"
-        $vlcModules | ForEach-Object { Write-Status "INFO" "  $_" }
-
-        # Test what audio devices VLC can see
-        $vlcDevices = & $vlcPath --intf dummy --list-audio-devices 2>&1
-        Write-Status "INFO" "VLC audio devices:"
-        $vlcDevices | ForEach-Object { Write-Status "INFO" "  $_" }
-    } catch {
-        Write-Status "WARN" "Could not query VLC audio capabilities: $_"
-    }
+    # Skip VLC diagnostics for now as they may hang - focus on getting audio working
 
     $script:VlcProcess = Start-Process -FilePath $vlcPath -ArgumentList $vlcArgs -PassThru -RedirectStandardOutput "vlc_capture_test.log" -RedirectStandardError "vlc_capture_test_error.log"
     
@@ -343,49 +329,10 @@ try {
                         Write-Status "WARN" "Could not get detailed Scream device info: $_"
                     }
 
-                    # CRITICAL FIX: VLC shows "bad device GUID: Scream" - need to set Scream as Windows default
-                    Write-Status "INFO" "Attempting to set Scream as Windows default audio device..."
+                    # SIMPLIFIED: Focus on verifying Scream exists and Windows Audio service
+                    Write-Status "INFO" "Verifying Scream device and audio services..."
                     try {
-                        # Method 1: Use PowerShell to set Scream as default playback device
-                        Write-Status "INFO" "Setting Scream as default audio playback device..."
-
-                        # Get all audio devices and find Scream
-                        $audioDevices = Get-WmiObject -Class Win32_SoundDevice
-                        $screamDevice = $audioDevices | Where-Object { $_.Name -like "*Scream*" }
-
-                        if ($screamDevice) {
-                            Write-Status "OK" "Found Scream device: $($screamDevice.Name)"
-
-                            # Try to use nircmd if available (common Windows utility)
-                            $nircmdPath = "C:\Windows\System32\nircmd.exe"
-                            if (Test-Path $nircmdPath) {
-                                Write-Status "INFO" "Using nircmd to set default audio device..."
-                                & $nircmdPath setdefaultsounddevice "Scream" 1
-                                Write-Status "OK" "Attempted to set Scream as default using nircmd"
-                            } else {
-                                Write-Status "INFO" "nircmd not available, using alternative method..."
-
-                                # Alternative: Try using Windows Sound Control Panel automation
-                                # This is a more complex approach using COM objects
-                                try {
-                                    Add-Type -TypeDefinition @"
-                                        using System;
-                                        using System.Runtime.InteropServices;
-                                        public class AudioEndpointVolume {
-                                            [DllImport("ole32.dll")]
-                                            public static extern int CoCreateInstance(ref Guid rclsid, IntPtr pUnkOuter, uint dwClsContext, ref Guid riid, out IntPtr ppv);
-                                        }
-"@
-                                    Write-Status "INFO" "Loaded audio endpoint COM interface"
-                                } catch {
-                                    Write-Status "WARN" "Could not load audio endpoint interface: $_"
-                                }
-                            }
-                        } else {
-                            Write-Status "ERROR" "Could not find Scream device in WMI query!"
-                        }
-
-                        # Method 2: Ensure Windows Audio service is running
+                        # Ensure Windows Audio service is running
                         $audioService = Get-Service -Name "AudioSrv" -ErrorAction SilentlyContinue
                         if ($audioService -and $audioService.Status -eq "Running") {
                             Write-Status "OK" "Windows Audio service is running"
@@ -393,8 +340,11 @@ try {
                             Write-Status "WARN" "Windows Audio service may not be running properly"
                         }
 
+                        # Note: Relying on VLC WASAPI + default device approach
+                        Write-Status "INFO" "Using WASAPI + default device strategy for Scream routing"
+
                     } catch {
-                        Write-Status "WARN" "Could not configure default audio device: $_"
+                        Write-Status "WARN" "Audio service check failed: $_"
                     }
                 } else {
                     Write-Status "ERROR" "Scream device not found in WMI audio devices!"
