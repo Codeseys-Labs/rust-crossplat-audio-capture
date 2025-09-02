@@ -33,6 +33,46 @@ jobs:
       - name: Setup Windows SDK
         uses: microsoft/setup-msbuild@v1.3
 
+      - name: Install Virtual Audio Driver
+        run: |
+          Write-Host "Installing Virtual Audio Driver for headless audio support..."
+
+          # Download the latest Virtual Audio Driver
+          $downloadUrl = "https://github.com/VirtualDrivers/Virtual-Audio-Driver/releases/download/25.7.14/Virtual.Audio.Driver.Signed.-.25.7.14.zip"
+          $zipPath = "$env:TEMP\VirtualAudioDriver.zip"
+          $extractPath = "$env:TEMP\VirtualAudioDriver"
+
+          Write-Host "Downloading Virtual Audio Driver..."
+          Invoke-WebRequest -Uri $downloadUrl -OutFile $zipPath -UseBasicParsing
+
+          Write-Host "Extracting Virtual Audio Driver..."
+          Expand-Archive -Path $zipPath -DestinationPath $extractPath -Force
+
+          # Find the INF file
+          $infFile = Get-ChildItem -Path $extractPath -Filter "*.inf" -Recurse | Select-Object -First 1
+          if (-not $infFile) {
+            throw "Could not find INF file in Virtual Audio Driver package"
+          }
+
+          Write-Host "Installing Virtual Audio Driver from: $($infFile.FullName)"
+
+          # Install the driver using pnputil
+          try {
+            $result = & pnputil.exe /add-driver $infFile.FullName /install
+            Write-Host "Driver installation result: $result"
+          } catch {
+            Write-Host "Driver installation failed: $_"
+            # Continue anyway - the driver might still work
+          }
+
+          # Start Windows Audio services
+          Write-Host "Starting Windows Audio services..."
+          Start-Service -Name "AudioSrv" -ErrorAction SilentlyContinue
+          Start-Service -Name "AudioEndpointBuilder" -ErrorAction SilentlyContinue
+
+          Write-Host "Virtual Audio Driver installation completed"
+        shell: pwsh
+
       - name: Install VLC
         run: |
           Write-Host "Installing VLC using Chocolatey..."
@@ -48,6 +88,10 @@ jobs:
           cargo --version --verbose
           Write-Host "=== Audio Devices ==="
           Get-CimInstance Win32_SoundDevice | Format-List Name, Status, Manufacturer
+          Write-Host "=== Audio Services ==="
+          Get-Service -Name "AudioSrv", "AudioEndpointBuilder" | Format-List Name, Status
+          Write-Host "=== Virtual Audio Driver Check ==="
+          Get-CimInstance Win32_PnPEntity | Where-Object { $_.Name -like "*Virtual*Audio*" } | Format-List Name, Status, DeviceID
           Write-Host "=== VLC Installation ==="
           if (Test-Path "${env:ProgramFiles}\VideoLAN\VLC\vlc.exe") {
             Write-Host "VLC found at: ${env:ProgramFiles}\VideoLAN\VLC\vlc.exe"
@@ -82,6 +126,40 @@ jobs:
           Write-Host "Building Windows examples to verify compilation..."
           cargo build --example windows_application_capture --no-default-features --features feat_windows
           cargo build --example windows_apis --no-default-features --features feat_windows
+        shell: pwsh
+
+      - name: Verify Virtual Audio Devices
+        run: |
+          Write-Host "Verifying Virtual Audio Driver installation..."
+
+          # Check for virtual audio devices
+          Write-Host "=== Checking for Virtual Audio Devices ==="
+          $virtualDevices = Get-CimInstance Win32_PnPEntity | Where-Object { $_.Name -like "*Virtual*Audio*" -or $_.Name -like "*Virtual*Mic*" }
+          if ($virtualDevices) {
+            $virtualDevices | Format-List Name, Status, DeviceID
+          } else {
+            Write-Host "No virtual audio devices found"
+          }
+
+          # Check audio endpoints
+          Write-Host "=== Checking Audio Endpoints ==="
+          try {
+            Add-Type -AssemblyName System.Core
+            $audioDevices = Get-WmiObject -Class Win32_SoundDevice
+            $audioDevices | Where-Object { $_.Name -like "*Virtual*" } | Format-List Name, Status
+          } catch {
+            Write-Host "Could not enumerate audio endpoints: $_"
+          }
+
+          # Verify audio services are running
+          Write-Host "=== Audio Services Status ==="
+          $audioSrv = Get-Service -Name "AudioSrv" -ErrorAction SilentlyContinue
+          $endpointBuilder = Get-Service -Name "AudioEndpointBuilder" -ErrorAction SilentlyContinue
+
+          if ($audioSrv) { Write-Host "AudioSrv: $($audioSrv.Status)" }
+          if ($endpointBuilder) { Write-Host "AudioEndpointBuilder: $($endpointBuilder.Status)" }
+
+          Write-Host "Virtual Audio Device verification completed"
         shell: pwsh
 
       - name: Test VLC audio capture
