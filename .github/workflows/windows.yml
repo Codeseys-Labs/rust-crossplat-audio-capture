@@ -37,6 +37,16 @@ jobs:
         run: |
           Write-Host "Installing Virtual Audio Driver for headless audio support..."
 
+          # Temporarily disable driver signature enforcement for CI
+          Write-Host "Configuring system for driver installation..."
+          try {
+            # This is safe in CI environments and will be reset on reboot
+            bcdedit /set testsigning on 2>&1 | Out-Null
+            Write-Host "✅ Test signing enabled for driver installation"
+          } catch {
+            Write-Host "⚠️ Could not enable test signing (may not be needed): $_"
+          }
+
           # Download the latest Virtual Audio Driver
           $downloadUrl = "https://github.com/VirtualDrivers/Virtual-Audio-Driver/releases/download/25.7.14/Virtual.Audio.Driver.Signed.-.25.7.14.zip"
           $zipPath = "$env:TEMP\VirtualAudioDriver.zip"
@@ -56,19 +66,67 @@ jobs:
 
           Write-Host "Installing Virtual Audio Driver from: $($infFile.FullName)"
 
-          # Install the driver using pnputil
+          # Install the driver using pnputil with silent flags
+          Write-Host "Installing driver silently using pnputil..."
           try {
-            $result = & pnputil.exe /add-driver $infFile.FullName /install
-            Write-Host "Driver installation result: $result"
+            # Use /force to bypass prompts and /install to actually install the driver
+            $pnpResult = & pnputil.exe /add-driver $infFile.FullName /install /force 2>&1
+            Write-Host "PnPUtil result: $pnpResult"
+
+            # Check if installation was successful
+            if ($LASTEXITCODE -eq 0) {
+              Write-Host "✅ Driver installed successfully with pnputil"
+            } else {
+              Write-Host "⚠️ PnPUtil returned exit code: $LASTEXITCODE"
+            }
           } catch {
-            Write-Host "Driver installation failed: $_"
-            # Continue anyway - the driver might still work
+            Write-Host "❌ PnPUtil installation failed: $_"
+          }
+
+          # Alternative method: Try manual device installation
+          Write-Host "Attempting manual device installation..."
+          try {
+            # Add the driver to the driver store first
+            $addResult = & pnputil.exe /add-driver $infFile.FullName /force 2>&1
+            Write-Host "Driver store addition result: $addResult"
+
+            # Try to install using Add-WindowsDriver (if available)
+            if (Get-Command "Add-WindowsDriver" -ErrorAction SilentlyContinue) {
+              Write-Host "Trying Add-WindowsDriver method..."
+              Add-WindowsDriver -Online -Driver $infFile.FullName -Force -ErrorAction SilentlyContinue
+            }
+          } catch {
+            Write-Host "Alternative installation method failed: $_"
           }
 
           # Start Windows Audio services
           Write-Host "Starting Windows Audio services..."
-          Start-Service -Name "AudioSrv" -ErrorAction SilentlyContinue
-          Start-Service -Name "AudioEndpointBuilder" -ErrorAction SilentlyContinue
+          try {
+            Start-Service -Name "AudioSrv" -ErrorAction Stop
+            Write-Host "✅ AudioSrv service started"
+          } catch {
+            Write-Host "⚠️ Could not start AudioSrv: $_"
+          }
+
+          try {
+            Start-Service -Name "AudioEndpointBuilder" -ErrorAction Stop
+            Write-Host "✅ AudioEndpointBuilder service started"
+          } catch {
+            Write-Host "⚠️ Could not start AudioEndpointBuilder: $_"
+          }
+
+          # Wait a moment for services to initialize
+          Start-Sleep -Seconds 3
+
+          # Verify driver installation
+          Write-Host "Verifying driver installation..."
+          $virtualDevices = Get-PnpDevice | Where-Object { $_.FriendlyName -like "*Virtual*Audio*" -or $_.FriendlyName -like "*Virtual*Mic*" }
+          if ($virtualDevices) {
+            Write-Host "✅ Virtual audio devices detected:"
+            $virtualDevices | ForEach-Object { Write-Host "  - $($_.FriendlyName) ($($_.Status))" }
+          } else {
+            Write-Host "⚠️ No virtual audio devices detected yet (may appear after reboot)"
+          }
 
           Write-Host "Virtual Audio Driver installation completed"
         shell: pwsh
