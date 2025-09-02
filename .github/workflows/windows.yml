@@ -66,37 +66,45 @@ jobs:
 
           Write-Host "Installing Virtual Audio Driver from: $($infFile.FullName)"
 
-          # Install the driver using pnputil with silent flags
-          Write-Host "Installing driver silently using pnputil..."
-          try {
-            # Use /force to bypass prompts and /install to actually install the driver
-            $pnpResult = & pnputil.exe /add-driver $infFile.FullName /install /force 2>&1
-            Write-Host "PnPUtil result: $pnpResult"
+          # Install the driver using pnputil with timeout to prevent hanging
+          Write-Host "Installing driver silently using pnputil with timeout..."
 
-            # Check if installation was successful
-            if ($LASTEXITCODE -eq 0) {
+          # Method 1: Try with timeout using Start-Process
+          try {
+            Write-Host "Attempting pnputil installation with 60-second timeout..."
+            $pnpProcess = Start-Process -FilePath "pnputil.exe" -ArgumentList "/add-driver", $infFile.FullName, "/install", "/force" -Wait -PassThru -NoNewWindow -RedirectStandardOutput "$env:TEMP\pnp_output.txt" -RedirectStandardError "$env:TEMP\pnp_error.txt" -TimeoutSec 60
+
+            $output = Get-Content "$env:TEMP\pnp_output.txt" -ErrorAction SilentlyContinue
+            $errors = Get-Content "$env:TEMP\pnp_error.txt" -ErrorAction SilentlyContinue
+
+            Write-Host "PnPUtil output: $output"
+            if ($errors) { Write-Host "PnPUtil errors: $errors" }
+
+            if ($pnpProcess.ExitCode -eq 0) {
               Write-Host "✅ Driver installed successfully with pnputil"
             } else {
-              Write-Host "⚠️ PnPUtil returned exit code: $LASTEXITCODE"
+              Write-Host "⚠️ PnPUtil returned exit code: $($pnpProcess.ExitCode)"
             }
           } catch {
-            Write-Host "❌ PnPUtil installation failed: $_"
+            Write-Host "❌ PnPUtil installation with timeout failed: $_"
+
+            # Method 2: Try just adding to driver store (safer)
+            Write-Host "Trying to add driver to store only..."
+            try {
+              $storeResult = & pnputil.exe /add-driver $infFile.FullName /force 2>&1
+              Write-Host "Driver store result: $storeResult"
+            } catch {
+              Write-Host "Driver store addition failed: $_"
+            }
           }
 
-          # Alternative method: Try manual device installation
-          Write-Host "Attempting manual device installation..."
+          # Method 3: Try PowerShell DISM method as fallback
+          Write-Host "Attempting DISM driver installation as fallback..."
           try {
-            # Add the driver to the driver store first
-            $addResult = & pnputil.exe /add-driver $infFile.FullName /force 2>&1
-            Write-Host "Driver store addition result: $addResult"
-
-            # Try to install using Add-WindowsDriver (if available)
-            if (Get-Command "Add-WindowsDriver" -ErrorAction SilentlyContinue) {
-              Write-Host "Trying Add-WindowsDriver method..."
-              Add-WindowsDriver -Online -Driver $infFile.FullName -Force -ErrorAction SilentlyContinue
-            }
+            $dismResult = & dism.exe /online /add-driver /driver:$infFile.FullName /force 2>&1
+            Write-Host "DISM result: $dismResult"
           } catch {
-            Write-Host "Alternative installation method failed: $_"
+            Write-Host "DISM installation failed: $_"
           }
 
           # Start Windows Audio services
