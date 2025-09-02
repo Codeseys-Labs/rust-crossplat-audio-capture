@@ -249,14 +249,40 @@ jobs:
           powershell -ExecutionPolicy Bypass -File "scripts/test-vlc-capture-windows.ps1"
         shell: pwsh
 
-      - name: Upload test artifacts
+      - name: Upload VLC Audio Capture Files
         uses: actions/upload-artifact@v4
         with:
-          name: windows-audio-test-results
+          name: windows-vlc-audio-captures
           path: |
             dynamic_vlc_capture.wav
+            vlc_test_audio.wav
+            *.wav
+          compression-level: 0
+          if-no-files-found: warn
+        if: always()
+
+      - name: Upload VLC Logs
+        uses: actions/upload-artifact@v4
+        with:
+          name: windows-vlc-logs
+          path: |
             flexible_test.log
             vlc_capture_test.log
             vlc_capture_test_error.log
             process_tracking.log
+            *.log
+          compression-level: 0
+          if-no-files-found: warn
+        if: always()
+
+      - name: Upload Windows Audio Debug Info
+        uses: actions/upload-artifact@v4
+        with:
+          name: windows-audio-debug
+          path: |
+            audio_devices.txt
+            scream_verification.txt
+            *.txt
+          compression-level: 0
+          if-no-files-found: warn
         if: always()
