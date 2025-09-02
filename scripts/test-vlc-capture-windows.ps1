@@ -105,17 +105,54 @@ if (-not $WorkingUrl) {
     $testAudioFile = "vlc_test_audio.wav"
     
     if (Get-Command ffmpeg -ErrorAction SilentlyContinue) {
-        # Generate test audio with ffmpeg
-        & ffmpeg -f lavfi -i "sine=frequency=440:duration=10" -ar 48000 -ac 2 $testAudioFile -y
-        Write-Status "OK" "Created local test audio with ffmpeg: $testAudioFile"
+        # Generate test audio with ffmpeg - create a longer, more prominent tone
+        & ffmpeg -f lavfi -i "sine=frequency=440:duration=30" -ar 48000 -ac 2 $testAudioFile -y
+        Write-Status "OK" "Created local test audio with ffmpeg: $testAudioFile (30 second tone)"
     } else {
-        # Download a sample file
+        # Try to download a sample file first
         try {
             Invoke-WebRequest -Uri "https://www.soundjay.com/misc/sounds/bell-ringing-05.wav" -OutFile $testAudioFile -TimeoutSec 30
             Write-Status "OK" "Downloaded test audio: $testAudioFile"
         } catch {
-            Write-Status "ERROR" "Failed to create or download test audio: $($_.Exception.Message)"
-            exit 1
+            Write-Status "WARN" "Failed to download test audio, creating minimal WAV file: $($_.Exception.Message)"
+            
+            # Final fallback: Create a minimal WAV file with PowerShell
+            # This creates a very simple 1-second 440Hz tone
+            try {
+                $sampleRate = 44100
+                $frequency = 440
+                $duration = 10  # 10 seconds
+                $amplitude = 0.3
+                
+                $samples = [System.Collections.Generic.List[byte]]::new()
+                
+                # WAV header (44 bytes)
+                $samples.AddRange([System.Text.Encoding]::ASCII.GetBytes("RIFF"))
+                $samples.AddRange([System.BitConverter]::GetBytes([int32](36 + $sampleRate * $duration * 2)))
+                $samples.AddRange([System.Text.Encoding]::ASCII.GetBytes("WAVE"))
+                $samples.AddRange([System.Text.Encoding]::ASCII.GetBytes("fmt "))
+                $samples.AddRange([System.BitConverter]::GetBytes([int32]16))  # Subchunk1Size
+                $samples.AddRange([System.BitConverter]::GetBytes([int16]1))   # AudioFormat (PCM)
+                $samples.AddRange([System.BitConverter]::GetBytes([int16]1))   # NumChannels (mono)
+                $samples.AddRange([System.BitConverter]::GetBytes([int32]$sampleRate))
+                $samples.AddRange([System.BitConverter]::GetBytes([int32]($sampleRate * 2)))  # ByteRate
+                $samples.AddRange([System.BitConverter]::GetBytes([int16]2))   # BlockAlign
+                $samples.AddRange([System.BitConverter]::GetBytes([int16]16))  # BitsPerSample
+                $samples.AddRange([System.Text.Encoding]::ASCII.GetBytes("data"))
+                $samples.AddRange([System.BitConverter]::GetBytes([int32]($sampleRate * $duration * 2)))
+                
+                # Generate sine wave data
+                for ($i = 0; $i -lt ($sampleRate * $duration); $i++) {
+                    $sample = [Math]::Sin(2 * [Math]::PI * $frequency * $i / $sampleRate) * $amplitude * 32767
+                    $samples.AddRange([System.BitConverter]::GetBytes([int16]$sample))
+                }
+                
+                [System.IO.File]::WriteAllBytes($testAudioFile, $samples.ToArray())
+                Write-Status "OK" "Created minimal WAV file with PowerShell: $testAudioFile"
+            } catch {
+                Write-Status "ERROR" "Failed to create any test audio: $($_.Exception.Message)"
+                exit 1
+            }
         }
     }
     
@@ -205,18 +242,19 @@ try {
     Log-ProcessEvent "VLC_START" "Starting VLC with URL: $WorkingUrl"
     
     # VLC arguments with volume control and audio settings
-    # CRITICAL: VLC logs show "bad device GUID: Scream" - need to find correct device name
-    # Try multiple approaches to target Scream device
+    # CRITICAL: Ensure VLC plays audio at maximum volume for Scream capture
     $vlcArgs = @(
         "--intf", "dummy",           # No GUI interface
-        "--loop",                    # Loop the audio
-        "--volume-step", "50",       # Volume step size (newer VLC)
-        "--gain", "1.0",            # Audio gain
+        "--loop",                    # Loop the audio indefinitely
+        "--volume", "256",           # Set volume to maximum (256 = 100% in VLC)
+        "--gain", "1.5",            # Increase audio gain for better capture
         "--audio-visual", "dummy",   # Disable visualizations
         "--no-video",               # Audio only
         "--aout", "wasapi",         # Use WASAPI audio output (may work better with Scream)
         "--audio-replay-gain-mode", "none",  # Disable replay gain
         "--audio-replay-gain-preamp", "0",   # No preamp
+        "--start-time", "0",        # Start from beginning
+        "--repeat",                 # Repeat the playlist (ensures continuous playback)
         "--verbose", "2",           # Verbose logging
         $WorkingUrl
     )
