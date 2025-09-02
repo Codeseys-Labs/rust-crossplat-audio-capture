@@ -504,7 +504,7 @@ fn run_windows_vlc_capture(
             let vlc_app = vlc_apps
                 .iter()
                 .find(|app| app.name.to_lowercase() == "vlc.exe")
-                .unwrap_or(vlc_apps[0]);
+                .unwrap_or(&vlc_apps[0]);
             let process_id = vlc_app.process_id;
 
             println!(
