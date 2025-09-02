@@ -154,9 +154,9 @@ jobs:
           foreach ($service in $audioServices) {
             $svc = Get-Service -Name $service -ErrorAction SilentlyContinue
             if ($svc) {
-              Write-Host "  $service: $($svc.Status)"
+              Write-Host "  ${service}: $($svc.Status)"
             } else {
-              Write-Host "  $service: Not found"
+              Write-Host "  ${service}: Not found"
             }
           }
 
