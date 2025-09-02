@@ -242,7 +242,7 @@ try {
     Log-ProcessEvent "VLC_START" "Starting VLC with URL: $WorkingUrl"
     
     # VLC arguments with volume control and audio settings
-    # CRITICAL: Ensure VLC plays audio at maximum volume for Scream capture
+    # CRITICAL: Ensure VLC plays audio at maximum volume for Virtual Audio Driver capture
     $vlcArgs = @(
         "--intf", "dummy",           # No GUI interface
         "--loop",                    # Loop the audio indefinitely
@@ -250,7 +250,7 @@ try {
         "--gain", "1.5",            # Increase audio gain for better capture
         "--audio-visual", "dummy",   # Disable visualizations
         "--no-video",               # Audio only
-        "--aout", "wasapi",         # Use WASAPI audio output (may work better with Scream)
+        "--aout", "wasapi",         # Use WASAPI audio output (routes to Virtual Audio Driver)
         "--audio-replay-gain-mode", "none",  # Disable replay gain
         "--audio-replay-gain-preamp", "0",   # No preamp
         "--start-time", "0",        # Start from beginning
@@ -306,8 +306,8 @@ try {
         Write-Status "WARN" "No VLC processes found!"
     }
 
-    # CRITICAL: Set Scream as default audio device for VLC to use
-    Write-Status "INFO" "Setting up Scream as default audio device..."
+    # CRITICAL: Set Virtual Audio Driver as default audio device for VLC to use
+    Write-Status "INFO" "Setting up Virtual Audio Driver as default audio device..."
     try {
         # List all audio devices first
         Write-Status "INFO" "Available audio devices:"
@@ -316,19 +316,23 @@ try {
             Write-Status "INFO" "  Audio Device: $($device.Name) - $($device.Description)"
         }
 
-        # Try to set Scream as default using PowerShell audio cmdlets
+        # Try to set Virtual Audio Driver as default using PowerShell audio cmdlets
         # Note: This may require Windows 10/11 with audio management features
         try {
             # First try the AudioDeviceCmdlets module if available
             if (Get-Module -ListAvailable -Name AudioDeviceCmdlets) {
                 Import-Module AudioDeviceCmdlets -ErrorAction SilentlyContinue
-                $screamDevice = Get-AudioDevice -List | Where-Object { $_.Name -like "*Scream*" }
-                if ($screamDevice) {
-                    Write-Status "OK" "Found Scream device: $($screamDevice.Name)"
-                    Set-AudioDevice -ID $screamDevice.ID
-                    Write-Status "OK" "Set Scream as default audio device"
+                $virtualDevice = Get-AudioDevice -List | Where-Object { 
+                    $_.Name -like "*Virtual*Audio*" -or 
+                    $_.Name -like "*Virtual*Speaker*" -or
+                    $_.Name -like "*Virtual*Driver*"
+                }
+                if ($virtualDevice) {
+                    Write-Status "OK" "Found Virtual Audio device: $($virtualDevice.Name)"
+                    Set-AudioDevice -ID $virtualDevice.ID
+                    Write-Status "OK" "Set Virtual Audio Driver as default audio device"
                 } else {
-                    Write-Status "WARN" "Scream audio device not found in audio device list"
+                    Write-Status "WARN" "Virtual Audio device not found in audio device list"
                     # List all available audio devices for debugging
                     Get-AudioDevice -List | ForEach-Object {
                         Write-Status "INFO" "  Available: $($_.Name) (ID: $($_.ID))"
@@ -337,37 +341,41 @@ try {
             } else {
                 Write-Status "INFO" "AudioDeviceCmdlets module not available, using alternative method"
 
-                # Alternative: Use nircmd if available, or manual registry approach
-                Write-Status "INFO" "Attempting to verify Scream device installation..."
+                # Alternative: Verify Virtual Audio Driver device installation
+                Write-Status "INFO" "Attempting to verify Virtual Audio Driver device installation..."
 
-                # We already found Scream in WMI query above, so let's verify that
-                $screamFound = $false
+                # Look for Virtual Audio Driver in WMI query above
+                $virtualFound = $false
                 foreach ($device in $audioDevices) {
-                    if ($device.Name -like "*Scream*" -or $device.Description -like "*Scream*") {
-                        Write-Status "OK" "Scream device confirmed via WMI: $($device.Name)"
-                        $screamFound = $true
+                    if ($device.Name -like "*Virtual*Audio*" -or 
+                        $device.Description -like "*Virtual*Audio*" -or
+                        $device.Name -like "*Virtual*Driver*") {
+                        Write-Status "OK" "Virtual Audio device confirmed via WMI: $($device.Name)"
+                        $virtualFound = $true
                         break
                     }
                 }
 
-                if ($screamFound) {
-                    Write-Status "OK" "Scream virtual audio device is properly installed and detected"
+                if ($virtualFound) {
+                    Write-Status "OK" "Virtual Audio Driver is properly installed and detected"
 
-                    # Try to get more details about the Scream device
+                    # Try to get more details about the Virtual Audio device
                     try {
-                        $screamDetails = Get-WmiObject -Class Win32_SoundDevice | Where-Object { $_.Name -like "*Scream*" }
-                        if ($screamDetails) {
-                            Write-Status "INFO" "Scream device details:"
-                            Write-Status "INFO" "  Name: $($screamDetails.Name)"
-                            Write-Status "INFO" "  Status: $($screamDetails.Status)"
-                            Write-Status "INFO" "  DeviceID: $($screamDetails.DeviceID)"
+                        $virtualDetails = Get-WmiObject -Class Win32_SoundDevice | Where-Object { 
+                            $_.Name -like "*Virtual*Audio*" -or $_.Name -like "*Virtual*Driver*" 
+                        }
+                        if ($virtualDetails) {
+                            Write-Status "INFO" "Virtual Audio device details:"
+                            Write-Status "INFO" "  Name: $($virtualDetails.Name)"
+                            Write-Status "INFO" "  Status: $($virtualDetails.Status)"
+                            Write-Status "INFO" "  DeviceID: $($virtualDetails.DeviceID)"
                         }
                     } catch {
-                        Write-Status "WARN" "Could not get detailed Scream device info: $_"
+                        Write-Status "WARN" "Could not get detailed Virtual Audio device info: $_"
                     }
 
-                    # SIMPLIFIED: Focus on verifying Scream exists and Windows Audio service
-                    Write-Status "INFO" "Verifying Scream device and audio services..."
+                    # SIMPLIFIED: Focus on verifying Virtual Audio Driver exists and Windows Audio service
+                    Write-Status "INFO" "Verifying Virtual Audio Driver and audio services..."
                     try {
                         # Ensure Windows Audio service is running
                         $audioService = Get-Service -Name "AudioSrv" -ErrorAction SilentlyContinue
@@ -378,18 +386,18 @@ try {
                         }
 
                         # Note: Relying on VLC WASAPI + default device approach
-                        Write-Status "INFO" "Using WASAPI + default device strategy for Scream routing"
+                        Write-Status "INFO" "Using WASAPI + default device strategy for Virtual Audio Driver routing"
 
                     } catch {
                         Write-Status "WARN" "Audio service check failed: $_"
                     }
                 } else {
-                    Write-Status "ERROR" "Scream device not found in WMI audio devices!"
-                    Write-Status "ERROR" "This means Scream driver installation may have failed"
+                    Write-Status "ERROR" "Virtual Audio Driver device not found in WMI audio devices!"
+                    Write-Status "ERROR" "This means Virtual Audio Driver installation may have failed"
                 }
             }
         } catch {
-            Write-Status "WARN" "Could not set Scream as default using PowerShell: $_"
+            Write-Status "WARN" "Could not set Virtual Audio Driver as default using PowerShell: $_"
         }
     } catch {
         Write-Status "WARN" "Audio device configuration failed: $_"
