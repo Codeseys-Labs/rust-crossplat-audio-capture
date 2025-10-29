@@ -271,16 +271,27 @@ log_process_event "CARGO_COMPLETE" "Cargo completed with exit code: $CARGO_EXIT_
 log_child_processes "$$" "After cargo run"
 
 if [ $CARGO_EXIT_CODE -eq 124 ]; then
-    print_status "WARN" "Cargo command timed out after 40 seconds"
+    print_status "ERROR" "Cargo command timed out after 40 seconds"
     log_process_event "CARGO_TIMEOUT" "Timeout occurred (exit code 124)"
+    echo "=== Capture Logs ==="
+    cat flexible_test.log || true
+    exit 1
 elif [ $CARGO_EXIT_CODE -eq 143 ]; then
-    print_status "WARN" "Cargo command was terminated by signal (SIGTERM)"
+    print_status "ERROR" "Cargo command was terminated by signal (SIGTERM)"
     log_process_event "CARGO_SIGTERM" "Cargo terminated by SIGTERM (exit code 143)"
+    echo "=== Capture Logs ==="
+    cat flexible_test.log || true
+    exit 1
 elif [ $CARGO_EXIT_CODE -ne 0 ]; then
-    print_status "WARN" "Cargo command failed with exit code $CARGO_EXIT_CODE"
+    print_status "ERROR" "Cargo command failed with exit code $CARGO_EXIT_CODE"
     log_process_event "CARGO_ERROR" "Cargo failed with exit code: $CARGO_EXIT_CODE"
+    echo "=== Capture Logs ==="
+    cat flexible_test.log || true
+    echo "=== This is a FAILURE - audio capture did not succeed ==="
+    exit 1
 else
     log_process_event "CARGO_SUCCESS" "Cargo completed successfully"
+    print_status "OK" "Audio capture completed successfully"
 fi
 
 # Test 2: System audio capture is now disabled to focus on dynamic VLC capture.
@@ -296,17 +307,34 @@ cat flexible_test.log || true
 # print_status "INFO" "=== Capture Test Logs ==="
 # cat capture_test.log || true
 
-print_status "OK" "VLC Audio Capture Test Complete"
+print_status "INFO" "VLC Audio Capture Test Complete"
 
-# Summary
+# Summary and Validation
 echo ""
 echo "=== Test Summary ==="
 echo "VLC URL: $WORKING_URL"
 echo "VLC PID: $VLC_PID"
 echo "VLC Nodes Found: $([ -n "$VLC_NODES" ] && echo "Yes" || echo "No")"
-echo "Dynamic Capture File: $(if [ -f "dynamic_vlc_capture.wav" ]; then echo "Created ($(stat -c%s dynamic_vlc_capture.wav) bytes)"; else echo "Not created"; fi)"
 
-print_status "OK" "Test completed successfully"
+# Validate the output file
+if [ -f "dynamic_vlc_capture.wav" ]; then
+    FILE_SIZE=$(stat -c%s dynamic_vlc_capture.wav)
+    echo "Dynamic Capture File: Created ($FILE_SIZE bytes)"
+
+    # Check if file is suspiciously small (less than 1KB indicates failure)
+    if [ "$FILE_SIZE" -lt 1024 ]; then
+        print_status "ERROR" "WAV file is too small ($FILE_SIZE bytes) - likely empty or corrupt"
+        print_status "ERROR" "This indicates the audio capture failed or captured only silence"
+        exit 1
+    else
+        print_status "OK" "WAV file size is reasonable ($FILE_SIZE bytes)"
+    fi
+else
+    print_status "ERROR" "Dynamic capture file was not created"
+    exit 1
+fi
+
+print_status "OK" "✅ All validation checks passed!"
 log_process_event "TEST_SUCCESS" "All tests completed successfully"
 log_child_processes "$$" "Before script exit"
 

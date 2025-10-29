@@ -429,12 +429,19 @@ try {
     
     Log-ProcessEvent "CARGO_COMPLETE" "Cargo completed with exit code: $cargoExitCode"
     Log-ChildProcesses $PID "After cargo run"
-    
+
     if ($cargoExitCode -ne 0) {
-        Write-Status "WARN" "Cargo command failed with exit code $cargoExitCode"
+        Write-Status "ERROR" "Cargo command failed with exit code $cargoExitCode"
         Log-ProcessEvent "CARGO_ERROR" "Cargo failed with exit code: $cargoExitCode"
+        Write-Host "=== Capture Logs ==="
+        if (Test-Path "flexible_test.log") {
+            Get-Content "flexible_test.log" | Write-Host
+        }
+        Write-Host "=== This is a FAILURE - audio capture did not succeed ==="
+        exit 1
     } else {
         Log-ProcessEvent "CARGO_SUCCESS" "Cargo completed successfully"
+        Write-Status "OK" "Audio capture completed successfully"
     }
     
     # Show logs for debugging
@@ -477,23 +484,34 @@ try {
         Get-Content "flexible_test.log" | Write-Host
     }
     
-    Write-Status "OK" "VLC Audio Capture Test Complete"
-    
-    # Summary
+    Write-Status "INFO" "VLC Audio Capture Test Complete"
+
+    # Summary and Validation
     Write-Host ""
     Write-Host "=== Test Summary ==="
     Write-Host "VLC URL: $WorkingUrl"
     Write-Host "VLC PID: $($script:VlcProcess.Id)"
-    
+
+    # Validate the output file
     $captureFile = "dynamic_vlc_capture.wav"
     if (Test-Path $captureFile) {
         $fileSize = (Get-Item $captureFile).Length
         Write-Host "Dynamic Capture File: Created ($fileSize bytes)"
+
+        # Check if file is suspiciously small (less than 1KB indicates failure)
+        if ($fileSize -lt 1024) {
+            Write-Status "ERROR" "WAV file is too small ($fileSize bytes) - likely empty or corrupt"
+            Write-Status "ERROR" "This indicates the audio capture failed or captured only silence"
+            exit 1
+        } else {
+            Write-Status "OK" "WAV file size is reasonable ($fileSize bytes)"
+        }
     } else {
-        Write-Host "Dynamic Capture File: Not created"
+        Write-Status "ERROR" "Dynamic capture file was not created"
+        exit 1
     }
-    
-    Write-Status "OK" "Test completed successfully"
+
+    Write-Status "OK" "`u{2705} All validation checks passed!"
     Log-ProcessEvent "TEST_SUCCESS" "All tests completed successfully"
     Log-ChildProcesses $PID "Before script exit"
     

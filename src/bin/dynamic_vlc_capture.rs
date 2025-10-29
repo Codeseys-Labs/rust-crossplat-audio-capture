@@ -287,32 +287,37 @@ fn run_linux_vlc_capture(
     );
 
     if !captured_audio.is_empty() {
-        println!("🎉 SUCCESS: Captured audio data from VLC!");
+        // Check if the audio is not just silence
+        let has_signal = captured_audio.iter().any(|&sample| sample.abs() > 0.001);
 
-        match write_wav_file(&output_file, &captured_audio) {
-            Ok(_) => {
-                let file_size = std::fs::metadata(&output_file)?.len();
-                println!(
-                    "💾 Saved WAV file to: {} ({} bytes)",
-                    output_file, file_size
-                );
+        if has_signal {
+            println!("🎉 SUCCESS: Captured audio data from VLC with actual audio signal!");
+
+            match write_wav_file(&output_file, &captured_audio) {
+                Ok(_) => {
+                    let file_size = std::fs::metadata(&output_file)?.len();
+                    println!(
+                        "💾 Saved WAV file to: {} ({} bytes)",
+                        output_file, file_size
+                    );
+
+                    // Validate file size is reasonable (at least 1KB for a 10-second capture)
+                    if file_size < 1024 {
+                        return Err(format!(
+                            "WAV file suspiciously small: {} bytes. Expected at least 1KB for valid audio.",
+                            file_size
+                        ).into());
+                    }
+                }
+                Err(e) => {
+                    return Err(format!("Failed to write WAV file: {}", e).into());
+                }
             }
-            Err(e) => {
-                println!("⚠️  Failed to write WAV file: {}", e);
-                std::fs::write(
-                    &output_file,
-                    format!(
-                        "VLC audio capture: {} samples, peak: {:.3}",
-                        total_samples, *final_peak
-                    ),
-                )?;
-                println!("💾 Saved capture info to: {}", output_file);
-            }
+        } else {
+            return Err("Captured audio contains only silence. VLC may not be producing audio.".into());
         }
     } else {
-        println!("⚠️  No audio data captured (VLC might not be playing audio)");
-        write_empty_wav_file(&output_file)?;
-        println!("💾 Created empty WAV file: {}", output_file);
+        return Err("No audio data captured. VLC might not be running or not playing audio.".into());
     }
 
     Ok(())
@@ -759,8 +764,16 @@ fn run_windows_capture_loop(
     println!("  Audio data length: {}", audio_samples.len());
 
     if audio_samples.is_empty() {
-        return Err("No audio data captured".into());
+        return Err("No audio data captured. VLC might not be running or not playing audio.".into());
     }
+
+    // Check if the audio is not just silence
+    let has_signal = audio_samples.iter().any(|&sample| sample.abs() > 0.001);
+    if !has_signal {
+        return Err("Captured audio contains only silence. VLC may not be producing audio or Virtual Audio Driver routing failed.".into());
+    }
+
+    println!("✅ Audio validation: Signal detected (not silence)");
 
     // Create WAV file with same format as Linux version
     let spec = hound::WavSpec {
@@ -776,11 +789,22 @@ fn run_windows_capture_loop(
     }
     writer.finalize()?;
 
-    println!("✅ Audio saved successfully to {}", output_file);
+    // Validate file size
+    let file_size = std::fs::metadata(output_file)?.len();
+    println!("✅ Audio saved successfully to {} ({} bytes)", output_file, file_size);
+
+    if file_size < 1024 {
+        return Err(format!(
+            "WAV file suspiciously small: {} bytes. Expected at least 1KB for valid audio.",
+            file_size
+        ).into());
+    }
+
     println!("📊 Final capture statistics:");
     println!("  Duration: {:.2}s", duration);
     println!("  Samples captured: {}", final_sample_count);
     println!("  Peak level: {:.3}", final_peak);
+    println!("  File size: {} bytes", file_size);
 
     Ok(())
 }
