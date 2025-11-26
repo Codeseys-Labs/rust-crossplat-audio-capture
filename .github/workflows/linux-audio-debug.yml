@@ -1,17 +1,8 @@
 name: Linux Audio System Debug
 
+# Manual trigger only - this is a debug workflow
 on:
   workflow_dispatch:
-  push:
-    branches: [ master, main ]
-    paths:
-      - '.github/workflows/linux-audio-debug.yml'
-      - 'scripts/debug-audio-system.sh'
-  pull_request:
-    branches: [ master, main ]
-    paths:
-      - '.github/workflows/linux-audio-debug.yml'
-      - 'scripts/debug-audio-system.sh'
 
 jobs:
   debug-audio-system:

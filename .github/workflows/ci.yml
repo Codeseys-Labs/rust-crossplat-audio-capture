@@ -17,88 +17,96 @@ env:
   CARGO_TERM_COLOR: always
 
 jobs:
-  lint_and_format_checks:
-    name: Lint and Format Checks
+  lint_and_format:
+    name: Lint and Format
     runs-on: ubuntu-latest
     steps:
-      - name: Checkout code
-        uses: actions/checkout@v4
-
-      - name: Install Rust stable
-        uses: actions-rs/toolchain@v1
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
         with:
-          toolchain: stable
-          profile: minimal # Minimal profile is sufficient for linting
-          override: true
-
-      - name: Cache Cargo registry and build outputs
-        uses: Swatinem/rust-cache@v2 # Cache for clippy if it resolves dependencies
+          components: rustfmt, clippy
+      - uses: Swatinem/rust-cache@v2
 
       - name: Check formatting
         run: cargo fmt --all -- --check
 
-      - name: Install dependencies for linting
+      - name: Install PipeWire dev libraries
         run: |
           sudo apt-get update
           sudo add-apt-repository ppa:pipewire-debian/pipewire-upstream -y
           sudo apt-get update
           sudo apt-get install -y libpipewire-0.3-dev libspa-0.2-dev libasound2-dev pkg-config
 
-      - name: Run Clippy (Linux only on Ubuntu)
-        run: echo "Temporarily skipping Linux clippy to focus on Windows WASAPI development"
+      - name: Run Clippy
+        run: cargo clippy --lib --no-default-features --features feat_linux -- -D warnings
 
-  enhanced_linux_tests:
-    name: Enhanced Linux PipeWire Tests
-    needs: lint_and_format_checks
+  linux_tests:
+    name: Linux PipeWire Tests
+    needs: lint_and_format
     uses: ./.github/workflows/linux.yml
     with:
       debug_enabled: ${{ inputs.debug_enabled || false }}
 
   windows_tests:
     name: Windows WASAPI Tests
-    needs: lint_and_format_checks
+    needs: lint_and_format
     uses: ./.github/workflows/windows.yml
     with:
       debug_enabled: ${{ inputs.debug_enabled || false }}
 
-  # macos_tests:
-  #   name: macOS CoreAudio Tests
-  #   needs: lint_and_format_checks
-  #   uses: ./.github/workflows/macos.yml
-  #   with:
-  #     debug_enabled: ${{ inputs.debug_enabled || false }}
+  unit_tests:
+    name: Unit Tests (All Platforms)
+    needs: lint_and_format
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-latest
+            features: feat_linux
+            setup: |
+              sudo apt-get update
+              sudo add-apt-repository ppa:pipewire-debian/pipewire-upstream -y
+              sudo apt-get update
+              sudo apt-get install -y libpipewire-0.3-dev libspa-0.2-dev pkg-config
+          - os: windows-latest
+            features: feat_windows
+            setup: echo "No additional setup needed for Windows"
+          - os: macos-latest
+            features: feat_macos
+            setup: echo "No additional setup needed for macOS"
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Platform setup
+        run: ${{ matrix.setup }}
+        shell: bash
+
+      - name: Run unit tests
+        run: cargo test --lib --no-default-features --features ${{ matrix.features }}
 
   coverage:
     name: Code Coverage
-    needs: lint_and_format_checks
+    needs: lint_and_format
     runs-on: ubuntu-latest
     steps:
-      - name: Checkout code
-        uses: actions/checkout@v4
-
-      - name: Install Rust stable
-        uses: dtolnay/rust-toolchain@stable
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
 
       - name: Install PipeWire dev libraries
         run: |
-          # Check if development libraries are available
-          if pkg-config --exists libpipewire-0.3; then
-            echo "[OK] PipeWire development libraries already available"
-          else
-            echo "Installing PipeWire development libraries..."
-            sudo apt-get update
-            sudo add-apt-repository ppa:pipewire-debian/pipewire-upstream -y
-            sudo apt-get update
-            sudo apt-get install -y libpipewire-0.3-dev libspa-0.2-dev pkg-config
-          fi
-
-      - name: Cache Cargo dependencies
-        uses: Swatinem/rust-cache@v2
+          sudo apt-get update
+          sudo add-apt-repository ppa:pipewire-debian/pipewire-upstream -y
+          sudo apt-get update
+          sudo apt-get install -y libpipewire-0.3-dev libspa-0.2-dev pkg-config
 
       - name: Install cargo-tarpaulin
         run: cargo install cargo-tarpaulin --version 0.27.3
 
-      - name: Generate code coverage (Linux only)
+      - name: Generate code coverage
         run: cargo tarpaulin --features feat_linux --workspace --out Lcov --output-dir coverage/ --run-types Tests Lib
 
       - name: Upload coverage to Codecov
