@@ -75,7 +75,7 @@ pub enum CrossPlatformDeviceEnumerator {
     Linux(linux::LinuxDeviceEnumerator),
 
     #[cfg(all(target_os = "macos", feature = "feat_macos"))]
-    MacOS(macos::MacOSDeviceEnumerator),
+    MacOS(macos::MacosDeviceEnumerator),
 }
 
 impl CrossPlatformDeviceEnumerator {
@@ -197,7 +197,7 @@ pub fn get_device_enumerator() -> Result<CrossPlatformDeviceEnumerator, AudioErr
     #[cfg(all(target_os = "macos", feature = "feat_macos"))]
     {
         Ok(CrossPlatformDeviceEnumerator::MacOS(
-            macos::MacOSDeviceEnumerator::new(),
+            macos::MacosDeviceEnumerator::new(),
         ))
     }
     #[cfg(not(any(

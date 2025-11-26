@@ -90,6 +90,7 @@ libspa-sys = "0.8.0"  # Low-level SPA bindings for direct parameter access
 [target.'cfg(target_os = "macos")'.dependencies]
 # CoreAudio dependencies for Process Tap (macOS 14.4+)
 coreaudio-rs = { version = "0.13.0", features = ["core_audio"] }  # High-level CoreAudio bindings
+coreaudio-sys = "0.2.16"  # Low-level CoreAudio FFI bindings
 objc2-core-audio = { version = "0.3.1", features = [
     "std",
     "AudioHardware",              # For AudioHardwareCreateProcessTap, AudioHardwareCreateAggregateDevice
@@ -105,6 +106,9 @@ objc2-core-foundation = { version = "0.3.1", features = [
     "CFString",                   # For CFString handling in device UIDs
 ] }
 core-foundation = "0.10.1"          # For CFDictionary creation (aggregate device description)
+core-foundation-sys = "0.8.7"       # Low-level Core Foundation FFI bindings
+cocoa = "0.26.0"                    # Cocoa bindings for NSRunningApplication enumeration
+objc = "0.2.7"                      # Objective-C runtime bindings
 # Note: Process Tap APIs (AudioHardwareCreateProcessTap, CATapDescription) may require
 # custom FFI bindings as they are very new (macOS 14.4+) and may not be in objc2 yet
 

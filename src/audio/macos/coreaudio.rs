@@ -1,5 +1,5 @@
 // macOS CoreAudio backend implementation.
-// CoreAudio OSStatus errors, typically wrapped in `coreaudio_rs::Error`,
+// CoreAudio OSStatus errors, typically wrapped in `coreaudio::Error`,
 // are consistently mapped to this crate's `AudioError::BackendSpecificError`
 // using the `map_ca_error` utility function within this module. This ensures
 // uniform error reporting from the CoreAudio backend.
@@ -18,16 +18,16 @@ use crate::audio::core::{
     // AudioBuffer trait is removed, struct will be imported from crate::core::buffer
 };
 use crate::core::buffer::AudioBuffer; // This is the new AudioBuffer struct
-use coreaudio_rs::audio_buffer::AudioBufferList as CAAudioBufferList;
-use coreaudio_rs::audio_object::{
+use coreaudio::audio_buffer::AudioBufferList as CAAudioBufferList;
+use coreaudio::audio_object::{
     AudioObject, AudioObjectPropertyAddress, AudioObjectPropertyElement, AudioObjectPropertyScope,
 };
-use coreaudio_rs::audio_unit::audio_device::AudioDeviceID;
-use coreaudio_rs::audio_unit::audio_unit_element::{self as au_element, INPUT_BUS, OUTPUT_BUS};
-use coreaudio_rs::audio_unit::{
+use coreaudio::audio_unit::audio_device::AudioDeviceID;
+use coreaudio::audio_unit::audio_unit_element::{self as au_element, INPUT_BUS, OUTPUT_BUS};
+use coreaudio::audio_unit::{
     AudioComponent, AudioComponentDescription, AudioUnit, Element, RenderArgs, Scope, StreamFormat,
 };
-use coreaudio_rs::sys::{
+use coreaudio::sys::{
     self, kAudioDevicePropertyDeviceIsAlive, kAudioDevicePropertyStreamFormat,
     kAudioDevicePropertyStreamFormatSupported, kAudioFormatFlagIsBigEndian,
     kAudioFormatFlagIsFloat, kAudioFormatFlagIsNonInterleaved, kAudioFormatFlagIsPacked,
@@ -38,7 +38,7 @@ use coreaudio_rs::sys::{
     kAudioUnitProperty_StreamFormat, kAudioUnitSubType_HALOutput, kAudioUnitType_Output,
     AudioStreamBasicDescription, AudioUnitRenderActionFlags, OSStatus,
 };
-use coreaudio_rs::Error as CAError;
+use coreaudio::Error as CAError;
 use futures_channel::mpsc;
 use futures_core::Stream as FuturesStream;
 use std::collections::VecDeque;
@@ -324,7 +324,7 @@ fn asbd_to_audio_format(asbd: &AudioStreamBasicDescription) -> AudioResult<Audio
 }
 
 pub(crate) fn map_ca_error(err: CAError) -> AudioError {
-    // err is coreaudio_rs::Error, which is a tuple struct `pub struct Error(pub OSStatus);`
+    // err is coreaudio::Error, which is a tuple struct `pub struct Error(pub OSStatus);`
     // So, err.0 gives the OSStatus.
     let os_status = err.0;
     match os_status as u32 {
@@ -480,7 +480,7 @@ impl CapturingStream for MacosAudioStream {
                 let is_input_interleaved =
                     (input_asbd.mFormatFlags & sys::kAudioFormatFlagIsNonInterleaved) == 0;
 
-                // `coreaudio_rs::audio_buffer::AudioBufferList::allocate` creates a Box<sys::AudioBufferList>
+                // `coreaudio::audio_buffer::AudioBufferList::allocate` creates a Box<sys::AudioBufferList>
                 // and allocates mData for each buffer if the last param is true.
                 let captured_abl_boxed_result = CAAudioBufferList::allocate(
                     input_asbd.mChannelsPerFrame, // Number of channels in the ASBD
@@ -976,8 +976,8 @@ use crate::audio::macos::tap::CoreAudioProcessTap;
 // use crate::core::buffer::VecAudioBuffer; // This will be removed or unused
 use crate::audio::core::{AudioFormat, AudioResult, CapturingStream, SampleFormat}; // AudioBuffer trait removed from here
                                                                                    // AudioBuffer struct is already imported at the top of the module.
-use coreaudio_rs::audio_unit::{AudioUnit, Element, RenderArgs, Scope};
-use coreaudio_rs::sys::{
+use coreaudio::audio_unit::{AudioUnit, Element, RenderArgs, Scope};
+use coreaudio::sys::{
     self, kAudioFormatFlagIsFloat, kAudioFormatFlagIsNonInterleaved,
     kAudioOutputUnitProperty_CurrentDevice, kAudioOutputUnitProperty_EnableIO,
     kAudioUnitManufacturer_Apple, kAudioUnitProperty_StreamFormat, kAudioUnitSubType_HALOutput,

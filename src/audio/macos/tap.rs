@@ -7,7 +7,7 @@ use cocoa::foundation::{NSArray, NSAutoreleasePool, NSNumber, NSString};
 use core_foundation_sys::base::OSStatus;
 // use core_foundation_sys::string::CFStringRef; // Not directly used after removing local map_osstatus
 use crate::audio::macos::map_ca_error; // Import the refined error mapper
-use coreaudio_rs::Error as CAError; // To wrap OSStatus for map_ca_error
+use coreaudio::Error as CAError; // To wrap OSStatus for map_ca_error
 use coreaudio_sys as sys;
 use objc::runtime::{Class, Object, Sel, BOOL, NO, YES};
 use objc::{class, msg_send, sel, sel_impl};
