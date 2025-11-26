@@ -4,8 +4,8 @@ pub mod wasapi;
 
 // Re-export for convenience
 pub use wasapi::{
-    WindowsApplicationCapture, WindowsAudioDevice, WindowsAudioStream, 
-    WindowsDeviceEnumerator, ComInitializer
+    ComInitializer, WindowsApplicationCapture, WindowsAudioDevice, WindowsAudioStream,
+    WindowsDeviceEnumerator,
 };
 
 // Legacy backend exports (to be deprecated)
@@ -21,7 +21,8 @@ pub struct ApplicationAudioSessionInfo {
 }
 
 /// Enumerate application audio sessions on Windows
-pub fn enumerate_application_audio_sessions() -> crate::core::error::Result<Vec<ApplicationAudioSessionInfo>> {
+pub fn enumerate_application_audio_sessions(
+) -> crate::core::error::Result<Vec<ApplicationAudioSessionInfo>> {
     // This would use WASAPI session enumeration
     // For now, return empty list as placeholder
     Ok(vec![])

@@ -8,14 +8,14 @@
 //! cargo run --example audio_recorder_example --features feat_linux
 //! ```
 
-use rsac::audio::linux::pipewire::{PipeWireApplicationCapture, ApplicationSelector};
-use std::sync::{Arc, Mutex};
-use std::sync::atomic::{AtomicUsize, AtomicBool, Ordering};
-use std::time::{Duration, Instant};
-use std::path::Path;
+use hound::{SampleFormat, WavSpec, WavWriter};
+use rsac::audio::linux::pipewire::{ApplicationSelector, PipeWireApplicationCapture};
 use std::fs::File;
 use std::io::BufWriter;
-use hound::{WavWriter, WavSpec, SampleFormat};
+use std::path::Path;
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant};
 
 /// Audio recording configuration
 #[derive(Debug, Clone)]
@@ -53,7 +53,10 @@ impl AudioRecorder {
     }
 
     /// Record audio from a specific application to file
-    pub fn record_application(&mut self, app_selector: ApplicationSelector) -> Result<(), Box<dyn std::error::Error>> {
+    pub fn record_application(
+        &mut self,
+        app_selector: ApplicationSelector,
+    ) -> Result<(), Box<dyn std::error::Error>> {
         println!("🎙️  Starting audio recording...");
         println!("    📁 Output: {}", self.config.output_path);
         println!("    ⏱️  Duration: {:?}", self.config.duration);
@@ -65,7 +68,7 @@ impl AudioRecorder {
 
         // Set up PipeWire capture
         let mut capture = PipeWireApplicationCapture::new(app_selector);
-        
+
         // Discover and create stream
         match capture.discover_target_node() {
             Ok(node_id) => {
@@ -85,7 +88,7 @@ impl AudioRecorder {
         // Set up recording state
         self.is_recording.store(true, Ordering::SeqCst);
         self.start_time = Some(Instant::now());
-        
+
         let samples_captured = self.samples_captured.clone();
         let is_recording = self.is_recording.clone();
         let audio_writer_clone = audio_writer.clone();
@@ -98,7 +101,7 @@ impl AudioRecorder {
             }
 
             let count = samples_captured.fetch_add(samples.len(), Ordering::SeqCst);
-            
+
             // Write samples to file
             if let Ok(mut writer_option) = audio_writer_clone.lock() {
                 if let Some(ref mut writer) = writer_option.as_mut() {
@@ -117,8 +120,12 @@ impl AudioRecorder {
             if count % 96000 == 0 {
                 let elapsed = start_time.elapsed();
                 let samples_per_second = count as f64 / elapsed.as_secs_f64();
-                println!("    📊 {:.1}s: {} samples ({:.0} samples/sec)", 
-                         elapsed.as_secs_f32(), count + samples.len(), samples_per_second);
+                println!(
+                    "    📊 {:.1}s: {} samples ({:.0} samples/sec)",
+                    elapsed.as_secs_f32(),
+                    count + samples.len(),
+                    samples_per_second
+                );
             }
         };
 
@@ -128,7 +135,7 @@ impl AudioRecorder {
 
         // Stop recording
         self.is_recording.store(false, Ordering::SeqCst);
-        
+
         // Finalize the audio file
         if let Ok(mut writer_option) = audio_writer.lock() {
             if let Some(writer) = writer_option.take() {
@@ -144,22 +151,33 @@ impl AudioRecorder {
             Ok(()) => {
                 let total_samples = self.samples_captured.load(Ordering::SeqCst);
                 let duration_actual = self.start_time.unwrap().elapsed();
-                let estimated_duration = total_samples as f64 / (self.config.sample_rate as f64 * self.config.channels as f64);
-                
+                let estimated_duration = total_samples as f64
+                    / (self.config.sample_rate as f64 * self.config.channels as f64);
+
                 println!("✅ Recording completed successfully!");
                 println!("    📊 Total samples: {}", total_samples);
-                println!("    ⏱️  Actual duration: {:.2}s", duration_actual.as_secs_f32());
-                println!("    🎵 Estimated audio duration: {:.2}s", estimated_duration);
+                println!(
+                    "    ⏱️  Actual duration: {:.2}s",
+                    duration_actual.as_secs_f32()
+                );
+                println!(
+                    "    🎵 Estimated audio duration: {:.2}s",
+                    estimated_duration
+                );
                 println!("    📁 Saved to: {}", self.config.output_path);
-                
+
                 // Verify file was created
                 if Path::new(&self.config.output_path).exists() {
                     let file_size = std::fs::metadata(&self.config.output_path)?.len();
-                    println!("    💾 File size: {} bytes ({:.2} MB)", file_size, file_size as f64 / 1_048_576.0);
+                    println!(
+                        "    💾 File size: {} bytes ({:.2} MB)",
+                        file_size,
+                        file_size as f64 / 1_048_576.0
+                    );
                 } else {
                     println!("⚠️  Warning: Output file not found!");
                 }
-                
+
                 Ok(())
             }
             Err(e) => {
@@ -170,7 +188,9 @@ impl AudioRecorder {
     }
 
     /// Create an audio writer based on the configured format
-    fn create_audio_writer(&self) -> Result<WavWriter<BufWriter<File>>, Box<dyn std::error::Error>> {
+    fn create_audio_writer(
+        &self,
+    ) -> Result<WavWriter<BufWriter<File>>, Box<dyn std::error::Error>> {
         match self.config.format {
             AudioFormat::Wav => {
                 let spec = WavSpec {
@@ -190,12 +210,16 @@ impl AudioRecorder {
     /// Get recording statistics
     pub fn get_stats(&self) -> RecordingStats {
         let samples = self.samples_captured.load(Ordering::SeqCst);
-        let duration = self.start_time.map(|start| start.elapsed()).unwrap_or_default();
-        
+        let duration = self
+            .start_time
+            .map(|start| start.elapsed())
+            .unwrap_or_default();
+
         RecordingStats {
             samples_captured: samples,
             duration_elapsed: duration,
-            estimated_audio_duration: samples as f64 / (self.config.sample_rate as f64 * self.config.channels as f64),
+            estimated_audio_duration: samples as f64
+                / (self.config.sample_rate as f64 * self.config.channels as f64),
             is_recording: self.is_recording.load(Ordering::SeqCst),
         }
     }
@@ -240,7 +264,7 @@ fn example_record_vlc_to_wav() {
     };
 
     let mut recorder = AudioRecorder::new(config);
-    
+
     match recorder.record_application(ApplicationSelector::NodeId(62)) {
         Ok(()) => {
             let stats = recorder.get_stats();
@@ -263,7 +287,7 @@ fn example_custom_recording() {
     };
 
     let mut recorder = AudioRecorder::new(config);
-    
+
     println!("🔧 Recording with custom configuration...");
     match recorder.record_application(ApplicationSelector::NodeId(62)) {
         Ok(()) => {
@@ -279,7 +303,7 @@ fn example_custom_recording() {
 fn example_multiple_recordings() {
     for i in 1..=3 {
         println!("🎬 Recording session {}/3", i);
-        
+
         let config = RecordingConfig {
             output_path: format!("recording_{}.wav", i),
             duration: Duration::from_secs(2),
@@ -289,7 +313,7 @@ fn example_multiple_recordings() {
         };
 
         let mut recorder = AudioRecorder::new(config);
-        
+
         match recorder.record_application(ApplicationSelector::NodeId(62)) {
             Ok(()) => {
                 println!("✅ Session {} completed", i);
@@ -299,7 +323,7 @@ fn example_multiple_recordings() {
                 break;
             }
         }
-        
+
         // Small delay between recordings
         if i < 3 {
             println!("⏸️  Pausing 1 second between recordings...");

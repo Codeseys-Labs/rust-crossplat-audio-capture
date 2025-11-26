@@ -1,0 +1,81 @@
+# Dockerfile for Windows cross-compilation using cargo-xwin
+# Based on the official cargo-xwin Docker image approach
+
+ARG RUST_VERSION=1.88.0
+
+FROM rust:$RUST_VERSION as builder
+
+ENV CARGO_NET_GIT_FETCH_WITH_CLI=true
+
+# Install build dependencies
+RUN apt-get update && apt-get install -y \
+    build-essential \
+    clang \
+    llvm \
+    cmake \
+    ninja-build \
+    pkg-config \
+    && rm -rf /var/lib/apt/lists/*
+
+# Install cargo-xwin
+RUN cargo install --locked cargo-xwin
+
+# Pre-compile dependencies for caching
+WORKDIR /tmp/cache
+COPY Cargo.toml Cargo.lock ./
+RUN mkdir src && echo "fn main() {}" > src/main.rs
+RUN cargo fetch
+
+FROM rust:$RUST_VERSION
+
+ENV CARGO_NET_GIT_FETCH_WITH_CLI=true
+ENV RUST_BACKTRACE=1
+
+# Install wine for testing Windows binaries
+RUN set -eux; \
+    curl --fail https://dl.winehq.org/wine-builds/winehq.key | gpg --dearmor > /usr/share/keyrings/winehq.gpg; \
+    echo "deb [signed-by=/usr/share/keyrings/winehq.gpg] https://dl.winehq.org/wine-builds/debian/ bookworm main" > /etc/apt/sources.list.d/winehq.list; \
+    dpkg --add-architecture i386; \
+    apt-get update && apt-get install --no-install-recommends -y \
+        clang \
+        llvm \
+        winehq-staging \
+        cmake \
+        ninja-build \
+        pkg-config \
+        jq \
+        curl \
+        git; \
+    apt-get remove -y --auto-remove; \
+    rm -rf /var/lib/apt/lists/*;
+
+# Install Rust targets for Windows
+RUN rustup target add x86_64-pc-windows-msvc aarch64-pc-windows-msvc && \
+    rustup component add llvm-tools-preview
+
+# Copy cargo-xwin from builder
+COPY --from=builder /usr/local/cargo/bin/cargo-xwin /usr/local/cargo/bin/
+
+# Copy cached dependencies
+COPY --from=builder /usr/local/cargo/registry /usr/local/cargo/registry
+
+# Set up environment for Windows cross-compilation
+ENV XWIN_CACHE_DIR=/root/.xwin
+ENV CARGO_TARGET_X86_64_PC_WINDOWS_MSVC_LINKER=lld-link
+ENV CC_x86_64_pc_windows_msvc=clang-cl
+ENV CXX_x86_64_pc_windows_msvc=clang-cl
+
+# Create directories
+RUN mkdir -p /app /test-results /root/.xwin
+
+WORKDIR /app
+
+# Copy project files
+COPY . .
+
+# Create Windows-specific test script
+COPY docker/windows/test-cargo-xwin.sh /test-cargo-xwin.sh
+RUN chmod +x /test-cargo-xwin.sh
+
+# Default command
+CMD ["/test-cargo-xwin.sh"]

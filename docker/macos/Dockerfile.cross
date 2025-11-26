@@ -1,0 +1,38 @@
+# Dockerfile for macOS cross-compilation using osxcross
+# Based on joseluisq/rust-linux-darwin-builder
+
+ARG RUST_VERSION=1.88.0
+
+FROM joseluisq/rust-linux-darwin-builder:${RUST_VERSION} as base
+
+# Install additional tools for testing and development
+RUN apt-get update && apt-get install -y \
+    jq \
+    curl \
+    git \
+    pkg-config \
+    && rm -rf /var/lib/apt/lists/*
+
+# Set environment variables for macOS cross-compilation
+ENV RUST_BACKTRACE=1
+ENV CARGO_TARGET_X86_64_APPLE_DARWIN_LINKER=x86_64-apple-darwin20.4-clang
+ENV CARGO_TARGET_AARCH64_APPLE_DARWIN_LINKER=aarch64-apple-darwin20.4-clang
+ENV CC_x86_64_apple_darwin=x86_64-apple-darwin20.4-clang
+ENV CXX_x86_64_apple_darwin=x86_64-apple-darwin20.4-clang++
+ENV CC_aarch64_apple_darwin=aarch64-apple-darwin20.4-clang
+ENV CXX_aarch64_apple_darwin=aarch64-apple-darwin20.4-clang++
+
+# Create directories
+RUN mkdir -p /app /test-results
+
+WORKDIR /app
+
+# Copy project files
+COPY . .
+
+# Create macOS-specific test script
+COPY docker/macos/test-cross.sh /test-cross.sh
+RUN chmod +x /test-cross.sh
+
+# Default command
+CMD ["/test-cross.sh"]

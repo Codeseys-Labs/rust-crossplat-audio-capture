@@ -1,10 +1,10 @@
 //! PipeWire Integration Test
-//! 
+//!
 //! This binary tests the enhanced PipeWire functionality that combines
 //! the simplified implementation with concepts from the original pipwire-1.rs
 
-use std::time::Duration;
 use std::thread;
+use std::time::Duration;
 
 fn main() {
     println!("🔧 PipeWire Integration Test");
@@ -120,7 +120,8 @@ fn test_application_enumeration() {
                 }
 
                 // Check if any Firefox process might be handling audio
-                let main_firefox = firefox_processes.iter()
+                let main_firefox = firefox_processes
+                    .iter()
                     .find(|(_, ptype)| ptype.contains("Main"))
                     .or_else(|| firefox_processes.first());
 
@@ -157,12 +158,16 @@ fn test_application_enumeration() {
             let output_str = String::from_utf8_lossy(&output.stdout);
 
             // Look for audio stream nodes
-            let audio_nodes: Vec<&str> = output_str.lines()
-                .filter(|line| line.contains("Stream/Output/Audio") || line.contains("Stream/Input/Audio"))
+            let audio_nodes: Vec<&str> = output_str
+                .lines()
+                .filter(|line| {
+                    line.contains("Stream/Output/Audio") || line.contains("Stream/Input/Audio")
+                })
                 .collect();
 
             // Look for Firefox-related nodes
-            let firefox_nodes: Vec<&str> = output_str.lines()
+            let firefox_nodes: Vec<&str> = output_str
+                .lines()
                 .filter(|line| line.to_lowercase().contains("firefox"))
                 .collect();
 
@@ -183,16 +188,17 @@ fn test_application_enumeration() {
     }
 
     // Alternative: Try pw-dump for more detailed info
-    if let Ok(output) = std::process::Command::new("pw-dump")
-        .output()
-    {
+    if let Ok(output) = std::process::Command::new("pw-dump").output() {
         if output.status.success() {
             let output_str = String::from_utf8_lossy(&output.stdout);
             let firefox_mentions = output_str.matches("firefox").count();
             let firefox_mentions_ci = output_str.to_lowercase().matches("firefox").count();
 
             if firefox_mentions_ci > 0 {
-                println!("    🦊 pw-dump found {} Firefox references", firefox_mentions_ci);
+                println!(
+                    "    🦊 pw-dump found {} Firefox references",
+                    firefox_mentions_ci
+                );
             }
         }
     }
@@ -206,51 +212,86 @@ fn test_application_capture() {
     let max_samples = 100; // Capture for a short time
 
     println!("  🎵 Starting simulated audio capture...");
-    
+
     // Simulate the callback-based capture
     let start_time = std::time::Instant::now();
-    
+
     while sample_count < max_samples {
         // Simulate audio buffer (stereo, 1024 samples)
         let mut buffer = vec![0.0f32; 1024];
         let phase = sample_count as f32 * 0.01;
-        
+
         // Generate test audio (sine waves)
         for i in 0..buffer.len() {
             if i % 2 == 0 {
                 // Left channel - 440 Hz
                 buffer[i] = (phase * 440.0 * 2.0 * std::f32::consts::PI).sin() * 0.1;
             } else {
-                // Right channel - 880 Hz  
+                // Right channel - 880 Hz
                 buffer[i] = (phase * 880.0 * 2.0 * std::f32::consts::PI).sin() * 0.1;
             }
         }
-        
+
         // Simulate processing the buffer
         let rms = calculate_rms(&buffer);
         if sample_count % 20 == 0 {
             println!("    📊 Sample {}: RMS level = {:.4}", sample_count, rms);
         }
-        
+
         sample_count += 1;
         thread::sleep(Duration::from_millis(10));
     }
-    
+
     let elapsed = start_time.elapsed();
-    println!("  ✅ Captured {} audio buffers in {:?}", sample_count, elapsed);
-    println!("  📈 Average processing rate: {:.1} buffers/sec", 
-             sample_count as f64 / elapsed.as_secs_f64());
+    println!(
+        "  ✅ Captured {} audio buffers in {:?}",
+        sample_count, elapsed
+    );
+    println!(
+        "  📈 Average processing rate: {:.1} buffers/sec",
+        sample_count as f64 / elapsed.as_secs_f64()
+    );
 }
 
 fn is_likely_audio_app(app_name: &str) -> bool {
     let audio_keywords = [
-        "audio", "music", "video", "chrome", "vlc",
-        "spotify", "mpv", "mplayer", "audacity", "pulseaudio",
-        "pipewire", "jack", "alsa", "youtube", "discord", "zoom",
-        "obs", "steam", "wine", "rhythmbox", "banshee", "amarok",
-        "clementine", "deadbeef", "qmmp", "audacious", "totem",
-        "parole", "smplayer", "kaffeine", "dragon", "phonon",
-        "gstreamer", "ffmpeg", "mplayer2", "xine", "vlc-bin"
+        "audio",
+        "music",
+        "video",
+        "chrome",
+        "vlc",
+        "spotify",
+        "mpv",
+        "mplayer",
+        "audacity",
+        "pulseaudio",
+        "pipewire",
+        "jack",
+        "alsa",
+        "youtube",
+        "discord",
+        "zoom",
+        "obs",
+        "steam",
+        "wine",
+        "rhythmbox",
+        "banshee",
+        "amarok",
+        "clementine",
+        "deadbeef",
+        "qmmp",
+        "audacious",
+        "totem",
+        "parole",
+        "smplayer",
+        "kaffeine",
+        "dragon",
+        "phonon",
+        "gstreamer",
+        "ffmpeg",
+        "mplayer2",
+        "xine",
+        "vlc-bin",
     ];
 
     let app_lower = app_name.to_lowercase();
@@ -260,14 +301,16 @@ fn is_likely_audio_app(app_name: &str) -> bool {
         return false;
     }
 
-    audio_keywords.iter().any(|keyword| app_lower.contains(keyword))
+    audio_keywords
+        .iter()
+        .any(|keyword| app_lower.contains(keyword))
 }
 
 fn calculate_rms(samples: &[f32]) -> f32 {
     if samples.is_empty() {
         return 0.0;
     }
-    
+
     let sum_squares: f32 = samples.iter().map(|&x| x * x).sum();
     (sum_squares / samples.len() as f32).sqrt()
 }

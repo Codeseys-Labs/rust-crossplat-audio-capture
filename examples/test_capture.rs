@@ -3,7 +3,7 @@ use hound::{WavSpec, WavWriter};
 use rsac::api::AudioCaptureBuilder;
 use rsac::core::config::DeviceSelector;
 use rsac::core::error::AudioError;
-use rsac::{get_audio_backend, SampleFormat, StreamConfig, AudioFormat, LatencyMode};
+use rsac::{get_audio_backend, AudioFormat, LatencyMode, SampleFormat, StreamConfig};
 use std::path::PathBuf;
 use std::thread;
 use std::time::Duration;
@@ -90,7 +90,8 @@ fn capture_with_new_api(args: &Args) -> Result<(), AudioError> {
         .channels(2)
         .sample_format(SampleFormat::F32LE)
         .bits_per_sample(32)
-        .build() {
+        .build()
+    {
         Ok(s) => s,
         Err(e48) => {
             eprintln!("New API 48kHz build failed: {e48}. Trying 44.1kHz...");
@@ -100,7 +101,8 @@ fn capture_with_new_api(args: &Args) -> Result<(), AudioError> {
                 .channels(2)
                 .sample_format(SampleFormat::F32LE)
                 .bits_per_sample(32)
-                .build() {
+                .build()
+            {
                 Ok(s) => s,
                 Err(e44) => {
                     eprintln!("New API 44.1kHz build also failed: {e44}. Writing placeholder WAV.");
@@ -135,7 +137,8 @@ fn capture_with_new_api(args: &Args) -> Result<(), AudioError> {
 
     // For now, create a placeholder WAV file since we need to implement
     // the actual data collection from the stream
-    create_placeholder_wav(&args.output).map_err(|e| AudioError::ConfigurationError(e.to_string()))?;
+    create_placeholder_wav(&args.output)
+        .map_err(|e| AudioError::ConfigurationError(e.to_string()))?;
 
     Ok(())
 }

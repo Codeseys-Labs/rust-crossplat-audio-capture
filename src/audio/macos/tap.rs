@@ -255,6 +255,39 @@ unsafe fn msg_send_responds_to(obj: id, sel: Sel) -> bool {
 
 // --- Enhanced Application-Specific Capture (Process Tap + Aggregate Device) ---
 
+/// Internal tap description for process tap creation
+#[derive(Debug, Clone)]
+#[allow(dead_code)]
+struct TapDescription {
+    process_object_id: u32,
+    uuid: String,
+    mute_behavior: MuteBehavior,
+    stream_format: TapAudioStreamBasicDescription,
+}
+
+/// Mute behavior for process tap
+#[derive(Debug, Clone)]
+#[allow(dead_code)]
+enum MuteBehavior {
+    MutedWhenTapped,
+    Unmuted,
+}
+
+/// Audio stream format description for tap
+#[derive(Debug, Clone)]
+#[allow(dead_code)]
+struct TapAudioStreamBasicDescription {
+    sample_rate: f64,
+    format_id: u32,
+    format_flags: u32,
+    bytes_per_packet: u32,
+    frames_per_packet: u32,
+    bytes_per_frame: u32,
+    channels_per_frame: u32,
+    bits_per_channel: u32,
+    reserved: u32,
+}
+
 /// Enhanced macOS application capture using CoreAudio Process Tap with Aggregate Device
 /// Based on research from insidegui/AudioCap ProcessTap.swift
 pub struct MacOSApplicationCapture {
@@ -366,6 +399,7 @@ impl MacOSApplicationCapture {
         let uuid_string = tap_uuid.to_string();
 
         // Create tap description (simplified version)
+        #[allow(unused_variables)]
         let tap_description = TapDescription {
             process_object_id,
             uuid: uuid_string.clone(),
@@ -374,10 +408,10 @@ impl MacOSApplicationCapture {
             } else {
                 MuteBehavior::Unmuted
             },
-            stream_format: AudioStreamBasicDescription {
+            stream_format: TapAudioStreamBasicDescription {
                 sample_rate: 48000.0,
                 format_id: 0x6C70636D, // 'lpcm'
-                format_flags: 0x29, // kAudioFormatFlagIsFloat | kAudioFormatFlagIsPacked
+                format_flags: 0x29,    // kAudioFormatFlagIsFloat | kAudioFormatFlagIsPacked
                 bytes_per_packet: 8,
                 frames_per_packet: 1,
                 bytes_per_frame: 8,
@@ -395,33 +429,6 @@ impl MacOSApplicationCapture {
         self.tap_uuid = Some(uuid_string);
 
         Ok(tap_id)
-    }
-
-    #[derive(Debug, Clone)]
-    struct TapDescription {
-        process_object_id: u32,
-        uuid: String,
-        mute_behavior: MuteBehavior,
-        stream_format: AudioStreamBasicDescription,
-    }
-
-    #[derive(Debug, Clone)]
-    enum MuteBehavior {
-        MutedWhenTapped,
-        Unmuted,
-    }
-
-    #[derive(Debug, Clone)]
-    struct AudioStreamBasicDescription {
-        sample_rate: f64,
-        format_id: u32,
-        format_flags: u32,
-        bytes_per_packet: u32,
-        frames_per_packet: u32,
-        bytes_per_frame: u32,
-        channels_per_frame: u32,
-        bits_per_channel: u32,
-        reserved: u32,
     }
 
     /// Create an Aggregate Device that includes the process tap
@@ -454,7 +461,9 @@ impl MacOSApplicationCapture {
         // 3. Call AudioHardwareCreateAggregateDevice(description, &deviceID)
         // 4. Store device ID and return it
 
-        Err(AudioError::NotImplemented("Aggregate device creation not yet implemented".to_string()))
+        Err(AudioError::NotImplemented(
+            "Aggregate device creation not yet implemented".to_string(),
+        ))
     }
 
     /// Read the audio format from the process tap
@@ -476,7 +485,9 @@ impl MacOSApplicationCapture {
         // 2. Call AudioObjectGetPropertyData on process tap ID
         // 3. Return AudioStreamBasicDescription
 
-        Err(AudioError::NotImplemented("Tap format reading not yet implemented".to_string()))
+        Err(AudioError::NotImplemented(
+            "Tap format reading not yet implemented".to_string(),
+        ))
     }
 
     /// Start capturing audio using I/O proc
@@ -502,7 +513,8 @@ impl MacOSApplicationCapture {
         // Create a simplified capture simulation
         // In a real implementation, this would use AudioDeviceCreateIOProcIDWithBlock
 
-        self.is_capturing.store(true, std::sync::atomic::Ordering::SeqCst);
+        self.is_capturing
+            .store(true, std::sync::atomic::Ordering::SeqCst);
         let is_capturing = self.is_capturing.clone();
         let callback = Arc::new(Mutex::new(callback));
 
@@ -548,7 +560,8 @@ impl MacOSApplicationCapture {
     /// - Add error handling for cleanup failures
     /// - Ensure all resources are released even if some steps fail
     pub fn stop_capture(&mut self) -> Result<(), Box<dyn std::error::Error>> {
-        self.is_capturing.store(false, std::sync::atomic::Ordering::SeqCst);
+        self.is_capturing
+            .store(false, std::sync::atomic::Ordering::SeqCst);
 
         // Clean up resources
         // In a real implementation, this would call:
@@ -573,31 +586,31 @@ impl MacOSApplicationCapture {
     ///
     /// # Returns
     /// Vector of (PID, app_name) tuples for running applications
-    pub fn list_capturable_applications() -> Result<Vec<(u32, String)>, Box<dyn std::error::Error>> {
+    pub fn list_capturable_applications() -> Result<Vec<(u32, String)>, Box<dyn std::error::Error>>
+    {
         use std::process::Command;
 
         let mut applications = Vec::new();
 
         // Use system_profiler to get running applications
-        if let Ok(output) = Command::new("ps")
-            .args(&["-eo", "pid,comm"])
-            .output()
-        {
+        if let Ok(output) = Command::new("ps").args(&["-eo", "pid,comm"]).output() {
             if let Ok(output_str) = String::from_utf8(output.stdout) {
-                for line in output_str.lines().skip(1) { // Skip header
+                for line in output_str.lines().skip(1) {
+                    // Skip header
                     let parts: Vec<&str> = line.trim().split_whitespace().collect();
                     if parts.len() >= 2 {
                         if let Ok(pid) = parts[0].parse::<u32>() {
                             let app_name = parts[1..].join(" ");
 
                             // Filter for likely audio applications
-                            if app_name.contains(".app") ||
-                               app_name.to_lowercase().contains("audio") ||
-                               app_name.to_lowercase().contains("music") ||
-                               app_name.to_lowercase().contains("video") ||
-                               app_name.to_lowercase().contains("safari") ||
-                               app_name.to_lowercase().contains("chrome") ||
-                               app_name.to_lowercase().contains("firefox") {
+                            if app_name.contains(".app")
+                                || app_name.to_lowercase().contains("audio")
+                                || app_name.to_lowercase().contains("music")
+                                || app_name.to_lowercase().contains("video")
+                                || app_name.to_lowercase().contains("safari")
+                                || app_name.to_lowercase().contains("chrome")
+                                || app_name.to_lowercase().contains("firefox")
+                            {
                                 applications.push((pid, app_name));
                             }
                         }

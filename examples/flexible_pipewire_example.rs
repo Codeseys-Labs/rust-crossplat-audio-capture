@@ -8,9 +8,9 @@
 //! cargo run --example flexible_pipewire_example --features feat_linux
 //! ```
 
-use rsac::audio::linux::pipewire::{PipeWireApplicationCapture, ApplicationSelector};
-use std::sync::{Arc, Mutex};
+use rsac::audio::linux::pipewire::{ApplicationSelector, PipeWireApplicationCapture};
 use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 fn main() {
@@ -49,7 +49,7 @@ fn example_duration_based_capture() {
     match capture.discover_target_node() {
         Ok(node_id) => {
             println!("✅ Found target node: {}", node_id);
-            
+
             if let Err(e) = capture.create_monitor_stream() {
                 println!("❌ Failed to create monitor stream: {}", e);
                 return;
@@ -59,7 +59,7 @@ fn example_duration_based_capture() {
             let result = capture.start_capture_for_duration(
                 move |samples| {
                     let count = sample_count_clone.fetch_add(samples.len(), Ordering::SeqCst);
-                    
+
                     // Calculate peak level
                     let peak = samples.iter().map(|s| s.abs()).fold(0.0f32, f32::max);
                     if let Ok(mut current_peak) = peak_level_clone.lock() {
@@ -68,17 +68,24 @@ fn example_duration_based_capture() {
 
                     // Print progress occasionally
                     if count % 50000 == 0 {
-                        println!("    📊 Captured {} samples, peak: {:.3}", count + samples.len(), peak);
+                        println!(
+                            "    📊 Captured {} samples, peak: {:.3}",
+                            count + samples.len(),
+                            peak
+                        );
                     }
                 },
-                Duration::from_secs(3)
+                Duration::from_secs(3),
             );
 
             match result {
                 Ok(()) => {
                     let total = sample_count.load(Ordering::SeqCst);
                     let peak = peak_level.lock().unwrap();
-                    println!("✅ Capture completed: {} samples, peak: {:.3}", total, *peak);
+                    println!(
+                        "✅ Capture completed: {} samples, peak: {:.3}",
+                        total, *peak
+                    );
                 }
                 Err(e) => println!("❌ Capture failed: {}", e),
             }
@@ -110,7 +117,10 @@ fn example_indefinite_capture() {
                 let count = sample_count_clone.fetch_add(samples.len(), Ordering::SeqCst);
 
                 if count % 50000 == 0 {
-                    println!("    📊 Indefinite capture: {} samples", count + samples.len());
+                    println!(
+                        "    📊 Indefinite capture: {} samples",
+                        count + samples.len()
+                    );
                 }
             });
 
@@ -138,14 +148,19 @@ fn example_manual_lifecycle() {
     let mut capture = PipeWireApplicationCapture::new(ApplicationSelector::NodeId(62)); // VLC
 
     println!("🔍 Stream ready: {}", capture.is_stream_ready());
-    println!("🔍 Application selector: {:?}", capture.get_application_selector());
+    println!(
+        "🔍 Application selector: {:?}",
+        capture.get_application_selector()
+    );
 
     // Step 1: Discover target
     match capture.discover_target_node() {
         Ok(node_id) => {
-            println!("✅ Discovered node: {} (serial: {:?})",
-                     capture.get_node_id().unwrap(),
-                     capture.get_discovered_node_serial());
+            println!(
+                "✅ Discovered node: {} (serial: {:?})",
+                capture.get_node_id().unwrap(),
+                capture.get_discovered_node_serial()
+            );
         }
         Err(e) => {
             println!("❌ Discovery failed: {}", e);
@@ -182,9 +197,12 @@ fn example_manual_lifecycle() {
 
     // Step 5: Stop capture
     capture.stop_capture().unwrap();
-    
+
     println!("🔍 Is capturing: {}", capture.is_capturing());
-    println!("✅ Manual lifecycle completed: {} samples", sample_count.load(Ordering::SeqCst));
+    println!(
+        "✅ Manual lifecycle completed: {} samples",
+        sample_count.load(Ordering::SeqCst)
+    );
 }
 
 /// Example 4: Multiple capture sessions
@@ -206,24 +224,28 @@ fn example_multiple_sessions() {
     println!("📡 Session 1: 1 second capture");
     let count1 = Arc::new(AtomicUsize::new(0));
     let count1_clone = count1.clone();
-    
+
     let _ = capture.start_capture_for_duration(
-        move |samples| { count1_clone.fetch_add(samples.len(), Ordering::SeqCst); },
-        Duration::from_secs(1)
+        move |samples| {
+            count1_clone.fetch_add(samples.len(), Ordering::SeqCst);
+        },
+        Duration::from_secs(1),
     );
-    
+
     println!("✅ Session 1: {} samples", count1.load(Ordering::SeqCst));
 
     // Session 2: Another short capture
     println!("📡 Session 2: 1 second capture");
     let count2 = Arc::new(AtomicUsize::new(0));
     let count2_clone = count2.clone();
-    
+
     let _ = capture.start_capture_for_duration(
-        move |samples| { count2_clone.fetch_add(samples.len(), Ordering::SeqCst); },
-        Duration::from_secs(1)
+        move |samples| {
+            count2_clone.fetch_add(samples.len(), Ordering::SeqCst);
+        },
+        Duration::from_secs(1),
     );
-    
+
     println!("✅ Session 2: {} samples", count2.load(Ordering::SeqCst));
     println!("✅ Multiple sessions completed!");
 }

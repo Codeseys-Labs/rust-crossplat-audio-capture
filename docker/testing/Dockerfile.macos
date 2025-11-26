@@ -1,0 +1,101 @@
+# macOS Testing Environment
+# Based on sickcodes/docker-osx for running macOS in Docker
+
+FROM sickcodes/docker-osx:monterey
+
+# Install Homebrew and dependencies
+RUN /bin/bash -c "$(curl -fsSL https://raw.githubusercontent.com/Homebrew/install/HEAD/install.sh)"
+
+# Add Homebrew to PATH
+ENV PATH="/opt/homebrew/bin:/usr/local/bin:${PATH}"
+
+# Install development tools and dependencies
+RUN brew update && brew install \
+    # Development tools
+    rust \
+    git \
+    cmake \
+    ninja \
+    pkg-config \
+    # Audio and multimedia
+    vlc \
+    blackhole-2ch \
+    sox \
+    ffmpeg \
+    # Audio testing tools
+    switchaudio-osx \
+    # Development utilities
+    jq \
+    curl \
+    wget
+
+# Install Rust components
+RUN rustup component add clippy rustfmt && \
+    cargo install cargo-watch cargo-audit
+
+# Set up audio permissions and configuration
+RUN osascript -e 'tell application "System Events" to tell security preferences to set require password to wake to false'
+
+# Create test audio directory
+RUN mkdir -p /test-audio
+
+# Generate test audio files using sox
+RUN sox -n -r 44100 -c 2 /test-audio/test-tone-440hz.wav synth 10 sine 440 && \
+    sox -n -r 44100 -c 2 /test-audio/test-tone-1khz.wav synth 10 sine 1000 && \
+    sox -n -r 44100 -c 2 /test-audio/test-music.wav synth 30 sine 440 sine 554 sine 659
+
+# Set up BlackHole audio driver for testing
+RUN brew install --cask blackhole-2ch
+
+# Create workspace
+WORKDIR /workspace
+
+# Copy test scripts
+COPY docker/testing/scripts/ /scripts/
+RUN chmod +x /scripts/*.sh
+
+# Set environment variables
+ENV RUST_BACKTRACE=1
+ENV RUST_LOG=debug
+
+# Create entrypoint script for macOS
+RUN cat > /entrypoint.sh << 'EOF'
+#!/bin/bash
+set -e
+
+echo "🍎 Starting macOS Core Audio Testing Environment..."
+
+# Wait for macOS to fully boot
+echo "Waiting for macOS to be ready..."
+sleep 10
+
+# Check audio system
+echo "Checking Core Audio system..."
+system_profiler SPAudioDataType || echo "Audio system not ready"
+
+# List audio devices
+echo "Available audio devices:"
+SwitchAudioSource -a || echo "SwitchAudioSource not available"
+
+# Set up BlackHole as audio device if available
+echo "Setting up BlackHole audio device..."
+SwitchAudioSource -s "BlackHole 2ch" || echo "BlackHole not available"
+
+# Test VLC installation
+echo "Testing VLC installation..."
+/Applications/VLC.app/Contents/MacOS/VLC --version || echo "VLC not ready"
+
+# Execute the provided command or start interactive shell
+if [ $# -eq 0 ]; then
+    echo "Starting interactive shell..."
+    exec /bin/bash
+else
+    echo "Executing: $@"
+    exec "$@"
+fi
+EOF
+
+RUN chmod +x /entrypoint.sh
+
+ENTRYPOINT ["/entrypoint.sh"]
+CMD ["/scripts/test-macos-coreaudio.sh"]

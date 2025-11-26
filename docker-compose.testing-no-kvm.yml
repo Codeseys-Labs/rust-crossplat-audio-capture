@@ -1,0 +1,121 @@
+version: '3.8'
+
+services:
+  # =============================================================================
+  # Linux PipeWire Testing Environment (works without KVM)
+  # =============================================================================
+  linux-pipewire-test:
+    build:
+      context: .
+      dockerfile: docker/testing/Dockerfile.linux-pipewire
+    container_name: rsac-linux-pipewire-test
+    volumes:
+      - .:/workspace
+      - ./test-results:/test-results
+      - /tmp/.X11-unix:/tmp/.X11-unix:rw
+    devices:
+      - /dev/snd:/dev/snd
+    environment:
+      - DISPLAY=${DISPLAY}
+      - XDG_RUNTIME_DIR=/run/user/1000
+      - RUST_BACKTRACE=1
+      - RUST_LOG=debug
+    privileged: true
+    network_mode: host
+    tty: true
+    stdin_open: true
+    command: ["/workspace/docker/testing/scripts/test-linux-pipewire.sh"]
+
+  # =============================================================================
+  # Windows Cross-Compilation Testing (no KVM required)
+  # =============================================================================
+  windows-cross-test:
+    build:
+      context: .
+      dockerfile: docker/testing/Dockerfile.windows-cross
+    container_name: rsac-windows-cross-test
+    volumes:
+      - .:/workspace
+      - ./test-results:/test-results
+      - cargo-cache:/usr/local/cargo/registry
+      - xwin-cache:/root/.xwin
+    environment:
+      - RUST_BACKTRACE=1
+      - RUST_LOG=debug
+      - XWIN_CACHE_DIR=/root/.xwin
+    tty: true
+    stdin_open: true
+    command: ["/workspace/docker/testing/scripts/test-windows-cross.sh"]
+
+  # =============================================================================
+  # Windows Testing with Wine (alternative to full Windows VM)
+  # =============================================================================
+  windows-wine-test:
+    build:
+      context: .
+      dockerfile: docker/testing/Dockerfile.windows-wine
+    container_name: rsac-windows-wine-test
+    volumes:
+      - .:/workspace
+      - ./test-results:/test-results
+      - cargo-cache:/usr/local/cargo/registry
+      - xwin-cache:/root/.xwin
+      - wine-prefix:/root/.wine
+    environment:
+      - DISPLAY=${DISPLAY}
+      - RUST_BACKTRACE=1
+      - RUST_LOG=debug
+      - XWIN_CACHE_DIR=/root/.xwin
+      - WINEARCH=win64
+      - WINEPREFIX=/root/.wine
+    tty: true
+    stdin_open: true
+    command: ["/workspace/docker/testing/scripts/test-windows-wine.sh"]
+
+  # =============================================================================
+  # Test Orchestrator (no KVM dependencies)
+  # =============================================================================
+  test-orchestrator-no-kvm:
+    build:
+      context: .
+      dockerfile: docker/testing/Dockerfile.orchestrator
+    container_name: rsac-test-orchestrator-no-kvm
+    volumes:
+      - .:/workspace
+      - ./test-results:/test-results
+      - /var/run/docker.sock:/var/run/docker.sock
+    environment:
+      - RUST_BACKTRACE=1
+      - NO_KVM=true
+    depends_on:
+      - linux-pipewire-test
+      - windows-cross-test
+    command: ["/workspace/docker/testing/scripts/orchestrate-tests-no-kvm.sh"]
+
+  # =============================================================================
+  # VNC/Web Interface for GUI Testing (no KVM required)
+  # =============================================================================
+  vnc-server:
+    image: dorowu/ubuntu-desktop-lxde-vnc:latest
+    container_name: rsac-vnc-server
+    ports:
+      - "6080:80"  # Web VNC interface
+      - "5900:5900"  # VNC port
+    volumes:
+      - .:/workspace
+    environment:
+      - VNC_PASSWORD=audiotest
+      - RESOLUTION=1920x1080
+    shm_size: 2gb
+
+volumes:
+  cargo-cache:
+    driver: local
+  xwin-cache:
+    driver: local
+  wine-prefix:
+    driver: local
+
+networks:
+  default:
+    driver: bridge

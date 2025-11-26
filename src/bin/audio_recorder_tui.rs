@@ -3,27 +3,25 @@ use crossterm::{
     execute,
     terminal::{disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen},
 };
+use hound::{SampleFormat, WavSpec, WavWriter};
 use ratatui::{
     backend::{Backend, CrosstermBackend},
     layout::{Alignment, Constraint, Direction, Layout, Rect},
     style::{Color, Modifier, Style},
     text::{Line, Span},
-    widgets::{
-        Block, Borders, Clear, List, ListItem, ListState, Paragraph, Wrap,
-    },
+    widgets::{Block, Borders, Clear, List, ListItem, ListState, Paragraph, Wrap},
     Frame, Terminal,
 };
-use rsac::audio::linux::pipewire::{PipeWireApplicationCapture, ApplicationSelector};
 use rsac::audio::discovery::{AudioSourceDiscovery, AudioSourceType as DiscoveredAudioSourceType};
-use std::sync::{Arc, Mutex};
-use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
-use std::time::{Duration, Instant};
-use std::thread;
-use std::io;
-use tokio::sync::mpsc;
-use hound::{WavWriter, WavSpec, SampleFormat};
+use rsac::audio::linux::pipewire::{ApplicationSelector, PipeWireApplicationCapture};
 use std::fs::File;
+use std::io;
 use std::io::BufWriter;
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::{Arc, Mutex};
+use std::thread;
+use std::time::{Duration, Instant};
+use tokio::sync::mpsc;
 
 #[derive(Debug, Clone)]
 pub struct AudioSource {
@@ -253,7 +251,8 @@ impl App {
         }
 
         // Group sources by application/process
-        let mut app_groups: std::collections::HashMap<String, Vec<AudioSource>> = std::collections::HashMap::new();
+        let mut app_groups: std::collections::HashMap<String, Vec<AudioSource>> =
+            std::collections::HashMap::new();
         let mut system_sources = Vec::new();
 
         for source in &self.audio_sources {
@@ -264,7 +263,10 @@ impl App {
                 _ => {
                     // Extract application name from the display name
                     let app_name = self.extract_app_name(&source.name);
-                    app_groups.entry(app_name).or_insert_with(Vec::new).push(source.clone());
+                    app_groups
+                        .entry(app_name)
+                        .or_insert_with(Vec::new)
+                        .push(source.clone());
                 }
             }
         }
@@ -278,7 +280,8 @@ impl App {
         for (app_name, mut sources) in app_groups {
             if sources.len() == 1 {
                 // Single process - add directly
-                self.audio_tree.push(TreeNode::new(sources.into_iter().next().unwrap(), 0));
+                self.audio_tree
+                    .push(TreeNode::new(sources.into_iter().next().unwrap(), 0));
             } else {
                 // Multiple processes - create a parent node
                 sources.sort_by(|a, b| a.name.cmp(&b.name));
@@ -295,7 +298,12 @@ impl App {
                 for source in sources {
                     let child_source = AudioSource {
                         id: source.id,
-                        name: source.name.replace(&format!("📱 {}", app_name), "├─").replace(&format!("🎬 {}", app_name), "├─").replace(&format!("🦊 {}", app_name), "├─").replace(&format!("🌐 {}", app_name), "├─"),
+                        name: source
+                            .name
+                            .replace(&format!("📱 {}", app_name), "├─")
+                            .replace(&format!("🎬 {}", app_name), "├─")
+                            .replace(&format!("🦊 {}", app_name), "├─")
+                            .replace(&format!("🌐 {}", app_name), "├─"),
                         description: source.description,
                         source_type: source.source_type,
                     };
@@ -411,12 +419,20 @@ impl App {
     pub fn handle_event(&mut self, event: AppEvent) {
         match event {
             AppEvent::UpdateProgress(session_id, _samples, file_size) => {
-                if let Some(session) = self.recording_sessions.iter_mut().find(|s| s.id == session_id) {
+                if let Some(session) = self
+                    .recording_sessions
+                    .iter_mut()
+                    .find(|s| s.id == session_id)
+                {
                     session.file_size = file_size;
                 }
             }
             AppEvent::RecordingFinished(session_id) => {
-                if let Some(session) = self.recording_sessions.iter_mut().find(|s| s.id == session_id) {
+                if let Some(session) = self
+                    .recording_sessions
+                    .iter_mut()
+                    .find(|s| s.id == session_id)
+                {
                     session.is_active.store(false, Ordering::SeqCst);
                 }
             }
@@ -491,31 +507,39 @@ fn start_recording_thread(
     let event_sender_clone = event_sender.clone();
 
     // Start capture with callback
-    capture.start_capture(move |samples| {
-        if !is_active_clone.load(Ordering::SeqCst) {
-            return;
-        }
+    capture
+        .start_capture(move |samples| {
+            if !is_active_clone.load(Ordering::SeqCst) {
+                return;
+            }
 
-        let count = samples_counter_clone.fetch_add(samples.len(), Ordering::SeqCst);
+            let count = samples_counter_clone.fetch_add(samples.len(), Ordering::SeqCst);
 
-        // Write samples to file
-        if let Ok(mut writer_option) = writer_clone.lock() {
-            if let Some(ref mut writer) = writer_option.as_mut() {
-                for &sample in samples {
-                    let sample_i16 = (sample * i16::MAX as f32) as i16;
-                    if let Err(_) = writer.write_sample(sample_i16) {
-                        break;
+            // Write samples to file
+            if let Ok(mut writer_option) = writer_clone.lock() {
+                if let Some(ref mut writer) = writer_option.as_mut() {
+                    for &sample in samples {
+                        let sample_i16 = (sample * i16::MAX as f32) as i16;
+                        if let Err(_) = writer.write_sample(sample_i16) {
+                            break;
+                        }
                     }
                 }
             }
-        }
 
-        // Send progress update every 48000 samples (1 second at 48kHz)
-        if count % 48000 == 0 {
-            let file_size = std::fs::metadata(&output_path).map(|m| m.len()).unwrap_or(0);
-            let _ = event_sender_clone.send(AppEvent::UpdateProgress(session_id, count + samples.len(), file_size));
-        }
-    }).map_err(|e| e.to_string())?;
+            // Send progress update every 48000 samples (1 second at 48kHz)
+            if count % 48000 == 0 {
+                let file_size = std::fs::metadata(&output_path)
+                    .map(|m| m.len())
+                    .unwrap_or(0);
+                let _ = event_sender_clone.send(AppEvent::UpdateProgress(
+                    session_id,
+                    count + samples.len(),
+                    file_size,
+                ));
+            }
+        })
+        .map_err(|e| e.to_string())?;
 
     // Run main loop with duration check
     loop {
@@ -531,7 +555,9 @@ fn start_recording_thread(
         }
 
         // Run main loop iteration
-        capture.run_main_loop_with_options(Some(Duration::from_millis(100)), false).map_err(|e| e.to_string())?;
+        capture
+            .run_main_loop_with_options(Some(Duration::from_millis(100)), false)
+            .map_err(|e| e.to_string())?;
     }
 
     // Finalize recording
@@ -637,40 +663,36 @@ fn run_app<B: Backend>(
                                 _ => {}
                             }
                         }
-                        InputMode::EditingFilename => {
-                            match key.code {
-                                KeyCode::Enter => {
-                                    app.input_mode = InputMode::Normal;
-                                }
-                                KeyCode::Esc => {
-                                    app.input_mode = InputMode::Normal;
-                                }
-                                KeyCode::Backspace => {
-                                    app.output_filename.pop();
-                                }
-                                KeyCode::Char(c) => {
-                                    app.output_filename.push(c);
-                                }
-                                _ => {}
+                        InputMode::EditingFilename => match key.code {
+                            KeyCode::Enter => {
+                                app.input_mode = InputMode::Normal;
                             }
-                        }
-                        InputMode::EditingDuration => {
-                            match key.code {
-                                KeyCode::Enter => {
-                                    app.input_mode = InputMode::Normal;
-                                }
-                                KeyCode::Esc => {
-                                    app.input_mode = InputMode::Normal;
-                                }
-                                KeyCode::Backspace => {
-                                    app.duration_input.pop();
-                                }
-                                KeyCode::Char(c) if c.is_ascii_digit() => {
-                                    app.duration_input.push(c);
-                                }
-                                _ => {}
+                            KeyCode::Esc => {
+                                app.input_mode = InputMode::Normal;
                             }
-                        }
+                            KeyCode::Backspace => {
+                                app.output_filename.pop();
+                            }
+                            KeyCode::Char(c) => {
+                                app.output_filename.push(c);
+                            }
+                            _ => {}
+                        },
+                        InputMode::EditingDuration => match key.code {
+                            KeyCode::Enter => {
+                                app.input_mode = InputMode::Normal;
+                            }
+                            KeyCode::Esc => {
+                                app.input_mode = InputMode::Normal;
+                            }
+                            KeyCode::Backspace => {
+                                app.duration_input.pop();
+                            }
+                            KeyCode::Char(c) if c.is_ascii_digit() => {
+                                app.duration_input.push(c);
+                            }
+                            _ => {}
+                        },
                     }
                 }
             }
@@ -688,15 +710,19 @@ fn ui(f: &mut Frame, app: &App) {
         .direction(Direction::Vertical)
         .margin(1)
         .constraints([
-            Constraint::Length(3),  // Title
-            Constraint::Min(10),    // Main content
-            Constraint::Length(3),  // Status bar
+            Constraint::Length(3), // Title
+            Constraint::Min(10),   // Main content
+            Constraint::Length(3), // Status bar
         ])
         .split(f.area());
 
     // Title
     let title = Paragraph::new("🎙️ Audio Recorder TUI")
-        .style(Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD))
+        .style(
+            Style::default()
+                .fg(Color::Cyan)
+                .add_modifier(Modifier::BOLD),
+        )
         .alignment(Alignment::Center)
         .block(Block::default().borders(Borders::ALL));
     f.render_widget(title, chunks[0]);
@@ -738,7 +764,9 @@ fn render_audio_sources(f: &mut Frame, app: &App, area: Rect) {
             .enumerate()
             .map(|(i, (source, depth, has_children))| {
                 let style = if i == app.selected_source {
-                    Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD)
+                    Style::default()
+                        .fg(Color::Yellow)
+                        .add_modifier(Modifier::BOLD)
                 } else {
                     Style::default()
                 };
@@ -778,7 +806,9 @@ fn render_audio_sources(f: &mut Frame, app: &App, area: Rect) {
             .enumerate()
             .map(|(i, source)| {
                 let style = if i == app.selected_source {
-                    Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD)
+                    Style::default()
+                        .fg(Color::Yellow)
+                        .add_modifier(Modifier::BOLD)
                 } else {
                     Style::default()
                 };
@@ -805,11 +835,7 @@ fn render_audio_sources(f: &mut Frame, app: &App, area: Rect) {
     };
 
     let list = List::new(items)
-        .block(
-            Block::default()
-                .title(title)
-                .borders(Borders::ALL)
-        )
+        .block(Block::default().title(title).borders(Borders::ALL))
         .highlight_style(Style::default().bg(Color::DarkGray));
 
     f.render_stateful_widget(list, area, &mut app.source_list_state.clone());
@@ -834,7 +860,11 @@ fn render_recording_sessions(f: &mut Frame, app: &App, area: Rect) {
                     Span::raw(format!("#{} ", session.id)),
                     Span::styled(status, Style::default().fg(Color::Red)),
                     Span::raw(format!(" {} ", session.source.name)),
-                    Span::raw(format!("({:.1}s, {} samples)", duration.as_secs_f32(), samples)),
+                    Span::raw(format!(
+                        "({:.1}s, {} samples)",
+                        duration.as_secs_f32(),
+                        samples
+                    )),
                 ])
             })
             .collect()
@@ -844,7 +874,7 @@ fn render_recording_sessions(f: &mut Frame, app: &App, area: Rect) {
         .block(
             Block::default()
                 .title("Recording Sessions (s to stop)")
-                .borders(Borders::ALL)
+                .borders(Borders::ALL),
         )
         .wrap(Wrap { trim: true });
 
@@ -857,11 +887,19 @@ fn render_status_bar(f: &mut Frame, app: &App, area: Rect) {
             format!(
                 "File: {} | Duration: {} | Press 'h' for help, 'q' to quit",
                 app.output_filename,
-                if app.duration_input.is_empty() { "unlimited" } else { &app.duration_input }
+                if app.duration_input.is_empty() {
+                    "unlimited"
+                } else {
+                    &app.duration_input
+                }
             )
         }
-        InputMode::EditingFilename => "Editing filename... (Enter to confirm, Esc to cancel)".to_string(),
-        InputMode::EditingDuration => "Editing duration in seconds... (Enter to confirm, Esc to cancel)".to_string(),
+        InputMode::EditingFilename => {
+            "Editing filename... (Enter to confirm, Esc to cancel)".to_string()
+        }
+        InputMode::EditingDuration => {
+            "Editing duration in seconds... (Enter to confirm, Esc to cancel)".to_string()
+        }
     };
 
     let status = Paragraph::new(status_text)
@@ -914,9 +952,13 @@ fn render_duration_dialog(f: &mut Frame, app: &App) {
     let text = vec![
         Line::from("Start Recording?"),
         Line::from(""),
-        Line::from(format!("Source: {}", app.audio_sources[app.selected_source].name)),
+        Line::from(format!(
+            "Source: {}",
+            app.audio_sources[app.selected_source].name
+        )),
         Line::from(format!("File: {}", app.output_filename)),
-        Line::from(format!("Duration: {}",
+        Line::from(format!(
+            "Duration: {}",
             if app.duration_input.is_empty() {
                 "unlimited".to_string()
             } else {
@@ -928,7 +970,11 @@ fn render_duration_dialog(f: &mut Frame, app: &App) {
     ];
 
     let dialog = Paragraph::new(text)
-        .block(Block::default().title("Confirm Recording").borders(Borders::ALL))
+        .block(
+            Block::default()
+                .title("Confirm Recording")
+                .borders(Borders::ALL),
+        )
         .style(Style::default().fg(Color::White));
 
     f.render_widget(dialog, area);

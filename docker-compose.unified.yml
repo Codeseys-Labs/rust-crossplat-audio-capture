@@ -1,0 +1,184 @@
+version: '3.8'
+
+services:
+  # =============================================================================
+  # Unified cross-platform testing service
+  # =============================================================================
+  rsac-unified:
+    build:
+      context: .
+      dockerfile: docker/unified/Dockerfile
+      target: test-runner
+    volumes:
+      - .:/app
+      - ./test-results:/test-results
+      - cargo-cache:/usr/local/cargo/registry
+      - target-cache:/app/target
+    environment:
+      - RUST_BACKTRACE=1
+      - RUST_LOG=info
+      - CARGO_NET_GIT_FETCH_WITH_CLI=true
+    tty: true
+    stdin_open: true
+    command: ["./test-runner.sh", "--results-dir", "/test-results"]
+
+  # =============================================================================
+  # Development environment with all tools
+  # =============================================================================
+  rsac-dev:
+    build:
+      context: .
+      dockerfile: docker/unified/Dockerfile
+      target: dev
+    volumes:
+      - .:/app
+      - ./test-results:/test-results
+      - cargo-cache:/usr/local/cargo/registry
+      - target-cache:/app/target
+    environment:
+      - RUST_BACKTRACE=1
+      - RUST_LOG=debug
+      - CARGO_NET_GIT_FETCH_WITH_CLI=true
+    tty: true
+    stdin_open: true
+    command: ["/bin/bash"]
+
+  # =============================================================================
+  # Linux-specific testing with audio support
+  # =============================================================================
+  rsac-linux-audio:
+    build:
+      context: .
+      dockerfile: docker/unified/Dockerfile
+      target: linux-test
+    volumes:
+      - .:/app
+      - ./test-results:/test-results
+      - cargo-cache:/usr/local/cargo/registry
+      - target-cache:/app/target
+    privileged: true
+    devices:
+      - /dev/snd:/dev/snd
+    environment:
+      - XDG_RUNTIME_DIR=/run/user/0
+      - PIPEWIRE_RUNTIME_DIR=/run/user/0
+      - PULSE_RUNTIME_PATH=/run/user/0/pulse
+      - RUST_BACKTRACE=1
+      - RUST_LOG=debug
+    tty: true
+    stdin_open: true
+    command: ["bash", "-c", "/app/scripts/run_audio_tests.sh --backend pipewire --type all --output-dir /test-results"]
+
+  # =============================================================================
+  # Windows cross-compilation testing
+  # =============================================================================
+  rsac-windows-cross:
+    build:
+      context: .
+      dockerfile: docker/unified/Dockerfile
+      target: windows-cross
+    volumes:
+      - .:/app
+      - ./test-results:/test-results
+      - cargo-cache:/usr/local/cargo/registry
+      - target-cache:/app/target
+      - xwin-cache:/root/.xwin
+    environment:
+      - RUST_BACKTRACE=1
+      - RUST_LOG=info
+      - XWIN_CACHE_DIR=/root/.xwin
+    tty: true
+    stdin_open: true
+    command: ["bash", "-c", "cargo xwin build --target x86_64-pc-windows-msvc --no-default-features --features feat_windows --examples"]
+
+  # =============================================================================
+  # macOS cross-compilation testing
+  # =============================================================================
+  rsac-macos-cross:
+    build:
+      context: .
+      dockerfile: docker/unified/Dockerfile
+      target: macos-cross
+    volumes:
+      - .:/app
+      - ./test-results:/test-results
+      - cargo-cache:/usr/local/cargo/registry
+      - target-cache:/app/target
+    environment:
+      - RUST_BACKTRACE=1
+      - RUST_LOG=info
+      - CC=o64-clang
+      - CXX=o64-clang++
+    tty: true
+    stdin_open: true
+    command: ["bash", "-c", "cargo build --target x86_64-apple-darwin --no-default-features --features feat_macos --examples"]
+
+  # =============================================================================
+  # Test result aggregation and reporting
+  # =============================================================================
+  rsac-reporter:
+    build:
+      context: .
+      dockerfile: docker/unified/Dockerfile
+      target: test-runner
+    volumes:
+      - ./test-results:/test-results
+    environment:
+      - RUST_BACKTRACE=1
+    depends_on:
+      - rsac-unified
+    command: ["bash", "-c", "echo 'Test results available in /test-results' && ls -la /test-results"]
+
+  # =============================================================================
+  # Cargo-xwin standalone service for Windows testing
+  # =============================================================================
+  cargo-xwin:
+    image: messense/cargo-xwin:latest
+    volumes:
+      - .:/io
+      - cargo-cache:/usr/local/cargo/registry
+      - xwin-cache:/root/.xwin
+    working_dir: /io
+    environment:
+      - RUST_BACKTRACE=1
+      - XWIN_CACHE_DIR=/root/.xwin
+    tty: true
+    stdin_open: true
+    command: ["bash"]
+
+  # =============================================================================
+  # Quick compilation check service
+  # =============================================================================
+  rsac-check:
+    build:
+      context: .
+      dockerfile: docker/unified/Dockerfile
+      target: test-runner
+    volumes:
+      - .:/app
+      - cargo-cache:/usr/local/cargo/registry
+      - target-cache:/app/target
+    environment:
+      - RUST_BACKTRACE=1
+    command: |
+      bash -c "
+        echo '🐧 Checking Linux compilation...' &&
+        cargo build --target x86_64-unknown-linux-gnu --no-default-features --features feat_linux --examples &&
+        echo '🪟 Checking Windows compilation...' &&
+        cargo xwin build --target x86_64-pc-windows-msvc --no-default-features --features feat_windows --examples &&
+        echo '🍎 Checking macOS compilation...' &&
+        cargo build --target x86_64-apple-darwin --no-default-features --features feat_macos --examples &&
+        echo '✅ All platform checks completed successfully!'
+      "
+
+volumes:
+  cargo-cache:
+    driver: local
+  target-cache:
+    driver: local
+  xwin-cache:
+    driver: local
+
+networks:
+  default:
+    driver: bridge

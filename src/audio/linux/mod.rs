@@ -3,11 +3,11 @@
 pub mod pipewire;
 
 // Re-export for convenience
-pub use pipewire::{PipeWireApplicationCapture, ApplicationSelector};
+pub use pipewire::{ApplicationSelector, PipeWireApplicationCapture};
 
 // Stub implementation for LinuxDeviceEnumerator to fix compilation
-use crate::{AudioApplication, AudioCaptureStream, Result};
 use crate::core::config::StreamConfig;
+use crate::{AudioApplication, AudioCaptureStream, Result};
 
 pub struct LinuxDeviceEnumerator;
 
@@ -27,7 +27,8 @@ impl LinuxDeviceEnumerator {
     ) -> Result<Box<dyn AudioCaptureStream>> {
         Err(crate::core::error::AudioError::UnsupportedPlatform(
             "Linux application capture not yet fully implemented".to_string(),
-        ).into())
+        )
+        .into())
     }
 
     /// Get PipeWire devices using pw-cli
@@ -47,9 +48,7 @@ impl LinuxDeviceEnumerator {
 
         // If no devices found via pw-cli, try pw-dump
         if devices.is_empty() {
-            if let Ok(output) = std::process::Command::new("pw-dump")
-                .output()
-            {
+            if let Ok(output) = std::process::Command::new("pw-dump").output() {
                 if output.status.success() {
                     let output_str = String::from_utf8_lossy(&output.stdout);
                     devices.extend(self.parse_pw_dump_nodes(&output_str));
@@ -61,7 +60,10 @@ impl LinuxDeviceEnumerator {
     }
 
     /// Get the default PipeWire device for a given kind
-    fn get_pipewire_default_device(&self, kind: crate::core::interface::DeviceKind) -> crate::core::error::Result<LinuxAudioDevice> {
+    fn get_pipewire_default_device(
+        &self,
+        kind: crate::core::interface::DeviceKind,
+    ) -> crate::core::error::Result<LinuxAudioDevice> {
         // Try to get default device info from pw-metadata
         if let Ok(output) = std::process::Command::new("pw-metadata")
             .args(&["-n", "settings"])
@@ -126,7 +128,11 @@ impl LinuxDeviceEnumerator {
                     if is_audio_source || is_audio_sink {
                         devices.push(LinuxAudioDevice {
                             id,
-                            name: if name.is_empty() { format!("PipeWire Device") } else { name },
+                            name: if name.is_empty() {
+                                format!("PipeWire Device")
+                            } else {
+                                name
+                            },
                             is_input: is_audio_source,
                             is_output: is_audio_sink,
                         });
@@ -159,7 +165,11 @@ impl LinuxDeviceEnumerator {
     }
 
     /// Extract device info from pw-dump context around a node line
-    fn extract_device_from_dump_context(&self, full_output: &str, node_line: &str) -> Option<LinuxAudioDevice> {
+    fn extract_device_from_dump_context(
+        &self,
+        full_output: &str,
+        node_line: &str,
+    ) -> Option<LinuxAudioDevice> {
         // Find the position of this line in the full output
         let lines: Vec<&str> = full_output.lines().collect();
         let node_line_index = lines.iter().position(|&line| line == node_line)?;
@@ -177,15 +187,33 @@ impl LinuxDeviceEnumerator {
 
             if line.contains("\"id\":") {
                 if let Some(id_str) = line.split(':').nth(1) {
-                    id = Some(id_str.trim().trim_matches(',').trim_matches('"').to_string());
+                    id = Some(
+                        id_str
+                            .trim()
+                            .trim_matches(',')
+                            .trim_matches('"')
+                            .to_string(),
+                    );
                 }
             } else if line.contains("\"node.name\":") {
                 if let Some(name_str) = line.split(':').nth(1) {
-                    name = Some(name_str.trim().trim_matches(',').trim_matches('"').to_string());
+                    name = Some(
+                        name_str
+                            .trim()
+                            .trim_matches(',')
+                            .trim_matches('"')
+                            .to_string(),
+                    );
                 }
             } else if line.contains("\"media.class\":") {
                 if let Some(class_str) = line.split(':').nth(1) {
-                    media_class = Some(class_str.trim().trim_matches(',').trim_matches('"').to_string());
+                    media_class = Some(
+                        class_str
+                            .trim()
+                            .trim_matches(',')
+                            .trim_matches('"')
+                            .to_string(),
+                    );
                 }
             }
         }
@@ -208,7 +236,11 @@ impl LinuxDeviceEnumerator {
     }
 
     /// Parse default device from pw-metadata output
-    fn parse_default_device(&self, output: &str, kind: crate::core::interface::DeviceKind) -> Option<LinuxAudioDevice> {
+    fn parse_default_device(
+        &self,
+        output: &str,
+        kind: crate::core::interface::DeviceKind,
+    ) -> Option<LinuxAudioDevice> {
         use crate::core::interface::DeviceKind;
 
         let target_key = match kind {
@@ -222,7 +254,14 @@ impl LinuxDeviceEnumerator {
                     let id = id_part.trim_matches('"').to_string();
                     return Some(LinuxAudioDevice {
                         id: id.clone(),
-                        name: format!("Default {} Device", if kind == DeviceKind::Input { "Input" } else { "Output" }),
+                        name: format!(
+                            "Default {} Device",
+                            if kind == DeviceKind::Input {
+                                "Input"
+                            } else {
+                                "Output"
+                            }
+                        ),
                         is_input: kind == DeviceKind::Input,
                         is_output: kind == DeviceKind::Output,
                     });
@@ -254,7 +293,9 @@ impl crate::core::interface::AudioDevice for LinuxAudioDevice {
         self.name.clone()
     }
 
-    fn get_supported_formats(&self) -> crate::core::error::Result<Vec<crate::core::config::AudioFormat>> {
+    fn get_supported_formats(
+        &self,
+    ) -> crate::core::error::Result<Vec<crate::core::config::AudioFormat>> {
         Ok(vec![])
     }
 
@@ -279,11 +320,17 @@ impl crate::core::interface::AudioDevice for LinuxAudioDevice {
         false
     }
 
-    fn is_format_supported(&self, _format: &crate::core::config::AudioFormat) -> crate::core::error::Result<bool> {
+    fn is_format_supported(
+        &self,
+        _format: &crate::core::config::AudioFormat,
+    ) -> crate::core::error::Result<bool> {
         Ok(false)
     }
 
-    fn create_stream(&mut self, _config: &crate::api::AudioCaptureConfig) -> crate::core::error::Result<Box<dyn crate::core::interface::CapturingStream>> {
+    fn create_stream(
+        &mut self,
+        _config: &crate::api::AudioCaptureConfig,
+    ) -> crate::core::error::Result<Box<dyn crate::core::interface::CapturingStream>> {
         Err(crate::core::error::AudioError::UnsupportedPlatform(
             "Linux audio streams not yet implemented".to_string(),
         ))
@@ -315,7 +362,10 @@ impl crate::core::interface::DeviceEnumerator for LinuxDeviceEnumerator {
         Ok(devices)
     }
 
-    fn get_default_device(&self, kind: crate::core::interface::DeviceKind) -> crate::core::error::Result<Self::Device> {
+    fn get_default_device(
+        &self,
+        kind: crate::core::interface::DeviceKind,
+    ) -> crate::core::error::Result<Self::Device> {
         // Try to get the actual default device from PipeWire
         if let Ok(device) = self.get_pipewire_default_device(kind) {
             return Ok(device);
@@ -323,22 +373,18 @@ impl crate::core::interface::DeviceEnumerator for LinuxDeviceEnumerator {
 
         // Fallback to a generic default
         match kind {
-            crate::core::interface::DeviceKind::Input => {
-                Ok(LinuxAudioDevice {
-                    id: "default_input".to_string(),
-                    name: "Default Linux Input Device".to_string(),
-                    is_input: true,
-                    is_output: false,
-                })
-            }
-            crate::core::interface::DeviceKind::Output => {
-                Ok(LinuxAudioDevice {
-                    id: "default_output".to_string(),
-                    name: "Default Linux Output Device".to_string(),
-                    is_input: false,
-                    is_output: true,
-                })
-            }
+            crate::core::interface::DeviceKind::Input => Ok(LinuxAudioDevice {
+                id: "default_input".to_string(),
+                name: "Default Linux Input Device".to_string(),
+                is_input: true,
+                is_output: false,
+            }),
+            crate::core::interface::DeviceKind::Output => Ok(LinuxAudioDevice {
+                id: "default_output".to_string(),
+                name: "Default Linux Output Device".to_string(),
+                is_input: false,
+                is_output: true,
+            }),
         }
     }
 

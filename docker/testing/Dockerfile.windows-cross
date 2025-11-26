@@ -1,0 +1,87 @@
+# Windows Cross-Compilation Testing (No KVM Required)
+# Uses cargo-xwin for Windows cross-compilation and testing
+
+FROM rust:1.88.0
+
+ENV DEBIAN_FRONTEND=noninteractive
+ENV CARGO_NET_GIT_FETCH_WITH_CLI=true
+ENV RUST_BACKTRACE=1
+
+# Install system dependencies
+RUN apt-get update && apt-get install -y \
+    # Build tools
+    build-essential \
+    curl \
+    git \
+    pkg-config \
+    cmake \
+    ninja-build \
+    clang \
+    llvm \
+    # Development tools
+    vim \
+    htop \
+    jq \
+    wget \
+    unzip \
+    && rm -rf /var/lib/apt/lists/*
+
+# Install cargo-xwin for Windows cross-compilation
+RUN cargo install --locked cargo-xwin
+
+# Install Rust Windows targets
+RUN rustup target add x86_64-pc-windows-msvc aarch64-pc-windows-msvc && \
+    rustup component add llvm-tools-preview
+
+# Set up environment for Windows cross-compilation
+ENV XWIN_CACHE_DIR=/root/.xwin
+ENV CARGO_TARGET_X86_64_PC_WINDOWS_MSVC_LINKER=lld-link
+ENV CC_x86_64_pc_windows_msvc=clang-cl
+ENV CXX_x86_64_pc_windows_msvc=clang-cl
+
+# Create directories
+RUN mkdir -p /workspace /test-results /root/.xwin
+
+WORKDIR /workspace
+
+# Copy test scripts
+COPY docker/testing/scripts/ /scripts/
+RUN chmod +x /scripts/*.sh
+
+# Create entrypoint script
+RUN cat > /entrypoint.sh << 'EOF'
+#!/bin/bash
+set -e
+
+echo "🪟 Starting Windows Cross-Compilation Testing Environment..."
+
+# Check cargo-xwin installation
+echo "Checking cargo-xwin installation..."
+cargo xwin --version || {
+    echo "❌ cargo-xwin not available"
+    exit 1
+}
+
+# Check Windows targets
+echo "Checking Windows targets..."
+rustup target list --installed | grep windows || {
+    echo "❌ Windows targets not installed"
+    exit 1
+}
+
+echo "✅ Windows cross-compilation environment ready"
+
+# Execute the provided command or start interactive shell
+if [ $# -eq 0 ]; then
+    echo "Starting interactive shell..."
+    exec /bin/bash
+else
+    echo "Executing: $@"
+    exec "$@"
+fi
+EOF
+
+RUN chmod +x /entrypoint.sh
+
+ENTRYPOINT ["/entrypoint.sh"]
+CMD ["/scripts/test-windows-cross.sh"]

@@ -1,6 +1,6 @@
 #!/usr/bin/env cargo
 //! PipeWire Diagnostics Tool
-//! 
+//!
 //! This tool helps diagnose PipeWire issues in CI environments
 //! by testing various stream creation scenarios.
 
@@ -27,19 +27,26 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     // Test 2: List all nodes
     println!("\n📊 Test 2: Available Nodes");
-    match Command::new("pw-cli").arg("list-objects").arg("Node").output() {
+    match Command::new("pw-cli")
+        .arg("list-objects")
+        .arg("Node")
+        .output()
+    {
         Ok(output) => {
             if output.status.success() {
                 let stdout = String::from_utf8_lossy(&output.stdout);
                 let lines: Vec<&str> = stdout.lines().collect();
                 println!("✅ Found {} lines of node information", lines.len());
-                
+
                 // Show VLC-related nodes
-                let vlc_lines: Vec<&str> = lines.iter()
-                    .filter(|line| line.to_lowercase().contains("vlc") || line.contains("Dynamic_vlc_cap"))
+                let vlc_lines: Vec<&str> = lines
+                    .iter()
+                    .filter(|line| {
+                        line.to_lowercase().contains("vlc") || line.contains("Dynamic_vlc_cap")
+                    })
                     .cloned()
                     .collect();
-                
+
                 if !vlc_lines.is_empty() {
                     println!("🎯 VLC-related nodes:");
                     for line in vlc_lines {
@@ -50,11 +57,12 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 }
 
                 // Show audio nodes
-                let audio_lines: Vec<&str> = lines.iter()
+                let audio_lines: Vec<&str> = lines
+                    .iter()
                     .filter(|line| line.contains("Audio/Sink") || line.contains("Audio/Source"))
                     .cloned()
                     .collect();
-                
+
                 if !audio_lines.is_empty() {
                     println!("🔊 Audio nodes:");
                     for line in audio_lines {
@@ -75,11 +83,11 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     println!("\n📊 Test 3: Environment Variables");
     let env_vars = [
         "PIPEWIRE_RUNTIME_DIR",
-        "PULSE_RUNTIME_PATH", 
+        "PULSE_RUNTIME_PATH",
         "XDG_RUNTIME_DIR",
         "PIPEWIRE_LATENCY",
     ];
-    
+
     for var in &env_vars {
         match std::env::var(var) {
             Ok(value) => println!("✅ {}: {}", var, value),
@@ -91,7 +99,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     println!("\n📊 Test 4: User and Permissions");
     println!("User ID: {}", unsafe { libc::getuid() });
     println!("Group ID: {}", unsafe { libc::getgid() });
-    
+
     // Check if we're in audio group
     match Command::new("groups").output() {
         Ok(output) => {
@@ -109,13 +117,22 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     // Test 5: Try to create a simple stream (this will help us understand the exact error)
     println!("\n📊 Test 5: Stream Creation Test");
     println!("This test will help identify why monitor stream creation fails...");
-    
+
     // We'll use a simple pw-cat command to test stream creation
     match Command::new("pw-cat")
-        .args(&["--record", "--format", "s16", "--rate", "48000", "--channels", "2"])
+        .args(&[
+            "--record",
+            "--format",
+            "s16",
+            "--rate",
+            "48000",
+            "--channels",
+            "2",
+        ])
         .args(&["--volume", "0.0", "/dev/null"])
         .arg("--help")
-        .output() {
+        .output()
+    {
         Ok(output) => {
             if output.status.success() {
                 println!("✅ pw-cat is available for stream testing");
@@ -128,6 +145,6 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     println!("\n🎯 Diagnostics Complete");
     println!("This information will help debug the monitor stream creation issue.");
-    
+
     Ok(())
 }

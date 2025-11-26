@@ -1,0 +1,135 @@
+# Linux PipeWire Testing Environment
+# Ubuntu 22.04 with PipeWire, VLC, and Rust for audio capture testing
+
+FROM ubuntu:22.04
+
+ENV DEBIAN_FRONTEND=noninteractive
+ENV RUST_BACKTRACE=1
+
+# Install system dependencies
+RUN apt-get update && apt-get install -y \
+    # Build tools
+    build-essential \
+    curl \
+    git \
+    pkg-config \
+    cmake \
+    ninja-build \
+    clang \
+    llvm \
+    # Audio system dependencies
+    pipewire \
+    pipewire-audio-client-libraries \
+    pipewire-pulse \
+    wireplumber \
+    libpipewire-0.3-dev \
+    libspa-0.2-dev \
+    # PulseAudio (for compatibility)
+    pulseaudio \
+    pulseaudio-utils \
+    libpulse-dev \
+    # ALSA
+    alsa-utils \
+    libasound2-dev \
+    # VLC and multimedia
+    vlc \
+    vlc-plugin-base \
+    vlc-plugin-video-output \
+    libvlc-dev \
+    # Audio testing tools
+    pavucontrol \
+    paprefs \
+    audacity \
+    sox \
+    ffmpeg \
+    # GUI support
+    x11-apps \
+    xvfb \
+    # Development tools
+    vim \
+    htop \
+    jq \
+    && rm -rf /var/lib/apt/lists/*
+
+# Install Rust
+RUN curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --default-toolchain stable
+ENV PATH="/root/.cargo/bin:${PATH}"
+
+# Install Rust components and tools
+RUN rustup component add clippy rustfmt && \
+    cargo install cargo-watch cargo-audit
+
+# Create user for audio testing (to avoid root issues with audio)
+RUN useradd -m -s /bin/bash audiotest && \
+    usermod -a -G audio,pulse,pipewire audiotest
+
+# Set up PipeWire configuration
+RUN mkdir -p /etc/pipewire/pipewire.conf.d && \
+    mkdir -p /home/audiotest/.config/pipewire
+
+# Copy PipeWire configuration
+COPY docker/testing/configs/pipewire.conf /etc/pipewire/pipewire.conf.d/99-custom.conf
+
+# Create test audio files directory
+RUN mkdir -p /test-audio && \
+    chown -R audiotest:audiotest /test-audio
+
+# Generate test audio files
+RUN sox -n -r 44100 -c 2 /test-audio/test-tone-440hz.wav synth 10 sine 440 && \
+    sox -n -r 44100 -c 2 /test-audio/test-tone-1khz.wav synth 10 sine 1000 && \
+    sox -n -r 44100 -c 2 /test-audio/test-music.wav synth 30 sine 440 sine 554 sine 659 && \
+    chown -R audiotest:audiotest /test-audio
+
+# Set up workspace
+WORKDIR /workspace
+
+# Copy test scripts
+COPY docker/testing/scripts/ /scripts/
+RUN chmod +x /scripts/*.sh
+
+# Set up environment for audio testing
+ENV XDG_RUNTIME_DIR=/run/user/1000
+ENV PIPEWIRE_RUNTIME_DIR=/run/user/1000
+ENV PULSE_RUNTIME_PATH=/run/user/1000/pulse
+
+# Create entrypoint script
+RUN cat > /entrypoint.sh << 'EOF'
+#!/bin/bash
+set -e
+
+echo "🐧 Starting Linux PipeWire Testing Environment..."
+
+# Start PipeWire services
+echo "Starting PipeWire services..."
+pipewire &
+pipewire-pulse &
+wireplumber &
+
+# Wait for services to start
+sleep 3
+
+# Test audio system
+echo "Testing audio system..."
+pactl info || echo "PulseAudio not ready"
+pw-cli info || echo "PipeWire not ready"
+
+# List audio devices
+echo "Available audio devices:"
+aplay -l || echo "No ALSA devices found"
+pactl list short sinks || echo "No PulseAudio sinks found"
+pw-cli list-objects | grep -i audio || echo "No PipeWire audio objects found"
+
+# Execute the provided command or start interactive shell
+if [ $# -eq 0 ]; then
+    echo "Starting interactive shell..."
+    exec /bin/bash
+else
+    echo "Executing: $@"
+    exec "$@"
+fi
+EOF
+
+RUN chmod +x /entrypoint.sh
+
+ENTRYPOINT ["/entrypoint.sh"]
+CMD ["/scripts/test-linux-pipewire.sh"]

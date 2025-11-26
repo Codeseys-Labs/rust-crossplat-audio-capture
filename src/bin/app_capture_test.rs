@@ -13,14 +13,14 @@
 
 use std::env;
 use std::process;
-use std::time::Duration;
-use std::thread;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
+use std::thread;
+use std::time::Duration;
 
 fn main() {
     let args: Vec<String> = env::args().collect();
-    
+
     let result = match args.get(1).map(|s| s.as_str()) {
         Some("--version") => {
             println!("app_capture_test v{}", env!("CARGO_PKG_VERSION"));
@@ -43,7 +43,7 @@ fn main() {
             process::exit(1);
         }
     };
-    
+
     match result {
         Ok(()) => {
             println!("✅ Test completed successfully");
@@ -197,7 +197,9 @@ fn test_capture_lifecycle() -> Result<(), Box<dyn std::error::Error>> {
     thread::spawn(move || {
         let mut count = counter_clone.lock().unwrap();
         *count += 1;
-    }).join().unwrap();
+    })
+    .join()
+    .unwrap();
 
     let final_count = *counter.lock().unwrap();
     if final_count != 1 {
@@ -210,15 +212,15 @@ fn test_capture_lifecycle() -> Result<(), Box<dyn std::error::Error>> {
 
 fn test_platform_specific() -> Result<(), Box<dyn std::error::Error>> {
     println!("🖥️  Testing platform-specific features...");
-    
+
     #[cfg(target_os = "windows")]
     {
         println!("  Windows platform detected");
         use rsac::audio::windows::WindowsApplicationCapture;
-        
+
         let processes = WindowsApplicationCapture::list_audio_processes();
         println!("    Found {} Windows processes", processes.len());
-        
+
         if let Some((pid, name)) = processes.first() {
             let found_pid = WindowsApplicationCapture::find_process_by_name(name, false);
             if found_pid.is_some() {
@@ -228,7 +230,7 @@ fn test_platform_specific() -> Result<(), Box<dyn std::error::Error>> {
             }
         }
     }
-    
+
     #[cfg(target_os = "linux")]
     {
         println!("  Linux platform detected");
@@ -252,25 +254,25 @@ fn test_platform_specific() -> Result<(), Box<dyn std::error::Error>> {
             }
         }
     }
-    
+
     #[cfg(target_os = "macos")]
     {
         println!("  macOS platform detected");
         use rsac::audio::macos::tap::MacOSApplicationCapture;
-        
+
         let is_available = MacOSApplicationCapture::is_process_tap_available();
         println!("    Process Tap available: {}", is_available);
-        
+
         if is_available {
             println!("    ✅ Process Tap APIs available");
         } else {
             println!("    ⚠️  Process Tap requires macOS 14.4+");
         }
-        
+
         let apps = MacOSApplicationCapture::list_capturable_applications()?;
         println!("    Found {} capturable applications", apps.len());
     }
-    
+
     Ok(())
 }
 
@@ -289,7 +291,11 @@ fn quick_functionality_test() -> Result<(), Box<dyn std::error::Error>> {
     #[cfg(target_os = "linux")]
     {
         // Check for PipeWire
-        if std::process::Command::new("which").arg("pipewire").status().is_ok() {
+        if std::process::Command::new("which")
+            .arg("pipewire")
+            .status()
+            .is_ok()
+        {
             println!("      ✅ PipeWire binary found");
         } else {
             println!("      ⚠️  PipeWire binary not found");

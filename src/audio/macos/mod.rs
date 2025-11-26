@@ -5,11 +5,11 @@ pub mod tap;
 
 // Re-export for convenience
 pub use coreaudio::{
-    MacosAudioDevice, MacosAudioStream, MacosApplicationAudioStream,
-    enumerate_audio_applications, ApplicationInfo
+    enumerate_audio_applications, ApplicationInfo, MacosApplicationAudioStream, MacosAudioDevice,
+    MacosAudioStream,
 };
 
-// Legacy backend exports (to be deprecated)  
+// Legacy backend exports (to be deprecated)
 pub use coreaudio::MacosAudioDevice as CoreAudioBackend;
 
 /// Device enumerator for macOS

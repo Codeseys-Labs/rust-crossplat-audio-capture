@@ -1,0 +1,132 @@
+version: '3.8'
+
+services:
+  # =============================================================================
+  # Linux PipeWire Testing Environment
+  # =============================================================================
+  linux-pipewire-test:
+    build:
+      context: .
+      dockerfile: docker/testing/Dockerfile.linux-pipewire
+    container_name: rsac-linux-pipewire-test
+    volumes:
+      - .:/workspace
+      - ./test-results:/test-results
+      - /tmp/.X11-unix:/tmp/.X11-unix:rw
+      - /run/user/1000/pipewire-0:/run/user/1000/pipewire-0:ro
+      - /run/user/1000/pulse:/run/user/1000/pulse:ro
+    devices:
+      - /dev/snd:/dev/snd
+      - /dev/dri:/dev/dri
+    environment:
+      - DISPLAY=${DISPLAY}
+      - XDG_RUNTIME_DIR=/run/user/1000
+      - PIPEWIRE_RUNTIME_DIR=/run/user/1000
+      - PULSE_RUNTIME_PATH=/run/user/1000/pulse
+      - RUST_BACKTRACE=1
+      - RUST_LOG=debug
+    privileged: true
+    network_mode: host
+    tty: true
+    stdin_open: true
+    command: ["/workspace/docker/testing/scripts/test-linux-pipewire.sh"]
+
+  # =============================================================================
+  # Windows Testing Environment (Full Windows VM)
+  # =============================================================================
+  windows-test:
+    image: dockurr/windows
+    container_name: rsac-windows-test
+    environment:
+      VERSION: "11"
+      RAM_SIZE: "4G"  # Reduced for software emulation
+      CPU_CORES: "2"  # Reduced for software emulation
+      DISK_SIZE: "32G"  # Reduced for faster setup
+      USERNAME: "RustDev"
+      PASSWORD: "AudioTest123"
+      LANGUAGE: "English"
+      KVM: "false"  # Disable KVM acceleration
+      BOOT_MODE: "windows_secure"
+    devices:
+      - /dev/net/tun
+    cap_add:
+      - NET_ADMIN
+    ports:
+      - "8006:8006"  # Web interface
+      - "3389:3389"  # RDP
+    volumes:
+      - ./windows-storage:/storage
+      - .:/data  # Project files accessible as \\host.lan\Data
+      - ./docker/testing/scripts:/scripts
+    restart: unless-stopped
+    stop_grace_period: 5m  # Longer grace period for software emulation
+
+  # =============================================================================
+  # macOS Testing Environment (macOS in Docker)
+  # =============================================================================
+  macos-test:
+    build:
+      context: .
+      dockerfile: docker/testing/Dockerfile.macos
+    container_name: rsac-macos-test
+    # Note: KVM removed for compatibility with non-KVM environments
+    volumes:
+      - .:/workspace
+      - ./test-results:/test-results
+      - /tmp/.X11-unix:/tmp/.X11-unix:rw
+    environment:
+      - DISPLAY=${DISPLAY}
+      - SHORTNAME=monterey
+      - GENERATE_UNIQUE=true
+      - RAM=2048  # Reduced for software emulation
+      - CPU_CORES=2  # Reduced for software emulation
+      - RUST_BACKTRACE=1
+      - KVM=false  # Disable KVM acceleration
+    ports:
+      - "50922:10022"  # SSH
+    privileged: true
+    tty: true
+    stdin_open: true
+    command: ["/workspace/docker/testing/scripts/test-macos-coreaudio.sh"]
+
+  # =============================================================================
+  # Test Orchestrator (runs tests on all platforms)
+  # =============================================================================
+  test-orchestrator:
+    build:
+      context: .
+      dockerfile: docker/testing/Dockerfile.orchestrator
+    container_name: rsac-test-orchestrator
+    volumes:
+      - .:/workspace
+      - ./test-results:/test-results
+      - /var/run/docker.sock:/var/run/docker.sock
+    environment:
+      - RUST_BACKTRACE=1
+    depends_on:
+      - linux-pipewire-test
+    command: ["/workspace/docker/testing/scripts/orchestrate-tests.sh"]
+
+  # =============================================================================
+  # VNC/Web Interface for GUI Testing
+  # =============================================================================
+  vnc-server:
+    image: dorowu/ubuntu-desktop-lxde-vnc:latest
+    container_name: rsac-vnc-server
+    ports:
+      - "6080:80"  # Web VNC interface
+      - "5900:5900"  # VNC port
+    volumes:
+      - .:/workspace
+    environment:
+      - VNC_PASSWORD=audiotest
+      - RESOLUTION=1920x1080
+    shm_size: 2gb
+
+volumes:
+  windows-storage:
+    driver: local
+
+networks:
+  default:
+    driver: bridge
