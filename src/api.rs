@@ -1627,7 +1627,7 @@ impl fmt::Debug for AudioCapture {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::core::config::{DeviceSelector, LatencyMode, SampleFormat};
+    use crate::core::config::{DeviceSelector, SampleFormat};
 
     // Helper to create a builder for tests that would successfully build AudioCaptureConfig
     fn minimal_valid_builder() -> AudioCaptureBuilder {

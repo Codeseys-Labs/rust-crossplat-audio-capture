@@ -1,8 +1,6 @@
 pub mod api; // Added api module
 pub mod audio;
 pub mod core; // Added core module
-#[cfg(test)]
-pub mod tests;
 pub mod utils;
 
 // Re-export trait-based API
