@@ -4,23 +4,23 @@
 //! application-specific audio capture using monitor streams.
 //! Based on the wiremix approach for robust PipeWire integration.
 
-use log::{warn, trace};
+use log::{trace, warn};
+use std::collections::HashMap;
+use std::mem;
+use std::rc::Rc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
-use std::collections::HashMap;
 use std::time::Duration;
-use std::rc::Rc;
-use std::mem;
 
 // PipeWire and libspa imports (conditional compilation)
 #[cfg(feature = "pipewire")]
 use pipewire::{
-    core::Core,
-    properties::properties,
-    stream::{Stream, StreamListener},
-    main_loop::MainLoop,
     context::Context,
+    core::Core,
+    main_loop::MainLoop,
+    properties::properties,
     registry::Registry,
+    stream::{Stream, StreamListener},
 };
 
 #[cfg(feature = "libspa")]
@@ -58,15 +58,19 @@ pub enum ApplicationSelector {
 #[derive(Default)]
 pub struct StreamData {
     format: AudioInfoRaw,
+    #[allow(dead_code)] // Reserved for future callback-based API
     callback: Option<Box<dyn Fn(&[f32]) + Send + 'static>>,
 }
 
 /// PipeWire context and main loop management
 #[cfg(feature = "pipewire")]
 pub struct PipeWireContext {
+    #[allow(dead_code)] // Used for main loop iteration
     main_loop: MainLoop,
+    #[allow(dead_code)] // Kept for future native registry enumeration
     context: Context,
     core: Core,
+    #[allow(dead_code)] // Kept for future native registry enumeration
     registry: Registry,
 }
 
@@ -147,13 +151,16 @@ impl PipeWireApplicationCapture {
         let target_app = match &self.app_selector {
             ApplicationSelector::ProcessId(target_pid) => {
                 println!("🎯 Looking for PID: {}", target_pid);
-                applications.iter().find(|app| app.process_id == Some(*target_pid))
+                applications
+                    .iter()
+                    .find(|app| app.process_id == Some(*target_pid))
             }
             ApplicationSelector::ApplicationName(target_name) => {
                 println!("🎯 Looking for application: {}", target_name);
                 applications.iter().find(|app| {
-                    app.name.as_ref()
-                        .map_or(false, |name| name.to_lowercase().contains(&target_name.to_lowercase()))
+                    app.name.as_ref().map_or(false, |name| {
+                        name.to_lowercase().contains(&target_name.to_lowercase())
+                    })
                 })
             }
             ApplicationSelector::NodeId(_) => {
@@ -163,7 +170,9 @@ impl PipeWireApplicationCapture {
             ApplicationSelector::NodeSerial(target_serial) => {
                 println!("🎯 Looking for node serial: {}", target_serial);
                 if let Ok(id) = target_serial.parse::<u32>() {
-                    applications.iter().find(|app| app.pipewire_node_id == Some(id))
+                    applications
+                        .iter()
+                        .find(|app| app.pipewire_node_id == Some(id))
                 } else {
                     None
                 }
@@ -172,8 +181,11 @@ impl PipeWireApplicationCapture {
 
         if let Some(app) = target_app {
             if let Some(node_id) = app.pipewire_node_id {
-                println!("✅ Found target application: {} (Node ID: {})",
-                         app.name.as_deref().unwrap_or("Unknown"), node_id);
+                println!(
+                    "✅ Found target application: {} (Node ID: {})",
+                    app.name.as_deref().unwrap_or("Unknown"),
+                    node_id
+                );
 
                 self.node_id = Some(node_id);
                 // We need to get the actual object.serial, not just the node ID
@@ -200,20 +212,30 @@ impl PipeWireApplicationCapture {
 
                 Ok(node_id)
             } else {
-                Err(format!("Application found but no PipeWire node ID available: {:?}", app.name).into())
+                Err(format!(
+                    "Application found but no PipeWire node ID available: {:?}",
+                    app.name
+                )
+                .into())
             }
         } else {
             // Print available applications for debugging
             println!("❌ Target application not found. Available applications:");
             for (i, app) in applications.iter().enumerate() {
-                println!("   {}. {} (PID: {:?}, Node: {:?})",
-                         i + 1,
-                         app.name.as_deref().unwrap_or("Unknown"),
-                         app.process_id,
-                         app.pipewire_node_id);
+                println!(
+                    "   {}. {} (PID: {:?}, Node: {:?})",
+                    i + 1,
+                    app.name.as_deref().unwrap_or("Unknown"),
+                    app.process_id,
+                    app.pipewire_node_id
+                );
             }
 
-            Err(format!("Target application not found for selector: {:?}", self.app_selector).into())
+            Err(format!(
+                "Target application not found for selector: {:?}",
+                self.app_selector
+            )
+            .into())
         }
     }
 
@@ -221,9 +243,7 @@ impl PipeWireApplicationCapture {
     fn get_node_serial(&self, node_id: u32) -> Result<String, Box<dyn std::error::Error>> {
         use std::process::Command;
 
-        let output = Command::new("pw-cli")
-            .args(&["list-objects"])
-            .output()?;
+        let output = Command::new("pw-cli").args(&["list-objects"]).output()?;
 
         let stdout = String::from_utf8(output.stdout)?;
 
@@ -327,7 +347,10 @@ impl PipeWireApplicationCapture {
 
         self.stream = Some(Rc::new(stream));
 
-        println!("✅ Created PipeWire monitor stream for node {}", self.node_id.unwrap());
+        println!(
+            "✅ Created PipeWire monitor stream for node {}",
+            self.node_id.unwrap()
+        );
         Ok(())
     }
 
@@ -339,27 +362,30 @@ impl PipeWireApplicationCapture {
         println!("🔧 Checking audio permissions...");
 
         // Check if user is in audio group (with CI environment awareness)
-        let audio_group_configured = std::env::var("AUDIO_GROUP_CONFIGURED").unwrap_or_default() == "true";
-        let user_in_audio_group = std::env::var("USER_IN_AUDIO_GROUP").unwrap_or_default() == "true";
+        let audio_group_configured =
+            std::env::var("AUDIO_GROUP_CONFIGURED").unwrap_or_default() == "true";
+        let user_in_audio_group =
+            std::env::var("USER_IN_AUDIO_GROUP").unwrap_or_default() == "true";
 
         if audio_group_configured && user_in_audio_group {
             println!("✅ User is in audio group (configured by CI)");
         } else {
-            let groups_output = Command::new("groups")
-                .output();
+            let groups_output = Command::new("groups").output();
 
             if let Ok(output) = groups_output {
                 let groups_str = String::from_utf8_lossy(&output.stdout);
                 if groups_str.contains("audio") {
                     println!("✅ User is in audio group");
                 } else {
-                    println!("⚠️  User is NOT in audio group - this may cause stream creation to fail");
+                    println!(
+                        "⚠️  User is NOT in audio group - this may cause stream creation to fail"
+                    );
                     println!("🔧 To fix: sudo usermod -aG audio $(whoami) && newgrp audio");
 
                     // Only try to add user to audio group if we're in an interactive environment
-                    let is_interactive = std::env::var("CI").is_err() &&
-                                       std::env::var("GITHUB_ACTIONS").is_err() &&
-                                       atty::is(atty::Stream::Stdin);
+                    let is_interactive = std::env::var("CI").is_err()
+                        && std::env::var("GITHUB_ACTIONS").is_err()
+                        && atty::is(atty::Stream::Stdin);
 
                     if is_interactive {
                         println!("🔧 Attempting to add user to audio group...");
@@ -373,7 +399,10 @@ impl PipeWireApplicationCapture {
                                 println!("✅ Successfully added user to audio group");
                                 println!("🔧 Note: You may need to restart the session for changes to take effect");
                             } else {
-                                println!("⚠️  Could not add user to audio group: {}", String::from_utf8_lossy(&result.stderr));
+                                println!(
+                                    "⚠️  Could not add user to audio group: {}",
+                                    String::from_utf8_lossy(&result.stderr)
+                                );
                             }
                         }
                     } else {
@@ -405,8 +434,13 @@ impl PipeWireApplicationCapture {
 
     /// Try multiple stream creation approaches based on research findings
     #[cfg(feature = "pipewire")]
-    fn try_multiple_stream_approaches(&self, context: &PipeWireContext) -> Result<Stream, Box<dyn std::error::Error>> {
-        let serial = self.node_serial.as_ref()
+    fn try_multiple_stream_approaches(
+        &self,
+        context: &PipeWireContext,
+    ) -> Result<Stream, Box<dyn std::error::Error>> {
+        let serial = self
+            .node_serial
+            .as_ref()
             .ok_or("No node serial available")?;
         let node_id = self.node_id.ok_or("No node ID available")?;
 
@@ -414,7 +448,8 @@ impl PipeWireApplicationCapture {
         println!("🔧 Node ID: {}, Node Serial: {}", node_id, serial);
 
         // Check if we have audio group permissions configured
-        let audio_group_configured = std::env::var("AUDIO_GROUP_CONFIGURED").unwrap_or_default() == "true";
+        let audio_group_configured =
+            std::env::var("AUDIO_GROUP_CONFIGURED").unwrap_or_default() == "true";
         if audio_group_configured {
             println!("🔧 Audio group permissions configured by CI environment");
         }
@@ -460,8 +495,15 @@ impl PipeWireApplicationCapture {
 
     /// Approach 1: Original wiremix approach with STREAM_CAPTURE_SINK
     #[cfg(feature = "pipewire")]
-    fn try_wiremix_approach(&self, context: &PipeWireContext, serial: &str) -> Result<Stream, Box<dyn std::error::Error>> {
-        println!("🔧   Creating wiremix-style monitor stream with TARGET_OBJECT: {}", serial);
+    fn try_wiremix_approach(
+        &self,
+        context: &PipeWireContext,
+        serial: &str,
+    ) -> Result<Stream, Box<dyn std::error::Error>> {
+        println!(
+            "🔧   Creating wiremix-style monitor stream with TARGET_OBJECT: {}",
+            serial
+        );
 
         let mut props = properties! {
             *pipewire::keys::TARGET_OBJECT => String::from(serial),
@@ -484,7 +526,11 @@ impl PipeWireApplicationCapture {
 
     /// Approach 2: Use node.name instead of object.serial
     #[cfg(feature = "pipewire")]
-    fn try_node_name_approach(&self, context: &PipeWireContext, node_id: u32) -> Result<Stream, Box<dyn std::error::Error>> {
+    fn try_node_name_approach(
+        &self,
+        context: &PipeWireContext,
+        node_id: u32,
+    ) -> Result<Stream, Box<dyn std::error::Error>> {
         println!("🔧   Creating monitor stream with node.name targeting");
 
         let props = properties! {
@@ -507,7 +553,11 @@ impl PipeWireApplicationCapture {
 
     /// Approach 3: Direct node ID targeting without STREAM_CAPTURE_SINK
     #[cfg(feature = "pipewire")]
-    fn try_direct_node_approach(&self, context: &PipeWireContext, node_id: u32) -> Result<Stream, Box<dyn std::error::Error>> {
+    fn try_direct_node_approach(
+        &self,
+        context: &PipeWireContext,
+        node_id: u32,
+    ) -> Result<Stream, Box<dyn std::error::Error>> {
         println!("🔧   Creating direct node monitor stream");
 
         let props = properties! {
@@ -530,7 +580,10 @@ impl PipeWireApplicationCapture {
 
     /// Approach 4: Basic monitor without specific targeting
     #[cfg(feature = "pipewire")]
-    fn try_basic_monitor_approach(&self, context: &PipeWireContext) -> Result<Stream, Box<dyn std::error::Error>> {
+    fn try_basic_monitor_approach(
+        &self,
+        context: &PipeWireContext,
+    ) -> Result<Stream, Box<dyn std::error::Error>> {
         println!("🔧   Creating basic monitor stream");
 
         let props = properties! {
@@ -552,7 +605,10 @@ impl PipeWireApplicationCapture {
 
     /// Approach 5: System-wide capture fallback
     #[cfg(feature = "pipewire")]
-    fn try_system_capture_approach(&self, context: &PipeWireContext) -> Result<Stream, Box<dyn std::error::Error>> {
+    fn try_system_capture_approach(
+        &self,
+        context: &PipeWireContext,
+    ) -> Result<Stream, Box<dyn std::error::Error>> {
         println!("🔧   Creating system-wide capture stream");
 
         let props = properties! {
@@ -590,7 +646,10 @@ impl PipeWireApplicationCapture {
 
     /// Approach 6: Minimal permissions approach for CI environments
     #[cfg(feature = "pipewire")]
-    fn try_minimal_permissions_approach(&self, context: &PipeWireContext) -> Result<Stream, Box<dyn std::error::Error>> {
+    fn try_minimal_permissions_approach(
+        &self,
+        context: &PipeWireContext,
+    ) -> Result<Stream, Box<dyn std::error::Error>> {
         println!("🔧   Creating minimal permissions stream (no TARGET_OBJECT)");
 
         // Try creating a stream without any TARGET_OBJECT or special permissions
@@ -677,7 +736,10 @@ impl PipeWireApplicationCapture {
                 std::thread::sleep(std::time::Duration::from_secs(2));
                 return Ok(());
             } else {
-                println!("⚠️  WirePlumber start failed: {}", String::from_utf8_lossy(&output.stderr));
+                println!(
+                    "⚠️  WirePlumber start failed: {}",
+                    String::from_utf8_lossy(&output.stderr)
+                );
             }
         }
 
@@ -694,7 +756,10 @@ impl PipeWireApplicationCapture {
                 std::thread::sleep(std::time::Duration::from_secs(2));
                 return Ok(());
             } else {
-                println!("⚠️  PipeWire Media Session start failed: {}", String::from_utf8_lossy(&output.stderr));
+                println!(
+                    "⚠️  PipeWire Media Session start failed: {}",
+                    String::from_utf8_lossy(&output.stderr)
+                );
                 println!("🔧 Note: pipewire-media-session is deprecated in favor of wireplumber");
             }
         }
@@ -733,9 +798,7 @@ impl PipeWireApplicationCapture {
     {
         use std::sync::{Arc, Mutex};
 
-        let stream = self.stream.as_ref()
-            .ok_or("No stream available")?
-            .clone();
+        let stream = self.stream.as_ref().ok_or("No stream available")?.clone();
 
         // Wrap callback in Arc<Mutex> for thread safety
         let callback = Arc::new(Mutex::new(callback));
@@ -751,7 +814,11 @@ impl PipeWireApplicationCapture {
         let listener = stream
             .add_local_listener_with_user_data(data)
             .param_changed(move |_stream, user_data, id, param| {
-                println!("🔧 Stream param_changed callback: id={}, param={:?}", id, param.is_some());
+                println!(
+                    "🔧 Stream param_changed callback: id={}, param={:?}",
+                    id,
+                    param.is_some()
+                );
 
                 // NULL means to clear the format (wiremix comment)
                 let Some(param) = param else {
@@ -769,27 +836,36 @@ impl PipeWireApplicationCapture {
                     Ok(v) => {
                         println!("✅ Format parsed successfully: {:?}, {:?}", v.0, v.1);
                         v
-                    },
+                    }
                     Err(_) => {
                         println!("❌ Failed to parse format");
                         return;
-                    },
+                    }
                 };
 
                 // only accept raw audio (wiremix comment)
                 if media_type != MediaType::Audio || media_subtype != MediaSubtype::Raw {
-                    warn!("Rejecting non-raw audio format: {:?}/{:?}", media_type, media_subtype);
+                    warn!(
+                        "Rejecting non-raw audio format: {:?}/{:?}",
+                        media_type, media_subtype
+                    );
                     return;
                 }
 
                 // call a helper function to parse the format for us (wiremix comment)
                 let _ = user_data.format.parse(param);
-                println!("🎵 Audio format negotiated: {} channels, {} Hz",
-                         user_data.format.channels(), user_data.format.rate());
+                println!(
+                    "🎵 Audio format negotiated: {} channels, {} Hz",
+                    user_data.format.channels(),
+                    user_data.format.rate()
+                );
             })
             .process(move |stream, user_data| {
-                trace!("Stream process callback triggered! (format: {}ch @ {}Hz)",
-                         user_data.format.channels(), user_data.format.rate());
+                trace!(
+                    "Stream process callback triggered! (format: {}ch @ {}Hz)",
+                    user_data.format.channels(),
+                    user_data.format.rate()
+                );
 
                 let Some(mut buffer) = stream.dequeue_buffer() else {
                     warn!("No buffer available in process callback");
@@ -806,7 +882,11 @@ impl PipeWireApplicationCapture {
                 let n_channels = user_data.format.channels();
                 let n_samples = data.chunk().size() / (mem::size_of::<f32>() as u32);
 
-                trace!("Processing {} samples from buffer ({} channels)", n_samples, n_channels);
+                trace!(
+                    "Processing {} samples from buffer ({} channels)",
+                    n_samples,
+                    n_channels
+                );
 
                 if let Some(samples) = data.data() {
                     // Convert raw bytes to f32 samples (following wiremix pattern)
@@ -836,7 +916,10 @@ impl PipeWireApplicationCapture {
             .register()?;
 
         println!("🔧 Stream listener registered successfully");
-        println!("🔧 Stream state after listener registration: {:?}", stream.state());
+        println!(
+            "🔧 Stream state after listener registration: {:?}",
+            stream.state()
+        );
 
         // Set up audio format parameters AFTER listener registration (wiremix order)
         println!("🔧 Setting up audio format parameters...");
@@ -853,7 +936,9 @@ impl PipeWireApplicationCapture {
         let values: Vec<u8> = pipewire::spa::pod::serialize::PodSerializer::serialize(
             std::io::Cursor::new(Vec::new()),
             &pipewire::spa::pod::Value::Object(pod_object),
-        )?.0.into_inner();
+        )?
+        .0
+        .into_inner();
 
         let pod = Pod::from_bytes(&values).ok_or("Failed to create Pod from bytes")?;
         let mut params = [pod];
@@ -885,6 +970,7 @@ impl PipeWireApplicationCapture {
     }
 
     /// Start simulated capture for testing/fallback
+    #[cfg(not(feature = "pipewire"))]
     fn start_simulated_capture<F>(&mut self, callback: F) -> Result<(), Box<dyn std::error::Error>>
     where
         F: Fn(&[f32]) + Send + 'static,
@@ -919,8 +1005,6 @@ impl PipeWireApplicationCapture {
         Ok(())
     }
 
-
-
     /// Run the PipeWire main loop for a specified duration (simplified approach)
     #[cfg(feature = "pipewire")]
     pub fn run_main_loop(&self, duration: Duration) -> Result<(), Box<dyn std::error::Error>> {
@@ -936,7 +1020,7 @@ impl PipeWireApplicationCapture {
     pub fn run_main_loop_with_options(
         &self,
         duration: Option<Duration>,
-        verbose: bool
+        verbose: bool,
     ) -> Result<(), Box<dyn std::error::Error>> {
         if let Some(context) = &self.context {
             let start_time = std::time::Instant::now();
@@ -975,7 +1059,10 @@ impl PipeWireApplicationCapture {
                 }
 
                 // Run one iteration of the main loop to process events
-                let loop_result = context.main_loop.loop_().iterate(Duration::from_millis(100));
+                let loop_result = context
+                    .main_loop
+                    .loop_()
+                    .iterate(Duration::from_millis(100));
                 iteration_count += 1;
 
                 // Print progress if verbose and duration is set
@@ -986,8 +1073,11 @@ impl PipeWireApplicationCapture {
                         if let Some(dur) = duration {
                             let remaining = dur.saturating_sub(elapsed);
                             if remaining > Duration::from_millis(200) {
-                                println!("    ⏱️  {:.1}s remaining... (loop iterations: {})",
-                                         remaining.as_secs_f32(), iteration_count);
+                                println!(
+                                    "    ⏱️  {:.1}s remaining... (loop iterations: {})",
+                                    remaining.as_secs_f32(),
+                                    iteration_count
+                                );
                             }
                         }
                         last_progress_time = now;
@@ -1005,8 +1095,11 @@ impl PipeWireApplicationCapture {
 
             let actual_duration = start_time.elapsed();
             if verbose {
-                println!("⏹️  Main loop completed after {:.2}s ({} iterations)",
-                         actual_duration.as_secs_f32(), iteration_count);
+                println!(
+                    "⏹️  Main loop completed after {:.2}s ({} iterations)",
+                    actual_duration.as_secs_f32(),
+                    iteration_count
+                );
             }
         } else {
             return Err("No PipeWire context available".into());
@@ -1019,7 +1112,10 @@ impl PipeWireApplicationCapture {
     /// This is a convenience method that combines start_capture() and run_main_loop_with_options()
     /// The capture will run until stop_capture() is called from another thread.
     #[cfg(feature = "pipewire")]
-    pub fn start_capture_indefinitely<F>(&mut self, callback: F) -> Result<(), Box<dyn std::error::Error>>
+    pub fn start_capture_indefinitely<F>(
+        &mut self,
+        callback: F,
+    ) -> Result<(), Box<dyn std::error::Error>>
     where
         F: Fn(&[f32]) + Send + 'static,
     {
@@ -1034,7 +1130,7 @@ impl PipeWireApplicationCapture {
     pub fn start_capture_for_duration<F>(
         &mut self,
         callback: F,
-        duration: Duration
+        duration: Duration,
     ) -> Result<(), Box<dyn std::error::Error>>
     where
         F: Fn(&[f32]) + Send + 'static,
@@ -1081,7 +1177,8 @@ impl PipeWireApplicationCapture {
     /// List available applications with audio streams
     ///
     /// This implementation tries to use PipeWire if available, falls back to process enumeration
-    pub fn list_audio_applications() -> Result<Vec<LinuxApplicationInfo>, Box<dyn std::error::Error>> {
+    pub fn list_audio_applications() -> Result<Vec<LinuxApplicationInfo>, Box<dyn std::error::Error>>
+    {
         // Try PipeWire-based enumeration first
         if let Ok(apps) = Self::list_pipewire_applications() {
             if !apps.is_empty() {
@@ -1094,7 +1191,8 @@ impl PipeWireApplicationCapture {
     }
 
     /// Try to enumerate applications using PipeWire (if available)
-    fn list_pipewire_applications() -> Result<Vec<LinuxApplicationInfo>, Box<dyn std::error::Error>> {
+    fn list_pipewire_applications() -> Result<Vec<LinuxApplicationInfo>, Box<dyn std::error::Error>>
+    {
         // Try real PipeWire crate first
         #[cfg(feature = "pipewire")]
         {
@@ -1122,7 +1220,8 @@ impl PipeWireApplicationCapture {
 
     /// Enumerate applications using real PipeWire crate (simplified approach)
     #[cfg(feature = "pipewire")]
-    fn enumerate_via_pipewire_crate() -> Result<Vec<LinuxApplicationInfo>, Box<dyn std::error::Error>> {
+    fn enumerate_via_pipewire_crate(
+    ) -> Result<Vec<LinuxApplicationInfo>, Box<dyn std::error::Error>> {
         println!("🔧 Using real PipeWire crate for node discovery...");
 
         // For now, let's use a simpler approach that doesn't require complex main loop handling
@@ -1144,8 +1243,7 @@ impl PipeWireApplicationCapture {
 
     /// Enumerate applications using pw-dump (most comprehensive)
     fn enumerate_via_pw_dump() -> Result<Vec<LinuxApplicationInfo>, Box<dyn std::error::Error>> {
-        let output = std::process::Command::new("pw-dump")
-            .output()?;
+        let output = std::process::Command::new("pw-dump").output()?;
 
         if !output.status.success() {
             return Err("pw-dump command failed".into());
@@ -1215,7 +1313,10 @@ impl PipeWireApplicationCapture {
         // Only include audio stream nodes with application info
         if let (Some(mc), Some(name)) = (&media_class, &app_name) {
             if mc.contains("Stream/Output/Audio") || mc.contains("Stream/Input/Audio") {
-                println!("🎵 Found audio application: {} (PID: {:?}, Node: {:?})", name, app_pid, node_id);
+                println!(
+                    "🎵 Found audio application: {} (PID: {:?}, Node: {:?})",
+                    name, app_pid, node_id
+                );
                 return Some(LinuxApplicationInfo {
                     process_id: app_pid,
                     name: Some(name.clone()),
@@ -1255,7 +1356,11 @@ impl PipeWireApplicationCapture {
             if let Some(comma) = value_part.find(',') {
                 return Some(value_part[..comma].trim().to_string());
             } else {
-                return Some(value_part.trim_end_matches(['}', ' ', '\n', '\r']).to_string());
+                return Some(
+                    value_part
+                        .trim_end_matches(['}', ' ', '\n', '\r'])
+                        .to_string(),
+                );
             }
         }
         None
@@ -1334,7 +1439,9 @@ impl PipeWireApplicationCapture {
         let media_class = node.get("media.class")?;
 
         // Only include audio stream nodes
-        if !media_class.contains("Stream/Output/Audio") && !media_class.contains("Stream/Input/Audio") {
+        if !media_class.contains("Stream/Output/Audio")
+            && !media_class.contains("Stream/Input/Audio")
+        {
             return None;
         }
 
@@ -1346,11 +1453,16 @@ impl PipeWireApplicationCapture {
         }
 
         Some(LinuxApplicationInfo {
-            process_id: node.get("application.process.id").and_then(|s| s.parse().ok()),
+            process_id: node
+                .get("application.process.id")
+                .and_then(|s| s.parse().ok()),
             name: app_name.cloned(),
             executable_path: node.get("application.process.binary").cloned(),
             pipewire_node_id: node.get("object.id").and_then(|s| s.parse().ok()),
-            stream_description: node.get("node.description").or_else(|| node.get("node.name")).cloned(),
+            stream_description: node
+                .get("node.description")
+                .or_else(|| node.get("node.name"))
+                .cloned(),
             pulseaudio_sink_input_index: None,
             media_class: media_class.clone(),
             node_name: node.get("node.name").cloned(),
@@ -1376,7 +1488,8 @@ impl PipeWireApplicationCapture {
     }
 
     /// Fallback enumeration using process information
-    fn list_process_based_applications() -> Result<Vec<LinuxApplicationInfo>, Box<dyn std::error::Error>> {
+    fn list_process_based_applications(
+    ) -> Result<Vec<LinuxApplicationInfo>, Box<dyn std::error::Error>> {
         let mut applications = Vec::new();
 
         // Try to get actual running processes
@@ -1430,12 +1543,28 @@ impl PipeWireApplicationCapture {
     /// Check if a process name is likely to be an audio application
     fn is_likely_audio_app(app_name: &str) -> bool {
         let audio_keywords = [
-            "audio", "music", "video", "firefox", "chrome", "vlc",
-            "spotify", "mpv", "mplayer", "audacity", "pulseaudio",
-            "pipewire", "jack", "alsa", "youtube", "discord", "zoom"
+            "audio",
+            "music",
+            "video",
+            "firefox",
+            "chrome",
+            "vlc",
+            "spotify",
+            "mpv",
+            "mplayer",
+            "audacity",
+            "pulseaudio",
+            "pipewire",
+            "jack",
+            "alsa",
+            "youtube",
+            "discord",
+            "zoom",
         ];
 
         let app_lower = app_name.to_lowercase();
-        audio_keywords.iter().any(|keyword| app_lower.contains(keyword))
+        audio_keywords
+            .iter()
+            .any(|keyword| app_lower.contains(keyword))
     }
 }

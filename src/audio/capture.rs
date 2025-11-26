@@ -1,9 +1,19 @@
 use std::fmt;
 
 #[cfg(target_os = "windows")]
+use std::collections::VecDeque;
+#[cfg(target_os = "windows")]
+use std::ffi::OsString;
+
+#[cfg(target_os = "windows")]
 use wasapi::*;
 
+#[cfg(target_os = "windows")]
+use sysinfo::{ProcessRefreshKind, ProcessesToUpdate, RefreshKind, System};
+
+/// Error types for audio capture operations
 #[derive(Debug)]
+#[allow(dead_code)] // Used on Windows, fallback stubs on other platforms
 pub enum AudioCaptureError {
     ProcessNotFound(String),
     WasapiError(String),
@@ -198,12 +208,15 @@ impl ProcessAudioCapture {
     }
 }
 
+/// Fallback stub for non-Windows platforms
 #[cfg(not(target_os = "windows"))]
+#[allow(dead_code)]
 pub struct ProcessAudioCapture {
     verbose: bool,
 }
 
 #[cfg(not(target_os = "windows"))]
+#[allow(dead_code)]
 impl ProcessAudioCapture {
     pub fn new() -> Result<Self, AudioCaptureError> {
         Ok(Self { verbose: false })

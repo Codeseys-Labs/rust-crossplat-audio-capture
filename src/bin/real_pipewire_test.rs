@@ -1,16 +1,18 @@
 //! Real PipeWire Integration Test
-//! 
+//!
 //! This test uses the actual PipeWire Rust crate integration
 //! following the wiremix approach to capture Firefox audio.
 
-use std::time::Duration;
-use std::thread;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
+use std::thread;
+use std::time::Duration;
 
 // Import our PipeWire implementation
-use rsac::audio::linux::pipewire::{PipeWireApplicationCapture, ApplicationSelector};
+#[cfg(all(target_os = "linux", feature = "feat_linux"))]
+use rsac::audio::linux::pipewire::{ApplicationSelector, PipeWireApplicationCapture};
 
+#[cfg(all(target_os = "linux", feature = "feat_linux"))]
 fn main() {
     println!("🎵 Real PipeWire Integration Test");
     println!("==================================");
@@ -18,7 +20,7 @@ fn main() {
     // Test 1: Detect Firefox and get its node info
     println!("\n1️⃣ Detecting Firefox with real PipeWire integration...");
     let firefox_pid = detect_firefox_main_process();
-    
+
     if firefox_pid.is_none() {
         println!("❌ No Firefox main process found. Please start Firefox with audio content.");
         return;
@@ -31,20 +33,14 @@ fn main() {
     println!("\n2️⃣ Creating PipeWire application capture...");
 
     // First try by PID, then fallback to known node ID
-    let mut capture = PipeWireApplicationCapture::new(
-        ApplicationSelector::ProcessId(firefox_pid)
-    );
+    let mut capture = PipeWireApplicationCapture::new(ApplicationSelector::ProcessId(firefox_pid));
 
     // Also try by node ID if we know it from CLI tools
     println!("💡 Also testing with known Firefox Node ID 52...");
-    let mut capture_by_node = PipeWireApplicationCapture::new(
-        ApplicationSelector::NodeId(52)
-    );
+    let mut capture_by_node = PipeWireApplicationCapture::new(ApplicationSelector::NodeId(52));
 
     // Also test VLC which is actively playing audio
-    let mut capture_vlc = PipeWireApplicationCapture::new(
-        ApplicationSelector::NodeId(62)
-    );
+    let mut capture_vlc = PipeWireApplicationCapture::new(ApplicationSelector::NodeId(62));
 
     // Test 3: Discover the target node
     println!("\n3️⃣ Discovering audio node...");
@@ -117,9 +113,7 @@ fn main() {
         let count = sample_count_clone.fetch_add(samples.len(), Ordering::SeqCst);
 
         // Calculate peak level for this buffer
-        let buffer_peak = samples.iter()
-            .map(|&s| s.abs())
-            .fold(0.0f32, f32::max);
+        let buffer_peak = samples.iter().map(|&s| s.abs()).fold(0.0f32, f32::max);
 
         // Update peak level
         if let Ok(mut peak) = peak_level_clone.lock() {
@@ -129,8 +123,12 @@ fn main() {
         }
 
         // Print periodic updates
-        if count % 4800 == 0 { // More frequent updates (every ~0.1 seconds at 48kHz)
-            println!("    📊 Captured {} samples, buffer peak: {:.3}", count, buffer_peak);
+        if count % 4800 == 0 {
+            // More frequent updates (every ~0.1 seconds at 48kHz)
+            println!(
+                "    📊 Captured {} samples, buffer peak: {:.3}",
+                count, buffer_peak
+            );
         }
     });
 
@@ -182,12 +180,18 @@ fn main() {
             println!("\n📈 Capture Results:");
             println!("   • Total samples captured: {}", total_samples);
             println!("   • Peak audio level: {:.3}", *max_peak);
-            println!("   • Estimated duration: {:.2} seconds", total_samples as f32 / 48000.0);
+            println!(
+                "   • Estimated duration: {:.2} seconds",
+                total_samples as f32 / 48000.0
+            );
 
             if total_samples > 0 {
                 println!("   ✅ Successfully captured real Firefox audio via PipeWire!");
                 if *max_peak > 0.01 {
-                    println!("   🎵 Audio content detected (peak level: {:.3})", *max_peak);
+                    println!(
+                        "   🎵 Audio content detected (peak level: {:.3})",
+                        *max_peak
+                    );
                 } else {
                     println!("   🔇 Very low audio levels - Firefox may be playing quiet content");
                 }
@@ -237,7 +241,8 @@ fn detect_firefox_main_process() -> Option<u32> {
 
                         // Look for main Firefox process
                         if (comm.contains("firefox") || args.contains("firefox"))
-                            && !args.contains("-contentproc") {
+                            && !args.contains("-contentproc")
+                        {
                             main_firefox = Some(pid);
                         }
                         // Look for RDD Process (handles audio/video)
@@ -264,9 +269,7 @@ fn detect_firefox_main_process() -> Option<u32> {
 
 fn get_firefox_audio_pid_from_pipewire() -> Option<u32> {
     // Use pw-dump to find the actual PID associated with Firefox audio
-    if let Ok(output) = std::process::Command::new("pw-dump")
-        .output()
-    {
+    if let Ok(output) = std::process::Command::new("pw-dump").output() {
         if let Ok(output_str) = String::from_utf8(output.stdout) {
             let lines: Vec<&str> = output_str.lines().collect();
 
@@ -282,7 +285,10 @@ fn get_firefox_audio_pid_from_pipewire() -> Option<u32> {
                                 if let Some(comma_pos) = value_part.find(',') {
                                     let pid_str = value_part[..comma_pos].trim();
                                     if let Ok(pid) = pid_str.parse::<u32>() {
-                                        println!("🔍 Found Firefox audio PID from PipeWire: {}", pid);
+                                        println!(
+                                            "🔍 Found Firefox audio PID from PipeWire: {}",
+                                            pid
+                                        );
                                         return Some(pid);
                                     }
                                 }
@@ -296,7 +302,7 @@ fn get_firefox_audio_pid_from_pipewire() -> Option<u32> {
     None
 }
 
-#[cfg(not(feature = "pipewire"))]
+#[cfg(not(all(target_os = "linux", feature = "feat_linux")))]
 fn main() {
     println!("❌ Real PipeWire Integration Test");
     println!("==================================");
@@ -309,12 +315,12 @@ fn main() {
     println!("  ✅ feat_linux enabled");
     #[cfg(not(feature = "feat_linux"))]
     println!("  ❌ feat_linux disabled");
-    
+
     #[cfg(feature = "pipewire")]
     println!("  ✅ pipewire enabled");
     #[cfg(not(feature = "pipewire"))]
     println!("  ❌ pipewire disabled");
-    
+
     #[cfg(feature = "libspa")]
     println!("  ✅ libspa enabled");
     #[cfg(not(feature = "libspa"))]

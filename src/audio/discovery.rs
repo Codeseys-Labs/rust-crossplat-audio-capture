@@ -10,6 +10,7 @@ struct ProcessInfo {
     pid: u32,
     name: String,
     parent_pid: Option<u32>,
+    #[allow(dead_code)] // Reserved for future command-line based filtering
     cmd: String,
 }
 
