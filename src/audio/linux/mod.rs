@@ -11,6 +11,12 @@ use crate::{AudioApplication, AudioCaptureStream, Result};
 
 pub struct LinuxDeviceEnumerator;
 
+impl Default for LinuxDeviceEnumerator {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl LinuxDeviceEnumerator {
     pub fn new() -> Self {
         LinuxDeviceEnumerator
@@ -37,7 +43,7 @@ impl LinuxDeviceEnumerator {
 
         // Try to get devices using pw-cli list-objects
         if let Ok(output) = std::process::Command::new("pw-cli")
-            .args(&["list-objects", "Node"])
+            .args(["list-objects", "Node"])
             .output()
         {
             if output.status.success() {
@@ -66,7 +72,7 @@ impl LinuxDeviceEnumerator {
     ) -> crate::core::error::Result<LinuxAudioDevice> {
         // Try to get default device info from pw-metadata
         if let Ok(output) = std::process::Command::new("pw-metadata")
-            .args(&["-n", "settings"])
+            .args(["-n", "settings"])
             .output()
         {
             if output.status.success() {
@@ -92,7 +98,7 @@ impl LinuxDeviceEnumerator {
             }
         }
 
-        Err(crate::core::error::AudioError::DeviceNotFound.into())
+        Err(crate::core::error::AudioError::DeviceNotFound)
     }
 
     /// Parse pw-cli list-objects Node output
@@ -129,7 +135,7 @@ impl LinuxDeviceEnumerator {
                         devices.push(LinuxAudioDevice {
                             id,
                             name: if name.is_empty() {
-                                format!("PipeWire Device")
+                                "PipeWire Device".to_string()
                             } else {
                                 name
                             },
@@ -182,8 +188,8 @@ impl LinuxDeviceEnumerator {
         let mut name = None;
         let mut media_class = None;
 
-        for i in start..end {
-            let line = lines[i].trim();
+        for line in lines.iter().take(end).skip(start) {
+            let line = line.trim();
 
             if line.contains("\"id\":") {
                 if let Some(id_str) = line.split(':').nth(1) {

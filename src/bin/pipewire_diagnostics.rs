@@ -120,7 +120,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     // We'll use a simple pw-cat command to test stream creation
     match Command::new("pw-cat")
-        .args(&[
+        .args([
             "--record",
             "--format",
             "s16",
@@ -129,7 +129,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             "--channels",
             "2",
         ])
-        .args(&["--volume", "0.0", "/dev/null"])
+        .args(["--volume", "0.0", "/dev/null"])
         .arg("--help")
         .output()
     {

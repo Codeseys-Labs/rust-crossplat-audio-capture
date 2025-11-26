@@ -135,6 +135,12 @@ pub enum InputMode {
     EditingDuration,
 }
 
+impl Default for App {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl App {
     pub fn new() -> Self {
         let (event_sender, event_receiver) = mpsc::unbounded_channel();
@@ -263,10 +269,7 @@ impl App {
                 _ => {
                     // Extract application name from the display name
                     let app_name = self.extract_app_name(&source.name);
-                    app_groups
-                        .entry(app_name)
-                        .or_insert_with(Vec::new)
-                        .push(source.clone());
+                    app_groups.entry(app_name).or_default().push(source.clone());
                 }
             }
         }
@@ -520,7 +523,7 @@ fn start_recording_thread(
                 if let Some(ref mut writer) = writer_option.as_mut() {
                     for &sample in samples {
                         let sample_i16 = (sample * i16::MAX as f32) as i16;
-                        if let Err(_) = writer.write_sample(sample_i16) {
+                        if writer.write_sample(sample_i16).is_err() {
                             break;
                         }
                     }
@@ -528,7 +531,7 @@ fn start_recording_thread(
             }
 
             // Send progress update every 48000 samples (1 second at 48kHz)
-            if count % 48000 == 0 {
+            if count.is_multiple_of(48000) {
                 let file_size = std::fs::metadata(&output_path)
                     .map(|m| m.len())
                     .unwrap_or(0);
@@ -762,7 +765,7 @@ fn render_audio_sources(f: &mut Frame, app: &App, area: Rect) {
         app.flattened_sources
             .iter()
             .enumerate()
-            .map(|(i, (source, depth, has_children))| {
+            .map(|(i, (source, depth, _has_children))| {
                 let style = if i == app.selected_source {
                     Style::default()
                         .fg(Color::Yellow)

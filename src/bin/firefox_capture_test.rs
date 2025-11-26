@@ -37,7 +37,7 @@ fn detect_firefox_processes() -> Vec<u32> {
     let mut firefox_pids = Vec::new();
 
     if let Ok(output) = std::process::Command::new("ps")
-        .args(&["-eo", "pid,comm,args"])
+        .args(["-eo", "pid,comm,args"])
         .output()
     {
         if let Ok(output_str) = String::from_utf8(output.stdout) {
@@ -93,7 +93,7 @@ fn test_pipewire_enumeration(firefox_pids: &[u32]) {
 
     // Test pw-cli for Firefox nodes
     if let Ok(output) = std::process::Command::new("pw-cli")
-        .args(&["list-objects"])
+        .args(["list-objects"])
         .output()
     {
         if output.status.success() {
@@ -181,7 +181,7 @@ fn find_audio_node_for_pid(pid: u32) -> Option<String> {
 
 fn find_audio_node_via_pw_cli(pid: u32) -> Option<String> {
     if let Ok(output) = std::process::Command::new("pw-cli")
-        .args(&["list-objects"])
+        .args(["list-objects"])
         .output()
     {
         if output.status.success() {
@@ -276,14 +276,14 @@ fn find_audio_node_via_pw_dump(pid: u32) -> Option<String> {
                     let search_start = i.saturating_sub(50);
                     let search_end = std::cmp::min(i + 50, lines.len());
 
-                    for j in search_start..search_end {
-                        if lines[j].contains("\"media.class\": \"Stream/Output/Audio\"") {
+                    for line_j in lines.iter().take(search_end).skip(search_start) {
+                        if line_j.contains("\"media.class\": \"Stream/Output/Audio\"") {
                             println!("      ✅ Found audio output stream for PID {}", pid);
 
                             // Try to find the node ID
-                            for k in search_start..search_end {
-                                if lines[k].contains("\"id\":") {
-                                    if let Some(id_str) = extract_json_number_value(lines[k]) {
+                            for line_k in lines.iter().take(search_end).skip(search_start) {
+                                if line_k.contains("\"id\":") {
+                                    if let Some(id_str) = extract_json_number_value(line_k) {
                                         if let Ok(node_id) = id_str.parse::<u32>() {
                                             return Some(format!(
                                                 "Node {} (Firefox Audio Stream via pw-dump)",

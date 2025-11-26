@@ -1,10 +1,6 @@
 use clap::{arg, Parser};
-use hound::{WavSpec, WavWriter};
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 use std::process::exit;
-use std::process::{Child, Command};
-use std::thread;
-use std::time::Duration;
 
 #[derive(Parser, Debug)]
 #[command(
@@ -36,7 +32,7 @@ struct Args {
 
 pub mod test_backends {
     use hound::{WavSpec, WavWriter};
-    use std::path::{Path, PathBuf};
+    use std::path::Path;
     use std::process::{Child, Command};
     use std::thread;
     use std::time::Duration;
@@ -94,7 +90,7 @@ pub mod test_backends {
         // Placeholder for application capture test
         pub fn test_capture_application(
             &self,
-            app_name: &str,
+            _app_name: &str,
             duration: u32,
             output_path: &Path,
         ) -> Result<(), String> {
@@ -103,8 +99,12 @@ pub mod test_backends {
         }
 
         // Placeholder for system capture test
-        pub fn test_capture_system(&self, duration: u32, output_path: &Path) -> Result<(), String> {
-            println!("Testing system capture for {} seconds", duration);
+        pub fn test_capture_system(
+            &self,
+            _duration: u32,
+            output_path: &Path,
+        ) -> Result<(), String> {
+            println!("Testing system capture");
             self.create_test_wav(output_path)
         }
 
@@ -133,6 +133,7 @@ pub mod test_backends {
     }
 
     // Simple test result structure
+    #[allow(dead_code)]
     pub struct TestResult {
         test_type: String,
         backend: String,
@@ -167,6 +168,7 @@ pub mod test_backends {
     }
 
     // Test report structure
+    #[allow(dead_code)]
     pub struct TestReport {
         platform: String,
         results: Vec<TestResult>,
@@ -370,6 +372,8 @@ fn main() {
     println!("Output directory: {}", args.output_dir.display());
 
     // Start test audio playback when needed
+    // Note: The process is killed and waited on at the end of the function
+    #[allow(clippy::zombie_processes)]
     let mut test_process =
         test_backends::start_audio_playback(args.duration, args.audio_file.as_deref())
             .unwrap_or_else(|e| {

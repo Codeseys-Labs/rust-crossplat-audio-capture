@@ -47,7 +47,7 @@ fn main() {
     if let Ok(entries) = fs::read_dir(&args.input_dir) {
         for entry in entries.filter_map(Result::ok) {
             let path = entry.path();
-            if path.is_file() && path.extension().map_or(false, |ext| ext == "json") {
+            if path.is_file() && path.extension().is_some_and(|ext| ext == "json") {
                 json_files.push(path);
             }
         }

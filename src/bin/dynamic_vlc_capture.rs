@@ -289,9 +289,9 @@ fn run_linux_vlc_capture(
     if !captured_audio.is_empty() {
         println!("🎉 SUCCESS: Captured audio data from VLC!");
 
-        match write_wav_file(&output_file, &captured_audio) {
+        match write_wav_file(output_file, &captured_audio) {
             Ok(_) => {
-                let file_size = std::fs::metadata(&output_file)?.len();
+                let file_size = std::fs::metadata(output_file)?.len();
                 println!(
                     "💾 Saved WAV file to: {} ({} bytes)",
                     output_file, file_size
@@ -300,7 +300,7 @@ fn run_linux_vlc_capture(
             Err(e) => {
                 println!("⚠️  Failed to write WAV file: {}", e);
                 std::fs::write(
-                    &output_file,
+                    output_file,
                     format!(
                         "VLC audio capture: {} samples, peak: {:.3}",
                         total_samples, *final_peak
@@ -311,7 +311,7 @@ fn run_linux_vlc_capture(
         }
     } else {
         println!("⚠️  No audio data captured (VLC might not be playing audio)");
-        write_empty_wav_file(&output_file)?;
+        write_empty_wav_file(output_file)?;
         println!("💾 Created empty WAV file: {}", output_file);
     }
 
@@ -363,7 +363,7 @@ fn try_alternative_vlc_discovery(
 
                             if total_samples > 0 {
                                 std::fs::write(
-                                    &output_file,
+                                    output_file,
                                     format!(
                                         "VLC PID {} capture: {} samples",
                                         app.process_id, total_samples
@@ -409,7 +409,7 @@ fn try_alternative_vlc_discovery(
 
             if total_samples > 0 {
                 std::fs::write(
-                    &output_file,
+                    output_file,
                     format!("VLC by name capture: {} samples", total_samples),
                 )?;
                 println!("✅ Name-based method succeeded!");

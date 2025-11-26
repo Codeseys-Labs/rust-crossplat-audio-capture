@@ -16,7 +16,6 @@ use std::process;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread;
-use std::time::Duration;
 
 fn main() {
     let args: Vec<String> = env::args().collect();
@@ -95,7 +94,7 @@ fn test_list_applications() -> Result<(), Box<dyn std::error::Error>> {
 
         // Check if PipeWire development files are available
         if std::process::Command::new("pkg-config")
-            .args(&["--exists", "libpipewire-0.3"])
+            .args(["--exists", "libpipewire-0.3"])
             .status()
             .map(|s| s.success())
             .unwrap_or(false)
@@ -149,12 +148,15 @@ fn test_invalid_inputs() -> Result<(), Box<dyn std::error::Error>> {
     }
 
     // Test invalid process ID (basic validation)
-    if 0u32 == 0 {
+    let invalid_pid: u32 = 0;
+    if invalid_pid == 0 {
         println!("    ✅ Invalid PID detection logic works");
     }
 
     // Test empty string validation
-    if "".is_empty() {
+    let empty_str = "";
+    #[allow(clippy::const_is_empty)]
+    if empty_str.is_empty() {
         println!("    ✅ Empty string validation works");
     }
 

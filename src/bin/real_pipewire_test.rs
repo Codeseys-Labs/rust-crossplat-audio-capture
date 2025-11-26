@@ -5,7 +5,6 @@
 
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
-use std::thread;
 use std::time::Duration;
 
 // Import our PipeWire implementation
@@ -46,7 +45,7 @@ fn main() {
     println!("\n3️⃣ Discovering audio node...");
 
     // Try VLC first since it's actively playing audio
-    let mut working_capture = None;
+    let working_capture;
     println!("🎵 Trying VLC Node 62 (actively playing audio)...");
     match capture_vlc.discover_target_node() {
         Ok(node_id) => {
@@ -123,7 +122,7 @@ fn main() {
         }
 
         // Print periodic updates
-        if count % 4800 == 0 {
+        if count.is_multiple_of(4800) {
             // More frequent updates (every ~0.1 seconds at 48kHz)
             println!(
                 "    📊 Captured {} samples, buffer peak: {:.3}",
@@ -225,7 +224,7 @@ fn detect_firefox_main_process() -> Option<u32> {
 
     // Fallback to process detection
     if let Ok(output) = std::process::Command::new("ps")
-        .args(&["-eo", "pid,comm,args"])
+        .args(["-eo", "pid,comm,args"])
         .output()
     {
         if let Ok(output_str) = String::from_utf8(output.stdout) {
@@ -277,11 +276,15 @@ fn get_firefox_audio_pid_from_pipewire() -> Option<u32> {
                 // Look for Firefox application name
                 if line.contains("\"application.name\": \"Firefox\"") {
                     // Look for process ID in nearby lines
-                    for j in i.saturating_sub(20)..std::cmp::min(i + 20, lines.len()) {
-                        if lines[j].contains("\"application.process.id\":") {
+                    for nearby_line in lines
+                        .iter()
+                        .take(std::cmp::min(i + 20, lines.len()))
+                        .skip(i.saturating_sub(20))
+                    {
+                        if nearby_line.contains("\"application.process.id\":") {
                             // Extract PID
-                            if let Some(colon_pos) = lines[j].find(':') {
-                                let value_part = &lines[j][colon_pos + 1..];
+                            if let Some(colon_pos) = nearby_line.find(':') {
+                                let value_part = &nearby_line[colon_pos + 1..];
                                 if let Some(comma_pos) = value_part.find(',') {
                                     let pid_str = value_part[..comma_pos].trim();
                                     if let Ok(pid) = pid_str.parse::<u32>() {

@@ -59,6 +59,7 @@ pub enum ApplicationSelector {
 pub struct StreamData {
     format: AudioInfoRaw,
     #[allow(dead_code)] // Reserved for future callback-based API
+    #[allow(clippy::type_complexity)]
     callback: Option<Box<dyn Fn(&[f32]) + Send + 'static>>,
 }
 
@@ -158,7 +159,7 @@ impl PipeWireApplicationCapture {
             ApplicationSelector::ApplicationName(target_name) => {
                 println!("🎯 Looking for application: {}", target_name);
                 applications.iter().find(|app| {
-                    app.name.as_ref().map_or(false, |name| {
+                    app.name.as_ref().is_some_and(|name| {
                         name.to_lowercase().contains(&target_name.to_lowercase())
                     })
                 })
@@ -243,7 +244,7 @@ impl PipeWireApplicationCapture {
     fn get_node_serial(&self, node_id: u32) -> Result<String, Box<dyn std::error::Error>> {
         use std::process::Command;
 
-        let output = Command::new("pw-cli").args(&["list-objects"]).output()?;
+        let output = Command::new("pw-cli").args(["list-objects"]).output()?;
 
         let stdout = String::from_utf8(output.stdout)?;
 
@@ -390,7 +391,7 @@ impl PipeWireApplicationCapture {
                     if is_interactive {
                         println!("🔧 Attempting to add user to audio group...");
                         let add_to_group = Command::new("sudo")
-                            .args(&["usermod", "-aG", "audio"])
+                            .args(["usermod", "-aG", "audio"])
                             .arg(std::env::var("USER").unwrap_or_else(|_| "runner".to_string()))
                             .output();
 
@@ -699,7 +700,7 @@ impl PipeWireApplicationCapture {
 
         // Check if wireplumber is running
         let wireplumber_status = Command::new("systemctl")
-            .args(&["--user", "is-active", "wireplumber"])
+            .args(["--user", "is-active", "wireplumber"])
             .output();
 
         if let Ok(output) = wireplumber_status {
@@ -711,7 +712,7 @@ impl PipeWireApplicationCapture {
 
         // Check if pipewire-media-session is running
         let media_session_status = Command::new("systemctl")
-            .args(&["--user", "is-active", "pipewire-media-session"])
+            .args(["--user", "is-active", "pipewire-media-session"])
             .output();
 
         if let Ok(output) = media_session_status {
@@ -726,7 +727,7 @@ impl PipeWireApplicationCapture {
         // Try to start wireplumber first (modern session manager)
         println!("🔧 Attempting to start WirePlumber...");
         let wireplumber_start = Command::new("systemctl")
-            .args(&["--user", "start", "wireplumber"])
+            .args(["--user", "start", "wireplumber"])
             .output();
 
         if let Ok(output) = wireplumber_start {
@@ -746,7 +747,7 @@ impl PipeWireApplicationCapture {
         // Fallback to pipewire-media-session (if available)
         println!("🔧 Attempting to start PipeWire Media Session...");
         let media_session_start = Command::new("systemctl")
-            .args(&["--user", "start", "pipewire-media-session"])
+            .args(["--user", "start", "pipewire-media-session"])
             .output();
 
         if let Ok(output) = media_session_start {
@@ -1030,11 +1031,9 @@ impl PipeWireApplicationCapture {
                     println!("🔄 Running PipeWire main loop for {:?}...", dur);
                     println!("    (This is CRITICAL for stream connection and process callbacks)");
                 }
-            } else {
-                if verbose {
-                    println!("🔄 Running PipeWire main loop indefinitely...");
-                    println!("    (Call stop_capture() to stop)");
-                }
+            } else if verbose {
+                println!("🔄 Running PipeWire main loop indefinitely...");
+                println!("    (Call stop_capture() to stop)");
             }
 
             // Run the main loop in small iterations
@@ -1280,9 +1279,8 @@ impl PipeWireApplicationCapture {
         let mut node_id = None;
 
         // Look at the next 100 lines for properties (increased range)
-        for i in node_line_idx..std::cmp::min(node_line_idx + 100, lines.len()) {
-            let line = lines[i];
-
+        let end_idx = std::cmp::min(node_line_idx + 100, lines.len());
+        for (i, line) in lines.iter().enumerate().take(end_idx).skip(node_line_idx) {
             if line.contains("\"application.name\":") {
                 app_name = Self::extract_json_string_value(line);
             } else if line.contains("\"application.process.id\":") {
@@ -1369,7 +1367,7 @@ impl PipeWireApplicationCapture {
     /// Enumerate applications using pw-cli (fallback method)
     fn enumerate_via_pw_cli() -> Result<Vec<LinuxApplicationInfo>, Box<dyn std::error::Error>> {
         let output = std::process::Command::new("pw-cli")
-            .args(&["list-objects"])
+            .args(["list-objects"])
             .output()?;
 
         if !output.status.success() {
@@ -1448,9 +1446,7 @@ impl PipeWireApplicationCapture {
         let app_name = node.get("application.name");
 
         // Only include nodes with application names (actual applications, not system nodes)
-        if app_name.is_none() {
-            return None;
-        }
+        app_name?;
 
         Some(LinuxApplicationInfo {
             process_id: node
@@ -1494,12 +1490,12 @@ impl PipeWireApplicationCapture {
 
         // Try to get actual running processes
         if let Ok(output) = std::process::Command::new("ps")
-            .args(&["-eo", "pid,comm"])
+            .args(["-eo", "pid,comm"])
             .output()
         {
             if let Ok(output_str) = String::from_utf8(output.stdout) {
                 for line in output_str.lines().skip(1).take(10) {
-                    let parts: Vec<&str> = line.trim().split_whitespace().collect();
+                    let parts: Vec<&str> = line.split_whitespace().collect();
                     if parts.len() >= 2 {
                         if let Ok(pid) = parts[0].parse::<u32>() {
                             let app_name = parts[1].to_string();

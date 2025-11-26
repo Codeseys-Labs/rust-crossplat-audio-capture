@@ -644,6 +644,7 @@ pub struct AudioCapture {
     processors: Arc<Mutex<Vec<Box<dyn crate::core::processing::AudioProcessor>>>>,
 
     /// Stores an optional callback function.
+    #[allow(clippy::type_complexity)]
     callback: Arc<
         Mutex<
             Option<

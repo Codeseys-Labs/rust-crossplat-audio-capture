@@ -153,7 +153,7 @@ impl AudioSourceDiscovery {
             }) {
                 let source_type = if process_tree
                     .get(&process_info.pid)
-                    .map_or(false, |children| !children.is_empty())
+                    .is_some_and(|children| !children.is_empty())
                 {
                     AudioSourceType::ProcessTree
                 } else {
@@ -174,7 +174,7 @@ impl AudioSourceDiscovery {
         }
 
         // Add high-priority audio processes that don't have PipeWire nodes yet
-        let high_priority_apps = vec![
+        let high_priority_apps = [
             "vlc", "firefox", "chrome", "chromium", "spotify", "discord", "obs",
         ];
 

@@ -54,7 +54,7 @@ fn test_pipewire_availability() {
 
     // Check for development files
     let dev_files = std::process::Command::new("pkg-config")
-        .args(&["--exists", "libpipewire-0.3"])
+        .args(["--exists", "libpipewire-0.3"])
         .status()
         .map(|s| s.success())
         .unwrap_or(false);
@@ -71,7 +71,7 @@ fn test_application_enumeration() {
 
     // Enhanced process-based enumeration with more details
     if let Ok(output) = std::process::Command::new("ps")
-        .args(&["-eo", "pid,comm,args"])
+        .args(["-eo", "pid,comm,args"])
         .output()
     {
         if let Ok(output_str) = String::from_utf8(output.stdout) {
@@ -151,7 +151,7 @@ fn test_application_enumeration() {
     // Test PipeWire command-line tools if available
     println!("  🔧 PipeWire Node Detection:");
     if let Ok(output) = std::process::Command::new("pw-cli")
-        .args(&["list-objects"])
+        .args(["list-objects"])
         .output()
     {
         if output.status.success() {
@@ -191,7 +191,7 @@ fn test_application_enumeration() {
     if let Ok(output) = std::process::Command::new("pw-dump").output() {
         if output.status.success() {
             let output_str = String::from_utf8_lossy(&output.stdout);
-            let firefox_mentions = output_str.matches("firefox").count();
+            let _firefox_mentions = output_str.matches("firefox").count();
             let firefox_mentions_ci = output_str.to_lowercase().matches("firefox").count();
 
             if firefox_mentions_ci > 0 {
@@ -222,13 +222,13 @@ fn test_application_capture() {
         let phase = sample_count as f32 * 0.01;
 
         // Generate test audio (sine waves)
-        for i in 0..buffer.len() {
+        for (i, sample) in buffer.iter_mut().enumerate() {
             if i % 2 == 0 {
                 // Left channel - 440 Hz
-                buffer[i] = (phase * 440.0 * 2.0 * std::f32::consts::PI).sin() * 0.1;
+                *sample = (phase * 440.0 * 2.0 * std::f32::consts::PI).sin() * 0.1;
             } else {
                 // Right channel - 880 Hz
-                buffer[i] = (phase * 880.0 * 2.0 * std::f32::consts::PI).sin() * 0.1;
+                *sample = (phase * 880.0 * 2.0 * std::f32::consts::PI).sin() * 0.1;
             }
         }
 
