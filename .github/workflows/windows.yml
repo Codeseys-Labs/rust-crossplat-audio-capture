@@ -304,8 +304,10 @@ jobs:
           powershell -ExecutionPolicy Bypass -File "scripts/test-vlc-capture-windows.ps1"
         shell: pwsh
 
+      # Artifact uploads are optional (may fail due to storage quota)
       - name: Upload VLC Audio Capture Files
         uses: actions/upload-artifact@v4
+        continue-on-error: true
         with:
           name: windows-vlc-audio-captures
           path: |
@@ -318,6 +320,7 @@ jobs:
 
       - name: Upload VLC Logs
         uses: actions/upload-artifact@v4
+        continue-on-error: true
         with:
           name: windows-vlc-logs
           path: |
@@ -332,6 +335,7 @@ jobs:
 
       - name: Upload Windows Audio Debug Info
         uses: actions/upload-artifact@v4
+        continue-on-error: true
         with:
           name: windows-audio-debug
           path: |

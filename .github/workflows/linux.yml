@@ -191,8 +191,10 @@ jobs:
           ls -la
         if: always()
 
+      # Artifact uploads are optional (may fail due to storage quota)
       - name: Upload VLC Audio Capture Files
         uses: actions/upload-artifact@v4
+        continue-on-error: true
         with:
           name: vlc-audio-captures
           path: |
@@ -204,6 +206,7 @@ jobs:
 
       - name: Upload VLC Logs
         uses: actions/upload-artifact@v4
+        continue-on-error: true
         with:
           name: vlc-logs
           path: |
@@ -216,6 +219,7 @@ jobs:
 
       - name: Upload PipeWire Logs
         uses: actions/upload-artifact@v4
+        continue-on-error: true
         with:
           name: pipewire-logs
           path: |

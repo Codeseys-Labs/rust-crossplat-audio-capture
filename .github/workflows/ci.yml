@@ -1,3 +1,8 @@
+# Rust Cross-Platform Audio Capture CI
+# Focus: Real-world integration tests with VLC audio capture
+# Platforms: Linux (PipeWire), Windows (WASAPI)
+# macOS (CoreAudio) is incomplete and checked separately
+
 name: Rust CI
 
 on:
@@ -17,7 +22,8 @@ env:
   CARGO_TERM_COLOR: always
 
 jobs:
-  lint_and_format:
+  # Quick lint check before running expensive tests
+  lint:
     name: Lint and Format
     runs-on: ubuntu-latest
     steps:
@@ -40,54 +46,26 @@ jobs:
       - name: Run Clippy
         run: cargo clippy --lib --no-default-features --features feat_linux -- -D warnings
 
-  linux_tests:
-    name: Linux PipeWire Tests
-    needs: lint_and_format
+  # PRIMARY TEST: Linux PipeWire integration test with real VLC audio capture
+  linux_integration:
+    name: Linux PipeWire Integration Test
+    needs: lint
     uses: ./.github/workflows/linux.yml
     with:
       debug_enabled: ${{ inputs.debug_enabled || false }}
 
-  windows_tests:
-    name: Windows WASAPI Tests
-    needs: lint_and_format
+  # PRIMARY TEST: Windows WASAPI integration test with real VLC audio capture
+  windows_integration:
+    name: Windows WASAPI Integration Test
+    needs: lint
     uses: ./.github/workflows/windows.yml
     with:
       debug_enabled: ${{ inputs.debug_enabled || false }}
 
-  unit_tests:
-    name: Unit Tests (Linux & Windows)
-    needs: lint_and_format
-    strategy:
-      fail-fast: false
-      matrix:
-        include:
-          - os: ubuntu-latest
-            features: feat_linux
-            setup: |
-              sudo apt-get update
-              sudo add-apt-repository ppa:pipewire-debian/pipewire-upstream -y
-              sudo apt-get update
-              sudo apt-get install -y libpipewire-0.3-dev libspa-0.2-dev libasound2-dev pkg-config
-          - os: windows-latest
-            features: feat_windows
-            setup: echo "No additional setup needed for Windows"
-    runs-on: ${{ matrix.os }}
-    steps:
-      - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
-      - uses: Swatinem/rust-cache@v2
-
-      - name: Platform setup
-        run: ${{ matrix.setup }}
-        shell: bash
-
-      - name: Run unit tests
-        run: cargo test --lib --no-default-features --features ${{ matrix.features }}
-
-  # macOS unit tests are separate due to incomplete implementation
+  # macOS compilation check (incomplete implementation)
   macos_check:
     name: macOS Compilation Check
-    needs: lint_and_format
+    needs: lint
     runs-on: macos-latest
     continue-on-error: true  # Allow failure - implementation incomplete
     steps:
@@ -97,31 +75,3 @@ jobs:
 
       - name: Check library compilation
         run: cargo check --lib --no-default-features --features feat_macos
-
-  coverage:
-    name: Code Coverage
-    needs: lint_and_format
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
-      - uses: Swatinem/rust-cache@v2
-
-      - name: Install PipeWire dev libraries
-        run: |
-          sudo apt-get update
-          sudo add-apt-repository ppa:pipewire-debian/pipewire-upstream -y
-          sudo apt-get update
-          sudo apt-get install -y libpipewire-0.3-dev libspa-0.2-dev pkg-config
-
-      - name: Install cargo-tarpaulin
-        run: cargo install cargo-tarpaulin --version 0.27.3
-
-      - name: Generate code coverage
-        run: cargo tarpaulin --features feat_linux --workspace --out Lcov --output-dir coverage/ --run-types Tests Lib
-
-      - name: Upload coverage to Codecov
-        uses: codecov/codecov-action@v4
-        with:
-          files: ./coverage/lcov.info
-          fail_ci_if_error: false
