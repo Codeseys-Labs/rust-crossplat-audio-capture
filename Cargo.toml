@@ -215,4 +215,4 @@ path = "examples/flexible_pipewire_example.rs"
 required-features = ["feat_linux"]
 
 [workspace]
-members = []
+members = ["virtual-audio-device"]

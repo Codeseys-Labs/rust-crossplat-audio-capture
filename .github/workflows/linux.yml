@@ -160,6 +160,33 @@ jobs:
           systemctl --user --now enable pipewire-pulse.service
           sleep 2
 
+      - name: Create Virtual Audio Sink
+        run: |
+          echo "=== Creating Virtual Audio Sink (No External Dependencies) ==="
+
+          # Create a null sink for VLC to output to
+          # This uses PipeWire's built-in module-null-sink - no external drivers needed!
+          pactl load-module module-null-sink sink_name=rsac_ci_test_sink sink_properties=device.description="RSAC_CI_Test_Sink"
+
+          # Set it as the default sink so VLC uses it automatically
+          pactl set-default-sink rsac_ci_test_sink
+
+          echo "✅ Created virtual audio sink: rsac_ci_test_sink"
+          echo "✅ Monitor source available: rsac_ci_test_sink.monitor"
+
+          # Verify the sink was created
+          echo ""
+          echo "=== Available Audio Sinks ==="
+          pactl list short sinks
+
+          echo ""
+          echo "=== Available Audio Sources (for capture) ==="
+          pactl list short sources
+
+          # Export sink name for use in tests
+          echo "RSAC_TEST_SINK=rsac_ci_test_sink" >> $GITHUB_ENV
+          echo "RSAC_TEST_SOURCE=rsac_ci_test_sink.monitor" >> $GITHUB_ENV
+
       - name: Cache dependencies
         uses: actions/cache@v3
         with:
