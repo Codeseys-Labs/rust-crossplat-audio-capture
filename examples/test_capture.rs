@@ -1,9 +1,8 @@
 use clap::Parser;
 use hound::{WavSpec, WavWriter};
 use rsac::api::AudioCaptureBuilder;
-use rsac::core::config::DeviceSelector;
 use rsac::core::error::AudioError;
-use rsac::{get_audio_backend, AudioFormat, LatencyMode, SampleFormat, StreamConfig};
+use rsac::{CaptureTarget, SampleFormat};
 use std::path::PathBuf;
 use std::thread;
 use std::time::Duration;
@@ -43,7 +42,6 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
     }
 
-    // Try new API first, fallback to old API if needed
     match capture_with_new_api(&args) {
         Ok(_) => {
             if args.verbose {
@@ -51,13 +49,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             }
         }
         Err(e) => {
-            if args.verbose {
-                println!("⚠️  New API failed ({}), trying old API...", e);
-            }
-            capture_with_old_api(&args)?;
-            if args.verbose {
-                println!("✅ Capture completed using old API");
-            }
+            eprintln!("❌ Capture failed: {}", e);
+            // TODO: Rewrite to use new API (AudioCaptureBuilder) for application capture
+            // Old fallback to get_audio_backend() has been removed.
+            return Err(e.into());
         }
     }
 
@@ -74,41 +69,40 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 }
 
 fn capture_with_new_api(args: &Args) -> Result<(), AudioError> {
-    // Use the new trait-based API
-    let device_selector = if args.application.is_some() {
-        // For application capture, we'd need to implement application selection
-        // For now, use default input
-        DeviceSelector::DefaultInput
+    // Determine capture target from arguments
+    let target = if let Some(ref app_name) = args.application {
+        CaptureTarget::ApplicationByName(app_name.clone())
     } else {
-        DeviceSelector::DefaultInput
+        CaptureTarget::SystemDefault
     };
 
     // Try 48k first (matches CI virtual devices), then 44.1k as fallback
     let mut capture_session = match AudioCaptureBuilder::new()
-        .device(device_selector.clone())
+        .with_target(target.clone())
         .sample_rate(48000)
         .channels(2)
-        .sample_format(SampleFormat::F32LE)
-        .bits_per_sample(32)
+        .sample_format(SampleFormat::F32)
         .build()
     {
         Ok(s) => s,
         Err(e48) => {
             eprintln!("New API 48kHz build failed: {e48}. Trying 44.1kHz...");
             match AudioCaptureBuilder::new()
-                .device(device_selector)
+                .with_target(target)
                 .sample_rate(44100)
                 .channels(2)
-                .sample_format(SampleFormat::F32LE)
-                .bits_per_sample(32)
+                .sample_format(SampleFormat::F32)
                 .build()
             {
                 Ok(s) => s,
                 Err(e44) => {
                     eprintln!("New API 44.1kHz build also failed: {e44}. Writing placeholder WAV.");
                     // Create placeholder WAV so CI can proceed
-                    create_placeholder_wav(&args.output)
-                        .map_err(|e| AudioError::ConfigurationError(e.to_string()))?;
+                    create_placeholder_wav(&args.output).map_err(|e| {
+                        AudioError::ConfigurationError {
+                            message: e.to_string(),
+                        }
+                    })?;
                     return Ok(());
                 }
             }
@@ -137,73 +131,9 @@ fn capture_with_new_api(args: &Args) -> Result<(), AudioError> {
 
     // For now, create a placeholder WAV file since we need to implement
     // the actual data collection from the stream
-    create_placeholder_wav(&args.output)
-        .map_err(|e| AudioError::ConfigurationError(e.to_string()))?;
-
-    Ok(())
-}
-
-fn capture_with_old_api(args: &Args) -> Result<(), Box<dyn std::error::Error>> {
-    // Use the old API as fallback
-    let backend = get_audio_backend()?;
-
-    if args.verbose {
-        println!("Using audio backend: {}", backend.name());
-    }
-
-    if let Some(ref app_name) = args.application {
-        // Application-specific capture
-        let applications = backend.list_applications()?;
-
-        if args.verbose {
-            println!("Available applications:");
-            for app in &applications {
-                println!("  - {}", app.name);
-            }
-        }
-
-        // Find the target application
-        if let Some(target_app) = applications
-            .iter()
-            .find(|app| app.name.to_lowercase().contains(&app_name.to_lowercase()))
-        {
-            if args.verbose {
-                println!("Found target application: {}", target_app.name);
-            }
-
-            // Create stream config
-            let audio_format = AudioFormat {
-                sample_rate: 48000,
-                channels: 2,
-                bits_per_sample: 32,
-                sample_format: SampleFormat::F32LE,
-            };
-
-            let config = StreamConfig {
-                format: audio_format,
-                buffer_size_frames: None,
-                latency_mode: LatencyMode::Balanced,
-            };
-
-            let mut stream = backend.capture_application(target_app, config)?;
-            stream.start()?;
-
-            if args.verbose {
-                println!(
-                    "Started application capture, recording for {} seconds...",
-                    args.duration
-                );
-            }
-
-            thread::sleep(Duration::from_secs(args.duration));
-            stream.stop()?;
-        } else {
-            return Err(format!("Application '{}' not found", app_name).into());
-        }
-    }
-
-    // Create placeholder WAV file
-    create_placeholder_wav(&args.output)?;
+    create_placeholder_wav(&args.output).map_err(|e| AudioError::ConfigurationError {
+        message: e.to_string(),
+    })?;
 
     Ok(())
 }

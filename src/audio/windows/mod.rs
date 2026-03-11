@@ -8,9 +8,6 @@ pub use wasapi::{
     WindowsDeviceEnumerator,
 };
 
-// Legacy backend exports (to be deprecated)
-pub use wasapi::WindowsApplicationCapture as WasapiBackend;
-
 /// Application audio session information for Windows
 #[derive(Debug, Clone)]
 pub struct ApplicationAudioSessionInfo {

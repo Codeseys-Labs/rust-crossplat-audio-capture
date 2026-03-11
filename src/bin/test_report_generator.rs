@@ -1,4 +1,4 @@
-use clap::{arg, Parser};
+use clap::Parser;
 use std::collections::HashMap;
 use std::fs;
 use std::path::{Path, PathBuf};

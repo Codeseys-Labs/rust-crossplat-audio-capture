@@ -1,83 +1,196 @@
 // src/core/config.rs
 
-/// Specifies the format of audio samples.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-pub enum SampleFormat {
-    /// Signed 8-bit integer.
-    S8,
-    /// Unsigned 8-bit integer.
-    U8,
-    /// Signed 16-bit integer, little-endian.
-    S16LE,
-    /// Signed 16-bit integer, big-endian.
-    S16BE,
-    /// Unsigned 16-bit integer, little-endian.
-    U16LE,
-    /// Unsigned 16-bit integer, big-endian.
-    U16BE,
-    /// Signed 24-bit integer (often packed in 32 bits), little-endian.
-    S24LE,
-    /// Signed 24-bit integer (often packed in 32 bits), big-endian.
-    S24BE,
-    /// Unsigned 24-bit integer (often packed in 32 bits), little-endian.
-    U24LE,
-    /// Unsigned 24-bit integer (often packed in 32 bits), big-endian.
-    U24BE,
-    /// Signed 32-bit integer, little-endian.
-    S32LE,
-    /// Signed 32-bit integer, big-endian.
-    S32BE,
-    /// Unsigned 32-bit integer, little-endian.
-    U32LE,
-    /// Unsigned 32-bit integer, big-endian.
-    U32BE,
-    /// 32-bit floating-point, little-endian.
-    F32LE,
-    /// 32-bit floating-point, big-endian.
-    F32BE,
-    /// 64-bit floating-point, little-endian.
-    F64LE,
-    /// 64-bit floating-point, big-endian.
-    F64BE,
-}
+// ── ID Newtypes ──────────────────────────────────────────────────────────
 
-impl Default for SampleFormat {
-    /// Returns a default sample format, typically S16LE.
-    fn default() -> Self {
-        SampleFormat::S16LE
+/// Opaque identifier for an audio device.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub struct DeviceId(pub String);
+
+impl std::fmt::Display for DeviceId {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}", self.0)
     }
 }
 
-/// Represents an audio format, detailing sample rate, channels, and sample type.
+/// Opaque identifier for an application (audio session).
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub struct ApplicationId(pub String);
+
+impl std::fmt::Display for ApplicationId {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}", self.0)
+    }
+}
+
+/// Opaque identifier for an OS process (PID).
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub struct ProcessId(pub u32);
+
+impl std::fmt::Display for ProcessId {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}", self.0)
+    }
+}
+
+// ── CaptureTarget ────────────────────────────────────────────────────────
+
+/// Unified capture target model covering all capture modes.
+///
+/// This enum specifies *what* audio should be captured. It replaces the old
+/// combination of `DeviceSelector` + PID/session fields with a single,
+/// explicit discriminated union.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub enum CaptureTarget {
+    /// Capture from the system default audio device / mix.
+    SystemDefault,
+    /// Capture from a specific device identified by [`DeviceId`].
+    Device(DeviceId),
+    /// Capture audio from a specific application session identified by [`ApplicationId`].
+    Application(ApplicationId),
+    /// Capture audio from the first application whose name matches the given string.
+    ApplicationByName(String),
+    /// Capture audio from a process and its child processes, identified by [`ProcessId`].
+    ProcessTree(ProcessId),
+}
+
+impl Default for CaptureTarget {
+    fn default() -> Self {
+        CaptureTarget::SystemDefault
+    }
+}
+
+// ── SampleFormat (new canonical 4-variant) ───────────────────────────────
+
+/// Specifies the format of audio samples.
+///
+/// All audio data is standardized to `f32` internally, but this enum
+/// describes the wire/storage format for configuration and capability
+/// negotiation.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum SampleFormat {
+    /// Signed 16-bit integer.
+    I16,
+    /// Signed 24-bit integer (packed in 32-bit container).
+    I24,
+    /// Signed 32-bit integer.
+    I32,
+    /// 32-bit IEEE 754 floating-point.
+    F32,
+}
+
+impl Default for SampleFormat {
+    /// Returns `F32` — the library's internal standard format.
+    fn default() -> Self {
+        SampleFormat::F32
+    }
+}
+
+impl SampleFormat {
+    /// Returns the number of bits per sample for this format.
+    pub fn bits_per_sample(&self) -> u16 {
+        match self {
+            SampleFormat::I16 => 16,
+            SampleFormat::I24 => 24,
+            SampleFormat::I32 | SampleFormat::F32 => 32,
+        }
+    }
+}
+
+// ── AudioFormat ──────────────────────────────────────────────────────────
+
+/// Represents a concrete audio format describing sample rate, channels,
+/// and sample type.
+///
+/// Used by [`AudioBuffer`](super::buffer::AudioBuffer) and the
+/// [`AudioDevice`](super::interface::AudioDevice) trait to describe
+/// the actual format of audio data.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct AudioFormat {
     /// The number of samples per second (e.g., 44100, 48000).
     pub sample_rate: u32,
     /// The number of audio channels (e.g., 1 for mono, 2 for stereo).
     pub channels: u16,
-    /// The number of bits per sample (e.g., 16, 24, 32).
-    /// This should correspond to the `SampleFormat`.
-    pub bits_per_sample: u16,
-    /// The specific type and endianness of samples.
+    /// The specific sample format.
     pub sample_format: SampleFormat,
 }
 
 impl Default for AudioFormat {
-    /// Provides a default `AudioFormat`.
-    ///
-    /// - Sample Rate: 44100 Hz
-    /// - Channels: 2 (stereo)
-    /// - Bits Per Sample: 16
-    /// - Sample Format: S16LE (Signed 16-bit Little Endian)
+    /// Provides a default `AudioFormat`: 48 kHz, stereo, F32.
     fn default() -> Self {
         AudioFormat {
-            sample_rate: 44100,
+            sample_rate: 48000,
             channels: 2,
-            bits_per_sample: 16,
-            sample_format: SampleFormat::S16LE,
+            sample_format: SampleFormat::F32,
         }
     }
 }
+
+// ── StreamConfig ─────────────────────────────────────────────────────────
+
+/// Configuration for an audio stream.
+///
+/// Specifies the desired audio format and buffer size when opening a stream.
+/// This is a simplified, flat representation — no nested `AudioFormat`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct StreamConfig {
+    /// The desired sample rate in Hz (e.g., 48000).
+    pub sample_rate: u32,
+    /// The desired number of audio channels (e.g., 2 for stereo).
+    pub channels: u16,
+    /// The desired sample format.
+    pub sample_format: SampleFormat,
+    /// Optional desired buffer size in frames.
+    /// If `None`, the backend will choose a suitable default.
+    pub buffer_size: Option<usize>,
+}
+
+impl Default for StreamConfig {
+    /// Provides a default `StreamConfig`: 48 kHz, 2 channels, F32, no buffer size preference.
+    fn default() -> Self {
+        StreamConfig {
+            sample_rate: 48000,
+            channels: 2,
+            sample_format: SampleFormat::F32,
+            buffer_size: None,
+        }
+    }
+}
+
+impl StreamConfig {
+    /// Converts this `StreamConfig` into a corresponding [`AudioFormat`].
+    pub fn to_audio_format(&self) -> AudioFormat {
+        AudioFormat {
+            sample_rate: self.sample_rate,
+            channels: self.channels,
+            sample_format: self.sample_format,
+        }
+    }
+}
+
+// ── AudioCaptureConfig ───────────────────────────────────────────────────
+
+/// Full configuration for an audio capture session.
+///
+/// Created by [`AudioCaptureBuilder`](crate::api::AudioCaptureBuilder),
+/// this struct stores the validated capture parameters.
+#[derive(Debug, Clone, PartialEq)]
+pub struct AudioCaptureConfig {
+    /// What to capture — system default, specific device, application, etc.
+    pub target: CaptureTarget,
+    /// Stream format and buffer configuration.
+    pub stream_config: StreamConfig,
+}
+
+impl Default for AudioCaptureConfig {
+    fn default() -> Self {
+        AudioCaptureConfig {
+            target: CaptureTarget::default(),
+            stream_config: StreamConfig::default(),
+        }
+    }
+}
+
+// ── Legacy / Compatibility Types ─────────────────────────────────────────
 
 /// Defines preferred latency modes for an audio stream.
 ///
@@ -85,83 +198,60 @@ impl Default for AudioFormat {
 /// may vary based on system capabilities and load.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum LatencyMode {
-    /// Prioritizes the lowest possible latency, potentially at the cost of higher CPU usage or power consumption.
+    /// Prioritizes the lowest possible latency.
     LowLatency,
-    /// Aims for a balance between latency, CPU usage, and power consumption. This is often the default.
+    /// Aims for a balance (default).
     Balanced,
-    /// Prioritizes lower power consumption, potentially at the cost of higher latency.
+    /// Prioritizes lower power consumption.
     PowerSaving,
 }
 
 impl Default for LatencyMode {
-    /// Returns the default latency mode, `Balanced`.
     fn default() -> Self {
         LatencyMode::Balanced
     }
 }
 
-/// Configuration for an audio stream.
-///
-/// This struct specifies the desired audio format, buffer size, and latency preferences
-/// when opening an audio stream.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct StreamConfig {
-    /// The desired audio format for the stream.
-    pub format: AudioFormat,
-    /// Optional: Desired buffer size in frames.
-    /// If `None`, the backend will choose a suitable default.
-    /// The actual buffer size used by the backend may differ from this request.
-    pub buffer_size_frames: Option<u32>,
-    /// Preferred latency mode for the stream.
-    pub latency_mode: LatencyMode,
-    // Potentially other parameters like desired latency in ms, specific device flags, etc.
-}
-
-impl Default for StreamConfig {
-    /// Provides a default `StreamConfig`.
-    ///
-    /// - Format: Default `AudioFormat` (44.1kHz, 2ch, S16LE)
-    /// - Buffer Size: `None` (backend default)
-    /// - Latency Mode: `Balanced`
-    fn default() -> Self {
-        StreamConfig {
-            format: AudioFormat::default(),
-            buffer_size_frames: None,
-            latency_mode: LatencyMode::default(),
-        }
-    }
-}
-
 /// Specifies criteria for selecting an audio device.
 ///
-/// This enum allows users to request devices by default role, unique ID, or human-readable name.
+/// **Deprecated** — prefer [`CaptureTarget`] for new code.
+/// Retained for backward compatibility during the API transition.
+#[deprecated(note = "Use CaptureTarget instead")]
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub enum DeviceSelector {
     /// Selects the system's default input device.
     DefaultInput,
     /// Selects the system's default output device.
     DefaultOutput,
-    /// Selects a device by its unique, platform-specific identifier.
-    ById(String), // Assuming DeviceId can often be represented or converted to a String.
-    // If DeviceId is more complex, this might need adjustment or a generic parameter.
-    /// Selects a device by its human-readable name.
-    /// Note: Names may not be unique; the first match is typically chosen.
+    /// Selects a device by its platform-specific identifier.
+    ById(String),
+    /// Selects a device by name (first match).
     ByName(String),
 }
 
+#[allow(deprecated)]
 impl Default for DeviceSelector {
-    /// Returns a default device selector, `DefaultInput`.
     fn default() -> Self {
         DeviceSelector::DefaultInput
     }
 }
+
+#[allow(deprecated)]
+impl std::fmt::Display for DeviceSelector {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            DeviceSelector::DefaultInput => write!(f, "DefaultInput"),
+            DeviceSelector::DefaultOutput => write!(f, "DefaultOutput"),
+            DeviceSelector::ById(id) => write!(f, "ById({})", id),
+            DeviceSelector::ByName(name) => write!(f, "ByName({})", name),
+        }
+    }
+}
+
 /// Specifies the audio file format for recording.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum AudioFileFormat {
     /// Waveform Audio File Format.
     #[default]
     Wav,
-    // Placeholder for future formats like Mp3, Ogg, etc.
-    // Mp3,
-    // Ogg,
 }

@@ -5,10 +5,6 @@ pub mod pipewire;
 // Re-export for convenience
 pub use pipewire::{ApplicationSelector, PipeWireApplicationCapture};
 
-// Stub implementation for LinuxDeviceEnumerator to fix compilation
-use crate::core::config::StreamConfig;
-use crate::{AudioApplication, AudioCaptureStream, Result};
-
 pub struct LinuxDeviceEnumerator;
 
 impl Default for LinuxDeviceEnumerator {
@@ -20,21 +16,6 @@ impl Default for LinuxDeviceEnumerator {
 impl LinuxDeviceEnumerator {
     pub fn new() -> Self {
         LinuxDeviceEnumerator
-    }
-
-    pub fn list_applications(&self) -> Result<Vec<AudioApplication>> {
-        Ok(vec![])
-    }
-
-    pub fn capture_application(
-        &self,
-        _app: &AudioApplication,
-        _config: StreamConfig,
-    ) -> Result<Box<dyn AudioCaptureStream>> {
-        Err(crate::core::error::AudioError::UnsupportedPlatform(
-            "Linux application capture not yet fully implemented".to_string(),
-        )
-        .into())
     }
 
     /// Get PipeWire devices using pw-cli
@@ -98,7 +79,9 @@ impl LinuxDeviceEnumerator {
             }
         }
 
-        Err(crate::core::error::AudioError::DeviceNotFound)
+        Err(crate::core::error::AudioError::DeviceNotFound {
+            device_id: format!("default_{:?}", kind),
+        })
     }
 
     /// Parse pw-cli list-objects Node output
@@ -289,168 +272,79 @@ pub struct LinuxAudioDevice {
 }
 
 impl crate::core::interface::AudioDevice for LinuxAudioDevice {
-    type DeviceId = String;
-
-    fn get_id(&self) -> Self::DeviceId {
-        self.id.clone()
+    fn id(&self) -> crate::core::config::DeviceId {
+        crate::core::config::DeviceId(self.id.clone())
     }
 
-    fn get_name(&self) -> String {
+    fn name(&self) -> String {
         self.name.clone()
     }
 
-    fn get_supported_formats(
-        &self,
-    ) -> crate::core::error::Result<Vec<crate::core::config::AudioFormat>> {
-        Ok(vec![])
-    }
-
-    fn get_default_format(&self) -> crate::core::error::Result<crate::core::config::AudioFormat> {
-        Ok(crate::core::config::AudioFormat {
-            sample_rate: 44100,
-            channels: 2,
-            bits_per_sample: 16,
-            sample_format: crate::core::config::SampleFormat::S16LE,
-        })
-    }
-
-    fn is_input(&self) -> bool {
-        self.is_input
-    }
-
-    fn is_output(&self) -> bool {
-        self.is_output
-    }
-
-    fn is_active(&self) -> bool {
+    fn is_default(&self) -> bool {
+        // Default detection is handled at the enumerator level
         false
     }
 
-    fn is_format_supported(
-        &self,
-        _format: &crate::core::config::AudioFormat,
-    ) -> crate::core::error::Result<bool> {
-        Ok(false)
+    fn supported_formats(&self) -> Vec<crate::core::config::AudioFormat> {
+        // TODO: Query actual supported formats from PipeWire
+        vec![]
     }
 
     fn create_stream(
-        &mut self,
-        _config: &crate::api::AudioCaptureConfig,
+        &self,
+        _config: &crate::core::config::StreamConfig,
     ) -> crate::core::error::Result<Box<dyn crate::core::interface::CapturingStream>> {
-        Err(crate::core::error::AudioError::UnsupportedPlatform(
-            "Linux audio streams not yet implemented".to_string(),
-        ))
+        Err(crate::core::error::AudioError::PlatformNotSupported {
+            feature: "audio streams".to_string(),
+            platform: "linux".to_string(),
+        })
     }
 }
 
 // Implement DeviceEnumerator trait
 impl crate::core::interface::DeviceEnumerator for LinuxDeviceEnumerator {
-    type Device = LinuxAudioDevice;
-
-    fn enumerate_devices(&self) -> crate::core::error::Result<Vec<Self::Device>> {
-        let mut devices = Vec::new();
+    fn enumerate_devices(
+        &self,
+    ) -> crate::core::error::Result<Vec<Box<dyn crate::core::interface::AudioDevice>>> {
+        let mut devices: Vec<Box<dyn crate::core::interface::AudioDevice>> = Vec::new();
 
         // Try to get devices from PipeWire
         if let Ok(pw_devices) = self.get_pipewire_devices() {
-            devices.extend(pw_devices);
+            for d in pw_devices {
+                devices.push(Box::new(d));
+            }
         }
 
         // If no devices found, add a fallback default
         if devices.is_empty() {
-            devices.push(LinuxAudioDevice {
+            devices.push(Box::new(LinuxAudioDevice {
                 id: "default".to_string(),
                 name: "Default Linux Audio Device".to_string(),
-                is_input: true, // Mark as input device
+                is_input: true,
                 is_output: false,
-            });
+            }));
         }
 
         Ok(devices)
     }
 
-    fn get_default_device(
+    fn default_device(
         &self,
-        kind: crate::core::interface::DeviceKind,
-    ) -> crate::core::error::Result<Self::Device> {
-        // Try to get the actual default device from PipeWire
-        if let Ok(device) = self.get_pipewire_default_device(kind) {
-            return Ok(device);
+    ) -> crate::core::error::Result<Box<dyn crate::core::interface::AudioDevice>> {
+        // Try to get the actual default output device from PipeWire
+        // (output is most relevant for audio capture / loopback)
+        if let Ok(device) =
+            self.get_pipewire_default_device(crate::core::interface::DeviceKind::Output)
+        {
+            return Ok(Box::new(device));
         }
 
         // Fallback to a generic default
-        match kind {
-            crate::core::interface::DeviceKind::Input => Ok(LinuxAudioDevice {
-                id: "default_input".to_string(),
-                name: "Default Linux Input Device".to_string(),
-                is_input: true,
-                is_output: false,
-            }),
-            crate::core::interface::DeviceKind::Output => Ok(LinuxAudioDevice {
-                id: "default_output".to_string(),
-                name: "Default Linux Output Device".to_string(),
-                is_input: false,
-                is_output: true,
-            }),
-        }
-    }
-
-    fn get_input_devices(&self) -> crate::core::error::Result<Vec<Self::Device>> {
-        let all_devices = self.enumerate_devices()?;
-        Ok(all_devices.into_iter().filter(|d| d.is_input).collect())
-    }
-
-    fn get_output_devices(&self) -> crate::core::error::Result<Vec<Self::Device>> {
-        let all_devices = self.enumerate_devices()?;
-        Ok(all_devices.into_iter().filter(|d| d.is_output).collect())
-    }
-
-    fn get_device_by_id(&self, id: &String) -> crate::core::error::Result<Self::Device> {
-        // Try to find the device in our enumerated list first
-        let devices = self.enumerate_devices()?;
-        if let Some(device) = devices.into_iter().find(|d| &d.id == id) {
-            return Ok(device);
-        }
-
-        // Fallback to creating a device with the given ID
-        Ok(LinuxAudioDevice {
-            id: id.clone(),
-            name: format!("Linux Audio Device {}", id),
-            is_input: true, // Assume input by default for capture
-            is_output: false,
-        })
-    }
-}
-
-// Stub for PipeWireBackend
-pub struct PipeWireBackend;
-
-impl PipeWireBackend {
-    pub fn new() -> crate::core::error::Result<Self> {
-        Ok(PipeWireBackend)
-    }
-
-    pub fn is_available() -> bool {
-        false // Simplified for now
-    }
-}
-
-// Implement AudioCaptureBackend trait
-impl crate::audio::core::AudioCaptureBackend for PipeWireBackend {
-    fn name(&self) -> &'static str {
-        "PipeWire"
-    }
-
-    fn list_applications(&self) -> crate::core::error::Result<Vec<AudioApplication>> {
-        Ok(vec![])
-    }
-
-    fn capture_application(
-        &self,
-        _app: &AudioApplication,
-        _config: StreamConfig,
-    ) -> crate::core::error::Result<Box<dyn crate::audio::core::AudioCaptureStream>> {
-        Err(crate::core::error::AudioError::UnsupportedPlatform(
-            "PipeWire backend not yet implemented".to_string(),
-        ))
+        Ok(Box::new(LinuxAudioDevice {
+            id: "default".to_string(),
+            name: "Default Linux Audio Device".to_string(),
+            is_input: false,
+            is_output: true,
+        }))
     }
 }

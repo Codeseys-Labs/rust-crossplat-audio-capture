@@ -1,4 +1,4 @@
-use clap::{arg, Parser};
+use clap::Parser;
 use std::path::PathBuf;
 use std::process::exit;
 
@@ -41,65 +41,32 @@ fn main() {
         exit(1);
     }
 
-    // Get the appropriate audio backend
-    let backend = match rsac::get_audio_backend() {
-        Ok(backend) => backend,
-        Err(e) => {
-            eprintln!("Failed to get audio backend: {}", e);
-            exit(1);
-        }
-    };
+    // TODO: Rewrite to use new API (AudioCaptureBuilder)
+    // The old API (get_audio_backend / AudioCaptureBackend trait) has been removed.
+    // This binary needs to be rewritten to use:
+    //   rsac::AudioCaptureBuilder::new()
+    //       .with_target(CaptureTarget::SystemDefault)
+    //       .build()? -> AudioCapture -> .start()? -> CapturingStream
+    //
+    // Old code that was removed:
+    //   let backend = rsac::get_audio_backend()?;
+    //   backend.name(), backend.list_applications(), etc.
 
-    println!("Using audio backend: {}", backend.name());
-
-    // Run the requested test
     match args.test_type.as_str() {
         "application" => {
             println!("Listing available applications...");
-            match backend.list_applications() {
-                Ok(apps) => {
-                    if apps.is_empty() {
-                        println!("No applications found.");
-                    } else {
-                        println!("Found {} applications:", apps.len());
-                        for (i, app) in apps.iter().enumerate() {
-                            println!("{}: {} ({})", i + 1, app.name, app.id);
-                        }
-                    }
-                }
-                Err(e) => {
-                    eprintln!("Failed to list applications: {}", e);
-                }
-            }
+            // TODO: Rewrite to use new API (AudioCaptureBuilder)
+            println!("Application listing not yet ported to new API.");
         }
         "system" => {
             println!("Testing system audio capture...");
-            // Implementation would depend on the specific backend
-            println!("System audio capture test not implemented yet.");
+            // TODO: Rewrite to use new API (AudioCaptureBuilder)
+            println!("System audio capture test not yet ported to new API.");
         }
         "all" => {
             println!("Running all tests...");
-            // Run application test
-            println!("Listing available applications...");
-            match backend.list_applications() {
-                Ok(apps) => {
-                    if apps.is_empty() {
-                        println!("No applications found.");
-                    } else {
-                        println!("Found {} applications:", apps.len());
-                        for (i, app) in apps.iter().enumerate() {
-                            println!("{}: {} ({})", i + 1, app.name, app.id);
-                        }
-                    }
-                }
-                Err(e) => {
-                    eprintln!("Failed to list applications: {}", e);
-                }
-            }
-
-            // Run system test
-            println!("Testing system audio capture...");
-            println!("System audio capture test not implemented yet.");
+            // TODO: Rewrite to use new API (AudioCaptureBuilder)
+            println!("Tests not yet ported to new API.");
         }
         _ => {
             eprintln!("Unknown test type: {}", args.test_type);

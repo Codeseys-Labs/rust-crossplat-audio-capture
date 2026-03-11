@@ -8,11 +8,25 @@
 //! into a common framework.
 
 pub mod buffer;
+pub mod capabilities;
 pub mod config;
 pub mod error;
 pub mod interface;
-pub mod processing; // Added processing module
+pub mod processing;
 
-pub use buffer::AudioBuffer; // Changed from VecAudioBuffer to the new AudioBuffer struct
-pub use error::ProcessError; // Added ProcessError export
-pub use processing::AudioProcessor; // Added AudioProcessor export
+// ── Re-exports ───────────────────────────────────────────────────────────
+
+pub use buffer::AudioBuffer;
+pub use capabilities::PlatformCapabilities;
+pub use error::{AudioError, AudioResult, BackendContext, ErrorKind, ProcessError, Recoverability};
+pub use processing::AudioProcessor;
+
+// Config types
+pub use config::{
+    ApplicationId, AudioCaptureConfig, AudioFileFormat, AudioFormat, CaptureTarget, DeviceId,
+    LatencyMode, ProcessId, SampleFormat, StreamConfig,
+};
+
+// Legacy / compat (deprecated)
+#[allow(deprecated)]
+pub use config::DeviceSelector;

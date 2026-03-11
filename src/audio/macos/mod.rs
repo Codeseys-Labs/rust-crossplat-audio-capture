@@ -9,9 +9,6 @@ pub use coreaudio::{
     MacosAudioStream,
 };
 
-// Legacy backend exports (to be deprecated)
-pub use coreaudio::MacosAudioDevice as CoreAudioBackend;
-
 /// Device enumerator for macOS
 pub struct MacosDeviceEnumerator;
 
