@@ -20,9 +20,15 @@ default = ["feat_windows", "feat_linux", "feat_macos"]
 
 test-utils = [] # Feature to enable test utilities
 
+# Streaming/data-plane features
+async-stream = ["dep:atomic-waker"]  # Async Stream support (adds atomic-waker for async notification)
+sink-wav = []                        # WavFileSink sink adapter (hound is always available)
+
 [dependencies]
 # Core dependencies
 futures-core = "0.3.31"
+rtrb = "0.3"                                               # Lock-free SPSC ring buffer for audio data bridge
+atomic-waker = { version = "1", optional = true }           # Async waker for ring buffer notification (behind async-stream feature)
 futures-util = "0.3.31"                                    # For stream utilities
 futures-channel = "0.3.31"                                 # For MPSC channel for async stream
 thiserror = "2.0.16"                                       # For error handling
