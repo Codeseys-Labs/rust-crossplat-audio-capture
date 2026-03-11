@@ -24,7 +24,7 @@
 
 ## 2. Architecture Overview
 
-The architecture is documented in detail across four canonical documents:
+The architecture is documented in detail across four canonical documents, plus a comprehensive reference analysis:
 
 | Document | Purpose |
 |---|---|
@@ -32,6 +32,7 @@ The architecture is documented in detail across four canonical documents:
 | [API Design](docs/architecture/API_DESIGN.md) | Canonical public API surface |
 | [Error & Capability Design](docs/architecture/ERROR_CAPABILITY_DESIGN.md) | Error taxonomy + platform capabilities |
 | [Backend Contract](docs/architecture/BACKEND_CONTRACT.md) | Internal backend traits + module architecture |
+| [Reference Analysis](reference/REFERENCE_ANALYSIS.md) | Analysis of 10 reference repos mapped to rsac's architecture |
 
 ### Key Architecture Points
 
