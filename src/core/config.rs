@@ -255,3 +255,283 @@ pub enum AudioFileFormat {
     #[default]
     Wav,
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // ── DeviceId ─────────────────────────────────────────────────────
+
+    #[test]
+    fn device_id_construction_and_display() {
+        let id = DeviceId("hw:0,0".to_string());
+        assert_eq!(id.to_string(), "hw:0,0");
+    }
+
+    #[test]
+    fn device_id_clone_and_eq() {
+        let id = DeviceId("device-1".to_string());
+        let cloned = id.clone();
+        assert_eq!(id, cloned);
+    }
+
+    #[test]
+    fn device_id_inequality() {
+        let a = DeviceId("a".to_string());
+        let b = DeviceId("b".to_string());
+        assert_ne!(a, b);
+    }
+
+    #[test]
+    fn device_id_debug() {
+        let id = DeviceId("test".to_string());
+        let dbg = format!("{:?}", id);
+        assert!(dbg.contains("DeviceId"));
+        assert!(dbg.contains("test"));
+    }
+
+    // ── ApplicationId ────────────────────────────────────────────────
+
+    #[test]
+    fn application_id_construction_and_display() {
+        let id = ApplicationId("com.example.app".to_string());
+        assert_eq!(id.to_string(), "com.example.app");
+    }
+
+    #[test]
+    fn application_id_clone_and_eq() {
+        let id = ApplicationId("session-42".to_string());
+        let cloned = id.clone();
+        assert_eq!(id, cloned);
+    }
+
+    #[test]
+    fn application_id_debug() {
+        let id = ApplicationId("app".to_string());
+        let dbg = format!("{:?}", id);
+        assert!(dbg.contains("ApplicationId"));
+    }
+
+    // ── ProcessId ────────────────────────────────────────────────────
+
+    #[test]
+    fn process_id_construction_and_display() {
+        let pid = ProcessId(12345);
+        assert_eq!(pid.to_string(), "12345");
+    }
+
+    #[test]
+    fn process_id_clone_and_eq() {
+        let pid = ProcessId(42);
+        let cloned = pid.clone();
+        assert_eq!(pid, cloned);
+    }
+
+    #[test]
+    fn process_id_debug() {
+        let pid = ProcessId(1);
+        let dbg = format!("{:?}", pid);
+        assert!(dbg.contains("ProcessId"));
+        assert!(dbg.contains("1"));
+    }
+
+    // ── CaptureTarget ────────────────────────────────────────────────
+
+    #[test]
+    fn capture_target_default_is_system_default() {
+        assert_eq!(CaptureTarget::default(), CaptureTarget::SystemDefault);
+    }
+
+    #[test]
+    fn capture_target_all_variants_constructible() {
+        let _ = CaptureTarget::SystemDefault;
+        let _ = CaptureTarget::Device(DeviceId("d".to_string()));
+        let _ = CaptureTarget::Application(ApplicationId("a".to_string()));
+        let _ = CaptureTarget::ApplicationByName("Firefox".to_string());
+        let _ = CaptureTarget::ProcessTree(ProcessId(1));
+    }
+
+    #[test]
+    fn capture_target_clone() {
+        let target = CaptureTarget::Device(DeviceId("hw:1".to_string()));
+        let cloned = target.clone();
+        assert_eq!(target, cloned);
+    }
+
+    #[test]
+    fn capture_target_eq_same_variant() {
+        let a = CaptureTarget::ApplicationByName("Spotify".to_string());
+        let b = CaptureTarget::ApplicationByName("Spotify".to_string());
+        assert_eq!(a, b);
+    }
+
+    #[test]
+    fn capture_target_ne_different_variant() {
+        assert_ne!(
+            CaptureTarget::SystemDefault,
+            CaptureTarget::ProcessTree(ProcessId(1))
+        );
+    }
+
+    #[test]
+    fn capture_target_debug() {
+        let dbg = format!("{:?}", CaptureTarget::SystemDefault);
+        assert!(dbg.contains("SystemDefault"));
+    }
+
+    // ── SampleFormat ─────────────────────────────────────────────────
+
+    #[test]
+    fn sample_format_default_is_f32() {
+        assert_eq!(SampleFormat::default(), SampleFormat::F32);
+    }
+
+    #[test]
+    fn sample_format_bits_per_sample() {
+        assert_eq!(SampleFormat::I16.bits_per_sample(), 16);
+        assert_eq!(SampleFormat::I24.bits_per_sample(), 24);
+        assert_eq!(SampleFormat::I32.bits_per_sample(), 32);
+        assert_eq!(SampleFormat::F32.bits_per_sample(), 32);
+    }
+
+    #[test]
+    fn sample_format_copy() {
+        let fmt = SampleFormat::I16;
+        let copied = fmt; // Copy — not move
+        assert_eq!(fmt, copied);
+    }
+
+    #[test]
+    fn sample_format_all_variants_eq() {
+        assert_eq!(SampleFormat::I16, SampleFormat::I16);
+        assert_eq!(SampleFormat::I24, SampleFormat::I24);
+        assert_eq!(SampleFormat::I32, SampleFormat::I32);
+        assert_eq!(SampleFormat::F32, SampleFormat::F32);
+        assert_ne!(SampleFormat::I16, SampleFormat::F32);
+    }
+
+    // ── AudioFormat ──────────────────────────────────────────────────
+
+    #[test]
+    fn audio_format_default() {
+        let fmt = AudioFormat::default();
+        assert_eq!(fmt.sample_rate, 48000);
+        assert_eq!(fmt.channels, 2);
+        assert_eq!(fmt.sample_format, SampleFormat::F32);
+    }
+
+    #[test]
+    fn audio_format_custom_construction() {
+        let fmt = AudioFormat {
+            sample_rate: 44100,
+            channels: 1,
+            sample_format: SampleFormat::I16,
+        };
+        assert_eq!(fmt.sample_rate, 44100);
+        assert_eq!(fmt.channels, 1);
+        assert_eq!(fmt.sample_format, SampleFormat::I16);
+    }
+
+    #[test]
+    fn audio_format_clone_and_eq() {
+        let fmt = AudioFormat {
+            sample_rate: 96000,
+            channels: 8,
+            sample_format: SampleFormat::I32,
+        };
+        let cloned = fmt.clone();
+        assert_eq!(fmt, cloned);
+    }
+
+    // ── StreamConfig ─────────────────────────────────────────────────
+
+    #[test]
+    fn stream_config_default() {
+        let cfg = StreamConfig::default();
+        assert_eq!(cfg.sample_rate, 48000);
+        assert_eq!(cfg.channels, 2);
+        assert_eq!(cfg.sample_format, SampleFormat::F32);
+        assert_eq!(cfg.buffer_size, None);
+    }
+
+    #[test]
+    fn stream_config_to_audio_format() {
+        let cfg = StreamConfig {
+            sample_rate: 44100,
+            channels: 6,
+            sample_format: SampleFormat::I24,
+            buffer_size: Some(1024),
+        };
+        let fmt = cfg.to_audio_format();
+        assert_eq!(fmt.sample_rate, 44100);
+        assert_eq!(fmt.channels, 6);
+        assert_eq!(fmt.sample_format, SampleFormat::I24);
+    }
+
+    #[test]
+    fn stream_config_to_audio_format_default_roundtrip() {
+        let cfg = StreamConfig::default();
+        let fmt = cfg.to_audio_format();
+        assert_eq!(fmt, AudioFormat::default());
+    }
+
+    #[test]
+    fn stream_config_custom_with_buffer_size() {
+        let cfg = StreamConfig {
+            sample_rate: 22050,
+            channels: 1,
+            sample_format: SampleFormat::I16,
+            buffer_size: Some(512),
+        };
+        assert_eq!(cfg.buffer_size, Some(512));
+    }
+
+    // ── AudioCaptureConfig ───────────────────────────────────────────
+
+    #[test]
+    fn audio_capture_config_default() {
+        let cfg = AudioCaptureConfig::default();
+        assert_eq!(cfg.target, CaptureTarget::SystemDefault);
+        assert_eq!(cfg.stream_config, StreamConfig::default());
+    }
+
+    #[test]
+    fn audio_capture_config_custom() {
+        let cfg = AudioCaptureConfig {
+            target: CaptureTarget::ProcessTree(ProcessId(999)),
+            stream_config: StreamConfig {
+                sample_rate: 96000,
+                channels: 2,
+                sample_format: SampleFormat::F32,
+                buffer_size: Some(2048),
+            },
+        };
+        assert_eq!(cfg.target, CaptureTarget::ProcessTree(ProcessId(999)));
+        assert_eq!(cfg.stream_config.sample_rate, 96000);
+        assert_eq!(cfg.stream_config.buffer_size, Some(2048));
+    }
+
+    #[test]
+    fn audio_capture_config_clone_and_eq() {
+        let cfg = AudioCaptureConfig {
+            target: CaptureTarget::ApplicationByName("VLC".to_string()),
+            stream_config: StreamConfig::default(),
+        };
+        let cloned = cfg.clone();
+        assert_eq!(cfg, cloned);
+    }
+
+    // ── Edge cases ───────────────────────────────────────────────────
+
+    #[test]
+    fn device_id_empty_string() {
+        let id = DeviceId(String::new());
+        assert_eq!(id.to_string(), "");
+    }
+
+    #[test]
+    fn process_id_zero() {
+        let pid = ProcessId(0);
+        assert_eq!(pid.to_string(), "0");
+    }
+}

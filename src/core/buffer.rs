@@ -354,4 +354,130 @@ mod tests {
         assert_eq!(buf.num_frames(), 480);
         assert_eq!(buf.num_frames(), buf.samples_per_channel());
     }
+
+    // ── Additional tests ────────────────────────────────────────────
+
+    #[test]
+    fn from_interleaved_alias() {
+        let data = vec![1.0, 2.0, 3.0, 4.0];
+        let buf_new = AudioBuffer::new(data.clone(), 2, 48000);
+        let buf_alias = AudioBuffer::from_interleaved(data, 2, 48000);
+        assert_eq!(buf_new.data(), buf_alias.data());
+        assert_eq!(buf_new.channels(), buf_alias.channels());
+        assert_eq!(buf_new.sample_rate(), buf_alias.sample_rate());
+        assert_eq!(buf_new.format(), buf_alias.format());
+    }
+
+    #[test]
+    fn with_format_constructor() {
+        let fmt = AudioFormat {
+            sample_rate: 96000,
+            channels: 6,
+            sample_format: SampleFormat::I32,
+        };
+        let buf = AudioBuffer::with_format(vec![0.0; 12], fmt.clone());
+        assert_eq!(buf.format(), &fmt);
+        assert_eq!(buf.channels(), 6);
+        assert_eq!(buf.sample_rate(), 96000);
+        assert!(buf.timestamp().is_none());
+    }
+
+    #[test]
+    fn interleaved_returns_data_ref() {
+        let buf = AudioBuffer::new(vec![1.0, 2.0, 3.0], 1, 44100);
+        assert_eq!(
+            buf.interleaved() as *const [f32],
+            buf.data() as *const [f32],
+        );
+    }
+
+    #[test]
+    fn as_slice_returns_data_ref() {
+        let buf = AudioBuffer::new(vec![5.0, 6.0], 1, 44100);
+        assert_eq!(buf.as_slice() as *const [f32], buf.data() as *const [f32],);
+    }
+
+    #[test]
+    fn as_mut_slice_allows_modification() {
+        let mut buf = AudioBuffer::new(vec![1.0, 2.0, 3.0, 4.0], 2, 48000);
+        let slice = buf.as_mut_slice();
+        slice[0] = 10.0;
+        slice[3] = 40.0;
+        assert_eq!(buf.data()[0], 10.0);
+        assert_eq!(buf.data()[3], 40.0);
+        assert_eq!(buf.data()[1], 2.0);
+    }
+
+    #[test]
+    fn format_accessor() {
+        let fmt = AudioFormat {
+            sample_rate: 22050,
+            channels: 1,
+            sample_format: SampleFormat::I16,
+        };
+        let buf = AudioBuffer::with_format(vec![0.0; 100], fmt.clone());
+        assert_eq!(*buf.format(), fmt);
+    }
+
+    #[test]
+    fn zero_channels_samples_per_channel() {
+        let buf = AudioBuffer::new(vec![1.0, 2.0, 3.0], 0, 48000);
+        assert_eq!(buf.samples_per_channel(), 0);
+    }
+
+    #[test]
+    fn zero_sample_rate_duration() {
+        let buf = AudioBuffer::new(vec![0.0; 100], 1, 0);
+        assert_eq!(buf.duration(), Duration::ZERO);
+    }
+
+    #[test]
+    fn channel_data_zero_channels() {
+        let buf = AudioBuffer::new(vec![1.0, 2.0], 0, 48000);
+        assert_eq!(buf.channel_data(0), None);
+    }
+
+    #[test]
+    fn send_sync_traits() {
+        fn assert_send_sync<T: Send + Sync>() {}
+        assert_send_sync::<AudioBuffer>();
+    }
+
+    #[test]
+    fn clone_produces_independent_copy() {
+        let original = AudioBuffer::new(vec![1.0, 2.0, 3.0, 4.0], 2, 48000);
+        let mut cloned = original.clone();
+        cloned.as_mut_slice()[0] = 99.0;
+        assert_eq!(original.data()[0], 1.0);
+        assert_eq!(cloned.data()[0], 99.0);
+    }
+
+    #[test]
+    fn large_buffer_duration() {
+        // 10 seconds of 48 kHz stereo audio
+        let num_samples = 48000 * 2 * 10;
+        let buf = AudioBuffer::new(vec![0.0; num_samples], 2, 48000);
+        assert_eq!(buf.duration(), Duration::from_secs(10));
+        assert_eq!(buf.samples_per_channel(), 480000);
+        assert_eq!(buf.num_frames(), 480000);
+    }
+
+    #[test]
+    fn mono_buffer_operations() {
+        let buf = AudioBuffer::new(vec![0.1, 0.2, 0.3, 0.4, 0.5], 1, 44100);
+        assert_eq!(buf.channels(), 1);
+        assert_eq!(buf.samples_per_channel(), 5);
+        let ch0 = buf.channel_data(0).expect("channel 0 should exist");
+        assert_eq!(ch0, vec![0.1, 0.2, 0.3, 0.4, 0.5]);
+        assert_eq!(buf.channel_data(1), None);
+    }
+
+    #[test]
+    fn timestamp_none_by_default() {
+        let buf_new = AudioBuffer::new(vec![1.0], 1, 48000);
+        assert!(buf_new.timestamp().is_none());
+
+        let buf_empty = AudioBuffer::empty(2, 44100);
+        assert!(buf_empty.timestamp().is_none());
+    }
 }

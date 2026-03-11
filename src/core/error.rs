@@ -429,3 +429,670 @@ pub enum ProcessError {
     #[error("Audio processing failed")]
     Failed,
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::io;
+    use std::time::Duration;
+
+    // ── Helper: construct every variant ──────────────────────────────
+
+    fn make_all_variants() -> Vec<AudioError> {
+        vec![
+            AudioError::InvalidParameter {
+                param: "rate".into(),
+                reason: "too high".into(),
+            },
+            AudioError::UnsupportedFormat {
+                format: "PCM-64".into(),
+                context: None,
+            },
+            AudioError::ConfigurationError {
+                message: "bad config".into(),
+            },
+            AudioError::DeviceNotFound {
+                device_id: "hw:0".into(),
+            },
+            AudioError::DeviceNotAvailable {
+                device_id: "hw:1".into(),
+                reason: "in use".into(),
+            },
+            AudioError::DeviceEnumerationError {
+                reason: "no perms".into(),
+                context: None,
+            },
+            AudioError::StreamCreationFailed {
+                reason: "format mismatch".into(),
+                context: None,
+            },
+            AudioError::StreamStartFailed {
+                reason: "busy".into(),
+            },
+            AudioError::StreamStopFailed {
+                reason: "already stopped".into(),
+            },
+            AudioError::StreamReadError {
+                reason: "timeout".into(),
+            },
+            AudioError::BufferOverrun { dropped_frames: 42 },
+            AudioError::BufferUnderrun {
+                requested: 1024,
+                available: 256,
+            },
+            AudioError::BackendError {
+                backend: "WASAPI".into(),
+                operation: "init".into(),
+                message: "fail".into(),
+                context: None,
+            },
+            AudioError::BackendNotAvailable {
+                backend: "CoreAudio".into(),
+            },
+            AudioError::BackendInitializationFailed {
+                backend: "PipeWire".into(),
+                reason: "daemon down".into(),
+            },
+            AudioError::ApplicationNotFound {
+                identifier: "com.app".into(),
+            },
+            AudioError::ApplicationCaptureFailed {
+                app_id: "app-1".into(),
+                reason: "denied".into(),
+            },
+            AudioError::PlatformNotSupported {
+                feature: "process-tap".into(),
+                platform: "linux".into(),
+            },
+            AudioError::PermissionDenied {
+                operation: "capture".into(),
+                details: Some("need root".into()),
+            },
+            AudioError::InternalError {
+                message: "boom".into(),
+                source: None,
+            },
+            AudioError::Timeout {
+                operation: "connect".into(),
+                duration: Duration::from_secs(5),
+            },
+        ]
+    }
+
+    // ── Construction ─────────────────────────────────────────────────
+
+    #[test]
+    fn all_21_variants_constructible() {
+        let variants = make_all_variants();
+        assert_eq!(variants.len(), 21, "Must have exactly 21 variants");
+    }
+
+    // ── ErrorKind: Configuration ─────────────────────────────────────
+
+    #[test]
+    fn kind_configuration_variants() {
+        assert_eq!(
+            AudioError::InvalidParameter {
+                param: "x".into(),
+                reason: "y".into()
+            }
+            .kind(),
+            ErrorKind::Configuration
+        );
+        assert_eq!(
+            AudioError::UnsupportedFormat {
+                format: "x".into(),
+                context: None
+            }
+            .kind(),
+            ErrorKind::Configuration
+        );
+        assert_eq!(
+            AudioError::ConfigurationError {
+                message: "x".into()
+            }
+            .kind(),
+            ErrorKind::Configuration
+        );
+    }
+
+    // ── ErrorKind: Device ────────────────────────────────────────────
+
+    #[test]
+    fn kind_device_variants() {
+        assert_eq!(
+            AudioError::DeviceNotFound {
+                device_id: "x".into()
+            }
+            .kind(),
+            ErrorKind::Device
+        );
+        assert_eq!(
+            AudioError::DeviceNotAvailable {
+                device_id: "x".into(),
+                reason: "y".into()
+            }
+            .kind(),
+            ErrorKind::Device
+        );
+        assert_eq!(
+            AudioError::DeviceEnumerationError {
+                reason: "x".into(),
+                context: None
+            }
+            .kind(),
+            ErrorKind::Device
+        );
+    }
+
+    // ── ErrorKind: Stream ────────────────────────────────────────────
+
+    #[test]
+    fn kind_stream_variants() {
+        assert_eq!(
+            AudioError::StreamCreationFailed {
+                reason: "x".into(),
+                context: None
+            }
+            .kind(),
+            ErrorKind::Stream
+        );
+        assert_eq!(
+            AudioError::StreamStartFailed { reason: "x".into() }.kind(),
+            ErrorKind::Stream
+        );
+        assert_eq!(
+            AudioError::StreamStopFailed { reason: "x".into() }.kind(),
+            ErrorKind::Stream
+        );
+        assert_eq!(
+            AudioError::StreamReadError { reason: "x".into() }.kind(),
+            ErrorKind::Stream
+        );
+        assert_eq!(
+            AudioError::BufferOverrun { dropped_frames: 0 }.kind(),
+            ErrorKind::Stream
+        );
+        assert_eq!(
+            AudioError::BufferUnderrun {
+                requested: 0,
+                available: 0
+            }
+            .kind(),
+            ErrorKind::Stream
+        );
+    }
+
+    // ── ErrorKind: Backend ───────────────────────────────────────────
+
+    #[test]
+    fn kind_backend_variants() {
+        assert_eq!(
+            AudioError::BackendError {
+                backend: "x".into(),
+                operation: "y".into(),
+                message: "z".into(),
+                context: None
+            }
+            .kind(),
+            ErrorKind::Backend
+        );
+        assert_eq!(
+            AudioError::BackendNotAvailable {
+                backend: "x".into()
+            }
+            .kind(),
+            ErrorKind::Backend
+        );
+        assert_eq!(
+            AudioError::BackendInitializationFailed {
+                backend: "x".into(),
+                reason: "y".into()
+            }
+            .kind(),
+            ErrorKind::Backend
+        );
+    }
+
+    // ── ErrorKind: Application ───────────────────────────────────────
+
+    #[test]
+    fn kind_application_variants() {
+        assert_eq!(
+            AudioError::ApplicationNotFound {
+                identifier: "x".into()
+            }
+            .kind(),
+            ErrorKind::Application
+        );
+        assert_eq!(
+            AudioError::ApplicationCaptureFailed {
+                app_id: "x".into(),
+                reason: "y".into()
+            }
+            .kind(),
+            ErrorKind::Application
+        );
+    }
+
+    // ── ErrorKind: Platform ──────────────────────────────────────────
+
+    #[test]
+    fn kind_platform_variants() {
+        assert_eq!(
+            AudioError::PlatformNotSupported {
+                feature: "x".into(),
+                platform: "y".into()
+            }
+            .kind(),
+            ErrorKind::Platform
+        );
+        assert_eq!(
+            AudioError::PermissionDenied {
+                operation: "x".into(),
+                details: None
+            }
+            .kind(),
+            ErrorKind::Platform
+        );
+    }
+
+    // ── ErrorKind: Internal ──────────────────────────────────────────
+
+    #[test]
+    fn kind_internal_variants() {
+        assert_eq!(
+            AudioError::InternalError {
+                message: "x".into(),
+                source: None
+            }
+            .kind(),
+            ErrorKind::Internal
+        );
+        assert_eq!(
+            AudioError::Timeout {
+                operation: "x".into(),
+                duration: Duration::from_millis(1)
+            }
+            .kind(),
+            ErrorKind::Internal
+        );
+    }
+
+    // ── Recoverability classification ────────────────────────────────
+
+    #[test]
+    fn recoverability_recoverable_variants() {
+        assert_eq!(
+            AudioError::StreamReadError { reason: "x".into() }.recoverability(),
+            Recoverability::Recoverable
+        );
+        assert_eq!(
+            AudioError::BufferOverrun { dropped_frames: 1 }.recoverability(),
+            Recoverability::Recoverable
+        );
+        assert_eq!(
+            AudioError::BufferUnderrun {
+                requested: 1,
+                available: 0
+            }
+            .recoverability(),
+            Recoverability::Recoverable
+        );
+    }
+
+    #[test]
+    fn recoverability_transient_retry_variants() {
+        assert_eq!(
+            AudioError::DeviceNotAvailable {
+                device_id: "x".into(),
+                reason: "y".into()
+            }
+            .recoverability(),
+            Recoverability::TransientRetry
+        );
+        assert_eq!(
+            AudioError::Timeout {
+                operation: "x".into(),
+                duration: Duration::from_secs(1)
+            }
+            .recoverability(),
+            Recoverability::TransientRetry
+        );
+        assert_eq!(
+            AudioError::BackendError {
+                backend: "x".into(),
+                operation: "y".into(),
+                message: "z".into(),
+                context: None
+            }
+            .recoverability(),
+            Recoverability::TransientRetry
+        );
+    }
+
+    #[test]
+    fn recoverability_fatal_variants() {
+        // Test a representative set of fatal variants
+        let fatal_errors: Vec<AudioError> = vec![
+            AudioError::InvalidParameter {
+                param: "x".into(),
+                reason: "y".into(),
+            },
+            AudioError::UnsupportedFormat {
+                format: "x".into(),
+                context: None,
+            },
+            AudioError::ConfigurationError {
+                message: "x".into(),
+            },
+            AudioError::DeviceNotFound {
+                device_id: "x".into(),
+            },
+            AudioError::DeviceEnumerationError {
+                reason: "x".into(),
+                context: None,
+            },
+            AudioError::StreamCreationFailed {
+                reason: "x".into(),
+                context: None,
+            },
+            AudioError::StreamStartFailed { reason: "x".into() },
+            AudioError::StreamStopFailed { reason: "x".into() },
+            AudioError::BackendNotAvailable {
+                backend: "x".into(),
+            },
+            AudioError::BackendInitializationFailed {
+                backend: "x".into(),
+                reason: "y".into(),
+            },
+            AudioError::ApplicationNotFound {
+                identifier: "x".into(),
+            },
+            AudioError::ApplicationCaptureFailed {
+                app_id: "x".into(),
+                reason: "y".into(),
+            },
+            AudioError::PlatformNotSupported {
+                feature: "x".into(),
+                platform: "y".into(),
+            },
+            AudioError::PermissionDenied {
+                operation: "x".into(),
+                details: None,
+            },
+            AudioError::InternalError {
+                message: "x".into(),
+                source: None,
+            },
+        ];
+        for err in &fatal_errors {
+            assert_eq!(
+                err.recoverability(),
+                Recoverability::Fatal,
+                "Expected Fatal for {:?}",
+                err
+            );
+        }
+    }
+
+    // ── is_recoverable / is_fatal ────────────────────────────────────
+
+    #[test]
+    fn is_recoverable_true_for_recoverable_and_transient() {
+        // Recoverable
+        assert!(AudioError::BufferOverrun { dropped_frames: 1 }.is_recoverable());
+        assert!(AudioError::BufferUnderrun {
+            requested: 1,
+            available: 0
+        }
+        .is_recoverable());
+        assert!(AudioError::StreamReadError { reason: "x".into() }.is_recoverable());
+        // TransientRetry
+        assert!(AudioError::DeviceNotAvailable {
+            device_id: "x".into(),
+            reason: "y".into()
+        }
+        .is_recoverable());
+        assert!(AudioError::Timeout {
+            operation: "x".into(),
+            duration: Duration::from_secs(1)
+        }
+        .is_recoverable());
+        assert!(AudioError::BackendError {
+            backend: "x".into(),
+            operation: "y".into(),
+            message: "z".into(),
+            context: None
+        }
+        .is_recoverable());
+    }
+
+    #[test]
+    fn is_fatal_true_for_fatal_variants() {
+        assert!(AudioError::InvalidParameter {
+            param: "x".into(),
+            reason: "y".into()
+        }
+        .is_fatal());
+        assert!(AudioError::DeviceNotFound {
+            device_id: "x".into()
+        }
+        .is_fatal());
+        assert!(AudioError::PlatformNotSupported {
+            feature: "x".into(),
+            platform: "y".into()
+        }
+        .is_fatal());
+        assert!(AudioError::InternalError {
+            message: "x".into(),
+            source: None
+        }
+        .is_fatal());
+    }
+
+    #[test]
+    fn is_fatal_false_for_recoverable() {
+        assert!(!AudioError::BufferOverrun { dropped_frames: 1 }.is_fatal());
+        assert!(!AudioError::DeviceNotAvailable {
+            device_id: "x".into(),
+            reason: "y".into()
+        }
+        .is_fatal());
+    }
+
+    // ── Display output ───────────────────────────────────────────────
+
+    #[test]
+    fn display_invalid_parameter() {
+        let msg = AudioError::InvalidParameter {
+            param: "rate".into(),
+            reason: "negative".into(),
+        }
+        .to_string();
+        assert!(msg.contains("rate"));
+        assert!(msg.contains("negative"));
+    }
+
+    #[test]
+    fn display_buffer_overrun() {
+        let msg = AudioError::BufferOverrun { dropped_frames: 42 }.to_string();
+        assert!(msg.contains("42"));
+        assert!(msg.contains("overrun"));
+    }
+
+    #[test]
+    fn display_buffer_underrun() {
+        let msg = AudioError::BufferUnderrun {
+            requested: 1024,
+            available: 256,
+        }
+        .to_string();
+        assert!(msg.contains("1024"));
+        assert!(msg.contains("256"));
+    }
+
+    #[test]
+    fn display_timeout() {
+        let msg = AudioError::Timeout {
+            operation: "connect".into(),
+            duration: Duration::from_secs(5),
+        }
+        .to_string();
+        assert!(msg.contains("connect"));
+        assert!(msg.contains("5"));
+    }
+
+    #[test]
+    fn display_permission_denied_with_details() {
+        let msg = AudioError::PermissionDenied {
+            operation: "capture".into(),
+            details: Some("need root".into()),
+        }
+        .to_string();
+        assert!(msg.contains("capture"));
+        assert!(msg.contains("need root"));
+    }
+
+    #[test]
+    fn display_permission_denied_without_details() {
+        let msg = AudioError::PermissionDenied {
+            operation: "record".into(),
+            details: None,
+        }
+        .to_string();
+        assert!(msg.contains("record"));
+        assert!(!msg.contains("None"));
+    }
+
+    // ── From impls ───────────────────────────────────────────────────
+
+    #[test]
+    fn from_io_error() {
+        let io_err = io::Error::new(io::ErrorKind::NotFound, "file missing");
+        let audio_err: AudioError = io_err.into();
+        assert_eq!(audio_err.kind(), ErrorKind::Internal);
+        let msg = audio_err.to_string();
+        assert!(msg.contains("I/O error"));
+        assert!(msg.contains("file missing"));
+    }
+
+    #[test]
+    fn from_string() {
+        let audio_err: AudioError = "something broke".to_string().into();
+        assert_eq!(audio_err.kind(), ErrorKind::Internal);
+        assert!(audio_err.to_string().contains("something broke"));
+    }
+
+    #[test]
+    fn from_str() {
+        let audio_err: AudioError = "literal error".into();
+        assert_eq!(audio_err.kind(), ErrorKind::Internal);
+        assert!(audio_err.to_string().contains("literal error"));
+    }
+
+    // ── std::error::Error::source() ──────────────────────────────────
+
+    #[test]
+    fn source_some_for_internal_with_source() {
+        let io_err = io::Error::new(io::ErrorKind::Other, "root cause");
+        let audio_err: AudioError = io_err.into();
+        let src = std::error::Error::source(&audio_err);
+        assert!(
+            src.is_some(),
+            "InternalError from io::Error should have a source"
+        );
+    }
+
+    #[test]
+    fn source_none_for_internal_without_source() {
+        let audio_err = AudioError::InternalError {
+            message: "no source".into(),
+            source: None,
+        };
+        assert!(std::error::Error::source(&audio_err).is_none());
+    }
+
+    #[test]
+    fn source_none_for_non_internal() {
+        let err = AudioError::DeviceNotFound {
+            device_id: "x".into(),
+        };
+        assert!(std::error::Error::source(&err).is_none());
+    }
+
+    // ── ErrorKind Display ────────────────────────────────────────────
+
+    #[test]
+    fn error_kind_display_all_variants() {
+        assert_eq!(ErrorKind::Configuration.to_string(), "Configuration");
+        assert_eq!(ErrorKind::Device.to_string(), "Device");
+        assert_eq!(ErrorKind::Stream.to_string(), "Stream");
+        assert_eq!(ErrorKind::Backend.to_string(), "Backend");
+        assert_eq!(ErrorKind::Application.to_string(), "Application");
+        assert_eq!(ErrorKind::Platform.to_string(), "Platform");
+        assert_eq!(ErrorKind::Internal.to_string(), "Internal");
+    }
+
+    // ── Recoverability Display ───────────────────────────────────────
+
+    #[test]
+    fn recoverability_display_all_variants() {
+        assert_eq!(Recoverability::Recoverable.to_string(), "Recoverable");
+        assert_eq!(Recoverability::TransientRetry.to_string(), "TransientRetry");
+        assert_eq!(Recoverability::Fatal.to_string(), "Fatal");
+    }
+
+    // ── BackendContext Display ────────────────────────────────────────
+
+    #[test]
+    fn backend_context_display_name_only() {
+        let ctx = BackendContext {
+            backend_name: "PipeWire".into(),
+            os_error_code: None,
+            os_error_message: None,
+        };
+        assert_eq!(ctx.to_string(), "[PipeWire]");
+    }
+
+    #[test]
+    fn backend_context_display_with_code() {
+        let ctx = BackendContext {
+            backend_name: "WASAPI".into(),
+            os_error_code: Some(-2004287478),
+            os_error_message: None,
+        };
+        let s = ctx.to_string();
+        assert!(s.contains("[WASAPI]"));
+        assert!(s.contains("os_error=-2004287478"));
+    }
+
+    #[test]
+    fn backend_context_display_full() {
+        let ctx = BackendContext {
+            backend_name: "CoreAudio".into(),
+            os_error_code: Some(560227702),
+            os_error_message: Some("format not supported".into()),
+        };
+        let s = ctx.to_string();
+        assert!(s.contains("[CoreAudio]"));
+        assert!(s.contains("os_error=560227702"));
+        assert!(s.contains("format not supported"));
+    }
+
+    // ── AudioResult alias ────────────────────────────────────────────
+
+    #[test]
+    fn audio_result_ok() {
+        let r: AudioResult<i32> = Ok(42);
+        assert_eq!(r.unwrap(), 42);
+    }
+
+    #[test]
+    fn audio_result_err() {
+        let r: AudioResult<i32> = Err(AudioError::ConfigurationError {
+            message: "oops".into(),
+        });
+        assert!(r.is_err());
+    }
+}

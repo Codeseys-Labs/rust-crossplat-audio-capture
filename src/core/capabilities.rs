@@ -218,4 +218,105 @@ mod tests {
         let caps = PlatformCapabilities::query();
         assert!(!caps.supports_channels(0));
     }
+
+    // ── Additional tests ────────────────────────────────────────────
+
+    #[test]
+    fn backend_name_is_pipewire_on_linux() {
+        let caps = PlatformCapabilities::query();
+        assert_eq!(caps.backend_name, "PipeWire");
+    }
+
+    #[test]
+    fn supports_i16_format() {
+        let caps = PlatformCapabilities::query();
+        assert!(caps.supports_format(SampleFormat::I16));
+    }
+
+    #[test]
+    fn supports_i32_format() {
+        let caps = PlatformCapabilities::query();
+        assert!(caps.supports_format(SampleFormat::I32));
+    }
+
+    #[test]
+    fn does_not_support_i24_on_linux() {
+        let caps = PlatformCapabilities::query();
+        assert!(!caps.supports_format(SampleFormat::I24));
+    }
+
+    #[test]
+    fn supports_sample_rate_at_boundaries() {
+        let caps = PlatformCapabilities::query();
+        assert!(
+            caps.supports_sample_rate(8000),
+            "min boundary 8000 should be supported"
+        );
+        assert!(
+            caps.supports_sample_rate(384000),
+            "max boundary 384000 should be supported"
+        );
+    }
+
+    #[test]
+    fn does_not_support_sample_rate_above_max() {
+        let caps = PlatformCapabilities::query();
+        assert!(!caps.supports_sample_rate(384001));
+    }
+
+    #[test]
+    fn supports_channels_max_boundary() {
+        let caps = PlatformCapabilities::query();
+        assert!(caps.supports_channels(32));
+    }
+
+    #[test]
+    fn does_not_support_channels_above_max() {
+        let caps = PlatformCapabilities::query();
+        assert!(!caps.supports_channels(33));
+    }
+
+    #[test]
+    fn query_system_capture_supported() {
+        let caps = PlatformCapabilities::query();
+        assert!(caps.supports_system_capture);
+    }
+
+    #[test]
+    fn query_application_capture_supported() {
+        let caps = PlatformCapabilities::query();
+        assert!(caps.supports_application_capture);
+    }
+
+    #[test]
+    fn query_process_tree_not_supported() {
+        let caps = PlatformCapabilities::query();
+        assert!(!caps.supports_process_tree_capture);
+    }
+
+    #[test]
+    fn clone_capabilities() {
+        let caps = PlatformCapabilities::query();
+        let cloned = caps.clone();
+        assert_eq!(caps.backend_name, cloned.backend_name);
+        assert_eq!(caps.supports_system_capture, cloned.supports_system_capture);
+        assert_eq!(
+            caps.supports_application_capture,
+            cloned.supports_application_capture
+        );
+        assert_eq!(
+            caps.supports_process_tree_capture,
+            cloned.supports_process_tree_capture
+        );
+        assert_eq!(
+            caps.supports_device_selection,
+            cloned.supports_device_selection
+        );
+        assert_eq!(
+            caps.supported_sample_formats,
+            cloned.supported_sample_formats
+        );
+        assert_eq!(caps.sample_rate_range, cloned.sample_rate_range);
+        assert_eq!(caps.max_channels, cloned.max_channels);
+    }
 }
