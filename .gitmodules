@@ -1,0 +1,30 @@
+[submodule "reference/wasapi-rs"]
+	path = reference/wasapi-rs
+	url = https://github.com/HEnquist/wasapi-rs
+[submodule "reference/wiremix"]
+	path = reference/wiremix
+	url = https://github.com/tsowell/wiremix
+[submodule "reference/AudioCap"]
+	path = reference/AudioCap
+	url = https://github.com/insidegui/AudioCap
+[submodule "reference/cpal"]
+	path = reference/cpal
+	url = https://github.com/RustAudio/cpal
+[submodule "reference/pipewire-rs"]
+	path = reference/pipewire-rs
+	url = https://gitlab.freedesktop.org/pipewire/pipewire-rs
+[submodule "reference/camilladsp"]
+	path = reference/camilladsp
+	url = https://github.com/HEnquist/camilladsp
+[submodule "reference/obs-pipewire-audio-capture"]
+	path = reference/obs-pipewire-audio-capture
+	url = https://github.com/dimtpap/obs-pipewire-audio-capture
+[submodule "reference/audio-rec"]
+	path = reference/audio-rec
+	url = https://github.com/DSRCorporation/audio-rec
+[submodule "reference/screencapturekit-rs"]
+	path = reference/screencapturekit-rs
+	url = https://github.com/doom-fish/screencapturekit-rs
+[submodule "reference/rtrb"]
+	path = reference/rtrb
+	url = https://github.com/mgeier/rtrb
