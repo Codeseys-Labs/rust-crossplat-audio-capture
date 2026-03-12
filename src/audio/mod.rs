@@ -17,25 +17,12 @@ pub mod macos;
 #[cfg(all(target_os = "windows", feature = "feat_windows"))]
 pub mod windows;
 
-// Application-specific capture module
-pub mod application_capture;
-
-// Audio source discovery module
-pub mod discovery;
-
 // Deprecated/Old API components - to be removed or refactored
 mod capture; // Keep for now if ProcessAudioCapture is still used
 #[cfg(target_os = "windows")]
 pub use capture::{AudioCaptureError, ProcessAudioCapture};
 
 // --- New Trait-Based API Exports ---
-
-// Re-export the unified application capture API
-pub use application_capture::{
-    capture_application_by_name, capture_application_by_pid, list_capturable_applications,
-    ApplicationCapture, ApplicationCaptureFactory, ApplicationInfo,
-    CrossPlatformApplicationCapture,
-};
 
 // Re-export platform-specific DeviceEnumerators
 #[cfg(all(target_os = "linux", feature = "feat_linux"))]

@@ -332,10 +332,10 @@ fn pw_thread_main(
     init_tx: std_mpsc::Sender<AudioResult<()>>,
     is_running: Arc<AtomicBool>,
 ) {
-    use pipewire::context::Context;
-    use pipewire::main_loop::MainLoop;
+    use pipewire::context::ContextBox;
+    use pipewire::main_loop::MainLoopBox;
     use pipewire::properties::properties;
-    use pipewire::stream::{Stream, StreamFlags, StreamListener};
+    use pipewire::stream::{StreamBox, StreamFlags, StreamListener};
 
     use libspa::param::audio::{AudioFormat as SpaAudioFormat, AudioInfoRaw};
     use libspa::param::format::{MediaSubtype, MediaType};
@@ -346,7 +346,7 @@ fn pw_thread_main(
     pipewire::init();
 
     // Step 2: Create the MainLoop (non-threaded — we drive it manually via iterate()).
-    let main_loop = match MainLoop::new(None) {
+    let main_loop = match MainLoopBox::new(None) {
         Ok(ml) => ml,
         Err(e) => {
             let _ = init_tx.send(Err(AudioError::BackendInitializationFailed {
@@ -359,7 +359,7 @@ fn pw_thread_main(
     };
 
     // Step 3: Create Context and connect to the PipeWire daemon.
-    let context = match Context::new(&main_loop) {
+    let context = match ContextBox::new(&main_loop.loop_(), None) {
         Ok(ctx) => ctx,
         Err(e) => {
             let _ = init_tx.send(Err(AudioError::BackendInitializationFailed {
@@ -408,7 +408,7 @@ fn pw_thread_main(
     // The stream must outlive its listener (the listener registers C callbacks
     // against the stream's raw pointer). We enforce this by dropping the
     // listener before the stream in all cleanup paths.
-    let mut capture_stream: Option<Stream> = None;
+    let mut capture_stream: Option<StreamBox> = None;
     let mut capture_listener: Option<StreamListener<CaptureStreamData>> = None;
 
     loop {
@@ -488,7 +488,7 @@ fn pw_thread_main(
 
                 // ── Create the PipeWire stream ──
 
-                let stream = match Stream::new(&core, "rsac-capture", props) {
+                let stream = match StreamBox::new(&core, "rsac-capture", props) {
                     Ok(s) => s,
                     Err(e) => {
                         let _ = response_tx.send(Err(AudioError::BackendError {

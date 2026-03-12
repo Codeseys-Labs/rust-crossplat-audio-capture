@@ -1,12 +1,7 @@
 //! Linux audio implementation using PipeWire
 
-pub mod pipewire;
-
 #[cfg(feature = "pipewire")]
 pub(crate) mod thread;
-
-// Re-export for convenience
-pub use pipewire::{ApplicationSelector, PipeWireApplicationCapture};
 
 pub struct LinuxDeviceEnumerator;
 

@@ -35,9 +35,9 @@ fn main() {
     println!("Duration: {} seconds", args.duration);
     println!("Output directory: {}", args.output_dir.display());
 
-    // Initialize the library
-    if let Err(e) = rsac::init() {
-        eprintln!("Failed to initialize library: {}", e);
+    // Initialize error reporting
+    if let Err(e) = color_eyre::install() {
+        eprintln!("Failed to initialize error reporting: {}", e);
         exit(1);
     }
 

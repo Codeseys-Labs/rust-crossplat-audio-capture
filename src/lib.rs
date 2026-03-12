@@ -32,14 +32,3 @@ pub use crate::sink::WavFileSink;
 // Re-export test utils if the feature is enabled
 #[cfg(feature = "test-utils")]
 pub use utils::test_utils;
-
-/// Error type for the library
-pub type Error = color_eyre::Report;
-/// Result type for the library
-pub type Result<T> = std::result::Result<T, Error>;
-
-/// Initialize the library
-pub fn init() -> Result<()> {
-    color_eyre::install()?;
-    Ok(())
-}
