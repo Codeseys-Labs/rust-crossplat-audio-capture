@@ -1,3 +1,12 @@
+//! **DEPRECATED**: This binary uses the old rsac API (PipeWireApplicationCapture,
+//! ApplicationSelector, AudioSourceDiscovery, ApplicationCapture, ApplicationCaptureFactory).
+//! It needs to be rewritten to use the new AudioCaptureBuilder → AudioCapture → CapturingStream
+//! pipeline.
+//!
+//! This binary is disabled in Cargo.toml. To re-enable, add its [[bin]] entry back.
+//!
+//! ---
+//!
 //! Dynamic VLC Audio Capture Test
 //!
 //! This binary discovers running VLC applications dynamically and captures their audio.

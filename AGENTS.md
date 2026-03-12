@@ -10,9 +10,9 @@
 | Field | Value |
 |---|---|
 | **Name** | `rsac` (Rust Cross-Platform Audio Capture) |
-| **Type** | Rust library with sample CLI/TUI demo applications |
+| **Type** | Rust library with sample CLI demo application |
 | **Primary deliverable** | Library crate (`rsac`) |
-| **Secondary deliverables** | Sample CLI and TUI demo applications |
+| **Secondary deliverables** | CLI demo app (`rsac` binary) + example programs |
 | **Platforms** | Windows (WASAPI), Linux (PipeWire), macOS (CoreAudio Process Tap) |
 | **Priority order** | **Correctness → UX → Breadth** |
 
@@ -34,16 +34,18 @@ The architecture is documented in detail across four canonical documents, plus a
 | [Backend Contract](docs/architecture/BACKEND_CONTRACT.md) | Internal backend traits + module architecture |
 | [Reference Analysis](reference/REFERENCE_ANALYSIS.md) | Analysis of 10 reference repos mapped to rsac's architecture |
 
-### Key Architecture Points
+### Key Architecture Points (Implemented)
 
-- **Canonical API**: New builder/trait API flow:
+- **Canonical API**: Builder/trait API flow — fully implemented:
   ```
   AudioCaptureBuilder → AudioCapture → CapturingStream
   ```
-- **Streaming-first**: The core abstraction is `CapturingStream::read_chunk() → AudioBuffer`. File writing is implemented as a sink adapter, not a primary concern.
-- **Ring buffer bridge**: OS audio callbacks push data into an `rtrb` SPSC lock-free ring buffer; consumer threads pull data out via `CapturingStream`.
-- **`BridgeStream<S>`**: Universal `CapturingStream` implementation that eliminates per-platform duplication of the ring-buffer-to-consumer pattern.
-- **`CaptureTarget` enum**: Unified target model covering all capture modes:
+- **Streaming-first**: The core abstraction is `CapturingStream::read_chunk() → AudioBuffer`. File writing is implemented as a sink adapter ([`src/sink/`](src/sink/mod.rs)), not a primary concern.
+- **Ring buffer bridge**: OS audio callbacks push data into an `rtrb` SPSC lock-free ring buffer; consumer threads pull data out via `BridgeStream`. Implemented in [`src/bridge/`](src/bridge/mod.rs).
+- **[`BridgeStream<S>`](src/bridge/stream.rs)**: Universal `CapturingStream` implementation used by **all three backends** (WASAPI, PipeWire, CoreAudio). Eliminates per-platform duplication of the ring-buffer-to-consumer pattern.
+- **[`PlatformStream`](src/bridge/stream.rs:47) trait**: Internal backend contract. Each platform implements `stop_capture()` and `is_active()`. The rest (ring buffer, state, reads) is handled by `BridgeStream`.
+- **[`AtomicStreamState`](src/bridge/state.rs)**: Lock-free state machine for stream lifecycle: `Created → Running → Stopping → Stopped → Closed`.
+- **[`CaptureTarget`](src/core/config.rs) enum**: Unified target model covering all capture modes:
   ```rust
   enum CaptureTarget {
       SystemDefault,
@@ -54,38 +56,56 @@ The architecture is documented in detail across four canonical documents, plus a
   }
   ```
 - **Error model**: 21 categorized error variants with three-state recoverability (`Recoverable`, `TransientRetry`, `Fatal`). See [`src/core/error.rs`](src/core/error.rs).
-- **Platform capabilities**: `PlatformCapabilities` struct for honest reporting of what each backend supports — never pretend a platform can do something it cannot.
+- **Platform capabilities**: [`PlatformCapabilities`](src/core/capabilities.rs) struct for honest reporting of what each backend supports — never pretend a platform can do something it cannot.
+- **Sink adapters**: [`AudioSink`](src/sink/traits.rs) trait with three implementations:
+  - [`NullSink`](src/sink/null.rs) — discards data (testing/benchmarking)
+  - [`ChannelSink`](src/sink/channel.rs) — sends buffers over `mpsc` channel
+  - [`WavFileSink`](src/sink/wav.rs) — writes to WAV files (behind `sink-wav` feature)
 - **Module layering** (strict DAG — no reverse dependencies):
   ```
-  core/ → bridge/ → backend/ → api/ → lib.rs
+  core/ → bridge/ → audio/ (backends) → api/ → lib.rs
   ```
 
 ---
 
 ## 3. Current State
 
-The codebase is **in transition** from an old backend-centric API to the new builder/trait API.
+The architectural transformation is **complete**. Phases 0–4 are done. The old API has been fully removed and the new builder/trait API is the only API.
 
-### What's old (to be removed)
+### What was removed (Phase 0 — Done ✅)
 
-- `AudioCaptureBackend` trait — dead code
-- `AudioCaptureStream` trait — dead code
-- `get_audio_backend()` function — dead code
-- Standalone `ApplicationCapture` trait — to be merged into `CapturingStream`
-- [`src/audio/core.rs`](src/audio/core.rs) — old API types, scheduled for removal
+The following legacy types were deleted and no longer exist in the codebase:
 
-### Platform backend maturity
+- `AudioCaptureBackend` trait
+- `AudioCaptureStream` trait
+- `get_audio_backend()` function
+- `PipeWireBackend`, `WasapiBackend`, `CoreAudioBackend` structs
+- `AudioApplication`, `AudioStream`, `SampleType`, `StreamDataCallback`
+- Duplicate `ProcessError`
+- [`src/audio/core.rs`] — entire file removed
+- 14 old types removed from [`src/lib.rs`](src/lib.rs) exports
 
-| Platform | Status |
-|---|---|
-| **macOS** | Most complete — validates the architecture end-to-end |
-| **Windows** | Needs `create_stream()` wiring to the new API |
-| **Linux** | Needs `CapturingStream` implementation |
+### Platform backend maturity (Phase 3 — Done ✅)
 
-### Other known gaps
+All three backends are wired through `BridgeStream<S>`:
 
-- [`src/audio/discovery.rs`](src/audio/discovery.rs) contains mostly mock data and needs a full rewrite against real platform APIs.
-- [`src/main.rs`](src/main.rs) needs to be rebuilt as a thin library consumer (not a standalone application).
+| Platform | Backend | Thread module | Status |
+|---|---|---|---|
+| **Windows** | WASAPI | [`src/audio/windows/thread.rs`](src/audio/windows/thread.rs) | ✅ Wired via `WindowsPlatformStream` |
+| **Linux** | PipeWire | [`src/audio/linux/thread.rs`](src/audio/linux/thread.rs) | ✅ Wired via `LinuxPlatformStream` |
+| **macOS** | CoreAudio | [`src/audio/macos/thread.rs`](src/audio/macos/thread.rs) | ✅ Wired via `MacosPlatformStream` |
+
+### Demo apps (Phase 4 — Done ✅)
+
+- [`src/main.rs`](src/main.rs) is a cross-platform CLI demo with `info`, `list`, `capture`, `record` subcommands — uses only the public library API, no `#[cfg(target_os)]`
+- Three new examples: [`basic_capture.rs`](examples/basic_capture.rs), [`record_to_file.rs`](examples/record_to_file.rs), [`list_devices.rs`](examples/list_devices.rs)
+- Four old-API binaries disabled in `Cargo.toml` (commented out): `firefox_capture_test`, `real_pipewire_test`, `dynamic_vlc_capture`, `audio_recorder_tui`
+
+### Known remaining gaps
+
+- [`src/audio/discovery.rs`](src/audio/discovery.rs) — still contains mostly mock data; needs a full rewrite against real platform APIs.
+- [`src/audio/application_capture.rs`](src/audio/application_capture.rs) — deprecated standalone trait; superseded by `CaptureTarget` + builder but file still exists.
+- Several old binaries in `src/bin/` still reference deprecated patterns (commented out in Cargo.toml but source files remain).
 
 ---
 
@@ -95,33 +115,66 @@ The codebase is **in transition** from an old backend-centric API to the new bui
 src/
 ├── lib.rs                  # Public API exports
 ├── api.rs                  # AudioCaptureBuilder, AudioCapture
-├── main.rs                 # CLI binary (to be rebuilt as thin library consumer)
+├── main.rs                 # CLI demo (info, list, capture, record subcommands)
 ├── core/                   # Core types, traits, errors
 │   ├── mod.rs
-│   ├── buffer.rs           # AudioBuffer
-│   ├── config.rs           # AudioCaptureConfig, StreamConfig
-│   ├── error.rs            # AudioError taxonomy (21 variants)
+│   ├── buffer.rs           # AudioBuffer (18+ methods)
+│   ├── capabilities.rs     # PlatformCapabilities
+│   ├── config.rs           # CaptureTarget, StreamConfig, AudioFormat, SampleFormat,
+│   │                       #   DeviceId, ApplicationId, ProcessId newtypes
+│   ├── error.rs            # AudioError (21 variants), ErrorKind, Recoverability,
+│   │                       #   BackendContext
 │   ├── interface.rs        # CapturingStream, AudioDevice, DeviceEnumerator traits
 │   └── processing.rs       # Audio processing traits
-├── audio/                  # Platform backends + cross-platform abstractions
+├── bridge/                 # Ring buffer bridge (data plane)
+│   ├── mod.rs              # Re-exports + integration tests
+│   ├── state.rs            # AtomicStreamState, StreamState enum
+│   ├── ring_buffer.rs      # BridgeProducer, BridgeConsumer, BridgeShared, create_bridge()
+│   └── stream.rs           # BridgeStream<S>, PlatformStream trait
+├── sink/                   # Sink adapters for audio data
+│   ├── mod.rs              # Re-exports
+│   ├── traits.rs           # AudioSink trait
+│   ├── null.rs             # NullSink (discard)
+│   ├── channel.rs          # ChannelSink (mpsc)
+│   └── wav.rs              # WavFileSink (behind sink-wav feature)
+├── audio/                  # Platform backends
 │   ├── mod.rs              # Cross-platform dispatch
-│   ├── application_capture.rs  # ApplicationCapture trait (to be merged)
+│   ├── application_capture.rs  # (deprecated — superseded by CaptureTarget)
 │   ├── capture.rs          # Capture helpers
-│   ├── core.rs             # Old API types (to be removed)
-│   ├── discovery.rs        # App discovery (mostly mock, needs rewrite)
+│   ├── discovery.rs        # App discovery (mostly mock — needs rewrite)
 │   ├── windows/            # WASAPI backend
+│   │   ├── mod.rs
+│   │   ├── wasapi.rs       # WASAPI capture implementation
+│   │   └── thread.rs       # WindowsPlatformStream + WASAPI capture thread
 │   ├── linux/              # PipeWire backend
+│   │   ├── mod.rs
+│   │   ├── pipewire.rs     # PipeWire capture implementation
+│   │   └── thread.rs       # LinuxPlatformStream + PipeWire dedicated thread
 │   └── macos/              # CoreAudio + Process Tap backend
-├── bin/                    # Binary targets (demo apps, test utilities)
+│       ├── mod.rs
+│       ├── coreaudio.rs    # CoreAudio capture (uses BridgeProducer, no old VecDeque)
+│       ├── tap.rs          # Process Tap FFI
+│       └── thread.rs       # MacosPlatformStream + CoreAudio callback → BridgeProducer
+├── bin/                    # Binary targets (some deprecated)
+│   ├── standardized_test.rs
+│   ├── run_tests.rs
+│   ├── test_report_generator.rs
+│   ├── app_capture_test.rs
+│   ├── pipewire_test.rs
+│   ├── pipewire_diagnostics.rs
+│   └── (deprecated: firefox_capture_test, real_pipewire_test, etc.)
 └── utils/                  # Utility modules
+    ├── mod.rs
+    └── test_utils.rs
 ```
 
 ### Supporting directories
 
 ```
 docs/architecture/          # Canonical architecture documents (source of truth)
-examples/                   # Example programs
+examples/                   # Example programs (basic_capture, record_to_file, list_devices, etc.)
 tests/                      # Integration tests
+reference/                  # Reference repos + analysis (REFERENCE_ANALYSIS.md)
 scripts/                    # Build/test/CI helper scripts
 docker/                     # Docker-based cross-platform testing
 .github/workflows/          # CI workflows
@@ -138,23 +191,33 @@ docker/                     # Docker-based cross-platform testing
   - `feat_windows` — Windows/WASAPI backend
   - `feat_linux` — Linux/PipeWire backend
   - `feat_macos` — macOS/CoreAudio backend
+  - `async-stream` — Async `Stream` support (adds `atomic-waker`)
+  - `sink-wav` — `WavFileSink` adapter
+  - `test-utils` — Test utility exports
 
 ### Data & Types
 
 - All audio data standardized to **`f32`** internally
+- [`SampleFormat`](src/core/config.rs) enum: `I16`, `I24`, `I32`, `F32`
+- [`AudioFormat`](src/core/config.rs) struct: `sample_rate`, `channels`, `sample_format`
 - Error type: [`AudioError`](src/core/error.rs) (21 categorized variants)
 - Result type: `AudioResult<T> = Result<T, AudioError>`
 
 ### Patterns
 
-- **Builder pattern** for capture configuration (`AudioCaptureBuilder`)
+- **Builder pattern** for capture configuration ([`AudioCaptureBuilder`](src/api.rs))
 - **Interior mutability** (`Mutex`, `Arc`) inside `AudioCapture` for `&self` methods
 - **Lock-free ring buffers** (`rtrb`) for bridging OS callback threads to consumer threads
-- **Trait-based abstraction** — platform backends implement internal traits; consumers use `CapturingStream`
+- **[`PlatformStream`](src/bridge/stream.rs:47) trait** — internal contract for platform-specific stop/active-check; wrapped by `BridgeStream<S>`
+- **[`BridgeStream<S>`](src/bridge/stream.rs:83)** — universal `CapturingStream` implementation; all backends use this
+- **[`AtomicStreamState`](src/bridge/state.rs)** — lock-free state machine for lifecycle: `Created → Running → Stopping → Stopped → Closed`
+- **Sink adapters** — [`AudioSink`](src/sink/traits.rs) trait decouples data consumption from the capture pipeline
 
 ### Naming
 
 - Public API types live in [`src/api.rs`](src/api.rs) and [`src/core/`](src/core/mod.rs)
+- Bridge types live in [`src/bridge/`](src/bridge/mod.rs)
+- Sink adapters live in [`src/sink/`](src/sink/mod.rs)
 - Platform backends live in `src/audio/{platform}/`
 - Binary targets live in `src/bin/`
 
@@ -173,6 +236,9 @@ cargo test
 
 # Check a specific platform feature
 cargo check --features feat_linux
+
+# Run library tests only
+cargo test --lib
 ```
 
 ### CI expectations
@@ -196,13 +262,15 @@ This project uses [Task Master](https://github.com/task-master-ai/task-master-ai
 | ❌ Don't | Why |
 |---|---|
 | Add backend-specific logic to demo apps | Demo apps must go through the library API only |
-| Use the old API (`AudioCaptureBackend`, `get_audio_backend()`) | Deprecated — will be removed |
+| Reference any old API types (`AudioCaptureBackend`, `get_audio_backend()`, etc.) | They have been deleted — they no longer exist |
 | Use the standalone `ApplicationCapture` trait for new code | Use `CaptureTarget` with the builder instead |
 | Make `CapturingStream` depend on file I/O | File writing is a sink adapter, not a core concern |
 | Pretend a platform supports a feature it doesn't | Use explicit capability errors via `PlatformCapabilities` |
-| Hold locks in real-time audio callback threads | Use lock-free ring buffers (`rtrb`) |
+| Hold locks in real-time audio callback threads | Use lock-free ring buffers (`rtrb`) via `BridgeProducer` |
 | Add new `AudioError` variants without categorizing them | Every variant must have an `ErrorKind` and recoverability classification |
+| Bypass `BridgeStream<S>` for new backends | All backends must use `BridgeStream` + `PlatformStream` trait |
 | Silently diverge from architecture docs | Propose changes explicitly if the design needs updating |
+| Import from `src/audio/core.rs` | File was deleted in Phase 0 |
 
 ---
 
@@ -210,12 +278,20 @@ This project uses [Task Master](https://github.com/task-master-ai/task-master-ai
 
 | Phase | Focus | Status |
 |---|---|---|
-| **Phase 0** | Repo alignment & legacy API deprecation | In progress |
-| **Phase 1** | Core API contract freeze (new types, traits, errors) | In progress |
-| **Phase 2** | Streaming/data-plane & sink adapters (ring buffer bridge, `BridgeStream`) | Planned |
-| **Phase 3** | Platform backends — macOS first (validates architecture), then Windows, then Linux | Planned |
-| **Phase 4** | Rebuild demo CLI/TUI as thin library consumers | Planned |
+| **Phase 0** | Repo alignment & legacy API removal | ✅ Done |
+| **Phase 1** | Core API contract freeze (new types, traits, errors) | ✅ Done |
+| **Phase 2** | Streaming/data-plane & sink adapters (`BridgeStream`, ring buffer, sinks) | ✅ Done |
+| **Phase 3** | Platform backends — all 3 wired through `BridgeStream` | ✅ Done |
+| **Phase 4** | Rebuild demo CLI as thin library consumer + examples | ✅ Done |
 | **Phase 5** | Breadth expansion (more formats, richer async, advanced features) | Future |
+
+### Phase 5 potential work
+
+- Async stream support (behind `async-stream` feature, foundation in place via `atomic-waker`)
+- Richer device enumeration (replace mock data in `discovery.rs`)
+- Additional sink adapters
+- Advanced capture modes per platform
+- Performance benchmarking and optimization
 
 ---
 
@@ -224,17 +300,21 @@ This project uses [Task Master](https://github.com/task-master-ai/task-master-ai
 | Crate | Purpose |
 |---|---|
 | `rtrb` | Lock-free SPSC ring buffer for audio data bridge |
-| `hound` | WAV file writing (for sink adapter) |
-| `futures-core` | Async `Stream` trait (optional, behind `async` feature) |
-| `atomic-waker` | Async notification from ring buffer (optional) |
+| `hound` | WAV file writing (for `WavFileSink` and CLI `record` command) |
+| `clap` | CLI argument parsing (with derive) |
+| `color-eyre` | Error reporting for CLI |
+| `thiserror` | Error derive macros for `AudioError` |
+| `log` | Logging facade |
+| `futures-core` | Async `Stream` trait (optional, behind `async-stream` feature) |
+| `atomic-waker` | Async notification from ring buffer (optional, behind `async-stream` feature) |
 
 ### Platform-specific
 
 | Platform | Dependencies |
 |---|---|
-| **Windows** | `wasapi` crate |
-| **Linux** | `pipewire` / `libpipewire-sys` crates |
-| **macOS** | CoreAudio frameworks (system, linked via `build.rs`) |
+| **Windows** | `wasapi`, `windows`, `windows-core`, `widestring`, `sysinfo` |
+| **Linux** | `pipewire`, `libspa`, `libspa-sys` |
+| **macOS** | `coreaudio-rs`, `coreaudio-sys`, `objc2-core-audio`, `objc2-core-audio-types`, `objc2-core-foundation`, `core-foundation`, `core-foundation-sys`, `cocoa`, `objc` |
 
 ---
 
@@ -242,14 +322,21 @@ This project uses [Task Master](https://github.com/task-master-ai/task-master-ai
 
 ```rust
 // Builder → configured capture → active stream
-AudioCaptureBuilder::new()
+let mut capture = AudioCaptureBuilder::new()
     .with_target(CaptureTarget::SystemDefault)
-    .with_config(StreamConfig { sample_rate: 48000, channels: 2, .. })
-    .build()?                    // → AudioCapture
-    .start()?                    // → CapturingStream
+    .sample_rate(48000)
+    .channels(2)
+    .build()?;                   // → AudioCapture
+
+capture.start()?;
 
 // Reading audio (streaming-first)
-let chunk: AudioBuffer = stream.read_chunk()?;
+let buffer: AudioBuffer = capture.read_buffer()?.unwrap();
+let data: &[f32] = buffer.data();
+let frames: usize = buffer.num_frames();
+
+// Stop capture
+capture.stop()?;
 
 // Error handling
 match result {
@@ -264,16 +351,49 @@ let caps = PlatformCapabilities::query();
 if caps.supports_application_capture {
     // safe to use CaptureTarget::Application(..)
 }
+
+// Sink adapters
+use rsac::{NullSink, ChannelSink};
+use rsac::sink::AudioSink;
+
+let mut sink = NullSink::new();
+sink.write(&buffer)?;
+
+let (mut tx, rx) = ChannelSink::new();
+tx.write(&buffer)?;
+let received = rx.try_recv()?;
+```
+
+### Internal Types (for backend implementors)
+
+```rust
+// Bridge: producer side (OS callback thread)
+let (mut producer, consumer) = create_bridge(capacity, format);
+producer.push(audio_buffer)?;       // or push_or_drop for non-blocking
+producer.signal_done();              // when capture ends
+
+// Bridge: consumer side (wrapped by BridgeStream)
+let stream = BridgeStream::new(consumer, platform_stream, format, timeout);
+let chunk = stream.read_chunk()?;    // blocking
+let chunk = stream.try_read_chunk()?; // non-blocking
+
+// PlatformStream trait (implement per backend)
+impl PlatformStream for MyPlatformStream {
+    fn stop_capture(&self) -> AudioResult<()> { /* ... */ }
+    fn is_active(&self) -> bool { /* ... */ }
+}
 ```
 
 ---
 
 ## 11. For AI Agents Specifically
 
-1. **Read the architecture docs first.** The four documents in `docs/architecture/` are the source of truth. Code may lag behind them during transition.
-2. **Check current state before implementing.** The old API and new API coexist. Verify which types/traits are canonical before writing code.
-3. **Scope changes tightly.** Prefer small, focused changes that move one thing forward over sweeping refactors.
-4. **Report back clearly.** When completing a task, summarize what changed, what was discovered, and what remains.
-5. **Respect the module DAG.** `core/` knows nothing about `audio/`. `audio/` knows nothing about `api/`. Violations break the architecture.
-6. **Test on the target platform.** If you're implementing a Windows backend change, validate with `cargo check --features feat_windows` at minimum.
-7. **When in doubt, ask.** If a design decision isn't covered by the architecture docs, surface it rather than guessing.
+1. **The architecture is implemented.** Phases 0–4 are complete. The four documents in `docs/architecture/` are the source of truth, and the code now *matches* them. Do not treat the codebase as "in transition" — the new API is the only API.
+2. **The old API is gone.** Do not reference `AudioCaptureBackend`, `AudioCaptureStream`, `get_audio_backend()`, `src/audio/core.rs`, or any of the 14 removed types. They do not exist.
+3. **All backends use `BridgeStream<S>`.** If adding a new backend, implement the `PlatformStream` trait and wrap with `BridgeStream`. Do not create a custom `CapturingStream` implementation.
+4. **Scope changes tightly.** Prefer small, focused changes that move one thing forward over sweeping refactors.
+5. **Report back clearly.** When completing a task, summarize what changed, what was discovered, and what remains.
+6. **Respect the module DAG.** `core/` knows nothing about `bridge/`. `bridge/` knows nothing about `audio/`. `audio/` knows nothing about `api/`. Violations break the architecture.
+7. **Test on the target platform.** If you're implementing a Windows backend change, validate with `cargo check --features feat_windows` at minimum.
+8. **Phase 5 is the frontier.** New work should focus on breadth expansion: async streams, better device enumeration, additional sinks, performance optimization.
+9. **When in doubt, ask.** If a design decision isn't covered by the architecture docs, surface it rather than guessing.

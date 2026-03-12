@@ -1,3 +1,11 @@
+//! **DEPRECATED**: This binary uses the old rsac API (PipeWireApplicationCapture,
+//! ApplicationSelector). It needs to be rewritten to use the new
+//! AudioCaptureBuilder → AudioCapture → CapturingStream pipeline.
+//!
+//! This binary is disabled in Cargo.toml. To re-enable, add its [[bin]] entry back.
+//!
+//! ---
+//!
 //! Real PipeWire Integration Test
 //!
 //! This test uses the actual PipeWire Rust crate integration

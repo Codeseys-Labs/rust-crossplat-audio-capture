@@ -45,12 +45,10 @@ pub use macos::MacosDeviceEnumerator;
 #[cfg(all(target_os = "windows", feature = "feat_windows"))]
 pub use windows::WindowsDeviceEnumerator;
 
-// Re-export platform-specific AudioDevice and AudioStream types if they need to be named directly.
+// Re-export platform-specific AudioDevice types if they need to be named directly.
 // Usually, interaction will be through the traits.
 #[cfg(all(target_os = "macos", feature = "feat_macos"))]
-pub use macos::{
-    enumerate_audio_applications, ApplicationInfo, MacosAudioDevice, MacosAudioStream,
-};
+pub use macos::{enumerate_audio_applications, ApplicationInfo, MacosAudioDevice};
 #[cfg(all(target_os = "windows", feature = "feat_windows"))]
 pub use windows::{
     enumerate_application_audio_sessions, ApplicationAudioSessionInfo, WindowsAudioDevice,

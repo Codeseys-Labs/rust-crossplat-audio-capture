@@ -1,3 +1,11 @@
+//! **DEPRECATED**: This binary uses the old rsac API patterns (shell-based PipeWire
+//! discovery, simulated capture). It needs to be rewritten to use the new
+//! AudioCaptureBuilder → AudioCapture → CapturingStream pipeline.
+//!
+//! This binary is disabled in Cargo.toml. To re-enable, add its [[bin]] entry back.
+//!
+//! ---
+//!
 //! Firefox Audio Capture Test
 //!
 //! This test specifically targets Firefox instances and attempts to capture
