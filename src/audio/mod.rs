@@ -54,7 +54,6 @@ pub use macos::{
 #[cfg(all(target_os = "windows", feature = "feat_windows"))]
 pub use windows::{
     enumerate_application_audio_sessions, ApplicationAudioSessionInfo, WindowsAudioDevice,
-    WindowsAudioStream,
 };
 
 // --- Factory function for the new DeviceEnumerator ---

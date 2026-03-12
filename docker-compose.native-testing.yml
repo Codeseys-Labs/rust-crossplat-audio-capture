@@ -1,0 +1,74 @@
+# Native OS testing via dockur — requires KVM (/dev/kvm)
+# These run full Windows/macOS VMs via QEMU/KVM inside Docker containers.
+#
+# Usage:
+#   docker compose -f docker-compose.native-testing.yml up windows-native
+#   docker compose -f docker-compose.native-testing.yml up macos-native
+#
+# First boot takes 15-30 minutes (OS installation).
+# Connect via web console (noVNC) or RDP/VNC once ready.
+
+services:
+  # ===========================================================================
+  # Windows 11 Native VM — WASAPI audio testing
+  # ===========================================================================
+  windows-native:
+    image: dockurr/windows
+    container_name: rsac-windows-native
+    environment:
+      VERSION: "11"
+      RAM_SIZE: "8G"
+      CPU_CORES: "4"
+      DISK_SIZE: "64G"
+      USERNAME: "RustDev"
+      PASSWORD: "AudioTest123"
+      # Virtual Intel HDA sound card for WASAPI testing.
+      # PulseAudio backend works with both native PulseAudio and PipeWire
+      # (via PipeWire's PulseAudio compatibility layer).
+      # Fallback if no host audio daemon: change 'pa' to 'none'
+      #   i.e. "-audiodev none,id=snd0 -device intel-hda -device hda-duplex,audiodev=snd0"
+      # WASAPI will still enumerate the device even with audiodev=none.
+      ARGUMENTS: "-audiodev pa,id=snd0 -device intel-hda -device hda-duplex,audiodev=snd0"
+    devices:
+      - /dev/kvm
+      - /dev/net/tun
+    cap_add:
+      - NET_ADMIN
+    ports:
+      - "8006:8006"    # Web console (noVNC)
+      - "3389:3389"    # RDP
+    volumes:
+      - windows-storage:/storage
+      - .:/shared                          # Project root → \\host.lan\Data inside VM
+      - ./docker/dockur/windows/oem:/oem   # Auto-install scripts (run on first boot)
+    stop_grace_period: 2m
+    restart: unless-stopped
+
+  # ===========================================================================
+  # macOS Ventura Native VM — CoreAudio testing
+  # ===========================================================================
+  macos-native:
+    image: dockurr/macos
+    container_name: rsac-macos-native
+    environment:
+      VERSION: "13"        # Ventura
+      RAM_SIZE: "8G"
+      CPU_CORES: "4"
+      DISK_SIZE: "64G"
+    devices:
+      - /dev/kvm
+      - /dev/net/tun
+    cap_add:
+      - NET_ADMIN
+    ports:
+      - "8007:8006"    # Web console (noVNC) — offset to avoid conflict with Windows
+      - "5900:5900"    # VNC
+    volumes:
+      - macos-storage:/storage
+      - .:/shared                          # Project root → mount with: sudo mount_9p shared
+    stop_grace_period: 2m
+    restart: unless-stopped
+
+volumes:
+  windows-storage:
+  macos-storage:

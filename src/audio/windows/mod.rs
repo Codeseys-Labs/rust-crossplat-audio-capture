@@ -1,26 +1,16 @@
 //! Windows audio implementation using WASAPI
 
+pub(crate) mod thread;
 pub mod wasapi;
 
-// Re-export for convenience
+// Re-export public types from wasapi module
 pub use wasapi::{
-    ComInitializer, WindowsApplicationCapture, WindowsAudioDevice, WindowsAudioStream,
-    WindowsDeviceEnumerator,
+    ComInitializer, WindowsApplicationCapture, WindowsAudioDevice, WindowsDeviceEnumerator,
 };
 
-/// Application audio session information for Windows
-#[derive(Debug, Clone)]
-pub struct ApplicationAudioSessionInfo {
-    pub process_id: u32,
-    pub session_id: String,
-    pub display_name: String,
-    pub is_system_sounds: bool,
-}
+// Re-export application session types from wasapi (canonical definitions)
+pub use wasapi::enumerate_application_audio_sessions;
+pub use wasapi::ApplicationAudioSessionInfo;
 
-/// Enumerate application audio sessions on Windows
-pub fn enumerate_application_audio_sessions(
-) -> crate::core::error::Result<Vec<ApplicationAudioSessionInfo>> {
-    // This would use WASAPI session enumeration
-    // For now, return empty list as placeholder
-    Ok(vec![])
-}
+// Re-export new types for BridgeStream architecture
+pub(crate) use thread::{WindowsCaptureConfig, WindowsCaptureThread, WindowsPlatformStream};

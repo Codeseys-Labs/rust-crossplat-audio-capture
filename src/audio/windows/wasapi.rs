@@ -2,47 +2,24 @@
 //! Testing Windows compilation in GitHub Actions.
 #![cfg(target_os = "windows")]
 
-use crate::api::AudioCaptureConfig;
+use crate::core::buffer::AudioBuffer;
 use crate::core::config::{AudioFormat, StreamConfig};
 use crate::core::error::{AudioError, Result as AudioResult};
 use crate::core::interface::{AudioDevice, CapturingStream, DeviceEnumerator, DeviceKind};
-// Removed VecAudioBuffer import, will use the new AudioBuffer struct
-use crate::core::buffer::AudioBuffer; // Ensure this is the new struct
 
-use futures_channel::mpsc;
-use futures_core::Stream as FuturesStreamTrait; // Alias to avoid conflict if Stream is used elsewhere
-use std::collections::VecDeque; // Enhanced buffering like wasapi-rs
 use std::ffi::OsStr;
-use std::os::windows::ffi::OsStrExt;
-use std::pin::Pin;
-use std::ptr;
-use std::slice;
 use std::sync::{
     atomic::{AtomicBool, Ordering},
     Arc,
 };
-use std::thread;
-use std::time::{Duration, Instant};
-// Note: Using futures_channel instead of tokio_stream for compatibility // Added Instant // For efficient data copying
 
-// TODO: Remove these once the actual WASAPI logic is integrated with the new traits.
-// These are placeholders from the old structure.
-use sysinfo::{ProcessRefreshKind, ProcessesToUpdate, RefreshKind, System}; // Keep for old backend
-use wasapi::{
-    self,
-    get_default_device,
-    initialize_mta,
-    AudioCaptureClient as WasapiAudioCaptureClient,
-    AudioClient as WasapiAudioClient, // Renamed to avoid conflict
-    Direction as WasapiDirection,
-    SampleType as WasapiSampleType,
-    ShareMode as WasapiShareMode,
-    WaveFormat as WasapiWaveFormat,
-}; // Keep for old backend, note: wasapi::get_default_device is different from IMMDeviceEnumerator::GetDefaultAudioEndpoint
+use sysinfo::{ProcessesToUpdate, System};
+use wasapi::{self, initialize_mta};
 
-// --- New Skeleton Implementations ---
-
-use crate::core::config::SampleFormat;
+// --- New BridgeStream Architecture Imports ---
+use super::thread::{WindowsCaptureConfig, WindowsCaptureThread, WindowsPlatformStream};
+use crate::bridge::{calculate_capacity, create_bridge, BridgeStream, PlatformStream, StreamState};
+use crate::core::config::{CaptureTarget, DeviceId};
 
 // --- Application-Specific Capture (Process Loopback) ---
 
@@ -50,6 +27,15 @@ use windows::{
     core::*, Win32::Foundation::*, Win32::Media::Audio::*, Win32::System::Com::*,
     Win32::System::Threading::*, Win32::System::Variant::*,
 };
+
+// Specific imports not covered by the glob imports above
+use windows::Win32::Devices::Properties::DEVPKEY_Device_FriendlyName as PKEY_Device_FriendlyName;
+use windows::Win32::UI::Shell::PropertiesSystem::IPropertyStore;
+
+// Constants
+const E_NOTFOUND: windows::core::HRESULT = windows::core::HRESULT(-2147024894i32); // 0x80070002
+const RPC_E_CHANGED_MODE: windows::core::HRESULT = windows::core::HRESULT(-2147417850i32); // 0x80010106
+const VT_LPWSTR: u16 = 31;
 
 /// Windows-specific application capture using wasapi-rs library
 /// Based on wasapi-rs examples/record_application.rs for simplicity and reliability
@@ -295,32 +281,6 @@ unsafe impl Send for WindowsApplicationCapture {}
 // Note: Cannot implement Send for external COM types due to orphan rules
 // The thread spawn issue will need to be handled differently
 
-// Simplified imports for library-first approach
-// We only need basic Windows types for the remaining helper functions
-use windows::core::{GUID, HRESULT, PWSTR};
-use windows::Win32::Devices::Properties::DEVPKEY_Device_FriendlyName as PKEY_Device_FriendlyName;
-use windows::Win32::Foundation::{CloseHandle, HANDLE, WAIT_OBJECT_0};
-use windows::Win32::Media::Audio::{
-    eAll, eCapture, eConsole, eRender, IAudioCaptureClient, IAudioClient, IMMDevice,
-    IMMDeviceCollection, IMMDeviceEnumerator, IMMEndpoint, MMDeviceEnumerator,
-    AUDCLNT_SHAREMODE_SHARED, AUDCLNT_STREAMFLAGS_LOOPBACK, DEVICE_STATE_ACTIVE, WAVEFORMATEX,
-    WAVE_FORMAT_PCM,
-};
-use windows::Win32::System::Com::StructuredStorage::{PropVariantClear, PROPVARIANT};
-use windows::Win32::System::Com::{
-    CoCreateInstance, CoInitializeEx, CoTaskMemFree, CoUninitialize, CLSCTX_ALL,
-    COINIT_MULTITHREADED, STGM_READ,
-};
-use windows::Win32::System::Threading::CreateEventW;
-use windows::Win32::System::Threading::{OpenProcess, WaitForSingleObject, PROCESS_SYNCHRONIZE};
-use windows::Win32::UI::Shell::PropertiesSystem::IPropertyStore;
-
-// Constants
-const E_NOTFOUND: windows::core::HRESULT = windows::core::HRESULT(-2147024894i32); // 0x80070002
-const WAVE_FORMAT_IEEE_FLOAT: u16 = 3;
-const RPC_E_CHANGED_MODE: windows::core::HRESULT = windows::core::HRESULT(-2147417850i32); // 0x80010106
-const VT_LPWSTR: u16 = 31;
-
 /// RAII wrapper for a Windows HANDLE to ensure it's closed on drop.
 #[derive(Debug)]
 struct ProcessHandle(Option<HANDLE>);
@@ -367,23 +327,22 @@ impl ComInitializer {
             Ok(ComInitializer)
         } else if hr == RPC_E_CHANGED_MODE {
             // COM was already initialized with a different concurrency model.
-            // This is generally okay for our purposes if it's already initialized.
-            // However, for strictness, one might treat this as an error or log it.
-            // For now, we'll consider it a success if it's already initialized,
-            // as long as it's not a clear failure.
-            // If CoInitializeEx returns S_FALSE, it means COM was already initialized.
-            // If it returns RPC_E_CHANGED_MODE, it means it was initialized with a different model.
-            // We are aiming for MTA, if it's already STA and we try MTA, it's an issue.
-            // Let's treat RPC_E_CHANGED_MODE as an error for now to be safe.
-            Err(AudioError::BackendError(format!(
-                "Failed to initialize COM: Already initialized with a different concurrency model (HRESULT: {:?})",
-                hr
-            )))
+            Err(AudioError::BackendError {
+                backend: "wasapi".to_string(),
+                operation: "com_init".to_string(),
+                message: format!(
+                    "Already initialized with a different concurrency model (HRESULT: {:?})",
+                    hr
+                ),
+                context: None,
+            })
         } else {
-            Err(AudioError::BackendError(format!(
-                "Failed to initialize COM (HRESULT: {:?})",
-                hr
-            )))
+            Err(AudioError::BackendError {
+                backend: "wasapi".to_string(),
+                operation: "com_init".to_string(),
+                message: format!("COM initialization failed (HRESULT: {:?})", hr),
+                context: None,
+            })
         }
     }
 }
@@ -396,20 +355,17 @@ impl Drop for ComInitializer {
     }
 }
 
-// Removed WindowsDeviceId struct as DeviceId will be String
-
 /// Represents a Windows audio device using WASAPI.
 ///
 /// This struct holds an `IMMDevice` instance, which is the core representation
 /// of an audio endpoint in WASAPI.
-#[derive(Debug)] // IMMDevice itself is a COM interface pointer, Debug should be fine.
+#[derive(Debug)]
 pub struct WindowsAudioDevice {
     device: IMMDevice,
     com_initializer: Arc<ComInitializer>,
 }
 
 impl WindowsAudioDevice {
-    /// Creates a new `WindowsAudioDevice` from an `IMMDevice`.
     /// Creates a new `WindowsAudioDevice` from an `IMMDevice` and a `ComInitializer`.
     fn new(device: IMMDevice, com_initializer: Arc<ComInitializer>) -> Self {
         Self {
@@ -422,84 +378,113 @@ impl WindowsAudioDevice {
     /// Assumes the PWSTR is null-terminated.
     unsafe fn pwstr_to_string(pwstr: PWSTR) -> AudioResult<String> {
         if pwstr.is_null() {
-            return Err(AudioError::BackendError("PWSTR pointer was null".into()));
+            return Err(AudioError::BackendError {
+                backend: "wasapi".to_string(),
+                operation: "pwstr_to_string".to_string(),
+                message: "PWSTR pointer was null".to_string(),
+                context: None,
+            });
         }
-        pwstr.to_string().map_err(|e| {
-            AudioError::BackendError(format!("Failed to convert PWSTR to string: {:?}", e))
+        pwstr.to_string().map_err(|e| AudioError::BackendError {
+            backend: "wasapi".to_string(),
+            operation: "pwstr_to_string".to_string(),
+            message: format!("Failed to convert PWSTR to string: {:?}", e),
+            context: None,
         })
     }
-
-    // WAVEFORMATEX conversion functions removed - wasapi-rs handles format conversion
 }
 
+/// New canonical `AudioDevice` trait implementation for `WindowsAudioDevice`.
+///
+/// This follows the BridgeStream architecture pattern established by the Linux
+/// backend. The `create_stream()` method wires through:
+///   `WindowsCaptureThread` → `BridgeProducer` → ring buffer → `BridgeConsumer` → `BridgeStream`
 impl AudioDevice for WindowsAudioDevice {
-    type DeviceId = String;
-
-    /// Gets the unique identifier for this audio device.
-    /// This ID is typically a string provided by the underlying OS audio backend.
-    fn get_id(&self) -> Self::DeviceId {
+    fn id(&self) -> DeviceId {
+        // Use the IMMDevice::GetId() COM method
         unsafe {
-            let mut id_pwstr: PWSTR = PWSTR::null();
             if let Ok(id_pwstr) = self.device.GetId() {
                 if let Ok(id_str) = Self::pwstr_to_string(id_pwstr) {
                     CoTaskMemFree(Some(id_pwstr.as_ptr().cast()));
-                    return id_str;
+                    return DeviceId(id_str);
                 }
                 CoTaskMemFree(Some(id_pwstr.as_ptr().cast()));
             }
-            "unknown-device".to_string()
+            DeviceId("unknown-device".to_string())
         }
     }
 
-    /// Gets the human-readable friendly name of this audio device.
-    fn get_name(&self) -> String {
+    fn name(&self) -> String {
         self.get_name_internal()
-            .unwrap_or_else(|_| "Unknown Device".to_string())
+            .unwrap_or_else(|_| "Unknown Windows Device".to_string())
     }
 
-    fn get_supported_formats(&self) -> AudioResult<Vec<AudioFormat>> {
-        let default_format = self.get_default_format()?;
-        Ok(vec![default_format])
-    }
-
-    fn get_default_format(&self) -> AudioResult<AudioFormat> {
-        // TODO: Implement actual default format detection
-        Ok(AudioFormat {
-            sample_rate: 44100,
-            channels: 2,
-            bits_per_sample: 32,
-            sample_format: SampleFormat::F32LE,
-        })
-    }
-
-    fn is_input(&self) -> bool {
-        // TODO: Implement actual device type detection
+    fn is_default(&self) -> bool {
+        // Default detection requires enumerator context — return false.
+        // The enumerator's default_device() handles default selection.
         false
     }
 
-    fn is_output(&self) -> bool {
-        // TODO: Implement actual device type detection
-        true
+    fn supported_formats(&self) -> Vec<AudioFormat> {
+        // Return common default format — detailed format negotiation can be added later
+        vec![AudioFormat::default()] // 48kHz, 2ch, F32
     }
 
-    fn is_active(&self) -> bool {
-        // TODO: Implement actual device state detection
-        true
-    }
+    fn create_stream(&self, config: &StreamConfig) -> AudioResult<Box<dyn CapturingStream>> {
+        // === 9-step BridgeStream wiring (following Linux pattern) ===
 
-    fn is_format_supported(&self, _format: &AudioFormat) -> AudioResult<bool> {
-        // TODO: Implement actual format support checking
-        Ok(true)
-    }
+        // 1. Build AudioFormat from StreamConfig
+        let format = config.to_audio_format();
 
-    fn create_stream(
-        &mut self,
-        _capture_config: &AudioCaptureConfig,
-    ) -> AudioResult<Box<dyn CapturingStream + 'static>> {
-        // TODO: Implement actual stream creation
-        Err(AudioError::InvalidOperation(
-            "Stream creation not yet implemented".to_string(),
-        ))
+        // 2. Determine capture target from device ID
+        let device_id_str = self.id().0;
+        let target = if device_id_str == "default" || device_id_str == "unknown-device" {
+            CaptureTarget::SystemDefault
+        } else {
+            CaptureTarget::Device(DeviceId(device_id_str))
+        };
+
+        // 3. Create the ring buffer bridge
+        let capacity = calculate_capacity(config.buffer_size, 4);
+        let (producer, consumer) = create_bridge(capacity, format.clone());
+
+        // 4. Transition bridge state Created → Running
+        consumer
+            .shared()
+            .state
+            .transition(StreamState::Created, StreamState::Running)
+            .map_err(|actual| AudioError::InternalError {
+                message: format!(
+                    "Bridge state transition failed: expected Created, got {:?}",
+                    actual
+                ),
+                source: None,
+            })?;
+
+        // 5. Build WindowsCaptureConfig
+        let capture_config = WindowsCaptureConfig {
+            target,
+            sample_rate: config.sample_rate,
+            channels: config.channels,
+        };
+
+        // 6. Spawn the WASAPI capture thread (sends producer to thread)
+        let capture_thread = WindowsCaptureThread::spawn(capture_config, producer)?;
+
+        // 7. Wrap in Arc<Mutex> → WindowsPlatformStream
+        let capture_thread_arc = std::sync::Arc::new(std::sync::Mutex::new(capture_thread));
+        let platform_stream = WindowsPlatformStream::new(capture_thread_arc);
+
+        // 8. Create BridgeStream with 1-second default timeout
+        let bridge_stream = BridgeStream::new(
+            consumer,
+            platform_stream,
+            format,
+            std::time::Duration::from_secs(1),
+        );
+
+        // 9. Return as boxed CapturingStream
+        Ok(Box::new(bridge_stream))
     }
 }
 
@@ -509,15 +494,25 @@ impl WindowsAudioDevice {
         unsafe {
             let property_store: IPropertyStore =
                 self.device.OpenPropertyStore(STGM_READ).map_err(|hr| {
-                    AudioError::BackendError(format!(
-                        "IMMDevice::OpenPropertyStore failed (HRESULT: {:?})",
-                        hr
-                    ))
+                    AudioError::BackendError {
+                        backend: "wasapi".to_string(),
+                        operation: "get_device_name".to_string(),
+                        message: format!("IMMDevice::OpenPropertyStore failed (HRESULT: {:?})", hr),
+                        context: None,
+                    }
                 })?;
 
             let prop_variant = property_store
                 .GetValue(&PKEY_Device_FriendlyName as *const _ as *const _)
-                .map_err(|hr| AudioError::BackendError(format!("IPropertyStore::GetValue for PKEY_Device_FriendlyName failed (HRESULT: {:?})", hr)))?;
+                .map_err(|hr| AudioError::BackendError {
+                    backend: "wasapi".to_string(),
+                    operation: "get_device_name".to_string(),
+                    message: format!(
+                        "IPropertyStore::GetValue for PKEY_Device_FriendlyName failed (HRESULT: {:?})",
+                        hr
+                    ),
+                    context: None,
+                })?;
 
             let name = if prop_variant.vt() == windows::Win32::System::Variant::VARENUM(VT_LPWSTR) {
                 let name_pwstr = unsafe { prop_variant.Anonymous.Anonymous.Anonymous.pwszVal };
@@ -529,51 +524,6 @@ impl WindowsAudioDevice {
             Ok(name)
         }
     }
-
-    fn get_supported_formats(&self) -> AudioResult<Vec<AudioFormat>> {
-        let default_format = self.get_default_format()?;
-        Ok(vec![default_format])
-    }
-
-    fn get_default_format(&self) -> AudioResult<AudioFormat> {
-        // TODO: Implement actual default format detection
-        Ok(AudioFormat {
-            sample_rate: 44100,
-            channels: 2,
-            bits_per_sample: 32,
-            sample_format: SampleFormat::F32LE,
-        })
-    }
-
-    fn is_input(&self) -> bool {
-        // TODO: Implement actual device type detection
-        false
-    }
-
-    fn is_output(&self) -> bool {
-        // TODO: Implement actual device type detection
-        true
-    }
-
-    fn is_active(&self) -> bool {
-        // TODO: Implement actual device state detection
-        true
-    }
-
-    fn is_format_supported(&self, _format: &AudioFormat) -> AudioResult<bool> {
-        // TODO: Implement actual format support checking
-        Ok(true)
-    }
-
-    fn create_stream(
-        &mut self,
-        _capture_config: &AudioCaptureConfig,
-    ) -> AudioResult<Box<dyn CapturingStream + 'static>> {
-        // TODO: Implement actual stream creation
-        Err(AudioError::InvalidOperation(
-            "Stream creation not yet implemented".to_string(),
-        ))
-    }
 }
 
 impl WindowsAudioDevice {
@@ -581,42 +531,44 @@ impl WindowsAudioDevice {
     /// This is a helper method, not part of the AudioDevice trait.
     pub fn kind(&self) -> AudioResult<DeviceKind> {
         // QueryInterface for IMMEndpoint
-        let endpoint: IMMEndpoint = self.device.cast().map_err(|hr| {
-            AudioError::BackendError(format!(
+        let endpoint: IMMEndpoint = self.device.cast().map_err(|hr| AudioError::BackendError {
+            backend: "wasapi".to_string(),
+            operation: "get_device_kind".to_string(),
+            message: format!(
                 "Failed to cast IMMDevice to IMMEndpoint (HRESULT: {:?})",
                 hr
-            ))
+            ),
+            context: None,
         })?;
 
         unsafe {
-            // Remove this line since we get the value directly from GetDataFlow()
-            let data_flow_val = endpoint.GetDataFlow().map_err(|hr| {
-                AudioError::BackendError(format!(
-                    "IMMEndpoint::GetDataFlow failed (HRESULT: {:?})",
-                    hr
-                ))
-            })?;
+            let data_flow_val = endpoint
+                .GetDataFlow()
+                .map_err(|hr| AudioError::BackendError {
+                    backend: "wasapi".to_string(),
+                    operation: "get_device_kind".to_string(),
+                    message: format!("IMMEndpoint::GetDataFlow failed (HRESULT: {:?})", hr),
+                    context: None,
+                })?;
 
             match data_flow_val {
                 eRender => Ok(DeviceKind::Output),
                 eCapture => Ok(DeviceKind::Input),
-                _ => Err(AudioError::BackendError(format!(
-                    "Unknown data flow value: {:?}",
-                    data_flow_val
-                ))),
+                _ => Err(AudioError::BackendError {
+                    backend: "wasapi".to_string(),
+                    operation: "get_device_kind".to_string(),
+                    message: format!("Unknown data flow value: {:?}", data_flow_val),
+                    context: None,
+                }),
             }
         }
     }
-
-    // Removed duplicate method implementations - these are already in the AudioDevice trait impl above
-
-    // Removed duplicate create_stream method - already implemented in AudioDevice trait above
 }
 
 /// Enumerates audio devices available on a Windows system using WASAPI.
 #[derive(Debug)]
 pub struct WindowsDeviceEnumerator {
-    com_initializer: Arc<ComInitializer>, // Changed to Arc
+    com_initializer: Arc<ComInitializer>,
     enumerator: IMMDeviceEnumerator,
 }
 
@@ -629,820 +581,88 @@ impl WindowsDeviceEnumerator {
         let com_initializer = Arc::new(ComInitializer::new()?);
         // SAFETY: CoCreateInstance is called to create a COM object.
         // The HRESULT is checked for errors.
-        let enumerator: IMMDeviceEnumerator =
-            unsafe { CoCreateInstance(&MMDeviceEnumerator, None, CLSCTX_ALL) }.map_err(|hr| {
-                AudioError::BackendError(format!(
-                    "Failed to create IMMDeviceEnumerator (HRESULT: {:?})",
-                    hr
-                ))
-            })?;
+        let enumerator: IMMDeviceEnumerator = unsafe {
+            CoCreateInstance(&MMDeviceEnumerator, None, CLSCTX_ALL)
+        }
+        .map_err(|hr| AudioError::BackendError {
+            backend: "wasapi".to_string(),
+            operation: "create_device_enumerator".to_string(),
+            message: format!("Failed to create IMMDeviceEnumerator (HRESULT: {:?})", hr),
+            context: None,
+        })?;
 
         Ok(Self {
-            com_initializer, // Store Arc
+            com_initializer,
             enumerator,
         })
     }
 }
 
+/// New canonical `DeviceEnumerator` trait implementation for `WindowsDeviceEnumerator`.
+///
+/// Returns `Box<dyn AudioDevice>` instead of concrete types, matching the
+/// platform-agnostic trait contract in `core::interface`.
 impl DeviceEnumerator for WindowsDeviceEnumerator {
-    type Device = WindowsAudioDevice;
-
-    // Note: The task specifies Box<dyn AudioDevice>, so Self::Device is WindowsAudioDevice,
-    // but methods return Box<dyn AudioDevice>.
-
-    /// Enumerates all active audio endpoint devices.
-    ///
-    /// This method retrieves a collection of all active audio rendering and capture
-    /// devices on the system.
-    fn enumerate_devices(&self) -> AudioResult<Vec<Self::Device>> {
-        // SAFETY: Calling EnumAudioEndpoints on a valid IMMDeviceEnumerator. HRESULT is checked.
+    fn enumerate_devices(&self) -> AudioResult<Vec<Box<dyn AudioDevice>>> {
+        // SAFETY: Calling EnumAudioEndpoints on a valid IMMDeviceEnumerator.
         let collection: IMMDeviceCollection = unsafe {
             self.enumerator
                 .EnumAudioEndpoints(eAll, DEVICE_STATE_ACTIVE)
         }
-        .map_err(|hr| {
-            AudioError::BackendError(format!(
-                "Failed to enumerate audio endpoints (HRESULT: {:?})",
-                hr
-            ))
+        .map_err(|hr| AudioError::DeviceEnumerationError {
+            reason: format!("Failed to enumerate audio endpoints (HRESULT: {:?})", hr),
+            context: None,
         })?;
 
-        // SAFETY: Calling GetCount on a valid IMMDeviceCollection. HRESULT is checked.
-        let count = unsafe { collection.GetCount() }.map_err(|hr| {
-            AudioError::BackendError(format!(
-                "Failed to get device count from collection (HRESULT: {:?})",
-                hr
-            ))
-        })?;
-
-        let mut devices: Vec<Self::Device> = Vec::with_capacity(count as usize);
-        for i in 0..count {
-            // SAFETY: Calling Item on a valid IMMDeviceCollection with a valid index. HRESULT is checked.
-            let imm_device: IMMDevice = unsafe { collection.Item(i) }.map_err(|hr| {
-                AudioError::BackendError(format!(
-                    "Failed to get device item {} from collection (HRESULT: {:?})",
-                    i, hr
-                ))
+        // SAFETY: Calling GetCount on a valid IMMDeviceCollection.
+        let count =
+            unsafe { collection.GetCount() }.map_err(|hr| AudioError::DeviceEnumerationError {
+                reason: format!(
+                    "Failed to get device count from collection (HRESULT: {:?})",
+                    hr
+                ),
+                context: None,
             })?;
-            devices.push(WindowsAudioDevice::new(
+
+        let mut devices: Vec<Box<dyn AudioDevice>> = Vec::with_capacity(count as usize);
+        for i in 0..count {
+            // SAFETY: Calling Item on a valid IMMDeviceCollection with a valid index.
+            let imm_device: IMMDevice =
+                unsafe { collection.Item(i) }.map_err(|hr| AudioError::DeviceEnumerationError {
+                    reason: format!(
+                        "Failed to get device item {} from collection (HRESULT: {:?})",
+                        i, hr
+                    ),
+                    context: None,
+                })?;
+            devices.push(Box::new(WindowsAudioDevice::new(
                 imm_device,
                 self.com_initializer.clone(),
-            ));
+            )));
         }
         Ok(devices)
     }
 
-    /// Gets the default audio endpoint device for the specified kind (input/output).
-    ///
-    /// # Arguments
-    /// * `kind` - The [`DeviceKind`] (input/capture or output/render) for which
-    ///            to get the default device.
-    ///
-    /// Returns `Ok(Some(device))` if a default device is found, `Ok(None)` if no
-    /// default device is available for the specified kind (e.g., `E_NOTFOUND`),
-    /// or an `AudioError` on other failures.
-    fn get_default_device(&self, kind: DeviceKind) -> AudioResult<Self::Device> {
-        let data_flow = match kind {
-            DeviceKind::Input => eCapture,
-            DeviceKind::Output => eRender,
-        };
+    fn default_device(&self) -> AudioResult<Box<dyn AudioDevice>> {
+        // For audio capture, the default render device is most relevant (loopback).
+        let data_flow = eRender;
 
-        // SAFETY: Calling GetDefaultAudioEndpoint on a valid IMMDeviceEnumerator. HRESULT is checked.
+        // SAFETY: Calling GetDefaultAudioEndpoint on a valid IMMDeviceEnumerator.
         match unsafe { self.enumerator.GetDefaultAudioEndpoint(data_flow, eConsole) } {
-            Ok(imm_device) => Ok(WindowsAudioDevice::new(
+            Ok(imm_device) => Ok(Box::new(WindowsAudioDevice::new(
                 imm_device,
                 self.com_initializer.clone(),
-            )),
-            Err(hr) if hr.code() == E_NOTFOUND => Err(AudioError::DeviceNotFound),
-            Err(hr) => Err(AudioError::BackendError(format!(
-                "Failed to get default audio endpoint (HRESULT: {:?})",
-                hr
             ))),
-        }
-    }
-
-    /// Gets an audio endpoint device by its ID string.
-    ///
-    /// # Arguments
-    /// * `id` - The string ID of the device to retrieve. This ID is typically obtained
-    ///          from a previous enumeration or from `AudioDevice::get_id()`.
-    /// * `_kind` - Currently unused, but reserved for future use if device kind needs
-    ///             to be validated against the ID.
-    ///
-    /// Returns `Ok(Some(device))` if a device with the given ID is found, `Ok(None)`
-    /// if no such device exists (e.g., `E_NOTFOUND`), or an `AudioError` on other failures.
-    fn get_device_by_id(
-        &self,
-        id: &<Self::Device as AudioDevice>::DeviceId,
-    ) -> AudioResult<Self::Device> {
-        let wide_id: Vec<u16> = OsStr::new(id).encode_wide().chain(Some(0)).collect();
-        let pwstr_id = PWSTR(wide_id.as_ptr() as *mut _); // Cast to *mut _ as PWSTR is *mut u16
-
-        // SAFETY: Calling GetDevice on a valid IMMDeviceEnumerator with a null-terminated PWSTR. HRESULT is checked.
-        match unsafe { self.enumerator.GetDevice(pwstr_id) } {
-            Ok(imm_device) => Ok(WindowsAudioDevice::new(
-                imm_device,
-                self.com_initializer.clone(),
-            )),
-            Err(hr) if hr.code() == E_NOTFOUND => Err(AudioError::DeviceNotFound),
-            Err(hr) => Err(AudioError::DeviceNotFoundError(format!(
-                "Failed to get device by ID '{}' (HRESULT: {:?})",
-                id, hr
-            ))),
-        }
-    }
-
-    fn get_input_devices(&self) -> AudioResult<Vec<Self::Device>> {
-        // TODO: Implement actual input device enumeration
-        Ok(vec![])
-    }
-
-    fn get_output_devices(&self) -> AudioResult<Vec<Self::Device>> {
-        // TODO: Implement actual output device enumeration
-        Ok(vec![])
-    }
-}
-
-/// Represents an active audio capture stream on Windows using WASAPI.
-///
-/// This struct holds the necessary WASAPI client interfaces (`IAudioClient`, `IAudioCaptureClient`)
-/// to manage and read data from an audio capture stream. It also holds an `Arc<ComInitializer>`
-/// to ensure COM remains initialized for the lifetime of the stream.
-///
-/// Enhanced with wasapi-rs inspired optimizations:
-/// - Efficient VecDeque buffering for sample management
-/// - Event-driven timing for better performance
-/// - Process tree support for application capture
-///
-/// For application-level audio capture, it can store the target application's
-/// Process ID (PID) or session identifier.
-// Note: We need unsafe Send + Sync implementations for COM interfaces
-// This is safe because we ensure single-threaded access to COM objects
-unsafe impl Send for WindowsAudioStream {}
-unsafe impl Sync for WindowsAudioStream {}
-
-// Note: Can't derive Debug because WAVEFORMATEX doesn't implement Debug
-pub struct WindowsAudioStream {
-    audio_client: IAudioClient,
-    capture_client: IAudioCaptureClient,
-    wave_format: WAVEFORMATEX, // Store the format it was initialized with
-    _com_initializer: Arc<ComInitializer>, // Ensures COM is alive for the stream
-    is_started: Arc<AtomicBool>, // Tracks if Start() has been called
-    stream_start_time: Instant, // Epoch for timestamping audio buffers
-
-    // Enhanced buffering inspired by wasapi-rs
-    sample_queue: VecDeque<u8>, // Efficient sample buffering
-    buffer_frame_count: u32,    // Current buffer size in frames
-    block_align: u16,           // Bytes per frame for the audio format
-
-    /// Optional Process ID of the application to target for audio capture.
-    pub target_pid: Option<u32>,
-    /// Optional session identifier of the application to target for audio capture.
-    pub target_session_identifier: Option<String>,
-    /// Whether to include process tree when capturing application audio
-    pub include_process_tree: bool,
-}
-
-impl WindowsAudioStream {
-    /// Creates a new `WindowsAudioStream` with enhanced buffering capabilities.
-    ///
-    /// This is typically called by `WindowsAudioDevice::create_stream` after
-    /// successfully initializing the `IAudioClient` and obtaining the `IAudioCaptureClient`.
-    /// It also accepts optional application targeting information.
-    /// It records the stream creation time to be used as an epoch for `AudioBuffer` timestamps.
-    ///
-    /// Enhanced with wasapi-rs inspired optimizations for better performance.
-    ///
-    /// # Arguments
-    /// * `audio_client` - The initialized `IAudioClient` for the stream.
-    /// * `capture_client` - The `IAudioCaptureClient` obtained from the `audio_client`.
-    /// * `wave_format` - The `WAVEFORMATEX` with which the `audio_client` was initialized.
-    /// * `com_initializer` - An `Arc<ComInitializer>` to keep COM alive.
-    /// * `target_pid` - Optional PID of the application to capture audio from.
-    /// * `target_session_identifier` - Optional session identifier for application audio capture.
-    fn new(
-        audio_client: IAudioClient,
-        capture_client: IAudioCaptureClient,
-        wave_format: WAVEFORMATEX,
-        com_initializer: Arc<ComInitializer>,
-        target_pid: Option<u32>,
-        target_session_identifier: Option<String>,
-    ) -> AudioResult<Self> {
-        // Calculate block alignment for efficient buffering
-        let block_align = wave_format.nBlockAlign;
-
-        // Get initial buffer size from the audio client
-        let buffer_frame_count = unsafe {
-            audio_client.GetBufferSize().map_err(|hr| {
-                AudioError::BackendError(format!(
-                    "Failed to get audio client buffer size (HRESULT: {:?})",
-                    hr
-                ))
-            })?
-        };
-
-        // Pre-allocate efficient sample queue with capacity based on buffer size
-        // Using wasapi-rs approach: 100 * block_align * (1024 + 2 * buffer_frame_count)
-        let queue_capacity = 100 * block_align as usize * (1024 + 2 * buffer_frame_count as usize);
-        let sample_queue = VecDeque::with_capacity(queue_capacity);
-
-        Ok(Self {
-            audio_client,
-            capture_client,
-            wave_format,
-            _com_initializer: com_initializer,
-            is_started: Arc::new(AtomicBool::new(false)),
-            stream_start_time: Instant::now(),
-
-            // Enhanced buffering
-            sample_queue,
-            buffer_frame_count,
-            block_align,
-
-            // Application targeting
-            target_pid,
-            target_session_identifier,
-            include_process_tree: true, // Default to including process tree like wasapi-rs
-        })
-    }
-
-    /// Processes raw WASAPI packet data into an `AudioBuffer`.
-    /// Timestamps are generated relative to the provided `stream_start_time`.
-    ///
-    /// # Arguments
-    /// * `p_data` - Pointer to the raw buffer data from `IAudioCaptureClient::GetBuffer`.
-    /// * `num_frames_read` - Number of audio frames read into `p_data`.
-    /// * `source_wave_format` - The `WAVEFORMATEX` describing the format of `p_data`.
-    /// * `stream_start_time` - The `Instant` the stream was started, used as epoch for timestamps.
-    ///
-    /// # Returns
-    /// An `AudioResult` containing an `AudioBuffer` struct on success,
-    /// or an `AudioError` if conversion fails or formats are unsupported.
-    fn process_wasapi_packet_data(
-        p_data: *const u8, // Changed from *mut u8 as we only read
-        num_frames_read: u32,
-        source_wave_format: &WAVEFORMATEX,
-        stream_start_time: Instant,
-    ) -> AudioResult<AudioBuffer> {
-        // Return concrete AudioBuffer struct
-        if num_frames_read == 0 {
-            return Err(AudioError::InvalidParameter(
-                "num_frames_read cannot be zero for processing.".to_string(),
-            ));
-        }
-
-        let mut converted_samples_vec: Vec<f32> = Vec::new();
-        let channels = source_wave_format.nChannels; // u16
-        if channels == 0 {
-            return Err(AudioError::BackendError(
-                "Wave format has 0 channels.".to_string(),
-            ));
-        }
-
-        let total_samples_to_convert = num_frames_read as usize * channels as usize;
-        converted_samples_vec.reserve(total_samples_to_convert);
-
-        // Copy packed fields to local variables to avoid alignment issues
-        let format_tag = source_wave_format.wFormatTag;
-        let bits_per_sample = source_wave_format.wBitsPerSample;
-
-        // SAFETY: p_data is assumed valid for num_frames_read based on GetBuffer success.
-        // source_wave_format describes the data at p_data.
-        unsafe {
-            match format_tag as u32 {
-                x if x == WAVE_FORMAT_IEEE_FLOAT as u32 => {
-                    if bits_per_sample == 32 {
-                        let typed_ptr = p_data as *const f32;
-                        for i in 0..total_samples_to_convert {
-                            converted_samples_vec.push(*typed_ptr.add(i));
-                        }
-                    } else {
-                        return Err(AudioError::UnsupportedFormat(format!(
-                            "Unsupported bit depth for IEEE float: {}",
-                            bits_per_sample
-                        )));
-                    }
-                }
-                WAVE_FORMAT_PCM => {
-                    if bits_per_sample == 16 {
-                        let typed_ptr = p_data as *const i16;
-                        for i in 0..total_samples_to_convert {
-                            let sample_i16 = *typed_ptr.add(i);
-                            converted_samples_vec.push(sample_i16 as f32 / i16::MAX as f32);
-                        }
-                    } else {
-                        return Err(AudioError::UnsupportedFormat(format!(
-                            "Unsupported bit depth for PCM: {}",
-                            bits_per_sample
-                        )));
-                    }
-                }
-                _ => {
-                    return Err(AudioError::UnsupportedFormat(format!(
-                        "Unsupported wave format tag: {}",
-                        format_tag
-                    )));
-                }
-            }
-        } // end unsafe
-
-        // Create output AudioFormat for the new AudioBuffer struct
-        let output_audio_format_struct = AudioFormat {
-            sample_rate: source_wave_format.nSamplesPerSec,
-            channels,                           // u16
-            bits_per_sample: 32,                // We converted to f32
-            sample_format: SampleFormat::F32LE, // Standard for f32
-        };
-
-        // Timestamp is duration since stream start.
-        let timestamp = Instant::now().duration_since(stream_start_time);
-
-        Ok(AudioBuffer {
-            data: converted_samples_vec,
-            channels, // u16
-            sample_rate: source_wave_format.nSamplesPerSec,
-            format: output_audio_format_struct,
-            timestamp,
-        })
-    }
-}
-
-impl CapturingStream for WindowsAudioStream {
-    /// Starts the WASAPI audio capture stream.
-    ///
-    /// This method calls `IAudioClient::Start()`. If the stream is already started,
-    /// it returns `Ok(())` without taking further action.
-    /// Errors from `IAudioClient::Start()` are mapped to `AudioError::BackendError`.
-    fn start(&mut self) -> AudioResult<()> {
-        if self
-            .is_started
-            .compare_exchange(false, true, Ordering::Acquire, Ordering::Relaxed)
-            .is_ok()
-        {
-            // Successfully changed from false to true, so proceed to start.
-            unsafe {
-                self.audio_client.Start().map_err(|hr| {
-                    // If Start fails, revert the state.
-                    self.is_started.store(false, Ordering::Relaxed);
-                    AudioError::BackendError(format!(
-                        "IAudioClient::Start failed (HRESULT: {:?})",
-                        hr
-                    ))
-                })?;
-            }
-            Ok(())
-        } else {
-            // Stream was already started (or another thread started it).
-            // Depending on desired strictness, this could be an error or Ok.
-            // For idempotency, Ok(()) is often preferred.
-            // If strict "call start only once" is needed, return an error:
-            // Err(AudioError::InvalidOperation("Stream already started".to_string()))
-            Ok(())
-        }
-    }
-
-    /// Stops the WASAPI audio capture stream.
-    ///
-    /// This method calls `IAudioClient::Stop()`. If the stream is already stopped,
-    /// it returns `Ok(())` without taking further action (idempotent).
-    /// Errors from `IAudioClient::Stop()` are mapped to `AudioError::BackendError`.
-    /// The internal `is_started` flag is set to `false` regardless of the `Stop()` call's success,
-    /// as the intention is to stop.
-    fn stop(&mut self) -> AudioResult<()> {
-        if self
-            .is_started
-            .compare_exchange(true, false, Ordering::Acquire, Ordering::Relaxed)
-            .is_ok()
-        {
-            // Successfully changed from true to false, so proceed to stop.
-            unsafe {
-                self.audio_client.Stop().map_err(|hr| {
-                    // Even if Stop fails, we consider the stream logically stopped from our side.
-                    // The flag is already set to false by compare_exchange.
-                    AudioError::BackendError(format!(
-                        "IAudioClient::Stop failed (HRESULT: {:?})",
-                        hr
-                    ))
-                })?;
-            }
-        }
-        // If it was already false, or if Stop failed, we still return Ok(())
-        // as the stream is considered stopped from an API perspective.
-        Ok(())
-    }
-
-    /// Closes the audio stream.
-    ///
-    /// For WASAPI, this primarily ensures the stream is stopped by calling `self.stop()`.
-    /// COM resources (`IAudioClient`, `IAudioCaptureClient`) are released when
-    /// `WindowsAudioStream` is dropped.
-    fn close(&mut self) -> AudioResult<()> {
-        if self.is_started.load(Ordering::Relaxed) {
-            self.stop()?;
-        }
-        Ok(())
-    }
-
-    /// Checks if the WASAPI audio stream is currently considered running.
-    ///
-    /// Returns `Ok(true)` if `start()` has been successfully called and `stop()` or `close()`
-    /// has not yet been called to change its state. Otherwise, returns `Ok(false)`.
-    fn is_running(&self) -> bool {
-        self.is_started.load(Ordering::Relaxed)
-    }
-
-    /// Reads a chunk of audio data from the WASAPI capture stream synchronously.
-    ///
-    /// Enhanced with wasapi-rs inspired buffering for better performance:
-    /// - Uses VecDeque for efficient sample management
-    /// - Accumulates samples until a full chunk is available
-    /// - Better handling of partial reads and buffer management
-    ///
-    /// This method attempts to read the next available packet of audio data from the
-    /// capture client. If no data is immediately available (`GetNextPacketSize` returns 0),
-    /// it returns `Ok(None)`.
-    ///
-    /// # Parameters
-    /// * `timeout_ms`: An optional timeout in milliseconds for waiting for data.
-    ///
-    /// # Returns
-    /// * `Ok(Some(buffer))`: If a chunk of audio data was successfully read and converted.
-    /// * `Ok(None)`: If no audio packet is currently available.
-    /// * `Err(AudioError::InvalidOperation)`: If the stream has not been started.
-    /// * `Err(AudioError::BackendError)`: For other WASAPI errors.
-    /// * `Err(AudioError::UnsupportedFormat)`: If the captured audio format is not supported for conversion.
-    fn read_chunk(&mut self, timeout_ms: Option<u32>) -> AudioResult<Option<AudioBuffer>> {
-        if !self.is_started.load(Ordering::Relaxed) {
-            return Err(AudioError::InvalidOperation(
-                "Stream not started".to_string(),
-            ));
-        }
-
-        // Define chunk size (number of frames we want to return at once)
-        let chunk_size_frames = 4096; // Same as wasapi-rs example
-        let bytes_per_chunk = chunk_size_frames * self.block_align as usize;
-
-        // Check if we have enough buffered samples for a full chunk
-        if self.sample_queue.len() >= bytes_per_chunk {
-            // Extract a chunk from our buffer
-            let mut chunk_data = vec![0u8; bytes_per_chunk];
-            for byte in chunk_data.iter_mut() {
-                *byte = self.sample_queue.pop_front().unwrap();
-            }
-
-            // Convert the chunk to AudioBuffer using our existing helper
-            return Self::process_wasapi_packet_data(
-                chunk_data.as_ptr(),
-                chunk_size_frames as u32,
-                &self.wave_format,
-                self.stream_start_time,
-            )
-            .map(Some);
-        }
-
-        // Need more data - try to read from WASAPI
-        unsafe {
-            let num_frames_in_packet = self.capture_client.GetNextPacketSize().map_err(|hr| {
-                AudioError::BackendError(format!(
-                    "IAudioCaptureClient::GetNextPacketSize failed (HRESULT: {:?})",
-                    hr
-                ))
-            })?;
-
-            if num_frames_in_packet == 0 {
-                // No new data available, but check timeout
-                if let Some(timeout) = timeout_ms {
-                    thread::sleep(Duration::from_millis(std::cmp::min(timeout as u64, 10)));
-                }
-                return Ok(None);
-            }
-
-            let mut p_data: *mut u8 = ptr::null_mut();
-            let mut num_frames_read: u32 = 0;
-            let mut flags: u32 = 0;
-
-            self.capture_client
-                .GetBuffer(&mut p_data, &mut num_frames_read, &mut flags, None, None)
-                .map_err(|hr| {
-                    AudioError::BackendError(format!(
-                        "IAudioCaptureClient::GetBuffer failed (HRESULT: {:?})",
-                        hr
-                    ))
-                })?;
-
-            if num_frames_read > 0 {
-                // Calculate bytes to read and reserve space in queue
-                let bytes_to_read = num_frames_read as usize * self.block_align as usize;
-                let additional_capacity = bytes_to_read
-                    .saturating_sub(self.sample_queue.capacity() - self.sample_queue.len());
-                self.sample_queue.reserve(additional_capacity);
-
-                // Copy data to our sample queue (inspired by wasapi-rs approach)
-                let data_slice = slice::from_raw_parts(p_data, bytes_to_read);
-                for &byte in data_slice {
-                    self.sample_queue.push_back(byte);
-                }
-            }
-
-            // Always release the buffer
-            self.capture_client
-                .ReleaseBuffer(num_frames_read)
-                .map_err(|hr| {
-                    AudioError::BackendError(format!(
-                        "IAudioCaptureClient::ReleaseBuffer failed (HRESULT: {:?})",
-                        hr
-                    ))
-                })?;
-
-            // Check again if we now have enough for a chunk
-            if self.sample_queue.len() >= bytes_per_chunk {
-                let mut chunk_data = vec![0u8; bytes_per_chunk];
-                for byte in chunk_data.iter_mut() {
-                    *byte = self.sample_queue.pop_front().unwrap();
-                }
-
-                return Self::process_wasapi_packet_data(
-                    chunk_data.as_ptr(),
-                    chunk_size_frames as u32,
-                    &self.wave_format,
-                    self.stream_start_time,
-                )
-                .map(Some);
-            }
-        }
-
-        Ok(None) // Still not enough data for a full chunk
-    }
-
-    /// Converts this synchronous stream into an asynchronous stream of audio data.
-    ///
-    /// This method sets up a dedicated polling thread that continuously reads audio data
-    /// from the WASAPI capture client using logic similar to `read_chunk`. The data
-    /// (or errors) are then sent over an MPSC channel to the returned stream.
-    ///
-    /// The returned stream is a `Pin<Box<dyn FuturesStreamTrait<Item = AudioResult<AudioBuffer>> + Send + Sync + 'a>>`.
-    /// Each item in the stream is an `AudioResult` which can either be an `Ok(AudioBuffer)`
-    /// containing the audio data, or an `Err(AudioError)` if an issue occurred during capture.
-    ///
-    /// **Important:**
-    /// - The polling thread will run as long as the `WindowsAudioStream` is active
-    ///   (`is_started` is true) and the receiver end of the MPSC channel has not been dropped.
-    /// - If the `WindowsAudioStream` is stopped, the polling thread will detect this,
-    ///   send an `AudioError::StreamClosed` message, and then terminate.
-    /// - If the returned async stream is dropped, the polling thread will detect that the
-    ///   channel is closed and will also terminate.
-    /// - If a `target_pid` is specified, the thread will monitor the target application.
-    ///   If the application terminates, an `AudioError::StreamClosed` is sent, and the
-    ///   polling thread stops. If the application cannot be monitored (e.g., `OpenProcess` fails),
-    ///   an `AudioError::ApplicationNotFound` is sent, and the thread terminates.
-    ///
-    /// # Errors
-    /// - Returns `AudioError::InvalidOperation` if the stream has not been started via `start()`.
-    /// - Returns `AudioError::BackendError` if the polling thread fails to initialize COM.
-    /// - Returns `AudioError::ApplicationNotFound` if a `target_pid` is given but the process
-    ///   cannot be opened for monitoring at the start of the polling thread.
-    fn to_async_stream<'a>(
-        &'a mut self,
-    ) -> AudioResult<
-        Pin<
-            Box<
-                dyn FuturesStreamTrait<Item = AudioResult<AudioBuffer>>
-                    // Ensure this uses the concrete AudioBuffer struct
-                    + Send
-                    + Sync
-                    + 'a,
-            >,
-        >,
-    > {
-        if !self.is_started.load(Ordering::Relaxed) {
-            return Err(AudioError::InvalidOperation(
-                "Stream not started".to_string(),
-            ));
-        }
-
-        let (mut tx, rx) = mpsc::unbounded::<AudioResult<AudioBuffer>>(); // Ensure this uses the concrete AudioBuffer struct
-
-        // TODO: Fix COM object thread safety issue
-        // For now, return a simple placeholder stream to allow compilation
-        // The capture_client contains COM objects that can't be sent between threads
-        // This needs to be redesigned to work with wasapi-rs properly
-
-        // Placeholder implementation that returns empty audio data
-        let (mut tx, rx) = mpsc::unbounded::<AudioResult<AudioBuffer>>();
-
-        // Send a single empty buffer and close the stream
-        let _ = tx.unbounded_send(Ok(AudioBuffer {
-            data: vec![0.0; 1024], // Empty audio data
-            channels: 2,
-            sample_rate: 44100,
-            format: AudioFormat {
-                sample_rate: 44100,
-                channels: 2,
-                bits_per_sample: 32,
-                sample_format: SampleFormat::F32LE,
-            },
-            timestamp: std::time::Duration::from_secs(0),
-        }));
-
-        // Return the receiver as a stream (futures_channel receiver implements Stream)
-        return Ok(Box::pin(rx));
-
-        // Original thread spawn code commented out due to Send trait issues:
-        /*
-        let capture_client_clone = self.capture_client.clone();
-        let wave_format_clone = self.wave_format;
-        let stream_is_started_clone = self.is_started.clone();
-        let stream_start_time_clone = self.stream_start_time;
-        let target_pid_clone = self.target_pid;
-
-        thread::spawn(move || {
-            let _com_thread_initializer = match ComInitializer::new() {
-                Ok(init) => Some(init),
-                Err(e) => {
-                    let _ = tx.unbounded_send(Err(AudioError::BackendError(format!(
-                        "Polling thread failed to initialize COM: {}",
-                        e
-                    ))));
-                    return;
-                }
-            };
-
-            // Process monitoring setup
-            let process_monitor_handle = if let Some(pid_val) = target_pid_clone {
-                match unsafe { OpenProcess(PROCESS_SYNCHRONIZE, false, pid_val) } {
-                    Ok(handle) if !handle.is_invalid() => ProcessHandle::new(Some(handle)),
-                    Ok(invalid_handle) => {
-                        if !invalid_handle.is_invalid() {
-                            unsafe {
-                                CloseHandle(invalid_handle);
-                            }
-                        }
-                        let _ = tx.unbounded_send(Err(AudioError::ApplicationNotFound(format!(
-                            "Target application with PID {} could not be monitored (OpenProcess returned invalid handle).",
-                            pid_val
-                        ))));
-                        return;
-                    }
-                    Err(e) => {
-                        let _ = tx.unbounded_send(Err(AudioError::ApplicationNotFound(format!(
-                            "Target application with PID {} could not be monitored (OpenProcess failed: {:?}).",
-                            pid_val, e
-                        ))));
-                        return;
-                    }
-                }
-            } else {
-                ProcessHandle::new(None)
-            };
-
-            let mut check_process_counter = 0;
-
-            loop {
-                if !stream_is_started_clone.load(Ordering::Relaxed) {
-                    let _ = tx.unbounded_send(Err(AudioError::StreamCloseFailed(
-                        "Capture stream was stopped.".to_string(),
-                    )));
-                    break;
-                }
-
-                if let Some(h) = process_monitor_handle.get() {
-                    check_process_counter += 1;
-                    if check_process_counter >= 10 {
-                        check_process_counter = 0;
-                        let wait_result = unsafe { WaitForSingleObject(h, 0) };
-                        if wait_result == WAIT_OBJECT_0 {
-                            let _ = tx.unbounded_send(Err(AudioError::StreamCloseFailed(
-                                "Target application terminated.".to_string(),
-                            )));
-                            stream_is_started_clone.store(false, Ordering::Relaxed);
-                        }
-                    }
-                }
-
-                let num_frames_in_packet = match unsafe { capture_client_clone.GetNextPacketSize() }
-                {
-                    Ok(frames) => frames,
-                    Err(hr) => {
-                        if tx
-                            .unbounded_send(Err(AudioError::BackendError(format!(
-                                "Polling thread: GetNextPacketSize failed (HRESULT: {:?})",
-                                hr
-                            ))))
-                            .is_err()
-                        {
-                            // Receiver dropped
-                        }
-                        break;
-                    }
-                };
-
-                if num_frames_in_packet == 0 {
-                    thread::sleep(Duration::from_millis(10));
-                    continue;
-                }
-
-                let mut p_data: *mut u8 = ptr::null_mut();
-                let mut num_frames_read_from_buffer: u32 = 0;
-                let mut flags: u32 = 0;
-
-                let hr_get_buffer = unsafe {
-                    capture_client_clone.GetBuffer(
-                        &mut p_data,
-                        &mut num_frames_read_from_buffer,
-                        &mut flags,
-                        None,
-                        None,
-                    )
-                };
-
-                if hr_get_buffer.is_err() {
-                    if tx
-                        .unbounded_send(Err(AudioError::BackendError(format!(
-                            "Polling thread: GetBuffer failed (HRESULT: {:?})",
-                            hr_get_buffer
-                        ))))
-                        .is_err()
-                    { /* Receiver dropped */ }
-                    break;
-                }
-
-                if num_frames_read_from_buffer == 0 {
-                    let hr_release_empty = unsafe { capture_client_clone.ReleaseBuffer(0) };
-                    if hr_release_empty.is_err() {
-                        if tx
-                            .unbounded_send(Err(AudioError::BackendError(format!(
-                                "Polling thread: ReleaseBuffer (0 frames) failed (HRESULT: {:?})",
-                                hr_release_empty
-                            ))))
-                            .is_err()
-                        { /* Receiver dropped */ }
-                        break;
-                    }
-                    thread::sleep(Duration::from_millis(10));
-                    continue;
-                }
-
-                let conversion_result = WindowsAudioStream::process_wasapi_packet_data(
-                    p_data as *const u8,
-                    num_frames_read_from_buffer,
-                    &wave_format_clone,
-                    stream_start_time_clone, // Pass the cloned start time
-                );
-
-                let hr_release_data =
-                    unsafe { capture_client_clone.ReleaseBuffer(num_frames_read_from_buffer) };
-
-                if hr_release_data.is_err() {
-                    if tx
-                        .unbounded_send(Err(AudioError::BackendError(format!(
-                            "Polling thread: ReleaseBuffer (with data) failed (HRESULT: {:?})",
-                            hr_release_data
-                        ))))
-                        .is_err()
-                    { /* Receiver dropped */ }
-                    break;
-                }
-
-                match conversion_result {
-                    Ok(audio_buffer) => {
-                        if tx.unbounded_send(Ok(audio_buffer)).is_err() {
-                            break;
-                        }
-                    }
-                    Err(e) => {
-                        if tx.unbounded_send(Err(e)).is_err() {
-                            break;
-                        }
-                        break;
-                    }
-                }
-            }
-        });
-
-        Ok(Box::pin(rx))
-        */
-    }
-}
-
-impl Drop for WindowsAudioStream {
-    /// Ensures the audio stream is stopped when `WindowsAudioStream` is dropped.
-    ///
-    /// This calls `IAudioClient::Stop()` as a best-effort cleanup. Errors are ignored
-    /// as `drop` should not panic.
-    fn drop(&mut self) {
-        if self.is_started.load(Ordering::Relaxed) {
-            // Best effort to stop the client.
-            // Errors are ignored in drop.
-            let _ = unsafe { self.audio_client.Stop() };
-            self.is_started.store(false, Ordering::Relaxed);
+            Err(hr) if hr.code() == E_NOTFOUND => Err(AudioError::DeviceNotFound {
+                device_id: "default_render".to_string(),
+            }),
+            Err(hr) => Err(AudioError::DeviceEnumerationError {
+                reason: format!("Failed to get default audio endpoint (HRESULT: {:?})", hr),
+                context: None,
+            }),
         }
     }
 }
-
-// The AudioStream trait implementation for WindowsAudioStream is removed as per task focus on CapturingStream.
-// If AudioStream methods (open, pause, resume etc.) are needed for CapturingStream,
-// they would typically be part of the CapturingStream trait or called internally.
-// For now, the CapturingStream methods (start, stop, close, is_running, read_chunk) are the focus.
 
 /// Information about an active audio session associated with an application.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -1456,7 +676,6 @@ pub struct ApplicationAudioSessionInfo {
     /// The full path to the executable file of the application owning the session.
     /// This can be `None` if the path cannot be retrieved (e.g., due to permissions).
     pub executable_path: Option<String>,
-    // pub icon_path: Option<String>, // TODO: Consider adding icon path if easily obtainable
 }
 
 /// Enumerates all active application audio sessions on the system.
@@ -1474,18 +693,7 @@ pub struct ApplicationAudioSessionInfo {
 /// * `Ok(Vec<ApplicationAudioSessionInfo>)` - A vector of structs, each containing
 ///   information about an active application audio session.
 /// * `Err(AudioError)` - If an error occurs during COM initialization, device enumeration,
-///   session enumeration, or while retrieving session details. This can include
-///   `AudioError::BackendError` for WASAPI HRESULT failures or
-///   `AudioError::DeviceNotFound` if the default audio device cannot be accessed.
-///
-/// # Errors
-///
-/// This function can return `AudioError` for various reasons:
-/// - COM initialization failure.
-/// - Failure to get the default audio rendering device.
-/// - Failure to activate `IAudioSessionManager2`.
-/// - Errors during session enumeration or when querying session properties.
-/// - Errors when trying to open a process or query its executable path (e.g., access denied).
+///   session enumeration, or while retrieving session details.
 ///
 /// # Example
 ///
@@ -1522,7 +730,7 @@ pub fn enumerate_application_audio_sessions() -> AudioResult<Vec<ApplicationAudi
     use windows::Win32::Media::Audio::{
         IAudioSessionControl, IAudioSessionControl2, IAudioSessionEnumerator, IAudioSessionManager2,
     };
-    use windows::Win32::System::ProcessStatus::K32GetModuleFileNameExW; // Or QueryFullProcessImageNameW from Win32_System_Threading
+    use windows::Win32::System::ProcessStatus::K32GetModuleFileNameExW;
     use windows::Win32::System::Threading::{OpenProcess, PROCESS_QUERY_LIMITED_INFORMATION};
 
     let _com_initializer = ComInitializer::new()?;
@@ -1532,58 +740,83 @@ pub fn enumerate_application_audio_sessions() -> AudioResult<Vec<ApplicationAudi
     unsafe {
         let device_enumerator: IMMDeviceEnumerator =
             CoCreateInstance(&MMDeviceEnumerator, None, CLSCTX_ALL).map_err(|hr| {
-                AudioError::BackendError(format!(
-                    "CoCreateInstance(MMDeviceEnumerator) failed (HRESULT: {:?})",
-                    hr
-                ))
+                AudioError::BackendError {
+                    backend: "wasapi".to_string(),
+                    operation: "enumerate_audio_sessions".to_string(),
+                    message: format!(
+                        "CoCreateInstance(MMDeviceEnumerator) failed (HRESULT: {:?})",
+                        hr
+                    ),
+                    context: None,
+                }
             })?;
 
         let default_device: IMMDevice = device_enumerator
             .GetDefaultAudioEndpoint(eRender, eConsole)
             .map_err(|hr| {
                 if hr.code() == E_NOTFOUND {
-                    AudioError::DeviceNotFoundError(
-                        "Default rendering device not found.".to_string(),
-                    )
+                    AudioError::DeviceNotFound {
+                        device_id: "default_render".to_string(),
+                    }
                 } else {
-                    AudioError::BackendError(format!(
-                        "GetDefaultAudioEndpoint failed (HRESULT: {:?})",
-                        hr
-                    ))
+                    AudioError::BackendError {
+                        backend: "wasapi".to_string(),
+                        operation: "enumerate_audio_sessions".to_string(),
+                        message: format!("GetDefaultAudioEndpoint failed (HRESULT: {:?})", hr),
+                        context: None,
+                    }
                 }
             })?;
 
-        let session_manager: IAudioSessionManager2 =
-            default_device.Activate(CLSCTX_ALL, None).map_err(|hr| {
-                AudioError::BackendError(format!(
+        let session_manager: IAudioSessionManager2 = default_device
+            .Activate(CLSCTX_ALL, None)
+            .map_err(|hr| AudioError::BackendError {
+                backend: "wasapi".to_string(),
+                operation: "enumerate_audio_sessions".to_string(),
+                message: format!(
                     "IMMDevice::Activate(IAudioSessionManager2) failed (HRESULT: {:?})",
                     hr
-                ))
+                ),
+                context: None,
             })?;
 
-        let session_enumerator: IAudioSessionEnumerator =
-            session_manager.GetSessionEnumerator().map_err(|hr| {
-                AudioError::BackendError(format!(
+        let session_enumerator: IAudioSessionEnumerator = session_manager
+            .GetSessionEnumerator()
+            .map_err(|hr| AudioError::BackendError {
+                backend: "wasapi".to_string(),
+                operation: "enumerate_audio_sessions".to_string(),
+                message: format!(
                     "IAudioSessionManager2::GetSessionEnumerator failed (HRESULT: {:?})",
                     hr
-                ))
+                ),
+                context: None,
             })?;
 
-        let count = session_enumerator.GetCount().map_err(|hr| {
-            AudioError::BackendError(format!(
-                "IAudioSessionEnumerator::GetCount failed (HRESULT: {:?})",
-                hr
-            ))
-        })?;
+        let count = session_enumerator
+            .GetCount()
+            .map_err(|hr| AudioError::BackendError {
+                backend: "wasapi".to_string(),
+                operation: "enumerate_audio_sessions".to_string(),
+                message: format!(
+                    "IAudioSessionEnumerator::GetCount failed (HRESULT: {:?})",
+                    hr
+                ),
+                context: None,
+            })?;
 
         for i in 0..count {
             let session_control: IAudioSessionControl =
-                session_enumerator.GetSession(i).map_err(|hr| {
-                    AudioError::BackendError(format!(
-                        "IAudioSessionEnumerator::GetSession({}) failed (HRESULT: {:?})",
-                        i, hr
-                    ))
-                })?;
+                session_enumerator
+                    .GetSession(i)
+                    .map_err(|hr| AudioError::BackendError {
+                        backend: "wasapi".to_string(),
+                        operation: "enumerate_audio_sessions".to_string(),
+                        message: format!(
+                            "IAudioSessionEnumerator::GetSession({}) failed (HRESULT: {:?})",
+                            i, hr
+                        ),
+                        context: None,
+                    })?;
 
             let session_control2: IAudioSessionControl2 = match session_control.cast() {
                 Ok(sc2) => sc2,
@@ -1597,12 +830,17 @@ pub fn enumerate_application_audio_sessions() -> AudioResult<Vec<ApplicationAudi
                 }
             };
 
-            let pid = session_control2.GetProcessId().map_err(|hr| {
-                AudioError::BackendError(format!(
-                    "IAudioSessionControl2::GetProcessId for session {} failed (HRESULT: {:?})",
-                    i, hr
-                ))
-            })?;
+            let pid = session_control2
+                .GetProcessId()
+                .map_err(|hr| AudioError::BackendError {
+                    backend: "wasapi".to_string(),
+                    operation: "enumerate_audio_sessions".to_string(),
+                    message: format!(
+                        "IAudioSessionControl2::GetProcessId for session {} failed (HRESULT: {:?})",
+                        i, hr
+                    ),
+                    context: None,
+                })?;
 
             if pid == 0 {
                 // Skip system sounds or non-application sessions
@@ -1661,18 +899,13 @@ pub fn enumerate_application_audio_sessions() -> AudioResult<Vec<ApplicationAudi
                     );
                     if len > 0 {
                         executable_path = Some(String::from_utf16_lossy(&path_buf[..len as usize]));
-                    } else {
-                        // K32GetModuleFileNameExW failed, could log GetLastError()
-                        // eprintln!("K32GetModuleFileNameExW failed for PID {}: {:?}", pid, std::io::Error::last_os_error());
                     }
                     let _ = CloseHandle(process_handle);
                 }
                 Ok(_) => { // INVALID_HANDLE_VALUE
-                     // eprintln!("OpenProcess returned INVALID_HANDLE_VALUE for PID {}: {:?}", pid, std::io::Error::last_os_error());
                 }
-                Err(e) => {
+                Err(_e) => {
                     // OpenProcess failed
-                    // eprintln!("OpenProcess failed for PID {}: {:?}", pid, e);
                 }
             }
 
@@ -1686,4 +919,289 @@ pub fn enumerate_application_audio_sessions() -> AudioResult<Vec<ApplicationAudi
     }
 
     Ok(sessions_info)
+}
+
+// ── Tests ────────────────────────────────────────────────────────────────
+//
+// These tests are automatically Windows-only because this file has
+// `#![cfg(target_os = "windows")]` at the top. They will never compile
+// on Linux or macOS.
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::core::config::{ApplicationId, CaptureTarget, DeviceId, ProcessId, StreamConfig};
+    use crate::core::interface::{AudioDevice, DeviceEnumerator};
+
+    // ── ComInitializer Tests ─────────────────────────────────────────
+
+    /// Test that ComInitializer can be created (COM init succeeds on Windows).
+    #[test]
+    fn test_com_initializer_creation() {
+        let result = ComInitializer::new();
+        assert!(
+            result.is_ok(),
+            "ComInitializer::new() failed: {:?}",
+            result.err()
+        );
+    }
+
+    /// Test that ComInitializer is Debug-printable.
+    #[test]
+    fn test_com_initializer_debug() {
+        let com = ComInitializer::new().expect("COM init failed");
+        let dbg = format!("{:?}", com);
+        assert!(dbg.contains("ComInitializer"));
+    }
+
+    // ── WindowsDeviceEnumerator Tests ────────────────────────────────
+
+    /// Test WindowsDeviceEnumerator creation (COM + IMMDeviceEnumerator).
+    #[test]
+    fn test_windows_device_enumerator_creation() {
+        let result = WindowsDeviceEnumerator::new();
+        assert!(
+            result.is_ok(),
+            "WindowsDeviceEnumerator::new() failed: {:?}",
+            result.err()
+        );
+    }
+
+    /// Test that WindowsDeviceEnumerator is Debug-printable.
+    #[test]
+    fn test_windows_device_enumerator_debug() {
+        let enumerator = WindowsDeviceEnumerator::new().expect("new() failed");
+        let dbg = format!("{:?}", enumerator);
+        assert!(dbg.contains("WindowsDeviceEnumerator"));
+    }
+
+    /// Test enumerate_devices returns a non-empty list on Windows.
+    #[test]
+    fn test_enumerate_devices_returns_devices() {
+        let enumerator = WindowsDeviceEnumerator::new().expect("new() failed");
+        let devices = enumerator.enumerate_devices().expect("enumerate failed");
+        assert!(
+            !devices.is_empty(),
+            "Expected at least one audio device on Windows"
+        );
+    }
+
+    /// Test default_device returns a valid boxed AudioDevice.
+    #[test]
+    fn test_default_device_returns_device() {
+        let enumerator = WindowsDeviceEnumerator::new().expect("new() failed");
+        let device = enumerator.default_device().expect("default_device failed");
+        // Verify it has a name.
+        let name = device.name();
+        assert!(!name.is_empty(), "Default device should have a name");
+    }
+
+    // ── WindowsAudioDevice Trait Implementation Tests ────────────────
+
+    /// Test AudioDevice::id() returns a non-empty DeviceId for a real device.
+    #[test]
+    fn test_audio_device_id() {
+        let enumerator = WindowsDeviceEnumerator::new().expect("new() failed");
+        let device = enumerator.default_device().expect("no default device");
+        let id = device.id();
+        assert!(
+            !id.0.is_empty(),
+            "Device ID should not be empty, got: {:?}",
+            id
+        );
+    }
+
+    /// Test AudioDevice::name() returns a non-empty string.
+    #[test]
+    fn test_audio_device_name() {
+        let enumerator = WindowsDeviceEnumerator::new().expect("new() failed");
+        let device = enumerator.default_device().expect("no default device");
+        let name = device.name();
+        assert!(
+            !name.is_empty() && name != "Unknown Windows Device",
+            "Expected a real device name, got: {:?}",
+            name
+        );
+    }
+
+    /// Test AudioDevice::supported_formats() returns at least the default format.
+    #[test]
+    fn test_audio_device_supported_formats() {
+        let enumerator = WindowsDeviceEnumerator::new().expect("new() failed");
+        let device = enumerator.default_device().expect("no default device");
+        let formats = device.supported_formats();
+        assert!(
+            !formats.is_empty(),
+            "Device should have at least one supported format"
+        );
+        // First format should be the default (48kHz, 2ch, F32).
+        let first = &formats[0];
+        assert_eq!(first.sample_rate, 48000);
+        assert_eq!(first.channels, 2);
+    }
+
+    /// Test AudioDevice::create_stream() creates a valid CapturingStream.
+    /// This is the full BridgeStream wiring test.
+    #[test]
+    fn test_audio_device_create_stream() {
+        let enumerator = WindowsDeviceEnumerator::new().expect("new() failed");
+        let device = enumerator.default_device().expect("no default device");
+
+        let config = StreamConfig::default(); // 48kHz, 2ch, F32
+        let stream_result = device.create_stream(&config);
+
+        assert!(
+            stream_result.is_ok(),
+            "create_stream() failed: {:?}",
+            stream_result.err()
+        );
+
+        let stream = stream_result.unwrap();
+        // Stream should be running after creation.
+        assert!(stream.is_running(), "Stream should be running after create");
+        // Format should match config.
+        assert_eq!(stream.format().sample_rate, 48000);
+        assert_eq!(stream.format().channels, 2);
+
+        // Stop the stream cleanly.
+        let stop_result = stream.stop();
+        assert!(
+            stop_result.is_ok(),
+            "stop() failed: {:?}",
+            stop_result.err()
+        );
+        assert!(
+            !stream.is_running(),
+            "Stream should not be running after stop"
+        );
+    }
+
+    // ── WindowsApplicationCapture Tests ──────────────────────────────
+
+    /// Test WindowsApplicationCapture::new() construction.
+    #[test]
+    fn test_application_capture_creation() {
+        let result = WindowsApplicationCapture::new(1234, false);
+        assert!(result.is_ok(), "new() failed: {:?}", result.err());
+        let capture = result.unwrap();
+        assert!(!capture.is_capturing());
+    }
+
+    /// Test WindowsApplicationCapture::new() with include_tree.
+    #[test]
+    fn test_application_capture_with_tree() {
+        let result = WindowsApplicationCapture::new(5678, true);
+        assert!(result.is_ok());
+    }
+
+    /// Test find_process_by_name returns None for non-existent process.
+    #[test]
+    fn test_find_process_by_name_nonexistent() {
+        let result = WindowsApplicationCapture::find_process_by_name(
+            "nonexistent_process_xyz_12345.exe",
+            false,
+        );
+        assert!(result.is_none(), "Should not find a nonexistent process");
+    }
+
+    /// Test list_audio_processes returns a non-empty list on a running system.
+    #[test]
+    fn test_list_audio_processes() {
+        let processes = WindowsApplicationCapture::list_audio_processes();
+        assert!(
+            !processes.is_empty(),
+            "Expected at least one process on a running system"
+        );
+    }
+
+    // ── ApplicationAudioSessionInfo Tests ────────────────────────────
+
+    /// Test ApplicationAudioSessionInfo struct construction and equality.
+    #[test]
+    fn test_application_session_info_construction() {
+        let info = ApplicationAudioSessionInfo {
+            process_id: 1234,
+            display_name: "TestApp".to_string(),
+            session_identifier: "session-1".to_string(),
+            executable_path: Some("C:\\test\\app.exe".to_string()),
+        };
+        assert_eq!(info.process_id, 1234);
+        assert_eq!(info.display_name, "TestApp");
+        assert_eq!(info.session_identifier, "session-1");
+        assert_eq!(info.executable_path, Some("C:\\test\\app.exe".to_string()));
+    }
+
+    /// Test ApplicationAudioSessionInfo Clone and PartialEq.
+    #[test]
+    fn test_application_session_info_clone_eq() {
+        let info = ApplicationAudioSessionInfo {
+            process_id: 42,
+            display_name: "App".to_string(),
+            session_identifier: "s".to_string(),
+            executable_path: None,
+        };
+        let cloned = info.clone();
+        assert_eq!(info, cloned);
+    }
+
+    /// Test ApplicationAudioSessionInfo Debug format.
+    #[test]
+    fn test_application_session_info_debug() {
+        let info = ApplicationAudioSessionInfo {
+            process_id: 100,
+            display_name: "Debug Test".to_string(),
+            session_identifier: "sid".to_string(),
+            executable_path: None,
+        };
+        let dbg = format!("{:?}", info);
+        assert!(dbg.contains("100"));
+        assert!(dbg.contains("Debug Test"));
+    }
+
+    // ── enumerate_application_audio_sessions Tests ───────────────────
+
+    /// Test that enumerate_application_audio_sessions doesn't panic.
+    #[test]
+    fn test_enumerate_audio_sessions() {
+        let result = enumerate_application_audio_sessions();
+        assert!(
+            result.is_ok(),
+            "enumerate_application_audio_sessions() failed: {:?}",
+            result.err()
+        );
+        // Result may be empty if no apps are playing audio.
+    }
+
+    // ── BridgeStream Integration (full wiring) ──────────────────────
+
+    /// Test that create_stream() produces a CapturingStream that can read audio.
+    /// This is a deeper integration test of the full WASAPI → BridgeStream pipeline.
+    #[test]
+    fn test_create_stream_can_read() {
+        use crate::core::interface::CapturingStream;
+
+        let enumerator = WindowsDeviceEnumerator::new().expect("new() failed");
+        let device = enumerator.default_device().expect("no default device");
+
+        let config = StreamConfig::default();
+        let stream = device.create_stream(&config).expect("create_stream failed");
+
+        // Try a non-blocking read — may or may not have data yet.
+        let try_result = stream.try_read_chunk();
+        // Should not be an error (stream is Running).
+        match try_result {
+            Ok(None) => { /* No data yet — fine */ }
+            Ok(Some(buf)) => {
+                // Got data — verify it has the right format.
+                assert_eq!(buf.channels(), 2);
+                assert_eq!(buf.sample_rate(), 48000);
+            }
+            Err(e) => {
+                panic!("try_read_chunk() returned unexpected error: {:?}", e);
+            }
+        }
+
+        // Clean up.
+        stream.stop().expect("stop failed");
+    }
 }
