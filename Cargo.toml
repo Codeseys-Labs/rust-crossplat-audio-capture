@@ -101,6 +101,7 @@ core-foundation = "0.10.1"          # For CFDictionary creation (aggregate devic
 core-foundation-sys = "0.8.7"       # Low-level Core Foundation FFI bindings
 cocoa = "0.26.1"                    # Cocoa bindings for NSRunningApplication enumeration
 objc = "0.2.7"                      # Objective-C runtime bindings
+sysinfo = "0.38.4"                  # For process tree discovery (ProcessTree capture target)
 # Note: Process Tap APIs (AudioHardwareCreateProcessTap, CATapDescription) may require
 # custom FFI bindings as they are very new (macOS 14.4+) and may not be in objc2 yet
 
