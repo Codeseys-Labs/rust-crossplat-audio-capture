@@ -110,6 +110,7 @@ impl<S: PlatformStream> BridgeStream<S> {
     /// * `platform_stream` — The platform-specific stream handle.
     /// * `format` — The audio format of data in this stream.
     /// * `default_timeout` — Default timeout for blocking `read_chunk()` calls.
+    ///
     /// Platform-conditional: called by platform backends when features are enabled.
     #[allow(dead_code)]
     pub fn new(

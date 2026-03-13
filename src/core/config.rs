@@ -39,9 +39,10 @@ impl std::fmt::Display for ProcessId {
 /// This enum specifies *what* audio should be captured. It replaces the old
 /// combination of `DeviceSelector` + PID/session fields with a single,
 /// explicit discriminated union.
-#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, Hash)]
 pub enum CaptureTarget {
     /// Capture from the system default audio device / mix.
+    #[default]
     SystemDefault,
     /// Capture from a specific device identified by [`DeviceId`].
     Device(DeviceId),
@@ -51,12 +52,6 @@ pub enum CaptureTarget {
     ApplicationByName(String),
     /// Capture audio from a process and its child processes, identified by [`ProcessId`].
     ProcessTree(ProcessId),
-}
-
-impl Default for CaptureTarget {
-    fn default() -> Self {
-        CaptureTarget::SystemDefault
-    }
 }
 
 // ── SampleFormat (new canonical 4-variant) ───────────────────────────────
@@ -173,21 +168,12 @@ impl StreamConfig {
 ///
 /// Created by [`AudioCaptureBuilder`](crate::api::AudioCaptureBuilder),
 /// this struct stores the validated capture parameters.
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, Default, PartialEq)]
 pub struct AudioCaptureConfig {
     /// What to capture — system default, specific device, application, etc.
     pub target: CaptureTarget,
     /// Stream format and buffer configuration.
     pub stream_config: StreamConfig,
-}
-
-impl Default for AudioCaptureConfig {
-    fn default() -> Self {
-        AudioCaptureConfig {
-            target: CaptureTarget::default(),
-            stream_config: StreamConfig::default(),
-        }
-    }
 }
 
 // ── Legacy / Compatibility Types ─────────────────────────────────────────
@@ -196,30 +182,27 @@ impl Default for AudioCaptureConfig {
 ///
 /// Backends will attempt to honor this preference, but actual latency
 /// may vary based on system capabilities and load.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Hash)]
 pub enum LatencyMode {
     /// Prioritizes the lowest possible latency.
     LowLatency,
     /// Aims for a balance (default).
+    #[default]
     Balanced,
     /// Prioritizes lower power consumption.
     PowerSaving,
-}
-
-impl Default for LatencyMode {
-    fn default() -> Self {
-        LatencyMode::Balanced
-    }
 }
 
 /// Specifies criteria for selecting an audio device.
 ///
 /// **Deprecated** — prefer [`CaptureTarget`] for new code.
 /// Retained for backward compatibility during the API transition.
+#[allow(deprecated)]
 #[deprecated(note = "Use CaptureTarget instead")]
-#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, Hash)]
 pub enum DeviceSelector {
     /// Selects the system's default input device.
+    #[default]
     DefaultInput,
     /// Selects the system's default output device.
     DefaultOutput,
@@ -227,13 +210,6 @@ pub enum DeviceSelector {
     ById(String),
     /// Selects a device by name (first match).
     ByName(String),
-}
-
-#[allow(deprecated)]
-impl Default for DeviceSelector {
-    fn default() -> Self {
-        DeviceSelector::DefaultInput
-    }
 }
 
 #[allow(deprecated)]

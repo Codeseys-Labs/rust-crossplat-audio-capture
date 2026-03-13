@@ -363,7 +363,7 @@ fn pw_thread_main(
     };
 
     // Step 3: Create Context and connect to the PipeWire daemon.
-    let context = match ContextBox::new(&main_loop.loop_(), None) {
+    let context = match ContextBox::new(main_loop.loop_(), None) {
         Ok(ctx) => ctx,
         Err(e) => {
             let _ = init_tx.send(Err(AudioError::BackendInitializationFailed {
