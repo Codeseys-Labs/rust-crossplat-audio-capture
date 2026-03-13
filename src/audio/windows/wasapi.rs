@@ -2,7 +2,6 @@
 //! Testing Windows compilation in GitHub Actions.
 #![cfg(target_os = "windows")]
 
-use crate::core::buffer::AudioBuffer;
 use crate::core::config::{AudioFormat, StreamConfig};
 use crate::core::error::{AudioError, Result as AudioResult};
 use crate::core::interface::{AudioDevice, CapturingStream, DeviceEnumerator, DeviceKind};
@@ -18,14 +17,14 @@ use wasapi::{self, initialize_mta};
 
 // --- New BridgeStream Architecture Imports ---
 use super::thread::{WindowsCaptureConfig, WindowsCaptureThread, WindowsPlatformStream};
-use crate::bridge::{calculate_capacity, create_bridge, BridgeStream, PlatformStream, StreamState};
+use crate::bridge::{calculate_capacity, create_bridge, BridgeStream, StreamState};
 use crate::core::config::{CaptureTarget, DeviceId};
 
 // --- Application-Specific Capture (Process Loopback) ---
 
 use windows::{
     core::*, Win32::Foundation::*, Win32::Media::Audio::*, Win32::System::Com::*,
-    Win32::System::Threading::*, Win32::System::Variant::*,
+    Win32::System::Variant::*,
 };
 
 // Specific imports not covered by the glob imports above
@@ -77,8 +76,8 @@ impl WindowsApplicationCapture {
     ///
     /// This uses wasapi-rs AudioClient::new_application_loopback_client for simplicity
     pub fn initialize(&mut self) -> std::result::Result<(), Box<dyn std::error::Error>> {
-        // Initialize COM using wasapi-rs
-        initialize_mta().ok().unwrap();
+        // Initialize COM using wasapi-rs (0.22.0: returns HRESULT, not Result)
+        let _hr = initialize_mta();
 
         // Create wasapi-rs AudioClient for application loopback
         let mut audio_client = wasapi::AudioClient::new_application_loopback_client(
@@ -373,7 +372,16 @@ impl WindowsAudioDevice {
             com_initializer,
         }
     }
+}
 
+// SAFETY: WindowsAudioDevice wraps COM interfaces (IMMDevice) that are created
+// in a Multi-Threaded Apartment (MTA) context via CoInitializeEx(COINIT_MULTITHREADED).
+// In MTA, COM objects are free-threaded and can be safely used from any thread.
+// The Arc<ComInitializer> ensures COM remains initialized while any device exists.
+unsafe impl Send for WindowsAudioDevice {}
+unsafe impl Sync for WindowsAudioDevice {}
+
+impl WindowsAudioDevice {
     /// Helper function to convert a PWSTR to a String.
     /// Assumes the PWSTR is null-terminated.
     unsafe fn pwstr_to_string(pwstr: PWSTR) -> AudioResult<String> {
@@ -597,6 +605,11 @@ impl WindowsDeviceEnumerator {
         })
     }
 }
+
+// SAFETY: WindowsDeviceEnumerator wraps IMMDeviceEnumerator, also created in MTA.
+// Same MTA thread-safety reasoning as WindowsAudioDevice.
+unsafe impl Send for WindowsDeviceEnumerator {}
+unsafe impl Sync for WindowsDeviceEnumerator {}
 
 /// New canonical `DeviceEnumerator` trait implementation for `WindowsDeviceEnumerator`.
 ///
