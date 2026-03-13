@@ -492,17 +492,17 @@ unsafe fn build_aggregate_device_dict(
     pid: u32,
 ) -> AudioResult<CFMutableDictionary> {
     // --- Build tap inner dict: { uid: tapUUID, drift_compensation: true } ---
-    let tap_inner = CFMutableDictionary::new();
+    let mut tap_inner = CFMutableDictionary::new();
     let tap_uid_key = CFString::new(SUB_TAP_UID_KEY);
     let tap_uuid_val = CFString::new(tap_uuid_str);
     tap_inner.add(
-        tap_uid_key.as_concrete_TypeRef() as *const c_void,
-        tap_uuid_val.as_concrete_TypeRef() as *const c_void,
+        &(tap_uid_key.as_concrete_TypeRef() as *const c_void),
+        &(tap_uuid_val.as_concrete_TypeRef() as *const c_void),
     );
     let tap_drift_key = CFString::new(SUB_TAP_DRIFT_COMPENSATION_KEY);
     tap_inner.add(
-        tap_drift_key.as_concrete_TypeRef() as *const c_void,
-        CFBoolean::true_value().as_concrete_TypeRef() as *const c_void,
+        &(tap_drift_key.as_concrete_TypeRef() as *const c_void),
+        &(CFBoolean::true_value().as_concrete_TypeRef() as *const c_void),
     );
 
     // Wrap tap dict in a single-element CFArray
@@ -523,11 +523,11 @@ unsafe fn build_aggregate_device_dict(
     }
 
     // --- Build sub-device inner dict: { uid: outputUID } ---
-    let sub_inner = CFMutableDictionary::new();
+    let mut sub_inner = CFMutableDictionary::new();
     let sub_uid_key = CFString::new(SUB_DEVICE_UID_KEY);
     sub_inner.add(
-        sub_uid_key.as_concrete_TypeRef() as *const c_void,
-        output_uid.as_concrete_TypeRef() as *const c_void,
+        &(sub_uid_key.as_concrete_TypeRef() as *const c_void),
+        &(output_uid.as_concrete_TypeRef() as *const c_void),
     );
 
     // Wrap sub-device dict in a single-element CFArray
@@ -549,64 +549,64 @@ unsafe fn build_aggregate_device_dict(
     }
 
     // --- Build top-level aggregate device dictionary ---
-    let dict = CFMutableDictionary::new();
+    let mut dict = CFMutableDictionary::new();
 
     // name
     let k_name = CFString::new(AGG_DEVICE_NAME_KEY);
     let v_name = CFString::new(&format!("rsac-agg-{}", pid));
     dict.add(
-        k_name.as_concrete_TypeRef() as *const c_void,
-        v_name.as_concrete_TypeRef() as *const c_void,
+        &(k_name.as_concrete_TypeRef() as *const c_void),
+        &(v_name.as_concrete_TypeRef() as *const c_void),
     );
 
     // uid
     let k_uid = CFString::new(AGG_DEVICE_UID_KEY);
     let v_uid = CFString::new(&format!("rsac-agg-uid-{}", pid));
     dict.add(
-        k_uid.as_concrete_TypeRef() as *const c_void,
-        v_uid.as_concrete_TypeRef() as *const c_void,
+        &(k_uid.as_concrete_TypeRef() as *const c_void),
+        &(v_uid.as_concrete_TypeRef() as *const c_void),
     );
 
     // master sub-device = output device UID
     let k_master = CFString::new(AGG_DEVICE_MAIN_SUBDEVICE_KEY);
     dict.add(
-        k_master.as_concrete_TypeRef() as *const c_void,
-        output_uid.as_concrete_TypeRef() as *const c_void,
+        &(k_master.as_concrete_TypeRef() as *const c_void),
+        &(output_uid.as_concrete_TypeRef() as *const c_void),
     );
 
     // private = true
     let k_private = CFString::new(AGG_DEVICE_IS_PRIVATE_KEY);
     dict.add(
-        k_private.as_concrete_TypeRef() as *const c_void,
-        CFBoolean::true_value().as_concrete_TypeRef() as *const c_void,
+        &(k_private.as_concrete_TypeRef() as *const c_void),
+        &(CFBoolean::true_value().as_concrete_TypeRef() as *const c_void),
     );
 
     // stacked = false
     let k_stacked = CFString::new(AGG_DEVICE_IS_STACKED_KEY);
     dict.add(
-        k_stacked.as_concrete_TypeRef() as *const c_void,
-        CFBoolean::false_value().as_concrete_TypeRef() as *const c_void,
+        &(k_stacked.as_concrete_TypeRef() as *const c_void),
+        &(CFBoolean::false_value().as_concrete_TypeRef() as *const c_void),
     );
 
     // tap_auto_start = true
     let k_auto_start = CFString::new(AGG_DEVICE_TAP_AUTO_START_KEY);
     dict.add(
-        k_auto_start.as_concrete_TypeRef() as *const c_void,
-        CFBoolean::true_value().as_concrete_TypeRef() as *const c_void,
+        &(k_auto_start.as_concrete_TypeRef() as *const c_void),
+        &(CFBoolean::true_value().as_concrete_TypeRef() as *const c_void),
     );
 
     // sub-device list (array of dicts)
     let k_subdevices = CFString::new(AGG_DEVICE_SUBDEVICE_LIST_KEY);
     dict.add(
-        k_subdevices.as_concrete_TypeRef() as *const c_void,
-        sub_array as *const c_void,
+        &(k_subdevices.as_concrete_TypeRef() as *const c_void),
+        &(sub_array as *const c_void),
     );
 
     // tap list (array of dicts)
     let k_taps = CFString::new(AGG_DEVICE_TAP_LIST_KEY);
     dict.add(
-        k_taps.as_concrete_TypeRef() as *const c_void,
-        tap_array as *const c_void,
+        &(k_taps.as_concrete_TypeRef() as *const c_void),
+        &(tap_array as *const c_void),
     );
 
     // Release the arrays — dict.add() has already retained them via CFDictionaryAddValue
