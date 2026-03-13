@@ -285,10 +285,9 @@ impl CoreAudioProcessTap {
     /// **Important:** Requires macOS 14.4+ and the `CATapDescription` class.
     pub fn new_tree(parent_pid: u32) -> AudioResult<Self> {
         // ── Step 1: Discover child processes via sysinfo ──
-        use sysinfo::{ProcessRefreshKind, RefreshKind, System, UpdateKind};
+        use sysinfo::{ProcessRefreshKind, RefreshKind, System};
 
-        let refresh_kind = RefreshKind::nothing()
-            .with_processes(ProcessRefreshKind::nothing().with_parent(UpdateKind::Always));
+        let refresh_kind = RefreshKind::nothing().with_processes(ProcessRefreshKind::everything());
         let sys = System::new_with_specifics(refresh_kind);
 
         let parent_sysinfo_pid = sysinfo::Pid::from_u32(parent_pid);
