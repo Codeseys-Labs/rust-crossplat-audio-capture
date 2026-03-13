@@ -989,7 +989,7 @@ mod tests {
         };
         let result = create_audio_client(&config);
         assert!(result.is_err(), "Should fail for non-numeric PID");
-        match result.unwrap_err() {
+        match result.err().unwrap() {
             AudioError::ApplicationNotFound { identifier } => {
                 assert!(identifier.contains("not_a_number"));
             }
@@ -1048,7 +1048,7 @@ mod tests {
         };
         let result = create_audio_client(&config);
         assert!(result.is_err(), "Should fail for non-existent device ID");
-        match result.unwrap_err() {
+        match result.err().unwrap() {
             AudioError::DeviceNotFound { device_id } => {
                 assert_eq!(device_id, "nonexistent-device-id-12345");
             }
