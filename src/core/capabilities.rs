@@ -92,7 +92,7 @@ impl PlatformCapabilities {
         Self {
             supports_system_capture: true,
             supports_application_capture: true, // WASAPI session capture
-            supports_process_tree_capture: false,
+            supports_process_tree_capture: true, // WASAPI include_tree=true
             supports_device_selection: true,
             supported_sample_formats: vec![
                 SampleFormat::I16,
@@ -111,7 +111,7 @@ impl PlatformCapabilities {
         Self {
             supports_system_capture: true,
             supports_application_capture: true, // CoreAudio Process Tap
-            supports_process_tree_capture: true, // Process Tap supports trees
+            supports_process_tree_capture: false, // single-PID stub only; not yet implemented
             supports_device_selection: true,
             supported_sample_formats: vec![SampleFormat::I16, SampleFormat::I32, SampleFormat::F32],
             sample_rate_range: (8000, 192000),
@@ -371,17 +371,24 @@ mod tests {
     }
 
     #[test]
-    #[cfg(any(target_os = "linux", target_os = "windows"))]
-    fn query_process_tree_not_supported() {
+    #[cfg(target_os = "linux")]
+    fn query_process_tree_not_supported_on_linux() {
         let caps = PlatformCapabilities::query();
         assert!(!caps.supports_process_tree_capture);
     }
 
     #[test]
-    #[cfg(target_os = "macos")]
-    fn query_process_tree_supported_on_macos() {
+    #[cfg(target_os = "windows")]
+    fn query_process_tree_supported_on_windows() {
         let caps = PlatformCapabilities::query();
         assert!(caps.supports_process_tree_capture);
+    }
+
+    #[test]
+    #[cfg(target_os = "macos")]
+    fn query_process_tree_not_supported_on_macos() {
+        let caps = PlatformCapabilities::query();
+        assert!(!caps.supports_process_tree_capture);
     }
 
     #[test]
