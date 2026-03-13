@@ -115,6 +115,14 @@ pub trait CapturingStream: Send + Sync {
     /// Returns `true` if the stream is currently capturing audio.
     fn is_running(&self) -> bool;
 
+    /// Returns the number of audio buffers dropped due to ring buffer overflow.
+    ///
+    /// A non-zero value indicates the consumer could not keep up with the
+    /// producer (OS audio callback). The default implementation returns 0.
+    fn overrun_count(&self) -> u64 {
+        0
+    }
+
     /// Closes the stream and releases all OS resources.
     ///
     /// After `close()`, the stream cannot be restarted. Any subsequent

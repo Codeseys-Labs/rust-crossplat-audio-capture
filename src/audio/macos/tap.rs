@@ -273,6 +273,232 @@ impl CoreAudioProcessTap {
         }
     }
 
+    /// Creates and configures a new Core Audio Tap + aggregate device that
+    /// captures audio from a process tree (parent + all direct children).
+    ///
+    /// Uses `sysinfo` to enumerate child processes of `parent_pid`, then
+    /// creates a `CATapDescription` targeting all discovered PIDs.
+    ///
+    /// If no child processes are found, the tap is created with just the
+    /// parent PID (graceful degradation to single-process capture).
+    ///
+    /// **Important:** Requires macOS 14.4+ and the `CATapDescription` class.
+    pub fn new_tree(parent_pid: u32) -> AudioResult<Self> {
+        // ── Step 1: Discover child processes via sysinfo ──
+        use sysinfo::{ProcessRefreshKind, RefreshKind, System, UpdateKind};
+
+        let refresh_kind = RefreshKind::nothing()
+            .with_processes(ProcessRefreshKind::nothing().with_parent(UpdateKind::Always));
+        let sys = System::new_with_specifics(refresh_kind);
+
+        let parent_sysinfo_pid = sysinfo::Pid::from_u32(parent_pid);
+
+        // Collect parent + direct children
+        let mut all_pids: Vec<u32> = vec![parent_pid];
+        for (pid, process) in sys.processes() {
+            if let Some(ppid) = process.parent() {
+                if ppid == parent_sysinfo_pid && *pid != parent_sysinfo_pid {
+                    all_pids.push(pid.as_u32());
+                }
+            }
+        }
+        all_pids.sort();
+        all_pids.dedup();
+
+        log::info!(
+            "ProcessTree capture: parent_pid={}, discovered {} total PIDs: {:?}",
+            parent_pid,
+            all_pids.len(),
+            all_pids
+        );
+
+        // ── Step 2: Create the tap with all discovered PIDs ──
+        unsafe {
+            let _pool = NSAutoreleasePool::new(nil);
+
+            // Build NSArray of NSNumber PIDs
+            let pid_nsnumbers: Vec<id> = all_pids
+                .iter()
+                .map(|&pid| {
+                    let n: id = msg_send![class!(NSNumber), numberWithInt: pid as i32];
+                    n
+                })
+                .collect();
+
+            // Check none are nil
+            for (i, &n) in pid_nsnumbers.iter().enumerate() {
+                if n == nil {
+                    return Err(AudioError::BackendError {
+                        backend: "CoreAudio".into(),
+                        operation: "process_tap_tree".into(),
+                        message: format!(
+                            "Failed to create NSNumber for PID {} (index {})",
+                            all_pids[i], i
+                        ),
+                        context: None,
+                    });
+                }
+            }
+
+            // Create NSArray from the Vec of NSNumber objects
+            let pids_nsarray: id = msg_send![
+                class!(NSArray),
+                arrayWithObjects: pid_nsnumbers.as_ptr()
+                count: pid_nsnumbers.len()
+            ];
+            if pids_nsarray == nil {
+                return Err(AudioError::BackendError {
+                    backend: "CoreAudio".into(),
+                    operation: "process_tap_tree".into(),
+                    message: "Failed to create NSArray for PIDs".into(),
+                    context: None,
+                });
+            }
+
+            // Allocate and initialize CATapDescription
+            let ca_tap_description_class = Class::get("CATapDescription");
+            if ca_tap_description_class.is_none() {
+                return Err(AudioError::BackendError {
+                    backend: "CoreAudio".into(),
+                    operation: "process_tap_tree".into(),
+                    message: "CATapDescription class not found. Ensure macOS 14.4+ and CoreAudio framework is linked.".into(),
+                    context: None,
+                });
+            }
+            let ca_tap_description_class = ca_tap_description_class.unwrap();
+
+            let tap_desc_obj: id = msg_send![ca_tap_description_class, alloc];
+            let tap_desc_obj: id = msg_send![tap_desc_obj, init];
+
+            if tap_desc_obj == nil {
+                return Err(AudioError::BackendError {
+                    backend: "CoreAudio".into(),
+                    operation: "process_tap_tree".into(),
+                    message: "Failed to allocate or initialize CATapDescription".into(),
+                    context: None,
+                });
+            }
+
+            // Set name
+            let tap_name_str = format!("rsac-tap-tree-{}", parent_pid);
+            let tap_name_nsstring = NSString::alloc(nil).init_str(&tap_name_str);
+            if tap_name_nsstring == nil {
+                return Err(AudioError::BackendError {
+                    backend: "CoreAudio".into(),
+                    operation: "process_tap_tree".into(),
+                    message: "Failed to create NSString for tap name".into(),
+                    context: None,
+                });
+            }
+            let _: () = msg_send![tap_desc_obj, setName: tap_name_nsstring];
+
+            // Set processes and exclusive (non-exclusive: hear audio + capture it)
+            let sel_set_processes_exclusive = sel!(setProcesses:exclusive:);
+            if msg_send_responds_to(tap_desc_obj, sel_set_processes_exclusive) {
+                let _: () = msg_send![tap_desc_obj, setProcesses: pids_nsarray exclusive: NO];
+            } else {
+                return Err(AudioError::BackendError {
+                    backend: "CoreAudio".into(),
+                    operation: "process_tap_tree".into(),
+                    message:
+                        "CATapDescription does not respond to setProcesses:exclusive:. Check API."
+                            .into(),
+                    context: None,
+                });
+            }
+
+            // Set UUID on tap description
+            let nsuuid_class = class!(NSUUID);
+            let tap_uuid: id = msg_send![nsuuid_class, UUID];
+            let _: () = msg_send![tap_desc_obj, setUUID: tap_uuid];
+
+            // Set mute behavior to unmuted (CATapUnmuted = 0)
+            let _: () = msg_send![tap_desc_obj, setMuteBehavior: 0i32];
+
+            // Set privateTap = true
+            let _: () = msg_send![tap_desc_obj, setPrivateTap: YES];
+
+            // Set mixdown = true (stereo mixdown)
+            let _: () = msg_send![tap_desc_obj, setMixdown: YES];
+
+            // Call AudioHardwareCreateProcessTap
+            let mut tap_id: sys::AudioObjectID = 0;
+            let status: OSStatus = AudioHardwareCreateProcessTap(tap_desc_obj, &mut tap_id);
+
+            if status != sys::noErr as OSStatus {
+                return Err(map_ca_error(CAError::Unknown(status)));
+            }
+
+            if tap_id == 0 {
+                return Err(AudioError::BackendError {
+                    backend: "CoreAudio".into(),
+                    operation: "process_tap_tree".into(),
+                    message:
+                        "AudioHardwareCreateProcessTap succeeded but returned an invalid tap_id (0)"
+                            .into(),
+                    context: None,
+                });
+            }
+
+            // Read tap UUID string for use in aggregate device dictionary
+            let uuid_nsstring: id = msg_send![tap_uuid, UUIDString];
+            let uuid_cstr = cocoa::foundation::NSString::UTF8String(uuid_nsstring);
+            let tap_uuid_str = std::ffi::CStr::from_ptr(uuid_cstr)
+                .to_string_lossy()
+                .into_owned();
+
+            log::debug!(
+                "Process tree tap created: tap_id={}, uuid={}, pids={:?}",
+                tap_id,
+                tap_uuid_str,
+                all_pids
+            );
+
+            // Get default output device UID
+            let output_uid = get_default_output_device_uid()?;
+            log::debug!("Default output device UID: {}", output_uid.to_string());
+
+            // Build aggregate device dictionary
+            let agg_dict = build_aggregate_device_dict(&output_uid, &tap_uuid_str, parent_pid)?;
+
+            // Create aggregate device
+            let mut aggregate_device_id: sys::AudioObjectID = 0;
+            let agg_status = AudioHardwareCreateAggregateDevice(
+                agg_dict.as_concrete_TypeRef() as CFDictionaryRef,
+                &mut aggregate_device_id,
+            );
+
+            if agg_status != sys::noErr as OSStatus {
+                // Clean up: destroy the already-created tap before returning error
+                AudioHardwareDestroyProcessTap(tap_id);
+                return Err(AudioError::BackendError {
+                    backend: "CoreAudio".into(),
+                    operation: "create_aggregate_device".into(),
+                    message: format!(
+                        "AudioHardwareCreateAggregateDevice failed: OSStatus {}",
+                        agg_status
+                    ),
+                    context: None,
+                });
+            }
+
+            log::info!(
+                "Aggregate device created for process tree: agg_id={}, tap_id={}, uuid={}, pids={:?}",
+                aggregate_device_id,
+                tap_id,
+                tap_uuid_str,
+                all_pids
+            );
+
+            Ok(Self {
+                tap_id,
+                aggregate_device_id,
+                tap_uuid_string: tap_uuid_str,
+                target_pid: parent_pid,
+            })
+        }
+    }
+
     /// Returns the aggregate device's `AudioObjectID`.
     ///
     /// This is the device ID to use with AUHAL's `kAudioOutputUnitProperty_CurrentDevice`.

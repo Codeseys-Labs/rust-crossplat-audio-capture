@@ -111,7 +111,7 @@ impl PlatformCapabilities {
         Self {
             supports_system_capture: true,
             supports_application_capture: true, // CoreAudio Process Tap
-            supports_process_tree_capture: false, // single-PID stub only; not yet implemented
+            supports_process_tree_capture: true, // Multi-PID tap via sysinfo child discovery
             supports_device_selection: true,
             supported_sample_formats: vec![SampleFormat::I16, SampleFormat::I32, SampleFormat::F32],
             sample_rate_range: (8000, 192000),
@@ -386,9 +386,9 @@ mod tests {
 
     #[test]
     #[cfg(target_os = "macos")]
-    fn query_process_tree_not_supported_on_macos() {
+    fn query_process_tree_supported_on_macos() {
         let caps = PlatformCapabilities::query();
-        assert!(!caps.supports_process_tree_capture);
+        assert!(caps.supports_process_tree_capture);
     }
 
     #[test]

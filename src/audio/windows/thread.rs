@@ -498,7 +498,7 @@ fn wasapi_capture_thread_main(
 /// | `SystemDefault`        | Default render device → loopback capture              |
 /// | `Device(id)`           | Find device by ID → loopback capture                 |
 /// | `Application(app_id)`  | Parse PID from app_id → process loopback              |
-/// | `ApplicationByName(_)` | Falls back to SystemDefault (name resolution is TBD)  |
+/// | `ApplicationByName(_)` | Resolve name → PID via sysinfo → process loopback     |
 /// | `ProcessTree(pid)`     | Process loopback with `include_tree = true`           |
 fn create_audio_client(config: &WindowsCaptureConfig) -> AudioResult<wasapi::AudioClient> {
     match &config.target {
@@ -585,45 +585,27 @@ fn create_audio_client(config: &WindowsCaptureConfig) -> AudioResult<wasapi::Aud
         }
 
         CaptureTarget::ApplicationByName(name) => {
-            // ApplicationByName requires resolving the name to a PID, which
-            // is not yet implemented in the new API. Fall back to SystemDefault
-            // with a warning.
-            log::warn!(
-                "WASAPI: ApplicationByName('{}') is not yet fully supported, \
-                 falling back to SystemDefault capture",
+            // Resolve application name to PID using sysinfo, then create
+            // a WASAPI application loopback client (same as Application arm).
+            log::debug!(
+                "WASAPI: resolving application name '{}' to PID via sysinfo",
                 name
             );
 
-            let enumerator =
-                wasapi::DeviceEnumerator::new().map_err(|e| AudioError::BackendError {
-                    backend: "wasapi".to_string(),
-                    operation: "create_enumerator".to_string(),
-                    message: format!("Failed to create DeviceEnumerator: {}", e),
-                    context: None,
-                })?;
-            let device = enumerator
-                .get_default_device(&wasapi::Direction::Render)
-                .map_err(|e| AudioError::BackendError {
-                    backend: "wasapi".to_string(),
-                    operation: "get_default_device".to_string(),
-                    message: format!(
-                        "Failed to get default render device (fallback for ApplicationByName '{}'): {}",
-                        name, e
-                    ),
-                    context: None,
-                })?;
+            let pid = resolve_process_name_to_pid(name)?;
 
-            device
-                .get_iaudioclient()
-                .map_err(|e| AudioError::BackendError {
-                    backend: "wasapi".to_string(),
-                    operation: "get_iaudioclient".to_string(),
-                    message: format!(
-                        "Failed to get IAudioClient (fallback for ApplicationByName '{}'): {}",
-                        name, e
-                    ),
-                    context: None,
-                })
+            log::debug!(
+                "WASAPI: resolved '{}' to PID {}, creating application loopback client",
+                name,
+                pid
+            );
+
+            wasapi::AudioClient::new_application_loopback_client(pid, false).map_err(|e| {
+                AudioError::ApplicationCaptureFailed {
+                    app_id: format!("{}(pid={})", name, pid),
+                    reason: format!("Failed to create application loopback client: {}", e),
+                }
+            })
         }
 
         CaptureTarget::ProcessTree(pid) => {
@@ -694,6 +676,48 @@ fn find_device_by_id(device_id: &str) -> AudioResult<wasapi::Device> {
 
     Err(AudioError::DeviceNotFound {
         device_id: device_id.to_string(),
+    })
+}
+
+// ── Process Name Resolution Helper ───────────────────────────────────────
+
+/// Resolve a process name to a PID using the `sysinfo` crate.
+///
+/// Performs a **case-insensitive** match against the names of all running
+/// processes. Returns the PID of the first matching process found.
+///
+/// # Errors
+///
+/// - [`AudioError::ApplicationNotFound`] if no running process matches
+///   the given `name` (case-insensitive comparison).
+fn resolve_process_name_to_pid(name: &str) -> AudioResult<u32> {
+    use sysinfo::{ProcessRefreshKind, RefreshKind, System};
+
+    let refreshes = RefreshKind::nothing().with_processes(ProcessRefreshKind::everything());
+    let system = System::new_with_specifics(refreshes);
+
+    let name_lower = name.to_lowercase();
+
+    // Iterate all processes and perform a case-insensitive name match.
+    for (pid, process) in system.processes() {
+        let proc_name = process.name().to_string_lossy();
+        if proc_name.to_lowercase() == name_lower {
+            let resolved = pid.as_u32();
+            log::debug!(
+                "sysinfo: matched process '{}' (name='{}') → PID {}",
+                name,
+                proc_name,
+                resolved
+            );
+            return Ok(resolved);
+        }
+    }
+
+    Err(AudioError::ApplicationNotFound {
+        identifier: format!(
+            "No running process found matching name '{}' (case-insensitive)",
+            name
+        ),
     })
 }
 
@@ -956,9 +980,9 @@ mod tests {
         );
     }
 
-    /// Test that ApplicationByName falls back to SystemDefault.
+    /// Test that ApplicationByName with a nonexistent process returns ApplicationNotFound.
     #[test]
-    fn test_create_audio_client_app_by_name_fallback() {
+    fn test_create_audio_client_app_by_name_not_found() {
         // wasapi 0.22.0: initialize_mta() returns HRESULT, not Result
         let _hr = wasapi::initialize_mta();
 
@@ -967,13 +991,22 @@ mod tests {
             sample_rate: 48000,
             channels: 2,
         };
-        // Should fall back to SystemDefault and succeed.
+        // Should fail with ApplicationNotFound since no such process exists.
         let result = create_audio_client(&config);
         assert!(
-            result.is_ok(),
-            "ApplicationByName fallback failed: {:?}",
-            result.err()
+            result.is_err(),
+            "Should fail for nonexistent application name"
         );
+        match result.err().unwrap() {
+            AudioError::ApplicationNotFound { identifier } => {
+                assert!(
+                    identifier.contains("nonexistent_app_xyz"),
+                    "Error should mention the requested name, got: {}",
+                    identifier
+                );
+            }
+            other => panic!("Expected ApplicationNotFound, got: {:?}", other),
+        }
     }
 
     /// Test that Application target with invalid PID returns appropriate error.

@@ -6,6 +6,7 @@ use crate::core::error::{AudioError, AudioResult};
 use crate::core::interface::DeviceKind;
 use std::fmt;
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::mpsc;
 use std::sync::{Arc, Mutex};
 
 // Re-export AudioCaptureConfig from core::config so downstream code
@@ -233,7 +234,7 @@ impl AudioCaptureBuilder {
 pub struct AudioCapture {
     config: AudioCaptureConfig,
     device: Option<Box<dyn crate::core::interface::AudioDevice>>,
-    stream: Option<Box<dyn crate::core::interface::CapturingStream + 'static>>,
+    stream: Option<Arc<dyn crate::core::interface::CapturingStream + 'static>>,
     is_running: AtomicBool,
     #[allow(clippy::type_complexity)]
     callback: Arc<Mutex<Option<Box<dyn FnMut(&AudioBuffer) + Send + 'static>>>>,
@@ -260,7 +261,7 @@ impl AudioCapture {
                         context: None,
                     })?;
             let capturing_stream_obj = device_ref.create_stream(&self.config.stream_config)?;
-            self.stream = Some(capturing_stream_obj);
+            self.stream = Some(Arc::from(capturing_stream_obj));
         }
 
         // Verify stream is available
@@ -280,6 +281,10 @@ impl AudioCapture {
     ///
     /// Stops the underlying OS stream and releases resources. After stopping,
     /// the stream cannot be restarted — create a new `AudioCapture` instead.
+    ///
+    /// Any active subscriber threads will terminate once they detect the stream
+    /// has stopped. The underlying stream is released when all references
+    /// (including subscriber threads) are dropped.
     pub fn stop(&mut self) -> AudioResult<()> {
         if !self.is_running.load(Ordering::SeqCst) {
             return Ok(());
@@ -290,13 +295,9 @@ impl AudioCapture {
                 eprintln!("Error stopping stream: {:?}", e);
             }
         }
-        if let Some(stream_to_close) = self.stream.take() {
-            stream_to_close
-                .close()
-                .map_err(|e| AudioError::StreamStopFailed {
-                    reason: format!("Failed to close stream: {}", e),
-                })?;
-        }
+        // Drop our Arc reference. The stream will be fully deallocated once all
+        // subscriber threads also drop their clones.
+        self.stream.take();
 
         self.is_running.store(false, Ordering::SeqCst);
         Ok(())
@@ -439,6 +440,80 @@ impl AudioCapture {
             }),
         }
     }
+
+    /// Creates a subscription channel that delivers audio buffers as they are captured.
+    ///
+    /// Spawns a background thread that reads from the capture stream and sends
+    /// buffers over an [`mpsc`](std::sync::mpsc) channel. Returns the receiving
+    /// end of the channel.
+    ///
+    /// **Important:** The background thread competes with [`read_buffer()`](Self::read_buffer)
+    /// and [`read_buffer_blocking()`](Self::read_buffer_blocking) for audio data
+    /// from the same ring buffer. Avoid mixing `subscribe()` with manual buffer reads.
+    ///
+    /// The background thread exits automatically when:
+    /// - The stream is stopped or encounters an error
+    /// - The returned [`Receiver`](mpsc::Receiver) is dropped
+    ///
+    /// Multiple subscriptions are allowed but each subscriber competes for buffers.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the capture is not currently running.
+    pub fn subscribe(&self) -> AudioResult<mpsc::Receiver<AudioBuffer>> {
+        if !self.is_running.load(Ordering::SeqCst) {
+            return Err(AudioError::StreamReadError {
+                reason: "Stream is not running. Call start() first.".to_string(),
+            });
+        }
+
+        let stream =
+            Arc::clone(
+                self.stream
+                    .as_ref()
+                    .ok_or_else(|| AudioError::StreamReadError {
+                        reason: "Stream is not initialized.".to_string(),
+                    })?,
+            );
+
+        let (tx, rx) = mpsc::channel();
+
+        std::thread::Builder::new()
+            .name("rsac-subscribe".into())
+            .spawn(move || loop {
+                match stream.try_read_chunk() {
+                    Ok(Some(buffer)) => {
+                        if tx.send(buffer).is_err() {
+                            break; // Receiver dropped
+                        }
+                    }
+                    Ok(None) => {
+                        // No data available, sleep briefly to avoid busy-spinning
+                        std::thread::sleep(std::time::Duration::from_millis(1));
+                    }
+                    Err(_) => {
+                        break; // Stream error (stopped, closed, etc.)
+                    }
+                }
+            })
+            .map_err(|e| AudioError::InternalError {
+                message: format!("Failed to spawn subscribe thread: {}", e),
+                source: None,
+            })?;
+
+        Ok(rx)
+    }
+
+    /// Returns the number of audio buffers dropped due to ring buffer overflow (overruns).
+    ///
+    /// This counter reflects how many times the OS audio callback had to discard
+    /// a buffer because the consumer was not reading fast enough. A non-zero value
+    /// indicates the consumer is too slow or the ring buffer capacity is too small.
+    ///
+    /// Returns `0` if the stream has not been created yet.
+    pub fn overrun_count(&self) -> u64 {
+        self.stream.as_ref().map(|s| s.overrun_count()).unwrap_or(0)
+    }
 }
 
 // AudioDataStreamWrapper has been removed — async streaming will be
@@ -474,11 +549,14 @@ impl Drop for AudioCapture {
             if let Err(e) = self.stop() {
                 eprintln!("Error stopping audio stream during drop: {:?}", e);
             }
-        } else if let Some(stream) = self.stream.take() {
-            if let Err(e) = stream.close() {
-                eprintln!("Error closing audio stream during drop: {:?}", e);
+        } else if let Some(stream) = self.stream.as_ref() {
+            // Best-effort stop; the Arc will be dropped when all references are gone.
+            if let Err(e) = stream.stop() {
+                eprintln!("Error stopping audio stream during drop: {:?}", e);
             }
         }
+        // Drop the Arc reference (stream fully deallocated when last clone is dropped).
+        self.stream.take();
     }
 }
 
@@ -507,7 +585,9 @@ impl fmt::Debug for AudioCapture {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::core::config::SampleFormat;
+    use crate::core::config::{AudioFormat, SampleFormat};
+    use crate::core::interface::CapturingStream;
+    use std::sync::atomic::AtomicU64;
 
     #[test]
     fn builder_defaults_to_system_default() {
@@ -740,5 +820,227 @@ mod tests {
         assert_eq!(builder.config.sample_rate, 96000);
         assert_eq!(builder.config.channels, 8);
         assert_eq!(builder.config.sample_format, SampleFormat::I32);
+    }
+
+    // ── Mock CapturingStream for subscribe/overrun_count tests ────────
+
+    /// A mock CapturingStream that serves buffers from an internal Mutex<VecDeque>
+    /// and tracks an overrun counter via an AtomicU64.
+    struct MockCapturingStream {
+        buffers: Mutex<std::collections::VecDeque<AudioBuffer>>,
+        running: AtomicBool,
+        overruns: AtomicU64,
+    }
+
+    impl MockCapturingStream {
+        fn new() -> Self {
+            Self {
+                buffers: Mutex::new(std::collections::VecDeque::new()),
+                running: AtomicBool::new(true),
+                overruns: AtomicU64::new(0),
+            }
+        }
+
+        /// Push a buffer for the mock to serve on the next try_read_chunk call.
+        fn push_buffer(&self, buf: AudioBuffer) {
+            self.buffers.lock().unwrap().push_back(buf);
+        }
+
+        /// Simulate overruns by incrementing the counter.
+        fn add_overruns(&self, count: u64) {
+            self.overruns.fetch_add(count, Ordering::Relaxed);
+        }
+
+        /// Signal the mock stream is stopped.
+        fn signal_stop(&self) {
+            self.running.store(false, Ordering::SeqCst);
+        }
+    }
+
+    impl CapturingStream for MockCapturingStream {
+        fn read_chunk(&self) -> AudioResult<AudioBuffer> {
+            // Blocking: spin-wait until data or stopped
+            loop {
+                if let Some(buf) = self.buffers.lock().unwrap().pop_front() {
+                    return Ok(buf);
+                }
+                if !self.running.load(Ordering::SeqCst) {
+                    return Err(AudioError::StreamReadError {
+                        reason: "Mock stream stopped".into(),
+                    });
+                }
+                std::thread::sleep(std::time::Duration::from_millis(1));
+            }
+        }
+
+        fn try_read_chunk(&self) -> AudioResult<Option<AudioBuffer>> {
+            if !self.running.load(Ordering::SeqCst) {
+                return Err(AudioError::StreamReadError {
+                    reason: "Mock stream stopped".into(),
+                });
+            }
+            Ok(self.buffers.lock().unwrap().pop_front())
+        }
+
+        fn stop(&self) -> AudioResult<()> {
+            self.running.store(false, Ordering::SeqCst);
+            Ok(())
+        }
+
+        fn format(&self) -> AudioFormat {
+            AudioFormat::default()
+        }
+
+        fn is_running(&self) -> bool {
+            self.running.load(Ordering::SeqCst)
+        }
+
+        fn overrun_count(&self) -> u64 {
+            self.overruns.load(Ordering::Relaxed)
+        }
+    }
+
+    /// Creates an AudioCapture with a mock stream, bypassing the builder (no hardware needed).
+    fn make_mock_capture(mock: Arc<MockCapturingStream>) -> AudioCapture {
+        AudioCapture {
+            config: AudioCaptureConfig {
+                target: CaptureTarget::SystemDefault,
+                stream_config: StreamConfig::default(),
+            },
+            device: None,
+            stream: Some(mock),
+            is_running: AtomicBool::new(true),
+            callback: Arc::new(Mutex::new(None)),
+        }
+    }
+
+    // ── subscribe() tests ─────────────────────────────────────────────
+
+    #[test]
+    fn subscribe_returns_error_when_not_running() {
+        let mock = Arc::new(MockCapturingStream::new());
+        let capture = make_mock_capture(mock);
+        capture.is_running.store(false, Ordering::SeqCst);
+
+        let result = capture.subscribe();
+        assert!(result.is_err());
+        match result.unwrap_err() {
+            AudioError::StreamReadError { reason } => {
+                assert!(reason.contains("not running"));
+            }
+            e => panic!("Expected StreamReadError, got: {e:?}"),
+        }
+    }
+
+    #[test]
+    fn subscribe_receives_buffers() {
+        let mock = Arc::new(MockCapturingStream::new());
+        // Push some test buffers before subscribing
+        mock.push_buffer(AudioBuffer::new(vec![0.1; 960], 2, 48000));
+        mock.push_buffer(AudioBuffer::new(vec![0.2; 960], 2, 48000));
+        mock.push_buffer(AudioBuffer::new(vec![0.3; 960], 2, 48000));
+
+        let capture = make_mock_capture(Arc::clone(&mock));
+        let rx = capture.subscribe().expect("subscribe should succeed");
+
+        // Receive the three buffers
+        let buf1 = rx.recv_timeout(std::time::Duration::from_secs(2)).unwrap();
+        assert_eq!(buf1.data()[0], 0.1);
+
+        let buf2 = rx.recv_timeout(std::time::Duration::from_secs(2)).unwrap();
+        assert_eq!(buf2.data()[0], 0.2);
+
+        let buf3 = rx.recv_timeout(std::time::Duration::from_secs(2)).unwrap();
+        assert_eq!(buf3.data()[0], 0.3);
+
+        // Stop the mock so the subscribe thread exits
+        mock.signal_stop();
+    }
+
+    #[test]
+    fn subscribe_thread_stops_when_stream_stops() {
+        let mock = Arc::new(MockCapturingStream::new());
+        let capture = make_mock_capture(Arc::clone(&mock));
+        let rx = capture.subscribe().expect("subscribe should succeed");
+
+        // Signal stop — the subscribe thread should exit
+        mock.signal_stop();
+
+        // After a short delay, recv should fail (channel disconnected)
+        std::thread::sleep(std::time::Duration::from_millis(50));
+        let result = rx.recv_timeout(std::time::Duration::from_millis(100));
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn subscribe_thread_stops_when_receiver_dropped() {
+        let mock = Arc::new(MockCapturingStream::new());
+        let capture = make_mock_capture(Arc::clone(&mock));
+        let rx = capture.subscribe().expect("subscribe should succeed");
+
+        // Drop the receiver — the subscribe thread should eventually exit
+        drop(rx);
+
+        // Push a buffer to trigger the send error in the thread
+        mock.push_buffer(AudioBuffer::new(vec![1.0; 960], 2, 48000));
+
+        // Give the thread time to realize the receiver is gone and exit
+        std::thread::sleep(std::time::Duration::from_millis(50));
+
+        // Clean up
+        mock.signal_stop();
+    }
+
+    // ── overrun_count() tests ─────────────────────────────────────────
+
+    #[test]
+    fn overrun_count_returns_zero_when_no_stream() {
+        let capture = AudioCapture {
+            config: AudioCaptureConfig {
+                target: CaptureTarget::SystemDefault,
+                stream_config: StreamConfig::default(),
+            },
+            device: None,
+            stream: None,
+            is_running: AtomicBool::new(false),
+            callback: Arc::new(Mutex::new(None)),
+        };
+        assert_eq!(capture.overrun_count(), 0);
+    }
+
+    #[test]
+    fn overrun_count_returns_zero_initially() {
+        let mock = Arc::new(MockCapturingStream::new());
+        let capture = make_mock_capture(mock);
+        assert_eq!(capture.overrun_count(), 0);
+    }
+
+    #[test]
+    fn overrun_count_reflects_mock_overruns() {
+        let mock = Arc::new(MockCapturingStream::new());
+        let capture = make_mock_capture(Arc::clone(&mock));
+
+        assert_eq!(capture.overrun_count(), 0);
+
+        mock.add_overruns(5);
+        assert_eq!(capture.overrun_count(), 5);
+
+        mock.add_overruns(3);
+        assert_eq!(capture.overrun_count(), 8);
+    }
+
+    #[test]
+    fn overrun_count_returns_zero_after_stop() {
+        let mock = Arc::new(MockCapturingStream::new());
+        mock.add_overruns(10);
+        let mut capture = make_mock_capture(mock);
+
+        assert_eq!(capture.overrun_count(), 10);
+
+        // Stop drops the stream Arc
+        capture.stop().unwrap();
+
+        // After stop, stream is None, so overrun_count returns 0
+        assert_eq!(capture.overrun_count(), 0);
     }
 }

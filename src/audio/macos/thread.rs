@@ -267,7 +267,7 @@ pub(crate) fn create_macos_capture(
 /// | `Device(id)`           | Parse `DeviceId.0` as `u32` → `AudioDeviceID`          |
 /// | `Application(pid)`     | `CoreAudioProcessTap::new(pid)` → tap's AudioObjectID  |
 /// | `ApplicationByName(n)` | `enumerate_audio_applications()` → find PID → tap       |
-/// | `ProcessTree(pid)`     | Same as Application for initial implementation          |
+/// | `ProcessTree(pid)`     | `CoreAudioProcessTap::new_tree(pid)` → multi-PID tap   |
 fn resolve_capture_target(
     config: &MacosCaptureConfig,
 ) -> AudioResult<(AudioDeviceID, Option<CoreAudioProcessTap>)> {
@@ -338,11 +338,11 @@ fn resolve_capture_target(
         }
 
         CaptureTarget::ProcessTree(pid) => {
-            // For initial implementation, treat same as single Application capture
-            let tap = CoreAudioProcessTap::new(pid.0, &format!("rsac-tap-tree-{}", pid.0))?;
+            // Multi-PID tap: captures parent process + all direct child processes
+            let tap = CoreAudioProcessTap::new_tree(pid.0)?;
             let tap_device_id = tap.id();
             log::debug!(
-                "CoreAudio: ProcessTree (PID={}) → tap_id={} (single-process for now)",
+                "CoreAudio: ProcessTree (parent PID={}) → tap_id={}",
                 pid.0,
                 tap_device_id
             );

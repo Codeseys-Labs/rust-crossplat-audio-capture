@@ -303,6 +303,161 @@ impl PlatformStream for LinuxPlatformStream {
     }
 }
 
+// ── pw-dump Node Lookup ──────────────────────────────────────────────────
+
+/// Specifies how to look up a PipeWire node via `pw-dump`.
+enum PwNodeLookup<'a> {
+    /// Match by application name (case-insensitive against `application.name`
+    /// or `application.process.binary`).
+    ByAppName(&'a str),
+    /// Match by process ID (exact match against `application.process.id`).
+    ByPid(u32),
+}
+
+/// Runs `pw-dump`, parses the JSON output, and finds the `object.serial` of
+/// the first PipeWire node that:
+/// - has `type == "PipeWire:Interface:Node"`
+/// - has `info.props.media.class` containing `"Stream/Output/Audio"`
+/// - matches the given [`PwNodeLookup`] criteria
+///
+/// Returns the `object.serial` as a `String` suitable for use as `TARGET_OBJECT`.
+///
+/// # Errors
+///
+/// - [`AudioError::BackendError`] if `pw-dump` cannot be executed or returns
+///   non-zero, or if the output cannot be parsed as JSON.
+/// - [`AudioError::ApplicationNotFound`] if no matching node is found.
+fn find_pipewire_node_serial(lookup: &PwNodeLookup<'_>) -> AudioResult<String> {
+    // Run pw-dump and capture its JSON output.
+    let output = std::process::Command::new("pw-dump")
+        .arg("--no-colors")
+        .output()
+        .map_err(|e| AudioError::BackendError {
+            backend: "PipeWire".to_string(),
+            operation: "pw-dump".to_string(),
+            message: format!("Failed to run pw-dump: {}. Is pipewire-utils installed?", e),
+            context: None,
+        })?;
+
+    if !output.status.success() {
+        return Err(AudioError::BackendError {
+            backend: "PipeWire".to_string(),
+            operation: "pw-dump".to_string(),
+            message: format!(
+                "pw-dump exited with status: {}; stderr: {}",
+                output.status,
+                String::from_utf8_lossy(&output.stderr).trim()
+            ),
+            context: None,
+        });
+    }
+
+    let json_str = String::from_utf8_lossy(&output.stdout);
+    let entries: serde_json::Value =
+        serde_json::from_str(&json_str).map_err(|e| AudioError::BackendError {
+            backend: "PipeWire".to_string(),
+            operation: "pw-dump parse".to_string(),
+            message: format!("Failed to parse pw-dump JSON: {}", e),
+            context: None,
+        })?;
+
+    let array = entries.as_array().ok_or_else(|| AudioError::BackendError {
+        backend: "PipeWire".to_string(),
+        operation: "pw-dump parse".to_string(),
+        message: "pw-dump output is not a JSON array".to_string(),
+        context: None,
+    })?;
+
+    let pid_string; // storage for PID → String conversion (avoids per-iteration alloc)
+    let pid_str = match lookup {
+        PwNodeLookup::ByPid(pid) => {
+            pid_string = pid.to_string();
+            Some(pid_string.as_str())
+        }
+        _ => None,
+    };
+
+    for entry in array {
+        // Filter: must be a PipeWire node.
+        let entry_type = entry.get("type").and_then(|v| v.as_str()).unwrap_or("");
+        if entry_type != "PipeWire:Interface:Node" {
+            continue;
+        }
+
+        // Get info.props (where all the metadata lives).
+        let props = match entry.get("info").and_then(|i| i.get("props")) {
+            Some(p) => p,
+            None => continue,
+        };
+
+        // Filter: media.class must indicate an audio output stream.
+        let media_class = props
+            .get("media.class")
+            .and_then(|v| v.as_str())
+            .unwrap_or("");
+        if !media_class.contains("Stream/Output/Audio") {
+            continue;
+        }
+
+        // Check if this node matches the lookup criteria.
+        let matches = match lookup {
+            PwNodeLookup::ByAppName(name) => {
+                let app_name = props
+                    .get("application.name")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("");
+                let app_binary = props
+                    .get("application.process.binary")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("");
+                app_name.eq_ignore_ascii_case(name) || app_binary.eq_ignore_ascii_case(name)
+            }
+            PwNodeLookup::ByPid(_) => {
+                let proc_id = props
+                    .get("application.process.id")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("");
+                proc_id == pid_str.unwrap()
+            }
+        };
+
+        if !matches {
+            continue;
+        }
+
+        // Extract object.serial — may be a JSON string or number.
+        if let Some(serial) = props.get("object.serial") {
+            if let Some(s) = serial.as_str() {
+                log::debug!("pw-dump: matched node with object.serial={}", s);
+                return Ok(s.to_string());
+            }
+            if let Some(n) = serial.as_u64() {
+                log::debug!("pw-dump: matched node with object.serial={}", n);
+                return Ok(n.to_string());
+            }
+        }
+
+        // Fallback: use the top-level node `id` if object.serial is missing.
+        if let Some(id) = entry.get("id").and_then(|v| v.as_u64()) {
+            log::warn!(
+                "pw-dump: matched node has no object.serial, falling back to id={}",
+                id
+            );
+            return Ok(id.to_string());
+        }
+    }
+
+    // No matching node found.
+    match lookup {
+        PwNodeLookup::ByAppName(name) => Err(AudioError::ApplicationNotFound {
+            identifier: name.to_string(),
+        }),
+        PwNodeLookup::ByPid(pid) => Err(AudioError::ApplicationNotFound {
+            identifier: format!("PID {}", pid),
+        }),
+    }
+}
+
 // ── PipeWire Thread Main Function ────────────────────────────────────────
 
 /// The main function for the dedicated PipeWire thread.
@@ -469,23 +624,50 @@ fn pw_thread_main(
                         log::debug!("PipeWire: Application target — TARGET_OBJECT={}", app_id.0);
                     }
                     CaptureTarget::ApplicationByName(name) => {
-                        // Best-effort: use the name as TARGET_OBJECT.
-                        // Full implementation would enumerate PW nodes and
-                        // resolve the name to a node ID first.
-                        props.insert(*pipewire::keys::TARGET_OBJECT, name.as_str());
+                        // Resolve application name → PipeWire node object.serial
+                        // via pw-dump. TARGET_OBJECT requires a serial, not a name.
+                        let serial = match find_pipewire_node_serial(&PwNodeLookup::ByAppName(name))
+                        {
+                            Ok(s) => s,
+                            Err(e) => {
+                                log::warn!(
+                                    "PipeWire: ApplicationByName '{}' — node lookup failed: {}",
+                                    name,
+                                    e
+                                );
+                                let _ = response_tx.send(Err(e));
+                                continue;
+                            }
+                        };
+                        props.insert(*pipewire::keys::TARGET_OBJECT, serial.as_str());
                         log::debug!(
-                            "PipeWire: ApplicationByName target — TARGET_OBJECT={}",
-                            name
+                            "PipeWire: ApplicationByName '{}' resolved to node serial={}",
+                            name,
+                            serial
                         );
                     }
                     CaptureTarget::ProcessTree(pid) => {
-                        // Treat as single-process capture for now.
-                        // Full tree capture is a future enhancement.
-                        let pid_str = pid.0.to_string();
-                        props.insert(*pipewire::keys::TARGET_OBJECT, pid_str.as_str());
+                        // Resolve PID → PipeWire node object.serial via pw-dump.
+                        // TARGET_OBJECT requires a node serial, not a PID.
+                        // Note: this captures the single process's stream; full
+                        // tree capture is a future enhancement.
+                        let serial = match find_pipewire_node_serial(&PwNodeLookup::ByPid(pid.0)) {
+                            Ok(s) => s,
+                            Err(e) => {
+                                log::warn!(
+                                    "PipeWire: ProcessTree PID {} — node lookup failed: {}",
+                                    pid.0,
+                                    e
+                                );
+                                let _ = response_tx.send(Err(e));
+                                continue;
+                            }
+                        };
+                        props.insert(*pipewire::keys::TARGET_OBJECT, serial.as_str());
                         log::debug!(
-                            "PipeWire: ProcessTree target (single-process) — TARGET_OBJECT={}",
-                            pid.0
+                            "PipeWire: ProcessTree PID {} resolved to node serial={}",
+                            pid.0,
+                            serial
                         );
                     }
                 }

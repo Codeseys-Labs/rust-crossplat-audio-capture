@@ -246,6 +246,10 @@ impl<S: PlatformStream + Sync + 'static> CapturingStream for BridgeStream<S> {
         self.shared.state.is_running()
     }
 
+    fn overrun_count(&self) -> u64 {
+        self.shared.buffers_dropped.load(Ordering::Relaxed)
+    }
+
     #[cfg(feature = "async-stream")]
     fn register_waker(&self, waker: &std::task::Waker) -> bool {
         self.shared.waker.register(waker);
@@ -534,6 +538,70 @@ mod tests {
         stream.try_read_chunk().unwrap();
         stream.try_read_chunk().unwrap();
         assert_eq!(stream.buffers_read(), 3);
+    }
+
+    // ===== overrun_count via CapturingStream trait =====
+
+    #[test]
+    fn test_overrun_count_via_trait() {
+        let format = test_format();
+        let (mut producer, consumer) = create_bridge(4, format.clone());
+        consumer
+            .shared()
+            .state
+            .transition(StreamState::Created, StreamState::Running)
+            .unwrap();
+        let stream: Box<dyn CapturingStream> = Box::new(BridgeStream::new(
+            consumer,
+            MockPlatformStream::new(),
+            format,
+            Duration::from_secs(1),
+        ));
+
+        // Initially zero
+        assert_eq!(stream.overrun_count(), 0);
+
+        // Fill ring buffer (capacity 4)
+        for _ in 0..4 {
+            assert!(producer.push_or_drop(test_buffer(1.0)));
+        }
+        assert_eq!(stream.overrun_count(), 0);
+
+        // Now push_or_drop should drop and increment
+        assert!(!producer.push_or_drop(test_buffer(2.0)));
+        assert_eq!(stream.overrun_count(), 1);
+
+        assert!(!producer.push_or_drop(test_buffer(3.0)));
+        assert!(!producer.push_or_drop(test_buffer(4.0)));
+        assert_eq!(stream.overrun_count(), 3);
+    }
+
+    #[test]
+    fn test_overrun_count_default_is_zero() {
+        // Verify the default trait implementation returns 0
+        // (MockPlatformStream doesn't override overrun_count)
+        struct MinimalStream;
+        impl CapturingStream for MinimalStream {
+            fn read_chunk(&self) -> AudioResult<AudioBuffer> {
+                Err(AudioError::StreamReadError {
+                    reason: "not implemented".into(),
+                })
+            }
+            fn try_read_chunk(&self) -> AudioResult<Option<AudioBuffer>> {
+                Ok(None)
+            }
+            fn stop(&self) -> AudioResult<()> {
+                Ok(())
+            }
+            fn format(&self) -> AudioFormat {
+                AudioFormat::default()
+            }
+            fn is_running(&self) -> bool {
+                false
+            }
+        }
+        let stream: Box<dyn CapturingStream> = Box::new(MinimalStream);
+        assert_eq!(stream.overrun_count(), 0);
     }
 
     // 13. Stop from Created state returns error
