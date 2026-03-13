@@ -213,23 +213,27 @@ pub(crate) fn create_macos_capture(
     let sample_rate = config.sample_rate;
 
     audio_unit
-        .set_input_callback(move |args| {
-            // REAL-TIME SAFETY:
-            // - BridgeProducer::push_or_drop() is lock-free (rtrb)
-            // - Vec allocation is acceptable for initial impl
-            //   (optimize with scratch buffer later)
-            // - No locks, no blocking I/O
+        .set_input_callback(
+            move |args: coreaudio::audio_unit::render_callback::Args<
+                coreaudio::audio_unit::render_callback::data::Interleaved<f32>,
+            >| {
+                // REAL-TIME SAFETY:
+                // - BridgeProducer::push_or_drop() is lock-free (rtrb)
+                // - Vec allocation is acceptable for initial impl
+                //   (optimize with scratch buffer later)
+                // - No locks, no blocking I/O
 
-            let data: &[f32] = args.data.buffer;
+                let data: &[f32] = args.data.buffer;
 
-            if !data.is_empty() {
-                let audio_buffer = AudioBuffer::new(data.to_vec(), channels, sample_rate);
-                // Push to ring buffer — if full, silently dropped (back-pressure)
-                producer.push_or_drop(audio_buffer);
-            }
+                if !data.is_empty() {
+                    let audio_buffer = AudioBuffer::new(data.to_vec(), channels, sample_rate);
+                    // Push to ring buffer — if full, silently dropped (back-pressure)
+                    producer.push_or_drop(audio_buffer);
+                }
 
-            Ok(())
-        })
+                Ok(())
+            },
+        )
         .map_err(map_ca_error)?;
 
     // ── Step 5: Start the AudioUnit ──
