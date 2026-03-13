@@ -6,7 +6,7 @@
 use super::coreaudio::map_ca_error;
 use crate::core::error::{AudioError, AudioResult};
 use cocoa::base::{id, nil};
-use cocoa::foundation::{NSArray, NSAutoreleasePool, NSNumber, NSString};
+use cocoa::foundation::{NSArray, NSAutoreleasePool, NSString};
 use core_foundation_sys::base::OSStatus;
 use coreaudio::Error as CAError;
 use coreaudio_sys as sys;
@@ -49,33 +49,45 @@ impl CoreAudioProcessTap {
             // 1. Create NSString for tap name
             let tap_name_nsstring = NSString::alloc(nil).init_str(tap_name_str);
             if tap_name_nsstring == nil {
-                return Err(AudioError::SystemError(
-                    "Failed to create NSString for tap name".to_string(),
-                ));
+                return Err(AudioError::BackendError {
+                    backend: "CoreAudio".into(),
+                    operation: "process_tap".into(),
+                    message: "Failed to create NSString for tap name".into(),
+                    context: None,
+                });
             }
 
             // 2. Create NSNumber for target_pid
             let pid_nsnumber: id = msg_send![class!(NSNumber), numberWithInt: target_pid as i32];
             if pid_nsnumber == nil {
-                return Err(AudioError::SystemError(
-                    "Failed to create NSNumber for PID".to_string(),
-                ));
+                return Err(AudioError::BackendError {
+                    backend: "CoreAudio".into(),
+                    operation: "process_tap".into(),
+                    message: "Failed to create NSNumber for PID".into(),
+                    context: None,
+                });
             }
 
             // 3. Create NSArray containing the NSNumber PID
             let pids_nsarray: id = msg_send![class!(NSArray), arrayWithObject: pid_nsnumber];
             if pids_nsarray == nil {
-                return Err(AudioError::SystemError(
-                    "Failed to create NSArray for PIDs".to_string(),
-                ));
+                return Err(AudioError::BackendError {
+                    backend: "CoreAudio".into(),
+                    operation: "process_tap".into(),
+                    message: "Failed to create NSArray for PIDs".into(),
+                    context: None,
+                });
             }
 
             // 4. Allocate and initialize CATapDescription
             let ca_tap_description_class = Class::get("CATapDescription");
             if ca_tap_description_class.is_none() {
-                return Err(AudioError::SystemError(
-                    "CATapDescription class not found. Ensure macOS 14.4+ and CoreAudio framework is linked.".to_string(),
-                ));
+                return Err(AudioError::BackendError {
+                    backend: "CoreAudio".into(),
+                    operation: "process_tap".into(),
+                    message: "CATapDescription class not found. Ensure macOS 14.4+ and CoreAudio framework is linked.".into(),
+                    context: None,
+                });
             }
             let ca_tap_description_class = ca_tap_description_class.unwrap();
 
@@ -83,9 +95,12 @@ impl CoreAudioProcessTap {
             let tap_desc_obj: id = msg_send![tap_desc_obj, init];
 
             if tap_desc_obj == nil {
-                return Err(AudioError::SystemError(
-                    "Failed to allocate or initialize CATapDescription".to_string(),
-                ));
+                return Err(AudioError::BackendError {
+                    backend: "CoreAudio".into(),
+                    operation: "process_tap".into(),
+                    message: "Failed to allocate or initialize CATapDescription".into(),
+                    context: None,
+                });
             }
 
             // 5. Set name
@@ -93,15 +108,17 @@ impl CoreAudioProcessTap {
 
             // 6. Set processes and exclusive
             let sel_set_processes_exclusive = sel!(setProcesses:exclusive:);
-            if !sel_set_processes_exclusive.is_null()
-                && msg_send_responds_to(tap_desc_obj, sel_set_processes_exclusive)
-            {
+            if msg_send_responds_to(tap_desc_obj, sel_set_processes_exclusive) {
                 let _: () = msg_send![tap_desc_obj, setProcesses: pids_nsarray exclusive: NO];
             } else {
-                return Err(AudioError::SystemError(
-                    "CATapDescription does not respond to setProcesses:exclusive:. Check API."
-                        .to_string(),
-                ));
+                return Err(AudioError::BackendError {
+                    backend: "CoreAudio".into(),
+                    operation: "process_tap".into(),
+                    message:
+                        "CATapDescription does not respond to setProcesses:exclusive:. Check API."
+                            .into(),
+                    context: None,
+                });
             }
 
             // 7. Call AudioHardwareCreateProcessTap
@@ -113,10 +130,14 @@ impl CoreAudioProcessTap {
             }
 
             if tap_id == 0 {
-                return Err(AudioError::SystemError(
-                    "AudioHardwareCreateProcessTap succeeded but returned an invalid tap_id (0)"
-                        .to_string(),
-                ));
+                return Err(AudioError::BackendError {
+                    backend: "CoreAudio".into(),
+                    operation: "process_tap".into(),
+                    message:
+                        "AudioHardwareCreateProcessTap succeeded but returned an invalid tap_id (0)"
+                            .into(),
+                    context: None,
+                });
             }
 
             Ok(Self { tap_id, target_pid })

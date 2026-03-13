@@ -31,19 +31,28 @@ use crate::core::buffer::AudioBuffer;
 use crate::core::config::CaptureTarget;
 use crate::core::error::{AudioError, AudioResult};
 
-use super::coreaudio::{map_ca_error, MacosAudioDevice};
+use super::coreaudio::map_ca_error;
 use super::tap::CoreAudioProcessTap;
 
-use coreaudio::audio_unit::audio_unit_element;
-use coreaudio::audio_unit::{AudioComponent, AudioComponentDescription, AudioUnit, Element, Scope};
-use coreaudio::sys::{
-    self, kAudioFormatFlagIsFloat, kAudioFormatFlagIsNonInterleaved, kAudioFormatFlagIsPacked,
+// Fix Group 4 & 5: Use AudioUnit::new(IOType) instead of AudioComponent/AudioComponentDescription.
+// Fix Group 1: Import from coreaudio_sys (the -sys crate), not coreaudio::sys.
+use coreaudio::audio_unit::macos_helpers::get_default_device_id;
+use coreaudio::audio_unit::{AudioUnit, IOType, Scope};
+use coreaudio_sys::{
+    kAudioFormatFlagIsFloat, kAudioFormatFlagIsNonInterleaved, kAudioFormatFlagIsPacked,
     kAudioFormatLinearPCM, kAudioOutputUnitProperty_CurrentDevice,
-    kAudioOutputUnitProperty_EnableIO, kAudioUnitManufacturer_Apple,
-    kAudioUnitProperty_StreamFormat, kAudioUnitSubType_HALOutput, kAudioUnitType_Output,
-    AudioStreamBasicDescription, AudioUnitRenderActionFlags, OSStatus,
+    kAudioOutputUnitProperty_EnableIO, kAudioUnitProperty_StreamFormat,
+    AudioStreamBasicDescription,
 };
-use coreaudio::Error as CAError;
+
+/// Standard CoreAudio bus constants (Fix Group 5).
+/// Element 0 = output bus, element 1 = input bus.
+const INPUT_BUS: u32 = 1;
+const OUTPUT_BUS: u32 = 0;
+
+/// AudioDeviceID type alias (Fix Group 3).
+/// Same as CoreAudio's AudioObjectID = u32.
+type AudioDeviceID = u32;
 
 // ── MacosCaptureConfig ───────────────────────────────────────────────────
 
@@ -87,7 +96,8 @@ pub(crate) struct MacosPlatformStream {
 
 impl PlatformStream for MacosPlatformStream {
     fn stop_capture(&self) -> AudioResult<()> {
-        let au = self
+        // Fix Group 11: `stop()` requires `&mut self`, so the lock guard must be `mut`.
+        let mut au = self
             .audio_unit
             .lock()
             .map_err(|_| AudioError::InternalError {
@@ -132,24 +142,11 @@ pub(crate) fn create_macos_capture(
 
     let (device_id, process_tap) = resolve_capture_target(&config)?;
 
-    // ── Step 2: Create AUHAL AudioUnit ──
+    // ── Step 2: Create AUHAL AudioUnit (Fix Group 4) ──
+    // Use AudioUnit::new(IOType::HalOutput) instead of manual AudioComponent lookup.
+    // IOType::HalOutput handles the component description internally.
 
-    let desc = AudioComponentDescription {
-        component_type: kAudioUnitType_Output,
-        component_sub_type: kAudioUnitSubType_HALOutput,
-        component_manufacturer: kAudioUnitManufacturer_Apple,
-        component_flags: 0,
-        component_flags_mask: 0,
-    };
-
-    let component = AudioComponent::find(Some(&desc), None)
-        .ok_or_else(|| AudioError::BackendInitializationFailed {
-            backend: "CoreAudio".to_string(),
-            reason: "Failed to find AUHAL component".to_string(),
-        })?
-        .into_owned();
-
-    let mut audio_unit = component.new_instance().map_err(map_ca_error)?;
+    let mut audio_unit = AudioUnit::new(IOType::HalOutput).map_err(map_ca_error)?;
 
     // ── Step 3: Configure the AudioUnit ──
 
@@ -158,7 +155,7 @@ pub(crate) fn create_macos_capture(
         .set_property(
             kAudioOutputUnitProperty_CurrentDevice,
             Scope::Global,
-            audio_unit_element::OUTPUT_BUS,
+            OUTPUT_BUS,
             Some(&device_id),
         )
         .map_err(map_ca_error)?;
@@ -169,7 +166,7 @@ pub(crate) fn create_macos_capture(
         .set_property(
             kAudioOutputUnitProperty_EnableIO,
             Scope::Input,
-            audio_unit_element::INPUT_BUS,
+            INPUT_BUS,
             Some(&enable_io),
         )
         .map_err(map_ca_error)?;
@@ -180,7 +177,7 @@ pub(crate) fn create_macos_capture(
         .set_property(
             kAudioOutputUnitProperty_EnableIO,
             Scope::Output,
-            audio_unit_element::OUTPUT_BUS,
+            OUTPUT_BUS,
             Some(&disable_io),
         )
         .map_err(map_ca_error)?;
@@ -193,7 +190,7 @@ pub(crate) fn create_macos_capture(
         .set_property(
             kAudioUnitProperty_StreamFormat,
             Scope::Output,
-            audio_unit_element::INPUT_BUS,
+            INPUT_BUS,
             Some(&asbd),
         )
         .map_err(map_ca_error)?;
@@ -203,7 +200,7 @@ pub(crate) fn create_macos_capture(
         .set_property(
             kAudioUnitProperty_StreamFormat,
             Scope::Input,
-            audio_unit_element::OUTPUT_BUS,
+            OUTPUT_BUS,
             Some(&asbd),
         )
         .map_err(map_ca_error)?;
@@ -212,114 +209,26 @@ pub(crate) fn create_macos_capture(
     audio_unit.initialize().map_err(map_ca_error)?;
 
     // ── Step 4: Register input callback that pushes to BridgeProducer ──
+    // Fix Group 6: Use the high-level coreaudio-rs callback API instead of
+    // manually allocating AudioBufferList and calling AudioUnitRender.
+    // The `set_input_callback` handles buffer management and render internally,
+    // providing audio data directly via `args.data.buffer`.
 
     let channels = config.channels;
     let sample_rate = config.sample_rate;
 
     audio_unit
-        .set_input_callback(move |args| -> Result<(), OSStatus> {
+        .set_input_callback(move |args| {
             // REAL-TIME SAFETY:
             // - BridgeProducer::push_or_drop() is lock-free (rtrb)
             // - Vec allocation is acceptable for initial impl
             //   (optimize with scratch buffer later)
             // - No locks, no blocking I/O
 
-            let au_instance = args.audio_unit_ref.instance();
-            let num_frames = args.num_frames;
-            let timestamp = args.timestamp;
+            let data: &[f32] = args.data.buffer;
 
-            // Allocate AudioBufferList for interleaved capture
-            let captured_abl_result = coreaudio::audio_buffer::AudioBufferList::allocate(
-                channels as u32,
-                num_frames,
-                true, // interleaved
-                true, // allocate mData
-            );
-
-            let mut captured_abl = match captured_abl_result {
-                Ok(abl) => abl,
-                Err(_) => {
-                    // Cannot allocate — skip this callback invocation
-                    return Ok(());
-                }
-            };
-
-            let captured_abl_ptr: *mut sys::AudioBufferList = &mut *captured_abl;
-            let mut render_action_flags: AudioUnitRenderActionFlags = 0;
-
-            // Call AudioUnitRender on INPUT BUS to get captured data
-            let os_status = unsafe {
-                sys::AudioUnitRender(
-                    au_instance,
-                    &mut render_action_flags,
-                    timestamp,
-                    audio_unit_element::INPUT_BUS,
-                    num_frames,
-                    captured_abl_ptr,
-                )
-            };
-
-            if os_status != sys::noErr {
-                // AudioUnitRender failed — log and skip this callback
-                // Do NOT propagate error through ring buffer (it only carries AudioBuffer)
-                return Ok(());
-            }
-
-            // Convert raw buffer to interleaved f32 samples
-            let num_channels = channels as usize;
-            let num_frames_usize = num_frames as usize;
-            let total_samples = num_frames_usize * num_channels;
-
-            let buffers_slice = unsafe {
-                std::slice::from_raw_parts(
-                    (*captured_abl_ptr).mBuffers.as_ptr(),
-                    (*captured_abl_ptr).mNumberBuffers as usize,
-                )
-            };
-
-            if buffers_slice.is_empty() {
-                return Ok(());
-            }
-
-            // Check if data is interleaved (single buffer) or non-interleaved (one per channel)
-            let is_non_interleaved = buffers_slice.len() > 1;
-
-            let mut samples = Vec::with_capacity(total_samples);
-
-            if !is_non_interleaved {
-                // Interleaved: single buffer contains all channels
-                let source = &buffers_slice[0];
-                let n_samples = source.mDataByteSize as usize / std::mem::size_of::<f32>();
-                if !source.mData.is_null() && n_samples > 0 {
-                    let source_slice = unsafe {
-                        std::slice::from_raw_parts(source.mData as *const f32, n_samples)
-                    };
-                    samples.extend_from_slice(source_slice);
-                }
-            } else {
-                // Non-interleaved: interleave manually
-                for frame_idx in 0..num_frames_usize {
-                    for ch_idx in 0..num_channels {
-                        if ch_idx < buffers_slice.len() {
-                            let source = &buffers_slice[ch_idx];
-                            if !source.mData.is_null()
-                                && source.mDataByteSize
-                                    >= ((frame_idx + 1) * std::mem::size_of::<f32>()) as u32
-                            {
-                                let sample_ptr = source.mData as *const f32;
-                                samples.push(unsafe { *sample_ptr.add(frame_idx) });
-                            } else {
-                                samples.push(0.0); // Silence for missing data
-                            }
-                        } else {
-                            samples.push(0.0);
-                        }
-                    }
-                }
-            }
-
-            if !samples.is_empty() {
-                let audio_buffer = AudioBuffer::new(samples, channels, sample_rate);
+            if !data.is_empty() {
+                let audio_buffer = AudioBuffer::new(data.to_vec(), channels, sample_rate);
                 // Push to ring buffer — if full, silently dropped (back-pressure)
                 producer.push_or_drop(audio_buffer);
             }
@@ -362,16 +271,12 @@ pub(crate) fn create_macos_capture(
 /// | `ProcessTree(pid)`     | Same as Application for initial implementation          |
 fn resolve_capture_target(
     config: &MacosCaptureConfig,
-) -> AudioResult<(
-    coreaudio::audio_unit::audio_device::AudioDeviceID,
-    Option<CoreAudioProcessTap>,
-)> {
-    use coreaudio::audio_object::AudioObject;
-
+) -> AudioResult<(AudioDeviceID, Option<CoreAudioProcessTap>)> {
     match &config.target {
         CaptureTarget::SystemDefault => {
-            // Get macro default output device for loopback capture
-            let device_id = AudioObject::default_output_device().map_err(map_ca_error)?;
+            // Fix Group 2: Use get_default_device_id(false) instead of AudioObject::default_output_device()
+            // false = output device (for loopback capture)
+            let device_id = get_default_device_id(false).map_err(map_ca_error)?;
             log::debug!("CoreAudio: SystemDefault → device_id={}", device_id);
             Ok((device_id, None))
         }
@@ -582,9 +487,9 @@ mod tests {
     #[test]
     #[ignore = "requires macOS audio hardware"]
     fn resolve_device_by_id_succeeds_for_default() {
-        // First, get the default device ID
-        use coreaudio::audio_object::AudioObject;
-        let default_id = AudioObject::default_output_device().expect("should get default device");
+        // First, get the default device ID (Fix Group 2: use get_default_device_id)
+        use coreaudio::audio_unit::macos_helpers::get_default_device_id;
+        let default_id = get_default_device_id(false).expect("should get default device");
 
         let config = MacosCaptureConfig {
             target: CaptureTarget::Device(DeviceId(default_id.to_string())),
@@ -681,8 +586,8 @@ mod tests {
             Err(AudioError::BackendError { .. }) => {
                 // Expected: the current process may not be a valid audio source
             }
-            Err(AudioError::SystemError(_)) => {
-                // Expected: CATapDescription might not be available
+            Err(AudioError::InternalError { .. }) => {
+                // Expected: CATapDescription or process tap API might not be available
             }
             Err(other) => {
                 panic!("Unexpected error type for Application target: {:?}", other);

@@ -25,15 +25,20 @@ use crate::bridge::{calculate_capacity, create_bridge, BridgeStream};
 use super::thread::{create_macos_capture, MacosCaptureConfig};
 
 // ── CoreAudio crate imports ──────────────────────────────────────────────
-use coreaudio::audio_object::AudioObject;
-use coreaudio::audio_unit::audio_device::AudioDeviceID;
-use coreaudio::sys::{
-    self, kAudioDevicePropertyStreamFormat, kAudioFormatFlagIsBigEndian, kAudioFormatFlagIsFloat,
-    kAudioFormatFlagIsPacked, kAudioFormatFlagIsSignedInteger, kAudioFormatLinearPCM,
-    kAudioObjectPropertyElementMaster, kAudioObjectPropertyScopeOutput,
+use coreaudio::audio_unit::macos_helpers::{get_default_device_id, get_device_name};
+use coreaudio::Error as CAError;
+
+// ── CoreAudio-sys raw FFI imports ────────────────────────────────────────
+use coreaudio_sys::{
+    self as sys, kAudioDevicePropertyStreamFormat, kAudioFormatFlagIsBigEndian,
+    kAudioFormatFlagIsFloat, kAudioFormatFlagIsPacked, kAudioFormatFlagIsSignedInteger,
+    kAudioFormatLinearPCM, kAudioObjectPropertyElementMaster, kAudioObjectPropertyScopeOutput,
+    AudioObjectGetPropertyData, AudioObjectID, AudioObjectPropertyAddress,
     AudioStreamBasicDescription,
 };
-use coreaudio::Error as CAError;
+
+/// AudioDeviceID is an alias for AudioObjectID (u32).
+type AudioDeviceID = AudioObjectID;
 
 // ── ObjC imports for application enumeration ─────────────────────────────
 use cocoa::base::{id, nil};
@@ -154,32 +159,43 @@ impl AudioDevice for MacosAudioDevice {
     }
 
     fn name(&self) -> String {
-        AudioObject::name(&self.device_id)
-            .unwrap_or_else(|_| "Unknown CoreAudio Device".to_string())
+        get_device_name(self.device_id).unwrap_or_else(|_| "Unknown CoreAudio Device".to_string())
     }
 
     fn is_default(&self) -> bool {
         // Compare against default output device ID
-        match AudioObject::default_output_device() {
+        match get_default_device_id(false) {
             Ok(default_id) => self.device_id == default_id,
             Err(_) => false,
         }
     }
 
     fn supported_formats(&self) -> Vec<AudioFormat> {
-        // Return the device's default format if queryable
-        let address = coreaudio::audio_object::AudioObjectPropertyAddress {
+        // Query the device's default stream format using raw CoreAudio API
+        let address = AudioObjectPropertyAddress {
             mSelector: kAudioDevicePropertyStreamFormat,
             mScope: kAudioObjectPropertyScopeOutput,
             mElement: kAudioObjectPropertyElementMaster,
         };
 
-        match AudioObject::get_property::<AudioStreamBasicDescription>(&self.device_id, address) {
-            Ok(asbd) => match asbd_to_audio_format(&asbd) {
+        unsafe {
+            let mut asbd: AudioStreamBasicDescription = std::mem::zeroed();
+            let mut size = std::mem::size_of::<AudioStreamBasicDescription>() as u32;
+            let status = AudioObjectGetPropertyData(
+                self.device_id,
+                &address,
+                0,
+                std::ptr::null(),
+                &mut size,
+                &mut asbd as *mut _ as *mut std::ffi::c_void,
+            );
+            if status != 0 {
+                return vec![];
+            }
+            match asbd_to_audio_format(&asbd) {
                 Ok(fmt) => vec![fmt],
                 Err(_) => vec![],
-            },
-            Err(_) => vec![],
+            }
         }
     }
 
@@ -188,7 +204,7 @@ impl AudioDevice for MacosAudioDevice {
         let format = config.to_audio_format();
 
         // 2. Determine CaptureTarget from device identity
-        let default_id = AudioObject::default_output_device().map_err(map_ca_error)?;
+        let default_id = get_default_device_id(false).map_err(map_ca_error)?;
         let target = if self.device_id == default_id {
             CaptureTarget::SystemDefault
         } else {
@@ -260,7 +276,7 @@ impl DeviceEnumerator for MacosDeviceEnumerator {
     }
 
     fn default_device(&self) -> AudioResult<Box<dyn AudioDevice>> {
-        let device_id = AudioObject::default_output_device().map_err(map_ca_error)?;
+        let device_id = get_default_device_id(false).map_err(map_ca_error)?;
         Ok(Box::new(MacosAudioDevice { device_id }))
     }
 }
@@ -272,20 +288,41 @@ impl DeviceEnumerator for MacosDeviceEnumerator {
 /// Maps a `coreaudio::Error` (wrapping OSStatus) to an [`AudioError`].
 ///
 /// Used throughout the macOS backend for consistent error reporting.
+///
+/// The `coreaudio::Error` enum has variants like `AudioUnit(i32)`, `AudioCodec(i32)`,
+/// `AudioFormat(i32)`, `Audio(i32)`, and `Unspecified`. We extract the inner OSStatus
+/// and map well-known codes to specific `AudioError` variants.
 pub(crate) fn map_ca_error(err: CAError) -> AudioError {
-    let os_status = err.0;
-    match os_status as u32 {
-        sys::kAudioHardwarePermissionsError => AudioError::PermissionDenied,
-        sys::kAudioUnitErr_FormatNotSupported => AudioError::FormatNotSupported {
-            requested: "unknown".to_string(),
-            available: vec![],
-        },
-        _ => AudioError::BackendError {
-            backend: "CoreAudio".to_string(),
-            operation: "unknown".to_string(),
-            message: format!("CoreAudio error: {:?} (OSStatus: {})", err, os_status),
+    let (category, os_status) = match &err {
+        CAError::AudioUnit(status) => ("AudioUnit", *status),
+        CAError::AudioCodec(status) => ("AudioCodec", *status),
+        CAError::AudioFormat(status) => ("AudioFormat", *status),
+        CAError::Audio(status) => ("Audio", *status),
+        _ => ("Unknown", -1i32),
+    };
+
+    // Check for well-known CoreAudio OSStatus codes
+    if os_status == sys::kAudioHardwarePermissionsError as i32 {
+        return AudioError::PermissionDenied {
+            operation: "audio_capture".into(),
+            details: Some(format!(
+                "CoreAudio permission denied (OSStatus: {})",
+                os_status
+            )),
+        };
+    }
+    if os_status == sys::kAudioUnitErr_FormatNotSupported as i32 {
+        return AudioError::UnsupportedFormat {
+            format: "requested format".into(),
             context: None,
-        },
+        };
+    }
+
+    AudioError::BackendError {
+        backend: "CoreAudio".into(),
+        operation: category.into(),
+        message: format!("CoreAudio error ({}): OSStatus {}", category, os_status),
+        context: None,
     }
 }
 
@@ -294,25 +331,25 @@ pub(crate) fn map_ca_error(err: CAError) -> AudioError {
 /// Only handles Linear PCM formats (float and signed integer).
 pub(crate) fn asbd_to_audio_format(asbd: &AudioStreamBasicDescription) -> AudioResult<AudioFormat> {
     if asbd.mFormatID != kAudioFormatLinearPCM {
-        return Err(AudioError::FormatNotSupported {
-            requested: format!("format_id={}", asbd.mFormatID),
-            available: vec![],
+        return Err(AudioError::UnsupportedFormat {
+            format: format!("format_id={}", asbd.mFormatID),
+            context: None,
         });
     }
 
     let sample_format = if (asbd.mFormatFlags & kAudioFormatFlagIsFloat) != 0 {
         if (asbd.mFormatFlags & kAudioFormatFlagIsBigEndian) != 0 {
-            return Err(AudioError::FormatNotSupported {
-                requested: "F32BE".to_string(),
-                available: vec![],
+            return Err(AudioError::UnsupportedFormat {
+                format: "F32BE".to_string(),
+                context: None,
             });
         }
         SampleFormat::F32
     } else if (asbd.mFormatFlags & kAudioFormatFlagIsSignedInteger) != 0 {
         if (asbd.mFormatFlags & kAudioFormatFlagIsBigEndian) != 0 {
-            return Err(AudioError::FormatNotSupported {
-                requested: "Signed Int Big Endian".to_string(),
-                available: vec![],
+            return Err(AudioError::UnsupportedFormat {
+                format: "Signed Int Big Endian".to_string(),
+                context: None,
             });
         }
         match asbd.mBitsPerChannel {
@@ -320,16 +357,16 @@ pub(crate) fn asbd_to_audio_format(asbd: &AudioStreamBasicDescription) -> AudioR
             24 => SampleFormat::I24,
             32 => SampleFormat::I32,
             _ => {
-                return Err(AudioError::FormatNotSupported {
-                    requested: format!("{}-bit signed int", asbd.mBitsPerChannel),
-                    available: vec![],
+                return Err(AudioError::UnsupportedFormat {
+                    format: format!("{}-bit signed int", asbd.mBitsPerChannel),
+                    context: None,
                 });
             }
         }
     } else {
-        return Err(AudioError::FormatNotSupported {
-            requested: "Unknown sample format".to_string(),
-            available: vec![],
+        return Err(AudioError::UnsupportedFormat {
+            format: "Unknown sample format".to_string(),
+            context: None,
         });
     };
 
@@ -615,9 +652,10 @@ mod tests {
 
     #[test]
     fn map_ca_error_permission_denied() {
-        let err = map_ca_error(CAError(sys::kAudioHardwarePermissionsError as i32));
+        // Construct a CAError::Audio variant with the permissions error OSStatus
+        let err = map_ca_error(CAError::Audio(sys::kAudioHardwarePermissionsError as i32));
         assert!(
-            matches!(err, AudioError::PermissionDenied),
+            matches!(err, AudioError::PermissionDenied { .. }),
             "Expected PermissionDenied, got: {:?}",
             err
         );
@@ -625,10 +663,13 @@ mod tests {
 
     #[test]
     fn map_ca_error_format_not_supported() {
-        let err = map_ca_error(CAError(sys::kAudioUnitErr_FormatNotSupported as i32));
+        // Construct a CAError::AudioUnit variant with the format-not-supported OSStatus
+        let err = map_ca_error(CAError::AudioUnit(
+            sys::kAudioUnitErr_FormatNotSupported as i32,
+        ));
         assert!(
-            matches!(err, AudioError::FormatNotSupported { .. }),
-            "Expected FormatNotSupported, got: {:?}",
+            matches!(err, AudioError::UnsupportedFormat { .. }),
+            "Expected UnsupportedFormat, got: {:?}",
             err
         );
     }
@@ -636,7 +677,7 @@ mod tests {
     #[test]
     fn map_ca_error_unknown_status() {
         // Use an arbitrary unknown OSStatus (e.g., -50 = paramErr)
-        let err = map_ca_error(CAError(-50));
+        let err = map_ca_error(CAError::Audio(-50));
         assert!(
             matches!(err, AudioError::BackendError { .. }),
             "Expected BackendError, got: {:?}",
