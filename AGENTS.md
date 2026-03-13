@@ -291,6 +291,12 @@ This project uses [Task Master](https://github.com/task-master-ai/task-master-ai
 - ✅ `cmd_list()` CLI command now enumerates actual devices via the library API
 - ✅ [`list_devices.rs`](examples/list_devices.rs) example updated to use real enumeration
 - ✅ Compiler warnings cleaned up to zero
+- ✅ Application capture integration tests added (`tests/ci_audio/app_capture.rs`):
+  - `test_app_capture_by_process_id` — spawns audio player, captures by PID
+  - `test_app_capture_by_pipewire_node_id` — Linux PipeWire node discovery + capture
+  - `test_app_capture_nonexistent_target` — graceful error handling
+- ✅ Test helpers for app capture: `require_app_capture!()`, `spawn_audio_player_get_pid()`, `find_pipewire_node_for_pid()`
+- ✅ Platform-specific capability unit tests fixed for cross-platform CI (5 tests with `#[cfg]` guards + Windows/macOS variants)
 
 **Remaining:**
 - Async stream support (behind `async-stream` feature, foundation in place via `atomic-waker`)
