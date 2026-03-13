@@ -2,7 +2,7 @@ name: CI Audio Integration Tests
 
 on:
   push:
-    branches: [main, develop]
+    branches: [main, master]
     paths:
       - 'src/**'
       - 'tests/**'
@@ -10,7 +10,7 @@ on:
       - 'Cargo.lock'
       - '.github/workflows/ci-audio-tests.yml'
   pull_request:
-    branches: [main, develop]
+    branches: [main, master]
     paths:
       - 'src/**'
       - 'tests/**'
