@@ -90,11 +90,33 @@ jobs:
     name: macOS Unit Tests
     needs: lint
     runs-on: macos-latest
-    continue-on-error: true  # macOS implementation incomplete — expected failures
+    continue-on-error: true  # macOS tests may have platform-specific failures
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
+
+      - name: Grant audio permissions for CI
+        run: |
+          # Grant microphone/audio access to avoid TCC dialog blocking tests
+          # This allows the test binary to access audio devices without UI prompts
+          TCC_DB="$HOME/Library/Application Support/com.apple.TCC/TCC.db"
+          if [ -f "$TCC_DB" ]; then
+            sqlite3 "$TCC_DB" \
+              "INSERT OR IGNORE INTO access VALUES('kTCCServiceMicrophone','com.apple.Terminal',1,2,4,1,NULL,NULL,0,'UNUSED',NULL,0,$(date +%s))" 2>/dev/null || true
+            sqlite3 "$TCC_DB" \
+              "INSERT OR IGNORE INTO access VALUES('kTCCServiceMicrophone','com.apple.dt.CommandLineTools',1,2,4,1,NULL,NULL,0,'UNUSED',NULL,0,$(date +%s))" 2>/dev/null || true
+            echo "TCC permissions granted (or already present)"
+          else
+            echo "TCC database not found — skipping permission grants"
+          fi
+
+      - name: Report audio environment
+        run: |
+          echo "=== macOS Version ==="
+          sw_vers
+          echo "=== Audio Devices ==="
+          system_profiler SPAudioDataType 2>/dev/null || echo "No audio profiler available"
 
       - name: Cargo check
         run: cargo check --lib --no-default-features --features feat_macos

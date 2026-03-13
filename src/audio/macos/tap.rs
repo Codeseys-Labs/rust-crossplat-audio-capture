@@ -126,7 +126,7 @@ impl CoreAudioProcessTap {
             let status: OSStatus = AudioHardwareCreateProcessTap(tap_desc_obj, &mut tap_id);
 
             if status != sys::noErr as OSStatus {
-                return Err(map_ca_error(CAError(status)));
+                return Err(map_ca_error(CAError::Unknown(status)));
             }
 
             if tap_id == 0 {
@@ -181,7 +181,7 @@ impl CoreAudioProcessTap {
         };
 
         if status != sys::noErr as OSStatus {
-            return Err(map_ca_error(CAError(status)));
+            return Err(map_ca_error(CAError::Unknown(status)));
         }
         Ok(asbd)
     }

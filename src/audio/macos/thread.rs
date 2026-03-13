@@ -37,18 +37,13 @@ use super::tap::CoreAudioProcessTap;
 // Fix Group 4 & 5: Use AudioUnit::new(IOType) instead of AudioComponent/AudioComponentDescription.
 // Fix Group 1: Import from coreaudio_sys (the -sys crate), not coreaudio::sys.
 use coreaudio::audio_unit::macos_helpers::get_default_device_id;
-use coreaudio::audio_unit::{AudioUnit, IOType, Scope};
+use coreaudio::audio_unit::{AudioUnit, Element, IOType, Scope};
 use coreaudio_sys::{
     kAudioFormatFlagIsFloat, kAudioFormatFlagIsNonInterleaved, kAudioFormatFlagIsPacked,
     kAudioFormatLinearPCM, kAudioOutputUnitProperty_CurrentDevice,
     kAudioOutputUnitProperty_EnableIO, kAudioUnitProperty_StreamFormat,
     AudioStreamBasicDescription,
 };
-
-/// Standard CoreAudio bus constants (Fix Group 5).
-/// Element 0 = output bus, element 1 = input bus.
-const INPUT_BUS: u32 = 1;
-const OUTPUT_BUS: u32 = 0;
 
 /// AudioDeviceID type alias (Fix Group 3).
 /// Same as CoreAudio's AudioObjectID = u32.
@@ -155,7 +150,7 @@ pub(crate) fn create_macos_capture(
         .set_property(
             kAudioOutputUnitProperty_CurrentDevice,
             Scope::Global,
-            OUTPUT_BUS,
+            Element::Output,
             Some(&device_id),
         )
         .map_err(map_ca_error)?;
@@ -166,7 +161,7 @@ pub(crate) fn create_macos_capture(
         .set_property(
             kAudioOutputUnitProperty_EnableIO,
             Scope::Input,
-            INPUT_BUS,
+            Element::Input,
             Some(&enable_io),
         )
         .map_err(map_ca_error)?;
@@ -177,7 +172,7 @@ pub(crate) fn create_macos_capture(
         .set_property(
             kAudioOutputUnitProperty_EnableIO,
             Scope::Output,
-            OUTPUT_BUS,
+            Element::Output,
             Some(&disable_io),
         )
         .map_err(map_ca_error)?;
@@ -190,7 +185,7 @@ pub(crate) fn create_macos_capture(
         .set_property(
             kAudioUnitProperty_StreamFormat,
             Scope::Output,
-            INPUT_BUS,
+            Element::Input,
             Some(&asbd),
         )
         .map_err(map_ca_error)?;
@@ -200,7 +195,7 @@ pub(crate) fn create_macos_capture(
         .set_property(
             kAudioUnitProperty_StreamFormat,
             Scope::Input,
-            OUTPUT_BUS,
+            Element::Output,
             Some(&asbd),
         )
         .map_err(map_ca_error)?;
@@ -276,7 +271,10 @@ fn resolve_capture_target(
         CaptureTarget::SystemDefault => {
             // Fix Group 2: Use get_default_device_id(false) instead of AudioObject::default_output_device()
             // false = output device (for loopback capture)
-            let device_id = get_default_device_id(false).map_err(map_ca_error)?;
+            let device_id =
+                get_default_device_id(false).ok_or_else(|| AudioError::DeviceNotFound {
+                    device_id: "default_output".into(),
+                })?;
             log::debug!("CoreAudio: SystemDefault → device_id={}", device_id);
             Ok((device_id, None))
         }

@@ -30,11 +30,10 @@ use coreaudio::Error as CAError;
 
 // ── CoreAudio-sys raw FFI imports ────────────────────────────────────────
 use coreaudio_sys::{
-    self as sys, kAudioDevicePropertyStreamFormat, kAudioFormatFlagIsBigEndian,
-    kAudioFormatFlagIsFloat, kAudioFormatFlagIsPacked, kAudioFormatFlagIsSignedInteger,
-    kAudioFormatLinearPCM, kAudioObjectPropertyElementMaster, kAudioObjectPropertyScopeOutput,
-    AudioObjectGetPropertyData, AudioObjectID, AudioObjectPropertyAddress,
-    AudioStreamBasicDescription,
+    kAudioDevicePropertyStreamFormat, kAudioFormatFlagIsBigEndian, kAudioFormatFlagIsFloat,
+    kAudioFormatFlagIsPacked, kAudioFormatFlagIsSignedInteger, kAudioFormatLinearPCM,
+    kAudioObjectPropertyElementMaster, kAudioObjectPropertyScopeOutput, AudioObjectGetPropertyData,
+    AudioObjectID, AudioObjectPropertyAddress, AudioStreamBasicDescription,
 };
 
 /// AudioDeviceID is an alias for AudioObjectID (u32).
@@ -164,9 +163,10 @@ impl AudioDevice for MacosAudioDevice {
 
     fn is_default(&self) -> bool {
         // Compare against default output device ID
+        // get_default_device_id returns Option<AudioDeviceID>
         match get_default_device_id(false) {
-            Ok(default_id) => self.device_id == default_id,
-            Err(_) => false,
+            Some(default_id) => self.device_id == default_id,
+            None => false,
         }
     }
 
@@ -204,7 +204,10 @@ impl AudioDevice for MacosAudioDevice {
         let format = config.to_audio_format();
 
         // 2. Determine CaptureTarget from device identity
-        let default_id = get_default_device_id(false).map_err(map_ca_error)?;
+        let default_id =
+            get_default_device_id(false).ok_or_else(|| AudioError::DeviceNotFound {
+                device_id: "default_output".into(),
+            })?;
         let target = if self.device_id == default_id {
             CaptureTarget::SystemDefault
         } else {
@@ -276,7 +279,9 @@ impl DeviceEnumerator for MacosDeviceEnumerator {
     }
 
     fn default_device(&self) -> AudioResult<Box<dyn AudioDevice>> {
-        let device_id = get_default_device_id(false).map_err(map_ca_error)?;
+        let device_id = get_default_device_id(false).ok_or_else(|| AudioError::DeviceNotFound {
+            device_id: "default_output".into(),
+        })?;
         Ok(Box::new(MacosAudioDevice { device_id }))
     }
 }
@@ -285,24 +290,35 @@ impl DeviceEnumerator for MacosDeviceEnumerator {
 // Helper Functions
 // ══════════════════════════════════════════════════════════════════════════
 
-/// Maps a `coreaudio::Error` (wrapping OSStatus) to an [`AudioError`].
+/// Well-known CoreAudio OSStatus code for permission denied ('hog!' as u32).
+/// Not always present in coreaudio-sys, so we define it here.
+const KAUDIO_HARDWARE_PERMISSIONS_ERROR: i32 = 0x686F6721_u32 as i32; // 'hog!'
+
+/// Well-known CoreAudio OSStatus code for format not supported.
+const KAUDIO_UNIT_ERR_FORMAT_NOT_SUPPORTED: i32 = -10868;
+
+/// Maps a `coreaudio::Error` to an [`AudioError`].
 ///
 /// Used throughout the macOS backend for consistent error reporting.
 ///
-/// The `coreaudio::Error` enum has variants like `AudioUnit(i32)`, `AudioCodec(i32)`,
-/// `AudioFormat(i32)`, `Audio(i32)`, and `Unspecified`. We extract the inner OSStatus
-/// and map well-known codes to specific `AudioError` variants.
+/// In coreaudio-rs 0.14, the `Error` enum wraps typed sub-enums (not raw i32).
+/// We use `as_os_status()` to extract the underlying OSStatus code and then
+/// map well-known codes to specific `AudioError` variants.
 pub(crate) fn map_ca_error(err: CAError) -> AudioError {
-    let (category, os_status) = match &err {
-        CAError::AudioUnit(status) => ("AudioUnit", *status),
-        CAError::AudioCodec(status) => ("AudioCodec", *status),
-        CAError::AudioFormat(status) => ("AudioFormat", *status),
-        CAError::Audio(status) => ("Audio", *status),
-        _ => ("Unknown", -1i32),
+    let os_status = err.as_os_status();
+
+    // Determine category from the variant
+    let category = match &err {
+        CAError::AudioUnit(_) => "AudioUnit",
+        CAError::AudioCodec(_) => "AudioCodec",
+        CAError::AudioFormat(_) => "AudioFormat",
+        CAError::Audio(_) => "Audio",
+        CAError::Unknown(_) => "Unknown",
+        _ => "Other",
     };
 
     // Check for well-known CoreAudio OSStatus codes
-    if os_status == sys::kAudioHardwarePermissionsError as i32 {
+    if os_status == KAUDIO_HARDWARE_PERMISSIONS_ERROR {
         return AudioError::PermissionDenied {
             operation: "audio_capture".into(),
             details: Some(format!(
@@ -311,7 +327,7 @@ pub(crate) fn map_ca_error(err: CAError) -> AudioError {
             )),
         };
     }
-    if os_status == sys::kAudioUnitErr_FormatNotSupported as i32 {
+    if os_status == KAUDIO_UNIT_ERR_FORMAT_NOT_SUPPORTED {
         return AudioError::UnsupportedFormat {
             format: "requested format".into(),
             context: None,
@@ -320,7 +336,7 @@ pub(crate) fn map_ca_error(err: CAError) -> AudioError {
 
     AudioError::BackendError {
         backend: "CoreAudio".into(),
-        operation: category.into(),
+        operation: category.to_string(),
         message: format!("CoreAudio error ({}): OSStatus {}", category, os_status),
         context: None,
     }
@@ -652,8 +668,8 @@ mod tests {
 
     #[test]
     fn map_ca_error_permission_denied() {
-        // Construct a CAError::Audio variant with the permissions error OSStatus
-        let err = map_ca_error(CAError::Audio(sys::kAudioHardwarePermissionsError as i32));
+        // Construct a CAError::Unknown variant with the permissions error OSStatus
+        let err = map_ca_error(CAError::Unknown(KAUDIO_HARDWARE_PERMISSIONS_ERROR));
         assert!(
             matches!(err, AudioError::PermissionDenied { .. }),
             "Expected PermissionDenied, got: {:?}",
@@ -663,10 +679,10 @@ mod tests {
 
     #[test]
     fn map_ca_error_format_not_supported() {
-        // Construct a CAError::AudioUnit variant with the format-not-supported OSStatus
-        let err = map_ca_error(CAError::AudioUnit(
-            sys::kAudioUnitErr_FormatNotSupported as i32,
-        ));
+        // Construct a CAError with the format-not-supported OSStatus
+        // Use AudioUnitError::FormatNotSupported since that's the typed variant
+        use coreaudio::error::AudioUnitError;
+        let err = map_ca_error(CAError::AudioUnit(AudioUnitError::FormatNotSupported));
         assert!(
             matches!(err, AudioError::UnsupportedFormat { .. }),
             "Expected UnsupportedFormat, got: {:?}",
@@ -677,7 +693,7 @@ mod tests {
     #[test]
     fn map_ca_error_unknown_status() {
         // Use an arbitrary unknown OSStatus (e.g., -50 = paramErr)
-        let err = map_ca_error(CAError::Audio(-50));
+        let err = map_ca_error(CAError::Unknown(-50));
         assert!(
             matches!(err, AudioError::BackendError { .. }),
             "Expected BackendError, got: {:?}",
