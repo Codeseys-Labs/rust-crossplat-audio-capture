@@ -311,3 +311,155 @@ pub fn stop_player(mut player: Child) {
     let _ = player.kill();
     let _ = player.wait();
 }
+
+// ---------------------------------------------------------------------------
+// require_app_capture!() macro — skips when app capture is unsupported
+// ---------------------------------------------------------------------------
+
+/// Macro that skips the current test if application capture is not supported.
+/// First checks audio infrastructure availability, then platform capabilities.
+macro_rules! require_app_capture {
+    () => {
+        require_audio!();
+        let caps = rsac::PlatformCapabilities::query();
+        if !caps.supports_application_capture {
+            eprintln!(
+                "\n╔══════════════════════════════════════════════════════════╗"
+            );
+            eprintln!(
+                "║  SKIPPING: App capture not supported on this platform   ║"
+            );
+            eprintln!(
+                "╚══════════════════════════════════════════════════════════╝\n"
+            );
+            return;
+        }
+    };
+}
+
+// ---------------------------------------------------------------------------
+// Application capture helpers
+// ---------------------------------------------------------------------------
+
+/// Spawn a platform-specific audio player and return the child process + its PID.
+/// Unlike `spawn_test_tone_player`, this always returns the PID for use with
+/// `CaptureTarget::ProcessTree` or PipeWire node discovery.
+pub fn spawn_audio_player_get_pid(wav_path: &std::path::Path) -> Result<(Child, u32), String> {
+    #[cfg(target_os = "linux")]
+    {
+        let child = Command::new("pw-play")
+            .arg(wav_path)
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::piped())
+            .spawn()
+            .or_else(|_| {
+                // Fall back to paplay
+                Command::new("paplay")
+                    .arg(wav_path)
+                    .stdin(std::process::Stdio::null())
+                    .stdout(std::process::Stdio::null())
+                    .stderr(std::process::Stdio::piped())
+                    .spawn()
+            })
+            .map_err(|e| format!("Failed to spawn audio player: {e}"))?;
+
+        let pid = child.id();
+        eprintln!(
+            "[ci_audio] Started audio player PID={pid} for {:?}",
+            wav_path
+        );
+        Ok((child, pid))
+    }
+
+    #[cfg(target_os = "windows")]
+    {
+        let path_str = wav_path.to_string_lossy();
+        let child = Command::new("powershell")
+            .args([
+                "-Command",
+                &format!("(New-Object Media.SoundPlayer '{}').PlaySync()", path_str),
+            ])
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::piped())
+            .spawn()
+            .map_err(|e| format!("Failed to spawn Windows audio player: {e}"))?;
+
+        let pid = child.id();
+        eprintln!("[ci_audio] Started Windows audio player PID={pid}");
+        Ok((child, pid))
+    }
+
+    #[cfg(target_os = "macos")]
+    {
+        let child = Command::new("afplay")
+            .arg(wav_path)
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::piped())
+            .spawn()
+            .map_err(|e| format!("Failed to spawn macOS audio player: {e}"))?;
+
+        let pid = child.id();
+        eprintln!("[ci_audio] Started macOS audio player PID={pid}");
+        Ok((child, pid))
+    }
+
+    #[cfg(not(any(target_os = "linux", target_os = "windows", target_os = "macos")))]
+    {
+        let _ = wav_path;
+        Err("No audio player available for this platform".to_string())
+    }
+}
+
+/// Discover the PipeWire node ID for a given process PID.
+///
+/// Runs `pw-dump` and parses the JSON output to find a node whose
+/// `application.process.id` property matches the given PID.
+/// Returns the node's `id` field as a `String`, or `None` if not found.
+#[cfg(target_os = "linux")]
+pub fn find_pipewire_node_for_pid(pid: u32) -> Option<String> {
+    let output = Command::new("pw-dump").output().ok()?;
+
+    if !output.status.success() {
+        eprintln!(
+            "[ci_audio] pw-dump failed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        return None;
+    }
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+
+    // Parse the JSON array from pw-dump
+    let json: serde_json::Value = serde_json::from_str(&stdout).ok()?;
+    let arr = json.as_array()?;
+
+    let pid_str = pid.to_string();
+
+    for obj in arr {
+        // Check that this is a Node type
+        let obj_type = obj.get("type")?.as_str()?;
+        if obj_type != "PipeWire:Interface:Node" {
+            continue;
+        }
+
+        // Look for application.process.id in info.props
+        let props = obj.get("info").and_then(|i| i.get("props"));
+
+        if let Some(props) = props {
+            let app_pid = props.get("application.process.id").and_then(|v| v.as_str());
+
+            if app_pid == Some(&pid_str) {
+                // Return the node's id
+                let node_id = obj.get("id")?.as_u64()?;
+                eprintln!("[ci_audio] Found PipeWire node {} for PID {}", node_id, pid);
+                return Some(node_id.to_string());
+            }
+        }
+    }
+
+    eprintln!("[ci_audio] No PipeWire node found for PID {}", pid);
+    None
+}

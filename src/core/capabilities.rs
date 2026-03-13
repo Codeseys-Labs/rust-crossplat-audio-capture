@@ -221,11 +221,30 @@ mod tests {
 
     // ── Additional tests ────────────────────────────────────────────
 
+    // ── Backend name (platform-specific) ────────────────────────────
+
     #[test]
+    #[cfg(target_os = "linux")]
     fn backend_name_is_pipewire_on_linux() {
         let caps = PlatformCapabilities::query();
         assert_eq!(caps.backend_name, "PipeWire");
     }
+
+    #[test]
+    #[cfg(target_os = "windows")]
+    fn backend_name_is_wasapi_on_windows() {
+        let caps = PlatformCapabilities::query();
+        assert_eq!(caps.backend_name, "WASAPI");
+    }
+
+    #[test]
+    #[cfg(target_os = "macos")]
+    fn backend_name_is_coreaudio_on_macos() {
+        let caps = PlatformCapabilities::query();
+        assert_eq!(caps.backend_name, "CoreAudio");
+    }
+
+    // ── Sample format support (cross-platform) ──────────────────────
 
     #[test]
     fn supports_i16_format() {
@@ -239,42 +258,105 @@ mod tests {
         assert!(caps.supports_format(SampleFormat::I32));
     }
 
+    // ── I24 support (platform-specific) ─────────────────────────────
+
     #[test]
+    #[cfg(target_os = "linux")]
     fn does_not_support_i24_on_linux() {
         let caps = PlatformCapabilities::query();
         assert!(!caps.supports_format(SampleFormat::I24));
     }
 
     #[test]
-    fn supports_sample_rate_at_boundaries() {
+    #[cfg(target_os = "windows")]
+    fn supports_i24_on_windows() {
+        let caps = PlatformCapabilities::query();
+        assert!(caps.supports_format(SampleFormat::I24));
+    }
+
+    #[test]
+    #[cfg(target_os = "macos")]
+    fn does_not_support_i24_on_macos() {
+        let caps = PlatformCapabilities::query();
+        assert!(!caps.supports_format(SampleFormat::I24));
+    }
+
+    // ── Sample rate boundaries (platform-specific) ──────────────────
+
+    #[test]
+    fn supports_sample_rate_min_boundary() {
         let caps = PlatformCapabilities::query();
         assert!(
             caps.supports_sample_rate(8000),
-            "min boundary 8000 should be supported"
+            "min boundary 8000 should be supported on all platforms"
         );
+    }
+
+    #[test]
+    #[cfg(any(target_os = "linux", target_os = "windows"))]
+    fn supports_sample_rate_max_boundary_384000() {
+        let caps = PlatformCapabilities::query();
         assert!(
             caps.supports_sample_rate(384000),
-            "max boundary 384000 should be supported"
+            "max boundary 384000 should be supported on Linux/Windows"
+        );
+    }
+
+    #[test]
+    #[cfg(target_os = "macos")]
+    fn supports_sample_rate_max_boundary_192000() {
+        let caps = PlatformCapabilities::query();
+        assert!(
+            caps.supports_sample_rate(192000),
+            "max boundary 192000 should be supported on macOS"
+        );
+        assert!(
+            !caps.supports_sample_rate(192001),
+            "above max boundary 192000 should not be supported on macOS"
         );
     }
 
     #[test]
     fn does_not_support_sample_rate_above_max() {
         let caps = PlatformCapabilities::query();
+        // 384001 is above the maximum for all platforms (Linux/Windows: 384000, macOS: 192000)
         assert!(!caps.supports_sample_rate(384001));
     }
 
+    // ── Channel count boundaries (platform-specific) ────────────────
+
     #[test]
-    fn supports_channels_max_boundary() {
+    #[cfg(target_os = "linux")]
+    fn supports_channels_max_boundary_linux() {
         let caps = PlatformCapabilities::query();
-        assert!(caps.supports_channels(32));
+        assert!(caps.supports_channels(32)); // Linux max is 32
+        assert!(!caps.supports_channels(33));
+    }
+
+    #[test]
+    #[cfg(target_os = "windows")]
+    fn supports_channels_max_boundary_windows() {
+        let caps = PlatformCapabilities::query();
+        assert!(caps.supports_channels(8)); // Windows max is 8
+        assert!(!caps.supports_channels(9));
+    }
+
+    #[test]
+    #[cfg(target_os = "macos")]
+    fn supports_channels_max_boundary_macos() {
+        let caps = PlatformCapabilities::query();
+        assert!(caps.supports_channels(8)); // macOS max is 8
+        assert!(!caps.supports_channels(9));
     }
 
     #[test]
     fn does_not_support_channels_above_max() {
         let caps = PlatformCapabilities::query();
+        // 33 is above the maximum for all platforms (Linux: 32, Windows/macOS: 8)
         assert!(!caps.supports_channels(33));
     }
+
+    // ── Capture capability tests ────────────────────────────────────
 
     #[test]
     fn query_system_capture_supported() {
@@ -289,9 +371,17 @@ mod tests {
     }
 
     #[test]
+    #[cfg(any(target_os = "linux", target_os = "windows"))]
     fn query_process_tree_not_supported() {
         let caps = PlatformCapabilities::query();
         assert!(!caps.supports_process_tree_capture);
+    }
+
+    #[test]
+    #[cfg(target_os = "macos")]
+    fn query_process_tree_supported_on_macos() {
+        let caps = PlatformCapabilities::query();
+        assert!(caps.supports_process_tree_capture);
     }
 
     #[test]

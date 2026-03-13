@@ -9,6 +9,7 @@
 #[macro_use]
 mod helpers;
 
+mod app_capture;
 mod device_enumeration;
 mod platform_caps;
 mod stream_lifecycle;
