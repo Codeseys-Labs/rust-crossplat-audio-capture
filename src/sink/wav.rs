@@ -226,4 +226,98 @@ mod tests {
         let msg = err.to_string();
         assert!(msg.contains("WAV writer already closed"));
     }
+
+    // ===== K5.5: WavFileSink Edge Case Tests =====
+
+    #[test]
+    fn wav_sink_write_empty_buffer() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("empty.wav");
+        let format = AudioFormat {
+            sample_rate: 48000,
+            channels: 2,
+            sample_format: SampleFormat::F32,
+        };
+        let mut sink = WavFileSink::new(&path, &format).unwrap();
+        let buf = AudioBuffer::empty(2, 48000);
+        assert!(sink.write(&buf).is_ok());
+        assert_eq!(sink.frames_written(), 0);
+        sink.close().unwrap();
+    }
+
+    #[test]
+    fn wav_sink_mono_format() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("mono.wav");
+        let format = AudioFormat {
+            sample_rate: 44100,
+            channels: 1,
+            sample_format: SampleFormat::F32,
+        };
+        let mut sink = WavFileSink::new(&path, &format).unwrap();
+        let buf = AudioBuffer::new(vec![0.5, -0.5, 0.25], 1, 44100);
+        assert!(sink.write(&buf).is_ok());
+        assert_eq!(sink.frames_written(), 3);
+        sink.close().unwrap();
+
+        // Verify the WAV file is readable
+        let reader = hound::WavReader::open(&path).unwrap();
+        let spec = reader.spec();
+        assert_eq!(spec.channels, 1);
+        assert_eq!(spec.sample_rate, 44100);
+    }
+
+    #[test]
+    fn wav_sink_flush_then_continue_writing() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("flush_continue.wav");
+        let format = AudioFormat {
+            sample_rate: 48000,
+            channels: 2,
+            sample_format: SampleFormat::F32,
+        };
+        let mut sink = WavFileSink::new(&path, &format).unwrap();
+
+        let buf1 = AudioBuffer::new(vec![1.0, 2.0], 2, 48000);
+        assert!(sink.write(&buf1).is_ok());
+        assert!(sink.flush().is_ok());
+
+        // Should be able to continue writing after flush
+        let buf2 = AudioBuffer::new(vec![3.0, 4.0], 2, 48000);
+        assert!(sink.write(&buf2).is_ok());
+        assert_eq!(sink.frames_written(), 2); // 2 frames total (each buf has 1 frame of stereo)
+
+        sink.close().unwrap();
+    }
+
+    #[test]
+    fn wav_sink_invalid_path() {
+        let format = AudioFormat {
+            sample_rate: 48000,
+            channels: 2,
+            sample_format: SampleFormat::F32,
+        };
+        // Try to create in a non-existent directory
+        let result = WavFileSink::new("/nonexistent/directory/test.wav", &format);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn wav_sink_multiple_writes_accumulate_frames() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("multi.wav");
+        let format = AudioFormat {
+            sample_rate: 48000,
+            channels: 2,
+            sample_format: SampleFormat::F32,
+        };
+        let mut sink = WavFileSink::new(&path, &format).unwrap();
+
+        for _ in 0..10 {
+            let buf = AudioBuffer::new(vec![0.0; 4], 2, 48000); // 2 frames each
+            assert!(sink.write(&buf).is_ok());
+        }
+        assert_eq!(sink.frames_written(), 20); // 10 writes × 2 frames
+        sink.close().unwrap();
+    }
 }

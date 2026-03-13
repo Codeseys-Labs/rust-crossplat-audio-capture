@@ -112,6 +112,8 @@ criterion = "0.8.2" # Benchmarking
 tempfile = "3.27.0" # Temporary files for tests
 rand = "0.10.0" # For generating test data
 rand_pcg = "0.10.1" # For deterministic random numbers in tests
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "time"] }
+futures-util = "0.3"
 
 [[bin]]
 name = "rsac"
@@ -136,6 +138,11 @@ path = "examples/record_to_file.rs"
 [[example]]
 name = "list_devices"
 path = "examples/list_devices.rs"
+
+[[example]]
+name = "async_capture"
+path = "examples/async_capture.rs"
+required-features = ["async-stream"]
 
 [[bin]]
 name = "app_capture_test"

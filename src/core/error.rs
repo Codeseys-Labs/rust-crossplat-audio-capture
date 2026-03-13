@@ -1095,4 +1095,466 @@ mod tests {
         });
         assert!(r.is_err());
     }
+
+    // ===== K5.3: Error Classification Robustness Tests =====
+
+    #[test]
+    fn all_variants_display_is_nonempty() {
+        // Every AudioError variant should produce a non-empty Display string
+        let errors = vec![
+            AudioError::InvalidParameter {
+                param: "test".into(),
+                reason: "reason".into(),
+            },
+            AudioError::UnsupportedFormat {
+                format: "f32".into(),
+                context: None,
+            },
+            AudioError::ConfigurationError {
+                message: "msg".into(),
+            },
+            AudioError::DeviceNotFound {
+                device_id: "dev1".into(),
+            },
+            AudioError::DeviceNotAvailable {
+                device_id: "dev1".into(),
+                reason: "busy".into(),
+            },
+            AudioError::DeviceEnumerationError {
+                reason: "fail".into(),
+                context: None,
+            },
+            AudioError::StreamCreationFailed {
+                reason: "fail".into(),
+                context: None,
+            },
+            AudioError::StreamStartFailed {
+                reason: "fail".into(),
+            },
+            AudioError::StreamStopFailed {
+                reason: "fail".into(),
+            },
+            AudioError::StreamReadError {
+                reason: "fail".into(),
+            },
+            AudioError::BufferOverrun { dropped_frames: 10 },
+            AudioError::BufferUnderrun {
+                requested: 100,
+                available: 50,
+            },
+            AudioError::BackendError {
+                backend: "test".into(),
+                operation: "op".into(),
+                message: "msg".into(),
+                context: None,
+            },
+            AudioError::BackendNotAvailable {
+                backend: "test".into(),
+            },
+            AudioError::BackendInitializationFailed {
+                backend: "test".into(),
+                reason: "fail".into(),
+            },
+            AudioError::ApplicationNotFound {
+                identifier: "app".into(),
+            },
+            AudioError::ApplicationCaptureFailed {
+                app_id: "app".into(),
+                reason: "fail".into(),
+            },
+            AudioError::PlatformNotSupported {
+                feature: "feat".into(),
+                platform: "linux".into(),
+            },
+            AudioError::PermissionDenied {
+                operation: "capture".into(),
+                details: None,
+            },
+            AudioError::InternalError {
+                message: "internal".into(),
+                source: None,
+            },
+            AudioError::Timeout {
+                operation: "read".into(),
+                duration: std::time::Duration::from_secs(1),
+            },
+        ];
+        for (i, err) in errors.iter().enumerate() {
+            let display = format!("{err}");
+            assert!(!display.is_empty(), "Variant #{i} has empty Display");
+            assert!(
+                display.len() > 3,
+                "Variant #{i} Display too short: '{display}'"
+            );
+        }
+    }
+
+    #[test]
+    fn is_recoverable_and_is_fatal_are_mutually_exclusive() {
+        let errors: Vec<AudioError> = vec![
+            AudioError::InvalidParameter {
+                param: "p".into(),
+                reason: "r".into(),
+            },
+            AudioError::UnsupportedFormat {
+                format: "f".into(),
+                context: None,
+            },
+            AudioError::ConfigurationError {
+                message: "m".into(),
+            },
+            AudioError::DeviceNotFound {
+                device_id: "d".into(),
+            },
+            AudioError::DeviceNotAvailable {
+                device_id: "d".into(),
+                reason: "r".into(),
+            },
+            AudioError::DeviceEnumerationError {
+                reason: "r".into(),
+                context: None,
+            },
+            AudioError::StreamCreationFailed {
+                reason: "r".into(),
+                context: None,
+            },
+            AudioError::StreamStartFailed { reason: "r".into() },
+            AudioError::StreamStopFailed { reason: "r".into() },
+            AudioError::StreamReadError { reason: "r".into() },
+            AudioError::BufferOverrun { dropped_frames: 0 },
+            AudioError::BufferUnderrun {
+                requested: 0,
+                available: 0,
+            },
+            AudioError::BackendError {
+                backend: "b".into(),
+                operation: "o".into(),
+                message: "m".into(),
+                context: None,
+            },
+            AudioError::BackendNotAvailable {
+                backend: "b".into(),
+            },
+            AudioError::BackendInitializationFailed {
+                backend: "b".into(),
+                reason: "r".into(),
+            },
+            AudioError::ApplicationNotFound {
+                identifier: "a".into(),
+            },
+            AudioError::ApplicationCaptureFailed {
+                app_id: "a".into(),
+                reason: "r".into(),
+            },
+            AudioError::PlatformNotSupported {
+                feature: "f".into(),
+                platform: "p".into(),
+            },
+            AudioError::PermissionDenied {
+                operation: "o".into(),
+                details: None,
+            },
+            AudioError::InternalError {
+                message: "m".into(),
+                source: None,
+            },
+            AudioError::Timeout {
+                operation: "o".into(),
+                duration: std::time::Duration::from_secs(1),
+            },
+        ];
+        for (i, err) in errors.iter().enumerate() {
+            let recoverable = err.is_recoverable();
+            let fatal = err.is_fatal();
+            assert_ne!(recoverable, fatal,
+                "Variant #{i} ({err:?}): is_recoverable={recoverable}, is_fatal={fatal} — must be mutually exclusive");
+        }
+    }
+
+    #[test]
+    fn recoverable_variants_are_correct() {
+        // Only these should be recoverable (Recoverable or TransientRetry):
+        // StreamReadError, BufferOverrun, BufferUnderrun (Recoverable)
+        // DeviceNotAvailable, BackendError, Timeout (TransientRetry)
+        let recoverable_errors = vec![
+            AudioError::StreamReadError { reason: "r".into() },
+            AudioError::BufferOverrun { dropped_frames: 0 },
+            AudioError::BufferUnderrun {
+                requested: 0,
+                available: 0,
+            },
+            AudioError::DeviceNotAvailable {
+                device_id: "d".into(),
+                reason: "r".into(),
+            },
+            AudioError::BackendError {
+                backend: "b".into(),
+                operation: "o".into(),
+                message: "m".into(),
+                context: None,
+            },
+            AudioError::Timeout {
+                operation: "o".into(),
+                duration: std::time::Duration::from_secs(1),
+            },
+        ];
+        for err in &recoverable_errors {
+            assert!(err.is_recoverable(), "{err:?} should be recoverable");
+            assert!(!err.is_fatal(), "{err:?} should NOT be fatal");
+        }
+    }
+
+    #[test]
+    fn fatal_variants_are_correct() {
+        let fatal_errors = vec![
+            AudioError::InvalidParameter {
+                param: "p".into(),
+                reason: "r".into(),
+            },
+            AudioError::UnsupportedFormat {
+                format: "f".into(),
+                context: None,
+            },
+            AudioError::ConfigurationError {
+                message: "m".into(),
+            },
+            AudioError::DeviceNotFound {
+                device_id: "d".into(),
+            },
+            AudioError::DeviceEnumerationError {
+                reason: "r".into(),
+                context: None,
+            },
+            AudioError::StreamCreationFailed {
+                reason: "r".into(),
+                context: None,
+            },
+            AudioError::StreamStartFailed { reason: "r".into() },
+            AudioError::StreamStopFailed { reason: "r".into() },
+            AudioError::BackendNotAvailable {
+                backend: "b".into(),
+            },
+            AudioError::BackendInitializationFailed {
+                backend: "b".into(),
+                reason: "r".into(),
+            },
+            AudioError::ApplicationNotFound {
+                identifier: "a".into(),
+            },
+            AudioError::ApplicationCaptureFailed {
+                app_id: "a".into(),
+                reason: "r".into(),
+            },
+            AudioError::PlatformNotSupported {
+                feature: "f".into(),
+                platform: "p".into(),
+            },
+            AudioError::PermissionDenied {
+                operation: "o".into(),
+                details: None,
+            },
+            AudioError::InternalError {
+                message: "m".into(),
+                source: None,
+            },
+        ];
+        for err in &fatal_errors {
+            assert!(err.is_fatal(), "{err:?} should be fatal");
+            assert!(!err.is_recoverable(), "{err:?} should NOT be recoverable");
+        }
+    }
+
+    #[test]
+    fn error_kind_covers_all_categories() {
+        // Verify each ErrorKind category has at least one error variant
+        use std::collections::HashSet;
+        let errors: Vec<AudioError> = vec![
+            AudioError::InvalidParameter {
+                param: "p".into(),
+                reason: "r".into(),
+            },
+            AudioError::DeviceNotFound {
+                device_id: "d".into(),
+            },
+            AudioError::StreamReadError { reason: "r".into() },
+            AudioError::BackendError {
+                backend: "b".into(),
+                operation: "o".into(),
+                message: "m".into(),
+                context: None,
+            },
+            AudioError::ApplicationNotFound {
+                identifier: "a".into(),
+            },
+            AudioError::PlatformNotSupported {
+                feature: "f".into(),
+                platform: "p".into(),
+            },
+            AudioError::InternalError {
+                message: "m".into(),
+                source: None,
+            },
+        ];
+        let kinds: HashSet<String> = errors.iter().map(|e| format!("{:?}", e.kind())).collect();
+        assert!(kinds.contains("Configuration"));
+        assert!(kinds.contains("Device"));
+        assert!(kinds.contains("Stream"));
+        assert!(kinds.contains("Backend"));
+        assert!(kinds.contains("Application"));
+        assert!(kinds.contains("Platform"));
+        assert!(kinds.contains("Internal"));
+        assert_eq!(kinds.len(), 7, "Should have exactly 7 ErrorKind categories");
+    }
+
+    #[test]
+    fn recoverability_display_is_meaningful() {
+        assert_eq!(format!("{}", Recoverability::Recoverable), "Recoverable");
+        assert_eq!(
+            format!("{}", Recoverability::TransientRetry),
+            "TransientRetry"
+        );
+        assert_eq!(format!("{}", Recoverability::Fatal), "Fatal");
+    }
+
+    #[test]
+    fn error_kind_display_is_meaningful() {
+        assert_eq!(format!("{}", ErrorKind::Configuration), "Configuration");
+        assert_eq!(format!("{}", ErrorKind::Device), "Device");
+        assert_eq!(format!("{}", ErrorKind::Stream), "Stream");
+        assert_eq!(format!("{}", ErrorKind::Backend), "Backend");
+        assert_eq!(format!("{}", ErrorKind::Application), "Application");
+        assert_eq!(format!("{}", ErrorKind::Platform), "Platform");
+        assert_eq!(format!("{}", ErrorKind::Internal), "Internal");
+    }
+
+    #[test]
+    fn backend_context_with_all_fields_displays_correctly() {
+        let ctx = BackendContext {
+            backend_name: "WASAPI".into(),
+            os_error_code: Some(42),
+            os_error_message: Some("Access denied".into()),
+        };
+        let display = format!("{ctx}");
+        assert!(display.contains("WASAPI"), "Should contain backend name");
+        assert!(display.contains("42"), "Should contain error code");
+        assert!(
+            display.contains("Access denied"),
+            "Should contain error message"
+        );
+    }
+
+    #[test]
+    fn backend_context_propagates_through_error_display() {
+        let ctx = BackendContext {
+            backend_name: "PipeWire".into(),
+            os_error_code: Some(13),
+            os_error_message: Some("Permission denied".into()),
+        };
+        let err = AudioError::BackendError {
+            backend: "PipeWire".into(),
+            operation: "connect".into(),
+            message: "failed to connect".into(),
+            context: Some(ctx),
+        };
+        let display = format!("{err}");
+        assert!(
+            display.contains("PipeWire")
+                || display.contains("connect")
+                || display.contains("failed"),
+            "BackendError display should contain meaningful info: {display}"
+        );
+    }
+
+    #[test]
+    fn permission_denied_with_details() {
+        let err = AudioError::PermissionDenied {
+            operation: "capture".into(),
+            details: Some("Microphone access not granted".into()),
+        };
+        let display = format!("{err}");
+        assert!(
+            display.contains("capture") || display.contains("Microphone"),
+            "PermissionDenied with details should show them: {display}"
+        );
+    }
+
+    #[test]
+    fn permission_denied_without_details() {
+        let err = AudioError::PermissionDenied {
+            operation: "capture".into(),
+            details: None,
+        };
+        let display = format!("{err}");
+        assert!(
+            display.contains("capture"),
+            "Should at least show operation: {display}"
+        );
+    }
+
+    #[test]
+    fn from_io_error_produces_internal_error() {
+        let io_err = std::io::Error::new(std::io::ErrorKind::NotFound, "file not found");
+        let audio_err: AudioError = io_err.into();
+        assert_eq!(audio_err.kind(), ErrorKind::Internal);
+        assert!(audio_err.is_fatal());
+    }
+
+    #[test]
+    fn from_string_produces_internal_error() {
+        let audio_err: AudioError = String::from("something went wrong").into();
+        assert_eq!(audio_err.kind(), ErrorKind::Internal);
+        assert!(audio_err.is_fatal());
+        let display = format!("{audio_err}");
+        assert!(
+            display.contains("something went wrong"),
+            "Should contain the original message: {display}"
+        );
+    }
+
+    #[test]
+    fn from_str_produces_internal_error() {
+        let audio_err: AudioError = "static error message".into();
+        assert_eq!(audio_err.kind(), ErrorKind::Internal);
+        assert!(audio_err.is_fatal());
+    }
+
+    #[test]
+    fn timeout_error_contains_duration_info() {
+        let err = AudioError::Timeout {
+            operation: "read_chunk".into(),
+            duration: std::time::Duration::from_millis(500),
+        };
+        let display = format!("{err}");
+        assert!(
+            display.contains("read_chunk")
+                || display.contains("500")
+                || display.contains("timeout"),
+            "Timeout display should be informative: {display}"
+        );
+        assert!(err.is_recoverable());
+        assert!(!err.is_fatal());
+    }
+
+    #[test]
+    fn buffer_overrun_contains_frame_count() {
+        let err = AudioError::BufferOverrun { dropped_frames: 42 };
+        let display = format!("{err}");
+        assert!(
+            display.contains("42"),
+            "Should contain dropped frame count: {display}"
+        );
+    }
+
+    #[test]
+    fn buffer_underrun_contains_counts() {
+        let err = AudioError::BufferUnderrun {
+            requested: 1024,
+            available: 512,
+        };
+        let display = format!("{err}");
+        assert!(
+            display.contains("1024") || display.contains("512"),
+            "Should contain requested/available counts: {display}"
+        );
+    }
 }

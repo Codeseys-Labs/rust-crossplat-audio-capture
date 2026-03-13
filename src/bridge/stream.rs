@@ -44,6 +44,8 @@ use super::state::StreamState;
 /// implements `PlatformStream`. The type is moved into a `BridgeStream` during
 /// stream creation and is only accessed through the `stop_capture()` and
 /// `is_active()` methods.
+// Platform-conditional: only used when a platform backend feature is enabled.
+#[allow(dead_code)]
 pub(crate) trait PlatformStream: Send {
     /// Stop the OS audio capture callback.
     ///
@@ -80,6 +82,8 @@ pub(crate) trait PlatformStream: Send {
 /// consumer.shared().state.transition(StreamState::Created, StreamState::Running).unwrap();
 /// let stream = BridgeStream::new(consumer, platform_stream, format, Duration::from_secs(1));
 /// ```
+// Platform-conditional: only constructed when a platform backend feature is enabled.
+#[allow(dead_code)]
 pub(crate) struct BridgeStream<S: PlatformStream> {
     /// Consumer side of the SPSC ring buffer, protected by Mutex for &self access.
     consumer: Mutex<BridgeConsumer>,
@@ -105,7 +109,9 @@ impl<S: PlatformStream> BridgeStream<S> {
     /// * `consumer` — The consumer side of the ring buffer bridge.
     /// * `platform_stream` — The platform-specific stream handle.
     /// * `format` — The audio format of data in this stream.
-    /// * `default_timeout` — Default timeout for blocking [`read_chunk()`](CapturingStream::read_chunk) calls.
+    /// * `default_timeout` — Default timeout for blocking `read_chunk()` calls.
+    /// Platform-conditional: called by platform backends when features are enabled.
+    #[allow(dead_code)]
     pub fn new(
         consumer: BridgeConsumer,
         platform_stream: S,
@@ -126,16 +132,22 @@ impl<S: PlatformStream> BridgeStream<S> {
     ///
     /// Useful for external code that needs to inspect or transition the
     /// stream lifecycle state.
+    /// Diagnostic API — used in tests and by platform backends for state inspection.
+    #[allow(dead_code)]
     pub(crate) fn shared(&self) -> &Arc<BridgeShared> {
         &self.shared
     }
 
     /// Returns the number of buffers dropped by the producer due to ring buffer overflow.
+    /// Diagnostic counter — used in tests; part of the stream monitoring API.
+    #[allow(dead_code)]
     pub fn buffers_dropped(&self) -> u64 {
         self.shared.buffers_dropped.load(Ordering::Relaxed)
     }
 
     /// Returns the number of buffers successfully read by the consumer.
+    /// Diagnostic counter — used in tests; part of the stream monitoring API.
+    #[allow(dead_code)]
     pub fn buffers_read(&self) -> u64 {
         self.shared.buffers_popped.load(Ordering::Relaxed)
     }
@@ -231,6 +243,20 @@ impl<S: PlatformStream + Sync + 'static> CapturingStream for BridgeStream<S> {
 
     fn is_running(&self) -> bool {
         self.shared.state.is_running()
+    }
+
+    #[cfg(feature = "async-stream")]
+    fn register_waker(&self, waker: &std::task::Waker) -> bool {
+        self.shared.waker.register(waker);
+        true
+    }
+
+    #[cfg(feature = "async-stream")]
+    fn is_stream_producing(&self) -> bool {
+        matches!(
+            self.shared.state.get(),
+            StreamState::Created | StreamState::Running
+        )
     }
 }
 
@@ -619,5 +645,129 @@ mod tests {
                 i
             );
         }
+    }
+
+    // ===== K5.2: BridgeStream Lifecycle Edge Case Tests =====
+
+    #[test]
+    fn read_from_created_stream_returns_error() {
+        // A stream that was never started (state=Created) should error on read
+        let format = AudioFormat {
+            sample_rate: 48000,
+            channels: 2,
+            sample_format: crate::core::config::SampleFormat::F32,
+        };
+        let (_producer, consumer) = create_bridge(4, format.clone());
+        let stream = BridgeStream::new(
+            consumer,
+            MockPlatformStream::new(),
+            format,
+            Duration::from_millis(100),
+        );
+
+        // State is Created — not readable
+        let result = stream.read_chunk();
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn try_read_from_created_stream_returns_error() {
+        let format = AudioFormat {
+            sample_rate: 48000,
+            channels: 2,
+            sample_format: crate::core::config::SampleFormat::F32,
+        };
+        let (_producer, consumer) = create_bridge(4, format.clone());
+        let stream = BridgeStream::new(
+            consumer,
+            MockPlatformStream::new(),
+            format,
+            Duration::from_millis(100),
+        );
+
+        let result = stream.try_read_chunk();
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn stop_from_created_returns_error() {
+        let format = AudioFormat {
+            sample_rate: 48000,
+            channels: 2,
+            sample_format: crate::core::config::SampleFormat::F32,
+        };
+        let (_producer, consumer) = create_bridge(4, format.clone());
+        let stream = BridgeStream::new(
+            consumer,
+            MockPlatformStream::new(),
+            format,
+            Duration::from_millis(100),
+        );
+
+        let result = stream.stop();
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn stop_is_idempotent() {
+        let format = AudioFormat {
+            sample_rate: 48000,
+            channels: 2,
+            sample_format: crate::core::config::SampleFormat::F32,
+        };
+        let (_producer, consumer) = create_bridge(4, format.clone());
+        consumer.shared().state.force_set(StreamState::Running);
+        let stream = BridgeStream::new(
+            consumer,
+            MockPlatformStream::new(),
+            format,
+            Duration::from_millis(100),
+        );
+
+        // First stop should succeed
+        assert!(stream.stop().is_ok());
+        // Second stop should also succeed (idempotent)
+        assert!(stream.stop().is_ok());
+    }
+
+    #[test]
+    fn format_returns_correct_format() {
+        let format = AudioFormat {
+            sample_rate: 96000,
+            channels: 4,
+            sample_format: crate::core::config::SampleFormat::I16,
+        };
+        let (_producer, consumer) = create_bridge(4, format.clone());
+        let stream = BridgeStream::new(
+            consumer,
+            MockPlatformStream::new(),
+            format.clone(),
+            Duration::from_millis(100),
+        );
+
+        assert_eq!(stream.format().sample_rate, 96000);
+        assert_eq!(stream.format().channels, 4);
+    }
+
+    #[test]
+    fn is_running_reflects_state() {
+        let format = AudioFormat {
+            sample_rate: 48000,
+            channels: 2,
+            sample_format: crate::core::config::SampleFormat::F32,
+        };
+        let (_producer, consumer) = create_bridge(4, format.clone());
+        let stream = BridgeStream::new(
+            consumer,
+            MockPlatformStream::new(),
+            format,
+            Duration::from_millis(100),
+        );
+
+        assert!(!stream.is_running()); // Created
+        stream.shared().state.force_set(StreamState::Running);
+        assert!(stream.is_running());
+        stream.shared().state.force_set(StreamState::Stopped);
+        assert!(!stream.is_running());
     }
 }

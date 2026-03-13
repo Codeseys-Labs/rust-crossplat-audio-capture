@@ -13,7 +13,10 @@ pub use crate::core::config::{
     SampleFormat, StreamConfig,
 };
 pub use crate::core::error::{AudioError, AudioResult, BackendContext, ErrorKind, Recoverability};
-pub use crate::core::interface::{AudioDevice, CapturingStream, DeviceEnumerator};
+pub use crate::core::interface::{AudioDevice, CapturingStream, DeviceEnumerator, DeviceKind};
+
+// Audio module re-exports
+pub use crate::audio::get_device_enumerator;
 
 // API types
 pub use crate::api::{AudioCapture, AudioCaptureBuilder};
@@ -28,6 +31,10 @@ pub use crate::sink::NullSink;
 
 #[cfg(feature = "sink-wav")]
 pub use crate::sink::WavFileSink;
+
+// Async stream support
+#[cfg(feature = "async-stream")]
+pub use crate::bridge::AsyncAudioStream;
 
 // Re-export test utils if the feature is enabled
 #[cfg(feature = "test-utils")]

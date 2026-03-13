@@ -480,4 +480,210 @@ mod tests {
         let buf_empty = AudioBuffer::empty(2, 44100);
         assert!(buf_empty.timestamp().is_none());
     }
+
+    // ===== K5.4: AudioBuffer Edge Case Tests =====
+
+    #[test]
+    fn single_sample_buffer() {
+        let buf = AudioBuffer::new(vec![0.5], 1, 44100);
+        assert_eq!(buf.len(), 1);
+        assert_eq!(buf.num_frames(), 1);
+        assert!(!buf.is_empty());
+        assert_eq!(buf.data(), &[0.5]);
+        assert_eq!(buf.channels(), 1);
+    }
+
+    #[test]
+    fn single_sample_stereo_buffer() {
+        // 1 sample with 2 channels = 0 complete frames (integer division)
+        let buf = AudioBuffer::new(vec![0.5], 2, 44100);
+        assert_eq!(buf.len(), 1);
+        assert_eq!(buf.num_frames(), 0); // 1 / 2 = 0
+        assert!(!buf.is_empty()); // has data, even if incomplete frame
+    }
+
+    #[test]
+    fn odd_sample_count_not_divisible_by_channels() {
+        // 7 samples with 2 channels = 3 complete frames (7 / 2 = 3)
+        let buf = AudioBuffer::new(vec![1.0; 7], 2, 48000);
+        assert_eq!(buf.len(), 7);
+        assert_eq!(buf.num_frames(), 3); // integer division
+        assert_eq!(buf.samples_per_channel(), 3);
+    }
+
+    #[test]
+    fn high_channel_count_buffer() {
+        // 32 channels with 1 frame
+        let data: Vec<f32> = (0..32).map(|i| i as f32 / 32.0).collect();
+        let buf = AudioBuffer::new(data.clone(), 32, 48000);
+        assert_eq!(buf.channels(), 32);
+        assert_eq!(buf.num_frames(), 1);
+        assert_eq!(buf.len(), 32);
+        // Extract each channel
+        for ch in 0..32u16 {
+            let ch_data = buf.channel_data(ch);
+            assert!(ch_data.is_some(), "Channel {ch} should exist");
+            assert_eq!(ch_data.unwrap().len(), 1);
+        }
+        // Channel 32 should be out of range (0-indexed, so 32 channels = 0..31)
+        assert!(buf.channel_data(32).is_none());
+    }
+
+    #[test]
+    fn duration_precision_for_standard_rates() {
+        // 48000 samples at 48kHz = exactly 1 second
+        let buf = AudioBuffer::new(vec![0.0; 48000], 1, 48000);
+        assert_eq!(buf.duration(), std::time::Duration::from_secs(1));
+
+        // 44100 samples at 44100Hz = exactly 1 second
+        let buf2 = AudioBuffer::new(vec![0.0; 44100], 1, 44100);
+        assert_eq!(buf2.duration(), std::time::Duration::from_secs(1));
+    }
+
+    #[test]
+    fn duration_for_stereo_buffer() {
+        // 96000 samples, 2 channels, 48kHz = 1 second (96000 / 2 / 48000)
+        let buf = AudioBuffer::new(vec![0.0; 96000], 2, 48000);
+        assert_eq!(buf.num_frames(), 48000);
+        assert_eq!(buf.duration(), std::time::Duration::from_secs(1));
+    }
+
+    #[test]
+    fn empty_buffer_all_methods_safe() {
+        let buf = AudioBuffer::empty(2, 48000);
+        assert!(buf.is_empty());
+        assert_eq!(buf.len(), 0);
+        assert_eq!(buf.num_frames(), 0);
+        assert_eq!(buf.samples_per_channel(), 0);
+        assert_eq!(buf.duration(), std::time::Duration::ZERO);
+        assert_eq!(buf.data(), &[] as &[f32]);
+        assert_eq!(buf.as_slice(), &[] as &[f32]);
+        assert_eq!(buf.interleaved(), &[] as &[f32]);
+        assert!(buf.channel_data(0).is_some()); // channel exists but empty
+        assert!(buf.channel_data(2).is_none()); // out of range
+        assert_eq!(buf.channels(), 2);
+        assert_eq!(buf.sample_rate(), 48000);
+        assert!(buf.timestamp().is_none());
+    }
+
+    #[test]
+    fn default_buffer_is_empty() {
+        let buf = AudioBuffer::default();
+        assert!(buf.is_empty());
+        assert_eq!(buf.channels(), 2);
+        assert_eq!(buf.sample_rate(), 48000);
+        assert_eq!(buf.format().sample_format, SampleFormat::F32);
+    }
+
+    #[test]
+    fn with_timestamp_preserves_all_fields() {
+        let format = AudioFormat {
+            sample_rate: 96000,
+            channels: 4,
+            sample_format: SampleFormat::I24,
+        };
+        let ts = std::time::Duration::from_millis(1500);
+        let buf = AudioBuffer::with_timestamp(vec![1.0, 2.0, 3.0, 4.0], format.clone(), ts);
+        assert_eq!(buf.sample_rate(), 96000);
+        assert_eq!(buf.channels(), 4);
+        assert_eq!(buf.format().sample_format, SampleFormat::I24);
+        assert_eq!(buf.timestamp(), Some(ts));
+        assert_eq!(buf.data(), &[1.0, 2.0, 3.0, 4.0]);
+    }
+
+    #[test]
+    fn as_mut_slice_full_modification() {
+        let mut buf = AudioBuffer::new(vec![0.0, 0.0, 0.0, 0.0], 2, 48000);
+        let slice = buf.as_mut_slice();
+        slice[0] = 1.0;
+        slice[1] = -1.0;
+        slice[2] = 0.5;
+        slice[3] = -0.5;
+        assert_eq!(buf.data(), &[1.0, -1.0, 0.5, -0.5]);
+    }
+
+    #[test]
+    fn into_data_consumes_buffer() {
+        let original_data = vec![0.1, 0.2, 0.3];
+        let buf = AudioBuffer::new(original_data.clone(), 1, 44100);
+        let recovered = buf.into_data();
+        assert_eq!(recovered, original_data);
+        // buf is consumed — can't use it anymore (compile-time guarantee)
+    }
+
+    #[test]
+    fn channel_data_extracts_correct_interleaved_samples() {
+        // Stereo: L R L R L R
+        let data = vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0];
+        let buf = AudioBuffer::new(data, 2, 48000);
+
+        let left = buf.channel_data(0).unwrap();
+        assert_eq!(left, vec![1.0, 3.0, 5.0]);
+
+        let right = buf.channel_data(1).unwrap();
+        assert_eq!(right, vec![2.0, 4.0, 6.0]);
+    }
+
+    #[test]
+    fn channel_data_for_quad_channel() {
+        // 4 channels: C0 C1 C2 C3 C0 C1 C2 C3
+        let data = vec![10.0, 20.0, 30.0, 40.0, 50.0, 60.0, 70.0, 80.0];
+        let buf = AudioBuffer::new(data, 4, 48000);
+        assert_eq!(buf.num_frames(), 2);
+
+        assert_eq!(buf.channel_data(0).unwrap(), vec![10.0, 50.0]);
+        assert_eq!(buf.channel_data(1).unwrap(), vec![20.0, 60.0]);
+        assert_eq!(buf.channel_data(2).unwrap(), vec![30.0, 70.0]);
+        assert_eq!(buf.channel_data(3).unwrap(), vec![40.0, 80.0]);
+    }
+
+    #[test]
+    fn buffer_with_nan_and_infinity() {
+        // AudioBuffer should handle any f32 value without panicking
+        let data = vec![f32::NAN, f32::INFINITY, f32::NEG_INFINITY, 0.0];
+        let buf = AudioBuffer::new(data, 2, 48000);
+        assert_eq!(buf.len(), 4);
+        assert_eq!(buf.num_frames(), 2);
+        assert!(buf.data()[0].is_nan());
+        assert!(buf.data()[1].is_infinite());
+        // Duration should still compute without panic
+        let _ = buf.duration();
+    }
+
+    #[test]
+    fn buffer_with_extreme_values() {
+        let data = vec![f32::MAX, f32::MIN, f32::MIN_POSITIVE, f32::EPSILON];
+        let buf = AudioBuffer::new(data.clone(), 1, 48000);
+        assert_eq!(buf.data(), &data[..]);
+    }
+
+    #[test]
+    fn clone_is_independent() {
+        let mut buf1 = AudioBuffer::new(vec![1.0, 2.0], 1, 48000);
+        let buf2 = buf1.clone();
+        buf1.as_mut_slice()[0] = 99.0;
+        assert_eq!(buf1.data()[0], 99.0);
+        assert_eq!(buf2.data()[0], 1.0); // clone is independent
+    }
+
+    #[test]
+    fn debug_format_is_nonempty() {
+        let buf = AudioBuffer::new(vec![1.0], 1, 48000);
+        let debug = format!("{buf:?}");
+        assert!(!debug.is_empty());
+        assert!(debug.contains("AudioBuffer"));
+    }
+
+    #[test]
+    fn with_format_non_f32_sample_format() {
+        // Buffer stores f32 internally regardless of declared format
+        let format = AudioFormat {
+            sample_rate: 44100,
+            channels: 1,
+            sample_format: SampleFormat::I16,
+        };
+        let buf = AudioBuffer::with_format(vec![0.5, -0.5], format);
+        assert_eq!(buf.format().sample_format, SampleFormat::I16);
+        assert_eq!(buf.data(), &[0.5, -0.5]); // data is still f32
+    }
 }

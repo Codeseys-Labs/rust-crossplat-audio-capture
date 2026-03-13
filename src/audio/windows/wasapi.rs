@@ -57,7 +57,7 @@ impl WindowsApplicationCapture {
     ///
     /// # Example
     /// ```rust,no_run
-    /// use rust_crossplat_audio_capture::audio::windows::WindowsApplicationCapture;
+    /// use rsac::audio::windows::WindowsApplicationCapture;
     ///
     /// let capture = WindowsApplicationCapture::new(1234, true);
     /// ```

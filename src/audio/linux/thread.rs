@@ -119,6 +119,8 @@ pub(crate) struct PipeWireThread {
     /// Join handle for the dedicated thread (taken on drop).
     thread_handle: Option<std::thread::JoinHandle<()>>,
     /// Shared flag: `true` while the PipeWire thread's event loop is running.
+    /// Read by `is_alive()`, which is called from `LinuxPlatformStream::is_active()`.
+    #[allow(dead_code)]
     is_running: Arc<AtomicBool>,
 }
 
@@ -244,6 +246,8 @@ impl PipeWireThread {
     ///
     /// This checks the shared atomic flag, which is set to `false` when the
     /// thread's event loop exits (either due to `Shutdown` or an error).
+    /// Called by `LinuxPlatformStream::is_active()` (PlatformStream trait contract).
+    #[allow(dead_code)]
     pub fn is_alive(&self) -> bool {
         self.is_running.load(Ordering::SeqCst)
     }
@@ -718,8 +722,9 @@ fn pw_thread_main(
             Ok(PipeWireCommand::Shutdown) => {
                 log::debug!("PipeWire thread: Shutdown received, exiting event loop");
                 // Clean up any active capture before exiting.
-                capture_listener = None;
-                capture_stream = None;
+                // Drop listener before stream — listener callbacks reference stream internals.
+                drop(capture_listener.take());
+                drop(capture_stream.take());
                 break;
             }
 
@@ -730,8 +735,9 @@ fn pw_thread_main(
             Err(std_mpsc::TryRecvError::Disconnected) => {
                 // Command channel closed — caller is gone, exit gracefully.
                 log::debug!("PipeWire thread: command channel disconnected, exiting");
-                capture_listener = None;
-                capture_stream = None;
+                // Drop listener before stream — listener callbacks reference stream internals.
+                drop(capture_listener.take());
+                drop(capture_stream.take());
                 break;
             }
         }

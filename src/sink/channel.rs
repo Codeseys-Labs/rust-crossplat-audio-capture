@@ -128,4 +128,70 @@ mod tests {
         fn assert_send<T: Send>() {}
         assert_send::<ChannelSink>();
     }
+
+    // ===== K5.5: ChannelSink Edge Case Tests =====
+
+    #[test]
+    fn channel_sink_write_empty_buffer() {
+        let (mut sink, rx) = ChannelSink::new();
+        let buf = AudioBuffer::empty(2, 48000);
+        assert!(sink.write(&buf).is_ok());
+        let received = rx.try_recv().unwrap();
+        assert!(received.is_empty());
+    }
+
+    #[test]
+    fn channel_sink_flush_is_noop() {
+        let (mut sink, _rx) = ChannelSink::new();
+        assert!(sink.flush().is_ok());
+    }
+
+    #[test]
+    fn channel_sink_close_is_noop() {
+        let (mut sink, _rx) = ChannelSink::new();
+        assert!(sink.close().is_ok());
+    }
+
+    #[test]
+    fn channel_sink_multiple_writes_then_reads() {
+        let (mut sink, rx) = ChannelSink::new();
+        let bufs: Vec<AudioBuffer> = (0..10)
+            .map(|i| AudioBuffer::new(vec![i as f32], 1, 48000))
+            .collect();
+
+        for buf in &bufs {
+            assert!(sink.write(buf).is_ok());
+        }
+
+        for i in 0..10 {
+            let received = rx.try_recv().unwrap();
+            assert_eq!(received.data(), &[i as f32]);
+        }
+
+        // No more data
+        assert!(rx.try_recv().is_err());
+    }
+
+    #[test]
+    fn channel_sink_dropped_receiver_returns_error() {
+        let (mut sink, rx) = ChannelSink::new();
+        drop(rx); // Drop receiver
+
+        let buf = AudioBuffer::new(vec![1.0], 1, 48000);
+        let result = sink.write(&buf);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn channel_sink_write_preserves_buffer_data() {
+        let (mut sink, rx) = ChannelSink::new();
+        let data = vec![0.1, 0.2, 0.3, 0.4, 0.5, 0.6];
+        let buf = AudioBuffer::new(data.clone(), 2, 48000);
+        assert!(sink.write(&buf).is_ok());
+
+        let received = rx.try_recv().unwrap();
+        assert_eq!(received.data(), &data[..]);
+        assert_eq!(received.channels(), 2);
+        assert_eq!(received.sample_rate(), 48000);
+    }
 }

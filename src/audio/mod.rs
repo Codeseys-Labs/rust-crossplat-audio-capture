@@ -44,7 +44,13 @@ pub use windows::{
 // --- Factory function for the new DeviceEnumerator ---
 
 use crate::core::error::AudioError;
-use crate::core::interface::DeviceEnumerator; // Import the trait itself
+// DeviceEnumerator is used in match arms that are compiled only with platform features
+#[cfg(any(
+    all(target_os = "windows", feature = "feat_windows"),
+    all(target_os = "linux", feature = "feat_linux"),
+    all(target_os = "macos", feature = "feat_macos")
+))]
+use crate::core::interface::DeviceEnumerator;
 
 /// Cross-platform device enumerator that wraps platform-specific implementations.
 pub enum CrossPlatformDeviceEnumerator {

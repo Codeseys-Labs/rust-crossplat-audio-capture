@@ -7,12 +7,23 @@ pub mod ring_buffer;
 pub mod state;
 pub mod stream;
 
+#[cfg(feature = "async-stream")]
+pub mod async_stream;
+
 // Re-exports for internal use
-pub(crate) use ring_buffer::BridgeShared;
 pub use ring_buffer::{calculate_capacity, create_bridge, BridgeConsumer, BridgeProducer};
 pub use state::{AtomicStreamState, StreamState};
+// Platform-conditional: used by platform backends when features are enabled,
+// and by integration tests in this module.
+#[allow(unused_imports)]
 pub(crate) use stream::BridgeStream;
+// Platform-conditional: used by Windows WASAPI backend via this re-export path;
+// Linux/macOS backends import directly from bridge::stream.
+#[allow(unused_imports)]
 pub(crate) use stream::PlatformStream;
+
+#[cfg(feature = "async-stream")]
+pub use async_stream::AsyncAudioStream;
 
 // ── Integration Tests ────────────────────────────────────────────────────
 
@@ -260,5 +271,308 @@ mod integration_tests {
         // (only Running → Stopping → Stopped transitions happen when stop() initiates)
         assert_eq!(stream.shared().state.get(), StreamState::Stopping);
         assert!(!stream.is_running());
+    }
+}
+
+// ── Async Stream Tests ───────────────────────────────────────────────────
+
+#[cfg(all(test, feature = "async-stream"))]
+mod async_stream_tests {
+    use super::*;
+    use crate::bridge::async_stream::AsyncAudioStream;
+    use crate::core::buffer::AudioBuffer;
+    use crate::core::config::AudioFormat;
+    use crate::core::error::AudioResult;
+    use futures_core::Stream;
+    use std::pin::Pin;
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::Arc;
+    use std::task::{Context, Poll, Wake, Waker};
+    use std::time::Duration;
+
+    // ── Test Waker ───────────────────────────────────────────────────
+
+    struct TestWaker {
+        woken: AtomicBool,
+    }
+
+    impl Wake for TestWaker {
+        fn wake(self: Arc<Self>) {
+            self.woken.store(true, Ordering::SeqCst);
+        }
+    }
+
+    fn make_test_waker() -> (Waker, Arc<TestWaker>) {
+        let test_waker = Arc::new(TestWaker {
+            woken: AtomicBool::new(false),
+        });
+        let waker = Waker::from(test_waker.clone());
+        (waker, test_waker)
+    }
+
+    // ── Mock PlatformStream ──────────────────────────────────────────
+
+    struct MockPlatformStream {
+        active: AtomicBool,
+    }
+
+    impl MockPlatformStream {
+        fn new() -> Self {
+            Self {
+                active: AtomicBool::new(true),
+            }
+        }
+    }
+
+    impl PlatformStream for MockPlatformStream {
+        fn stop_capture(&self) -> AudioResult<()> {
+            self.active.store(false, Ordering::Relaxed);
+            Ok(())
+        }
+
+        fn is_active(&self) -> bool {
+            self.active.load(Ordering::Relaxed)
+        }
+    }
+
+    // ── Helpers ──────────────────────────────────────────────────────
+
+    fn test_format() -> AudioFormat {
+        AudioFormat::default() // 48 kHz, 2ch, F32
+    }
+
+    fn test_buffer(value: f32) -> AudioBuffer {
+        AudioBuffer::new(vec![value; 960], 2, 48000) // 10ms stereo 48kHz
+    }
+
+    fn create_test_stream() -> (
+        crate::bridge::ring_buffer::BridgeProducer,
+        BridgeStream<MockPlatformStream>,
+    ) {
+        let format = test_format();
+        let (producer, consumer) = create_bridge(8, format.clone());
+        consumer
+            .shared()
+            .state
+            .transition(StreamState::Created, StreamState::Running)
+            .unwrap();
+        let stream = BridgeStream::new(
+            consumer,
+            MockPlatformStream::new(),
+            format,
+            Duration::from_secs(1),
+        );
+        (producer, stream)
+    }
+
+    // ── Tests ────────────────────────────────────────────────────────
+
+    /// 1. Poll an empty stream — should return Pending because no data has been pushed.
+    #[test]
+    fn test_async_stream_pending_when_empty() {
+        let (_producer, bridge_stream) = create_test_stream();
+        let (waker, _test_waker) = make_test_waker();
+        let mut cx = Context::from_waker(&waker);
+
+        let mut async_stream = AsyncAudioStream::new(&bridge_stream);
+        let pinned = Pin::new(&mut async_stream);
+
+        match pinned.poll_next(&mut cx) {
+            Poll::Pending => {} // Expected — no data pushed yet
+            Poll::Ready(Some(Ok(_))) => panic!("Expected Pending, got Ready with data"),
+            Poll::Ready(Some(Err(e))) => panic!("Expected Pending, got error: {:?}", e),
+            Poll::Ready(None) => panic!("Expected Pending, got stream end (None)"),
+        }
+    }
+
+    /// 2. Push data via producer, then poll — should return Ready(Some(Ok(buffer))).
+    #[test]
+    fn test_async_stream_ready_after_push() {
+        let (mut producer, bridge_stream) = create_test_stream();
+
+        // Push data before polling
+        producer.push(test_buffer(0.42)).unwrap();
+
+        let (waker, _test_waker) = make_test_waker();
+        let mut cx = Context::from_waker(&waker);
+
+        let mut async_stream = AsyncAudioStream::new(&bridge_stream);
+        let pinned = Pin::new(&mut async_stream);
+
+        match pinned.poll_next(&mut cx) {
+            Poll::Ready(Some(Ok(buffer))) => {
+                assert_eq!(
+                    buffer.data()[0],
+                    0.42,
+                    "Buffer data should match pushed value"
+                );
+                assert_eq!(buffer.len(), 960, "Buffer length should be 960 samples");
+                assert_eq!(buffer.channels(), 2, "Buffer should have 2 channels");
+                assert_eq!(
+                    buffer.sample_rate(),
+                    48000,
+                    "Buffer sample rate should be 48000"
+                );
+            }
+            Poll::Ready(Some(Err(e))) => panic!("Expected Ok buffer, got error: {:?}", e),
+            Poll::Ready(None) => panic!("Expected Some(Ok(buffer)), got None (stream ended)"),
+            Poll::Pending => panic!("Expected Ready with data, got Pending"),
+        }
+    }
+
+    /// 3. Poll (Pending, registers waker), push data, verify waker notified, poll again to get data.
+    #[test]
+    fn test_async_stream_waker_notified_on_push() {
+        let (mut producer, bridge_stream) = create_test_stream();
+        let (waker, test_waker) = make_test_waker();
+        let mut cx = Context::from_waker(&waker);
+
+        let mut async_stream = AsyncAudioStream::new(&bridge_stream);
+
+        // First poll — should be Pending (no data yet), registers the waker
+        {
+            let pinned = Pin::new(&mut async_stream);
+            match pinned.poll_next(&mut cx) {
+                Poll::Pending => {} // Expected — registers waker
+                Poll::Ready(Some(Ok(_))) => panic!("Expected Pending on first poll, got data"),
+                Poll::Ready(Some(Err(e))) => {
+                    panic!("Expected Pending on first poll, got error: {:?}", e)
+                }
+                Poll::Ready(None) => panic!("Expected Pending on first poll, got stream end"),
+            }
+        }
+
+        // Waker should not yet be woken
+        assert!(
+            !test_waker.woken.load(Ordering::SeqCst),
+            "Waker should NOT be triggered before push"
+        );
+
+        // Push data — this should wake the registered waker
+        producer.push(test_buffer(0.77)).unwrap();
+
+        assert!(
+            test_waker.woken.load(Ordering::SeqCst),
+            "Waker SHOULD be triggered after push"
+        );
+
+        // Reset waker flag and poll again — should get the data
+        test_waker.woken.store(false, Ordering::SeqCst);
+        {
+            let pinned = Pin::new(&mut async_stream);
+            match pinned.poll_next(&mut cx) {
+                Poll::Ready(Some(Ok(buffer))) => {
+                    assert_eq!(
+                        buffer.data()[0],
+                        0.77,
+                        "Should receive the pushed buffer data"
+                    );
+                }
+                Poll::Ready(Some(Err(e))) => panic!("Expected Ok buffer, got error: {:?}", e),
+                Poll::Ready(None) => panic!("Expected data, got stream end"),
+                Poll::Pending => panic!("Expected Ready after push, got Pending"),
+            }
+        }
+    }
+
+    /// 4. Push data + signal_done, drain all buffers, final poll returns None.
+    #[test]
+    fn test_async_stream_ends_on_signal_done() {
+        let (mut producer, bridge_stream) = create_test_stream();
+        let (waker, _test_waker) = make_test_waker();
+        let mut cx = Context::from_waker(&waker);
+
+        // Push some data, then signal producer is done
+        producer.push(test_buffer(1.0)).unwrap();
+        producer.push(test_buffer(2.0)).unwrap();
+        producer.signal_done();
+
+        let mut async_stream = AsyncAudioStream::new(&bridge_stream);
+
+        // Poll 1 — should get first buffer
+        {
+            let pinned = Pin::new(&mut async_stream);
+            match pinned.poll_next(&mut cx) {
+                Poll::Ready(Some(Ok(buf))) => {
+                    assert_eq!(buf.data()[0], 1.0, "First buffer should have value 1.0");
+                }
+                Poll::Ready(Some(Err(e))) => panic!("Expected first buffer, got error: {:?}", e),
+                Poll::Ready(None) => panic!("Expected first buffer, got stream end"),
+                Poll::Pending => panic!("Expected first buffer, got Pending"),
+            }
+        }
+
+        // Poll 2 — should get second buffer
+        {
+            let pinned = Pin::new(&mut async_stream);
+            match pinned.poll_next(&mut cx) {
+                Poll::Ready(Some(Ok(buf))) => {
+                    assert_eq!(buf.data()[0], 2.0, "Second buffer should have value 2.0");
+                }
+                Poll::Ready(Some(Err(e))) => panic!("Expected second buffer, got error: {:?}", e),
+                Poll::Ready(None) => panic!("Expected second buffer, got stream end"),
+                Poll::Pending => panic!("Expected second buffer, got Pending"),
+            }
+        }
+
+        // Poll 3 — stream should end (None) since producer signaled done and buffer is drained
+        {
+            let pinned = Pin::new(&mut async_stream);
+            match pinned.poll_next(&mut cx) {
+                Poll::Ready(None) => {} // Expected — producer done, buffer drained
+                Poll::Ready(Some(Ok(_))) => panic!("Expected stream end (None), got more data"),
+                Poll::Ready(Some(Err(e))) => {
+                    panic!("Expected stream end (None), got error: {:?}", e)
+                }
+                Poll::Pending => panic!("Expected stream end (None), got Pending"),
+            }
+        }
+    }
+
+    /// 5. Poll (Pending), signal_done, verify waker woken, poll returns None.
+    #[test]
+    fn test_async_stream_waker_notified_on_signal_done() {
+        let (producer, bridge_stream) = create_test_stream();
+        let (waker, test_waker) = make_test_waker();
+        let mut cx = Context::from_waker(&waker);
+
+        let mut async_stream = AsyncAudioStream::new(&bridge_stream);
+
+        // Poll — should be Pending (no data, producer still active)
+        {
+            let pinned = Pin::new(&mut async_stream);
+            match pinned.poll_next(&mut cx) {
+                Poll::Pending => {} // Expected — registers waker
+                Poll::Ready(Some(Ok(_))) => panic!("Expected Pending, got data"),
+                Poll::Ready(Some(Err(e))) => panic!("Expected Pending, got error: {:?}", e),
+                Poll::Ready(None) => panic!("Expected Pending, got stream end"),
+            }
+        }
+
+        assert!(
+            !test_waker.woken.load(Ordering::SeqCst),
+            "Waker should NOT be triggered before signal_done"
+        );
+
+        // Signal done — should wake the registered waker
+        producer.signal_done();
+
+        assert!(
+            test_waker.woken.load(Ordering::SeqCst),
+            "Waker SHOULD be triggered after signal_done"
+        );
+
+        // Poll again — should return None (stream ended, no data was pushed)
+        {
+            let pinned = Pin::new(&mut async_stream);
+            match pinned.poll_next(&mut cx) {
+                Poll::Ready(None) => {} // Expected — producer done, no data
+                Poll::Ready(Some(Ok(_))) => panic!("Expected None (stream end), got data"),
+                Poll::Ready(Some(Err(e))) => {
+                    panic!("Expected None (stream end), got error: {:?}", e)
+                }
+                Poll::Pending => panic!("Expected None (stream end), got Pending"),
+            }
+        }
     }
 }

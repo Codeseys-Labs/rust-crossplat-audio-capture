@@ -85,4 +85,42 @@ mod tests {
         fn assert_send<T: Send>() {}
         assert_send::<NullSink>();
     }
+
+    // ===== K5.5: NullSink Edge Case Tests =====
+
+    #[test]
+    fn null_sink_write_empty_buffer() {
+        let mut sink = NullSink::new();
+        let buf = AudioBuffer::empty(2, 48000);
+        assert!(sink.write(&buf).is_ok());
+        assert_eq!(sink.buffers_received(), 1);
+        assert_eq!(sink.frames_received(), 0); // empty buffer has 0 frames
+    }
+
+    #[test]
+    fn null_sink_multiple_writes() {
+        let mut sink = NullSink::new();
+        for i in 0..100 {
+            let buf = AudioBuffer::new(vec![i as f32; 4], 2, 48000);
+            assert!(sink.write(&buf).is_ok());
+        }
+        assert_eq!(sink.buffers_received(), 100);
+        assert_eq!(sink.frames_received(), 200); // 4 samples / 2 channels = 2 frames each
+    }
+
+    #[test]
+    fn null_sink_counters_start_at_zero() {
+        let sink = NullSink::new();
+        assert_eq!(sink.buffers_received(), 0);
+        assert_eq!(sink.frames_received(), 0);
+    }
+
+    #[test]
+    fn null_sink_write_single_sample() {
+        let mut sink = NullSink::new();
+        let buf = AudioBuffer::new(vec![0.5], 1, 44100);
+        assert!(sink.write(&buf).is_ok());
+        assert_eq!(sink.buffers_received(), 1);
+        assert_eq!(sink.frames_received(), 1);
+    }
 }

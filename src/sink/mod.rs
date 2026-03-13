@@ -3,7 +3,7 @@
 //! Sinks provide different ways to process/store audio buffers:
 //! - [`NullSink`] — discards all data (for testing/benchmarking)
 //! - [`ChannelSink`] — sends buffers over a std::sync::mpsc channel
-//! - [`WavFileSink`] — writes audio to WAV files (requires `sink-wav` feature)
+//! - `WavFileSink` — writes audio to WAV files (requires `sink-wav` feature)
 
 pub mod channel;
 pub mod null;

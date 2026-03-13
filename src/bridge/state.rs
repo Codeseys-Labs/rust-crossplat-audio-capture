@@ -413,4 +413,125 @@ mod tests {
         assert!(debug_str.contains("AtomicStreamState"));
         assert!(debug_str.contains("Running"));
     }
+
+    // ===== K5.2: Stream State Lifecycle Edge Case Tests =====
+
+    #[test]
+    fn invalid_transition_created_to_stopped() {
+        // Created → Stopped is not a standard lifecycle path, but transition() is a raw CAS
+        // It should succeed because transition() doesn't enforce valid paths — it only does CAS
+        let state = AtomicStreamState::new(StreamState::Created);
+        assert_eq!(
+            state.transition(StreamState::Created, StreamState::Stopped),
+            Ok(())
+        );
+        assert_eq!(state.get(), StreamState::Stopped);
+    }
+
+    #[test]
+    fn transition_fails_on_wrong_current_state() {
+        let state = AtomicStreamState::new(StreamState::Running);
+        // Try to transition from Created, but actual state is Running
+        let result = state.transition(StreamState::Created, StreamState::Stopping);
+        assert!(result.is_err());
+        if let Err(actual) = result {
+            assert_eq!(actual, StreamState::Running);
+        }
+    }
+
+    #[test]
+    fn full_lifecycle_created_to_closed() {
+        let state = AtomicStreamState::new(StreamState::Created);
+        assert!(!state.is_running());
+        assert!(!state.is_stopped());
+        assert!(!state.is_terminal());
+        assert!(!state.is_readable());
+
+        // Created → Running
+        assert!(state
+            .transition(StreamState::Created, StreamState::Running)
+            .is_ok());
+        assert!(state.is_running());
+        assert!(state.is_readable());
+        assert!(!state.is_stopped());
+
+        // Running → Stopping
+        assert!(state
+            .transition(StreamState::Running, StreamState::Stopping)
+            .is_ok());
+        assert!(!state.is_running());
+        assert!(state.is_readable()); // Stopping is still readable
+        assert!(!state.is_stopped());
+
+        // Stopping → Stopped
+        assert!(state
+            .transition(StreamState::Stopping, StreamState::Stopped)
+            .is_ok());
+        assert!(!state.is_running());
+        assert!(!state.is_readable());
+        assert!(state.is_stopped());
+        assert!(state.is_terminal());
+
+        // Stopped → Closed
+        assert!(state
+            .transition(StreamState::Stopped, StreamState::Closed)
+            .is_ok());
+        assert!(state.is_stopped()); // Closed counts as stopped
+        assert!(state.is_terminal());
+    }
+
+    #[test]
+    fn error_state_is_terminal() {
+        let state = AtomicStreamState::new(StreamState::Error);
+        assert!(state.is_terminal());
+        assert!(!state.is_running());
+        assert!(!state.is_readable());
+        // Error is NOT "stopped" — is_stopped() only matches Stopped | Closed
+        assert!(!state.is_stopped());
+    }
+
+    #[test]
+    fn force_set_overrides_any_state() {
+        let state = AtomicStreamState::new(StreamState::Created);
+        state.force_set(StreamState::Error);
+        assert_eq!(state.get(), StreamState::Error);
+        state.force_set(StreamState::Running);
+        assert_eq!(state.get(), StreamState::Running);
+        state.force_set(StreamState::Closed);
+        assert_eq!(state.get(), StreamState::Closed);
+    }
+
+    #[test]
+    fn default_state_is_created() {
+        let state = AtomicStreamState::default();
+        assert_eq!(state.get(), StreamState::Created);
+    }
+
+    #[test]
+    fn stream_state_u8_roundtrip() {
+        // StreamState should convert to/from u8 via from_u8()
+        for &s in &[
+            StreamState::Created,
+            StreamState::Running,
+            StreamState::Stopping,
+            StreamState::Stopped,
+            StreamState::Closed,
+            StreamState::Error,
+        ] {
+            let val = s as u8;
+            let back = StreamState::from_u8(val);
+            assert!(
+                back.is_some(),
+                "Failed to roundtrip StreamState {s:?} (u8={val})"
+            );
+            assert_eq!(back.unwrap(), s);
+        }
+    }
+
+    #[test]
+    fn stream_state_invalid_u8() {
+        // Values > 5 should fail to convert
+        assert!(StreamState::from_u8(6).is_none());
+        assert!(StreamState::from_u8(255).is_none());
+    }
 }

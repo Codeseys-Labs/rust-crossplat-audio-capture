@@ -50,7 +50,12 @@ pub(crate) struct BridgeShared {
     /// Total buffers successfully popped by the consumer.
     pub buffers_popped: AtomicU64,
     /// Audio format for this bridge (immutable after creation).
+    /// Stored for diagnostics and future format-aware consumers.
+    #[allow(dead_code)]
     pub format: AudioFormat,
+    /// Waker for async stream consumers — notified when new data is pushed.
+    #[cfg(feature = "async-stream")]
+    pub waker: atomic_waker::AtomicWaker,
 }
 
 // ── BridgeProducer ───────────────────────────────────────────────────────
@@ -85,6 +90,8 @@ impl BridgeProducer {
         match self.producer.push(buffer) {
             Ok(()) => {
                 self.shared.buffers_pushed.fetch_add(1, Ordering::Relaxed);
+                #[cfg(feature = "async-stream")]
+                self.shared.waker.wake();
                 Ok(())
             }
             Err(rtrb::PushError::Full(buffer)) => Err(buffer),
@@ -121,6 +128,8 @@ impl BridgeProducer {
             .shared
             .state
             .transition(StreamState::Running, StreamState::Stopping);
+        #[cfg(feature = "async-stream")]
+        self.shared.waker.wake();
     }
 
     /// Returns the number of free slots in the ring buffer.
@@ -134,6 +143,8 @@ impl BridgeProducer {
     }
 
     /// Returns a reference to the shared state.
+    /// Part of the bridge API surface for platform backends and diagnostics.
+    #[allow(dead_code)]
     pub(crate) fn shared(&self) -> &Arc<BridgeShared> {
         &self.shared
     }
@@ -229,6 +240,8 @@ impl BridgeConsumer {
     }
 
     /// Returns a reference to the shared state.
+    /// Platform-conditional: called by BridgeStream::new() and used by platform backends.
+    #[allow(dead_code)]
     pub(crate) fn shared(&self) -> &Arc<BridgeShared> {
         &self.shared
     }
@@ -257,6 +270,8 @@ pub fn create_bridge(capacity: usize, format: AudioFormat) -> (BridgeProducer, B
         buffers_dropped: AtomicU64::new(0),
         buffers_popped: AtomicU64::new(0),
         format,
+        #[cfg(feature = "async-stream")]
+        waker: atomic_waker::AtomicWaker::new(),
     });
 
     (
@@ -553,6 +568,96 @@ mod tests {
         producer.signal_done();
 
         assert_eq!(producer.shared().state.get(), StreamState::Stopping);
+        assert!(consumer.is_producer_done());
+    }
+
+    // ===== K5.2: Ring Buffer Edge Case Tests =====
+
+    #[test]
+    fn signal_done_then_remaining_data_drains() {
+        let (mut producer, mut consumer) = create_bridge(4, test_format());
+        producer.shared().state.force_set(StreamState::Running);
+
+        // Push some data
+        let buf1 = AudioBuffer::new(vec![1.0, 2.0], 2, 48000);
+        let buf2 = AudioBuffer::new(vec![3.0, 4.0], 2, 48000);
+        assert!(producer.push(buf1).is_ok());
+        assert!(producer.push(buf2).is_ok());
+
+        // Signal done
+        producer.signal_done();
+
+        // Should still be able to read remaining data
+        let read1 = consumer.pop();
+        assert!(read1.is_some());
+        assert_eq!(read1.unwrap().data(), &[1.0, 2.0]);
+
+        let read2 = consumer.pop();
+        assert!(read2.is_some());
+        assert_eq!(read2.unwrap().data(), &[3.0, 4.0]);
+
+        // Now empty
+        let read3 = consumer.pop();
+        assert!(read3.is_none());
+    }
+
+    #[test]
+    fn push_to_full_buffer_returns_error() {
+        let (mut producer, _consumer) = create_bridge(2, test_format());
+
+        let buf1 = AudioBuffer::new(vec![1.0], 1, 48000);
+        let buf2 = AudioBuffer::new(vec![2.0], 1, 48000);
+        assert!(producer.push(buf1).is_ok());
+        assert!(producer.push(buf2).is_ok());
+
+        // Buffer should be full now — next push fails
+        let buf3 = AudioBuffer::new(vec![3.0], 1, 48000);
+        let result = producer.push(buf3);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn push_or_drop_on_full_buffer_increments_dropped() {
+        let (mut producer, _consumer) = create_bridge(2, test_format());
+
+        // Fill the buffer
+        for i in 0..2 {
+            let buf = AudioBuffer::new(vec![i as f32], 1, 48000);
+            let _ = producer.push(buf);
+        }
+
+        // push_or_drop should not panic
+        let buf_extra = AudioBuffer::new(vec![99.0], 1, 48000);
+        producer.push_or_drop(buf_extra);
+        assert!(producer.buffers_dropped() >= 1);
+    }
+
+    #[test]
+    fn consumer_pop_empty_returns_none() {
+        let (_producer, mut consumer) = create_bridge(4, test_format());
+        assert!(consumer.pop().is_none());
+        assert_eq!(consumer.available_buffers(), 0);
+    }
+
+    #[test]
+    fn buffers_popped_counter_increments() {
+        let (mut producer, mut consumer) = create_bridge(4, test_format());
+
+        let buf = AudioBuffer::new(vec![1.0], 1, 48000);
+        assert!(producer.push(buf).is_ok());
+
+        assert_eq!(consumer.buffers_popped(), 0);
+        let _ = consumer.pop();
+        assert_eq!(consumer.buffers_popped(), 1);
+    }
+
+    #[test]
+    fn is_producer_done_after_signal() {
+        let (producer, consumer) = create_bridge(4, test_format());
+        producer.shared().state.force_set(StreamState::Running);
+
+        assert!(!consumer.is_producer_done());
+        producer.signal_done();
         assert!(consumer.is_producer_done());
     }
 }

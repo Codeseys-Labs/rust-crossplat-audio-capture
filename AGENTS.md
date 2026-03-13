@@ -103,8 +103,8 @@ All three backends are wired through `BridgeStream<S>`:
 
 ### Known remaining gaps
 
-- [`src/audio/discovery.rs`](src/audio/discovery.rs) — still contains mostly mock data; needs a full rewrite against real platform APIs.
-- [`src/audio/application_capture.rs`](src/audio/application_capture.rs) — deprecated standalone trait; superseded by `CaptureTarget` + builder but file still exists.
+- Device enumeration now uses real platform APIs (PipeWire `pw-cli`/`pw-dump` on Linux, WASAPI on Windows, CoreAudio on macOS). The former mock-data files (`discovery.rs`, `application_capture.rs`) have been removed.
+- `get_device_enumerator()` and `DeviceKind` are now part of the public API.
 - Several old binaries in `src/bin/` still reference deprecated patterns (commented out in Cargo.toml but source files remain).
 
 ---
@@ -139,9 +139,7 @@ src/
 │   └── wav.rs              # WavFileSink (behind sink-wav feature)
 ├── audio/                  # Platform backends
 │   ├── mod.rs              # Cross-platform dispatch
-│   ├── application_capture.rs  # (deprecated — superseded by CaptureTarget)
 │   ├── capture.rs          # Capture helpers
-│   ├── discovery.rs        # App discovery (mostly mock — needs rewrite)
 │   ├── windows/            # WASAPI backend
 │   │   ├── mod.rs
 │   │   ├── wasapi.rs       # WASAPI capture implementation
@@ -263,7 +261,7 @@ This project uses [Task Master](https://github.com/task-master-ai/task-master-ai
 |---|---|
 | Add backend-specific logic to demo apps | Demo apps must go through the library API only |
 | Reference any old API types (`AudioCaptureBackend`, `get_audio_backend()`, etc.) | They have been deleted — they no longer exist |
-| Use the standalone `ApplicationCapture` trait for new code | Use `CaptureTarget` with the builder instead |
+| Reference the deleted `ApplicationCapture` trait | It was removed — use `CaptureTarget` with the builder instead |
 | Make `CapturingStream` depend on file I/O | File writing is a sink adapter, not a core concern |
 | Pretend a platform supports a feature it doesn't | Use explicit capability errors via `PlatformCapabilities` |
 | Hold locks in real-time audio callback threads | Use lock-free ring buffers (`rtrb`) via `BridgeProducer` |
@@ -283,12 +281,19 @@ This project uses [Task Master](https://github.com/task-master-ai/task-master-ai
 | **Phase 2** | Streaming/data-plane & sink adapters (`BridgeStream`, ring buffer, sinks) | ✅ Done |
 | **Phase 3** | Platform backends — all 3 wired through `BridgeStream` | ✅ Done |
 | **Phase 4** | Rebuild demo CLI as thin library consumer + examples | ✅ Done |
-| **Phase 5** | Breadth expansion (more formats, richer async, advanced features) | Future |
+| **Phase 5** | Breadth expansion (more formats, richer async, advanced features) | 🟡 In Progress |
 
-### Phase 5 potential work
+### Phase 5 progress
 
+**Completed:**
+- ✅ Device enumeration rewritten against real platform APIs (PipeWire `pw-cli`/`pw-dump` on Linux, WASAPI on Windows, CoreAudio on macOS) — mock data removed
+- ✅ `get_device_enumerator()` and `DeviceKind` exposed in public API ([`src/lib.rs`](src/lib.rs))
+- ✅ `cmd_list()` CLI command now enumerates actual devices via the library API
+- ✅ [`list_devices.rs`](examples/list_devices.rs) example updated to use real enumeration
+- ✅ Compiler warnings cleaned up to zero
+
+**Remaining:**
 - Async stream support (behind `async-stream` feature, foundation in place via `atomic-waker`)
-- Richer device enumeration (replace mock data in `discovery.rs`)
 - Additional sink adapters
 - Advanced capture modes per platform
 - Performance benchmarking and optimization
@@ -351,6 +356,11 @@ let caps = PlatformCapabilities::query();
 if caps.supports_application_capture {
     // safe to use CaptureTarget::Application(..)
 }
+
+// Device enumeration
+let enumerator = rsac::get_device_enumerator()?;
+let devices = enumerator.enumerate_devices()?;
+let default = enumerator.get_default_device(DeviceKind::Output)?;
 
 // Sink adapters
 use rsac::{NullSink, ChannelSink};

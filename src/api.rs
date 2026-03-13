@@ -21,8 +21,8 @@ pub use crate::core::config::AudioCaptureConfig;
 /// ## Example (new API)
 ///
 /// ```rust,no_run
-/// # use rust_crossplat_audio_capture::api::AudioCaptureBuilder;
-/// # use rust_crossplat_audio_capture::core::config::{CaptureTarget, SampleFormat};
+/// # use rsac::api::AudioCaptureBuilder;
+/// # use rsac::core::config::{CaptureTarget, SampleFormat};
 /// # fn main() -> Result<(), Box<dyn std::error::Error>> {
 /// let capture = AudioCaptureBuilder::new()
 ///     .with_target(CaptureTarget::SystemDefault)
@@ -314,7 +314,7 @@ impl AudioCapture {
 
     /// Reads a buffer of audio data synchronously.
     ///
-    /// Uses [`CapturingStream::try_read_chunk`] for non-blocking reads.
+    /// Uses `CapturingStream::try_read_chunk` for non-blocking reads.
     /// Returns `Ok(None)` if no data is currently available.
     pub fn read_buffer(&mut self) -> AudioResult<Option<AudioBuffer>> {
         if !self.is_running.load(Ordering::SeqCst) {
@@ -333,7 +333,7 @@ impl AudioCapture {
 
     /// Reads a buffer of audio data, blocking until data is available.
     ///
-    /// Uses [`CapturingStream::read_chunk`] which blocks until data arrives.
+    /// Uses `CapturingStream::read_chunk` which blocks until data arrives.
     pub fn read_buffer_blocking(&mut self) -> AudioResult<AudioBuffer> {
         if !self.is_running.load(Ordering::SeqCst) {
             return Err(AudioError::StreamReadError {
@@ -356,15 +356,40 @@ impl AudioCapture {
 
     /// Returns an asynchronous stream of audio data buffers.
     ///
-    /// **Note:** Async streaming is not yet implemented in the new `CapturingStream`
-    /// trait. This method is a placeholder and will be implemented in a future
-    /// subtask when `to_async_stream()` is added to the bridge layer.
+    /// The returned [`AsyncAudioStream`](crate::bridge::AsyncAudioStream) implements
+    /// [`futures_core::Stream`] and yields [`AudioBuffer`]s as they become available
+    /// from the audio capture backend.
+    ///
+    /// The capture must be started (via [`start()`](Self::start)) before calling this method.
+    ///
+    /// # Feature Flag
+    ///
+    /// This method is only available when the `async-stream` feature is enabled.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the capture has not been started.
+    #[cfg(feature = "async-stream")]
+    pub fn audio_data_stream(&self) -> AudioResult<crate::bridge::AsyncAudioStream<'_>> {
+        let stream = self
+            .stream
+            .as_ref()
+            .ok_or_else(|| AudioError::StreamReadError {
+                reason: "Capture not started. Call start() before audio_data_stream().".to_string(),
+            })?;
+
+        Ok(crate::bridge::AsyncAudioStream::new(stream.as_ref()))
+    }
+
+    /// Returns an asynchronous stream of audio data buffers.
+    ///
+    /// **Note:** The `async-stream` feature is not enabled. Enable it in `Cargo.toml`
+    /// to use async audio streaming.
+    #[cfg(not(feature = "async-stream"))]
     pub fn audio_data_stream(
         &mut self,
     ) -> AudioResult<impl futures_core::Stream<Item = AudioResult<AudioBuffer>> + Send + Sync + '_>
     {
-        // to_async_stream() has been removed from CapturingStream in the trait freeze.
-        // It will be re-added via the BridgeStream layer in a later phase.
         Err::<
             std::pin::Pin<
                 Box<dyn futures_core::Stream<Item = AudioResult<AudioBuffer>> + Send + Sync>,
@@ -372,7 +397,7 @@ impl AudioCapture {
             AudioError,
         >(AudioError::PlatformNotSupported {
             feature: "async audio streaming".to_string(),
-            platform: "not yet implemented in new API".to_string(),
+            platform: "enable the 'async-stream' feature".to_string(),
         })
     }
 
@@ -547,5 +572,173 @@ mod tests {
         };
         let builder = AudioCaptureBuilder::new().with_config(config.clone());
         assert_eq!(builder.config, config);
+    }
+
+    // ── Builder method chainability & defaults ────────────────────────
+
+    #[test]
+    fn builder_is_chainable() {
+        // Verify all builder methods return Self and can be chained
+        let builder = AudioCaptureBuilder::new()
+            .with_target(CaptureTarget::SystemDefault)
+            .sample_rate(44100)
+            .channels(2)
+            .sample_format(SampleFormat::F32)
+            .buffer_size(Some(1024))
+            .buffer_size_frames(Some(512));
+        // Just verifying compilation and chainability — no panic
+        assert_eq!(builder.config.sample_rate, 44100);
+        assert_eq!(builder.config.channels, 2);
+    }
+
+    #[test]
+    fn builder_default_trait_matches_new() {
+        let from_new = AudioCaptureBuilder::new();
+        let from_default = AudioCaptureBuilder::default();
+        // Both should produce identical builders
+        assert_eq!(from_new.config.sample_rate, from_default.config.sample_rate);
+        assert_eq!(from_new.config.channels, from_default.config.channels);
+        assert_eq!(
+            from_new.config.sample_format,
+            from_default.config.sample_format
+        );
+    }
+
+    // ── Invalid sample rate tests ────────────────────────────────────
+
+    #[test]
+    fn builder_rejects_sample_rate_zero() {
+        let result = AudioCaptureBuilder::new().sample_rate(0).build();
+        assert!(result.is_err());
+        match result.unwrap_err() {
+            AudioError::InvalidParameter { param, .. } => assert_eq!(param, "sample_rate"),
+            e => panic!("Expected InvalidParameter, got: {e:?}"),
+        }
+    }
+
+    #[test]
+    fn builder_rejects_very_high_sample_rate() {
+        let result = AudioCaptureBuilder::new().sample_rate(999999).build();
+        assert!(result.is_err());
+        match result.unwrap_err() {
+            AudioError::InvalidParameter { param, .. } => assert_eq!(param, "sample_rate"),
+            e => panic!("Expected InvalidParameter, got: {e:?}"),
+        }
+    }
+
+    #[test]
+    fn builder_rejects_nonstandard_sample_rate() {
+        // 11025 is a valid audio rate but not in the supported list
+        let result = AudioCaptureBuilder::new().sample_rate(11025).build();
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn builder_accepts_all_supported_sample_rates() {
+        // These should NOT fail at the sample_rate validation step
+        // They may fail later at device enumeration, which is fine
+        for rate in [22050u32, 32000, 44100, 48000, 88200, 96000] {
+            let result = AudioCaptureBuilder::new().sample_rate(rate).build();
+            // Should NOT be InvalidParameter for sample_rate
+            if let Err(AudioError::InvalidParameter { param, .. }) = &result {
+                panic!(
+                    "Rate {rate} should be valid, but got InvalidParameter {{ param: {param} }}"
+                );
+            }
+            // Other errors (DeviceEnumeration, etc.) are expected without hardware
+        }
+    }
+
+    // ── Invalid channel count tests ──────────────────────────────────
+
+    #[test]
+    fn builder_rejects_channels_above_max() {
+        let result = AudioCaptureBuilder::new()
+            .channels(33) // MAX_CHANNELS = 32
+            .build();
+        assert!(result.is_err());
+        match result.unwrap_err() {
+            AudioError::ConfigurationError { .. } => {} // expected
+            e => panic!("Expected ConfigurationError, got: {e:?}"),
+        }
+    }
+
+    #[test]
+    fn builder_rejects_channels_way_above_max() {
+        let result = AudioCaptureBuilder::new().channels(u16::MAX).build();
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn builder_accepts_max_channels() {
+        // 32 channels should be accepted (it's the max, not above it)
+        let result = AudioCaptureBuilder::new().channels(32).build();
+        // Should NOT be ConfigurationError
+        if let Err(AudioError::ConfigurationError { .. }) = &result {
+            panic!("32 channels (MAX_CHANNELS) should be accepted");
+        }
+        // Other errors (DeviceEnumeration, etc.) are fine
+    }
+
+    #[test]
+    fn builder_accepts_mono() {
+        let result = AudioCaptureBuilder::new().channels(1).build();
+        // Should NOT be ConfigurationError for channels
+        if let Err(AudioError::ConfigurationError { message }) = &result {
+            if message.contains("hannels") {
+                panic!("Mono (1 channel) should be accepted, got ConfigurationError: {message}");
+            }
+        }
+    }
+
+    // ── Sample format tests ──────────────────────────────────────────
+
+    #[test]
+    fn builder_with_all_sample_formats() {
+        // Verify all sample formats can be set without panic
+        for format in [
+            SampleFormat::I16,
+            SampleFormat::I24,
+            SampleFormat::I32,
+            SampleFormat::F32,
+        ] {
+            let builder = AudioCaptureBuilder::new().sample_format(format);
+            assert_eq!(builder.config.sample_format, format);
+        }
+    }
+
+    // ── Buffer size tests ────────────────────────────────────────────
+
+    #[test]
+    fn builder_buffer_size_can_be_set_and_cleared() {
+        let b1 = AudioCaptureBuilder::new().buffer_size(Some(1024));
+        assert_eq!(b1.config.buffer_size, Some(1024));
+
+        let b2 = AudioCaptureBuilder::new().buffer_size(None);
+        assert_eq!(b2.config.buffer_size, None);
+    }
+
+    #[test]
+    fn builder_buffer_size_frames_sets_buffer_size() {
+        let builder = AudioCaptureBuilder::new().buffer_size_frames(Some(256));
+        assert_eq!(builder.config.buffer_size, Some(256));
+    }
+
+    // ── With_config override test ────────────────────────────────────
+
+    #[test]
+    fn builder_with_config_overrides_individual_settings() {
+        let config = StreamConfig {
+            sample_rate: 96000,
+            channels: 8,
+            sample_format: SampleFormat::I32,
+            buffer_size: Some(2048),
+        };
+        let builder = AudioCaptureBuilder::new()
+            .sample_rate(44100) // This should be overridden
+            .with_config(config.clone());
+        assert_eq!(builder.config.sample_rate, 96000);
+        assert_eq!(builder.config.channels, 8);
+        assert_eq!(builder.config.sample_format, SampleFormat::I32);
     }
 }

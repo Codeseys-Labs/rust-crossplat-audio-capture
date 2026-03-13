@@ -10,7 +10,10 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use rsac::{AudioCaptureBuilder, CaptureTarget, PlatformCapabilities, ProcessId};
+use rsac::{
+    get_device_enumerator, AudioCaptureBuilder, CaptureTarget, DeviceKind, PlatformCapabilities,
+    ProcessId,
+};
 
 // ── CLI definition ───────────────────────────────────────────────────────
 
@@ -142,28 +145,103 @@ fn cmd_info() -> Result<()> {
 }
 
 /// `rsac list` — list available audio devices.
-///
-/// Device enumeration is performed internally by `AudioCaptureBuilder::build()`.
-/// The public API does not expose a standalone enumerator, so we print what we
-/// can from `PlatformCapabilities` and note the limitation.
 fn cmd_list() -> Result<()> {
     let caps = PlatformCapabilities::query();
-
     println!("rsac — Audio Devices");
     println!("════════════════════════════════════════");
     println!("  Backend: {}", caps.backend_name);
     println!();
 
-    if caps.supports_device_selection {
-        println!("  Device enumeration is handled internally by the builder.");
-        println!("  Use `rsac capture` or `rsac record` with default settings");
-        println!("  to capture from the system default device.");
-        println!();
-        println!("  Targeting options:");
-        println!("    --app <name>   Capture a specific application by name");
-        println!("    --pid <id>     Capture a specific process by PID");
-    } else {
-        println!("  Device selection is not supported on this platform.");
+    // Capabilities overview
+    println!("  Capabilities:");
+    println!(
+        "    System audio capture:      {}",
+        if caps.supports_system_capture {
+            "✓"
+        } else {
+            "✗"
+        }
+    );
+    println!(
+        "    Application capture:       {}",
+        if caps.supports_application_capture {
+            "✓"
+        } else {
+            "✗"
+        }
+    );
+    println!(
+        "    Process tree capture:      {}",
+        if caps.supports_process_tree_capture {
+            "✓"
+        } else {
+            "✗"
+        }
+    );
+    println!(
+        "    Device selection:          {}",
+        if caps.supports_device_selection {
+            "✓"
+        } else {
+            "✗"
+        }
+    );
+    println!();
+
+    // Device enumeration
+    match get_device_enumerator() {
+        Ok(enumerator) => {
+            // Default device
+            match enumerator.get_default_device(DeviceKind::Output) {
+                Ok(device) => {
+                    println!("  Default device: {} (ID: {})", device.name(), device.id());
+                }
+                Err(e) => {
+                    println!("  Default device: unavailable ({})", e);
+                }
+            }
+            println!();
+
+            // All devices
+            match enumerator.enumerate_devices() {
+                Ok(devices) => {
+                    if devices.is_empty() {
+                        println!("  No audio devices found.");
+                    } else {
+                        println!("  Found {} device(s):", devices.len());
+                        println!();
+                        for device in &devices {
+                            let default_marker = if device.is_default() {
+                                " [default]"
+                            } else {
+                                ""
+                            };
+                            println!("    • {}{}", device.name(), default_marker);
+                            println!("      ID: {}", device.id());
+                            let formats = device.supported_formats();
+                            if !formats.is_empty() {
+                                for fmt in &formats {
+                                    println!(
+                                        "      Format: {}ch {}Hz {:?}",
+                                        fmt.channels, fmt.sample_rate, fmt.sample_format
+                                    );
+                                }
+                            }
+                            println!();
+                        }
+                    }
+                }
+                Err(e) => {
+                    println!("  Failed to enumerate devices: {}", e);
+                }
+            }
+        }
+        Err(e) => {
+            println!("  Device enumeration unavailable: {}", e);
+            println!();
+            println!("  Use `rsac capture` or `rsac record` with default settings");
+            println!("  to capture from the system default device.");
+        }
     }
 
     Ok(())

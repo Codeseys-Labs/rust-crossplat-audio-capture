@@ -125,6 +125,25 @@ pub trait CapturingStream: Send + Sync {
         self.stop()?;
         Ok(())
     }
+
+    /// Register an async waker to be notified when new audio data is available.
+    ///
+    /// Returns `true` if the stream supports async notification, `false` otherwise.
+    /// Used internally by `AsyncAudioStream`.
+    #[cfg(feature = "async-stream")]
+    fn register_waker(&self, waker: &std::task::Waker) -> bool {
+        let _ = waker;
+        false
+    }
+
+    /// Returns `true` if the stream's producer is still active and may produce more data.
+    ///
+    /// Returns `false` once the producer has signaled completion.
+    /// Used internally by `AsyncAudioStream` to determine when to return `None`.
+    #[cfg(feature = "async-stream")]
+    fn is_stream_producing(&self) -> bool {
+        true
+    }
 }
 
 /// A trait for discovering and enumerating audio devices on the system.
