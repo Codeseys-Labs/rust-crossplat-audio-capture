@@ -165,5 +165,10 @@ name = "pipewire_diagnostics"
 path = "src/bin/pipewire_diagnostics.rs"
 required-features = ["feat_linux"]
 
+[[test]]
+name = "ci_audio"
+path = "tests/ci_audio/main.rs"
+harness = true
+
 [workspace]
 members = []
