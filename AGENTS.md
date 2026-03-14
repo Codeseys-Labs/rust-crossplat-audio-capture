@@ -33,6 +33,7 @@ The architecture is documented in detail across four canonical documents, plus a
 | [Error & Capability Design](docs/architecture/ERROR_CAPABILITY_DESIGN.md) | Error taxonomy + platform capabilities |
 | [Backend Contract](docs/architecture/BACKEND_CONTRACT.md) | Internal backend traits + module architecture |
 | [Reference Analysis](reference/REFERENCE_ANALYSIS.md) | Analysis of 10 reference repos mapped to rsac's architecture |
+| [Local Testing Guide](docs/LOCAL_TESTING_GUIDE.md) | How to test on physical macOS, Windows, and Linux machines |
 
 ### Key Architecture Points (Implemented)
 
@@ -70,7 +71,7 @@ The architecture is documented in detail across four canonical documents, plus a
 
 ## 3. Current State
 
-The architectural transformation is **complete**. Phases 0–4 are done. The old API has been fully removed and the new builder/trait API is the only API.
+The architectural transformation is **complete**. Phases 0–4 are done. The old API has been fully removed and the new builder/trait API is the only API. **All 10 gap closures (G1–G10) are done** — every capture level (system, application, process tree) is implemented on all three platforms.
 
 ### What was removed (Phase 0 — Done ✅)
 
@@ -101,11 +102,32 @@ All three backends are wired through `BridgeStream<S>`:
 - Three new examples: [`basic_capture.rs`](examples/basic_capture.rs), [`record_to_file.rs`](examples/record_to_file.rs), [`list_devices.rs`](examples/list_devices.rs)
 - Four old-API binaries disabled in `Cargo.toml` (commented out): `firefox_capture_test`, `real_pipewire_test`, `dynamic_vlc_capture`, `audio_recorder_tui`
 
-### Known remaining gaps
+### Gap closures (G1–G10 — All Done ✅)
 
-- Device enumeration now uses real platform APIs (PipeWire `pw-cli`/`pw-dump` on Linux, WASAPI on Windows, CoreAudio on macOS). The former mock-data files (`discovery.rs`, `application_capture.rs`) have been removed.
-- `get_device_enumerator()` and `DeviceKind` are now part of the public API.
-- Several old binaries in `src/bin/` still reference deprecated patterns (commented out in Cargo.toml but source files remain).
+All ten identified gaps have been closed:
+
+| Gap | Description | Status |
+|---|---|---|
+| **G1** | Windows WASAPI application capture (`ApplicationByName` via `sysinfo` PID resolution) | ✅ Done |
+| **G2** | Windows WASAPI process tree capture (`ProcessTree` via process loopback) | ✅ Done |
+| **G3** | Linux PipeWire application capture (`ApplicationByName` via `pw-dump` node resolution) | ✅ Done |
+| **G4** | Linux PipeWire process tree capture (`ProcessTree` via PID → PipeWire node mapping) | ✅ Done |
+| **G5** | macOS CoreAudio application capture (`ApplicationByName` via Process Tap) | ✅ Done |
+| **G6** | macOS CoreAudio process tree capture (`ProcessTree` via Process Tap) | ✅ Done |
+| **G7** | `subscribe()` method on `AudioCapture` — push-based channel delivery | ✅ Done |
+| **G8** | `overrun_count()` on `AudioCapture` and `CapturingStream` — ring buffer overflow monitoring | ✅ Done |
+| **G9** | Full `PlatformCapabilities` reporting with `supports_process_tree_capture` field | ✅ Done |
+| **G10** | Device enumeration via real platform APIs (PipeWire, WASAPI, CoreAudio) | ✅ Done |
+
+### Capture mode support matrix
+
+| Capture Mode | Windows (WASAPI) | Linux (PipeWire) | macOS (CoreAudio) |
+|---|---|---|---|
+| **System default** | ✅ | ✅ | ✅ |
+| **Application (by PID)** | ✅ process loopback | ✅ pw-dump node | ✅ Process Tap |
+| **ApplicationByName** | ✅ sysinfo → PID | ✅ pw-dump → node serial | ✅ Process Tap |
+| **ProcessTree** | ✅ process loopback | ✅ PID → PipeWire node | ✅ Process Tap |
+| **Device selection** | ✅ | ✅ | ✅ |
 
 ---
 
@@ -239,6 +261,12 @@ cargo check --features feat_linux
 cargo test --lib
 ```
 
+### Local testing on physical machines
+
+See the [Local Testing Guide](docs/LOCAL_TESTING_GUIDE.md) for comprehensive instructions
+on testing system capture, application capture, and process tree capture on macOS, Windows,
+and Linux.
+
 ### CI expectations
 
 - **Linux + Windows** are primary CI platforms
@@ -286,6 +314,13 @@ This project uses [Task Master](https://github.com/task-master-ai/task-master-ai
 ### Phase 5 progress
 
 **Completed:**
+- ✅ **All 10 gap closures (G1–G10) done** — see §3 for the full table
+- ✅ Windows WASAPI: application capture (`ApplicationByName` via `sysinfo` PID resolution) + process tree capture (process loopback)
+- ✅ Linux PipeWire: application capture (`ApplicationByName` via `pw-dump` node resolution) + process tree capture (PID → PipeWire node mapping)
+- ✅ macOS CoreAudio: application capture + process tree capture (both via Process Tap)
+- ✅ [`subscribe()`](src/api.rs:463) method on `AudioCapture` — push-based `mpsc` channel delivery
+- ✅ [`overrun_count()`](src/api.rs:514) on `AudioCapture` and [`CapturingStream`](src/core/interface.rs:122) — ring buffer overflow monitoring
+- ✅ Full [`PlatformCapabilities`](src/core/capabilities.rs) reporting with `supports_process_tree_capture` field
 - ✅ Device enumeration rewritten against real platform APIs (PipeWire `pw-cli`/`pw-dump` on Linux, WASAPI on Windows, CoreAudio on macOS) — mock data removed
 - ✅ `get_device_enumerator()` and `DeviceKind` exposed in public API ([`src/lib.rs`](src/lib.rs))
 - ✅ `cmd_list()` CLI command now enumerates actual devices via the library API
@@ -301,7 +336,6 @@ This project uses [Task Master](https://github.com/task-master-ai/task-master-ai
 **Remaining:**
 - Async stream support (behind `async-stream` feature, foundation in place via `atomic-waker`)
 - Additional sink adapters
-- Advanced capture modes per platform
 - Performance benchmarking and optimization
 
 ---
@@ -361,6 +395,20 @@ match result {
 let caps = PlatformCapabilities::query();
 if caps.supports_application_capture {
     // safe to use CaptureTarget::Application(..)
+}
+
+// Push-based subscription (G7)
+let rx = capture.subscribe()?;  // mpsc::Receiver<AudioBuffer>
+std::thread::spawn(move || {
+    while let Ok(buf) = rx.recv() {
+        println!("Got {} frames", buf.num_frames());
+    }
+});
+
+// Ring buffer overflow monitoring (G8)
+let dropped = capture.overrun_count();
+if dropped > 0 {
+    eprintln!("Warning: {} buffers dropped (consumer too slow)", dropped);
 }
 
 // Device enumeration
