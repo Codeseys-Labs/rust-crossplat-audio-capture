@@ -13,4 +13,5 @@ pub use wasapi::enumerate_application_audio_sessions;
 pub use wasapi::ApplicationAudioSessionInfo;
 
 // Re-export new types for BridgeStream architecture
+#[allow(unused_imports)]
 pub(crate) use thread::{WindowsCaptureConfig, WindowsCaptureThread, WindowsPlatformStream};

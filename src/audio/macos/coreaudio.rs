@@ -203,16 +203,8 @@ impl AudioDevice for MacosAudioDevice {
         // 1. Build AudioFormat from StreamConfig
         let format = config.to_audio_format();
 
-        // 2. Determine CaptureTarget from device identity
-        let default_id =
-            get_default_device_id(false).ok_or_else(|| AudioError::DeviceNotFound {
-                device_id: "default_output".into(),
-            })?;
-        let target = if self.device_id == default_id {
-            CaptureTarget::SystemDefault
-        } else {
-            CaptureTarget::Device(DeviceId(self.device_id.to_string()))
-        };
+        // 2. Use the capture target from StreamConfig (propagated from builder)
+        let target = config.capture_target.clone();
 
         // 3. Create the ring buffer bridge
         let capacity = calculate_capacity(None, 4);
@@ -901,6 +893,7 @@ mod tests {
             channels: 2,
             sample_format: SampleFormat::F32,
             buffer_size: None,
+            capture_target: CaptureTarget::SystemDefault,
         };
         let stream = device
             .create_stream(&config)

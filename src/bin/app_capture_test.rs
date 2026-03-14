@@ -223,7 +223,7 @@ fn test_platform_specific() -> Result<(), Box<dyn std::error::Error>> {
         let processes = WindowsApplicationCapture::list_audio_processes();
         println!("    Found {} Windows processes", processes.len());
 
-        if let Some((pid, name)) = processes.first() {
+        if let Some((_pid, name)) = processes.first() {
             let found_pid = WindowsApplicationCapture::find_process_by_name(name, false);
             if found_pid.is_some() {
                 println!("    ✅ Process discovery working");

@@ -151,6 +151,7 @@ impl WindowsCaptureThread {
     /// # Errors
     ///
     /// - [`AudioError::BackendError`] if the thread panicked during join.
+    #[allow(dead_code)] // Planned for future use; Drop handles joining currently
     pub fn stop_and_join(&mut self) -> AudioResult<()> {
         self.stop_flag.store(true, Ordering::SeqCst);
 
@@ -697,11 +698,30 @@ fn resolve_process_name_to_pid(name: &str) -> AudioResult<u32> {
     let system = System::new_with_specifics(refreshes);
 
     let name_lower = name.to_lowercase();
+    // Also prepare a variant with .exe appended (if user omitted it)
+    let name_with_exe = if !name_lower.ends_with(".exe") {
+        Some(format!("{}.exe", name_lower))
+    } else {
+        None
+    };
+    // Also prepare the bare name (without .exe) for matching against stripped proc names
+    let name_bare = name_lower.strip_suffix(".exe").unwrap_or(&name_lower);
 
-    // Iterate all processes and perform a case-insensitive name match.
+    // Iterate all processes and perform flexible case-insensitive name matching.
+    // Matches: exact name, name with .exe appended, or process name with .exe stripped.
     for (pid, process) in system.processes() {
         let proc_name = process.name().to_string_lossy();
-        if proc_name.to_lowercase() == name_lower {
+        let proc_name_lower = proc_name.to_lowercase();
+
+        let matched = proc_name_lower == name_lower
+            || name_with_exe
+                .as_deref()
+                .is_some_and(|n| proc_name_lower == n)
+            || proc_name_lower
+                .strip_suffix(".exe")
+                .is_some_and(|bare| bare == name_bare);
+
+        if matched {
             let resolved = pid.as_u32();
             log::debug!(
                 "sysinfo: matched process '{}' (name='{}') → PID {}",
@@ -715,7 +735,7 @@ fn resolve_process_name_to_pid(name: &str) -> AudioResult<u32> {
 
     Err(AudioError::ApplicationNotFound {
         identifier: format!(
-            "No running process found matching name '{}' (case-insensitive)",
+            "No running process found matching name '{}' (case-insensitive, with/without .exe)",
             name
         ),
     })

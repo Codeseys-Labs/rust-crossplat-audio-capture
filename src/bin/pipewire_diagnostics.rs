@@ -97,8 +97,15 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     // Test 4: Check user permissions
     println!("\n📊 Test 4: User and Permissions");
-    println!("User ID: {}", unsafe { libc::getuid() });
-    println!("Group ID: {}", unsafe { libc::getgid() });
+    #[cfg(target_os = "linux")]
+    {
+        println!("User ID: {}", unsafe { libc::getuid() });
+        println!("Group ID: {}", unsafe { libc::getgid() });
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        println!("⚠️  User/group ID checks only available on Linux");
+    }
 
     // Check if we're in audio group
     match Command::new("groups").output() {

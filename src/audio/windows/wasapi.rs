@@ -18,14 +18,11 @@ use wasapi::{self, initialize_mta};
 // --- New BridgeStream Architecture Imports ---
 use super::thread::{WindowsCaptureConfig, WindowsCaptureThread, WindowsPlatformStream};
 use crate::bridge::{calculate_capacity, create_bridge, BridgeStream, StreamState};
-use crate::core::config::{CaptureTarget, DeviceId};
+use crate::core::config::DeviceId;
 
 // --- Application-Specific Capture (Process Loopback) ---
 
-use windows::{
-    core::*, Win32::Foundation::*, Win32::Media::Audio::*, Win32::System::Com::*,
-    Win32::System::Variant::*,
-};
+use windows::{core::*, Win32::Foundation::*, Win32::Media::Audio::*, Win32::System::Com::*};
 
 // Specific imports not covered by the glob imports above
 use windows::Win32::Devices::Properties::DEVPKEY_Device_FriendlyName as PKEY_Device_FriendlyName;
@@ -281,9 +278,11 @@ unsafe impl Send for WindowsApplicationCapture {}
 // The thread spawn issue will need to be handled differently
 
 /// RAII wrapper for a Windows HANDLE to ensure it's closed on drop.
+#[allow(dead_code)] // Planned for future use in process handle management
 #[derive(Debug)]
 struct ProcessHandle(Option<HANDLE>);
 
+#[allow(dead_code)] // Planned for future use in process handle management
 impl ProcessHandle {
     fn new(handle: Option<HANDLE>) -> Self {
         Self(handle)
@@ -361,6 +360,7 @@ impl Drop for ComInitializer {
 #[derive(Debug)]
 pub struct WindowsAudioDevice {
     device: IMMDevice,
+    #[allow(dead_code)] // RAII guard: held to keep COM initialized for this device's lifetime
     com_initializer: Arc<ComInitializer>,
 }
 
@@ -444,13 +444,8 @@ impl AudioDevice for WindowsAudioDevice {
         // 1. Build AudioFormat from StreamConfig
         let format = config.to_audio_format();
 
-        // 2. Determine capture target from device ID
-        let device_id_str = self.id().0;
-        let target = if device_id_str == "default" || device_id_str == "unknown-device" {
-            CaptureTarget::SystemDefault
-        } else {
-            CaptureTarget::Device(DeviceId(device_id_str))
-        };
+        // 2. Use the capture target from StreamConfig (propagated from builder)
+        let target = config.capture_target.clone();
 
         // 3. Create the ring buffer bridge
         let capacity = calculate_capacity(config.buffer_size, 4);
@@ -523,7 +518,7 @@ impl WindowsAudioDevice {
                 })?;
 
             let name = if prop_variant.vt() == windows::Win32::System::Variant::VARENUM(VT_LPWSTR) {
-                let name_pwstr = unsafe { prop_variant.Anonymous.Anonymous.Anonymous.pwszVal };
+                let name_pwstr = prop_variant.Anonymous.Anonymous.Anonymous.pwszVal;
                 Self::pwstr_to_string(name_pwstr).unwrap_or_else(|_| "Unknown Device".to_string())
             } else {
                 "Unknown Device".to_string()
@@ -559,6 +554,7 @@ impl WindowsAudioDevice {
                     context: None,
                 })?;
 
+            #[allow(non_upper_case_globals)]
             match data_flow_val {
                 eRender => Ok(DeviceKind::Output),
                 eCapture => Ok(DeviceKind::Input),
@@ -739,7 +735,7 @@ pub struct ApplicationAudioSessionInfo {
 /// ```
 pub fn enumerate_application_audio_sessions() -> AudioResult<Vec<ApplicationAudioSessionInfo>> {
     use windows::Win32::Foundation::HMODULE;
-    use windows::Win32::Foundation::{CloseHandle, HANDLE, INVALID_HANDLE_VALUE};
+    use windows::Win32::Foundation::{CloseHandle, INVALID_HANDLE_VALUE};
     use windows::Win32::Media::Audio::{
         IAudioSessionControl, IAudioSessionControl2, IAudioSessionEnumerator, IAudioSessionManager2,
     };

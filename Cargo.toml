@@ -13,7 +13,7 @@ autobins = false
 # and enabling only the desired platform features.
 # Example: `cargo build --no-default-features --features feat_windows`
 feat_windows = []
-feat_linux = ["pipewire", "libspa"]
+feat_linux = []
 feat_macos = []
 
 # Default features - enables all platform backends
@@ -33,9 +33,6 @@ atomic-waker = { version = "1.1.2", optional = true }           # Async waker fo
 thiserror = "2.0.18"                                       # For error handling
 log = "0.4.29"                                                 # For logging
 
-# Linux PipeWire dependencies (conditional)
-pipewire = { version = "0.9.2", features = ["v0_3_44"], optional = true }
-libspa = { version = "0.9.2", optional = true }
 hound = "3.5.1"
 clap = { version = "4.5.60", features = ["derive"] }
 color-eyre = "0.6.5"

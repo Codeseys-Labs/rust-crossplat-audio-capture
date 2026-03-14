@@ -31,3 +31,7 @@ tasks/
 windows-storage/tmp/
 windows-storage/
 .upstream-refs/
+
+# Test artifacts
+*.wav
+capture*.txt

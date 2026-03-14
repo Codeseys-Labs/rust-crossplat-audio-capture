@@ -157,9 +157,11 @@ impl AudioCaptureBuilder {
         }
 
         // ── Build capture config ────────────────────────────────────
+        let mut stream_config = self.config;
+        stream_config.capture_target = self.target.clone();
         let capture_config = AudioCaptureConfig {
             target: self.target,
-            stream_config: self.config,
+            stream_config,
         };
 
         // ── Resolve device from target ──────────────────────────────
@@ -649,6 +651,7 @@ mod tests {
             channels: 1,
             sample_format: SampleFormat::I16,
             buffer_size: Some(1024),
+            capture_target: CaptureTarget::SystemDefault,
         };
         let builder = AudioCaptureBuilder::new().with_config(config.clone());
         assert_eq!(builder.config, config);
@@ -813,6 +816,7 @@ mod tests {
             channels: 8,
             sample_format: SampleFormat::I32,
             buffer_size: Some(2048),
+            capture_target: CaptureTarget::SystemDefault,
         };
         let builder = AudioCaptureBuilder::new()
             .sample_rate(44100) // This should be overridden

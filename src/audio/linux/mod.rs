@@ -1,6 +1,6 @@
 //! Linux audio implementation using PipeWire
 
-#[cfg(feature = "pipewire")]
+#[cfg(feature = "feat_linux")]
 pub(crate) mod thread;
 
 pub struct LinuxDeviceEnumerator;
@@ -292,7 +292,7 @@ impl crate::core::interface::AudioDevice for LinuxAudioDevice {
         &self,
         config: &crate::core::config::StreamConfig,
     ) -> crate::core::error::Result<Box<dyn crate::core::interface::CapturingStream>> {
-        #[cfg(feature = "pipewire")]
+        #[cfg(feature = "feat_linux")]
         {
             use std::sync::{Arc, Mutex};
             use std::time::Duration;
@@ -306,14 +306,8 @@ impl crate::core::interface::AudioDevice for LinuxAudioDevice {
             // 1. Build AudioFormat from StreamConfig
             let format = config.to_audio_format();
 
-            // 2. Determine capture target based on device identity.
-            //    StreamConfig does not carry a CaptureTarget, so we derive it
-            //    from the device: "default" → SystemDefault, otherwise Device(id).
-            let target = if self.id == "default" {
-                CaptureTarget::SystemDefault
-            } else {
-                CaptureTarget::Device(crate::core::config::DeviceId(self.id.clone()))
-            };
+            // 2. Use the capture target from StreamConfig (propagated from builder)
+            let target = config.capture_target.clone();
 
             // 3. Create the ring buffer bridge (64 AudioBuffer slots by default)
             let capacity = calculate_capacity(None, 4);
@@ -356,7 +350,7 @@ impl crate::core::interface::AudioDevice for LinuxAudioDevice {
             Ok(Box::new(bridge_stream))
         }
 
-        #[cfg(not(feature = "pipewire"))]
+        #[cfg(not(feature = "feat_linux"))]
         {
             let _ = config;
             Err(crate::core::error::AudioError::PlatformNotSupported {
@@ -658,7 +652,7 @@ id 42, type PipeWire:Interface:Node/3
 
     // ── create_stream without pipewire feature ──────────────────────
 
-    #[cfg(not(feature = "pipewire"))]
+    #[cfg(not(feature = "feat_linux"))]
     #[test]
     fn test_create_stream_without_pipewire_feature_returns_error() {
         let device = LinuxAudioDevice {
@@ -685,7 +679,7 @@ id 42, type PipeWire:Interface:Node/3
 
 #[cfg(test)]
 #[cfg(target_os = "linux")]
-#[cfg(feature = "pipewire")]
+#[cfg(feature = "feat_linux")]
 mod pipewire_integration_tests {
     use super::*;
     use crate::core::config::StreamConfig;

@@ -137,6 +137,10 @@ pub struct StreamConfig {
     /// Optional desired buffer size in frames.
     /// If `None`, the backend will choose a suitable default.
     pub buffer_size: Option<usize>,
+    /// The capture target for this stream.
+    /// Propagated from [`AudioCaptureBuilder`] so backends know
+    /// whether to do system, application, or process-tree capture.
+    pub capture_target: CaptureTarget,
 }
 
 impl Default for StreamConfig {
@@ -147,6 +151,7 @@ impl Default for StreamConfig {
             channels: 2,
             sample_format: SampleFormat::F32,
             buffer_size: None,
+            capture_target: CaptureTarget::default(), // SystemDefault
         }
     }
 }
@@ -437,6 +442,7 @@ mod tests {
             channels: 6,
             sample_format: SampleFormat::I24,
             buffer_size: Some(1024),
+            capture_target: CaptureTarget::SystemDefault,
         };
         let fmt = cfg.to_audio_format();
         assert_eq!(fmt.sample_rate, 44100);
@@ -458,6 +464,7 @@ mod tests {
             channels: 1,
             sample_format: SampleFormat::I16,
             buffer_size: Some(512),
+            capture_target: CaptureTarget::SystemDefault,
         };
         assert_eq!(cfg.buffer_size, Some(512));
     }
@@ -480,6 +487,7 @@ mod tests {
                 channels: 2,
                 sample_format: SampleFormat::F32,
                 buffer_size: Some(2048),
+                capture_target: CaptureTarget::ProcessTree(ProcessId(999)),
             },
         };
         assert_eq!(cfg.target, CaptureTarget::ProcessTree(ProcessId(999)));
