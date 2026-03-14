@@ -301,7 +301,6 @@ impl crate::core::interface::AudioDevice for LinuxAudioDevice {
             use crate::bridge::{calculate_capacity, create_bridge, BridgeStream};
 
             use crate::audio::linux::thread::{CaptureConfig, LinuxPlatformStream, PipeWireThread};
-            use crate::core::config::CaptureTarget;
 
             // 1. Build AudioFormat from StreamConfig
             let format = config.to_audio_format();

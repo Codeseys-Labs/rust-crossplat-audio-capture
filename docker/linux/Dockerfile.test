@@ -1,0 +1,73 @@
+FROM ubuntu:24.04
+
+ENV DEBIAN_FRONTEND=noninteractive
+
+# Install build tools, PipeWire dev libraries, and audio utilities
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    build-essential \
+    ca-certificates \
+    curl \
+    pkg-config \
+    clang \
+    libclang-dev \
+    libpipewire-0.3-dev \
+    libspa-0.2-dev \
+    pipewire \
+    pipewire-audio-client-libraries \
+    pipewire-pulse \
+    wireplumber \
+    dbus \
+    alsa-utils \
+    pulseaudio-utils \
+    && rm -rf /var/lib/apt/lists/*
+
+# Install Rust via rustup
+RUN curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --default-toolchain stable
+ENV CARGO_HOME=/root/.cargo
+ENV RUSTUP_HOME=/root/.rustup
+ENV PATH="/root/.cargo/bin:${PATH}"
+
+# Working directory for the mounted project
+WORKDIR /workspace
+
+# Environment for PipeWire runtime
+ENV XDG_RUNTIME_DIR=/run/user/0
+ENV PIPEWIRE_RUNTIME_DIR=/run/user/0
+
+# Create entrypoint that starts PipeWire services
+RUN cat > /usr/local/bin/entrypoint.sh << 'ENTRYPOINT_EOF'
+#!/bin/bash
+set -e
+
+# Create runtime directory
+mkdir -p /run/user/0
+chmod 700 /run/user/0
+
+# Start D-Bus
+dbus-daemon --system --nofork &
+sleep 0.5
+
+# Start PipeWire
+pipewire &
+sleep 1
+
+# Start WirePlumber (session manager)
+wireplumber &
+sleep 0.5
+
+# Start PipeWire-Pulse (PulseAudio compat)
+pipewire-pulse &
+sleep 1
+
+# Verify PipeWire is running (non-fatal)
+pw-cli info 2>/dev/null || echo "WARNING: PipeWire not fully available (expected in Docker)"
+
+# Execute the passed command
+exec "$@"
+ENTRYPOINT_EOF
+
+# Fix Windows CRLF line endings and make executable
+RUN sed -i 's/\r$//' /usr/local/bin/entrypoint.sh && chmod +x /usr/local/bin/entrypoint.sh
+
+ENTRYPOINT ["/usr/local/bin/entrypoint.sh"]
+CMD ["cargo", "test", "--lib", "--no-default-features", "--features", "feat_linux"]
