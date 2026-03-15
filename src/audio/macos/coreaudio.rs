@@ -297,7 +297,15 @@ const KAUDIO_UNIT_ERR_FORMAT_NOT_SUPPORTED: i32 = -10868;
 /// We use `as_os_status()` to extract the underlying OSStatus code and then
 /// map well-known codes to specific `AudioError` variants.
 pub(crate) fn map_ca_error(err: CAError) -> AudioError {
-    let os_status = err.as_os_status();
+    // Extract the real OSStatus value.
+    // Note: coreaudio-rs 0.14 has a bug where CAError::Unknown(status)
+    // returns kAudioServicesSystemSoundUnspecifiedError (-1500) from
+    // as_os_status() instead of the actual wrapped status value.
+    // We extract it directly for the Unknown variant.
+    let os_status = match &err {
+        CAError::Unknown(status) => *status,
+        _ => err.as_os_status(),
+    };
 
     // Determine category from the variant
     let category = match &err {

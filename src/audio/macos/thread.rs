@@ -36,7 +36,6 @@ use super::tap::CoreAudioProcessTap;
 
 // Fix Group 4 & 5: Use AudioUnit::new(IOType) instead of AudioComponent/AudioComponentDescription.
 // Fix Group 1: Import from coreaudio_sys (the -sys crate), not coreaudio::sys.
-use coreaudio::audio_unit::macos_helpers::get_default_device_id;
 use coreaudio::audio_unit::{AudioUnit, Element, IOType, Scope};
 use coreaudio_sys::{
     kAudioFormatFlagIsFloat, kAudioFormatFlagIsNonInterleaved, kAudioFormatFlagIsPacked,
@@ -261,26 +260,29 @@ pub(crate) fn create_macos_capture(
 /// Resolves a [`CaptureTarget`] to a CoreAudio `AudioDeviceID` and optional
 /// `CoreAudioProcessTap`.
 ///
-/// | Target                 | Strategy                                                |
-/// |------------------------|---------------------------------------------------------|
-/// | `SystemDefault`        | Default output device ID (for loopback)                 |
-/// | `Device(id)`           | Parse `DeviceId.0` as `u32` → `AudioDeviceID`          |
-/// | `Application(pid)`     | `CoreAudioProcessTap::new(pid)` → tap's AudioObjectID  |
-/// | `ApplicationByName(n)` | `enumerate_audio_applications()` → find PID → tap       |
-/// | `ProcessTree(pid)`     | `CoreAudioProcessTap::new_tree(pid)` → multi-PID tap   |
+/// | Target                 | Strategy                                                    |
+/// |------------------------|-------------------------------------------------------------|
+/// | `SystemDefault`        | `CoreAudioProcessTap::new_system()` → global tap + agg dev |
+/// | `Device(id)`           | Parse `DeviceId.0` as `u32` → `AudioDeviceID`              |
+/// | `Application(pid)`     | `CoreAudioProcessTap::new(pid)` → tap's AudioObjectID      |
+/// | `ApplicationByName(n)` | `enumerate_audio_applications()` → find PID → tap           |
+/// | `ProcessTree(pid)`     | `CoreAudioProcessTap::new_tree(pid)` → multi-PID tap       |
 fn resolve_capture_target(
     config: &MacosCaptureConfig,
 ) -> AudioResult<(AudioDeviceID, Option<CoreAudioProcessTap>)> {
     match &config.target {
         CaptureTarget::SystemDefault => {
-            // Fix Group 2: Use get_default_device_id(false) instead of AudioObject::default_output_device()
-            // false = output device (for loopback capture)
-            let device_id =
-                get_default_device_id(false).ok_or_else(|| AudioError::DeviceNotFound {
-                    device_id: "default_output".into(),
-                })?;
-            log::debug!("CoreAudio: SystemDefault → device_id={}", device_id);
-            Ok((device_id, None))
+            // System-wide capture via Process Tap + Aggregate Device.
+            // Direct AUHAL input capture from the default output device does NOT work
+            // (the output device's AUHAL callback never fires). The Process Tap pattern
+            // is required even for system-wide capture on macOS 14.4+.
+            let tap = CoreAudioProcessTap::new_system()?;
+            let tap_device_id = tap.id();
+            log::debug!(
+                "CoreAudio: SystemDefault → tap aggregate device_id={}",
+                tap_device_id
+            );
+            Ok((tap_device_id, Some(tap)))
         }
 
         CaptureTarget::Device(device_id) => {
@@ -463,7 +465,7 @@ mod tests {
     // ── resolve_capture_target tests (require audio hardware) ────────
 
     #[test]
-    #[ignore = "requires macOS audio hardware"]
+    #[ignore = "requires macOS 14.4+ audio hardware"]
     fn resolve_system_default_returns_valid_device_id() {
         let config = MacosCaptureConfig {
             target: CaptureTarget::SystemDefault,
@@ -481,8 +483,8 @@ mod tests {
         let (device_id, process_tap) = result.unwrap();
         assert!(device_id > 0, "device_id should be > 0, got {}", device_id);
         assert!(
-            process_tap.is_none(),
-            "SystemDefault should not create a ProcessTap"
+            process_tap.is_some(),
+            "SystemDefault should create a system-wide ProcessTap"
         );
     }
 

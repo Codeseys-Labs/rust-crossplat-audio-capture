@@ -260,19 +260,36 @@ fn test_platform_specific() -> Result<(), Box<dyn std::error::Error>> {
     #[cfg(target_os = "macos")]
     {
         println!("  macOS platform detected");
-        use rsac::audio::macos::tap::MacOSApplicationCapture;
 
-        let is_available = MacOSApplicationCapture::is_process_tap_available();
-        println!("    Process Tap available: {}", is_available);
-
-        if is_available {
-            println!("    ✅ Process Tap APIs available");
-        } else {
-            println!("    ⚠️  Process Tap requires macOS 14.4+");
+        // Use the public API: enumerate_audio_applications + device enumerator
+        // (MacOSApplicationCapture was removed during Phase 0 architecture cleanup)
+        match rsac::audio::get_device_enumerator() {
+            Ok(enumerator) => {
+                println!("    ✅ Device enumerator created successfully");
+                match enumerator.enumerate_devices() {
+                    Ok(devices) => {
+                        println!("    Found {} audio devices", devices.len());
+                        println!("    ✅ macOS audio integration working");
+                    }
+                    Err(e) => {
+                        println!("    ⚠️  Could not enumerate devices: {}", e);
+                    }
+                }
+            }
+            Err(e) => {
+                println!("    ⚠️  Could not create device enumerator: {}", e);
+            }
         }
 
-        let apps = MacOSApplicationCapture::list_capturable_applications()?;
-        println!("    Found {} capturable applications", apps.len());
+        match rsac::audio::enumerate_audio_applications() {
+            Ok(apps) => {
+                println!("    Found {} capturable applications", apps.len());
+                println!("    ✅ Application enumeration working");
+            }
+            Err(e) => {
+                println!("    ⚠️  Could not enumerate applications: {}", e);
+            }
+        }
     }
 
     Ok(())
