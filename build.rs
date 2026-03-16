@@ -145,8 +145,9 @@ fn configure_macos_build() {
     println!("cargo:rustc-link-lib=framework=AudioToolbox");
     println!("cargo:rustc-link-lib=framework=CoreFoundation");
 
-    // For Process Tap APIs (macOS 14.4+), we may need additional frameworks
-    println!("cargo:rustc-link-lib=framework=AVFoundation"); // For AVAudioFormat, AVAudioFile
+    // Note: AVFoundation was previously linked here but is unused by the current codebase.
+    // Kept as a comment for reference if needed for future objc2 migration:
+    // println!("cargo:rustc-link-lib=framework=AVFoundation"); // For AVAudioFormat, AVAudioFile
 
     // Check macOS version and warn if Process Tap APIs may not be available
     if let Ok(version) = std::process::Command::new("sw_vers")

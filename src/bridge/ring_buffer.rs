@@ -72,6 +72,11 @@ pub(crate) struct BridgeShared {
 pub struct BridgeProducer {
     producer: rtrb::Producer<AudioBuffer>,
     shared: Arc<BridgeShared>,
+    /// Reusable scratch buffer to reduce heap allocations in the real-time
+    /// audio callback. When a push is rejected (ring buffer full), the Vec
+    /// is reclaimed and reused on the next call, avoiding alloc+free cycles
+    /// on the RT thread during back-pressure.
+    scratch: Vec<f32>,
 }
 
 // BridgeProducer is Send (can be moved to the callback thread) but not necessarily Sync.
@@ -109,6 +114,50 @@ impl BridgeProducer {
         match self.push(buffer) {
             Ok(()) => true,
             Err(_dropped) => {
+                self.shared.buffers_dropped.fetch_add(1, Ordering::Relaxed);
+                false
+            }
+        }
+    }
+
+    /// Push raw audio samples into the ring buffer without requiring the
+    /// caller to allocate a `Vec<f32>`.
+    ///
+    /// Uses an internal scratch buffer to minimize heap allocations on the
+    /// real-time audio callback thread:
+    ///
+    /// - **Ring buffer has space (success):** Samples are copied into the
+    ///   scratch buffer, which is then moved into an [`AudioBuffer`] and
+    ///   pushed. The scratch buffer is consumed (left empty).
+    /// - **Ring buffer is full (back-pressure):** The rejected [`AudioBuffer`]'s
+    ///   `Vec` is reclaimed into the scratch buffer, so the **next** call
+    ///   reuses the allocation — zero heap allocation on the RT thread when
+    ///   the consumer can't keep up.
+    ///
+    /// This is the preferred method for OS audio callbacks where real-time
+    /// safety is critical. Callers should use this instead of manually
+    /// calling `data.to_vec()` + `AudioBuffer::new()` + `push_or_drop()`.
+    pub fn push_samples_or_drop(&mut self, data: &[f32], channels: u16, sample_rate: u32) -> bool {
+        // Fill scratch from slice (reuses allocation if capacity is sufficient)
+        self.scratch.clear();
+        self.scratch.extend_from_slice(data);
+
+        // Take ownership of the filled scratch Vec
+        let vec = std::mem::take(&mut self.scratch);
+        let buffer = AudioBuffer::new(vec, channels, sample_rate);
+
+        match self.producer.push(buffer) {
+            Ok(()) => {
+                self.shared.buffers_pushed.fetch_add(1, Ordering::Relaxed);
+                #[cfg(feature = "async-stream")]
+                self.shared.waker.wake();
+                true
+            }
+            Err(rtrb::PushError::Full(rejected)) => {
+                // Reclaim the Vec allocation for reuse on the next call.
+                // This is the key optimization: no alloc+free cycle under
+                // back-pressure on the RT thread.
+                self.scratch = rejected.into_data();
                 self.shared.buffers_dropped.fetch_add(1, Ordering::Relaxed);
                 false
             }
@@ -278,6 +327,10 @@ pub fn create_bridge(capacity: usize, format: AudioFormat) -> (BridgeProducer, B
         BridgeProducer {
             producer,
             shared: Arc::clone(&shared),
+            // Pre-allocate for a typical callback size:
+            // 512 frames × 2 channels = 1024 samples.
+            // This avoids a heap allocation on the very first callback.
+            scratch: Vec::with_capacity(1024),
         },
         BridgeConsumer { consumer, shared },
     )

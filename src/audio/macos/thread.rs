@@ -27,7 +27,6 @@ use std::sync::Mutex;
 
 use crate::bridge::ring_buffer::BridgeProducer;
 use crate::bridge::stream::PlatformStream;
-use crate::core::buffer::AudioBuffer;
 use crate::core::config::CaptureTarget;
 use crate::core::error::{AudioError, AudioResult};
 
@@ -217,17 +216,17 @@ pub(crate) fn create_macos_capture(
                 coreaudio::audio_unit::render_callback::data::Interleaved<f32>,
             >| {
                 // REAL-TIME SAFETY:
-                // - BridgeProducer::push_or_drop() is lock-free (rtrb)
-                // - Vec allocation is acceptable for initial impl
-                //   (optimize with scratch buffer later)
+                // - BridgeProducer::push_samples_or_drop() is lock-free (rtrb)
+                // - Uses internal scratch buffer to avoid heap allocation when
+                //   ring buffer is full (back-pressure). On successful push,
+                //   one copy from the callback slice into a Vec is unavoidable
+                //   since AudioBuffer owns its data.
                 // - No locks, no blocking I/O
 
                 let data: &[f32] = args.data.buffer;
 
                 if !data.is_empty() {
-                    let audio_buffer = AudioBuffer::new(data.to_vec(), channels, sample_rate);
-                    // Push to ring buffer — if full, silently dropped (back-pressure)
-                    producer.push_or_drop(audio_buffer);
+                    producer.push_samples_or_drop(data, channels, sample_rate);
                 }
 
                 Ok(())

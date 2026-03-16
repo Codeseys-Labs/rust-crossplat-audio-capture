@@ -64,6 +64,13 @@ const SUB_TAP_UID_KEY: &str = "uid";
 /// `kAudioSubTapDriftCompensationKey` (macOS 14.4+)
 const SUB_TAP_DRIFT_COMPENSATION_KEY: &str = "drift_compensation";
 
+/// Forward-compatible alias for `kAudioObjectPropertyElementMain`.
+///
+/// `kAudioObjectPropertyElementMaster` was deprecated in macOS 12.0 and replaced
+/// by `kAudioObjectPropertyElementMain`. The value is `0` in both cases.
+/// `coreaudio-sys` 0.2.17 doesn't export the new name, so we define it here.
+const KAUDIO_OBJECT_PROPERTY_ELEMENT_MAIN: u32 = 0;
+
 /// `kAudioHardwarePropertyTranslatePIDToProcessObject` = `'id2p'`
 ///
 /// Translates a PID (pid_t qualifier) into the corresponding audio process
@@ -189,9 +196,14 @@ impl CoreAudioProcessTap {
             // 9. Read tap UUID string for use in aggregate device dictionary
             let uuid_nsstring: id = msg_send![tap_uuid, UUIDString];
             let uuid_cstr = cocoa::foundation::NSString::UTF8String(uuid_nsstring);
-            let tap_uuid_str = std::ffi::CStr::from_ptr(uuid_cstr)
-                .to_string_lossy()
-                .into_owned();
+            let tap_uuid_str = if uuid_cstr.is_null() {
+                "<unknown-uuid>".to_owned()
+            } else {
+                std::ffi::CStr::from_ptr(uuid_cstr)
+                    .to_str()
+                    .unwrap_or("<invalid-utf8>")
+                    .to_owned()
+            };
 
             log::debug!(
                 "Process tap created: tap_id={}, uuid={}",
@@ -360,9 +372,14 @@ impl CoreAudioProcessTap {
             // Read tap UUID string for use in aggregate device dictionary
             let uuid_nsstring: id = msg_send![tap_uuid, UUIDString];
             let uuid_cstr = cocoa::foundation::NSString::UTF8String(uuid_nsstring);
-            let tap_uuid_str = std::ffi::CStr::from_ptr(uuid_cstr)
-                .to_string_lossy()
-                .into_owned();
+            let tap_uuid_str = if uuid_cstr.is_null() {
+                "<unknown-uuid>".to_owned()
+            } else {
+                std::ffi::CStr::from_ptr(uuid_cstr)
+                    .to_str()
+                    .unwrap_or("<invalid-utf8>")
+                    .to_owned()
+            };
 
             log::debug!(
                 "Process tree tap created: tap_id={}, uuid={}, pids={:?}",
@@ -524,9 +541,14 @@ impl CoreAudioProcessTap {
             // Read tap UUID string for use in aggregate device dictionary
             let uuid_nsstring: id = msg_send![tap_uuid, UUIDString];
             let uuid_cstr = cocoa::foundation::NSString::UTF8String(uuid_nsstring);
-            let tap_uuid_str = std::ffi::CStr::from_ptr(uuid_cstr)
-                .to_string_lossy()
-                .into_owned();
+            let tap_uuid_str = if uuid_cstr.is_null() {
+                "<unknown-uuid>".to_owned()
+            } else {
+                std::ffi::CStr::from_ptr(uuid_cstr)
+                    .to_str()
+                    .unwrap_or("<invalid-utf8>")
+                    .to_owned()
+            };
 
             log::debug!(
                 "System-wide process tap created: tap_id={}, uuid={}",
@@ -606,7 +628,7 @@ impl CoreAudioProcessTap {
         let address = sys::AudioObjectPropertyAddress {
             mSelector: sys::kAudioStreamPropertyVirtualFormat,
             mScope: sys::kAudioObjectPropertyScopeGlobal,
-            mElement: sys::kAudioObjectPropertyElementMaster,
+            mElement: KAUDIO_OBJECT_PROPERTY_ELEMENT_MAIN,
         };
         let mut asbd: sys::AudioStreamBasicDescription = unsafe { std::mem::zeroed() };
         let mut size = std::mem::size_of::<sys::AudioStreamBasicDescription>() as u32;
@@ -701,7 +723,7 @@ unsafe fn translate_pid_to_audio_object_id(pid: u32) -> Option<sys::AudioObjectI
     let addr = sys::AudioObjectPropertyAddress {
         mSelector: K_AUDIO_HARDWARE_PROPERTY_TRANSLATE_PID_TO_PROCESS_OBJECT,
         mScope: sys::kAudioObjectPropertyScopeGlobal,
-        mElement: sys::kAudioObjectPropertyElementMaster,
+        mElement: KAUDIO_OBJECT_PROPERTY_ELEMENT_MAIN,
     };
 
     let mut pid_value = pid as i32; // pid_t is i32 on macOS
@@ -933,13 +955,14 @@ unsafe fn create_process_tap_description(
 /// in the audio system. These IDs can be passed directly to
 /// `initStereoMixdownOfProcesses:` on `CATapDescription`.
 ///
-/// Used by `new_system()` to create a system-wide tap targeting every
-/// audio-producing process.
+/// Currently only used in tests. Retained for potential future use in
+/// system-wide tap creation with explicit process enumeration.
+#[cfg(test)]
 unsafe fn get_all_audio_process_object_ids() -> AudioResult<Vec<sys::AudioObjectID>> {
     let addr = sys::AudioObjectPropertyAddress {
         mSelector: sys::kAudioHardwarePropertyProcessObjectList,
         mScope: sys::kAudioObjectPropertyScopeGlobal,
-        mElement: sys::kAudioObjectPropertyElementMaster,
+        mElement: KAUDIO_OBJECT_PROPERTY_ELEMENT_MAIN,
     };
 
     let mut data_size: u32 = 0;
@@ -1015,7 +1038,7 @@ unsafe fn get_default_output_device_uid() -> AudioResult<CFString> {
     let addr = sys::AudioObjectPropertyAddress {
         mSelector: sys::kAudioHardwarePropertyDefaultSystemOutputDevice,
         mScope: sys::kAudioObjectPropertyScopeGlobal,
-        mElement: sys::kAudioObjectPropertyElementMaster,
+        mElement: KAUDIO_OBJECT_PROPERTY_ELEMENT_MAIN,
     };
 
     let status = sys::AudioObjectGetPropertyData(
@@ -1049,7 +1072,7 @@ unsafe fn get_default_output_device_uid() -> AudioResult<CFString> {
     let uid_addr = sys::AudioObjectPropertyAddress {
         mSelector: sys::kAudioDevicePropertyDeviceUID,
         mScope: sys::kAudioObjectPropertyScopeGlobal,
-        mElement: sys::kAudioObjectPropertyElementMaster,
+        mElement: KAUDIO_OBJECT_PROPERTY_ELEMENT_MAIN,
     };
 
     let status = sys::AudioObjectGetPropertyData(
@@ -1094,7 +1117,7 @@ unsafe fn get_default_output_device_uid() -> AudioResult<CFString> {
 /// ```text
 /// {
 ///   name: "rsac-agg-{pid}",
-///   uid: "rsac-agg-uid-{pid}",
+///   uid: "rsac-agg-uid-{tap_uuid}",
 ///   master: <output_device_uid>,
 ///   private: true,
 ///   stacked: false,
@@ -1103,6 +1126,10 @@ unsafe fn get_default_output_device_uid() -> AudioResult<CFString> {
 ///   taps: [ { uid: <tap_uuid>, drift_compensation: true } ],
 /// }
 /// ```
+///
+/// The aggregate device UID uses the tap UUID (not the PID) to ensure global
+/// uniqueness. PID-based UIDs would collide if two concurrent captures target
+/// the same process.
 unsafe fn build_aggregate_device_dict(
     output_uid: &CFString,
     tap_uuid_str: &str,
@@ -1178,7 +1205,7 @@ unsafe fn build_aggregate_device_dict(
 
     // uid
     let k_uid = CFString::new(AGG_DEVICE_UID_KEY);
-    let v_uid = CFString::new(&format!("rsac-agg-uid-{}", pid));
+    let v_uid = CFString::new(&format!("rsac-agg-uid-{}", tap_uuid_str));
     dict.add(
         &(k_uid.as_concrete_TypeRef() as *const c_void),
         &(v_uid.as_concrete_TypeRef() as *const c_void),

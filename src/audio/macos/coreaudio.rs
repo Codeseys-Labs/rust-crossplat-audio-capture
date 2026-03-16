@@ -25,16 +25,25 @@ use crate::bridge::{calculate_capacity, create_bridge, BridgeStream};
 use super::thread::{create_macos_capture, MacosCaptureConfig};
 
 // ── CoreAudio crate imports ──────────────────────────────────────────────
-use coreaudio::audio_unit::macos_helpers::{get_default_device_id, get_device_name};
+use coreaudio::audio_unit::macos_helpers::{
+    get_audio_device_ids, get_default_device_id, get_device_name,
+};
 use coreaudio::Error as CAError;
 
 // ── CoreAudio-sys raw FFI imports ────────────────────────────────────────
 use coreaudio_sys::{
     kAudioDevicePropertyStreamFormat, kAudioFormatFlagIsBigEndian, kAudioFormatFlagIsFloat,
     kAudioFormatFlagIsPacked, kAudioFormatFlagIsSignedInteger, kAudioFormatLinearPCM,
-    kAudioObjectPropertyElementMaster, kAudioObjectPropertyScopeOutput, AudioObjectGetPropertyData,
-    AudioObjectID, AudioObjectPropertyAddress, AudioStreamBasicDescription,
+    kAudioObjectPropertyScopeOutput, AudioObjectGetPropertyData, AudioObjectID,
+    AudioObjectPropertyAddress, AudioStreamBasicDescription,
 };
+
+/// Forward-compatible alias for `kAudioObjectPropertyElementMain`.
+///
+/// `kAudioObjectPropertyElementMaster` was deprecated in macOS 12.0 and replaced
+/// by `kAudioObjectPropertyElementMain`. The value is `0` in both cases.
+/// `coreaudio-sys` 0.2.17 doesn't export the new name, so we define it here.
+const KAUDIO_OBJECT_PROPERTY_ELEMENT_MAIN: u32 = 0;
 
 /// AudioDeviceID is an alias for AudioObjectID (u32).
 type AudioDeviceID = AudioObjectID;
@@ -175,7 +184,7 @@ impl AudioDevice for MacosAudioDevice {
         let address = AudioObjectPropertyAddress {
             mSelector: kAudioDevicePropertyStreamFormat,
             mScope: kAudioObjectPropertyScopeOutput,
-            mElement: kAudioObjectPropertyElementMaster,
+            mElement: KAUDIO_OBJECT_PROPERTY_ELEMENT_MAIN,
         };
 
         unsafe {
@@ -262,15 +271,27 @@ impl Default for MacosDeviceEnumerator {
 
 impl DeviceEnumerator for MacosDeviceEnumerator {
     fn enumerate_devices(&self) -> AudioResult<Vec<Box<dyn AudioDevice>>> {
-        // For now, return the default output device (suitable for loopback capture).
-        // TODO: Full enumeration of all output devices.
-        match self.default_device() {
-            Ok(device) => Ok(vec![device]),
-            Err(_) => Ok(vec![]),
-        }
+        // Use coreaudio-rs helper to get all audio device IDs from CoreAudio.
+        // This calls kAudioHardwarePropertyDevices on kAudioObjectSystemObject.
+        let device_ids = get_audio_device_ids().map_err(|e| AudioError::BackendError {
+            backend: "CoreAudio".into(),
+            operation: "enumerate_devices".into(),
+            message: format!("Failed to get audio device IDs: {:?}", e),
+            context: None,
+        })?;
+
+        let devices: Vec<Box<dyn AudioDevice>> = device_ids
+            .into_iter()
+            .map(|device_id| -> Box<dyn AudioDevice> { Box::new(MacosAudioDevice { device_id }) })
+            .collect();
+
+        Ok(devices)
     }
 
     fn default_device(&self) -> AudioResult<Box<dyn AudioDevice>> {
+        // get_default_device_id(false) returns the default output device
+        // get_default_device_id(true) returns the default input device
+        // For audio capture (loopback), we want the output device.
         let device_id = get_default_device_id(false).ok_or_else(|| AudioError::DeviceNotFound {
             device_id: "default_output".into(),
         })?;

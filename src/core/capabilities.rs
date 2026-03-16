@@ -4,6 +4,9 @@
 //!
 //! [`PlatformCapabilities`] provides honest reporting of what each platform's
 //! audio backend supports — never pretend a platform can do something it cannot.
+//!
+//! On macOS, capabilities are determined at runtime based on the OS version
+//! (Process Tap requires macOS 14.4+).
 
 use super::config::SampleFormat;
 
@@ -108,10 +111,14 @@ impl PlatformCapabilities {
 
     #[cfg(target_os = "macos")]
     fn macos() -> Self {
+        // Process Tap API requires macOS 14.4+. Detect at runtime.
+        let (major, minor, _patch) = get_macos_version();
+        let has_process_tap = major > 14 || (major == 14 && minor >= 4);
+
         Self {
             supports_system_capture: true,
-            supports_application_capture: true, // CoreAudio Process Tap
-            supports_process_tree_capture: true, // Multi-PID tap via sysinfo child discovery
+            supports_application_capture: has_process_tap, // CoreAudio Process Tap (14.4+)
+            supports_process_tree_capture: has_process_tap, // Multi-PID tap via sysinfo child discovery (14.4+)
             supports_device_selection: true,
             supported_sample_formats: vec![SampleFormat::I16, SampleFormat::I32, SampleFormat::F32],
             sample_rate_range: (8000, 192000),
@@ -147,6 +154,101 @@ impl PlatformCapabilities {
             backend_name: "unsupported",
         }
     }
+}
+
+// ── macOS version detection ──────────────────────────────────────────────
+
+/// Returns the macOS version as `(major, minor, patch)`.
+///
+/// Uses `sysctl kern.osproductversion` for reliable detection without
+/// spawning a subprocess. Falls back to parsing `sw_vers -productVersion`
+/// output, then to `(0, 0, 0)` if both fail.
+///
+/// # Examples
+///
+/// - macOS 14.4.1 → `(14, 4, 1)`
+/// - macOS 15.0   → `(15, 0, 0)`
+///
+/// Used by [`PlatformCapabilities::macos()`] to determine Process Tap
+/// availability (requires macOS 14.4+).
+#[cfg(target_os = "macos")]
+pub fn get_macos_version() -> (u32, u32, u32) {
+    // Try sysctl first (no subprocess needed)
+    if let Some(version) = get_macos_version_sysctl() {
+        return version;
+    }
+
+    // Fallback: parse sw_vers output
+    if let Some(version) = get_macos_version_sw_vers() {
+        return version;
+    }
+
+    // Last resort: unknown version (capabilities will report false for version-gated features)
+    log::warn!("Could not determine macOS version; defaulting to (0, 0, 0)");
+    (0, 0, 0)
+}
+
+/// Try to get macOS version via sysctl `kern.osproductversion`.
+#[cfg(target_os = "macos")]
+fn get_macos_version_sysctl() -> Option<(u32, u32, u32)> {
+    use std::ffi::CStr;
+
+    // Safety: sysctl with a well-known name and null-terminated output buffer is safe.
+    unsafe {
+        let name = b"kern.osproductversion\0";
+        let mut buf = [0u8; 32];
+        let mut buf_len = buf.len();
+        let ret = libc::sysctlbyname(
+            name.as_ptr() as *const libc::c_char,
+            buf.as_mut_ptr() as *mut libc::c_void,
+            &mut buf_len,
+            std::ptr::null_mut(),
+            0,
+        );
+        if ret != 0 {
+            return None;
+        }
+
+        let version_str = CStr::from_ptr(buf.as_ptr() as *const libc::c_char)
+            .to_str()
+            .ok()?;
+        parse_version_string(version_str)
+    }
+}
+
+/// Try to get macOS version via `sw_vers -productVersion`.
+#[cfg(target_os = "macos")]
+fn get_macos_version_sw_vers() -> Option<(u32, u32, u32)> {
+    let output = std::process::Command::new("sw_vers")
+        .arg("-productVersion")
+        .output()
+        .ok()?;
+
+    if !output.status.success() {
+        return None;
+    }
+
+    let version_str = String::from_utf8(output.stdout).ok()?;
+    parse_version_string(version_str.trim())
+}
+
+/// Parse a version string like "14.4.1" or "15.0" into `(major, minor, patch)`.
+#[cfg(target_os = "macos")]
+fn parse_version_string(s: &str) -> Option<(u32, u32, u32)> {
+    let parts: Vec<&str> = s.split('.').collect();
+    if parts.is_empty() {
+        return None;
+    }
+    let major = parts[0].parse::<u32>().ok()?;
+    let minor = parts
+        .get(1)
+        .and_then(|p| p.parse::<u32>().ok())
+        .unwrap_or(0);
+    let patch = parts
+        .get(2)
+        .and_then(|p| p.parse::<u32>().ok())
+        .unwrap_or(0);
+    Some((major, minor, patch))
 }
 
 // ── Tests ────────────────────────────────────────────────────────────────
@@ -365,9 +467,23 @@ mod tests {
     }
 
     #[test]
+    #[cfg(not(target_os = "macos"))]
     fn query_application_capture_supported() {
         let caps = PlatformCapabilities::query();
         assert!(caps.supports_application_capture);
+    }
+
+    #[test]
+    #[cfg(target_os = "macos")]
+    fn query_application_capture_reflects_version() {
+        let caps = PlatformCapabilities::query();
+        let (major, minor, _) = get_macos_version();
+        let expected = major > 14 || (major == 14 && minor >= 4);
+        assert_eq!(
+            caps.supports_application_capture, expected,
+            "supports_application_capture should match macOS version ({}.{})",
+            major, minor
+        );
     }
 
     #[test]
@@ -386,9 +502,15 @@ mod tests {
 
     #[test]
     #[cfg(target_os = "macos")]
-    fn query_process_tree_supported_on_macos() {
+    fn query_process_tree_reflects_version_on_macos() {
         let caps = PlatformCapabilities::query();
-        assert!(caps.supports_process_tree_capture);
+        let (major, minor, _) = get_macos_version();
+        let expected = major > 14 || (major == 14 && minor >= 4);
+        assert_eq!(
+            caps.supports_process_tree_capture, expected,
+            "supports_process_tree_capture should match macOS version ({}.{})",
+            major, minor
+        );
     }
 
     #[test]
@@ -415,5 +537,35 @@ mod tests {
         );
         assert_eq!(caps.sample_rate_range, cloned.sample_rate_range);
         assert_eq!(caps.max_channels, cloned.max_channels);
+    }
+
+    // ── macOS version detection tests ────────────────────────────────
+
+    #[test]
+    #[cfg(target_os = "macos")]
+    fn get_macos_version_returns_nonzero() {
+        let (major, _minor, _patch) = get_macos_version();
+        // We should always be able to detect the version on a real macOS system
+        assert!(
+            major >= 10,
+            "macOS major version should be >= 10, got {}",
+            major
+        );
+    }
+
+    #[test]
+    #[cfg(target_os = "macos")]
+    fn parse_version_string_typical() {
+        assert_eq!(parse_version_string("14.4.1"), Some((14, 4, 1)));
+        assert_eq!(parse_version_string("15.0"), Some((15, 0, 0)));
+        assert_eq!(parse_version_string("12.6.3"), Some((12, 6, 3)));
+    }
+
+    #[test]
+    #[cfg(target_os = "macos")]
+    fn parse_version_string_edge_cases() {
+        assert_eq!(parse_version_string("14"), Some((14, 0, 0)));
+        assert_eq!(parse_version_string(""), None);
+        assert_eq!(parse_version_string("abc"), None);
     }
 }
