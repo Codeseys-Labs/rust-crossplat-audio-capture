@@ -34,6 +34,7 @@ The architecture is documented in detail across four canonical documents, plus a
 | [Backend Contract](docs/architecture/BACKEND_CONTRACT.md) | Internal backend traits + module architecture |
 | [Reference Analysis](reference/REFERENCE_ANALYSIS.md) | Analysis of 10 reference repos mapped to rsac's architecture |
 | [Local Testing Guide](docs/LOCAL_TESTING_GUIDE.md) | How to test on physical macOS, Windows, and Linux machines |
+| [macOS Version Compatibility](docs/MACOS_VERSION_COMPATIBILITY.md) | macOS API compatibility matrix, version-specific fallbacks, known issues |
 
 ### Key Architecture Points (Implemented)
 
@@ -42,7 +43,7 @@ The architecture is documented in detail across four canonical documents, plus a
   AudioCaptureBuilder → AudioCapture → CapturingStream
   ```
 - **Streaming-first**: The core abstraction is `CapturingStream::read_chunk() → AudioBuffer`. File writing is implemented as a sink adapter ([`src/sink/`](src/sink/mod.rs)), not a primary concern.
-- **Ring buffer bridge**: OS audio callbacks push data into an `rtrb` SPSC lock-free ring buffer; consumer threads pull data out via `BridgeStream`. Implemented in [`src/bridge/`](src/bridge/mod.rs).
+- **Ring buffer bridge**: OS audio callbacks push data into an `rtrb` SPSC lock-free ring buffer; consumer threads pull data out via `BridgeStream`. The [`push_samples_or_drop()`](src/bridge/ring_buffer.rs:140) method provides zero-allocation pushes on real-time callback threads via an internal scratch buffer. Implemented in [`src/bridge/`](src/bridge/mod.rs).
 - **[`BridgeStream<S>`](src/bridge/stream.rs)**: Universal `CapturingStream` implementation used by **all three backends** (WASAPI, PipeWire, CoreAudio). Eliminates per-platform duplication of the ring-buffer-to-consumer pattern.
 - **[`PlatformStream`](src/bridge/stream.rs:47) trait**: Internal backend contract. Each platform implements `stop_capture()` and `is_active()`. The rest (ring buffer, state, reads) is handled by `BridgeStream`.
 - **[`AtomicStreamState`](src/bridge/state.rs)**: Lock-free state machine for stream lifecycle: `Created → Running → Stopping → Stopped → Closed`.
@@ -57,7 +58,7 @@ The architecture is documented in detail across four canonical documents, plus a
   }
   ```
 - **Error model**: 21 categorized error variants with three-state recoverability (`Recoverable`, `TransientRetry`, `Fatal`). See [`src/core/error.rs`](src/core/error.rs).
-- **Platform capabilities**: [`PlatformCapabilities`](src/core/capabilities.rs) struct for honest reporting of what each backend supports — never pretend a platform can do something it cannot.
+- **Platform capabilities**: [`PlatformCapabilities`](src/core/capabilities.rs) struct for honest reporting of what each backend supports — never pretend a platform can do something it cannot. On macOS, capabilities are determined at runtime using [`get_macos_version()`](src/core/capabilities.rs:175) (sysctl-based, no subprocess) to detect Process Tap availability (requires macOS 14.4+).
 - **Sink adapters**: [`AudioSink`](src/sink/traits.rs) trait with three implementations:
   - [`NullSink`](src/sink/null.rs) — discards data (testing/benchmarking)
   - [`ChannelSink`](src/sink/channel.rs) — sends buffers over `mpsc` channel
@@ -71,7 +72,7 @@ The architecture is documented in detail across four canonical documents, plus a
 
 ## 3. Current State
 
-The architectural transformation is **complete**. Phases 0–4 are done. The old API has been fully removed and the new builder/trait API is the only API. **All 10 gap closures (G1–G10) are done** — every capture level (system, application, process tree) is implemented on all three platforms.
+The architectural transformation is **complete**. Phases 0–4 are done. The old API has been fully removed and the new builder/trait API is the only API. **All 10 gap closures (G1–G10) are done** — every capture level (system, application, process tree) is implemented on all three platforms. **All 3 platforms are verified on real hardware:** Windows ✅, macOS ✅ (macOS 26 Tahoe), Linux ✅ (CI).
 
 ### What was removed (Phase 0 — Done ✅)
 
@@ -94,7 +95,7 @@ All three backends are wired through `BridgeStream<S>`:
 |---|---|---|---|
 | **Windows** | WASAPI | [`src/audio/windows/thread.rs`](src/audio/windows/thread.rs) | ✅ Wired via `WindowsPlatformStream` |
 | **Linux** | PipeWire | [`src/audio/linux/thread.rs`](src/audio/linux/thread.rs) | ✅ Wired via `LinuxPlatformStream` |
-| **macOS** | CoreAudio | [`src/audio/macos/thread.rs`](src/audio/macos/thread.rs) | ✅ Wired via `MacosPlatformStream` |
+| **macOS** | CoreAudio | [`src/audio/macos/thread.rs`](src/audio/macos/thread.rs) | ✅ Wired via `MacosPlatformStream` — tested on macOS 26 Tahoe (289 unit tests + 12 integration tests) |
 
 ### Demo apps (Phase 4 — Done ✅)
 
@@ -267,11 +268,18 @@ See the [Local Testing Guide](docs/LOCAL_TESTING_GUIDE.md) for comprehensive ins
 on testing system capture, application capture, and process tree capture on macOS, Windows,
 and Linux.
 
-### CI expectations
+### CI expectations & platform verification status
 
-- **Linux + Windows** are primary CI platforms
-- **macOS** is treated as incomplete (expected failures in some areas)
+All three platforms are verified:
+
+| Platform | Verification | Test Results |
+|---|---|---|
+| **Linux** | ✅ CI (PipeWire) | 258 platform-independent unit tests pass |
+| **Windows** | ✅ Real hardware | WASAPI capture tested with all capture modes |
+| **macOS** | ✅ Real hardware (macOS 26 Tahoe) | 289 unit tests + 12 integration tests pass |
+
 - Docker-based testing available for cross-platform validation (see `docker/`)
+- macOS backend includes compatibility with macOS 14.4–15 (Sonoma/Sequoia) and macOS 26 (Tahoe) via 3-path API fallback. See [macOS Version Compatibility](docs/MACOS_VERSION_COMPATIBILITY.md).
 
 ### Architecture alignment
 
@@ -292,7 +300,7 @@ This project uses [Task Master](https://github.com/task-master-ai/task-master-ai
 | Reference the deleted `ApplicationCapture` trait | It was removed — use `CaptureTarget` with the builder instead |
 | Make `CapturingStream` depend on file I/O | File writing is a sink adapter, not a core concern |
 | Pretend a platform supports a feature it doesn't | Use explicit capability errors via `PlatformCapabilities` |
-| Hold locks in real-time audio callback threads | Use lock-free ring buffers (`rtrb`) via `BridgeProducer` |
+| Hold locks or allocate on real-time audio callback threads | Use lock-free ring buffers (`rtrb`) via `BridgeProducer`; use [`push_samples_or_drop()`](src/bridge/ring_buffer.rs:140) for zero-alloc RT callbacks |
 | Add new `AudioError` variants without categorizing them | Every variant must have an `ErrorKind` and recoverability classification |
 | Bypass `BridgeStream<S>` for new backends | All backends must use `BridgeStream` + `PlatformStream` trait |
 | Silently diverge from architecture docs | Propose changes explicitly if the design needs updating |
@@ -332,11 +340,27 @@ This project uses [Task Master](https://github.com/task-master-ai/task-master-ai
   - `test_app_capture_nonexistent_target` — graceful error handling
 - ✅ Test helpers for app capture: `require_app_capture!()`, `spawn_audio_player_get_pid()`, `find_pipewire_node_for_pid()`
 - ✅ Platform-specific capability unit tests fixed for cross-platform CI (5 tests with `#[cfg]` guards + Windows/macOS variants)
+- ✅ **macOS fully tested on real hardware (macOS 26 Tahoe)**:
+  - 289 unit tests + 12 integration tests passing
+  - System capture, application capture, process tree capture all verified
+  - macOS 26 compatibility: 3-path API fallback in [`create_process_tap_description()`](src/audio/macos/tap.rs:774)
+    - Path 1: `initStereoMixdownOfProcesses:` with AudioObjectIDs (macOS 26+)
+    - Path 2: `setProcesses:exclusive:` with PIDs (macOS 14.4–15)
+    - Path 3: Separate `setProcesses:` + `setExclusive:` (macOS 26 fallback)
+  - `respondsToSelector:` guards for removed selectors (`setPrivateTap:`, `setProcesses:exclusive:`)
+  - PID→AudioObjectID translation via `kAudioHardwarePropertyTranslatePIDToProcessObject` (`'id2p'`)
+  - Aggregate device UID uses tap UUID for collision prevention
+  - CStr null pointer checks added to prevent UB in tap UUID handling
+  - [`push_samples_or_drop()`](src/bridge/ring_buffer.rs:140) — zero-allocation RT callback method with scratch buffer recycling
+  - Runtime macOS version detection via sysctl in [`PlatformCapabilities::macos()`](src/core/capabilities.rs:113)
+  - Comprehensive docs: [macOS Version Compatibility](docs/MACOS_VERSION_COMPATIBILITY.md), [macOS 26 Process Tap Fix](docs/MACOS26_PROCESS_TAP_FIX.md)
 
 **Remaining:**
 - Async stream support (behind `async-stream` feature, foundation in place via `atomic-waker`)
 - Additional sink adapters
 - Performance benchmarking and optimization
+- macOS 15 (Sequoia) testing on real hardware (expected to work via Path 2, untested)
+- Complete device enumeration on macOS (currently returns only default device)
 
 ---
 
@@ -434,6 +458,7 @@ let received = rx.try_recv()?;
 // Bridge: producer side (OS callback thread)
 let (mut producer, consumer) = create_bridge(capacity, format);
 producer.push(audio_buffer)?;       // or push_or_drop for non-blocking
+producer.push_samples_or_drop(data, channels, sample_rate); // zero-alloc RT-safe
 producer.signal_done();              // when capture ends
 
 // Bridge: consumer side (wrapped by BridgeStream)
@@ -461,3 +486,4 @@ impl PlatformStream for MyPlatformStream {
 7. **Test on the target platform.** If you're implementing a Windows backend change, validate with `cargo check --features feat_windows` at minimum.
 8. **Phase 5 is the frontier.** New work should focus on breadth expansion: async streams, better device enumeration, additional sinks, performance optimization.
 9. **When in doubt, ask.** If a design decision isn't covered by the architecture docs, surface it rather than guessing.
+10. **macOS is tested and working.** All capture modes verified on macOS 26 Tahoe. The 3-path fallback in [`tap.rs`](src/audio/macos/tap.rs) handles API differences across macOS 14.4–26. See [macOS Version Compatibility](docs/MACOS_VERSION_COMPATIBILITY.md) for the full compatibility matrix.
