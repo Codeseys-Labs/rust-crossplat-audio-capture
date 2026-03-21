@@ -4,8 +4,10 @@
 //! in command handlers via `State<'_, AppState>`.
 
 use std::collections::VecDeque;
-use std::sync::{Arc, RwLock};
+use std::sync::{Arc, Mutex, RwLock};
 
+use crate::audio::pipeline::ProcessedAudioChunk;
+use crate::audio::{AudioCaptureManager, AudioChunk};
 use crate::events::PipelineStatus;
 use crate::graph::entities::GraphSnapshot;
 
@@ -63,16 +65,44 @@ pub struct AppState {
 
     /// Whether capture is currently active.
     pub is_capturing: Arc<RwLock<bool>>,
+
+    // ── Audio capture infrastructure ────────────────────────────────────
+    /// The capture manager (behind Mutex because AudioCaptureManager has &mut self methods).
+    pub capture_manager: Arc<Mutex<AudioCaptureManager>>,
+
+    /// Sender side of the raw audio channel (capture → pipeline).
+    pub pipeline_tx: crossbeam_channel::Sender<AudioChunk>,
+
+    /// Receiver side (held here so pipeline thread can take it on first start).
+    pub pipeline_rx: Arc<Mutex<Option<crossbeam_channel::Receiver<AudioChunk>>>>,
+
+    /// Sender for processed audio (pipeline → downstream ASR/VAD).
+    pub processed_tx: crossbeam_channel::Sender<ProcessedAudioChunk>,
+
+    /// Receiver for processed audio (held for downstream consumers).
+    pub processed_rx: Arc<Mutex<Option<crossbeam_channel::Receiver<ProcessedAudioChunk>>>>,
+
+    /// Handle to the pipeline worker thread.
+    pub pipeline_thread: Arc<Mutex<Option<std::thread::JoinHandle<()>>>>,
 }
 
 impl AppState {
     /// Create a new `AppState` with empty defaults.
     pub fn new() -> Self {
+        let (pipeline_tx, pipeline_rx) = crossbeam_channel::unbounded::<AudioChunk>();
+        let (processed_tx, processed_rx) = crossbeam_channel::unbounded::<ProcessedAudioChunk>();
+
         Self {
             transcript_buffer: Arc::new(RwLock::new(VecDeque::with_capacity(500))),
             graph_snapshot: Arc::new(RwLock::new(GraphSnapshot::default())),
             pipeline_status: Arc::new(RwLock::new(PipelineStatus::default())),
             is_capturing: Arc::new(RwLock::new(false)),
+            capture_manager: Arc::new(Mutex::new(AudioCaptureManager::new())),
+            pipeline_tx,
+            pipeline_rx: Arc::new(Mutex::new(Some(pipeline_rx))),
+            processed_tx,
+            processed_rx: Arc::new(Mutex::new(Some(processed_rx))),
+            pipeline_thread: Arc::new(Mutex::new(None)),
         }
     }
 }
