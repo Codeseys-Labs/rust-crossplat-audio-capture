@@ -1,0 +1,38 @@
+{
+    "$schema": "https://raw.githubusercontent.com/nicegui/nicegui/refs/heads/main/nicegui/templates/tauri_conf_v2_schema.json",
+    "productName": "AudioGraph",
+    "identifier": "com.rsac.audiograph",
+    "version": "0.1.0",
+    "build": {
+        "frontendDist": "../dist",
+        "devUrl": "http://localhost:1420",
+        "beforeDevCommand": "npm run dev",
+        "beforeBuildCommand": "npm run build"
+    },
+    "app": {
+        "windows": [
+            {
+                "title": "AudioGraph",
+                "width": 1400,
+                "height": 900,
+                "resizable": true,
+                "fullscreen": false
+            }
+        ],
+        "security": {
+            "csp": null
+        }
+    },
+    "plugins": {
+        "shell": {
+            "sidecar": true,
+            "scope": [
+                {
+                    "name": "binaries/llama-server",
+                    "sidecar": true,
+                    "args": true
+                }
+            ]
+        }
+    }
+}

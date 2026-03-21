@@ -1,0 +1,42 @@
+[audio]
+sample_rate = 48000
+channels = 2
+buffer_size = 480            # frames per buffer (10ms at 48kHz)
+ring_buffer_capacity = 65536
+
+[pipeline]
+vad_threshold = 0.5
+vad_min_speech_ms = 500
+vad_max_speech_ms = 30000
+vad_silence_ms = 300
+
+[asr]
+model_path = "models/ggml-small.en.bin"
+language = "en"
+beam_size = 5
+temperature = 0.0
+
+[diarization]
+segmentation_model = "models/pyannote-segmentation-3.0.onnx"
+embedding_model = "models/wespeaker-voxceleb-resnet34.onnx"
+speaker_similarity_threshold = 0.7
+max_speakers = 10
+
+[sidecar]
+model_path = "models/lfm2-350m-extract.Q8_0.gguf"
+port = 8081
+ctx_size = 2048
+n_predict = 512
+health_check_interval_ms = 5000
+max_restart_attempts = 3
+
+[graph]
+entity_similarity_threshold = 0.85
+max_nodes = 1000
+max_edges = 5000
+snapshot_interval_ms = 500
+
+[ui]
+theme = "dark"
+graph_dimension = "2d"
+max_transcript_entries = 500

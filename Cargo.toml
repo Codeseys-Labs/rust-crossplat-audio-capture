@@ -171,3 +171,4 @@ harness = true
 
 [workspace]
 members = []
+exclude = ["apps/audio-graph/src-tauri"]
