@@ -5,3 +5,6 @@
 
 pub mod capture;
 pub mod pipeline;
+
+pub use capture::{AudioCaptureManager, AudioChunk};
+pub use pipeline::ProcessedAudioChunk;
