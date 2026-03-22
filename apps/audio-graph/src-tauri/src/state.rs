@@ -95,14 +95,14 @@ pub struct AppState {
     /// Sender side of the raw audio channel (capture → pipeline).
     pub pipeline_tx: crossbeam_channel::Sender<AudioChunk>,
 
-    /// Receiver side (held here so pipeline thread can take it on first start).
-    pub pipeline_rx: Arc<Mutex<Option<crossbeam_channel::Receiver<AudioChunk>>>>,
+    /// Receiver side — cloneable, workers call `.clone()` to get their own handle.
+    pub pipeline_rx: crossbeam_channel::Receiver<AudioChunk>,
 
     /// Sender for processed audio (pipeline → downstream ASR/VAD).
     pub processed_tx: crossbeam_channel::Sender<ProcessedAudioChunk>,
 
-    /// Receiver for processed audio (held for downstream consumers).
-    pub processed_rx: Arc<Mutex<Option<crossbeam_channel::Receiver<ProcessedAudioChunk>>>>,
+    /// Receiver for processed audio — cloneable for worker threads.
+    pub processed_rx: crossbeam_channel::Receiver<ProcessedAudioChunk>,
 
     /// Handle to the pipeline worker thread.
     pub pipeline_thread: Arc<Mutex<Option<std::thread::JoinHandle<()>>>>,
@@ -111,8 +111,8 @@ pub struct AppState {
     /// Sender for speech segments (VAD → speech processor).
     pub speech_tx: crossbeam_channel::Sender<SpeechSegment>,
 
-    /// Receiver for speech segments (held so the speech processor thread can take it).
-    pub speech_rx: Arc<Mutex<Option<crossbeam_channel::Receiver<SpeechSegment>>>>,
+    /// Receiver for speech segments — cloneable for worker threads.
+    pub speech_rx: crossbeam_channel::Receiver<SpeechSegment>,
 
     /// Handle to the VAD worker thread.
     pub vad_thread: Arc<Mutex<Option<std::thread::JoinHandle<()>>>>,
@@ -124,9 +124,14 @@ pub struct AppState {
 impl AppState {
     /// Create a new `AppState` with empty defaults.
     pub fn new() -> Self {
-        let (pipeline_tx, pipeline_rx) = crossbeam_channel::unbounded::<AudioChunk>();
-        let (processed_tx, processed_rx) = crossbeam_channel::unbounded::<ProcessedAudioChunk>();
-        let (speech_tx, speech_rx) = crossbeam_channel::unbounded::<SpeechSegment>();
+        // Bounded channels prevent OOM if downstream consumers stall.
+        // Capacities chosen per architecture spec:
+        //   pipeline: 64 chunks (~2s of audio at 32ms/chunk)
+        //   processed: 16 chunks (VAD processes quickly)
+        //   speech: 32 segments (speech segments are larger but less frequent)
+        let (pipeline_tx, pipeline_rx) = crossbeam_channel::bounded::<AudioChunk>(64);
+        let (processed_tx, processed_rx) = crossbeam_channel::bounded::<ProcessedAudioChunk>(16);
+        let (speech_tx, speech_rx) = crossbeam_channel::bounded::<SpeechSegment>(32);
 
         Self {
             transcript_buffer: Arc::new(RwLock::new(VecDeque::with_capacity(500))),
@@ -140,12 +145,12 @@ impl AppState {
             chat_history: Arc::new(RwLock::new(Vec::new())),
             capture_manager: Arc::new(Mutex::new(AudioCaptureManager::new())),
             pipeline_tx,
-            pipeline_rx: Arc::new(Mutex::new(Some(pipeline_rx))),
+            pipeline_rx,
             processed_tx,
-            processed_rx: Arc::new(Mutex::new(Some(processed_rx))),
+            processed_rx,
             pipeline_thread: Arc::new(Mutex::new(None)),
             speech_tx,
-            speech_rx: Arc::new(Mutex::new(Some(speech_rx))),
+            speech_rx,
             vad_thread: Arc::new(Mutex::new(None)),
             speech_processor_thread: Arc::new(Mutex::new(None)),
         }

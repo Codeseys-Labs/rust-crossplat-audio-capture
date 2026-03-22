@@ -26,6 +26,12 @@ pub struct TemporalEdge {
     pub weight: f32,
 }
 
+/// Maximum number of nodes before eviction of oldest (lowest `last_seen`).
+const MAX_NODES: usize = 1000;
+
+/// Maximum number of edges before eviction of oldest (lowest `valid_from`).
+const MAX_EDGES: usize = 5000;
+
 /// A temporal knowledge graph backed by petgraph's StableGraph.
 pub struct TemporalKnowledgeGraph {
     /// The underlying petgraph graph.
@@ -194,6 +200,10 @@ impl TemporalKnowledgeGraph {
 
     /// Process a full extraction result from a transcript segment.
     /// This is the main entry point for feeding data into the graph.
+    ///
+    /// After inserting entities and relations, enforces size limits by
+    /// evicting the oldest nodes/edges when [`MAX_NODES`] or [`MAX_EDGES`]
+    /// are exceeded.
     pub fn process_extraction(
         &mut self,
         result: &ExtractionResult,
@@ -218,6 +228,75 @@ impl TemporalKnowledgeGraph {
         }
 
         self.event_counter += 1;
+
+        // Evict oldest nodes if over limit
+        self.evict_excess_nodes();
+
+        // Evict oldest edges if over limit
+        self.evict_excess_edges();
+    }
+
+    /// Remove the oldest nodes (by `last_seen`) until count ≤ [`MAX_NODES`].
+    fn evict_excess_nodes(&mut self) {
+        while self.graph.node_count() > MAX_NODES {
+            // Find the node with the smallest `last_seen` timestamp
+            let oldest = self.graph.node_indices().min_by(|&a, &b| {
+                let a_ts = self
+                    .graph
+                    .node_weight(a)
+                    .map(|n| n.last_seen)
+                    .unwrap_or(f64::MAX);
+                let b_ts = self
+                    .graph
+                    .node_weight(b)
+                    .map(|n| n.last_seen)
+                    .unwrap_or(f64::MAX);
+                a_ts.partial_cmp(&b_ts).unwrap_or(std::cmp::Ordering::Equal)
+            });
+
+            if let Some(idx) = oldest {
+                // Remove from name_index before removing from graph
+                if let Some(entity) = self.graph.node_weight(idx) {
+                    let key = entity.name.to_lowercase();
+                    self.name_index.remove(&key);
+                    log::debug!(
+                        "Graph eviction: removed oldest node '{}' (last_seen={:.1})",
+                        entity.name,
+                        entity.last_seen,
+                    );
+                }
+                self.graph.remove_node(idx);
+            } else {
+                break;
+            }
+        }
+    }
+
+    /// Remove the oldest edges (by `valid_from`) until count ≤ [`MAX_EDGES`].
+    fn evict_excess_edges(&mut self) {
+        while self.graph.edge_count() > MAX_EDGES {
+            // Find the edge with the smallest `valid_from` timestamp
+            let oldest = self.graph.edge_indices().min_by(|&a, &b| {
+                let a_ts = self
+                    .graph
+                    .edge_weight(a)
+                    .map(|e| e.valid_from)
+                    .unwrap_or(f64::MAX);
+                let b_ts = self
+                    .graph
+                    .edge_weight(b)
+                    .map(|e| e.valid_from)
+                    .unwrap_or(f64::MAX);
+                a_ts.partial_cmp(&b_ts).unwrap_or(std::cmp::Ordering::Equal)
+            });
+
+            if let Some(idx) = oldest {
+                log::debug!("Graph eviction: removed oldest edge (idx={:?})", idx);
+                self.graph.remove_edge(idx);
+            } else {
+                break;
+            }
+        }
     }
 
     /// Take a snapshot of the current graph state for frontend rendering.

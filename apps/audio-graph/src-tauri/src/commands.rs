@@ -94,12 +94,7 @@ pub async fn start_capture(
             .lock()
             .map_err(|e| format!("Lock error: {}", e))?;
         if pipeline_handle.is_none() {
-            let rx = state
-                .pipeline_rx
-                .lock()
-                .map_err(|e| format!("Lock error: {}", e))?
-                .take()
-                .ok_or("Pipeline receiver already taken")?;
+            let rx = state.pipeline_rx.clone();
             let tx = state.processed_tx.clone();
             let handle = std::thread::Builder::new()
                 .name("audio-pipeline".to_string())
@@ -120,12 +115,7 @@ pub async fn start_capture(
             .lock()
             .map_err(|e| format!("Lock error: {}", e))?;
         if vad_handle.is_none() {
-            let processed_rx = state
-                .processed_rx
-                .lock()
-                .map_err(|e| format!("Lock error: {}", e))?
-                .take()
-                .ok_or("Processed audio receiver already taken")?;
+            let processed_rx = state.processed_rx.clone();
             let speech_tx = state.speech_tx.clone();
             let vad_config = VadConfig::default();
 
@@ -149,12 +139,7 @@ pub async fn start_capture(
             .lock()
             .map_err(|e| format!("Lock error: {}", e))?;
         if sp_handle.is_none() {
-            let speech_rx = state
-                .speech_rx
-                .lock()
-                .map_err(|e| format!("Lock error: {}", e))?
-                .take()
-                .ok_or("Speech receiver already taken")?;
+            let speech_rx = state.speech_rx.clone();
 
             let transcript_buffer = state.transcript_buffer.clone();
             let pipeline_status = state.pipeline_status.clone();
@@ -207,6 +192,129 @@ pub async fn start_capture(
     log::info!("Started capture for source: {}", source_id);
     Ok(())
 }
+
+// ---------------------------------------------------------------------------
+// Helper: extraction + graph update + event emission (I1: deduplicated)
+// ---------------------------------------------------------------------------
+
+/// Perform entity extraction, update the knowledge graph, and emit events.
+///
+/// Shared by both the full (ASR + diarization) and diarization-only speech
+/// processor loops. Tries the native LLM engine first, falls back to the
+/// sidecar LLM, then to rule-based extraction.
+#[allow(clippy::too_many_arguments)]
+fn process_extraction_and_emit(
+    text: &str,
+    speaker: &str,
+    segment_id: &str,
+    timestamp: f64,
+    llm_engine: &std::sync::Arc<std::sync::Mutex<Option<LlmEngine>>>,
+    sidecar_manager: &std::sync::Arc<std::sync::Mutex<SidecarManager>>,
+    graph_extractor: &std::sync::Arc<RuleBasedExtractor>,
+    knowledge_graph: &std::sync::Arc<std::sync::Mutex<TemporalKnowledgeGraph>>,
+    graph_snapshot: &std::sync::Arc<std::sync::RwLock<GraphSnapshot>>,
+    pipeline_status: &std::sync::Arc<std::sync::RwLock<PipelineStatus>>,
+    app_handle: &tauri::AppHandle,
+    extraction_count: &mut u64,
+    graph_update_count: &mut u64,
+) {
+    // Try native LLM engine first, then sidecar, then rule-based
+    let llm_result = {
+        let engine_guard = llm_engine.lock().unwrap_or_else(|e| {
+            log::warn!("LLM engine mutex poisoned, recovering: {}", e);
+            e.into_inner()
+        });
+        if let Some(ref engine) = *engine_guard {
+            match engine.extract_entities(text, speaker) {
+                Ok(result) => Some(result),
+                Err(e) => {
+                    log::warn!("Native LLM extraction failed: {}", e);
+                    None
+                }
+            }
+        } else {
+            None
+        }
+    };
+
+    let extraction_result = if let Some(result) = llm_result {
+        log::debug!(
+            "Native LLM extraction: {} entities, {} relations",
+            result.entities.len(),
+            result.relations.len()
+        );
+        result
+    } else {
+        // Fallback: try sidecar, then rule-based
+        let sidecar = sidecar_manager.lock().unwrap_or_else(|e| {
+            log::warn!("Sidecar manager mutex poisoned, recovering: {}", e);
+            e.into_inner()
+        });
+        if sidecar.is_healthy() {
+            match sidecar.extract_entities(speaker, text) {
+                Ok(result) => {
+                    log::debug!(
+                        "Sidecar LLM extraction: {} entities, {} relations",
+                        result.entities.len(),
+                        result.relations.len()
+                    );
+                    result
+                }
+                Err(e) => {
+                    log::warn!("Sidecar extraction failed, using rule-based: {}", e);
+                    graph_extractor.extract(speaker, text)
+                }
+            }
+        } else {
+            graph_extractor.extract(speaker, text)
+        }
+    };
+
+    *extraction_count += 1;
+
+    // Feed extraction into the knowledge graph
+    if !extraction_result.entities.is_empty() {
+        let mut graph = knowledge_graph.lock().unwrap_or_else(|e| {
+            log::warn!("Knowledge graph mutex poisoned, recovering: {}", e);
+            e.into_inner()
+        });
+        graph.process_extraction(&extraction_result, timestamp, speaker, segment_id);
+
+        *graph_update_count += 1;
+
+        // Update graph snapshot for frontend
+        let snapshot = graph.snapshot();
+        if let Ok(mut gs) = graph_snapshot.write() {
+            *gs = snapshot.clone();
+        }
+
+        // Emit graph-update event
+        let _ = app_handle.emit(crate::events::GRAPH_UPDATE, &snapshot);
+
+        log::debug!(
+            "Graph updated: {} nodes, {} edges",
+            snapshot.stats.total_nodes,
+            snapshot.stats.total_edges
+        );
+    }
+
+    // Update entity_extraction and graph status, then emit pipeline status
+    if let Ok(mut status) = pipeline_status.write() {
+        status.entity_extraction = StageStatus::Running {
+            processed_count: *extraction_count,
+        };
+        status.graph = StageStatus::Running {
+            processed_count: *graph_update_count,
+        };
+    }
+    if let Ok(status) = pipeline_status.read() {
+        let _ = app_handle.emit(events::PIPELINE_STATUS_EVENT, &*status);
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Speech processor threads
+// ---------------------------------------------------------------------------
 
 /// Speech processor orchestrator — runs ASR and diarization inline on a
 /// single thread. Receives `SpeechSegment`s from VAD, transcribes each via
@@ -346,109 +454,28 @@ fn run_speech_processor(
                         &diarized.segment.text,
                     );
 
-                    // 6. Knowledge Graph Extraction
+                    // 6. Knowledge Graph Extraction (delegated to helper)
                     {
                         let speaker = diarized
                             .segment
                             .speaker_label
                             .as_deref()
                             .unwrap_or("Unknown");
-                        let text = &diarized.segment.text;
-                        let timestamp = diarized.segment.start_time;
-                        let segment_id = &diarized.segment.id;
-
-                        // Try native LLM engine first, then sidecar, then rule-based
-                        let llm_result = {
-                            let engine_guard = llm_engine.lock().unwrap_or_else(|e| e.into_inner());
-                            if let Some(ref engine) = *engine_guard {
-                                match engine.extract_entities(text, speaker) {
-                                    Ok(result) => Some(result),
-                                    Err(e) => {
-                                        log::warn!("Native LLM extraction failed: {}", e);
-                                        None
-                                    }
-                                }
-                            } else {
-                                None
-                            }
-                        };
-
-                        let extraction_result = if let Some(result) = llm_result {
-                            log::debug!(
-                                "Native LLM extraction: {} entities, {} relations",
-                                result.entities.len(),
-                                result.relations.len()
-                            );
-                            result
-                        } else {
-                            // Fallback: try sidecar, then rule-based
-                            let sidecar = sidecar_manager.lock().unwrap_or_else(|e| e.into_inner());
-                            if sidecar.is_healthy() {
-                                match sidecar.extract_entities(speaker, text) {
-                                    Ok(result) => {
-                                        log::debug!(
-                                            "Sidecar LLM extraction: {} entities, {} relations",
-                                            result.entities.len(),
-                                            result.relations.len()
-                                        );
-                                        result
-                                    }
-                                    Err(e) => {
-                                        log::warn!(
-                                            "Sidecar extraction failed, using rule-based: {}",
-                                            e
-                                        );
-                                        graph_extractor.extract(speaker, text)
-                                    }
-                                }
-                            } else {
-                                graph_extractor.extract(speaker, text)
-                            }
-                        };
-
-                        extraction_count += 1;
-
-                        // Feed extraction into the knowledge graph
-                        if !extraction_result.entities.is_empty() {
-                            let mut graph =
-                                knowledge_graph.lock().unwrap_or_else(|e| e.into_inner());
-                            graph.process_extraction(
-                                &extraction_result,
-                                timestamp,
-                                speaker,
-                                segment_id,
-                            );
-
-                            graph_update_count += 1;
-
-                            // Update graph snapshot for frontend
-                            let snapshot = graph.snapshot();
-                            if let Ok(mut gs) = graph_snapshot.write() {
-                                *gs = snapshot.clone();
-                            }
-
-                            // Emit graph-update event
-                            let _ = app_handle.emit(crate::events::GRAPH_UPDATE, &snapshot);
-
-                            log::debug!(
-                                "Graph updated: {} nodes, {} edges",
-                                snapshot.stats.total_nodes,
-                                snapshot.stats.total_edges
-                            );
-                        }
-
-                        // Update entity_extraction and graph status, then emit pipeline status
-                        if let Ok(mut status) = pipeline_status.write() {
-                            status.entity_extraction = StageStatus::Running {
-                                processed_count: extraction_count,
-                            };
-                            status.graph = StageStatus::Running {
-                                processed_count: graph_update_count,
-                            };
-                        }
-                        if let Ok(status) = pipeline_status.read() {
-                            let _ = app_handle.emit(events::PIPELINE_STATUS_EVENT, &*status);
-                        }
+                        process_extraction_and_emit(
+                            &diarized.segment.text,
+                            speaker,
+                            &diarized.segment.id,
+                            diarized.segment.start_time,
+                            &llm_engine,
+                            &sidecar_manager,
+                            &graph_extractor,
+                            &knowledge_graph,
+                            &graph_snapshot,
+                            &pipeline_status,
+                            &app_handle,
+                            &mut extraction_count,
+                            &mut graph_update_count,
+                        );
                     }
                 }
             }
@@ -540,100 +567,28 @@ fn run_speech_processor_diarization_only(
             };
         }
 
-        // Knowledge Graph Extraction
+        // Knowledge Graph Extraction (delegated to helper)
         {
             let speaker = diarized
                 .segment
                 .speaker_label
                 .as_deref()
                 .unwrap_or("Unknown");
-            let text = &diarized.segment.text;
-            let timestamp = diarized.segment.start_time;
-            let segment_id = &diarized.segment.id;
-
-            // Try native LLM engine first, then sidecar, then rule-based
-            let llm_result = {
-                let engine_guard = llm_engine.lock().unwrap_or_else(|e| e.into_inner());
-                if let Some(ref engine) = *engine_guard {
-                    match engine.extract_entities(text, speaker) {
-                        Ok(result) => Some(result),
-                        Err(e) => {
-                            log::warn!("Native LLM extraction failed: {}", e);
-                            None
-                        }
-                    }
-                } else {
-                    None
-                }
-            };
-
-            let extraction_result = if let Some(result) = llm_result {
-                log::debug!(
-                    "Native LLM extraction: {} entities, {} relations",
-                    result.entities.len(),
-                    result.relations.len()
-                );
-                result
-            } else {
-                // Fallback: try sidecar, then rule-based
-                let sidecar = sidecar_manager.lock().unwrap_or_else(|e| e.into_inner());
-                if sidecar.is_healthy() {
-                    match sidecar.extract_entities(speaker, text) {
-                        Ok(result) => {
-                            log::debug!(
-                                "Sidecar LLM extraction: {} entities, {} relations",
-                                result.entities.len(),
-                                result.relations.len()
-                            );
-                            result
-                        }
-                        Err(e) => {
-                            log::warn!("Sidecar extraction failed, using rule-based: {}", e);
-                            graph_extractor.extract(speaker, text)
-                        }
-                    }
-                } else {
-                    graph_extractor.extract(speaker, text)
-                }
-            };
-
-            extraction_count += 1;
-
-            // Feed extraction into the knowledge graph
-            if !extraction_result.entities.is_empty() {
-                let mut graph = knowledge_graph.lock().unwrap_or_else(|e| e.into_inner());
-                graph.process_extraction(&extraction_result, timestamp, speaker, segment_id);
-
-                graph_update_count += 1;
-
-                // Update graph snapshot for frontend
-                let snapshot = graph.snapshot();
-                if let Ok(mut gs) = graph_snapshot.write() {
-                    *gs = snapshot.clone();
-                }
-
-                // Emit graph-update event
-                let _ = app_handle.emit(crate::events::GRAPH_UPDATE, &snapshot);
-
-                log::debug!(
-                    "Graph updated: {} nodes, {} edges",
-                    snapshot.stats.total_nodes,
-                    snapshot.stats.total_edges
-                );
-            }
-
-            // Update entity_extraction and graph status, then emit pipeline status
-            if let Ok(mut status) = pipeline_status.write() {
-                status.entity_extraction = StageStatus::Running {
-                    processed_count: extraction_count,
-                };
-                status.graph = StageStatus::Running {
-                    processed_count: graph_update_count,
-                };
-            }
-            if let Ok(status) = pipeline_status.read() {
-                let _ = app_handle.emit(events::PIPELINE_STATUS_EVENT, &*status);
-            }
+            process_extraction_and_emit(
+                &diarized.segment.text,
+                speaker,
+                &diarized.segment.id,
+                diarized.segment.start_time,
+                &llm_engine,
+                &sidecar_manager,
+                &graph_extractor,
+                &knowledge_graph,
+                &graph_snapshot,
+                &pipeline_status,
+                &app_handle,
+                &mut extraction_count,
+                &mut graph_update_count,
+            );
         }
     }
 
