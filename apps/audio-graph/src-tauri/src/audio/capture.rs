@@ -14,7 +14,9 @@ use std::time::{Duration, Instant};
 
 use crossbeam_channel::Sender;
 use rsac::{AudioCaptureBuilder, CaptureTarget};
+use tauri::{AppHandle, Emitter};
 
+use crate::events::{CaptureErrorPayload, CAPTURE_ERROR};
 use crate::state::{AudioSourceInfo, AudioSourceType};
 
 // ---------------------------------------------------------------------------
@@ -157,6 +159,7 @@ impl AudioCaptureManager {
         source_id: &str,
         target: CaptureTarget,
         pipeline_tx: Sender<AudioChunk>,
+        app_handle: AppHandle,
     ) -> Result<(), String> {
         if self.sources.contains_key(source_id) {
             return Err(format!("Source '{}' is already being captured", source_id));
@@ -176,7 +179,7 @@ impl AudioCaptureManager {
         let thread = std::thread::Builder::new()
             .name(format!("capture-{}", source_id))
             .spawn(move || {
-                Self::capture_thread_fn(sid, target, stop_clone, pipeline_tx);
+                Self::capture_thread_fn(sid, target, stop_clone, pipeline_tx, app_handle);
             })
             .map_err(|e| format!("Failed to spawn capture thread: {}", e))?;
 
@@ -268,6 +271,7 @@ impl AudioCaptureManager {
         target: CaptureTarget,
         stop_signal: Arc<AtomicBool>,
         pipeline_tx: Sender<AudioChunk>,
+        app_handle: AppHandle,
     ) {
         log::info!("[capture-{}] Thread started", source_id);
 
@@ -285,6 +289,14 @@ impl AudioCaptureManager {
                     source_id,
                     e
                 );
+                let _ = app_handle.emit(
+                    CAPTURE_ERROR,
+                    CaptureErrorPayload {
+                        source_id: source_id.clone(),
+                        error: format!("{}", e),
+                        recoverable: false,
+                    },
+                );
                 return;
             }
         };
@@ -292,6 +304,14 @@ impl AudioCaptureManager {
         // 2. Start capture.
         if let Err(e) = capture.start() {
             log::error!("[capture-{}] Failed to start capture: {}", source_id, e);
+            let _ = app_handle.emit(
+                CAPTURE_ERROR,
+                CaptureErrorPayload {
+                    source_id: source_id.clone(),
+                    error: format!("{}", e),
+                    recoverable: false,
+                },
+            );
             return;
         }
 
@@ -300,6 +320,14 @@ impl AudioCaptureManager {
             Ok(r) => r,
             Err(e) => {
                 log::error!("[capture-{}] Failed to subscribe: {}", source_id, e);
+                let _ = app_handle.emit(
+                    CAPTURE_ERROR,
+                    CaptureErrorPayload {
+                        source_id: source_id.clone(),
+                        error: format!("{}", e),
+                        recoverable: false,
+                    },
+                );
                 let _ = capture.stop();
                 return;
             }

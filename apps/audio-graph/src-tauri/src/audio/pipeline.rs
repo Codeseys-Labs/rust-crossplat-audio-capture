@@ -6,9 +6,11 @@
 
 use std::time::Duration;
 
+use audioadapter_buffers::direct::SequentialSliceOfVecs;
 use crossbeam_channel::{Receiver, Sender};
 use rubato::{
-    Resampler, SincFixedIn, SincInterpolationParameters, SincInterpolationType, WindowFunction,
+    Async, FixedAsync, Resampler, SincInterpolationParameters, SincInterpolationType,
+    WindowFunction,
 };
 
 use super::capture::AudioChunk;
@@ -39,7 +41,7 @@ pub struct AudioPipeline {
     /// Sends processed chunks downstream (ASR, VAD, etc.).
     output_tx: Sender<ProcessedAudioChunk>,
     /// rubato resampler (created lazily on first chunk).
-    resampler: Option<SincFixedIn<f32>>,
+    resampler: Option<Async<f32>>,
     /// Input sample rate the resampler was created for.
     resampler_input_rate: u32,
     /// Buffer accumulating mono samples waiting for the resampler.
@@ -76,28 +78,6 @@ impl AudioPipeline {
         }
         self.flush();
         log::info!("AudioPipeline: processing loop ended (channel closed)");
-    }
-
-    /// Run with timeout — returns when channel closes or no data for the given duration.
-    pub fn run_with_timeout(&mut self, timeout: Duration) {
-        log::info!(
-            "AudioPipeline: starting processing loop (timeout={:?})",
-            timeout
-        );
-        loop {
-            match self.audio_rx.recv_timeout(timeout) {
-                Ok(chunk) => self.process_chunk(chunk),
-                Err(crossbeam_channel::RecvTimeoutError::Timeout) => {
-                    // No data for a while — keep waiting
-                    continue;
-                }
-                Err(crossbeam_channel::RecvTimeoutError::Disconnected) => {
-                    break;
-                }
-            }
-        }
-        self.flush();
-        log::info!("AudioPipeline: processing loop ended (timeout variant)");
     }
 
     /// Process a single audio chunk: mixdown → resample → accumulate → emit.
@@ -162,15 +142,24 @@ impl AudioPipeline {
                 break;
             }
 
-            // Drain exactly `needed` samples
+            // Drain exactly `needed` samples into a channel vec
             let input_chunk: Vec<f32> = self.resampler_input_buffer.drain(..needed).collect();
             let waves_in = vec![input_chunk];
 
-            match resampler.process(&waves_in, None) {
-                Ok(waves_out) => {
-                    if let Some(resampled) = waves_out.first() {
-                        self.accumulation_buffer.extend_from_slice(resampled);
-                    }
+            // Wrap in audioadapter SequentialSliceOfVecs for rubato 1.0 API
+            let input_adapter = match SequentialSliceOfVecs::new(&waves_in, 1, needed) {
+                Ok(a) => a,
+                Err(e) => {
+                    log::error!("AudioPipeline: failed to create input adapter: {}", e);
+                    break;
+                }
+            };
+
+            match resampler.process(&input_adapter, 0, None) {
+                Ok(interleaved_out) => {
+                    // For mono, interleaved data is just the samples directly
+                    let resampled = interleaved_out.take_data();
+                    self.accumulation_buffer.extend_from_slice(&resampled);
                 }
                 Err(e) => {
                     log::error!("AudioPipeline: resampling error: {}", e);
@@ -242,7 +231,7 @@ impl AudioPipeline {
     }
 
     /// Create a rubato sinc resampler for the given input sample rate → 16kHz.
-    fn create_resampler(input_rate: u32) -> Result<SincFixedIn<f32>, String> {
+    fn create_resampler(input_rate: u32) -> Result<Async<f32>, String> {
         let ratio = TARGET_SAMPLE_RATE as f64 / input_rate as f64;
 
         let params = SincInterpolationParameters {
@@ -253,12 +242,13 @@ impl AudioPipeline {
             window: WindowFunction::BlackmanHarris2,
         };
 
-        SincFixedIn::<f32>::new(
+        Async::<f32>::new_sinc(
             ratio,
             2.0, // max_resample_ratio_relative
-            params,
+            &params,
             RESAMPLER_CHUNK_SIZE,
             1, // mono
+            FixedAsync::Input,
         )
         .map_err(|e| format!("Failed to create resampler: {}", e))
     }

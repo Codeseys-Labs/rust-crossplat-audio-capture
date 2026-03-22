@@ -17,6 +17,7 @@ pub mod commands;
 pub mod diarization;
 pub mod events;
 pub mod graph;
+pub mod llm;
 pub mod sidecar;
 pub mod state;
 
@@ -38,6 +39,9 @@ pub fn run() {
             commands::get_graph_snapshot,
             commands::get_transcript,
             commands::get_pipeline_status,
+            commands::send_chat_message,
+            commands::get_chat_history,
+            commands::clear_chat_history,
         ])
         .run(tauri::generate_context!())
         .expect("error while running AudioGraph");

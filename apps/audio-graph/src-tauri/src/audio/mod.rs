@@ -5,6 +5,8 @@
 
 pub mod capture;
 pub mod pipeline;
+pub mod vad;
 
 pub use capture::{AudioCaptureManager, AudioChunk};
 pub use pipeline::ProcessedAudioChunk;
+pub use vad::{SpeechSegment, VadProcessor};
