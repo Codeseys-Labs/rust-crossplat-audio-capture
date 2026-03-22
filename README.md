@@ -9,7 +9,7 @@ A robust, high-performance audio capture library for Rust, supporting Windows, m
 - **Cross-Platform Support**
   - Windows: WASAPI-based capture with both system-wide and application-specific support
   - Linux: Modern PipeWire backend (preferred) with PulseAudio fallback, supporting both system-wide and application-specific capture
-  - macOS: CoreAudio implementation with system-wide capture
+  - macOS: CoreAudio implementation with system-wide and application-specific capture (Process Tap, macOS 14.4+)
 
 ### Audio Capabilities
 
@@ -23,7 +23,13 @@ A robust, high-performance audio capture library for Rust, supporting Windows, m
 
   - Windows: WASAPI-based per-application capture
   - Linux: PipeWire/PulseAudio process-specific capture
+  - macOS: CoreAudio Process Tap for per-application capture (requires macOS 14.4+)
   - Capture from multiple applications simultaneously
+
+- **Process Tree Capture**
+  - Windows: WASAPI process loopback for child process trees
+  - Linux: PipeWire PID-based node mapping for process trees
+  - macOS: CoreAudio Process Tap for process tree capture (macOS 14.4+)
 
 - **Flexible Output Formats**
   - Multiple formats: WAV, RAW PCM
@@ -35,10 +41,10 @@ A robust, high-performance audio capture library for Rust, supporting Windows, m
 
 ### Advanced Features
 
-- Async support with Tokio
+- Async stream support (optional, via `atomic-waker`)
 - Lock-free audio buffers
-- SIMD optimizations
-- Zero-copy audio processing
+- Ring buffer overflow monitoring (`overrun_count()`)
+- Push-based subscription (`subscribe()` for channel-based delivery)
 - Comprehensive error handling
 - Detailed logging and diagnostics
 
@@ -49,6 +55,21 @@ A robust, high-performance audio capture library for Rust, supporting Windows, m
 - Mock implementations for testing
 - Comprehensive documentation
 - Performance benchmarks
+
+## Applications Built on rsac
+
+### AudioGraph 🎙️🔗
+
+[AudioGraph](apps/audio-graph/) is a desktop application that captures live system audio, performs real-time speech recognition, identifies speakers, extracts entities, and builds an evolving temporal knowledge graph — all visualized in a force-directed graph.
+
+Built with Tauri v2 (Rust backend + React frontend), AudioGraph demonstrates rsac's streaming-first capture capabilities in a real-world pipeline:
+
+- **Audio Capture** → Voice Activity Detection → Automatic Speech Recognition (Whisper) → Speaker Diarization → Entity Extraction → Temporal Knowledge Graph
+- Supports system-wide and per-application capture on all three platforms
+- Native LLM inference via llama.cpp or OpenAI-compatible API endpoints
+- GPU-accelerated (Metal on macOS, CUDA/Vulkan on Windows/Linux)
+
+See the [AudioGraph README](apps/audio-graph/README.md) for setup instructions and architecture details.
 
 ## Installation
 
@@ -90,7 +111,7 @@ RSAC supports both interactive and command-line modes, with bounded or unbounded
 - **NEW**: Application-specific capture via CoreAudio Process Tap (macOS 14.4+)
 - Requires Screen Recording permission to be granted
 - Process Tap requires additional permissions for application audio access
-- Process selection is limited to system audio
+- Application-specific capture available on macOS 14.4+ via Process Tap
 
 ### Interactive Mode
 

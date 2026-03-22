@@ -69,94 +69,263 @@ See [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md) for the full architecture doc
 
 ---
 
-## Prerequisites
+## Setup
 
-| Requirement | Details |
-|---|---|
-| **Rust** | 1.75+ with `cargo` |
-| **Bun** | 1.0+ (runtime & package manager) |
-| **cmake** | Required by `whisper-rs` and `llama-cpp-2` build scripts |
-| **clang** | Required by `bindgen` for FFI bindings |
-| **Whisper model** | GGML model file (see [Model Setup](#model-setup)) |
+### Windows (Step-by-Step)
 
-### Linux (Debian/Ubuntu)
-
-Install build tools and PipeWire development libraries:
-
-```bash
-# Build essentials + clang/LLVM (for bindgen + llama.cpp)
-sudo apt install build-essential cmake clang libclang-dev
-
-# PipeWire audio backend
-sudo apt install libpipewire-0.3-dev libspa-0.2-dev
-
-# Tauri v2 system dependencies (WebKitGTK, etc.)
-sudo apt install libwebkit2gtk-4.1-dev libgtk-3-dev libayatana-appindicator3-dev librsvg2-dev
-```
-
-### Windows
-
-1. **Visual Studio Build Tools 2019+** with the "Desktop development with C++" workload:
-   - Download from [visualstudio.microsoft.com](https://visualstudio.microsoft.com/visual-cpp-build-tools/)
-   - Or: `winget install Microsoft.VisualStudio.2022.BuildTools`
-
-2. **CMake** and **LLVM/Clang** (for `whisper-rs` and `llama-cpp-2` bindgen):
+1. **Install Rust** via [rustup](https://rustup.rs/):
    ```powershell
-   winget install Kitware.CMake LLVM.LLVM
+   winget install Rustlang.Rustup
+   # Or download from https://rustup.rs
    ```
 
-3. **WebView2 Runtime** — pre-installed on Windows 10 (1803+) and Windows 11. If missing:
+2. **Install Visual Studio Build Tools 2019+** with the "Desktop development with C++" workload:
    ```powershell
-   winget install Microsoft.EdgeWebView2Runtime
+   winget install Microsoft.VisualStudio.2022.BuildTools
+   ```
+   > During installation, select the **"Desktop development with C++"** workload. This provides MSVC, Windows SDK, and the C++ toolchain needed by Rust and native dependencies.
+
+3. **Install CMake** (required by `whisper-rs` and `llama-cpp-2` build scripts):
+   ```powershell
+   winget install Kitware.CMake
    ```
 
-4. **Bun**:
+4. **Install LLVM/Clang** (required by `bindgen` for FFI bindings):
+   ```powershell
+   winget install LLVM.LLVM
+   ```
+
+5. **Install Bun** (frontend runtime & package manager):
    ```powershell
    powershell -c "irm bun.sh/install.ps1 | iex"
    ```
 
-### macOS
+6. **Clone the repo and navigate to the app**:
+   ```powershell
+   git clone https://github.com/user/rust-crossplat-audio-capture.git
+   cd rust-crossplat-audio-capture/apps/audio-graph
+   ```
 
-1. **Xcode Command Line Tools** (provides clang, Metal framework, CoreAudio):
+7. **Install frontend dependencies**:
+   ```powershell
+   bun install
+   ```
+
+8. **Download ML models** (Whisper for ASR, optional LLM for entity extraction):
+   ```powershell
+   .\scripts\download-models.ps1
+   ```
+   > Or skip this step — AudioGraph can download models in-app via the model manager.
+
+9. **Build the Rust backend**:
+   ```powershell
+   cd src-tauri
+   cargo build
+   # For NVIDIA GPU acceleration:
+   # cargo build --features cuda
+   cd ..
+   ```
+
+10. **Run in development mode**:
+    ```powershell
+    bun run tauri dev
+    ```
+
+11. **First-run workflow**: Select an audio source from the dropdown → click Start → watch the knowledge graph build in real time.
+
+### macOS (Step-by-Step)
+
+1. **Install Rust** via [rustup](https://rustup.rs/):
+   ```bash
+   curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh
+   ```
+
+2. **Install Xcode Command Line Tools** (provides clang, Metal framework, CoreAudio):
    ```bash
    xcode-select --install
    ```
 
-2. **CMake** (for `whisper-rs` and `llama-cpp-2`):
+3. **Install CMake** (required by `whisper-rs` and `llama-cpp-2`):
    ```bash
    brew install cmake
    ```
+   > CMake may auto-detect via Xcode in some configurations, but explicit installation is recommended.
 
-3. **Cargo config** for Apple Silicon (M1/M2/M3) — create or append to `~/.cargo/config.toml`:
-   ```toml
-   [target.aarch64-apple-darwin]
-   rustflags = ["-C", "link-arg=-lc++", "-C", "link-arg=-framework", "-C", "link-arg=Accelerate"]
+4. **Install Bun** (frontend runtime & package manager):
+   ```bash
+   curl -fsSL https://bun.sh/install | bash
    ```
 
-> **Note:** On macOS, `whisper-rs` and `llama-cpp-2` are built with Metal GPU acceleration
-> enabled automatically (see `Cargo.toml` platform-specific features). macOS 14.4+ is
-> required for full audio capture support (Process Tap API).
+5. **Clone the repo and navigate to the app**:
+   ```bash
+   git clone https://github.com/user/rust-crossplat-audio-capture.git
+   cd rust-crossplat-audio-capture/apps/audio-graph
+   ```
+
+6. **Install frontend dependencies**:
+   ```bash
+   bun install
+   ```
+
+7. **Download ML models** (Whisper for ASR, optional LLM for entity extraction):
+   ```bash
+   ./scripts/download-models.sh
+   ```
+   > Or skip this step — AudioGraph can download models in-app via the model manager.
+
+8. **Build the Rust backend** (Metal GPU acceleration enabled automatically on macOS):
+   ```bash
+   cd src-tauri && cargo build && cd ..
+   ```
+
+9. **Run in development mode**:
+   ```bash
+   bun run tauri dev
+   ```
+
+10. **Grant microphone permission** when prompted by macOS. AudioGraph needs audio capture access.
+
+11. **For application-specific capture**: Requires **macOS 14.4+** (Sonoma with Process Tap API). On older macOS versions, only system-wide capture is available.
+
+### Linux (Debian/Ubuntu)
+
+1. **Install Rust** via [rustup](https://rustup.rs/):
+   ```bash
+   curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh
+   ```
+
+2. **Install build tools, clang, and PipeWire development libraries**:
+   ```bash
+   # Build essentials + clang/LLVM (for bindgen + llama.cpp)
+   sudo apt install build-essential cmake clang libclang-dev
+
+   # PipeWire audio backend
+   sudo apt install libpipewire-0.3-dev libspa-0.2-dev
+
+   # Tauri v2 system dependencies (WebKitGTK, etc.)
+   sudo apt install libwebkit2gtk-4.1-dev libgtk-3-dev libayatana-appindicator3-dev librsvg2-dev
+   ```
+
+3. **Install Bun**:
+   ```bash
+   curl -fsSL https://bun.sh/install | bash
+   ```
+
+4. **Clone, install, and run**:
+   ```bash
+   git clone https://github.com/user/rust-crossplat-audio-capture.git
+   cd rust-crossplat-audio-capture/apps/audio-graph
+   bun install
+   ./scripts/download-models.sh    # or use in-app model manager
+   bun run tauri dev
+   ```
 
 ---
 
-## Quick Start
+## Configuration Reference
 
-```bash
-# Navigate to the app directory
-cd apps/audio-graph
+### LLM Backend Selection
 
-# Install frontend dependencies
-bun install
+AudioGraph supports two LLM backends for entity extraction and chat:
 
-# Download the Whisper model
-#   Linux/macOS:
-./scripts/download-models.sh
-#   Windows (PowerShell):
-#   .\scripts\download-models.ps1
+| Backend | Description | When to Use |
+|---|---|---|
+| **Native (llama-cpp-2)** | In-process GGUF model inference | Offline use, low latency, no API keys |
+| **API (OpenAI-compatible)** | HTTP calls to external endpoint | Cloud models, larger models, no local GPU |
 
-# Run in development mode
-bun run tauri dev
+The extraction chain tries backends in order: **native LLM → API endpoint → rule-based NER**.
+
+### Model Paths and Download
+
+| Model | Purpose | Size | Download |
+|---|---|---|---|
+| `ggml-small.en.bin` | Whisper ASR (speech recognition) | ~500 MB | `./scripts/download-models.sh` or in-app |
+| `lfm2-350m-extract-q4_k_m.gguf` | Entity extraction + chat | ~350 MB | `./scripts/download-models.sh` or in-app |
+| Silero VAD v5 | Voice activity detection | ~2 MB | Auto-downloaded on first run |
+
+Models are stored in `apps/audio-graph/models/` (gitignored).
+
+### GPU Acceleration
+
+| Platform | Backend | How to Enable |
+|---|---|---|
+| **macOS** | Metal | Automatic — enabled by default |
+| **Windows / Linux** | CUDA (NVIDIA) | `cargo build --features cuda` |
+| **Windows / Linux** | Vulkan (AMD/NVIDIA/Intel) | `cargo build --features vulkan` |
+| **All** | CPU only | Default build, no flags needed |
+
+### API Endpoint Configuration
+
+Configure an OpenAI-compatible API endpoint for entity extraction and chat:
+
+```typescript
+// OpenAI
+configureApiEndpoint({
+    endpoint: 'https://api.openai.com/v1',
+    apiKey: 'sk-...',
+    model: 'gpt-4o-mini',
+});
+
+// Ollama (local, no API key)
+configureApiEndpoint({
+    endpoint: 'http://localhost:11434/v1',
+    model: 'qwen2.5:3b',
+});
+
+// LM Studio (local, no API key)
+configureApiEndpoint({
+    endpoint: 'http://localhost:1234/v1',
+    model: 'loaded-model-name',
+});
+
+// OpenRouter
+configureApiEndpoint({
+    endpoint: 'https://openrouter.ai/api/v1',
+    apiKey: 'sk-or-...',
+    model: 'anthropic/claude-sonnet-4',
+});
 ```
+
+### Audio Capture Settings
+
+Configured in [`src-tauri/config/default.toml`](src-tauri/config/default.toml):
+
+| Setting | Default | Description |
+|---|---|---|
+| `audio.sample_rate` | 48000 | Capture sample rate (Hz) |
+| `audio.channels` | 2 | Capture channels (stereo) |
+| `audio.buffer_size` | 4096 | Buffer size per read |
+| `audio.ring_buffer_capacity` | 262144 | Ring buffer capacity (samples) |
+| `pipeline.vad_threshold` | 0.5 | VAD speech probability threshold |
+| `asr.model_path` | `models/ggml-small.en.bin` | Whisper model file path |
+| `asr.language` | `en` | ASR language |
+
+---
+
+## Platform Capabilities Matrix
+
+### Audio Capture Modes
+
+| Capture Mode | Windows (WASAPI) | Linux (PipeWire) | macOS (CoreAudio) |
+|---|---|---|---|
+| **System default** | ✅ | ✅ | ✅ |
+| **Specific device** | ✅ | ✅ | ✅ |
+| **Application (by PID)** | ✅ Process loopback | ✅ pw-dump node | ✅ Process Tap (14.4+) |
+| **Application (by name)** | ✅ sysinfo → PID | ✅ pw-dump → node serial | ✅ Process Tap (14.4+) |
+| **Process tree** | ✅ Process loopback | ✅ PID → PipeWire node | ✅ Process Tap (14.4+) |
+
+### LLM Backends
+
+| Feature | Native (llama-cpp-2) | API (OpenAI-compatible) |
+|---|---|---|
+| **Offline operation** | ✅ | ❌ (requires network) |
+| **Latency** | Low (in-process) | Varies (network-dependent) |
+| **Model size** | Limited by local RAM/VRAM | Unlimited (cloud) |
+| **GPU acceleration** | Metal / CUDA / Vulkan | N/A (server-side) |
+| **Entity extraction** | ✅ Grammar-constrained JSON | ✅ JSON mode |
+| **Chat** | ✅ Free-form generation | ✅ Free-form generation |
+| **Cost** | Free (local compute) | Per-token pricing |
+| **Providers** | Local GGUF files | OpenAI, OpenRouter, Ollama, LM Studio, vLLM, Groq, Together AI |
 
 ---
 
