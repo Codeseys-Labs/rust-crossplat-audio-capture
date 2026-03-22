@@ -1,72 +1,113 @@
 import { useAudioGraphStore } from "../store";
 import type { StageStatus, SidecarStatus } from "../types";
 
-function getStageLabel(status: StageStatus): string {
+/** Pipeline stages in processing order, with icons. */
+const PIPELINE_STAGES = [
+  { key: "capture" as const, name: "Capture", icon: "🎙️" },
+  { key: "pipeline" as const, name: "Resample", icon: "🔄" },
+  { key: "asr" as const, name: "ASR", icon: "📝" },
+  { key: "diarization" as const, name: "Diarization", icon: "👥" },
+  { key: "entity_extraction" as const, name: "Extraction", icon: "🔍" },
+  { key: "graph" as const, name: "Graph", icon: "🕸️" },
+] as const;
+
+/** Map StageStatus to a CSS modifier and tooltip. */
+function stageStatusInfo(status: StageStatus): {
+  modifier: string;
+  tooltip: string;
+} {
   switch (status.type) {
     case "Idle":
-      return "Idle";
+      return { modifier: "idle", tooltip: "Idle" };
     case "Running":
-      return `Running (${status.processed_count})`;
+      return {
+        modifier: "running",
+        tooltip: `Running — ${status.processed_count} processed`,
+      };
     case "Error":
-      return `Error: ${status.message}`;
+      return { modifier: "error", tooltip: `Error: ${status.message}` };
   }
 }
 
-function getSidecarLabel(status: SidecarStatus): string {
+/** Map SidecarStatus to display info. */
+function sidecarInfo(status: SidecarStatus): {
+  modifier: string;
+  label: string;
+  tooltip: string;
+} {
   switch (status.type) {
     case "NotStarted":
-      return "Not Started";
+      return { modifier: "idle", label: "Sidecar", tooltip: "Not started" };
     case "Starting":
-      return "Starting...";
+      return {
+        modifier: "running",
+        label: "Sidecar",
+        tooltip: "Starting…",
+      };
     case "Healthy":
-      return "Healthy";
+      return { modifier: "running", label: "Sidecar", tooltip: "Healthy" };
     case "Unhealthy":
-      return `Unhealthy: ${status.reason}`;
+      return {
+        modifier: "error",
+        label: "Sidecar",
+        tooltip: `Unhealthy: ${status.reason}`,
+      };
     case "Stopped":
-      return "Stopped";
-  }
-}
-
-function getStatusColor(status: StageStatus): string {
-  switch (status.type) {
-    case "Idle":
-      return "var(--text-muted)";
-    case "Running":
-      return "var(--accent-green)";
-    case "Error":
-      return "var(--accent-red)";
+      return { modifier: "idle", label: "Sidecar", tooltip: "Stopped" };
   }
 }
 
 function PipelineStatusBar() {
   const pipelineStatus = useAudioGraphStore((s) => s.pipelineStatus);
 
-  const stages = [
-    { name: "Capture", status: pipelineStatus.capture },
-    { name: "Pipeline", status: pipelineStatus.pipeline },
-    { name: "ASR", status: pipelineStatus.asr },
-    { name: "Diarization", status: pipelineStatus.diarization },
-    { name: "Extraction", status: pipelineStatus.entity_extraction },
-    { name: "Graph", status: pipelineStatus.graph },
-  ];
+  const sidecar = sidecarInfo(pipelineStatus.sidecar);
 
   return (
-    <div className="pipeline-status-bar">
-      {stages.map((stage) => (
-        <div key={stage.name} className="status-item">
-          <span
-            className="status-dot"
-            style={{ backgroundColor: getStatusColor(stage.status) }}
-          />
-          <span className="status-label">{stage.name}</span>
-          <span className="status-value">{getStageLabel(stage.status)}</span>
-        </div>
-      ))}
-      <div className="status-item sidecar-status">
-        <span className="status-label">Sidecar</span>
-        <span className="status-value">{getSidecarLabel(pipelineStatus.sidecar)}</span>
+    <nav
+      className="pipeline-status"
+      aria-label="Pipeline status"
+      role="status"
+    >
+      {PIPELINE_STAGES.map((stage, idx) => {
+        const status = pipelineStatus[stage.key];
+        const info = stageStatusInfo(status);
+
+        return (
+          <div key={stage.key} className="pipeline-stage__wrapper">
+            {idx > 0 && (
+              <span className="pipeline-stage__arrow" aria-hidden="true">
+                →
+              </span>
+            )}
+            <div className="pipeline-stage" title={info.tooltip}>
+              <span className="pipeline-stage__icon" aria-hidden="true">
+                {stage.icon}
+              </span>
+              <span className="pipeline-stage__name">{stage.name}</span>
+              <span
+                className={`pipeline-stage__dot pipeline-stage__dot--${info.modifier}`}
+                aria-label={`${stage.name}: ${info.tooltip}`}
+              />
+            </div>
+          </div>
+        );
+      })}
+
+      {/* Sidecar status (separated) */}
+      <span className="pipeline-stage__divider" aria-hidden="true">
+        │
+      </span>
+      <div className="pipeline-stage" title={sidecar.tooltip}>
+        <span className="pipeline-stage__icon" aria-hidden="true">
+          ⚡
+        </span>
+        <span className="pipeline-stage__name">{sidecar.label}</span>
+        <span
+          className={`pipeline-stage__dot pipeline-stage__dot--${sidecar.modifier}`}
+          aria-label={`Sidecar: ${sidecar.tooltip}`}
+        />
       </div>
-    </div>
+    </nav>
   );
 }
 

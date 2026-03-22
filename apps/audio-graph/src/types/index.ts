@@ -27,7 +27,10 @@ export interface TranscriptSegment {
     confidence: number;
 }
 
-// Knowledge graph types
+// ---------------------------------------------------------------------------
+// Knowledge graph internal types
+// ---------------------------------------------------------------------------
+
 export interface GraphEntity {
     id: string;
     name: string;
@@ -36,6 +39,8 @@ export interface GraphEntity {
     first_seen: number;
     last_seen: number;
     aliases: string[];
+    description?: string;
+    speakers: string[];
 }
 
 export interface GraphRelation {
@@ -49,12 +54,52 @@ export interface GraphRelation {
     source_segment_id: string;
 }
 
+// ---------------------------------------------------------------------------
+// react-force-graph compatible types (sent from backend via events)
+// ---------------------------------------------------------------------------
+
+/** A graph node ready for react-force-graph rendering. */
+export interface GraphNode {
+    id: string;
+    name: string;
+    entity_type: string;
+    /** Node size (based on mention_count). */
+    val: number;
+    /** Hex color by entity_type. */
+    color: string;
+    first_seen: number;
+    last_seen: number;
+    mention_count: number;
+    description?: string;
+}
+
+/** A graph link ready for react-force-graph rendering. */
+export interface GraphLink {
+    /** Source node id. */
+    source: string;
+    /** Target node id. */
+    target: string;
+    relation_type: string;
+    weight: number;
+    color: string;
+    label?: string;
+}
+
+/** Aggregate graph statistics. */
+export interface GraphStats {
+    total_nodes: number;
+    total_edges: number;
+    total_episodes: number;
+}
+
+/** A point-in-time snapshot of the knowledge graph for frontend rendering. */
 export interface GraphSnapshot {
-    entities: GraphEntity[];
-    relations: GraphRelation[];
-    last_updated: number;
-    node_count: number;
-    edge_count: number;
+    /** All nodes in react-force-graph format. */
+    nodes: GraphNode[];
+    /** All links in react-force-graph format. */
+    links: GraphLink[];
+    /** Aggregate statistics. */
+    stats: GraphStats;
 }
 
 // Pipeline status types
@@ -101,4 +146,70 @@ export interface CaptureErrorPayload {
     source_id: string;
     error: string;
     recoverable: boolean;
+}
+
+// ---------------------------------------------------------------------------
+// Chat types
+// ---------------------------------------------------------------------------
+
+export interface ChatMessage {
+    role: "user" | "assistant" | "system";
+    content: string;
+}
+
+export interface ChatResponse {
+    message: ChatMessage;
+    tokens_used: number;
+}
+
+// ---------------------------------------------------------------------------
+// Store type
+// ---------------------------------------------------------------------------
+
+/** Shape of the Zustand audio-graph store. */
+export interface AudioGraphStore {
+    // Audio sources
+    audioSources: AudioSourceInfo[];
+    selectedSourceId: string | null;
+    setAudioSources: (sources: AudioSourceInfo[]) => void;
+    setSelectedSourceId: (id: string | null) => void;
+    fetchSources: () => Promise<void>;
+
+    // Transcript
+    transcriptSegments: TranscriptSegment[];
+    addTranscriptSegment: (segment: TranscriptSegment) => void;
+    clearTranscript: () => void;
+
+    // Knowledge graph
+    graphSnapshot: GraphSnapshot;
+    setGraphSnapshot: (snapshot: GraphSnapshot) => void;
+
+    // Pipeline status
+    pipelineStatus: PipelineStatus;
+    setPipelineStatus: (status: PipelineStatus) => void;
+
+    // Speakers
+    speakers: SpeakerInfo[];
+    addOrUpdateSpeaker: (speaker: SpeakerInfo) => void;
+    clearSpeakers: () => void;
+
+    // Capture state
+    isCapturing: boolean;
+    captureStartTime: number | null;
+    setIsCapturing: (capturing: boolean) => void;
+    startCapture: () => Promise<void>;
+    stopCapture: () => Promise<void>;
+
+    // Error state
+    error: string | null;
+    setError: (error: string | null) => void;
+    clearError: () => void;
+
+    // ── Chat ─────────────────────────────────────────────────────────────
+    chatMessages: ChatMessage[];
+    isChatLoading: boolean;
+    rightPanelTab: "transcript" | "chat";
+    setRightPanelTab: (tab: "transcript" | "chat") => void;
+    sendChatMessage: (message: string) => Promise<void>;
+    clearChatHistory: () => Promise<void>;
 }

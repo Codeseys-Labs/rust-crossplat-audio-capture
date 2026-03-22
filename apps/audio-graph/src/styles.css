@@ -1,14 +1,15 @@
 :root {
   --bg-primary: #1a1a2e;
-  --bg-secondary: #16162a;
-  --bg-tertiary: #0f0f1a;
-  --border-color: #2a2a4a;
-  --text-primary: #e0e0e0;
+  --bg-secondary: #16213e;
+  --bg-tertiary: #0f3460;
+  --border-color: #2a2a3e;
+  --text-primary: #e8e8e8;
   --text-secondary: #a0a0b0;
   --text-muted: #6a6a7a;
-  --accent-blue: #4a9eff;
-  --accent-green: #4aff9e;
-  --accent-red: #ff4a4a;
+  --accent: #e94560;
+  --accent-red: #e94560;
+  --accent-green: #4ade80;
+  --accent-blue: #60a5fa;
   --accent-yellow: #ffcc4a;
   --accent-purple: #9e4aff;
 }

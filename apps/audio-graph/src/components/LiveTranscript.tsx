@@ -1,36 +1,142 @@
-import { useRef, useEffect } from "react";
+import { useRef, useEffect, useMemo, useCallback } from "react";
 import { useAudioGraphStore } from "../store";
+
+/** Format seconds as M:SS (e.g. "2:15"). */
+function formatTime(seconds: number): string {
+  const mins = Math.floor(seconds / 60);
+  const secs = Math.floor(seconds % 60);
+  return `${mins}:${secs.toString().padStart(2, "0")}`;
+}
+
+/** Default fallback colors when speaker has no assigned color. */
+const FALLBACK_COLORS = [
+  "#60a5fa",
+  "#f59e0b",
+  "#10b981",
+  "#ef4444",
+  "#a78bfa",
+  "#ec4899",
+  "#6b7280",
+];
 
 function LiveTranscript() {
   const segments = useAudioGraphStore((s) => s.transcriptSegments);
-  const scrollRef = useRef<HTMLDivElement>(null);
+  const speakers = useAudioGraphStore((s) => s.speakers);
 
+  const scrollRef = useRef<HTMLDivElement>(null);
+  const wasNearBottomRef = useRef(true);
+
+  // Build a quick speaker-color lookup
+  const speakerColorMap = useMemo(() => {
+    const map = new Map<string, string>();
+    speakers.forEach((s) => {
+      map.set(s.id, s.color);
+    });
+    return map;
+  }, [speakers]);
+
+  // Get color for a speaker, with fallback
+  const getSpeakerColor = useCallback(
+    (speakerId: string | null): string => {
+      if (!speakerId) return FALLBACK_COLORS[0];
+      const mapped = speakerColorMap.get(speakerId);
+      if (mapped) return mapped;
+      // Deterministic fallback based on id hash
+      let hash = 0;
+      for (let i = 0; i < speakerId.length; i++) {
+        hash = (hash * 31 + speakerId.charCodeAt(i)) | 0;
+      }
+      return FALLBACK_COLORS[Math.abs(hash) % FALLBACK_COLORS.length];
+    },
+    [speakerColorMap]
+  );
+
+  // Auto-scroll: only if user is near the bottom
   useEffect(() => {
-    if (scrollRef.current) {
-      scrollRef.current.scrollTop = scrollRef.current.scrollHeight;
+    const el = scrollRef.current;
+    if (!el) return;
+
+    // Check if we were near the bottom before the new segment arrived
+    if (wasNearBottomRef.current) {
+      el.scrollTop = el.scrollHeight;
     }
   }, [segments]);
 
-  const formatTime = (seconds: number): string => {
-    const mins = Math.floor(seconds / 60);
-    const secs = Math.floor(seconds % 60);
-    return `${mins.toString().padStart(2, "0")}:${secs.toString().padStart(2, "0")}`;
-  };
+  // Track scroll position to decide auto-scroll behavior
+  const handleScroll = useCallback(() => {
+    const el = scrollRef.current;
+    if (!el) return;
+    const distanceFromBottom =
+      el.scrollHeight - el.scrollTop - el.clientHeight;
+    wasNearBottomRef.current = distanceFromBottom < 100;
+  }, []);
+
+  // Display last 200 segments for performance
+  const visibleSegments = useMemo(
+    () => segments.slice(-200),
+    [segments]
+  );
 
   return (
-    <div className="panel live-transcript">
-      <h3 className="panel-title">Live Transcript</h3>
-      <div className="transcript-scroll" ref={scrollRef}>
-        {segments.length === 0 ? (
-          <p className="panel-empty">Waiting for speech...</p>
+    <div className="transcript">
+      <div className="transcript__header">
+        <h3 className="panel-title">Live Transcript</h3>
+        {segments.length > 0 && (
+          <span className="transcript__count">{segments.length}</span>
+        )}
+      </div>
+
+      <div
+        className="transcript__list"
+        ref={scrollRef}
+        onScroll={handleScroll}
+        role="log"
+        aria-live="polite"
+        aria-label="Live transcript"
+      >
+        {visibleSegments.length === 0 ? (
+          <div className="transcript__empty">
+            <span className="transcript__empty-icon" aria-hidden="true">
+              ═══
+            </span>
+            <p className="transcript__empty-text">Waiting for speech…</p>
+          </div>
         ) : (
-          segments.map((seg) => (
-            <div key={seg.id} className="transcript-entry">
-              <span className="transcript-time">{formatTime(seg.start_time)}</span>
-              {seg.speaker_label && (
-                <span className="transcript-speaker">{seg.speaker_label}</span>
+          visibleSegments.map((seg) => (
+            <div key={seg.id} className="transcript__segment">
+              <div className="transcript__segment-header">
+                {seg.speaker_label && (
+                  <span
+                    className="transcript__speaker-badge"
+                    style={{
+                      backgroundColor: `${getSpeakerColor(seg.speaker_id)}20`,
+                      color: getSpeakerColor(seg.speaker_id),
+                      borderColor: `${getSpeakerColor(seg.speaker_id)}40`,
+                    }}
+                  >
+                    {seg.speaker_label}
+                  </span>
+                )}
+                <span className="transcript__timestamp">
+                  {formatTime(seg.start_time)}
+                </span>
+              </div>
+              <p className="transcript__text">{seg.text}</p>
+              {seg.confidence < 1 && (
+                <div
+                  className="transcript__confidence"
+                  role="meter"
+                  aria-valuenow={Math.round(seg.confidence * 100)}
+                  aria-valuemin={0}
+                  aria-valuemax={100}
+                  aria-label={`Confidence: ${Math.round(seg.confidence * 100)}%`}
+                >
+                  <div
+                    className="transcript__confidence-fill"
+                    style={{ width: `${seg.confidence * 100}%` }}
+                  />
+                </div>
               )}
-              <span className="transcript-text">{seg.text}</span>
             </div>
           ))
         )}
