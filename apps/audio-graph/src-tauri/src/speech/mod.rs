@@ -17,7 +17,7 @@ use crate::events::{self, PipelineStatus, StageStatus};
 use crate::graph::entities::GraphSnapshot;
 use crate::graph::extraction::RuleBasedExtractor;
 use crate::graph::temporal::TemporalKnowledgeGraph;
-use crate::llm::LlmEngine;
+use crate::llm::{ApiClient, LlmEngine};
 use crate::state::TranscriptSegment;
 
 // ---------------------------------------------------------------------------
@@ -27,8 +27,7 @@ use crate::state::TranscriptSegment;
 /// Perform entity extraction, update the knowledge graph, and emit events.
 ///
 /// Shared by both the full (ASR + diarization) and diarization-only speech
-/// processor loops. Tries the native LLM engine first, falls back to
-/// rule-based extraction.
+/// processor loops. Extraction chain: native LLM → API client → rule-based.
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn process_extraction_and_emit(
     text: &str,
@@ -36,6 +35,7 @@ pub(crate) fn process_extraction_and_emit(
     segment_id: &str,
     timestamp: f64,
     llm_engine: &Arc<Mutex<Option<LlmEngine>>>,
+    api_client: &Arc<Mutex<Option<ApiClient>>>,
     graph_extractor: &Arc<RuleBasedExtractor>,
     knowledge_graph: &Arc<Mutex<TemporalKnowledgeGraph>>,
     graph_snapshot: &Arc<RwLock<GraphSnapshot>>,
@@ -44,7 +44,7 @@ pub(crate) fn process_extraction_and_emit(
     extraction_count: &mut u64,
     graph_update_count: &mut u64,
 ) {
-    // Try native LLM engine first, then rule-based fallback
+    // 1. Try native LLM engine first
     let llm_result = {
         let engine_guard = llm_engine.lock().unwrap_or_else(|e| {
             log::warn!("LLM engine mutex poisoned, recovering: {}", e);
@@ -63,9 +63,38 @@ pub(crate) fn process_extraction_and_emit(
         }
     };
 
+    // 2. If native failed, try API client
+    let api_result = if llm_result.is_none() {
+        let api_guard = api_client.lock().unwrap_or_else(|e| {
+            log::warn!("API client mutex poisoned, recovering: {}", e);
+            e.into_inner()
+        });
+        if let Some(ref client) = *api_guard {
+            match client.extract_entities(text, speaker) {
+                Ok(result) => Some(result),
+                Err(e) => {
+                    log::warn!("API extraction failed: {}", e);
+                    None
+                }
+            }
+        } else {
+            None
+        }
+    } else {
+        None
+    };
+
+    // 3. Pick the best result or fall back to rule-based
     let extraction_result = if let Some(result) = llm_result {
         log::debug!(
             "Native LLM extraction: {} entities, {} relations",
+            result.entities.len(),
+            result.relations.len()
+        );
+        result
+    } else if let Some(result) = api_result {
+        log::debug!(
+            "API extraction: {} entities, {} relations",
             result.entities.len(),
             result.relations.len()
         );
@@ -133,6 +162,7 @@ pub(crate) fn run_speech_processor(
     graph_snapshot: Arc<RwLock<GraphSnapshot>>,
     graph_extractor: Arc<RuleBasedExtractor>,
     llm_engine: Arc<Mutex<Option<LlmEngine>>>,
+    api_client: Arc<Mutex<Option<ApiClient>>>,
 ) {
     use whisper_rs::{WhisperContext, WhisperContextParameters};
 
@@ -169,6 +199,7 @@ pub(crate) fn run_speech_processor(
                     graph_snapshot,
                     graph_extractor,
                     llm_engine,
+                    api_client,
                 );
                 return;
             }
@@ -187,6 +218,7 @@ pub(crate) fn run_speech_processor(
                 graph_snapshot,
                 graph_extractor,
                 llm_engine,
+                api_client,
             );
             return;
         }
@@ -272,6 +304,7 @@ pub(crate) fn run_speech_processor(
                             &diarized.segment.id,
                             diarized.segment.start_time,
                             &llm_engine,
+                            &api_client,
                             &graph_extractor,
                             &knowledge_graph,
                             &graph_snapshot,
@@ -309,6 +342,7 @@ pub(crate) fn run_speech_processor_diarization_only(
     graph_snapshot: Arc<RwLock<GraphSnapshot>>,
     graph_extractor: Arc<RuleBasedExtractor>,
     llm_engine: Arc<Mutex<Option<LlmEngine>>>,
+    api_client: Arc<Mutex<Option<ApiClient>>>,
 ) {
     let diarization_config = DiarizationConfig::default();
     // Same dummy-channel pattern as in `run_speech_processor` — see M2
@@ -383,6 +417,7 @@ pub(crate) fn run_speech_processor_diarization_only(
                 &diarized.segment.id,
                 diarized.segment.start_time,
                 &llm_engine,
+                &api_client,
                 &graph_extractor,
                 &knowledge_graph,
                 &graph_snapshot,

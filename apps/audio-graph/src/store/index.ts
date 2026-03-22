@@ -1,6 +1,7 @@
 import { create } from "zustand";
 import { invoke } from "@tauri-apps/api/core";
 import type {
+    ApiEndpointConfig,
     AudioGraphStore,
     AudioSourceInfo,
     ChatMessage,
@@ -174,4 +175,20 @@ export const useAudioGraphStore = create<AudioGraphStore>((set, get) => ({
             });
         }
     },
+
+    // ── API endpoint ──────────────────────────────────────────────────────
+    apiConfig: null,
+    configureApiEndpoint: async (config: ApiEndpointConfig) => {
+        try {
+            await invoke("configure_api_endpoint", {
+                endpoint: config.endpoint,
+                apiKey: config.apiKey ?? null,
+                model: config.model,
+            });
+            set({ apiConfig: config, error: null });
+        } catch (e) {
+            set({ error: e instanceof Error ? e.message : String(e) });
+        }
+    },
+    clearApiEndpoint: () => set({ apiConfig: null }),
 }));

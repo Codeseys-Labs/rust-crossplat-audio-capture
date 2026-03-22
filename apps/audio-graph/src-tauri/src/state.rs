@@ -21,7 +21,7 @@ use crate::graph::entities::GraphSnapshot;
 use crate::graph::extraction::RuleBasedExtractor;
 use crate::graph::temporal::TemporalKnowledgeGraph;
 use crate::llm::engine::ChatMessage;
-use crate::llm::LlmEngine;
+use crate::llm::{ApiClient, LlmEngine};
 
 /// Transcript segment for frontend consumption.
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
@@ -88,6 +88,9 @@ pub struct AppState {
     /// Native LLM engine for entity extraction + chat.
     pub llm_engine: Arc<Mutex<Option<LlmEngine>>>,
 
+    /// OpenAI-compatible API client (alternative to native LLM).
+    pub api_client: Arc<Mutex<Option<ApiClient>>>,
+
     /// Chat message history for the sidebar.
     pub chat_history: Arc<RwLock<Vec<ChatMessage>>>,
 
@@ -144,6 +147,7 @@ impl AppState {
             knowledge_graph: Arc::new(Mutex::new(TemporalKnowledgeGraph::new())),
             graph_extractor: Arc::new(RuleBasedExtractor::new()),
             llm_engine: Arc::new(Mutex::new(None)),
+            api_client: Arc::new(Mutex::new(None)),
             chat_history: Arc::new(RwLock::new(Vec::new())),
             capture_manager: Arc::new(Mutex::new(AudioCaptureManager::new())),
             pipeline_tx,

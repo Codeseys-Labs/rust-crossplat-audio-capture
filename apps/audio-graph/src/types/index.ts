@@ -152,6 +152,20 @@ export interface DownloadProgress {
 }
 
 // ---------------------------------------------------------------------------
+// API endpoint configuration
+// ---------------------------------------------------------------------------
+
+/** Configuration for an OpenAI-compatible API endpoint. */
+export interface ApiEndpointConfig {
+    /** Base URL, e.g. "https://openrouter.ai/api/v1" or "http://localhost:11434/v1" */
+    endpoint: string;
+    /** Bearer token. Omit for local servers (Ollama, LM Studio). */
+    apiKey?: string;
+    /** Model identifier, e.g. "gpt-4o-mini", "llama3.2", "qwen2.5:3b" */
+    model: string;
+}
+
+// ---------------------------------------------------------------------------
 // Chat types
 // ---------------------------------------------------------------------------
 
@@ -222,4 +236,9 @@ export interface AudioGraphStore {
     downloadProgress: DownloadProgress | null;
     fetchModels: () => Promise<void>;
     downloadModel: (filename: string) => Promise<void>;
+
+    // ── API endpoint ──────────────────────────────────────────────────────
+    apiConfig: ApiEndpointConfig | null;
+    configureApiEndpoint: (config: ApiEndpointConfig) => Promise<void>;
+    clearApiEndpoint: () => void;
 }

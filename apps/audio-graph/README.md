@@ -24,7 +24,7 @@ The pipeline streams audio through Voice Activity Detection, Automatic Speech Re
 - **Voice Activity Detection** — Silero VAD v5 (ONNX) for speech segmentation
 - **Automatic Speech Recognition** — `whisper-rs` (`whisper.cpp`) with configurable model size
 - **Speaker Diarization** — MVP audio-feature-based clustering (RMS energy, zero-crossing rate)
-- **Entity Extraction** — Native LLM engine (LFM2-350M-Extract GGUF) with rule-based NER fallback
+- **Entity Extraction** — 3-tier chain: native LLM (llama-cpp-2) → OpenAI-compatible API → rule-based NER
 - 💬 **Chat Sidebar** — Ask questions about the conversation and knowledge graph
 - 🧠 **Native LLM Inference** — In-process GGUF model via llama-cpp-2 (replaces HTTP sidecar)
 - **Temporal Knowledge Graph** — `petgraph`-based graph with episodic memory, entity resolution (Jaro-Winkler), temporal decay
@@ -259,6 +259,51 @@ The chat uses the knowledge graph context (entities, relationships) and recent t
 - **Chat**: Free-form generation with graph context in system prompt
 - **Fallback**: If no model is loaded, rule-based extraction is used automatically
 
+### OpenAI-Compatible API Endpoint (Alternative to Local Model)
+
+Instead of (or in addition to) a local GGUF model, AudioGraph can use any **OpenAI-compatible API endpoint** for entity extraction and chat. This includes:
+
+| Provider | Endpoint | API Key Required |
+|---|---|---|
+| **OpenAI** | `https://api.openai.com/v1` | Yes |
+| **OpenRouter** | `https://openrouter.ai/api/v1` | Yes |
+| **Ollama** (local) | `http://localhost:11434/v1` | No |
+| **LM Studio** (local) | `http://localhost:1234/v1` | No |
+| **vLLM** | `http://localhost:8000/v1` | No |
+| **Together AI** | `https://api.together.xyz/v1` | Yes |
+| **Groq** | `https://api.groq.com/openai/v1` | Yes |
+
+Configure from the frontend store:
+```typescript
+import { useAudioGraphStore } from './store';
+
+// Configure OpenRouter
+useAudioGraphStore.getState().configureApiEndpoint({
+    endpoint: 'https://openrouter.ai/api/v1',
+    apiKey: 'sk-or-...',
+    model: 'anthropic/claude-sonnet-4',
+});
+
+// Configure local Ollama
+useAudioGraphStore.getState().configureApiEndpoint({
+    endpoint: 'http://localhost:11434/v1',
+    model: 'qwen2.5:3b',
+});
+```
+
+Or invoke the Tauri command directly:
+```typescript
+import { invoke } from '@tauri-apps/api/core';
+
+await invoke('configure_api_endpoint', {
+    endpoint: 'https://openrouter.ai/api/v1',
+    apiKey: 'sk-or-...',
+    model: 'anthropic/claude-sonnet-4',
+});
+```
+
+**Extraction chain order:** native LLM → API endpoint → rule-based NER. The first available backend is used. If the native model is loaded, it takes priority (fastest, no network). If only an API endpoint is configured, it handles both entity extraction and chat.
+
 ### Build Requirements
 
 The native LLM requires:
@@ -432,8 +477,9 @@ apps/audio-graph/
     │   │   ├── extraction.rs          # Entity extraction (NER)
     │   │   └── temporal.rs            # Temporal knowledge graph
     │   ├── llm/
-    │   │   ├── mod.rs                 # LLM module
-    │   │   └── engine.rs              # Native llama.cpp inference engine
+    │   │   ├── mod.rs                 # LLM module (native + API backends)
+    │   │   ├── engine.rs              # Native llama.cpp inference engine
+    │   │   └── api_client.rs          # OpenAI-compatible API client
     │   └── models/
     │       └── mod.rs                 # Model management + download
     └── gen/                           # Generated Tauri schemas
@@ -458,6 +504,7 @@ These commands are invokable from the React frontend via `@tauri-apps/api`:
 | `clear_chat_history` | Clear the chat message history | `()` |
 | `list_available_models` | List available models and download status | `Vec<ModelInfo>` |
 | `download_model_cmd` | Download a model by filename with progress events | `String` (path) |
+| `configure_api_endpoint` | Configure an OpenAI-compatible API endpoint | `Result<(), String>` |
 
 ---
 
@@ -497,7 +544,7 @@ These events are emitted from the Rust backend and consumed by the React fronten
 - [x] Cross-platform builds (Windows WASAPI, macOS CoreAudio, Linux PipeWire — platform-conditional Cargo features)
 - [ ] Periodic pipeline status updates
 - [ ] Capture error forwarding to frontend
-- [ ] OpenAI-compatible API endpoint support (alternative to local model)
+- [x] OpenAI-compatible API endpoint support (OpenAI, OpenRouter, Ollama, LM Studio, vLLM, etc.)
 - [ ] Graph persistence (save/load knowledge graph)
 - [ ] Multi-language ASR support
 - [ ] Graph search and entity filtering

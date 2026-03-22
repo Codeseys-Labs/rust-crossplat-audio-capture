@@ -44,6 +44,7 @@ pub fn run() {
             commands::clear_chat_history,
             commands::list_available_models,
             commands::download_model_cmd,
+            commands::configure_api_endpoint,
         ])
         .run(tauri::generate_context!())
         .expect("error while running AudioGraph");

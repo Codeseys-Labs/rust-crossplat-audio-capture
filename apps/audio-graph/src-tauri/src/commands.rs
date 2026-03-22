@@ -13,6 +13,7 @@ use crate::audio::vad::{VadConfig, VadProcessor};
 use crate::events::{self, PipelineStatus, StageStatus};
 use crate::graph::entities::GraphSnapshot;
 use crate::llm::engine::{ChatMessage, ChatResponse};
+use crate::llm::{ApiClient, ApiConfig};
 use crate::speech;
 use crate::state::{AppState, AudioSourceInfo, TranscriptSegment};
 
@@ -144,6 +145,7 @@ pub async fn start_capture(
             let graph_snapshot_clone = state.graph_snapshot.clone();
             let graph_extractor = state.graph_extractor.clone();
             let llm_engine = state.llm_engine.clone();
+            let api_client = state.api_client.clone();
 
             let handle = std::thread::Builder::new()
                 .name("speech-processor".to_string())
@@ -157,6 +159,7 @@ pub async fn start_capture(
                         graph_snapshot_clone,
                         graph_extractor,
                         llm_engine,
+                        api_client,
                     );
                 })
                 .map_err(|e| format!("Failed to spawn speech processor thread: {}", e))?;
@@ -264,11 +267,56 @@ pub async fn get_pipeline_status(state: State<'_, AppState>) -> Result<PipelineS
 }
 
 // ---------------------------------------------------------------------------
-// Chat commands (backed by native LLM engine)
+// API endpoint configuration
+// ---------------------------------------------------------------------------
+
+/// Configure an OpenAI-compatible API endpoint for LLM inference.
+///
+/// This allows using cloud providers (OpenAI, OpenRouter) or local servers
+/// (Ollama, LM Studio, vLLM) as an alternative to the native llama-cpp-2 engine.
+#[tauri::command]
+pub async fn configure_api_endpoint(
+    endpoint: String,
+    api_key: Option<String>,
+    model: String,
+    state: State<'_, AppState>,
+) -> Result<(), String> {
+    log::info!(
+        "configure_api_endpoint: endpoint={}, model={}",
+        endpoint,
+        model
+    );
+
+    let config = ApiConfig {
+        endpoint,
+        api_key,
+        model,
+        max_tokens: 512,
+        temperature: 0.1,
+    };
+    let client = ApiClient::new(config);
+
+    if !client.is_configured() {
+        return Err("Invalid API configuration: endpoint and model must be non-empty".to_string());
+    }
+
+    *state
+        .api_client
+        .lock()
+        .map_err(|e| format!("Lock error: {}", e))? = Some(client);
+
+    log::info!("API endpoint configured successfully");
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// Chat commands (backed by native LLM engine or API client)
 // ---------------------------------------------------------------------------
 
 /// Send a chat message and get a response from the LLM, informed by the
 /// current knowledge graph and transcript context.
+///
+/// Tries backends in order: native LLM → API client → graph context fallback.
 ///
 /// I4 fix: takes a snapshot of the graph and transcript, releases the locks,
 /// then builds the context string from the snapshot (no lock held during
@@ -357,33 +405,80 @@ pub async fn send_chat_message(
         history.clone()
     };
 
-    // Try LLM engine.
+    // Try backends in order: native LLM → API client → graph context fallback.
     let response_text = {
-        let engine_guard = state
-            .llm_engine
-            .lock()
-            .map_err(|e| format!("Lock error: {}", e))?;
-        if let Some(ref engine) = *engine_guard {
-            match engine.chat(&messages, &graph_context) {
-                Ok(text) => text,
-                Err(e) => {
-                    log::warn!("LLM chat failed: {}", e);
-                    format!(
-                        "I can see the knowledge graph has {} entities and {} relationships. \
-                         However, I couldn't generate a detailed response (LLM error: {}). \
-                         Please check the model configuration.",
-                        messages.len(),
-                        graph_context.len(),
-                        e
-                    )
+        // 1. Try native LLM engine first.
+        let native_result = {
+            let engine_guard = state
+                .llm_engine
+                .lock()
+                .map_err(|e| format!("Lock error: {}", e))?;
+            if let Some(ref engine) = *engine_guard {
+                match engine.chat(&messages, &graph_context) {
+                    Ok(text) => Some(Ok(text)),
+                    Err(e) => {
+                        log::warn!("Native LLM chat failed: {}", e);
+                        Some(Err(e))
+                    }
+                }
+            } else {
+                None // No native LLM loaded
+            }
+        };
+
+        match native_result {
+            Some(Ok(text)) => text,
+            _ => {
+                // 2. Try API client.
+                let api_result = {
+                    let api_guard = state
+                        .api_client
+                        .lock()
+                        .map_err(|e| format!("Lock error: {}", e))?;
+                    if let Some(ref client) = *api_guard {
+                        match client.chat_with_history(&messages, &graph_context) {
+                            Ok(text) => Some(Ok(text)),
+                            Err(e) => {
+                                log::warn!("API chat failed: {}", e);
+                                Some(Err(e))
+                            }
+                        }
+                    } else {
+                        None // No API client configured
+                    }
+                };
+
+                match api_result {
+                    Some(Ok(text)) => text,
+                    Some(Err(e)) => {
+                        // API configured but failed — report error with context.
+                        format!(
+                            "I can see the knowledge graph has {} entities and {} relationships. \
+                             However, I couldn't generate a detailed response (API error: {}). \
+                             Please check the API endpoint configuration.",
+                            snapshot.nodes.len(),
+                            snapshot.links.len(),
+                            e
+                        )
+                    }
+                    None => {
+                        // 3. No backend available — provide graph context fallback.
+                        if let Some(Err(e)) = native_result {
+                            format!(
+                                "Native LLM error: {}. No API endpoint configured.\n\n\
+                                 Here's what I know from the knowledge graph:\n\n{}",
+                                e, graph_context
+                            )
+                        } else {
+                            format!(
+                                "No LLM backend available. Configure a native model or API endpoint.\n\n\
+                                 Here's what I know from the knowledge graph:\n\n{}",
+                                graph_context
+                            )
+                        }
+                    }
                 }
             }
-        } else {
-            // No LLM loaded — provide a summary from graph context.
-            format!(
-                "LLM model not loaded. Here's what I know from the knowledge graph:\n\n{}",
-                graph_context
-            )
         }
     };
 
