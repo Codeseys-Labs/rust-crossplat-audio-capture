@@ -303,6 +303,49 @@ sudo apt install build-essential clang cmake
 
 ---
 
+## GPU Acceleration
+
+AudioGraph supports GPU-accelerated inference for both Whisper (ASR) and llama.cpp (LLM). GPU support varies by platform:
+
+| Platform | Backend | How to Enable |
+|---|---|---|
+| **macOS** | Metal | Automatic — enabled by default in `Cargo.toml` |
+| **Windows / Linux** | CUDA (NVIDIA) | `cargo build --features cuda` |
+| **Windows / Linux** | Vulkan (AMD, NVIDIA, Intel) | `cargo build --features vulkan` |
+
+### Build Commands
+
+```bash
+# CPU only (default — works everywhere)
+cd apps/audio-graph && bun run tauri build
+
+# NVIDIA CUDA (requires CUDA Toolkit 11.7+)
+cd apps/audio-graph/src-tauri && cargo build --features cuda
+
+# Vulkan (requires Vulkan SDK)
+cd apps/audio-graph/src-tauri && cargo build --features vulkan
+
+# macOS Metal — automatic, no extra flags needed
+cd apps/audio-graph && bun run tauri build
+```
+
+### Prerequisites for GPU Builds
+
+**CUDA (NVIDIA):**
+- NVIDIA GPU with Compute Capability 5.0+
+- [CUDA Toolkit](https://developer.nvidia.com/cuda-toolkit) 11.7 or later
+- NVIDIA driver 515+ (Linux) or 527+ (Windows)
+
+**Vulkan:**
+- GPU with Vulkan 1.1+ support (AMD, NVIDIA, or Intel)
+- [Vulkan SDK](https://vulkan.lunarg.com/) installed
+- Linux: `sudo apt install libvulkan-dev` (Debian/Ubuntu)
+- Windows: Install the LunarG Vulkan SDK
+
+> **Note:** GPU features are opt-in Cargo features. The default build is CPU-only and requires no GPU SDKs. On macOS, Metal acceleration is always enabled via platform-specific dependencies.
+
+---
+
 ## Development
 
 ```bash
@@ -431,7 +474,7 @@ These events are emitted from the Rust backend and consumed by the React fronten
 ## Known Limitations
 
 - **MVP speaker diarization** — Uses audio features (RMS, ZCR), not ML speaker embeddings. Speaker identification accuracy is limited.
-- **No GPU acceleration** for Whisper inference — CPU-only via `whisper.cpp`.
+- **GPU acceleration is opt-in** — macOS uses Metal by default; on Windows/Linux, CUDA and Vulkan are available as Cargo features (see [GPU Acceleration](#gpu-acceleration)).
 - **Cross-platform audio** — Platform-conditional Cargo features (`feat_linux`, `feat_windows`, `feat_macos`) are compiled automatically per target OS. Application discovery (PipeWire `pw-dump`) is Linux-only; on Windows/macOS only system-default and device-level capture appear in the source list.
 - **Config file** ([`default.toml`](src-tauri/config/default.toml)) defines the spec but runtime uses hardcoded defaults.
 - **LLM sidecar not auto-started** — Rule-based entity extraction is used by default. The sidecar requires manual launch.
@@ -444,7 +487,7 @@ These events are emitted from the Rust backend and consumed by the React fronten
 
 - [ ] **In-app model download** — First-run setup wizard or "Download Models" button with progress bar and Tauri event-driven status updates (eliminates the shell script requirement for end users)
 - [ ] ML-based speaker diarization (pyannote/wespeaker ONNX models)
-- [ ] GPU-accelerated Whisper inference (CUDA/Metal)
+- [x] GPU-accelerated inference — Metal (macOS, automatic), CUDA and Vulkan (Windows/Linux, opt-in Cargo features)
 - [ ] Runtime config loading from `default.toml`
 - [x] Cross-platform builds (Windows WASAPI, macOS CoreAudio, Linux PipeWire — platform-conditional Cargo features)
 - [ ] Periodic pipeline status updates

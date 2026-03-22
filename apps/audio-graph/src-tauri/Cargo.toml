@@ -8,6 +8,21 @@ edition = "2021"
 [build-dependencies]
 tauri-build = { version = "2.5.6", features = [] }
 
+# GPU acceleration features (opt-in).
+# Default build is CPU-only. Enable one of these for GPU-accelerated
+# Whisper ASR and llama.cpp LLM inference on Windows/Linux.
+# macOS Metal acceleration is always enabled (see platform-specific deps below).
+[features]
+default = []
+cuda = [
+    "whisper-rs/cuda",
+    "llama-cpp-2/cuda",
+] # NVIDIA GPUs (requires CUDA Toolkit)
+vulkan = [
+    "whisper-rs/vulkan",
+    "llama-cpp-2/vulkan",
+] # Cross-vendor GPUs (requires Vulkan SDK)
+
 # Audio capture (rsac library from workspace root)
 # Platform-conditional: each OS pulls in only its own backend feature.
 [target.'cfg(target_os = "linux")'.dependencies]
