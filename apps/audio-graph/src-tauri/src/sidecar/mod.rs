@@ -37,6 +37,9 @@ pub struct SidecarConfig {
 impl Default for SidecarConfig {
     fn default() -> Self {
         Self {
+            #[cfg(target_os = "windows")]
+            binary_path: "llama-server.exe".to_string(),
+            #[cfg(not(target_os = "windows"))]
             binary_path: "llama-server".to_string(),
             model_path: String::new(),
             host: "127.0.0.1".to_string(),

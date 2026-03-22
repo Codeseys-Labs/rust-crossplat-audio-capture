@@ -18,6 +18,11 @@ rsac = { path = "../../..", features = ["feat_windows"] }
 
 [target.'cfg(target_os = "macos")'.dependencies]
 rsac = { path = "../../..", features = ["feat_macos"] }
+# Enable Metal GPU acceleration on macOS for Whisper ASR and llama.cpp LLM inference.
+# Both crates detect Apple Metal via their build.rs, but the feature flag must be
+# opted-in explicitly to link the Metal framework and compile the GPU kernels.
+whisper-rs = { version = "0.16.0", features = ["metal"] }
+llama-cpp-2 = { version = "0.1.139", features = ["metal"] }
 
 [dependencies]
 # Tauri framework

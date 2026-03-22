@@ -75,22 +75,67 @@ See [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md) for the full architecture doc
 |---|---|
 | **Rust** | 1.75+ with `cargo` |
 | **Bun** | 1.0+ (runtime & package manager) |
-| **Linux** | PipeWire + dev headers: `libpipewire-0.3-dev`, `libclang-dev`, `libspa-0.2-dev` |
-| **macOS** | Xcode Command Line Tools (CoreAudio) |
-| **Windows** | Visual Studio Build Tools (WASAPI) |
+| **cmake** | Required by `whisper-rs` and `llama-cpp-2` build scripts |
+| **clang** | Required by `bindgen` for FFI bindings |
 | **Whisper model** | GGML model file (see [Model Setup](#model-setup)) |
 
 ### Linux (Debian/Ubuntu)
 
+Install build tools and PipeWire development libraries:
+
 ```bash
-sudo apt install libpipewire-0.3-dev libspa-0.2-dev libclang-dev
+# Build essentials + clang/LLVM (for bindgen + llama.cpp)
+sudo apt install build-essential cmake clang libclang-dev
+
+# PipeWire audio backend
+sudo apt install libpipewire-0.3-dev libspa-0.2-dev
+
+# Tauri v2 system dependencies (WebKitGTK, etc.)
+sudo apt install libwebkit2gtk-4.1-dev libgtk-3-dev libayatana-appindicator3-dev librsvg2-dev
 ```
+
+### Windows
+
+1. **Visual Studio Build Tools 2019+** with the "Desktop development with C++" workload:
+   - Download from [visualstudio.microsoft.com](https://visualstudio.microsoft.com/visual-cpp-build-tools/)
+   - Or: `winget install Microsoft.VisualStudio.2022.BuildTools`
+
+2. **CMake** and **LLVM/Clang** (for `whisper-rs` and `llama-cpp-2` bindgen):
+   ```powershell
+   winget install Kitware.CMake LLVM.LLVM
+   ```
+
+3. **WebView2 Runtime** — pre-installed on Windows 10 (1803+) and Windows 11. If missing:
+   ```powershell
+   winget install Microsoft.EdgeWebView2Runtime
+   ```
+
+4. **Bun**:
+   ```powershell
+   powershell -c "irm bun.sh/install.ps1 | iex"
+   ```
 
 ### macOS
 
-```bash
-xcode-select --install
-```
+1. **Xcode Command Line Tools** (provides clang, Metal framework, CoreAudio):
+   ```bash
+   xcode-select --install
+   ```
+
+2. **CMake** (for `whisper-rs` and `llama-cpp-2`):
+   ```bash
+   brew install cmake
+   ```
+
+3. **Cargo config** for Apple Silicon (M1/M2/M3) — create or append to `~/.cargo/config.toml`:
+   ```toml
+   [target.aarch64-apple-darwin]
+   rustflags = ["-C", "link-arg=-lc++", "-C", "link-arg=-framework", "-C", "link-arg=Accelerate"]
+   ```
+
+> **Note:** On macOS, `whisper-rs` and `llama-cpp-2` are built with Metal GPU acceleration
+> enabled automatically (see `Cargo.toml` platform-specific features). macOS 14.4+ is
+> required for full audio capture support (Process Tap API).
 
 ---
 
@@ -104,7 +149,10 @@ cd apps/audio-graph
 bun install
 
 # Download the Whisper model
+#   Linux/macOS:
 ./scripts/download-models.sh
+#   Windows (PowerShell):
+#   .\scripts\download-models.ps1
 
 # Run in development mode
 bun run tauri dev
@@ -122,7 +170,11 @@ AudioGraph uses [`whisper-rs`](https://github.com/tazz4843/whisper-rs) for speec
 
 1. **Automatic download** (recommended):
    ```bash
+   # Linux/macOS
    ./scripts/download-models.sh
+
+   # Windows (PowerShell)
+   .\scripts\download-models.ps1
    ```
 
 2. **Manual download**:
@@ -149,7 +201,11 @@ For improved entity extraction beyond the built-in rule-based NER, you can run a
 
 Or use the download script:
 ```bash
+# Linux/macOS
 ./scripts/download-models.sh --with-sidecar
+
+# Windows (PowerShell)
+.\scripts\download-models.ps1 -WithSidecar
 ```
 
 ---
@@ -278,7 +334,8 @@ apps/audio-graph/
 ├── vite.config.ts                      # Vite configuration
 ├── tsconfig.json                       # TypeScript config
 ├── scripts/
-│   └── download-models.sh             # Model download helper
+│   ├── download-models.sh             # Model download helper (Linux/macOS)
+│   └── download-models.ps1            # Model download helper (Windows)
 ├── models/                             # ML models (gitignored)
 │   └── ggml-small.en.bin             # Whisper GGML model
 ├── docs/
