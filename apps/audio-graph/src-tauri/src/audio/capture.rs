@@ -143,6 +143,58 @@ impl AudioCaptureManager {
             }
         }
 
+        // 4. On Windows, enumerate active WASAPI audio sessions.
+        #[cfg(target_os = "windows")]
+        {
+            match rsac::audio::windows::enumerate_application_audio_sessions() {
+                Ok(sessions) => {
+                    log::info!("Discovered {} Windows audio session(s)", sessions.len());
+                    for session in sessions {
+                        let key = format!("app:{}", session.process_id);
+                        let is_active = self.sources.contains_key(&key);
+                        sources.push(AudioSourceInfo {
+                            id: key,
+                            name: session.display_name.clone(),
+                            source_type: AudioSourceType::Application {
+                                pid: session.process_id,
+                                app_name: session.display_name,
+                            },
+                            is_active,
+                        });
+                    }
+                }
+                Err(e) => {
+                    log::warn!("Failed to enumerate Windows audio sessions: {}", e);
+                }
+            }
+        }
+
+        // 5. On macOS, enumerate running applications via CoreAudio / NSWorkspace.
+        #[cfg(target_os = "macos")]
+        {
+            match rsac::audio::macos::enumerate_audio_applications() {
+                Ok(apps) => {
+                    log::info!("Discovered {} macOS application(s)", apps.len());
+                    for app in apps {
+                        let key = format!("app:{}", app.process_id);
+                        let is_active = self.sources.contains_key(&key);
+                        sources.push(AudioSourceInfo {
+                            id: key,
+                            name: app.name.clone(),
+                            source_type: AudioSourceType::Application {
+                                pid: app.process_id,
+                                app_name: app.name,
+                            },
+                            is_active,
+                        });
+                    }
+                }
+                Err(e) => {
+                    log::warn!("Failed to enumerate macOS audio applications: {}", e);
+                }
+            }
+        }
+
         log::info!("Total audio sources listed: {}", sources.len());
         sources
     }

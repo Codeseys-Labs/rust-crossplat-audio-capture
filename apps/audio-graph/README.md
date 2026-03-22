@@ -19,7 +19,7 @@ The pipeline streams audio through Voice Activity Detection, Automatic Speech Re
 
 ## Features
 
-- **Multi-source audio capture** — System default, specific devices, per-application (Linux PipeWire)
+- **Multi-source audio capture** — System default, specific devices, per-application (Linux PipeWire, Windows WASAPI, macOS CoreAudio)
 - **Real-time audio processing** — 48kHz→16kHz resampling via `rubato`, stereo→mono downmix
 - **Voice Activity Detection** — Silero VAD v5 (ONNX) for speech segmentation
 - **Automatic Speech Recognition** — `whisper-rs` (`whisper.cpp`) with configurable model size
@@ -375,7 +375,7 @@ These events are emitted from the Rust backend and consumed by the React fronten
 
 - **MVP speaker diarization** — Uses audio features (RMS, ZCR), not ML speaker embeddings. Speaker identification accuracy is limited.
 - **No GPU acceleration** for Whisper inference — CPU-only via `whisper.cpp`.
-- **Linux-only audio backend** compiled by default (`feat_linux` in `Cargo.toml`). Cross-platform feature flags exist but are not enabled.
+- **Cross-platform audio** — Platform-conditional Cargo features (`feat_linux`, `feat_windows`, `feat_macos`) are compiled automatically per target OS. Application discovery (PipeWire `pw-dump`) is Linux-only; on Windows/macOS only system-default and device-level capture appear in the source list.
 - **Config file** ([`default.toml`](src-tauri/config/default.toml)) defines the spec but runtime uses hardcoded defaults.
 - **LLM sidecar not auto-started** — Rule-based entity extraction is used by default. The sidecar requires manual launch.
 - **`capture-error` event** is defined but not yet emitted from the backend.
@@ -389,7 +389,7 @@ These events are emitted from the Rust backend and consumed by the React fronten
 - [ ] ML-based speaker diarization (pyannote/wespeaker ONNX models)
 - [ ] GPU-accelerated Whisper inference (CUDA/Metal)
 - [ ] Runtime config loading from `default.toml`
-- [ ] Cross-platform builds (Windows WASAPI, macOS CoreAudio features)
+- [x] Cross-platform builds (Windows WASAPI, macOS CoreAudio, Linux PipeWire — platform-conditional Cargo features)
 - [ ] Periodic pipeline status updates
 - [ ] Capture error forwarding to frontend
 - [ ] LLM sidecar auto-start with health monitoring
