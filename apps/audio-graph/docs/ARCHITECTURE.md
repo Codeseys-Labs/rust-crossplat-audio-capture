@@ -1329,7 +1329,7 @@ apps/audio-graph/
 │   │   └── index.ts               # TypeScript interfaces (mirrors Rust models)
 │   └── styles/
 │       └── globals.css            # TailwindCSS imports + custom styles
-├── package.json                   # npm dependencies
+├── package.json                   # Frontend dependencies (managed by Bun)
 ├── tsconfig.json                  # TypeScript config
 ├── vite.config.ts                 # Vite config (Tauri plugin)
 ├── tailwind.config.js             # Tailwind config
@@ -1392,7 +1392,7 @@ apps/audio-graph/
 |---|---|---|
 | `reqwest` | `0.12` | HTTP client for llama-server (features: blocking, json) |
 
-### 10.2 npm Dependencies (`package.json`)
+### 10.2 Frontend Dependencies (`package.json`)
 
 #### Core
 
@@ -1465,8 +1465,7 @@ The `llama-server` binary must be placed in `src-tauri/binaries/` with the Tauri
 | Requirement | Version | Notes |
 |---|---|---|
 | Rust | 1.82+ | Stable toolchain |
-| Node.js | 20+ | LTS recommended |
-| pnpm | 9+ | Package manager (or npm/yarn) |
+| Bun | 1.0+ | JavaScript runtime & package manager |
 | Tauri CLI | 2.x | `cargo install tauri-cli` |
 | System libs | | See platform sections below |
 
@@ -1515,7 +1514,7 @@ chmod +x src-tauri/binaries/llama-server-x86_64-unknown-linux-gnu
 cd apps/audio-graph
 
 # Install frontend dependencies
-pnpm install
+bun install
 
 # Run in development mode (hot-reload frontend + Rust recompilation)
 cargo tauri dev

@@ -1,0 +1,34 @@
+# Dependencies
+node_modules/
+# Note: bun.lock is committed (lockfile)
+
+# Build output
+dist/
+src-tauri/target/
+
+# Rust lock file (large, regenerated from Cargo.toml)
+src-tauri/Cargo.lock
+
+# ML models (large binary files)
+models/
+
+# Generated Tauri schemas (can be regenerated)
+src-tauri/gen/
+
+# Environment
+.env
+.env.local
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Logs
+*.log

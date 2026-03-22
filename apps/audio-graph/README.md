@@ -1,0 +1,404 @@
+# AudioGraph 🎙️🔗
+
+> Live audio capture → speech recognition → temporal knowledge graph
+
+[![Rust](https://img.shields.io/badge/Rust-1.75%2B-orange)](https://www.rust-lang.org/)
+[![Tauri](https://img.shields.io/badge/Tauri-v2-blue)](https://v2.tauri.app/)
+[![React](https://img.shields.io/badge/React-18-61dafb)](https://react.dev/)
+[![License](https://img.shields.io/badge/license-see%20root-green)](/LICENSE)
+
+---
+
+## Overview
+
+AudioGraph is a desktop application that captures live system audio, performs real-time speech recognition, identifies speakers, extracts entities, and builds an evolving temporal knowledge graph — all visualized in a force-directed graph. Built with Tauri v2 (Rust backend + React frontend).
+
+The pipeline streams audio through Voice Activity Detection, Automatic Speech Recognition (Whisper), speaker diarization, and entity extraction, feeding results into a [`petgraph`](https://docs.rs/petgraph)-based temporal knowledge graph. The React frontend renders the graph live using [`react-force-graph-2d`](https://github.com/vasturiano/react-force-graph) alongside a scrolling transcript and pipeline status monitor.
+
+---
+
+## Features
+
+- **Multi-source audio capture** — System default, specific devices, per-application (Linux PipeWire)
+- **Real-time audio processing** — 48kHz→16kHz resampling via `rubato`, stereo→mono downmix
+- **Voice Activity Detection** — Silero VAD v5 (ONNX) for speech segmentation
+- **Automatic Speech Recognition** — `whisper-rs` (`whisper.cpp`) with configurable model size
+- **Speaker Diarization** — MVP audio-feature-based clustering (RMS energy, zero-crossing rate)
+- **Entity Extraction** — Rule-based NER (fallback) + optional LLM sidecar (LFM2-350M-Extract)
+- 💬 **Chat Sidebar** — Ask questions about the conversation and knowledge graph
+- 🧠 **Native LLM Inference** — In-process GGUF model via llama-cpp-2 (replaces HTTP sidecar)
+- **Temporal Knowledge Graph** — `petgraph`-based graph with episodic memory, entity resolution (Jaro-Winkler), temporal decay
+- **Live Visualization** — `react-force-graph-2d` with color-coded entity types
+- **Live Transcript** — Scrolling transcript with speaker labels and timestamps
+- **Pipeline Status Monitor** — Real-time display of each pipeline stage
+- **Dark Theme** — Full dark theme with CSS custom properties
+- **Graceful Degradation** — Falls back to diarization-only mode if Whisper model unavailable
+
+---
+
+## Screenshots
+
+> Screenshots coming soon. Run `cargo tauri dev` to see the UI.
+
+---
+
+## Architecture
+
+AudioGraph uses a **4-thread pipeline model** to keep the UI responsive while processing audio in real time:
+
+```
+┌─────────────┐    ┌──────────────────┐    ┌────────────┐    ┌─────────────────────┐
+│ Capture      │───▶│ Pipeline thread  │───▶│ VAD thread │───▶│ Speech processor    │
+│ thread(s)    │    │ (resample/downmix)│    │ (Silero v5)│    │ thread              │
+└─────────────┘    └──────────────────┘    └────────────┘    └─────────────────────┘
+                                                                │
+                                                                ├─ ASR (Whisper)
+                                                                ├─ Diarization
+                                                                ├─ Entity Extraction
+                                                                ├─ Graph update
+                                                                ├─ Tauri events
+                                                                └─▶ React UI
+```
+
+- **Capture thread(s)** — Pulls audio from `rsac` via ring buffer, sends raw PCM downstream
+- **Pipeline thread** — Resamples 48kHz→16kHz (`rubato`), downmixes stereo→mono
+- **VAD thread** — Silero VAD v5 segments speech from silence
+- **Speech processor thread** — ASR → Diarization → Entity Extraction → Graph → Tauri events → React UI
+
+See [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md) for the full architecture document.
+
+---
+
+## Prerequisites
+
+| Requirement | Details |
+|---|---|
+| **Rust** | 1.75+ with `cargo` |
+| **Bun** | 1.0+ (runtime & package manager) |
+| **Linux** | PipeWire + dev headers: `libpipewire-0.3-dev`, `libclang-dev`, `libspa-0.2-dev` |
+| **macOS** | Xcode Command Line Tools (CoreAudio) |
+| **Windows** | Visual Studio Build Tools (WASAPI) |
+| **Whisper model** | GGML model file (see [Model Setup](#model-setup)) |
+
+### Linux (Debian/Ubuntu)
+
+```bash
+sudo apt install libpipewire-0.3-dev libspa-0.2-dev libclang-dev
+```
+
+### macOS
+
+```bash
+xcode-select --install
+```
+
+---
+
+## Quick Start
+
+```bash
+# Navigate to the app directory
+cd apps/audio-graph
+
+# Install frontend dependencies
+bun install
+
+# Download the Whisper model
+./scripts/download-models.sh
+
+# Run in development mode
+bun run tauri dev
+```
+
+---
+
+## Model Setup
+
+### Whisper (Required for ASR)
+
+AudioGraph uses [`whisper-rs`](https://github.com/tazz4843/whisper-rs) for speech recognition, which requires a GGML-format Whisper model file.
+
+> **Planned:** In-app model download with a progress UI is on the [roadmap](#roadmap). For now, use the shell script or manual download below.
+
+1. **Automatic download** (recommended):
+   ```bash
+   ./scripts/download-models.sh
+   ```
+
+2. **Manual download**:
+   - Download [`ggml-small.en.bin`](https://huggingface.co/ggerganov/whisper.cpp/resolve/main/ggml-small.en.bin) from HuggingFace (`ggerganov/whisper.cpp`)
+   - Place it in the `models/` directory relative to the application root:
+     ```
+     apps/audio-graph/models/ggml-small.en.bin
+     ```
+
+### Silero VAD (Auto-downloaded)
+
+The Silero VAD v5 ONNX model is automatically downloaded and cached by the [`voice_activity_detector`](https://crates.io/crates/voice_activity_detector) crate on first run. No manual setup required.
+
+### LFM2-350M-Extract (Optional — Enhanced Entity Extraction)
+
+For improved entity extraction beyond the built-in rule-based NER, you can run an LLM sidecar:
+
+1. Download the [LFM2-350M-Extract GGUF](https://huggingface.co/collections/LambdaFunAI/lambdafun-models-68c9e6f74c4c95eeca5) model
+2. Start a `llama-server` instance:
+   ```bash
+   llama-server -m models/LFM2-350M-Extract.Q8_0.gguf --port 8090 -c 2048
+   ```
+3. The sidecar module in AudioGraph will auto-detect the running server
+
+Or use the download script:
+```bash
+./scripts/download-models.sh --with-sidecar
+```
+
+---
+
+## Configuration
+
+AudioGraph's configuration spec is defined in [`src-tauri/config/default.toml`](src-tauri/config/default.toml):
+
+| Section | Keys | Description |
+|---|---|---|
+| `[audio]` | `sample_rate`, `channels`, `buffer_size`, `ring_buffer_capacity` | Audio capture parameters |
+| `[pipeline]` | `vad_threshold`, `vad_min_speech_ms`, `vad_max_speech_ms`, `vad_silence_ms` | Pipeline processing settings |
+| `[asr]` | `model_path`, `language`, `beam_size`, `temperature` | Whisper ASR configuration |
+| `[diarization]` | `speaker_similarity_threshold`, `max_speakers` | Speaker identification tuning |
+| `[sidecar]` | `model_path`, `port`, `ctx_size`, `n_predict` | LLM sidecar settings |
+| `[graph]` | `entity_similarity_threshold`, `max_nodes`, `max_edges`, `snapshot_interval_ms` | Knowledge graph parameters |
+| `[ui]` | `theme`, `graph_dimension`, `max_transcript_entries` | Frontend display settings |
+
+> **Note:** The config file defines the spec. The current version uses hardcoded defaults at runtime. Runtime config loading from `default.toml` is on the [roadmap](#roadmap).
+
+---
+
+## Chat & LLM Setup
+
+AudioGraph includes a native LLM engine for entity extraction and an interactive chat sidebar.
+
+### Model Download
+
+Download a small GGUF model for entity extraction and chat:
+
+```bash
+# Download a Q4 quantized model (~350MB)
+./scripts/download-models.sh
+```
+
+Or manually download any GGUF model and configure the path in `config/default.toml`.
+
+### Chat Sidebar
+
+The right panel includes a **Transcript | Chat** tab switcher:
+- **Transcript** — Live speech-to-text output (default)
+- **Chat** — Ask questions about the conversation and knowledge graph
+
+The chat uses the knowledge graph context (entities, relationships) and recent transcript to provide informed answers.
+
+### LLM Architecture
+
+- **Engine**: `llama-cpp-2` (Rust bindings to llama.cpp) — no external server needed
+- **Entity Extraction**: Grammar-constrained JSON output via GBNF grammar
+- **Chat**: Free-form generation with graph context in system prompt
+- **Fallback**: If no model is loaded, rule-based extraction is used automatically
+
+### Build Requirements
+
+The native LLM requires:
+- C++17 compiler (gcc 9+ or clang 10+)
+- clang (for bindgen)
+- cmake
+
+On Ubuntu/Debian:
+```bash
+sudo apt install build-essential clang cmake
+```
+
+---
+
+## Technology Stack
+
+### Rust Backend
+
+| Component | Crate |
+|---|---|
+| Audio capture | [`rsac`](/) (Rust Cross-Platform Audio Capture) |
+| App framework | [`tauri`](https://v2.tauri.app/) v2.10 |
+| Resampling | [`rubato`](https://crates.io/crates/rubato) 1.0 |
+| VAD | [`voice_activity_detector`](https://crates.io/crates/voice_activity_detector) 0.2 (Silero v5) |
+| ASR | [`whisper-rs`](https://crates.io/crates/whisper-rs) 0.16 |
+| Graph | [`petgraph`](https://crates.io/crates/petgraph) 0.8 |
+| Entity matching | [`strsim`](https://crates.io/crates/strsim) 0.11 (Jaro-Winkler) |
+| Native LLM | [`llama-cpp-2`](https://crates.io/crates/llama-cpp-2) 0.1 (llama.cpp bindings) |
+| IPC channels | [`crossbeam-channel`](https://crates.io/crates/crossbeam-channel) 0.5 |
+| Config format | [`toml`](https://crates.io/crates/toml) 0.9 |
+| HTTP (sidecar) | [`reqwest`](https://crates.io/crates/reqwest) 0.12 |
+
+### React Frontend
+
+| Component | Package |
+|---|---|
+| UI framework | [`react`](https://react.dev/) 18 |
+| State management | [`zustand`](https://github.com/pmndrs/zustand) 5 |
+| Graph visualization | [`react-force-graph-2d`](https://github.com/vasturiano/react-force-graph) 1.25 |
+| Desktop bridge | [`@tauri-apps/api`](https://v2.tauri.app/reference/javascript/) 2 |
+| Build tool | [`vite`](https://vite.dev/) 6 |
+| Language | [`typescript`](https://www.typescriptlang.org/) 5.7 |
+
+---
+
+## Development
+
+```bash
+# Development mode (hot-reload frontend + Rust rebuild)
+bun run tauri dev
+
+# Build for production
+bun run tauri build
+
+# Frontend only (no Tauri window)
+bun run dev
+
+# Rust backend checks
+cd src-tauri && cargo check
+cd src-tauri && cargo test
+
+# TypeScript type checking
+bun run typecheck
+```
+
+---
+
+## Project Structure
+
+```
+apps/audio-graph/
+├── index.html                          # Vite entry point
+├── package.json                        # Frontend dependencies
+├── vite.config.ts                      # Vite configuration
+├── tsconfig.json                       # TypeScript config
+├── scripts/
+│   └── download-models.sh             # Model download helper
+├── models/                             # ML models (gitignored)
+│   └── ggml-small.en.bin             # Whisper GGML model
+├── docs/
+│   └── ARCHITECTURE.md                # Full architecture document
+├── src/                                # React frontend
+│   ├── main.tsx                       # React entry point
+│   ├── App.tsx                        # Root component
+│   ├── App.css                        # Application styles (dark theme)
+│   ├── styles.css                     # Global styles
+│   ├── components/
+│   │   ├── AudioSourceSelector.tsx    # Audio source dropdown
+│   │   ├── ChatSidebar.tsx            # Chat sidebar (LLM Q&A)
+│   │   ├── ControlBar.tsx             # Start/stop controls
+│   │   ├── KnowledgeGraphViewer.tsx   # Force-directed graph
+│   │   ├── LiveTranscript.tsx         # Scrolling transcript
+│   │   ├── PipelineStatusBar.tsx      # Pipeline stage monitor
+│   │   └── SpeakerPanel.tsx           # Speaker list
+│   ├── hooks/
+│   │   └── useTauriEvents.ts          # Tauri event subscriptions
+│   ├── store/
+│   │   └── index.ts                   # Zustand state store
+│   └── types/
+│       └── index.ts                   # TypeScript type definitions
+└── src-tauri/                          # Rust backend
+    ├── Cargo.toml                     # Rust dependencies
+    ├── tauri.conf.json                # Tauri configuration
+    ├── build.rs                       # Tauri build script
+    ├── config/
+    │   └── default.toml               # Configuration spec
+    ├── capabilities/
+    │   └── default.json               # Tauri v2 permissions
+    ├── src/
+    │   ├── main.rs                    # Tauri entry point
+    │   ├── lib.rs                     # Tauri app setup
+    │   ├── commands.rs                # IPC command handlers
+    │   ├── events.rs                  # Tauri event definitions
+    │   ├── state.rs                   # Application state
+    │   ├── audio/
+    │   │   ├── mod.rs                 # Audio module
+    │   │   ├── capture.rs             # rsac audio capture
+    │   │   ├── pipeline.rs            # Audio processing pipeline
+    │   │   └── vad.rs                 # Voice Activity Detection
+    │   ├── asr/
+    │   │   └── mod.rs                 # Whisper ASR integration
+    │   ├── diarization/
+    │   │   └── mod.rs                 # Speaker diarization
+    │   ├── graph/
+    │   │   ├── mod.rs                 # Graph module
+    │   │   ├── entities.rs            # Entity type definitions
+    │   │   ├── extraction.rs          # Entity extraction (NER)
+    │   │   └── temporal.rs            # Temporal knowledge graph
+    │   ├── llm/
+    │   │   ├── mod.rs                 # LLM module
+    │   │   └── engine.rs              # Native llama.cpp inference engine
+    │   └── sidecar/
+    │       └── mod.rs                 # LLM sidecar client (legacy)
+    └── gen/                           # Generated Tauri schemas
+```
+
+---
+
+## Tauri Commands (IPC)
+
+These commands are invokable from the React frontend via `@tauri-apps/api`:
+
+| Command | Description | Returns |
+|---|---|---|
+| `list_audio_sources` | Enumerate available audio capture sources | `Vec<AudioSource>` |
+| `start_capture` | Start the audio capture + processing pipeline | `Result<(), String>` |
+| `stop_capture` | Stop the active capture pipeline | `Result<(), String>` |
+| `get_graph_snapshot` | Get the current knowledge graph state | `GraphSnapshot` |
+| `get_transcript` | Get the current transcript entries | `Vec<TranscriptEntry>` |
+| `get_pipeline_status` | Get the status of each pipeline stage | `PipelineStatus` |
+| `send_chat_message` | Send a chat message to the native LLM | `ChatResponse` |
+| `get_llm_status` | Check if the LLM engine is loaded | `LlmStatus` |
+
+---
+
+## Tauri Events
+
+These events are emitted from the Rust backend and consumed by the React frontend:
+
+| Event | Payload | Description |
+|---|---|---|
+| `transcript-update` | `TranscriptEntry` | New transcript segment with speaker label and text |
+| `graph-update` | `GraphSnapshot` | Updated knowledge graph (nodes + edges) |
+| `pipeline-status` | `PipelineStatus` | Pipeline stage status changes |
+| `speaker-detected` | `SpeakerInfo` | New speaker identified by diarization |
+| `capture-error` | `ErrorInfo` | Capture or processing error |
+
+---
+
+## Known Limitations
+
+- **MVP speaker diarization** — Uses audio features (RMS, ZCR), not ML speaker embeddings. Speaker identification accuracy is limited.
+- **No GPU acceleration** for Whisper inference — CPU-only via `whisper.cpp`.
+- **Linux-only audio backend** compiled by default (`feat_linux` in `Cargo.toml`). Cross-platform feature flags exist but are not enabled.
+- **Config file** ([`default.toml`](src-tauri/config/default.toml)) defines the spec but runtime uses hardcoded defaults.
+- **LLM sidecar not auto-started** — Rule-based entity extraction is used by default. The sidecar requires manual launch.
+- **`capture-error` event** is defined but not yet emitted from the backend.
+- **`pipeline-status`** is emitted once at start, not periodically updated.
+
+---
+
+## Roadmap
+
+- [ ] **In-app model download** — First-run setup wizard or "Download Models" button with progress bar and Tauri event-driven status updates (eliminates the shell script requirement for end users)
+- [ ] ML-based speaker diarization (pyannote/wespeaker ONNX models)
+- [ ] GPU-accelerated Whisper inference (CUDA/Metal)
+- [ ] Runtime config loading from `default.toml`
+- [ ] Cross-platform builds (Windows WASAPI, macOS CoreAudio features)
+- [ ] Periodic pipeline status updates
+- [ ] Capture error forwarding to frontend
+- [ ] LLM sidecar auto-start with health monitoring
+- [ ] Graph persistence (save/load knowledge graph)
+- [ ] Multi-language ASR support
+- [ ] Graph search and entity filtering
+
+---
+
+## License
+
+Part of the [`rsac`](/) (Rust Cross-Platform Audio Capture) project. See the root [LICENSE](/LICENSE) for details.
