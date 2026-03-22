@@ -33,23 +33,6 @@ impl Default for StageStatus {
     }
 }
 
-/// Status of the LLM sidecar process.
-#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
-#[serde(tag = "type")]
-pub enum SidecarStatus {
-    NotStarted,
-    Starting,
-    Healthy,
-    Unhealthy { reason: String },
-    Stopped,
-}
-
-impl Default for SidecarStatus {
-    fn default() -> Self {
-        SidecarStatus::NotStarted
-    }
-}
-
 /// Overall pipeline status, combining all stages.
 #[derive(Debug, Clone, Default, serde::Serialize, serde::Deserialize)]
 pub struct PipelineStatus {
@@ -59,7 +42,6 @@ pub struct PipelineStatus {
     pub diarization: StageStatus,
     pub entity_extraction: StageStatus,
     pub graph: StageStatus,
-    pub sidecar: SidecarStatus,
 }
 
 /// Payload for capture error events.

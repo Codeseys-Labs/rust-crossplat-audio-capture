@@ -100,7 +100,7 @@ pub struct GraphSnapshot {
     pub stats: GraphStats,
 }
 
-/// Result of entity extraction from a transcript segment (from LLM sidecar or rule-based).
+/// Result of entity extraction from a transcript segment (from native LLM or rule-based).
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ExtractionResult {
     pub entities: Vec<ExtractedEntity>,

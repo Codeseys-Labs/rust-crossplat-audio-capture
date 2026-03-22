@@ -9,7 +9,7 @@
 //!   asr       — Automatic speech recognition (whisper-rs)
 //!   diarization — Speaker diarization (pyannote-rs)
 //!   graph     — Temporal knowledge graph (petgraph)
-//!   sidecar   — LLM sidecar management (llama-server)
+//!   models    — Model management and downloading
 
 pub mod asr;
 pub mod audio;
@@ -18,7 +18,7 @@ pub mod diarization;
 pub mod events;
 pub mod graph;
 pub mod llm;
-pub mod sidecar;
+pub mod models;
 pub mod speech;
 pub mod state;
 
@@ -31,7 +31,6 @@ pub fn run() {
     let app_state = AppState::new();
 
     tauri::Builder::default()
-        .plugin(tauri_plugin_shell::init())
         .manage(app_state)
         .invoke_handler(tauri::generate_handler![
             commands::list_audio_sources,
@@ -43,6 +42,8 @@ pub fn run() {
             commands::send_chat_message,
             commands::get_chat_history,
             commands::clear_chat_history,
+            commands::list_available_models,
+            commands::download_model_cmd,
         ])
         .run(tauri::generate_context!())
         .expect("error while running AudioGraph");

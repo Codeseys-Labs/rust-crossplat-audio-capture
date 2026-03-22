@@ -1,6 +1,6 @@
 //! Native LLM engine using llama-cpp-2.
 //!
-//! Replaces the HTTP sidecar with in-process GGUF model inference.
+//! In-process GGUF model inference for entity extraction and chat.
 //! Supports grammar-constrained entity extraction and free-form chat.
 
 pub mod engine;

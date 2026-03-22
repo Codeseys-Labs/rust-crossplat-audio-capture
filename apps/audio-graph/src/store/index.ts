@@ -5,12 +5,11 @@ import type {
     AudioSourceInfo,
     ChatMessage,
     ChatResponse,
+    ModelInfo,
     StageStatus,
-    SidecarStatus,
 } from "../types";
 
 const idleStage: StageStatus = { type: "Idle" };
-const defaultSidecar: SidecarStatus = { type: "NotStarted" };
 
 export const useAudioGraphStore = create<AudioGraphStore>((set, get) => ({
     // ── Audio sources ────────────────────────────────────────────────────
@@ -51,7 +50,6 @@ export const useAudioGraphStore = create<AudioGraphStore>((set, get) => ({
         diarization: idleStage,
         entity_extraction: idleStage,
         graph: idleStage,
-        sidecar: defaultSidecar,
     },
     setPipelineStatus: (status) => set({ pipelineStatus: status }),
 
@@ -147,6 +145,33 @@ export const useAudioGraphStore = create<AudioGraphStore>((set, get) => ({
             set({ chatMessages: [] });
         } catch (e) {
             set({ error: e instanceof Error ? e.message : String(e) });
+        }
+    },
+
+    // ── Models ────────────────────────────────────────────────────────────
+    models: [],
+    isDownloading: false,
+    downloadProgress: null,
+    fetchModels: async () => {
+        try {
+            const models = await invoke<ModelInfo[]>("list_available_models");
+            set({ models, error: null });
+        } catch (e) {
+            set({ error: e instanceof Error ? e.message : String(e) });
+        }
+    },
+    downloadModel: async (filename: string) => {
+        set({ isDownloading: true, downloadProgress: null });
+        try {
+            await invoke("download_model_cmd", { modelFilename: filename });
+            // Refresh model list after download
+            const models = await invoke<ModelInfo[]>("list_available_models");
+            set({ models, isDownloading: false, error: null });
+        } catch (e) {
+            set({
+                isDownloading: false,
+                error: e instanceof Error ? e.message : String(e),
+            });
         }
     },
 }));

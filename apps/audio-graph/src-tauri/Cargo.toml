@@ -42,7 +42,6 @@ llama-cpp-2 = { version = "0.1.139", features = ["metal"] }
 [dependencies]
 # Tauri framework
 tauri = { version = "2.10.3", features = ["devtools"] }
-tauri-plugin-shell = "2.3.5"
 
 # Serialization
 serde = { version = "1.0.228", features = ["derive"] }
@@ -82,7 +81,7 @@ whisper-rs = "0.16.0"
 # Entity extraction (rule-based)
 regex = "1"
 
-# HTTP client for LLM sidecar
+# HTTP client for model downloads (json feature retained for future OpenAI-compatible API support)
 reqwest = { version = "0.13.2", features = ["blocking", "json"] }
 
 # Native LLM inference (llama.cpp bindings)

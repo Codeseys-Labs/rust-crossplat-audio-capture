@@ -6,9 +6,6 @@
         "main"
     ],
     "permissions": [
-        "core:default",
-        "shell:allow-open",
-        "shell:allow-execute",
-        "shell:allow-spawn"
+        "core:default"
     ]
 }

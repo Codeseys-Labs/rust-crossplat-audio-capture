@@ -24,7 +24,7 @@ The pipeline streams audio through Voice Activity Detection, Automatic Speech Re
 - **Voice Activity Detection** — Silero VAD v5 (ONNX) for speech segmentation
 - **Automatic Speech Recognition** — `whisper-rs` (`whisper.cpp`) with configurable model size
 - **Speaker Diarization** — MVP audio-feature-based clustering (RMS energy, zero-crossing rate)
-- **Entity Extraction** — Rule-based NER (fallback) + optional LLM sidecar (LFM2-350M-Extract)
+- **Entity Extraction** — Native LLM engine (LFM2-350M-Extract GGUF) with rule-based NER fallback
 - 💬 **Chat Sidebar** — Ask questions about the conversation and knowledge graph
 - 🧠 **Native LLM Inference** — In-process GGUF model via llama-cpp-2 (replaces HTTP sidecar)
 - **Temporal Knowledge Graph** — `petgraph`-based graph with episodic memory, entity resolution (Jaro-Winkler), temporal decay
@@ -190,22 +190,23 @@ The Silero VAD v5 ONNX model is automatically downloaded and cached by the [`voi
 
 ### LFM2-350M-Extract (Optional — Enhanced Entity Extraction)
 
-For improved entity extraction beyond the built-in rule-based NER, you can run an LLM sidecar:
+For improved entity extraction beyond the built-in rule-based NER, download the LLM model. AudioGraph uses native in-process inference via `llama-cpp-2` — no external server required.
 
-1. Download the [LFM2-350M-Extract GGUF](https://huggingface.co/collections/LambdaFunAI/lambdafun-models-68c9e6f74c4c95eeca5) model
-2. Start a `llama-server` instance:
-   ```bash
-   llama-server -m models/LFM2-350M-Extract.Q8_0.gguf --port 8090 -c 2048
+The model can be downloaded via the **in-app model manager** (invoke the `list_available_models` and `download_model_cmd` Tauri commands), or manually:
+
+1. Download [`lfm2-350m-extract-q4_k_m.gguf`](https://huggingface.co/LiquidAI/LFM2-350M-Extract-GGUF/resolve/main/lfm2-350m-extract-q4_k_m.gguf) from HuggingFace
+2. Place it in the `models/` directory:
    ```
-3. The sidecar module in AudioGraph will auto-detect the running server
+   apps/audio-graph/models/lfm2-350m-extract-q4_k_m.gguf
+   ```
 
 Or use the download script:
 ```bash
 # Linux/macOS
-./scripts/download-models.sh --with-sidecar
+./scripts/download-models.sh
 
 # Windows (PowerShell)
-.\scripts\download-models.ps1 -WithSidecar
+.\scripts\download-models.ps1
 ```
 
 ---
@@ -220,7 +221,7 @@ AudioGraph's configuration spec is defined in [`src-tauri/config/default.toml`](
 | `[pipeline]` | `vad_threshold`, `vad_min_speech_ms`, `vad_max_speech_ms`, `vad_silence_ms` | Pipeline processing settings |
 | `[asr]` | `model_path`, `language`, `beam_size`, `temperature` | Whisper ASR configuration |
 | `[diarization]` | `speaker_similarity_threshold`, `max_speakers` | Speaker identification tuning |
-| `[sidecar]` | `model_path`, `port`, `ctx_size`, `n_predict` | LLM sidecar settings |
+| `[llm]` | `model_path`, `ctx_size`, `n_predict` | Native LLM engine settings |
 | `[graph]` | `entity_similarity_threshold`, `max_nodes`, `max_edges`, `snapshot_interval_ms` | Knowledge graph parameters |
 | `[ui]` | `theme`, `graph_dimension`, `max_transcript_entries` | Frontend display settings |
 
@@ -288,7 +289,7 @@ sudo apt install build-essential clang cmake
 | Native LLM | [`llama-cpp-2`](https://crates.io/crates/llama-cpp-2) 0.1 (llama.cpp bindings) |
 | IPC channels | [`crossbeam-channel`](https://crates.io/crates/crossbeam-channel) 0.5 |
 | Config format | [`toml`](https://crates.io/crates/toml) 0.9 |
-| HTTP (sidecar) | [`reqwest`](https://crates.io/crates/reqwest) 0.12 |
+| HTTP (model download) | [`reqwest`](https://crates.io/crates/reqwest) 0.13 |
 
 ### React Frontend
 
@@ -433,8 +434,8 @@ apps/audio-graph/
     │   ├── llm/
     │   │   ├── mod.rs                 # LLM module
     │   │   └── engine.rs              # Native llama.cpp inference engine
-    │   └── sidecar/
-    │       └── mod.rs                 # LLM sidecar client (legacy)
+    │   └── models/
+    │       └── mod.rs                 # Model management + download
     └── gen/                           # Generated Tauri schemas
 ```
 
@@ -453,7 +454,10 @@ These commands are invokable from the React frontend via `@tauri-apps/api`:
 | `get_transcript` | Get the current transcript entries | `Vec<TranscriptEntry>` |
 | `get_pipeline_status` | Get the status of each pipeline stage | `PipelineStatus` |
 | `send_chat_message` | Send a chat message to the native LLM | `ChatResponse` |
-| `get_llm_status` | Check if the LLM engine is loaded | `LlmStatus` |
+| `get_chat_history` | Get the chat message history | `Vec<ChatMessage>` |
+| `clear_chat_history` | Clear the chat message history | `()` |
+| `list_available_models` | List available models and download status | `Vec<ModelInfo>` |
+| `download_model_cmd` | Download a model by filename with progress events | `String` (path) |
 
 ---
 
@@ -468,6 +472,7 @@ These events are emitted from the Rust backend and consumed by the React fronten
 | `pipeline-status` | `PipelineStatus` | Pipeline stage status changes |
 | `speaker-detected` | `SpeakerInfo` | New speaker identified by diarization |
 | `capture-error` | `ErrorInfo` | Capture or processing error |
+| `model-download-progress` | `DownloadProgress` | Model download progress updates |
 
 ---
 
@@ -477,7 +482,7 @@ These events are emitted from the Rust backend and consumed by the React fronten
 - **GPU acceleration is opt-in** — macOS uses Metal by default; on Windows/Linux, CUDA and Vulkan are available as Cargo features (see [GPU Acceleration](#gpu-acceleration)).
 - **Cross-platform audio** — Platform-conditional Cargo features (`feat_linux`, `feat_windows`, `feat_macos`) are compiled automatically per target OS. Application discovery (PipeWire `pw-dump`) is Linux-only; on Windows/macOS only system-default and device-level capture appear in the source list.
 - **Config file** ([`default.toml`](src-tauri/config/default.toml)) defines the spec but runtime uses hardcoded defaults.
-- **LLM sidecar not auto-started** — Rule-based entity extraction is used by default. The sidecar requires manual launch.
+- **LLM model not auto-downloaded** — Rule-based entity extraction is used by default. Download the GGUF model via the in-app model manager or shell scripts for native LLM inference.
 - **`capture-error` event** is defined but not yet emitted from the backend.
 - **`pipeline-status`** is emitted once at start, not periodically updated.
 
@@ -485,14 +490,14 @@ These events are emitted from the Rust backend and consumed by the React fronten
 
 ## Roadmap
 
-- [ ] **In-app model download** — First-run setup wizard or "Download Models" button with progress bar and Tauri event-driven status updates (eliminates the shell script requirement for end users)
+- [x] **In-app model download** — Native Tauri commands (`list_available_models`, `download_model_cmd`) with progress events; frontend model manager UI planned
 - [ ] ML-based speaker diarization (pyannote/wespeaker ONNX models)
 - [x] GPU-accelerated inference — Metal (macOS, automatic), CUDA and Vulkan (Windows/Linux, opt-in Cargo features)
 - [ ] Runtime config loading from `default.toml`
 - [x] Cross-platform builds (Windows WASAPI, macOS CoreAudio, Linux PipeWire — platform-conditional Cargo features)
 - [ ] Periodic pipeline status updates
 - [ ] Capture error forwarding to frontend
-- [ ] LLM sidecar auto-start with health monitoring
+- [ ] OpenAI-compatible API endpoint support (alternative to local model)
 - [ ] Graph persistence (save/load knowledge graph)
 - [ ] Multi-language ASR support
 - [ ] Graph search and entity filtering

@@ -143,7 +143,6 @@ pub async fn start_capture(
             let knowledge_graph = state.knowledge_graph.clone();
             let graph_snapshot_clone = state.graph_snapshot.clone();
             let graph_extractor = state.graph_extractor.clone();
-            let sidecar_manager = state.sidecar_manager.clone();
             let llm_engine = state.llm_engine.clone();
 
             let handle = std::thread::Builder::new()
@@ -157,7 +156,6 @@ pub async fn start_capture(
                         knowledge_graph,
                         graph_snapshot_clone,
                         graph_extractor,
-                        sidecar_manager,
                         llm_engine,
                     );
                 })
@@ -428,4 +426,31 @@ pub async fn clear_chat_history(state: State<'_, AppState>) -> Result<(), String
         .map_err(|e| format!("Lock error: {}", e))?;
     history.clear();
     Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// Model management commands
+// ---------------------------------------------------------------------------
+
+/// List available models and their download status.
+#[tauri::command]
+pub fn list_available_models() -> Vec<crate::models::ModelInfo> {
+    crate::models::list_models()
+}
+
+/// Download a model by filename, with progress events emitted to the frontend.
+#[tauri::command]
+pub fn download_model_cmd(
+    model_filename: String,
+    app_handle: tauri::AppHandle,
+) -> Result<String, String> {
+    let models = crate::models::list_models();
+    let model = models
+        .iter()
+        .find(|m| m.filename == model_filename)
+        .ok_or_else(|| format!("Model not found: {}", model_filename))?;
+
+    let path =
+        crate::models::download_model(&model.name, &model.url, &model.filename, &app_handle)?;
+    Ok(path.to_string_lossy().to_string())
 }

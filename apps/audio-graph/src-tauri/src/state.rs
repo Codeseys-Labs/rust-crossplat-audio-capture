@@ -22,7 +22,6 @@ use crate::graph::extraction::RuleBasedExtractor;
 use crate::graph::temporal::TemporalKnowledgeGraph;
 use crate::llm::engine::ChatMessage;
 use crate::llm::LlmEngine;
-use crate::sidecar::SidecarManager;
 
 /// Transcript segment for frontend consumption.
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
@@ -83,13 +82,10 @@ pub struct AppState {
     /// The temporal knowledge graph engine.
     pub knowledge_graph: Arc<Mutex<TemporalKnowledgeGraph>>,
 
-    /// Rule-based entity extractor (fallback when no LLM sidecar).
+    /// Rule-based entity extractor (fallback when no LLM available).
     pub graph_extractor: Arc<RuleBasedExtractor>,
 
-    /// LLM sidecar manager for entity extraction.
-    pub sidecar_manager: Arc<Mutex<SidecarManager>>,
-
-    /// Native LLM engine (replaces sidecar for entity extraction + provides chat).
+    /// Native LLM engine for entity extraction + chat.
     pub llm_engine: Arc<Mutex<Option<LlmEngine>>>,
 
     /// Chat message history for the sidebar.
@@ -147,7 +143,6 @@ impl AppState {
             is_capturing: Arc::new(RwLock::new(false)),
             knowledge_graph: Arc::new(Mutex::new(TemporalKnowledgeGraph::new())),
             graph_extractor: Arc::new(RuleBasedExtractor::new()),
-            sidecar_manager: Arc::new(Mutex::new(SidecarManager::default())),
             llm_engine: Arc::new(Mutex::new(None)),
             chat_history: Arc::new(RwLock::new(Vec::new())),
             capture_manager: Arc::new(Mutex::new(AudioCaptureManager::new())),

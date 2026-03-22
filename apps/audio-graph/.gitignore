@@ -9,8 +9,8 @@ src-tauri/target/
 # Rust lock file (large, regenerated from Cargo.toml)
 src-tauri/Cargo.lock
 
-# ML models (large binary files)
-models/
+# ML models (large binary files — only the top-level models/ directory)
+/models/
 
 # Generated Tauri schemas (can be regenerated)
 src-tauri/gen/

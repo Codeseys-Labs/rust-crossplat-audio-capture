@@ -97,13 +97,6 @@ export type StageStatus =
     | { type: "Running"; processed_count: number }
     | { type: "Error"; message: string };
 
-export type SidecarStatus =
-    | { type: "NotStarted" }
-    | { type: "Starting" }
-    | { type: "Healthy" }
-    | { type: "Unhealthy"; reason: string }
-    | { type: "Stopped" };
-
 export interface PipelineStatus {
     capture: StageStatus;
     pipeline: StageStatus;
@@ -111,7 +104,6 @@ export interface PipelineStatus {
     diarization: StageStatus;
     entity_extraction: StageStatus;
     graph: StageStatus;
-    sidecar: SidecarStatus;
 }
 
 // Speaker types
@@ -135,6 +127,28 @@ export interface CaptureErrorPayload {
     source_id: string;
     error: string;
     recoverable: boolean;
+}
+
+// ---------------------------------------------------------------------------
+// Model management types
+// ---------------------------------------------------------------------------
+
+export interface ModelInfo {
+    name: string;
+    filename: string;
+    url: string;
+    size_bytes: number | null;
+    is_downloaded: boolean;
+    local_path: string | null;
+}
+
+export interface DownloadProgress {
+    model_name: string;
+    bytes_downloaded: number;
+    total_bytes: number | null;
+    percent: number;
+    /** One of: "downloading", "complete", "error" */
+    status: string;
 }
 
 // ---------------------------------------------------------------------------
@@ -201,4 +215,11 @@ export interface AudioGraphStore {
     setRightPanelTab: (tab: "transcript" | "chat") => void;
     sendChatMessage: (message: string) => Promise<void>;
     clearChatHistory: () => Promise<void>;
+
+    // ── Models ────────────────────────────────────────────────────────────
+    models: ModelInfo[];
+    isDownloading: boolean;
+    downloadProgress: DownloadProgress | null;
+    fetchModels: () => Promise<void>;
+    downloadModel: (filename: string) => Promise<void>;
 }

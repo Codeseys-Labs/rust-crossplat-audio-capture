@@ -1,6 +1,6 @@
 //! Rule-based entity extraction fallback.
 //!
-//! Provides entity extraction when no LLM sidecar is available.
+//! Provides rule-based entity extraction as a fallback when no LLM is available.
 //! Uses regex patterns and heuristics to identify entities and relations.
 
 use crate::graph::entities::{ExtractedEntity, ExtractedRelation, ExtractionResult};
@@ -8,7 +8,7 @@ use regex::Regex;
 
 /// Rule-based entity extractor using regex patterns and heuristics.
 ///
-/// This is the fallback extractor used when the LLM sidecar is unavailable.
+/// This is the fallback extractor used when no native LLM model is available.
 /// It identifies entities (persons, organizations, locations, topics) and
 /// relations from transcript text using pre-compiled regex patterns.
 pub struct RuleBasedExtractor {

@@ -18,7 +18,6 @@ use crate::graph::entities::GraphSnapshot;
 use crate::graph::extraction::RuleBasedExtractor;
 use crate::graph::temporal::TemporalKnowledgeGraph;
 use crate::llm::LlmEngine;
-use crate::sidecar::SidecarManager;
 use crate::state::TranscriptSegment;
 
 // ---------------------------------------------------------------------------
@@ -28,8 +27,8 @@ use crate::state::TranscriptSegment;
 /// Perform entity extraction, update the knowledge graph, and emit events.
 ///
 /// Shared by both the full (ASR + diarization) and diarization-only speech
-/// processor loops. Tries the native LLM engine first, falls back to the
-/// sidecar LLM, then to rule-based extraction.
+/// processor loops. Tries the native LLM engine first, falls back to
+/// rule-based extraction.
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn process_extraction_and_emit(
     text: &str,
@@ -37,7 +36,6 @@ pub(crate) fn process_extraction_and_emit(
     segment_id: &str,
     timestamp: f64,
     llm_engine: &Arc<Mutex<Option<LlmEngine>>>,
-    sidecar_manager: &Arc<Mutex<SidecarManager>>,
     graph_extractor: &Arc<RuleBasedExtractor>,
     knowledge_graph: &Arc<Mutex<TemporalKnowledgeGraph>>,
     graph_snapshot: &Arc<RwLock<GraphSnapshot>>,
@@ -46,7 +44,7 @@ pub(crate) fn process_extraction_and_emit(
     extraction_count: &mut u64,
     graph_update_count: &mut u64,
 ) {
-    // Try native LLM engine first, then sidecar, then rule-based
+    // Try native LLM engine first, then rule-based fallback
     let llm_result = {
         let engine_guard = llm_engine.lock().unwrap_or_else(|e| {
             log::warn!("LLM engine mutex poisoned, recovering: {}", e);
@@ -73,29 +71,8 @@ pub(crate) fn process_extraction_and_emit(
         );
         result
     } else {
-        // Fallback: try sidecar, then rule-based
-        let sidecar = sidecar_manager.lock().unwrap_or_else(|e| {
-            log::warn!("Sidecar manager mutex poisoned, recovering: {}", e);
-            e.into_inner()
-        });
-        if sidecar.is_healthy() {
-            match sidecar.extract_entities(speaker, text) {
-                Ok(result) => {
-                    log::debug!(
-                        "Sidecar LLM extraction: {} entities, {} relations",
-                        result.entities.len(),
-                        result.relations.len()
-                    );
-                    result
-                }
-                Err(e) => {
-                    log::warn!("Sidecar extraction failed, using rule-based: {}", e);
-                    graph_extractor.extract(speaker, text)
-                }
-            }
-        } else {
-            graph_extractor.extract(speaker, text)
-        }
+        // Fallback to rule-based extraction
+        graph_extractor.extract(speaker, text)
     };
 
     *extraction_count += 1;
@@ -155,7 +132,6 @@ pub(crate) fn run_speech_processor(
     knowledge_graph: Arc<Mutex<TemporalKnowledgeGraph>>,
     graph_snapshot: Arc<RwLock<GraphSnapshot>>,
     graph_extractor: Arc<RuleBasedExtractor>,
-    sidecar_manager: Arc<Mutex<SidecarManager>>,
     llm_engine: Arc<Mutex<Option<LlmEngine>>>,
 ) {
     use whisper_rs::{WhisperContext, WhisperContextParameters};
@@ -192,7 +168,6 @@ pub(crate) fn run_speech_processor(
                     knowledge_graph,
                     graph_snapshot,
                     graph_extractor,
-                    sidecar_manager,
                     llm_engine,
                 );
                 return;
@@ -211,7 +186,6 @@ pub(crate) fn run_speech_processor(
                 knowledge_graph,
                 graph_snapshot,
                 graph_extractor,
-                sidecar_manager,
                 llm_engine,
             );
             return;
@@ -298,7 +272,6 @@ pub(crate) fn run_speech_processor(
                             &diarized.segment.id,
                             diarized.segment.start_time,
                             &llm_engine,
-                            &sidecar_manager,
                             &graph_extractor,
                             &knowledge_graph,
                             &graph_snapshot,
@@ -335,7 +308,6 @@ pub(crate) fn run_speech_processor_diarization_only(
     knowledge_graph: Arc<Mutex<TemporalKnowledgeGraph>>,
     graph_snapshot: Arc<RwLock<GraphSnapshot>>,
     graph_extractor: Arc<RuleBasedExtractor>,
-    sidecar_manager: Arc<Mutex<SidecarManager>>,
     llm_engine: Arc<Mutex<Option<LlmEngine>>>,
 ) {
     let diarization_config = DiarizationConfig::default();
@@ -411,7 +383,6 @@ pub(crate) fn run_speech_processor_diarization_only(
                 &diarized.segment.id,
                 diarized.segment.start_time,
                 &llm_engine,
-                &sidecar_manager,
                 &graph_extractor,
                 &knowledge_graph,
                 &graph_snapshot,

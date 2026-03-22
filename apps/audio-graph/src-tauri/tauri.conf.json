@@ -32,17 +32,5 @@
             "signingIdentity": null,
             "infoPlist": "Info.plist"
         }
-    },
-    "plugins": {
-        "shell": {
-            "sidecar": true,
-            "scope": [
-                {
-                    "name": "binaries/llama-server",
-                    "sidecar": true,
-                    "args": true
-                }
-            ]
-        }
     }
 }
