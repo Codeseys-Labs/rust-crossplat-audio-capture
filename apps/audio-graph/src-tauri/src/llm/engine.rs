@@ -168,12 +168,22 @@ Output JSON:
     }
 
     /// Generate text without grammar constraint.
+    ///
+    /// Uses a time-based seed for the distribution sampler so that chat
+    /// responses are non-deterministic (unlike entity extraction which keeps
+    /// seed 42 for reproducibility).
     fn generate(&self, prompt: &str, max_tokens: u32, temperature: f32) -> Result<String, String> {
+        // I9: Use a non-deterministic seed for chat generation.
+        let seed = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .subsec_nanos();
+
         let sampler = LlamaSampler::chain_simple([
             LlamaSampler::top_k(40),
             LlamaSampler::top_p(0.95, 1),
             LlamaSampler::temp(temperature),
-            LlamaSampler::dist(42),
+            LlamaSampler::dist(seed),
         ]);
 
         self.run_inference(prompt, max_tokens, sampler)

@@ -1,13 +1,8 @@
 import { useAudioGraphStore } from "../store";
+import { formatDuration } from "../utils/format";
 
 function SpeakerPanel() {
   const speakers = useAudioGraphStore((s) => s.speakers);
-
-  const formatDuration = (seconds: number): string => {
-    const mins = Math.floor(seconds / 60);
-    const secs = Math.floor(seconds % 60);
-    return `${mins}m ${secs}s`;
-  };
 
   return (
     <section className="panel speaker-panel" aria-label="Detected speakers">

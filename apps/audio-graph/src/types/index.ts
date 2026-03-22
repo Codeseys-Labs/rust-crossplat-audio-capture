@@ -43,17 +43,6 @@ export interface GraphEntity {
     speakers: string[];
 }
 
-export interface GraphRelation {
-    id: string;
-    source_id: string; // source entity ID
-    target_id: string; // target entity ID
-    relation_type: string; // WORKS_AT, LOCATED_IN, KNOWS, etc.
-    valid_from: number;
-    valid_until: number | null;
-    confidence: number;
-    source_segment_id: string;
-}
-
 // ---------------------------------------------------------------------------
 // react-force-graph compatible types (sent from backend via events)
 // ---------------------------------------------------------------------------

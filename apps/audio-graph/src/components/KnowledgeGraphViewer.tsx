@@ -6,19 +6,12 @@ import ForceGraph2D, {
 } from "react-force-graph-2d";
 import { useAudioGraphStore } from "../store";
 import type { GraphNode, GraphLink } from "../types";
+import { formatTime } from "../utils/format";
 
 /** Compute node radius from val. */
 function nodeRadius(val: number): number {
   const r = Math.sqrt(val) * 3 + 4;
   return Math.max(4, Math.min(24, r));
-}
-
-/** Format elapsed seconds to a readable duration string. */
-function formatTime(seconds: number): string {
-  if (!seconds && seconds !== 0) return "—";
-  const mins = Math.floor(seconds / 60);
-  const secs = Math.floor(seconds % 60);
-  return mins > 0 ? `${mins}m ${secs}s` : `${secs}s`;
 }
 
 function KnowledgeGraphViewer() {

@@ -52,6 +52,13 @@ pub struct VadConfig {
     /// Pre-speech audio padding to include (ms).
     pub pre_speech_padding_ms: u32,
     /// Post-speech audio padding to include (ms).
+    ///
+    /// M5: In the current implementation the `silence_timeout_ms` effectively
+    /// serves as post-speech padding — once enough silence accumulates, the
+    /// segment is emitted and the accumulated silence IS the trailing padding.
+    /// This field is kept for future use if finer-grained control is needed
+    /// (e.g., collecting extra audio beyond the silence timeout), but is not
+    /// separately enforced today.
     pub post_speech_padding_ms: u32,
 }
 

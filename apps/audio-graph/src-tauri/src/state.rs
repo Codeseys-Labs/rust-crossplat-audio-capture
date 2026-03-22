@@ -2,6 +2,13 @@
 //!
 //! `AppState` is registered with `tauri::Builder::manage()` and accessed
 //! in command handlers via `State<'_, AppState>`.
+//!
+//! TODO(I6): Load configuration from `config/default.toml` at startup.
+//! Currently all config values (channel capacities, VAD thresholds, model
+//! paths, etc.) are hardcoded as defaults.  A future PR should parse the
+//! TOML file via `toml` + resolve paths via `dirs` and populate `AppState`
+//! fields accordingly.  The `toml` and `dirs` crate dependencies have been
+//! removed until that work is done to avoid carrying unused dependencies.
 
 use std::collections::VecDeque;
 use std::sync::{Arc, Mutex, RwLock};

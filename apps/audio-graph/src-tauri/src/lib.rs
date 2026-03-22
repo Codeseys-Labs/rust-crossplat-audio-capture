@@ -19,6 +19,7 @@ pub mod events;
 pub mod graph;
 pub mod llm;
 pub mod sidecar;
+pub mod speech;
 pub mod state;
 
 use state::AppState;

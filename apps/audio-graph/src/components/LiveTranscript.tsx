@@ -1,12 +1,6 @@
 import { useRef, useEffect, useMemo, useCallback } from "react";
 import { useAudioGraphStore } from "../store";
-
-/** Format seconds as M:SS (e.g. "2:15"). */
-function formatTime(seconds: number): string {
-  const mins = Math.floor(seconds / 60);
-  const secs = Math.floor(seconds % 60);
-  return `${mins}:${secs.toString().padStart(2, "0")}`;
-}
+import { formatTime } from "../utils/format";
 
 /** Default fallback colors when speaker has no assigned color. */
 const FALLBACK_COLORS = [

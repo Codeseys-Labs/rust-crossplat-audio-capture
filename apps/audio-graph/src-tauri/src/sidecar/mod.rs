@@ -2,6 +2,14 @@
 //!
 //! Manages a llama-server subprocess for entity extraction via HTTP.
 //! Falls back to rule-based extraction if no sidecar is available.
+//!
+//! ## Design note: blocking HTTP (I10)
+//!
+//! This module intentionally uses `reqwest::blocking::Client` rather than an
+//! async client.  The sidecar is only called from the speech-processor thread
+//! (a dedicated OS thread, not a Tokio task), so blocking I/O is appropriate
+//! and avoids pulling the async runtime into the hot audio path.  If the
+//! sidecar is ever called from an async context, switch to `reqwest::Client`.
 
 use std::process::{Child, Command};
 use std::sync::{Arc, Mutex};

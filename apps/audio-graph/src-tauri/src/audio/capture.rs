@@ -45,7 +45,7 @@ pub struct AudioChunk {
 // ---------------------------------------------------------------------------
 
 /// Handle to a running audio capture thread.
-#[allow(dead_code)] // source_info will be read when commands.rs wires up the manager
+#[allow(dead_code)] // M8: source_info is stored for future introspection (e.g., active-capture queries)
 struct CaptureHandle {
     thread: Option<JoinHandle<()>>,
     stop_signal: Arc<AtomicBool>,
@@ -221,10 +221,30 @@ impl AudioCaptureManager {
         let stop_clone = Arc::clone(&stop_signal);
         let sid = source_id.to_string();
 
+        // M3: Derive the actual AudioSourceType from the CaptureTarget.
+        let source_type = match &target {
+            CaptureTarget::SystemDefault => AudioSourceType::SystemDefault,
+            CaptureTarget::Device(dev_id) => AudioSourceType::Device {
+                device_id: dev_id.0.clone(),
+            },
+            CaptureTarget::Application(app_id) => AudioSourceType::Application {
+                pid: app_id.0.parse::<u32>().unwrap_or(0),
+                app_name: source_id.to_string(),
+            },
+            CaptureTarget::ApplicationByName(name) => AudioSourceType::Application {
+                pid: 0,
+                app_name: name.clone(),
+            },
+            CaptureTarget::ProcessTree(proc_id) => AudioSourceType::Application {
+                pid: proc_id.0,
+                app_name: source_id.to_string(),
+            },
+        };
+
         let source_info = AudioSourceInfo {
             id: source_id.to_string(),
             name: source_id.to_string(),
-            source_type: AudioSourceType::SystemDefault, // simplified — caller provides target
+            source_type,
             is_active: true,
         };
 

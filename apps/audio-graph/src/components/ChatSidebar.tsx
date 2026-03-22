@@ -65,7 +65,7 @@ function ChatSidebar() {
 
                 {chatMessages.map((msg: ChatMessage, idx: number) => (
                     <div
-                        key={idx}
+                        key={`${msg.role}-${idx}`}
                         className={`chat-sidebar__message chat-sidebar__message--${msg.role}`}
                     >
                         <div className="chat-sidebar__message-role">
