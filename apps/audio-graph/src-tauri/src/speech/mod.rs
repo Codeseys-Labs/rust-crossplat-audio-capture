@@ -4,6 +4,7 @@
 //! extracted from `commands.rs` to keep command handlers thin.
 
 use std::collections::VecDeque;
+use std::path::PathBuf;
 use std::sync::{Arc, Mutex, RwLock};
 
 use crossbeam_channel::Receiver;
@@ -163,12 +164,13 @@ pub(crate) fn run_speech_processor(
     graph_extractor: Arc<RuleBasedExtractor>,
     llm_engine: Arc<Mutex<Option<LlmEngine>>>,
     api_client: Arc<Mutex<Option<ApiClient>>>,
+    models_dir: PathBuf,
 ) {
     use whisper_rs::{WhisperContext, WhisperContextParameters};
 
     log::info!("Speech processor: loading Whisper model...");
 
-    let asr_config = AsrConfig::default();
+    let asr_config = AsrConfig::with_models_dir(&models_dir);
     let model_path_str = asr_config.model_path.display().to_string();
 
     // Load Whisper model — must stay on this thread

@@ -147,6 +147,8 @@ pub async fn start_capture(
             let llm_engine = state.llm_engine.clone();
             let api_client = state.api_client.clone();
 
+            let models_dir = crate::models::get_models_dir(&app);
+
             let handle = std::thread::Builder::new()
                 .name("speech-processor".to_string())
                 .spawn(move || {
@@ -160,6 +162,7 @@ pub async fn start_capture(
                         graph_extractor,
                         llm_engine,
                         api_client,
+                        models_dir,
                     );
                 })
                 .map_err(|e| format!("Failed to spawn speech processor thread: {}", e))?;
@@ -529,23 +532,56 @@ pub async fn clear_chat_history(state: State<'_, AppState>) -> Result<(), String
 
 /// List available models and their download status.
 #[tauri::command]
-pub fn list_available_models() -> Vec<crate::models::ModelInfo> {
-    crate::models::list_models()
+pub fn list_available_models(app: tauri::AppHandle) -> Vec<crate::models::ModelInfo> {
+    crate::models::list_models(&app)
 }
 
 /// Download a model by filename, with progress events emitted to the frontend.
+///
+/// Runs the blocking HTTP download on a background thread via
+/// `tokio::task::spawn_blocking` so the IPC handler stays async (G3).
 #[tauri::command]
-pub fn download_model_cmd(
+pub async fn download_model_cmd(
+    app: tauri::AppHandle,
     model_filename: String,
-    app_handle: tauri::AppHandle,
 ) -> Result<String, String> {
-    let models = crate::models::list_models();
-    let model = models
-        .iter()
-        .find(|m| m.filename == model_filename)
-        .ok_or_else(|| format!("Model not found: {}", model_filename))?;
+    let handle = app.clone();
+    tokio::task::spawn_blocking(move || crate::models::download_model(&handle, &model_filename))
+        .await
+        .map_err(|e| format!("Download task failed: {}", e))?
+}
 
-    let path =
-        crate::models::download_model(&model.name, &model.url, &model.filename, &app_handle)?;
-    Ok(path.to_string_lossy().to_string())
+/// Get the readiness status of all known models (G1).
+#[tauri::command]
+pub fn get_model_status(app: tauri::AppHandle) -> crate::models::ModelStatus {
+    crate::models::get_model_status(&app)
+}
+
+/// Load the native LLM model into memory (G2).
+///
+/// Resolves the model path from the app data directory, then loads it on a
+/// background thread. On success the engine is stored in `AppState.llm_engine`.
+#[tauri::command]
+pub async fn load_llm_model(
+    app: tauri::AppHandle,
+    state: State<'_, AppState>,
+) -> Result<String, String> {
+    let models_dir = crate::models::get_models_dir(&app);
+    let model_path = models_dir.join(crate::models::LLM_MODEL_FILENAME);
+
+    if !model_path.exists() {
+        return Err("LLM model not downloaded".to_string());
+    }
+
+    let path = model_path.clone();
+    let engine =
+        tokio::task::spawn_blocking(move || crate::llm::LlmEngine::new(&path.to_string_lossy()))
+            .await
+            .map_err(|e| format!("Failed to spawn LLM loading task: {}", e))?
+            .map_err(|e| format!("Failed to load LLM model: {}", e))?;
+
+    let mut guard = state.llm_engine.lock().map_err(|e| e.to_string())?;
+    *guard = Some(engine);
+
+    Ok("LLM model loaded successfully".to_string())
 }

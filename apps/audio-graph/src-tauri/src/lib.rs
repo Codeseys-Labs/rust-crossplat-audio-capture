@@ -44,6 +44,8 @@ pub fn run() {
             commands::clear_chat_history,
             commands::list_available_models,
             commands::download_model_cmd,
+            commands::get_model_status,
+            commands::load_llm_model,
             commands::configure_api_endpoint,
         ])
         .run(tauri::generate_context!())

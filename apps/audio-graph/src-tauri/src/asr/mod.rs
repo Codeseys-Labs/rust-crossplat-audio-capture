@@ -4,7 +4,7 @@
 //! The ASR worker runs in its own thread, receiving `SpeechSegment`s from the
 //! VAD processor via a crossbeam channel and producing `TranscriptSegment`s.
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use crossbeam_channel::{Receiver, Sender};
 use log::{debug, error, info, warn};
@@ -26,6 +26,20 @@ pub struct AsrConfig {
     pub temperature: f32,
     /// Beam size (only used with beam-search strategy). Default: 5.
     pub beam_size: i32,
+}
+
+impl AsrConfig {
+    /// Create an `AsrConfig` with the model path resolved under the given
+    /// models directory.
+    pub fn with_models_dir(models_dir: &Path) -> Self {
+        Self {
+            model_path: models_dir.join("ggml-small.en.bin"),
+            language: "en".to_string(),
+            n_threads: 4,
+            temperature: 0.0,
+            beam_size: 5,
+        }
+    }
 }
 
 impl Default for AsrConfig {
