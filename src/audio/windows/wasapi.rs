@@ -687,6 +687,56 @@ pub struct ApplicationAudioSessionInfo {
     pub executable_path: Option<String>,
 }
 
+/// Resolves a process name from its PID by opening the process handle and querying
+/// its module filename.
+///
+/// Returns the executable filename without the `.exe` extension (e.g. `"firefox"`),
+/// or `None` if the process cannot be opened or the name cannot be retrieved.
+fn get_process_name_by_pid(pid: u32) -> Option<String> {
+    use windows::Win32::Foundation::{CloseHandle, HMODULE};
+    use windows::Win32::System::ProcessStatus::K32GetModuleFileNameExW;
+    use windows::Win32::System::Threading::{OpenProcess, PROCESS_QUERY_LIMITED_INFORMATION};
+
+    unsafe {
+        let handle = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, false, pid).ok()?;
+        let mut name_buf = [0u16; 260];
+        let len = K32GetModuleFileNameExW(
+            Some(handle),
+            Some(HMODULE(std::ptr::null_mut())),
+            &mut name_buf,
+        );
+        let _ = CloseHandle(handle);
+        if len > 0 {
+            let path = String::from_utf16_lossy(&name_buf[..len as usize]);
+            let filename = path.rsplit('\\').next().unwrap_or(&path);
+            let name = filename.strip_suffix(".exe").unwrap_or(filename);
+            Some(name.to_string())
+        } else {
+            None
+        }
+    }
+}
+
+/// Extracts a human-readable name from a WASAPI session identifier string.
+///
+/// Session identifiers typically look like:
+/// `{executable_path}|{session_guid}|{device_id}`
+///
+/// This function attempts to extract the executable name from the path component.
+/// Returns an empty string if no meaningful name can be extracted.
+fn parse_session_identifier(session_id: &str) -> String {
+    let parts: Vec<&str> = session_id.split('|').collect();
+    if let Some(name_part) = parts.first() {
+        if let Some(exe_name) = name_part.split('\\').last() {
+            let name = exe_name.strip_suffix(".exe").unwrap_or(exe_name);
+            if !name.is_empty() {
+                return name.to_string();
+            }
+        }
+    }
+    String::new()
+}
+
 /// Enumerates all active application audio sessions on the system.
 ///
 /// This function queries WASAPI for audio sessions that are currently active and
@@ -737,7 +787,8 @@ pub fn enumerate_application_audio_sessions() -> AudioResult<Vec<ApplicationAudi
     use windows::Win32::Foundation::HMODULE;
     use windows::Win32::Foundation::{CloseHandle, INVALID_HANDLE_VALUE};
     use windows::Win32::Media::Audio::{
-        IAudioSessionControl, IAudioSessionControl2, IAudioSessionEnumerator, IAudioSessionManager2,
+        AudioSessionStateActive, IAudioSessionControl, IAudioSessionControl2,
+        IAudioSessionEnumerator, IAudioSessionManager2,
     };
     use windows::Win32::System::ProcessStatus::K32GetModuleFileNameExW;
     use windows::Win32::System::Threading::{OpenProcess, PROCESS_QUERY_LIMITED_INFORMATION};
@@ -827,6 +878,22 @@ pub fn enumerate_application_audio_sessions() -> AudioResult<Vec<ApplicationAudi
                         context: None,
                     })?;
 
+            // Check session state — only include active sessions
+            let state = session_control
+                .GetState()
+                .map_err(|hr| AudioError::BackendError {
+                    backend: "wasapi".to_string(),
+                    operation: "enumerate_audio_sessions".to_string(),
+                    message: format!(
+                        "IAudioSessionControl::GetState for session {} failed (HRESULT: {:?})",
+                        i, hr
+                    ),
+                    context: None,
+                })?;
+            if state != AudioSessionStateActive {
+                continue;
+            }
+
             let session_control2: IAudioSessionControl2 = match session_control.cast() {
                 Ok(sc2) => sc2,
                 Err(hr) => {
@@ -856,20 +923,11 @@ pub fn enumerate_application_audio_sessions() -> AudioResult<Vec<ApplicationAudi
                 continue;
             }
 
-            let display_name_pwstr = session_control2.GetDisplayName().unwrap_or(PWSTR::null());
-            let mut display_name = if !display_name_pwstr.is_null() {
-                let dn = WindowsAudioDevice::pwstr_to_string(display_name_pwstr)
-                    .unwrap_or_else(|_| String::new());
-                CoTaskMemFree(Some(display_name_pwstr.as_ptr().cast()));
-                dn
-            } else {
-                String::new()
-            };
-
+            // Retrieve the session identifier (used as fallback for display name)
             let session_identifier_pwstr = session_control2
                 .GetSessionIdentifier()
                 .unwrap_or(PWSTR::null());
-            let session_identifier = if !session_identifier_pwstr.is_null() {
+            let session_id_str = if !session_identifier_pwstr.is_null() {
                 let si = WindowsAudioDevice::pwstr_to_string(session_identifier_pwstr)
                     .unwrap_or_else(|_| String::new());
                 CoTaskMemFree(Some(session_identifier_pwstr.as_ptr().cast()));
@@ -878,22 +936,41 @@ pub fn enumerate_application_audio_sessions() -> AudioResult<Vec<ApplicationAudi
                 String::new()
             };
 
-            if display_name.is_empty() && !session_identifier.is_empty() {
-                // Fallback to session identifier if display name is empty
-                let parts: Vec<&str> = session_identifier.split('|').collect();
-                if let Some(name_part) = parts.get(0) {
-                    if let Some(exe_name) = name_part.split('\\').last() {
-                        display_name = exe_name.trim_end_matches(".exe").to_string();
+            // Better display name resolution:
+            // 1. Try GetDisplayName() first
+            // 2. Try to get the process executable name via PID
+            // 3. Fall back to session identifier parsing
+            let display_name = {
+                let raw_name = {
+                    let display_name_pwstr =
+                        session_control2.GetDisplayName().unwrap_or(PWSTR::null());
+                    if !display_name_pwstr.is_null() {
+                        let dn = WindowsAudioDevice::pwstr_to_string(display_name_pwstr)
+                            .unwrap_or_else(|_| String::new());
+                        CoTaskMemFree(Some(display_name_pwstr.as_ptr().cast()));
+                        dn
+                    } else {
+                        String::new()
                     }
-                }
-                if display_name.is_empty() {
-                    // if still empty after trying to parse session_identifier
-                    display_name = format!("PID: {}", pid); // Fallback further
-                }
-            } else if display_name.is_empty() {
-                display_name = format!("Unknown App (PID: {})", pid); // Ultimate fallback
-            }
+                };
 
+                if !raw_name.is_empty() {
+                    raw_name
+                } else {
+                    // Resolve executable name from PID for a cleaner display name
+                    get_process_name_by_pid(pid).unwrap_or_else(|| {
+                        // Last resort: parse session identifier
+                        let parsed = parse_session_identifier(&session_id_str);
+                        if !parsed.is_empty() {
+                            parsed
+                        } else {
+                            format!("PID: {}", pid)
+                        }
+                    })
+                }
+            };
+
+            // Retrieve the executable path for the process
             let mut executable_path: Option<String> = None;
             let process_handle_result = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, false, pid);
 
@@ -921,7 +998,7 @@ pub fn enumerate_application_audio_sessions() -> AudioResult<Vec<ApplicationAudi
             sessions_info.push(ApplicationAudioSessionInfo {
                 process_id: pid,
                 display_name,
-                session_identifier,
+                session_identifier: session_id_str,
                 executable_path,
             });
         }

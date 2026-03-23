@@ -2,11 +2,13 @@ import { create } from "zustand";
 import { invoke } from "@tauri-apps/api/core";
 import type {
     ApiEndpointConfig,
+    AppSettings,
     AudioGraphStore,
     AudioSourceInfo,
     ChatMessage,
     ChatResponse,
     ModelInfo,
+    ModelStatus,
     StageStatus,
 } from "../types";
 
@@ -15,9 +17,17 @@ const idleStage: StageStatus = { type: "Idle" };
 export const useAudioGraphStore = create<AudioGraphStore>((set, get) => ({
     // ── Audio sources ────────────────────────────────────────────────────
     audioSources: [],
-    selectedSourceId: null,
+    selectedSourceIds: [],
     setAudioSources: (sources) => set({ audioSources: sources }),
-    setSelectedSourceId: (id) => set({ selectedSourceId: id }),
+    toggleSourceId: (id) =>
+        set((state) => {
+            const idx = state.selectedSourceIds.indexOf(id);
+            if (idx >= 0) {
+                return { selectedSourceIds: state.selectedSourceIds.filter((sid) => sid !== id) };
+            }
+            return { selectedSourceIds: [...state.selectedSourceIds, id] };
+        }),
+    clearSelectedSources: () => set({ selectedSourceIds: [] }),
     fetchSources: async () => {
         try {
             const sources = await invoke<AudioSourceInfo[]>("list_audio_sources");
@@ -73,13 +83,15 @@ export const useAudioGraphStore = create<AudioGraphStore>((set, get) => ({
     captureStartTime: null,
     setIsCapturing: (capturing) => set({ isCapturing: capturing }),
     startCapture: async () => {
-        const { selectedSourceId } = get();
-        if (!selectedSourceId) {
+        const { selectedSourceIds } = get();
+        if (selectedSourceIds.length === 0) {
             set({ error: "No audio source selected" });
             return;
         }
         try {
-            await invoke("start_capture", { sourceId: selectedSourceId });
+            for (const sourceId of selectedSourceIds) {
+                await invoke("start_capture", { sourceId });
+            }
             set({
                 isCapturing: true,
                 captureStartTime: Date.now(),
@@ -90,10 +102,12 @@ export const useAudioGraphStore = create<AudioGraphStore>((set, get) => ({
         }
     },
     stopCapture: async () => {
-        const { selectedSourceId } = get();
-        if (!selectedSourceId) return;
+        const { selectedSourceIds } = get();
+        if (selectedSourceIds.length === 0) return;
         try {
-            await invoke("stop_capture", { sourceId: selectedSourceId });
+            for (const sourceId of selectedSourceIds) {
+                await invoke("stop_capture", { sourceId });
+            }
             set({
                 isCapturing: false,
                 captureStartTime: null,
@@ -191,4 +205,64 @@ export const useAudioGraphStore = create<AudioGraphStore>((set, get) => ({
         }
     },
     clearApiEndpoint: () => set({ apiConfig: null }),
+
+    // ── Settings ──────────────────────────────────────────────────────────
+    settings: null,
+    modelStatus: null,
+    settingsOpen: false,
+    settingsLoading: false,
+    isDeletingModel: null,
+
+    openSettings: () => {
+        set({ settingsOpen: true });
+        const { fetchSettings, fetchModels, fetchModelStatus } = get();
+        fetchSettings();
+        fetchModels();
+        fetchModelStatus();
+    },
+    closeSettings: () => set({ settingsOpen: false }),
+
+    fetchSettings: async () => {
+        set({ settingsLoading: true });
+        try {
+            const settings = await invoke<AppSettings>("load_settings_cmd");
+            set({ settings, settingsLoading: false, error: null });
+        } catch (e) {
+            set({
+                settingsLoading: false,
+                error: e instanceof Error ? e.message : String(e),
+            });
+        }
+    },
+    saveSettings: async (settings: AppSettings) => {
+        try {
+            await invoke("save_settings_cmd", { settings });
+            set({ settings, error: null });
+        } catch (e) {
+            set({ error: e instanceof Error ? e.message : String(e) });
+        }
+    },
+    fetchModelStatus: async () => {
+        try {
+            const modelStatus = await invoke<ModelStatus>("get_model_status");
+            set({ modelStatus, error: null });
+        } catch (e) {
+            set({ error: e instanceof Error ? e.message : String(e) });
+        }
+    },
+    deleteModel: async (filename: string) => {
+        set({ isDeletingModel: filename });
+        try {
+            await invoke("delete_model_cmd", { modelFilename: filename });
+            // Refresh models and model status after deletion
+            const models = await invoke<ModelInfo[]>("list_available_models");
+            const modelStatus = await invoke<ModelStatus>("get_model_status");
+            set({ models, modelStatus, isDeletingModel: null, error: null });
+        } catch (e) {
+            set({
+                isDeletingModel: null,
+                error: e instanceof Error ? e.message : String(e),
+            });
+        }
+    },
 }));

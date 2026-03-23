@@ -139,6 +139,8 @@ export interface ModelInfo {
     url: string;
     size_bytes: number | null;
     is_downloaded: boolean;
+    is_valid: boolean;
+    description: string;
     local_path: string | null;
 }
 
@@ -166,6 +168,47 @@ export interface ApiEndpointConfig {
 }
 
 // ---------------------------------------------------------------------------
+// Settings & model readiness types
+// ---------------------------------------------------------------------------
+
+/** Model readiness status (matches Rust ModelReadiness enum) */
+export type ModelReadiness = "Ready" | "NotDownloaded" | "Invalid";
+
+/** Aggregate model status (matches Rust ModelStatus struct) */
+export interface ModelStatus {
+    whisper: ModelReadiness;
+    llm: ModelReadiness;
+    vad: ModelReadiness;
+}
+
+/** ASR provider configuration (matches Rust AsrProvider enum with serde tag) */
+export type AsrProvider =
+    | { type: "local_whisper" }
+    | { type: "api"; endpoint: string; api_key: string; model: string };
+
+/** LLM API configuration for persistence */
+export interface LlmApiConfig {
+    endpoint: string;
+    api_key: string | null;
+    model: string;
+    max_tokens: number;
+    temperature: number;
+}
+
+/** Audio processing settings */
+export interface AudioSettings {
+    sample_rate: number;
+    channels: number;
+}
+
+/** Top-level application settings (matches Rust AppSettings) */
+export interface AppSettings {
+    asr_provider: AsrProvider;
+    llm_api_config: LlmApiConfig | null;
+    audio_settings: AudioSettings;
+}
+
+// ---------------------------------------------------------------------------
 // Chat types
 // ---------------------------------------------------------------------------
 
@@ -187,9 +230,10 @@ export interface ChatResponse {
 export interface AudioGraphStore {
     // Audio sources
     audioSources: AudioSourceInfo[];
-    selectedSourceId: string | null;
+    selectedSourceIds: string[];
     setAudioSources: (sources: AudioSourceInfo[]) => void;
-    setSelectedSourceId: (id: string | null) => void;
+    toggleSourceId: (id: string) => void;
+    clearSelectedSources: () => void;
     fetchSources: () => Promise<void>;
 
     // Transcript
@@ -241,4 +285,17 @@ export interface AudioGraphStore {
     apiConfig: ApiEndpointConfig | null;
     configureApiEndpoint: (config: ApiEndpointConfig) => Promise<void>;
     clearApiEndpoint: () => void;
+
+    // ── Settings ──────────────────────────────────────────────────────────
+    settings: AppSettings | null;
+    modelStatus: ModelStatus | null;
+    settingsOpen: boolean;
+    settingsLoading: boolean;
+    isDeletingModel: string | null;
+    openSettings: () => void;
+    closeSettings: () => void;
+    fetchSettings: () => Promise<void>;
+    saveSettings: (settings: AppSettings) => Promise<void>;
+    fetchModelStatus: () => Promise<void>;
+    deleteModel: (filename: string) => Promise<void>;
 }

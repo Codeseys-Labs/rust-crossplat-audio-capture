@@ -299,3 +299,32 @@ pub fn download_model(app: &AppHandle, filename: &str) -> Result<String, String>
 
     Ok(target_path.to_string_lossy().to_string())
 }
+
+// ---------------------------------------------------------------------------
+// Deletion
+// ---------------------------------------------------------------------------
+
+/// Delete a downloaded model file
+pub fn delete_model(app: &AppHandle, filename: &str) -> Result<String, String> {
+    // Validate filename - prevent path traversal
+    if filename.contains('/') || filename.contains('\\') || filename.contains("..") {
+        return Err("Invalid filename".to_string());
+    }
+
+    let models_dir = get_models_dir(app);
+    let model_path = models_dir.join(filename);
+
+    // Verify the file is actually in the models directory
+    if !model_path.starts_with(&models_dir) {
+        return Err("Invalid model path".to_string());
+    }
+
+    if !model_path.exists() {
+        return Err(format!("Model file not found: {}", filename));
+    }
+
+    fs::remove_file(&model_path).map_err(|e| format!("Failed to delete model: {}", e))?;
+
+    log::info!("Deleted model: {}", filename);
+    Ok(format!("Model '{}' deleted successfully", filename))
+}

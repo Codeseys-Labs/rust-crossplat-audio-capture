@@ -125,6 +125,10 @@ pub struct AppState {
 
     /// Handle to the speech processor (ASR + diarization) orchestrator thread.
     pub speech_processor_thread: Arc<Mutex<Option<std::thread::JoinHandle<()>>>>,
+
+    // ── Settings ─────────────────────────────────────────────────────────
+    /// Persisted application settings (ASR provider, LLM config, audio params).
+    pub app_settings: Arc<RwLock<crate::settings::AppSettings>>,
 }
 
 impl AppState {
@@ -159,6 +163,7 @@ impl AppState {
             speech_rx,
             vad_thread: Arc::new(Mutex::new(None)),
             speech_processor_thread: Arc::new(Mutex::new(None)),
+            app_settings: Arc::new(RwLock::new(crate::settings::AppSettings::default())),
         }
     }
 }

@@ -585,3 +585,28 @@ pub async fn load_llm_model(
 
     Ok("LLM model loaded successfully".to_string())
 }
+
+// ---------------------------------------------------------------------------
+// Settings commands
+// ---------------------------------------------------------------------------
+
+/// Load application settings from disk (returns defaults if missing).
+#[tauri::command]
+pub fn load_settings_cmd(app: tauri::AppHandle) -> crate::settings::AppSettings {
+    crate::settings::load_settings(&app)
+}
+
+/// Save application settings to disk (atomic write).
+#[tauri::command]
+pub fn save_settings_cmd(
+    app: tauri::AppHandle,
+    settings: crate::settings::AppSettings,
+) -> Result<(), String> {
+    crate::settings::save_settings(&app, &settings)
+}
+
+/// Delete a downloaded model file by filename.
+#[tauri::command]
+pub fn delete_model_cmd(app: tauri::AppHandle, filename: String) -> Result<String, String> {
+    crate::models::delete_model(&app, &filename)
+}

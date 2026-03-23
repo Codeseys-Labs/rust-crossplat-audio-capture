@@ -5,6 +5,7 @@ import KnowledgeGraphViewer from "./components/KnowledgeGraphViewer";
 import ControlBar from "./components/ControlBar";
 import SpeakerPanel from "./components/SpeakerPanel";
 import PipelineStatusBar from "./components/PipelineStatusBar";
+import SettingsPage from "./components/SettingsPage";
 import { useTauriEvents } from "./hooks/useTauriEvents";
 import { useAudioGraphStore } from "./store";
 import "./App.css";
@@ -17,6 +18,7 @@ function App() {
   const clearError = useAudioGraphStore((s) => s.clearError);
   const rightPanelTab = useAudioGraphStore((s) => s.rightPanelTab);
   const setRightPanelTab = useAudioGraphStore((s) => s.setRightPanelTab);
+  const settingsOpen = useAudioGraphStore((s) => s.settingsOpen);
 
   return (
     <div className="app-container">
@@ -44,7 +46,11 @@ function App() {
               💬 Chat
             </button>
           </div>
-          {rightPanelTab === "transcript" ? <LiveTranscript /> : <ChatSidebar />}
+          {rightPanelTab === "transcript" ? (
+            <LiveTranscript />
+          ) : (
+            <ChatSidebar />
+          )}
         </aside>
       </div>
       <PipelineStatusBar />
@@ -52,7 +58,9 @@ function App() {
       {/* Error toast notification */}
       {error && (
         <div className="error-toast" role="alert">
-          <span className="error-toast__icon" aria-hidden="true">⚠️</span>
+          <span className="error-toast__icon" aria-hidden="true">
+            ⚠️
+          </span>
           <span className="error-toast__message">{error}</span>
           <button
             className="error-toast__dismiss"
@@ -63,6 +71,9 @@ function App() {
           </button>
         </div>
       )}
+
+      {/* Settings modal */}
+      {settingsOpen && <SettingsPage />}
     </div>
   );
 }

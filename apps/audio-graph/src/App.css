@@ -8,7 +8,8 @@
   height: 100vh;
   background-color: var(--bg-primary, #1a1a2e);
   color: var(--text-primary, #e0e0e0);
-  font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
+  font-family:
+    -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
   position: relative;
 }
 
@@ -324,30 +325,34 @@
   cursor: not-allowed;
 }
 
-/* Radio indicator */
-.source-item__radio {
+/* Checkbox indicator */
+.source-item__checkbox {
   width: 14px;
   height: 14px;
-  border-radius: 50%;
+  border-radius: 3px;
   border: 2px solid var(--text-muted, #6a6a7a);
   flex-shrink: 0;
   position: relative;
-  transition: border-color 0.12s ease;
+  transition:
+    border-color 0.12s ease,
+    background-color 0.12s ease;
 }
 
-.source-item__radio--checked {
+.source-item__checkbox--checked {
   border-color: var(--accent-green, #4ade80);
+  background-color: var(--accent-green, #4ade80);
 }
 
-.source-item__radio--checked::after {
+.source-item__checkbox--checked::after {
   content: "";
   position: absolute;
-  top: 2px;
-  left: 2px;
-  width: 6px;
-  height: 6px;
-  border-radius: 50%;
-  background-color: var(--accent-green, #4ade80);
+  top: 1px;
+  left: 4px;
+  width: 4px;
+  height: 7px;
+  border: solid #0a2010;
+  border-width: 0 2px 2px 0;
+  transform: rotate(45deg);
 }
 
 .source-item__name {
@@ -523,7 +528,9 @@
   height: 8px;
   border-radius: 50%;
   flex-shrink: 0;
-  transition: background-color 0.2s ease, box-shadow 0.2s ease;
+  transition:
+    background-color 0.2s ease,
+    box-shadow 0.2s ease;
 }
 
 .pipeline-stage__dot--running {
@@ -1026,12 +1033,20 @@
   animation: chat-dot-bounce 1.4s infinite ease-in-out both;
 }
 
-.chat-sidebar__dot:nth-child(1) { animation-delay: -0.32s; }
-.chat-sidebar__dot:nth-child(2) { animation-delay: -0.16s; }
-.chat-sidebar__dot:nth-child(3) { animation-delay: 0s; }
+.chat-sidebar__dot:nth-child(1) {
+  animation-delay: -0.32s;
+}
+.chat-sidebar__dot:nth-child(2) {
+  animation-delay: -0.16s;
+}
+.chat-sidebar__dot:nth-child(3) {
+  animation-delay: 0s;
+}
 
 @keyframes chat-dot-bounce {
-  0%, 80%, 100% {
+  0%,
+  80%,
+  100% {
     transform: scale(0.6);
     opacity: 0.4;
   }
@@ -1095,4 +1110,339 @@
 .chat-sidebar__send-btn:disabled {
   opacity: 0.4;
   cursor: not-allowed;
+}
+
+/* ==========================================================================
+   Settings Page
+   ========================================================================== */
+
+/* Overlay backdrop */
+.settings-overlay {
+  position: fixed;
+  inset: 0;
+  background: rgba(0, 0, 0, 0.7);
+  z-index: 1000;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  animation: settings-fade-in 0.2s ease-out;
+}
+
+@keyframes settings-fade-in {
+  from {
+    opacity: 0;
+  }
+  to {
+    opacity: 1;
+  }
+}
+
+/* Modal container */
+.settings-modal {
+  background: var(--bg-secondary, #16162a);
+  border-radius: 12px;
+  max-width: 640px;
+  width: 90%;
+  max-height: 85vh;
+  overflow-y: auto;
+  border: 1px solid var(--border-color, #2a2a4a);
+  box-shadow: 0 8px 40px rgba(0, 0, 0, 0.5);
+  display: flex;
+  flex-direction: column;
+  scrollbar-width: thin;
+  scrollbar-color: rgba(255, 255, 255, 0.1) transparent;
+}
+
+.settings-modal::-webkit-scrollbar {
+  width: 6px;
+}
+
+.settings-modal::-webkit-scrollbar-track {
+  background: transparent;
+}
+
+.settings-modal::-webkit-scrollbar-thumb {
+  background-color: rgba(255, 255, 255, 0.1);
+  border-radius: 3px;
+}
+
+/* Header with title and close */
+.settings-header {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  padding: 20px 24px;
+  border-bottom: 1px solid var(--border-color, #2a2a4a);
+  flex-shrink: 0;
+}
+
+.settings-header__title {
+  font-size: 18px;
+  font-weight: 700;
+  color: var(--text-primary, #e0e0e0);
+  margin: 0;
+}
+
+.settings-header__close {
+  background: none;
+  border: none;
+  color: var(--text-secondary, #a0a0b0);
+  cursor: pointer;
+  font-size: 18px;
+  padding: 4px 8px;
+  border-radius: 4px;
+  transition: all 0.15s;
+  line-height: 1;
+}
+
+.settings-header__close:hover {
+  color: var(--text-primary, #e0e0e0);
+  background-color: rgba(255, 255, 255, 0.08);
+}
+
+/* Content area */
+.settings-content {
+  flex: 1;
+  overflow-y: auto;
+}
+
+.settings-content--loading {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  padding: 48px 24px;
+  color: var(--text-secondary, #a0a0b0);
+  font-size: 14px;
+}
+
+/* Sections */
+.settings-section {
+  padding: 20px 24px;
+  border-bottom: 1px solid var(--border-color, #2a2a4a);
+}
+
+.settings-section__title {
+  font-size: 14px;
+  font-weight: 600;
+  text-transform: uppercase;
+  letter-spacing: 0.05em;
+  color: var(--text-secondary, #a0a0b0);
+  margin: 0 0 16px;
+}
+
+.settings-section__empty {
+  color: var(--text-muted, #6a6a7a);
+  font-size: 13px;
+  font-style: italic;
+  margin: 0;
+}
+
+.settings-section__api-fields {
+  margin-top: 16px;
+}
+
+/* Model cards */
+.model-card {
+  background: var(--bg-tertiary, #0f0f1a);
+  border-radius: 8px;
+  padding: 16px;
+  margin-bottom: 12px;
+  border: 1px solid var(--border-color, #2a2a4a);
+}
+
+.model-card:last-child {
+  margin-bottom: 0;
+}
+
+.model-card__header {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  gap: 8px;
+}
+
+.model-card__name {
+  font-weight: 600;
+  color: var(--text-primary, #e0e0e0);
+  margin-right: 8px;
+}
+
+.model-card__size {
+  font-size: 12px;
+  color: var(--text-muted, #6a6a7a);
+  white-space: nowrap;
+}
+
+.model-card__description {
+  font-size: 13px;
+  color: var(--text-secondary, #a0a0b0);
+  margin: 4px 0 0;
+  line-height: 1.4;
+}
+
+.model-card__actions {
+  display: flex;
+  gap: 8px;
+  margin-top: 12px;
+}
+
+/* Status badges */
+.status-badge {
+  padding: 2px 8px;
+  border-radius: 4px;
+  font-size: 12px;
+  font-weight: 500;
+  display: inline-block;
+  vertical-align: middle;
+}
+
+.status-badge--ready {
+  background: rgba(74, 222, 128, 0.15);
+  color: var(--accent-green, #4ade80);
+}
+
+.status-badge--not-downloaded {
+  background: rgba(251, 191, 36, 0.15);
+  color: #fbbf24;
+}
+
+.status-badge--invalid {
+  background: rgba(233, 69, 96, 0.15);
+  color: var(--accent-red, #e94560);
+}
+
+/* Buttons */
+.settings-btn {
+  padding: 6px 16px;
+  border-radius: 6px;
+  border: none;
+  cursor: pointer;
+  font-size: 13px;
+  font-weight: 500;
+  transition: all 0.2s;
+  line-height: 1.4;
+}
+
+.settings-btn--primary {
+  background: var(--accent-blue, #60a5fa);
+  color: #fff;
+}
+
+.settings-btn--primary:hover {
+  background: #3b82f6;
+}
+
+.settings-btn--danger {
+  background: rgba(233, 69, 96, 0.15);
+  color: var(--accent-red, #e94560);
+}
+
+.settings-btn--danger:hover {
+  background: rgba(233, 69, 96, 0.3);
+}
+
+.settings-btn:disabled {
+  opacity: 0.5;
+  cursor: not-allowed;
+}
+
+/* Form inputs */
+.settings-input {
+  width: 100%;
+  padding: 8px 12px;
+  border-radius: 6px;
+  border: 1px solid var(--border-color, #2a2a4a);
+  background: var(--bg-tertiary, #0f0f1a);
+  color: var(--text-primary, #e0e0e0);
+  font-size: 14px;
+  box-sizing: border-box;
+  transition: border-color 0.2s;
+}
+
+.settings-input:focus {
+  border-color: var(--accent-blue, #60a5fa);
+  outline: none;
+}
+
+.settings-input::placeholder {
+  color: var(--text-muted, #6a6a7a);
+}
+
+/* Radio group */
+.settings-radio-group {
+  display: flex;
+  flex-direction: column;
+  gap: 12px;
+}
+
+.settings-radio {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  cursor: pointer;
+  font-size: 14px;
+  color: var(--text-primary, #e0e0e0);
+}
+
+.settings-radio input[type="radio"] {
+  accent-color: var(--accent-blue, #60a5fa);
+}
+
+/* Form field */
+.settings-field {
+  margin-bottom: 12px;
+}
+
+.settings-field:last-child {
+  margin-bottom: 0;
+}
+
+.settings-field__label {
+  display: block;
+  font-size: 13px;
+  color: var(--text-secondary, #a0a0b0);
+  margin-bottom: 4px;
+}
+
+/* Progress bar */
+.download-progress {
+  width: 100%;
+  height: 4px;
+  background: var(--bg-primary, #1a1a2e);
+  border-radius: 2px;
+  overflow: hidden;
+  margin-top: 8px;
+}
+
+.download-progress__bar {
+  height: 100%;
+  background: var(--accent-blue, #60a5fa);
+  transition: width 0.3s;
+  border-radius: 2px;
+}
+
+/* Footer */
+.settings-footer {
+  padding: 16px 24px;
+  display: flex;
+  justify-content: flex-end;
+  gap: 12px;
+  flex-shrink: 0;
+  border-top: 1px solid var(--border-color, #2a2a4a);
+}
+
+/* ControlBar settings button */
+.control-bar__settings-btn {
+  background: none;
+  border: none;
+  font-size: 20px;
+  cursor: pointer;
+  padding: 4px 8px;
+  opacity: 0.7;
+  transition: opacity 0.2s;
+  line-height: 1;
+}
+
+.control-bar__settings-btn:hover {
+  opacity: 1;
 }

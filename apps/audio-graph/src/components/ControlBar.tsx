@@ -3,11 +3,12 @@ import { useAudioGraphStore } from "../store";
 
 function ControlBar() {
   const isCapturing = useAudioGraphStore((s) => s.isCapturing);
-  const selectedSourceId = useAudioGraphStore((s) => s.selectedSourceId);
+  const selectedSourceIds = useAudioGraphStore((s) => s.selectedSourceIds);
   const audioSources = useAudioGraphStore((s) => s.audioSources);
   const captureStartTime = useAudioGraphStore((s) => s.captureStartTime);
   const startCapture = useAudioGraphStore((s) => s.startCapture);
   const stopCapture = useAudioGraphStore((s) => s.stopCapture);
+  const openSettings = useAudioGraphStore((s) => s.openSettings);
 
   const [elapsed, setElapsed] = useState("00:00");
 
@@ -40,12 +41,19 @@ function ControlBar() {
     }
   }, [isCapturing, startCapture, stopCapture]);
 
-  // Find selected source name
-  const selectedSource = audioSources.find((s) => s.id === selectedSourceId);
-  const canStart = selectedSourceId !== null && !isCapturing;
+  // Find selected source names
+  const selectedSources = audioSources.filter((s) =>
+    selectedSourceIds.includes(s.id),
+  );
+  const canStart = selectedSourceIds.length > 0 && !isCapturing;
+  const selectedLabel = selectedSources.map((s) => s.name).join(", ");
 
   return (
-    <header className="control-bar" role="toolbar" aria-label="Capture controls">
+    <header
+      className="control-bar"
+      role="toolbar"
+      aria-label="Capture controls"
+    >
       <div className="control-bar__left">
         <h1 className="control-bar__title">AudioGraph</h1>
       </div>
@@ -67,23 +75,37 @@ function ControlBar() {
           </div>
         )}
 
-        {selectedSource && !isCapturing && (
-          <span className="control-bar__source-name" title={selectedSource.name}>
-            {selectedSource.name}
+        {selectedSources.length > 0 && !isCapturing && (
+          <span className="control-bar__source-name" title={selectedLabel}>
+            {selectedSources.length === 1
+              ? selectedLabel
+              : `${selectedSources.length} sources selected`}
           </span>
         )}
 
-        {!selectedSourceId && !isCapturing && (
-          <span className="control-bar__hint">Select an audio source to begin</span>
+        {selectedSourceIds.length === 0 && !isCapturing && (
+          <span className="control-bar__hint">
+            Select audio sources to begin
+          </span>
         )}
       </div>
 
       <div className="control-bar__right">
-        {isCapturing && selectedSource && (
+        {isCapturing && selectedSources.length > 0 && (
           <span className="control-bar__active-source">
-            🎧 {selectedSource.name}
+            🎧{" "}
+            {selectedSources.length === 1
+              ? selectedLabel
+              : `${selectedSources.length} sources`}
           </span>
         )}
+        <button
+          className="control-bar__settings-btn"
+          onClick={openSettings}
+          title="Settings"
+        >
+          ⚙️
+        </button>
       </div>
     </header>
   );

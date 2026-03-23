@@ -29,8 +29,8 @@ const GROUP_ORDER: Record<string, number> = {
 
 function AudioSourceSelector() {
   const audioSources = useAudioGraphStore((s) => s.audioSources);
-  const selectedSourceId = useAudioGraphStore((s) => s.selectedSourceId);
-  const setSelectedSourceId = useAudioGraphStore((s) => s.setSelectedSourceId);
+  const selectedSourceIds = useAudioGraphStore((s) => s.selectedSourceIds);
+  const toggleSourceId = useAudioGraphStore((s) => s.toggleSourceId);
   const fetchSources = useAudioGraphStore((s) => s.fetchSources);
   const isCapturing = useAudioGraphStore((s) => s.isCapturing);
 
@@ -41,7 +41,10 @@ function AudioSourceSelector() {
 
   // Group sources by type
   const grouped = useMemo(() => {
-    const groups = new Map<string, { icon: string; sources: AudioSourceInfo[] }>();
+    const groups = new Map<
+      string,
+      { icon: string; sources: AudioSourceInfo[] }
+    >();
 
     for (const source of audioSources) {
       const { group, icon } = getSourceGroup(source);
@@ -53,17 +56,17 @@ function AudioSourceSelector() {
 
     // Sort groups by predefined order
     return Array.from(groups.entries()).sort(
-      ([a], [b]) => (GROUP_ORDER[a] ?? 99) - (GROUP_ORDER[b] ?? 99)
+      ([a], [b]) => (GROUP_ORDER[a] ?? 99) - (GROUP_ORDER[b] ?? 99),
     );
   }, [audioSources]);
 
   const handleSelect = useCallback(
     (id: string) => {
       if (!isCapturing) {
-        setSelectedSourceId(id);
+        toggleSourceId(id);
       }
     },
-    [isCapturing, setSelectedSourceId]
+    [isCapturing, toggleSourceId],
   );
 
   const handleRefresh = useCallback(() => {
@@ -71,7 +74,10 @@ function AudioSourceSelector() {
   }, [fetchSources]);
 
   return (
-    <section className="panel audio-source-selector" aria-label="Audio source selection">
+    <section
+      className="panel audio-source-selector"
+      aria-label="Audio source selection"
+    >
       <div className="audio-source-selector__header">
         <h3 className="panel-title">Audio Sources</h3>
         <button
@@ -102,16 +108,21 @@ function AudioSourceSelector() {
               <h4 className="audio-source-selector__group-label">
                 <span aria-hidden="true">{icon}</span> {groupName}
               </h4>
-              <ul className="source-list" role="radiogroup" aria-label={`${groupName} sources`}>
+              <ul
+                className="source-list"
+                role="group"
+                aria-label={`${groupName} sources`}
+              >
                 {sources.map((source) => {
-                  const isSelected = selectedSourceId === source.id;
-                  const isSystemDefault = source.source_type.type === "SystemDefault";
+                  const isSelected = selectedSourceIds.includes(source.id);
+                  const isSystemDefault =
+                    source.source_type.type === "SystemDefault";
                   return (
                     <li
                       key={source.id}
                       className={`source-item ${isSelected ? "source-item--selected" : ""} ${isCapturing ? "source-item--disabled" : ""}`}
                       onClick={() => handleSelect(source.id)}
-                      role="radio"
+                      role="checkbox"
                       aria-checked={isSelected}
                       tabIndex={0}
                       onKeyDown={(e) => {
@@ -122,7 +133,7 @@ function AudioSourceSelector() {
                       }}
                     >
                       <span
-                        className={`source-item__radio ${isSelected ? "source-item__radio--checked" : ""}`}
+                        className={`source-item__checkbox ${isSelected ? "source-item__checkbox--checked" : ""}`}
                         aria-hidden="true"
                       />
                       <span className="source-item__name">{source.name}</span>
@@ -130,7 +141,9 @@ function AudioSourceSelector() {
                         <span className="source-item__badge">Default</span>
                       )}
                       {isSelected && (
-                        <span className="source-item__check" aria-hidden="true">✓</span>
+                        <span className="source-item__check" aria-hidden="true">
+                          ✓
+                        </span>
                       )}
                     </li>
                   );

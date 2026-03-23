@@ -19,6 +19,7 @@ pub mod events;
 pub mod graph;
 pub mod llm;
 pub mod models;
+pub mod settings;
 pub mod speech;
 pub mod state;
 
@@ -47,6 +48,9 @@ pub fn run() {
             commands::get_model_status,
             commands::load_llm_model,
             commands::configure_api_endpoint,
+            commands::load_settings_cmd,
+            commands::save_settings_cmd,
+            commands::delete_model_cmd,
         ])
         .run(tauri::generate_context!())
         .expect("error while running AudioGraph");
