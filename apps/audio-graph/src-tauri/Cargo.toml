@@ -67,6 +67,9 @@ audioadapter-buffers = "2.0"
 # String similarity (entity resolution)
 strsim = "0.11.1"
 
+# Process enumeration (cross-platform)
+sysinfo = "0.38.4"
+
 # UUID generation
 uuid = { version = "1.22.0", features = ["v4"] }
 

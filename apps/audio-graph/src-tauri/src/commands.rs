@@ -591,22 +591,74 @@ pub async fn load_llm_model(
 // ---------------------------------------------------------------------------
 
 /// Load application settings from disk (returns defaults if missing).
+/// Syncs the loaded settings into the in-memory `AppState.app_settings` cache
+/// so other backend modules (e.g. speech processor) can read them without I/O.
 #[tauri::command]
-pub fn load_settings_cmd(app: tauri::AppHandle) -> crate::settings::AppSettings {
-    crate::settings::load_settings(&app)
+pub fn load_settings_cmd(
+    app: tauri::AppHandle,
+    state: State<'_, AppState>,
+) -> crate::settings::AppSettings {
+    let settings = crate::settings::load_settings(&app);
+    // Sync in-memory cache
+    if let Ok(mut cached) = state.app_settings.write() {
+        *cached = settings.clone();
+    }
+    settings
 }
 
 /// Save application settings to disk (atomic write).
+/// Also updates the in-memory `AppState.app_settings` cache.
 #[tauri::command]
 pub fn save_settings_cmd(
     app: tauri::AppHandle,
     settings: crate::settings::AppSettings,
+    state: State<'_, AppState>,
 ) -> Result<(), String> {
-    crate::settings::save_settings(&app, &settings)
+    crate::settings::save_settings(&app, &settings)?;
+    // Sync in-memory cache
+    if let Ok(mut cached) = state.app_settings.write() {
+        *cached = settings;
+    }
+    Ok(())
 }
 
 /// Delete a downloaded model file by filename.
 #[tauri::command]
-pub fn delete_model_cmd(app: tauri::AppHandle, filename: String) -> Result<String, String> {
-    crate::models::delete_model(&app, &filename)
+pub fn delete_model_cmd(app: tauri::AppHandle, model_filename: String) -> Result<String, String> {
+    crate::models::delete_model(&app, &model_filename)
+}
+
+// ---------------------------------------------------------------------------
+// Process enumeration
+// ---------------------------------------------------------------------------
+
+/// A running system process (for target-selection UI).
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct ProcessInfo {
+    pub pid: u32,
+    pub name: String,
+    pub exe_path: Option<String>,
+}
+
+/// List running system processes (deduplicated by name, sorted alphabetically).
+#[tauri::command]
+pub fn list_running_processes() -> Vec<ProcessInfo> {
+    use sysinfo::System;
+    let mut sys = System::new();
+    sys.refresh_processes(sysinfo::ProcessesToUpdate::All, true);
+
+    let mut processes: Vec<ProcessInfo> = sys
+        .processes()
+        .iter()
+        .filter(|(_, p)| !p.name().to_string_lossy().is_empty())
+        .map(|(pid, p)| ProcessInfo {
+            pid: pid.as_u32(),
+            name: p.name().to_string_lossy().to_string(),
+            exe_path: p.exe().map(|e| e.to_string_lossy().to_string()),
+        })
+        .collect();
+
+    processes.sort_by(|a, b| a.name.to_lowercase().cmp(&b.name.to_lowercase()));
+    processes.dedup_by(|a, b| a.name == b.name);
+    processes
 }

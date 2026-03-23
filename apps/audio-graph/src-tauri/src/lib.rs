@@ -51,6 +51,7 @@ pub fn run() {
             commands::load_settings_cmd,
             commands::save_settings_cmd,
             commands::delete_model_cmd,
+            commands::list_running_processes,
         ])
         .run(tauri::generate_context!())
         .expect("error while running AudioGraph");

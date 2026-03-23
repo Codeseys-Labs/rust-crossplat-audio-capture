@@ -250,6 +250,66 @@
   cursor: not-allowed;
 }
 
+/* Search input */
+.audio-source-selector__search {
+  position: relative;
+  padding: 0 8px 8px 8px;
+}
+
+.audio-source-selector__search-input {
+  width: 100%;
+  padding: 6px 28px 6px 10px;
+  background: var(--bg-tertiary);
+  border: 1px solid var(--border-color);
+  border-radius: 4px;
+  color: var(--text-primary);
+  font-size: 12px;
+  outline: none;
+  box-sizing: border-box;
+}
+
+.audio-source-selector__search-input::placeholder {
+  color: var(--text-muted);
+}
+
+.audio-source-selector__search-input:focus {
+  border-color: var(--accent-blue);
+}
+
+.audio-source-selector__search-clear {
+  position: absolute;
+  right: 14px;
+  top: 50%;
+  transform: translateY(-50%);
+  background: none;
+  border: none;
+  color: var(--text-muted);
+  cursor: pointer;
+  font-size: 12px;
+  padding: 2px 4px;
+  line-height: 1;
+}
+
+.audio-source-selector__search-clear:hover {
+  color: var(--text-primary);
+}
+
+/* Group count badge */
+.audio-source-selector__group-count {
+  margin-left: 6px;
+  font-size: 10px;
+  color: var(--text-muted);
+  font-weight: normal;
+}
+
+/* PID badge for processes */
+.source-item__pid {
+  font-size: 10px;
+  color: var(--text-muted);
+  font-family: monospace;
+  white-space: nowrap;
+}
+
 .audio-source-selector__empty {
   display: flex;
   flex-direction: column;

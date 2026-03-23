@@ -15,6 +15,12 @@ export interface AudioSourceInfo {
     is_active: boolean;
 }
 
+export interface ProcessInfo {
+    pid: number;
+    name: string;
+    exe_path: string | null;
+}
+
 // Transcript types
 export interface TranscriptSegment {
     id: string; // UUID
@@ -235,6 +241,12 @@ export interface AudioGraphStore {
     toggleSourceId: (id: string) => void;
     clearSelectedSources: () => void;
     fetchSources: () => Promise<void>;
+
+    // Processes
+    processes: ProcessInfo[];
+    searchFilter: string;
+    fetchProcesses: () => Promise<void>;
+    setSearchFilter: (filter: string) => void;
 
     // Transcript
     transcriptSegments: TranscriptSegment[];

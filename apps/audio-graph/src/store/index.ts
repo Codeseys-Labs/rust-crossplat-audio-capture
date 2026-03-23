@@ -9,6 +9,7 @@ import type {
     ChatResponse,
     ModelInfo,
     ModelStatus,
+    ProcessInfo,
     StageStatus,
 } from "../types";
 
@@ -36,6 +37,19 @@ export const useAudioGraphStore = create<AudioGraphStore>((set, get) => ({
             set({ error: e instanceof Error ? e.message : String(e) });
         }
     },
+
+    // ── Processes ────────────────────────────────────────────────────────
+    processes: [],
+    searchFilter: '',
+    fetchProcesses: async () => {
+        try {
+            const processes = await invoke<ProcessInfo[]>("list_running_processes");
+            set({ processes });
+        } catch (err) {
+            console.error("Failed to fetch processes:", err);
+        }
+    },
+    setSearchFilter: (filter: string) => set({ searchFilter: filter }),
 
     // ── Transcript ───────────────────────────────────────────────────────
     transcriptSegments: [],

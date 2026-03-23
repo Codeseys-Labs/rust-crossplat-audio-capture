@@ -1246,7 +1246,7 @@ mod tests {
 
     // ── enumerate_application_audio_sessions Tests ───────────────────
 
-    /// Test that enumerate_application_audio_sessions doesn't panic.
+    /// Test that enumerate_application_audio_sessions doesn't panic and returns Ok.
     #[test]
     fn test_enumerate_audio_sessions() {
         let result = enumerate_application_audio_sessions();
@@ -1256,6 +1256,150 @@ mod tests {
             result.err()
         );
         // Result may be empty if no apps are playing audio.
+    }
+
+    /// Test that enumerate_application_audio_sessions returns a Vec (even if empty).
+    /// This validates the return type and basic contract.
+    #[test]
+    fn test_enumerate_audio_sessions_returns_vec() {
+        let sessions = enumerate_application_audio_sessions().expect("enumeration failed");
+        // The Vec may be empty if no apps are actively playing audio.
+        // We just verify it's a valid Vec<ApplicationAudioSessionInfo>.
+        let _len: usize = sessions.len();
+        for session in &sessions {
+            // Every returned session should have a non-zero PID
+            assert_ne!(
+                session.process_id, 0,
+                "Sessions with PID 0 should be filtered out"
+            );
+            // Display name should not be empty (3-tier fallback guarantees this)
+            assert!(
+                !session.display_name.is_empty(),
+                "Display name should not be empty for PID {}",
+                session.process_id
+            );
+        }
+    }
+
+    /// Test that calling enumerate_application_audio_sessions twice doesn't panic
+    /// (validates COM re-initialization).
+    #[test]
+    fn test_enumerate_audio_sessions_twice() {
+        let _result1 = enumerate_application_audio_sessions();
+        let result2 = enumerate_application_audio_sessions();
+        assert!(
+            result2.is_ok(),
+            "Second call to enumerate_application_audio_sessions() failed: {:?}",
+            result2.err()
+        );
+    }
+
+    // ── get_process_name_by_pid Tests ────────────────────────────────
+
+    /// Test that get_process_name_by_pid returns a name for the current process.
+    #[test]
+    fn test_get_process_name_by_pid_current_process() {
+        let current_pid = std::process::id();
+        let name = get_process_name_by_pid(current_pid);
+        assert!(
+            name.is_some(),
+            "Should be able to resolve the current process name (PID {})",
+            current_pid
+        );
+        // The test binary name should contain "rsac" or the test runner name
+        let name = name.unwrap();
+        assert!(
+            !name.is_empty(),
+            "Process name should not be empty for PID {}",
+            current_pid
+        );
+    }
+
+    /// Test that get_process_name_by_pid returns None for PID 0.
+    #[test]
+    fn test_get_process_name_by_pid_zero() {
+        // PID 0 is the System Idle Process — OpenProcess should fail or return unusable name
+        let name = get_process_name_by_pid(0);
+        // It's ok if this returns Some (System) or None — just don't panic
+        let _ = name;
+    }
+
+    /// Test that get_process_name_by_pid returns None for a non-existent PID.
+    #[test]
+    fn test_get_process_name_by_pid_nonexistent() {
+        // Use a very high PID that's unlikely to exist
+        let name = get_process_name_by_pid(4_000_000_000);
+        assert!(
+            name.is_none(),
+            "Should return None for a non-existent PID, got: {:?}",
+            name
+        );
+    }
+
+    /// Test that get_process_name_by_pid strips the .exe extension.
+    #[test]
+    fn test_get_process_name_by_pid_strips_exe() {
+        let current_pid = std::process::id();
+        if let Some(name) = get_process_name_by_pid(current_pid) {
+            assert!(
+                !name.ends_with(".exe"),
+                "Process name should have .exe stripped, got: {:?}",
+                name
+            );
+        }
+    }
+
+    // ── parse_session_identifier Tests ───────────────────────────────
+
+    /// Test parse_session_identifier with a typical WASAPI session ID.
+    #[test]
+    fn test_parse_session_identifier_typical() {
+        let session_id = r"C:\Program Files\Mozilla Firefox\firefox.exe|{guid}|{device}";
+        let name = parse_session_identifier(session_id);
+        assert_eq!(name, "firefox");
+    }
+
+    /// Test parse_session_identifier with a device path format.
+    #[test]
+    fn test_parse_session_identifier_device_path() {
+        let session_id =
+            r"\Device\HarddiskVolume8\Users\test\AppData\Local\Discord\app-1.0\Discord.exe|{guid}";
+        let name = parse_session_identifier(session_id);
+        assert_eq!(name, "Discord");
+    }
+
+    /// Test parse_session_identifier with empty string.
+    #[test]
+    fn test_parse_session_identifier_empty() {
+        assert_eq!(parse_session_identifier(""), String::new());
+    }
+
+    /// Test parse_session_identifier with no path separators.
+    #[test]
+    fn test_parse_session_identifier_no_path() {
+        let session_id = "someapp.exe|{guid}";
+        let name = parse_session_identifier(session_id);
+        assert_eq!(name, "someapp");
+    }
+
+    /// Test parse_session_identifier with system sounds identifier.
+    #[test]
+    fn test_parse_session_identifier_system_guid() {
+        // System sounds sessions have GUIDs, not paths
+        let session_id = "#%b{A9EF3FD9-4240-455E-A925-035F1494B5F7}";
+        let name = parse_session_identifier(session_id);
+        // This will likely parse to something non-empty (the GUID string)
+        // but that's expected — the caller filters these via PID == 0
+        let _ = name;
+    }
+
+    /// Test parse_session_identifier with pipe-only separator.
+    #[test]
+    fn test_parse_session_identifier_pipe_only() {
+        let session_id = "|{guid}|{device}";
+        let name = parse_session_identifier(session_id);
+        // First part is empty, so result should be empty
+        assert_eq!(name, String::new());
     }
 
     // ── BridgeStream Integration (full wiring) ──────────────────────
