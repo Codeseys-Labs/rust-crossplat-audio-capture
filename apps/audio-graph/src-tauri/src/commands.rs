@@ -213,6 +213,20 @@ pub async fn start_capture(
                     .map(|g| g.is_none())
                     .unwrap_or(false);
                 if api_empty && !endpoint.is_empty() {
+                    // Read advanced parameters from the user's persisted
+                    // llm_api_config settings, falling back to
+                    // extraction-oriented defaults.
+                    let (api_max_tokens, api_temperature) = state
+                        .app_settings
+                        .read()
+                        .ok()
+                        .and_then(|s| {
+                            s.llm_api_config
+                                .as_ref()
+                                .map(|c| (c.max_tokens, c.temperature))
+                        })
+                        .unwrap_or((512, 0.1));
+
                     let config = crate::llm::ApiConfig {
                         endpoint: endpoint.clone(),
                         api_key: if api_key.is_empty() {
@@ -221,8 +235,8 @@ pub async fn start_capture(
                             Some(api_key.clone())
                         },
                         model: model.clone(),
-                        max_tokens: 512,
-                        temperature: 0.1,
+                        max_tokens: api_max_tokens,
+                        temperature: api_temperature,
                     };
                     let client = crate::llm::ApiClient::new(config);
                     if client.is_configured() {

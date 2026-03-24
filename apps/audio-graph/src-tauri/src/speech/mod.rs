@@ -15,12 +15,78 @@ use crate::diarization::{
     DiarizationConfig, DiarizationInput, DiarizationWorker, DiarizedTranscript,
 };
 use crate::events::{self, PipelineStatus, StageStatus};
-use crate::graph::entities::GraphSnapshot;
+use crate::graph::entities::{ExtractionResult, GraphSnapshot};
 use crate::graph::extraction::RuleBasedExtractor;
 use crate::graph::temporal::TemporalKnowledgeGraph;
 use crate::llm::{ApiClient, LlmEngine};
 use crate::settings::{AsrProvider, LlmProvider};
 use crate::state::TranscriptSegment;
+
+// ---------------------------------------------------------------------------
+// Extraction helpers
+// ---------------------------------------------------------------------------
+
+/// Try entity extraction using the native LLM engine.
+/// Returns `None` if no engine is loaded or extraction fails.
+fn try_native_llm(
+    text: &str,
+    speaker: &str,
+    llm_engine: &Arc<Mutex<Option<LlmEngine>>>,
+) -> Option<ExtractionResult> {
+    let engine_guard = llm_engine.lock().unwrap_or_else(|e| {
+        log::warn!("LLM engine mutex poisoned, recovering: {}", e);
+        e.into_inner()
+    });
+    if let Some(ref engine) = *engine_guard {
+        match engine.extract_entities(text, speaker) {
+            Ok(result) => {
+                log::debug!(
+                    "Native LLM extraction: {} entities, {} relations",
+                    result.entities.len(),
+                    result.relations.len()
+                );
+                Some(result)
+            }
+            Err(e) => {
+                log::warn!("Native LLM extraction failed: {}", e);
+                None
+            }
+        }
+    } else {
+        None
+    }
+}
+
+/// Try entity extraction using the API client.
+/// Returns `None` if no client is configured or extraction fails.
+fn try_api_client(
+    text: &str,
+    speaker: &str,
+    api_client: &Arc<Mutex<Option<ApiClient>>>,
+) -> Option<ExtractionResult> {
+    let api_guard = api_client.lock().unwrap_or_else(|e| {
+        log::warn!("API client mutex poisoned, recovering: {}", e);
+        e.into_inner()
+    });
+    if let Some(ref client) = *api_guard {
+        match client.extract_entities(text, speaker) {
+            Ok(result) => {
+                log::debug!(
+                    "API extraction: {} entities, {} relations",
+                    result.entities.len(),
+                    result.relations.len()
+                );
+                Some(result)
+            }
+            Err(e) => {
+                log::warn!("API extraction failed: {}", e);
+                None
+            }
+        }
+    } else {
+        None
+    }
+}
 
 // ---------------------------------------------------------------------------
 // Helper: extraction + graph update + event emission (I1: deduplicated)
@@ -29,7 +95,10 @@ use crate::state::TranscriptSegment;
 /// Perform entity extraction, update the knowledge graph, and emit events.
 ///
 /// Shared by both the full (ASR + diarization) and diarization-only speech
-/// processor loops. Extraction chain: native LLM → API client → rule-based.
+/// processor loops.  Extraction is routed based on the user's `LlmProvider`
+/// preference, with automatic fallback:
+///   `LocalLlama` → native LLM → API → rule-based
+///   `Api`        → API → native LLM → rule-based
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn process_extraction_and_emit(
     text: &str,
@@ -38,6 +107,7 @@ pub(crate) fn process_extraction_and_emit(
     timestamp: f64,
     llm_engine: &Arc<Mutex<Option<LlmEngine>>>,
     api_client: &Arc<Mutex<Option<ApiClient>>>,
+    llm_provider: &LlmProvider,
     graph_extractor: &Arc<RuleBasedExtractor>,
     knowledge_graph: &Arc<Mutex<TemporalKnowledgeGraph>>,
     graph_snapshot: &Arc<RwLock<GraphSnapshot>>,
@@ -46,64 +116,20 @@ pub(crate) fn process_extraction_and_emit(
     extraction_count: &mut u64,
     graph_update_count: &mut u64,
 ) {
-    // 1. Try native LLM engine first
-    let llm_result = {
-        let engine_guard = llm_engine.lock().unwrap_or_else(|e| {
-            log::warn!("LLM engine mutex poisoned, recovering: {}", e);
-            e.into_inner()
-        });
-        if let Some(ref engine) = *engine_guard {
-            match engine.extract_entities(text, speaker) {
-                Ok(result) => Some(result),
-                Err(e) => {
-                    log::warn!("Native LLM extraction failed: {}", e);
-                    None
-                }
-            }
-        } else {
-            None
+    // Route extraction based on user's LLM provider preference
+    let extraction_result = match llm_provider {
+        LlmProvider::LocalLlama => {
+            // Prefer native LLM → fallback to API → fallback to rule-based
+            try_native_llm(text, speaker, llm_engine)
+                .or_else(|| try_api_client(text, speaker, api_client))
+                .unwrap_or_else(|| graph_extractor.extract(speaker, text))
         }
-    };
-
-    // 2. If native failed, try API client
-    let api_result = if llm_result.is_none() {
-        let api_guard = api_client.lock().unwrap_or_else(|e| {
-            log::warn!("API client mutex poisoned, recovering: {}", e);
-            e.into_inner()
-        });
-        if let Some(ref client) = *api_guard {
-            match client.extract_entities(text, speaker) {
-                Ok(result) => Some(result),
-                Err(e) => {
-                    log::warn!("API extraction failed: {}", e);
-                    None
-                }
-            }
-        } else {
-            None
+        LlmProvider::Api { .. } => {
+            // Prefer API → fallback to native LLM → fallback to rule-based
+            try_api_client(text, speaker, api_client)
+                .or_else(|| try_native_llm(text, speaker, llm_engine))
+                .unwrap_or_else(|| graph_extractor.extract(speaker, text))
         }
-    } else {
-        None
-    };
-
-    // 3. Pick the best result or fall back to rule-based
-    let extraction_result = if let Some(result) = llm_result {
-        log::debug!(
-            "Native LLM extraction: {} entities, {} relations",
-            result.entities.len(),
-            result.relations.len()
-        );
-        result
-    } else if let Some(result) = api_result {
-        log::debug!(
-            "API extraction: {} entities, {} relations",
-            result.entities.len(),
-            result.relations.len()
-        );
-        result
-    } else {
-        // Fallback to rule-based extraction
-        graph_extractor.extract(speaker, text)
     };
 
     *extraction_count += 1;
@@ -171,6 +197,28 @@ pub(crate) fn run_speech_processor(
 ) {
     use whisper_rs::{WhisperContext, WhisperContextParameters};
 
+    // Macro to reduce duplication: each fallback site calls
+    // run_speech_processor_diarization_only with the same arguments
+    // and then returns.  Only one branch is ever taken at runtime, so
+    // the compiler accepts the conditional moves.
+    macro_rules! fallback_diarization_only {
+        () => {
+            run_speech_processor_diarization_only(
+                speech_rx,
+                transcript_buffer,
+                pipeline_status,
+                app_handle,
+                knowledge_graph,
+                graph_snapshot,
+                graph_extractor,
+                llm_engine,
+                api_client,
+                llm_provider,
+            );
+            return;
+        };
+    }
+
     // Log LLM provider for diagnostics
     match &llm_provider {
         LlmProvider::LocalLlama => {
@@ -195,18 +243,7 @@ pub(crate) fn run_speech_processor(
             "Speech processor: ASR provider is API — skipping local Whisper model, \
              running diarization-only mode."
         );
-        run_speech_processor_diarization_only(
-            speech_rx,
-            transcript_buffer,
-            pipeline_status,
-            app_handle,
-            knowledge_graph,
-            graph_snapshot,
-            graph_extractor,
-            llm_engine,
-            api_client,
-        );
-        return;
+        fallback_diarization_only!();
     }
 
     log::info!("Speech processor: loading Whisper model...");
@@ -230,18 +267,7 @@ pub(crate) fn run_speech_processor(
                  Download the model via Settings → Models.",
                 model_path_str
             );
-            run_speech_processor_diarization_only(
-                speech_rx,
-                transcript_buffer,
-                pipeline_status,
-                app_handle,
-                knowledge_graph,
-                graph_snapshot,
-                graph_extractor,
-                llm_engine,
-                api_client,
-            );
-            return;
+            fallback_diarization_only!();
         }
 
         match std::fs::metadata(model_path) {
@@ -259,18 +285,7 @@ pub(crate) fn run_speech_processor(
                         meta.len(),
                         MIN_MODEL_SIZE
                     );
-                    run_speech_processor_diarization_only(
-                        speech_rx,
-                        transcript_buffer,
-                        pipeline_status,
-                        app_handle,
-                        knowledge_graph,
-                        graph_snapshot,
-                        graph_extractor,
-                        llm_engine,
-                        api_client,
-                    );
-                    return;
+                    fallback_diarization_only!();
                 }
                 log::info!(
                     "Speech processor: model file validated — {} ({:.1} MB)",
@@ -285,18 +300,7 @@ pub(crate) fn run_speech_processor(
                     model_path_str,
                     e
                 );
-                run_speech_processor_diarization_only(
-                    speech_rx,
-                    transcript_buffer,
-                    pipeline_status,
-                    app_handle,
-                    knowledge_graph,
-                    graph_snapshot,
-                    graph_extractor,
-                    llm_engine,
-                    api_client,
-                );
-                return;
+                fallback_diarization_only!();
             }
         }
     }
@@ -319,19 +323,7 @@ pub(crate) fn run_speech_processor(
                     model_path_str,
                     e
                 );
-                // Run in diarization-only mode (no ASR)
-                run_speech_processor_diarization_only(
-                    speech_rx,
-                    transcript_buffer,
-                    pipeline_status,
-                    app_handle,
-                    knowledge_graph,
-                    graph_snapshot,
-                    graph_extractor,
-                    llm_engine,
-                    api_client,
-                );
-                return;
+                fallback_diarization_only!();
             }
         };
 
@@ -339,18 +331,7 @@ pub(crate) fn run_speech_processor(
         Ok(s) => s,
         Err(e) => {
             log::error!("Speech processor: failed to create Whisper state: {}", e);
-            run_speech_processor_diarization_only(
-                speech_rx,
-                transcript_buffer,
-                pipeline_status,
-                app_handle,
-                knowledge_graph,
-                graph_snapshot,
-                graph_extractor,
-                llm_engine,
-                api_client,
-            );
-            return;
+            fallback_diarization_only!();
         }
     };
 
@@ -435,6 +416,7 @@ pub(crate) fn run_speech_processor(
                             diarized.segment.start_time,
                             &llm_engine,
                             &api_client,
+                            &llm_provider,
                             &graph_extractor,
                             &knowledge_graph,
                             &graph_snapshot,
@@ -473,6 +455,7 @@ pub(crate) fn run_speech_processor_diarization_only(
     graph_extractor: Arc<RuleBasedExtractor>,
     llm_engine: Arc<Mutex<Option<LlmEngine>>>,
     api_client: Arc<Mutex<Option<ApiClient>>>,
+    llm_provider: LlmProvider,
 ) {
     let diarization_config = DiarizationConfig::default();
     // Same dummy-channel pattern as in `run_speech_processor` — see M2
@@ -548,6 +531,7 @@ pub(crate) fn run_speech_processor_diarization_only(
                 diarized.segment.start_time,
                 &llm_engine,
                 &api_client,
+                &llm_provider,
                 &graph_extractor,
                 &knowledge_graph,
                 &graph_snapshot,
