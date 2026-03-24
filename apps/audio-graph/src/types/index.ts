@@ -192,6 +192,11 @@ export type AsrProvider =
     | { type: "local_whisper" }
     | { type: "api"; endpoint: string; api_key: string; model: string };
 
+/** LLM provider configuration (matches Rust LlmProvider enum with serde tag) */
+export type LlmProvider =
+    | { type: "local_llama" }
+    | { type: "api"; endpoint: string; api_key: string; model: string };
+
 /** LLM API configuration for persistence */
 export interface LlmApiConfig {
     endpoint: string;
@@ -210,6 +215,7 @@ export interface AudioSettings {
 /** Top-level application settings (matches Rust AppSettings) */
 export interface AppSettings {
     asr_provider: AsrProvider;
+    llm_provider: LlmProvider;
     llm_api_config: LlmApiConfig | null;
     audio_settings: AudioSettings;
 }

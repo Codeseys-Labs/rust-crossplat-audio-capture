@@ -19,6 +19,7 @@ use crate::graph::entities::GraphSnapshot;
 use crate::graph::extraction::RuleBasedExtractor;
 use crate::graph::temporal::TemporalKnowledgeGraph;
 use crate::llm::{ApiClient, LlmEngine};
+use crate::settings::{AsrProvider, LlmProvider};
 use crate::state::TranscriptSegment;
 
 // ---------------------------------------------------------------------------
@@ -165,13 +166,140 @@ pub(crate) fn run_speech_processor(
     llm_engine: Arc<Mutex<Option<LlmEngine>>>,
     api_client: Arc<Mutex<Option<ApiClient>>>,
     models_dir: PathBuf,
+    asr_provider: AsrProvider,
+    llm_provider: LlmProvider,
 ) {
     use whisper_rs::{WhisperContext, WhisperContextParameters};
+
+    // Log LLM provider for diagnostics
+    match &llm_provider {
+        LlmProvider::LocalLlama => {
+            log::info!("Speech processor: LLM provider is LocalLlama — will prefer native LLM engine for entity extraction.");
+        }
+        LlmProvider::Api {
+            endpoint, model, ..
+        } => {
+            log::info!(
+                "Speech processor: LLM provider is API (endpoint={}, model={}) — will prefer API client for entity extraction.",
+                endpoint,
+                model
+            );
+        }
+    }
+
+    // ── Respect AsrProvider setting ──────────────────────────────────────
+    // If the user has selected an API provider for ASR, skip local Whisper
+    // model loading entirely and run in diarization-only mode.
+    if matches!(asr_provider, AsrProvider::Api { .. }) {
+        log::info!(
+            "Speech processor: ASR provider is API — skipping local Whisper model, \
+             running diarization-only mode."
+        );
+        run_speech_processor_diarization_only(
+            speech_rx,
+            transcript_buffer,
+            pipeline_status,
+            app_handle,
+            knowledge_graph,
+            graph_snapshot,
+            graph_extractor,
+            llm_engine,
+            api_client,
+        );
+        return;
+    }
 
     log::info!("Speech processor: loading Whisper model...");
 
     let asr_config = AsrConfig::with_models_dir(&models_dir);
     let model_path_str = asr_config.model_path.display().to_string();
+
+    // ── Pre-validate model file ─────────────────────────────────────────
+    // Guard against missing or corrupted model files BEFORE calling into
+    // whisper.cpp's C code.  In debug builds, passing a missing/truncated
+    // file to whisper.cpp triggers a UCRT debug assertion crash
+    // (`_osfile(fh) & FOPEN` in read.cpp:381) because the C runtime tries
+    // to `read()` from an invalid file descriptor.  By checking here we
+    // gracefully fall back to diarization-only mode instead of aborting.
+    {
+        let model_path = &asr_config.model_path;
+        if !model_path.exists() {
+            log::warn!(
+                "Speech processor: Whisper model not found at '{}'. \
+                 ASR disabled — running diarization-only mode. \
+                 Download the model via Settings → Models.",
+                model_path_str
+            );
+            run_speech_processor_diarization_only(
+                speech_rx,
+                transcript_buffer,
+                pipeline_status,
+                app_handle,
+                knowledge_graph,
+                graph_snapshot,
+                graph_extractor,
+                llm_engine,
+                api_client,
+            );
+            return;
+        }
+
+        match std::fs::metadata(model_path) {
+            Ok(meta) => {
+                // The smallest valid Whisper model (tiny) is ~75 MB.
+                // Anything under 1 MB is definitely a partial download or corrupt.
+                const MIN_MODEL_SIZE: u64 = 1_000_000;
+                if meta.len() < MIN_MODEL_SIZE {
+                    log::warn!(
+                        "Speech processor: Whisper model at '{}' appears corrupted \
+                         (size: {} bytes, expected >= {} bytes). \
+                         ASR disabled — running diarization-only mode. \
+                         Re-download the model via Settings → Models.",
+                        model_path_str,
+                        meta.len(),
+                        MIN_MODEL_SIZE
+                    );
+                    run_speech_processor_diarization_only(
+                        speech_rx,
+                        transcript_buffer,
+                        pipeline_status,
+                        app_handle,
+                        knowledge_graph,
+                        graph_snapshot,
+                        graph_extractor,
+                        llm_engine,
+                        api_client,
+                    );
+                    return;
+                }
+                log::info!(
+                    "Speech processor: model file validated — {} ({:.1} MB)",
+                    model_path_str,
+                    meta.len() as f64 / 1_048_576.0
+                );
+            }
+            Err(e) => {
+                log::warn!(
+                    "Speech processor: cannot read model file metadata at '{}': {}. \
+                     ASR disabled — running diarization-only mode.",
+                    model_path_str,
+                    e
+                );
+                run_speech_processor_diarization_only(
+                    speech_rx,
+                    transcript_buffer,
+                    pipeline_status,
+                    app_handle,
+                    knowledge_graph,
+                    graph_snapshot,
+                    graph_extractor,
+                    llm_engine,
+                    api_client,
+                );
+                return;
+            }
+        }
+    }
 
     // Load Whisper model — must stay on this thread
     let ctx =

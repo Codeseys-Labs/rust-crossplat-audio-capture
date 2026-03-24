@@ -149,6 +149,91 @@ pub async fn start_capture(
 
             let models_dir = crate::models::get_models_dir(&app);
 
+            // Read the ASR provider setting so the speech processor knows
+            // whether to load the local Whisper model or skip it.
+            let asr_provider = state
+                .app_settings
+                .read()
+                .map(|s| s.asr_provider.clone())
+                .unwrap_or_default();
+
+            // Read the LLM provider setting so the speech processor knows
+            // whether to use the local LLM engine or the API client for
+            // entity extraction.
+            let llm_provider = state
+                .app_settings
+                .read()
+                .map(|s| s.llm_provider.clone())
+                .unwrap_or_default();
+
+            // If the user selected local LLM and the engine is not yet
+            // loaded, attempt to load it now on a blocking background task.
+            if matches!(llm_provider, crate::settings::LlmProvider::LocalLlama) {
+                let engine_empty = state
+                    .llm_engine
+                    .lock()
+                    .map(|g| g.is_none())
+                    .unwrap_or(false);
+                if engine_empty {
+                    let models_dir_clone = models_dir.clone();
+                    let llm_engine_clone = state.llm_engine.clone();
+                    let model_path = models_dir_clone.join(crate::models::LLM_MODEL_FILENAME);
+                    if model_path.exists() {
+                        log::info!("Auto-loading local LLM model for LocalLlama provider...");
+                        let _ = std::thread::Builder::new()
+                            .name("llm-autoload".to_string())
+                            .spawn(move || {
+                                match crate::llm::LlmEngine::new(&model_path.to_string_lossy()) {
+                                    Ok(engine) => {
+                                        if let Ok(mut guard) = llm_engine_clone.lock() {
+                                            *guard = Some(engine);
+                                            log::info!("Local LLM model auto-loaded successfully");
+                                        }
+                                    }
+                                    Err(e) => {
+                                        log::warn!("Failed to auto-load local LLM model: {}", e);
+                                    }
+                                }
+                            });
+                    }
+                }
+            }
+
+            // If the user selected API LLM provider, configure the API
+            // client from the provider settings.
+            if let crate::settings::LlmProvider::Api {
+                ref endpoint,
+                ref api_key,
+                ref model,
+            } = llm_provider
+            {
+                let api_empty = state
+                    .api_client
+                    .lock()
+                    .map(|g| g.is_none())
+                    .unwrap_or(false);
+                if api_empty && !endpoint.is_empty() {
+                    let config = crate::llm::ApiConfig {
+                        endpoint: endpoint.clone(),
+                        api_key: if api_key.is_empty() {
+                            None
+                        } else {
+                            Some(api_key.clone())
+                        },
+                        model: model.clone(),
+                        max_tokens: 512,
+                        temperature: 0.1,
+                    };
+                    let client = crate::llm::ApiClient::new(config);
+                    if client.is_configured() {
+                        if let Ok(mut guard) = state.api_client.lock() {
+                            *guard = Some(client);
+                            log::info!("API client auto-configured from LLM provider settings");
+                        }
+                    }
+                }
+            }
+
             let handle = std::thread::Builder::new()
                 .name("speech-processor".to_string())
                 .spawn(move || {
@@ -163,6 +248,8 @@ pub async fn start_capture(
                         llm_engine,
                         api_client,
                         models_dir,
+                        asr_provider,
+                        llm_provider,
                     );
                 })
                 .map_err(|e| format!("Failed to spawn speech processor thread: {}", e))?;

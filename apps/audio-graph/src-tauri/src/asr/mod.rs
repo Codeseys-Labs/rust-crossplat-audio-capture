@@ -85,6 +85,40 @@ impl AsrWorker {
         // ── Load Whisper model ──────────────────────────────────────────
         let model_path_str = self.config.model_path.display().to_string();
 
+        // Pre-validate model file to avoid UCRT debug assertion crash
+        // (`_osfile(fh) & FOPEN` in read.cpp:381) when whisper.cpp tries
+        // to read from a missing or corrupted file in debug builds.
+        {
+            let model_path = &self.config.model_path;
+            if !model_path.exists() {
+                error!(
+                    "Whisper model not found at '{}'. ASR worker cannot start.",
+                    model_path_str
+                );
+                return;
+            }
+            match std::fs::metadata(model_path) {
+                Ok(meta) if meta.len() < 1_000_000 => {
+                    error!(
+                        "Whisper model at '{}' appears corrupted ({} bytes). \
+                         ASR worker cannot start.",
+                        model_path_str,
+                        meta.len()
+                    );
+                    return;
+                }
+                Err(e) => {
+                    error!(
+                        "Cannot read model file metadata at '{}': {}. \
+                         ASR worker cannot start.",
+                        model_path_str, e
+                    );
+                    return;
+                }
+                Ok(_) => {}
+            }
+        }
+
         let ctx = match WhisperContext::new_with_params(
             &model_path_str,
             WhisperContextParameters::default(),

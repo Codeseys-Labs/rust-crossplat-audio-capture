@@ -57,6 +57,34 @@ fn default_temperature() -> f32 {
 }
 
 // ---------------------------------------------------------------------------
+// LLM provider
+// ---------------------------------------------------------------------------
+
+/// LLM provider configuration — local LFM2-350M GGUF model vs API endpoint.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(tag = "type")]
+pub enum LlmProvider {
+    #[serde(rename = "local_llama")]
+    LocalLlama,
+    #[serde(rename = "api")]
+    Api {
+        endpoint: String,
+        api_key: String,
+        model: String,
+    },
+}
+
+impl Default for LlmProvider {
+    fn default() -> Self {
+        Self::Api {
+            endpoint: "http://localhost:11434/v1".to_string(),
+            api_key: String::new(),
+            model: "llama3.2".to_string(),
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Audio settings
 // ---------------------------------------------------------------------------
 
@@ -95,6 +123,8 @@ pub struct AppSettings {
     #[serde(default)]
     pub asr_provider: AsrProvider,
     #[serde(default)]
+    pub llm_provider: LlmProvider,
+    #[serde(default)]
     pub llm_api_config: Option<LlmApiConfig>,
     #[serde(default)]
     pub audio_settings: AudioSettings,
@@ -104,6 +134,7 @@ impl Default for AppSettings {
     fn default() -> Self {
         Self {
             asr_provider: AsrProvider::default(),
+            llm_provider: LlmProvider::default(),
             llm_api_config: None,
             audio_settings: AudioSettings::default(),
         }

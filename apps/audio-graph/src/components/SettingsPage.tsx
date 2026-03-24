@@ -1,6 +1,11 @@
 import { useEffect, useState } from "react";
 import { useAudioGraphStore } from "../store";
-import type { AsrProvider, LlmApiConfig, ModelReadiness } from "../types";
+import type {
+  AsrProvider,
+  LlmApiConfig,
+  LlmProvider,
+  ModelReadiness,
+} from "../types";
 
 /** Format bytes to a human-readable size string (e.g. "466 MB"). */
 function formatSize(bytes: number | null): string {
@@ -50,9 +55,10 @@ function SettingsPage() {
   const [asrApiKey, setAsrApiKey] = useState("");
   const [asrModel, setAsrModel] = useState("");
 
-  const [llmEndpoint, setLlmEndpoint] = useState("");
+  const [llmType, setLlmType] = useState<"local_llama" | "api">("api");
+  const [llmEndpoint, setLlmEndpoint] = useState("http://localhost:11434/v1");
   const [llmApiKey, setLlmApiKey] = useState("");
-  const [llmModel, setLlmModel] = useState("");
+  const [llmModel, setLlmModel] = useState("llama3.2");
   const [llmMaxTokens, setLlmMaxTokens] = useState(2048);
   const [llmTemperature, setLlmTemperature] = useState(0.7);
 
@@ -72,11 +78,18 @@ function SettingsPage() {
       setAsrType("local_whisper");
     }
 
-    // LLM config
+    // LLM provider
+    if (settings.llm_provider.type === "api") {
+      setLlmType("api");
+      setLlmEndpoint(settings.llm_provider.endpoint);
+      setLlmApiKey(settings.llm_provider.api_key);
+      setLlmModel(settings.llm_provider.model);
+    } else {
+      setLlmType("local_llama");
+    }
+
+    // LLM config (advanced — max_tokens / temperature)
     if (settings.llm_api_config) {
-      setLlmEndpoint(settings.llm_api_config.endpoint);
-      setLlmApiKey(settings.llm_api_config.api_key ?? "");
-      setLlmModel(settings.llm_api_config.model);
       setLlmMaxTokens(settings.llm_api_config.max_tokens);
       setLlmTemperature(settings.llm_api_config.temperature);
     }
@@ -94,18 +107,30 @@ function SettingsPage() {
           }
         : { type: "local_whisper" };
 
-    const llmConfig: LlmApiConfig | null = llmEndpoint
-      ? {
-          endpoint: llmEndpoint,
-          api_key: llmApiKey || null,
-          model: llmModel,
-          max_tokens: llmMaxTokens,
-          temperature: llmTemperature,
-        }
-      : null;
+    const llmProvider: LlmProvider =
+      llmType === "api"
+        ? {
+            type: "api",
+            endpoint: llmEndpoint,
+            api_key: llmApiKey,
+            model: llmModel,
+          }
+        : { type: "local_llama" };
+
+    const llmConfig: LlmApiConfig | null =
+      llmType === "api" && llmEndpoint
+        ? {
+            endpoint: llmEndpoint,
+            api_key: llmApiKey || null,
+            model: llmModel,
+            max_tokens: llmMaxTokens,
+            temperature: llmTemperature,
+          }
+        : null;
 
     await saveSettings({
       asr_provider: asrProvider,
+      llm_provider: llmProvider,
       llm_api_config: llmConfig,
       audio_settings: settings?.audio_settings ?? {
         sample_rate: 16000,
@@ -293,66 +318,102 @@ function SettingsPage() {
               )}
             </div>
 
-            {/* ── LLM API Section ──────────────────────────────── */}
+            {/* ── LLM Provider Section ───────────────────────────── */}
             <div className="settings-section">
-              <h3 className="settings-section__title">LLM API</h3>
-              <div className="settings-field">
-                <label className="settings-field__label">Endpoint URL</label>
-                <input
-                  className="settings-input"
-                  type="text"
-                  value={llmEndpoint}
-                  onChange={(e) => setLlmEndpoint(e.target.value)}
-                  placeholder="https://openrouter.ai/api/v1"
-                />
-              </div>
-              <div className="settings-field">
-                <label className="settings-field__label">API Key</label>
-                <input
-                  className="settings-input"
-                  type="password"
-                  value={llmApiKey}
-                  onChange={(e) => setLlmApiKey(e.target.value)}
-                  placeholder="sk-..."
-                />
-              </div>
-              <div className="settings-field">
-                <label className="settings-field__label">Model</label>
-                <input
-                  className="settings-input"
-                  type="text"
-                  value={llmModel}
-                  onChange={(e) => setLlmModel(e.target.value)}
-                  placeholder="gpt-4o-mini"
-                />
-              </div>
-              <div className="settings-field">
-                <label className="settings-field__label">
-                  Max Tokens ({llmMaxTokens})
+              <h3 className="settings-section__title">LLM Provider</h3>
+              <div className="settings-radio-group">
+                <label className="settings-radio">
+                  <input
+                    type="radio"
+                    name="llm-provider"
+                    checked={llmType === "local_llama"}
+                    onChange={() => setLlmType("local_llama")}
+                  />
+                  <span>Local LLM (LFM2-350M)</span>
+                  {llmType === "local_llama" && modelStatus && (
+                    <span
+                      className={`status-badge ${readinessBadge(modelStatus.llm).cls}`}
+                    >
+                      {readinessBadge(modelStatus.llm).label}
+                    </span>
+                  )}
                 </label>
-                <input
-                  className="settings-input"
-                  type="number"
-                  value={llmMaxTokens}
-                  onChange={(e) => setLlmMaxTokens(Number(e.target.value))}
-                  min={1}
-                  max={32768}
-                />
-              </div>
-              <div className="settings-field">
-                <label className="settings-field__label">
-                  Temperature ({llmTemperature})
+                <label className="settings-radio">
+                  <input
+                    type="radio"
+                    name="llm-provider"
+                    checked={llmType === "api"}
+                    onChange={() => setLlmType("api")}
+                  />
+                  <span>OpenAI-compatible API</span>
                 </label>
-                <input
-                  className="settings-input"
-                  type="number"
-                  step="0.1"
-                  value={llmTemperature}
-                  onChange={(e) => setLlmTemperature(Number(e.target.value))}
-                  min={0}
-                  max={2}
-                />
               </div>
+
+              {llmType === "api" && (
+                <div className="settings-section__api-fields">
+                  <div className="settings-field">
+                    <label className="settings-field__label">
+                      Endpoint URL
+                    </label>
+                    <input
+                      className="settings-input"
+                      type="text"
+                      value={llmEndpoint}
+                      onChange={(e) => setLlmEndpoint(e.target.value)}
+                      placeholder="https://openrouter.ai/api/v1"
+                    />
+                  </div>
+                  <div className="settings-field">
+                    <label className="settings-field__label">API Key</label>
+                    <input
+                      className="settings-input"
+                      type="password"
+                      value={llmApiKey}
+                      onChange={(e) => setLlmApiKey(e.target.value)}
+                      placeholder="sk-..."
+                    />
+                  </div>
+                  <div className="settings-field">
+                    <label className="settings-field__label">Model</label>
+                    <input
+                      className="settings-input"
+                      type="text"
+                      value={llmModel}
+                      onChange={(e) => setLlmModel(e.target.value)}
+                      placeholder="gpt-4o-mini"
+                    />
+                  </div>
+                  <div className="settings-field">
+                    <label className="settings-field__label">
+                      Max Tokens ({llmMaxTokens})
+                    </label>
+                    <input
+                      className="settings-input"
+                      type="number"
+                      value={llmMaxTokens}
+                      onChange={(e) => setLlmMaxTokens(Number(e.target.value))}
+                      min={1}
+                      max={32768}
+                    />
+                  </div>
+                  <div className="settings-field">
+                    <label className="settings-field__label">
+                      Temperature ({llmTemperature})
+                    </label>
+                    <input
+                      className="settings-input"
+                      type="number"
+                      step="0.1"
+                      value={llmTemperature}
+                      onChange={(e) =>
+                        setLlmTemperature(Number(e.target.value))
+                      }
+                      min={0}
+                      max={2}
+                    />
+                  </div>
+                </div>
+              )}
             </div>
           </div>
         )}
