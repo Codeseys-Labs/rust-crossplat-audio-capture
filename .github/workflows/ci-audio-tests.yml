@@ -1,15 +1,16 @@
-name: CI Audio Integration Tests
+name: Audio Integration Tests
 
 # =============================================================================
 # Cross-platform audio integration tests for rsac.
 #
+# Structured as platform × tier matrix for granular CI visibility.
+# Each job is independently identifiable in GitHub Actions.
+#
 # Platform status:
 #   ✅ Linux (PipeWire)  — PRIMARY. Fully validated, expected to pass.
-#   ⚠️  Windows (WASAPI)  — EXPERIMENTAL. Scream virtual driver is unreliable
-#                           in CI (install timeouts, driver signing issues).
-#                           Job is continue-on-error.
-#   ✅ macOS (CoreAudio)  — VALIDATED. Compiles and passes tests on real hardware
-#                           (macOS 14.4+). CI audio depends on BlackHole availability.
+#   ⚠️  Windows (WASAPI)  — VB-CABLE virtual driver. continue-on-error.
+#   ✅ macOS (CoreAudio)  — VALIDATED on real hardware (macOS 14.4+).
+#                           CI audio depends on BlackHole availability.
 # =============================================================================
 
 on:
@@ -36,844 +37,738 @@ env:
   RUST_BACKTRACE: 1
   RUST_LOG: rsac=debug
 
+# =============================================================================
+# Linux tiers
+# =============================================================================
+
 jobs:
-  # ===========================================================================
-  # ✅ Linux Audio Integration Tests (PipeWire) — PRIMARY PLATFORM
-  #
-  # This is the primary validated platform. These tests are expected to pass.
-  # ===========================================================================
-  linux-audio-tests:
-    name: "✅ Linux Audio Tests (PipeWire)"
+  linux-system:
+    name: "Linux | System Capture"
     runs-on: ubuntu-latest
     timeout-minutes: 15
-
     steps:
-      - name: Checkout
-        uses: actions/checkout@v4
-
-      - name: Install Rust toolchain
-        uses: dtolnay/rust-toolchain@stable
-
-      - name: Cache cargo registry
-        uses: actions/cache@v4
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
         with:
-          path: |
-            ~/.cargo/registry
-            ~/.cargo/git
-            target
-          key: ${{ runner.os }}-cargo-ci-audio-${{ hashFiles('**/Cargo.lock') }}
-          restore-keys: |
-            ${{ runner.os }}-cargo-ci-audio-
-            ${{ runner.os }}-cargo-
+          key: linux-audio
 
       - name: Install PipeWire and audio dependencies
         run: |
           sudo add-apt-repository -y ppa:pipewire-debian/pipewire-upstream
           sudo apt-get update
           sudo apt-get install -y \
-            pipewire \
-            pipewire-bin \
-            pipewire-audio-client-libraries \
-            pipewire-pulse \
-            libpipewire-0.3-dev \
-            libspa-0.2-dev \
-            wireplumber \
-            sox \
-            libclang-dev
+            pipewire pipewire-bin pipewire-audio-client-libraries \
+            pipewire-pulse libpipewire-0.3-dev libspa-0.2-dev \
+            wireplumber sox libclang-dev
 
-      - name: Configure audio permissions
-        run: |
-          # Add user to audio group
-          sudo usermod -aG audio $USER
-
-          # Set real-time priority limits
-          echo "@audio - rtprio 95" | sudo tee /etc/security/limits.d/audio.conf
-          echo "@audio - memlock unlimited" | sudo tee -a /etc/security/limits.d/audio.conf
-
-      - name: Disable PulseAudio
+      - name: Start PipeWire
         run: |
           systemctl --user --now disable pulseaudio.service pulseaudio.socket || true
           systemctl --user mask pulseaudio.service pulseaudio.socket || true
-
-      - name: Start PipeWire services
-        run: |
-          # Start WirePlumber first, then PipeWire services
           systemctl --user --now enable wireplumber.service || true
           systemctl --user --now enable pipewire.service || true
           systemctl --user --now enable pipewire-pulse.service || true
-
-          # Wait for services to stabilize
           sleep 3
-
-          # Verify PipeWire is running
-          echo "=== PipeWire status ==="
-          systemctl --user status pipewire.service || true
-          echo "=== PipeWire-Pulse status ==="
-          systemctl --user status pipewire-pulse.service || true
-          echo "=== WirePlumber status ==="
-          systemctl --user status wireplumber.service || true
-
-          # Verify pw-cli responds
           pw-cli info 0 || echo "WARNING: pw-cli info failed"
 
       - name: Create virtual audio sink
         run: |
-          # Create null sink for CI testing
           pactl load-module module-null-sink \
             sink_name=ci_test_sink \
             sink_properties=device.description="CI_Test_Sink" \
-            rate=48000 \
-            channels=2 \
-            format=float32le || echo "WARNING: Failed to create null sink"
+            rate=48000 channels=2 format=float32le || true
+          pactl set-default-sink ci_test_sink || true
 
-          # Set as default
-          pactl set-default-sink ci_test_sink || echo "WARNING: Failed to set default sink"
-
-          # Verify
-          echo "=== Default sink ==="
-          pactl info | grep "Default Sink" || true
-          echo "=== All sinks ==="
-          pactl list short sinks || true
-
-      - name: "Run tests: Platform capabilities (no audio required)"
+      - name: Run system capture tests
         env:
           RSAC_CI_AUDIO_AVAILABLE: "1"
           RSAC_TEST_CAPTURE_TIMEOUT_SECS: "15"
         run: |
-          echo "=== Platform Capabilities Tests ==="
-          cargo test --test ci_audio platform_caps \
-            --no-default-features --features feat_linux \
-            -- --test-threads=1 --nocapture \
-            2>&1 | tee -a ci-audio-test-output.log
-
-      - name: "Run tests: Device enumeration"
-        env:
-          RSAC_CI_AUDIO_AVAILABLE: "1"
-          RSAC_TEST_CAPTURE_TIMEOUT_SECS: "15"
-        run: |
-          echo "=== Device Enumeration Tests ==="
-          cargo test --test ci_audio device_enumeration \
-            --no-default-features --features feat_linux \
-            -- --test-threads=1 --nocapture \
-            2>&1 | tee -a ci-audio-test-output.log
-
-      - name: "Run tests: System capture"
-        env:
-          RSAC_CI_AUDIO_AVAILABLE: "1"
-          RSAC_TEST_CAPTURE_TIMEOUT_SECS: "15"
-        run: |
-          echo "=== System Capture Tests ==="
           cargo test --test ci_audio system_capture \
             --no-default-features --features feat_linux \
-            -- --test-threads=1 --nocapture \
-            2>&1 | tee -a ci-audio-test-output.log
+            -- --test-threads=1 --nocapture 2>&1 | tee ci-audio-output.log
 
-      - name: "Run tests: Device selection capture"
+      - name: Run platform capabilities tests
         env:
           RSAC_CI_AUDIO_AVAILABLE: "1"
           RSAC_TEST_CAPTURE_TIMEOUT_SECS: "15"
         run: |
-          echo "=== Device Selection Capture Tests ==="
-          cargo test --test ci_audio device_capture \
+          cargo test --test ci_audio platform_caps \
             --no-default-features --features feat_linux \
-            -- --test-threads=1 --nocapture \
-            2>&1 | tee -a ci-audio-test-output.log
+            -- --test-threads=1 --nocapture 2>&1 | tee -a ci-audio-output.log
 
-      - name: "Run tests: Application capture"
+      - name: Run stream lifecycle tests
         env:
           RSAC_CI_AUDIO_AVAILABLE: "1"
           RSAC_TEST_CAPTURE_TIMEOUT_SECS: "15"
         run: |
-          echo "=== Application Capture Tests ==="
-          cargo test --test ci_audio app_capture \
-            --no-default-features --features feat_linux \
-            -- --test-threads=1 --nocapture \
-            2>&1 | tee -a ci-audio-test-output.log
-
-      - name: "Run tests: Process tree capture"
-        env:
-          RSAC_CI_AUDIO_AVAILABLE: "1"
-          RSAC_TEST_CAPTURE_TIMEOUT_SECS: "15"
-        run: |
-          echo "=== Process Tree Capture Tests ==="
-          cargo test --test ci_audio process_tree_capture \
-            --no-default-features --features feat_linux \
-            -- --test-threads=1 --nocapture \
-            2>&1 | tee -a ci-audio-test-output.log
-
-      - name: "Run tests: Stream lifecycle"
-        env:
-          RSAC_CI_AUDIO_AVAILABLE: "1"
-          RSAC_TEST_CAPTURE_TIMEOUT_SECS: "15"
-        run: |
-          echo "=== Stream Lifecycle Tests ==="
           cargo test --test ci_audio stream_lifecycle \
             --no-default-features --features feat_linux \
-            -- --test-threads=1 --nocapture \
-            2>&1 | tee -a ci-audio-test-output.log
+            -- --test-threads=1 --nocapture 2>&1 | tee -a ci-audio-output.log
 
-      - name: Collect diagnostic info on failure
+      - name: Diagnostics on failure
         if: failure()
         run: |
-          echo "=== PipeWire services ==="
           systemctl --user status pipewire.service || true
           systemctl --user status pipewire-pulse.service || true
-          systemctl --user status wireplumber.service || true
-
-          echo "=== PipeWire nodes ==="
           pw-cli list-objects Node || true
-
-          echo "=== PulseAudio sinks ==="
           pactl list short sinks || true
-
-          echo "=== PipeWire log ==="
           journalctl --user -u pipewire.service --no-pager -n 50 || true
 
-          echo "=== Environment ==="
-          echo "XDG_RUNTIME_DIR=$XDG_RUNTIME_DIR"
-          ls -la ${XDG_RUNTIME_DIR}/pipewire-0 2>/dev/null || echo "No PipeWire socket"
-
-      - name: Upload test logs
+      - name: Upload logs
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: linux-ci-audio-test-logs
-          path: |
-            ci-audio-test-output.log
+          name: linux-system-capture-logs
+          path: ci-audio-output.log
           retention-days: 14
 
-  # ===========================================================================
-  # ⚠️  Windows Audio Integration Tests (WASAPI + Scream virtual driver)
-  #
-  # STATUS: EXPERIMENTAL — continue-on-error
-  # The Scream virtual audio driver installation is unreliable in GitHub
-  # Actions CI (driver signing issues, timeout during install, no audio
-  # endpoint after install). This job provides best-effort testing and
-  # diagnostics but is NOT expected to block CI.
-  # ===========================================================================
-  windows-audio-integration:
-    name: "⚠️ Windows Audio Tests (WASAPI)"
-    runs-on: windows-latest
-    continue-on-error: true  # Scream driver install is unreliable in CI
-    timeout-minutes: 25
-
+  linux-device:
+    name: "Linux | Device Capture"
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
     steps:
-      - name: Checkout
-        uses: actions/checkout@v4
-
-      - name: Install Rust toolchain
-        uses: dtolnay/rust-toolchain@stable
-
-      - name: Cache cargo registry
-        uses: actions/cache@v4
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
         with:
-          path: |
-            ~/.cargo/registry
-            ~/.cargo/git
-            target
-          key: ${{ runner.os }}-cargo-ci-audio-${{ hashFiles('**/Cargo.lock') }}
-          restore-keys: |
-            ${{ runner.os }}-cargo-ci-audio-
-            ${{ runner.os }}-cargo-
+          key: linux-audio
+
+      - name: Install PipeWire and audio dependencies
+        run: |
+          sudo add-apt-repository -y ppa:pipewire-debian/pipewire-upstream
+          sudo apt-get update
+          sudo apt-get install -y \
+            pipewire pipewire-bin pipewire-audio-client-libraries \
+            pipewire-pulse libpipewire-0.3-dev libspa-0.2-dev \
+            wireplumber sox libclang-dev
+
+      - name: Start PipeWire
+        run: |
+          systemctl --user --now disable pulseaudio.service pulseaudio.socket || true
+          systemctl --user mask pulseaudio.service pulseaudio.socket || true
+          systemctl --user --now enable wireplumber.service || true
+          systemctl --user --now enable pipewire.service || true
+          systemctl --user --now enable pipewire-pulse.service || true
+          sleep 3
+          pw-cli info 0 || echo "WARNING: pw-cli info failed"
+
+      - name: Create virtual audio sink
+        run: |
+          pactl load-module module-null-sink \
+            sink_name=ci_test_sink \
+            sink_properties=device.description="CI_Test_Sink" \
+            rate=48000 channels=2 format=float32le || true
+          pactl set-default-sink ci_test_sink || true
+
+      - name: Run device capture tests
+        env:
+          RSAC_CI_AUDIO_AVAILABLE: "1"
+          RSAC_TEST_CAPTURE_TIMEOUT_SECS: "15"
+        run: |
+          cargo test --test ci_audio device_capture \
+            --no-default-features --features feat_linux \
+            -- --test-threads=1 --nocapture 2>&1 | tee ci-audio-output.log
+
+      - name: Run device enumeration tests
+        env:
+          RSAC_CI_AUDIO_AVAILABLE: "1"
+          RSAC_TEST_CAPTURE_TIMEOUT_SECS: "15"
+        run: |
+          cargo test --test ci_audio device_enumeration \
+            --no-default-features --features feat_linux \
+            -- --test-threads=1 --nocapture 2>&1 | tee -a ci-audio-output.log
+
+      - name: Diagnostics on failure
+        if: failure()
+        run: |
+          systemctl --user status pipewire.service || true
+          pw-cli list-objects Node || true
+          pactl list short sinks || true
+
+      - name: Upload logs
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: linux-device-capture-logs
+          path: ci-audio-output.log
+          retention-days: 14
+
+  linux-process:
+    name: "Linux | Process Capture"
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: linux-audio
+
+      - name: Install PipeWire and audio dependencies
+        run: |
+          sudo add-apt-repository -y ppa:pipewire-debian/pipewire-upstream
+          sudo apt-get update
+          sudo apt-get install -y \
+            pipewire pipewire-bin pipewire-audio-client-libraries \
+            pipewire-pulse libpipewire-0.3-dev libspa-0.2-dev \
+            wireplumber sox libclang-dev
+
+      - name: Start PipeWire
+        run: |
+          systemctl --user --now disable pulseaudio.service pulseaudio.socket || true
+          systemctl --user mask pulseaudio.service pulseaudio.socket || true
+          systemctl --user --now enable wireplumber.service || true
+          systemctl --user --now enable pipewire.service || true
+          systemctl --user --now enable pipewire-pulse.service || true
+          sleep 3
+          pw-cli info 0 || echo "WARNING: pw-cli info failed"
+
+      - name: Create virtual audio sink
+        run: |
+          pactl load-module module-null-sink \
+            sink_name=ci_test_sink \
+            sink_properties=device.description="CI_Test_Sink" \
+            rate=48000 channels=2 format=float32le || true
+          pactl set-default-sink ci_test_sink || true
+
+      - name: Run application capture tests
+        env:
+          RSAC_CI_AUDIO_AVAILABLE: "1"
+          RSAC_TEST_CAPTURE_TIMEOUT_SECS: "15"
+        run: |
+          cargo test --test ci_audio app_capture \
+            --no-default-features --features feat_linux \
+            -- --test-threads=1 --nocapture 2>&1 | tee ci-audio-output.log
+
+      - name: Run process tree capture tests
+        env:
+          RSAC_CI_AUDIO_AVAILABLE: "1"
+          RSAC_TEST_CAPTURE_TIMEOUT_SECS: "15"
+        run: |
+          cargo test --test ci_audio process_tree_capture \
+            --no-default-features --features feat_linux \
+            -- --test-threads=1 --nocapture 2>&1 | tee -a ci-audio-output.log
+
+      - name: Diagnostics on failure
+        if: failure()
+        run: |
+          systemctl --user status pipewire.service || true
+          pw-cli list-objects Node || true
+          pactl list short sinks || true
+
+      - name: Upload logs
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: linux-process-capture-logs
+          path: ci-audio-output.log
+          retention-days: 14
+
+  # =============================================================================
+  # Windows tiers — VB-CABLE virtual audio driver
+  # =============================================================================
+
+  windows-system:
+    name: "Windows | System Capture"
+    runs-on: windows-latest
+    continue-on-error: true
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: windows-audio
 
       - name: Start Windows Audio services
         shell: pwsh
         run: |
-          Write-Host "Starting Windows Audio services..."
+          Start-Service -Name "AudioEndpointBuilder" -ErrorAction SilentlyContinue
+          Start-Service -Name "AudioSrv" -ErrorAction SilentlyContinue
 
-          # Start AudioEndpointBuilder first (dependency of AudioSrv)
-          try {
-            Start-Service -Name "AudioEndpointBuilder" -ErrorAction Stop
-            Write-Host "✅ AudioEndpointBuilder service started"
-          } catch {
-            Write-Host "⚠️ Could not start AudioEndpointBuilder: $_"
-          }
-
-          try {
-            Start-Service -Name "AudioSrv" -ErrorAction Stop
-            Write-Host "✅ AudioSrv service started"
-          } catch {
-            Write-Host "⚠️ Could not start AudioSrv: $_"
-          }
-
-          # Verify services
-          $audioServices = @("AudioSrv", "AudioEndpointBuilder")
-          foreach ($service in $audioServices) {
-            $svc = Get-Service -Name $service -ErrorAction SilentlyContinue
-            if ($svc) {
-              Write-Host "  ${service}: $($svc.Status)"
-            } else {
-              Write-Host "  ${service}: Not found"
-            }
-          }
-
-      - name: Install Scream virtual audio driver
-        id: scream_install
-        continue-on-error: true  # Driver install is unreliable; don't fail the job
-        shell: pwsh
-        timeout-minutes: 10
-        run: |
-          Write-Host "=== Installing Scream Virtual Audio Driver ==="
-          Write-Host "NOTE: This step is best-effort. Scream driver installation"
-          Write-Host "      frequently fails in CI due to driver signing and"
-          Write-Host "      device enumeration issues."
-          Write-Host ""
-
-          # Download Scream 4.0 with retry logic
-          $screamUrl = "https://github.com/duncanthrax/scream/releases/download/4.0/Scream4.0.zip"
-          $screamZip = "$env:TEMP\Scream.zip"
-          $screamDir = "$env:TEMP\Scream"
-
-          $maxRetries = 3
-          $downloaded = $false
-          for ($attempt = 1; $attempt -le $maxRetries; $attempt++) {
-            try {
-              Write-Host "Download attempt $attempt of ${maxRetries}..."
-              Invoke-WebRequest -Uri $screamUrl -OutFile $screamZip -UseBasicParsing -TimeoutSec 60
-              $downloaded = $true
-              Write-Host "✅ Download succeeded on attempt $attempt"
-              break
-            } catch {
-              Write-Host "⚠️ Download attempt $attempt failed: $_"
-              if ($attempt -lt $maxRetries) {
-                Start-Sleep -Seconds 5
-              }
-            }
-          }
-
-          if (-not $downloaded) {
-            Write-Host "❌ Failed to download Scream after $maxRetries attempts"
-            echo "scream_installed=false" >> $env:GITHUB_OUTPUT
-            exit 1
-          }
-
-          Write-Host "Extracting Scream..."
-          Expand-Archive -Path $screamZip -DestinationPath $screamDir -Force
-
-          # List extracted contents for debugging
-          Write-Host "=== Scream contents ==="
-          Get-ChildItem $screamDir -Recurse | ForEach-Object { Write-Host "  $($_.FullName)" }
-
-          # Trust the driver certificate from the .sys file
-          $driverPath = "$screamDir\Install\driver\x64\Scream.sys"
-          if (Test-Path $driverPath) {
-            Write-Host "Extracting certificate from Scream.sys..."
-            $cert = (Get-AuthenticodeSignature $driverPath).SignerCertificate
-            if ($cert) {
-              Write-Host "Found certificate: $($cert.Subject)"
-              $store = [System.Security.Cryptography.X509Certificates.X509Store]::new("TrustedPublisher", "LocalMachine")
-              $store.Open("ReadWrite")
-              $store.Add($cert)
-              $store.Close()
-              Write-Host "✅ Certificate added to TrustedPublisher store"
-            } else {
-              Write-Host "⚠️ No certificate found on Scream.sys, trying .cat files..."
-              $catFiles = Get-ChildItem "$screamDir\Install\driver\x64" -Filter "*.cat" -ErrorAction SilentlyContinue
-              foreach ($catFile in $catFiles) {
-                $catCert = (Get-AuthenticodeSignature $catFile.FullName).SignerCertificate
-                if ($catCert) {
-                  Write-Host "Found certificate in $($catFile.Name): $($catCert.Subject)"
-                  $store = [System.Security.Cryptography.X509Certificates.X509Store]::new("TrustedPublisher", "LocalMachine")
-                  $store.Open("ReadWrite")
-                  $store.Add($catCert)
-                  $store.Close()
-                  Write-Host "✅ Certificate added to TrustedPublisher store from .cat"
-                }
-              }
-            }
-          } else {
-            Write-Host "⚠️ Scream.sys not found at expected path: $driverPath"
-            Write-Host "Searching for .sys files..."
-            Get-ChildItem $screamDir -Recurse -Filter "*.sys" | ForEach-Object { Write-Host "  Found: $($_.FullName)" }
-          }
-
-          # Enable test signing (required for some CI environments)
-          $result = & bcdedit /set testsigning on 2>&1
-          Write-Host "Test signing result: $result"
-
-          # Install the driver using devcon or pnputil
-          $infPath = "$screamDir\Install\driver\x64\Scream.inf"
-          if (Test-Path $infPath) {
-            Write-Host "Installing Scream driver from: $infPath"
-
-            # Try pnputil first (available on all modern Windows)
-            Write-Host "Attempting install with pnputil..."
-            $pnpResult = & pnputil /add-driver $infPath /install 2>&1
-            Write-Host "pnputil result: $pnpResult"
-
-            if ($LASTEXITCODE -ne 0) {
-              Write-Host "pnputil returned exit code: $LASTEXITCODE"
-              Write-Host "Trying devcon as fallback..."
-
-              # Try devcon if available
-              $devconPaths = @(
-                "C:\Program Files (x86)\Windows Kits\10\Tools\x64\devcon.exe",
-                "$env:TEMP\Scream\Install\driver\x64\devcon.exe"
-              )
-              $devcon = $devconPaths | Where-Object { Test-Path $_ } | Select-Object -First 1
-
-              if ($devcon) {
-                Push-Location "$screamDir\Install\driver\x64"
-                & $devcon install Scream.inf *Scream 2>&1
-                Write-Host "devcon exit code: $LASTEXITCODE"
-                Pop-Location
-              } else {
-                Write-Host "⚠️ devcon not available, relying on pnputil result"
-              }
-            }
-          } else {
-            Write-Host "⚠️ Scream.inf not found at expected path"
-            Get-ChildItem $screamDir -Recurse -Filter "*.inf" | ForEach-Object { Write-Host "  Found: $($_.FullName)" }
-          }
-
-          # Wait for the device to appear
-          Write-Host "Waiting for Scream device to appear..."
-          Start-Sleep -Seconds 5
-
-          Write-Host "✅ Scream driver installation process completed"
-          echo "scream_installed=true" >> $env:GITHUB_OUTPUT
+      - name: Install VB-CABLE virtual audio driver
+        uses: AlekseyMartynov/action-vbcable-win@v1
 
       - name: Verify audio devices
         id: verify_audio
         shell: pwsh
         run: |
-          Write-Host "=== Verifying audio devices ==="
-
-          $audioFound = $false
-
-          # Check for Scream devices via PnP
-          Write-Host "--- PnP Devices ---"
-          $screamDevices = Get-PnpDevice -ErrorAction SilentlyContinue | Where-Object {
-            $_.FriendlyName -like "*Scream*" -or
-            $_.FriendlyName -like "*Virtual*Audio*"
+          Write-Host "=== Audio Devices ==="
+          $devices = Get-PnpDevice -ErrorAction SilentlyContinue | Where-Object {
+            $_.FriendlyName -like "*VB-Audio*" -or
+            $_.FriendlyName -like "*CABLE*" -or
+            $_.Class -eq "AudioEndpoint" -or
+            $_.Class -eq "MEDIA"
           }
-          if ($screamDevices) {
-            Write-Host "✅ Scream/Virtual audio devices found via PnP:"
-            $screamDevices | ForEach-Object {
-              Write-Host "  - $($_.FriendlyName) (Status: $($_.Status))"
-            }
-            $audioFound = $true
-          } else {
-            Write-Host "⚠️ No Scream devices found via PnP"
-          }
-
-          # Check via WMI Win32_SoundDevice
-          Write-Host "--- WMI Sound Devices ---"
-          $wmiDevices = Get-CimInstance Win32_SoundDevice -ErrorAction SilentlyContinue
-          if ($wmiDevices) {
-            Write-Host "Sound devices found: $($wmiDevices.Count)"
-            $wmiDevices | ForEach-Object {
-              Write-Host "  - $($_.Name) (Status: $($_.Status))"
-            }
-            $audioFound = $true
-          } else {
-            Write-Host "⚠️ No sound devices found via WMI"
-          }
-
-          # Check audio services
-          Write-Host "--- Audio Services ---"
-          $audioSrv = Get-Service -Name "AudioSrv" -ErrorAction SilentlyContinue
-          $endpointBuilder = Get-Service -Name "AudioEndpointBuilder" -ErrorAction SilentlyContinue
-          if ($audioSrv) { Write-Host "  AudioSrv: $($audioSrv.Status)" }
-          if ($endpointBuilder) { Write-Host "  AudioEndpointBuilder: $($endpointBuilder.Status)" }
-
-          # Set environment variable for subsequent steps
-          if ($audioFound) {
-            Write-Host "✅ Audio infrastructure detected — enabling audio tests"
+          if ($devices) {
+            $devices | Format-List FriendlyName, Status
             echo "RSAC_CI_AUDIO_AVAILABLE=1" >> $env:GITHUB_ENV
-            echo "audio_available=true" >> $env:GITHUB_OUTPUT
           } else {
-            Write-Host "⚠️ No audio devices detected — tests will skip gracefully"
+            Write-Host "No audio devices found"
             echo "RSAC_CI_AUDIO_AVAILABLE=0" >> $env:GITHUB_ENV
-            echo "audio_available=false" >> $env:GITHUB_OUTPUT
           }
 
       - name: Compilation check
-        id: win_compile
-        shell: pwsh
-        run: |
-          Write-Host "=== Verifying rsac compiles on Windows with feat_windows ==="
-          cargo check --no-default-features --features feat_windows
-          Write-Host "✅ Compilation check passed"
-          echo "compiled=true" >> $env:GITHUB_OUTPUT
+        run: cargo check --no-default-features --features feat_windows
 
-      - name: Generate test WAV file
-        if: steps.win_compile.outcome == 'success'
-        shell: pwsh
-        run: |
-          Write-Host "=== Generating test WAV file ==="
-
-          # Try sox first (best quality)
-          try {
-            choco install sox.portable -y --no-progress 2>$null
-            $soxPath = (Get-Command sox -ErrorAction SilentlyContinue).Source
-            if ($soxPath) {
-              Write-Host "Using sox to generate test tone..."
-              & sox -n -r 48000 -c 2 -b 32 -e floating-point "$env:TEMP\test_440hz.wav" synth 5 sine 440
-              Write-Host "✅ Test WAV generated with sox at: $env:TEMP\test_440hz.wav"
-            } else {
-              throw "sox not found after install"
-            }
-          } catch {
-            Write-Host "sox not available, generating WAV with PowerShell..."
-
-            # Generate a simple WAV file using PowerShell
-            $sampleRate = 48000
-            $channels = 2
-            $durationSecs = 5
-            $frequency = 440.0
-            $amplitude = 0.8
-            $numSamples = $sampleRate * $durationSecs
-
-            $wavPath = "$env:TEMP\test_440hz.wav"
-            $stream = [System.IO.File]::Create($wavPath)
-            $writer = New-Object System.IO.BinaryWriter($stream)
-
-            # WAV header (float32 PCM)
-            $dataSize = $numSamples * $channels * 4
-            $writer.Write([System.Text.Encoding]::ASCII.GetBytes("RIFF"))
-            $writer.Write([int]($dataSize + 36))
-            $writer.Write([System.Text.Encoding]::ASCII.GetBytes("WAVE"))
-            $writer.Write([System.Text.Encoding]::ASCII.GetBytes("fmt "))
-            $writer.Write([int]16)           # chunk size
-            $writer.Write([int16]3)          # format: IEEE float
-            $writer.Write([int16]$channels)
-            $writer.Write([int]$sampleRate)
-            $writer.Write([int]($sampleRate * $channels * 4))  # byte rate
-            $writer.Write([int16]($channels * 4))              # block align
-            $writer.Write([int16]32)         # bits per sample
-            $writer.Write([System.Text.Encoding]::ASCII.GetBytes("data"))
-            $writer.Write([int]$dataSize)
-
-            # Generate sine wave samples
-            for ($i = 0; $i -lt $numSamples; $i++) {
-              $t = $i / $sampleRate
-              $sample = [float]($amplitude * [Math]::Sin(2.0 * [Math]::PI * $frequency * $t))
-              for ($ch = 0; $ch -lt $channels; $ch++) {
-                $writer.Write([float]$sample)
-              }
-            }
-
-            $writer.Close()
-            $stream.Close()
-            Write-Host "✅ Test WAV generated with PowerShell at: $wavPath"
-          }
-
-          # Verify the file exists and has content
-          $wavFile = Get-Item "$env:TEMP\test_440hz.wav" -ErrorAction SilentlyContinue
-          if ($wavFile -and $wavFile.Length -gt 44) {
-            Write-Host "Test WAV file: $($wavFile.Length) bytes"
-          } else {
-            Write-Host "⚠️ Test WAV file not created or too small"
-          }
-
-      - name: Run CI audio integration tests
-        if: steps.win_compile.outcome == 'success'
+      - name: Run system capture tests
         shell: pwsh
         env:
           RSAC_TEST_CAPTURE_TIMEOUT_SECS: "15"
-          RUST_BACKTRACE: "1"
-          RUST_LOG: "rsac=debug"
         run: |
-          Write-Host "=== Running Windows CI Audio Integration Tests ==="
-          Write-Host "RSAC_CI_AUDIO_AVAILABLE: $env:RSAC_CI_AUDIO_AVAILABLE"
-          Write-Host "Scream install outcome: ${{ steps.scream_install.outcome }}"
-          Write-Host ""
-
-          if ("${{ steps.scream_install.outcome }}" -eq "failure") {
-            Write-Host "⚠️ Scream driver installation failed — audio tests may skip gracefully"
-          }
-
-          cargo test --test ci_audio `
+          cargo test --test ci_audio system_capture `
             --no-default-features --features feat_windows `
             -- --test-threads=1 --nocapture `
-            2>&1 | Tee-Object -FilePath ci-audio-test-output.log
+            2>&1 | Tee-Object -FilePath ci-audio-output.log
 
-          $exitCode = $LASTEXITCODE
-          Write-Host "=== Test Exit Code: $exitCode ==="
+      - name: Run platform capabilities tests
+        shell: pwsh
+        env:
+          RSAC_TEST_CAPTURE_TIMEOUT_SECS: "15"
+        run: |
+          cargo test --test ci_audio platform_caps `
+            --no-default-features --features feat_windows `
+            -- --test-threads=1 --nocapture `
+            2>&1 | Tee-Object -FilePath ci-audio-output-caps.log
 
-          # Don't fail the step if tests merely skipped (exit 0) or had expected failures
-          if ($exitCode -ne 0) {
-            Write-Host "⚠️ Some tests may have failed — see logs for details"
-            exit $exitCode
-          }
+      - name: Run stream lifecycle tests
+        shell: pwsh
+        env:
+          RSAC_TEST_CAPTURE_TIMEOUT_SECS: "15"
+        run: |
+          cargo test --test ci_audio stream_lifecycle `
+            --no-default-features --features feat_windows `
+            -- --test-threads=1 --nocapture `
+            2>&1 | Tee-Object -FilePath ci-audio-output-lifecycle.log
 
-      - name: Collect diagnostic info on failure
+      - name: Diagnostics on failure
         if: failure()
         shell: pwsh
         run: |
-          Write-Host "=== Collecting Windows audio diagnostics ==="
+          Get-Service -Name "AudioSrv", "AudioEndpointBuilder" -ErrorAction SilentlyContinue | Format-List Name, Status
+          Get-PnpDevice -ErrorAction SilentlyContinue | Where-Object { $_.Class -eq "AudioEndpoint" -or $_.Class -eq "MEDIA" } | Format-List FriendlyName, Status
 
-          Write-Host "--- Audio Services ---"
-          Get-Service -Name "AudioSrv", "AudioEndpointBuilder" -ErrorAction SilentlyContinue |
-            Format-List Name, Status
-
-          Write-Host "--- PnP Audio Devices ---"
-          Get-PnpDevice -ErrorAction SilentlyContinue |
-            Where-Object { $_.Class -eq "AudioEndpoint" -or $_.Class -eq "MEDIA" -or $_.FriendlyName -like "*Scream*" } |
-            Format-List FriendlyName, Status, InstanceId
-
-          Write-Host "--- WMI Sound Devices ---"
-          Get-CimInstance Win32_SoundDevice -ErrorAction SilentlyContinue |
-            Format-List Name, Status, Manufacturer
-
-          Write-Host "--- Installed Drivers (audio related) ---"
-          pnputil /enum-drivers 2>$null | Select-String -Pattern "Scream|Audio|Sound" -Context 2,2
-
-          Write-Host "--- System Event Log (Audio errors) ---"
-          Get-WinEvent -FilterHashtable @{LogName='System'; Level=2,3; StartTime=(Get-Date).AddMinutes(-30)} -MaxEvents 20 -ErrorAction SilentlyContinue |
-            Where-Object { $_.Message -like "*audio*" -or $_.ProviderName -like "*audio*" } |
-            Format-List TimeCreated, ProviderName, Message
-
-      - name: Upload test logs
+      - name: Upload logs
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: windows-ci-audio-test-logs
-          path: |
-            ci-audio-test-output.log
+          name: windows-system-capture-logs
+          path: ci-audio-output*.log
           retention-days: 14
 
-  # ===========================================================================
-  # ✅ macOS Audio Integration Tests (CoreAudio + Process Tap)
-  #
-  # STATUS: VALIDATED — compiles and runs on macOS 14.4+
-  # The macOS backend is fully implemented with 3-path API fallback for
-  # Process Tap (macOS 14.4–15 Sonoma/Sequoia and macOS 26 Tahoe).
-  # CI audio availability depends on BlackHole virtual audio driver.
-  # ===========================================================================
-  macos-audio-integration:
-    name: "✅ macOS Audio Tests (CoreAudio)"
+  windows-device:
+    name: "Windows | Device Capture"
+    runs-on: windows-latest
+    continue-on-error: true
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: windows-audio
+
+      - name: Start Windows Audio services
+        shell: pwsh
+        run: |
+          Start-Service -Name "AudioEndpointBuilder" -ErrorAction SilentlyContinue
+          Start-Service -Name "AudioSrv" -ErrorAction SilentlyContinue
+
+      - name: Install VB-CABLE virtual audio driver
+        uses: AlekseyMartynov/action-vbcable-win@v1
+
+      - name: Verify audio devices
+        shell: pwsh
+        run: |
+          $devices = Get-PnpDevice -ErrorAction SilentlyContinue | Where-Object {
+            $_.FriendlyName -like "*VB-Audio*" -or $_.FriendlyName -like "*CABLE*"
+          }
+          if ($devices) {
+            echo "RSAC_CI_AUDIO_AVAILABLE=1" >> $env:GITHUB_ENV
+          } else {
+            echo "RSAC_CI_AUDIO_AVAILABLE=0" >> $env:GITHUB_ENV
+          }
+
+      - name: Compilation check
+        run: cargo check --no-default-features --features feat_windows
+
+      - name: Run device capture tests
+        shell: pwsh
+        env:
+          RSAC_TEST_CAPTURE_TIMEOUT_SECS: "15"
+        run: |
+          cargo test --test ci_audio device_capture `
+            --no-default-features --features feat_windows `
+            -- --test-threads=1 --nocapture `
+            2>&1 | Tee-Object -FilePath ci-audio-output.log
+
+      - name: Run device enumeration tests
+        shell: pwsh
+        env:
+          RSAC_TEST_CAPTURE_TIMEOUT_SECS: "15"
+        run: |
+          cargo test --test ci_audio device_enumeration `
+            --no-default-features --features feat_windows `
+            -- --test-threads=1 --nocapture `
+            2>&1 | Tee-Object -FilePath ci-audio-output-enum.log
+
+      - name: Diagnostics on failure
+        if: failure()
+        shell: pwsh
+        run: |
+          Get-Service -Name "AudioSrv", "AudioEndpointBuilder" -ErrorAction SilentlyContinue | Format-List Name, Status
+          Get-PnpDevice -ErrorAction SilentlyContinue | Where-Object { $_.Class -eq "AudioEndpoint" -or $_.Class -eq "MEDIA" } | Format-List FriendlyName, Status
+
+      - name: Upload logs
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: windows-device-capture-logs
+          path: ci-audio-output*.log
+          retention-days: 14
+
+  windows-process:
+    name: "Windows | Process Capture"
+    runs-on: windows-latest
+    continue-on-error: true
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: windows-audio
+
+      - name: Start Windows Audio services
+        shell: pwsh
+        run: |
+          Start-Service -Name "AudioEndpointBuilder" -ErrorAction SilentlyContinue
+          Start-Service -Name "AudioSrv" -ErrorAction SilentlyContinue
+
+      - name: Install VB-CABLE virtual audio driver
+        uses: AlekseyMartynov/action-vbcable-win@v1
+
+      - name: Verify audio devices
+        shell: pwsh
+        run: |
+          $devices = Get-PnpDevice -ErrorAction SilentlyContinue | Where-Object {
+            $_.FriendlyName -like "*VB-Audio*" -or $_.FriendlyName -like "*CABLE*"
+          }
+          if ($devices) {
+            echo "RSAC_CI_AUDIO_AVAILABLE=1" >> $env:GITHUB_ENV
+          } else {
+            echo "RSAC_CI_AUDIO_AVAILABLE=0" >> $env:GITHUB_ENV
+          }
+
+      - name: Compilation check
+        run: cargo check --no-default-features --features feat_windows
+
+      - name: Generate test WAV file
+        shell: pwsh
+        run: |
+          # Generate a simple WAV file for audio playback tests
+          $sampleRate = 48000; $channels = 2; $durationSecs = 5; $frequency = 440.0; $amplitude = 0.8
+          $numSamples = $sampleRate * $durationSecs
+          $wavPath = "$env:TEMP\test_440hz.wav"
+          $stream = [System.IO.File]::Create($wavPath)
+          $writer = New-Object System.IO.BinaryWriter($stream)
+          $dataSize = $numSamples * $channels * 4
+          $writer.Write([System.Text.Encoding]::ASCII.GetBytes("RIFF"))
+          $writer.Write([int]($dataSize + 36))
+          $writer.Write([System.Text.Encoding]::ASCII.GetBytes("WAVE"))
+          $writer.Write([System.Text.Encoding]::ASCII.GetBytes("fmt "))
+          $writer.Write([int]16); $writer.Write([int16]3); $writer.Write([int16]$channels)
+          $writer.Write([int]$sampleRate); $writer.Write([int]($sampleRate * $channels * 4))
+          $writer.Write([int16]($channels * 4)); $writer.Write([int16]32)
+          $writer.Write([System.Text.Encoding]::ASCII.GetBytes("data"))
+          $writer.Write([int]$dataSize)
+          for ($i = 0; $i -lt $numSamples; $i++) {
+            $sample = [float]($amplitude * [Math]::Sin(2.0 * [Math]::PI * $frequency * ($i / $sampleRate)))
+            for ($ch = 0; $ch -lt $channels; $ch++) { $writer.Write([float]$sample) }
+          }
+          $writer.Close(); $stream.Close()
+          Write-Host "Test WAV: $((Get-Item $wavPath).Length) bytes"
+
+      - name: Run application capture tests
+        shell: pwsh
+        env:
+          RSAC_TEST_CAPTURE_TIMEOUT_SECS: "15"
+        run: |
+          cargo test --test ci_audio app_capture `
+            --no-default-features --features feat_windows `
+            -- --test-threads=1 --nocapture `
+            2>&1 | Tee-Object -FilePath ci-audio-output.log
+
+      - name: Run process tree capture tests
+        shell: pwsh
+        env:
+          RSAC_TEST_CAPTURE_TIMEOUT_SECS: "15"
+        run: |
+          cargo test --test ci_audio process_tree_capture `
+            --no-default-features --features feat_windows `
+            -- --test-threads=1 --nocapture `
+            2>&1 | Tee-Object -FilePath ci-audio-output-proctree.log
+
+      - name: Diagnostics on failure
+        if: failure()
+        shell: pwsh
+        run: |
+          Get-Service -Name "AudioSrv", "AudioEndpointBuilder" -ErrorAction SilentlyContinue | Format-List Name, Status
+          Get-PnpDevice -ErrorAction SilentlyContinue | Where-Object { $_.Class -eq "AudioEndpoint" -or $_.Class -eq "MEDIA" } | Format-List FriendlyName, Status
+
+      - name: Upload logs
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: windows-process-capture-logs
+          path: ci-audio-output*.log
+          retention-days: 14
+
+  # =============================================================================
+  # macOS tiers — CoreAudio + BlackHole
+  # =============================================================================
+
+  macos-system:
+    name: "macOS | System Capture"
     runs-on: macos-15
     timeout-minutes: 20
-
     steps:
-      - name: Checkout
-        uses: actions/checkout@v4
-
-      - name: Install Rust toolchain
-        uses: dtolnay/rust-toolchain@stable
-
-      - name: Cache cargo registry
-        uses: actions/cache@v4
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
         with:
-          path: |
-            ~/.cargo/registry
-            ~/.cargo/git
-            target
-          key: ${{ runner.os }}-cargo-ci-audio-${{ hashFiles('**/Cargo.lock') }}
-          restore-keys: |
-            ${{ runner.os }}-cargo-ci-audio-
-            ${{ runner.os }}-cargo-
+          key: macos-audio
 
-      - name: Check audio device availability
+      - name: Check audio and install BlackHole
         id: check_audio
         run: |
-          echo "=== macOS System Audio Information ==="
-          echo "--- system_profiler SPAudioDataType ---"
           system_profiler SPAudioDataType 2>/dev/null || true
-
-          echo ""
-          echo "--- IORegistry audio devices ---"
-          ioreg -l | grep -i audio | head -30 || true
-
-          echo ""
-          echo "--- Checking for audio output device ---"
-          if system_profiler SPAudioDataType 2>/dev/null | grep -qi "output"; then
-              echo "✅ Audio output device found"
-              echo "RSAC_CI_AUDIO_AVAILABLE=1" >> $GITHUB_ENV
-              echo "audio_available=true" >> $GITHUB_OUTPUT
-          else
-              echo "⚠️ No audio output device found"
-              echo "Tests will skip gracefully via require_audio!() macro"
-              echo "audio_available=false" >> $GITHUB_OUTPUT
-          fi
-
-      - name: Attempt BlackHole installation (best-effort)
-        continue-on-error: true
-        run: |
-          echo "=== Attempting BlackHole virtual audio driver installation ==="
-          echo "Note: BlackHole typically requires a reboot to activate — this is best-effort"
-          echo ""
-
-          brew install blackhole-2ch || echo "⚠️ BlackHole installation failed (expected in CI)"
-
-          echo ""
-          echo "--- Attempting to restart coreaudiod to pick up new driver ---"
+          brew install blackhole-2ch || echo "BlackHole installation failed (expected in CI)"
           sudo killall coreaudiod 2>/dev/null || true
           sleep 5
-
-          echo ""
-          echo "--- Re-checking audio devices after BlackHole install attempt ---"
-          system_profiler SPAudioDataType 2>/dev/null || true
-
-          # Re-check for audio devices — BlackHole may have appeared
           if system_profiler SPAudioDataType 2>/dev/null | grep -qi "output"; then
-              echo ""
-              echo "✅ Audio output device found after BlackHole install"
-              echo "RSAC_CI_AUDIO_AVAILABLE=1" >> $GITHUB_ENV
-          else
-              echo ""
-              echo "⚠️ Still no audio output device — BlackHole likely needs reboot"
+            echo "RSAC_CI_AUDIO_AVAILABLE=1" >> $GITHUB_ENV
+          fi
+
+      - name: Compilation check
+        run: cargo check --no-default-features --features feat_macos
+
+      - name: Run system capture tests
+        env:
+          RSAC_TEST_CAPTURE_TIMEOUT_SECS: "15"
+        run: |
+          cargo test --test ci_audio system_capture \
+            --no-default-features --features feat_macos \
+            -- --test-threads=1 --nocapture 2>&1 | tee ci-audio-output.log
+
+      - name: Run platform capabilities tests
+        env:
+          RSAC_TEST_CAPTURE_TIMEOUT_SECS: "15"
+        run: |
+          cargo test --test ci_audio platform_caps \
+            --no-default-features --features feat_macos \
+            -- --test-threads=1 --nocapture 2>&1 | tee -a ci-audio-output.log
+
+      - name: Run stream lifecycle tests
+        env:
+          RSAC_TEST_CAPTURE_TIMEOUT_SECS: "15"
+        run: |
+          cargo test --test ci_audio stream_lifecycle \
+            --no-default-features --features feat_macos \
+            -- --test-threads=1 --nocapture 2>&1 | tee -a ci-audio-output.log
+
+      - name: Diagnostics on failure
+        if: failure()
+        run: |
+          system_profiler SPAudioDataType 2>/dev/null || true
+          ps aux | grep -i coreaudio || true
+          sw_vers || true
+
+      - name: Upload logs
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: macos-system-capture-logs
+          path: ci-audio-output.log
+          retention-days: 14
+
+  macos-device:
+    name: "macOS | Device Capture"
+    runs-on: macos-15
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: macos-audio
+
+      - name: Check audio and install BlackHole
+        run: |
+          brew install blackhole-2ch || echo "BlackHole installation failed (expected in CI)"
+          sudo killall coreaudiod 2>/dev/null || true
+          sleep 5
+          if system_profiler SPAudioDataType 2>/dev/null | grep -qi "output"; then
+            echo "RSAC_CI_AUDIO_AVAILABLE=1" >> $GITHUB_ENV
+          fi
+
+      - name: Compilation check
+        run: cargo check --no-default-features --features feat_macos
+
+      - name: Run device capture tests
+        env:
+          RSAC_TEST_CAPTURE_TIMEOUT_SECS: "15"
+        run: |
+          cargo test --test ci_audio device_capture \
+            --no-default-features --features feat_macos \
+            -- --test-threads=1 --nocapture 2>&1 | tee ci-audio-output.log
+
+      - name: Run device enumeration tests
+        env:
+          RSAC_TEST_CAPTURE_TIMEOUT_SECS: "15"
+        run: |
+          cargo test --test ci_audio device_enumeration \
+            --no-default-features --features feat_macos \
+            -- --test-threads=1 --nocapture 2>&1 | tee -a ci-audio-output.log
+
+      - name: Diagnostics on failure
+        if: failure()
+        run: |
+          system_profiler SPAudioDataType 2>/dev/null || true
+          sw_vers || true
+
+      - name: Upload logs
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: macos-device-capture-logs
+          path: ci-audio-output.log
+          retention-days: 14
+
+  macos-process:
+    name: "macOS | Process Capture"
+    runs-on: macos-15
+    continue-on-error: true  # Process Tap expected to skip due to TCC in CI
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: macos-audio
+
+      - name: Check audio and install BlackHole
+        run: |
+          brew install blackhole-2ch || echo "BlackHole installation failed (expected in CI)"
+          sudo killall coreaudiod 2>/dev/null || true
+          sleep 5
+          if system_profiler SPAudioDataType 2>/dev/null | grep -qi "output"; then
+            echo "RSAC_CI_AUDIO_AVAILABLE=1" >> $GITHUB_ENV
           fi
 
       - name: Generate test WAV file
         run: |
-          echo "=== Generating 440 Hz test tone WAV file ==="
-
-          # sox should be available on macOS GH Actions runners
           if command -v sox &>/dev/null; then
-              sox -n -r 48000 -c 2 -b 32 -e floating-point /tmp/test_440hz.wav synth 5 sine 440
-              echo "✅ Test WAV generated with sox at /tmp/test_440hz.wav"
-              ls -la /tmp/test_440hz.wav
+            sox -n -r 48000 -c 2 -b 32 -e floating-point /tmp/test_440hz.wav synth 5 sine 440
           else
-              echo "⚠️ sox not found — attempting install via brew"
-              brew install sox || echo "Failed to install sox"
-              if command -v sox &>/dev/null; then
-                  sox -n -r 48000 -c 2 -b 32 -e floating-point /tmp/test_440hz.wav synth 5 sine 440
-                  echo "✅ Test WAV generated with sox at /tmp/test_440hz.wav"
-                  ls -la /tmp/test_440hz.wav
-              else
-                  echo "⚠️ Cannot generate test WAV — sox unavailable"
-              fi
+            brew install sox || true
+            sox -n -r 48000 -c 2 -b 32 -e floating-point /tmp/test_440hz.wav synth 5 sine 440 2>/dev/null || true
           fi
 
-      - name: "Compilation check (guards test execution)"
-        id: macos_compile
-        run: |
-          echo "=== Verifying rsac compiles on macOS with feat_macos ==="
-          cargo check --no-default-features --features feat_macos
-          echo "✅ Compilation check passed"
+      - name: Compilation check
+        run: cargo check --no-default-features --features feat_macos
 
-      - name: Run CI audio integration tests
-        if: steps.macos_compile.outcome == 'success'
+      - name: Run application capture tests
         env:
           RSAC_TEST_CAPTURE_TIMEOUT_SECS: "15"
-          RUST_BACKTRACE: "1"
-          RUST_LOG: "rsac=debug"
         run: |
-          echo "=== Running macOS CI Audio Integration Tests ==="
-          echo "RSAC_CI_AUDIO_AVAILABLE=${RSAC_CI_AUDIO_AVAILABLE:-unset}"
-          echo ""
-
-          cargo test --test ci_audio \
+          cargo test --test ci_audio app_capture \
             --no-default-features --features feat_macos \
-            -- --test-threads=1 --nocapture \
-            2>&1 | tee ci-audio-test-output.log
+            -- --test-threads=1 --nocapture 2>&1 | tee ci-audio-output.log
 
-          EXIT_CODE=$?
-          echo ""
-          echo "=== Test Exit Code: $EXIT_CODE ==="
-
-          # Don't fail if tests merely skipped
-          if [ $EXIT_CODE -ne 0 ]; then
-              echo "⚠️ Some tests may have failed — see logs for details"
-          fi
-          exit $EXIT_CODE
-
-      - name: Report compilation failure
-        if: steps.macos_compile.outcome == 'failure'
+      - name: Run process tree capture tests
+        env:
+          RSAC_TEST_CAPTURE_TIMEOUT_SECS: "15"
         run: |
-          echo "============================================================"
-          echo "⚠️  macOS COMPILATION FAILED — skipping audio tests"
-          echo "============================================================"
-          echo ""
-          echo "Unexpected compilation failure on macOS. The backend should"
-          echo "compile cleanly. Check for dependency version changes or"
-          echo "API breakage in coreaudio-rs, cocoa, or objc2 crates."
-          echo "============================================================"
+          cargo test --test ci_audio process_tree_capture \
+            --no-default-features --features feat_macos \
+            -- --test-threads=1 --nocapture 2>&1 | tee -a ci-audio-output.log
 
-          # Write a summary log file
-          echo "macOS compilation failed — tests skipped" > ci-audio-test-output.log
-          echo "See workflow logs for compilation error details" >> ci-audio-test-output.log
-
-      - name: Collect diagnostic info on failure
+      - name: Diagnostics on failure
         if: failure()
         run: |
-          echo "=== macOS Audio Diagnostics ==="
-
-          echo "--- system_profiler SPAudioDataType ---"
           system_profiler SPAudioDataType 2>/dev/null || true
-
-          echo ""
-          echo "--- IORegistry audio entries ---"
-          ioreg -l | grep -i audio | head -50 || true
-
-          echo ""
-          echo "--- CoreAudio device list (via system_profiler) ---"
-          system_profiler SPAudioDataType -json 2>/dev/null | head -200 || true
-
-          echo ""
-          echo "--- Installed audio kexts ---"
-          kextstat 2>/dev/null | grep -i audio || true
-
-          echo ""
-          echo "--- coreaudiod process ---"
           ps aux | grep -i coreaudio || true
-
-          echo ""
-          echo "--- BlackHole status ---"
-          brew list blackhole-2ch 2>/dev/null && echo "BlackHole is installed" || echo "BlackHole is NOT installed"
-
-          echo ""
-          echo "--- Environment ---"
-          echo "RSAC_CI_AUDIO_AVAILABLE=${RSAC_CI_AUDIO_AVAILABLE:-unset}"
           sw_vers || true
 
-      - name: Upload test logs
+      - name: Upload logs
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: macos-ci-audio-test-logs
-          path: |
-            ci-audio-test-output.log
+          name: macos-process-capture-logs
+          path: ci-audio-output.log
           retention-days: 14
 
-  # ===========================================================================
-  # Summary job — reports overall audio test status across all platforms
-  # ===========================================================================
+  # =============================================================================
+  # Summary — reports overall status, fails only if Linux (primary) fails
+  # =============================================================================
+
   summary:
     name: "Audio Test Summary"
     runs-on: ubuntu-latest
     if: always()
-    needs: [linux-audio-tests, windows-audio-integration, macos-audio-integration]
-
+    needs:
+      - linux-system
+      - linux-device
+      - linux-process
+      - windows-system
+      - windows-device
+      - windows-process
+      - macos-system
+      - macos-device
+      - macos-process
     steps:
-      - name: Report audio test results
+      - name: Report results
         run: |
           echo "============================================================"
-          echo "  CI Audio Integration Tests — Summary"
+          echo "  Audio Integration Tests — Summary"
           echo "============================================================"
           echo ""
-          echo "Platform Results:"
-          echo "  Linux (PipeWire):   ${{ needs.linux-audio-tests.result }}"
-          echo "  Windows (WASAPI):   ${{ needs.windows-audio-integration.result }}"
-          echo "  macOS (CoreAudio):  ${{ needs.macos-audio-integration.result }}"
+          echo "Linux:"
+          echo "  System Capture:  ${{ needs.linux-system.result }}"
+          echo "  Device Capture:  ${{ needs.linux-device.result }}"
+          echo "  Process Capture: ${{ needs.linux-process.result }}"
           echo ""
-          echo "------------------------------------------------------------"
-          echo "Notes:"
-          echo "  • Linux is the PRIMARY validated platform"
-          echo "  • Windows is EXPERIMENTAL (Scream driver unreliable in CI)"
-          echo "  • macOS is VALIDATED (compiles clean, CI audio depends on BlackHole)"
-          echo "------------------------------------------------------------"
+          echo "Windows (VB-CABLE, continue-on-error):"
+          echo "  System Capture:  ${{ needs.windows-system.result }}"
+          echo "  Device Capture:  ${{ needs.windows-device.result }}"
+          echo "  Process Capture: ${{ needs.windows-process.result }}"
           echo ""
+          echo "macOS (BlackHole):"
+          echo "  System Capture:  ${{ needs.macos-system.result }}"
+          echo "  Device Capture:  ${{ needs.macos-device.result }}"
+          echo "  Process Capture: ${{ needs.macos-process.result }}"
+          echo ""
+          echo "============================================================"
 
-          # Fail the summary only if Linux (the primary platform) failed
-          if [ "${{ needs.linux-audio-tests.result }}" != "success" ]; then
-            echo "❌ FAILED: Linux audio tests did not pass!"
-            echo "   Linux is the primary platform — this failure must be investigated."
+          # Fail only if any Linux job failed (primary platform)
+          FAILED=0
+          for result in \
+            "${{ needs.linux-system.result }}" \
+            "${{ needs.linux-device.result }}" \
+            "${{ needs.linux-process.result }}"; do
+            if [ "$result" != "success" ]; then
+              echo "FAILED: Linux job returned '$result'"
+              FAILED=1
+            fi
+          done
+
+          if [ "$FAILED" -eq 1 ]; then
+            echo ""
+            echo "Linux is the primary platform — failures must be investigated."
             exit 1
           else
-            echo "✅ PRIMARY PLATFORM (Linux) passed"
+            echo "All Linux (primary) jobs passed."
           fi
-
-          if [ "${{ needs.windows-audio-integration.result }}" != "success" ]; then
-            echo "⚠️  Windows audio tests did not pass (expected — continue-on-error)"
-          fi
-
-          if [ "${{ needs.macos-audio-integration.result }}" != "success" ]; then
-            echo "⚠️  macOS audio tests did not pass (check BlackHole availability or compilation)"
-          fi
-
-          echo ""
-          echo "============================================================"

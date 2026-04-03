@@ -1,467 +1,184 @@
-# Cross-Platform Audio Capture Library
+# rsac — Rust Cross-Platform Audio Capture
 
-A robust, high-performance audio capture library for Rust, supporting Windows, macOS, and Linux platforms. This library provides a unified interface for capturing audio across different operating systems, with support for both system-wide and application-specific capture.
+A streaming-first audio capture library for Rust. Captures system audio, per-application audio, and process-tree audio on Windows (WASAPI), Linux (PipeWire), and macOS (CoreAudio Process Tap).
+
+## CI Status
+
+### Unit Tests
+
+| Platform | Status |
+|----------|--------|
+| Linux | ![Linux](https://github.com/baladithyab/rust-crossplat-audio-capture/actions/workflows/ci.yml/badge.svg?branch=master) |
+| Windows | ![Windows](https://github.com/baladithyab/rust-crossplat-audio-capture/actions/workflows/ci.yml/badge.svg?branch=master) |
+| macOS | ![macOS](https://github.com/baladithyab/rust-crossplat-audio-capture/actions/workflows/ci.yml/badge.svg?branch=master) |
+
+### Audio Integration Tests
+
+![Audio Tests](https://github.com/baladithyab/rust-crossplat-audio-capture/actions/workflows/ci-audio-tests.yml/badge.svg?branch=master)
+
+| | System | Device | Process |
+|---|---|---|---|
+| **Linux** (PipeWire) | `linux-system` | `linux-device` | `linux-process` |
+| **Windows** (VB-CABLE) | `windows-system` | `windows-device` | `windows-process` |
+| **macOS** (BlackHole) | `macos-system` | `macos-device` | `macos-process` |
+
+Each cell is a separate CI job visible in the [Actions tab](https://github.com/baladithyab/rust-crossplat-audio-capture/actions/workflows/ci-audio-tests.yml). Linux is the primary platform; Windows and macOS process capture use `continue-on-error`.
 
 ## Features
 
-### Core Features
+- **Streaming-first** — audio data is delivered via `AudioBuffer` chunks for in-flight processing, not just file writing
+- **System-wide capture** on all three platforms
+- **Per-application capture** by PID or name (WASAPI process loopback, PipeWire node mapping, CoreAudio Process Tap)
+- **Process-tree capture** for child process hierarchies
+- **Lock-free ring buffers** (`rtrb` SPSC) bridging OS callback threads to consumer threads
+- **Push-based subscription** (`subscribe()` returns `mpsc::Receiver<AudioBuffer>`)
+- **Overflow monitoring** (`overrun_count()` tracks dropped buffers)
+- **Sink adapters** — `NullSink`, `ChannelSink`, `WavFileSink`
+- **Platform capability reporting** — `PlatformCapabilities::query()` for honest feature detection
 
-- **Cross-Platform Support**
-  - Windows: WASAPI-based capture with both system-wide and application-specific support
-  - Linux: Modern PipeWire backend (preferred) with PulseAudio fallback, supporting both system-wide and application-specific capture
-  - macOS: CoreAudio implementation with system-wide and application-specific capture (Process Tap, macOS 14.4+)
+## Quick Start
 
-### Audio Capabilities
+```rust
+use rsac::{AudioCaptureBuilder, CaptureTarget};
 
-- **System-wide Audio Capture**
+let mut capture = AudioCaptureBuilder::new()
+    .with_target(CaptureTarget::SystemDefault)
+    .sample_rate(48000)
+    .channels(2)
+    .build()?;
 
-  - Supported on all platforms (Windows, Linux, macOS)
-  - High-quality audio capture from system output
-  - Zero-configuration setup on most systems
+capture.start()?;
 
-- **Application-specific Capture**
+// Streaming-first: read audio chunks in a loop
+loop {
+    if let Some(buffer) = capture.read_buffer()? {
+        let samples: &[f32] = buffer.data();
+        let frames = buffer.num_frames();
+        // process audio...
+    }
+}
 
-  - Windows: WASAPI-based per-application capture
-  - Linux: PipeWire/PulseAudio process-specific capture
-  - macOS: CoreAudio Process Tap for per-application capture (requires macOS 14.4+)
-  - Capture from multiple applications simultaneously
+capture.stop()?;
+```
 
-- **Process Tree Capture**
-  - Windows: WASAPI process loopback for child process trees
-  - Linux: PipeWire PID-based node mapping for process trees
-  - macOS: CoreAudio Process Tap for process tree capture (macOS 14.4+)
+### Application Capture
 
-- **Flexible Output Formats**
-  - Multiple formats: WAV, RAW PCM
-  - Configurable parameters:
-    - Sample rates: 44.1kHz, 48kHz, 96kHz
-    - Bit depths: 16-bit, 24-bit, 32-bit
-    - Channel configurations: Mono, Stereo
-    - Format types: F32LE, S16LE, S32LE
+```rust
+use rsac::{AudioCaptureBuilder, CaptureTarget};
 
-### Advanced Features
+let capture = AudioCaptureBuilder::new()
+    .with_target(CaptureTarget::ApplicationByName("firefox".into()))
+    .build()?;
+```
 
-- Async stream support (optional, via `atomic-waker`)
-- Lock-free audio buffers
-- Ring buffer overflow monitoring (`overrun_count()`)
-- Push-based subscription (`subscribe()` for channel-based delivery)
-- Comprehensive error handling
-- Detailed logging and diagnostics
+### Device Enumeration
 
-### Development Features
+```rust
+use rsac::{get_device_enumerator, DeviceKind};
 
-- Trait-based API design
-- Extensive test coverage
-- Mock implementations for testing
-- Comprehensive documentation
-- Performance benchmarks
+let enumerator = get_device_enumerator()?;
+let devices = enumerator.enumerate_devices()?;
+let default = enumerator.get_default_device(DeviceKind::Output)?;
+```
 
-## Applications Built on rsac
+## CLI Demo
 
-### AudioGraph 🎙️🔗
+The binary is a thin demo over the library API:
 
-[AudioGraph](apps/audio-graph/) is a desktop application that captures live system audio, performs real-time speech recognition, identifies speakers, extracts entities, and builds an evolving temporal knowledge graph — all visualized in a force-directed graph.
+```bash
+# Show platform capabilities
+rsac info
 
-Built with Tauri v2 (Rust backend + React frontend), AudioGraph demonstrates rsac's streaming-first capture capabilities in a real-world pipeline:
+# List audio devices
+rsac list
 
-- **Audio Capture** → Voice Activity Detection → Automatic Speech Recognition (Whisper) → Speaker Diarization → Entity Extraction → Temporal Knowledge Graph
-- Supports system-wide and per-application capture on all three platforms
-- Native LLM inference via llama.cpp or OpenAI-compatible API endpoints
-- GPU-accelerated (Metal on macOS, CUDA/Vulkan on Windows/Linux)
+# Capture system audio (live level meter)
+rsac capture
 
-See the [AudioGraph README](apps/audio-graph/README.md) for setup instructions and architecture details.
+# Capture a specific app by name
+rsac capture --app firefox
+
+# Record to WAV file
+rsac record --duration 30 --output recording.wav
+```
+
+## Capture Mode Support
+
+| Mode | Windows (WASAPI) | Linux (PipeWire) | macOS (CoreAudio) |
+|---|---|---|---|
+| System default | Yes | Yes | Yes |
+| Application (PID) | Process loopback | pw-dump node | Process Tap (14.4+) |
+| ApplicationByName | sysinfo PID resolve | pw-dump node serial | Process Tap (14.4+) |
+| Process tree | Process loopback | PID node mapping | Process Tap (14.4+) |
+| Device selection | Yes | Yes | Yes |
 
 ## Installation
 
-1. Ensure you have Rust installed on your system
-2. Clone this repository
-3. Build the project:
+Add to `Cargo.toml`:
 
-```bash
-cargo build --release
+```toml
+[dependencies]
+rsac = { git = "https://github.com/baladithyab/rust-crossplat-audio-capture" }
 ```
 
-4. The executable will be available at `target/release/rsac` (or `rsac.exe` on Windows)
+### Platform Dependencies
 
-## Usage
-
-RSAC supports both interactive and command-line modes, with bounded or unbounded recording duration. The functionality varies slightly between platforms.
-
-### Platform-Specific Notes
-
-#### Windows
-
-- Supports both system-wide and application-specific audio capture
-- Uses WASAPI for high-quality audio capture
-- Process names should include the `.exe` extension for app-specific capture
-- Use "System" as the process name for system-wide capture
-- Administrative privileges may be required for some applications
-
-#### Linux
-
-- Primary support through PipeWire (modern audio system)
-- Fallback to PulseAudio when PipeWire is not available
-- Supports both system-wide and application-specific capture
-- Process names should match the application name in PipeWire/PulseAudio
-- No special privileges required for most applications
-
-#### macOS
-
-- System-wide audio capture supported
-- **NEW**: Application-specific capture via CoreAudio Process Tap (macOS 14.4+)
-- Requires Screen Recording permission to be granted
-- Process Tap requires additional permissions for application audio access
-- Application-specific capture available on macOS 14.4+ via Process Tap
-
-### Interactive Mode
-
-Simply run the application without any process specification:
-
+**Linux** — PipeWire dev libraries:
 ```bash
-rsac
+# Debian/Ubuntu
+sudo apt install libpipewire-0.3-dev libspa-0.2-dev pkg-config libclang-dev
+
+# Fedora
+sudo dnf install pipewire-devel pkg-config clang-devel
+
+# Arch
+sudo pacman -S pipewire pkgconf clang
 ```
 
-This will:
+**Windows** — Rust toolchain only (WASAPI is built-in).
 
-1. List available audio sources (processes on Windows/Linux, system audio on macOS)
-2. Allow you to select a source interactively
-3. Start capturing audio from the selected source
+**macOS** — Xcode Command Line Tools. Screen Recording permission required. Process Tap requires macOS 14.4+.
 
-You can filter the source list in interactive mode (Windows/Linux):
+## Architecture
 
-```bash
-rsac -i spotify
+```
+core/ → bridge/ → audio/ (backends) → api/ → lib.rs
 ```
 
-### Command Line Mode
+- **`core/`** — `AudioBuffer`, `CaptureTarget`, `AudioError`, `PlatformCapabilities`, traits
+- **`bridge/`** — `BridgeStream<S>`, lock-free ring buffer, `AtomicStreamState`
+- **`audio/`** — Platform backends (WASAPI, PipeWire, CoreAudio), each implementing `PlatformStream`
+- **`api/`** — `AudioCaptureBuilder` → `AudioCapture` (public entry points)
+- **`sink/`** — `AudioSink` trait + `NullSink`, `ChannelSink`, `WavFileSink`
 
-#### Bounded Recording
+See [`docs/architecture/`](docs/architecture/) for the full design documents.
 
-Specify a duration to capture for a fixed time:
+## Applications Built on rsac
 
-```bash
-# Windows
-rsac -p System -d 30
+### AudioGraph
 
-# Linux
-rsac -p System -d 30
+[AudioGraph](https://github.com/baladithyab/audio-graph) is a desktop app (Tauri v2) that captures live system audio, performs real-time speech recognition, speaker diarization, entity extraction, and builds a temporal knowledge graph. Included as a [git submodule](apps/audio-graph/).
 
-# macOS
-rsac -p "System Audio" -d 30
-```
-
-#### Unbounded Recording
-
-Omit the duration to record until Ctrl+C is pressed:
+## Running Tests
 
 ```bash
-# Windows
-rsac -p Spotify.exe
+# Unit tests (no audio hardware needed)
+cargo test --lib --no-default-features --features feat_linux
 
-# Linux
-rsac -p spotify
+# CI audio integration tests (requires PipeWire + virtual sink)
+cargo test --test ci_audio --no-default-features --features feat_linux -- --test-threads=1
 
-# macOS
-rsac -p "System Audio"
+# Docker-based testing
+cd docker/linux && docker-compose run pipewire-test
 ```
-
-### Available Options
-
-- `-p, --process <n>`: Process/source name to capture audio from
-- `-d, --duration <SECONDS>`: Duration to capture (omit for unbounded recording)
-- `-o, --output-dir <PATH>`: Output directory (default: current directory)
-- `-f, --format <FORMAT>`: Output format: raw, wav, or both (default: both)
-- `-i, --filter <FILTER>`: Filter source list in interactive mode
-- `-v, --verbose`: Enable verbose output for debugging
-- `-r, --rate <RATE>`: Sample rate in Hz (default: 48000)
-- `-c, --channels <COUNT>`: Number of channels (default: 2)
-- `--format-type <TYPE>`: Audio format type: f32le, s16le, s32le (default: f32le)
-
-### Examples
-
-1. Record 30 seconds of system-wide audio:
-
-```bash
-# Windows
-rsac -p System -d 30
-
-# Linux
-rsac -p System -d 30
-
-# macOS
-rsac -p "System Audio" -d 30
-```
-
-2. Record 30 seconds of application-specific audio:
-
-```bash
-# Windows
-rsac -p Spotify.exe -d 30
-
-# Linux
-rsac -p firefox -d 30
-
-# macOS (system audio only)
-rsac -p "System Audio" -d 30
-```
-
-3. Record with custom audio format:
-
-```bash
-rsac -p firefox --format-type s16le -r 44100 -c 1
-```
-
-4. Record in WAV format only with high quality:
-
-```bash
-rsac -p chrome -f wav --format-type f32le -r 96000
-```
-
-5. Save to custom directory with verbose output:
-
-```bash
-rsac -p vlc -o ./captures -v
-```
-
-6. Record system audio on macOS with custom format:
-
-```bash
-rsac -p "System Audio" --format-type f32le -r 48000 -c 2
-```
-
-## Output Files
-
-For a process named "example", the following files will be created:
-
-- `example_audio.raw`: Raw audio data (if raw or both format selected)
-- `example_audio.wav`: WAV format audio (if wav or both format selected)
-- `example_capture.log`: Capture statistics and debug information
-
-## Audio Format
-
-The captured audio supports the following configurations:
-
-- Channels: 1 (Mono) or 2 (Stereo)
-- Sample Rate: Any standard rate (44100, 48000, 96000 Hz, etc.)
-- Bit Depth/Format:
-  - 32-bit float (F32LE)
-  - 16-bit signed integer (S16LE)
-  - 32-bit signed integer (S32LE)
-
-## Progress Display
-
-- Bounded recording: Shows a progress bar with elapsed time and completion percentage
-- Unbounded recording: Shows a spinner with elapsed time
-- Both modes display a capture summary at completion with:
-  - Total packets captured
-  - Silent packet detection
-  - Total data size
-  - Average packet size
-  - Recording duration
-
-## Requirements
-
-### Windows
-
-- Windows 7 or later
-- Rust toolchain
-- Administrative privileges may be required for some applications
-
-### Linux
-- PipeWire (recommended) or PulseAudio sound server
-- Development libraries:
-  - For PipeWire: `libpipewire-dev`
-  - For PulseAudio: `libpulse-dev`
-- Verify dependencies using `pkg-config`:
-  ```bash
-  ./scripts/check_deps.sh
-  ```
-  If libraries are installed in non-standard locations, set `PKG_CONFIG_PATH` accordingly.
-  To let the build script attempt automatic installation via `apt-get`, set:
-  ```bash
-  export RSAC_AUTO_INSTALL=1
-  ```
-- Rust toolchain
-
-#### Installing PipeWire Dependencies
-
-**Debian/Ubuntu:**
-
-```bash
-# Runtime dependencies
-sudo apt install libpipewire-0.3-0
-
-# Development dependencies (only needed for building)
-sudo apt install libpipewire-0.3-dev pkg-config build-essential clang libclang-dev llvm-dev
-```
-
-**Fedora:**
-
-```bash
-# Runtime dependencies
-sudo dnf install pipewire-libs
-
-# Development dependencies
-sudo dnf install pipewire-devel pkg-config gcc clang clang-devel llvm-devel
-```
-
-**Arch Linux:**
-
-```bash
-# Both runtime and development dependencies
-sudo pacman -S pipewire pkgconf base-devel clang llvm
-```
-
-**Automated Installation:**
-This repository includes an installation script to help you set up all required dependencies:
-
-```bash
-sudo ./install-dependencies.sh
-```
-
-### macOS
-
-- macOS 10.13 or later
-- Rust toolchain
-- Xcode Command Line Tools
-- Screen Recording permission (required for audio capture)
 
 ## Contributing
 
-Contributions are welcome! Here's how you can help:
-
-### Development Workflow
-
-1. Fork the repository
-2. Create a feature branch
-3. Make your changes
-4. Run the test suite locally
-5. Submit a Pull Request
-
-### Running Tests
-
-The project includes comprehensive test suites for each platform:
-
-```bash
-# Run basic tests
-cargo test
-
-# Run platform-specific audio tests (requires audio setup)
-cargo test --features audio-tests
-```
-
-### Docker-based Testing
-
-For reliable testing across environments, Docker containers are provided:
-
-#### Linux PipeWire Tests
-
-The preferred way to test PipeWire functionality is using the provided Docker setup:
-
-```bash
-# Build and run PipeWire tests
-cd docker/linux
-docker-compose build
-docker-compose run pipewire-test
-
-# Or for interactive exploration
-docker-compose run --entrypoint /bin/bash pipewire-test
-```
-
-This Docker setup:
-
-1. Installs all PipeWire dependencies automatically
-2. Sets up PipeWire with proper environment
-3. Performs validation to ensure PipeWire is working correctly
-4. Runs the test suite in an isolated environment
-
-#### Advanced Docker Options
-
-There are two ways to run PipeWire in Docker:
-
-1. **Self-contained mode** (default): PipeWire runs entirely inside the container
-
-   ```bash
-   docker-compose run pipewire-test
-   ```
-
-2. **Host socket mode**: Container uses host's PipeWire server (uncomment socket mount in docker-compose.yml)
-   ```bash
-   # Edit docker-compose.yml first to uncomment socket mount
-   docker-compose run pipewire-test
-   ```
-
-### CI/CD
-
-- GitHub Actions workflows are configured for each platform
-- Tests can be triggered manually through GitHub Actions UI
-- Available workflows:
-  - Windows Audio Tests
-  - Linux Audio Tests (PipeWire)
-  - macOS Audio Tests
-  - Code Quality Checks
-
-### Best Practices
-
-- Write tests for new features
-- Update documentation for API changes
-- Follow Rust coding guidelines
-- Include both system-wide and app-specific tests where applicable
-
-### Docker-Based Testing
-The repository includes Docker configurations for Linux, Windows, and macOS
-under the `docker/` directory. Each Dockerfile provisions the necessary audio
-services and tooling to run the example programs and automated tests on that
-platform. The easiest way to spin up all environments is via
-`docker-compose`:
-
-```bash
-docker-compose up --build
-```
-
-This command builds the platform images and runs the bundled test scripts.
-Individual Dockerfiles can also be built separately if you only need a single
-platform:
-
-```bash
-# Linux
-docker build -f docker/linux/Dockerfile -t rsac-linux .
-
-# Windows
-docker build -f docker/windows/Dockerfile -t rsac-windows .
-
-# macOS (requires virtualization support)
-docker build -f docker/macos/Dockerfile -t rsac-macos .
-```
-
-## Testing Application Capture
-
-A dedicated test binary is available for CI/CD and manual testing:
-
-```bash
-# Quick functionality test (ideal for CI)
-cargo run --bin app_capture_test -- --quick-test
-
-# List all capturable applications
-cargo run --bin app_capture_test -- --list
-
-# Test error handling
-cargo run --bin app_capture_test -- --test-invalid
-
-# Test platform-specific features
-cargo run --bin app_capture_test -- --test-platform
-
-# Test capture lifecycle
-cargo run --bin app_capture_test -- --test-lifecycle
-
-# Show version and platform info
-cargo run --bin app_capture_test -- --version
-```
-
-### CI/CD Integration
-
-The project includes GitHub Actions workflows that automatically test application capture functionality across Windows, Linux, and macOS. See `.github/workflows/application_capture_ci.yml` for the complete CI configuration.
+1. Fork & create a feature branch
+2. Read [`AGENTS.md`](AGENTS.md) for architecture rules and conventions
+3. Run `cargo fmt --all && cargo clippy` before submitting
+4. CI runs lint, unit tests (3 platforms), and audio integration tests
 
 ## License
 
-This project is licensed under the MIT License - see the LICENSE file for details.
+MIT — see [LICENSE](LICENSE) for details.
