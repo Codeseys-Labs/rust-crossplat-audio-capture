@@ -90,7 +90,6 @@ jobs:
     name: macOS Unit Tests
     needs: lint
     runs-on: macos-latest
-    continue-on-error: true  # macOS tests may have platform-specific failures
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
@@ -123,7 +122,6 @@ jobs:
 
       - name: Cargo test (unit tests)
         run: cargo test --lib --no-default-features --features feat_macos -- --test-threads=1
-        continue-on-error: true  # macOS tests may have platform-specific failures
 
   # ── Linux ARM64 cross-compilation check ─────────────────────────────
   cross-compile-linux-arm64:

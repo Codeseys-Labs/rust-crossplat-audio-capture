@@ -73,8 +73,12 @@ impl WindowsApplicationCapture {
     ///
     /// This uses wasapi-rs AudioClient::new_application_loopback_client for simplicity
     pub fn initialize(&mut self) -> std::result::Result<(), Box<dyn std::error::Error>> {
-        // Initialize COM using wasapi-rs (0.22.0: returns HRESULT, not Result)
-        let _hr = initialize_mta();
+        // Initialize COM using wasapi-rs (0.22.0: returns HRESULT, not Result).
+        // S_OK (0) and S_FALSE (1) are both success. Only fail on actual errors.
+        let hr = initialize_mta();
+        if hr.is_err() && hr != windows::core::HRESULT(1) {
+            return Err(format!("COM initialization failed: HRESULT {:?}", hr).into());
+        }
 
         // Create wasapi-rs AudioClient for application loopback
         let mut audio_client = wasapi::AudioClient::new_application_loopback_client(
@@ -137,23 +141,25 @@ impl WindowsApplicationCapture {
         // Reset stop flag at start of capture
         self.should_stop.store(false, Ordering::SeqCst);
 
-        // Simple capture loop based on wasapi-rs examples
-        loop {
-            // Check if we should stop capture (internal flag)
-            if self.should_stop.load(Ordering::SeqCst) {
-                break; // Stop requested
-            }
+        // Pre-allocate reusable buffers outside the loop to avoid per-iteration allocations.
+        let mut sample_queue = std::collections::VecDeque::with_capacity(48000 * 4 * 2 / 10);
+        let mut samples: Vec<f32> = Vec::with_capacity(48000 * 2 / 10);
 
-            // Check external stop flag if provided
+        // Capture loop based on wasapi-rs examples
+        loop {
+            // Check if we should stop capture (internal or external flag)
+            if self.should_stop.load(Ordering::SeqCst) {
+                break;
+            }
             if let Some(ref external_flag) = external_stop_flag {
                 if external_flag.load(Ordering::SeqCst) {
-                    break; // External stop requested
+                    break;
                 }
             }
 
             // Wait for audio data (shorter timeout to check stop flag more frequently)
             if h_event.wait_for_event(100).is_err() {
-                // Check stop flags on timeout too
+                // Timeout — check stop flags and continue
                 if self.should_stop.load(Ordering::SeqCst) {
                     break;
                 }
@@ -162,30 +168,26 @@ impl WindowsApplicationCapture {
                         break;
                     }
                 }
-                continue; // Continue on timeout, don't break immediately
+                continue;
             }
 
             // Get available packet size
             let packet_length = capture_client.get_next_packet_size()?.unwrap_or(0);
 
             if packet_length > 0 {
-                // Use wasapi-rs to read audio data into a VecDeque
-                let mut sample_queue = std::collections::VecDeque::new();
+                // Reuse sample_queue across iterations
+                sample_queue.clear();
                 capture_client.read_from_device_to_deque(&mut sample_queue)?;
 
-                // Convert bytes to f32 samples and call callback
+                // Convert bytes to f32 samples using efficient slice access
                 if !sample_queue.is_empty() {
-                    // Convert VecDeque<u8> to Vec<f32>
-                    // Assuming 32-bit float format (4 bytes per sample)
-                    let mut samples = Vec::new();
-                    while sample_queue.len() >= 4 {
-                        let bytes: [u8; 4] = [
-                            sample_queue.pop_front().unwrap(),
-                            sample_queue.pop_front().unwrap(),
-                            sample_queue.pop_front().unwrap(),
-                            sample_queue.pop_front().unwrap(),
-                        ];
-                        samples.push(f32::from_le_bytes(bytes));
+                    samples.clear();
+                    let (front, back) = sample_queue.as_slices();
+                    for chunk in front.chunks_exact(4) {
+                        samples.push(f32::from_le_bytes([chunk[0], chunk[1], chunk[2], chunk[3]]));
+                    }
+                    for chunk in back.chunks_exact(4) {
+                        samples.push(f32::from_le_bytes([chunk[0], chunk[1], chunk[2], chunk[3]]));
                     }
 
                     if !samples.is_empty() {
@@ -218,11 +220,9 @@ impl WindowsApplicationCapture {
         self.audio_client.is_some()
     }
 
-    /// Stop capturing audio
+    /// Stop capturing audio (alias for [`stop_capture`]).
     pub fn stop(&mut self) -> std::result::Result<(), Box<dyn std::error::Error>> {
-        // Clear the audio client
-        self.audio_client = None;
-        Ok(())
+        self.stop_capture()
     }
 
     /// Find process ID by name (convenience helper)
@@ -278,16 +278,17 @@ unsafe impl Send for WindowsApplicationCapture {}
 // The thread spawn issue will need to be handled differently
 
 /// RAII wrapper for a Windows HANDLE to ensure it's closed on drop.
-#[allow(dead_code)] // Planned for future use in process handle management
 #[derive(Debug)]
 struct ProcessHandle(Option<HANDLE>);
 
-#[allow(dead_code)] // Planned for future use in process handle management
 impl ProcessHandle {
+    /// Wraps a HANDLE value. Pass `None` for no handle.
     fn new(handle: Option<HANDLE>) -> Self {
         Self(handle)
     }
 
+    /// Returns the wrapped HANDLE, if any.
+    #[allow(dead_code)] // Available for future callers who need the raw HANDLE
     fn get(&self) -> Option<HANDLE> {
         self.0
     }
@@ -318,13 +319,22 @@ impl ComInitializer {
     ///
     /// Returns `Ok(Self)` on success, or an `AudioError::BackendError`
     /// if COM initialization fails.
+    ///
+    /// Both `S_OK` and `S_FALSE` are treated as success:
+    /// - `S_OK` means COM was freshly initialized.
+    /// - `S_FALSE` means COM was already initialized with MTA on this thread.
+    ///
+    /// In both cases, `CoUninitialize` must be called (handled by `Drop`).
     pub fn new() -> AudioResult<Self> {
         // SAFETY: CoInitializeEx is safe to call. We check the HRESULT.
         let hr = unsafe { CoInitializeEx(None, COINIT_MULTITHREADED) };
-        if hr.is_ok() {
+
+        // S_OK (0) = freshly initialized, S_FALSE (1) = already initialized in MTA.
+        // Both are success — CoUninitialize must be called for each successful call.
+        if hr.is_ok() || hr == windows::core::HRESULT(1) {
             Ok(ComInitializer)
         } else if hr == RPC_E_CHANGED_MODE {
-            // COM was already initialized with a different concurrency model.
+            // COM was already initialized with a different concurrency model (STA).
             Err(AudioError::BackendError {
                 backend: "wasapi".to_string(),
                 operation: "com_init".to_string(),
@@ -434,8 +444,8 @@ impl AudioDevice for WindowsAudioDevice {
     }
 
     fn supported_formats(&self) -> Vec<AudioFormat> {
-        // Return common default format — detailed format negotiation can be added later
-        vec![AudioFormat::default()] // 48kHz, 2ch, F32
+        self.query_supported_formats_internal()
+            .unwrap_or_else(|_| vec![AudioFormat::default()])
     }
 
     fn create_stream(&self, config: &StreamConfig) -> AudioResult<Box<dyn CapturingStream>> {
@@ -492,6 +502,125 @@ impl AudioDevice for WindowsAudioDevice {
 }
 
 impl WindowsAudioDevice {
+    /// Query the device's supported audio formats via WASAPI format negotiation.
+    ///
+    /// This queries the device's mix format (its preferred shared-mode format),
+    /// then probes common sample rates to build a list of supported formats.
+    /// The mix format is always first in the returned list.
+    ///
+    /// Uses `IAudioClient::IsFormatSupported` in shared mode, matching the
+    /// pattern from camilladsp's `get_supported_wave_format()`.
+    fn query_supported_formats_internal(&self) -> AudioResult<Vec<AudioFormat>> {
+        let mut formats = Vec::new();
+
+        // Get a wasapi-rs AudioClient through the wasapi-rs Device wrapper,
+        // which gives us access to get_mixformat() and is_supported().
+        let audio_client: wasapi::AudioClient = unsafe {
+            let enumerator =
+                wasapi::DeviceEnumerator::new().map_err(|e| AudioError::BackendError {
+                    backend: "wasapi".to_string(),
+                    operation: "query_supported_formats".to_string(),
+                    message: format!("Failed to create DeviceEnumerator: {}", e),
+                    context: None,
+                })?;
+
+            // Get our device's ID to find the matching wasapi-rs Device
+            let id_pwstr = self.device.GetId().map_err(|hr| AudioError::BackendError {
+                backend: "wasapi".to_string(),
+                operation: "query_supported_formats".to_string(),
+                message: format!("Failed to get device ID (HRESULT: {:?})", hr),
+                context: None,
+            })?;
+            let device_id = if !id_pwstr.is_null() {
+                let id = Self::pwstr_to_string(id_pwstr).unwrap_or_default();
+                CoTaskMemFree(Some(id_pwstr.as_ptr().cast()));
+                id
+            } else {
+                String::new()
+            };
+
+            let wasapi_device = find_wasapi_device_by_id(&enumerator, &device_id)?;
+            wasapi_device
+                .get_iaudioclient()
+                .map_err(|e| AudioError::BackendError {
+                    backend: "wasapi".to_string(),
+                    operation: "query_supported_formats".to_string(),
+                    message: format!("Failed to get IAudioClient: {}", e),
+                    context: None,
+                })?
+        };
+
+        // Query the device's mix format (its preferred shared-mode format).
+        // This is always supported and goes first in the list.
+        if let Ok(mix_fmt) = audio_client.get_mixformat() {
+            let mix_sr = mix_fmt.get_samplespersec();
+            let mix_ch = mix_fmt.get_nchannels();
+            let mix_bits = mix_fmt.get_bitspersample();
+            let mix_valid_bits = mix_fmt.get_validbitspersample();
+
+            let sample_format = wasapi_bits_to_sample_format(mix_bits, mix_valid_bits);
+            formats.push(AudioFormat {
+                sample_rate: mix_sr,
+                channels: mix_ch,
+                sample_format,
+            });
+        }
+
+        // Probe common sample rates with the device's channel count.
+        let probe_channels = formats.first().map(|f| f.channels).unwrap_or(2) as usize;
+        let common_rates: &[usize] = &[44100, 48000, 88200, 96000, 176400, 192000];
+        let probe_formats: &[(usize, usize, wasapi::SampleType)] = &[
+            (32, 32, wasapi::SampleType::Float), // F32
+            (16, 16, wasapi::SampleType::Int),   // I16
+            (32, 24, wasapi::SampleType::Int),   // I24 in 32-bit container
+            (32, 32, wasapi::SampleType::Int),   // I32
+        ];
+
+        for &rate in common_rates {
+            for &(bits, valid_bits, ref sample_type) in probe_formats {
+                let wave_fmt = wasapi::WaveFormat::new(
+                    bits,
+                    valid_bits,
+                    sample_type,
+                    rate,
+                    probe_channels,
+                    None,
+                );
+
+                // is_supported returns Ok(None) if directly supported,
+                // Ok(Some(closest)) if a close match exists, Err if unsupported.
+                match audio_client.is_supported(&wave_fmt, &wasapi::ShareMode::Shared) {
+                    Ok(None) => {
+                        // Format is directly supported
+                        let sf = wasapi_bits_to_sample_format(bits as u16, valid_bits as u16);
+                        let fmt = AudioFormat {
+                            sample_rate: rate as u32,
+                            channels: probe_channels as u16,
+                            sample_format: sf,
+                        };
+                        if !formats.contains(&fmt) {
+                            formats.push(fmt);
+                        }
+                    }
+                    Ok(Some(_closest)) => {
+                        // A close match exists — the exact requested format is not supported,
+                        // but we don't add the closest since it may be redundant with mix format.
+                    }
+                    Err(_) => {
+                        // Format not supported at all
+                    }
+                }
+            }
+        }
+
+        // Ensure we always return at least the default format as a fallback.
+        if formats.is_empty() {
+            formats.push(AudioFormat::default());
+        }
+
+        Ok(formats)
+    }
+
     /// Helper method that returns Result for get_name implementation
     fn get_name_internal(&self) -> AudioResult<String> {
         unsafe {
@@ -554,16 +683,20 @@ impl WindowsAudioDevice {
                     context: None,
                 })?;
 
-            #[allow(non_upper_case_globals)]
-            match data_flow_val {
-                eRender => Ok(DeviceKind::Output),
-                eCapture => Ok(DeviceKind::Input),
-                _ => Err(AudioError::BackendError {
+            // EDataFlow is a newtype struct (e.g. EDataFlow(0)), not a Rust enum.
+            // Using `match` with `eRender` as a pattern would create a variable binding,
+            // not compare against the constant. We must use `if` chains instead.
+            if data_flow_val == eRender {
+                Ok(DeviceKind::Output)
+            } else if data_flow_val == eCapture {
+                Ok(DeviceKind::Input)
+            } else {
+                Err(AudioError::BackendError {
                     backend: "wasapi".to_string(),
                     operation: "get_device_kind".to_string(),
                     message: format!("Unknown data flow value: {:?}", data_flow_val),
                     context: None,
-                }),
+                })
             }
         }
     }
@@ -687,25 +820,80 @@ pub struct ApplicationAudioSessionInfo {
     pub executable_path: Option<String>,
 }
 
+/// Convert WASAPI bits-per-sample / valid-bits to rsac [`SampleFormat`].
+fn wasapi_bits_to_sample_format(
+    bits_per_sample: u16,
+    valid_bits_per_sample: u16,
+) -> crate::core::config::SampleFormat {
+    use crate::core::config::SampleFormat;
+    match (bits_per_sample, valid_bits_per_sample) {
+        (32, 32) => SampleFormat::F32, // Could be Int32, but F32 is our default
+        (32, 24) => SampleFormat::I24,
+        (16, 16) => SampleFormat::I16,
+        (32, _) => SampleFormat::F32,
+        _ => SampleFormat::F32, // Fallback
+    }
+}
+
+/// Find a wasapi-rs `Device` by its Windows device ID string.
+///
+/// Searches both render and capture device collections.
+fn find_wasapi_device_by_id(
+    enumerator: &wasapi::DeviceEnumerator,
+    device_id: &str,
+) -> AudioResult<wasapi::Device> {
+    // Try render devices first (most common for audio capture via loopback)
+    for direction in &[wasapi::Direction::Render, wasapi::Direction::Capture] {
+        if let Ok(collection) = enumerator.get_device_collection(direction) {
+            if let Ok(count) = collection.get_nbr_devices() {
+                for i in 0..count {
+                    if let Ok(device) = collection.get_device_at_index(i) {
+                        if let Ok(id) = device.get_id() {
+                            if id == device_id {
+                                return Ok(device);
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    // Fall back to default render device
+    enumerator
+        .get_default_device(&wasapi::Direction::Render)
+        .map_err(|e| AudioError::BackendError {
+            backend: "wasapi".to_string(),
+            operation: "find_wasapi_device_by_id".to_string(),
+            message: format!(
+                "Device '{}' not found, and default device unavailable: {}",
+                device_id, e
+            ),
+            context: None,
+        })
+}
+
 /// Resolves a process name from its PID by opening the process handle and querying
 /// its module filename.
 ///
 /// Returns the executable filename without the `.exe` extension (e.g. `"firefox"`),
 /// or `None` if the process cannot be opened or the name cannot be retrieved.
 fn get_process_name_by_pid(pid: u32) -> Option<String> {
-    use windows::Win32::Foundation::{CloseHandle, HMODULE};
+    use windows::Win32::Foundation::HMODULE;
     use windows::Win32::System::ProcessStatus::K32GetModuleFileNameExW;
     use windows::Win32::System::Threading::{OpenProcess, PROCESS_QUERY_LIMITED_INFORMATION};
 
     unsafe {
         let handle = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, false, pid).ok()?;
+        // Wrap in RAII guard so the handle is always closed, even on early return.
+        let _guard = ProcessHandle::new(Some(handle));
+
         let mut name_buf = [0u16; 260];
         let len = K32GetModuleFileNameExW(
             Some(handle),
             Some(HMODULE(std::ptr::null_mut())),
             &mut name_buf,
         );
-        let _ = CloseHandle(handle);
         if len > 0 {
             let path = String::from_utf16_lossy(&name_buf[..len as usize]);
             let filename = path.rsplit('\\').next().unwrap_or(&path);
@@ -784,8 +972,7 @@ fn parse_session_identifier(session_id: &str) -> String {
 /// }
 /// ```
 pub fn enumerate_application_audio_sessions() -> AudioResult<Vec<ApplicationAudioSessionInfo>> {
-    use windows::Win32::Foundation::HMODULE;
-    use windows::Win32::Foundation::{CloseHandle, INVALID_HANDLE_VALUE};
+    use windows::Win32::Foundation::{HMODULE, INVALID_HANDLE_VALUE};
     use windows::Win32::Media::Audio::{
         AudioSessionStateActive, IAudioSessionControl, IAudioSessionControl2,
         IAudioSessionEnumerator, IAudioSessionManager2,
@@ -976,6 +1163,8 @@ pub fn enumerate_application_audio_sessions() -> AudioResult<Vec<ApplicationAudi
 
             match process_handle_result {
                 Ok(process_handle) if process_handle != INVALID_HANDLE_VALUE => {
+                    // RAII guard ensures handle is closed even on early exit
+                    let _guard = ProcessHandle::new(Some(process_handle));
                     let mut path_buf: [u16; 1024] = [0; 1024];
                     // Using HMODULE(0) for the main executable module of the process.
                     let len = K32GetModuleFileNameExW(
@@ -986,7 +1175,6 @@ pub fn enumerate_application_audio_sessions() -> AudioResult<Vec<ApplicationAudi
                     if len > 0 {
                         executable_path = Some(String::from_utf16_lossy(&path_buf[..len as usize]));
                     }
-                    let _ = CloseHandle(process_handle);
                 }
                 Ok(_) => { // INVALID_HANDLE_VALUE
                 }
@@ -1016,8 +1204,8 @@ pub fn enumerate_application_audio_sessions() -> AudioResult<Vec<ApplicationAudi
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::core::config::{ApplicationId, CaptureTarget, DeviceId, ProcessId, StreamConfig};
-    use crate::core::interface::{AudioDevice, DeviceEnumerator};
+    use crate::core::config::StreamConfig;
+    use crate::core::interface::DeviceEnumerator;
 
     // ── ComInitializer Tests ─────────────────────────────────────────
 
@@ -1110,7 +1298,9 @@ mod tests {
         );
     }
 
-    /// Test AudioDevice::supported_formats() returns at least the default format.
+    /// Test AudioDevice::supported_formats() returns at least one format.
+    /// The first format is now the device's mix format (queried from WASAPI),
+    /// which may differ from the hardcoded 48kHz/2ch default.
     #[test]
     fn test_audio_device_supported_formats() {
         let enumerator = WindowsDeviceEnumerator::new().expect("new() failed");
@@ -1120,10 +1310,21 @@ mod tests {
             !formats.is_empty(),
             "Device should have at least one supported format"
         );
-        // First format should be the default (48kHz, 2ch, F32).
+        // The first format should be the device's mix format.
         let first = &formats[0];
-        assert_eq!(first.sample_rate, 48000);
-        assert_eq!(first.channels, 2);
+        assert!(
+            first.sample_rate > 0,
+            "Mix format sample rate should be > 0"
+        );
+        assert!(first.channels > 0, "Mix format channels should be > 0");
+        // Most devices support at least 2 formats (mix format + common probes)
+        println!(
+            "Device supports {} format(s), mix format: {}Hz {}ch {:?}",
+            formats.len(),
+            first.sample_rate,
+            first.channels,
+            first.sample_format
+        );
     }
 
     /// Test AudioDevice::create_stream() creates a valid CapturingStream.
@@ -1408,8 +1609,6 @@ mod tests {
     /// This is a deeper integration test of the full WASAPI → BridgeStream pipeline.
     #[test]
     fn test_create_stream_can_read() {
-        use crate::core::interface::CapturingStream;
-
         let enumerator = WindowsDeviceEnumerator::new().expect("new() failed");
         let device = enumerator.default_device().expect("no default device");
 

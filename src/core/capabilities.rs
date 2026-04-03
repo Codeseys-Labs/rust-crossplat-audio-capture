@@ -132,7 +132,7 @@ impl PlatformCapabilities {
         Self {
             supports_system_capture: true,
             supports_application_capture: true, // PipeWire node targeting
-            supports_process_tree_capture: false,
+            supports_process_tree_capture: true, // /proc-based child PID discovery + pw-dump node lookup
             supports_device_selection: true,
             supported_sample_formats: vec![SampleFormat::I16, SampleFormat::I32, SampleFormat::F32],
             sample_rate_range: (8000, 384000),
@@ -267,7 +267,7 @@ mod tests {
             assert_eq!(caps.backend_name, "PipeWire");
             assert!(caps.supports_system_capture);
             assert!(caps.supports_application_capture);
-            assert!(!caps.supports_process_tree_capture);
+            assert!(caps.supports_process_tree_capture);
             assert!(caps.supports_device_selection);
             assert_eq!(caps.max_channels, 32);
             assert_eq!(caps.sample_rate_range, (8000, 384000));
@@ -488,9 +488,9 @@ mod tests {
 
     #[test]
     #[cfg(target_os = "linux")]
-    fn query_process_tree_not_supported_on_linux() {
+    fn query_process_tree_supported_on_linux() {
         let caps = PlatformCapabilities::query();
-        assert!(!caps.supports_process_tree_capture);
+        assert!(caps.supports_process_tree_capture);
     }
 
     #[test]

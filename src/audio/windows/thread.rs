@@ -26,7 +26,6 @@ use std::sync::{Arc, Mutex};
 
 use crate::bridge::ring_buffer::BridgeProducer;
 use crate::bridge::stream::PlatformStream;
-use crate::core::buffer::AudioBuffer;
 use crate::core::config::CaptureTarget;
 use crate::core::error::{AudioError, AudioResult};
 
@@ -397,6 +396,11 @@ fn wasapi_capture_thread_main(
     let channels = config.channels;
     let sample_rate = config.sample_rate;
 
+    // Pre-allocate reusable buffers outside the loop to avoid per-iteration allocations.
+    // The VecDeque is reused for raw bytes from WASAPI, and the Vec<f32> for converted samples.
+    let mut sample_queue = std::collections::VecDeque::with_capacity(48000 * 4 * 2 / 10); // ~100ms at 48kHz stereo f32
+    let mut samples: Vec<f32> = Vec::with_capacity(48000 * 2 / 10); // ~100ms at 48kHz stereo
+
     loop {
         // Check stop flag before waiting.
         if stop_flag.load(Ordering::SeqCst) {
@@ -417,8 +421,8 @@ fn wasapi_capture_thread_main(
 
         // Read all available packets from the capture client.
         // The wasapi-rs crate provides read_from_device_to_deque which
-        // reads raw bytes into a VecDeque.
-        let mut sample_queue = std::collections::VecDeque::new();
+        // reads raw bytes into a VecDeque. We reuse the VecDeque across iterations.
+        sample_queue.clear();
 
         match capture_client.read_from_device_to_deque(&mut sample_queue) {
             Ok(_) => {}
@@ -438,34 +442,28 @@ fn wasapi_capture_thread_main(
             continue;
         }
 
-        // Make the VecDeque contiguous for efficient byte processing.
-        let raw_bytes: Vec<u8> = sample_queue.into_iter().collect();
+        // Make the VecDeque contiguous so we can access it as a slice.
+        // This is O(n) worst case but typically a no-op if the deque hasn't wrapped.
+        let (front, back) = sample_queue.as_slices();
 
         // Convert bytes to f32 samples (4 bytes per sample, little-endian).
-        let n_samples = raw_bytes.len() / 4;
-        if n_samples == 0 {
-            continue;
-        }
+        // Reuse the samples Vec to avoid allocation on every iteration.
+        samples.clear();
 
-        let mut samples = Vec::with_capacity(n_samples);
-        for i in 0..n_samples {
-            let offset = i * 4;
-            if offset + 4 <= raw_bytes.len() {
-                let sample = f32::from_le_bytes([
-                    raw_bytes[offset],
-                    raw_bytes[offset + 1],
-                    raw_bytes[offset + 2],
-                    raw_bytes[offset + 3],
-                ]);
-                samples.push(sample);
-            }
+        // Process the front slice
+        for chunk in front.chunks_exact(4) {
+            samples.push(f32::from_le_bytes([chunk[0], chunk[1], chunk[2], chunk[3]]));
+        }
+        // Process the back slice (non-empty when VecDeque has wrapped)
+        for chunk in back.chunks_exact(4) {
+            samples.push(f32::from_le_bytes([chunk[0], chunk[1], chunk[2], chunk[3]]));
         }
 
         if !samples.is_empty() {
-            let audio_buffer = AudioBuffer::new(samples, channels, sample_rate);
-            // Push to ring buffer. If full, the buffer is silently dropped
-            // (back-pressure — real-time safety).
-            producer.push_or_drop(audio_buffer);
+            // Use push_samples_or_drop for zero-allocation on the capture thread.
+            // This uses the BridgeProducer's internal scratch buffer to avoid
+            // allocating a new Vec<f32> on every iteration.
+            producer.push_samples_or_drop(&samples, channels, sample_rate);
         }
 
         // Check stop flag after processing.
@@ -932,7 +930,7 @@ mod tests {
     #[test]
     fn test_default_device() {
         use crate::audio::windows::wasapi::WindowsDeviceEnumerator;
-        use crate::core::interface::{AudioDevice, DeviceEnumerator};
+        use crate::core::interface::DeviceEnumerator;
 
         let enumerator = WindowsDeviceEnumerator::new().expect("Enumerator creation failed");
         let device = enumerator.default_device();
@@ -951,7 +949,7 @@ mod tests {
     #[test]
     fn test_device_id() {
         use crate::audio::windows::wasapi::WindowsDeviceEnumerator;
-        use crate::core::interface::{AudioDevice, DeviceEnumerator};
+        use crate::core::interface::DeviceEnumerator;
 
         let enumerator = WindowsDeviceEnumerator::new().expect("Enumerator creation failed");
         let device = enumerator.default_device().expect("No default device");
@@ -963,7 +961,7 @@ mod tests {
     #[test]
     fn test_device_supported_formats() {
         use crate::audio::windows::wasapi::WindowsDeviceEnumerator;
-        use crate::core::interface::{AudioDevice, DeviceEnumerator};
+        use crate::core::interface::DeviceEnumerator;
 
         let enumerator = WindowsDeviceEnumerator::new().expect("Enumerator creation failed");
         let device = enumerator.default_device().expect("No default device");

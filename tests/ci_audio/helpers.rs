@@ -338,6 +338,56 @@ macro_rules! require_app_capture {
 }
 
 // ---------------------------------------------------------------------------
+// require_device_selection!() macro — skips when device selection unsupported
+// ---------------------------------------------------------------------------
+
+/// Macro that skips the current test if device selection is not supported.
+/// First checks audio infrastructure availability, then platform capabilities.
+macro_rules! require_device_selection {
+    () => {
+        require_audio!();
+        let caps = rsac::PlatformCapabilities::query();
+        if !caps.supports_device_selection {
+            eprintln!(
+                "\n╔══════════════════════════════════════════════════════════╗"
+            );
+            eprintln!(
+                "║  SKIPPING: Device selection not supported on platform   ║"
+            );
+            eprintln!(
+                "╚══════════════════════════════════════════════════════════╝\n"
+            );
+            return;
+        }
+    };
+}
+
+// ---------------------------------------------------------------------------
+// require_process_capture!() macro — skips when process tree capture unsupported
+// ---------------------------------------------------------------------------
+
+/// Macro that skips the current test if process tree capture is not supported.
+/// First checks audio infrastructure availability, then platform capabilities.
+macro_rules! require_process_capture {
+    () => {
+        require_audio!();
+        let caps = rsac::PlatformCapabilities::query();
+        if !caps.supports_process_tree_capture {
+            eprintln!(
+                "\n╔══════════════════════════════════════════════════════════╗"
+            );
+            eprintln!(
+                "║  SKIPPING: Process tree capture not supported           ║"
+            );
+            eprintln!(
+                "╚══════════════════════════════════════════════════════════╝\n"
+            );
+            return;
+        }
+    };
+}
+
+// ---------------------------------------------------------------------------
 // Application capture helpers
 // ---------------------------------------------------------------------------
 

@@ -303,6 +303,127 @@ impl PlatformStream for LinuxPlatformStream {
     }
 }
 
+// ── Process Tree Discovery ───────────────────────────────────────────────
+
+/// Discovers all PIDs in a process tree rooted at `parent_pid`.
+///
+/// Walks the Linux `/proc` filesystem to find all descendant processes
+/// (children, grandchildren, etc.) of the given parent PID. Returns a
+/// deduplicated, sorted `Vec<u32>` containing the parent PID and all
+/// discovered descendants.
+///
+/// # Algorithm
+///
+/// For each process in `/proc`, reads `/proc/{pid}/stat` to extract the
+/// parent PID (field 4). Builds a parent→children map, then performs a
+/// breadth-first traversal from `parent_pid` to collect all descendants.
+///
+/// If `/proc` cannot be read (e.g., in a containerized environment without
+/// procfs), returns a single-element vector containing just `parent_pid`
+/// (graceful degradation to single-process capture).
+///
+/// # Example
+///
+/// If process 1000 has children 1001 and 1002, and 1001 has child 1003:
+/// ```text
+/// discover_process_tree_pids(1000) → [1000, 1001, 1002, 1003]
+/// ```
+fn discover_process_tree_pids(parent_pid: u32) -> Vec<u32> {
+    use std::collections::{HashMap, VecDeque};
+    use std::fs;
+
+    // Build a map of pid → parent_pid by reading /proc/*/stat
+    let mut parent_map: HashMap<u32, u32> = HashMap::new();
+
+    let proc_entries = match fs::read_dir("/proc") {
+        Ok(entries) => entries,
+        Err(e) => {
+            log::warn!(
+                "ProcessTree: cannot read /proc: {}. Falling back to single PID {}",
+                e,
+                parent_pid
+            );
+            return vec![parent_pid];
+        }
+    };
+
+    for entry in proc_entries.flatten() {
+        let file_name = entry.file_name();
+        let name = file_name.to_string_lossy();
+
+        // Only process numeric directory names (PIDs)
+        let pid: u32 = match name.parse() {
+            Ok(p) => p,
+            Err(_) => continue,
+        };
+
+        // Read /proc/{pid}/stat to extract PPID (field 4)
+        let stat_path = format!("/proc/{}/stat", pid);
+        if let Ok(stat_contents) = fs::read_to_string(&stat_path) {
+            if let Some(ppid) = parse_ppid_from_stat(&stat_contents) {
+                parent_map.insert(pid, ppid);
+            }
+        }
+    }
+
+    // BFS from parent_pid to find all descendants
+    let mut all_pids: Vec<u32> = vec![parent_pid];
+    let mut queue: VecDeque<u32> = VecDeque::new();
+    queue.push_back(parent_pid);
+
+    // Build children map for efficient lookup
+    let mut children_map: HashMap<u32, Vec<u32>> = HashMap::new();
+    for (&child, &parent) in &parent_map {
+        children_map.entry(parent).or_default().push(child);
+    }
+
+    while let Some(current_pid) = queue.pop_front() {
+        if let Some(children) = children_map.get(&current_pid) {
+            for &child_pid in children {
+                if !all_pids.contains(&child_pid) {
+                    all_pids.push(child_pid);
+                    queue.push_back(child_pid);
+                }
+            }
+        }
+    }
+
+    all_pids.sort();
+    all_pids.dedup();
+
+    log::info!(
+        "ProcessTree: parent_pid={}, discovered {} total PIDs: {:?}",
+        parent_pid,
+        all_pids.len(),
+        all_pids
+    );
+
+    all_pids
+}
+
+/// Parses the parent PID (PPID) from the contents of `/proc/{pid}/stat`.
+///
+/// The `/proc/{pid}/stat` format is:
+/// ```text
+/// pid (comm) state ppid pgid sid ...
+/// ```
+///
+/// The process name (`comm`) may contain spaces and parentheses, so we
+/// find the last `)` to locate the end of the comm field, then parse
+/// the fourth field (PPID) from the remaining fields.
+fn parse_ppid_from_stat(stat_contents: &str) -> Option<u32> {
+    // Find the end of the comm field (last ')' in the line)
+    let after_comm = stat_contents.rfind(')')? + 1;
+    let remainder = &stat_contents[after_comm..];
+
+    // Fields after comm: state ppid pgid ...
+    // Split by whitespace and get the 2nd field (ppid, 0-indexed: state=0, ppid=1)
+    let mut fields = remainder.split_whitespace();
+    fields.next()?; // skip state
+    let ppid_str = fields.next()?;
+    ppid_str.parse::<u32>().ok()
+}
+
 // ── pw-dump Node Lookup ──────────────────────────────────────────────────
 
 /// Specifies how to look up a PipeWire node via `pw-dump`.
@@ -312,6 +433,10 @@ enum PwNodeLookup<'a> {
     ByAppName(&'a str),
     /// Match by process ID (exact match against `application.process.id`).
     ByPid(u32),
+    /// Match by any PID in a set (for process tree capture).
+    /// Searches for the first audio output node whose `application.process.id`
+    /// matches any PID in the provided set.
+    ByPidSet(&'a [u32]),
 }
 
 /// Runs `pw-dump`, parses the JSON output, and finds the `object.serial` of
@@ -377,6 +502,12 @@ fn find_pipewire_node_serial(lookup: &PwNodeLookup<'_>) -> AudioResult<String> {
         _ => None,
     };
 
+    // For ByPidSet, pre-compute string representations of all PIDs.
+    let pid_set_strings: Vec<String> = match lookup {
+        PwNodeLookup::ByPidSet(pids) => pids.iter().map(|p| p.to_string()).collect(),
+        _ => Vec::new(),
+    };
+
     for entry in array {
         // Filter: must be a PipeWire node.
         let entry_type = entry.get("type").and_then(|v| v.as_str()).unwrap_or("");
@@ -419,6 +550,13 @@ fn find_pipewire_node_serial(lookup: &PwNodeLookup<'_>) -> AudioResult<String> {
                     .unwrap_or("");
                 proc_id == pid_str.unwrap()
             }
+            PwNodeLookup::ByPidSet(_) => {
+                let proc_id = props
+                    .get("application.process.id")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("");
+                pid_set_strings.iter().any(|s| s.as_str() == proc_id)
+            }
         };
 
         if !matches {
@@ -454,6 +592,9 @@ fn find_pipewire_node_serial(lookup: &PwNodeLookup<'_>) -> AudioResult<String> {
         }),
         PwNodeLookup::ByPid(pid) => Err(AudioError::ApplicationNotFound {
             identifier: format!("PID {}", pid),
+        }),
+        PwNodeLookup::ByPidSet(pids) => Err(AudioError::ApplicationNotFound {
+            identifier: format!("process tree PIDs {:?}", pids),
         }),
     }
 }
@@ -647,16 +788,33 @@ fn pw_thread_main(
                         );
                     }
                     CaptureTarget::ProcessTree(pid) => {
-                        // Resolve PID → PipeWire node object.serial via pw-dump.
-                        // TARGET_OBJECT requires a node serial, not a PID.
-                        // Note: this captures the single process's stream; full
-                        // tree capture is a future enhancement.
-                        let serial = match find_pipewire_node_serial(&PwNodeLookup::ByPid(pid.0)) {
+                        // ── Step 1: Discover the full process tree ──
+                        // Walk /proc to find all child/descendant PIDs of the
+                        // target process. Falls back to single PID if /proc
+                        // is unavailable.
+                        let tree_pids = discover_process_tree_pids(pid.0);
+
+                        log::debug!(
+                            "PipeWire: ProcessTree PID {} — discovered {} PIDs in tree: {:?}",
+                            pid.0,
+                            tree_pids.len(),
+                            tree_pids
+                        );
+
+                        // ── Step 2: Find PipeWire node for any PID in the tree ──
+                        // Search pw-dump for the first audio output node belonging
+                        // to any process in the tree. This handles the common case
+                        // where a parent process (e.g., browser main) spawns a
+                        // child that does the actual audio output (e.g., renderer).
+                        let serial = match find_pipewire_node_serial(&PwNodeLookup::ByPidSet(
+                            &tree_pids,
+                        )) {
                             Ok(s) => s,
                             Err(e) => {
                                 log::warn!(
-                                    "PipeWire: ProcessTree PID {} — node lookup failed: {}",
+                                    "PipeWire: ProcessTree PID {} — node lookup failed for {} PIDs: {}",
                                     pid.0,
+                                    tree_pids.len(),
                                     e
                                 );
                                 let _ = response_tx.send(Err(e));
@@ -665,9 +823,10 @@ fn pw_thread_main(
                         };
                         props.insert(*pipewire::keys::TARGET_OBJECT, serial.as_str());
                         log::debug!(
-                            "PipeWire: ProcessTree PID {} resolved to node serial={}",
+                            "PipeWire: ProcessTree PID {} resolved to node serial={} (searched {} PIDs)",
                             pid.0,
-                            serial
+                            serial,
+                            tree_pids.len()
                         );
                     }
                 }
@@ -943,4 +1102,155 @@ fn _assert_linux_platform_stream_send() {
 fn _assert_pipewire_thread_send() {
     fn _assert<T: Send>() {}
     _assert::<PipeWireThread>();
+}
+
+// ── Tests ────────────────────────────────────────────────────────────────
+
+#[cfg(test)]
+#[cfg(target_os = "linux")]
+mod tests {
+    use super::*;
+
+    // ── parse_ppid_from_stat ─────────────────────────────────────────
+
+    #[test]
+    fn test_parse_ppid_from_stat_typical() {
+        // Typical /proc/{pid}/stat: pid (name) state ppid ...
+        let stat = "1234 (my_process) S 567 1234 1234 0 -1 4194560 100 0 0 0 0 0 0 0 20 0 1 0 123456 12345678 100 18446744073709551615 0 0 0 0 0 0 0 0 0 0 0 0 17 0 0 0 0 0 0";
+        assert_eq!(parse_ppid_from_stat(stat), Some(567));
+    }
+
+    #[test]
+    fn test_parse_ppid_from_stat_name_with_spaces() {
+        // Process name can contain spaces
+        let stat = "5678 (Web Content) S 1000 5678 5678 0 -1 4194560 200 0 0 0 0 0 0 0 20 0 3 0 654321 87654321 500 18446744073709551615 0 0 0 0 0 0 0 0 0 0 0 0 17 0 0 0 0 0 0";
+        assert_eq!(parse_ppid_from_stat(stat), Some(1000));
+    }
+
+    #[test]
+    fn test_parse_ppid_from_stat_name_with_parens() {
+        // Process name can contain parentheses: "(sd-pam)"
+        let stat = "42 ((sd-pam)) S 1 42 42 0 -1 1077936384 50 0 0 0 0 0 0 0 20 0 1 0 100 1234567 10 18446744073709551615 0 0 0 0 0 0 0 0 0 0 0 0 17 0 0 0 0 0 0";
+        assert_eq!(parse_ppid_from_stat(stat), Some(1));
+    }
+
+    #[test]
+    fn test_parse_ppid_from_stat_pid_1_init() {
+        // PID 1 (init/systemd) has PPID 0
+        let stat = "1 (systemd) S 0 1 1 0 -1 4194560 100000 200000 10 20 1000 500 2000 300 20 0 1 0 1 200000000 1500 18446744073709551615 0 0 0 0 0 0 671173123 4096 1260 0 0 0 17 0 0 0 0 0 0";
+        assert_eq!(parse_ppid_from_stat(stat), Some(0));
+    }
+
+    #[test]
+    fn test_parse_ppid_from_stat_empty_string() {
+        assert_eq!(parse_ppid_from_stat(""), None);
+    }
+
+    #[test]
+    fn test_parse_ppid_from_stat_malformed() {
+        // No closing parenthesis
+        assert_eq!(parse_ppid_from_stat("1234 (broken"), None);
+    }
+
+    #[test]
+    fn test_parse_ppid_from_stat_truncated() {
+        // Only comm field, no state or ppid
+        assert_eq!(parse_ppid_from_stat("1234 (name)"), None);
+    }
+
+    #[test]
+    fn test_parse_ppid_from_stat_state_only() {
+        // Has state but no ppid
+        assert_eq!(parse_ppid_from_stat("1234 (name) S"), None);
+    }
+
+    // ── discover_process_tree_pids ───────────────────────────────────
+
+    #[test]
+    fn test_discover_process_tree_pids_current_process() {
+        // The current process PID should always be in the result
+        let current_pid = std::process::id();
+        let pids = discover_process_tree_pids(current_pid);
+        assert!(
+            pids.contains(&current_pid),
+            "Result should contain the parent PID. Got: {:?}",
+            pids
+        );
+    }
+
+    #[test]
+    fn test_discover_process_tree_pids_nonexistent_pid() {
+        // A PID that (almost certainly) doesn't exist should return
+        // just that PID (graceful degradation).
+        let fake_pid = 4_000_000_000; // max PID on Linux is typically 4194304
+        let pids = discover_process_tree_pids(fake_pid);
+        assert_eq!(pids, vec![fake_pid]);
+    }
+
+    #[test]
+    fn test_discover_process_tree_pids_pid_1() {
+        // PID 1 (init/systemd) should have children
+        let pids = discover_process_tree_pids(1);
+        assert!(
+            pids.len() > 1,
+            "PID 1 should have child processes. Got: {:?}",
+            pids
+        );
+        assert!(pids.contains(&1), "Result should contain PID 1");
+        // Result should be sorted
+        for window in pids.windows(2) {
+            assert!(window[0] <= window[1], "PIDs should be sorted: {:?}", pids);
+        }
+    }
+
+    #[test]
+    fn test_discover_process_tree_pids_sorted_and_deduped() {
+        let current_pid = std::process::id();
+        let pids = discover_process_tree_pids(current_pid);
+
+        // Check sorted
+        for window in pids.windows(2) {
+            assert!(
+                window[0] < window[1],
+                "PIDs should be sorted and unique: {:?}",
+                pids
+            );
+        }
+    }
+
+    // ── PwNodeLookup::ByPidSet matching ──────────────────────────────
+
+    #[test]
+    fn test_pw_node_lookup_by_pid_set_display() {
+        // Verify the error message for ByPidSet includes the PID list
+        let pids = vec![100, 200, 300];
+        let result = find_pipewire_node_serial(&PwNodeLookup::ByPidSet(&pids));
+        // This will fail (pw-dump not available in test), but we can verify
+        // the error message format if pw-dump is available or the error type
+        match result {
+            Err(AudioError::ApplicationNotFound { identifier }) => {
+                assert!(
+                    identifier.contains("100")
+                        && identifier.contains("200")
+                        && identifier.contains("300"),
+                    "Error should list all PIDs. Got: {}",
+                    identifier
+                );
+            }
+            Err(AudioError::BackendError { message, .. }) => {
+                // pw-dump not available — that's fine for this test
+                assert!(
+                    message.contains("pw-dump"),
+                    "Should mention pw-dump in error: {}",
+                    message
+                );
+            }
+            Ok(_) => {
+                // Unlikely but possible if pw-dump returns matching data
+            }
+            Err(e) => {
+                panic!("Unexpected error type: {:?}", e);
+            }
+        }
+    }
 }

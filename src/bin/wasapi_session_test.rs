@@ -27,6 +27,7 @@ use windows::Win32::UI::Shell::PropertiesSystem::IPropertyStore;
 const VT_LPWSTR: u16 = 31;
 
 fn session_state_name(state: AudioSessionState) -> &'static str {
+    #[allow(non_upper_case_globals)]
     match state {
         AudioSessionStateInactive => "Inactive",
         AudioSessionStateActive => "Active",
@@ -153,6 +154,7 @@ fn enumerate_sessions_on_device(device: &IMMDevice, device_label: &str) -> Resul
                 .GetState()
                 .unwrap_or(AudioSessionStateExpired);
 
+            #[allow(non_upper_case_globals)]
             match state {
                 AudioSessionStateActive => active_count += 1,
                 AudioSessionStateInactive => inactive_count += 1,

@@ -8,9 +8,8 @@ name: CI Audio Integration Tests
 #   ⚠️  Windows (WASAPI)  — EXPERIMENTAL. Scream virtual driver is unreliable
 #                           in CI (install timeouts, driver signing issues).
 #                           Job is continue-on-error.
-#   ⚠️  macOS (CoreAudio)  — INCOMPLETE. Backend has known compilation errors
-#                           (31+ errors in src/audio/macos/). Job is
-#                           continue-on-error until backend code is updated.
+#   ✅ macOS (CoreAudio)  — VALIDATED. Compiles and passes tests on real hardware
+#                           (macOS 14.4+). CI audio depends on BlackHole availability.
 # =============================================================================
 
 on:
@@ -136,18 +135,82 @@ jobs:
           echo "=== All sinks ==="
           pactl list short sinks || true
 
-      - name: Run CI audio integration tests
+      - name: "Run tests: Platform capabilities (no audio required)"
         env:
           RSAC_CI_AUDIO_AVAILABLE: "1"
           RSAC_TEST_CAPTURE_TIMEOUT_SECS: "15"
         run: |
-          echo "=== Running CI Audio Tests ==="
-          cargo test --test ci_audio \
+          echo "=== Platform Capabilities Tests ==="
+          cargo test --test ci_audio platform_caps \
             --no-default-features --features feat_linux \
             -- --test-threads=1 --nocapture \
-            2>&1 | tee ci-audio-test-output.log
+            2>&1 | tee -a ci-audio-test-output.log
 
-          echo "=== Test Exit Code: $? ==="
+      - name: "Run tests: Device enumeration"
+        env:
+          RSAC_CI_AUDIO_AVAILABLE: "1"
+          RSAC_TEST_CAPTURE_TIMEOUT_SECS: "15"
+        run: |
+          echo "=== Device Enumeration Tests ==="
+          cargo test --test ci_audio device_enumeration \
+            --no-default-features --features feat_linux \
+            -- --test-threads=1 --nocapture \
+            2>&1 | tee -a ci-audio-test-output.log
+
+      - name: "Run tests: System capture"
+        env:
+          RSAC_CI_AUDIO_AVAILABLE: "1"
+          RSAC_TEST_CAPTURE_TIMEOUT_SECS: "15"
+        run: |
+          echo "=== System Capture Tests ==="
+          cargo test --test ci_audio system_capture \
+            --no-default-features --features feat_linux \
+            -- --test-threads=1 --nocapture \
+            2>&1 | tee -a ci-audio-test-output.log
+
+      - name: "Run tests: Device selection capture"
+        env:
+          RSAC_CI_AUDIO_AVAILABLE: "1"
+          RSAC_TEST_CAPTURE_TIMEOUT_SECS: "15"
+        run: |
+          echo "=== Device Selection Capture Tests ==="
+          cargo test --test ci_audio device_capture \
+            --no-default-features --features feat_linux \
+            -- --test-threads=1 --nocapture \
+            2>&1 | tee -a ci-audio-test-output.log
+
+      - name: "Run tests: Application capture"
+        env:
+          RSAC_CI_AUDIO_AVAILABLE: "1"
+          RSAC_TEST_CAPTURE_TIMEOUT_SECS: "15"
+        run: |
+          echo "=== Application Capture Tests ==="
+          cargo test --test ci_audio app_capture \
+            --no-default-features --features feat_linux \
+            -- --test-threads=1 --nocapture \
+            2>&1 | tee -a ci-audio-test-output.log
+
+      - name: "Run tests: Process tree capture"
+        env:
+          RSAC_CI_AUDIO_AVAILABLE: "1"
+          RSAC_TEST_CAPTURE_TIMEOUT_SECS: "15"
+        run: |
+          echo "=== Process Tree Capture Tests ==="
+          cargo test --test ci_audio process_tree_capture \
+            --no-default-features --features feat_linux \
+            -- --test-threads=1 --nocapture \
+            2>&1 | tee -a ci-audio-test-output.log
+
+      - name: "Run tests: Stream lifecycle"
+        env:
+          RSAC_CI_AUDIO_AVAILABLE: "1"
+          RSAC_TEST_CAPTURE_TIMEOUT_SECS: "15"
+        run: |
+          echo "=== Stream Lifecycle Tests ==="
+          cargo test --test ci_audio stream_lifecycle \
+            --no-default-features --features feat_linux \
+            -- --test-threads=1 --nocapture \
+            2>&1 | tee -a ci-audio-test-output.log
 
       - name: Collect diagnostic info on failure
         if: failure()
@@ -572,22 +635,16 @@ jobs:
           retention-days: 14
 
   # ===========================================================================
-  # ⚠️  macOS Audio Integration Tests (CoreAudio + opportunistic audio)
+  # ✅ macOS Audio Integration Tests (CoreAudio + Process Tap)
   #
-  # STATUS: INCOMPLETE — continue-on-error
-  # The macOS backend (src/audio/macos/) has 31+ compilation errors due to
-  # API incompatibilities with current versions of coreaudio-rs and cocoa
-  # crates. This is a known pre-existing issue documented in AGENTS.md
-  # ("macOS is treated as incomplete").
-  #
-  # This job will attempt compilation and skip tests if it fails, rather
-  # than timing out. Once the macOS backend is fixed, remove the
-  # continue-on-error and the compilation guard.
+  # STATUS: VALIDATED — compiles and runs on macOS 14.4+
+  # The macOS backend is fully implemented with 3-path API fallback for
+  # Process Tap (macOS 14.4–15 Sonoma/Sequoia and macOS 26 Tahoe).
+  # CI audio availability depends on BlackHole virtual audio driver.
   # ===========================================================================
   macos-audio-integration:
-    name: "⚠️ macOS Audio Tests (CoreAudio)"
+    name: "✅ macOS Audio Tests (CoreAudio)"
     runs-on: macos-15
-    continue-on-error: true  # macOS backend has known compilation errors
     timeout-minutes: 20
 
     steps:
@@ -683,13 +740,9 @@ jobs:
 
       - name: "Compilation check (guards test execution)"
         id: macos_compile
-        continue-on-error: true  # Known to fail — macOS backend has 31+ errors
         run: |
           echo "=== Verifying rsac compiles on macOS with feat_macos ==="
-          echo "NOTE: macOS backend currently has known compilation errors."
-          echo "      This step is expected to fail until src/audio/macos/ is updated."
-          echo ""
-          cargo check --no-default-features --features feat_macos 2>&1 | tail -30
+          cargo check --no-default-features --features feat_macos
           echo "✅ Compilation check passed"
 
       - name: Run CI audio integration tests
@@ -725,15 +778,9 @@ jobs:
           echo "⚠️  macOS COMPILATION FAILED — skipping audio tests"
           echo "============================================================"
           echo ""
-          echo "The macOS backend (src/audio/macos/) has known compilation"
-          echo "errors. Audio integration tests were skipped because the"
-          echo "code does not compile on this platform yet."
-          echo ""
-          echo "This is tracked as a known issue. See AGENTS.md:"
-          echo "  'macOS is treated as incomplete (expected failures in some areas)'"
-          echo ""
-          echo "To fix: update src/audio/macos/ to work with current versions"
-          echo "of coreaudio-rs, cocoa, and objc2 crates."
+          echo "Unexpected compilation failure on macOS. The backend should"
+          echo "compile cleanly. Check for dependency version changes or"
+          echo "API breakage in coreaudio-rs, cocoa, or objc2 crates."
           echo "============================================================"
 
           # Write a summary log file
@@ -807,7 +854,7 @@ jobs:
           echo "Notes:"
           echo "  • Linux is the PRIMARY validated platform"
           echo "  • Windows is EXPERIMENTAL (Scream driver unreliable in CI)"
-          echo "  • macOS is INCOMPLETE (backend has known compilation errors)"
+          echo "  • macOS is VALIDATED (compiles clean, CI audio depends on BlackHole)"
           echo "------------------------------------------------------------"
           echo ""
 
@@ -825,7 +872,7 @@ jobs:
           fi
 
           if [ "${{ needs.macos-audio-integration.result }}" != "success" ]; then
-            echo "⚠️  macOS audio tests did not pass (expected — backend incomplete)"
+            echo "⚠️  macOS audio tests did not pass (check BlackHole availability or compilation)"
           fi
 
           echo ""

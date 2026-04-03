@@ -10,7 +10,9 @@
 mod helpers;
 
 mod app_capture;
+mod device_capture;
 mod device_enumeration;
 mod platform_caps;
+mod process_tree_capture;
 mod stream_lifecycle;
 mod system_capture;
