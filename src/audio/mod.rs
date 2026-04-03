@@ -17,12 +17,7 @@ pub mod macos;
 #[cfg(all(target_os = "windows", feature = "feat_windows"))]
 pub mod windows;
 
-// Deprecated/Old API components - to be removed or refactored
-mod capture; // Keep for now if ProcessAudioCapture is still used
-#[cfg(target_os = "windows")]
-pub use capture::{AudioCaptureError, ProcessAudioCapture};
-
-// --- New Trait-Based API Exports ---
+// --- Trait-Based API Exports ---
 
 // Re-export platform-specific DeviceEnumerators
 #[cfg(all(target_os = "linux", feature = "feat_linux"))]

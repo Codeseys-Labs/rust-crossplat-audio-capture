@@ -7,7 +7,7 @@
 //! Process tree capture is platform-dependent:
 //! - Windows: ✅ WASAPI process loopback with include_tree
 //! - macOS: ✅ CoreAudio Process Tap (macOS 14.4+)
-//! - Linux: ❌ Not supported (PipeWire doesn't have process tree concept)
+//! - Linux: ✅ PipeWire PID → node mapping
 
 use std::time::{Duration, Instant};
 

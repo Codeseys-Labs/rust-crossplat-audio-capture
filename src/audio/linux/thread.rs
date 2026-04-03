@@ -247,7 +247,6 @@ impl PipeWireThread {
     /// This checks the shared atomic flag, which is set to `false` when the
     /// thread's event loop exits (either due to `Shutdown` or an error).
     /// Called by `LinuxPlatformStream::is_active()` (PlatformStream trait contract).
-    #[allow(dead_code)]
     pub fn is_alive(&self) -> bool {
         self.is_running.load(Ordering::SeqCst)
     }
