@@ -23,8 +23,6 @@
 
 use super::coreaudio::map_ca_error;
 use crate::core::error::{AudioError, AudioResult};
-use cocoa::base::{id, nil};
-use cocoa::foundation::{NSAutoreleasePool, NSString};
 use core_foundation::base::TCFType;
 use core_foundation::boolean::CFBoolean;
 use core_foundation::dictionary::CFMutableDictionary;
@@ -34,8 +32,10 @@ use core_foundation_sys::base::{kCFAllocatorDefault, CFRelease, CFTypeRef, OSSta
 use core_foundation_sys::dictionary::CFDictionaryRef;
 use coreaudio::Error as CAError;
 use coreaudio_sys as sys;
-use objc::runtime::{Class, Sel, BOOL, NO, YES};
-use objc::{class, msg_send, sel, sel_impl};
+use objc2::rc::Retained;
+use objc2::runtime::{AnyClass, AnyObject, Sel};
+use objc2::{msg_send, sel};
+use objc2_foundation::{NSArray, NSAutoreleasePool, NSNumber, NSString, NSUUID};
 use std::ffi::c_void;
 
 // ── Aggregate device dictionary keys (from CoreAudio/AudioHardware.h) ────
@@ -125,10 +125,10 @@ impl CoreAudioProcessTap {
     /// **Important:** Requires macOS 14.4+ and the `CATapDescription` class.
     pub fn new(target_pid: u32, tap_name_str: &str) -> AudioResult<Self> {
         unsafe {
-            let _pool = NSAutoreleasePool::new(nil);
+            let _pool = NSAutoreleasePool::new();
 
             // 1. Get CATapDescription class
-            let ca_tap_description_class = Class::get("CATapDescription");
+            let ca_tap_description_class = AnyClass::get(c"CATapDescription");
             if ca_tap_description_class.is_none() {
                 return Err(AudioError::BackendError {
                     backend: "CoreAudio".into(),
@@ -147,32 +147,23 @@ impl CoreAudioProcessTap {
             )?;
 
             // 3. Set name
-            let tap_name_nsstring = NSString::alloc(nil).init_str(tap_name_str);
-            if tap_name_nsstring == nil {
-                return Err(AudioError::BackendError {
-                    backend: "CoreAudio".into(),
-                    operation: "process_tap".into(),
-                    message: "Failed to create NSString for tap name".into(),
-                    context: None,
-                });
-            }
-            let _: () = msg_send![tap_desc_obj, setName: tap_name_nsstring];
+            let tap_name_nsstring = NSString::from_str(tap_name_str);
+            let _: () = msg_send![tap_desc_obj, setName: &*tap_name_nsstring];
 
             // 4. Set UUID on tap description (REQUIRED for aggregate device)
-            let nsuuid_class = class!(NSUUID);
-            let tap_uuid: id = msg_send![nsuuid_class, UUID];
-            let _: () = msg_send![tap_desc_obj, setUUID: tap_uuid];
+            let tap_uuid: Retained<NSUUID> = NSUUID::UUID();
+            let _: () = msg_send![tap_desc_obj, setUUID: &*tap_uuid];
 
             // 5. Set mute behavior to unmuted (CATapUnmuted = 0)
             let _: () = msg_send![tap_desc_obj, setMuteBehavior: 0i32];
 
             // 6. Set privateTap if available (guard for macOS 26+ where it may be removed)
             if msg_send_responds_to(tap_desc_obj, sel!(setPrivateTap:)) {
-                let _: () = msg_send![tap_desc_obj, setPrivateTap: YES];
+                let _: () = msg_send![tap_desc_obj, setPrivateTap: true];
             }
 
             // 7. Set mixdown = true (already configured by initStereoMixdown, but safe to set explicitly)
-            let _: () = msg_send![tap_desc_obj, setMixdown: YES];
+            let _: () = msg_send![tap_desc_obj, setMixdown: true];
 
             // 8. Call AudioHardwareCreateProcessTap
             let mut tap_id: sys::AudioObjectID = 0;
@@ -194,16 +185,7 @@ impl CoreAudioProcessTap {
             }
 
             // 9. Read tap UUID string for use in aggregate device dictionary
-            let uuid_nsstring: id = msg_send![tap_uuid, UUIDString];
-            let uuid_cstr = cocoa::foundation::NSString::UTF8String(uuid_nsstring);
-            let tap_uuid_str = if uuid_cstr.is_null() {
-                "<unknown-uuid>".to_owned()
-            } else {
-                std::ffi::CStr::from_ptr(uuid_cstr)
-                    .to_str()
-                    .unwrap_or("<invalid-utf8>")
-                    .to_owned()
-            };
+            let tap_uuid_str = tap_uuid.UUIDString().to_string();
 
             log::debug!(
                 "Process tap created: tap_id={}, uuid={}",
@@ -300,10 +282,10 @@ impl CoreAudioProcessTap {
 
         // ── Step 2: Create the tap with all discovered PIDs ──
         unsafe {
-            let _pool = NSAutoreleasePool::new(nil);
+            let _pool = NSAutoreleasePool::new();
 
             // Get CATapDescription class
-            let ca_tap_description_class = Class::get("CATapDescription");
+            let ca_tap_description_class = AnyClass::get(c"CATapDescription");
             if ca_tap_description_class.is_none() {
                 return Err(AudioError::BackendError {
                     backend: "CoreAudio".into(),
@@ -323,32 +305,23 @@ impl CoreAudioProcessTap {
 
             // Set name
             let tap_name_str = format!("rsac-tap-tree-{}", parent_pid);
-            let tap_name_nsstring = NSString::alloc(nil).init_str(&tap_name_str);
-            if tap_name_nsstring == nil {
-                return Err(AudioError::BackendError {
-                    backend: "CoreAudio".into(),
-                    operation: "process_tap_tree".into(),
-                    message: "Failed to create NSString for tap name".into(),
-                    context: None,
-                });
-            }
-            let _: () = msg_send![tap_desc_obj, setName: tap_name_nsstring];
+            let tap_name_nsstring = NSString::from_str(&tap_name_str);
+            let _: () = msg_send![tap_desc_obj, setName: &*tap_name_nsstring];
 
             // Set UUID on tap description
-            let nsuuid_class = class!(NSUUID);
-            let tap_uuid: id = msg_send![nsuuid_class, UUID];
-            let _: () = msg_send![tap_desc_obj, setUUID: tap_uuid];
+            let tap_uuid: Retained<NSUUID> = NSUUID::UUID();
+            let _: () = msg_send![tap_desc_obj, setUUID: &*tap_uuid];
 
             // Set mute behavior to unmuted (CATapUnmuted = 0)
             let _: () = msg_send![tap_desc_obj, setMuteBehavior: 0i32];
 
             // Set privateTap if available (guard for macOS 26+ where it may be removed)
             if msg_send_responds_to(tap_desc_obj, sel!(setPrivateTap:)) {
-                let _: () = msg_send![tap_desc_obj, setPrivateTap: YES];
+                let _: () = msg_send![tap_desc_obj, setPrivateTap: true];
             }
 
             // Set mixdown = true (already configured by initStereoMixdown, but safe to set explicitly)
-            let _: () = msg_send![tap_desc_obj, setMixdown: YES];
+            let _: () = msg_send![tap_desc_obj, setMixdown: true];
 
             // Call AudioHardwareCreateProcessTap
             let mut tap_id: sys::AudioObjectID = 0;
@@ -370,16 +343,7 @@ impl CoreAudioProcessTap {
             }
 
             // Read tap UUID string for use in aggregate device dictionary
-            let uuid_nsstring: id = msg_send![tap_uuid, UUIDString];
-            let uuid_cstr = cocoa::foundation::NSString::UTF8String(uuid_nsstring);
-            let tap_uuid_str = if uuid_cstr.is_null() {
-                "<unknown-uuid>".to_owned()
-            } else {
-                std::ffi::CStr::from_ptr(uuid_cstr)
-                    .to_str()
-                    .unwrap_or("<invalid-utf8>")
-                    .to_owned()
-            };
+            let tap_uuid_str = tap_uuid.UUIDString().to_string();
 
             log::debug!(
                 "Process tree tap created: tap_id={}, uuid={}, pids={:?}",
@@ -448,10 +412,10 @@ impl CoreAudioProcessTap {
     /// **Important:** Requires macOS 14.4+ and the `CATapDescription` class.
     pub fn new_system() -> AudioResult<Self> {
         unsafe {
-            let _pool = NSAutoreleasePool::new(nil);
+            let _pool = NSAutoreleasePool::new();
 
             // Get CATapDescription class (requires macOS 14.4+)
-            let ca_tap_description_class = Class::get("CATapDescription");
+            let ca_tap_description_class = AnyClass::get(c"CATapDescription");
             if ca_tap_description_class.is_none() {
                 return Err(AudioError::BackendError {
                     backend: "CoreAudio".into(),
@@ -464,8 +428,8 @@ impl CoreAudioProcessTap {
 
             // Use initStereoGlobalTapButExcludeProcesses: with empty array
             // to capture ALL system audio (no processes excluded).
-            let empty_array: id = msg_send![class!(NSArray), array];
-            let tap_desc_obj: id = msg_send![ca_tap_description_class, alloc];
+            let empty_array: Retained<NSArray<AnyObject>> = NSArray::new();
+            let tap_desc_obj: *mut AnyObject = msg_send![ca_tap_description_class, alloc];
 
             // Check that the selector is available before calling
             let sel_global_tap = sel!(initStereoGlobalTapButExcludeProcesses:);
@@ -478,10 +442,10 @@ impl CoreAudioProcessTap {
                 });
             }
 
-            let tap_desc_obj: id =
-                msg_send![tap_desc_obj, initStereoGlobalTapButExcludeProcesses: empty_array];
+            let tap_desc_obj: *mut AnyObject =
+                msg_send![tap_desc_obj, initStereoGlobalTapButExcludeProcesses: &*empty_array];
 
-            if tap_desc_obj == nil {
+            if tap_desc_obj.is_null() {
                 return Err(AudioError::BackendError {
                     backend: "CoreAudio".into(),
                     operation: "system_tap".into(),
@@ -492,32 +456,23 @@ impl CoreAudioProcessTap {
 
             // Set name
             let tap_name_str = "rsac-tap-system";
-            let tap_name_nsstring = NSString::alloc(nil).init_str(tap_name_str);
-            if tap_name_nsstring == nil {
-                return Err(AudioError::BackendError {
-                    backend: "CoreAudio".into(),
-                    operation: "system_tap".into(),
-                    message: "Failed to create NSString for tap name".into(),
-                    context: None,
-                });
-            }
-            let _: () = msg_send![tap_desc_obj, setName: tap_name_nsstring];
+            let tap_name_nsstring = NSString::from_str(tap_name_str);
+            let _: () = msg_send![tap_desc_obj, setName: &*tap_name_nsstring];
 
             // Set UUID on tap description (REQUIRED for aggregate device)
-            let nsuuid_class = class!(NSUUID);
-            let tap_uuid: id = msg_send![nsuuid_class, UUID];
-            let _: () = msg_send![tap_desc_obj, setUUID: tap_uuid];
+            let tap_uuid: Retained<NSUUID> = NSUUID::UUID();
+            let _: () = msg_send![tap_desc_obj, setUUID: &*tap_uuid];
 
             // Set mute behavior to unmuted (CATapUnmuted = 0)
             let _: () = msg_send![tap_desc_obj, setMuteBehavior: 0i32];
 
             // Set privateTap if available (removed in macOS 26+)
             if msg_send_responds_to(tap_desc_obj, sel!(setPrivateTap:)) {
-                let _: () = msg_send![tap_desc_obj, setPrivateTap: YES];
+                let _: () = msg_send![tap_desc_obj, setPrivateTap: true];
             }
 
             // Mixdown already configured by initStereoGlobalTap, but set explicitly for safety
-            let _: () = msg_send![tap_desc_obj, setMixdown: YES];
+            let _: () = msg_send![tap_desc_obj, setMixdown: true];
 
             // Call AudioHardwareCreateProcessTap
             let mut tap_id: sys::AudioObjectID = 0;
@@ -539,16 +494,7 @@ impl CoreAudioProcessTap {
             }
 
             // Read tap UUID string for use in aggregate device dictionary
-            let uuid_nsstring: id = msg_send![tap_uuid, UUIDString];
-            let uuid_cstr = cocoa::foundation::NSString::UTF8String(uuid_nsstring);
-            let tap_uuid_str = if uuid_cstr.is_null() {
-                "<unknown-uuid>".to_owned()
-            } else {
-                std::ffi::CStr::from_ptr(uuid_cstr)
-                    .to_str()
-                    .unwrap_or("<invalid-utf8>")
-                    .to_owned()
-            };
+            let tap_uuid_str = tap_uuid.UUIDString().to_string();
 
             log::debug!(
                 "System-wide process tap created: tap_id={}, uuid={}",
@@ -697,7 +643,7 @@ impl Drop for CoreAudioProcessTap {
 #[link(name = "CoreAudio", kind = "framework")]
 extern "C" {
     fn AudioHardwareCreateProcessTap(
-        description: id,
+        description: *mut AnyObject,
         outTapID: *mut sys::AudioObjectID,
     ) -> OSStatus;
 
@@ -772,15 +718,15 @@ unsafe fn translate_pid_to_audio_object_id(pid: u32) -> Option<sys::AudioObjectI
 ///
 /// Returns the initialized CATapDescription ObjC object or an error.
 unsafe fn create_process_tap_description(
-    ca_tap_class: &Class,
+    ca_tap_class: &AnyClass,
     pids: &[u32],
     operation: &str,
-) -> AudioResult<id> {
+) -> AudioResult<*mut AnyObject> {
     // ── Path 1: initStereoMixdownOfProcesses: (macOS 26+) ──
     //
     // This initializer takes an NSArray of AudioObjectIDs (not PIDs).
     // We translate each PID via kAudioHardwarePropertyTranslatePIDToProcessObject.
-    let alloc_obj: id = msg_send![ca_tap_class, alloc];
+    let alloc_obj: *mut AnyObject = msg_send![ca_tap_class, alloc];
     let sel_stereo_mixdown = sel!(initStereoMixdownOfProcesses:);
 
     if msg_send_responds_to(alloc_obj, sel_stereo_mixdown) {
@@ -799,50 +745,29 @@ unsafe fn create_process_tap_description(
 
         if !audio_obj_ids.is_empty() {
             // Create NSArray of AudioObjectIDs as NSNumber(unsignedInt:)
-            let nsnumbers: Vec<id> = audio_obj_ids
+            let nsnumbers: Vec<Retained<NSNumber>> = audio_obj_ids
                 .iter()
-                .map(|&obj_id| {
-                    let n: id = msg_send![class!(NSNumber), numberWithUnsignedInt: obj_id];
-                    n
-                })
+                .map(|&obj_id| NSNumber::new_u32(obj_id))
                 .collect();
 
-            // Verify no nil NSNumbers
-            let all_valid = nsnumbers.iter().all(|&n| n != nil);
-            if all_valid {
-                let processes_array: id = msg_send![
-                    class!(NSArray),
-                    arrayWithObjects: nsnumbers.as_ptr()
-                    count: nsnumbers.len()
-                ];
+            let processes_array = NSArray::from_retained_slice(&nsnumbers);
 
-                if processes_array != nil {
-                    let result: id =
-                        msg_send![alloc_obj, initStereoMixdownOfProcesses: processes_array];
-                    if result != nil {
-                        log::info!(
-                            "Using initStereoMixdownOfProcesses: for PIDs {:?} → AudioObjectIDs {:?}",
-                            pids,
-                            audio_obj_ids
-                        );
-                        return Ok(result);
-                    }
-                    // initStereoMixdownOfProcesses: returned nil — alloc_obj consumed by init.
-                    // Fall through to Path 2 with a fresh alloc.
-                    log::warn!(
-                        "initStereoMixdownOfProcesses: returned nil for AudioObjectIDs {:?}, trying fallback",
-                        audio_obj_ids
-                    );
-                } else {
-                    // NSArray creation failed; alloc_obj is still uninitialized — release it.
-                    log::warn!("Failed to create NSArray for AudioObjectIDs, trying fallback");
-                    let _: () = msg_send![alloc_obj, release];
-                }
-            } else {
-                // Some NSNumbers were nil; alloc_obj is still uninitialized — release it.
-                log::warn!("Failed to create NSNumber for some AudioObjectIDs, trying fallback");
-                let _: () = msg_send![alloc_obj, release];
+            let result: *mut AnyObject =
+                msg_send![alloc_obj, initStereoMixdownOfProcesses: &*processes_array];
+            if !result.is_null() {
+                log::info!(
+                    "Using initStereoMixdownOfProcesses: for PIDs {:?} → AudioObjectIDs {:?}",
+                    pids,
+                    audio_obj_ids
+                );
+                return Ok(result);
             }
+            // initStereoMixdownOfProcesses: returned nil — alloc_obj consumed by init.
+            // Fall through to Path 2 with a fresh alloc.
+            log::warn!(
+                "initStereoMixdownOfProcesses: returned nil for AudioObjectIDs {:?}, trying fallback",
+                audio_obj_ids
+            );
         } else {
             // No PIDs could be translated to AudioObjectIDs.
             // alloc_obj is still uninitialized — release it.
@@ -862,9 +787,9 @@ unsafe fn create_process_tap_description(
     // ── Path 2/3: alloc + init + setProcesses (PID-based, macOS 14.4+) ──
     //
     // Fall back to the traditional approach using PIDs.
-    let alloc_obj2: id = msg_send![ca_tap_class, alloc];
-    let init_obj: id = msg_send![alloc_obj2, init];
-    if init_obj == nil {
+    let alloc_obj2: *mut AnyObject = msg_send![ca_tap_class, alloc];
+    let init_obj: *mut AnyObject = msg_send![alloc_obj2, init];
+    if init_obj.is_null() {
         return Err(AudioError::BackendError {
             backend: "CoreAudio".into(),
             operation: operation.into(),
@@ -874,47 +799,17 @@ unsafe fn create_process_tap_description(
     }
 
     // Create NSArray of PIDs as NSNumber(int:)
-    let pid_nsnumbers: Vec<id> = pids
+    let pid_nsnumbers: Vec<Retained<NSNumber>> = pids
         .iter()
-        .map(|&pid| {
-            let n: id = msg_send![class!(NSNumber), numberWithInt: pid as i32];
-            n
-        })
+        .map(|&pid| NSNumber::new_i32(pid as i32))
         .collect();
 
-    // Verify no nil NSNumbers
-    for (i, &n) in pid_nsnumbers.iter().enumerate() {
-        if n == nil {
-            return Err(AudioError::BackendError {
-                backend: "CoreAudio".into(),
-                operation: operation.into(),
-                message: format!(
-                    "Failed to create NSNumber for PID {} (index {})",
-                    pids[i], i
-                ),
-                context: None,
-            });
-        }
-    }
-
-    let pids_nsarray: id = msg_send![
-        class!(NSArray),
-        arrayWithObjects: pid_nsnumbers.as_ptr()
-        count: pid_nsnumbers.len()
-    ];
-    if pids_nsarray == nil {
-        return Err(AudioError::BackendError {
-            backend: "CoreAudio".into(),
-            operation: operation.into(),
-            message: "Failed to create NSArray for PIDs".into(),
-            context: None,
-        });
-    }
+    let pids_nsarray = NSArray::from_retained_slice(&pid_nsnumbers);
 
     // Path 2: Try combined setProcesses:exclusive: (macOS 14.4–15)
     let sel_set_processes_exclusive = sel!(setProcesses:exclusive:);
     if msg_send_responds_to(init_obj, sel_set_processes_exclusive) {
-        let _: () = msg_send![init_obj, setProcesses: pids_nsarray exclusive: NO];
+        let _: () = msg_send![init_obj, setProcesses: &*pids_nsarray, exclusive: false];
         log::info!("Using setProcesses:exclusive: for PIDs {:?}", pids);
         return Ok(init_obj);
     }
@@ -925,8 +820,8 @@ unsafe fn create_process_tap_description(
     if msg_send_responds_to(init_obj, sel_set_processes)
         && msg_send_responds_to(init_obj, sel_set_exclusive)
     {
-        let _: () = msg_send![init_obj, setProcesses: pids_nsarray];
-        let _: () = msg_send![init_obj, setExclusive: NO];
+        let _: () = msg_send![init_obj, setProcesses: &*pids_nsarray];
+        let _: () = msg_send![init_obj, setExclusive: false];
         log::info!(
             "Using separate setProcesses: + setExclusive: for PIDs {:?}",
             pids
@@ -1261,9 +1156,8 @@ unsafe fn build_aggregate_device_dict(
 }
 
 /// Helper function to check if an object responds to a selector.
-unsafe fn msg_send_responds_to(obj: id, sel: Sel) -> bool {
-    let responds: BOOL = msg_send![obj, respondsToSelector: sel];
-    responds == YES
+unsafe fn msg_send_responds_to(obj: *mut AnyObject, sel: Sel) -> bool {
+    msg_send![obj, respondsToSelector: sel]
 }
 
 // ══════════════════════════════════════════════════════════════════════════
@@ -1300,7 +1194,7 @@ mod tests {
     /// Test that CATapDescription class is available on this macOS version.
     #[test]
     fn test_catap_description_class_exists() {
-        let cls = Class::get("CATapDescription");
+        let cls = AnyClass::get(c"CATapDescription");
         assert!(
             cls.is_some(),
             "CATapDescription class should exist on macOS 14.4+. \
@@ -1312,16 +1206,16 @@ mod tests {
     /// This is a diagnostic test to understand the available API surface.
     #[test]
     fn test_catap_description_available_selectors() {
-        let cls =
-            Class::get("CATapDescription").expect("CATapDescription class required for this test");
+        let cls = AnyClass::get(c"CATapDescription")
+            .expect("CATapDescription class required for this test");
 
         unsafe {
-            let _pool = NSAutoreleasePool::new(nil);
+            let _pool = NSAutoreleasePool::new();
 
-            let obj: id = msg_send![cls, alloc];
-            let obj: id = msg_send![obj, init];
+            let obj: *mut AnyObject = msg_send![cls, alloc];
+            let obj: *mut AnyObject = msg_send![obj, init];
             assert!(
-                obj != nil,
+                !obj.is_null(),
                 "CATapDescription alloc+init should not return nil"
             );
 
@@ -1344,7 +1238,7 @@ mod tests {
             }
 
             // Check init selectors on a fresh alloc (before init)
-            let fresh_alloc: id = msg_send![cls, alloc];
+            let fresh_alloc: *mut AnyObject = msg_send![cls, alloc];
             let init_selectors = [
                 ("init", sel!(init)),
                 (

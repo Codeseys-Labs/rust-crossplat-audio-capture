@@ -1,6 +1,6 @@
 # `cocoa`/`objc` → `objc2` Migration Plan
 
-> **Status:** Phase 1 complete (`coreaudio.rs` migrated), Phase 2 planned (`tap.rs`)  
+> **Status:** Phase 1–3 complete. Migration done. `cocoa`/`objc` fully removed from Cargo.toml.  
 > **Estimated effort:** 18–28 hours  
 > **Branch:** `feat/objc2-migration` (to be created)
 
