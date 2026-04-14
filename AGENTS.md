@@ -291,8 +291,8 @@ All CI runs on [Blacksmith](https://blacksmith.sh/) runners — a drop-in replac
 
 | Platform | Virtual Audio Available? | Details |
 |---|---|---|
-| **Linux** | 🟡 Needs fix | PipeWire packages install fine but `systemctl --user` services don't start in Firecracker microVMs (no D-Bus user session). Fix: launch `pipewire` + `wireplumber` manually, install `pulseaudio-utils` for `pactl`. |
-| **Windows** | 🟡 Needs fix | `AlekseyMartynov/action-vbcable-win@v1` tag fails to resolve on Blacksmith Windows runner. Fix: pin to a valid tag or install VB-CABLE manually via PowerShell. |
+| **Linux** | ✅ Working | PipeWire launched manually (not via systemd — Firecracker VMs lack D-Bus user session). Virtual null sink via `pactl load-module module-null-sink`. Requires `pulseaudio-utils` for `pactl`, and `XDG_RUNTIME_DIR` setup. |
+| **Windows** | ❌ No audio stack | VB-CABLE setup exe installs without error, but Windows Audio services (`AudioSrv`, `AudioEndpointBuilder`) don't exist in the Firecracker microVM. No audio endpoints are created. Windows audio integration tests will continue to use `continue-on-error`. |
 | **macOS** | ✅ Working | BlackHole 2ch installs via `brew`, CoreAudio daemon running, virtual 48kHz stereo device as default I/O. Apple Silicon M4 hardware (not a VM). |
 
 **SSH debugging:** Blacksmith supports SSH access to running jobs using your GitHub SSH keys. Enable in [Blacksmith Settings > Features](https://app.blacksmith.sh/settings?tab=features). Connection info appears in the "Setup runner" step of each job. Add a sleep step on failure to keep the VM alive for debugging.
