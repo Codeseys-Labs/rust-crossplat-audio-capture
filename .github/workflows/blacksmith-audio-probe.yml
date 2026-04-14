@@ -122,8 +122,50 @@ jobs:
           Get-WmiObject Win32_SoundDevice -ErrorAction SilentlyContinue |
             Format-Table Name, Status, Manufacturer -AutoSize
 
-      - name: Install VB-CABLE
-        uses: AlekseyMartynov/action-vbcable-win@main
+      - name: Install VB-CABLE (manual)
+        shell: pwsh
+        run: |
+          Write-Host "===== Starting Audio Service ====="
+          Start-Service audiosrv -ErrorAction SilentlyContinue
+          Get-Service audiosrv -ErrorAction SilentlyContinue | Format-Table Name, Status
+
+          Write-Host ""
+          Write-Host "===== Setting microphone app privacy ====="
+          New-Item -Path "HKLM:\SOFTWARE\Policies\Microsoft\Windows\AppPrivacy\" -Force | Out-Null
+          New-ItemProperty -Path "HKLM:\SOFTWARE\Policies\Microsoft\Windows\AppPrivacy" `
+            -Name "LetAppsAccessMicrophone" -Value 0x00000001 -PropertyType "dword" -Force | Out-Null
+
+          Write-Host ""
+          Write-Host "===== Downloading VB-CABLE ====="
+          $VBDir = "$env:TEMP\vbcable"
+          New-Item -ItemType Directory -Path $VBDir -Force | Out-Null
+          Invoke-WebRequest -Uri "https://download.vb-audio.com/Download_CABLE/VBCABLE_Driver_Pack43.zip" `
+            -OutFile "$VBDir\VBCABLE_Driver_Pack43.zip"
+          Expand-Archive "$VBDir\VBCABLE_Driver_Pack43.zip" -DestinationPath "$VBDir\driver"
+          Write-Host "Downloaded and extracted. Contents:"
+          Get-ChildItem "$VBDir\driver" -Recurse | Format-Table Name, Length
+
+          Write-Host ""
+          Write-Host "===== Adding VB-CABLE certificate to TrustedPublisher ====="
+          $cert = Get-ChildItem "$VBDir\driver" -Filter "*.cer" -Recurse | Select-Object -First 1
+          if ($cert) {
+            certutil -addstore TrustedPublisher $cert.FullName
+          } else {
+            Write-Host "No .cer file found, attempting install without cert"
+          }
+
+          Write-Host ""
+          Write-Host "===== Installing VB-CABLE driver ====="
+          $inf = Get-ChildItem "$VBDir\driver" -Filter "*64*.inf" -Recurse | Select-Object -First 1
+          if ($inf) {
+            Write-Host "Found INF: $($inf.FullName)"
+            # Try pnputil first (available on modern Windows)
+            pnputil /add-driver $inf.FullName /install 2>&1 | Write-Host
+            Start-Sleep -Seconds 3
+          } else {
+            Write-Host "No 64-bit INF found. Files available:"
+            Get-ChildItem "$VBDir\driver" -Recurse -Filter "*.inf" | Format-Table Name, FullName
+          }
 
       - name: Post-install audio check
         shell: pwsh
@@ -143,14 +185,19 @@ jobs:
           Get-Service -Name "AudioSrv", "AudioEndpointBuilder" -ErrorAction SilentlyContinue |
             Format-Table Name, Status, StartType -AutoSize
 
+          Write-Host ""
+          Write-Host "===== All audio endpoints ====="
+          Get-PnpDevice -Class AudioEndpoint -ErrorAction SilentlyContinue |
+            Format-Table FriendlyName, Status, InstanceId -AutoSize
+
       - name: Keep alive for SSH debug (on failure)
         if: failure()
         shell: pwsh
         run: |
           Write-Host "===== PROBE FAILED ====="
           Write-Host "SSH into this runner to debug. Connection info is in the 'Setup runner' step above."
-          Write-Host "Keeping VM alive for 20 minutes..."
-          Start-Sleep -Seconds 1200
+          Write-Host "Keeping VM alive for 10 minutes..."
+          Start-Sleep -Seconds 600
 
   # ── macOS ──────────────────────────────────────────────────────────
   probe-macos:
