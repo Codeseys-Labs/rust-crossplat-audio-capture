@@ -10,6 +10,9 @@ pub mod stream;
 #[cfg(feature = "async-stream")]
 pub mod async_stream;
 
+#[cfg(any(test, feature = "test-utils"))]
+pub mod mock;
+
 // Re-exports for internal use
 pub use ring_buffer::{calculate_capacity, create_bridge, BridgeConsumer, BridgeProducer};
 pub use state::{AtomicStreamState, StreamState};
