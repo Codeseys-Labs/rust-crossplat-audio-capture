@@ -44,7 +44,7 @@ env:
 jobs:
   linux-system:
     name: "Linux | System Capture"
-    runs-on: ubuntu-latest
+    runs-on: blacksmith-4vcpu-ubuntu-2404
     timeout-minutes: 15
     steps:
       - uses: actions/checkout@v4
@@ -126,7 +126,7 @@ jobs:
 
   linux-device:
     name: "Linux | Device Capture"
-    runs-on: ubuntu-latest
+    runs-on: blacksmith-4vcpu-ubuntu-2404
     timeout-minutes: 15
     steps:
       - uses: actions/checkout@v4
@@ -197,7 +197,7 @@ jobs:
 
   linux-process:
     name: "Linux | Process Capture"
-    runs-on: ubuntu-latest
+    runs-on: blacksmith-4vcpu-ubuntu-2404
     timeout-minutes: 15
     steps:
       - uses: actions/checkout@v4
@@ -272,7 +272,7 @@ jobs:
 
   windows-system:
     name: "Windows | System Capture"
-    runs-on: windows-latest
+    runs-on: blacksmith-4vcpu-windows-2025
     continue-on-error: true
     timeout-minutes: 20
     steps:
@@ -360,7 +360,7 @@ jobs:
 
   windows-device:
     name: "Windows | Device Capture"
-    runs-on: windows-latest
+    runs-on: blacksmith-4vcpu-windows-2025
     continue-on-error: true
     timeout-minutes: 20
     steps:
@@ -431,7 +431,7 @@ jobs:
 
   windows-process:
     name: "Windows | Process Capture"
-    runs-on: windows-latest
+    runs-on: blacksmith-4vcpu-windows-2025
     continue-on-error: true
     timeout-minutes: 20
     steps:
@@ -532,7 +532,7 @@ jobs:
 
   macos-system:
     name: "macOS | System Capture"
-    runs-on: macos-15
+    runs-on: blacksmith-6vcpu-macos-15
     timeout-minutes: 20
     steps:
       - uses: actions/checkout@v4
@@ -596,7 +596,7 @@ jobs:
 
   macos-device:
     name: "macOS | Device Capture"
-    runs-on: macos-15
+    runs-on: blacksmith-6vcpu-macos-15
     timeout-minutes: 20
     steps:
       - uses: actions/checkout@v4
@@ -649,7 +649,7 @@ jobs:
 
   macos-process:
     name: "macOS | Process Capture"
-    runs-on: macos-15
+    runs-on: blacksmith-6vcpu-macos-15
     continue-on-error: true  # Process Tap expected to skip due to TCC in CI
     timeout-minutes: 20
     steps:
@@ -717,7 +717,7 @@ jobs:
 
   summary:
     name: "Audio Test Summary"
-    runs-on: ubuntu-latest
+    runs-on: blacksmith-4vcpu-ubuntu-2404
     if: always()
     needs:
       - linux-system

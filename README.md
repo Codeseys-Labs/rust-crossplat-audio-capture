@@ -8,13 +8,13 @@ A streaming-first audio capture library for Rust. Captures system audio, per-app
 
 | Platform | Status |
 |----------|--------|
-| Linux | ![Linux](https://github.com/baladithyab/rust-crossplat-audio-capture/actions/workflows/ci.yml/badge.svg?branch=master) |
-| Windows | ![Windows](https://github.com/baladithyab/rust-crossplat-audio-capture/actions/workflows/ci.yml/badge.svg?branch=master) |
-| macOS | ![macOS](https://github.com/baladithyab/rust-crossplat-audio-capture/actions/workflows/ci.yml/badge.svg?branch=master) |
+| Linux | ![Linux](https://github.com/Codeseys-Labs/rust-crossplat-audio-capture/actions/workflows/ci.yml/badge.svg?branch=master) |
+| Windows | ![Windows](https://github.com/Codeseys-Labs/rust-crossplat-audio-capture/actions/workflows/ci.yml/badge.svg?branch=master) |
+| macOS | ![macOS](https://github.com/Codeseys-Labs/rust-crossplat-audio-capture/actions/workflows/ci.yml/badge.svg?branch=master) |
 
 ### Audio Integration Tests
 
-![Audio Tests](https://github.com/baladithyab/rust-crossplat-audio-capture/actions/workflows/ci-audio-tests.yml/badge.svg?branch=master)
+![Audio Tests](https://github.com/Codeseys-Labs/rust-crossplat-audio-capture/actions/workflows/ci-audio-tests.yml/badge.svg?branch=master)
 
 | | System | Device | Process |
 |---|---|---|---|
@@ -22,7 +22,7 @@ A streaming-first audio capture library for Rust. Captures system audio, per-app
 | **Windows** (VB-CABLE) | `windows-system` | `windows-device` | `windows-process` |
 | **macOS** (BlackHole) | `macos-system` | `macos-device` | `macos-process` |
 
-Each cell is a separate CI job visible in the [Actions tab](https://github.com/baladithyab/rust-crossplat-audio-capture/actions/workflows/ci-audio-tests.yml). Linux is the primary platform; Windows and macOS process capture use `continue-on-error`.
+Each cell is a separate CI job visible in the [Actions tab](https://github.com/Codeseys-Labs/rust-crossplat-audio-capture/actions/workflows/ci-audio-tests.yml). Linux is the primary platform; Windows and macOS process capture use `continue-on-error`.
 
 ## Features
 
@@ -118,7 +118,7 @@ Add to `Cargo.toml`:
 
 ```toml
 [dependencies]
-rsac = { git = "https://github.com/baladithyab/rust-crossplat-audio-capture" }
+rsac = { git = "https://github.com/Codeseys-Labs/rust-crossplat-audio-capture" }
 ```
 
 ### Platform Dependencies
@@ -157,7 +157,7 @@ See [`docs/architecture/`](docs/architecture/) for the full design documents.
 
 ### AudioGraph
 
-[AudioGraph](https://github.com/baladithyab/audio-graph) is a desktop app (Tauri v2) that captures live system audio, performs real-time speech recognition, speaker diarization, entity extraction, and builds a temporal knowledge graph. Included as a [git submodule](apps/audio-graph/).
+[AudioGraph](https://github.com/Codeseys-Labs/audio-graph) is a desktop app (Tauri v2) that captures live system audio, performs real-time speech recognition, speaker diarization, entity extraction, and builds a temporal knowledge graph. Included as a [git submodule](apps/audio-graph/).
 
 ## Running Tests
 

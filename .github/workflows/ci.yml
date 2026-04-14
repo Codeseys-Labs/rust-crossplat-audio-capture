@@ -18,7 +18,7 @@ jobs:
   # ── Lint ────────────────────────────────────────────────────────────
   lint:
     name: Lint & Format
-    runs-on: ubuntu-latest
+    runs-on: blacksmith-4vcpu-ubuntu-2404
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
@@ -42,7 +42,7 @@ jobs:
   test-linux:
     name: Linux Unit Tests
     needs: lint
-    runs-on: ubuntu-latest
+    runs-on: blacksmith-4vcpu-ubuntu-2404
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
@@ -64,7 +64,7 @@ jobs:
   test-windows:
     name: Windows Unit Tests
     needs: lint
-    runs-on: windows-latest
+    runs-on: blacksmith-4vcpu-windows-2025
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
@@ -89,7 +89,7 @@ jobs:
   test-macos:
     name: macOS Unit Tests
     needs: lint
-    runs-on: macos-latest
+    runs-on: blacksmith-6vcpu-macos-15
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
@@ -127,7 +127,7 @@ jobs:
   cross-compile-linux-arm64:
     name: Linux ARM64 Cross-Compile Check
     needs: lint
-    runs-on: ubuntu-latest
+    runs-on: blacksmith-4vcpu-ubuntu-2404
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable

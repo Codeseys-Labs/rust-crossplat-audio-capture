@@ -1,0 +1,210 @@
+# One-shot diagnostic: probe whether Blacksmith runners have audio device support.
+# Trigger manually via workflow_dispatch, SSH in on failure to debug.
+# Delete this workflow once audio support is confirmed/denied.
+
+name: Blacksmith Audio Device Probe
+
+on:
+  workflow_dispatch:
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  # ── Linux ──────────────────────────────────────────────────────────
+  probe-linux:
+    name: "Linux | Audio Probe"
+    runs-on: blacksmith-4vcpu-ubuntu-2404
+    timeout-minutes: 30
+    steps:
+      - name: System audio info
+        run: |
+          echo "===== Kernel modules (snd) ====="
+          lsmod | grep -i snd || echo "No snd modules loaded"
+
+          echo ""
+          echo "===== ALSA devices ====="
+          cat /proc/asound/cards 2>/dev/null || echo "No /proc/asound/cards"
+          aplay -l 2>/dev/null || echo "aplay not found or no devices"
+
+          echo ""
+          echo "===== PulseAudio ====="
+          pulseaudio --check 2>/dev/null && echo "PulseAudio running" || echo "PulseAudio not running"
+          pactl info 2>/dev/null || echo "pactl not available"
+
+          echo ""
+          echo "===== PipeWire ====="
+          pw-cli info 0 2>/dev/null || echo "PipeWire not running"
+          systemctl --user status pipewire.service 2>/dev/null || echo "pipewire.service not found"
+
+      - name: Install PipeWire and create virtual sink
+        run: |
+          sudo add-apt-repository -y ppa:pipewire-debian/pipewire-upstream
+          sudo apt-get update
+          sudo apt-get install -y \
+            pipewire pipewire-bin pipewire-audio-client-libraries \
+            pipewire-pulse libpipewire-0.3-dev libspa-0.2-dev \
+            wireplumber sox libclang-dev
+
+          echo ""
+          echo "===== Starting PipeWire ====="
+          systemctl --user --now disable pulseaudio.service pulseaudio.socket 2>/dev/null || true
+          systemctl --user mask pulseaudio.service pulseaudio.socket 2>/dev/null || true
+          systemctl --user --now enable wireplumber.service 2>/dev/null || true
+          systemctl --user --now enable pipewire.service 2>/dev/null || true
+          systemctl --user --now enable pipewire-pulse.service 2>/dev/null || true
+          sleep 3
+
+          echo ""
+          echo "===== PipeWire status after install ====="
+          pw-cli info 0 || echo "pw-cli info failed"
+          pw-cli list-objects Node 2>/dev/null || echo "No PipeWire nodes"
+
+          echo ""
+          echo "===== Creating virtual null sink ====="
+          pactl load-module module-null-sink \
+            sink_name=probe_sink \
+            sink_properties=device.description="Blacksmith_Probe_Sink" \
+            rate=48000 channels=2 format=float32le || echo "Failed to create null sink"
+          pactl set-default-sink probe_sink 2>/dev/null || true
+
+          echo ""
+          echo "===== Final device list ====="
+          pactl list short sinks 2>/dev/null || echo "No sinks"
+          pactl list short sources 2>/dev/null || echo "No sources"
+          pw-cli list-objects Node 2>/dev/null || echo "No PipeWire nodes"
+
+      - name: Keep alive for SSH debug (on failure)
+        if: failure()
+        run: |
+          echo "===== PROBE FAILED ====="
+          echo "SSH into this runner to debug. Connection info is in the 'Setup runner' step above."
+          echo "Keeping VM alive for 20 minutes..."
+          sleep 1200
+
+  # ── Windows ────────────────────────────────────────────────────────
+  probe-windows:
+    name: "Windows | Audio Probe"
+    runs-on: blacksmith-4vcpu-windows-2025
+    timeout-minutes: 30
+    steps:
+      - name: System audio info
+        shell: pwsh
+        run: |
+          Write-Host "===== Audio Services ====="
+          Get-Service -Name "AudioSrv", "AudioEndpointBuilder" -ErrorAction SilentlyContinue |
+            Format-Table Name, Status, StartType -AutoSize
+
+          Write-Host ""
+          Write-Host "===== Start audio services ====="
+          Start-Service -Name "AudioEndpointBuilder" -ErrorAction SilentlyContinue
+          Start-Service -Name "AudioSrv" -ErrorAction SilentlyContinue
+          Get-Service -Name "AudioSrv", "AudioEndpointBuilder" -ErrorAction SilentlyContinue |
+            Format-Table Name, Status, StartType -AutoSize
+
+          Write-Host ""
+          Write-Host "===== Audio Devices (PnP) ====="
+          Get-PnpDevice -ErrorAction SilentlyContinue |
+            Where-Object { $_.Class -eq "AudioEndpoint" -or $_.Class -eq "MEDIA" } |
+            Format-Table FriendlyName, Status, Class -AutoSize
+
+          Write-Host ""
+          Write-Host "===== WMI Sound Devices ====="
+          Get-WmiObject Win32_SoundDevice -ErrorAction SilentlyContinue |
+            Format-Table Name, Status, Manufacturer -AutoSize
+
+      - name: Install VB-CABLE
+        uses: AlekseyMartynov/action-vbcable-win@v1
+
+      - name: Post-install audio check
+        shell: pwsh
+        run: |
+          Write-Host "===== Audio Devices after VB-CABLE ====="
+          Get-PnpDevice -ErrorAction SilentlyContinue |
+            Where-Object {
+              $_.FriendlyName -like "*VB-Audio*" -or
+              $_.FriendlyName -like "*CABLE*" -or
+              $_.Class -eq "AudioEndpoint" -or
+              $_.Class -eq "MEDIA"
+            } |
+            Format-List FriendlyName, Status, Class
+
+          Write-Host ""
+          Write-Host "===== Audio Services (post-install) ====="
+          Get-Service -Name "AudioSrv", "AudioEndpointBuilder" -ErrorAction SilentlyContinue |
+            Format-Table Name, Status, StartType -AutoSize
+
+      - name: Keep alive for SSH debug (on failure)
+        if: failure()
+        shell: pwsh
+        run: |
+          Write-Host "===== PROBE FAILED ====="
+          Write-Host "SSH into this runner to debug. Connection info is in the 'Setup runner' step above."
+          Write-Host "Keeping VM alive for 20 minutes..."
+          Start-Sleep -Seconds 1200
+
+  # ── macOS ──────────────────────────────────────────────────────────
+  probe-macos:
+    name: "macOS | Audio Probe"
+    runs-on: blacksmith-6vcpu-macos-15
+    timeout-minutes: 30
+    steps:
+      - name: System audio info
+        run: |
+          echo "===== macOS Version ====="
+          sw_vers
+
+          echo ""
+          echo "===== Audio Devices (system_profiler) ====="
+          system_profiler SPAudioDataType 2>/dev/null || echo "No audio profiler available"
+
+          echo ""
+          echo "===== CoreAudio daemon ====="
+          ps aux | grep -i coreaudio || echo "No coreaudio processes"
+
+          echo ""
+          echo "===== Audio device list (ioreg) ====="
+          ioreg -l | grep -i "IOAudioEngine\|IOAudioDevice" | head -20 || echo "No IOAudio entries"
+
+      - name: Install BlackHole virtual audio
+        run: |
+          echo "===== Installing BlackHole ====="
+          brew install blackhole-2ch || echo "BlackHole installation failed"
+
+          echo ""
+          echo "===== Restarting coreaudiod ====="
+          sudo killall coreaudiod 2>/dev/null || true
+          sleep 5
+
+          echo ""
+          echo "===== Audio Devices after BlackHole ====="
+          system_profiler SPAudioDataType 2>/dev/null || echo "No audio profiler available"
+
+      - name: Keep alive for SSH debug (on failure)
+        if: failure()
+        run: |
+          echo "===== PROBE FAILED ====="
+          echo "SSH into this runner to debug. Connection info is in the 'Setup runner' step above."
+          echo "Keeping VM alive for 20 minutes..."
+          sleep 1200
+
+  # ── Summary ────────────────────────────────────────────────────────
+  summary:
+    name: "Audio Probe Summary"
+    runs-on: blacksmith-4vcpu-ubuntu-2404
+    if: always()
+    needs: [probe-linux, probe-windows, probe-macos]
+    steps:
+      - name: Results
+        run: |
+          echo "============================================"
+          echo "  Blacksmith Audio Device Probe — Results"
+          echo "============================================"
+          echo ""
+          echo "  Linux:   ${{ needs.probe-linux.result }}"
+          echo "  Windows: ${{ needs.probe-windows.result }}"
+          echo "  macOS:   ${{ needs.probe-macos.result }}"
+          echo ""
+          echo "If any job failed, enable SSH access in Blacksmith"
+          echo "settings and re-run to debug interactively."
+          echo "============================================"
