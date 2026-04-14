@@ -60,16 +60,30 @@ jobs:
           sudo apt-get install -y \
             pipewire pipewire-bin pipewire-audio-client-libraries \
             pipewire-pulse libpipewire-0.3-dev libspa-0.2-dev \
-            wireplumber sox libclang-dev
+            wireplumber pulseaudio-utils sox libclang-dev
 
       - name: Start PipeWire
         run: |
-          systemctl --user --now disable pulseaudio.service pulseaudio.socket || true
-          systemctl --user mask pulseaudio.service pulseaudio.socket || true
-          systemctl --user --now enable wireplumber.service || true
-          systemctl --user --now enable pipewire.service || true
-          systemctl --user --now enable pipewire-pulse.service || true
-          sleep 3
+          # Blacksmith Firecracker microVMs lack a D-Bus user session, so
+          # systemctl --user services won't start. Launch daemons manually.
+          export XDG_RUNTIME_DIR="${XDG_RUNTIME_DIR:-/run/user/$(id -u)}"
+          echo "XDG_RUNTIME_DIR=$XDG_RUNTIME_DIR" >> "$GITHUB_ENV"
+          sudo mkdir -p "$XDG_RUNTIME_DIR"
+          sudo chmod 700 "$XDG_RUNTIME_DIR"
+          sudo chown "$(id -u):$(id -g)" "$XDG_RUNTIME_DIR"
+
+          # Kill any pre-existing PulseAudio
+          pulseaudio --kill 2>/dev/null || true
+
+          # Launch PipeWire stack manually
+          pipewire &
+          sleep 1
+          wireplumber &
+          sleep 1
+          pipewire-pulse &
+          sleep 2
+
+          # Verify
           pw-cli info 0 || echo "WARNING: pw-cli info failed"
 
       - name: Create virtual audio sink
@@ -142,16 +156,22 @@ jobs:
           sudo apt-get install -y \
             pipewire pipewire-bin pipewire-audio-client-libraries \
             pipewire-pulse libpipewire-0.3-dev libspa-0.2-dev \
-            wireplumber sox libclang-dev
+            wireplumber pulseaudio-utils sox libclang-dev
 
       - name: Start PipeWire
         run: |
-          systemctl --user --now disable pulseaudio.service pulseaudio.socket || true
-          systemctl --user mask pulseaudio.service pulseaudio.socket || true
-          systemctl --user --now enable wireplumber.service || true
-          systemctl --user --now enable pipewire.service || true
-          systemctl --user --now enable pipewire-pulse.service || true
-          sleep 3
+          export XDG_RUNTIME_DIR="${XDG_RUNTIME_DIR:-/run/user/$(id -u)}"
+          echo "XDG_RUNTIME_DIR=$XDG_RUNTIME_DIR" >> "$GITHUB_ENV"
+          sudo mkdir -p "$XDG_RUNTIME_DIR"
+          sudo chmod 700 "$XDG_RUNTIME_DIR"
+          sudo chown "$(id -u):$(id -g)" "$XDG_RUNTIME_DIR"
+          pulseaudio --kill 2>/dev/null || true
+          pipewire &
+          sleep 1
+          wireplumber &
+          sleep 1
+          pipewire-pulse &
+          sleep 2
           pw-cli info 0 || echo "WARNING: pw-cli info failed"
 
       - name: Create virtual audio sink
@@ -213,16 +233,22 @@ jobs:
           sudo apt-get install -y \
             pipewire pipewire-bin pipewire-audio-client-libraries \
             pipewire-pulse libpipewire-0.3-dev libspa-0.2-dev \
-            wireplumber sox libclang-dev
+            wireplumber pulseaudio-utils sox libclang-dev
 
       - name: Start PipeWire
         run: |
-          systemctl --user --now disable pulseaudio.service pulseaudio.socket || true
-          systemctl --user mask pulseaudio.service pulseaudio.socket || true
-          systemctl --user --now enable wireplumber.service || true
-          systemctl --user --now enable pipewire.service || true
-          systemctl --user --now enable pipewire-pulse.service || true
-          sleep 3
+          export XDG_RUNTIME_DIR="${XDG_RUNTIME_DIR:-/run/user/$(id -u)}"
+          echo "XDG_RUNTIME_DIR=$XDG_RUNTIME_DIR" >> "$GITHUB_ENV"
+          sudo mkdir -p "$XDG_RUNTIME_DIR"
+          sudo chmod 700 "$XDG_RUNTIME_DIR"
+          sudo chown "$(id -u):$(id -g)" "$XDG_RUNTIME_DIR"
+          pulseaudio --kill 2>/dev/null || true
+          pipewire &
+          sleep 1
+          wireplumber &
+          sleep 1
+          pipewire-pulse &
+          sleep 2
           pw-cli info 0 || echo "WARNING: pw-cli info failed"
 
       - name: Create virtual audio sink
@@ -289,7 +315,7 @@ jobs:
           Start-Service -Name "AudioSrv" -ErrorAction SilentlyContinue
 
       - name: Install VB-CABLE virtual audio driver
-        uses: AlekseyMartynov/action-vbcable-win@v1
+        uses: AlekseyMartynov/action-vbcable-win@main
 
       - name: Verify audio devices
         id: verify_audio
@@ -377,7 +403,7 @@ jobs:
           Start-Service -Name "AudioSrv" -ErrorAction SilentlyContinue
 
       - name: Install VB-CABLE virtual audio driver
-        uses: AlekseyMartynov/action-vbcable-win@v1
+        uses: AlekseyMartynov/action-vbcable-win@main
 
       - name: Verify audio devices
         shell: pwsh
@@ -448,7 +474,7 @@ jobs:
           Start-Service -Name "AudioSrv" -ErrorAction SilentlyContinue
 
       - name: Install VB-CABLE virtual audio driver
-        uses: AlekseyMartynov/action-vbcable-win@v1
+        uses: AlekseyMartynov/action-vbcable-win@main
 
       - name: Verify audio devices
         shell: pwsh
