@@ -126,8 +126,10 @@ jobs:
         shell: pwsh
         run: |
           Write-Host "===== Starting Audio Service ====="
-          Start-Service audiosrv -ErrorAction SilentlyContinue
-          Get-Service audiosrv -ErrorAction SilentlyContinue | Format-Table Name, Status
+          Start-Service -Name "AudioEndpointBuilder" -ErrorAction SilentlyContinue
+          Start-Service -Name "AudioSrv" -ErrorAction SilentlyContinue
+          Get-Service -Name "AudioSrv", "AudioEndpointBuilder" -ErrorAction SilentlyContinue |
+            Format-Table Name, Status
 
           Write-Host ""
           Write-Host "===== Setting microphone app privacy ====="
@@ -142,29 +144,19 @@ jobs:
           Invoke-WebRequest -Uri "https://download.vb-audio.com/Download_CABLE/VBCABLE_Driver_Pack43.zip" `
             -OutFile "$VBDir\VBCABLE_Driver_Pack43.zip"
           Expand-Archive "$VBDir\VBCABLE_Driver_Pack43.zip" -DestinationPath "$VBDir\driver"
-          Write-Host "Downloaded and extracted. Contents:"
-          Get-ChildItem "$VBDir\driver" -Recurse | Format-Table Name, Length
 
           Write-Host ""
-          Write-Host "===== Adding VB-CABLE certificate to TrustedPublisher ====="
-          $cert = Get-ChildItem "$VBDir\driver" -Filter "*.cer" -Recurse | Select-Object -First 1
-          if ($cert) {
-            certutil -addstore TrustedPublisher $cert.FullName
+          Write-Host "===== Installing VB-CABLE via setup exe ====="
+          $setupExe = "$VBDir\driver\VBCABLE_Setup_x64.exe"
+          if (Test-Path $setupExe) {
+            Write-Host "Running: $setupExe -i -h"
+            # Run the installer silently — it handles cert + driver registration
+            Start-Process -FilePath $setupExe -ArgumentList "-i","-h" -Wait -NoNewWindow 2>&1
+            Start-Sleep -Seconds 5
+            Write-Host "VB-CABLE setup completed"
           } else {
-            Write-Host "No .cer file found, attempting install without cert"
-          }
-
-          Write-Host ""
-          Write-Host "===== Installing VB-CABLE driver ====="
-          $inf = Get-ChildItem "$VBDir\driver" -Filter "*64*.inf" -Recurse | Select-Object -First 1
-          if ($inf) {
-            Write-Host "Found INF: $($inf.FullName)"
-            # Try pnputil first (available on modern Windows)
-            pnputil /add-driver $inf.FullName /install 2>&1 | Write-Host
-            Start-Sleep -Seconds 3
-          } else {
-            Write-Host "No 64-bit INF found. Files available:"
-            Get-ChildItem "$VBDir\driver" -Recurse -Filter "*.inf" | Format-Table Name, FullName
+            Write-Host "Setup exe not found at: $setupExe"
+            Get-ChildItem "$VBDir\driver" | Format-Table Name, Length
           }
 
       - name: Post-install audio check

@@ -315,7 +315,15 @@ jobs:
           Start-Service -Name "AudioSrv" -ErrorAction SilentlyContinue
 
       - name: Install VB-CABLE virtual audio driver
-        uses: AlekseyMartynov/action-vbcable-win@main
+        shell: pwsh
+        run: |
+          $VBDir = "$env:TEMP\vbcable"
+          New-Item -ItemType Directory -Path $VBDir -Force | Out-Null
+          Invoke-WebRequest -Uri "https://download.vb-audio.com/Download_CABLE/VBCABLE_Driver_Pack43.zip" `
+            -OutFile "$VBDir\VBCABLE_Driver_Pack43.zip"
+          Expand-Archive "$VBDir\VBCABLE_Driver_Pack43.zip" -DestinationPath "$VBDir\driver"
+          Start-Process -FilePath "$VBDir\driver\VBCABLE_Setup_x64.exe" -ArgumentList "-i","-h" -Wait -NoNewWindow
+          Start-Sleep -Seconds 5
 
       - name: Verify audio devices
         id: verify_audio
@@ -403,7 +411,15 @@ jobs:
           Start-Service -Name "AudioSrv" -ErrorAction SilentlyContinue
 
       - name: Install VB-CABLE virtual audio driver
-        uses: AlekseyMartynov/action-vbcable-win@main
+        shell: pwsh
+        run: |
+          $VBDir = "$env:TEMP\vbcable"
+          New-Item -ItemType Directory -Path $VBDir -Force | Out-Null
+          Invoke-WebRequest -Uri "https://download.vb-audio.com/Download_CABLE/VBCABLE_Driver_Pack43.zip" `
+            -OutFile "$VBDir\VBCABLE_Driver_Pack43.zip"
+          Expand-Archive "$VBDir\VBCABLE_Driver_Pack43.zip" -DestinationPath "$VBDir\driver"
+          Start-Process -FilePath "$VBDir\driver\VBCABLE_Setup_x64.exe" -ArgumentList "-i","-h" -Wait -NoNewWindow
+          Start-Sleep -Seconds 5
 
       - name: Verify audio devices
         shell: pwsh
@@ -474,7 +490,15 @@ jobs:
           Start-Service -Name "AudioSrv" -ErrorAction SilentlyContinue
 
       - name: Install VB-CABLE virtual audio driver
-        uses: AlekseyMartynov/action-vbcable-win@main
+        shell: pwsh
+        run: |
+          $VBDir = "$env:TEMP\vbcable"
+          New-Item -ItemType Directory -Path $VBDir -Force | Out-Null
+          Invoke-WebRequest -Uri "https://download.vb-audio.com/Download_CABLE/VBCABLE_Driver_Pack43.zip" `
+            -OutFile "$VBDir\VBCABLE_Driver_Pack43.zip"
+          Expand-Archive "$VBDir\VBCABLE_Driver_Pack43.zip" -DestinationPath "$VBDir\driver"
+          Start-Process -FilePath "$VBDir\driver\VBCABLE_Setup_x64.exe" -ArgumentList "-i","-h" -Wait -NoNewWindow
+          Start-Sleep -Seconds 5
 
       - name: Verify audio devices
         shell: pwsh
