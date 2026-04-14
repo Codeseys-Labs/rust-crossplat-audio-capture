@@ -14,6 +14,7 @@
 | **Primary deliverable** | Library crate (`rsac`) |
 | **Secondary deliverables** | CLI demo app (`rsac` binary) + example programs |
 | **Platforms** | Windows (WASAPI), Linux (PipeWire), macOS (CoreAudio Process Tap) |
+| **GitHub org** | [Codeseys-Labs](https://github.com/Codeseys-Labs/rust-crossplat-audio-capture) |
 | **Priority order** | **Correctness → UX → Breadth** |
 
 ### Core Capability
@@ -267,6 +268,34 @@ cargo test --lib
 See the [Local Testing Guide](docs/LOCAL_TESTING_GUIDE.md) for comprehensive instructions
 on testing system capture, application capture, and process tree capture on macOS, Windows,
 and Linux.
+
+### CI infrastructure: Blacksmith runners
+
+All CI runs on [Blacksmith](https://blacksmith.sh/) runners — a drop-in replacement for GitHub-hosted runners with 2x faster hardware and co-located caching. Workflows are in [`.github/workflows/`](.github/workflows/).
+
+| Workflow | Purpose |
+|---|---|
+| [`ci.yml`](.github/workflows/ci.yml) | Lint, unit tests (3 platforms), ARM64 cross-compile |
+| [`ci-audio-tests.yml`](.github/workflows/ci-audio-tests.yml) | Audio integration tests (9 platform x tier jobs) |
+| [`blacksmith-audio-probe.yml`](.github/workflows/blacksmith-audio-probe.yml) | One-shot diagnostic: probe audio device availability on Blacksmith runners (workflow_dispatch only) |
+
+**Runner labels:**
+
+| Platform | Runner Label | Specs |
+|---|---|---|
+| **Linux** | `blacksmith-4vcpu-ubuntu-2404` | 4 vCPU, 16 GB RAM, Ubuntu 24.04 |
+| **Windows** | `blacksmith-4vcpu-windows-2025` | 4 vCPU, 14 GB RAM, Windows Server 2025 (public beta) |
+| **macOS** | `blacksmith-6vcpu-macos-15` | 6 vCPU, 24 GB RAM, macOS 15 Sequoia, Apple Silicon M4 |
+
+**Blacksmith audio device probe results** (run 2026-04-13):
+
+| Platform | Virtual Audio Available? | Details |
+|---|---|---|
+| **Linux** | 🟡 Needs fix | PipeWire packages install fine but `systemctl --user` services don't start in Firecracker microVMs (no D-Bus user session). Fix: launch `pipewire` + `wireplumber` manually, install `pulseaudio-utils` for `pactl`. |
+| **Windows** | 🟡 Needs fix | `AlekseyMartynov/action-vbcable-win@v1` tag fails to resolve on Blacksmith Windows runner. Fix: pin to a valid tag or install VB-CABLE manually via PowerShell. |
+| **macOS** | ✅ Working | BlackHole 2ch installs via `brew`, CoreAudio daemon running, virtual 48kHz stereo device as default I/O. Apple Silicon M4 hardware (not a VM). |
+
+**SSH debugging:** Blacksmith supports SSH access to running jobs using your GitHub SSH keys. Enable in [Blacksmith Settings > Features](https://app.blacksmith.sh/settings?tab=features). Connection info appears in the "Setup runner" step of each job. Add a sleep step on failure to keep the VM alive for debugging.
 
 ### CI expectations & platform verification status
 
