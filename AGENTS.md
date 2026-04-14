@@ -284,7 +284,8 @@ All CI runs on [Blacksmith](https://blacksmith.sh/) runners — a drop-in replac
 | Platform | Runner Label | Specs |
 |---|---|---|
 | **Linux** | `blacksmith-4vcpu-ubuntu-2404` | 4 vCPU, 16 GB RAM, Ubuntu 24.04 |
-| **Windows** | `blacksmith-4vcpu-windows-2025` | 4 vCPU, 14 GB RAM, Windows Server 2025 (public beta) |
+| **Windows (compile)** | `blacksmith-4vcpu-windows-2025` | 4 vCPU, 14 GB RAM, Windows Server 2025 (compile + unit tests only) |
+| **Windows (audio)** | `windows-latest` (GitHub-hosted) | GitHub-hosted runner with full audio stack (VB-CABLE via `LABSN/sound-ci-helpers@v1`) |
 | **macOS** | `blacksmith-6vcpu-macos-15` | 6 vCPU, 24 GB RAM, macOS 15 Sequoia, Apple Silicon M4 |
 
 **Blacksmith audio device probe results** (run 2026-04-13):
@@ -292,7 +293,7 @@ All CI runs on [Blacksmith](https://blacksmith.sh/) runners — a drop-in replac
 | Platform | Virtual Audio Available? | Details |
 |---|---|---|
 | **Linux** | ✅ Working | PipeWire launched manually (not via systemd — Firecracker VMs lack D-Bus user session). Virtual null sink via `pactl load-module module-null-sink`. Requires `pulseaudio-utils` for `pactl`, and `XDG_RUNTIME_DIR` setup. |
-| **Windows** | ❌ No audio stack | VB-CABLE setup exe installs without error, but Windows Audio services (`AudioSrv`, `AudioEndpointBuilder`) don't exist in the Firecracker microVM. No audio endpoints are created. Windows audio integration tests will continue to use `continue-on-error`. |
+| **Windows** | ❌ No audio stack | VB-CABLE setup exe installs without error, but Windows Audio services (`AudioSrv`, `AudioEndpointBuilder`) don't exist in the Firecracker microVM. No audio endpoints are created. **Option D probe confirmed**: `AudioSes.dll`, `AudioEndpointBuilder.dll`, `Audiodg.exe` are all absent from System32; audio registry keys don't exist; `Install-WindowsFeature Server-Media-Foundation` unavailable. The audio subsystem is not part of the Blacksmith Windows image at all. Windows audio integration tests run on GitHub-hosted `windows-latest` instead. |
 | **macOS** | ✅ Working | BlackHole 2ch installs via `brew`, CoreAudio daemon running, virtual 48kHz stereo device as default I/O. Apple Silicon M4 hardware (not a VM). |
 
 **SSH debugging:** Blacksmith supports SSH access to running jobs using your GitHub SSH keys. Enable in [Blacksmith Settings > Features](https://app.blacksmith.sh/settings?tab=features). Connection info appears in the "Setup runner" step of each job. Add a sleep step on failure to keep the VM alive for debugging.
@@ -390,6 +391,11 @@ This project uses [Task Master](https://github.com/task-master-ai/task-master-ai
 - Performance benchmarking and optimization
 - macOS 15 (Sequoia) testing on real hardware (expected to work via Path 2, untested)
 - Complete device enumeration on macOS (currently returns only default device)
+- **`ApplicationByName` integration tests** — the only `CaptureTarget` variant with zero test coverage
+- **Harden non-silence assertions** — all capture tests use soft warnings; Linux tests should hard-assert since PipeWire null sink is deterministic
+- **`subscribe()` and `overrun_count()` integration tests** — G7/G8 features have no integration coverage
+- **Migrate `cocoa`/`objc` → `objc2`** — see §9.1 below for details
+- **Blacksmith Windows audio support** — request Blacksmith add audio subsystem to Windows Server images (see §6 runner labels)
 
 ---
 
@@ -413,6 +419,16 @@ This project uses [Task Master](https://github.com/task-master-ai/task-master-ai
 | **Windows** | `wasapi`, `windows`, `windows-core`, `widestring`, `sysinfo` |
 | **Linux** | `pipewire`, `libspa`, `libspa-sys` |
 | **macOS** | `coreaudio-rs`, `coreaudio-sys`, `objc2-core-audio`, `objc2-core-audio-types`, `objc2-core-foundation`, `core-foundation`, `core-foundation-sys`, `cocoa`, `objc` |
+
+### 9.1 `cocoa`/`objc` → `objc2` Migration
+
+The `cocoa` (0.26.1) and `objc` (0.2.7) crates are **deprecated**. `cocoa`'s docs.rs explicitly says *"deprecated in favour of the objc2 crates"*; `objc` hasn't had a release since 2019 and the repo (`SSheldon/rust-objc`) is archived. The successor is `objc2` (v0.6.4, actively maintained).
+
+**Affected files:** [`src/audio/macos/tap.rs`](src/audio/macos/tap.rs) (~65 `msg_send!` callsites, `NSAutoreleasePool`, `NSString`, `Class::get()`) and [`src/audio/macos/coreaudio.rs`](src/audio/macos/coreaudio.rs) (~12 callsites for `NSWorkspace` application enumeration). Total: ~75-80 callsites across 2 files.
+
+**Key migration challenge:** `CATapDescription` is a **private CoreAudio class** not in any `objc2` framework crate. All its selectors (`initStereoMixdownOfProcesses:`, `setProcesses:exclusive:`, etc.) are discovered at runtime via `respondsToSelector:`. A migration to `objc2` would still require raw `msg_send!` for `CATapDescription` — the safety benefit of typed bindings doesn't apply to this code.
+
+**Estimated effort:** 18-27 hours. Recommended approach: migrate `coreaudio.rs` first (simpler, ~12 sites), then `tap.rs` (~65 sites). Keep `core-foundation`/`core-foundation-sys` as-is (still maintained by Servo).
 
 ---
 

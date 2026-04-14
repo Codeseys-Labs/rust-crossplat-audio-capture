@@ -294,11 +294,15 @@ jobs:
 
   # =============================================================================
   # Windows tiers — VB-CABLE virtual audio driver
+  # NOTE: Blacksmith Windows VMs (Firecracker) have no audio subsystem at all
+  # (AudioSrv, AudioEndpointBuilder, AudioSes.dll are all absent).
+  # We use GitHub-hosted windows-latest for audio integration tests, which
+  # has a full Windows audio stack. Blacksmith handles compilation/unit tests.
   # =============================================================================
 
   windows-system:
     name: "Windows | System Capture"
-    runs-on: blacksmith-4vcpu-windows-2025
+    runs-on: windows-latest
     continue-on-error: true
     timeout-minutes: 20
     steps:
@@ -308,22 +312,8 @@ jobs:
         with:
           key: windows-audio
 
-      - name: Start Windows Audio services
-        shell: pwsh
-        run: |
-          Start-Service -Name "AudioEndpointBuilder" -ErrorAction SilentlyContinue
-          Start-Service -Name "AudioSrv" -ErrorAction SilentlyContinue
-
-      - name: Install VB-CABLE virtual audio driver
-        shell: pwsh
-        run: |
-          $VBDir = "$env:TEMP\vbcable"
-          New-Item -ItemType Directory -Path $VBDir -Force | Out-Null
-          Invoke-WebRequest -Uri "https://download.vb-audio.com/Download_CABLE/VBCABLE_Driver_Pack43.zip" `
-            -OutFile "$VBDir\VBCABLE_Driver_Pack43.zip"
-          Expand-Archive "$VBDir\VBCABLE_Driver_Pack43.zip" -DestinationPath "$VBDir\driver"
-          Start-Process -FilePath "$VBDir\driver\VBCABLE_Setup_x64.exe" -ArgumentList "-i","-h" -Wait -NoNewWindow
-          Start-Sleep -Seconds 5
+      - name: Install virtual audio (VB-CABLE via LABSN)
+        uses: LABSN/sound-ci-helpers@v1
 
       - name: Verify audio devices
         id: verify_audio
@@ -394,7 +384,7 @@ jobs:
 
   windows-device:
     name: "Windows | Device Capture"
-    runs-on: blacksmith-4vcpu-windows-2025
+    runs-on: windows-latest
     continue-on-error: true
     timeout-minutes: 20
     steps:
@@ -404,22 +394,8 @@ jobs:
         with:
           key: windows-audio
 
-      - name: Start Windows Audio services
-        shell: pwsh
-        run: |
-          Start-Service -Name "AudioEndpointBuilder" -ErrorAction SilentlyContinue
-          Start-Service -Name "AudioSrv" -ErrorAction SilentlyContinue
-
-      - name: Install VB-CABLE virtual audio driver
-        shell: pwsh
-        run: |
-          $VBDir = "$env:TEMP\vbcable"
-          New-Item -ItemType Directory -Path $VBDir -Force | Out-Null
-          Invoke-WebRequest -Uri "https://download.vb-audio.com/Download_CABLE/VBCABLE_Driver_Pack43.zip" `
-            -OutFile "$VBDir\VBCABLE_Driver_Pack43.zip"
-          Expand-Archive "$VBDir\VBCABLE_Driver_Pack43.zip" -DestinationPath "$VBDir\driver"
-          Start-Process -FilePath "$VBDir\driver\VBCABLE_Setup_x64.exe" -ArgumentList "-i","-h" -Wait -NoNewWindow
-          Start-Sleep -Seconds 5
+      - name: Install virtual audio (VB-CABLE via LABSN)
+        uses: LABSN/sound-ci-helpers@v1
 
       - name: Verify audio devices
         shell: pwsh
@@ -473,7 +449,7 @@ jobs:
 
   windows-process:
     name: "Windows | Process Capture"
-    runs-on: blacksmith-4vcpu-windows-2025
+    runs-on: windows-latest
     continue-on-error: true
     timeout-minutes: 20
     steps:
@@ -489,16 +465,8 @@ jobs:
           Start-Service -Name "AudioEndpointBuilder" -ErrorAction SilentlyContinue
           Start-Service -Name "AudioSrv" -ErrorAction SilentlyContinue
 
-      - name: Install VB-CABLE virtual audio driver
-        shell: pwsh
-        run: |
-          $VBDir = "$env:TEMP\vbcable"
-          New-Item -ItemType Directory -Path $VBDir -Force | Out-Null
-          Invoke-WebRequest -Uri "https://download.vb-audio.com/Download_CABLE/VBCABLE_Driver_Pack43.zip" `
-            -OutFile "$VBDir\VBCABLE_Driver_Pack43.zip"
-          Expand-Archive "$VBDir\VBCABLE_Driver_Pack43.zip" -DestinationPath "$VBDir\driver"
-          Start-Process -FilePath "$VBDir\driver\VBCABLE_Setup_x64.exe" -ArgumentList "-i","-h" -Wait -NoNewWindow
-          Start-Sleep -Seconds 5
+      - name: Install virtual audio (VB-CABLE via LABSN)
+        uses: LABSN/sound-ci-helpers@v1
 
       - name: Verify audio devices
         shell: pwsh
