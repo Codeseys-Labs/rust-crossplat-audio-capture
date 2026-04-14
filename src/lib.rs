@@ -20,6 +20,12 @@ pub use crate::core::interface::{AudioDevice, CapturingStream, DeviceEnumerator,
 // Audio module re-exports
 pub use crate::audio::get_device_enumerator;
 
+// Introspection helpers (cross-platform source discovery)
+pub use crate::core::introspection::{
+    list_audio_applications, list_audio_sources, check_audio_capture_permission,
+    AudioSource, AudioSourceKind, PermissionStatus, StreamStats,
+};
+
 // API types
 pub use crate::api::{AudioCapture, AudioCaptureBuilder};
 

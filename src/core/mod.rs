@@ -12,6 +12,7 @@ pub mod capabilities;
 pub mod config;
 pub mod error;
 pub mod interface;
+pub mod introspection;
 pub mod processing;
 
 // ── Re-exports ───────────────────────────────────────────────────────────
