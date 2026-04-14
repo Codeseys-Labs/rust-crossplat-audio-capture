@@ -49,9 +49,8 @@ const KAUDIO_OBJECT_PROPERTY_ELEMENT_MAIN: u32 = 0;
 type AudioDeviceID = AudioObjectID;
 
 // ── ObjC imports for application enumeration ─────────────────────────────
-use cocoa::base::{id, nil};
-use cocoa::foundation::{NSArray, NSString};
-use objc::{class, msg_send, sel, sel_impl};
+use objc2_app_kit::{NSRunningApplication, NSWorkspace};
+use objc2_foundation::NSArray;
 
 use std::time::Duration;
 
@@ -80,69 +79,33 @@ pub struct ApplicationInfo {
 pub fn enumerate_audio_applications() -> AudioResult<Vec<ApplicationInfo>> {
     let mut app_infos: Vec<ApplicationInfo> = Vec::new();
 
-    unsafe {
-        let workspace_class = class!(NSWorkspace);
-        let shared_workspace: id = msg_send![workspace_class, sharedWorkspace];
-        let running_apps_nsarray: id = msg_send![shared_workspace, runningApplications];
+    let shared_workspace = NSWorkspace::sharedWorkspace();
+    let running_apps: objc2::rc::Retained<NSArray<NSRunningApplication>> =
+        shared_workspace.runningApplications();
+    let count = running_apps.count();
 
-        if running_apps_nsarray == nil {
-            return Err(AudioError::BackendError {
-                backend: "CoreAudio".to_string(),
-                operation: "enumerate_applications".to_string(),
-                message: "Failed to get running applications array from NSWorkspace".to_string(),
-                context: None,
-            });
-        }
+    for i in 0..count {
+        let app = running_apps.objectAtIndex(i);
+        let pid = app.processIdentifier();
 
-        let count: usize = msg_send![running_apps_nsarray, count];
+        let name_str = match app.localizedName() {
+            Some(ns) => format!("{ns}"),
+            None => String::from("<Unknown Name>"),
+        };
 
-        for i in 0..count {
-            let app: id = msg_send![running_apps_nsarray, objectAtIndex: i];
-            if app == nil {
-                continue;
+        let bundle_id: Option<String> = match app.bundleIdentifier() {
+            Some(ns) => {
+                let s = format!("{ns}");
+                if s.is_empty() { None } else { Some(s) }
             }
+            None => None,
+        };
 
-            let pid: i32 = msg_send![app, processIdentifier];
-
-            let name_nsstring: id = msg_send![app, localizedName];
-            let name_str: String = if name_nsstring != nil {
-                let c_str_ptr = NSString::UTF8String(name_nsstring);
-                if !c_str_ptr.is_null() {
-                    std::ffi::CStr::from_ptr(c_str_ptr)
-                        .to_string_lossy()
-                        .into_owned()
-                } else {
-                    String::from("<Invalid Name>")
-                }
-            } else {
-                String::from("<Unknown Name>")
-            };
-
-            let bundle_id_nsstring: id = msg_send![app, bundleIdentifier];
-            let bundle_id: Option<String> = if bundle_id_nsstring != nil {
-                let c_str_ptr = NSString::UTF8String(bundle_id_nsstring);
-                if !c_str_ptr.is_null() {
-                    let s = std::ffi::CStr::from_ptr(c_str_ptr)
-                        .to_string_lossy()
-                        .into_owned();
-                    if s.is_empty() {
-                        None
-                    } else {
-                        Some(s)
-                    }
-                } else {
-                    None
-                }
-            } else {
-                None
-            };
-
-            app_infos.push(ApplicationInfo {
-                process_id: pid as u32,
-                name: name_str,
-                bundle_id,
-            });
-        }
+        app_infos.push(ApplicationInfo {
+            process_id: pid as u32,
+            name: name_str,
+            bundle_id,
+        });
     }
 
     Ok(app_infos)

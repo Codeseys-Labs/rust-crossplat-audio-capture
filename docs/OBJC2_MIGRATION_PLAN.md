@@ -1,6 +1,6 @@
 # `cocoa`/`objc` → `objc2` Migration Plan
 
-> **Status:** Planned (Phase 5 remaining work)  
+> **Status:** Phase 1 complete (`coreaudio.rs` migrated), Phase 2 planned (`tap.rs`)  
 > **Estimated effort:** 18–28 hours  
 > **Branch:** `feat/objc2-migration` (to be created)
 

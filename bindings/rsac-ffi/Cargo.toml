@@ -1,0 +1,26 @@
+[package]
+name = "rsac-ffi"
+version = "0.1.0"
+edition = "2021"
+description = "C FFI bindings for the rsac (Rust Cross-Platform Audio Capture) library"
+license = "MIT OR Apache-2.0"
+publish = false
+
+[lib]
+name = "rsac_ffi"
+crate-type = ["cdylib", "staticlib"]
+
+[features]
+default = []
+# Mirror rsac's platform features so consumers can control backend compilation
+feat_windows = ["rsac/feat_windows"]
+feat_linux = ["rsac/feat_linux"]
+feat_macos = ["rsac/feat_macos"]
+sink-wav = ["rsac/sink-wav"]
+
+[dependencies]
+rsac = { path = "../../", default-features = false }
+log = "0.4"
+
+[build-dependencies]
+cbindgen = "0.28"

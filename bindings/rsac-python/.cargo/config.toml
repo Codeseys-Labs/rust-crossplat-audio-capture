@@ -1,0 +1,4 @@
+[env]
+# Allow building with Python 3.14+ (newer than PyO3's max tested version)
+# This uses the stable ABI, which is forward-compatible.
+PYO3_USE_ABI3_FORWARD_COMPATIBILITY = "1"

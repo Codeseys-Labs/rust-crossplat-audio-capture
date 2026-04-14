@@ -1,0 +1,21 @@
+[package]
+name = "rsac-python"
+version = "0.1.0"
+edition = "2021"
+description = "Python bindings for rsac (Rust Cross-Platform Audio Capture)"
+license = "MIT OR Apache-2.0"
+readme = "README.md"
+publish = false
+
+[lib]
+name = "_rsac"
+crate-type = ["cdylib"]
+
+[dependencies]
+pyo3 = { version = "0.24", features = ["extension-module"] }
+
+# Path dependency to the rsac library crate
+[dependencies.rsac]
+path = "../.."
+default-features = false
+features = ["feat_macos"]
