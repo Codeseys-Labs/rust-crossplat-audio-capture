@@ -149,12 +149,15 @@ src/
 │   ├── error.rs            # AudioError (21 variants), ErrorKind, Recoverability,
 │   │                       #   BackendContext
 │   ├── interface.rs        # CapturingStream, AudioDevice, DeviceEnumerator traits
+│   ├── introspection.rs    # Cross-platform source discovery, permission checks,
+│   │                       #   CaptureTarget convenience constructors
 │   └── processing.rs       # Audio processing traits
 ├── bridge/                 # Ring buffer bridge (data plane)
 │   ├── mod.rs              # Re-exports + integration tests
 │   ├── state.rs            # AtomicStreamState, StreamState enum
 │   ├── ring_buffer.rs      # BridgeProducer, BridgeConsumer, BridgeShared, create_bridge()
-│   └── stream.rs           # BridgeStream<S>, PlatformStream trait
+│   ├── stream.rs           # BridgeStream<S>, PlatformStream trait
+│   └── mock.rs             # Mock audio backend (440Hz sine wave, test-utils feature)
 ├── sink/                   # Sink adapters for audio data
 │   ├── mod.rs              # Re-exports
 │   ├── traits.rs           # AudioSink trait
@@ -193,7 +196,19 @@ src/
 ### Supporting directories
 
 ```
-docs/architecture/          # Canonical architecture documents (source of truth)
+bindings/
+├── rsac-ffi/               # C FFI layer (45 extern "C" functions, cdylib + staticlib)
+├── rsac-python/            # Python bindings (PyO3 + maturin)
+├── rsac-napi/              # Node.js/TypeScript bindings (napi-rs)
+└── rsac-go/                # Go bindings (CGo over C FFI)
+apps/
+└── audio-graph/            # Tauri v2 desktop app (submodule — Codeseys-Labs/audio-graph)
+docs/
+├── architecture/           # Canonical architecture documents (source of truth)
+├── OBJC2_MIGRATION_PLAN.md # objc2 migration plan (completed)
+├── CROSS_LANGUAGE_BINDINGS.md # Cross-language binding research + design
+├── LOCAL_TESTING_GUIDE.md
+└── MACOS_VERSION_COMPATIBILITY.md
 examples/                   # Example programs (basic_capture, record_to_file, list_devices, etc.)
 tests/                      # Integration tests
 reference/                  # Reference repos + analysis (REFERENCE_ANALYSIS.md)
@@ -307,6 +322,8 @@ All three platforms are verified:
 | **Linux** | ✅ CI (PipeWire) | 258 platform-independent unit tests pass |
 | **Windows** | ✅ Real hardware | WASAPI capture tested with all capture modes |
 | **macOS** | ✅ Real hardware (macOS 26 Tahoe) | 289 unit tests + 12 integration tests pass |
+
+**Latest local test run (macOS 26.4):** 298 unit tests + 18 integration tests = **316 total, 0 failures**.
 
 - Docker-based testing available for cross-platform validation (see `docker/`)
 - macOS backend includes compatibility with macOS 14.4–15 (Sonoma/Sequoia) and macOS 26 (Tahoe) via 3-path API fallback. See [macOS Version Compatibility](docs/MACOS_VERSION_COMPATIBILITY.md).
@@ -424,17 +441,17 @@ This project uses [Task Master](https://github.com/task-master-ai/task-master-ai
 |---|---|
 | **Windows** | `wasapi`, `windows`, `windows-core`, `widestring`, `sysinfo` |
 | **Linux** | `pipewire`, `libspa`, `libspa-sys` |
-| **macOS** | `coreaudio-rs`, `coreaudio-sys`, `objc2-core-audio`, `objc2-core-audio-types`, `objc2-core-foundation`, `core-foundation`, `core-foundation-sys`, `cocoa`, `objc` |
+| **macOS** | `coreaudio-rs`, `coreaudio-sys`, `objc2`, `objc2-foundation`, `objc2-app-kit`, `core-foundation`, `core-foundation-sys`, `sysinfo` |
 
-### 9.1 `cocoa`/`objc` → `objc2` Migration
+### 9.1 `cocoa`/`objc` → `objc2` Migration (COMPLETE ✅)
 
-The `cocoa` (0.26.1) and `objc` (0.2.7) crates are **deprecated**. `cocoa`'s docs.rs explicitly says *"deprecated in favour of the objc2 crates"*; `objc` hasn't had a release since 2019 and the repo (`SSheldon/rust-objc`) is archived. The successor is `objc2` (v0.6.4, actively maintained).
+The `cocoa` (0.26.1) and `objc` (0.2.7) crates were **deprecated** and have been fully replaced by `objc2` (v0.6). Both crates are removed from `Cargo.toml`. See [`docs/OBJC2_MIGRATION_PLAN.md`](docs/OBJC2_MIGRATION_PLAN.md) for the full migration plan.
 
-**Affected files:** [`src/audio/macos/tap.rs`](src/audio/macos/tap.rs) (~65 `msg_send!` callsites, `NSAutoreleasePool`, `NSString`, `Class::get()`) and [`src/audio/macos/coreaudio.rs`](src/audio/macos/coreaudio.rs) (~12 callsites for `NSWorkspace` application enumeration). Total: ~75-80 callsites across 2 files.
+**Phase 1** (coreaudio.rs): 12 callsites migrated to typed `objc2-app-kit` APIs (`NSWorkspace::sharedWorkspace()`, `.runningApplications()`, etc.). 50% code reduction, all `unsafe` blocks removed.
 
-**Key migration challenge:** `CATapDescription` is a **private CoreAudio class** not in any `objc2` framework crate. All its selectors (`initStereoMixdownOfProcesses:`, `setProcesses:exclusive:`, etc.) are discovered at runtime via `respondsToSelector:`. A migration to `objc2` would still require raw `msg_send!` for `CATapDescription` — the safety benefit of typed bindings doesn't apply to this code.
+**Phase 2** (tap.rs): ~65 callsites migrated. `CATapDescription` remains raw `objc2::msg_send!` (private class not in any framework crate). Foundation classes (`NSUUID`, `NSArray`, `NSNumber`, `NSString`, `NSAutoreleasePool`) migrated to typed `objc2-foundation` APIs. `YES`/`NO` → `true`/`false`, `id` → `*mut AnyObject`, `Class::get()` → `AnyClass::get(c"...")`.
 
-**Estimated effort:** 18-27 hours. Recommended approach: migrate `coreaudio.rs` first (simpler, ~12 sites), then `tap.rs` (~65 sites). Keep `core-foundation`/`core-foundation-sys` as-is (still maintained by Servo).
+**Key fix discovered during testing:** `setMuteBehavior:` selector expects `i64` (ObjC type code `'q'`), not `i32`. The old `objc` crate silently accepted the wrong type; `objc2` validates argument types at runtime and caught this bug.
 
 ---
 
