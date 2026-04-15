@@ -426,11 +426,13 @@ fn parse_ppid_from_stat(stat_contents: &str) -> Option<u32> {
 // ── pw-dump Node Lookup ──────────────────────────────────────────────────
 
 /// Specifies how to look up a PipeWire node via `pw-dump`.
+#[allow(clippy::enum_variant_names)] // By* prefix is intentional — describes lookup strategy
 enum PwNodeLookup<'a> {
     /// Match by application name (case-insensitive against `application.name`
     /// or `application.process.binary`).
     ByAppName(&'a str),
     /// Match by process ID (exact match against `application.process.id`).
+    #[allow(dead_code)] // API surface for future single-PID lookup; currently ByPidSet is used
     ByPid(u32),
     /// Match by any PID in a set (for process tree capture).
     /// Searches for the first audio output node whose `application.process.id`
