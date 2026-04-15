@@ -243,9 +243,7 @@ impl Default for MockDeviceEnumerator {
 impl DeviceEnumerator for MockDeviceEnumerator {
     fn enumerate_devices(&self) -> AudioResult<Vec<Box<dyn AudioDevice>>> {
         Ok(vec![
-            Box::new(
-                MockAudioDevice::new("Mock Output (Stereo)").with_frequency(self.frequency),
-            ),
+            Box::new(MockAudioDevice::new("Mock Output (Stereo)").with_frequency(self.frequency)),
             Box::new(MockAudioDevice {
                 id: DeviceId("mock-device-1".to_string()),
                 name: "Mock Input (Mono)".to_string(),

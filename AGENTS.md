@@ -385,6 +385,13 @@ This project uses [Task Master](https://github.com/task-master-ai/task-master-ai
   - Runtime macOS version detection via sysctl in [`PlatformCapabilities::macos()`](src/core/capabilities.rs:113)
   - Comprehensive docs: [macOS Version Compatibility](docs/MACOS_VERSION_COMPATIBILITY.md), [macOS 26 Process Tap Fix](docs/MACOS26_PROCESS_TAP_FIX.md)
 
+**Recently completed:**
+- ✅ **`cocoa`/`objc` → `objc2` migration** — Phase 1 (coreaudio.rs, 12 sites) + Phase 2 (tap.rs, ~65 sites) complete. `cocoa` and `objc` crates fully removed from dependencies. See §9.1.
+- ✅ **Cross-language bindings** — C FFI (`bindings/rsac-ffi/`, 45 functions), Python (`bindings/rsac-python/`, PyO3), Node.js/TS (`bindings/rsac-napi/`, napi-rs), Go (`bindings/rsac-go/`, CGo). All compile.
+- ✅ **Cross-platform introspection module** — `src/core/introspection.rs`: `list_audio_sources()`, `list_audio_applications()`, `CaptureTarget::app()`/`pid()`/`device()` convenience constructors, `check_audio_capture_permission()`.
+- ✅ **Mock audio backend** — `src/bridge/mock.rs`: synthetic 440Hz sine wave through real BridgeStream pipeline, 6 unit tests.
+- ✅ **Audio-graph migrated** to use `rsac::list_audio_sources()` — replaced ~120 lines of per-platform `#[cfg]` code.
+
 **Remaining:**
 - Async stream support (behind `async-stream` feature, foundation in place via `atomic-waker`)
 - Additional sink adapters
@@ -394,7 +401,6 @@ This project uses [Task Master](https://github.com/task-master-ai/task-master-ai
 - **`ApplicationByName` integration tests** — the only `CaptureTarget` variant with zero test coverage
 - **Harden non-silence assertions** — all capture tests use soft warnings; Linux tests should hard-assert since PipeWire null sink is deterministic
 - **`subscribe()` and `overrun_count()` integration tests** — G7/G8 features have no integration coverage
-- **Migrate `cocoa`/`objc` → `objc2`** — see §9.1 below for details
 - **Blacksmith Windows audio support** — request Blacksmith add audio subsystem to Windows Server images (see §6 runner labels)
 
 ---

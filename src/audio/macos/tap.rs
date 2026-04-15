@@ -195,7 +195,7 @@ impl CoreAudioProcessTap {
 
             // 10. Get default output device UID
             let output_uid = get_default_output_device_uid()?;
-            log::debug!("Default output device UID: {}", output_uid.to_string());
+            log::debug!("Default output device UID: {}", output_uid);
 
             // 11. Build aggregate device dictionary
             let agg_dict = build_aggregate_device_dict(&output_uid, &tap_uuid_str, target_pid)?;
@@ -354,7 +354,7 @@ impl CoreAudioProcessTap {
 
             // Get default output device UID
             let output_uid = get_default_output_device_uid()?;
-            log::debug!("Default output device UID: {}", output_uid.to_string());
+            log::debug!("Default output device UID: {}", output_uid);
 
             // Build aggregate device dictionary
             let agg_dict = build_aggregate_device_dict(&output_uid, &tap_uuid_str, parent_pid)?;
@@ -504,7 +504,7 @@ impl CoreAudioProcessTap {
 
             // Get default output device UID
             let output_uid = get_default_output_device_uid()?;
-            log::debug!("Default output device UID: {}", output_uid.to_string());
+            log::debug!("Default output device UID: {}", output_uid);
 
             // Build aggregate device dictionary (pid=0 sentinel for system-wide)
             let agg_dict = build_aggregate_device_dict(&output_uid, &tap_uuid_str, 0)?;

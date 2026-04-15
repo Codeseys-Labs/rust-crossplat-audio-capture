@@ -7,9 +7,7 @@
 extern crate napi_derive;
 
 use napi::bindgen_prelude::*;
-use napi::threadsafe_function::{
-    ErrorStrategy, ThreadsafeFunction, ThreadsafeFunctionCallMode,
-};
+use napi::threadsafe_function::{ErrorStrategy, ThreadsafeFunction, ThreadsafeFunctionCallMode};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 
@@ -27,10 +25,7 @@ fn audio_err_to_napi(e: rsac::AudioError) -> napi::Error {
         rsac::ErrorKind::Platform => "ERR_RSAC_PLATFORM",
         rsac::ErrorKind::Internal => "ERR_RSAC_INTERNAL",
     };
-    napi::Error::new(
-        napi::Status::GenericFailure,
-        format!("[{}] {}", code, e),
-    )
+    napi::Error::new(napi::Status::GenericFailure, format!("[{}] {}", code, e))
 }
 
 // ── AudioChunk (JS-facing audio buffer representation) ───────────────────
@@ -216,8 +211,7 @@ impl AudioCapture {
         channels: Option<u32>,
         buffer_size: Option<u32>,
     ) -> Result<Self> {
-        let mut builder = rsac::AudioCaptureBuilder::new()
-            .with_target(target.inner.clone());
+        let mut builder = rsac::AudioCaptureBuilder::new().with_target(target.inner.clone());
 
         if let Some(sr) = sample_rate {
             builder = builder.sample_rate(sr);
@@ -247,7 +241,10 @@ impl AudioCapture {
     pub fn start(&self) -> Result<()> {
         {
             let mut inner = self.inner.lock().map_err(|e| {
-                napi::Error::new(napi::Status::GenericFailure, format!("Lock poisoned: {}", e))
+                napi::Error::new(
+                    napi::Status::GenericFailure,
+                    format!("Lock poisoned: {}", e),
+                )
             })?;
             inner.start().map_err(audio_err_to_napi)?;
         }
@@ -255,7 +252,10 @@ impl AudioCapture {
         // If a callback is registered, start the data pump thread
         let has_callback = {
             let cb = self.callback.lock().map_err(|e| {
-                napi::Error::new(napi::Status::GenericFailure, format!("Lock poisoned: {}", e))
+                napi::Error::new(
+                    napi::Status::GenericFailure,
+                    format!("Lock poisoned: {}", e),
+                )
             })?;
             cb.is_some()
         };
@@ -277,7 +277,10 @@ impl AudioCapture {
         self.pump_active.store(false, Ordering::SeqCst);
 
         let mut inner = self.inner.lock().map_err(|e| {
-            napi::Error::new(napi::Status::GenericFailure, format!("Lock poisoned: {}", e))
+            napi::Error::new(
+                napi::Status::GenericFailure,
+                format!("Lock poisoned: {}", e),
+            )
         })?;
 
         inner.stop().map_err(audio_err_to_napi)?;
@@ -288,7 +291,10 @@ impl AudioCapture {
     #[napi(getter)]
     pub fn is_running(&self) -> Result<bool> {
         let inner = self.inner.lock().map_err(|e| {
-            napi::Error::new(napi::Status::GenericFailure, format!("Lock poisoned: {}", e))
+            napi::Error::new(
+                napi::Status::GenericFailure,
+                format!("Lock poisoned: {}", e),
+            )
         })?;
         Ok(inner.is_running())
     }
@@ -300,7 +306,10 @@ impl AudioCapture {
     #[napi]
     pub fn read(&self) -> Result<Option<AudioChunk>> {
         let mut inner = self.inner.lock().map_err(|e| {
-            napi::Error::new(napi::Status::GenericFailure, format!("Lock poisoned: {}", e))
+            napi::Error::new(
+                napi::Status::GenericFailure,
+                format!("Lock poisoned: {}", e),
+            )
         })?;
 
         let result = inner.read_buffer().map_err(audio_err_to_napi)?;
@@ -315,7 +324,10 @@ impl AudioCapture {
     #[napi]
     pub fn read_blocking(&self) -> Result<AudioChunk> {
         let mut inner = self.inner.lock().map_err(|e| {
-            napi::Error::new(napi::Status::GenericFailure, format!("Lock poisoned: {}", e))
+            napi::Error::new(
+                napi::Status::GenericFailure,
+                format!("Lock poisoned: {}", e),
+            )
         })?;
 
         let result = inner.read_buffer_blocking().map_err(audio_err_to_napi)?;
@@ -359,23 +371,22 @@ impl AudioCapture {
     pub async fn read_blocking_async(&self) -> Result<AudioChunk> {
         let inner = self.inner.clone();
 
-        let result =
-            tokio::task::spawn_blocking(move || -> napi::Result<rsac::AudioBuffer> {
-                let mut capture = inner.lock().map_err(|e| {
-                    napi::Error::new(
-                        napi::Status::GenericFailure,
-                        format!("Lock poisoned: {}", e),
-                    )
-                })?;
-                capture.read_buffer_blocking().map_err(audio_err_to_napi)
-            })
-            .await
-            .map_err(|e| {
+        let result = tokio::task::spawn_blocking(move || -> napi::Result<rsac::AudioBuffer> {
+            let mut capture = inner.lock().map_err(|e| {
                 napi::Error::new(
                     napi::Status::GenericFailure,
-                    format!("Task join error: {}", e),
+                    format!("Lock poisoned: {}", e),
                 )
-            })??;
+            })?;
+            capture.read_buffer_blocking().map_err(audio_err_to_napi)
+        })
+        .await
+        .map_err(|e| {
+            napi::Error::new(
+                napi::Status::GenericFailure,
+                format!("Task join error: {}", e),
+            )
+        })??;
 
         Ok(AudioChunk::from_rsac_buffer(&result))
     }
@@ -400,7 +411,10 @@ impl AudioCapture {
         // Store the callback
         {
             let mut cb_guard = self.callback.lock().map_err(|e| {
-                napi::Error::new(napi::Status::GenericFailure, format!("Lock poisoned: {}", e))
+                napi::Error::new(
+                    napi::Status::GenericFailure,
+                    format!("Lock poisoned: {}", e),
+                )
             })?;
             *cb_guard = Some(callback);
         }
@@ -408,7 +422,10 @@ impl AudioCapture {
         // If already running, start the data pump now
         let is_running = {
             let inner = self.inner.lock().map_err(|e| {
-                napi::Error::new(napi::Status::GenericFailure, format!("Lock poisoned: {}", e))
+                napi::Error::new(
+                    napi::Status::GenericFailure,
+                    format!("Lock poisoned: {}", e),
+                )
             })?;
             inner.is_running()
         };
@@ -428,7 +445,10 @@ impl AudioCapture {
         self.pump_active.store(false, Ordering::SeqCst);
 
         let mut cb_guard = self.callback.lock().map_err(|e| {
-            napi::Error::new(napi::Status::GenericFailure, format!("Lock poisoned: {}", e))
+            napi::Error::new(
+                napi::Status::GenericFailure,
+                format!("Lock poisoned: {}", e),
+            )
         })?;
         *cb_guard = None;
         Ok(())
@@ -441,7 +461,10 @@ impl AudioCapture {
     #[napi(getter)]
     pub fn overrun_count(&self) -> Result<u32> {
         let inner = self.inner.lock().map_err(|e| {
-            napi::Error::new(napi::Status::GenericFailure, format!("Lock poisoned: {}", e))
+            napi::Error::new(
+                napi::Status::GenericFailure,
+                format!("Lock poisoned: {}", e),
+            )
         })?;
         Ok(inner.overrun_count() as u32)
     }

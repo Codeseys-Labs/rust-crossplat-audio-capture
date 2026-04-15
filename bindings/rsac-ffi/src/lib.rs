@@ -101,13 +101,10 @@ fn map_rsac_error(err: &rsac::AudioError) -> rsac_error_t {
         AudioError::BackendError { .. }
         | AudioError::BackendNotAvailable { .. }
         | AudioError::BackendInitializationFailed { .. } => rsac_error_t::RSAC_ERROR_BACKEND,
-        AudioError::ApplicationNotFound { .. }
-        | AudioError::ApplicationCaptureFailed { .. } => {
+        AudioError::ApplicationNotFound { .. } | AudioError::ApplicationCaptureFailed { .. } => {
             rsac_error_t::RSAC_ERROR_APPLICATION_NOT_FOUND
         }
-        AudioError::PlatformNotSupported { .. } => {
-            rsac_error_t::RSAC_ERROR_PLATFORM_NOT_SUPPORTED
-        }
+        AudioError::PlatformNotSupported { .. } => rsac_error_t::RSAC_ERROR_PLATFORM_NOT_SUPPORTED,
         AudioError::PermissionDenied { .. } => rsac_error_t::RSAC_ERROR_PERMISSION_DENIED,
         AudioError::Timeout { .. } => rsac_error_t::RSAC_ERROR_TIMEOUT,
         AudioError::InternalError { .. } => rsac_error_t::RSAC_ERROR_INTERNAL,
@@ -271,9 +268,7 @@ pub unsafe extern "C" fn rsac_builder_free(builder: *mut RsacBuilder) {
 
 /// Sets the capture target to system default audio.
 #[no_mangle]
-pub unsafe extern "C" fn rsac_builder_set_target_system(
-    builder: *mut RsacBuilder,
-) -> rsac_error_t {
+pub unsafe extern "C" fn rsac_builder_set_target_system(builder: *mut RsacBuilder) -> rsac_error_t {
     catch(|| {
         if builder.is_null() {
             set_last_error("builder is null");
@@ -370,9 +365,12 @@ pub unsafe extern "C" fn rsac_builder_set_target_app_by_id(
             }
         };
         let b = unsafe { &mut *builder };
-        b.inner = b.inner.clone().with_target(CaptureTarget::Application(
-            ApplicationId(id_str.to_string()),
-        ));
+        b.inner = b
+            .inner
+            .clone()
+            .with_target(CaptureTarget::Application(ApplicationId(
+                id_str.to_string(),
+            )));
         rsac_error_t::RSAC_OK
     })
 }
@@ -505,7 +503,11 @@ pub unsafe extern "C" fn rsac_capture_is_running(capture: *const RsacCapture) ->
         return -1;
     }
     let c = unsafe { &*capture };
-    if c.inner.is_running() { 1 } else { 0 }
+    if c.inner.is_running() {
+        1
+    } else {
+        0
+    }
 }
 
 /// Returns the number of ring buffer overruns (dropped buffers).
@@ -923,7 +925,11 @@ pub unsafe extern "C" fn rsac_device_is_default(device: *const RsacDevice) -> i3
         return -1;
     }
     let d = unsafe { &*device };
-    if d.inner.is_default() { 1 } else { 0 }
+    if d.inner.is_default() {
+        1
+    } else {
+        0
+    }
 }
 
 /// Frees a device handle. No-op if null.
@@ -980,9 +986,7 @@ impl rsac::AudioDevice for DeviceSnapshot {
 /// On success, `*out` receives a capabilities handle. Must be freed with
 /// `rsac_capabilities_free()`.
 #[no_mangle]
-pub unsafe extern "C" fn rsac_capabilities_query(
-    out: *mut *mut RsacCapabilities,
-) -> rsac_error_t {
+pub unsafe extern "C" fn rsac_capabilities_query(out: *mut *mut RsacCapabilities) -> rsac_error_t {
     catch(|| {
         if out.is_null() {
             set_last_error("out pointer is null");
@@ -1013,7 +1017,11 @@ pub unsafe extern "C" fn rsac_capabilities_supports_system_capture(
         return -1;
     }
     let c = unsafe { &*caps };
-    if c.inner.supports_system_capture { 1 } else { 0 }
+    if c.inner.supports_system_capture {
+        1
+    } else {
+        0
+    }
 }
 
 /// Returns 1 if application capture is supported, 0 otherwise.

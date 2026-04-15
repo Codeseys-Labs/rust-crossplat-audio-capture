@@ -159,7 +159,7 @@ fn configure_macos_build() {
             println!("cargo:warning=Building for macOS {}", version_str);
 
             // Parse version to check if it's >= 14.4
-            if let Some((major, minor)) = parse_macos_version(&version_str) {
+            if let Some((major, minor)) = parse_macos_version(version_str) {
                 if major < 14 || (major == 14 && minor < 4) {
                     println!(
                         "cargo:warning=Process Tap APIs require macOS 14.4+, current: {}",

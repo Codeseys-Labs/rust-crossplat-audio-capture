@@ -40,10 +40,7 @@ pub enum AudioSourceKind {
     /// System default audio mix.
     SystemDefault,
     /// A specific audio device (input or output).
-    Device {
-        device_id: String,
-        is_default: bool,
-    },
+    Device { device_id: String, is_default: bool },
     /// An application producing audio.
     Application {
         pid: u32,
@@ -60,9 +57,7 @@ impl AudioSource {
             AudioSourceKind::Device { device_id, .. } => {
                 CaptureTarget::Device(DeviceId(device_id.clone()))
             }
-            AudioSourceKind::Application { pid, .. } => {
-                CaptureTarget::ProcessTree(ProcessId(*pid))
-            }
+            AudioSourceKind::Application { pid, .. } => CaptureTarget::ProcessTree(ProcessId(*pid)),
         }
     }
 }
@@ -204,7 +199,8 @@ fn list_audio_applications_into(sources: &mut Vec<AudioSource>) {
             if let Ok(json_str) = String::from_utf8(output.stdout) {
                 if let Ok(nodes) = serde_json::from_str::<Vec<serde_json::Value>>(&json_str) {
                     for node in &nodes {
-                        if node.get("type").and_then(|t| t.as_str()) != Some("PipeWire:Interface:Node")
+                        if node.get("type").and_then(|t| t.as_str())
+                            != Some("PipeWire:Interface:Node")
                         {
                             continue;
                         }
@@ -359,7 +355,9 @@ mod tests {
     #[test]
     fn test_list_audio_sources_includes_system_default() {
         let sources = list_audio_sources().unwrap();
-        assert!(sources.iter().any(|s| s.kind == AudioSourceKind::SystemDefault));
+        assert!(sources
+            .iter()
+            .any(|s| s.kind == AudioSourceKind::SystemDefault));
         assert!(sources.iter().any(|s| s.id == "system-default"));
     }
 }

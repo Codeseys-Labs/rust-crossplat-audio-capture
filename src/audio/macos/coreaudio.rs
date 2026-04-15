@@ -12,10 +12,9 @@
 #![cfg(target_os = "macos")]
 
 // ── New API imports ──────────────────────────────────────────────────────
-use crate::core::buffer::AudioBuffer;
-use crate::core::config::{AudioFormat, CaptureTarget, DeviceId, SampleFormat, StreamConfig};
+use crate::core::config::{AudioFormat, DeviceId, SampleFormat, StreamConfig};
 use crate::core::error::{AudioError, AudioResult};
-use crate::core::interface::{AudioDevice, CapturingStream, DeviceEnumerator, DeviceKind};
+use crate::core::interface::{AudioDevice, CapturingStream, DeviceEnumerator};
 
 // ── Bridge imports ───────────────────────────────────────────────────────
 use crate::bridge::state::StreamState;
@@ -96,7 +95,11 @@ pub fn enumerate_audio_applications() -> AudioResult<Vec<ApplicationInfo>> {
         let bundle_id: Option<String> = match app.bundleIdentifier() {
             Some(ns) => {
                 let s = format!("{ns}");
-                if s.is_empty() { None } else { Some(s) }
+                if s.is_empty() {
+                    None
+                } else {
+                    Some(s)
+                }
             }
             None => None,
         };
@@ -417,7 +420,7 @@ pub(crate) fn audio_format_to_asbd(format: &AudioFormat) -> AudioStreamBasicDesc
 #[cfg(all(test, target_os = "macos"))]
 mod tests {
     use super::*;
-    use crate::core::config::{AudioFormat, SampleFormat, StreamConfig};
+    use crate::core::config::{AudioFormat, CaptureTarget, SampleFormat, StreamConfig};
     use crate::core::interface::{AudioDevice, DeviceEnumerator};
 
     // ── Helper function tests: asbd_to_audio_format ──────────────────

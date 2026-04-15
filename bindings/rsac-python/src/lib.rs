@@ -33,10 +33,7 @@ fn create_exception_classes(m: &Bound<'_, PyModule>) -> PyResult<()> {
     //     ├── ApplicationNotFoundError(RsacError)
     //     └── TimeoutError(RsacError, TimeoutError)
 
-    m.add(
-        "RsacError",
-        m.py().get_type::<RsacError>(),
-    )?;
+    m.add("RsacError", m.py().get_type::<RsacError>())?;
     m.add(
         "DeviceNotFoundError",
         m.py().get_type::<DeviceNotFoundError>(),
@@ -49,10 +46,7 @@ fn create_exception_classes(m: &Bound<'_, PyModule>) -> PyResult<()> {
         "PlatformNotSupportedError",
         m.py().get_type::<PlatformNotSupportedError>(),
     )?;
-    m.add(
-        "StreamError",
-        m.py().get_type::<StreamError>(),
-    )?;
+    m.add("StreamError", m.py().get_type::<StreamError>())?;
     m.add(
         "ConfigurationError",
         m.py().get_type::<ConfigurationError>(),
@@ -69,23 +63,70 @@ fn create_exception_classes(m: &Bound<'_, PyModule>) -> PyResult<()> {
         "CaptureTimeoutError",
         m.py().get_type::<CaptureTimeoutError>(),
     )?;
-    m.add(
-        "BackendError",
-        m.py().get_type::<BackendError>(),
-    )?;
+    m.add("BackendError", m.py().get_type::<BackendError>())?;
     Ok(())
 }
 
-pyo3::create_exception!(_rsac, RsacError, PyOSError, "Base exception for all rsac errors.");
-pyo3::create_exception!(_rsac, DeviceNotFoundError, RsacError, "The requested audio device was not found.");
-pyo3::create_exception!(_rsac, DeviceNotAvailableError, RsacError, "The audio device exists but is not currently available.");
-pyo3::create_exception!(_rsac, PlatformNotSupportedError, RsacError, "The requested feature is not supported on this platform.");
-pyo3::create_exception!(_rsac, StreamError, RsacError, "An error occurred during audio stream operation.");
-pyo3::create_exception!(_rsac, ConfigurationError, PyValueError, "Invalid capture configuration.");
-pyo3::create_exception!(_rsac, PermissionDeniedError, RsacError, "Permission denied for the requested audio operation.");
-pyo3::create_exception!(_rsac, ApplicationNotFoundError, RsacError, "The target application for capture was not found.");
-pyo3::create_exception!(_rsac, CaptureTimeoutError, RsacError, "An audio capture operation timed out.");
-pyo3::create_exception!(_rsac, BackendError, RsacError, "A platform-specific audio backend error occurred.");
+pyo3::create_exception!(
+    _rsac,
+    RsacError,
+    PyOSError,
+    "Base exception for all rsac errors."
+);
+pyo3::create_exception!(
+    _rsac,
+    DeviceNotFoundError,
+    RsacError,
+    "The requested audio device was not found."
+);
+pyo3::create_exception!(
+    _rsac,
+    DeviceNotAvailableError,
+    RsacError,
+    "The audio device exists but is not currently available."
+);
+pyo3::create_exception!(
+    _rsac,
+    PlatformNotSupportedError,
+    RsacError,
+    "The requested feature is not supported on this platform."
+);
+pyo3::create_exception!(
+    _rsac,
+    StreamError,
+    RsacError,
+    "An error occurred during audio stream operation."
+);
+pyo3::create_exception!(
+    _rsac,
+    ConfigurationError,
+    PyValueError,
+    "Invalid capture configuration."
+);
+pyo3::create_exception!(
+    _rsac,
+    PermissionDeniedError,
+    RsacError,
+    "Permission denied for the requested audio operation."
+);
+pyo3::create_exception!(
+    _rsac,
+    ApplicationNotFoundError,
+    RsacError,
+    "The target application for capture was not found."
+);
+pyo3::create_exception!(
+    _rsac,
+    CaptureTimeoutError,
+    RsacError,
+    "An audio capture operation timed out."
+);
+pyo3::create_exception!(
+    _rsac,
+    BackendError,
+    RsacError,
+    "A platform-specific audio backend error occurred."
+);
 
 /// Convert an rsac AudioError into the appropriate Python exception.
 fn audio_error_to_pyerr(err: rsac::AudioError) -> PyErr {
@@ -115,9 +156,7 @@ fn audio_error_to_pyerr(err: rsac::AudioError) -> PyErr {
             ApplicationNotFoundError::new_err(msg)
         }
 
-        rsac::AudioError::PlatformNotSupported { .. } => {
-            PlatformNotSupportedError::new_err(msg)
-        }
+        rsac::AudioError::PlatformNotSupported { .. } => PlatformNotSupportedError::new_err(msg),
         rsac::AudioError::PermissionDenied { .. } => PermissionDeniedError::new_err(msg),
 
         rsac::AudioError::Timeout { .. } => CaptureTimeoutError::new_err(msg),
@@ -276,9 +315,8 @@ impl PyAudioBuffer {
     fn to_bytes<'py>(&self, py: Python<'py>) -> Bound<'py, PyBytes> {
         let data = self.inner.data();
         // Safety: reinterpret &[f32] as &[u8]
-        let byte_slice = unsafe {
-            std::slice::from_raw_parts(data.as_ptr() as *const u8, data.len() * 4)
-        };
+        let byte_slice =
+            unsafe { std::slice::from_raw_parts(data.as_ptr() as *const u8, data.len() * 4) };
         PyBytes::new(py, byte_slice)
     }
 
@@ -501,18 +539,20 @@ impl PyAudioCapture {
             .map(|t| t.inner.clone())
             .unwrap_or(rsac::CaptureTarget::SystemDefault);
 
-        let capture = py.allow_threads(|| {
-            let mut builder = rsac::AudioCaptureBuilder::new()
-                .with_target(rust_target)
-                .sample_rate(sample_rate)
-                .channels(channels);
+        let capture = py
+            .allow_threads(|| {
+                let mut builder = rsac::AudioCaptureBuilder::new()
+                    .with_target(rust_target)
+                    .sample_rate(sample_rate)
+                    .channels(channels);
 
-            if let Some(size) = buffer_size {
-                builder = builder.buffer_size(Some(size));
-            }
+                if let Some(size) = buffer_size {
+                    builder = builder.buffer_size(Some(size));
+                }
 
-            builder.build()
-        }).map_err(audio_error_to_pyerr)?;
+                builder.build()
+            })
+            .map_err(audio_error_to_pyerr)?;
 
         Ok(PyAudioCapture {
             inner: Mutex::new(Some(capture)),
@@ -525,14 +565,16 @@ impl PyAudioCapture {
     /// Must be called before reading audio data. Called automatically when
     /// using AudioCapture as a context manager.
     fn start(&self, py: Python<'_>) -> PyResult<()> {
-        let mut guard = self.inner.lock().map_err(|e| {
-            PyRuntimeError::new_err(format!("Lock poisoned: {}", e))
-        })?;
-        let capture = guard.as_mut().ok_or_else(|| {
-            PyRuntimeError::new_err("AudioCapture has been closed")
-        })?;
+        let mut guard = self
+            .inner
+            .lock()
+            .map_err(|e| PyRuntimeError::new_err(format!("Lock poisoned: {}", e)))?;
+        let capture = guard
+            .as_mut()
+            .ok_or_else(|| PyRuntimeError::new_err("AudioCapture has been closed"))?;
 
-        py.allow_threads(|| capture.start()).map_err(audio_error_to_pyerr)
+        py.allow_threads(|| capture.start())
+            .map_err(audio_error_to_pyerr)
     }
 
     /// Stop audio capture.
@@ -540,22 +582,25 @@ impl PyAudioCapture {
     /// Stops the underlying OS audio stream and releases resources.
     /// After stopping, the capture cannot be restarted.
     fn stop(&self, py: Python<'_>) -> PyResult<()> {
-        let mut guard = self.inner.lock().map_err(|e| {
-            PyRuntimeError::new_err(format!("Lock poisoned: {}", e))
-        })?;
-        let capture = guard.as_mut().ok_or_else(|| {
-            PyRuntimeError::new_err("AudioCapture has been closed")
-        })?;
+        let mut guard = self
+            .inner
+            .lock()
+            .map_err(|e| PyRuntimeError::new_err(format!("Lock poisoned: {}", e)))?;
+        let capture = guard
+            .as_mut()
+            .ok_or_else(|| PyRuntimeError::new_err("AudioCapture has been closed"))?;
 
-        py.allow_threads(|| capture.stop()).map_err(audio_error_to_pyerr)
+        py.allow_threads(|| capture.stop())
+            .map_err(audio_error_to_pyerr)
     }
 
     /// Whether the capture is currently running.
     #[getter]
     fn is_running(&self) -> PyResult<bool> {
-        let guard = self.inner.lock().map_err(|e| {
-            PyRuntimeError::new_err(format!("Lock poisoned: {}", e))
-        })?;
+        let guard = self
+            .inner
+            .lock()
+            .map_err(|e| PyRuntimeError::new_err(format!("Lock poisoned: {}", e)))?;
         Ok(guard.as_ref().map(|c| c.is_running()).unwrap_or(false))
     }
 
@@ -566,12 +611,13 @@ impl PyAudioCapture {
     ///
     /// The GIL is released during the read operation.
     fn try_read(&self, py: Python<'_>) -> PyResult<Option<PyAudioBuffer>> {
-        let mut guard = self.inner.lock().map_err(|e| {
-            PyRuntimeError::new_err(format!("Lock poisoned: {}", e))
-        })?;
-        let capture = guard.as_mut().ok_or_else(|| {
-            PyRuntimeError::new_err("AudioCapture has been closed")
-        })?;
+        let mut guard = self
+            .inner
+            .lock()
+            .map_err(|e| PyRuntimeError::new_err(format!("Lock poisoned: {}", e)))?;
+        let capture = guard
+            .as_mut()
+            .ok_or_else(|| PyRuntimeError::new_err("AudioCapture has been closed"))?;
 
         // We need to call read_buffer which takes &mut self.
         // Release GIL for the blocking part.
@@ -591,12 +637,13 @@ impl PyAudioCapture {
     ///
     /// Raises StreamError if the stream is not running or encounters an error.
     fn read(&self, py: Python<'_>) -> PyResult<PyAudioBuffer> {
-        let mut guard = self.inner.lock().map_err(|e| {
-            PyRuntimeError::new_err(format!("Lock poisoned: {}", e))
-        })?;
-        let capture = guard.as_mut().ok_or_else(|| {
-            PyRuntimeError::new_err("AudioCapture has been closed")
-        })?;
+        let mut guard = self
+            .inner
+            .lock()
+            .map_err(|e| PyRuntimeError::new_err(format!("Lock poisoned: {}", e)))?;
+        let capture = guard
+            .as_mut()
+            .ok_or_else(|| PyRuntimeError::new_err("AudioCapture has been closed"))?;
 
         let result = py.allow_threads(|| capture.read_buffer_blocking());
 
@@ -611,9 +658,10 @@ impl PyAudioCapture {
     /// A non-zero value indicates the consumer is not reading fast enough.
     #[getter]
     fn overrun_count(&self) -> PyResult<u64> {
-        let guard = self.inner.lock().map_err(|e| {
-            PyRuntimeError::new_err(format!("Lock poisoned: {}", e))
-        })?;
+        let guard = self
+            .inner
+            .lock()
+            .map_err(|e| PyRuntimeError::new_err(format!("Lock poisoned: {}", e)))?;
         Ok(guard.as_ref().map(|c| c.overrun_count()).unwrap_or(0))
     }
 
@@ -622,9 +670,10 @@ impl PyAudioCapture {
     /// After closing, the capture cannot be used. This is called automatically
     /// when exiting a `with` block.
     fn close(&self, py: Python<'_>) -> PyResult<()> {
-        let mut guard = self.inner.lock().map_err(|e| {
-            PyRuntimeError::new_err(format!("Lock poisoned: {}", e))
-        })?;
+        let mut guard = self
+            .inner
+            .lock()
+            .map_err(|e| PyRuntimeError::new_err(format!("Lock poisoned: {}", e)))?;
 
         if let Some(mut capture) = guard.take() {
             py.allow_threads(|| {
@@ -660,15 +709,17 @@ impl PyAudioCapture {
     fn __iter__(slf: Py<Self>, py: Python<'_>) -> PyResult<Py<Self>> {
         {
             let self_ref = slf.borrow(py);
-            let mut iter_guard = self_ref.iterating.lock().map_err(|e| {
-                PyRuntimeError::new_err(format!("Lock poisoned: {}", e))
-            })?;
+            let mut iter_guard = self_ref
+                .iterating
+                .lock()
+                .map_err(|e| PyRuntimeError::new_err(format!("Lock poisoned: {}", e)))?;
             *iter_guard = true;
 
             // Auto-start if not already running
-            let guard = self_ref.inner.lock().map_err(|e| {
-                PyRuntimeError::new_err(format!("Lock poisoned: {}", e))
-            })?;
+            let guard = self_ref
+                .inner
+                .lock()
+                .map_err(|e| PyRuntimeError::new_err(format!("Lock poisoned: {}", e)))?;
             if let Some(ref capture) = *guard {
                 if !capture.is_running() {
                     drop(guard);
@@ -680,9 +731,10 @@ impl PyAudioCapture {
     }
 
     fn __next__(&self, py: Python<'_>) -> PyResult<Option<PyAudioBuffer>> {
-        let mut guard = self.inner.lock().map_err(|e| {
-            PyRuntimeError::new_err(format!("Lock poisoned: {}", e))
-        })?;
+        let mut guard = self
+            .inner
+            .lock()
+            .map_err(|e| PyRuntimeError::new_err(format!("Lock poisoned: {}", e)))?;
         let capture = match guard.as_mut() {
             Some(c) => c,
             None => return Err(PyStopIteration::new_err("Capture closed")),
@@ -709,10 +761,7 @@ impl PyAudioCapture {
         let guard = self.inner.lock();
         match guard {
             Ok(ref g) => match g.as_ref() {
-                Some(c) => format!(
-                    "AudioCapture(running={})",
-                    c.is_running()
-                ),
+                Some(c) => format!("AudioCapture(running={})", c.is_running()),
                 None => "AudioCapture(closed)".to_string(),
             },
             Err(_) => "AudioCapture(error)".to_string(),

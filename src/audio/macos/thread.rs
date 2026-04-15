@@ -37,10 +37,9 @@ use super::tap::CoreAudioProcessTap;
 // Fix Group 1: Import from coreaudio_sys (the -sys crate), not coreaudio::sys.
 use coreaudio::audio_unit::{AudioUnit, Element, IOType, Scope};
 use coreaudio_sys::{
-    kAudioFormatFlagIsFloat, kAudioFormatFlagIsNonInterleaved, kAudioFormatFlagIsPacked,
-    kAudioFormatLinearPCM, kAudioOutputUnitProperty_CurrentDevice,
-    kAudioOutputUnitProperty_EnableIO, kAudioUnitProperty_StreamFormat,
-    AudioStreamBasicDescription,
+    kAudioFormatFlagIsFloat, kAudioFormatFlagIsPacked, kAudioFormatLinearPCM,
+    kAudioOutputUnitProperty_CurrentDevice, kAudioOutputUnitProperty_EnableIO,
+    kAudioUnitProperty_StreamFormat, AudioStreamBasicDescription,
 };
 
 /// AudioDeviceID type alias (Fix Group 3).
@@ -388,6 +387,7 @@ fn _assert_macos_platform_stream_send() {
 mod tests {
     use super::*;
     use crate::core::config::{ApplicationId, CaptureTarget, DeviceId, ProcessId};
+    use coreaudio_sys::kAudioFormatFlagIsNonInterleaved;
 
     // ── build_f32_asbd tests ─────────────────────────────────────────
 
