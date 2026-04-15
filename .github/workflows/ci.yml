@@ -149,3 +149,30 @@ jobs:
           # For ARM64, we can only check compilation, not link (no ARM64 PipeWire libs)
           echo "Checking ARM64 compilation (library code only, no linking)..."
           cargo check --lib --no-default-features --features feat_linux --target aarch64-unknown-linux-gnu 2>&1 || echo "ARM64 cross-check completed with expected linker warnings"
+
+  # ── Binding crates compilation check ─────────────────────────────────
+  check-bindings:
+    name: Binding Crates
+    needs: lint
+    runs-on: blacksmith-4vcpu-ubuntu-2404
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Install PipeWire dev libraries
+        run: |
+          sudo add-apt-repository ppa:pipewire-debian/pipewire-upstream -y
+          sudo apt-get update
+          sudo apt-get install -y libpipewire-0.3-dev libspa-0.2-dev pkg-config libclang-dev
+
+      - name: Check rsac-ffi (C FFI)
+        run: cargo check -p rsac-ffi
+
+      - name: Check rsac-napi (Node.js/TypeScript)
+        run: cargo check -p rsac-napi
+
+      - name: Check rsac-python (Python/PyO3)
+        env:
+          PYO3_USE_ABI3_FORWARD_COMPATIBILITY: "1"
+        run: cargo check -p rsac-python
