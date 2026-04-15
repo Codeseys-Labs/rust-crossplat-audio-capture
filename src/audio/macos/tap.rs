@@ -155,7 +155,7 @@ impl CoreAudioProcessTap {
             let _: () = msg_send![tap_desc_obj, setUUID: &*tap_uuid];
 
             // 5. Set mute behavior to unmuted (CATapUnmuted = 0)
-            let _: () = msg_send![tap_desc_obj, setMuteBehavior: 0i32];
+            let _: () = msg_send![tap_desc_obj, setMuteBehavior: 0i64];
 
             // 6. Set privateTap if available (guard for macOS 26+ where it may be removed)
             if msg_send_responds_to(tap_desc_obj, sel!(setPrivateTap:)) {
@@ -313,7 +313,7 @@ impl CoreAudioProcessTap {
             let _: () = msg_send![tap_desc_obj, setUUID: &*tap_uuid];
 
             // Set mute behavior to unmuted (CATapUnmuted = 0)
-            let _: () = msg_send![tap_desc_obj, setMuteBehavior: 0i32];
+            let _: () = msg_send![tap_desc_obj, setMuteBehavior: 0i64];
 
             // Set privateTap if available (guard for macOS 26+ where it may be removed)
             if msg_send_responds_to(tap_desc_obj, sel!(setPrivateTap:)) {
@@ -464,7 +464,7 @@ impl CoreAudioProcessTap {
             let _: () = msg_send![tap_desc_obj, setUUID: &*tap_uuid];
 
             // Set mute behavior to unmuted (CATapUnmuted = 0)
-            let _: () = msg_send![tap_desc_obj, setMuteBehavior: 0i32];
+            let _: () = msg_send![tap_desc_obj, setMuteBehavior: 0i64];
 
             // Set privateTap if available (removed in macOS 26+)
             if msg_send_responds_to(tap_desc_obj, sel!(setPrivateTap:)) {

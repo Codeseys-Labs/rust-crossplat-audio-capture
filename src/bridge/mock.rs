@@ -283,6 +283,7 @@ pub fn create_mock_stream(
         channels,
         sample_format: SampleFormat::F32,
         buffer_size: None,
+        capture_target: crate::core::config::CaptureTarget::SystemDefault,
     };
     device.create_stream(&config)
 }
