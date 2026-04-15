@@ -179,12 +179,23 @@ impl AudioCaptureBuilder {
             }
             CaptureTarget::Device(device_id) => {
                 let devices = enumerator.enumerate_devices()?;
-                devices
+                let device = devices
                     .into_iter()
                     .find(|d| d.id() == *device_id)
                     .ok_or_else(|| AudioError::DeviceNotFound {
                         device_id: device_id.0.clone(),
-                    })?
+                    })?;
+                // Warn users that targeting an output device for capture may
+                // not produce data on all platforms.  System capture or
+                // Process Tap loopback is required for output-device audio.
+                log::info!(
+                    "Device capture targeting '{}' (id: {}). Note: if this is \
+                     an output-only device, consider using CaptureTarget::SystemDefault \
+                     for loopback capture.",
+                    device.name(),
+                    device_id
+                );
+                device
             }
             CaptureTarget::Application(_)
             | CaptureTarget::ApplicationByName(_)
