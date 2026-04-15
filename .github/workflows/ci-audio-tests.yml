@@ -315,6 +315,36 @@ jobs:
       - name: Install virtual audio (VB-CABLE via LABSN)
         uses: LABSN/sound-ci-helpers@v1
 
+      - name: Set VB-CABLE as default audio device
+        shell: pwsh
+        run: |
+          # Install AudioDeviceCmdlets to set default device
+          Install-Module -Name AudioDeviceCmdlets -Force -Scope CurrentUser 2>$null
+          Import-Module AudioDeviceCmdlets -ErrorAction SilentlyContinue
+
+          # List all audio devices
+          Write-Host "=== All Audio Devices ==="
+          try {
+            $devices = Get-AudioDevice -List
+            $devices | Format-Table Index, Type, Name, Default -AutoSize
+
+            # Find VB-CABLE output and set as default
+            $cable = $devices | Where-Object { $_.Name -like "*CABLE Input*" -and $_.Type -eq "Playback" }
+            if ($cable) {
+              Write-Host "Setting VB-CABLE as default playback device: $($cable.Name)"
+              Set-AudioDevice -Index $cable.Index
+            } else {
+              Write-Host "VB-CABLE playback device not found, trying alternative names..."
+              $cable = $devices | Where-Object { $_.Name -like "*VB-Audio*" -and $_.Type -eq "Playback" }
+              if ($cable) {
+                Set-AudioDevice -Index $cable[0].Index
+                Write-Host "Set: $($cable[0].Name)"
+              }
+            }
+          } catch {
+            Write-Host "AudioDeviceCmdlets not available, skipping default device setup: $_"
+          }
+
       - name: Verify audio devices
         id: verify_audio
         shell: pwsh
@@ -397,6 +427,18 @@ jobs:
       - name: Install virtual audio (VB-CABLE via LABSN)
         uses: LABSN/sound-ci-helpers@v1
 
+      - name: Set VB-CABLE as default audio device
+        shell: pwsh
+        run: |
+          Install-Module -Name AudioDeviceCmdlets -Force -Scope CurrentUser 2>$null
+          Import-Module AudioDeviceCmdlets -ErrorAction SilentlyContinue
+          try {
+            $devices = Get-AudioDevice -List
+            $cable = $devices | Where-Object { $_.Name -like "*CABLE Input*" -and $_.Type -eq "Playback" }
+            if (-not $cable) { $cable = $devices | Where-Object { $_.Name -like "*VB-Audio*" -and $_.Type -eq "Playback" } }
+            if ($cable) { Set-AudioDevice -Index $cable[0].Index; Write-Host "Default playback: $($cable[0].Name)" }
+          } catch { Write-Host "Skipping default device setup: $_" }
+
       - name: Verify audio devices
         shell: pwsh
         run: |
@@ -467,6 +509,18 @@ jobs:
 
       - name: Install virtual audio (VB-CABLE via LABSN)
         uses: LABSN/sound-ci-helpers@v1
+
+      - name: Set VB-CABLE as default audio device
+        shell: pwsh
+        run: |
+          Install-Module -Name AudioDeviceCmdlets -Force -Scope CurrentUser 2>$null
+          Import-Module AudioDeviceCmdlets -ErrorAction SilentlyContinue
+          try {
+            $devices = Get-AudioDevice -List
+            $cable = $devices | Where-Object { $_.Name -like "*CABLE Input*" -and $_.Type -eq "Playback" }
+            if (-not $cable) { $cable = $devices | Where-Object { $_.Name -like "*VB-Audio*" -and $_.Type -eq "Playback" } }
+            if ($cable) { Set-AudioDevice -Index $cable[0].Index; Write-Host "Default playback: $($cable[0].Name)" }
+          } catch { Write-Host "Skipping default device setup: $_" }
 
       - name: Verify audio devices
         shell: pwsh
