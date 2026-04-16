@@ -13,8 +13,14 @@
 //!   4. PID → process name resolution for each session
 //!   5. Display name resolution via GetDisplayName, PID lookup, and session ID parsing
 
-#![cfg(target_os = "windows")]
+#[cfg(not(target_os = "windows"))]
+fn main() {
+    eprintln!("wasapi_session_test is only supported on Windows");
+    std::process::exit(1);
+}
 
+#[cfg(target_os = "windows")]
+mod imp {
 use windows::core::*;
 use windows::Win32::Devices::Properties::DEVPKEY_Device_FriendlyName as PKEY_Device_FriendlyName;
 use windows::Win32::Foundation::*;
@@ -235,7 +241,7 @@ fn enumerate_sessions_on_device(device: &IMMDevice, device_label: &str) -> Resul
     Ok(())
 }
 
-fn main() {
+pub fn run() {
     println!("╔══════════════════════════════════════════════════════════╗");
     println!("║  WASAPI Audio Session Diagnostic                       ║");
     println!("║  Enumerating ALL sessions on ALL render devices        ║");
@@ -373,3 +379,10 @@ fn main() {
         println!("\n=== DIAGNOSTIC COMPLETE ===");
     }
 }
+} // mod imp
+
+#[cfg(target_os = "windows")]
+fn main() {
+    imp::run();
+}
+
