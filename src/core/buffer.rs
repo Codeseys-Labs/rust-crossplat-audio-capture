@@ -196,12 +196,10 @@ impl AudioBuffer {
     /// For a stereo buffer with 960 total samples the result is 480.
     /// Returns 0 if `channels` is 0.
     pub fn samples_per_channel(&self) -> usize {
-        let ch = self.format.channels as usize;
-        if ch == 0 {
-            0
-        } else {
-            self.data.len() / ch
-        }
+        self.data
+            .len()
+            .checked_div(self.format.channels as usize)
+            .unwrap_or(0)
     }
 
     /// Returns the number of audio frames in the buffer.

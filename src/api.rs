@@ -108,21 +108,19 @@ impl AudioCaptureBuilder {
         // ── Validate target against platform capabilities ────────────
         let caps = PlatformCapabilities::query();
         match &self.target {
-            CaptureTarget::Application(_) | CaptureTarget::ApplicationByName(_) => {
-                if !caps.supports_application_capture {
-                    return Err(AudioError::PlatformNotSupported {
-                        feature: "application capture".to_string(),
-                        platform: caps.backend_name.to_string(),
-                    });
-                }
+            CaptureTarget::Application(_) | CaptureTarget::ApplicationByName(_)
+                if !caps.supports_application_capture =>
+            {
+                return Err(AudioError::PlatformNotSupported {
+                    feature: "application capture".to_string(),
+                    platform: caps.backend_name.to_string(),
+                });
             }
-            CaptureTarget::ProcessTree(_) => {
-                if !caps.supports_process_tree_capture {
-                    return Err(AudioError::PlatformNotSupported {
-                        feature: "process tree capture".to_string(),
-                        platform: caps.backend_name.to_string(),
-                    });
-                }
+            CaptureTarget::ProcessTree(_) if !caps.supports_process_tree_capture => {
+                return Err(AudioError::PlatformNotSupported {
+                    feature: "process tree capture".to_string(),
+                    platform: caps.backend_name.to_string(),
+                });
             }
             _ => {}
         }
