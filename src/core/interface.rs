@@ -123,6 +123,16 @@ pub trait CapturingStream: Send + Sync {
         0
     }
 
+    /// Returns true if the stream's producer is experiencing sustained
+    /// backpressure (consecutive ring buffer overflows above a threshold).
+    ///
+    /// Consumers should slow down, warn the user, or switch providers when
+    /// this returns true. Default implementation returns false for backends
+    /// that don't track backpressure.
+    fn is_under_backpressure(&self) -> bool {
+        false
+    }
+
     /// Closes the stream and releases all OS resources.
     ///
     /// After `close()`, the stream cannot be restarted. Any subsequent

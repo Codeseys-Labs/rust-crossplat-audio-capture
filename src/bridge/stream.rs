@@ -152,6 +152,12 @@ impl<S: PlatformStream> BridgeStream<S> {
     pub fn buffers_read(&self) -> u64 {
         self.shared.buffers_popped.load(Ordering::Relaxed)
     }
+
+    /// Returns true if the producer has dropped enough consecutive buffers to
+    /// indicate sustained backpressure (consumer cannot keep up with producer).
+    pub fn is_under_backpressure(&self) -> bool {
+        self.shared.is_under_backpressure()
+    }
 }
 
 // ── CapturingStream Implementation ───────────────────────────────────────
@@ -248,6 +254,10 @@ impl<S: PlatformStream + Sync + 'static> CapturingStream for BridgeStream<S> {
 
     fn overrun_count(&self) -> u64 {
         self.shared.buffers_dropped.load(Ordering::Relaxed)
+    }
+
+    fn is_under_backpressure(&self) -> bool {
+        self.shared.is_under_backpressure()
     }
 
     #[cfg(feature = "async-stream")]

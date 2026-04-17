@@ -5,7 +5,6 @@ use crate::core::config::{CaptureTarget, SampleFormat, StreamConfig};
 use crate::core::error::{AudioError, AudioResult};
 use crate::core::interface::DeviceKind;
 use std::fmt;
-use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc;
 use std::sync::{Arc, Mutex};
 
@@ -234,7 +233,6 @@ impl AudioCaptureBuilder {
             config: capture_config,
             device: Some(selected_device),
             stream: None,
-            is_running: AtomicBool::new(false),
             callback: Arc::new(Mutex::new(None)),
         })
     }
@@ -248,7 +246,6 @@ pub struct AudioCapture {
     config: AudioCaptureConfig,
     device: Option<Box<dyn crate::core::interface::AudioDevice>>,
     stream: Option<Arc<dyn crate::core::interface::CapturingStream + 'static>>,
-    is_running: AtomicBool,
     #[allow(clippy::type_complexity)]
     callback: Arc<Mutex<Option<Box<dyn FnMut(&AudioBuffer) + Send + 'static>>>>,
 }
@@ -260,8 +257,11 @@ impl AudioCapture {
     /// the capture as running. In the new `CapturingStream` contract, the
     /// stream starts producing data upon creation.
     pub fn start(&mut self) -> AudioResult<()> {
-        if self.is_running.load(Ordering::SeqCst) {
-            return Ok(());
+        // If a stream already exists and is running, this is a no-op.
+        if let Some(stream) = self.stream.as_ref() {
+            if stream.is_running() {
+                return Ok(());
+            }
         }
 
         if self.stream.is_none() {
@@ -286,7 +286,6 @@ impl AudioCapture {
                 context: None,
             })?;
 
-        self.is_running.store(true, Ordering::SeqCst);
         Ok(())
     }
 
@@ -299,7 +298,8 @@ impl AudioCapture {
     /// has stopped. The underlying stream is released when all references
     /// (including subscriber threads) are dropped.
     pub fn stop(&mut self) -> AudioResult<()> {
-        if !self.is_running.load(Ordering::SeqCst) {
+        // Nothing to stop if there is no stream (idempotent).
+        if self.stream.is_none() {
             return Ok(());
         }
 
@@ -312,13 +312,19 @@ impl AudioCapture {
         // subscriber threads also drop their clones.
         self.stream.take();
 
-        self.is_running.store(false, Ordering::SeqCst);
         Ok(())
     }
 
     /// Returns `true` if the stream is currently capturing.
+    ///
+    /// Delegates to the underlying stream's state machine — the single source
+    /// of truth for running status. Returns `false` if no stream has been
+    /// created yet.
     pub fn is_running(&self) -> bool {
-        self.is_running.load(Ordering::SeqCst)
+        self.stream
+            .as_ref()
+            .map(|s| s.is_running())
+            .unwrap_or(false)
     }
 
     /// Returns a reference to the capture configuration.
@@ -331,17 +337,23 @@ impl AudioCapture {
     /// Uses `CapturingStream::try_read_chunk` for non-blocking reads.
     /// Returns `Ok(None)` if no data is currently available.
     pub fn read_buffer(&mut self) -> AudioResult<Option<AudioBuffer>> {
-        if !self.is_running.load(Ordering::SeqCst) {
-            return Err(AudioError::StreamReadError {
-                reason: "Stream is not running. Call start() first.".to_string(),
-            });
-        }
+        // Get the stream first — if there's no stream, we're not running.
         let stream = self
             .stream
             .as_ref()
             .ok_or_else(|| AudioError::StreamReadError {
-                reason: "Stream is not initialized, though is_running was true.".to_string(),
+                reason: "Stream is not initialized. Call start() first.".to_string(),
             })?;
+
+        // Check running state via the stream itself — single source of truth.
+        // This eliminates the TOCTOU window that existed when a separate
+        // AtomicBool was consulted before touching the stream.
+        if !stream.is_running() {
+            return Err(AudioError::StreamReadError {
+                reason: "Stream is not running".to_string(),
+            });
+        }
+
         stream.try_read_chunk()
     }
 
@@ -349,17 +361,21 @@ impl AudioCapture {
     ///
     /// Uses `CapturingStream::read_chunk` which blocks until data arrives.
     pub fn read_buffer_blocking(&mut self) -> AudioResult<AudioBuffer> {
-        if !self.is_running.load(Ordering::SeqCst) {
-            return Err(AudioError::StreamReadError {
-                reason: "Stream is not running. Call start() first.".to_string(),
-            });
-        }
+        // Get the stream first — if there's no stream, we're not running.
         let stream = self
             .stream
             .as_ref()
             .ok_or_else(|| AudioError::StreamReadError {
-                reason: "Stream is not initialized, though is_running was true.".to_string(),
+                reason: "Stream is not initialized. Call start() first.".to_string(),
             })?;
+
+        // Check running state via the stream itself — single source of truth.
+        if !stream.is_running() {
+            return Err(AudioError::StreamReadError {
+                reason: "Stream is not running".to_string(),
+            });
+        }
+
         stream.read_chunk()
     }
 
@@ -474,20 +490,22 @@ impl AudioCapture {
     ///
     /// Returns an error if the capture is not currently running.
     pub fn subscribe(&self) -> AudioResult<mpsc::Receiver<AudioBuffer>> {
-        if !self.is_running.load(Ordering::SeqCst) {
+        // Get the stream first — if there's no stream, we're not running.
+        let stream_ref = self
+            .stream
+            .as_ref()
+            .ok_or_else(|| AudioError::StreamReadError {
+                reason: "Stream is not initialized. Call start() first.".to_string(),
+            })?;
+
+        // Check running state via the stream itself — single source of truth.
+        if !stream_ref.is_running() {
             return Err(AudioError::StreamReadError {
-                reason: "Stream is not running. Call start() first.".to_string(),
+                reason: "Stream is not running".to_string(),
             });
         }
 
-        let stream =
-            Arc::clone(
-                self.stream
-                    .as_ref()
-                    .ok_or_else(|| AudioError::StreamReadError {
-                        reason: "Stream is not initialized.".to_string(),
-                    })?,
-            );
+        let stream = Arc::clone(stream_ref);
 
         let (tx, rx) = mpsc::channel();
 
@@ -527,6 +545,19 @@ impl AudioCapture {
     pub fn overrun_count(&self) -> u64 {
         self.stream.as_ref().map(|s| s.overrun_count()).unwrap_or(0)
     }
+
+    /// Returns true if the stream is experiencing sustained backpressure —
+    /// the ring buffer has dropped enough consecutive frames to indicate the
+    /// consumer cannot keep up with the producer. Consumers should slow down
+    /// processing, warn the user, or switch to a lower-cost provider.
+    ///
+    /// Returns `false` if the stream has not been created yet.
+    pub fn is_under_backpressure(&self) -> bool {
+        self.stream
+            .as_ref()
+            .map(|s| s.is_under_backpressure())
+            .unwrap_or(false)
+    }
 }
 
 // AudioDataStreamWrapper has been removed — async streaming will be
@@ -558,14 +589,14 @@ impl<'a> Iterator for AudioBufferIterator<'a> {
 
 impl Drop for AudioCapture {
     fn drop(&mut self) {
-        if self.is_running.load(Ordering::SeqCst) {
-            if let Err(e) = self.stop() {
-                eprintln!("Error stopping audio stream during drop: {:?}", e);
-            }
-        } else if let Some(stream) = self.stream.as_ref() {
-            // Best-effort stop; the Arc will be dropped when all references are gone.
-            if let Err(e) = stream.stop() {
-                eprintln!("Error stopping audio stream during drop: {:?}", e);
+        // Best-effort stop of whatever stream we still hold. The stream's own
+        // state machine decides whether this is a no-op (already stopped) or
+        // a real stop; stop() is idempotent on the stream side.
+        if let Some(stream) = self.stream.as_ref() {
+            if stream.is_running() {
+                if let Err(e) = stream.stop() {
+                    eprintln!("Error stopping audio stream during drop: {:?}", e);
+                }
             }
         }
         // Drop the Arc reference (stream fully deallocated when last clone is dropped).
@@ -587,7 +618,7 @@ impl fmt::Debug for AudioCapture {
             .field("config", &self.config)
             .field("device_name", &device_name)
             .field("stream_is_some", &self.stream.is_some())
-            .field("is_running", &self.is_running.load(Ordering::SeqCst))
+            .field("is_running", &self.is_running())
             .field("callback_is_some", &self.callback.lock().unwrap().is_some())
             .finish()
     }
@@ -600,7 +631,7 @@ mod tests {
     use super::*;
     use crate::core::config::{AudioFormat, SampleFormat};
     use crate::core::interface::CapturingStream;
-    use std::sync::atomic::AtomicU64;
+    use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
     #[test]
     fn builder_defaults_to_system_default() {
@@ -924,7 +955,6 @@ mod tests {
             },
             device: None,
             stream: Some(mock),
-            is_running: AtomicBool::new(true),
             callback: Arc::new(Mutex::new(None)),
         }
     }
@@ -934,8 +964,10 @@ mod tests {
     #[test]
     fn subscribe_returns_error_when_not_running() {
         let mock = Arc::new(MockCapturingStream::new());
+        // Signal the mock (stream-side) that it's no longer running — the
+        // stream's state is now the single source of truth.
+        mock.signal_stop();
         let capture = make_mock_capture(mock);
-        capture.is_running.store(false, Ordering::SeqCst);
 
         let result = capture.subscribe();
         assert!(result.is_err());
@@ -1017,7 +1049,6 @@ mod tests {
             },
             device: None,
             stream: None,
-            is_running: AtomicBool::new(false),
             callback: Arc::new(Mutex::new(None)),
         };
         assert_eq!(capture.overrun_count(), 0);

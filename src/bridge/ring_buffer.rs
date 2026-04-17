@@ -24,7 +24,7 @@
 //! }
 //! ```
 
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -49,6 +49,12 @@ pub(crate) struct BridgeShared {
     pub buffers_dropped: AtomicU64,
     /// Total buffers successfully popped by the consumer.
     pub buffers_popped: AtomicU64,
+    /// Consecutive drop count — resets to 0 on successful push.
+    /// Used to detect sustained backpressure without relying on total drop rate.
+    pub consecutive_drops: AtomicU32,
+    /// Threshold above which `is_under_backpressure()` returns true.
+    /// Default: 10 consecutive drops ≈ 100ms of data loss at typical rates.
+    pub backpressure_threshold: u32,
     /// Audio format for this bridge (immutable after creation).
     /// Stored for diagnostics and future format-aware consumers.
     #[allow(dead_code)]
@@ -56,6 +62,15 @@ pub(crate) struct BridgeShared {
     /// Waker for async stream consumers — notified when new data is pushed.
     #[cfg(feature = "async-stream")]
     pub waker: atomic_waker::AtomicWaker,
+}
+
+impl BridgeShared {
+    /// Returns true if the producer has dropped `backpressure_threshold` or
+    /// more buffers in a row without a successful push — signals that the
+    /// consumer is falling behind and cannot keep up with the producer rate.
+    pub fn is_under_backpressure(&self) -> bool {
+        self.consecutive_drops.load(Ordering::Relaxed) >= self.backpressure_threshold
+    }
 }
 
 // ── BridgeProducer ───────────────────────────────────────────────────────
@@ -95,6 +110,7 @@ impl BridgeProducer {
         match self.producer.push(buffer) {
             Ok(()) => {
                 self.shared.buffers_pushed.fetch_add(1, Ordering::Relaxed);
+                self.shared.consecutive_drops.store(0, Ordering::Relaxed);
                 #[cfg(feature = "async-stream")]
                 self.shared.waker.wake();
                 Ok(())
@@ -115,6 +131,7 @@ impl BridgeProducer {
             Ok(()) => true,
             Err(_dropped) => {
                 self.shared.buffers_dropped.fetch_add(1, Ordering::Relaxed);
+                self.shared.consecutive_drops.fetch_add(1, Ordering::Relaxed);
                 false
             }
         }
@@ -149,6 +166,7 @@ impl BridgeProducer {
         match self.producer.push(buffer) {
             Ok(()) => {
                 self.shared.buffers_pushed.fetch_add(1, Ordering::Relaxed);
+                self.shared.consecutive_drops.store(0, Ordering::Relaxed);
                 #[cfg(feature = "async-stream")]
                 self.shared.waker.wake();
                 true
@@ -159,6 +177,7 @@ impl BridgeProducer {
                 // back-pressure on the RT thread.
                 self.scratch = rejected.into_data();
                 self.shared.buffers_dropped.fetch_add(1, Ordering::Relaxed);
+                self.shared.consecutive_drops.fetch_add(1, Ordering::Relaxed);
                 false
             }
         }
@@ -318,6 +337,8 @@ pub fn create_bridge(capacity: usize, format: AudioFormat) -> (BridgeProducer, B
         buffers_pushed: AtomicU64::new(0),
         buffers_dropped: AtomicU64::new(0),
         buffers_popped: AtomicU64::new(0),
+        consecutive_drops: AtomicU32::new(0),
+        backpressure_threshold: 10,
         format,
         #[cfg(feature = "async-stream")]
         waker: atomic_waker::AtomicWaker::new(),
