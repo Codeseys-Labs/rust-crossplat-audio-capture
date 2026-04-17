@@ -379,7 +379,7 @@ enum Rsacrsac_error_t rsac_device_list_get(const struct RsacRsacDeviceList *list
  */
 
 enum Rsacrsac_error_t rsac_default_device(const struct RsacRsacDeviceEnumerator *enumerator,
-                                          enum Rsacrsac_device_kind_t kind,
+                                          enum Rsacrsac_device_kind_t _kind,
                                           struct RsacRsacDevice **out)
 ;
 

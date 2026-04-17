@@ -579,9 +579,7 @@ pub async fn list_devices() -> Result<Vec<JsAudioDevice>> {
 pub async fn get_default_device() -> Result<JsAudioDevice> {
     tokio::task::spawn_blocking(|| -> napi::Result<JsAudioDevice> {
         let enumerator = rsac::get_device_enumerator().map_err(audio_err_to_napi)?;
-        let device = enumerator
-            .get_default_device()
-            .map_err(audio_err_to_napi)?;
+        let device = enumerator.get_default_device().map_err(audio_err_to_napi)?;
 
         Ok(JsAudioDevice {
             id: device.id().to_string(),

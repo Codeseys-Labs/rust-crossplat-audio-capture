@@ -20,5 +20,40 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   - Improved maintainability with modular structure
   - Added reusable workflow components
   - Fixed PipeWire setup in Linux workflow
+- Linux device enumeration failures (cannot reach PipeWire via `pw-cli` or
+  `pw-dump`) now return `AudioError::BackendError` with a descriptive
+  message, matching the variants used by the Windows (WASAPI) and macOS
+  (CoreAudio) backends. Callers pattern-matching for platform-specific
+  recovery can now distinguish "backend busted" from "device really not
+  there" on Linux. Cases where the backend is healthy but no matching
+  device exists continue to return `AudioError::DeviceNotFound`.
+- Strengthened `ci_audio` integration test assertions alongside the
+  existing no-panic backbone: `test_stream_start_read_stop` now checks
+  that returned buffers match the requested sample rate and channels and
+  that `num_frames() * channels() == data().len()`;
+  `test_capture_format_correct` asserts `overrun_count()` is monotonically
+  non-decreasing across successive reads. The graceful-fallthrough
+  pattern for heterogeneous CI hardware is preserved.
+
+### Deprecated
+
+- `CapturingStream::close()` is now a no-op default method. New code
+  should rely on `stop()` plus `Drop` for stream teardown. The trait
+  method is retained for one minor-version cycle to ease migration and
+  will be removed in a future release.
+
+### Removed (Breaking)
+
+- `CrossPlatformDeviceEnumerator::get_default_device()` no longer takes
+  a `DeviceKind` argument — the parameter was silently ignored by every
+  backend and has been dropped. Migration: remove the argument at the
+  call site (e.g. `enumerator.get_default_device(DeviceKind::Output)`
+  becomes `enumerator.get_default_device()`).
+- `BridgeStream::is_under_backpressure()` is no longer available as an
+  inherent method; the trait-backed dispatch path via
+  `CapturingStream::is_under_backpressure()` is now the only entry
+  point. Migration: call through `AudioCapture::is_under_backpressure()`
+  or bring `CapturingStream` into scope and invoke
+  `stream.is_under_backpressure()` via the trait.
 
 ### Technical Debt

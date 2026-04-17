@@ -164,6 +164,12 @@ fn test_capture_format_correct() {
     let start = Instant::now();
     let mut format_verified = false;
 
+    // Track overrun_count across successive reads — it is a cumulative
+    // counter and must be monotonically non-decreasing for the lifetime
+    // of the stream. Anything else indicates a bookkeeping regression.
+    let mut prev_overrun: Option<u64> = None;
+    let mut monotonic_samples: usize = 0;
+
     while start.elapsed() < timeout {
         match capture.read_buffer() {
             Ok(Some(buffer)) => {
@@ -179,8 +185,27 @@ fn test_capture_format_correct() {
                     "Audio format should match requested configuration"
                 );
 
-                format_verified = true;
-                break;
+                // Monotonic non-decreasing overrun_count check — property
+                // assertion alongside the no-panic backbone.
+                let current_overrun = capture.overrun_count();
+                if let Some(prev) = prev_overrun {
+                    assert!(
+                        current_overrun >= prev,
+                        "overrun_count must be monotonically non-decreasing: \
+                         previous={}, current={}",
+                        prev,
+                        current_overrun
+                    );
+                    monotonic_samples += 1;
+                }
+                prev_overrun = Some(current_overrun);
+
+                // Need at least two observations to have checked monotonicity;
+                // keep reading until we have that, then we can bail.
+                if monotonic_samples >= 1 {
+                    format_verified = true;
+                    break;
+                }
             }
             Ok(None) => {
                 std::thread::sleep(std::time::Duration::from_millis(10));
@@ -193,6 +218,13 @@ fn test_capture_format_correct() {
                 std::thread::sleep(std::time::Duration::from_millis(10));
             }
         }
+    }
+
+    // If we only got one buffer (CI hardware can be flaky), the format
+    // was still verified on that single read — mark it as such without
+    // forcing a second read that may never come on a quiet fixture.
+    if !format_verified && prev_overrun.is_some() {
+        format_verified = true;
     }
 
     let _ = capture.stop();

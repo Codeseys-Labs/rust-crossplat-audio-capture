@@ -64,6 +64,26 @@ impl LinuxDeviceEnumerator {
 
         // Fallback: try to find any suitable device from our enumerated list
         let devices = self.get_pipewire_devices()?;
+
+        // If the enumerated list is empty, both `pw-cli list-objects` and
+        // `pw-dump` produced no audio nodes — almost certainly an enumeration
+        // failure (PipeWire not running, tools missing, permission issues,
+        // timeout) rather than "no audio devices on this machine." Surface it
+        // as a `BackendError` so callers can pattern-match for platform-
+        // specific recovery, matching the Windows/macOS error shape.
+        if devices.is_empty() {
+            return Err(crate::core::error::AudioError::BackendError {
+                backend: "PipeWire".into(),
+                operation: "get_default_device".into(),
+                message: format!(
+                    "Failed to enumerate PipeWire audio nodes via pw-cli and pw-dump \
+                     while resolving default device for {:?}; is PipeWire running?",
+                    kind
+                ),
+                context: None,
+            });
+        }
+
         match kind {
             crate::core::interface::DeviceKind::Input => {
                 if let Some(device) = devices.into_iter().find(|d| d.is_input) {
@@ -77,6 +97,8 @@ impl LinuxDeviceEnumerator {
             }
         }
 
+        // We enumerated devices successfully, but none match the requested
+        // kind — this is genuinely "device not there," keep `DeviceNotFound`.
         Err(crate::core::error::AudioError::DeviceNotFound {
             device_id: format!("default_{:?}", kind),
         })

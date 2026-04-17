@@ -9,10 +9,13 @@ use rsac::{AudioCaptureBuilder, CaptureTarget};
 fn test_stream_start_read_stop() {
     require_audio!();
 
+    let expected_sample_rate: u32 = 48000;
+    let expected_channels: u16 = 2;
+
     let mut capture = match AudioCaptureBuilder::new()
         .with_target(CaptureTarget::SystemDefault)
-        .sample_rate(48000)
-        .channels(2)
+        .sample_rate(expected_sample_rate)
+        .channels(expected_channels)
         .build()
     {
         Ok(c) => c,
@@ -41,9 +44,36 @@ fn test_stream_start_read_stop() {
             Ok(Some(buf)) => {
                 read_count += 1;
                 eprintln!(
-                    "[ci_audio] Read buffer {}: {} frames",
+                    "[ci_audio] Read buffer {}: {} frames (rate={}, channels={})",
                     read_count,
-                    buf.num_frames()
+                    buf.num_frames(),
+                    buf.sample_rate(),
+                    buf.channels()
+                );
+
+                // Property assertions layered on top of the no-panic backbone.
+                // Goal: catch silent-wrong-output regressions (bogus-but-well-
+                // formed buffers) without breaking CI on heterogeneous audio
+                // hardware — we only assert if a buffer actually came back.
+                assert_eq!(
+                    buf.sample_rate(),
+                    expected_sample_rate,
+                    "Buffer sample_rate must match the value configured on the builder"
+                );
+                assert_eq!(
+                    buf.channels(),
+                    expected_channels,
+                    "Buffer channels must match the value configured on the builder"
+                );
+                assert_eq!(
+                    buf.num_frames() * buf.channels() as usize,
+                    buf.data().len(),
+                    "Interleaved data length must equal num_frames * channels \
+                     (rate={}, channels={}, frames={}, data.len={})",
+                    buf.sample_rate(),
+                    buf.channels(),
+                    buf.num_frames(),
+                    buf.data().len()
                 );
             }
             Ok(None) => {
@@ -59,7 +89,7 @@ fn test_stream_start_read_stop() {
         }
     }
 
-    // Stop
+    // Stop — important thing is no panic/crash on teardown.
     capture.stop().expect("Stop should succeed");
     assert!(!capture.is_running(), "Should not be running after stop");
 
