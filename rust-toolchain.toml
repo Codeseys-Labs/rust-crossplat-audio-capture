@@ -1,0 +1,18 @@
+# Pinned Rust toolchain for rsac.
+#
+# Bumping this file is deliberate: a PR that changes the channel also
+# surfaces any new clippy lints in that PR's CI run, so we catch
+# toolchain-bump breakage in review rather than in a random unrelated
+# PR a week later.
+#
+# When bumping:
+# 1. Change `channel` to the new version.
+# 2. Run `cargo clippy --all-targets -- -D warnings` locally with that
+#    toolchain.
+# 3. Fix any new lint errors before pushing.
+#
+# See ~/.claude/skills/clippy-toolchain-bump-ci-breakage for the
+# rationale behind pinning rather than floating on `stable`.
+[toolchain]
+channel = "1.95.0"
+components = ["rustfmt", "clippy"]
