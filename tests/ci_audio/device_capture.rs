@@ -6,7 +6,7 @@
 
 use std::time::Instant;
 
-use rsac::{AudioCaptureBuilder, CaptureTarget, DeviceId, DeviceKind};
+use rsac::{AudioCaptureBuilder, CaptureTarget, DeviceId};
 
 use crate::helpers;
 
@@ -26,7 +26,7 @@ fn test_capture_from_selected_device() {
         }
     };
 
-    let default_device = match enumerator.get_default_device(DeviceKind::Output) {
+    let default_device = match enumerator.get_default_device() {
         Ok(d) => d,
         Err(e) => {
             eprintln!("[ci_audio] Failed to get default device: {:?}", e);

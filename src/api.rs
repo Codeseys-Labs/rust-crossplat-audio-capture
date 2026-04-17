@@ -3,7 +3,6 @@ use crate::core::buffer::AudioBuffer;
 use crate::core::capabilities::PlatformCapabilities;
 use crate::core::config::{CaptureTarget, SampleFormat, StreamConfig};
 use crate::core::error::{AudioError, AudioResult};
-use crate::core::interface::DeviceKind;
 use std::fmt;
 use std::sync::mpsc;
 use std::sync::{Arc, Mutex};
@@ -166,11 +165,11 @@ impl AudioCaptureBuilder {
 
         let selected_device = match &capture_config.target {
             CaptureTarget::SystemDefault => {
-                // Default to input device for system default
+                // All backends return the default output device (used for loopback capture).
                 enumerator
-                    .get_default_device(DeviceKind::Input)
+                    .get_default_device()
                     .map_err(|e| AudioError::DeviceEnumerationError {
-                        reason: format!("Failed to get default input device: {}", e),
+                        reason: format!("Failed to get default device: {}", e),
                         context: None,
                     })?
             }
@@ -199,7 +198,7 @@ impl AudioCaptureBuilder {
             | CaptureTarget::ProcessTree(_) => {
                 // Application capture typically uses the default output device
                 enumerator
-                    .get_default_device(DeviceKind::Output)
+                    .get_default_device()
                     .map_err(|e| AudioError::DeviceEnumerationError {
                         reason: format!(
                             "Failed to get default output device for app capture: {}",

@@ -506,7 +506,7 @@ if dropped > 0 {
 // Device enumeration
 let enumerator = rsac::get_device_enumerator()?;
 let devices = enumerator.enumerate_devices()?;
-let default = enumerator.get_default_device(DeviceKind::Output)?;
+let default = enumerator.get_default_device()?;
 
 // Sink adapters
 use rsac::{NullSink, ChannelSink};

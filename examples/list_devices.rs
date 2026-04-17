@@ -6,7 +6,7 @@
 //! Run with: `cargo run --example list_devices`
 //! (add `--features feat_linux` on Linux, `--features feat_windows` on Windows, etc.)
 
-use rsac::{DeviceKind, PlatformCapabilities};
+use rsac::PlatformCapabilities;
 
 fn main() {
     let caps = PlatformCapabilities::query();
@@ -62,7 +62,7 @@ fn main() {
     match rsac::get_device_enumerator() {
         Ok(enumerator) => {
             // Default device
-            match enumerator.get_default_device(DeviceKind::Output) {
+            match enumerator.get_default_device() {
                 Ok(device) => {
                     println!("Default device: {} (ID: {})", device.name(), device.id());
                 }

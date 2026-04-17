@@ -91,12 +91,11 @@ impl CrossPlatformDeviceEnumerator {
 
     /// Get the default audio device.
     ///
-    /// The `_kind` parameter is accepted for backward compatibility but
-    /// the underlying `DeviceEnumerator::default_device()` returns the
-    /// platform's default capture-relevant device.
+    /// All platform backends (WASAPI, PipeWire, CoreAudio) return the default
+    /// output device here, since rsac is a loopback-capture library and the
+    /// output device is what consumers need for system audio capture.
     pub fn get_default_device(
         &self,
-        _kind: crate::core::interface::DeviceKind,
     ) -> crate::core::error::Result<Box<dyn crate::core::interface::AudioDevice>> {
         match self {
             #[cfg(all(target_os = "windows", feature = "feat_windows"))]

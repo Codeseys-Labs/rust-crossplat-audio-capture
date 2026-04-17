@@ -78,7 +78,7 @@ use rsac::{get_device_enumerator, DeviceKind};
 
 let enumerator = get_device_enumerator()?;
 let devices = enumerator.enumerate_devices()?;
-let default = enumerator.get_default_device(DeviceKind::Output)?;
+let default = enumerator.get_default_device()?;
 ```
 
 ## CLI Demo

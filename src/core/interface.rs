@@ -135,12 +135,18 @@ pub trait CapturingStream: Send + Sync {
 
     /// Closes the stream and releases all OS resources.
     ///
-    /// After `close()`, the stream cannot be restarted. Any subsequent
-    /// method calls should return `AudioError::StreamClosed`.
+    /// **Deprecated.** All real cleanup happens in the stream's `Drop` impl
+    /// (which itself invokes `stop()` when still running). Call
+    /// [`stop()`](Self::stop) explicitly to halt capture early and let the
+    /// stream drop normally to release resources.
     ///
-    /// The default implementation calls [`stop()`](Self::stop) and returns `Ok(())`.
+    /// The default implementation is a no-op; backends do not need to
+    /// override it.
+    #[deprecated(
+        since = "0.1.0",
+        note = "use stop() for explicit shutdown and rely on Drop for resource release"
+    )]
     fn close(self: Box<Self>) -> AudioResult<()> {
-        self.stop()?;
         Ok(())
     }
 

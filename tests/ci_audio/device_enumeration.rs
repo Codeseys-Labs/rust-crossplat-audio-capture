@@ -3,7 +3,7 @@
 //! These tests verify that rsac can enumerate audio devices and find
 //! defaults when audio infrastructure is available.
 
-use rsac::{get_device_enumerator, DeviceKind};
+use rsac::get_device_enumerator;
 
 #[test]
 fn test_enumerate_devices_finds_at_least_one() {
@@ -38,7 +38,7 @@ fn test_default_device_exists() {
     let enumerator = get_device_enumerator().expect("Failed to create device enumerator");
 
     let default_device = enumerator
-        .get_default_device(DeviceKind::Output)
+        .get_default_device()
         .expect("Failed to get default output device");
 
     eprintln!(

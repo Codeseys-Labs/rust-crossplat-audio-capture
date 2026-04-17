@@ -688,9 +688,10 @@ mod tests {
         assert!(buf3.is_none());
     }
 
-    // 16. close() default implementation stops the stream
+    // 16. close() default implementation is a no-op (deprecated; kept for ABI)
     #[test]
-    fn test_close_stops_stream() {
+    #[allow(deprecated)]
+    fn test_close_is_noop() {
         let (_, stream) = create_test_stream();
         assert!(stream.is_running());
 

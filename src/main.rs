@@ -11,8 +11,7 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use rsac::{
-    get_device_enumerator, AudioCaptureBuilder, CaptureTarget, DeviceKind, PlatformCapabilities,
-    ProcessId,
+    get_device_enumerator, AudioCaptureBuilder, CaptureTarget, PlatformCapabilities, ProcessId,
 };
 
 // ── CLI definition ───────────────────────────────────────────────────────
@@ -192,7 +191,7 @@ fn cmd_list() -> Result<()> {
     match get_device_enumerator() {
         Ok(enumerator) => {
             // Default device
-            match enumerator.get_default_device(DeviceKind::Output) {
+            match enumerator.get_default_device() {
                 Ok(device) => {
                     println!("  Default device: {} (ID: {})", device.name(), device.id());
                 }
