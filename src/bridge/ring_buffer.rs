@@ -131,7 +131,9 @@ impl BridgeProducer {
             Ok(()) => true,
             Err(_dropped) => {
                 self.shared.buffers_dropped.fetch_add(1, Ordering::Relaxed);
-                self.shared.consecutive_drops.fetch_add(1, Ordering::Relaxed);
+                self.shared
+                    .consecutive_drops
+                    .fetch_add(1, Ordering::Relaxed);
                 false
             }
         }
@@ -177,7 +179,9 @@ impl BridgeProducer {
                 // back-pressure on the RT thread.
                 self.scratch = rejected.into_data();
                 self.shared.buffers_dropped.fetch_add(1, Ordering::Relaxed);
-                self.shared.consecutive_drops.fetch_add(1, Ordering::Relaxed);
+                self.shared
+                    .consecutive_drops
+                    .fetch_add(1, Ordering::Relaxed);
                 false
             }
         }
