@@ -23,7 +23,7 @@ use std::ptr;
 
 use rsac::{
     ApplicationId, AudioBuffer, AudioCapture, AudioCaptureBuilder, CaptureTarget, DeviceId,
-    DeviceKind, PlatformCapabilities, ProcessId,
+    PlatformCapabilities, ProcessId,
 };
 
 // ── Error codes ──────────────────────────────────────────────────────────
@@ -848,9 +848,14 @@ pub unsafe extern "C" fn rsac_device_list_free(list: *mut RsacDeviceList) {
 #[no_mangle]
 pub unsafe extern "C" fn rsac_default_device(
     enumerator: *const RsacDeviceEnumerator,
-    kind: rsac_device_kind_t,
+    _kind: rsac_device_kind_t,
     out: *mut *mut RsacDevice,
 ) -> rsac_error_t {
+    // NOTE: The `_kind` parameter is currently ignored. All platform
+    // backends return the default *output* device (used for loopback
+    // capture); kind-based selection was never implemented. Preserved in
+    // the C ABI so existing consumers don't need to recompile. Future
+    // major versions may remove the parameter.
     catch(|| {
         if enumerator.is_null() {
             set_last_error("enumerator is null");
@@ -862,11 +867,7 @@ pub unsafe extern "C" fn rsac_default_device(
         }
         unsafe { *out = ptr::null_mut() };
         let e = unsafe { &*enumerator };
-        let dk = match kind {
-            rsac_device_kind_t::RSAC_DEVICE_INPUT => DeviceKind::Input,
-            rsac_device_kind_t::RSAC_DEVICE_OUTPUT => DeviceKind::Output,
-        };
-        match e.inner.get_default_device(dk) {
+        match e.inner.get_default_device() {
             Ok(device) => {
                 let handle = Box::new(RsacDevice { inner: device });
                 unsafe { *out = Box::into_raw(handle) };
