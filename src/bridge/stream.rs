@@ -152,17 +152,6 @@ impl<S: PlatformStream> BridgeStream<S> {
     pub fn buffers_read(&self) -> u64 {
         self.shared.buffers_popped.load(Ordering::Relaxed)
     }
-
-    /// Returns true if the producer has dropped enough consecutive buffers to
-    /// indicate sustained backpressure (consumer cannot keep up with producer).
-    ///
-    /// Part of the public observability API — no in-tree consumer today, but
-    /// downstream apps (e.g. audio-graph) are expected to poll this to decide
-    /// whether to throttle expensive per-chunk work.
-    #[allow(dead_code)]
-    pub fn is_under_backpressure(&self) -> bool {
-        self.shared.is_under_backpressure()
-    }
 }
 
 // ── CapturingStream Implementation ───────────────────────────────────────
