@@ -33,6 +33,7 @@ Each cell is a separate CI job visible in the [Actions tab](https://github.com/C
 - **Lock-free ring buffers** (`rtrb` SPSC) bridging OS callback threads to consumer threads
 - **Push-based subscription** (`subscribe()` returns `mpsc::Receiver<AudioBuffer>`)
 - **Overflow monitoring** (`overrun_count()` tracks dropped buffers)
+- **Backpressure signaling** (`is_under_backpressure()` on the `CapturingStream` trait — returns `true` when sustained consecutive frame drops indicate the consumer cannot keep up; use to throttle, warn, or switch providers)
 - **Sink adapters** — `NullSink`, `ChannelSink`, `WavFileSink`
 - **Platform capability reporting** — `PlatformCapabilities::query()` for honest feature detection
 

@@ -27,6 +27,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   recovery can now distinguish "backend busted" from "device really not
   there" on Linux. Cases where the backend is healthy but no matching
   device exists continue to return `AudioError::DeviceNotFound`.
+- Relocated `is_under_backpressure()` from an inherent method on
+  `BridgeStream<S>` to the `CapturingStream` trait, so every backend
+  (WASAPI, PipeWire, CoreAudio) exposes backpressure signaling through
+  the same dynamic-dispatch path used by `AudioCapture`. The inherent
+  `BridgeStream::is_under_backpressure()` has been removed (see the
+  Removed section below). Callers should invoke it via
+  `AudioCapture::is_under_backpressure()` or through the trait.
 - Strengthened `ci_audio` integration test assertions alongside the
   existing no-panic backbone: `test_stream_start_read_stop` now checks
   that returned buffers match the requested sample rate and channels and
