@@ -127,6 +127,28 @@ jobs:
       - name: Cargo test (unit tests)
         run: cargo test --lib --no-default-features --features feat_macos -- --test-threads=1
 
+      # OPTION B (existence check): Blacksmith macOS runners lack TCC grants for
+      # Process Tap capture (see macos-process job in ci-audio-tests.yml —
+      # continue-on-error with "Process Tap expected to skip due to TCC in CI").
+      # Rather than add a known-failing step, we assert the ignored tests exist
+      # and are discoverable by the harness. This catches regressions where the
+      # tests get deleted, renamed, or fail to compile — the common failure
+      # modes that a wiring check meaningfully guards against.
+      - name: Verify ApplicationByName + ApplicationByPID tests are wired up
+        timeout-minutes: 5
+        run: |
+          cargo test --test ci_audio --no-default-features --features feat_macos \
+            -- --list --ignored 2>&1 | tee ci-audio-ignored.log
+          grep -q "application_by_name" ci-audio-ignored.log || {
+            echo "FAIL: application_by_name tests not discovered in ignored test list"
+            exit 1
+          }
+          grep -q "application_by_pid" ci-audio-ignored.log || {
+            echo "FAIL: application_by_pid tests not discovered in ignored test list"
+            exit 1
+          }
+          echo "OK: application_by_{name,pid} tests are wired up (ignored, not run in CI — TCC unavailable on Blacksmith macOS)"
+
   # ── Linux ARM64 cross-compilation check ─────────────────────────────
   cross-compile-linux-arm64:
     name: Linux ARM64 Cross-Compile Check

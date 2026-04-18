@@ -11,6 +11,7 @@ mod helpers;
 
 mod app_capture;
 mod application_by_name;
+mod application_by_pid;
 mod device_capture;
 mod device_enumeration;
 mod platform_caps;
