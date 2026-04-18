@@ -198,8 +198,7 @@ fn list_audio_applications_into(sources: &mut Vec<AudioSource>) {
         if let Ok(json_str) = String::from_utf8(output.stdout) {
             if let Ok(nodes) = serde_json::from_str::<Vec<serde_json::Value>>(&json_str) {
                 for node in &nodes {
-                    if node.get("type").and_then(|t| t.as_str())
-                        != Some("PipeWire:Interface:Node")
+                    if node.get("type").and_then(|t| t.as_str()) != Some("PipeWire:Interface:Node")
                     {
                         continue;
                     }
