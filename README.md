@@ -113,6 +113,12 @@ rsac record --duration 30 --output recording.wav
 | Process tree | Process loopback | PID node mapping | Process Tap (14.4+) |
 | Device selection | Yes | Yes | Yes |
 
+### macOS Enumeration Scope
+
+On macOS, enumeration returns a superset of what is actually capturable — the audio graph is opaque until a Process Tap is installed. `list_audio_sources()` / `list_audio_applications()` use `NSWorkspace.runningApplications`, which reports every running app with a GUI activation policy, *not* only apps currently producing audio. Callers cannot distinguish "silent" from "playing" before attempting capture; most apps in the returned list will have no audio output at the moment of enumeration. By contrast, Windows (WASAPI session enumeration) and Linux (PipeWire stream nodes via `pw-dump`) report only endpoints with an active audio session, so those lists are closer to a true "currently producing audio" set.
+
+Device enumeration on macOS (`enumerate_devices()`) lists all CoreAudio output devices the process can see, which is comparable to the other platforms. What is *not* enumerable from rsac on macOS: the live per-process audio signal graph (which PIDs are routing to which device at this instant) — that information is not exposed outside Core Audio, and Process Tap attachment is the only way to observe per-app audio. Screen Recording permission (TCC) is required at capture time; `check_audio_capture_permission()` returns `NotDetermined` until the OS prompt has been answered, because macOS does not expose a reliable pre-flight query on supported versions.
+
 ## Installation
 
 Add to `Cargo.toml`:

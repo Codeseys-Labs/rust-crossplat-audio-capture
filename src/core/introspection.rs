@@ -157,104 +157,109 @@ pub fn list_audio_applications() -> AudioResult<Vec<AudioSource>> {
 }
 
 /// Internal: appends audio applications to the provided vec.
+#[cfg(all(target_os = "macos", feature = "feat_macos"))]
 fn list_audio_applications_into(sources: &mut Vec<AudioSource>) {
-    #[cfg(all(target_os = "macos", feature = "feat_macos"))]
-    {
-        if let Ok(apps) = crate::audio::macos::enumerate_audio_applications() {
-            for app in apps {
-                sources.push(AudioSource {
-                    id: format!("app:{}", app.process_id),
-                    name: app.name.clone(),
-                    kind: AudioSourceKind::Application {
-                        pid: app.process_id,
-                        app_name: app.name,
-                        bundle_id: app.bundle_id,
-                    },
-                });
-            }
+    if let Ok(apps) = crate::audio::macos::enumerate_audio_applications() {
+        for app in apps {
+            sources.push(AudioSource {
+                id: format!("app:{}", app.process_id),
+                name: app.name.clone(),
+                kind: AudioSourceKind::Application {
+                    pid: app.process_id,
+                    app_name: app.name,
+                    bundle_id: app.bundle_id,
+                },
+            });
         }
     }
+}
 
-    #[cfg(all(target_os = "windows", feature = "feat_windows"))]
-    {
-        if let Ok(sessions) = crate::audio::windows::enumerate_application_audio_sessions() {
-            for session in sessions {
-                sources.push(AudioSource {
-                    id: format!("app:{}", session.process_id),
-                    name: session.display_name.clone(),
-                    kind: AudioSourceKind::Application {
-                        pid: session.process_id,
-                        app_name: session.display_name,
-                        bundle_id: None,
-                    },
-                });
-            }
+#[cfg(all(target_os = "windows", feature = "feat_windows"))]
+fn list_audio_applications_into(sources: &mut Vec<AudioSource>) {
+    if let Ok(sessions) = crate::audio::windows::enumerate_application_audio_sessions() {
+        for session in sessions {
+            sources.push(AudioSource {
+                id: format!("app:{}", session.process_id),
+                name: session.display_name.clone(),
+                kind: AudioSourceKind::Application {
+                    pid: session.process_id,
+                    app_name: session.display_name,
+                    bundle_id: None,
+                },
+            });
         }
     }
+}
 
-    #[cfg(all(target_os = "linux", feature = "feat_linux"))]
-    {
-        // Linux PipeWire application discovery via pw-dump
-        if let Ok(output) = std::process::Command::new("pw-dump").output() {
-            if let Ok(json_str) = String::from_utf8(output.stdout) {
-                if let Ok(nodes) = serde_json::from_str::<Vec<serde_json::Value>>(&json_str) {
-                    for node in &nodes {
-                        if node.get("type").and_then(|t| t.as_str())
-                            != Some("PipeWire:Interface:Node")
-                        {
-                            continue;
-                        }
-                        let info = match node.get("info") {
-                            Some(i) => i,
-                            None => continue,
-                        };
-                        let props = match info.get("props") {
-                            Some(p) => p,
-                            None => continue,
-                        };
-                        // Only include audio stream nodes (not device nodes)
-                        let media_class = props
-                            .get("media.class")
-                            .and_then(|v| v.as_str())
-                            .unwrap_or("");
-                        if !media_class.contains("Stream") {
-                            continue;
-                        }
-                        let app_name = props
-                            .get("application.name")
-                            .and_then(|v| v.as_str())
-                            .unwrap_or("Unknown");
-                        let pid = props
-                            .get("application.process.id")
-                            .and_then(|v| v.as_str())
-                            .and_then(|s| s.parse::<u32>().ok())
-                            .unwrap_or(0);
-
-                        if pid == 0 {
-                            continue;
-                        }
-
-                        // Deduplicate by PID
-                        let id = format!("app:{}", pid);
-                        if sources.iter().any(|s| s.id == id) {
-                            continue;
-                        }
-
-                        sources.push(AudioSource {
-                            id,
-                            name: app_name.to_string(),
-                            kind: AudioSourceKind::Application {
-                                pid,
-                                app_name: app_name.to_string(),
-                                bundle_id: None,
-                            },
-                        });
+#[cfg(all(target_os = "linux", feature = "feat_linux"))]
+fn list_audio_applications_into(sources: &mut Vec<AudioSource>) {
+    // Linux PipeWire application discovery via pw-dump
+    if let Ok(output) = std::process::Command::new("pw-dump").output() {
+        if let Ok(json_str) = String::from_utf8(output.stdout) {
+            if let Ok(nodes) = serde_json::from_str::<Vec<serde_json::Value>>(&json_str) {
+                for node in &nodes {
+                    if node.get("type").and_then(|t| t.as_str())
+                        != Some("PipeWire:Interface:Node")
+                    {
+                        continue;
                     }
+                    let info = match node.get("info") {
+                        Some(i) => i,
+                        None => continue,
+                    };
+                    let props = match info.get("props") {
+                        Some(p) => p,
+                        None => continue,
+                    };
+                    // Only include audio stream nodes (not device nodes)
+                    let media_class = props
+                        .get("media.class")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or("");
+                    if !media_class.contains("Stream") {
+                        continue;
+                    }
+                    let app_name = props
+                        .get("application.name")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or("Unknown");
+                    let pid = props
+                        .get("application.process.id")
+                        .and_then(|v| v.as_str())
+                        .and_then(|s| s.parse::<u32>().ok())
+                        .unwrap_or(0);
+
+                    if pid == 0 {
+                        continue;
+                    }
+
+                    // Deduplicate by PID
+                    let id = format!("app:{}", pid);
+                    if sources.iter().any(|s| s.id == id) {
+                        continue;
+                    }
+
+                    sources.push(AudioSource {
+                        id,
+                        name: app_name.to_string(),
+                        kind: AudioSourceKind::Application {
+                            pid,
+                            app_name: app_name.to_string(),
+                            bundle_id: None,
+                        },
+                    });
                 }
             }
         }
     }
 }
+
+#[cfg(not(any(
+    all(target_os = "macos", feature = "feat_macos"),
+    all(target_os = "windows", feature = "feat_windows"),
+    all(target_os = "linux", feature = "feat_linux"),
+)))]
+fn list_audio_applications_into(_sources: &mut Vec<AudioSource>) {}
 
 // ── Permission helpers ──────────────────────────────────────────────────
 
