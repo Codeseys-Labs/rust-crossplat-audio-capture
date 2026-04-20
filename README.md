@@ -146,6 +146,13 @@ sudo pacman -S pipewire pkgconf clang
 
 **macOS** — Xcode Command Line Tools. Screen Recording permission required. Process Tap requires macOS 14.4+.
 
+## Documentation
+
+- [`docs/features.md`](docs/features.md) — Cargo feature matrix: which features are default, which platforms they enable, and what system packages each one needs.
+- [`docs/troubleshooting.md`](docs/troubleshooting.md) — High-signal fixes for the most common build and runtime errors (PipeWire libs missing, Xcode CLT, TCC permission, WASAPI session contention, etc.).
+- [`docs/architecture/`](docs/architecture/) — Full design documents for the core, bridge, and backend layers.
+- [`docs/CI_AUDIO_TESTING.md`](docs/CI_AUDIO_TESTING.md) — How audio integration tests run in CI across all three platforms.
+
 ## Architecture
 
 ```
@@ -157,8 +164,6 @@ core/ → bridge/ → audio/ (backends) → api/ → lib.rs
 - **`audio/`** — Platform backends (WASAPI, PipeWire, CoreAudio), each implementing `PlatformStream`
 - **`api/`** — `AudioCaptureBuilder` → `AudioCapture` (public entry points)
 - **`sink/`** — `AudioSink` trait + `NullSink`, `ChannelSink`, `WavFileSink`
-
-See [`docs/architecture/`](docs/architecture/) for the full design documents.
 
 ## Applications Built on rsac
 

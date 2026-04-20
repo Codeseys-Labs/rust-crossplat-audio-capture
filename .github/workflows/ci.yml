@@ -149,6 +149,26 @@ jobs:
           }
           echo "OK: application_by_{name,pid} tests are wired up (ignored, not run in CI — TCC unavailable on Blacksmith macOS)"
 
+      # Existence check for subscribe + process_tree coverage added in
+      # loop-18 task #3. These are NOT #[ignore]d — they use require_audio!()
+      # to skip at runtime — so we list the full (non-ignored) suite and
+      # grep for the module names. Keeps the wiring-regression guard in
+      # lockstep with the application_by_{name,pid} pattern above.
+      - name: Verify subscribe + process_tree tests are wired up
+        timeout-minutes: 5
+        run: |
+          cargo test --test ci_audio --no-default-features --features feat_macos \
+            -- --list 2>&1 | tee ci-audio-all.log
+          grep -q "subscribe" ci-audio-all.log || {
+            echo "FAIL: subscribe tests not discovered in test list"
+            exit 1
+          }
+          grep -q "process_tree" ci-audio-all.log || {
+            echo "FAIL: process_tree tests not discovered in test list"
+            exit 1
+          }
+          echo "OK: subscribe + process_tree tests are wired up"
+
   # ── Linux ARM64 cross-compilation check ─────────────────────────────
   cross-compile-linux-arm64:
     name: Linux ARM64 Cross-Compile Check
