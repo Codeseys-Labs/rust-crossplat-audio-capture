@@ -9,6 +9,68 @@ target version where appropriate.
 
 ---
 
+## Automated Release Flow
+
+`.github/workflows/release.yml` automates the happy path for the crates.io
+portion of this procedure. It is triggered by pushing a semver-shaped tag
+(`vMAJOR.MINOR.PATCH`, e.g. `v0.2.0`) and runs three jobs in sequence:
+
+1. **`verify`** — matrix of `blacksmith-4vcpu-ubuntu-2404`,
+   `blacksmith-4vcpu-windows-2025`, and `blacksmith-6vcpu-macos-15`, each
+   running `cargo test --lib` against its platform feature. Mirrors the
+   `test-*` jobs in `ci.yml` (including the Windows "no audio subsystem"
+   exemption via `continue-on-error`).
+2. **`publish`** — depends on `verify`; single Linux runner executes
+   `cargo publish --dry-run` and then `cargo publish`. Uses the
+   `CARGO_REGISTRY_TOKEN` repo secret.
+3. **`github-release`** — depends on `publish`; extracts the CHANGELOG
+   section matching the tag version and publishes a GitHub Release via
+   `softprops/action-gh-release@v2`.
+
+### One-time setup
+
+Before the **first** tag push, a maintainer must:
+
+- Generate a crates.io API token at <https://crates.io/me> scoped to
+  `publish-update` (and `publish-new` if `rsac` has not been published
+  yet) for the `rsac` crate.
+- Add it to GitHub repo secrets as **`CARGO_REGISTRY_TOKEN`**
+  (Settings → Secrets and variables → Actions → New repository secret).
+
+Without this secret the `publish` job will fail with a 401 from
+crates.io, leaving `verify` green and the GH release uncreated. In that
+state, fall back to the manual procedure below (§2–§5).
+
+### Using the automated flow
+
+From a clean `master` with CI already green on the commit you intend to
+release (see §2 for the pre-release checklist):
+
+```bash
+# Bump the version + promote CHANGELOG entries under a dated heading.
+# See §2 "CHANGELOG promotion" and §3 "Version bump" for the details.
+git add Cargo.toml Cargo.lock CHANGELOG.md
+git commit -m "rsac X.Y.Z"
+git push origin master
+
+# Tag and push — this is the workflow trigger.
+git tag -a vX.Y.Z -m "rsac X.Y.Z"
+git push origin vX.Y.Z
+```
+
+Watch the Actions tab. If `verify` fails, delete the tag locally and
+remotely (`git tag -d vX.Y.Z && git push --delete origin vX.Y.Z`), fix
+the underlying issue, and re-tag. crates.io publishes are irrevocable,
+so `publish` is gated behind a successful `verify` — but a failure
+inside `publish` (e.g. transient network, token rotation) is not safe
+to re-run blindly if `cargo publish` already succeeded. Inspect
+<https://crates.io/crates/rsac> before re-running.
+
+Bindings (`rsac-napi`, `rsac-python`) are **not** published by this
+workflow — see §6 and the TODO comment in `release.yml`.
+
+---
+
 ## 1. Prerequisites
 
 Before you start a release, confirm all of the following:
@@ -31,11 +93,13 @@ Before you start a release, confirm all of the following:
   git checkout master && git pull --ff-only origin master && git status
   ```
 
-> **Manual step required — not yet automated:** rsac currently has **no
-> `.github/workflows/release.yml`** and **no `scripts/bump-version.sh`**.
-> Every step below is run by hand from a maintainer's workstation. When a
-> release automation workflow is added, this document should be updated to
-> point at it.
+> **Manual fallback procedure.** The sections below describe how to run
+> the release by hand. When `.github/workflows/release.yml` is wired up
+> (see "Automated Release Flow" above), the tag push does §4–§5 and §7
+> step 4 for you; the manual steps here remain the fallback when the
+> `CARGO_REGISTRY_TOKEN` secret is unset or a maintainer needs to
+> override the automation. `scripts/bump-version.sh` is still absent —
+> §3 is always manual today.
 
 ---
 
@@ -242,12 +306,15 @@ with the bug resolved and publish it using this same procedure.
 
 ## Gaps / manual steps summary
 
-Tracked here so the next release-automation task can pick them up:
+Tracked here so follow-up release-automation tasks can pick them up:
 
-- No `.github/workflows/release.yml` — the entire publish flow is manual.
+- `.github/workflows/release.yml` exists (see "Automated Release Flow"
+  above), but `CARGO_REGISTRY_TOKEN` must be set in GH Actions secrets
+  before the first tag push — until it is, the `publish` job will fail
+  and the flow degrades to manual §2–§5.
 - No `scripts/bump-version.sh` — version strings are edited by hand
   (compare to `apps/audio-graph/`, which does have a bump script).
 - `rsac-napi` and `rsac-python` have no package manifests yet — neither
-  npm nor PyPI publishing is set up.
-- crates.io API token is not yet stored in GitHub Actions secrets (since
-  there is no release workflow to consume it).
+  npm nor PyPI publishing is set up, and `release.yml` intentionally
+  does not touch them (a TODO comment in the workflow flags this for a
+  future loop).

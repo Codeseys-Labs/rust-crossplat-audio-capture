@@ -1,0 +1,139 @@
+# Tag-triggered release workflow for rsac.
+# Mirrors the procedure in docs/RELEASE_PROCESS.md:
+#   1. verify       — run the unit test suite on Linux / Windows / macOS
+#   2. publish      — cargo publish --dry-run, then cargo publish to crates.io
+#   3. github-release — create a GH Release with the matching CHANGELOG section
+#
+# Triggered only by semver-shaped tags (vMAJOR.MINOR.PATCH) to avoid firing
+# on loose tags (rc, test-*, etc.). Bump Cargo.toml + CHANGELOG first, then
+# `git tag -a vX.Y.Z -m "rsac X.Y.Z" && git push origin vX.Y.Z` kicks this off.
+#
+# Required GitHub secret:
+#   CARGO_REGISTRY_TOKEN — crates.io API token with publish-update scope for `rsac`
+#
+# TODO(future): wire bindings/ publish once manifests exist — rsac-napi to npm
+# (needs NPM_TOKEN + NAPI-RS per-platform build matrix) and rsac-python to PyPI
+# via maturin (needs MATURIN_PYPI_TOKEN + maturin-action wheel matrix). Docs
+# note these bindings are placeholder dirs without package.json/pyproject.toml.
+
+name: Release
+
+on:
+  push:
+    tags:
+      - 'v*.*.*'
+
+env:
+  CARGO_TERM_COLOR: always
+  RUST_BACKTRACE: 1
+
+jobs:
+  # ── Verify: rerun per-platform unit tests on the tagged commit ──────
+  verify:
+    name: Verify (${{ matrix.os }})
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: blacksmith-4vcpu-ubuntu-2404
+            features: feat_linux
+            install_deps: true
+            continue_tests_on_error: false
+          - os: blacksmith-4vcpu-windows-2025
+            features: feat_windows
+            install_deps: false
+            # Blacksmith Windows runners lack an audio subsystem; ci.yml
+            # already treats WASAPI test failures as expected there.
+            continue_tests_on_error: true
+          - os: blacksmith-6vcpu-macos-15
+            features: feat_macos
+            install_deps: false
+            continue_tests_on_error: false
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v5
+      - uses: dtolnay/rust-toolchain@1.95.0
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Install PipeWire dev libraries (Linux)
+        if: matrix.install_deps
+        run: |
+          sudo add-apt-repository ppa:pipewire-debian/pipewire-upstream -y
+          sudo apt-get update
+          sudo apt-get install -y libpipewire-0.3-dev libspa-0.2-dev pkg-config
+
+      - name: Cargo test (unit tests)
+        continue-on-error: ${{ matrix.continue_tests_on_error }}
+        run: cargo test --lib --no-default-features --features ${{ matrix.features }} -- --test-threads=1
+
+  # ── Publish: cargo publish to crates.io ─────────────────────────────
+  publish:
+    name: Publish to crates.io
+    needs: verify
+    runs-on: blacksmith-4vcpu-ubuntu-2404
+    steps:
+      - uses: actions/checkout@v5
+      - uses: dtolnay/rust-toolchain@1.95.0
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Install PipeWire dev libraries
+        run: |
+          sudo add-apt-repository ppa:pipewire-debian/pipewire-upstream -y
+          sudo apt-get update
+          sudo apt-get install -y libpipewire-0.3-dev libspa-0.2-dev pkg-config
+
+      - name: Cargo publish (dry run)
+        env:
+          CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
+        run: cargo publish --dry-run
+
+      - name: Cargo publish
+        env:
+          CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
+        run: cargo publish
+
+  # ── GitHub Release: surface the CHANGELOG section on the tag ────────
+  github-release:
+    name: Create GitHub Release
+    needs: publish
+    runs-on: blacksmith-4vcpu-ubuntu-2404
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v5
+
+      - name: Extract version from tag
+        id: version
+        env:
+          GITHUB_REF_NAME_SAFE: ${{ github.ref_name }}
+        run: |
+          TAG="$GITHUB_REF_NAME_SAFE"
+          VERSION="${TAG#v}"
+          echo "tag=${TAG}" >> "$GITHUB_OUTPUT"
+          echo "version=${VERSION}" >> "$GITHUB_OUTPUT"
+
+      - name: Extract CHANGELOG section for this release
+        env:
+          VERSION: ${{ steps.version.outputs.version }}
+        run: |
+          # Awk the block between "## [VERSION]" and the next "## [" heading.
+          awk -v v="$VERSION" '
+            $0 ~ "^## \\[" v "\\]" { in_section = 1; print; next }
+            in_section && /^## \[/ { exit }
+            in_section { print }
+          ' CHANGELOG.md > release_body.md
+          if [ ! -s release_body.md ]; then
+            echo "No CHANGELOG section found for version ${VERSION}; using fallback body." >&2
+            echo "Release ${VERSION}. See CHANGELOG.md for details." > release_body.md
+          fi
+          echo "---- release_body.md ----"
+          cat release_body.md
+
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ steps.version.outputs.tag }}
+          name: rsac ${{ steps.version.outputs.version }}
+          body_path: release_body.md
+          draft: false
+          prerelease: false

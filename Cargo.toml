@@ -4,6 +4,12 @@ version = "0.2.0"
 edition = "2021"
 build = "build.rs"
 autobins = false
+description = "Cross-platform audio capture library with per-application process taps (macOS), WASAPI (Windows), and PipeWire (Linux)"
+license = "MIT OR Apache-2.0"
+repository = "https://github.com/baladita/rust-crossplat-audio-capture"
+readme = "README.md"
+keywords = ["audio", "capture", "wasapi", "coreaudio", "pipewire"]
+categories = ["multimedia::audio", "os"]
 
 [features]
 # Platform-specific features
