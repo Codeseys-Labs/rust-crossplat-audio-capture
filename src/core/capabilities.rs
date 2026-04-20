@@ -259,7 +259,7 @@ mod tests {
 
     #[test]
     fn query_returns_valid_capabilities() {
-        let caps = PlatformCapabilities::query();
+        let _caps = PlatformCapabilities::query();
 
         // We're on Linux, so these should be the PipeWire values
         #[cfg(target_os = "linux")]

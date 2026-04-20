@@ -386,7 +386,7 @@ fn _assert_macos_platform_stream_send() {
 #[cfg(all(test, target_os = "macos"))]
 mod tests {
     use super::*;
-    use crate::core::config::{ApplicationId, CaptureTarget, DeviceId, ProcessId};
+    use crate::core::config::{ApplicationId, CaptureTarget, DeviceId};
     use coreaudio_sys::kAudioFormatFlagIsNonInterleaved;
 
     // ── build_f32_asbd tests ─────────────────────────────────────────

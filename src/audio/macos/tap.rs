@@ -1310,7 +1310,7 @@ mod tests {
     /// the objc crate's "exception" feature is enabled).
     #[test]
     fn test_new_system_creates_tap() {
-        let result = std::panic::catch_unwind(|| CoreAudioProcessTap::new_system());
+        let result = std::panic::catch_unwind(CoreAudioProcessTap::new_system);
 
         match result {
             Ok(Ok(tap)) => {

@@ -421,7 +421,7 @@ pub(crate) fn audio_format_to_asbd(format: &AudioFormat) -> AudioStreamBasicDesc
 mod tests {
     use super::*;
     use crate::core::config::{AudioFormat, CaptureTarget, SampleFormat, StreamConfig};
-    use crate::core::interface::{AudioDevice, DeviceEnumerator};
+    use crate::core::interface::DeviceEnumerator;
 
     // ── Helper function tests: asbd_to_audio_format ──────────────────
 
@@ -776,7 +776,7 @@ mod tests {
     #[test]
     fn enumerator_new_and_default_are_equivalent() {
         let a = MacosDeviceEnumerator::new();
-        let b = MacosDeviceEnumerator::default();
+        let b = MacosDeviceEnumerator;
         // Both constructors produce equivalent enumerators (no internal state)
         let _ = (a, b); // Just verify they compile and are usable
     }

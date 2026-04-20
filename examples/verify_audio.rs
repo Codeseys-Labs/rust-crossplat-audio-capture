@@ -133,7 +133,7 @@ fn analyze_frequency(
     }
 
     // Calculate expected period in samples
-    let expected_period = sample_rate / target_freq;
+    let _expected_period = sample_rate / target_freq;
     let min_period = sample_rate / (target_freq + tolerance);
     let max_period = sample_rate / (target_freq - tolerance);
 

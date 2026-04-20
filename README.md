@@ -152,6 +152,7 @@ sudo pacman -S pipewire pkgconf clang
 - [`docs/troubleshooting.md`](docs/troubleshooting.md) — High-signal fixes for the most common build and runtime errors (PipeWire libs missing, Xcode CLT, TCC permission, WASAPI session contention, etc.).
 - [`docs/architecture/`](docs/architecture/) — Full design documents for the core, bridge, and backend layers.
 - [`docs/CI_AUDIO_TESTING.md`](docs/CI_AUDIO_TESTING.md) — How audio integration tests run in CI across all three platforms.
+- [`docs/RELEASE_PROCESS.md`](docs/RELEASE_PROCESS.md) — End-to-end procedure for cutting a new `rsac` release: pre-release checks, version bump, tag, `cargo publish`, verification, and rollback.
 
 ## Architecture
 

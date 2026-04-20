@@ -995,7 +995,7 @@ mod tests {
 
     #[test]
     fn source_some_for_internal_with_source() {
-        let io_err = io::Error::new(io::ErrorKind::Other, "root cause");
+        let io_err = io::Error::other("root cause");
         let audio_err: AudioError = io_err.into();
         let src = std::error::Error::source(&audio_err);
         assert!(
@@ -1083,6 +1083,7 @@ mod tests {
     // ── AudioResult alias ────────────────────────────────────────────
 
     #[test]
+    #[allow(clippy::unnecessary_literal_unwrap)]
     fn audio_result_ok() {
         let r: AudioResult<i32> = Ok(42);
         assert_eq!(r.unwrap(), 42);
