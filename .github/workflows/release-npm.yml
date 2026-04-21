@@ -1,0 +1,155 @@
+# Tag-triggered npm release workflow for @rsac/audio (Node.js bindings).
+#
+# Mirrors .github/workflows/release.yml for the crates.io flow:
+#   1. verify-napi-build — matrix builds per napi-rs target, uploads .node
+#   2. publish-npm       — merges artifacts, runs `napi prepublish -t npm`,
+#                          publishes main + platform sub-packages to npm
+#
+# Triggered by semver-shaped tags (vMAJOR.MINOR.PATCH) from push --tags.
+# Bump bindings/rsac-napi/package.json version in lockstep with the root
+# Cargo.toml before tagging (see docs/RELEASE_PROCESS.md).
+#
+# Required GitHub secret:
+#   NPM_TOKEN — npm automation token with publish rights on @rsac scope.
+#               Create at https://www.npmjs.com/settings/<user>/tokens
+#               (type: Automation). Add via Settings → Secrets and
+#               variables → Actions → New repository secret.
+#
+# Security note: this workflow is tag-triggered only. No untrusted
+# event payloads (issue bodies, PR titles, commit messages, etc.) are
+# interpolated into run: steps. Only `secrets.*` and static matrix
+# values are consumed.
+
+name: Release npm
+
+on:
+  push:
+    tags:
+      - 'v*.*.*'
+
+env:
+  CARGO_TERM_COLOR: always
+  RUST_BACKTRACE: 1
+
+jobs:
+  # verify-napi-build: per-target native builds.
+  # napi-rs v2 standard 5-target matrix. Each job produces a
+  # rsac-audio.<triple>.node artifact consumed by the publish job.
+  verify-napi-build:
+    name: Build napi (${{ matrix.target }})
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - target: x86_64-apple-darwin
+            os: blacksmith-6vcpu-macos-15
+            napi-target: darwin-x64
+            install_deps: false
+          - target: aarch64-apple-darwin
+            os: blacksmith-6vcpu-macos-15
+            napi-target: darwin-arm64
+            install_deps: false
+          - target: x86_64-unknown-linux-gnu
+            os: blacksmith-4vcpu-ubuntu-2404
+            napi-target: linux-x64-gnu
+            install_deps: true
+          - target: aarch64-unknown-linux-gnu
+            os: blacksmith-4vcpu-ubuntu-2404
+            napi-target: linux-arm64-gnu
+            install_deps: true
+            cross: true
+          - target: x86_64-pc-windows-msvc
+            os: blacksmith-4vcpu-windows-2025
+            napi-target: win32-x64-msvc
+            install_deps: false
+    runs-on: ${{ matrix.os }}
+    defaults:
+      run:
+        working-directory: bindings/rsac-napi
+    steps:
+      - uses: actions/checkout@v5
+
+      - uses: dtolnay/rust-toolchain@1.95.0
+        with:
+          targets: ${{ matrix.target }}
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: bindings/rsac-napi -> target
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+          registry-url: 'https://registry.npmjs.org'
+
+      - uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: latest
+
+      - name: Install PipeWire dev libraries (Linux)
+        if: matrix.install_deps
+        working-directory: .
+        run: |
+          sudo add-apt-repository ppa:pipewire-debian/pipewire-upstream -y
+          sudo apt-get update
+          sudo apt-get install -y libpipewire-0.3-dev libspa-0.2-dev pkg-config
+
+      - name: Install aarch64 cross-compile toolchain (Linux)
+        if: matrix.cross
+        working-directory: .
+        run: sudo apt-get install -y gcc-aarch64-linux-gnu
+
+      - name: bun install
+        run: bun install --frozen-lockfile || bun install
+
+      - name: napi build
+        run: bunx @napi-rs/cli build --platform --release --target ${{ matrix.target }}
+
+      - name: Upload .node artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: bindings-${{ matrix.napi-target }}
+          path: bindings/rsac-napi/*.node
+          if-no-files-found: error
+
+  # publish-npm: merge artifacts + publish platform sub-packages.
+  publish-npm:
+    name: Publish to npm
+    needs: verify-napi-build
+    runs-on: blacksmith-4vcpu-ubuntu-2404
+    defaults:
+      run:
+        working-directory: bindings/rsac-napi
+    steps:
+      - uses: actions/checkout@v5
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+          registry-url: 'https://registry.npmjs.org'
+
+      - uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: latest
+
+      - name: bun install
+        run: bun install --frozen-lockfile || bun install
+
+      - name: Download all .node artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: bindings/rsac-napi/artifacts
+
+      - name: Move artifacts into place
+        run: bunx @napi-rs/cli artifacts --dir artifacts
+
+      - name: napi prepublish (generate platform packages)
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: bunx @napi-rs/cli prepublish -t npm --skip-gh-release
+
+      - name: Publish main package + platform sub-packages
+        env:
+          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
+          NPM_CONFIG_TOKEN: ${{ secrets.NPM_TOKEN }}
+        run: bunx npm publish --access public --provenance

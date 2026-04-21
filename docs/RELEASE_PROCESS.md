@@ -11,9 +11,18 @@ target version where appropriate.
 
 ## Automated Release Flow
 
-`.github/workflows/release.yml` automates the happy path for the crates.io
-portion of this procedure. It is triggered by pushing a semver-shaped tag
-(`vMAJOR.MINOR.PATCH`, e.g. `v0.2.0`) and runs three jobs in sequence:
+A single `git tag -a vX.Y.Z && git push --tags` fans out to **three
+registry workflows**. They all key on the same `v*.*.*` tag push and run
+in parallel — each publishes to one registry, and the GitHub Release is
+created once the crates.io flow finishes.
+
+| Workflow | Registry | Matrix | Key jobs | Required secret |
+|---|---|---|---|---|
+| `.github/workflows/release.yml` | crates.io | linux/win/mac | `verify` → `publish` → `github-release` | `CARGO_REGISTRY_TOKEN` |
+| `.github/workflows/release-npm.yml` | npm (`@rsac/audio`) | 5 napi-rs targets | `verify-napi-build` (×5) → `publish-npm` | `NPM_TOKEN` |
+| `.github/workflows/release-pypi.yml` | PyPI (`rsac`) | 3 OS × 5 Python (+ sdist) | `build-wheels` (×15) + `build-sdist` → `publish-pypi` | `MATURIN_PYPI_TOKEN` |
+
+### `release.yml` (crates.io)
 
 1. **`verify`** — matrix of `blacksmith-4vcpu-ubuntu-2404`,
    `blacksmith-4vcpu-windows-2025`, and `blacksmith-6vcpu-macos-15`, each
@@ -27,19 +36,67 @@ portion of this procedure. It is triggered by pushing a semver-shaped tag
    section matching the tag version and publishes a GitHub Release via
    `softprops/action-gh-release@v2`.
 
+### `release-npm.yml` (npm)
+
+1. **`verify-napi-build`** — matrix of five napi-rs standard targets:
+   `x86_64-apple-darwin`, `aarch64-apple-darwin`,
+   `x86_64-unknown-linux-gnu`, `aarch64-unknown-linux-gnu` (cross-built
+   with `gcc-aarch64-linux-gnu`), `x86_64-pc-windows-msvc`. Each job
+   sets up Node 20 + Bun, installs `bindings/rsac-napi` deps with `bun
+   install`, runs `bunx @napi-rs/cli build --platform --release --target
+   <triple>`, and uploads the resulting `.node` as an artifact.
+2. **`publish-npm`** — depends on all five matrix entries. Downloads
+   every `.node` into `bindings/rsac-napi/artifacts/`, runs `bunx
+   @napi-rs/cli artifacts --dir artifacts` to move them into place and
+   `bunx @napi-rs/cli prepublish -t npm --skip-gh-release` to generate
+   the per-platform sub-packages (`@rsac/audio-darwin-arm64`, etc.),
+   then `bunx npm publish --access public --provenance` for the main
+   package. Uses `NPM_TOKEN` as `NODE_AUTH_TOKEN` / `NPM_CONFIG_TOKEN`.
+
+### `release-pypi.yml` (PyPI)
+
+1. **`build-wheels`** — matrix of three runners
+   (`blacksmith-4vcpu-ubuntu-2404`, `blacksmith-6vcpu-macos-15`,
+   `blacksmith-4vcpu-windows-2025`) × five Python interpreters (3.9,
+   3.10, 3.11, 3.12, 3.13) = 15 wheel builds. Uses
+   `PyO3/maturin-action@v1` with `command: build`, `target: auto`,
+   `manylinux: auto`, and
+   `--manifest-path bindings/rsac-python/Cargo.toml`. Each wheel is
+   uploaded as an artifact.
+2. **`build-sdist`** — single Linux job, `PyO3/maturin-action@v1` with
+   `command: sdist`. Uploads the `.tar.gz`.
+3. **`publish-pypi`** — depends on both of the above. Downloads all
+   artifacts into `dist-all/` with `merge-multiple: true`, then
+   `PyO3/maturin-action@v1` with `command: upload` and
+   `--skip-existing dist-all/*`. Uses `MATURIN_PYPI_TOKEN`.
+
+   Known limitations:
+   - `manylinux: auto` resolves to `manylinux2014` (glibc 2.17+) on
+     x86_64, which is fine for Python 3.9+. If downstream users need
+     older glibc, pin to `manylinux_2_17` explicitly.
+   - macOS 15 runners produce wheels tagged with the Rust toolchain's
+     default deployment target (macOS 11.0+ on `arm64`, 10.12+ on
+     `x86_64`). Users on older macOS need to install from sdist.
+   - Python 3.13 wheels require `maturin>=1.7` (already pinned in
+     `bindings/rsac-python/pyproject.toml`).
+
 ### One-time setup
 
-Before the **first** tag push, a maintainer must:
+Before the **first** tag push, a maintainer must create repo secrets
+for each registry they plan to publish to:
 
-- Generate a crates.io API token at <https://crates.io/me> scoped to
-  `publish-update` (and `publish-new` if `rsac` has not been published
-  yet) for the `rsac` crate.
-- Add it to GitHub repo secrets as **`CARGO_REGISTRY_TOKEN`**
-  (Settings → Secrets and variables → Actions → New repository secret).
+| Secret | Registry | Source |
+|---|---|---|
+| `CARGO_REGISTRY_TOKEN` | crates.io | <https://crates.io/me> → API Tokens, scope `publish-update` (+ `publish-new` if not yet published) |
+| `NPM_TOKEN` | npm | <https://www.npmjs.com/settings/~/tokens> → new **Automation** token with publish rights on the `@rsac` scope |
+| `MATURIN_PYPI_TOKEN` | PyPI | <https://pypi.org/manage/account/token/> → new token scoped to the `rsac` project |
 
-Without this secret the `publish` job will fail with a 401 from
-crates.io, leaving `verify` green and the GH release uncreated. In that
-state, fall back to the manual procedure below (§2–§5).
+Add each via **Settings → Secrets and variables → Actions → New
+repository secret**.
+
+Any secret that is missing causes its workflow's `publish-*` job to
+fail — the other two flows continue independently. In that state, fall
+back to the manual procedure below (§2–§6) for the affected registry.
 
 ### Using the automated flow
 
@@ -66,8 +123,11 @@ inside `publish` (e.g. transient network, token rotation) is not safe
 to re-run blindly if `cargo publish` already succeeded. Inspect
 <https://crates.io/crates/rsac> before re-running.
 
-Bindings (`rsac-napi`, `rsac-python`) are **not** published by this
-workflow — see §6 and the TODO comment in `release.yml`.
+Bindings are published by the companion workflows described above.
+The same tag push triggers `release-npm.yml` and `release-pypi.yml`
+in parallel with `release.yml`, so a single `git push --tags`
+publishes to all three registries. See §6 for manual fallbacks if one
+of the automated flows fails.
 
 ---
 
@@ -217,32 +277,56 @@ version (only yanking — see §8).
 
 ## 6. Publish language bindings
 
-> **Manual step required — not yet wired:** neither `rsac-napi` (Node.js
-> bindings via NAPI-RS) nor `rsac-python` (Python bindings via PyO3 /
-> maturin) currently has a publish workflow. The binding directories
-> exist as placeholders without manifests. Skip this section until they
-> are set up; update this document when they are.
+The automated path is `.github/workflows/release-npm.yml` and
+`.github/workflows/release-pypi.yml` (see **Automated Release Flow**
+above). Both fire on the same `v*.*.*` tag push as `release.yml`.
 
-When the bindings are ready, the shape of the process will be:
+Before tagging, bump the binding manifests in lockstep with the root
+`Cargo.toml`:
 
-- **`rsac-napi` → npm:**
-  ```bash
-  cd rsac-napi
-  npm run build --release
-  npm publish --access public
-  ```
-  Requires `NPM_TOKEN` / `npm login`. Platform-specific binaries should
-  be built in CI (typically via NAPI-RS's GitHub Actions template) and
-  published as scoped optional-dep packages.
+- `bindings/rsac-napi/package.json` — `"version": "X.Y.Z"`
+- `bindings/rsac-python/pyproject.toml` — `version = "X.Y.Z"` under
+  `[project]`. The Rust side's `bindings/rsac-python/Cargo.toml`
+  typically tracks this too.
 
-- **`rsac-python` → PyPI:**
-  ```bash
-  cd rsac-python
-  maturin publish --release
-  ```
-  Requires `MATURIN_PYPI_TOKEN` or `~/.pypirc`. Wheels must be built
-  per-platform (manylinux, macOS universal2, Windows) — typically via
-  `maturin-action` in a release workflow.
+### Manual fallback — `rsac-napi` → npm
+
+If `release-npm.yml` fails (missing `NPM_TOKEN`, transient npm outage,
+build regression on one target), publish by hand:
+
+```bash
+cd bindings/rsac-napi
+bun install
+# Build every triple listed in package.json "napi.triples":
+bunx @napi-rs/cli build --platform --release --target x86_64-apple-darwin
+bunx @napi-rs/cli build --platform --release --target aarch64-apple-darwin
+bunx @napi-rs/cli build --platform --release --target x86_64-unknown-linux-gnu
+bunx @napi-rs/cli build --platform --release --target aarch64-unknown-linux-gnu
+bunx @napi-rs/cli build --platform --release --target x86_64-pc-windows-msvc
+bunx @napi-rs/cli prepublish -t npm --skip-gh-release
+NODE_AUTH_TOKEN=<npm-token> bunx npm publish --access public
+```
+
+Cross-compiling all five targets from one host is impractical; in
+practice the manual fallback means rerunning the failed matrix leg on
+CI or building per-target on real hardware before running `prepublish`
++ `publish` on the aggregating machine.
+
+### Manual fallback — `rsac-python` → PyPI
+
+If `release-pypi.yml` fails, publish by hand from a Linux box (for
+manylinux wheels) and optionally macOS / Windows (for those wheels):
+
+```bash
+cd bindings/rsac-python
+maturin build --release --out dist --manifest-path Cargo.toml
+# Repeat on macOS and Windows if cross-building is unavailable.
+maturin upload --skip-existing dist/*
+```
+
+`maturin upload` reads `MATURIN_PYPI_TOKEN` from the environment (or
+`~/.pypirc`). `--skip-existing` is safe to re-run if a partial upload
+landed before the failure.
 
 ---
 
@@ -308,13 +392,20 @@ with the bug resolved and publish it using this same procedure.
 
 Tracked here so follow-up release-automation tasks can pick them up:
 
-- `.github/workflows/release.yml` exists (see "Automated Release Flow"
-  above), but `CARGO_REGISTRY_TOKEN` must be set in GH Actions secrets
-  before the first tag push — until it is, the `publish` job will fail
-  and the flow degrades to manual §2–§5.
-- No `scripts/bump-version.sh` — version strings are edited by hand
-  (compare to `apps/audio-graph/`, which does have a bump script).
-- `rsac-napi` and `rsac-python` have no package manifests yet — neither
-  npm nor PyPI publishing is set up, and `release.yml` intentionally
-  does not touch them (a TODO comment in the workflow flags this for a
-  future loop).
+- All three registry workflows exist (`release.yml`, `release-npm.yml`,
+  `release-pypi.yml`). Before the first tag push, the corresponding
+  secrets (`CARGO_REGISTRY_TOKEN`, `NPM_TOKEN`, `MATURIN_PYPI_TOKEN`)
+  must be set under **Settings → Secrets and variables → Actions**.
+  Missing secrets fail only the affected `publish-*` job; the other
+  flows continue. Fall back to §2–§6 for the affected registry.
+- No `scripts/bump-version.sh` — version strings are edited by hand in
+  `Cargo.toml`, `bindings/rsac-napi/package.json`, and
+  `bindings/rsac-python/pyproject.toml`. `apps/audio-graph/` has its
+  own bump script; a cross-manifest version sync helper is still a
+  nice-to-have.
+- `release-npm.yml` builds five napi-rs triples; other targets
+  (`linux-x64-musl`, `linux-arm-gnueabihf`, FreeBSD, Android) are not
+  wired. Add them to the matrix if downstream users request them.
+- `release-pypi.yml` relies on `manylinux: auto` — wheels are
+  `manylinux2014`. Consuming environments on glibc < 2.17 must install
+  from sdist.

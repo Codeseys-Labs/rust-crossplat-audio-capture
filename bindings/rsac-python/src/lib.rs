@@ -841,7 +841,7 @@ fn _rsac(m: &Bound<'_, PyModule>) -> PyResult<()> {
     create_exception_classes(m)?;
 
     // Module metadata
-    m.add("__version__", "0.1.0")?;
+    m.add("__version__", env!("CARGO_PKG_VERSION"))?;
 
     Ok(())
 }

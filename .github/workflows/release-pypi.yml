@@ -1,0 +1,124 @@
+# Tag-triggered PyPI release workflow for rsac (Python bindings via PyO3 + maturin).
+#
+# Mirrors .github/workflows/release.yml for the crates.io flow:
+#   1. build-wheels — matrix of (os × python) wheels via maturin-action
+#   2. build-sdist  — single sdist for source installs / offline mirrors
+#   3. publish-pypi — merges all artifacts, uploads to PyPI with skip-existing
+#
+# Triggered by semver-shaped tags (vMAJOR.MINOR.PATCH) from push --tags.
+# Bump bindings/rsac-python/pyproject.toml version in lockstep with the root
+# Cargo.toml before tagging (see docs/RELEASE_PROCESS.md).
+#
+# Required GitHub secret:
+#   MATURIN_PYPI_TOKEN — PyPI API token scoped to the `rsac` project.
+#                        Create at https://pypi.org/manage/account/token/
+#                        Add via Settings → Secrets and variables → Actions.
+#
+# manylinux note: PyO3/maturin-action `manylinux: auto` currently resolves to
+# manylinux2014 (glibc 2.17) on x86_64, which covers py3.9+. aarch64 Linux
+# wheels are built inside the same manylinux container. macOS 15 runners
+# produce wheels that require macOS 11.0+ (aarch64) / 10.12+ (x86_64) given
+# the Rust toolchain's default deployment targets.
+#
+# Security note: tag-triggered only; no untrusted event payloads are
+# interpolated into run: steps. Only `secrets.*` and matrix values.
+
+name: Release PyPI
+
+on:
+  push:
+    tags:
+      - 'v*.*.*'
+
+env:
+  CARGO_TERM_COLOR: always
+  RUST_BACKTRACE: 1
+
+jobs:
+  # build-wheels: os × python matrix.
+  build-wheels:
+    name: Wheel (${{ matrix.os }} py${{ matrix.python }})
+    strategy:
+      fail-fast: false
+      matrix:
+        os:
+          - blacksmith-4vcpu-ubuntu-2404
+          - blacksmith-6vcpu-macos-15
+          - blacksmith-4vcpu-windows-2025
+        python: ['3.9', '3.10', '3.11', '3.12', '3.13']
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v5
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python }}
+
+      - uses: dtolnay/rust-toolchain@1.95.0
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: bindings/rsac-python -> target
+
+      - name: Build wheel (maturin-action)
+        uses: PyO3/maturin-action@v1
+        with:
+          command: build
+          target: auto
+          manylinux: auto
+          args: --release --out dist --interpreter ${{ matrix.python }} --manifest-path bindings/rsac-python/Cargo.toml
+
+      - name: Upload wheel artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: wheels-${{ matrix.os }}-py${{ matrix.python }}
+          path: dist/*.whl
+          if-no-files-found: error
+
+  # build-sdist: single source distribution.
+  build-sdist:
+    name: Source distribution
+    runs-on: blacksmith-4vcpu-ubuntu-2404
+    steps:
+      - uses: actions/checkout@v5
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - uses: dtolnay/rust-toolchain@1.95.0
+
+      - name: Build sdist (maturin-action)
+        uses: PyO3/maturin-action@v1
+        with:
+          command: sdist
+          args: --out dist --manifest-path bindings/rsac-python/Cargo.toml
+
+      - name: Upload sdist artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: sdist
+          path: dist/*.tar.gz
+          if-no-files-found: error
+
+  # publish-pypi: upload every artifact with skip-existing.
+  publish-pypi:
+    name: Publish to PyPI
+    needs: [build-wheels, build-sdist]
+    runs-on: blacksmith-4vcpu-ubuntu-2404
+    steps:
+      - uses: actions/checkout@v5
+
+      - name: Download all build artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: dist-all
+          merge-multiple: true
+
+      - name: Publish with maturin upload
+        uses: PyO3/maturin-action@v1
+        env:
+          MATURIN_PYPI_TOKEN: ${{ secrets.MATURIN_PYPI_TOKEN }}
+        with:
+          command: upload
+          args: --skip-existing dist-all/*
