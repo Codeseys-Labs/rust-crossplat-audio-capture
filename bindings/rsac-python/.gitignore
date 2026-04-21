@@ -1,0 +1,27 @@
+target/
+dist/
+wheels/
+wheelhouse/
+build/
+*.egg-info/
+
+# Compiled extension modules
+*.so
+*.pyd
+*.dylib
+
+# Python caches
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+# Virtual envs
+.venv/
+venv/
+env/
+
+# maturin / pip
+*.whl
+pip-wheel-metadata/

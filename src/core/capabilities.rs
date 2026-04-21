@@ -169,7 +169,7 @@ impl PlatformCapabilities {
 /// - macOS 14.4.1 → `(14, 4, 1)`
 /// - macOS 15.0   → `(15, 0, 0)`
 ///
-/// Used by [`PlatformCapabilities::macos()`] to determine Process Tap
+/// Used by [`PlatformCapabilities`] to determine Process Tap
 /// availability (requires macOS 14.4+).
 #[cfg(target_os = "macos")]
 pub fn get_macos_version() -> (u32, u32, u32) {

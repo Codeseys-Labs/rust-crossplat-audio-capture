@@ -1,4 +1,5 @@
 #![allow(clippy::result_large_err)]
+#![deny(rustdoc::broken_intra_doc_links)]
 
 pub mod api;
 pub mod audio;

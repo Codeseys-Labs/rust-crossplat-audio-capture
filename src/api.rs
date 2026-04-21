@@ -470,7 +470,7 @@ impl AudioCapture {
     /// Creates a subscription channel that delivers audio buffers as they are captured.
     ///
     /// Spawns a background thread that reads from the capture stream and sends
-    /// buffers over an [`mpsc`](std::sync::mpsc) channel. Returns the receiving
+    /// buffers over an [`mpsc`] channel. Returns the receiving
     /// end of the channel.
     ///
     /// **Important:** The background thread competes with [`read_buffer()`](Self::read_buffer)

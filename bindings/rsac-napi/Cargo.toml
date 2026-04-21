@@ -1,9 +1,10 @@
 [package]
 name = "rsac-napi"
-version = "0.1.0"
+version = "0.2.0"
 edition = "2021"
 description = "Node.js/TypeScript bindings for rsac (Rust Cross-Platform Audio Capture)"
-license = "MIT"
+license = "MIT OR Apache-2.0"
+repository = "https://github.com/baladita/rust-crossplat-audio-capture"
 
 [lib]
 crate-type = ["cdylib"]

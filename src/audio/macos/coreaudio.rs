@@ -72,8 +72,8 @@ pub struct ApplicationInfo {
 
 /// Enumerates running applications on macOS that are potential audio sources.
 ///
-/// The returned PIDs can be used with [`CaptureTarget::Application`] via
-/// [`AudioCaptureBuilder`](crate::api::AudioCaptureBuilder) to capture
+/// The returned PIDs can be used with [`CaptureTarget::Application`](crate::core::config::CaptureTarget::Application)
+/// via [`AudioCaptureBuilder`](crate::api::AudioCaptureBuilder) to capture
 /// application-specific audio using CoreAudio Process Taps (macOS 14.4+).
 pub fn enumerate_audio_applications() -> AudioResult<Vec<ApplicationInfo>> {
     let mut app_infos: Vec<ApplicationInfo> = Vec::new();

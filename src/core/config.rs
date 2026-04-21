@@ -138,7 +138,7 @@ pub struct StreamConfig {
     /// If `None`, the backend will choose a suitable default.
     pub buffer_size: Option<usize>,
     /// The capture target for this stream.
-    /// Propagated from [`AudioCaptureBuilder`] so backends know
+    /// Propagated from [`AudioCaptureBuilder`](crate::api::AudioCaptureBuilder) so backends know
     /// whether to do system, application, or process-tree capture.
     pub capture_target: CaptureTarget,
 }

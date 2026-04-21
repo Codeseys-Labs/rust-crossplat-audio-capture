@@ -1,0 +1,20 @@
+node_modules/
+*.node
+dist/
+npm/
+artifacts/
+.yarn/
+
+# napi-rs generated platform packages
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+
+# Editor
+.vscode/
+.idea/
+*.swp
+
+# OS
+.DS_Store
+Thumbs.db
