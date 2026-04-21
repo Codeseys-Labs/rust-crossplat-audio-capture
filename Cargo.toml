@@ -10,6 +10,46 @@ repository = "https://github.com/baladita/rust-crossplat-audio-capture"
 readme = "README.md"
 keywords = ["audio", "capture", "wasapi", "coreaudio", "pipewire"]
 categories = ["multimedia::audio", "os"]
+exclude = [
+    "/apps",
+    "/docs",
+    "/docker",
+    "/.docker",
+    "/debian",
+    "/scripts",
+    "/reference",
+    "/test_audio",
+    "/.cursor",
+    "/.roo",
+    "/.taskmaster",
+    "/.github",
+    "/target",
+    "*.wav",
+    "*.mp3",
+    "/docker-compose*.yml",
+    "/Dockerfile*",
+    "/*.sh",
+    "/*.ps1",
+    "/*.bat",
+    "/slate.json",
+    "/.roomodes",
+    "/.taskmasterconfig",
+    "/.windsurfrules",
+    "/.env.example",
+    "/Makefile",
+    "/CARGO_TOML_FIXES.md",
+    "/CI_CD_IMPROVEMENTS_SUMMARY.md",
+    "/CI_CD_STATUS_REPORT.md",
+    "/CROSS_COMPILATION_STATUS.md",
+    "/CROSS_COMPILATION_TOOLS_SUMMARY.md",
+    "/DEPLOYMENT_STATUS.md",
+    "/DOCKER_CROSS_COMPILATION_OPTIONS.md",
+    "/MANUAL_WORKFLOW_SETUP.md",
+    "/PRODUCT_REQUIREMENTS.md",
+    "/PROJECT_ANALYSIS.md",
+    "/AGENTS.md",
+    "/031326-survey.md",
+]
 
 [features]
 # Platform-specific features
