@@ -92,9 +92,9 @@ done
 # `[package]` or `[project]` section so nested deps don't confuse it.
 cargo_package_version() {
     awk '
-        /^\[package\]/ || /^\[project\]/ { in_sec = 1; next }
-        /^\[/ && !/^\[package\]/ && !/^\[project\]/ { in_sec = 0 }
-        in_sec && /^[[:space:]]*version[[:space:]]*=[[:space:]]*"/ {
+        /^\[package\][[:space:]]*$/ || /^\[project\][[:space:]]*$/ { in_sec = 1; next }
+        /^\[/ { if ($0 !~ /^\[(package|project)\][[:space:]]*$/) in_sec = 0 }
+        in_sec && /^[[:space:]]*version[[:space:]]*=[[:space:]]*"[^"]+"[[:space:]]*$/ {
             match($0, /"[^"]+"/)
             v = substr($0, RSTART + 1, RLENGTH - 2)
             print v
@@ -107,11 +107,14 @@ cargo_package_version() {
 # npm-written format with "version" as a top-level key.
 json_version() {
     awk '
-        /^[[:space:]]*"version"[[:space:]]*:[[:space:]]*"[^"]+"/ {
-            match($0, /"[^"]+"[[:space:]]*,?[[:space:]]*$/)
-            v = substr($0, RSTART + 1, RLENGTH - 2)
-            # strip trailing quote/comma/whitespace
-            sub(/["[:space:],]+$/, "", v)
+        /^  "version"[[:space:]]*:[[:space:]]*"[^"]+"[[:space:]]*,?[[:space:]]*$/ {
+            # Capture the value literal — the second quoted string on the
+            # line — by skipping past the colon first so we do not match
+            # the key name.
+            colon = index($0, ":")
+            rest = substr($0, colon + 1)
+            match(rest, /"[^"]+"/)
+            v = substr(rest, RSTART + 1, RLENGTH - 2)
             print v
             exit
         }
@@ -125,9 +128,13 @@ rewrite_cargo_version() {
     local file="$1" new="$2"
     awk -v new="$new" '
         BEGIN { in_sec = 0; done = 0 }
-        /^\[package\]/ || /^\[project\]/ { in_sec = 1; print; next }
-        /^\[/ && !/^\[package\]/ && !/^\[project\]/ { in_sec = 0 }
-        in_sec && !done && /^[[:space:]]*version[[:space:]]*=[[:space:]]*"/ {
+        /^\[package\][[:space:]]*$/ || /^\[project\][[:space:]]*$/ {
+            in_sec = 1; print; next
+        }
+        /^\[/ {
+            if ($0 !~ /^\[(package|project)\][[:space:]]*$/) in_sec = 0
+        }
+        in_sec && !done && /^[[:space:]]*version[[:space:]]*=[[:space:]]*"[^"]+"[[:space:]]*$/ {
             sub(/"[^"]+"/, "\"" new "\"")
             done = 1
         }
@@ -145,7 +152,7 @@ rewrite_json_version() {
     local file="$1" new="$2"
     awk -v new="$new" '
         BEGIN { done = 0 }
-        !done && /^  "version"[[:space:]]*:[[:space:]]*"[^"]+"/ {
+        !done && /^  "version"[[:space:]]*:[[:space:]]*"[^"]+"[[:space:]]*,?[[:space:]]*$/ {
             # Rewrite only the value (second quoted string on the line),
             # preserving any trailing comma and whitespace.
             colon = index($0, ":")
@@ -161,11 +168,28 @@ rewrite_json_version() {
 }
 
 # ── plan ─────────────────────────────────────────────────────────────
-CUR_ROOT=$(cargo_package_version "$ROOT_CARGO")
-CUR_NAPI_CARGO=$(cargo_package_version "$NAPI_CARGO")
-CUR_NAPI_PKG=$(json_version "$NAPI_PKG")
-CUR_PY_CARGO=$(cargo_package_version "$PY_CARGO")
-CUR_PY_PYPROJ=$(cargo_package_version "$PY_PYPROJ")
+# Wraps an extractor call so an empty result becomes a fatal error rather
+# than silently propagating an empty string into later comparisons (which
+# would mis-plan or mis-rewrite).
+extract_or_die() {
+    local label="$1" file="$2" extractor="$3"
+    local v
+    v=$("$extractor" "$file")
+    if [ -z "$v" ]; then
+        err "could not extract version from $label ($file)"
+        err "  — check that the file has a [package]/[project] section"
+        err "    with a \`version = \"X.Y.Z\"\` line (or top-level"
+        err "    \"version\" key for JSON)"
+        exit 1
+    fi
+    printf '%s\n' "$v"
+}
+
+CUR_ROOT=$(extract_or_die       "root crate"   "$ROOT_CARGO" cargo_package_version)
+CUR_NAPI_CARGO=$(extract_or_die "rsac-napi"    "$NAPI_CARGO" cargo_package_version)
+CUR_NAPI_PKG=$(extract_or_die   "rsac-napi pkg" "$NAPI_PKG"   json_version)
+CUR_PY_CARGO=$(extract_or_die   "rsac-python"  "$PY_CARGO"   cargo_package_version)
+CUR_PY_PYPROJ=$(extract_or_die  "rsac-python pyproject" "$PY_PYPROJ" cargo_package_version)
 
 info "target version:  $NEW_VERSION"
 info "current versions:"
@@ -197,9 +221,16 @@ CHANGES=()
 
 # Changelog rotation is planned if there's an "## [Unreleased]" section
 # *and* no "## [$NEW_VERSION]" header already exists (idempotent).
+#
+# Use `grep -F` (fixed string) for the version header check rather than
+# trying to escape regex metacharacters in $NEW_VERSION. Today the semver
+# gate above ensures $NEW_VERSION contains only digits/dots/hyphens/
+# letters — none of which are grep-BRE metacharacters — but using -F
+# removes the regex-injection surface entirely, so this stays safe if the
+# semver regex is ever relaxed.
 CHANGELOG_ROTATE=0
-if grep -q '^## \[Unreleased\]' "$CHANGELOG" && \
-   ! grep -qE "^## \[$(printf '%s' "$NEW_VERSION" | sed 's/[.]/\\./g')\]" "$CHANGELOG"; then
+if grep -qF '## [Unreleased]' "$CHANGELOG" && \
+   ! grep -qF "## [$NEW_VERSION]" "$CHANGELOG"; then
     CHANGELOG_ROTATE=1
     CHANGES+=("$CHANGELOG (rotate Unreleased → [$NEW_VERSION])")
 fi
