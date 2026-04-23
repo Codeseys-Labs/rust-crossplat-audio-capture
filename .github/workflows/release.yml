@@ -21,7 +21,18 @@ name: Release
 on:
   push:
     tags:
+      # Stable semver tags only. The '!v*-*' exclude blocks pre-release
+      # shapes like v0.2.0-rc.1 / v0.2.0-beta.2 — those must not trigger
+      # irrevocable crates.io publishes. See docs/RELEASE_PROCESS.md.
       - 'v*.*.*'
+      - '!v*-*'
+  workflow_dispatch:
+    inputs:
+      dry_run:
+        description: 'Run cargo publish --dry-run instead of a real publish'
+        type: boolean
+        required: false
+        default: true
 
 env:
   CARGO_TERM_COLOR: always
@@ -88,6 +99,9 @@ jobs:
         run: cargo publish --dry-run
 
       - name: Cargo publish
+        # Skip the real publish on manual workflow_dispatch runs with
+        # dry_run=true — that path exists for on-demand validation only.
+        if: ${{ !(github.event_name == 'workflow_dispatch' && inputs.dry_run) }}
         env:
           CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
         run: cargo publish

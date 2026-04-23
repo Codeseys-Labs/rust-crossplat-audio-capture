@@ -19,7 +19,7 @@ created once the crates.io flow finishes.
 | Workflow | Registry | Matrix | Key jobs | Required secret |
 |---|---|---|---|---|
 | `.github/workflows/release.yml` | crates.io | linux/win/mac | `verify` → `publish` → `github-release` | `CARGO_REGISTRY_TOKEN` |
-| `.github/workflows/release-npm.yml` | npm (`@rsac/audio`) | 5 napi-rs targets | `verify-napi-build` (×5) → `publish-npm` | `NPM_TOKEN` |
+| `.github/workflows/release-npm.yml` | npm (`@rsac/audio`) | 8 napi-rs targets (5 required + 3 best-effort) | `verify-napi-build` (×8) → `publish-npm` | `NPM_TOKEN` |
 | `.github/workflows/release-pypi.yml` | PyPI (`rsac`) | 3 OS × 5 Python (+ sdist) | `build-wheels` (×15) + `build-sdist` → `publish-pypi` | `MATURIN_PYPI_TOKEN` |
 
 ### `release.yml` (crates.io)
@@ -38,20 +38,46 @@ created once the crates.io flow finishes.
 
 ### `release-npm.yml` (npm)
 
-1. **`verify-napi-build`** — matrix of five napi-rs standard targets:
-   `x86_64-apple-darwin`, `aarch64-apple-darwin`,
-   `x86_64-unknown-linux-gnu`, `aarch64-unknown-linux-gnu` (cross-built
-   with `gcc-aarch64-linux-gnu`), `x86_64-pc-windows-msvc`. Each job
-   sets up Node 20 + Bun, installs `bindings/rsac-napi` deps with `bun
-   install`, runs `bunx @napi-rs/cli build --platform --release --target
-   <triple>`, and uploads the resulting `.node` as an artifact.
-2. **`publish-npm`** — depends on all five matrix entries. Downloads
-   every `.node` into `bindings/rsac-napi/artifacts/`, runs `bunx
-   @napi-rs/cli artifacts --dir artifacts` to move them into place and
-   `bunx @napi-rs/cli prepublish -t npm --skip-gh-release` to generate
-   the per-platform sub-packages (`@rsac/audio-darwin-arm64`, etc.),
-   then `bunx npm publish --access public --provenance` for the main
-   package. Uses `NPM_TOKEN` as `NODE_AUTH_TOKEN` / `NPM_CONFIG_TOKEN`.
+1. **`verify-napi-build`** — matrix of eight napi-rs targets, split into
+   two tiers:
+
+   **Required (5 targets, must all pass):**
+   - `x86_64-apple-darwin`
+   - `aarch64-apple-darwin`
+   - `x86_64-unknown-linux-gnu`
+   - `aarch64-unknown-linux-gnu` (cross-built with `gcc-aarch64-linux-gnu`)
+   - `x86_64-pc-windows-msvc`
+
+   **Best-effort (3 targets, `continue-on-error: true`):**
+   - `x86_64-unknown-linux-musl` (via `cargo-zigbuild` + Zig 0.14.1)
+   - `aarch64-unknown-linux-musl` (via `cargo-zigbuild` + Zig 0.14.1)
+   - `armv7-unknown-linux-gnueabihf` (via `--use-napi-cross` +
+     `gcc-arm-linux-gnueabihf`)
+
+   Each job sets up Node 20 + Bun, installs `bindings/rsac-napi` deps
+   with `bun install`, runs `bunx @napi-rs/cli build --platform
+   --release --target <triple>` (plus `-x` for zigbuild or
+   `--use-napi-cross` for napi-cross), and uploads the resulting
+   `.node` as an artifact.
+
+   The best-effort tier mirrors napi-rs/package-template's approach for
+   musl and armv7. It is marked experimental because rsac links
+   `libpipewire-0.3` + `libspa-0.2` via pkg-config on Linux, and neither
+   `cargo-zigbuild` nor napi-cross ships a sysroot containing those
+   headers. If one of these builds fails, it does not block the npm
+   publish of the 5 required targets. The corresponding platform
+   sub-package simply will not be produced for that release, and
+   downstream users on that platform must build from source.
+
+2. **`publish-npm`** — depends on all eight matrix entries (but the
+   best-effort ones are gated by `continue-on-error`, so their failure
+   does not block this job). Downloads every available `.node` into
+   `bindings/rsac-napi/artifacts/`, runs `bunx @napi-rs/cli artifacts
+   --dir artifacts` to move them into place and `bunx @napi-rs/cli
+   prepublish -t npm --skip-gh-release` to generate the per-platform
+   sub-packages (`@rsac/audio-darwin-arm64`, etc.), then `bunx npm
+   publish --access public --provenance` for the main package. Uses
+   `NPM_TOKEN` as `NODE_AUTH_TOKEN` / `NPM_CONFIG_TOKEN`.
 
 ### `release-pypi.yml` (PyPI)
 
@@ -128,6 +154,61 @@ The same tag push triggers `release-npm.yml` and `release-pypi.yml`
 in parallel with `release.yml`, so a single `git push --tags`
 publishes to all three registries. See §6 for manual fallbacks if one
 of the automated flows fails.
+
+---
+
+## Pre-release Tags and Dry Runs
+
+All three release workflows key on the `v*.*.*` tag pattern and also
+exclude `v*-*` — so only stable semver tags (e.g. `v0.2.0`, `v1.3.7`)
+trigger a publish. Pre-release shapes like `v0.2.0-rc.1`,
+`v0.2.0-beta.2`, or `v1.0.0-alpha` are **not** published, because
+crates.io and PyPI uploads are irrevocable and a mis-tagged RC should
+never reach either registry.
+
+This means you can safely push RC tags for internal sharing or CI
+sanity checks without risking a real release:
+
+```bash
+git tag -a v0.2.0-rc.1 -m "rsac 0.2.0 release candidate 1"
+git push origin v0.2.0-rc.1   # does NOT trigger publishes
+```
+
+### On-demand dry-run (crates.io)
+
+`release.yml` also accepts a manual `workflow_dispatch` trigger with a
+`dry_run` boolean input (defaulting to `true`). This lets a maintainer
+rehearse the full `verify → publish` flow on any branch without
+tagging. When invoked with `dry_run=true`, the `publish` job runs
+`cargo publish --dry-run` and then **skips** the real `cargo publish`
+step.
+
+To use it:
+
+1. Go to **Actions → Release → Run workflow**.
+2. Pick the branch and leave `dry_run` checked (the default).
+3. Start the run and watch `verify` + the dry-run packaging succeed.
+
+Unchecking `dry_run` on `workflow_dispatch` would execute a real
+`cargo publish` off a non-tagged commit — do not do that. Real
+releases always go through a stable `vX.Y.Z` tag push.
+
+The npm and PyPI workflows do not expose a `workflow_dispatch`: their
+publishes are also irrevocable and there is no analogue to `cargo
+publish --dry-run` that exercises the whole wheel/napi pipeline. For
+those, rely on the tag-exclude guard above plus the existing per-PR CI
+matrix.
+
+### Promoting an RC to a stable release
+
+Once the RC is validated, tag the stable version and push:
+
+```bash
+git tag -a v0.2.0 -m "rsac 0.2.0"
+git push origin v0.2.0
+```
+
+That push triggers all three registry workflows in parallel.
 
 ---
 

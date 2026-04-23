@@ -25,7 +25,10 @@ name: Release npm
 on:
   push:
     tags:
+      # Stable semver tags only; pre-release shapes (v0.2.0-rc.1, etc.)
+      # must not trigger real npm publishes. See docs/RELEASE_PROCESS.md.
       - 'v*.*.*'
+      - '!v*-*'
 
 env:
   CARGO_TERM_COLOR: always
@@ -33,8 +36,21 @@ env:
 
 jobs:
   # verify-napi-build: per-target native builds.
-  # napi-rs v2 standard 5-target matrix. Each job produces a
+  # napi-rs 8-target matrix. Each job produces a
   # rsac-audio.<triple>.node artifact consumed by the publish job.
+  #
+  # Core 5 targets (proven, required): macOS x64/arm64, linux-x64-gnu,
+  # linux-arm64-gnu, windows-x64-msvc. Must all pass for publish to run.
+  #
+  # Expansion 3 targets (speculative, continue-on-error): linux-x64-musl,
+  # linux-arm64-musl, linux-armv7-gnueabihf. rsac links libpipewire-0.3 +
+  # libspa-0.2 via pkg-config on Linux; these system libs are not
+  # straightforward to satisfy in cross-compiled musl/armv7 sysroots
+  # (Alpine uses different pkg-config paths; napi-cross does not ship
+  # PipeWire headers). A single target failure must not block the publish
+  # of the 5 supported platforms — `continue-on-error: true` gates them.
+  # Pattern mirrors napi-rs/package-template (cargo-zigbuild for musl,
+  # --use-napi-cross for armv7-gnueabihf).
   verify-napi-build:
     name: Build napi (${{ matrix.target }})
     strategy:
@@ -62,7 +78,29 @@ jobs:
             os: blacksmith-4vcpu-windows-2025
             napi-target: win32-x64-msvc
             install_deps: false
+          # Speculative targets — experimental: true allows failure.
+          # See header comment for the PipeWire sysroot caveat.
+          - target: x86_64-unknown-linux-musl
+            os: blacksmith-4vcpu-ubuntu-2404
+            napi-target: linux-x64-musl
+            install_deps: true
+            zigbuild: true
+            experimental: true
+          - target: aarch64-unknown-linux-musl
+            os: blacksmith-4vcpu-ubuntu-2404
+            napi-target: linux-arm64-musl
+            install_deps: true
+            zigbuild: true
+            experimental: true
+          - target: armv7-unknown-linux-gnueabihf
+            os: blacksmith-4vcpu-ubuntu-2404
+            napi-target: linux-arm-gnueabihf
+            install_deps: true
+            armv7_cross: true
+            napi_cross: true
+            experimental: true
     runs-on: ${{ matrix.os }}
+    continue-on-error: ${{ matrix.experimental == true }}
     defaults:
       run:
         working-directory: bindings/rsac-napi
@@ -99,11 +137,40 @@ jobs:
         working-directory: .
         run: sudo apt-get install -y gcc-aarch64-linux-gnu
 
+      - name: Install armv7 cross-compile toolchain (Linux)
+        if: matrix.armv7_cross
+        working-directory: .
+        run: sudo apt-get install -y gcc-arm-linux-gnueabihf
+
+      - name: Setup Zig (musl targets)
+        if: matrix.zigbuild
+        uses: mlugg/setup-zig@v2
+        with:
+          version: 0.14.1
+
+      - name: Install cargo-zigbuild (musl targets)
+        if: matrix.zigbuild
+        uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-zigbuild
+
       - name: bun install
         run: bun install --frozen-lockfile || bun install
 
       - name: napi build
-        run: bunx @napi-rs/cli build --platform --release --target ${{ matrix.target }}
+        # Build path selection:
+        #   zigbuild=true     → cargo-zigbuild (musl cross via Zig).
+        #   napi_cross=true   → napi-rs bundled cross sysroot (armv7-gnueabihf).
+        #   otherwise         → native build for the current host target.
+        run: |
+          if [ "${{ matrix.zigbuild }}" = "true" ]; then
+            bunx @napi-rs/cli build --platform --release --target ${{ matrix.target }} -x
+          elif [ "${{ matrix.napi_cross }}" = "true" ]; then
+            bunx @napi-rs/cli build --platform --release --target ${{ matrix.target }} --use-napi-cross
+          else
+            bunx @napi-rs/cli build --platform --release --target ${{ matrix.target }}
+          fi
+        shell: bash
 
       - name: Upload .node artifact
         uses: actions/upload-artifact@v4

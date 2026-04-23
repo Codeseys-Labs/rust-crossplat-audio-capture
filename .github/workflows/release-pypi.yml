@@ -28,7 +28,10 @@ name: Release PyPI
 on:
   push:
     tags:
+      # Stable semver tags only; pre-release shapes (v0.2.0-rc.1, etc.)
+      # must not trigger real PyPI publishes. See docs/RELEASE_PROCESS.md.
       - 'v*.*.*'
+      - '!v*-*'
 
 env:
   CARGO_TERM_COLOR: always
