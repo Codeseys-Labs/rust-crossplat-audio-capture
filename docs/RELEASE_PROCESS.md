@@ -469,6 +469,104 @@ with the bug resolved and publish it using this same procedure.
 
 ---
 
+## Post-Publish Verification (rsac#16)
+
+After `cargo publish` returns and crates.io has had a minute or two to
+propagate, run the one-command spot-check:
+
+```bash
+bash scripts/verify-docs-rs.sh              # uses version from Cargo.toml
+bash scripts/verify-docs-rs.sh 0.2.0        # pin a specific version
+```
+
+The script is a focused probe — not a smoketest — and hits a handful of
+`docs.rs` URLs to confirm the automated rustdoc build succeeded and the
+rendered HTML contains the items rsac advertises.
+
+What it checks:
+
+1. `https://docs.rs/crate/rsac/<version>/builds.json` — parsed as JSON
+   (via `jq` if available, else a portable `grep`), build status must
+   report `success` or `succeeded`.
+2. `https://docs.rs/rsac/<version>/rsac/` — HTTP 200 on the landing page.
+3. The landing page HTML contains the names of core public items
+   (`PlatformCapabilities`, `CaptureTarget`, `AudioDevice`) plus at
+   least one feature-gated symbol (`feat_macos`) — the latter verifies
+   docs.rs rendered with `all-features` (or that
+   `[package.metadata.docs.rs]` was set correctly).
+4. A few representative intra-doc link targets resolve (HTTP 200):
+   `struct.AudioCaptureBuilder.html`, `struct.PlatformCapabilities.html`,
+   `enum.CaptureTarget.html`, `struct.AudioDevice.html`. Loop 23 A1
+   fixed four broken intra-doc links — this catches a regression.
+
+Exits 0 on green with a human-readable summary. Exits non-zero on any
+failed probe and prints the failing URLs, plus the `Cargo.toml` snippet
+to add if the build itself failed:
+
+```toml
+[package.metadata.docs.rs]
+all-features = true
+rustdoc-args = ["--cfg", "docsrs"]
+```
+
+Portable shell — BSD + GNU grep/curl, `shellcheck` clean. The script
+reads its own default version from the root `Cargo.toml` so it needs no
+arguments during a standard release.
+
+### GitHub Actions secrets path
+
+Before the first tag push, the publisher must add three repository
+secrets via **Settings → Secrets and variables → Actions → New
+repository secret**:
+
+| Secret name              | Registry   | Token source |
+|--------------------------|------------|--------------|
+| `CARGO_REGISTRY_TOKEN`   | crates.io  | <https://crates.io/me> → API Tokens (scope `publish-update`, plus `publish-new` on first publish) |
+| `NPM_TOKEN`              | npmjs      | <https://www.npmjs.com/settings/~/tokens> → new **Automation** token with publish rights on the `@rsac` scope |
+| `MATURIN_PYPI_TOKEN`     | PyPI       | <https://pypi.org/manage/account/token/> → project-scoped token for `rsac` |
+
+Each secret feeds exactly one `publish-*` job. A missing secret fails
+that registry's workflow only — the other two proceed independently.
+
+### Test-first-before-production flow
+
+The three release workflows key on the `v*.*.*` tag pattern and
+explicitly **exclude `v*-*`**, so pre-release tag shapes never publish.
+Use that fact plus the `workflow_dispatch` dry-run to rehearse without
+risking a real upload:
+
+1. **Tag a release candidate.** `vX.Y.Z-rc.1` does not fire any publish
+   workflow — it only exists for internal sharing / CI sanity.
+   ```bash
+   git tag -a v0.2.0-rc.1 -m "rsac 0.2.0 release candidate 1"
+   git push origin v0.2.0-rc.1
+   ```
+2. **Dry-run the crates.io flow.** Go to **Actions → Release → Run
+   workflow**, pick the RC branch or `master`, and leave
+   `dry_run` checked (default `true`). `verify` + `publish` run end to
+   end but `publish` stops at `cargo publish --dry-run` and never
+   uploads. The npm and PyPI flows do not expose `workflow_dispatch`
+   (no analogue to `--dry-run` exists for wheels/napi artifacts), so
+   for those rely on the tag-exclude guard plus per-PR CI.
+3. **Promote the RC to a real release.** Once the dry-run is green,
+   tag the stable version — this push is the real trigger:
+   ```bash
+   git tag -a v0.2.0 -m "rsac 0.2.0"
+   git push origin v0.2.0
+   ```
+   All three registry workflows fire in parallel against the same tag.
+4. **Immediately after `publish` reports success**, run the
+   verification script:
+   ```bash
+   bash scripts/verify-docs-rs.sh 0.2.0
+   ```
+   docs.rs usually starts the rustdoc build within a minute or two of
+   the crates.io upload; if the script fails with `build_status not
+   success`, re-run it in a few minutes before treating it as a real
+   regression.
+
+---
+
 ## Gaps / manual steps summary
 
 Tracked here so follow-up release-automation tasks can pick them up:
