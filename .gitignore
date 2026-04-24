@@ -1,37 +1,47 @@
+# Build output
 **/target
 test-results/
 research/
-.vscode/
 
-# Added by Claude Task Master
-# Logs
-logs
-*.log
-npm-debug.log*
-yarn-debug.log*
-yarn-error.log*
-dev-debug.log
-# Dependency directories
-node_modules/
-# Environment variables
-.env
-# Editor directories and files
-.idea
-.vscode
+# Editor / IDE
+.vscode/
+.idea/
 *.suo
 *.ntvs*
 *.njsproj
 *.sln
 *.sw?
-# OS specific
-.DS_Store
-# Task files
-tasks.json
-tasks/ 
-windows-storage/tmp/
-windows-storage/
-.upstream-refs/
 
-# Test artifacts
+# Logs
+logs/
+*.log
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+dev-debug.log
+
+# Node.js
+node_modules/
+
+# Environment variables
+.env
+.env.local
+
+# OS-specific
+.DS_Store
+
+# Test / audio artifacts (auto-downloaded or captured during test runs —
+# scripts/download_test_audio.sh + src/bin/standardized_test.rs know how
+# to fetch these on demand; no need to commit them.)
 *.wav
+*.mp3
 capture*.txt
+test_audio/
+system_audio*.wav
+dynamic_vlc_capture*.wav
+
+# Windows VM storage (docker/dockur/windows)
+windows-storage/
+
+# Stale tool-cache dirs
+.upstream-refs/
