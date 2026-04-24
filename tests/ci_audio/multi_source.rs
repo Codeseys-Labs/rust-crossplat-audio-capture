@@ -49,7 +49,10 @@ fn two_system_captures_both_produce_buffers() {
     let rx_a = match capture_a.subscribe() {
         Ok(rx) => rx,
         Err(e) => {
-            eprintln!("[ci_audio] multi_source: capture A subscribe failed: {:?}", e);
+            eprintln!(
+                "[ci_audio] multi_source: capture A subscribe failed: {:?}",
+                e
+            );
             return;
         }
     };
@@ -74,7 +77,10 @@ fn two_system_captures_both_produce_buffers() {
     let rx_b = match capture_b.subscribe() {
         Ok(rx) => rx,
         Err(e) => {
-            eprintln!("[ci_audio] multi_source: capture B subscribe failed: {:?}", e);
+            eprintln!(
+                "[ci_audio] multi_source: capture B subscribe failed: {:?}",
+                e
+            );
             return;
         }
     };
