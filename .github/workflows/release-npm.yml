@@ -51,6 +51,24 @@ jobs:
   # of the 5 supported platforms — `continue-on-error: true` gates them.
   # Pattern mirrors napi-rs/package-template (cargo-zigbuild for musl,
   # --use-napi-cross for armv7-gnueabihf).
+  #
+  # Cross-compile toolchain choice (armv7 GCC vs musl Zig):
+  #
+  # armv7-unknown-linux-gnueabihf uses `gcc-arm-linux-gnueabihf` +
+  # napi-rs's `--use-napi-cross` flag. GCC is native on Ubuntu
+  # runners and the sysroot is apt-gettable. Zig would also work,
+  # but napi-rs's pre-existing `--use-napi-cross` path bakes GCC
+  # assumptions; switching armv7 to Zig would require a broader
+  # napi-rs upgrade, not just a flag flip.
+  #
+  # musl targets (x86_64/aarch64-unknown-linux-musl) use
+  # `mlugg/setup-zig@v2` + `cargo-zigbuild`. napi-cross has no
+  # musl support, and Zig produces musl binaries more reliably
+  # than GCC musl cross toolchains (no sysroot hunting).
+  # cargo-zigbuild handles the interp/libc switch cleanly.
+  #
+  # Do not unify these without the above context — the split is
+  # load-bearing, not accidental.
   verify-napi-build:
     name: Build napi (${{ matrix.target }})
     strategy:
