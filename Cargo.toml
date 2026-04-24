@@ -11,7 +11,9 @@ readme = "README.md"
 keywords = ["audio", "capture", "wasapi", "coreaudio", "pipewire"]
 categories = ["multimedia::audio", "os"]
 exclude = [
+    # Application + binding subdirs (published separately or not at all)
     "/apps",
+    # Project-internal docs, scripts, infra (not library artifacts)
     "/docs",
     "/docker",
     "/.docker",
@@ -19,36 +21,20 @@ exclude = [
     "/scripts",
     "/reference",
     "/test_audio",
-    "/.cursor",
-    "/.roo",
-    "/.taskmaster",
     "/.github",
     "/target",
+    # Test/demo audio assets
     "*.wav",
     "*.mp3",
+    # Root-level infra + build-helpers not needed by downstream consumers
     "/docker-compose*.yml",
     "/Dockerfile*",
     "/*.sh",
     "/*.ps1",
     "/*.bat",
     "/slate.json",
-    "/.roomodes",
-    "/.taskmasterconfig",
-    "/.windsurfrules",
-    "/.env.example",
     "/Makefile",
-    "/CARGO_TOML_FIXES.md",
-    "/CI_CD_IMPROVEMENTS_SUMMARY.md",
-    "/CI_CD_STATUS_REPORT.md",
-    "/CROSS_COMPILATION_STATUS.md",
-    "/CROSS_COMPILATION_TOOLS_SUMMARY.md",
-    "/DEPLOYMENT_STATUS.md",
-    "/DOCKER_CROSS_COMPILATION_OPTIONS.md",
-    "/MANUAL_WORKFLOW_SETUP.md",
-    "/PRODUCT_REQUIREMENTS.md",
-    "/PROJECT_ANALYSIS.md",
     "/AGENTS.md",
-    "/031326-survey.md",
 ]
 
 [features]
@@ -187,14 +173,6 @@ path = "src/bin/app_capture_test.rs"
 [[bin]]
 name = "pipewire_test"
 path = "src/bin/pipewire_test.rs"
-
-[[bin]]
-name = "run_tests"
-path = "src/bin/run_tests.rs"
-
-[[bin]]
-name = "test_report_generator"
-path = "src/bin/test_report_generator.rs"
 
 [[bin]]
 name = "pipewire_diagnostics"
