@@ -17,6 +17,7 @@ mod device_enumeration;
 mod platform_caps;
 mod process_tree;
 mod process_tree_capture;
+mod multi_source;
 mod stream_lifecycle;
 mod subscribe;
 mod system_capture;

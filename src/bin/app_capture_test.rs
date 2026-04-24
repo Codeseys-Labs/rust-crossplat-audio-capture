@@ -281,6 +281,7 @@ fn test_platform_specific() -> Result<(), Box<dyn std::error::Error>> {
             }
         }
 
+        #[cfg(all(target_os = "macos", feature = "feat_macos"))]
         match rsac::audio::enumerate_audio_applications() {
             Ok(apps) => {
                 println!("    Found {} capturable applications", apps.len());
@@ -289,6 +290,10 @@ fn test_platform_specific() -> Result<(), Box<dyn std::error::Error>> {
             Err(e) => {
                 println!("    ⚠️  Could not enumerate applications: {}", e);
             }
+        }
+        #[cfg(not(all(target_os = "macos", feature = "feat_macos")))]
+        {
+            println!("    ℹ️  enumerate_audio_applications is macOS-only (feat_macos)");
         }
     }
 
