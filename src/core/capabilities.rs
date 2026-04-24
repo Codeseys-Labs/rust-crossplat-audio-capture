@@ -259,9 +259,15 @@ mod tests {
 
     #[test]
     fn query_returns_valid_capabilities() {
-        let _caps = PlatformCapabilities::query();
+        // `caps` is used in cfg-gated blocks below. On targets where no
+        // block matches (or when compiling without the corresponding
+        // platform feature), the binding appears unused — silence the
+        // lint with a blanket allow. (clippy --fix previously renamed
+        // this to _caps, which broke the Linux cfg block at runtime —
+        // see CI run 24905086492.)
+        #[allow(unused_variables)]
+        let caps = PlatformCapabilities::query();
 
-        // We're on Linux, so these should be the PipeWire values
         #[cfg(target_os = "linux")]
         {
             assert_eq!(caps.backend_name, "PipeWire");
@@ -272,6 +278,18 @@ mod tests {
             assert_eq!(caps.max_channels, 32);
             assert_eq!(caps.sample_rate_range, (8000, 384000));
             assert!(!caps.supported_sample_formats.is_empty());
+        }
+
+        #[cfg(target_os = "windows")]
+        {
+            assert_eq!(caps.backend_name, "WASAPI");
+            assert!(caps.supports_system_capture);
+        }
+
+        #[cfg(target_os = "macos")]
+        {
+            assert_eq!(caps.backend_name, "CoreAudio");
+            assert!(caps.supports_system_capture);
         }
     }
 
