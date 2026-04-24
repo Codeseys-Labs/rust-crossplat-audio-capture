@@ -148,6 +148,7 @@ sudo pacman -S pipewire pkgconf clang
 
 ## Documentation
 
+- [`VISION.md`](VISION.md) — What rsac is, what it isn't, and how we verify the vision on every commit.
 - [`docs/features.md`](docs/features.md) — Cargo feature matrix: which features are default, which platforms they enable, and what system packages each one needs.
 - [`docs/troubleshooting.md`](docs/troubleshooting.md) — High-signal fixes for the most common build and runtime errors (PipeWire libs missing, Xcode CLT, TCC permission, WASAPI session contention, etc.).
 - [`docs/architecture/`](docs/architecture/) — Full design documents for the core, bridge, and backend layers.
