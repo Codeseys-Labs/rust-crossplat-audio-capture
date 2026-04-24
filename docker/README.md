@@ -29,6 +29,18 @@ docker run --rm rsac:win-cross
 docker build -f docker/unified/Dockerfile -t rsac:unified .
 ```
 
+## `docker-compose.*.yml` — at repo root (not here)
+
+The compose files live at the repo root per docker-compose convention
+(it expects `docker-compose.yml` in the project root, not under
+`docker/`). Multiple variants select different test profiles:
+
+- `docker-compose.yml` — default unified test env
+- `docker-compose.unified.yml` — all-platform one-shot CI build
+- `docker-compose.testing.yml` — staged per-platform tests
+- `docker-compose.testing-no-kvm.yml` — fallback when KVM is unavailable
+- `docker-compose.native-testing.yml` — dockur native VM test stack
+
 See also: [docs/DOCKER_TESTING.md](../docs/DOCKER_TESTING.md) and
 [docs/LOCAL_CI.md](../docs/LOCAL_CI.md) for end-to-end workflows, and
 [scripts/docker-test-all.sh](../scripts/docker-test-all.sh) for the
