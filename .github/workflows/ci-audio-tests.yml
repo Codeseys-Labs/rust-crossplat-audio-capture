@@ -121,6 +121,18 @@ jobs:
             --no-default-features --features feat_linux \
             -- --test-threads=1 --nocapture 2>&1 | tee -a ci-audio-output.log
 
+      # Covers the VISION.md "multi-source" pillar: two captures at
+      # once must not starve each other, and stopping one must not
+      # halt the other. See tests/ci_audio/multi_source.rs.
+      - name: Run multi-source capture tests
+        env:
+          RSAC_CI_AUDIO_AVAILABLE: "1"
+          RSAC_TEST_CAPTURE_TIMEOUT_SECS: "15"
+        run: |
+          cargo test --test ci_audio multi_source \
+            --no-default-features --features feat_linux \
+            -- --test-threads=1 --nocapture 2>&1 | tee -a ci-audio-output.log
+
       - name: Diagnostics on failure
         if: failure()
         run: |
