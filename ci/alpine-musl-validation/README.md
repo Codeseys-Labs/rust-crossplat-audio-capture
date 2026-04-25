@@ -1,8 +1,14 @@
 # Alpine musl + PipeWire linkage validation (rsac#19)
 
 Manual, push-button validation of whether rsac's PipeWire backend
-actually dlopens at runtime on Alpine when built against musl. This is
-**deliberately not wired into regular CI** — it's a gate that runs
+actually works at runtime on Alpine when built against musl. The
+`pipewire` Rust crate is LINKED at build time (pkg-config), so the
+failure modes we care about are runtime ones: different library
+sonames, missing SPA plugin paths, musl dynamic-loader quirks, or the
+daemon refusing a musl-built client. This image runs a statically-
+compiled musl binary against a real Alpine PipeWire daemon.
+
+**Deliberately not wired into regular CI** — it's a gate that runs
 before promoting any of the experimental musl napi-rs targets to
 "supported".
 
@@ -13,8 +19,8 @@ Run this before promoting any of the following napi-rs rows from
 
 - `x86_64-unknown-linux-musl`
 - `aarch64-unknown-linux-musl`
-- `armv7-unknown-linux-gnueabihf` (glibc, but same "dlopen works?" story
-  on non-Debian distros)
+- `armv7-unknown-linux-gnueabihf` (glibc, but same "runtime linkage works?"
+  story on non-Debian distros)
 
 The trigger is usually: a downstream user files an issue like
 "`@rsac/napi-linux-x64-musl` installs fine but throws at

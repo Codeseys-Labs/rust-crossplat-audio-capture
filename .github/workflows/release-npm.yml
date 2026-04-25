@@ -231,21 +231,25 @@ jobs:
       # defense: if a core row silently produced no .node file (e.g.
       # compile warning-as-error swallowed by `if-no-files-found: error`
       # regression), we abort before calling `napi prepublish`.
+      # Artifact dir names use the napi-target value from the matrix
+      # (e.g. `bindings-darwin-x64`), not the Rust target triple — the
+      # upload step in verify-napi-build uses `name: bindings-${{
+      # matrix.napi-target }}`, so these strings must match napi-target.
       - name: Verify core platform artifacts are present
         working-directory: bindings/rsac-napi
         run: |
           missing=0
           for platform in \
-            "x86_64-apple-darwin" \
-            "aarch64-apple-darwin" \
-            "x86_64-pc-windows-msvc" \
-            "x86_64-unknown-linux-gnu" \
-            "aarch64-unknown-linux-gnu"; do
+            "darwin-x64" \
+            "darwin-arm64" \
+            "win32-x64-msvc" \
+            "linux-x64-gnu" \
+            "linux-arm64-gnu"; do
             if ! ls artifacts/bindings-${platform}/*.node 2>/dev/null | head -1 > /dev/null; then
-              echo "::error::Missing core .node artifact for ${platform}"
+              echo "::error::Missing core .node artifact for bindings-${platform}"
               missing=1
             else
-              echo "OK: found core artifact for ${platform}"
+              echo "OK: found core artifact for bindings-${platform}"
             fi
           done
           if [ "$missing" -ne 0 ]; then

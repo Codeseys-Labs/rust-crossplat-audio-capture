@@ -1,12 +1,16 @@
 # Alpine musl + PipeWire runtime-linkage validation image for rsac.
 #
-# This image exists to answer a single question:
-#   "If we ship musl napi-rs wheels, does `dlopen(libpipewire-0.3.so.0)`
-#    actually succeed on Alpine?"
+# This image answers: "If we ship musl napi-rs wheels, does a statically-
+# compiled musl rsac binary successfully connect to and enumerate PipeWire
+# on Alpine at runtime?"
 #
-# Alpine's PipeWire packaging uses slightly different sonames and search
-# paths than Debian/Ubuntu, so `pkg-config` at build time is not a
-# guarantee of runtime success — hence this dedicated smoke image.
+# The `pipewire` crate is LINKED (not dlopen'd) against libpipewire-0.3, so
+# the build-time question is settled by pkg-config. The runtime question
+# worth asking is whether the resulting musl binary can actually talk to
+# Alpine's PipeWire daemon — Alpine's packaging uses different sonames and
+# search paths than Debian/Ubuntu, and musl's dynamic-loader behavior is
+# subtly different from glibc's. This image exercises that end-to-end
+# runtime path.
 #
 # It is NOT wired into regular CI. Operators run it manually before
 # promoting any of the experimental musl napi-rs targets:

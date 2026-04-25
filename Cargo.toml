@@ -212,7 +212,14 @@ exclude = ["apps/audio-graph/src-tauri"]
 [package.metadata.docs.rs]
 all-features = true
 rustdoc-args = ["--cfg", "docsrs"]
-# Build docs on Linux and let feature flags pull in cross-platform code
-# paths. Platform-specific FFI modules guard their sys calls with `#[cfg]`
-# so docs build succeeds without host libpipewire/coreaudio/wasapi.
-targets = ["x86_64-unknown-linux-gnu"]
+# Render docs for each supported OS family separately. `all-features = true`
+# alone isn't enough: `#[cfg(target_os = "macos")]` / `"windows"` items are
+# stripped before rustdoc even sees them on a Linux-only build, so
+# per-platform renders are what makes macOS Process Tap + Windows WASAPI
+# public items appear on docs.rs. docs.rs will render once per target and
+# surface platform-availability badges when the `docsrs` cfg is set.
+targets = [
+    "x86_64-unknown-linux-gnu",
+    "x86_64-pc-windows-msvc",
+    "aarch64-apple-darwin",
+]
