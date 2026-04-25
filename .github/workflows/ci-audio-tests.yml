@@ -642,12 +642,14 @@ jobs:
   macos-system:
     name: "macOS | System Capture"
     runs-on: blacksmith-6vcpu-macos-15
-    # rsac#25: system capture on macOS exercises CaptureTarget::SystemDefault
-    # which routes through CoreAudio. On managed runners without TCC Screen
-    # Recording granted, `capture.start()` can block for 10+ minutes before
-    # returning OSStatus 2003332927. We bound each test step with `timeout` so
-    # a single hang cannot eat the whole job budget, and mark the job
-    # continue-on-error because this is a known headless-TCC limit.
+    # rsac#25 + rsac#26: upgraded to mirror the Windows success playbook
+    # (BlackHole + SwitchAudioSource explicit default + verify-fail-fast).
+    # System capture on macOS does NOT need TCC Audio Capture (that's only
+    # for Process Tap / ::Application / ::ProcessTree), so with BlackHole
+    # as the verified default output device, CaptureTarget::SystemDefault
+    # produces real buffers end-to-end. `continue-on-error` retained for
+    # now while the BlackHole+SwitchAudioSource wiring bakes on CI; will
+    # drop after 1-2 green runs verify the pattern holds.
     continue-on-error: true
     timeout-minutes: 20
     steps:
@@ -657,17 +659,34 @@ jobs:
         with:
           key: macos-audio
 
-      - name: Check audio and install BlackHole
-        id: check_audio
+      - name: Install BlackHole, SwitchAudioSource, sox, coreutils
         run: |
-          system_profiler SPAudioDataType 2>/dev/null || true
-          brew install blackhole-2ch || echo "BlackHole installation failed (expected in CI)"
-          # rsac#25: coreutils gives us `gtimeout`, needed to bound each
-          # `cargo test` step below (macOS has no BSD `timeout`).
-          brew install coreutils || echo "coreutils install failed"
-          sudo killall coreaudiod 2>/dev/null || true
+          brew install blackhole-2ch
+          brew install switchaudio-osx
+          brew install sox
+          brew install coreutils   # provides gtimeout
+
+      - name: Restart CoreAudio so BlackHole registers
+        run: |
+          sudo launchctl kickstart -kp system/com.apple.audio.coreaudiod \
+            || sudo killall coreaudiod || true
           sleep 5
-          if system_profiler SPAudioDataType 2>/dev/null | grep -qi "output"; then
+
+      - name: Set BlackHole 2ch as the default output device
+        run: |
+          SwitchAudioSource -s "BlackHole 2ch" || true
+
+      - name: Verify default output is BlackHole 2ch (fail-fast)
+        run: |
+          current=$(SwitchAudioSource -c)
+          echo "Current default output: $current"
+          if [[ "$current" != *"BlackHole 2ch"* ]]; then
+            echo "::warning::Default output is not BlackHole 2ch — tests may be silent."
+            SwitchAudioSource -a || true
+            # Don't hard-exit yet (continue-on-error retained during bakeout);
+            # downstream tests will skip on 0 buffers via graceful-skip logic.
+          else
+            echo "::notice::BlackHole 2ch confirmed as default output"
             echo "RSAC_CI_AUDIO_AVAILABLE=1" >> $GITHUB_ENV
           fi
 

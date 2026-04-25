@@ -388,15 +388,20 @@ pub fn stop_player(mut player: Child) {
 }
 
 // ---------------------------------------------------------------------------
-// macOS TCC gate — Process Tap / Application capture require Screen Recording
-// permission (TCC, kTCCServiceScreenCapture) that cannot be granted
+// macOS TCC gate — Process Tap / Application capture require Audio Capture
+// permission (TCC, kTCCServiceAudioCapture) that cannot be granted
 // non-interactively on headless managed runners (Blacksmith, GH-hosted).
+// Note: this is NOT the same as Screen Recording (kTCCServiceScreenCapture),
+// which GH-hosted runners DO pre-grant to /bin/bash. Audio Capture is a
+// separate, stricter TCC service that is NOT pre-granted anywhere.
 // Without TCC, CoreAudio's AudioHardwareCreateProcessTap can block for 10+
 // minutes before returning an error, eating the full job timeout. Tests that
 // drive Process Tap must gate on this env var on macOS.
+// Reference: insidegui/AudioCap uses NSAudioCaptureUsageDescription Info.plist
+// key + requests kTCCServiceAudioCapture via the standard system prompt.
 // ---------------------------------------------------------------------------
 
-/// Check whether the macOS TCC Screen Recording permission is granted for the
+/// Check whether the macOS TCC Audio Capture permission is granted for the
 /// test runner. On non-macOS platforms this is always true (no TCC gate).
 ///
 /// On macOS, returns true iff `RSAC_CI_MACOS_TCC_GRANTED=1` is set. CI
@@ -422,7 +427,8 @@ pub fn macos_tcc_available() -> bool {
 
 /// Macro that skips the current test if application capture is not supported.
 /// First checks audio infrastructure availability, then platform capabilities,
-/// then (on macOS) the TCC Screen Recording gate.
+/// then (on macOS) the TCC Audio Capture gate (kTCCServiceAudioCapture — NOT
+/// Screen Recording; those are distinct TCC services).
 macro_rules! require_app_capture {
     () => {
         require_audio!();
@@ -431,7 +437,7 @@ macro_rules! require_app_capture {
                 "\n╔══════════════════════════════════════════════════════════╗"
             );
             eprintln!(
-                "║  SKIPPING: macOS TCC Screen Recording not granted       ║"
+                "║  SKIPPING: macOS TCC Audio Capture not granted          ║"
             );
             eprintln!(
                 "║  Set RSAC_CI_MACOS_TCC_GRANTED=1 if TCC is pre-granted. ║"
@@ -488,7 +494,8 @@ macro_rules! require_device_selection {
 
 /// Macro that skips the current test if process tree capture is not supported.
 /// First checks audio infrastructure availability, then (on macOS) the TCC
-/// Screen Recording gate, then platform capabilities.
+/// Audio Capture gate (kTCCServiceAudioCapture — NOT Screen Recording; those
+/// are distinct TCC services), then platform capabilities.
 macro_rules! require_process_capture {
     () => {
         require_audio!();
@@ -497,7 +504,7 @@ macro_rules! require_process_capture {
                 "\n╔══════════════════════════════════════════════════════════╗"
             );
             eprintln!(
-                "║  SKIPPING: macOS TCC Screen Recording not granted       ║"
+                "║  SKIPPING: macOS TCC Audio Capture not granted          ║"
             );
             eprintln!(
                 "║  Set RSAC_CI_MACOS_TCC_GRANTED=1 if TCC is pre-granted. ║"

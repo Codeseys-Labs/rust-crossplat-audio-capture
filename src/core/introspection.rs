@@ -277,16 +277,25 @@ pub enum PermissionStatus {
 
 /// Checks whether the current process has permission to capture audio.
 ///
-/// On macOS, this checks the Screen Recording TCC permission (required for Process Tap).
-/// On other platforms, audio capture typically doesn't require special permissions,
-/// so this returns `PermissionStatus::NotRequired`.
+/// On macOS 14.4+, Process Tap is gated by the **Audio Capture** TCC service
+/// (`kTCCServiceAudioCapture`), which is a distinct, stricter TCC service from
+/// Screen Recording (`kTCCServiceScreenCapture`). Apps declare the dependency
+/// via `NSAudioCaptureUsageDescription` in Info.plist, and the OS prompts the
+/// user on first Process Tap attempt.
+///
+/// On other platforms, audio capture typically doesn't require special
+/// permissions, so this returns `PermissionStatus::NotRequired`.
 pub fn check_audio_capture_permission() -> PermissionStatus {
     #[cfg(target_os = "macos")]
     {
-        // On macOS, system audio capture via Process Tap requires Screen Recording permission.
-        // We can check this by attempting to access CGWindowListCopyWindowInfo.
-        // For simplicity, we report NotDetermined — the OS will prompt on first use.
-        // A more sophisticated check would use the CGPreflightScreenCaptureAccess API (macOS 15+).
+        // On macOS, Process Tap / per-application capture requires the Audio
+        // Capture TCC service (kTCCServiceAudioCapture). This is distinct from
+        // the Screen Recording service (kTCCServiceScreenCapture) that
+        // ScreenCaptureKit / CGWindowList use. Reporting NotDetermined until
+        // the OS prompt has been answered matches the behavior documented in
+        // `insidegui/AudioCap`. A future improvement can port AudioCap's
+        // `AudioRecordingPermission.swift` via the private AudioHardware
+        // preflight SPI.
         PermissionStatus::NotDetermined
     }
 
