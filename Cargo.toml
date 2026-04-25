@@ -184,6 +184,16 @@ name = "wasapi_session_test"
 path = "src/bin/wasapi_session_test.rs"
 required-features = ["feat_windows"]
 
+# Alpine musl + PipeWire linkage smoke test.
+# Only meaningful on Linux with feat_linux; guarded via required-features so
+# the default `cargo build` on macOS/Windows doesn't try to pull in PipeWire.
+# Driven by ci/alpine-musl-validation/smoke-test.sh — see that directory's
+# README for when and how to run it. Not wired into regular CI.
+[[bin]]
+name = "smoke_alpine"
+path = "src/bin/smoke_alpine.rs"
+required-features = ["feat_linux"]
+
 [[test]]
 name = "ci_audio"
 path = "tests/ci_audio/main.rs"
@@ -192,3 +202,17 @@ harness = true
 [workspace]
 members = ["bindings/rsac-python", "bindings/rsac-ffi", "bindings/rsac-napi"]
 exclude = ["apps/audio-graph/src-tauri"]
+
+# rsac#16: docs.rs rendering config. Without this, docs.rs builds with the
+# host Linux target's `#[cfg]` resolution — macOS/Windows items would be
+# cfg-filtered away and vanish from the rendered docs. `all-features = true`
+# compiles every gated module so every public item is reachable; the
+# `docsrs` cfg lets `#[cfg_attr(docsrs, doc(...))]` annotations render the
+# platform-availability badges in the docs.rs UI.
+[package.metadata.docs.rs]
+all-features = true
+rustdoc-args = ["--cfg", "docsrs"]
+# Build docs on Linux and let feature flags pull in cross-platform code
+# paths. Platform-specific FFI modules guard their sys calls with `#[cfg]`
+# so docs build succeeds without host libpipewire/coreaudio/wasapi.
+targets = ["x86_64-unknown-linux-gnu"]

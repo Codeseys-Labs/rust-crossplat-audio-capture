@@ -225,6 +225,34 @@ jobs:
         with:
           path: bindings/rsac-napi/artifacts
 
+      # rsac#21: belt-and-suspenders gate. The `needs: verify-napi-build`
+      # dependency blocks publish when any core (non-experimental) matrix
+      # row fails. This explicit presence-check is a second line of
+      # defense: if a core row silently produced no .node file (e.g.
+      # compile warning-as-error swallowed by `if-no-files-found: error`
+      # regression), we abort before calling `napi prepublish`.
+      - name: Verify core platform artifacts are present
+        working-directory: bindings/rsac-napi
+        run: |
+          missing=0
+          for platform in \
+            "x86_64-apple-darwin" \
+            "aarch64-apple-darwin" \
+            "x86_64-pc-windows-msvc" \
+            "x86_64-unknown-linux-gnu" \
+            "aarch64-unknown-linux-gnu"; do
+            if ! ls artifacts/bindings-${platform}/*.node 2>/dev/null | head -1 > /dev/null; then
+              echo "::error::Missing core .node artifact for ${platform}"
+              missing=1
+            else
+              echo "OK: found core artifact for ${platform}"
+            fi
+          done
+          if [ "$missing" -ne 0 ]; then
+            echo "::error::One or more core napi artifacts are missing — refusing to publish a partial release"
+            exit 1
+          fi
+
       - name: Move artifacts into place
         run: bunx @napi-rs/cli artifacts --dir artifacts
 
