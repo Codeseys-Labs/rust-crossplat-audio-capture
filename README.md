@@ -174,10 +174,12 @@ sudo pacman -S pipewire pkgconf clang
 ## Documentation
 
 - [`VISION.md`](VISION.md) — What rsac is, what it isn't, and how we verify the vision on every commit.
+- [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md) — Three-layer architecture overview plus per-backend specifics (WASAPI / PipeWire / CoreAudio Process Tap).
+- [`docs/CONTRIBUTING.md`](docs/CONTRIBUTING.md) — Toolchain pin, local gate (`fmt` + `clippy` + `doc`), test matrix, release procedure, PR checklist.
 - [`docs/features.md`](docs/features.md) — Cargo feature matrix: which features are default, which platforms they enable, and what system packages each one needs.
 - [`docs/troubleshooting.md`](docs/troubleshooting.md) — High-signal fixes for the most common build and runtime errors (PipeWire libs missing, Xcode CLT, TCC permission, WASAPI session contention, etc.).
-- [`docs/architecture/`](docs/architecture/) — Full design documents for the core, bridge, and backend layers.
-- [`docs/CI_AUDIO_TESTING.md`](docs/CI_AUDIO_TESTING.md) — How audio integration tests run in CI across all three platforms.
+- [`docs/architecture/`](docs/architecture/) — Detailed design documents for the core, bridge, and backend layers.
+- [`docs/CI_AUDIO_TESTING.md`](docs/CI_AUDIO_TESTING.md) — How audio integration tests run in CI across all three platforms (6 of 9 cells REAL on every run; macOS gaps explained).
 - [`docs/RELEASE_PROCESS.md`](docs/RELEASE_PROCESS.md) — End-to-end procedure for cutting a new `rsac` release: pre-release checks, version bump, tag, `cargo publish`, verification, and rollback.
 
 ## Architecture
@@ -213,11 +215,12 @@ cd docker/linux && docker-compose run pipewire-test
 
 ## Contributing
 
-1. Fork & create a feature branch
-2. Read [`AGENTS.md`](AGENTS.md) for architecture rules and conventions
-3. Run `cargo fmt --all && cargo clippy` before submitting
-4. CI runs lint, unit tests (3 platforms), and audio integration tests
+See [`docs/CONTRIBUTING.md`](docs/CONTRIBUTING.md) for the toolchain pin,
+local gate (`cargo fmt --all -- --check` + `cargo clippy --all-targets --all-features -- -D warnings` + `cargo doc --no-deps --all-features`),
+test matrix, release procedure, and PR checklist. Architecture rules
+and layering invariants live in [`AGENTS.md`](AGENTS.md).
 
 ## License
 
-MIT — see [LICENSE](LICENSE) for details.
+Dual-licensed under [MIT](LICENSE-MIT) or [Apache-2.0](LICENSE-APACHE),
+at your option.

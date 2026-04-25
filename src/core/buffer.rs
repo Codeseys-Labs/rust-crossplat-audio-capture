@@ -1,5 +1,12 @@
 // src/core/buffer.rs
 
+//! [`AudioBuffer`] — the chunk type flowing through the capture pipeline.
+//!
+//! Every platform backend produces [`AudioBuffer`]s and every downstream
+//! consumer (sinks, async streams, iterators) consumes them. Samples are
+//! always stored interleaved and always internally as `f32`; format metadata
+//! (sample rate, channel count, sample format) rides alongside the payload.
+
 use crate::core::config::{AudioFormat, SampleFormat};
 use std::time::Duration;
 

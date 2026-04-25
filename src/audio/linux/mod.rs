@@ -1,4 +1,27 @@
-//! Linux audio implementation using PipeWire
+//! Linux audio backend: PipeWire monitor streams.
+//!
+//! The Linux backend wraps [PipeWire](https://pipewire.org) 0.3.44+ behind
+//! the common [`BridgeStream`](crate::bridge::stream::BridgeStream) adapter.
+//! All PipeWire `Rc`-typed handles (`MainLoop`, `Context`, `Core`, `Stream`)
+//! are `!Send`, so ownership lives on a dedicated
+//! [`PipeWireThread`](thread::PipeWireThread); user code communicates with
+//! it via a command/response channel.
+//!
+//! ## Capture strategy
+//!
+//! - `SystemDefault` — attach a monitor stream to the default sink node.
+//! - `Device(DeviceId)` — attach to the named sink node by `object.serial`.
+//! - `Application(ApplicationId)` / `ApplicationByName` — resolve the
+//!   app's PipeWire node via `pw-dump` (matching `application.process.id`
+//!   or `application.name`), then attach a monitor stream to that node.
+//! - `ProcessTree(ProcessId)` — walk the process tree with `sysinfo`, then
+//!   resolve each child PID to a PipeWire node as above.
+//!
+//! ## System requirements
+//!
+//! Build-time: `libpipewire-0.3-dev`, `libspa-0.2-dev`, `pkg-config`,
+//! `clang`/`libclang-dev`, `llvm-dev` (bindgen). Runtime: PipeWire 0.3.44+
+//! with its user-session daemon active.
 
 #[cfg(feature = "feat_linux")]
 pub(crate) mod thread;

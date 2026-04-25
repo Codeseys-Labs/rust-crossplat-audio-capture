@@ -1,13 +1,14 @@
-// macOS CoreAudio backend implementation.
-//
-// Provides `MacosAudioDevice`, `MacosDeviceEnumerator`, application enumeration,
-// and helper functions for CoreAudio ↔ rsac type conversions.
-//
-// The old `MacosAudioStream` and `MacosApplicationAudioStream` (VecDeque + Mutex)
-// have been REMOVED. Audio capture now flows through `BridgeStream<MacosPlatformStream>`
-// via the ring buffer bridge (see `thread.rs`).
-//
-// CoreAudio OSStatus errors are mapped to `AudioError` via `map_ca_error()`.
+//! macOS CoreAudio backend — device enumeration and type conversions.
+//!
+//! Provides [`MacosAudioDevice`], [`MacosDeviceEnumerator`], the
+//! application-level enumeration helpers, and the CoreAudio ↔ rsac
+//! type-conversion glue. The runtime capture path itself lives in the
+//! sibling `thread` module and the Process Tap wiring is in the
+//! sibling [`tap`](super::tap) module; all three feed the common
+//! ring-buffer bridge in [`crate::bridge`].
+//!
+//! CoreAudio `OSStatus` errors are mapped to [`AudioError`] through the
+//! internal `map_ca_error()` helper.
 
 #![cfg(target_os = "macos")]
 

@@ -1,7 +1,21 @@
 // src/core/error.rs
-//
-// Canonical error taxonomy for the rsac library.
-// 21 categorized variants with ErrorKind, Recoverability, and BackendContext.
+
+//! Canonical error taxonomy for rsac.
+//!
+//! Every fallible API in the crate returns [`AudioResult<T>`] (alias for
+//! `Result<T, AudioError>`). [`AudioError`] is an enum of categorized
+//! failure modes. Each variant carries:
+//!
+//! - A high-level [`ErrorKind`] classifier (`Configuration`, `Device`,
+//!   `Stream`, `Backend`, `Application`, `Platform`, `Internal`).
+//! - A [`Recoverability`] hint (`Recoverable`, `TransientRetry`, `Fatal`,
+//!   `UserError`) so callers can decide whether to retry, fall back, or
+//!   surface the failure.
+//! - Optional [`BackendContext`] — a structured wrapper for OS-level error
+//!   codes + operation names from WASAPI, PipeWire, or CoreAudio.
+//!
+//! [`ProcessError`] is a small supporting type for the
+//! [`AudioProcessor`](crate::core::processing::AudioProcessor) trait.
 
 use std::fmt;
 
@@ -55,10 +69,19 @@ impl fmt::Display for Recoverability {
 }
 
 /// Platform-specific backend context attached to certain error variants.
+///
+/// Wraps the OS-level failure so callers can surface accurate
+/// diagnostics (e.g., a WASAPI `HRESULT`, a PipeWire errno, or a
+/// CoreAudio `OSStatus`) without having to branch on
+/// [`AudioError`] variants manually.
 #[derive(Debug, Clone)]
 pub struct BackendContext {
+    /// Human-readable backend name — e.g., `"WASAPI"`, `"PipeWire"`,
+    /// `"CoreAudio"`.
     pub backend_name: String,
+    /// Raw OS-level error code, when one is available.
     pub os_error_code: Option<i64>,
+    /// Human-readable OS-level error message, when one is available.
     pub os_error_message: Option<String>,
 }
 

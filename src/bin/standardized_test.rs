@@ -1,3 +1,13 @@
+//! `standardized_test` — cross-platform smoke-test binary used by local CI
+//! and ad-hoc debugging sessions.
+//!
+//! Captures a short window of audio through the rsac public API, writes
+//! (optionally) to a WAV, and prints a terse pass/fail verdict. Backend
+//! selection (`--backend auto|pipewire|wasapi|coreaudio`) exists so the
+//! same binary works on all three platforms and can be spot-checked in
+//! CI logs. Not shipped to crates.io; built via `cargo build --bin
+//! standardized_test`.
+
 use clap::Parser;
 use std::path::PathBuf;
 use std::process::exit;

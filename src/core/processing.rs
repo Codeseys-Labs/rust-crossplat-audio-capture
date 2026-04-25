@@ -1,3 +1,14 @@
+//! [`AudioProcessor`] trait for in-flight audio transformations.
+//!
+//! This is an extension point: consumers that want to chain effects or
+//! analysis passes on top of [`AudioBuffer`]s can implement
+//! [`AudioProcessor`] and feed it from any
+//! [`CapturingStream`](crate::core::interface::CapturingStream).
+//!
+//! rsac itself does not bundle DSP (mixing, resampling, VAD, etc.); see
+//! [`VISION.md`](https://github.com/Codeseys-Labs/rust-crossplat-audio-capture/blob/master/VISION.md)
+//! "What's Out of Scope" for the list of downstream crates to reach for.
+
 use crate::core::buffer::AudioBuffer; // This will be the new struct
 use crate::core::error::ProcessError;
 

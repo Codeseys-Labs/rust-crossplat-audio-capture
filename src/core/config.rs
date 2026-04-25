@@ -1,5 +1,16 @@
 // src/core/config.rs
 
+//! Configuration types: capture target, stream config, audio format, IDs.
+//!
+//! This module defines what a capture *describes* (as opposed to the runtime
+//! data flowing through it). The most important type is [`CaptureTarget`],
+//! which selects what audio to capture: system default, a specific device,
+//! a single application, or an entire process tree.
+//!
+//! [`StreamConfig`] carries the requested audio format ([`AudioFormat`]),
+//! buffer sizing hints, and latency mode. [`DeviceId`], [`ApplicationId`],
+//! and [`ProcessId`] are opaque newtypes that identify the capture subject.
+
 // ── ID Newtypes ──────────────────────────────────────────────────────────
 
 /// Opaque identifier for an audio device.

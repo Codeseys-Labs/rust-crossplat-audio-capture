@@ -1,3 +1,20 @@
+//! # Verify Captured Audio
+//!
+//! Standalone utility that opens a WAV file and checks whether it contains a
+//! tone at an expected frequency (default 440 Hz). Used by CI after a capture
+//! round-trip to assert the pipeline delivered non-silent, on-frequency
+//! samples.
+//!
+//! Run with:
+//!
+//! ```sh
+//! cargo run --example verify_audio -- --input recording.wav --frequency 440
+//! ```
+//!
+//! Exit code is `0` when the amplitude exceeds `--amplitude-threshold` and a
+//! zero-crossing frequency estimate falls within `--tolerance` Hz of
+//! `--frequency`; non-zero otherwise.
+
 use clap::Parser;
 use hound::WavReader;
 use std::path::PathBuf;

@@ -1,5 +1,15 @@
 // src/core/interface.rs
 
+//! Core traits: [`AudioDevice`], [`DeviceEnumerator`], [`CapturingStream`].
+//!
+//! These three traits are the platform-agnostic contract every backend
+//! implements. Consumers of the library rarely call them directly — the
+//! public [`AudioCapture`](crate::api::AudioCapture) facade already wires
+//! them together — but they are part of the public surface for advanced
+//! integrations (e.g., alternative builders, custom device filters).
+//!
+//! All implementations must be `Send + Sync`.
+
 use super::config::{AudioFormat, DeviceId, StreamConfig};
 use super::error::AudioResult;
 use crate::core::buffer::AudioBuffer;

@@ -1,16 +1,18 @@
-// NOTE: Test utilities are temporarily disabled due to compilation issues with AudioConfig
-// This will be fixed when the proper API structure is implemented
-
-/*
-All test utilities code has been temporarily commented out to allow the main codebase to compile.
-This includes:
-- Audio generation utilities
-- Mock implementations
-- Validation helpers
-- Audio stream testing tools
-
-These will be re-enabled once the AudioConfig type issues are resolved.
-*/
+//! Placeholder test-utility surface.
+//!
+//! The full test-utility module (audio generation, mock streams, validation
+//! helpers) was removed during the architectural refactor because its old
+//! `AudioConfig` dependency no longer exists. Nothing in-tree currently
+//! consumes these helpers — integration tests live in `tests/ci_audio/` and
+//! use their own helpers, and the bindings crates import the real public
+//! API.
+//!
+//! The two functions below are deliberately trivial stubs retained only so
+//! downstream code that imports `rsac::utils::test_utils::*` behind the
+//! `test-utils` feature still type-checks. They produce no audio and make no
+//! real assertions. If you need mock producers in your own tests, use
+//! [`crate::bridge::mock::MockDeviceEnumerator`] instead, which drives the
+//! real ring-buffer bridge with a synthetic 440 Hz sine producer.
 
 pub mod generation {
     /// Placeholder for audio generation utilities

@@ -1,3 +1,26 @@
+//! Public builder/handle facade: [`AudioCaptureBuilder`] → [`AudioCapture`].
+//!
+//! This module defines the library's primary entry points. Consumers interact
+//! with rsac through [`AudioCaptureBuilder`] (configuration) and
+//! [`AudioCapture`] (the lifecycle handle returned from `build()`).
+//!
+//! # Thread safety
+//!
+//! [`AudioCapture`] is `Send + Sync`. Its internal state guards the
+//! platform-specific stream behind an [`Arc<Mutex<_>>`] so the handle can be
+//! moved across threads or shared behind an [`Arc`]. The underlying data plane
+//! (ring buffer between OS callback and consumer) is lock-free; see
+//! [`crate::bridge`] for the full description.
+//!
+//! # Multiple concurrent captures
+//!
+//! Multiple [`AudioCapture`] instances can run in the same process; each has
+//! its own isolated ring buffer bridge (see [`crate::bridge`]), so they
+//! cannot interfere.
+//!
+//! [`Arc`]: std::sync::Arc
+//! [`Arc<Mutex<_>>`]: std::sync::Arc
+
 use crate::audio::get_device_enumerator;
 use crate::core::buffer::AudioBuffer;
 use crate::core::capabilities::PlatformCapabilities;
