@@ -2,6 +2,31 @@
 
 A streaming-first audio capture library for Rust. Captures system audio, per-application audio, and process-tree audio on Windows (WASAPI), Linux (PipeWire), and macOS (CoreAudio Process Tap).
 
+## Why rsac?
+
+`cpal` and `portaudio-rs` expose device-level primitives — open an input, read f32 samples — but cannot capture a single application's audio on any platform without virtual-cable workarounds. rsac wraps WASAPI Process Loopback, CoreAudio Process Tap, and PipeWire node monitors behind one unified `AudioCaptureBuilder → AudioCapture` API, so per-app and per-process-tree capture work the same way on Windows, macOS, and Linux.
+
+| Capability | rsac | cpal | portaudio-rs |
+|---|---|---|---|
+| System-output capture (loopback) | ✅ | ✅ | ✅ |
+| Per-device input capture | ✅ | ✅ | ✅ |
+| Per-app / per-PID capture | ✅ | ❌ | ❌ |
+| Per-process-tree capture (app + children) | ✅ | ❌ | ❌ |
+| Multi-source simultaneous | ✅ (one process, multiple `AudioCapture` instances) | ⚠️ (manual per-stream) | ⚠️ |
+| Backpressure signaling | ✅ (`is_under_backpressure()`) | ❌ | ❌ |
+| Cross-platform consistency | ✅ | ✅ (mature) | ⚠️ |
+
+### What rsac is NOT
+
+rsac is a capture library, not a DSP or playback library. For downstream concerns, reach for:
+
+- **Mixing** → `rodio::Source::mix`, or a 3-line `f32 + f32` adder over rsac's `AudioBuffer.data`
+- **Resampling** → `rubato` / `samplerate`
+- **Encoding** → `hound` (WAV) / `symphonia` / `opus`
+- **Playback** → `cpal` / `rodio`
+
+See [VISION.md](VISION.md) for the full in-scope / out-of-scope list.
+
 ## CI Status
 
 ### Unit Tests

@@ -330,32 +330,54 @@ jobs:
       - name: Set VB-CABLE as default audio device
         shell: pwsh
         run: |
-          # Install AudioDeviceCmdlets to set default device
+          # rsac#24: LABSN installs the VB-CABLE driver via devcon but
+          # does NOT set it as the default playback endpoint — we have
+          # to do that explicitly with AudioDeviceCmdlets
+          # (https://github.com/frgnca/AudioDeviceCmdlets). On
+          # windows-latest VB-CABLE's playback endpoint is named
+          # "Speakers (VB-Audio Virtual Cable)", not "CABLE Input ...",
+          # so the name filter has to accept either form.
           Install-Module -Name AudioDeviceCmdlets -Force -Scope CurrentUser 2>$null
-          Import-Module AudioDeviceCmdlets -ErrorAction SilentlyContinue
+          Import-Module AudioDeviceCmdlets -ErrorAction Stop
 
-          # List all audio devices
           Write-Host "=== All Audio Devices ==="
-          try {
-            $devices = Get-AudioDevice -List
-            $devices | Format-Table Index, Type, Name, Default -AutoSize
+          $devices = Get-AudioDevice -List
+          $devices | Format-Table Index, Type, Name, Default -AutoSize
 
-            # Find VB-CABLE output and set as default
-            $cable = $devices | Where-Object { $_.Name -like "*CABLE Input*" -and $_.Type -eq "Playback" }
-            if ($cable) {
-              Write-Host "Setting VB-CABLE as default playback device: $($cable.Name)"
-              Set-AudioDevice -Index $cable.Index
-            } else {
-              Write-Host "VB-CABLE playback device not found, trying alternative names..."
-              $cable = $devices | Where-Object { $_.Name -like "*VB-Audio*" -and $_.Type -eq "Playback" }
-              if ($cable) {
-                Set-AudioDevice -Index $cable[0].Index
-                Write-Host "Set: $($cable[0].Name)"
-              }
-            }
-          } catch {
-            Write-Host "AudioDeviceCmdlets not available, skipping default device setup: $_"
+          $cable = $devices | Where-Object {
+            $_.Type -eq "Playback" -and (
+              $_.Name -like "*CABLE Input*" -or
+              $_.Name -like "*VB-Audio*" -or
+              $_.Name -like "*VB-CABLE*"
+            )
+          } | Select-Object -First 1
+
+          if ($cable) {
+            Write-Host "Setting VB-CABLE as default playback device: $($cable.Name) (Index=$($cable.Index))"
+            Set-AudioDevice -Index $cable.Index -DefaultOnly
+          } else {
+            Write-Error "No VB-CABLE playback device found — LABSN install likely failed"
+            exit 1
           }
+
+      - name: Verify VB-CABLE is the active default playback
+        # rsac#24: if the default playback isn't VB-CABLE, the test
+        # tone goes to the wrong endpoint and system-capture loopback
+        # sees zero buffers. Fail loudly here instead of wasting 15
+        # minutes on cargo compile + tests that cannot possibly pass.
+        shell: pwsh
+        run: |
+          Import-Module AudioDeviceCmdlets -ErrorAction Stop
+          $playback = Get-AudioDevice -Playback
+          Write-Host "Default playback: $($playback.Name) (Default=$($playback.Default), Type=$($playback.Type))"
+          $isCable = ($playback.Name -like "*VB-Audio*") -or
+                     ($playback.Name -like "*CABLE*") -or
+                     ($playback.Name -like "*VB-CABLE*")
+          if (-not $isCable) {
+            Write-Error "Default playback is NOT VB-CABLE (got: '$($playback.Name)'). System capture loopback cannot succeed."
+            exit 1
+          }
+          Write-Host "OK: VB-CABLE is the default playback endpoint."
 
       - name: Verify audio devices
         id: verify_audio
@@ -415,6 +437,9 @@ jobs:
         run: |
           Get-Service -Name "AudioSrv", "AudioEndpointBuilder" -ErrorAction SilentlyContinue | Format-List Name, Status
           Get-PnpDevice -ErrorAction SilentlyContinue | Where-Object { $_.Class -eq "AudioEndpoint" -or $_.Class -eq "MEDIA" } | Format-List FriendlyName, Status
+          Import-Module AudioDeviceCmdlets -ErrorAction SilentlyContinue
+          Get-AudioDevice -List | Format-Table Index, Type, Name, Default -AutoSize
+          Get-AudioDevice -Playback | Format-List Name, Default, ID
 
       - name: Upload logs
         if: always()
@@ -617,6 +642,13 @@ jobs:
   macos-system:
     name: "macOS | System Capture"
     runs-on: blacksmith-6vcpu-macos-15
+    # rsac#25: system capture on macOS exercises CaptureTarget::SystemDefault
+    # which routes through CoreAudio. On managed runners without TCC Screen
+    # Recording granted, `capture.start()` can block for 10+ minutes before
+    # returning OSStatus 2003332927. We bound each test step with `timeout` so
+    # a single hang cannot eat the whole job budget, and mark the job
+    # continue-on-error because this is a known headless-TCC limit.
+    continue-on-error: true
     timeout-minutes: 20
     steps:
       - uses: actions/checkout@v5
@@ -630,6 +662,9 @@ jobs:
         run: |
           system_profiler SPAudioDataType 2>/dev/null || true
           brew install blackhole-2ch || echo "BlackHole installation failed (expected in CI)"
+          # rsac#25: coreutils gives us `gtimeout`, needed to bound each
+          # `cargo test` step below (macOS has no BSD `timeout`).
+          brew install coreutils || echo "coreutils install failed"
           sudo killall coreaudiod 2>/dev/null || true
           sleep 5
           if system_profiler SPAudioDataType 2>/dev/null | grep -qi "output"; then
@@ -639,11 +674,17 @@ jobs:
       - name: Compilation check
         run: cargo check --no-default-features --features feat_macos
 
+      # rsac#25: filter is `system_capture::` (not `system_capture`) so the
+      # substring match doesn't also pick up
+      # `multi_source::two_system_captures_both_produce_buffers`. The extra
+      # `gtimeout 360` (6 minutes via coreutils) is a hard wall-clock cap
+      # so a CoreAudio hang in .start() can't consume the full 20min budget.
       - name: Run system capture tests
         env:
           RSAC_TEST_CAPTURE_TIMEOUT_SECS: "15"
         run: |
-          cargo test --test ci_audio system_capture \
+          gtimeout --preserve-status 360 \
+            cargo test --test ci_audio "system_capture::" \
             --no-default-features --features feat_macos \
             -- --test-threads=1 --nocapture 2>&1 | tee ci-audio-output.log
 
@@ -651,7 +692,8 @@ jobs:
         env:
           RSAC_TEST_CAPTURE_TIMEOUT_SECS: "15"
         run: |
-          cargo test --test ci_audio platform_caps \
+          gtimeout --preserve-status 180 \
+            cargo test --test ci_audio platform_caps \
             --no-default-features --features feat_macos \
             -- --test-threads=1 --nocapture 2>&1 | tee -a ci-audio-output.log
 
@@ -659,7 +701,8 @@ jobs:
         env:
           RSAC_TEST_CAPTURE_TIMEOUT_SECS: "15"
         run: |
-          cargo test --test ci_audio stream_lifecycle \
+          gtimeout --preserve-status 360 \
+            cargo test --test ci_audio stream_lifecycle \
             --no-default-features --features feat_macos \
             -- --test-threads=1 --nocapture 2>&1 | tee -a ci-audio-output.log
 
@@ -734,7 +777,13 @@ jobs:
   macos-process:
     name: "macOS | Process Capture"
     runs-on: blacksmith-6vcpu-macos-15
-    continue-on-error: true  # Process Tap expected to skip due to TCC in CI
+    # rsac#25: Process Tap (`CaptureTarget::Application` / `::ProcessTree`)
+    # needs TCC Screen Recording permission, which can't be granted
+    # non-interactively on managed runners. Tests skip early via
+    # `require_app_capture!()` / `require_process_capture!()` unless
+    # `RSAC_CI_MACOS_TCC_GRANTED=1` is set. `gtimeout` + `continue-on-error`
+    # are belt-and-braces safety nets.
+    continue-on-error: true
     timeout-minutes: 20
     steps:
       - uses: actions/checkout@v5
@@ -746,6 +795,8 @@ jobs:
       - name: Check audio and install BlackHole
         run: |
           brew install blackhole-2ch || echo "BlackHole installation failed (expected in CI)"
+          # rsac#25: coreutils provides `gtimeout` used to bound cargo test steps.
+          brew install coreutils || echo "coreutils install failed"
           sudo killall coreaudiod 2>/dev/null || true
           sleep 5
           if system_profiler SPAudioDataType 2>/dev/null | grep -qi "output"; then
@@ -764,11 +815,15 @@ jobs:
       - name: Compilation check
         run: cargo check --no-default-features --features feat_macos
 
+      # rsac#25: RSAC_CI_MACOS_TCC_GRANTED is intentionally NOT set — the tests
+      # below must skip early on the TCC gate. `gtimeout 180` is the hard
+      # safety net in case a test slips past the gate.
       - name: Run application capture tests
         env:
           RSAC_TEST_CAPTURE_TIMEOUT_SECS: "15"
         run: |
-          cargo test --test ci_audio app_capture \
+          gtimeout --preserve-status 180 \
+            cargo test --test ci_audio app_capture \
             --no-default-features --features feat_macos \
             -- --test-threads=1 --nocapture 2>&1 | tee ci-audio-output.log
 
@@ -776,7 +831,8 @@ jobs:
         env:
           RSAC_TEST_CAPTURE_TIMEOUT_SECS: "15"
         run: |
-          cargo test --test ci_audio process_tree_capture \
+          gtimeout --preserve-status 180 \
+            cargo test --test ci_audio process_tree_capture \
             --no-default-features --features feat_macos \
             -- --test-threads=1 --nocapture 2>&1 | tee -a ci-audio-output.log
 

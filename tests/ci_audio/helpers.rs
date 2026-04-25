@@ -108,7 +108,7 @@ macro_rules! require_audio {
 // WAV test-tone generation
 // ---------------------------------------------------------------------------
 
-/// Generate a test tone WAV file (440 Hz sine wave).
+/// Generate a test tone WAV file (440 Hz sine wave) in 32-bit float PCM.
 /// Returns the path to the generated temporary WAV file.
 pub fn generate_test_wav(duration_secs: f32, sample_rate: u32, channels: u16) -> PathBuf {
     let dir = tempfile::tempdir().expect("Failed to create temp dir");
@@ -132,6 +132,63 @@ pub fn generate_test_wav(duration_secs: f32, sample_rate: u32, channels: u16) ->
         let sample = (2.0 * std::f32::consts::PI * frequency * t).sin() * 0.8;
         for _ in 0..channels {
             writer.write_sample(sample).expect("Failed to write sample");
+        }
+    }
+
+    writer.finalize().expect("Failed to finalize WAV");
+    path
+}
+
+/// Generate a 16-bit PCM sibling WAV next to the given float WAV.
+///
+/// Windows' built-in `PlaySound` / `System.Media.SoundPlayer` only reliably
+/// plays WAVE_FORMAT_PCM (integer) files. 32-bit IEEE-float PCM
+/// (WAVE_FORMAT_IEEE_FLOAT) frequently fails to play through the default
+/// endpoint on the `windows-latest` runner, which is the root cause of
+/// rsac#24: the test tone never reaches VB-CABLE's loopback, so system
+/// capture sees 0 buffers.
+///
+/// Writes a `<stem>_pcm16.wav` sibling in the same directory as `float_wav`.
+/// Duration, sample rate, and channel count match the float WAV's shape
+/// (440 Hz sine tone).
+#[cfg(target_os = "windows")]
+fn generate_pcm16_sibling(
+    float_wav: &std::path::Path,
+    duration_secs: f32,
+    sample_rate: u32,
+    channels: u16,
+) -> PathBuf {
+    let parent = float_wav
+        .parent()
+        .unwrap_or_else(|| std::path::Path::new("."));
+    let stem = float_wav
+        .file_stem()
+        .and_then(|s| s.to_str())
+        .unwrap_or("test_tone");
+    let path = parent.join(format!("{stem}_pcm16.wav"));
+
+    let spec = hound::WavSpec {
+        channels,
+        sample_rate,
+        bits_per_sample: 16,
+        sample_format: hound::SampleFormat::Int,
+    };
+
+    let mut writer = hound::WavWriter::create(&path, spec).expect("Failed to create WAV writer");
+
+    let num_samples = (duration_secs * sample_rate as f32) as usize;
+    let frequency = 440.0f32;
+    // Scale 0.8 amplitude into i16 range to match the float version's energy.
+    let peak = 0.8 * i16::MAX as f32;
+
+    for i in 0..num_samples {
+        let t = i as f32 / sample_rate as f32;
+        let sample_f = (2.0 * std::f32::consts::PI * frequency * t).sin();
+        let sample_i = (sample_f * peak) as i16;
+        for _ in 0..channels {
+            writer
+                .write_sample(sample_i)
+                .expect("Failed to write sample");
         }
     }
 
@@ -185,19 +242,37 @@ pub fn spawn_test_tone_player(wav_path: &std::path::Path) -> Option<Child> {
 
     #[cfg(target_os = "windows")]
     {
-        let path_str = wav_path.to_string_lossy();
+        // SoundPlayer.PlaySync on a 32-bit float WAV is unreliable on
+        // windows-latest runners: the PlaySound-backed winmm path often
+        // silently drops WAVE_FORMAT_IEEE_FLOAT frames, so the tone never
+        // reaches the default endpoint (VB-CABLE) and loopback capture
+        // sees 0 buffers (rsac#24). Work around by generating a 16-bit
+        // PCM sibling WAV and using PlayLooping — WAVE_FORMAT_PCM is the
+        // format PlaySound reliably handles on every Windows build.
+        let pcm16_path = generate_pcm16_sibling(wav_path, 5.0, 48000, 2);
+        let path_str = pcm16_path.to_string_lossy();
+        // PlayLooping runs asynchronously; keep the PowerShell host alive
+        // for 30s (longer than any single capture test's timeout) so the
+        // tone is always audible for the duration of the test.
+        let script = format!(
+            "$p = New-Object System.Media.SoundPlayer '{}'; $p.PlayLooping(); Start-Sleep -Seconds 30; $p.Stop()",
+            path_str
+        );
         let child = Command::new("powershell")
-            .args([
-                "-Command",
-                &format!("(New-Object Media.SoundPlayer '{}').PlaySync()", path_str),
-            ])
+            .args(["-NoProfile", "-NonInteractive", "-Command", &script])
             .stdin(std::process::Stdio::null())
             .stdout(std::process::Stdio::null())
             .stderr(std::process::Stdio::piped())
             .spawn();
 
         match child {
-            Ok(c) => Some(c),
+            Ok(c) => {
+                eprintln!(
+                    "[ci_audio] Started Windows PlayLooping for {:?}",
+                    pcm16_path
+                );
+                Some(c)
+            }
             Err(e) => {
                 eprintln!("[ci_audio] Failed to start Windows audio player: {}", e);
                 None
@@ -313,14 +388,59 @@ pub fn stop_player(mut player: Child) {
 }
 
 // ---------------------------------------------------------------------------
+// macOS TCC gate — Process Tap / Application capture require Screen Recording
+// permission (TCC, kTCCServiceScreenCapture) that cannot be granted
+// non-interactively on headless managed runners (Blacksmith, GH-hosted).
+// Without TCC, CoreAudio's AudioHardwareCreateProcessTap can block for 10+
+// minutes before returning an error, eating the full job timeout. Tests that
+// drive Process Tap must gate on this env var on macOS.
+// ---------------------------------------------------------------------------
+
+/// Check whether the macOS TCC Screen Recording permission is granted for the
+/// test runner. On non-macOS platforms this is always true (no TCC gate).
+///
+/// On macOS, returns true iff `RSAC_CI_MACOS_TCC_GRANTED=1` is set. CI
+/// environments that cannot grant TCC (Blacksmith, GH-hosted) must leave this
+/// unset so Process Tap tests skip cleanly instead of hanging.
+pub fn macos_tcc_available() -> bool {
+    #[cfg(target_os = "macos")]
+    {
+        matches!(
+            std::env::var("RSAC_CI_MACOS_TCC_GRANTED").as_deref(),
+            Ok("1")
+        )
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        true
+    }
+}
+
+// ---------------------------------------------------------------------------
 // require_app_capture!() macro — skips when app capture is unsupported
 // ---------------------------------------------------------------------------
 
 /// Macro that skips the current test if application capture is not supported.
-/// First checks audio infrastructure availability, then platform capabilities.
+/// First checks audio infrastructure availability, then platform capabilities,
+/// then (on macOS) the TCC Screen Recording gate.
 macro_rules! require_app_capture {
     () => {
         require_audio!();
+        if !$crate::helpers::macos_tcc_available() {
+            eprintln!(
+                "\n╔══════════════════════════════════════════════════════════╗"
+            );
+            eprintln!(
+                "║  SKIPPING: macOS TCC Screen Recording not granted       ║"
+            );
+            eprintln!(
+                "║  Set RSAC_CI_MACOS_TCC_GRANTED=1 if TCC is pre-granted. ║"
+            );
+            eprintln!(
+                "╚══════════════════════════════════════════════════════════╝\n"
+            );
+            return;
+        }
         let caps = rsac::PlatformCapabilities::query();
         if !caps.supports_application_capture {
             eprintln!(
@@ -367,10 +487,26 @@ macro_rules! require_device_selection {
 // ---------------------------------------------------------------------------
 
 /// Macro that skips the current test if process tree capture is not supported.
-/// First checks audio infrastructure availability, then platform capabilities.
+/// First checks audio infrastructure availability, then (on macOS) the TCC
+/// Screen Recording gate, then platform capabilities.
 macro_rules! require_process_capture {
     () => {
         require_audio!();
+        if !$crate::helpers::macos_tcc_available() {
+            eprintln!(
+                "\n╔══════════════════════════════════════════════════════════╗"
+            );
+            eprintln!(
+                "║  SKIPPING: macOS TCC Screen Recording not granted       ║"
+            );
+            eprintln!(
+                "║  Set RSAC_CI_MACOS_TCC_GRANTED=1 if TCC is pre-granted. ║"
+            );
+            eprintln!(
+                "╚══════════════════════════════════════════════════════════╝\n"
+            );
+            return;
+        }
         let caps = rsac::PlatformCapabilities::query();
         if !caps.supports_process_tree_capture {
             eprintln!(
@@ -424,12 +560,18 @@ pub fn spawn_audio_player_get_pid(wav_path: &std::path::Path) -> Result<(Child, 
 
     #[cfg(target_os = "windows")]
     {
-        let path_str = wav_path.to_string_lossy();
+        // See `spawn_test_tone_player` for the rsac#24 rationale: we
+        // must feed SoundPlayer a 16-bit PCM WAV and use PlayLooping so
+        // the tone keeps hitting VB-CABLE's default-endpoint loopback
+        // for the full test window.
+        let pcm16_path = generate_pcm16_sibling(wav_path, 5.0, 48000, 2);
+        let path_str = pcm16_path.to_string_lossy();
+        let script = format!(
+            "$p = New-Object System.Media.SoundPlayer '{}'; $p.PlayLooping(); Start-Sleep -Seconds 30; $p.Stop()",
+            path_str
+        );
         let child = Command::new("powershell")
-            .args([
-                "-Command",
-                &format!("(New-Object Media.SoundPlayer '{}').PlaySync()", path_str),
-            ])
+            .args(["-NoProfile", "-NonInteractive", "-Command", &script])
             .stdin(std::process::Stdio::null())
             .stdout(std::process::Stdio::null())
             .stderr(std::process::Stdio::piped())
@@ -437,7 +579,10 @@ pub fn spawn_audio_player_get_pid(wav_path: &std::path::Path) -> Result<(Child, 
             .map_err(|e| format!("Failed to spawn Windows audio player: {e}"))?;
 
         let pid = child.id();
-        eprintln!("[ci_audio] Started Windows audio player PID={pid}");
+        eprintln!(
+            "[ci_audio] Started Windows PlayLooping PID={pid} for {:?}",
+            pcm16_path
+        );
         Ok((child, pid))
     }
 

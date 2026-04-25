@@ -1438,3 +1438,32 @@ flowchart TD
     I -->|Yes - non-silent| J[Assert pass]
     I -->|No - all silent| K[Print WARNING - soft pass]
 ```
+
+---
+
+### macOS Process Tap Headless Limitation
+
+**Symptom:** `tests/ci_audio/app_capture.rs` and `tests/ci_audio/process_tree_capture.rs` are `#[ignore]`-gated on macOS, so the Application and ProcessTree capture paths are **not** exercised by CI on `macos-latest` (or any other hosted macOS runner). Only compilation and the system-capture smoke path are continuously verified.
+
+**Technical reason:** macOS gates Process Tap (the CoreAudio 14.4+ API rsac uses for per-process capture) behind the **Screen Recording** TCC (Transparency, Consent, Control) entitlement. TCC requires an *interactive* user grant through the GUI — System Settings → Privacy & Security → Screen & System Audio Recording — and the consent database is per-user, per-bundle-ID, and cannot be pre-seeded from a script. A headless CI runner has no logged-in desktop session, no way to click the prompt, and no supported API to auto-approve. `tccutil reset` can *revoke* entries but cannot *grant* them. The result: every Process Tap install call returns silent output or fails outright on a fresh runner.
+
+**Why this applies to every managed runner — not an rsac-specific constraint:** This is the macOS security model, not a rsac or GitHub limitation. The same wall hits **GitHub-hosted `macos-latest`**, **Blacksmith**, **BuildJet**, **Actuated**, and anyone else renting out managed macOS VMs. None of them can ship with Screen Recording pre-granted for an arbitrary test binary because TCC entries are bound to bundle ID + code signature + user, and the binary CI builds is freshly compiled each run. The only paths that *would* work — self-hosted macOS runners with a persistent logged-in user where you manually grant permission once — are out of scope for an OSS project's default CI.
+
+**How rsac handles it:** The two affected tests are gated with `#[cfg(target_os = "macos")]` + `#[ignore]` so they compile on macOS (catching type/signature regressions) but are skipped by `cargo test` unless `--ignored` is passed explicitly. System capture and device enumeration remain enabled on macOS CI and continue to exercise CoreAudio end-to-end.
+
+**Manual QA workaround:** On a real macOS 14.4+ machine, grant Screen Recording in System Settings → Privacy & Security → Screen Recording to Terminal.app (or your shell), fully quit and relaunch the terminal so the granted TCC entry is picked up at process start, then:
+
+```sh
+# On a real macOS 14.4+ machine, grant Screen Recording in
+# System Settings → Privacy & Security → Screen Recording to
+# Terminal.app (or your shell), then:
+RSAC_CI_AUDIO_AVAILABLE=1 cargo test --test ci_audio \
+  --no-default-features --features feat_macos \
+  -- --ignored --test-threads=1 app_capture process_tree_capture
+```
+
+Run this before every release that touches the macOS backend, the Process Tap bridge, or the `CaptureTarget::Application` / `CaptureTarget::ProcessTree` code paths.
+
+**What this means for users:** Process Tap works correctly in production. End users grant the hosting application's Screen Recording permission through the standard macOS prompt on first capture attempt, after which per-process and process-tree capture function normally. The gap is strictly one of *continuous* verification: rsac cannot prove on every commit that Process Tap still works — it can only prove that it still *compiles* and that the non-Tap paths still work. Manual verification by a human on a real Mac before tagging a release is the correct mitigation, and is the same discipline every other macOS screen/audio capture project (OBS, Loopback, Audio Hijack, Rogue Amoeba's SDK, BlackHole tooling) applies.
+
+See [`VISION.md` § "How We Verify the Vision"](../VISION.md#how-we-verify-the-vision) for how this gap fits into the broader CI verification strategy.
