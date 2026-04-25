@@ -42,7 +42,7 @@ fn stop(player: Option<std::process::Child>) {
 /// should be empty just because the other is also running.
 #[test]
 fn two_system_captures_both_produce_buffers() {
-    require_audio!();
+    require_system_capture!();
 
     // Play a test tone so SystemDefault loopback has audio to capture.
     let wav_path = helpers::generate_test_wav(5.0, 48000, 2);
@@ -175,7 +175,7 @@ fn two_system_captures_both_produce_buffers() {
 /// OS-level state.
 #[test]
 fn stopping_one_capture_does_not_halt_the_other() {
-    require_audio!();
+    require_system_capture!();
 
     let wav_path = helpers::generate_test_wav(5.0, 48000, 2);
     let player = helpers::spawn_test_tone_player(&wav_path);
@@ -277,7 +277,7 @@ fn stopping_one_capture_does_not_halt_the_other() {
 /// static), this test will hang or fail.
 #[test]
 fn mixed_target_captures_run_independently() {
-    require_audio!();
+    require_system_capture!();
 
     let wav_path = helpers::generate_test_wav(5.0, 48000, 2);
     let player = helpers::spawn_test_tone_player(&wav_path);

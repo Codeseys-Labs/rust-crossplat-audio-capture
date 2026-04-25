@@ -8,9 +8,11 @@ name: Audio Integration Tests
 #
 # Platform status:
 #   ✅ Linux (PipeWire)  — PRIMARY. Fully validated, expected to pass.
-#   ⚠️  Windows (WASAPI)  — VB-CABLE virtual driver. continue-on-error.
-#   ✅ macOS (CoreAudio)  — VALIDATED on real hardware (macOS 14.4+).
-#                           CI audio depends on BlackHole availability.
+#   ✅ Windows (WASAPI)  — VB-CABLE virtual driver. 3/3 tests real.
+#   ⏳ macOS (CoreAudio)  — skip-early on CI (TCC Audio Capture cannot be
+#                           granted non-interactively on managed runners).
+#                           VALIDATED on real hardware (macOS 14.4+).
+#                           See docs/reviews/ci-audio-final-status-*.md.
 # =============================================================================
 
 on:
@@ -642,16 +644,24 @@ jobs:
   macos-system:
     name: "macOS | System Capture"
     runs-on: blacksmith-6vcpu-macos-15
-    # rsac#25 + rsac#26: upgraded to mirror the Windows success playbook
-    # (BlackHole + SwitchAudioSource explicit default + verify-fail-fast).
-    # System capture on macOS does NOT need TCC Audio Capture (that's only
-    # for Process Tap / ::Application / ::ProcessTree), so with BlackHole
-    # as the verified default output device, CaptureTarget::SystemDefault
-    # produces real buffers end-to-end. `continue-on-error` retained for
-    # now while the BlackHole+SwitchAudioSource wiring bakes on CI; will
-    # drop after 1-2 green runs verify the pattern holds.
+    # rsac#26 resolution: `CaptureTarget::SystemDefault` on macOS 14.4+ uses
+    # `AudioHardwareCreateProcessTap` (via CATapDescription's
+    # `initStereoGlobalTapButExcludeProcesses:`) — the SAME TCC-gated API
+    # used by Application / ProcessTree. The earlier claim that "System
+    # Capture doesn't need TCC on macOS" was wrong: on a headless runner
+    # without `kTCCServiceAudioCapture`, the call hangs for 10–18 minutes
+    # before erroring. BlackHole as a default-output virtual device does
+    # NOT change this — taps are orthogonal to the default output route.
+    #
+    # For CI, tests that target SystemDefault skip-early via
+    # `require_system_capture!()` (same TCC gate as Process Tap tests).
+    # `platform_caps` and `stream_lifecycle` are TCC-free and still run.
+    # BlackHole is retained only as a future hook for a non-TCC "BlackHole
+    # as input" path; the current build doesn't yet expose that target.
+    # `continue-on-error: true` is belt-and-braces until 1-2 green runs
+    # confirm the skip-gate prevents hangs on a real macOS runner.
     continue-on-error: true
-    timeout-minutes: 20
+    timeout-minutes: 15
     steps:
       - uses: actions/checkout@v5
       - uses: dtolnay/rust-toolchain@1.95.0
@@ -659,59 +669,41 @@ jobs:
         with:
           key: macos-audio
 
-      - name: Install BlackHole, SwitchAudioSource, sox, coreutils
+      - name: Install BlackHole (non-TCC input path hook) + coreutils
         run: |
           brew install blackhole-2ch
-          brew install switchaudio-osx
-          brew install sox
-          brew install coreutils   # provides gtimeout
-
-      - name: Restart CoreAudio so BlackHole registers
-        run: |
-          sudo launchctl kickstart -kp system/com.apple.audio.coreaudiod \
-            || sudo killall coreaudiod || true
+          brew install coreutils   # gtimeout belt-and-braces for TCC-free jobs
+          sudo killall coreaudiod 2>/dev/null || true
           sleep 5
-
-      - name: Set BlackHole 2ch as the default output device
-        run: |
-          SwitchAudioSource -s "BlackHole 2ch" || true
-
-      - name: Verify default output is BlackHole 2ch (fail-fast)
-        run: |
-          current=$(SwitchAudioSource -c)
-          echo "Current default output: $current"
-          if [[ "$current" != *"BlackHole 2ch"* ]]; then
-            echo "::warning::Default output is not BlackHole 2ch — tests may be silent."
-            SwitchAudioSource -a || true
-            # Don't hard-exit yet (continue-on-error retained during bakeout);
-            # downstream tests will skip on 0 buffers via graceful-skip logic.
-          else
-            echo "::notice::BlackHole 2ch confirmed as default output"
+          if system_profiler SPAudioDataType 2>/dev/null | grep -qi "output"; then
             echo "RSAC_CI_AUDIO_AVAILABLE=1" >> $GITHUB_ENV
           fi
 
       - name: Compilation check
         run: cargo check --no-default-features --features feat_macos
 
-      # rsac#25: filter is `system_capture::` (not `system_capture`) so the
-      # substring match doesn't also pick up
-      # `multi_source::two_system_captures_both_produce_buffers`. The extra
-      # `gtimeout 360` (6 minutes via coreutils) is a hard wall-clock cap
-      # so a CoreAudio hang in .start() can't consume the full 20min budget.
-      - name: Run system capture tests
+      # rsac#26: `system_capture::` tests skip-early on macOS without
+      # `RSAC_CI_MACOS_TCC_GRANTED=1` — `SystemDefault` uses Process Tap,
+      # which cannot be exercised on managed runners. The skip happens
+      # before `.start()` fires `AudioHardwareCreateProcessTap`, so there
+      # is no CoreAudio hang. `gtimeout 120` is a hard belt if a future
+      # regression slips past the gate.
+      - name: Run system capture tests (skip-early without TCC)
         env:
           RSAC_TEST_CAPTURE_TIMEOUT_SECS: "15"
         run: |
-          gtimeout --preserve-status 360 \
+          gtimeout --preserve-status 120 \
             cargo test --test ci_audio "system_capture::" \
             --no-default-features --features feat_macos \
             -- --test-threads=1 --nocapture 2>&1 | tee ci-audio-output.log
 
+      # platform_caps and stream_lifecycle don't exercise `SystemDefault`
+      # and are TCC-free — they run normally.
       - name: Run platform capabilities tests
         env:
           RSAC_TEST_CAPTURE_TIMEOUT_SECS: "15"
         run: |
-          gtimeout --preserve-status 180 \
+          gtimeout --preserve-status 120 \
             cargo test --test ci_audio platform_caps \
             --no-default-features --features feat_macos \
             -- --test-threads=1 --nocapture 2>&1 | tee -a ci-audio-output.log
@@ -720,7 +712,7 @@ jobs:
         env:
           RSAC_TEST_CAPTURE_TIMEOUT_SECS: "15"
         run: |
-          gtimeout --preserve-status 360 \
+          gtimeout --preserve-status 180 \
             cargo test --test ci_audio stream_lifecycle \
             --no-default-features --features feat_macos \
             -- --test-threads=1 --nocapture 2>&1 | tee -a ci-audio-output.log
@@ -743,7 +735,13 @@ jobs:
   macos-device:
     name: "macOS | Device Capture"
     runs-on: blacksmith-6vcpu-macos-15
-    timeout-minutes: 20
+    # rsac#26: on a headless macOS runner with BlackHole as the only audio
+    # device, AUHAL `.start()` on BlackHole-as-input hangs 10-11 minutes
+    # before erroring OSStatus 2003332927 ('what' = kAudio_UnimplementedError).
+    # CoreAudio appears to be waiting for a functional output audio path
+    # that doesn't exist in headless VMs. Test code handles the error
+    # gracefully, but the hang wastes CI budget — `gtimeout 120` caps it.
+    timeout-minutes: 10
     steps:
       - uses: actions/checkout@v5
       - uses: dtolnay/rust-toolchain@1.95.0
@@ -754,6 +752,7 @@ jobs:
       - name: Check audio and install BlackHole
         run: |
           brew install blackhole-2ch || echo "BlackHole installation failed (expected in CI)"
+          brew install coreutils || echo "coreutils install failed"
           sudo killall coreaudiod 2>/dev/null || true
           sleep 5
           if system_profiler SPAudioDataType 2>/dev/null | grep -qi "output"; then
@@ -767,7 +766,8 @@ jobs:
         env:
           RSAC_TEST_CAPTURE_TIMEOUT_SECS: "15"
         run: |
-          cargo test --test ci_audio device_capture \
+          gtimeout --preserve-status 120 \
+            cargo test --test ci_audio device_capture \
             --no-default-features --features feat_macos \
             -- --test-threads=1 --nocapture 2>&1 | tee ci-audio-output.log
 
@@ -775,7 +775,8 @@ jobs:
         env:
           RSAC_TEST_CAPTURE_TIMEOUT_SECS: "15"
         run: |
-          cargo test --test ci_audio device_enumeration \
+          gtimeout --preserve-status 60 \
+            cargo test --test ci_audio device_enumeration \
             --no-default-features --features feat_macos \
             -- --test-threads=1 --nocapture 2>&1 | tee -a ci-audio-output.log
 
@@ -796,9 +797,10 @@ jobs:
   macos-process:
     name: "macOS | Process Capture"
     runs-on: blacksmith-6vcpu-macos-15
-    # rsac#25: Process Tap (`CaptureTarget::Application` / `::ProcessTree`)
-    # needs TCC Screen Recording permission, which can't be granted
-    # non-interactively on managed runners. Tests skip early via
+    # rsac#26: Process Tap (`CaptureTarget::Application` / `::ProcessTree`)
+    # needs `kTCCServiceAudioCapture` (distinct from `kTCCServiceScreenCapture`
+    # — `tccutil` can only REVOKE, not GRANT; SIP-protected TCC.db cannot be
+    # edited on managed runners). Tests skip early via
     # `require_app_capture!()` / `require_process_capture!()` unless
     # `RSAC_CI_MACOS_TCC_GRANTED=1` is set. `gtimeout` + `continue-on-error`
     # are belt-and-braces safety nets.

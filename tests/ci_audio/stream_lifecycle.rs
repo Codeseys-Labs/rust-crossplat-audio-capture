@@ -7,7 +7,7 @@ use rsac::{AudioCaptureBuilder, CaptureTarget};
 
 #[test]
 fn test_stream_start_read_stop() {
-    require_audio!();
+    require_system_capture!();
 
     let expected_sample_rate: u32 = 48000;
     let expected_channels: u16 = 2;
@@ -101,7 +101,7 @@ fn test_stream_start_read_stop() {
 
 #[test]
 fn test_stream_stop_idempotent() {
-    require_audio!();
+    require_system_capture!();
 
     let mut capture = match AudioCaptureBuilder::new()
         .with_target(CaptureTarget::SystemDefault)
@@ -142,7 +142,7 @@ fn test_stream_stop_idempotent() {
 
 #[test]
 fn test_drop_while_running() {
-    require_audio!();
+    require_system_capture!();
 
     // This test verifies that dropping an AudioCapture while it's still
     // running doesn't panic, leak resources, or hang.

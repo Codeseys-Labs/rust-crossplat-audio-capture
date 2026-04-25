@@ -11,7 +11,7 @@ use crate::helpers;
 
 #[test]
 fn test_system_capture_receives_audio() {
-    require_audio!();
+    require_system_capture!();
 
     // Generate and start playing a test tone
     let wav_path = helpers::generate_test_wav(5.0, 48000, 2);
@@ -134,7 +134,7 @@ fn test_system_capture_receives_audio() {
 
 #[test]
 fn test_capture_format_correct() {
-    require_audio!();
+    require_system_capture!();
 
     let expected_sample_rate = 48000u32;
     let expected_channels = 2u16;

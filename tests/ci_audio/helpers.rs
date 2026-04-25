@@ -422,6 +422,44 @@ pub fn macos_tcc_available() -> bool {
 }
 
 // ---------------------------------------------------------------------------
+// require_system_capture!() macro — skips when SystemDefault needs TCC
+// ---------------------------------------------------------------------------
+
+/// Macro that skips the current test if `CaptureTarget::SystemDefault` cannot
+/// be exercised on this host. On macOS 14.4+, `SystemDefault` is implemented
+/// via `AudioHardwareCreateProcessTap` + a system-wide `CATapDescription`,
+/// which is gated by `kTCCServiceAudioCapture`. On headless managed runners
+/// without a pre-granted TCC grant, that call hangs 10–18 minutes before
+/// erroring — identical symptom to Process Tap. Non-macOS platforms take
+/// a non-TCC path (WASAPI loopback / PipeWire monitor) and always proceed.
+macro_rules! require_system_capture {
+    () => {
+        require_audio!();
+        if !$crate::helpers::macos_tcc_available() {
+            eprintln!(
+                "\n╔══════════════════════════════════════════════════════════╗"
+            );
+            eprintln!(
+                "║  SKIPPING: macOS TCC Audio Capture not granted          ║"
+            );
+            eprintln!(
+                "║  CaptureTarget::SystemDefault uses Process Tap on macOS ║"
+            );
+            eprintln!(
+                "║  — same TCC gate as Application/ProcessTree. Use the    ║"
+            );
+            eprintln!(
+                "║  BlackHole-as-input pattern for CI system capture.      ║"
+            );
+            eprintln!(
+                "╚══════════════════════════════════════════════════════════╝\n"
+            );
+            return;
+        }
+    };
+}
+
+// ---------------------------------------------------------------------------
 // require_app_capture!() macro — skips when app capture is unsupported
 // ---------------------------------------------------------------------------
 
