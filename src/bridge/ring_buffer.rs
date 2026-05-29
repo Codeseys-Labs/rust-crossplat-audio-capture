@@ -900,4 +900,104 @@ mod tests {
         assert_eq!(buf.timestamp(), Some(ts));
         assert_eq!(buf.data(), &[0.9; 4]);
     }
+
+    // ===== Concurrent SPSC stress test (producer thread ⇄ consumer thread) =====
+    //
+    // This is the test that actually exercises the production data path: the
+    // producer runs on one thread (simulating the OS audio callback), the
+    // consumer on another (simulating the reader), and the free-list return
+    // ring recycles allocations across the thread boundary concurrently.
+    //
+    // It validates two invariants under real cross-thread contention:
+    //   1. Conservation: every successfully-pushed buffer is eventually popped
+    //      exactly once (buffers_pushed == buffers_popped at quiescence), and
+    //      dropped buffers never reach the consumer.
+    //   2. FIFO integrity: the sequence numbers the consumer observes are a
+    //      strictly increasing subsequence of those the producer sent — i.e.
+    //      no reordering, duplication, or corruption through either ring.
+    #[test]
+    fn concurrent_producer_consumer_stress() {
+        use std::sync::atomic::{AtomicBool, AtomicU64};
+        use std::sync::Arc as StdArc;
+
+        // Keep CI fast but large enough to surface races/corruption.
+        const ITEMS: u64 = 200_000;
+        // Small ring → frequent full/back-pressure → exercises the drop +
+        // scratch-reclaim path and keeps the free-list ring churning.
+        let (mut producer, mut consumer) = create_bridge(16, test_format());
+        producer.shared().state.force_set(StreamState::Running);
+
+        let producer_done = StdArc::new(AtomicBool::new(false));
+        let pushed_seqs = StdArc::new(AtomicU64::new(0)); // count of successful pushes
+
+        let producer_done_w = StdArc::clone(&producer_done);
+        let pushed_seqs_w = StdArc::clone(&pushed_seqs);
+
+        // Producer thread: each buffer encodes its sequence number in data[0].
+        let producer_handle = std::thread::spawn(move || {
+            let mut pushed = 0u64;
+            for seq in 0..ITEMS {
+                // Encode seq as the sole sample. push_samples_or_drop copies it
+                // through the (recycled) scratch/free-list allocation.
+                if producer.push_samples_or_drop(&[seq as f32], 1, 48000) {
+                    pushed += 1;
+                }
+                // else: ring full → dropped; that seq simply never arrives.
+            }
+            pushed_seqs_w.store(pushed, Ordering::SeqCst);
+            producer_done_w.store(true, Ordering::SeqCst);
+            // Return the producer so its free-list consumer side stays alive
+            // until the consumer finishes recycling.
+            producer
+        });
+
+        // Consumer thread: pop continuously, verify strictly-increasing seqs.
+        let consumer_handle = std::thread::spawn(move || {
+            let mut popped = 0u64;
+            let mut last_seq: i64 = -1;
+            loop {
+                match consumer.pop() {
+                    Some(buf) => {
+                        let seq = buf.data()[0] as i64;
+                        assert!(
+                            seq > last_seq,
+                            "FIFO/integrity violation: seq {seq} not > previous {last_seq}"
+                        );
+                        last_seq = seq;
+                        popped += 1;
+                    }
+                    None => {
+                        // Stop once the producer is finished AND the ring has
+                        // been fully drained.
+                        if producer_done.load(Ordering::SeqCst) && consumer.available_buffers() == 0
+                        {
+                            break;
+                        }
+                        std::thread::yield_now();
+                    }
+                }
+            }
+            (popped, consumer)
+        });
+
+        let _producer = producer_handle.join().expect("producer thread panicked");
+        let (popped, consumer) = consumer_handle.join().expect("consumer thread panicked");
+
+        let pushed = pushed_seqs.load(Ordering::SeqCst);
+
+        // Conservation: every successful push is popped exactly once.
+        assert_eq!(
+            pushed, popped,
+            "conservation violated: {pushed} pushed but {popped} popped"
+        );
+        // Cross-check against the bridge's own counters.
+        assert_eq!(consumer.buffers_popped(), popped, "popped counter mismatch");
+        // pushed + dropped must equal the total attempts.
+        let dropped = consumer.shared().buffers_dropped.load(Ordering::Relaxed);
+        assert_eq!(
+            pushed + dropped,
+            ITEMS,
+            "pushed ({pushed}) + dropped ({dropped}) must equal attempts ({ITEMS})"
+        );
+    }
 }

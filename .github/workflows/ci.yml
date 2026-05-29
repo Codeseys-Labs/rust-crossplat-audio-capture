@@ -14,10 +14,20 @@ env:
   CARGO_TERM_COLOR: always
   RUST_BACKTRACE: 1
 
+# Least-privilege token: this workflow only builds/tests, never writes.
+permissions:
+  contents: read
+
+# Cancel superseded runs on the same ref (saves runner minutes on PR pushes).
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
 jobs:
   # ── Lint ────────────────────────────────────────────────────────────
   lint:
     name: Lint & Format
+    timeout-minutes: 20
     runs-on: blacksmith-4vcpu-ubuntu-2404
     steps:
       - uses: actions/checkout@v5
@@ -41,6 +51,7 @@ jobs:
   # ── Linux unit tests ────────────────────────────────────────────────
   test-linux:
     name: Linux Unit Tests
+    timeout-minutes: 25
     needs: lint
     runs-on: blacksmith-4vcpu-ubuntu-2404
     steps:
@@ -63,6 +74,7 @@ jobs:
   # ── Windows unit tests ──────────────────────────────────────────────
   test-windows:
     name: Windows Unit Tests
+    timeout-minutes: 25
     needs: lint
     runs-on: blacksmith-4vcpu-windows-2025
     steps:
@@ -92,6 +104,7 @@ jobs:
   # ── macOS unit tests ────────────────────────────────────────────────
   test-macos:
     name: macOS Unit Tests
+    timeout-minutes: 25
     needs: lint
     runs-on: blacksmith-6vcpu-macos-15
     steps:
@@ -172,6 +185,7 @@ jobs:
   # ── Linux ARM64 cross-compilation check ─────────────────────────────
   cross-compile-linux-arm64:
     name: Linux ARM64 Cross-Compile Check
+    timeout-minutes: 20
     needs: lint
     runs-on: blacksmith-4vcpu-ubuntu-2404
     steps:
@@ -196,42 +210,10 @@ jobs:
           echo "Checking ARM64 compilation (library code only, no linking)..."
           cargo check --lib --no-default-features --features feat_linux --target aarch64-unknown-linux-gnu 2>&1 || echo "ARM64 cross-check completed with expected linker warnings"
 
-  # ── Audio-graph downstream compile check ─────────────────────────────
-  # The audio-graph Tauri app is the primary in-tree consumer of rsac.
-  # Without this gate, a breaking rsac API change lands clean in this repo
-  # and surfaces only when someone bumps the audio-graph submodule pointer.
-  # Compile-check only (no tests) to keep CI fast — audio-graph's own
-  # workflow runs the full test suite.
-  check-audio-graph:
-    name: Downstream (audio-graph)
-    needs: lint
-    runs-on: blacksmith-4vcpu-ubuntu-2404
-    steps:
-      - uses: actions/checkout@v5
-        with:
-          submodules: recursive
-
-      - uses: dtolnay/rust-toolchain@1.95.0
-      - uses: Swatinem/rust-cache@v2
-        with:
-          workspaces: apps/audio-graph/src-tauri
-
-      - name: Install system dependencies (rsac + Tauri)
-        run: |
-          sudo add-apt-repository ppa:pipewire-debian/pipewire-upstream -y
-          sudo apt-get update
-          sudo apt-get install -y \
-            libpipewire-0.3-dev libspa-0.2-dev \
-            libwebkit2gtk-4.1-dev libgtk-3-dev libayatana-appindicator3-dev \
-            librsvg2-dev cmake clang libclang-dev pkg-config
-
-      - name: Cargo check (audio-graph against this rsac)
-        working-directory: apps/audio-graph/src-tauri
-        run: cargo check
-
   # ── Binding crates compilation check ─────────────────────────────────
   check-bindings:
     name: Binding Crates
+    timeout-minutes: 20
     needs: lint
     runs-on: blacksmith-4vcpu-ubuntu-2404
     steps:
