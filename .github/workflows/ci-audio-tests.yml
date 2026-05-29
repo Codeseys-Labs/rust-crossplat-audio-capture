@@ -97,7 +97,13 @@ jobs:
             sink_name=ci_test_sink \
             sink_properties=device.description="CI_Test_Sink" \
             rate=48000 channels=2 format=float32le
-          pactl set-default-sink ci_test_sink
+          # Make ci_test_sink the default. `pactl set-default-sink` returns
+          # "Failure: Not supported" under pipewire-pulse, so tolerate it and set
+          # the default via PipeWire metadata (honored by the library + pw-play).
+          pactl set-default-sink ci_test_sink 2>/dev/null || true
+          pw-metadata 0 'default.configured.audio.sink' "{ \"name\": \"ci_test_sink\" }" 2>/dev/null || true
+          pw-metadata 0 'default.audio.sink' "{ \"name\": \"ci_test_sink\" }" 2>/dev/null || true
+          sleep 1
 
           # Mirror the Windows VB-CABLE fail-fast: the test sink must exist AND
           # be the default. Otherwise the test tone goes nowhere and capture
@@ -108,9 +114,15 @@ jobs:
             pactl list short sinks || true
             exit 1
           fi
-          DEFAULT_SINK="$(pactl get-default-sink)"
-          if [ "$DEFAULT_SINK" != "ci_test_sink" ]; then
-            echo "ERROR: default sink is '$DEFAULT_SINK', expected 'ci_test_sink'"
+          # Default confirmed via pactl OR PipeWire metadata (pactl may lag the
+          # metadata under pipewire-pulse). If neither agrees, the tone won't
+          # reach the captured monitor — fail loudly instead of capturing silence.
+          DEFAULT_SINK="$(pactl get-default-sink 2>/dev/null || echo unknown)"
+          META_SINK="$(pw-metadata 0 2>/dev/null | grep 'default.audio.sink' | grep -o 'ci_test_sink' | head -1 || true)"
+          echo "default sink (pactl)='${DEFAULT_SINK}' metadata='${META_SINK}'"
+          if [ "$DEFAULT_SINK" != "ci_test_sink" ] && [ "$META_SINK" != "ci_test_sink" ]; then
+            echo "ERROR: ci_test_sink is not the default sink"
+            pw-metadata 0 2>/dev/null || true
             exit 1
           fi
           echo "OK: ci_test_sink exists and is the default sink."
@@ -236,15 +248,24 @@ jobs:
             sink_name=ci_test_sink \
             sink_properties=device.description="CI_Test_Sink" \
             rate=48000 channels=2 format=float32le
-          pactl set-default-sink ci_test_sink
+          # Make ci_test_sink the default. `pactl set-default-sink` returns
+          # "Failure: Not supported" under pipewire-pulse, so tolerate it and set
+          # the default via PipeWire metadata (honored by the library + pw-play).
+          pactl set-default-sink ci_test_sink 2>/dev/null || true
+          pw-metadata 0 'default.configured.audio.sink' "{ \"name\": \"ci_test_sink\" }" 2>/dev/null || true
+          pw-metadata 0 'default.audio.sink' "{ \"name\": \"ci_test_sink\" }" 2>/dev/null || true
+          sleep 1
           if ! pactl list short sinks | grep -q "ci_test_sink"; then
             echo "ERROR: ci_test_sink not present in 'pactl list short sinks'"
             pactl list short sinks || true
             exit 1
           fi
-          DEFAULT_SINK="$(pactl get-default-sink)"
-          if [ "$DEFAULT_SINK" != "ci_test_sink" ]; then
-            echo "ERROR: default sink is '$DEFAULT_SINK', expected 'ci_test_sink'"
+          DEFAULT_SINK="$(pactl get-default-sink 2>/dev/null || echo unknown)"
+          META_SINK="$(pw-metadata 0 2>/dev/null | grep 'default.audio.sink' | grep -o 'ci_test_sink' | head -1 || true)"
+          echo "default sink (pactl)='${DEFAULT_SINK}' metadata='${META_SINK}'"
+          if [ "$DEFAULT_SINK" != "ci_test_sink" ] && [ "$META_SINK" != "ci_test_sink" ]; then
+            echo "ERROR: ci_test_sink is not the default sink"
+            pw-metadata 0 2>/dev/null || true
             exit 1
           fi
           echo "OK: ci_test_sink exists and is the default sink."
@@ -324,15 +345,24 @@ jobs:
             sink_name=ci_test_sink \
             sink_properties=device.description="CI_Test_Sink" \
             rate=48000 channels=2 format=float32le
-          pactl set-default-sink ci_test_sink
+          # Make ci_test_sink the default. `pactl set-default-sink` returns
+          # "Failure: Not supported" under pipewire-pulse, so tolerate it and set
+          # the default via PipeWire metadata (honored by the library + pw-play).
+          pactl set-default-sink ci_test_sink 2>/dev/null || true
+          pw-metadata 0 'default.configured.audio.sink' "{ \"name\": \"ci_test_sink\" }" 2>/dev/null || true
+          pw-metadata 0 'default.audio.sink' "{ \"name\": \"ci_test_sink\" }" 2>/dev/null || true
+          sleep 1
           if ! pactl list short sinks | grep -q "ci_test_sink"; then
             echo "ERROR: ci_test_sink not present in 'pactl list short sinks'"
             pactl list short sinks || true
             exit 1
           fi
-          DEFAULT_SINK="$(pactl get-default-sink)"
-          if [ "$DEFAULT_SINK" != "ci_test_sink" ]; then
-            echo "ERROR: default sink is '$DEFAULT_SINK', expected 'ci_test_sink'"
+          DEFAULT_SINK="$(pactl get-default-sink 2>/dev/null || echo unknown)"
+          META_SINK="$(pw-metadata 0 2>/dev/null | grep 'default.audio.sink' | grep -o 'ci_test_sink' | head -1 || true)"
+          echo "default sink (pactl)='${DEFAULT_SINK}' metadata='${META_SINK}'"
+          if [ "$DEFAULT_SINK" != "ci_test_sink" ] && [ "$META_SINK" != "ci_test_sink" ]; then
+            echo "ERROR: ci_test_sink is not the default sink"
+            pw-metadata 0 2>/dev/null || true
             exit 1
           fi
           echo "OK: ci_test_sink exists and is the default sink."

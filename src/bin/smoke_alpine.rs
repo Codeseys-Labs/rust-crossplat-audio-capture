@@ -34,13 +34,17 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     println!("[smoke_alpine] OK: enumerated {} device(s)", devices.len());
     for (idx, dev) in devices.iter().enumerate() {
-        println!("  [{idx}] {:?}", dev);
+        println!("  [{idx}] {} ({:?})", dev.name(), dev.id());
     }
 
     // Also exercise the default-device path, which is a separate PipeWire
     // roundtrip and often the first thing a real consumer calls.
     match enumerator.get_default_device() {
-        Ok(def) => println!("[smoke_alpine] OK: default device = {:?}", def),
+        Ok(def) => println!(
+            "[smoke_alpine] OK: default device = {} ({:?})",
+            def.name(),
+            def.id()
+        ),
         Err(e) => {
             // Not fatal on a headless box with no real sinks beyond the
             // null-sink we create, but log loudly so the operator sees it.
