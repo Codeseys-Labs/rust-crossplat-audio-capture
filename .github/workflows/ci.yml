@@ -24,11 +24,24 @@ concurrency:
   cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 jobs:
-  # ── Lint ────────────────────────────────────────────────────────────
+  # ── Lint (clippy matrix across all 3 OS) ────────────────────────────
   lint:
-    name: Lint & Format
+    name: Lint & Format (${{ matrix.feature }})
     timeout-minutes: 20
-    runs-on: blacksmith-4vcpu-ubuntu-2404
+    runs-on: ${{ matrix.runner }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - runner: blacksmith-4vcpu-ubuntu-2404
+            feature: feat_linux
+            os: linux
+          - runner: blacksmith-4vcpu-windows-2025
+            feature: feat_windows
+            os: windows
+          - runner: blacksmith-6vcpu-macos-15
+            feature: feat_macos
+            os: macos
     steps:
       - uses: actions/checkout@v5
       - uses: dtolnay/rust-toolchain@1.95.0
@@ -37,16 +50,25 @@ jobs:
       - uses: Swatinem/rust-cache@v2
 
       - name: Install PipeWire dev libraries
+        if: matrix.os == 'linux'
         run: |
           sudo add-apt-repository ppa:pipewire-debian/pipewire-upstream -y
           sudo apt-get update
           sudo apt-get install -y libpipewire-0.3-dev libspa-0.2-dev pkg-config
 
+      # rustfmt is platform-independent; run the check once on the Linux leg.
       - name: Check formatting
+        if: matrix.os == 'linux'
         run: cargo fmt --all -- --check
 
+      # Clippy lints --lib --bins for the active platform. NOTE: scoped to
+      # --lib --bins rather than --all-targets because pre-existing clippy
+      # warnings live in out-of-scope files owned by other agents:
+      #   - examples/basic_capture.rs (clippy::manual_is_multiple_of)
+      #   - tests/ci_audio/helpers.rs (dead_code, doc_lazy_continuation)
+      # Once those are fixed by their owners, widen this to --all-targets.
       - name: Run Clippy
-        run: cargo clippy --lib --no-default-features --features feat_linux -- -D warnings
+        run: cargo clippy --lib --bins --no-default-features --features ${{ matrix.feature }} -- -D warnings
 
   # ── Linux unit tests ────────────────────────────────────────────────
   test-linux:
@@ -68,8 +90,13 @@ jobs:
       - name: Cargo check
         run: cargo check --lib --no-default-features --features feat_linux
 
+      # Build every target (bin/ + examples/), not just the lib, so demo
+      # binaries and examples are compiled and kept from bit-rotting.
+      - name: Build all targets
+        run: cargo build --all-targets --no-default-features --features feat_linux
+
       - name: Cargo test (unit tests)
-        run: cargo test --lib --no-default-features --features feat_linux -- --test-threads=1
+        run: cargo test --lib --no-default-features --features feat_linux
 
   # ── Windows unit tests ──────────────────────────────────────────────
   test-windows:
@@ -85,12 +112,16 @@ jobs:
       - name: Cargo check
         run: cargo check --lib --no-default-features --features feat_windows
 
+      # Build every target (bin/ + examples/), not just the lib.
+      - name: Build all targets
+        run: cargo build --all-targets --no-default-features --features feat_windows
+
       - name: Cargo test (unit tests)
         # Blacksmith Windows VMs have no audio subsystem (AudioSrv absent).
         # WASAPI tests that try to open devices will fail. The compilation
         # check above is the important gate; test failures here are expected.
         continue-on-error: true
-        run: cargo test --lib --no-default-features --features feat_windows -- --test-threads=1
+        run: cargo test --lib --no-default-features --features feat_windows
 
       - name: Report audio service status
         if: always()
@@ -137,8 +168,12 @@ jobs:
       - name: Cargo check
         run: cargo check --lib --no-default-features --features feat_macos
 
+      # Build every target (bin/ + examples/), not just the lib.
+      - name: Build all targets
+        run: cargo build --all-targets --no-default-features --features feat_macos
+
       - name: Cargo test (unit tests)
-        run: cargo test --lib --no-default-features --features feat_macos -- --test-threads=1
+        run: cargo test --lib --no-default-features --features feat_macos
 
       # OPTION B (existence check): Blacksmith macOS runners lack TCC grants for
       # Process Tap capture (see macos-process job in ci-audio-tests.yml —
@@ -206,9 +241,23 @@ jobs:
 
       - name: Cross-compile check (lib only)
         run: |
-          # For ARM64, we can only check compilation, not link (no ARM64 PipeWire libs)
+          # ARM64 cross-check. We do NOT install :arm64 PipeWire dev packages:
+          # the pipewire-debian PPA does not publish arm64 binaries, so apt
+          # would fail. Instead we run `cargo check` (compile-only, no link) and
+          # turn it into a *real* gate by failing on genuine rustc errors while
+          # tolerating expected link/pkg-config noise. Errors are detected by
+          # grepping the captured output for `error[` / `error:` — a rustc
+          # error there fails the job (unlike the old `|| echo` mask, which
+          # could never fail).
+          set -o pipefail
           echo "Checking ARM64 compilation (library code only, no linking)..."
-          cargo check --lib --no-default-features --features feat_linux --target aarch64-unknown-linux-gnu 2>&1 || echo "ARM64 cross-check completed with expected linker warnings"
+          cargo check --lib --no-default-features --features feat_linux \
+            --target aarch64-unknown-linux-gnu 2>&1 | tee arm64-check.log || true
+          if grep -E 'error(\[|:)' arm64-check.log; then
+            echo "FAIL: rustc reported compilation errors for aarch64-unknown-linux-gnu"
+            exit 1
+          fi
+          echo "OK: ARM64 cross-check produced no rustc compilation errors"
 
   # ── Binding crates compilation check ─────────────────────────────────
   check-bindings:
@@ -237,3 +286,57 @@ jobs:
         env:
           PYO3_USE_ABI3_FORWARD_COMPATIBILITY: "1"
         run: cargo check -p rsac-python
+
+  # ── Feature-combo compile + doctests (Linux) ────────────────────────
+  # The async-stream / sink-wav / test-utils features are not exercised by
+  # any other job (they're off in the default --features feat_<platform>
+  # runs), so they can silently bit-rot. This job compiles them together and
+  # runs the doctests, which are otherwise never executed in CI.
+  feature-combo-doctests:
+    name: Feature Combo + Doctests (Linux)
+    timeout-minutes: 20
+    needs: lint
+    runs-on: blacksmith-4vcpu-ubuntu-2404
+    steps:
+      - uses: actions/checkout@v5
+      - uses: dtolnay/rust-toolchain@1.95.0
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Install PipeWire dev libraries
+        run: |
+          sudo add-apt-repository ppa:pipewire-debian/pipewire-upstream -y
+          sudo apt-get update
+          sudo apt-get install -y libpipewire-0.3-dev libspa-0.2-dev pkg-config
+
+      - name: Check feature combination (async-stream + sink-wav + test-utils)
+        run: cargo check --no-default-features --features feat_linux,async-stream,sink-wav,test-utils
+
+      - name: Run doctests
+        # Build doctests with the same feature set so doc examples that touch
+        # async-stream / sink-wav APIs are exercised too.
+        run: cargo test --doc --no-default-features --features feat_linux,async-stream,sink-wav,test-utils
+
+  # ── Supply-chain audit (cargo-deny) ─────────────────────────────────
+  # cargo-deny is chosen over cargo-audit because it covers advisories AND
+  # license compliance, banned/duplicate crates, and source registries in a
+  # single declarative config (deny.toml at the repo root). The initial
+  # deny.toml is conservative: hard-fail on security advisories + disallowed
+  # licenses, warn-only on duplicate versions so a benign version skew doesn't
+  # break CI on day one.
+  supply-chain:
+    name: Supply Chain (cargo-deny)
+    timeout-minutes: 20
+    needs: lint
+    runs-on: blacksmith-4vcpu-ubuntu-2404
+    steps:
+      - uses: actions/checkout@v5
+      - uses: dtolnay/rust-toolchain@1.95.0
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Install cargo-deny
+        uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-deny
+
+      - name: Run cargo-deny
+        run: cargo deny check advisories bans licenses sources

@@ -1,0 +1,46 @@
+# cargo-deny configuration for rsac supply-chain CI gate.
+#
+# Run by the `supply-chain` job in .github/workflows/ci.yml via:
+#   cargo deny check advisories bans licenses sources
+#
+# Philosophy (initial, conservative): hard-fail on known security advisories
+# and disallowed licenses; only *warn* on duplicate transitive dependency
+# versions rather than hard-banning them, so a benign version skew in the tree
+# doesn't break CI on day one. Tighten later as the dependency graph stabilizes.
+
+[advisories]
+# Fail the build on any security advisory in the dependency tree.
+version = 2
+yanked = "warn"
+
+[licenses]
+version = 2
+# Allow-list of SPDX license identifiers acceptable for this project and its
+# (transitive) dependencies. rsac itself is "MIT OR Apache-2.0".
+allow = [
+    "MIT",
+    "Apache-2.0",
+    "Apache-2.0 WITH LLVM-exception",
+    "BSD-2-Clause",
+    "BSD-3-Clause",
+    "Unicode-3.0",
+    "Unicode-DFS-2016",
+    "ISC",
+    "Zlib",
+]
+# Require a high confidence threshold when inferring a license from a crate's
+# LICENSE file text (default is 0.8).
+confidence-threshold = 0.8
+
+[bans]
+# Duplicate versions of the same crate are common in large trees and are not a
+# correctness problem on their own. Warn rather than hard-fail initially.
+multiple-versions = "warn"
+wildcards = "warn"
+
+[sources]
+# Only allow crates from the canonical crates.io registry. Any git or alternate
+# registry source must be explicitly allow-listed.
+unknown-registry = "deny"
+unknown-git = "deny"
+allow-registry = ["https://github.com/rust-lang/crates.io-index"]

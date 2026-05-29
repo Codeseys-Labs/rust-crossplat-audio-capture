@@ -924,7 +924,7 @@ fn get_process_name_by_pid(pid: u32) -> Option<String> {
 fn parse_session_identifier(session_id: &str) -> String {
     let parts: Vec<&str> = session_id.split('|').collect();
     if let Some(name_part) = parts.first() {
-        if let Some(exe_name) = name_part.split('\\').last() {
+        if let Some(exe_name) = name_part.split('\\').next_back() {
             let name = exe_name.strip_suffix(".exe").unwrap_or(exe_name);
             if !name.is_empty() {
                 return name.to_string();
