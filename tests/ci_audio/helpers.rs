@@ -31,6 +31,22 @@ pub fn audio_infrastructure_available() -> bool {
     runtime_detect_audio()
 }
 
+/// Whether the test environment provides a *deterministic* audio source.
+///
+/// Set by CI (`RSAC_CI_AUDIO_DETERMINISTIC=1`) only on platforms where the
+/// audio path is fully reproducible — currently the Linux PipeWire null sink
+/// + a known 440 Hz / 0.8-amplitude sine tone player. When this returns
+/// `true`, capture tests upgrade their soft "⚠ WARNING" non-silence checks
+/// into HARD ASSERTS: a deterministic source that yields silence is a real
+/// regression, not CI flakiness.
+///
+/// When unset (Windows VB-CABLE, macOS BlackHole/TCC — less deterministic or
+/// permission-gated), tests keep the existing soft-warn behavior so they do
+/// not flake on non-reproducible hosts.
+pub fn deterministic_audio_env() -> bool {
+    std::env::var("RSAC_CI_AUDIO_DETERMINISTIC").is_ok()
+}
+
 fn runtime_detect_audio() -> bool {
     // On Linux: check PipeWire
     #[cfg(target_os = "linux")]
@@ -200,6 +216,56 @@ fn generate_pcm16_sibling(
 // Audio playback helpers
 // ---------------------------------------------------------------------------
 
+/// Warm-up + early-exit guard for a freshly-spawned audio player.
+///
+/// Sleeps briefly to let the player begin streaming, then calls
+/// `child.try_wait()`. If the player has ALREADY exited with a non-success
+/// status, that means the source died before producing audio — capturing
+/// from a dead source would yield silence and make "capture is broken" look
+/// identical to "the test tone never played". To prevent that false signal,
+/// we drain the child's stderr and HARD PANIC with the diagnostic.
+///
+/// If the child is still running (the normal case) we return immediately,
+/// leaving the handle untouched for the caller to manage. A successful early
+/// exit (status 0) is tolerated — some one-shot players legitimately finish a
+/// short clip — and is left for the caller's read loop / timeout to handle.
+fn warmup_and_guard_player(child: &mut Child, label: &str) {
+    // Brief warm-up: long enough for a failing player to surface an error,
+    // short relative to capture timeouts so we don't eat the test budget.
+    std::thread::sleep(Duration::from_millis(300));
+
+    match child.try_wait() {
+        Ok(Some(status)) if !status.success() => {
+            // Player already died with an error — capture would see silence.
+            // Surface the real cause rather than masquerading as "capture broken".
+            let mut stderr_text = String::new();
+            if let Some(mut err) = child.stderr.take() {
+                use std::io::Read;
+                let _ = err.read_to_string(&mut stderr_text);
+            }
+            panic!(
+                "[ci_audio] {label} audio player exited early with {status} before \
+                 producing audio. This is a SOURCE failure, not a capture failure. \
+                 stderr:\n{stderr_text}"
+            );
+        }
+        Ok(Some(status)) => {
+            // Exited cleanly during warm-up (short clip). Unusual for our
+            // 5s tones, but not an error — let the caller's loop handle it.
+            eprintln!(
+                "[ci_audio] {label} audio player exited during warm-up with {status} \
+                 (clean) — continuing"
+            );
+        }
+        Ok(None) => {
+            // Still running — the expected healthy path.
+        }
+        Err(e) => {
+            eprintln!("[ci_audio] {label} try_wait() failed (non-fatal): {e}");
+        }
+    }
+}
+
 /// Spawn a platform-specific audio player for the given WAV file.
 /// Returns the child process handle so it can be stopped later.
 pub fn spawn_test_tone_player(wav_path: &std::path::Path) -> Option<Child> {
@@ -214,8 +280,9 @@ pub fn spawn_test_tone_player(wav_path: &std::path::Path) -> Option<Child> {
             .spawn();
 
         match child {
-            Ok(c) => {
+            Ok(mut c) => {
                 eprintln!("[ci_audio] Started pw-play for {:?}", wav_path);
+                warmup_and_guard_player(&mut c, "pw-play");
                 Some(c)
             }
             Err(_) => {
@@ -227,8 +294,9 @@ pub fn spawn_test_tone_player(wav_path: &std::path::Path) -> Option<Child> {
                     .stderr(std::process::Stdio::piped())
                     .spawn()
                 {
-                    Ok(c) => {
+                    Ok(mut c) => {
                         eprintln!("[ci_audio] Started paplay for {:?}", wav_path);
+                        warmup_and_guard_player(&mut c, "paplay");
                         Some(c)
                     }
                     Err(e) => {
@@ -266,11 +334,12 @@ pub fn spawn_test_tone_player(wav_path: &std::path::Path) -> Option<Child> {
             .spawn();
 
         match child {
-            Ok(c) => {
+            Ok(mut c) => {
                 eprintln!(
                     "[ci_audio] Started Windows PlayLooping for {:?}",
                     pcm16_path
                 );
+                warmup_and_guard_player(&mut c, "Windows PlayLooping");
                 Some(c)
             }
             Err(e) => {
@@ -290,7 +359,10 @@ pub fn spawn_test_tone_player(wav_path: &std::path::Path) -> Option<Child> {
             .spawn();
 
         match child {
-            Ok(c) => Some(c),
+            Ok(mut c) => {
+                warmup_and_guard_player(&mut c, "afplay");
+                Some(c)
+            }
             Err(e) => {
                 eprintln!("[ci_audio] Failed to start macOS audio player: {}", e);
                 None
@@ -339,6 +411,111 @@ pub fn verify_rms_energy(buffer: &AudioBuffer, min_rms: f32) -> (f32, bool) {
     );
 
     (rms, rms >= min_rms)
+}
+
+/// Verify that a tone at `target_hz` dominates the captured audio.
+///
+/// Uses the Goertzel algorithm — an efficient single-bin DFT — to measure the
+/// energy at `target_hz` relative to the *average* energy across a spread of
+/// reference frequencies. The deterministic CI source is a 440 Hz sine tone
+/// (see [`generate_test_wav`]); if capture is working, the 440 Hz bin should
+/// stand far above the noise floor of unrelated bins.
+///
+/// Algorithm:
+/// 1. Deinterleave the first channel (samples are interleaved by
+///    `buffer.channels()`).
+/// 2. Run Goertzel at the target frequency and at a set of off-target
+///    reference frequencies (sub-harmonics / unrelated bins).
+/// 3. Return `true` iff the target-bin power exceeds the dominance threshold
+///    times the mean off-target power.
+///
+/// Threshold: `DOMINANCE = 8.0`. A clean sine tone produces a target-bin
+/// power orders of magnitude above unrelated bins, so 8× is comfortably
+/// above ambient numerical leakage while still tolerating real-world spectral
+/// smearing from short capture windows and resampling. Returns `false` for
+/// empty buffers or a zero sample rate (cannot compute a frequency bin).
+pub fn verify_tone_present(buffer: &AudioBuffer, target_hz: f32) -> bool {
+    /// Target-bin power must exceed this multiple of the mean off-target
+    /// (reference) bin power for the tone to count as "present".
+    const DOMINANCE: f32 = 8.0;
+
+    let channels = buffer.channels().max(1) as usize;
+    let sample_rate = buffer.sample_rate() as f32;
+    let interleaved = buffer.data();
+
+    if interleaved.is_empty() || sample_rate <= 0.0 {
+        eprintln!("[ci_audio] verify_tone_present: empty buffer or zero sample rate");
+        return false;
+    }
+
+    // Deinterleave channel 0.
+    let mono: Vec<f32> = interleaved.iter().step_by(channels).copied().collect();
+    let n = mono.len();
+    if n == 0 {
+        return false;
+    }
+
+    // Goertzel single-bin power for an arbitrary (non-integer-bin) frequency.
+    let goertzel_power = |freq: f32| -> f32 {
+        let omega = 2.0 * std::f32::consts::PI * freq / sample_rate;
+        let coeff = 2.0 * omega.cos();
+        let mut s_prev = 0.0f32;
+        let mut s_prev2 = 0.0f32;
+        for &x in &mono {
+            let s = x + coeff * s_prev - s_prev2;
+            s_prev2 = s_prev;
+            s_prev = s;
+        }
+        // Power = |X(freq)|^2, normalized by sample count so it is comparable
+        // across buffers of different lengths.
+        let power = s_prev2 * s_prev2 + s_prev * s_prev - coeff * s_prev * s_prev2;
+        power / n as f32
+    };
+
+    let target_power = goertzel_power(target_hz);
+
+    // Off-target reference bins, kept clear of the target and its first
+    // harmonic to avoid spectral-leakage contamination. All within Nyquist
+    // for the deterministic 48 kHz fixture.
+    let nyquist = sample_rate / 2.0;
+    let refs: [f32; 4] = [
+        target_hz * 0.5,  // 220 Hz
+        target_hz * 1.5,  // 660 Hz
+        target_hz * 2.5,  // 1100 Hz
+        target_hz * 3.25, // 1430 Hz
+    ];
+    let mut ref_sum = 0.0f32;
+    let mut ref_count = 0.0f32;
+    for &f in &refs {
+        if f > 0.0 && f < nyquist {
+            ref_sum += goertzel_power(f);
+            ref_count += 1.0;
+        }
+    }
+    let ref_mean = if ref_count > 0.0 {
+        ref_sum / ref_count
+    } else {
+        0.0
+    };
+
+    let dominates = target_power > DOMINANCE * ref_mean && target_power > 0.0;
+
+    eprintln!(
+        "[ci_audio] verify_tone_present: target {:.0}Hz power={:.6}, ref_mean={:.6}, \
+         ratio={:.2} (threshold {:.1}x) → {}",
+        target_hz,
+        target_power,
+        ref_mean,
+        if ref_mean > 0.0 {
+            target_power / ref_mean
+        } else {
+            f32::INFINITY
+        },
+        DOMINANCE,
+        dominates
+    );
+
+    dominates
 }
 
 /// Verify the audio format matches expectations.
@@ -595,11 +772,13 @@ pub fn spawn_audio_player_get_pid(wav_path: &std::path::Path) -> Result<(Child, 
             })
             .map_err(|e| format!("Failed to spawn audio player: {e}"))?;
 
+        let mut child = child;
         let pid = child.id();
         eprintln!(
             "[ci_audio] Started audio player PID={pid} for {:?}",
             wav_path
         );
+        warmup_and_guard_player(&mut child, "pw-play/paplay");
         Ok((child, pid))
     }
 
@@ -623,11 +802,13 @@ pub fn spawn_audio_player_get_pid(wav_path: &std::path::Path) -> Result<(Child, 
             .spawn()
             .map_err(|e| format!("Failed to spawn Windows audio player: {e}"))?;
 
+        let mut child = child;
         let pid = child.id();
         eprintln!(
             "[ci_audio] Started Windows PlayLooping PID={pid} for {:?}",
             pcm16_path
         );
+        warmup_and_guard_player(&mut child, "Windows PlayLooping");
         Ok((child, pid))
     }
 
@@ -641,8 +822,10 @@ pub fn spawn_audio_player_get_pid(wav_path: &std::path::Path) -> Result<(Child, 
             .spawn()
             .map_err(|e| format!("Failed to spawn macOS audio player: {e}"))?;
 
+        let mut child = child;
         let pid = child.id();
         eprintln!("[ci_audio] Started macOS audio player PID={pid}");
+        warmup_and_guard_player(&mut child, "afplay");
         Ok((child, pid))
     }
 

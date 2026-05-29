@@ -61,6 +61,8 @@ fn test_process_tree_capture_receives_audio() {
     let mut got_audio = false;
     let mut total_frames = 0usize;
     let mut buffers_read = 0usize;
+    let mut tone_present = false;
+    let mut rms_ok = false;
 
     while start.elapsed() < timeout {
         match capture.read_buffer() {
@@ -69,7 +71,9 @@ fn test_process_tree_capture_receives_audio() {
                 total_frames += buf.num_frames();
                 if helpers::verify_non_silence(&buf, 0.001) {
                     got_audio = true;
-                    let (rms, _) = helpers::verify_rms_energy(&buf, 0.0);
+                    let (rms, ok) = helpers::verify_rms_energy(&buf, 0.01);
+                    rms_ok = ok;
+                    tone_present = helpers::verify_tone_present(&buf, 440.0);
                     eprintln!(
                         "[ci_audio] Process tree capture: non-silent audio, {} frames, RMS={:.6}",
                         buf.num_frames(),
@@ -97,7 +101,29 @@ fn test_process_tree_capture_receives_audio() {
         buffers_read, total_frames, got_audio
     );
 
-    if got_audio {
+    if helpers::deterministic_audio_env() {
+        assert!(
+            buffers_read > 0,
+            "deterministic source: process tree capture read 0 buffers for PID {pid}"
+        );
+        assert!(
+            total_frames > 0,
+            "deterministic source: process tree capture got 0 frames for PID {pid}"
+        );
+        assert!(
+            got_audio,
+            "deterministic source: process tree capture received only silence for PID {pid}"
+        );
+        assert!(
+            rms_ok,
+            "deterministic source: process tree RMS below 0.01 floor for PID {pid}"
+        );
+        assert!(
+            tone_present,
+            "deterministic source: 440 Hz tone not detected in process tree capture for PID {pid}"
+        );
+        eprintln!("[ci_audio] ✅ Process tree capture received the 440 Hz tone from PID {pid}");
+    } else if got_audio {
         eprintln!("[ci_audio] ✅ Process tree capture received audio from PID {pid}");
     } else {
         eprintln!(
@@ -143,11 +169,31 @@ fn test_process_tree_capture_nonexistent_pid() {
                     );
                 }
                 Ok(()) => {
-                    eprintln!(
-                        "[ci_audio] ⚠ Capture started with nonexistent PID (may produce silence)"
-                    );
-                    std::thread::sleep(Duration::from_millis(500));
+                    // Some backends accept any PID at build/start and just
+                    // route no audio. If audio DOES arrive for a bogus PID,
+                    // the tree resolved to the wrong source — assert silence.
+                    eprintln!("[ci_audio] Capture started with nonexistent PID; verifying silence");
+                    let start = Instant::now();
+                    let mut produced_audio = false;
+                    while start.elapsed() < Duration::from_millis(500) {
+                        match capture.read_buffer() {
+                            Ok(Some(buf)) => {
+                                if helpers::verify_non_silence(&buf, 0.001) {
+                                    produced_audio = true;
+                                    break;
+                                }
+                            }
+                            Ok(None) => std::thread::sleep(Duration::from_millis(10)),
+                            Err(_) => break,
+                        }
+                    }
                     let _ = capture.stop();
+                    assert!(
+                        !produced_audio,
+                        "nonexistent PID must not produce non-silent audio — \
+                         process tree resolved to the wrong source"
+                    );
+                    eprintln!("[ci_audio] ✅ Nonexistent PID produced only silence (as expected)");
                 }
             }
         }

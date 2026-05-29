@@ -64,6 +64,8 @@ fn test_app_capture_by_process_id() {
     let start = Instant::now();
     let mut got_audio = false;
     let mut total_samples = 0usize;
+    let mut tone_present = false;
+    let mut rms_ok = false;
 
     while start.elapsed() < timeout {
         match capture.read_buffer() {
@@ -71,6 +73,8 @@ fn test_app_capture_by_process_id() {
                 total_samples += buf.data().len();
                 if helpers::verify_non_silence(&buf, 0.001) {
                     got_audio = true;
+                    rms_ok = helpers::verify_rms_energy(&buf, 0.01).1;
+                    tone_present = helpers::verify_tone_present(&buf, 440.0);
                     break;
                 }
             }
@@ -93,8 +97,23 @@ fn test_app_capture_by_process_id() {
         total_samples, got_audio
     );
 
-    // Soft assertion — app capture may not route audio in all CI environments
-    if got_audio {
+    if helpers::deterministic_audio_env() {
+        // Deterministic Linux source: the spawned player streams a known
+        // 440 Hz tone into the null sink, so app capture MUST observe it.
+        assert!(
+            got_audio,
+            "deterministic source: app capture by PID {pid} received only silence"
+        );
+        assert!(
+            rms_ok,
+            "deterministic source: app capture RMS below 0.01 floor for PID {pid}"
+        );
+        assert!(
+            tone_present,
+            "deterministic source: 440 Hz tone not detected in app capture for PID {pid}"
+        );
+        eprintln!("[ci_audio] ✅ App capture received the 440 Hz tone from PID {pid}");
+    } else if got_audio {
         eprintln!("[ci_audio] ✅ App capture received non-silent audio from PID {pid}");
     } else {
         eprintln!(
@@ -168,6 +187,8 @@ fn test_app_capture_by_pipewire_node_id() {
     let start = Instant::now();
     let mut got_audio = false;
     let mut total_samples = 0usize;
+    let mut tone_present = false;
+    let mut rms_ok = false;
 
     while start.elapsed() < timeout {
         match capture.read_buffer() {
@@ -175,6 +196,8 @@ fn test_app_capture_by_pipewire_node_id() {
                 total_samples += buf.data().len();
                 if helpers::verify_non_silence(&buf, 0.001) {
                     got_audio = true;
+                    rms_ok = helpers::verify_rms_energy(&buf, 0.01).1;
+                    tone_present = helpers::verify_tone_present(&buf, 440.0);
                     break;
                 }
             }
@@ -197,7 +220,21 @@ fn test_app_capture_by_pipewire_node_id() {
         total_samples, got_audio
     );
 
-    if got_audio {
+    if helpers::deterministic_audio_env() {
+        assert!(
+            got_audio,
+            "deterministic source: app capture via PW node {node_id} received only silence"
+        );
+        assert!(
+            rms_ok,
+            "deterministic source: app capture RMS below 0.01 floor for node {node_id}"
+        );
+        assert!(
+            tone_present,
+            "deterministic source: 440 Hz tone not detected via PW node {node_id}"
+        );
+        eprintln!("[ci_audio] ✅ App capture via PW node {node_id} received the 440 Hz tone");
+    } else if got_audio {
         eprintln!("[ci_audio] ✅ App capture via PW node {node_id} received non-silent audio");
     } else {
         eprintln!("[ci_audio] ⚠ App capture via PW node did not receive audio (CI routing)");
@@ -243,11 +280,36 @@ fn test_app_capture_nonexistent_target() {
                     );
                 }
                 Ok(()) => {
+                    // Start may succeed even for a nonexistent target — in
+                    // PipeWire a missing TARGET_OBJECT just routes nothing to
+                    // us. If audio DOES arrive, it means we bound the wrong
+                    // source, which is a real routing bug. Assert silence.
                     eprintln!(
-                        "[ci_audio] ⚠ Capture started with nonexistent target (expected: silence)"
+                        "[ci_audio] Capture started with nonexistent target; verifying silence"
                     );
-                    std::thread::sleep(Duration::from_millis(500));
+                    let start = Instant::now();
+                    let mut produced_audio = false;
+                    while start.elapsed() < Duration::from_millis(500) {
+                        match capture.read_buffer() {
+                            Ok(Some(buf)) => {
+                                if helpers::verify_non_silence(&buf, 0.001) {
+                                    produced_audio = true;
+                                    break;
+                                }
+                            }
+                            Ok(None) => std::thread::sleep(Duration::from_millis(10)),
+                            Err(_) => break,
+                        }
+                    }
                     let _ = capture.stop();
+                    assert!(
+                        !produced_audio,
+                        "nonexistent application target must not produce non-silent \
+                         audio — capture bound the wrong source"
+                    );
+                    eprintln!(
+                        "[ci_audio] ✅ Nonexistent target produced only silence (as expected)"
+                    );
                 }
             }
         }

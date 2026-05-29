@@ -97,12 +97,24 @@ fn test_capture_from_selected_device() {
 
                 if !got_non_silence && helpers::verify_non_silence(&buffer, 0.001) {
                     got_non_silence = true;
-                    let (rms, _) = helpers::verify_rms_energy(&buffer, 0.0);
+                    let (rms, rms_ok) = helpers::verify_rms_energy(&buffer, 0.01);
                     eprintln!(
                         "[ci_audio] Device capture: first non-silent buffer, {} frames, RMS={:.6}",
                         buffer.num_frames(),
                         rms
                     );
+
+                    if helpers::deterministic_audio_env() {
+                        assert!(
+                            rms_ok,
+                            "deterministic source: device RMS energy {:.6} below 0.01 floor",
+                            rms
+                        );
+                        assert!(
+                            helpers::verify_tone_present(&buffer, 440.0),
+                            "deterministic source: 440 Hz tone not detected in device capture"
+                        );
+                    }
                 }
 
                 // If we have enough data, break early
@@ -141,6 +153,23 @@ fn test_capture_from_selected_device() {
         // (e.g., MacBook Air Speakers) is output-only and cannot produce
         // capture data directly.  System capture or Process Tap is needed
         // for loopback.  Rather than hard-fail, we warn and skip.
+        //
+        // Under the deterministic Linux source the default device is the
+        // PipeWire null sink, whose monitor DOES support capture — zero
+        // buffers there is a real regression, so we refuse to soft-skip.
+        if helpers::deterministic_audio_env() {
+            // Clean up before the panic so we don't leak the temp file.
+            let _ = std::fs::remove_file(&wav_path);
+            if let Some(parent) = wav_path.parent() {
+                let _ = std::fs::remove_dir(parent);
+            }
+            panic!(
+                "deterministic source: 0 buffers captured from device '{}' ({:?}) — \
+                 the null-sink monitor should always yield audio",
+                default_device.name(),
+                device_id
+            );
+        }
         eprintln!(
             "[ci_audio] WARNING: 0 buffers captured from device '{}' ({:?}). \
              This device is likely output-only and does not support direct \
@@ -162,7 +191,13 @@ fn test_capture_from_selected_device() {
         "Should have captured at least some audio frames from device"
     );
 
-    if !got_non_silence {
+    if helpers::deterministic_audio_env() {
+        assert!(
+            got_non_silence,
+            "deterministic source: all captured device audio was silence — \
+             real regression, not CI flakiness"
+        );
+    } else if !got_non_silence {
         eprintln!(
             "[ci_audio] WARNING: All captured audio from device was silence. \
              This may indicate audio routing issues in CI."
@@ -255,11 +290,35 @@ fn test_capture_nonexistent_device() {
                     );
                 }
                 Ok(()) => {
+                    // Some backends accept any device ID and produce silence
+                    // rather than erroring. If audio DOES flow from a bogus
+                    // device, that's a routing bug — assert the data is silent.
                     eprintln!(
-                        "[ci_audio] ⚠ Capture started with nonexistent device (may produce silence)"
+                        "[ci_audio] Capture started with nonexistent device; verifying it yields silence"
                     );
-                    std::thread::sleep(std::time::Duration::from_millis(500));
+                    let start = Instant::now();
+                    let mut produced_audio = false;
+                    while start.elapsed() < std::time::Duration::from_millis(500) {
+                        match capture.read_buffer() {
+                            Ok(Some(buf)) => {
+                                if helpers::verify_non_silence(&buf, 0.001) {
+                                    produced_audio = true;
+                                    break;
+                                }
+                            }
+                            Ok(None) => std::thread::sleep(std::time::Duration::from_millis(10)),
+                            Err(_) => break,
+                        }
+                    }
                     let _ = capture.stop();
+                    assert!(
+                        !produced_audio,
+                        "nonexistent device must not produce non-silent audio — \
+                         capture is reading from the wrong endpoint"
+                    );
+                    eprintln!(
+                        "[ci_audio] ✅ Nonexistent device produced only silence (as expected)"
+                    );
                 }
             }
         }

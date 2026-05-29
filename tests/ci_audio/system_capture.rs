@@ -69,12 +69,28 @@ fn test_system_capture_receives_audio() {
 
                 if !got_non_silence && helpers::verify_non_silence(&buffer, 0.001) {
                     got_non_silence = true;
-                    let (rms, _) = helpers::verify_rms_energy(&buffer, 0.0);
+                    let (rms, rms_ok) = helpers::verify_rms_energy(&buffer, 0.01);
                     eprintln!(
                         "[ci_audio] First non-silent buffer: {} frames, RMS={:.6}",
                         buffer.num_frames(),
                         rms
                     );
+
+                    // Under the deterministic Linux source (PipeWire null sink +
+                    // 440 Hz/0.8 sine tone) silence is impossible if capture works,
+                    // so promote the checks to hard asserts: RMS must clear the
+                    // 0.01 floor and the 440 Hz tone must dominate the spectrum.
+                    if helpers::deterministic_audio_env() {
+                        assert!(
+                            rms_ok,
+                            "deterministic source: RMS energy {:.6} below 0.01 floor",
+                            rms
+                        );
+                        assert!(
+                            helpers::verify_tone_present(&buffer, 440.0),
+                            "deterministic source: 440 Hz test tone not detected in capture"
+                        );
+                    }
                 }
 
                 // If we have enough data, break early
@@ -116,9 +132,18 @@ fn test_system_capture_receives_audio() {
         "Should have captured at least some audio frames"
     );
 
-    // Non-silence check is a soft warning, not a hard failure
-    // CI audio routing can be flaky
-    if !got_non_silence {
+    if helpers::deterministic_audio_env() {
+        // The Linux deterministic source guarantees audible, tonal output.
+        // Anything less than non-silence here is a genuine capture regression.
+        assert!(
+            got_non_silence,
+            "deterministic source: all captured audio was silence — \
+             the 440 Hz tone never reached the capture path (real regression, \
+             not CI flakiness)"
+        );
+    } else if !got_non_silence {
+        // Non-deterministic hosts (Windows VB-CABLE, macOS BlackHole/TCC):
+        // keep the soft warning — routing here is genuinely flaky.
         eprintln!(
             "[ci_audio] ⚠ WARNING: All captured audio was silence. \
              This may indicate audio routing issues in CI."

@@ -15,6 +15,7 @@ mod application_by_pid;
 mod device_capture;
 mod device_enumeration;
 mod multi_source;
+mod overrun;
 mod platform_caps;
 mod process_tree;
 mod process_tree_capture;
