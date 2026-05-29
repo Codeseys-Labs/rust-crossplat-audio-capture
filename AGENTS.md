@@ -44,7 +44,7 @@ The architecture is documented in detail across four canonical documents, plus a
   AudioCaptureBuilder → AudioCapture → CapturingStream
   ```
 - **Streaming-first**: The core abstraction is `CapturingStream::read_chunk() → AudioBuffer`. File writing is implemented as a sink adapter ([`src/sink/`](src/sink/mod.rs)), not a primary concern.
-- **Ring buffer bridge**: OS audio callbacks push data into an `rtrb` SPSC lock-free ring buffer; consumer threads pull data out via `BridgeStream`. The [`push_samples_or_drop()`](src/bridge/ring_buffer.rs:140) method provides zero-allocation pushes on real-time callback threads via an internal scratch buffer. Implemented in [`src/bridge/`](src/bridge/mod.rs).
+- **Ring buffer bridge**: OS audio callbacks push data into an `rtrb` SPSC lock-free ring buffer; consumer threads pull data out via `BridgeStream`. The [`push_samples_or_drop()`](src/bridge/ring_buffer.rs:159) method provides allocation-free pushes on real-time callback threads via a **free-list return ring**: the consumer recycles drained `Vec<f32>` allocations back to the producer (the unavoidable allocation is performed on the non-RT consumer thread). Implemented in [`src/bridge/`](src/bridge/mod.rs).
 - **[`BridgeStream<S>`](src/bridge/stream.rs)**: Universal `CapturingStream` implementation used by **all three backends** (WASAPI, PipeWire, CoreAudio). Eliminates per-platform duplication of the ring-buffer-to-consumer pattern.
 - **[`PlatformStream`](src/bridge/stream.rs:47) trait**: Internal backend contract. Each platform implements `stop_capture()` and `is_active()`. The rest (ring buffer, state, reads) is handled by `BridgeStream`.
 - **[`AtomicStreamState`](src/bridge/state.rs)**: Lock-free state machine for stream lifecycle: `Created → Running → Stopping → Stopped → Closed`.
@@ -347,7 +347,7 @@ This project uses [Task Master](https://github.com/task-master-ai/task-master-ai
 | Reference the deleted `ApplicationCapture` trait | It was removed — use `CaptureTarget` with the builder instead |
 | Make `CapturingStream` depend on file I/O | File writing is a sink adapter, not a core concern |
 | Pretend a platform supports a feature it doesn't | Use explicit capability errors via `PlatformCapabilities` |
-| Hold locks or allocate on real-time audio callback threads | Use lock-free ring buffers (`rtrb`) via `BridgeProducer`; use [`push_samples_or_drop()`](src/bridge/ring_buffer.rs:140) for zero-alloc RT callbacks |
+| Hold locks or allocate on real-time audio callback threads | Use lock-free ring buffers (`rtrb`) via `BridgeProducer`; use [`push_samples_or_drop()`](src/bridge/ring_buffer.rs:159) for alloc-free RT callbacks (free-list return ring) |
 | Add new `AudioError` variants without categorizing them | Every variant must have an `ErrorKind` and recoverability classification |
 | Bypass `BridgeStream<S>` for new backends | All backends must use `BridgeStream` + `PlatformStream` trait |
 | Silently diverge from architecture docs | Propose changes explicitly if the design needs updating |
@@ -398,7 +398,7 @@ This project uses [Task Master](https://github.com/task-master-ai/task-master-ai
   - PID→AudioObjectID translation via `kAudioHardwarePropertyTranslatePIDToProcessObject` (`'id2p'`)
   - Aggregate device UID uses tap UUID for collision prevention
   - CStr null pointer checks added to prevent UB in tap UUID handling
-  - [`push_samples_or_drop()`](src/bridge/ring_buffer.rs:140) — zero-allocation RT callback method with scratch buffer recycling
+  - [`push_samples_or_drop()`](src/bridge/ring_buffer.rs:159) — allocation-free RT callback method backed by a free-list return ring (consumer recycles drained `Vec<f32>`s to the producer)
   - Runtime macOS version detection via sysctl in [`PlatformCapabilities::macos()`](src/core/capabilities.rs:113)
   - Comprehensive docs: [macOS Version Compatibility](docs/MACOS_VERSION_COMPATIBILITY.md), [macOS 26 Process Tap Fix](docs/MACOS26_PROCESS_TAP_FIX.md)
 
@@ -526,7 +526,7 @@ let received = rx.try_recv()?;
 // Bridge: producer side (OS callback thread)
 let (mut producer, consumer) = create_bridge(capacity, format);
 producer.push(audio_buffer)?;       // or push_or_drop for non-blocking
-producer.push_samples_or_drop(data, channels, sample_rate); // zero-alloc RT-safe
+producer.push_samples_or_drop(data, channels, sample_rate); // alloc-free RT-safe (free-list ring)
 producer.signal_done();              // when capture ends
 
 // Bridge: consumer side (wrapped by BridgeStream)

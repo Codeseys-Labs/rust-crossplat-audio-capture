@@ -86,11 +86,20 @@ impl WindowsApplicationCapture {
             self.include_tree,
         )?;
 
-        // Initialize the audio client with a standard format
+        // Initialize the audio client with a standard format.
         let desired_format =
             wasapi::WaveFormat::new(32, 32, &wasapi::SampleType::Float, 48000, 2, None);
+        // C1 fix: this is a process-loopback client (created via
+        // new_application_loopback_client → ActivateAudioInterfaceAsync with
+        // AUDIOCLIENT_ACTIVATION_TYPE_PROCESS_LOOPBACK). That activation path
+        // does NOT support AUDCLNT_STREAMFLAGS_AUTOCONVERTPCM — combining it
+        // with the loopback flags makes IAudioClient::Initialize fail. We must
+        // initialize with the exact desired format and no autoconvert. The
+        // loopback client can't report its mix format (get_mixformat returns
+        // "Not implemented"), so the explicit f32 format above is what we hand
+        // it directly.
         let mode = wasapi::StreamMode::EventsShared {
-            autoconvert: true,
+            autoconvert: false,
             buffer_duration_hns: 0,
         };
 

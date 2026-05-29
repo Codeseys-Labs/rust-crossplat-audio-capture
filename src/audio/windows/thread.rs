@@ -298,6 +298,21 @@ fn wasapi_capture_thread_main(
     //
     // The client creation strategy depends on the CaptureTarget variant.
 
+    // Process-loopback targets (Application / ApplicationByName / ProcessTree)
+    // are activated via ActivateAudioInterfaceAsync with
+    // AUDIOCLIENT_ACTIVATION_TYPE_PROCESS_LOOPBACK. That activation path does
+    // NOT support AUDCLNT_STREAMFLAGS_AUTOCONVERTPCM — combining it with the
+    // loopback flags makes IAudioClient::Initialize fail (C1). These clients
+    // also can't report their mix format (get_mixformat returns "Not
+    // implemented"), so we must hand the client an explicit format and let it
+    // run without autoconvert.
+    let is_process_loopback = matches!(
+        config.target,
+        CaptureTarget::Application(_)
+            | CaptureTarget::ApplicationByName(_)
+            | CaptureTarget::ProcessTree(_)
+    );
+
     let audio_client_result = create_audio_client(&config);
     let mut audio_client = match audio_client_result {
         Ok(client) => client,
@@ -324,7 +339,19 @@ fn wasapi_capture_thread_main(
     );
 
     let mode = wasapi::StreamMode::EventsShared {
-        autoconvert: true,
+        // C1 fix: the process-loopback activation path rejects
+        // AUDCLNT_STREAMFLAGS_AUTOCONVERTPCM, so autoconvert must be disabled
+        // for Application/ApplicationByName/ProcessTree targets. The regular
+        // system/device-loopback path keeps autoconvert enabled so WASAPI can
+        // resample the endpoint mix format to our requested f32 format.
+        //
+        // TODO: When autoconvert is disabled (process loopback), the captured
+        // data is whatever format the loopback endpoint delivers. We currently
+        // request 32-bit float (see `desired_format`), which the process
+        // loopback path accepts; if a future Windows release delivers a
+        // different format here, downstream format handling/resampling will be
+        // needed since we can't query the mix format on a loopback client.
+        autoconvert: !is_process_loopback,
         buffer_duration_hns: 0, // default buffer duration
     };
 
@@ -410,63 +437,90 @@ fn wasapi_capture_thread_main(
 
         // Wait for audio data event with a short timeout so we can
         // check the stop flag periodically.
+        //
+        // C3 fix: regardless of whether the event fired or the wait timed
+        // out, drain ALL packets currently queued in the capture client.
+        // WASAPI typically has multiple packets ready per event signal;
+        // reading only one packet per event causes the client buffer to grow
+        // unbounded (latency growth) and eventually overrun/underrun. The
+        // drain loop below pulls packets until `get_next_packet_size()`
+        // reports none remaining, then we return to waiting for the next event.
         if h_event.wait_for_event(100).is_err() {
-            // Timeout or error — check stop flag and continue.
+            // Timeout or error — check stop flag, then still fall through to
+            // drain any packets that may be queued (timeout doesn't mean
+            // empty), so we don't strand data.
             if stop_flag.load(Ordering::SeqCst) {
                 log::debug!("WASAPI thread: stop flag set during wait, exiting");
                 break;
             }
-            continue;
         }
 
-        // Read all available packets from the capture client.
-        // The wasapi-rs crate provides read_from_device_to_deque which
-        // reads raw bytes into a VecDeque. We reuse the VecDeque across iterations.
-        sample_queue.clear();
+        // Drain loop: read every packet currently available, converting each
+        // to f32 and pushing it through the bridge. Remains responsive to the
+        // stop flag so shutdown isn't delayed by a long burst of packets.
+        loop {
+            // Stop promptly if requested mid-drain.
+            if stop_flag.load(Ordering::SeqCst) {
+                break;
+            }
 
-        match capture_client.read_from_device_to_deque(&mut sample_queue) {
-            Ok(_) => {}
-            Err(e) => {
-                log::warn!("WASAPI thread: read_from_device_to_deque failed: {}", e);
-                // Check if we should stop or continue on transient errors.
-                if stop_flag.load(Ordering::SeqCst) {
+            // How many frames are in the next packet? 0 (or None) means the
+            // client buffer is drained — go back to waiting for the event.
+            let packet_frames = match capture_client.get_next_packet_size() {
+                Ok(Some(frames)) => frames,
+                Ok(None) => 0,
+                Err(e) => {
+                    log::warn!("WASAPI thread: get_next_packet_size failed: {}", e);
                     break;
                 }
+            };
+            if packet_frames == 0 {
+                break;
+            }
+
+            // Read a single packet's raw bytes into the reused VecDeque.
+            sample_queue.clear();
+            match capture_client.read_from_device_to_deque(&mut sample_queue) {
+                Ok(_) => {}
+                Err(e) => {
+                    log::warn!("WASAPI thread: read_from_device_to_deque failed: {}", e);
+                    // Bail out of the drain loop on error; outer loop will
+                    // re-check the stop flag and resume waiting.
+                    break;
+                }
+            }
+
+            if sample_queue.is_empty() {
                 continue;
+            }
+
+            // Make the VecDeque contiguous so we can access it as a slice.
+            // This is O(n) worst case but typically a no-op if the deque
+            // hasn't wrapped.
+            let (front, back) = sample_queue.as_slices();
+
+            // Convert bytes to f32 samples (4 bytes per sample, little-endian).
+            // Reuse the samples Vec to avoid allocation on every iteration.
+            samples.clear();
+
+            // Process the front slice
+            for chunk in front.chunks_exact(4) {
+                samples.push(f32::from_le_bytes([chunk[0], chunk[1], chunk[2], chunk[3]]));
+            }
+            // Process the back slice (non-empty when VecDeque has wrapped)
+            for chunk in back.chunks_exact(4) {
+                samples.push(f32::from_le_bytes([chunk[0], chunk[1], chunk[2], chunk[3]]));
+            }
+
+            if !samples.is_empty() {
+                // Use push_samples_or_drop for zero-allocation on the capture
+                // thread. This uses the BridgeProducer's internal scratch
+                // buffer to avoid allocating a new Vec<f32> every iteration.
+                producer.push_samples_or_drop(&samples, channels, sample_rate);
             }
         }
 
-        // Convert the raw byte data to f32 samples.
-        // Data from WASAPI with our requested format is IEEE float 32-bit LE.
-        if sample_queue.is_empty() {
-            continue;
-        }
-
-        // Make the VecDeque contiguous so we can access it as a slice.
-        // This is O(n) worst case but typically a no-op if the deque hasn't wrapped.
-        let (front, back) = sample_queue.as_slices();
-
-        // Convert bytes to f32 samples (4 bytes per sample, little-endian).
-        // Reuse the samples Vec to avoid allocation on every iteration.
-        samples.clear();
-
-        // Process the front slice
-        for chunk in front.chunks_exact(4) {
-            samples.push(f32::from_le_bytes([chunk[0], chunk[1], chunk[2], chunk[3]]));
-        }
-        // Process the back slice (non-empty when VecDeque has wrapped)
-        for chunk in back.chunks_exact(4) {
-            samples.push(f32::from_le_bytes([chunk[0], chunk[1], chunk[2], chunk[3]]));
-        }
-
-        if !samples.is_empty() {
-            // Use push_samples_or_drop for zero-allocation on the capture thread.
-            // This uses the BridgeProducer's internal scratch buffer to avoid
-            // allocating a new Vec<f32> on every iteration.
-            producer.push_samples_or_drop(&samples, channels, sample_rate);
-        }
-
-        // Check stop flag after processing.
+        // Check stop flag after draining.
         if stop_flag.load(Ordering::SeqCst) {
             log::debug!("WASAPI thread: stop flag set after read, exiting");
             break;

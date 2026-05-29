@@ -26,7 +26,6 @@ use std::time::Duration;
 
 use crate::bridge::ring_buffer::BridgeProducer;
 use crate::bridge::stream::PlatformStream;
-use crate::core::buffer::AudioBuffer;
 use crate::core::config::CaptureTarget;
 use crate::core::error::{AudioError, AudioResult};
 
@@ -912,10 +911,11 @@ fn pw_thread_main(
                         // context during main_loop.iterate().
                         //
                         // REAL-TIME SAFETY:
-                        // - BridgeProducer::push_or_drop() is lock-free (rtrb)
-                        // - Vec allocation is acceptable for initial impl
-                        //   (optimize with scratch buffer later)
-                        // - No locks, no blocking, no I/O
+                        // - No heap allocation: `push_samples_or_drop` sources its
+                        //   buffer from the bridge's free-list return ring, so the
+                        //   only work here is a bulk reinterpret + the copy that
+                        //   `push_samples_or_drop` performs internally.
+                        // - Lock-free (rtrb), no blocking, no I/O, no logging.
 
                         let Some(mut buffer) = stream.dequeue_buffer() else {
                             return;
@@ -927,38 +927,48 @@ fn pw_thread_main(
                         }
 
                         let data = &mut datas[0];
-                        let chunk_size = data.chunk().size() as usize;
-                        let n_samples = chunk_size / std::mem::size_of::<f32>();
 
-                        if n_samples == 0 {
+                        // Honor the SPA chunk's offset/size: the valid audio
+                        // region is `[offset, offset + size)` within the mapped
+                        // buffer, NOT always `[0, size)`.
+                        let chunk = data.chunk();
+                        let offset = chunk.offset() as usize;
+                        let size = chunk.size() as usize;
+                        if size == 0 {
                             return;
                         }
 
+                        let channels = user_data.channels;
+                        let sample_rate = user_data.sample_rate;
+
                         if let Some(raw_bytes) = data.data() {
-                            // Convert raw F32LE bytes to f32 samples.
-                            let mut samples = Vec::with_capacity(n_samples);
-                            for i in 0..n_samples {
-                                let offset = i * 4;
-                                if offset + 4 <= raw_bytes.len() {
-                                    let sample = f32::from_le_bytes([
-                                        raw_bytes[offset],
-                                        raw_bytes[offset + 1],
-                                        raw_bytes[offset + 2],
-                                        raw_bytes[offset + 3],
-                                    ]);
-                                    samples.push(sample);
-                                }
+                            // Clamp the valid region to the actually-mapped bytes
+                            // to stay memory-safe regardless of offset/size.
+                            let end = offset.saturating_add(size).min(raw_bytes.len());
+                            if offset >= end {
+                                return;
                             }
+                            let valid = &raw_bytes[offset..end];
+
+                            // Reinterpret the negotiated F32LE bytes as `&[f32]`
+                            // instead of a per-sample `from_le_bytes` loop. On the
+                            // little-endian hosts PipeWire runs on, the in-memory
+                            // representation equals the F32LE byte layout. PipeWire
+                            // audio buffers are word-aligned, so `align_to`'s head
+                            // and tail are normally empty; we consume the aligned
+                            // run of whole samples and ignore any unaligned edge.
+                            //
+                            // SAFETY: every bit pattern is a valid `f32`, and we
+                            // only read initialized bytes within `valid`.
+                            let (_head, samples, _tail) = unsafe { valid.align_to::<f32>() };
 
                             if !samples.is_empty() {
-                                let audio_buffer = AudioBuffer::new(
-                                    samples,
-                                    user_data.channels,
-                                    user_data.sample_rate,
-                                );
-                                // Push to ring buffer. If full, the buffer is
-                                // silently dropped (back-pressure).
-                                user_data.producer.push_or_drop(audio_buffer);
+                                // Push to the ring buffer. If full, the data is
+                                // silently dropped (back-pressure) and the overrun
+                                // counter is incremented.
+                                user_data
+                                    .producer
+                                    .push_samples_or_drop(samples, channels, sample_rate);
                             }
                         }
 

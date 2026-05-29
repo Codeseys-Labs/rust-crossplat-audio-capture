@@ -87,10 +87,18 @@ impl BridgeShared {
 pub struct BridgeProducer {
     producer: rtrb::Producer<AudioBuffer>,
     shared: Arc<BridgeShared>,
-    /// Reusable scratch buffer to reduce heap allocations in the real-time
-    /// audio callback. When a push is rejected (ring buffer full), the Vec
-    /// is reclaimed and reused on the next call, avoiding alloc+free cycles
-    /// on the RT thread during back-pressure.
+    /// Consumer side of the **free-list return ring**. The data consumer pushes
+    /// drained `Vec<f32>` allocations back through this ring after handing the
+    /// user an owned copy; the producer pops them here to reuse on the next
+    /// callback. This is what makes [`push_samples_or_drop`] allocation-free on
+    /// the real-time thread in steady state — the unavoidable allocation is
+    /// performed on the (non-real-time) consumer thread instead.
+    ///
+    /// [`push_samples_or_drop`]: BridgeProducer::push_samples_or_drop
+    free_rx: rtrb::Consumer<Vec<f32>>,
+    /// Single-slot fallback buffer used only when the free-list ring is
+    /// momentarily empty (e.g. during warm-up before the consumer has recycled
+    /// anything, or under sustained back-pressure when a push is rejected).
     scratch: Vec<f32>,
 }
 
@@ -139,30 +147,40 @@ impl BridgeProducer {
         }
     }
 
-    /// Push raw audio samples into the ring buffer without requiring the
-    /// caller to allocate a `Vec<f32>`.
+    /// Push raw audio samples into the ring buffer without allocating on the
+    /// real-time callback thread in steady state.
     ///
-    /// Uses an internal scratch buffer to minimize heap allocations on the
-    /// real-time audio callback thread:
+    /// # Allocation behavior
     ///
-    /// - **Ring buffer has space (success):** Samples are copied into the
-    ///   scratch buffer, which is then moved into an [`AudioBuffer`] and
-    ///   pushed. The scratch buffer is consumed (left empty).
-    /// - **Ring buffer is full (back-pressure):** The rejected [`AudioBuffer`]'s
-    ///   `Vec` is reclaimed into the scratch buffer, so the **next** call
-    ///   reuses the allocation — zero heap allocation on the RT thread when
-    ///   the consumer can't keep up.
+    /// The `Vec<f32>` backing each [`AudioBuffer`] is sourced from the
+    /// **free-list return ring** (`free_rx`), which the consumer replenishes
+    /// every time it hands an owned buffer to the user (see
+    /// [`BridgeConsumer::pop`]). The unavoidable heap allocation for the user's
+    /// buffer is therefore performed on the consumer (non-RT) thread, and this
+    /// method reuses recycled allocations:
     ///
-    /// This is the preferred method for OS audio callbacks where real-time
-    /// safety is critical. Callers should use this instead of manually
-    /// calling `data.to_vec()` + `AudioBuffer::new()` + `push_or_drop()`.
+    /// - **Steady state:** a recycled `Vec` is popped from `free_rx`, cleared,
+    ///   filled from `data`, and pushed — **no heap allocation**.
+    /// - **Warm-up / free-list empty:** falls back to a single-slot `scratch`
+    ///   buffer; only allocates if `scratch` has insufficient capacity (a
+    ///   bounded, transient cost until the consumer starts recycling).
+    /// - **Back-pressure (ring full):** the rejected `Vec` is reclaimed into
+    ///   `scratch` so the next call reuses it — no alloc+free churn.
+    ///
+    /// This is the preferred method for OS audio callbacks. Callers should use
+    /// this instead of manually calling `data.to_vec()` + `AudioBuffer::new()` +
+    /// `push_or_drop()`.
     pub fn push_samples_or_drop(&mut self, data: &[f32], channels: u16, sample_rate: u32) -> bool {
-        // Fill scratch from slice (reuses allocation if capacity is sufficient)
-        self.scratch.clear();
-        self.scratch.extend_from_slice(data);
+        // Acquire a reusable Vec: prefer a recycled allocation from the
+        // free-list ring, otherwise fall back to the single-slot scratch.
+        let mut vec = match self.free_rx.pop() {
+            Ok(recycled) => recycled,
+            Err(rtrb::PopError::Empty) => std::mem::take(&mut self.scratch),
+        };
 
-        // Take ownership of the filled scratch Vec
-        let vec = std::mem::take(&mut self.scratch);
+        vec.clear();
+        vec.extend_from_slice(data);
+
         let buffer = AudioBuffer::new(vec, channels, sample_rate);
 
         match self.producer.push(buffer) {
@@ -174,9 +192,9 @@ impl BridgeProducer {
                 true
             }
             Err(rtrb::PushError::Full(rejected)) => {
-                // Reclaim the Vec allocation for reuse on the next call.
-                // This is the key optimization: no alloc+free cycle under
-                // back-pressure on the RT thread.
+                // Reclaim the Vec allocation into scratch for reuse on the next
+                // call. This keeps the RT thread alloc-free even when the
+                // consumer can't keep up.
                 self.scratch = rejected.into_data();
                 self.shared.buffers_dropped.fetch_add(1, Ordering::Relaxed);
                 self.shared
@@ -220,6 +238,13 @@ impl BridgeProducer {
     pub(crate) fn shared(&self) -> &Arc<BridgeShared> {
         &self.shared
     }
+
+    /// Number of recycled allocations currently available in the free-list
+    /// return ring. Test-only — used to assert allocation recycling behavior.
+    #[cfg(test)]
+    pub(crate) fn recycled_available(&self) -> usize {
+        self.free_rx.slots()
+    }
 }
 
 // ── BridgeConsumer ───────────────────────────────────────────────────────
@@ -231,6 +256,12 @@ impl BridgeProducer {
 pub struct BridgeConsumer {
     consumer: rtrb::Consumer<AudioBuffer>,
     shared: Arc<BridgeShared>,
+    /// Producer side of the **free-list return ring**. After popping a buffer
+    /// from the data ring and handing the user an owned copy, the consumer
+    /// pushes the now-spare `Vec<f32>` allocation back here so the producer can
+    /// reuse it without allocating on the real-time thread. If the ring is full
+    /// the spare allocation is simply dropped (freed) — bounded and harmless.
+    free_tx: rtrb::Producer<Vec<f32>>,
 }
 
 // BridgeConsumer is Send (can be moved to the consumer thread).
@@ -240,11 +271,37 @@ impl BridgeConsumer {
     /// Non-blocking pop. Returns `None` if the ring buffer is empty.
     ///
     /// Increments `buffers_popped` on success.
+    ///
+    /// # Allocation / recycling
+    ///
+    /// The user receives a freshly-allocated owned [`AudioBuffer`] (the
+    /// allocation happens here, on the non-real-time consumer thread). The
+    /// original `Vec<f32>` that travelled through the ring is recycled back to
+    /// the producer via the free-list return ring, which is what keeps
+    /// [`BridgeProducer::push_samples_or_drop`] allocation-free on the RT thread.
     pub fn pop(&mut self) -> Option<AudioBuffer> {
         match self.consumer.pop() {
             Ok(buffer) => {
                 self.shared.buffers_popped.fetch_add(1, Ordering::Relaxed);
-                Some(buffer)
+
+                // Reconstruct an owned buffer for the user (allocates here, on
+                // the consumer/non-RT thread) and recycle the original
+                // allocation back to the producer's free-list ring.
+                let format = buffer.format().clone();
+                let timestamp = buffer.timestamp();
+                let original = buffer.into_data();
+                let user_copy = original.clone();
+
+                let user_buffer = match timestamp {
+                    Some(ts) => AudioBuffer::with_timestamp(user_copy, format, ts),
+                    None => AudioBuffer::with_format(user_copy, format),
+                };
+
+                // Best-effort recycle; if the free-list ring is full, the spare
+                // allocation is dropped (freed) — bounded and harmless.
+                let _ = self.free_tx.push(original);
+
+                Some(user_buffer)
             }
             Err(rtrb::PopError::Empty) => None,
         }
@@ -336,6 +393,20 @@ impl BridgeConsumer {
 pub fn create_bridge(capacity: usize, format: AudioFormat) -> (BridgeProducer, BridgeConsumer) {
     let (producer, consumer) = rtrb::RingBuffer::<AudioBuffer>::new(capacity);
 
+    // Free-list return ring: carries drained `Vec<f32>` allocations from the
+    // consumer back to the producer so the RT thread can reuse them. Same
+    // capacity as the data ring so it can never be the limiting factor.
+    let (mut free_tx, free_rx) = rtrb::RingBuffer::<Vec<f32>>::new(capacity);
+
+    // Pre-seed a handful of reusable allocations so the producer is
+    // allocation-free from the very first callbacks, before the consumer has
+    // had a chance to recycle anything. Typical callback: 512 frames × 2ch.
+    let seed = capacity.min(8);
+    for _ in 0..seed {
+        // If the ring somehow rejects (it won't — it's empty), just drop.
+        let _ = free_tx.push(Vec::with_capacity(1024));
+    }
+
     let shared = Arc::new(BridgeShared {
         state: AtomicStreamState::new(StreamState::Created),
         buffers_pushed: AtomicU64::new(0),
@@ -352,12 +423,16 @@ pub fn create_bridge(capacity: usize, format: AudioFormat) -> (BridgeProducer, B
         BridgeProducer {
             producer,
             shared: Arc::clone(&shared),
-            // Pre-allocate for a typical callback size:
-            // 512 frames × 2 channels = 1024 samples.
-            // This avoids a heap allocation on the very first callback.
+            free_rx,
+            // Single-slot fallback for when the free-list ring is momentarily
+            // empty. Pre-sized for a typical callback (512 frames × 2ch).
             scratch: Vec::with_capacity(1024),
         },
-        BridgeConsumer { consumer, shared },
+        BridgeConsumer {
+            consumer,
+            shared,
+            free_tx,
+        },
     )
 }
 
@@ -737,5 +812,89 @@ mod tests {
         assert!(!consumer.is_producer_done());
         producer.signal_done();
         assert!(consumer.is_producer_done());
+    }
+
+    // ===== Free-list return ring (alloc-free RT producer) tests =====
+
+    // push_samples_or_drop → pop preserves data, channels, and rate.
+    #[test]
+    fn push_samples_then_pop_preserves_data() {
+        let (mut producer, mut consumer) = create_bridge(8, test_format());
+
+        let samples = [0.1, -0.2, 0.3, -0.4];
+        assert!(producer.push_samples_or_drop(&samples, 2, 44100));
+
+        let buf = consumer.pop().expect("should have one buffer");
+        assert_eq!(buf.data(), &samples);
+        assert_eq!(buf.channels(), 2);
+        assert_eq!(buf.sample_rate(), 44100);
+    }
+
+    // Popping a buffer recycles a Vec back to the producer's free-list ring.
+    #[test]
+    fn pop_recycles_allocation_to_producer() {
+        // Capacity 4 → free-list seeded with min(4, 8) = 4 buffers.
+        let (mut producer, mut consumer) = create_bridge(4, test_format());
+        assert_eq!(producer.recycled_available(), 4);
+
+        // Drain the seed: each push_samples_or_drop consumes one recycled Vec.
+        for _ in 0..4 {
+            assert!(producer.push_samples_or_drop(&[1.0, 2.0], 2, 48000));
+        }
+        assert_eq!(
+            producer.recycled_available(),
+            0,
+            "seed should be drained after 4 pushes"
+        );
+
+        // Popping hands the user a copy and returns the spare alloc to the ring.
+        let _ = consumer.pop().expect("buffer available");
+        assert_eq!(
+            producer.recycled_available(),
+            1,
+            "pop should recycle one allocation back to the producer"
+        );
+    }
+
+    // Steady-state push/pop loop preserves data integrity over many cycles
+    // and keeps recycling allocations (free-list never starves to allocation
+    // once warmed up).
+    #[test]
+    fn steady_state_push_samples_pop_loop() {
+        let (mut producer, mut consumer) = create_bridge(8, test_format());
+
+        for i in 0..1000u32 {
+            let v = i as f32;
+            let samples = [v, v + 0.5];
+            assert!(producer.push_samples_or_drop(&samples, 2, 48000));
+
+            let buf = consumer.pop().expect("one buffer per iteration");
+            assert_eq!(buf.data(), &[v, v + 0.5], "data integrity at iter {i}");
+        }
+
+        assert_eq!(producer.shared().buffers_pushed.load(Ordering::Relaxed), 1000);
+        assert_eq!(consumer.buffers_popped(), 1000);
+        // After warm-up the consumer keeps the producer supplied with recycled
+        // allocations, so the producer should have spare buffers on hand.
+        assert!(
+            producer.recycled_available() > 0,
+            "free-list should stay populated in steady state"
+        );
+    }
+
+    // Timestamps survive the recycle round-trip.
+    #[test]
+    fn pop_preserves_timestamp_through_recycle() {
+        let (mut producer, mut consumer) = create_bridge(4, test_format());
+
+        let fmt = AudioFormat::default();
+        let ts = Duration::from_millis(250);
+        producer
+            .push(AudioBuffer::with_timestamp(vec![0.9; 4], fmt, ts))
+            .unwrap();
+
+        let buf = consumer.pop().expect("buffer available");
+        assert_eq!(buf.timestamp(), Some(ts));
+        assert_eq!(buf.data(), &[0.9; 4]);
     }
 }
