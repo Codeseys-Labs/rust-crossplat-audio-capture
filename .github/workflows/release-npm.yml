@@ -34,6 +34,11 @@ env:
   CARGO_TERM_COLOR: always
   RUST_BACKTRACE: 1
 
+# Least privilege by default; the publish job needs nothing from the repo
+# beyond read, and npm provenance uses its own OIDC token requested below.
+permissions:
+  contents: read
+
 jobs:
   # verify-napi-build: per-target native builds.
   # napi-rs 8-target matrix. Each job produces a
@@ -79,14 +84,19 @@ jobs:
             os: blacksmith-6vcpu-macos-15
             napi-target: darwin-x64
             install_deps: false
+            # macos-15 Blacksmith runners are Apple Silicon (arm64); a
+            # darwin-x64 .node cannot be require()'d under the arm64 host
+            # node, so this row is NOT host-smoke-tested (cross-built).
           - target: aarch64-apple-darwin
             os: blacksmith-6vcpu-macos-15
             napi-target: darwin-arm64
             install_deps: false
+            native_smoke: true
           - target: x86_64-unknown-linux-gnu
             os: blacksmith-4vcpu-ubuntu-2404
             napi-target: linux-x64-gnu
             install_deps: true
+            native_smoke: true
           - target: aarch64-unknown-linux-gnu
             os: blacksmith-4vcpu-ubuntu-2404
             napi-target: linux-arm64-gnu
@@ -96,8 +106,13 @@ jobs:
             os: blacksmith-4vcpu-windows-2025
             napi-target: win32-x64-msvc
             install_deps: false
+            native_smoke: true
           # Speculative targets — experimental: true allows failure.
           # See header comment for the PipeWire sysroot caveat.
+          # NOTE: these rows (and aarch64-gnu above) are CROSS-BUILT; their
+          # .node cannot be loaded on the build host, so they receive NO
+          # native smoke test. They ship unvalidated at runtime — first
+          # real load happens on the consumer's machine.
           - target: x86_64-unknown-linux-musl
             os: blacksmith-4vcpu-ubuntu-2404
             napi-target: linux-x64-musl
@@ -123,22 +138,22 @@ jobs:
       run:
         working-directory: bindings/rsac-napi
     steps:
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@v5 # TODO: pin to SHA
 
       - uses: dtolnay/rust-toolchain@1.95.0
         with:
           targets: ${{ matrix.target }}
 
-      - uses: Swatinem/rust-cache@v2
+      - uses: useblacksmith/rust-cache@v1 # TODO: pin to SHA
         with:
           workspaces: bindings/rsac-napi -> target
 
-      - uses: actions/setup-node@v4
+      - uses: actions/setup-node@v4 # TODO: pin to SHA
         with:
           node-version: '20'
           registry-url: 'https://registry.npmjs.org'
 
-      - uses: oven-sh/setup-bun@v2
+      - uses: oven-sh/setup-bun@v2 # TODO: pin to SHA
         with:
           bun-version: latest
 
@@ -162,13 +177,13 @@ jobs:
 
       - name: Setup Zig (musl targets)
         if: matrix.zigbuild
-        uses: mlugg/setup-zig@v2
+        uses: mlugg/setup-zig@v2 # TODO: pin to SHA
         with:
           version: 0.14.1
 
       - name: Install cargo-zigbuild (musl targets)
         if: matrix.zigbuild
-        uses: taiki-e/install-action@v2
+        uses: taiki-e/install-action@v2 # TODO: pin to SHA
         with:
           tool: cargo-zigbuild
 
@@ -190,8 +205,21 @@ jobs:
           fi
         shell: bash
 
+      # Native-artifact smoke test: actually load the freshly built .node
+      # and call a device-free export (platformCapabilities) so a broken
+      # native module fails the build instead of publishing green. Runs
+      # ONLY on rows whose .node matches the host arch (native_smoke=true);
+      # cross-built rows (musl/aarch64/armv7) are skipped — they cannot be
+      # require()'d on the build host. napi build emits the binary as
+      # rsac-audio.<napi-target>.node (see index.js loader).
+      - name: Smoke test native .node (device-free)
+        if: matrix.native_smoke
+        shell: bash
+        run: |
+          node -e "const a = require('./rsac-audio.${{ matrix.napi-target }}.node'); const caps = a.platformCapabilities(); console.log('exports:', Object.keys(a)); console.log('backend:', caps.backendName);"
+
       - name: Upload .node artifact
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v4 # TODO: pin to SHA
         with:
           name: bindings-${{ matrix.napi-target }}
           path: bindings/rsac-napi/*.node
@@ -201,19 +229,40 @@ jobs:
   publish-npm:
     name: Publish to npm
     needs: verify-napi-build
+    # Guard against forks publishing to the @rsac npm scope.
+    if: github.repository == 'Codeseys-Labs/rust-crossplat-audio-capture'
     runs-on: blacksmith-4vcpu-ubuntu-2404
+    permissions:
+      contents: read
+      # `npm publish --provenance` mints a provenance attestation via OIDC.
+      id-token: write
     defaults:
       run:
         working-directory: bindings/rsac-napi
     steps:
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@v5 # TODO: pin to SHA
 
-      - uses: actions/setup-node@v4
+      # Tag↔manifest version guard: the pushed tag must match the version
+      # in package.json before we publish to npm. Tag events only.
+      - name: Verify tag matches package.json version
+        if: startsWith(github.ref, 'refs/tags/')
+        working-directory: bindings/rsac-napi
+        shell: bash
+        run: |
+          VERSION="${GITHUB_REF_NAME#v}"
+          MANIFEST="$(node -p "require('./package.json').version")"
+          echo "tag version: ${VERSION}  manifest version: ${MANIFEST}"
+          if [ "${VERSION}" != "${MANIFEST}" ]; then
+            echo "::error::Tag version (${VERSION}) does not match package.json version (${MANIFEST})"
+            exit 1
+          fi
+
+      - uses: actions/setup-node@v4 # TODO: pin to SHA
         with:
           node-version: '20'
           registry-url: 'https://registry.npmjs.org'
 
-      - uses: oven-sh/setup-bun@v2
+      - uses: oven-sh/setup-bun@v2 # TODO: pin to SHA
         with:
           bun-version: latest
 
@@ -221,7 +270,7 @@ jobs:
         run: bun install --frozen-lockfile || bun install
 
       - name: Download all .node artifacts
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@v4 # TODO: pin to SHA
         with:
           path: bindings/rsac-napi/artifacts
 

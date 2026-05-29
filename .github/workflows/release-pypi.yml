@@ -9,10 +9,13 @@
 # Bump bindings/rsac-python/pyproject.toml version in lockstep with the root
 # Cargo.toml before tagging (see docs/RELEASE_PROCESS.md).
 #
-# Required GitHub secret:
-#   MATURIN_PYPI_TOKEN — PyPI API token scoped to the `rsac` project.
-#                        Create at https://pypi.org/manage/account/token/
-#                        Add via Settings → Secrets and variables → Actions.
+# Authentication: PyPI Trusted Publishing (OIDC) — NO long-lived secret.
+#   The publish-pypi job requests `id-token: write` and uploads via
+#   pypa/gh-action-pypi-publish, which authenticates with a short-lived
+#   OIDC token. A Trusted Publisher must be configured on the PyPI `rsac`
+#   project for this repo + workflow:
+#     https://docs.pypi.org/trusted-publishers/
+#   (The previous MATURIN_PYPI_TOKEN secret is no longer used.)
 #
 # manylinux note: PyO3/maturin-action `manylinux: auto` currently resolves to
 # manylinux2014 (glibc 2.17) on x86_64, which covers py3.9+. aarch64 Linux
@@ -37,6 +40,11 @@ env:
   CARGO_TERM_COLOR: always
   RUST_BACKTRACE: 1
 
+# Least privilege by default. The publish job opts into id-token: write
+# for PyPI Trusted Publishing (OIDC); no other job needs write scope.
+permissions:
+  contents: read
+
 jobs:
   # build-wheels: os × python matrix.
   build-wheels:
@@ -51,28 +59,42 @@ jobs:
         python: ['3.9', '3.10', '3.11', '3.12', '3.13']
     runs-on: ${{ matrix.os }}
     steps:
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@v5 # TODO: pin to SHA
 
-      - uses: actions/setup-python@v5
+      - uses: actions/setup-python@v5 # TODO: pin to SHA
         with:
           python-version: ${{ matrix.python }}
 
       - uses: dtolnay/rust-toolchain@1.95.0
 
-      - uses: Swatinem/rust-cache@v2
+      - uses: useblacksmith/rust-cache@v1 # TODO: pin to SHA
         with:
           workspaces: bindings/rsac-python -> target
 
       - name: Build wheel (maturin-action)
-        uses: PyO3/maturin-action@v1
+        uses: PyO3/maturin-action@v1 # TODO: pin to SHA
         with:
           command: build
           target: auto
           manylinux: auto
           args: --release --out dist --interpreter ${{ matrix.python }} --manifest-path bindings/rsac-python/Cargo.toml
 
+      # Native-artifact smoke test: install the freshly built wheel into
+      # the matrix Python and import it, calling device-free APIs so a
+      # broken native extension fails here instead of publishing green.
+      # Every build-wheels row builds for its own host arch (no cross/qemu
+      # rows in this matrix), so the wheel is always host-loadable.
+      - name: Smoke test wheel (device-free import)
+        shell: bash
+        run: |
+          python -m pip install --upgrade pip
+          WHEEL="$(ls dist/*.whl | head -1)"
+          echo "Installing freshly built wheel: ${WHEEL}"
+          python -m pip install --force-reinstall "${WHEEL}"
+          python -c "import rsac; print('rsac', rsac.__version__); caps = rsac.platform_capabilities(); print('backend:', caps.backend_name)"
+
       - name: Upload wheel artifact
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v4 # TODO: pin to SHA
         with:
           name: wheels-${{ matrix.os }}-py${{ matrix.python }}
           path: dist/*.whl
@@ -83,45 +105,71 @@ jobs:
     name: Source distribution
     runs-on: blacksmith-4vcpu-ubuntu-2404
     steps:
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@v5 # TODO: pin to SHA
 
-      - uses: actions/setup-python@v5
+      - uses: actions/setup-python@v5 # TODO: pin to SHA
         with:
           python-version: '3.12'
 
       - uses: dtolnay/rust-toolchain@1.95.0
 
       - name: Build sdist (maturin-action)
-        uses: PyO3/maturin-action@v1
+        uses: PyO3/maturin-action@v1 # TODO: pin to SHA
         with:
           command: sdist
           args: --out dist --manifest-path bindings/rsac-python/Cargo.toml
 
       - name: Upload sdist artifact
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v4 # TODO: pin to SHA
         with:
           name: sdist
           path: dist/*.tar.gz
           if-no-files-found: error
 
-  # publish-pypi: upload every artifact with skip-existing.
+  # publish-pypi: upload every artifact via PyPI Trusted Publishing (OIDC).
+  #
+  # NOTE: This requires a Trusted Publisher to be configured on the PyPI
+  # `rsac` project pointing at this repository + workflow file
+  # (https://docs.pypi.org/trusted-publishers/). Once configured, no
+  # long-lived MATURIN_PYPI_TOKEN secret is needed — the upload authenticates
+  # with a short-lived OIDC token minted from `id-token: write` below.
   publish-pypi:
     name: Publish to PyPI
     needs: [build-wheels, build-sdist]
+    # Guard against forks publishing to the PyPI `rsac` project.
+    if: github.repository == 'Codeseys-Labs/rust-crossplat-audio-capture'
     runs-on: blacksmith-4vcpu-ubuntu-2404
+    permissions:
+      contents: read
+      # Required for PyPI Trusted Publishing (OIDC).
+      id-token: write
     steps:
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@v5 # TODO: pin to SHA
+
+      # Tag↔manifest version guard: the pushed tag must match the version
+      # in pyproject.toml before publishing to PyPI. Tag events only.
+      - name: Verify tag matches pyproject.toml version
+        if: startsWith(github.ref, 'refs/tags/')
+        shell: bash
+        run: |
+          VERSION="${GITHUB_REF_NAME#v}"
+          MANIFEST="$(grep -m1 '^version' bindings/rsac-python/pyproject.toml | sed -E 's/.*"([^"]+)".*/\1/')"
+          echo "tag version: ${VERSION}  manifest version: ${MANIFEST}"
+          if [ "${VERSION}" != "${MANIFEST}" ]; then
+            echo "::error::Tag version (${VERSION}) does not match pyproject.toml version (${MANIFEST})"
+            exit 1
+          fi
 
       - name: Download all build artifacts
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@v4 # TODO: pin to SHA
         with:
           path: dist-all
           merge-multiple: true
 
-      - name: Publish with maturin upload
-        uses: PyO3/maturin-action@v1
-        env:
-          MATURIN_PYPI_TOKEN: ${{ secrets.MATURIN_PYPI_TOKEN }}
+      # Upload via the official PyPA action using Trusted Publishing.
+      # No password/token input: it uses the OIDC id-token granted above.
+      - name: Publish to PyPI (Trusted Publishing)
+        uses: pypa/gh-action-pypi-publish@release/v1 # TODO: pin to SHA
         with:
-          command: upload
-          args: --skip-existing dist-all/*
+          packages-dir: dist-all
+          skip-existing: true
