@@ -24,7 +24,12 @@
 use crate::audio::get_device_enumerator;
 use crate::core::buffer::AudioBuffer;
 use crate::core::capabilities::PlatformCapabilities;
-use crate::core::config::{AudioFormat, CaptureTarget, SampleFormat, StreamConfig};
+use crate::core::config::{CaptureTarget, SampleFormat, StreamConfig};
+// `AudioFormat` is only referenced by `pick_supported_format` (and its tests),
+// which is itself `cfg(not(target_os = "linux"))`; gate the import to match so
+// the Linux build stays warning-clean under `-D warnings`.
+#[cfg(not(target_os = "linux"))]
+use crate::core::config::AudioFormat;
 use crate::core::error::{AudioError, AudioResult};
 use std::fmt;
 use std::sync::mpsc;
