@@ -966,9 +966,11 @@ fn pw_thread_main(
                                 // Push to the ring buffer. If full, the data is
                                 // silently dropped (back-pressure) and the overrun
                                 // counter is incremented.
-                                user_data
-                                    .producer
-                                    .push_samples_or_drop(samples, channels, sample_rate);
+                                user_data.producer.push_samples_or_drop(
+                                    samples,
+                                    channels,
+                                    sample_rate,
+                                );
                             }
                         }
 

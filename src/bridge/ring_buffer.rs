@@ -872,7 +872,10 @@ mod tests {
             assert_eq!(buf.data(), &[v, v + 0.5], "data integrity at iter {i}");
         }
 
-        assert_eq!(producer.shared().buffers_pushed.load(Ordering::Relaxed), 1000);
+        assert_eq!(
+            producer.shared().buffers_pushed.load(Ordering::Relaxed),
+            1000
+        );
         assert_eq!(consumer.buffers_popped(), 1000);
         // After warm-up the consumer keeps the producer supplied with recycled
         // allocations, so the producer should have spare buffers on hand.

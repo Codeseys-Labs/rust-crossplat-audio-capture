@@ -295,7 +295,10 @@ impl AudioCaptureBuilder {
 ///
 /// Returns `None` only when `supported` is empty.
 #[cfg(not(target_os = "linux"))]
-fn pick_supported_format(supported: &[AudioFormat], requested: &AudioFormat) -> Option<AudioFormat> {
+fn pick_supported_format(
+    supported: &[AudioFormat],
+    requested: &AudioFormat,
+) -> Option<AudioFormat> {
     if supported.is_empty() {
         return None;
     }
