@@ -24,7 +24,7 @@
 use crate::audio::get_device_enumerator;
 use crate::core::buffer::AudioBuffer;
 use crate::core::capabilities::PlatformCapabilities;
-use crate::core::config::{CaptureTarget, SampleFormat, StreamConfig};
+use crate::core::config::{AudioFormat, CaptureTarget, SampleFormat, StreamConfig};
 use crate::core::error::{AudioError, AudioResult};
 use std::fmt;
 use std::sync::mpsc;
@@ -178,7 +178,8 @@ impl AudioCaptureBuilder {
         // ── Build capture config ────────────────────────────────────
         let mut stream_config = self.config;
         stream_config.capture_target = self.target.clone();
-        let capture_config = AudioCaptureConfig {
+        #[allow(unused_mut)] // mutated only in the non-Linux negotiation block
+        let mut capture_config = AudioCaptureConfig {
             target: self.target,
             stream_config,
         };
@@ -232,20 +233,45 @@ impl AudioCaptureBuilder {
             }
         };
 
-        // ── Format validation (non-Linux) ───────────────────────────
+        // ── Format negotiation (non-Linux) ──────────────────────────
+        // Devices advertise a fixed set of formats via WASAPI / CoreAudio. If
+        // the exact requested format isn't on offer, negotiate to the closest
+        // supported one (prefer the requested sample rate, then an F32 sample
+        // type) instead of hard-failing — consumers resample/downmix
+        // downstream anyway, and the alternative is that perfectly capturable
+        // devices (e.g. a virtual surround endpoint that only advertises
+        // 8ch/96000, or a 44.1kHz-only interface) are unusable. Only error if
+        // the device advertises no formats at all.
         #[cfg(not(target_os = "linux"))]
         {
-            let audio_format = capture_config.stream_config.to_audio_format();
+            let requested = capture_config.stream_config.to_audio_format();
             let supported = selected_device.supported_formats();
-            if !supported.is_empty() && !supported.contains(&audio_format) {
-                return Err(AudioError::UnsupportedFormat {
-                    format: format!(
-                        "The selected device '{}' does not support the requested audio format: {:?}",
-                        selected_device.name(),
-                        audio_format
-                    ),
-                    context: None,
-                });
+            if !supported.is_empty() && !supported.contains(&requested) {
+                match pick_supported_format(&supported, &requested) {
+                    Some(f) => {
+                        log::warn!(
+                            "Device '{}' does not support requested format {:?}; \
+                             negotiated to {:?}",
+                            selected_device.name(),
+                            requested,
+                            f
+                        );
+                        capture_config.stream_config.sample_rate = f.sample_rate;
+                        capture_config.stream_config.channels = f.channels;
+                        capture_config.stream_config.sample_format = f.sample_format;
+                    }
+                    None => {
+                        return Err(AudioError::UnsupportedFormat {
+                            format: format!(
+                                "The selected device '{}' advertises no usable audio formats \
+                                 (requested {:?})",
+                                selected_device.name(),
+                                requested
+                            ),
+                            context: None,
+                        });
+                    }
+                }
             }
         }
 
@@ -255,6 +281,91 @@ impl AudioCaptureBuilder {
             stream: None,
             callback: Arc::new(Mutex::new(None)),
         })
+    }
+}
+
+/// Pick a device-supported format closest to `requested`.
+///
+/// Used by [`AudioCaptureBuilder::build()`] to negotiate when a device does
+/// not advertise the exact requested format. Preference order:
+/// 1. F32 at the requested sample rate (any channel count).
+/// 2. F32 at the requested channel count (any sample rate).
+/// 3. Any F32 format (fewest channels first — cheapest to downmix).
+/// 4. The device's first advertised format (last resort).
+///
+/// Returns `None` only when `supported` is empty.
+#[cfg(not(target_os = "linux"))]
+fn pick_supported_format(supported: &[AudioFormat], requested: &AudioFormat) -> Option<AudioFormat> {
+    if supported.is_empty() {
+        return None;
+    }
+    if supported.contains(requested) {
+        return Some(requested.clone());
+    }
+    let is_f32 = |f: &&AudioFormat| f.sample_format == SampleFormat::F32;
+    if let Some(f) = supported
+        .iter()
+        .filter(is_f32)
+        .find(|f| f.sample_rate == requested.sample_rate)
+    {
+        return Some(f.clone());
+    }
+    if let Some(f) = supported
+        .iter()
+        .filter(is_f32)
+        .find(|f| f.channels == requested.channels)
+    {
+        return Some(f.clone());
+    }
+    if let Some(f) = supported.iter().filter(is_f32).min_by_key(|f| f.channels) {
+        return Some(f.clone());
+    }
+    supported.first().cloned()
+}
+
+#[cfg(all(test, not(target_os = "linux")))]
+mod format_negotiation_tests {
+    use super::*;
+
+    fn fmt(sample_rate: u32, channels: u16, sample_format: SampleFormat) -> AudioFormat {
+        AudioFormat {
+            sample_rate,
+            channels,
+            sample_format,
+        }
+    }
+
+    #[test]
+    fn empty_supported_returns_none() {
+        assert!(pick_supported_format(&[], &fmt(48000, 2, SampleFormat::F32)).is_none());
+    }
+
+    #[test]
+    fn surround_only_device_negotiates() {
+        // The exact field failure: default output is an 8ch/96000-only endpoint.
+        let supported = [
+            fmt(96000, 8, SampleFormat::F32),
+            fmt(96000, 8, SampleFormat::I16),
+        ];
+        let chosen = pick_supported_format(&supported, &fmt(48000, 2, SampleFormat::F32)).unwrap();
+        assert_eq!(chosen, fmt(96000, 8, SampleFormat::F32));
+    }
+
+    #[test]
+    fn prefers_requested_sample_rate_f32() {
+        let supported = [
+            fmt(44100, 2, SampleFormat::F32),
+            fmt(48000, 2, SampleFormat::F32),
+        ];
+        let chosen = pick_supported_format(&supported, &fmt(48000, 1, SampleFormat::F32)).unwrap();
+        assert_eq!(chosen, fmt(48000, 2, SampleFormat::F32));
+    }
+
+    #[test]
+    fn exact_match_passthrough() {
+        let supported = [fmt(48000, 2, SampleFormat::F32)];
+        let chosen = pick_supported_format(&supported, &fmt(48000, 2, SampleFormat::F32)).unwrap();
+        assert_eq!(chosen, fmt(48000, 2, SampleFormat::F32));
     }
 }
 
