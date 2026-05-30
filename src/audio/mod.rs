@@ -121,6 +121,54 @@ impl CrossPlatformDeviceEnumerator {
             }),
         }
     }
+
+    /// Subscribe to device hot-plug / default-change notifications.
+    ///
+    /// This is the real public entry point for device-change watching (the
+    /// `CrossPlatformDeviceEnumerator` does not itself implement the
+    /// [`DeviceEnumerator`] trait). It dispatches to the active backend's
+    /// [`DeviceEnumerator::watch`] implementation; backends that have not wired
+    /// up an OS listener return
+    /// [`AudioError::PlatformNotSupported`],
+    /// consistent with their
+    /// [`supports_device_change_notifications`](crate::core::capabilities::PlatformCapabilities::supports_device_change_notifications)
+    /// flag.
+    ///
+    /// `on_event` runs on the backend's OS notification thread (never the
+    /// real-time audio callback thread); the returned
+    /// [`DeviceWatcher`](crate::core::interface::DeviceWatcher) unregisters the
+    /// listener and joins that thread on drop.
+    pub fn watch(
+        &self,
+        on_event: crate::core::interface::DeviceEventHandler,
+    ) -> crate::core::error::Result<crate::core::interface::DeviceWatcher> {
+        match self {
+            #[cfg(all(target_os = "windows", feature = "feat_windows"))]
+            CrossPlatformDeviceEnumerator::Windows(enumerator) => {
+                DeviceEnumerator::watch(enumerator, on_event)
+            }
+            #[cfg(all(target_os = "linux", feature = "feat_linux"))]
+            CrossPlatformDeviceEnumerator::Linux(enumerator) => {
+                DeviceEnumerator::watch(enumerator, on_event)
+            }
+            #[cfg(all(target_os = "macos", feature = "feat_macos"))]
+            CrossPlatformDeviceEnumerator::MacOS(enumerator) => {
+                DeviceEnumerator::watch(enumerator, on_event)
+            }
+            #[cfg(not(any(
+                all(target_os = "windows", feature = "feat_windows"),
+                all(target_os = "linux", feature = "feat_linux"),
+                all(target_os = "macos", feature = "feat_macos")
+            )))]
+            _ => {
+                drop(on_event);
+                Err(crate::core::error::AudioError::PlatformNotSupported {
+                    feature: "device change notifications".to_string(),
+                    platform: std::env::consts::OS.to_string(),
+                })
+            }
+        }
+    }
 }
 
 /// Returns a platform-specific implementation of `DeviceEnumerator`.

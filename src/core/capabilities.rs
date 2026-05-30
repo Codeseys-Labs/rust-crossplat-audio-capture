@@ -37,6 +37,15 @@ pub struct PlatformCapabilities {
     pub supports_process_tree_capture: bool,
     /// Whether device selection is supported.
     pub supports_device_selection: bool,
+    /// Whether the backend can deliver device hot-plug / default-change
+    /// notifications via [`DeviceEnumerator::watch`](crate::core::interface::DeviceEnumerator::watch).
+    ///
+    /// `false` means [`watch`](crate::core::interface::DeviceEnumerator::watch)
+    /// returns [`AudioError::PlatformNotSupported`](crate::core::error::AudioError::PlatformNotSupported);
+    /// honest reporting, never claim a notification source the backend has not
+    /// wired up. Each platform arm flips this to `true` only once its OS listener
+    /// is implemented.
+    pub supports_device_change_notifications: bool,
     /// Supported sample formats.
     pub supported_sample_formats: Vec<SampleFormat>,
     /// Supported sample rate range (min, max) in Hz.
@@ -134,6 +143,8 @@ impl PlatformCapabilities {
             supports_application_capture: true, // WASAPI session capture
             supports_process_tree_capture: true, // WASAPI include_tree=true
             supports_device_selection: true,
+            // Flipped to true when the IMMNotificationClient watch() arm lands (rsac-e360).
+            supports_device_change_notifications: false,
             supported_sample_formats: vec![
                 SampleFormat::I16,
                 SampleFormat::I24,
@@ -157,6 +168,8 @@ impl PlatformCapabilities {
             supports_application_capture: has_process_tap, // CoreAudio Process Tap (14.4+)
             supports_process_tree_capture: has_process_tap, // Multi-PID tap via sysinfo child discovery (14.4+)
             supports_device_selection: true,
+            // Flipped to true when the AudioObjectPropertyListener watch() arm lands (rsac-3093).
+            supports_device_change_notifications: false,
             supported_sample_formats: vec![SampleFormat::I16, SampleFormat::I32, SampleFormat::F32],
             sample_rate_range: (8000, 192000),
             max_channels: 8,
@@ -171,6 +184,8 @@ impl PlatformCapabilities {
             supports_application_capture: true, // PipeWire node targeting
             supports_process_tree_capture: true, // /proc-based child PID discovery + pw-dump node lookup
             supports_device_selection: true,
+            // Flipped to true when the PipeWire registry-listener watch() arm lands (rsac-b92e).
+            supports_device_change_notifications: false,
             supported_sample_formats: vec![SampleFormat::I16, SampleFormat::I32, SampleFormat::F32],
             sample_rate_range: (8000, 384000),
             max_channels: 32, // PipeWire supports many channels
@@ -187,6 +202,7 @@ impl PlatformCapabilities {
             supports_application_capture: false,
             supports_process_tree_capture: false,
             supports_device_selection: false,
+            supports_device_change_notifications: false,
             supported_sample_formats: vec![],
             sample_rate_range: (0, 0),
             max_channels: 0,
@@ -409,6 +425,7 @@ mod tests {
             supports_application_capture: false,
             supports_process_tree_capture: false,
             supports_device_selection: false,
+            supports_device_change_notifications: false,
             supported_sample_formats: vec![SampleFormat::I16],
             sample_rate_range: (8000, 48000),
             max_channels: 2,

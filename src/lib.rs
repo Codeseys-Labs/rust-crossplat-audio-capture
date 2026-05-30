@@ -113,7 +113,8 @@ pub use crate::core::error::{
     AudioError, AudioResult, BackendContext, ErrorKind, Recoverability, UserFacingError,
 };
 pub use crate::core::interface::{
-    AudioDevice, CapturingStream, DeviceEnumerator, DeviceInfo, DeviceKind,
+    AudioDevice, CapturingStream, DeviceEnumerator, DeviceEvent, DeviceEventHandler, DeviceInfo,
+    DeviceKind, DeviceWatcher,
 };
 
 // Audio module re-exports

@@ -346,6 +346,113 @@ pub trait CapturingStream: Send + Sync {
     }
 }
 
+/// A device-topology change reported through
+/// [`DeviceEnumerator::watch`].
+///
+/// Each variant carries the minimum identifying metadata for the change so a
+/// consumer can update a device list without re-enumerating. The event is
+/// delivered on the backend's OS notification thread (the WASAPI
+/// `IMMNotificationClient` callback, the CoreAudio property-listener thread, or
+/// the PipeWire loop thread) — **never** the real-time audio callback thread.
+///
+/// # Stability
+///
+/// `#[non_exhaustive]`: new variants may be added in a minor release. Match with
+/// a trailing `_ =>` arm.
+#[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum DeviceEvent {
+    /// A device became available (hot-plugged, or a virtual device appeared).
+    DeviceAdded {
+        /// Platform-specific identifier of the new device.
+        id: DeviceId,
+        /// Human-readable name at the time of the event.
+        name: String,
+        /// Whether it is an input or output endpoint.
+        kind: DeviceKind,
+    },
+    /// A device was removed (unplugged or destroyed). Only the id is guaranteed
+    /// to still be resolvable; the device may already be gone.
+    DeviceRemoved {
+        /// Identifier of the removed device.
+        id: DeviceId,
+    },
+    /// The system default device for `kind` changed to `id`.
+    DefaultChanged {
+        /// Identifier of the new default device.
+        id: DeviceId,
+        /// Which default role changed (input vs output).
+        kind: DeviceKind,
+    },
+    /// A device's availability/state changed without being added or removed
+    /// (e.g. disabled, unplugged-but-retained, format reset).
+    StateChanged {
+        /// Identifier of the affected device.
+        id: DeviceId,
+        /// Whether the device is currently available for capture.
+        available: bool,
+    },
+}
+
+/// An RAII guard for an active device-change subscription created by
+/// [`DeviceEnumerator::watch`].
+///
+/// While this value is alive the registered handler receives [`DeviceEvent`]s.
+/// Dropping it **unregisters the OS listener and joins the notify thread**, so
+/// the handler is guaranteed not to run after `drop` returns. Hold onto it for
+/// as long as notifications are wanted; let it drop to stop.
+///
+/// The guard owns a backend-specific teardown closure; it is `Send` so it can be
+/// moved across threads, and its `Drop` is best-effort and never panics.
+pub struct DeviceWatcher {
+    /// Backend teardown: unregister the OS listener and join the notify thread.
+    /// `Option` so `Drop` can take it exactly once; boxed so the public type is
+    /// backend-agnostic.
+    teardown: Option<Box<dyn FnOnce() + Send>>,
+}
+
+impl DeviceWatcher {
+    /// Construct a watcher from a backend teardown closure.
+    ///
+    /// Backends call this after registering their OS listener, passing a closure
+    /// that unregisters it and joins the notify thread. Crate-internal: the
+    /// public way to obtain a `DeviceWatcher` is
+    /// [`DeviceEnumerator::watch`].
+    // Unused until the per-OS `watch()` arms land (rsac-e360 / rsac-b92e /
+    // rsac-3093); this is the constructor they call. Allowed dead now so the
+    // public M10 surface can ship ahead of the platform implementations.
+    #[allow(dead_code)]
+    pub(crate) fn from_teardown(teardown: Box<dyn FnOnce() + Send>) -> Self {
+        Self {
+            teardown: Some(teardown),
+        }
+    }
+}
+
+impl std::fmt::Debug for DeviceWatcher {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("DeviceWatcher")
+            .field("active", &self.teardown.is_some())
+            .finish()
+    }
+}
+
+impl Drop for DeviceWatcher {
+    fn drop(&mut self) {
+        if let Some(teardown) = self.teardown.take() {
+            // Best-effort: unregister the OS listener and join the notify thread.
+            // The backend closure must not panic; if it could, it should catch
+            // internally — a panic in Drop while unwinding would abort.
+            teardown();
+        }
+    }
+}
+
+/// The boxed handler type [`DeviceEnumerator::watch`]
+/// invokes for each [`DeviceEvent`]. `Send + 'static` because it runs on the
+/// backend's OS notification thread.
+pub type DeviceEventHandler = Box<dyn FnMut(DeviceEvent) + Send + 'static>;
+
 /// A trait for discovering and enumerating audio devices on the system.
 ///
 /// Platform backends implement this trait to provide device discovery.
@@ -385,6 +492,33 @@ pub trait DeviceEnumerator: Send + Sync {
     /// A `Result` containing the default device, or an error if no
     /// default device exists or it cannot be determined.
     fn default_device(&self) -> AudioResult<Box<dyn AudioDevice>>;
+
+    /// Subscribe to device hot-plug / default-change notifications.
+    ///
+    /// On success returns a [`DeviceWatcher`] RAII guard; `on_event` is invoked
+    /// once per [`DeviceEvent`] on the backend's **OS notification thread**
+    /// (never the real-time audio callback thread, so the handler may allocate
+    /// and lock). Dropping the returned guard unregisters the OS listener and
+    /// joins the notify thread, after which the handler will not run again.
+    ///
+    /// # Errors
+    ///
+    /// This is a **provided** method that defaults to
+    /// [`AudioError::PlatformNotSupported`]. Backends whose
+    /// [`supports_device_change_notifications`](crate::core::capabilities::PlatformCapabilities::supports_device_change_notifications)
+    /// is `false` inherit this default; backends that wire up an OS listener
+    /// override it. Returning the default keeps the trait additive for external
+    /// implementations — they need not change to keep compiling.
+    fn watch(&self, on_event: DeviceEventHandler) -> AudioResult<DeviceWatcher> {
+        // `on_event` is intentionally dropped here: with no listener registered
+        // there is nothing to deliver. Named with a leading underscore would lose
+        // the doc-visible parameter name, so bind-and-drop instead.
+        drop(on_event);
+        Err(AudioError::PlatformNotSupported {
+            feature: "device change notifications".to_string(),
+            platform: std::env::consts::OS.to_string(),
+        })
+    }
 }
 
 // AudioError enum has been moved to src/core/error.rs
@@ -514,5 +648,77 @@ mod tests {
                 sample_format: SampleFormat::F32,
             })
         );
+    }
+
+    /// A minimal `DeviceEnumerator` that overrides nothing beyond the two
+    /// required methods — it must inherit the provided `watch()` default.
+    struct MinimalEnumerator;
+
+    impl DeviceEnumerator for MinimalEnumerator {
+        fn enumerate_devices(&self) -> AudioResult<Vec<Box<dyn AudioDevice>>> {
+            Ok(vec![])
+        }
+        fn default_device(&self) -> AudioResult<Box<dyn AudioDevice>> {
+            Err(AudioError::DeviceNotFound {
+                device_id: "none".to_string(),
+            })
+        }
+    }
+
+    /// The default `watch()` reports `PlatformNotSupported` without the impl
+    /// overriding it — proving the M10 surface is additive for external impls.
+    #[test]
+    fn default_watch_is_platform_not_supported() {
+        let enumerator = MinimalEnumerator;
+        let err = enumerator
+            .watch(Box::new(|_event| {}))
+            .expect_err("default watch() must be Err");
+        assert_eq!(err.kind(), ErrorKind::Platform);
+        match err {
+            AudioError::PlatformNotSupported { feature, .. } => {
+                assert_eq!(feature, "device change notifications");
+            }
+            other => panic!("expected PlatformNotSupported, got {other:?}"),
+        }
+    }
+
+    /// `DeviceWatcher`'s `Drop` runs the backend teardown closure exactly once.
+    #[test]
+    fn device_watcher_drop_runs_teardown_once() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use std::sync::Arc;
+
+        let calls = Arc::new(AtomicUsize::new(0));
+        let calls_in = Arc::clone(&calls);
+        let watcher = DeviceWatcher::from_teardown(Box::new(move || {
+            calls_in.fetch_add(1, Ordering::SeqCst);
+        }));
+        assert_eq!(
+            calls.load(Ordering::SeqCst),
+            0,
+            "teardown must not run early"
+        );
+        drop(watcher);
+        assert_eq!(
+            calls.load(Ordering::SeqCst),
+            1,
+            "teardown must run exactly once on drop"
+        );
+    }
+
+    /// `DeviceEvent` is constructible for each variant and `Clone`/`PartialEq`
+    /// hold (the binding layers rely on cloning events across the FFI boundary).
+    #[test]
+    fn device_event_variants_clone_and_compare() {
+        let added = DeviceEvent::DeviceAdded {
+            id: DeviceId("dev1".to_string()),
+            name: "Dev 1".to_string(),
+            kind: DeviceKind::Output,
+        };
+        assert_eq!(added, added.clone());
+        let removed = DeviceEvent::DeviceRemoved {
+            id: DeviceId("dev1".to_string()),
+        };
+        assert_ne!(added, removed);
     }
 }
