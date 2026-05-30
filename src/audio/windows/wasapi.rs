@@ -531,6 +531,17 @@ impl AudioDevice for WindowsAudioDevice {
             .unwrap_or_else(|_| vec![AudioFormat::default()])
     }
 
+    /// Resolves the endpoint direction via `IMMEndpoint::GetDataFlow`.
+    ///
+    /// Delegates to the inherent `kind_internal`
+    /// helper so the fallible `IMMEndpoint` probe is shared with any
+    /// crate-internal callers. `eRender` → [`DeviceKind::Output`],
+    /// `eCapture` → [`DeviceKind::Input`]. Stays fallible (resolves the M1
+    /// api-fit clash) rather than collapsing to a default.
+    fn kind(&self) -> AudioResult<DeviceKind> {
+        self.kind_internal()
+    }
+
     fn create_stream(&self, config: &StreamConfig) -> AudioResult<Box<dyn CapturingStream>> {
         // === 9-step BridgeStream wiring (following Linux pattern) ===
 
@@ -742,9 +753,13 @@ impl WindowsAudioDevice {
 }
 
 impl WindowsAudioDevice {
-    /// Determines the kind of device (Input or Output).
-    /// This is a helper method, not part of the AudioDevice trait.
-    pub fn kind(&self) -> AudioResult<DeviceKind> {
+    /// Determines the kind of device (Input or Output) via `IMMEndpoint`.
+    ///
+    /// Backing implementation for the [`AudioDevice::kind`] trait method. Kept
+    /// as a `pub(crate)` inherent helper (mirroring `get_name_internal` /
+    /// `query_supported_formats_internal`) so the trait method can delegate
+    /// without inherent-vs-trait call ambiguity.
+    pub(crate) fn kind_internal(&self) -> AudioResult<DeviceKind> {
         // QueryInterface for IMMEndpoint
         let endpoint: IMMEndpoint = self.device.cast().map_err(|hr| AudioError::BackendError {
             backend: "wasapi".to_string(),
@@ -920,29 +935,23 @@ fn wasapi_bits_to_sample_format(
 
 /// Find a wasapi-rs `Device` by its Windows device ID string.
 ///
-/// Searches both render and capture device collections.
+/// Uses wasapi 0.23's [`DeviceEnumerator::get_device`], which wraps
+/// `IMMDeviceEnumerator::GetDevice` and resolves the endpoint directly from
+/// its ID — no manual render/capture collection scan needed. Falls back to the
+/// default render device if the ID lookup fails (empty ID, stale ID, or an
+/// endpoint that has since disappeared).
 fn find_wasapi_device_by_id(
     enumerator: &wasapi::DeviceEnumerator,
     device_id: &str,
 ) -> AudioResult<wasapi::Device> {
-    // Try render devices first (most common for audio capture via loopback)
-    for direction in &[wasapi::Direction::Render, wasapi::Direction::Capture] {
-        if let Ok(collection) = enumerator.get_device_collection(direction) {
-            if let Ok(count) = collection.get_nbr_devices() {
-                for i in 0..count {
-                    if let Ok(device) = collection.get_device_at_index(i) {
-                        if let Ok(id) = device.get_id() {
-                            if id == device_id {
-                                return Ok(device);
-                            }
-                        }
-                    }
-                }
-            }
+    // Direct ID resolution via IMMDeviceEnumerator::GetDevice.
+    if !device_id.is_empty() {
+        if let Ok(device) = enumerator.get_device(device_id) {
+            return Ok(device);
         }
     }
 
-    // Fall back to default render device
+    // Fall back to default render device.
     enumerator
         .get_default_device(&wasapi::Direction::Render)
         .map_err(|e| AudioError::BackendError {
@@ -1435,6 +1444,53 @@ mod tests {
             first.channels,
             first.sample_format
         );
+    }
+
+    /// Test AudioDevice::kind() (the trait method) on the default device.
+    ///
+    /// The default device returned by `default_device()` is the default
+    /// **render** endpoint (used for loopback capture), so its kind must
+    /// resolve to `Output` via `IMMEndpoint::GetDataFlow`.
+    #[test]
+    fn test_audio_device_kind_default_is_output() {
+        let enumerator = WindowsDeviceEnumerator::new().expect("new() failed");
+        let device = enumerator.default_device().expect("no default device");
+
+        // Call through the trait object to exercise the AudioDevice::kind path.
+        let kind = device
+            .kind()
+            .expect("kind() should succeed for a real device");
+        assert_eq!(
+            kind,
+            DeviceKind::Output,
+            "default loopback device should be a render (Output) endpoint, got {:?}",
+            kind
+        );
+    }
+
+    /// Test that every enumerated device reports a definite, Ok kind.
+    ///
+    /// `enumerate_devices()` uses `eAll`, so the collection mixes render
+    /// (`Output`) and capture (`Input`) endpoints — both must resolve.
+    #[test]
+    fn test_enumerated_devices_kind_is_resolvable() {
+        let enumerator = WindowsDeviceEnumerator::new().expect("new() failed");
+        let devices = enumerator.enumerate_devices().expect("enumerate failed");
+        for device in &devices {
+            let kind = device.kind();
+            assert!(
+                kind.is_ok(),
+                "device {:?} ({}) should report a definite kind, got {:?}",
+                device.id(),
+                device.name(),
+                kind.err()
+            );
+            // The kind must be one of the two valid variants.
+            assert!(matches!(
+                kind.unwrap(),
+                DeviceKind::Input | DeviceKind::Output
+            ));
+        }
     }
 
     /// Test AudioDevice::create_stream() creates a valid CapturingStream.

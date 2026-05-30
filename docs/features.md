@@ -43,6 +43,82 @@ cargo build --features async-stream
 cargo build --features "async-stream sink-wav"
 ```
 
+## Binding feature-resolution convention (canonical)
+
+This is the **one** pattern every `rsac` language binding
+(`rsac-ffi`, `rsac-napi`, `rsac-python`, and any future binding) follows
+to select the host audio backend. New bindings copy this verbatim; it is
+the single source of truth referenced by all four manifests.
+
+**Rule:** a binding depends on `rsac` with `default-features = false` and
+selects exactly the one backend matching the build target via
+`[target.'cfg(...)'.dependencies.rsac]` blocks. This guarantees a Linux
+build never compiles (or links) the Windows/CoreAudio backends or pulls
+their OS-only system crates, and vice-versa — important because the
+`feat_*` flags are a two-way gate (see "Platform-feature semantics"
+above), so a wrong-OS backend would be dead code that still bloats the
+dependency graph.
+
+```toml
+# Canonical per-target backend selection for a binding's Cargo.toml.
+# Each table enables exactly the backend that matches the host platform;
+# default-features = false keeps the other two backends (and their
+# system deps) out of the build.
+
+[target.'cfg(windows)'.dependencies.rsac]
+path = "../.."           # or a published `version = "X.Y.Z"`
+default-features = false
+features = ["feat_windows"]
+
+[target.'cfg(target_os = "linux")'.dependencies.rsac]
+path = "../.."
+default-features = false
+features = ["feat_linux"]
+
+[target.'cfg(target_os = "macos")'.dependencies.rsac]
+path = "../.."
+default-features = false
+features = ["feat_macos"]
+```
+
+Bindings that re-export passthrough features (e.g. `sink-wav`,
+`async-stream`) declare a mirroring `[features]` entry, exactly as
+`rsac-ffi` does:
+
+```toml
+[features]
+default = []
+sink-wav = ["rsac/sink-wav"]
+# (feat_* are selected per-target above, not listed here)
+```
+
+### All-platform / docs.rs builds
+
+There is **no separate `all-backends` feature** and none is needed: the
+crate's existing `default = ["feat_windows", "feat_linux", "feat_macos"]`
+meta-feature is the all-backends opt-in. Because `feat_*` is two-way
+gated on `target_os`, turning all three on still compiles only the host
+backend on any single runner — so a docs.rs-style `--all-features`
+(or `default`) build is safe everywhere and is what
+`[package.metadata.docs.rs]` (`all-features = true`) relies on. To force
+all three backends *on* from a binding (e.g. a deliberate
+`cargo doc --all-features` of the binding crate), depend on `rsac`
+without `default-features = false`, or add a binding-local
+`all-backends = ["rsac/feat_windows", "rsac/feat_linux", "rsac/feat_macos"]`
+feature.
+
+### Per-binding status
+
+| Binding | Conforms? | Notes |
+|---|---|---|
+| `rsac-python` | yes | Uses the `[target.'cfg(...)'.dependencies.rsac]` blocks above with `default-features = false`. Reference implementation. |
+| `rsac-ffi` | yes (variant) | Mirrors `rsac`'s `feat_*` through its own `[features]` table and depends on `rsac` with `default-features = false`; consumers pass `--features feat_<os>`. Equivalent end state — only the host backend compiles. |
+| `rsac-napi` | migrating | Historically depended on `rsac` with implicit defaults (all three backends, bloating non-host builds). Should adopt the per-target blocks above so a Linux/Windows/macOS build pulls only its backend. |
+
+> The manifest edits that bring `rsac-napi` (and align `rsac-ffi`) onto
+> this pattern live with the crate-owning change; this document is the
+> convention those manifests point at.
+
 ## Binaries / examples gated by features
 
 Some binaries require a specific feature to build (see `Cargo.toml`):
@@ -67,3 +143,9 @@ The following are always compiled and have no opt-out:
 ## Version note
 
 This matrix reflects `rsac` at the 0.2.0 release line. Future provider-architecture work may add feature flags for cloud-backed capture providers — those will be listed here as they land.
+
+`rsac` and its bindings bump in lockstep on every semver tag, and any
+change to the `rsac-ffi` C ABI is a MAJOR bump for the FFI surface. See
+the [versioning & ABI contract](RELEASE_PROCESS.md#versioning--abi-contract)
+in the release process for the full policy, the CHANGELOG `### C ABI changes`
+convention, and the `rsac-go` tag shape.

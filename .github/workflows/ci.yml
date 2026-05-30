@@ -43,11 +43,13 @@ jobs:
             feature: feat_macos
             os: macos
     steps:
-      - uses: actions/checkout@v5
-      - uses: dtolnay/rust-toolchain@1.95.0
+      - uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5
+        with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@e081816240890017053eacbb1bdf337761dc5582 # 1.95.0
         with:
           components: rustfmt, clippy
-      - uses: Swatinem/rust-cache@v2
+      - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
 
       - name: Install PipeWire dev libraries
         if: matrix.os == 'linux'
@@ -75,9 +77,11 @@ jobs:
     needs: lint
     runs-on: blacksmith-4vcpu-ubuntu-2404
     steps:
-      - uses: actions/checkout@v5
-      - uses: dtolnay/rust-toolchain@1.95.0
-      - uses: Swatinem/rust-cache@v2
+      - uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5
+        with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@e081816240890017053eacbb1bdf337761dc5582 # 1.95.0
+      - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
 
       - name: Install PipeWire dev libraries
         run: |
@@ -103,9 +107,11 @@ jobs:
     needs: lint
     runs-on: blacksmith-4vcpu-windows-2025
     steps:
-      - uses: actions/checkout@v5
-      - uses: dtolnay/rust-toolchain@1.95.0
-      - uses: Swatinem/rust-cache@v2
+      - uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5
+        with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@e081816240890017053eacbb1bdf337761dc5582 # 1.95.0
+      - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
 
       - name: Cargo check
         run: cargo check --lib --no-default-features --features feat_windows
@@ -137,9 +143,11 @@ jobs:
     needs: lint
     runs-on: blacksmith-6vcpu-macos-15
     steps:
-      - uses: actions/checkout@v5
-      - uses: dtolnay/rust-toolchain@1.95.0
-      - uses: Swatinem/rust-cache@v2
+      - uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5
+        with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@e081816240890017053eacbb1bdf337761dc5582 # 1.95.0
+      - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
 
       - name: Grant audio permissions for CI
         run: |
@@ -222,11 +230,13 @@ jobs:
     needs: lint
     runs-on: blacksmith-4vcpu-ubuntu-2404
     steps:
-      - uses: actions/checkout@v5
-      - uses: dtolnay/rust-toolchain@1.95.0
+      - uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5
+        with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@e081816240890017053eacbb1bdf337761dc5582 # 1.95.0
         with:
           targets: aarch64-unknown-linux-gnu
-      - uses: Swatinem/rust-cache@v2
+      - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
 
       - name: Install cross-compilation tools
         run: |
@@ -264,9 +274,11 @@ jobs:
     needs: lint
     runs-on: blacksmith-4vcpu-ubuntu-2404
     steps:
-      - uses: actions/checkout@v5
-      - uses: dtolnay/rust-toolchain@1.95.0
-      - uses: Swatinem/rust-cache@v2
+      - uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5
+        with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@e081816240890017053eacbb1bdf337761dc5582 # 1.95.0
+      - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
 
       - name: Install PipeWire dev libraries
         run: |
@@ -296,9 +308,11 @@ jobs:
     needs: lint
     runs-on: blacksmith-4vcpu-ubuntu-2404
     steps:
-      - uses: actions/checkout@v5
-      - uses: dtolnay/rust-toolchain@1.95.0
-      - uses: Swatinem/rust-cache@v2
+      - uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5
+        with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@e081816240890017053eacbb1bdf337761dc5582 # 1.95.0
+      - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
 
       - name: Install PipeWire dev libraries
         run: |
@@ -334,9 +348,11 @@ jobs:
     needs: lint
     runs-on: blacksmith-4vcpu-ubuntu-2404
     steps:
-      - uses: actions/checkout@v5
-      - uses: dtolnay/rust-toolchain@1.95.0
-      - uses: Swatinem/rust-cache@v2
+      - uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5
+        with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@e081816240890017053eacbb1bdf337761dc5582 # 1.95.0
+      - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
 
       - name: Install PipeWire dev libraries
         run: |
@@ -362,14 +378,123 @@ jobs:
     needs: lint
     runs-on: blacksmith-4vcpu-ubuntu-2404
     steps:
-      - uses: actions/checkout@v5
-      - uses: dtolnay/rust-toolchain@1.95.0
-      - uses: Swatinem/rust-cache@v2
+      - uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5
+        with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@e081816240890017053eacbb1bdf337761dc5582 # 1.95.0
+      - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
 
       - name: Install cargo-deny
-        uses: taiki-e/install-action@v2
+        uses: taiki-e/install-action@0fd46367812ee04360509b4169d9f659d6892bb2 # v2
         with:
           tool: cargo-deny
 
       - name: Run cargo-deny
         run: cargo deny check advisories bans licenses sources
+
+  # ── Version lockstep guard (rsac + 4 bindings) ──────────────────────
+  # Enforces the versioning/ABI contract documented in
+  # docs/RELEASE_PROCESS.md §"Versioning & ABI contract":
+  # rsac and every publishable binding manifest bump in lockstep on a
+  # semver tag. This job extracts the [package].version of the root crate
+  # and the four binding manifests (rsac-ffi/rsac-napi/rsac-python +
+  # rsac-napi/package.json + rsac-python/pyproject.toml) and asserts they
+  # all agree.
+  #
+  #   • On a `vX.Y.Z` tag push it ALSO asserts every version equals the
+  #     tag (minus the leading `v`) and HARD-FAILS on any divergence — a
+  #     mismatched manifest must never reach a registry. This is the
+  #     "CI check that fails if versions diverge from the release tag"
+  #     required by the contract.
+  #   • On ordinary pushes / PRs it only WARNS (via ::warning::) so a
+  #     deliberate mid-cycle skew (e.g. a binding lagging behind the root
+  #     crate between releases) does not block day-to-day CI. The hard
+  #     gate runs at tag time, which is the point of no return.
+  version-lockstep:
+    name: Version Lockstep (rsac + bindings)
+    timeout-minutes: 5
+    needs: lint
+    runs-on: blacksmith-4vcpu-ubuntu-2404
+    steps:
+      - uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5
+        with:
+          persist-credentials: false
+
+      - name: Check rsac + binding versions are in lockstep
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          # Extract the first `version = "X.Y.Z"` inside the [package] /
+          # [project] section of a TOML manifest. Mirrors the extractor in
+          # scripts/bump-version.sh so the two stay in agreement.
+          toml_pkg_version() {
+            awk '
+              /^\[package\][[:space:]]*$/ || /^\[project\][[:space:]]*$/ { in_sec = 1; next }
+              /^\[/ { if ($0 !~ /^\[(package|project)\][[:space:]]*$/) in_sec = 0 }
+              in_sec && /^[[:space:]]*version[[:space:]]*=[[:space:]]*"[^"]+"[[:space:]]*$/ {
+                match($0, /"[^"]+"/); print substr($0, RSTART + 1, RLENGTH - 2); exit
+              }
+            ' "$1"
+          }
+          # Top-level (2-space indent) "version" key of a package.json.
+          json_top_version() {
+            awk '
+              /^  "version"[[:space:]]*:[[:space:]]*"[^"]+"[[:space:]]*,?[[:space:]]*$/ {
+                colon = index($0, ":"); rest = substr($0, colon + 1)
+                match(rest, /"[^"]+"/); print substr(rest, RSTART + 1, RLENGTH - 2); exit
+              }
+            ' "$1"
+          }
+
+          declare -A V
+          V[Cargo.toml]=$(toml_pkg_version Cargo.toml)
+          V[bindings/rsac-ffi/Cargo.toml]=$(toml_pkg_version bindings/rsac-ffi/Cargo.toml)
+          V[bindings/rsac-napi/Cargo.toml]=$(toml_pkg_version bindings/rsac-napi/Cargo.toml)
+          V[bindings/rsac-napi/package.json]=$(json_top_version bindings/rsac-napi/package.json)
+          V[bindings/rsac-python/Cargo.toml]=$(toml_pkg_version bindings/rsac-python/Cargo.toml)
+          V[bindings/rsac-python/pyproject.toml]=$(toml_pkg_version bindings/rsac-python/pyproject.toml)
+
+          echo "Discovered versions:"
+          for f in "${!V[@]}"; do
+            printf '  %-42s %s\n' "$f" "${V[$f]:-<none>}"
+            if [ -z "${V[$f]:-}" ]; then
+              echo "::error::could not extract a version from $f"
+              exit 1
+            fi
+          done
+
+          ROOT="${V[Cargo.toml]}"
+          DIVERGED=0
+          for f in "${!V[@]}"; do
+            if [ "${V[$f]}" != "$ROOT" ]; then
+              DIVERGED=1
+              echo "DIVERGENCE: $f is ${V[$f]}, root Cargo.toml is $ROOT"
+            fi
+          done
+
+          # rsac-go has no version field — releases are tagged
+          # bindings/rsac-go/vX.Y.Z (see docs/RELEASE_PROCESS.md). Nothing
+          # to compare in-tree; recorded here so the absence is intentional.
+          echo "note: rsac-go carries no manifest version (tagged out-of-band as bindings/rsac-go/vX.Y.Z)"
+
+          if [[ "${GITHUB_REF:-}" == refs/tags/v* ]]; then
+            TAG_VERSION="${GITHUB_REF#refs/tags/v}"
+            echo "release tag detected: v${TAG_VERSION} — enforcing lockstep + tag match"
+            FAIL=0
+            for f in "${!V[@]}"; do
+              if [ "${V[$f]}" != "$TAG_VERSION" ]; then
+                FAIL=1
+                echo "::error::$f version ${V[$f]} does not match release tag v${TAG_VERSION}"
+              fi
+            done
+            if [ "$FAIL" -ne 0 ]; then
+              echo "::error::version lockstep violated on release tag — refusing to proceed"
+              exit 1
+            fi
+            echo "OK: all manifests match release tag v${TAG_VERSION}"
+          elif [ "$DIVERGED" -ne 0 ]; then
+            echo "::warning::rsac + binding versions are not in lockstep (see above). This only HARD-FAILS on a release tag; bump every manifest to match before tagging (scripts/bump-version.sh)."
+          else
+            echo "OK: rsac + all bindings agree at $ROOT"
+          fi

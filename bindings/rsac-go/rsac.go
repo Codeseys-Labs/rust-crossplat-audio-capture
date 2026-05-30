@@ -510,11 +510,29 @@ func (c *AudioCapture) Close() error {
 }
 
 // closeLocked frees the C handle. Must be called with c.mu held.
+//
+// Ordering matters for the #28 callback use-after-free: the cgo.Handle backing
+// an active callback must never be Delete()d while a callback could still
+// resolve it on the FFI delivery thread. We therefore (1) clear the C-layer
+// callback and stop+free the capture — which tears down the delivery path and,
+// for any callback already dispatched, is the point past which no new
+// invocation can begin — and only then (2) Delete the cgo.Handle. The C ABI
+// guarantees rsac_capture_free stops the stream if running, so the explicit
+// set_callback(NULL) is belt-and-suspenders: it makes the "clear at the C layer
+// precedes handle Delete" ordering unconditional even on backends where free is
+// a thinner teardown. goAudioCallback additionally recovers from a resolve of an
+// already-deleted handle, closing the residual in-flight-callback window.
 func (c *AudioCapture) closeLocked() error {
 	c.closed = true
 	runtime.SetFinalizer(c, nil)
+	// Clear the C-layer callback first so the FFI pump stops dispatching to
+	// goAudioCallback before the handle it resolves is deleted.
+	if c.callback != 0 {
+		C.rsac_capture_set_callback(c.handle, nil, nil)
+	}
 	C.rsac_capture_free(c.handle)
 	c.handle = nil
+	// Now that delivery is torn down, it is safe to delete the cgo.Handle.
 	c.clearCallbackHandleLocked()
 	return nil
 }

@@ -6,12 +6,13 @@
 /**
  * A chunk of captured audio data.
  *
- * Contains interleaved Float64 PCM samples along with format metadata.
+ * Contains interleaved Float32 PCM samples along with format metadata.
  * This is the primary data unit flowing through the JS capture pipeline.
  */
 export interface AudioChunk {
-  /** Interleaved PCM audio samples (f32 from Rust, widened to f64 for JS). */
-  data: number[];
+  /** Interleaved PCM audio samples as a native `Float32Array` (the captured
+   * `f32` samples carried through directly — no `f32` -> `f64` widening). */
+  data: Float32Array;
   /** Number of audio frames (samples per channel). */
   numFrames: number;
   /** Number of audio channels. */

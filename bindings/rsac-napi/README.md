@@ -33,7 +33,7 @@ const capture = AudioCapture.create(
 
 capture.onData((chunk) => {
   console.log(`Got ${chunk.numFrames} frames @ ${chunk.sampleRate} Hz`)
-  // chunk.data is interleaved PCM samples as number[]
+  // chunk.data is interleaved PCM samples as a Float32Array
 })
 
 capture.start()

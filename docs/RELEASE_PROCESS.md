@@ -157,6 +157,84 @@ of the automated flows fails.
 
 ---
 
+## Versioning & ABI contract
+
+This is the **normative** policy for how `rsac` and its four bindings are
+versioned. The release tooling (`scripts/bump-version.sh`, the
+`version-lockstep` CI job in `.github/workflows/ci.yml`, and the
+tag↔manifest guard in `release.yml`) all enforce pieces of it.
+
+### (a) Lockstep version bumps
+
+`rsac` (root `Cargo.toml`) and the publishable bindings bump **in
+lockstep** on every semver tag. A tag `vX.Y.Z` means *all* of these
+carry version `X.Y.Z`:
+
+| Manifest | Field | Notes |
+|---|---|---|
+| `Cargo.toml` | `[package].version` | the crates.io crate, source of truth |
+| `bindings/rsac-ffi/Cargo.toml` | `[package].version` | C FFI crate (`publish = false`; versioned for ABI tracking, see (b)) |
+| `bindings/rsac-napi/Cargo.toml` | `[package].version` | napi crate |
+| `bindings/rsac-napi/package.json` | top-level `"version"` | npm package `@rsac/audio` |
+| `bindings/rsac-python/Cargo.toml` | `[package].version` | pyo3 crate |
+| `bindings/rsac-python/pyproject.toml` | `[project].version` | PyPI package `rsac` |
+
+Run `bash scripts/bump-version.sh X.Y.Z` to rewrite the manifests it knows
+about (root + napi + python, plus the CHANGELOG rotation); bring
+`bindings/rsac-ffi/Cargo.toml` to the same value in the same commit. The
+`version-lockstep` CI job re-checks all six values on every push/PR
+(warning on a mid-cycle skew) and **hard-fails on a `vX.Y.Z` tag** if any
+manifest disagrees with the tag — a mismatched manifest must never reach
+a registry.
+
+> Mid-cycle skew is tolerated by CI (warning only) so a binding can lag
+> the root crate between releases, but it must be reconciled before
+> tagging. As of this writing `rsac-ffi` trails at `0.1.0` while the
+> others are at `0.2.0`; the next release must bring all six to the same
+> version.
+
+### (b) C ABI changes are MAJOR for `rsac-ffi`
+
+The `rsac-ffi` crate exposes a C ABI: the exported `extern "C"` symbols
+and the generated `rsac.h` header. **Any** of the following is a
+**MAJOR** version change for the FFI surface and MUST be called out in
+the CHANGELOG under a dedicated `### C ABI changes` subsection (see
+[`CHANGELOG.md`](../CHANGELOG.md)):
+
+- removing or renaming an exported symbol;
+- changing the signature of an exported function (parameter/return types,
+  arity, calling convention);
+- changing the layout, size, or field order of any `#[repr(C)]` struct or
+  enum crossing the boundary;
+- changing the meaning of an existing return/error code.
+
+Additive changes (new symbols, new `#[repr(C)]` types that don't alter
+existing ones) are MINOR. Because `rsac` and the bindings bump in
+lockstep (a), an ABI-MAJOR change forces the whole line to the next MAJOR
+on a `0.x`→`0.(x+1)` (pre-1.0) or `x`→`x+1` (post-1.0) boundary; record
+the rationale in the ABI subsection so consumers pinning the `.so`/`.dll`
+know to recompile.
+
+### (c) `rsac-go` tag convention
+
+`bindings/rsac-go` is a Go module (`module
+github.com/Codeseys-Labs/rsac-go`, see `bindings/rsac-go/go.mod`) and
+carries **no in-manifest version** — Go derives versions from git tags.
+Because the module lives in a subdirectory, its releases are tagged with
+the **module-path-prefixed** form Go's module proxy expects:
+
+```
+bindings/rsac-go/vX.Y.Z
+```
+
+Push this tag in lockstep with the `vX.Y.Z` crate tag (same `X.Y.Z`).
+Consumers then `go get
+github.com/Codeseys-Labs/rsac-go@vX.Y.Z`. The `version-lockstep`
+CI job notes rsac-go's absence of an in-tree version explicitly so the
+gap is intentional, not an oversight.
+
+---
+
 ## Pre-release Tags and Dry Runs
 
 All three release workflows key on the `v*.*.*` tag pattern and also
@@ -577,11 +655,15 @@ Tracked here so follow-up release-automation tasks can pick them up:
   must be set under **Settings → Secrets and variables → Actions**.
   Missing secrets fail only the affected `publish-*` job; the other
   flows continue. Fall back to §2–§6 for the affected registry.
-- No `scripts/bump-version.sh` — version strings are edited by hand in
-  `Cargo.toml`, `bindings/rsac-napi/package.json`, and
-  `bindings/rsac-python/pyproject.toml`. `apps/audio-graph/` has its
-  own bump script; a cross-manifest version sync helper is still a
-  nice-to-have.
+- `scripts/bump-version.sh X.Y.Z` rewrites the root `Cargo.toml`,
+  `bindings/rsac-napi/{Cargo.toml,package.json}`, and
+  `bindings/rsac-python/{Cargo.toml,pyproject.toml}` and rotates the
+  CHANGELOG. It does **not** yet touch `bindings/rsac-ffi/Cargo.toml`
+  (bring it to the target version by hand in the same commit) and cannot
+  tag `rsac-go` (push `bindings/rsac-go/vX.Y.Z` separately — see
+  §"Versioning & ABI contract" (c)). The `version-lockstep` CI job in
+  `ci.yml` catches any manifest that drifts: it warns on push/PR and
+  hard-fails on a release tag.
 - `release-npm.yml` builds five napi-rs triples; other targets
   (`linux-x64-musl`, `linux-arm-gnueabihf`, FreeBSD, Android) are not
   wired. Add them to the matrix if downstream users request them.

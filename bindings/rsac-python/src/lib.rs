@@ -246,6 +246,22 @@ impl PyCaptureTarget {
     }
 }
 
+/// Serialize interleaved `f32` samples to little-endian IEEE-754 bytes.
+///
+/// This is the provably-sound replacement for the old `from_raw_parts`
+/// reinterpret flagged by issue #30: each sample is encoded via
+/// [`f32::to_le_bytes`], so the result is always exactly `samples.len() * 4`
+/// bytes in little-endian order regardless of host endianness, and the
+/// conversion can never alias or misread memory. The byte layout matches
+/// numpy dtype `'<f4'`.
+fn f32_slice_to_le_bytes(samples: &[f32]) -> Vec<u8> {
+    let mut bytes = Vec::with_capacity(samples.len() * 4);
+    for &sample in samples {
+        bytes.extend_from_slice(&sample.to_le_bytes());
+    }
+    bytes
+}
+
 // ── AudioBuffer ──────────────────────────────────────────────────────────
 
 /// A buffer of interleaved audio samples (f32).
@@ -312,13 +328,14 @@ impl PyAudioBuffer {
 
     /// Return the raw sample data as bytes (little-endian f32, 4 bytes per sample).
     ///
+    /// The byte layout is **little-endian IEEE-754 single-precision** (numpy
+    /// dtype ``'<f4'``), independent of the host's native endianness. The
+    /// returned buffer round-trips with ``numpy.frombuffer(b, dtype='<f4')``,
+    /// which equals :meth:`to_list`. Length is always ``len(self) * 4``.
+    ///
     /// Suitable for writing to files or passing to audio processing libraries.
     fn to_bytes<'py>(&self, py: Python<'py>) -> Bound<'py, PyBytes> {
-        let data = self.inner.data();
-        // Safety: reinterpret &[f32] as &[u8]
-        let byte_slice =
-            unsafe { std::slice::from_raw_parts(data.as_ptr() as *const u8, data.len() * 4) };
-        PyBytes::new(py, byte_slice)
+        PyBytes::new(py, &f32_slice_to_le_bytes(self.inner.data()))
     }
 
     /// Extract samples for a single channel (0-indexed).
@@ -845,4 +862,49 @@ fn _rsac(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add("__version__", env!("CARGO_PKG_VERSION"))?;
 
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::f32_slice_to_le_bytes;
+
+    #[test]
+    fn to_le_bytes_length_is_four_per_sample() {
+        assert_eq!(f32_slice_to_le_bytes(&[]).len(), 0);
+        assert_eq!(f32_slice_to_le_bytes(&[0.0]).len(), 4);
+        assert_eq!(f32_slice_to_le_bytes(&[1.0, -1.0, 0.5]).len(), 12);
+    }
+
+    #[test]
+    fn to_le_bytes_is_little_endian_ieee754() {
+        // 1.0f32 == 0x3F800000, little-endian byte order 00 00 80 3F.
+        assert_eq!(f32_slice_to_le_bytes(&[1.0]), [0x00, 0x00, 0x80, 0x3F]);
+        // -2.0f32 == 0xC0000000, little-endian 00 00 00 C0.
+        assert_eq!(f32_slice_to_le_bytes(&[-2.0]), [0x00, 0x00, 0x00, 0xC0]);
+    }
+
+    #[test]
+    fn to_le_bytes_round_trips_via_from_le_bytes() {
+        let samples = [0.0f32, 1.0, -1.5, 3.14159, f32::MIN, f32::MAX, -0.0];
+        let bytes = f32_slice_to_le_bytes(&samples);
+        assert_eq!(bytes.len(), samples.len() * 4);
+        let decoded: Vec<f32> = bytes
+            .chunks_exact(4)
+            .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
+            .collect();
+        // Bit-exact round trip (compare bit patterns so -0.0 and NaN-free
+        // values match precisely).
+        for (orig, got) in samples.iter().zip(decoded.iter()) {
+            assert_eq!(orig.to_bits(), got.to_bits());
+        }
+    }
+
+    #[test]
+    fn to_le_bytes_concatenates_samples_in_order() {
+        let bytes = f32_slice_to_le_bytes(&[1.0, 2.0]);
+        let mut expected = Vec::new();
+        expected.extend_from_slice(&1.0f32.to_le_bytes());
+        expected.extend_from_slice(&2.0f32.to_le_bytes());
+        assert_eq!(bytes, expected);
+    }
 }

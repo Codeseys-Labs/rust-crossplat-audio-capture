@@ -155,6 +155,20 @@ impl<S: PlatformStream> BridgeStream<S> {
     pub fn buffers_read(&self) -> u64 {
         self.shared.buffers_popped.load(Ordering::Relaxed)
     }
+
+    /// Aggregate `(pushed, dropped)` totals across the bridge's sliding
+    /// drop-rate window (`rsac-cfe4`).
+    ///
+    /// This is the windowed view that does **not** reset on a single successful
+    /// push (unlike [`is_under_backpressure`](CapturingStream::is_under_backpressure)),
+    /// so it surfaces sustained 1-in-N loss the consecutive-drop bool misses.
+    /// The `AudioCapture`/`BackpressureReport` layer (stats area) reads this to
+    /// compute a windowed `drop_rate`; exposed here so it can reach the bridge
+    /// atomics through the stream without touching producer internals.
+    #[allow(dead_code)]
+    pub fn drop_window_snapshot(&self) -> (u64, u64) {
+        self.shared.drop_window_snapshot()
+    }
 }
 
 // ── CapturingStream Implementation ───────────────────────────────────────
@@ -759,6 +773,37 @@ mod tests {
         assert!(stream.is_producing());
         stream.stop().unwrap();
         assert!(!stream.is_producing());
+    }
+
+    // rsac-cfe4: the windowed drop snapshot is reachable through BridgeStream and
+    // reflects pushes/drops recorded on the producer's shared state.
+    #[test]
+    fn test_drop_window_snapshot_through_stream() {
+        let format = test_format();
+        let (mut producer, consumer) = create_bridge(2, format.clone());
+        consumer
+            .shared()
+            .state
+            .transition(StreamState::Created, StreamState::Running)
+            .unwrap();
+        let stream = BridgeStream::new(
+            consumer,
+            MockPlatformStream::new(),
+            format,
+            Duration::from_secs(1),
+        );
+
+        // Fresh: all-zero window.
+        assert_eq!(stream.drop_window_snapshot(), (0, 0));
+
+        // Fill the ring (cap 2) with 2 successful pushes, then force 1 drop.
+        assert!(producer.push_or_drop(test_buffer(1.0)));
+        assert!(producer.push_or_drop(test_buffer(1.0)));
+        assert!(!producer.push_or_drop(test_buffer(9.0)));
+
+        let (pushed, dropped) = stream.drop_window_snapshot();
+        assert_eq!(pushed, 2, "two successful pushes recorded in the window");
+        assert_eq!(dropped, 1, "one drop recorded in the window");
     }
 
     // 13. Stop from Created state returns error

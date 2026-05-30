@@ -2,6 +2,11 @@
 name = "rsac"
 version = "0.2.0"
 edition = "2021"
+# Explicit MSRV floor. wasapi 0.23 bumps its own MSRV to 1.76; declaring it here
+# makes the minimum supported Rust version visible (under the pinned 1.95
+# toolchain). Floor is 1.87: wasapi 0.23 needs 1.76, and the codebase uses
+# `u64::is_multiple_of` (stable 1.87). Bump if a dependency/feature requires more.
+rust-version = "1.87"
 build = "build.rs"
 autobins = false
 description = "Cross-platform audio capture library with per-application process taps (macOS), WASAPI (Windows), and PipeWire (Linux)"
@@ -56,11 +61,16 @@ test-utils = [] # Feature to enable test utilities
 # Streaming/data-plane features
 async-stream = ["dep:atomic-waker"]  # Async Stream support (adds atomic-waker for async notification)
 sink-wav = []                        # WavFileSink sink adapter (hound is always available)
+# rsac-3616: opt-in sample-domain SPSC ring (interleaved f32 written via rtrb
+# write_chunk_uninit + CopyToUninit) that avoids the per-buffer Vec/AudioBuffer
+# allocation on the producer's RT thread. Default OFF — the AudioBuffer ring
+# remains the default path; this is A/B'd in benches/bridge.rs.
+bridge-zerocopy = []
 
 [dependencies]
 # Core dependencies
 futures-core = "0.3.32"
-rtrb = "0.3.3"                                               # Lock-free SPSC ring buffer for audio data bridge
+rtrb = "0.3.4"                                               # Lock-free SPSC ring buffer for audio data bridge (0.3.4: write_chunk_uninit + CopyToUninit for bridge-zerocopy)
 atomic-waker = { version = "1.1.2", optional = true }           # Async waker for ring buffer notification (behind async-stream feature)
 thiserror = "2.0.18"                                       # For error handling
 log = "0.4.29"                                                 # For logging
@@ -78,7 +88,7 @@ serde_json = "1.0.149"
 
 # Platform-specific audio capture
 [target.'cfg(target_os = "windows")'.dependencies]
-wasapi = "0.22.0"  # WASAPI bindings for Process Loopback
+wasapi = "0.23.0"  # WASAPI bindings for Process Loopback (0.23: safe parse_from_blob_bytes, get_device)
 windows = { version = "0.62.2", features = [
     "Foundation",                 # For basic Windows types like HRESULT, BOOL, HANDLE
     "Win32_Foundation",           # For basic Windows types like HRESULT, BOOL, HANDLE

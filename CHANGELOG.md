@@ -5,6 +5,17 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+In addition to the standard Keep-a-Changelog subsections, each release that
+touches the C ABI carries a dedicated **`### C ABI changes`** subsection.
+This records every change to the `rsac-ffi` exported `extern "C"` symbols or
+the generated `rsac.h` header that affects binary compatibility — symbol
+removals/renames, signature or `#[repr(C)]` layout changes, and changed
+return/error-code semantics. Per the
+[versioning & ABI contract](docs/RELEASE_PROCESS.md#versioning--abi-contract),
+any such change is a **MAJOR** bump for the FFI surface; the subsection tells
+consumers who pin the `.so`/`.dll`/`.dylib` exactly what to recompile against.
+Releases with no ABI change omit the subsection (or state "No C ABI changes").
+
 ## [Unreleased]
 
 Correctness-focused fixes from the 2026-05-29 deep-dive audit (waves 1–2),
@@ -59,6 +70,11 @@ findings. Three Architecture Decision Records were recorded alongside the code:
 ### Removed
 
 ### Security
+
+### C ABI changes
+
+No C ABI changes. (See the note at the top of this file for when this
+subsection is required and what it must record.)
 
 ## [0.2.0] - 2026-04-18
 

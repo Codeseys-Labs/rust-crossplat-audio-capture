@@ -16,6 +16,7 @@
 
 use crate::core::config::{ApplicationId, CaptureTarget, DeviceId, ProcessId};
 use crate::core::error::AudioResult;
+use std::time::Duration;
 
 // ── AudioSource ─────────────────────────────────────────────────────────
 
@@ -323,15 +324,132 @@ pub fn check_audio_capture_permission() -> PermissionStatus {
 
 /// Captures real-time statistics about a running audio stream.
 ///
-/// Obtained via `AudioCapture::stream_stats()`.
+/// Obtained via [`AudioCapture::stream_stats()`](crate::api::AudioCapture::stream_stats).
+///
+/// This is a cheap, point-in-time snapshot of the bridge's diagnostic counters
+/// plus the running state, uptime, and negotiated format. The counters are read
+/// with `Relaxed` loads on the (non-real-time) query path; reading them never
+/// allocates on or blocks the OS audio callback thread.
+///
+/// This struct is `#[non_exhaustive]`: new diagnostic fields may be added in a
+/// minor release, so construct it only via [`StreamStats::default()`] (it
+/// implements [`Default`]) plus field assignment, and match it with `..`.
 #[derive(Debug, Clone, Default)]
+#[non_exhaustive]
 pub struct StreamStats {
     /// Number of audio buffers dropped due to ring buffer overflow.
+    ///
+    /// Equivalent to [`buffers_dropped`](Self::buffers_dropped); retained as a
+    /// distinct field for backward compatibility with the original surface.
     pub overruns: u64,
+    /// Cumulative number of buffers **delivered to the consumer** (popped off the
+    /// ring buffer) since the stream started.
+    pub buffers_captured: u64,
+    /// Cumulative number of buffers **dropped due to ring buffer overflow** since
+    /// the stream started (alias of [`overruns`](Self::overruns)).
+    pub buffers_dropped: u64,
+    /// Cumulative number of buffers **enqueued by the producer** (the OS audio
+    /// callback) since the stream started.
+    pub buffers_pushed: u64,
+    /// How long the stream has been running. [`Duration::ZERO`] when the stream
+    /// has not been started (or has been stopped).
+    pub uptime: Duration,
     /// Whether the stream is currently capturing.
     pub is_running: bool,
     /// The audio format being captured.
     pub format_description: String,
+}
+
+impl StreamStats {
+    /// Fraction of buffers lost to ring-buffer overflow, in `0.0..=1.0`.
+    ///
+    /// Computed as `buffers_dropped / (buffers_captured + buffers_dropped)`,
+    /// i.e. the share of *accounted-for* buffers (delivered or dropped) that were
+    /// lost. Returns `0.0` when the denominator is zero (no buffers yet), so it is
+    /// safe to call on a freshly created or never-started capture.
+    ///
+    /// For example, three captured and one dropped yields `0.25`.
+    pub fn dropped_ratio(&self) -> f64 {
+        let denom = self.buffers_captured + self.buffers_dropped;
+        if denom == 0 {
+            return 0.0;
+        }
+        self.buffers_dropped as f64 / denom as f64
+    }
+}
+
+// ── Backpressure reporting ───────────────────────────────────────────────
+
+/// A windowed view of recent producer→consumer backpressure.
+///
+/// Obtained via
+/// [`AudioCapture::backpressure_report()`](crate::api::AudioCapture::backpressure_report).
+///
+/// The legacy [`is_under_backpressure`](Self::is_under_backpressure) signal is an
+/// all-or-nothing flag that trips only on a run of *consecutive* drops and resets
+/// on any successful push, so it misses sustained partial loss (e.g. a steady
+/// 1-in-3 drop pattern). This report carries the legacy bool unchanged **and**
+/// adds a [`drop_rate`](Self::drop_rate) computed over a window of recent push
+/// activity, which surfaces partial-loss patterns the bool cannot.
+///
+/// This struct is `#[non_exhaustive]`: prefer [`Default`] plus field assignment
+/// and match with `..`.
+#[derive(Debug, Clone, Default, PartialEq)]
+#[non_exhaustive]
+pub struct BackpressureReport {
+    /// The wall-clock span the `pushed`/`dropped` tallies cover. [`Duration::ZERO`]
+    /// when the implementation reports lifetime totals rather than a bounded
+    /// window (the current bridge fallback — see the type-level note).
+    pub window: Duration,
+    /// Buffers successfully pushed by the producer within the window.
+    pub pushed: u64,
+    /// Buffers dropped due to ring-buffer overflow within the window.
+    pub dropped: u64,
+    /// Fraction of buffers lost within the window, in `0.0..=1.0`. Computed
+    /// read-side as `dropped / (pushed + dropped)` with a zero-division guard
+    /// (`0.0` when nothing has been pushed or dropped).
+    pub drop_rate: f64,
+    /// The legacy consecutive-drop backpressure flag, carried unchanged so callers
+    /// that relied on it keep working. See
+    /// [`CapturingStream::is_under_backpressure`](crate::core::interface::CapturingStream::is_under_backpressure).
+    pub is_under_backpressure: bool,
+}
+
+impl BackpressureReport {
+    /// Builds a report from raw push/drop tallies and the legacy bool, computing
+    /// [`drop_rate`](Self::drop_rate) with a zero-division guard.
+    ///
+    /// `window` is the span the tallies cover; pass [`Duration::ZERO`] when the
+    /// counts are lifetime totals rather than a bounded window.
+    ///
+    /// Until the bridge exposes a fixed-size ring of per-window snapshots
+    /// (rsac-cfe4's RT-side counters live in `bridge/ring_buffer.rs`, owned by the
+    /// bridge-internals area), [`AudioCapture::backpressure_report`] builds this
+    /// from the lifetime `buffers_pushed`/`buffers_dropped` counters and reports a
+    /// zero `window`. When the windowed atomics land, swap the source counters and
+    /// set `window` to the snapshot span — the public shape here does not change.
+    // TODO(rsac-cfe4): consume the bridge's windowed (pushed,dropped) atomics once
+    // the bridge-internals area exposes them; until then this is a lifetime view.
+    pub(crate) fn from_counts(
+        window: Duration,
+        pushed: u64,
+        dropped: u64,
+        is_under_backpressure: bool,
+    ) -> Self {
+        let denom = pushed + dropped;
+        let drop_rate = if denom == 0 {
+            0.0
+        } else {
+            dropped as f64 / denom as f64
+        };
+        Self {
+            window,
+            pushed,
+            dropped,
+            drop_rate,
+            is_under_backpressure,
+        }
+    }
 }
 
 // ── Tests ───────────────────────────────────────────────────────────────
@@ -394,5 +512,85 @@ mod tests {
             .iter()
             .any(|s| s.kind == AudioSourceKind::SystemDefault));
         assert!(sources.iter().any(|s| s.id == "system-default"));
+    }
+
+    // ── StreamStats (rsac-4c07) ───────────────────────────────────────
+
+    /// Default StreamStats has zeroed counters, ZERO uptime, not running, and a
+    /// `dropped_ratio()` of 0.0 (divide-by-zero guard).
+    #[test]
+    fn stream_stats_default_is_zeroed_and_safe() {
+        let s = StreamStats::default();
+        assert_eq!(s.overruns, 0);
+        assert_eq!(s.buffers_captured, 0);
+        assert_eq!(s.buffers_dropped, 0);
+        assert_eq!(s.buffers_pushed, 0);
+        assert_eq!(s.uptime, std::time::Duration::ZERO);
+        assert!(!s.is_running);
+        assert!(s.format_description.is_empty());
+        // No buffers accounted for → guard returns 0.0, no panic.
+        assert_eq!(s.dropped_ratio(), 0.0);
+    }
+
+    /// dropped_ratio() = dropped / (captured + dropped); 3 captured + 1 dropped → 0.25.
+    #[test]
+    fn stream_stats_dropped_ratio_computes_quarter() {
+        let s = StreamStats {
+            buffers_captured: 3,
+            buffers_dropped: 1,
+            ..StreamStats::default()
+        };
+        assert_eq!(s.dropped_ratio(), 0.25);
+    }
+
+    /// dropped_ratio() guards a zero denominator even when other fields are set.
+    #[test]
+    fn stream_stats_dropped_ratio_zero_denominator_guard() {
+        let s = StreamStats {
+            buffers_pushed: 100, // pushed does not enter the denominator
+            ..StreamStats::default()
+        };
+        assert_eq!(s.dropped_ratio(), 0.0);
+    }
+
+    // ── BackpressureReport (rsac-cfe4) ────────────────────────────────
+
+    /// drop_rate is 0.0 when nothing has been pushed or dropped (guard).
+    #[test]
+    fn backpressure_report_default_drop_rate_is_zero() {
+        let r = BackpressureReport::default();
+        assert_eq!(r.pushed, 0);
+        assert_eq!(r.dropped, 0);
+        assert_eq!(r.drop_rate, 0.0);
+        assert!(!r.is_under_backpressure);
+        assert_eq!(r.window, std::time::Duration::ZERO);
+    }
+
+    /// from_counts() computes drop_rate = dropped / (pushed + dropped). A
+    /// half-and-half loss pattern (which never trips the consecutive-drop bool)
+    /// reports drop_rate ~0.5.
+    #[test]
+    fn backpressure_report_from_counts_half_loss() {
+        // is_under_backpressure stays false: this models the interleaved
+        // drop,push,drop,push pattern that resets consecutive_drops each push.
+        let r = BackpressureReport::from_counts(std::time::Duration::ZERO, 2, 2, false);
+        assert_eq!(r.pushed, 2);
+        assert_eq!(r.dropped, 2);
+        assert!(
+            (r.drop_rate - 0.5).abs() < f64::EPSILON,
+            "drop_rate should be ~0.5, got {}",
+            r.drop_rate
+        );
+        assert!(
+            !r.is_under_backpressure,
+            "windowed report must surface partial loss the legacy bool misses"
+        );
+    }
+
+    /// from_counts() guards a zero denominator.
+    #[test]
+    fn backpressure_report_from_counts_zero_denominator() {
+        let r = BackpressureReport::from_counts(std::time::Duration::ZERO, 0, 0, false);
+        assert_eq!(r.drop_rate, 0.0);
     }
 }

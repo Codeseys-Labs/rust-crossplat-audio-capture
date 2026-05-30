@@ -11,7 +11,7 @@
 //! All implementations must be `Send + Sync`.
 
 use super::config::{AudioFormat, DeviceId, StreamConfig};
-use super::error::AudioResult;
+use super::error::{AudioError, AudioResult};
 use crate::core::buffer::AudioBuffer;
 
 /// Represents the kind of an audio device.
@@ -50,6 +50,37 @@ pub trait AudioDevice: Send + Sync {
 
     /// Returns the audio formats supported by this device.
     fn supported_formats(&self) -> Vec<AudioFormat>;
+
+    /// Returns whether this device is an [`Input`](DeviceKind::Input) or
+    /// [`Output`](DeviceKind::Output) endpoint.
+    ///
+    /// # Platform behaviour
+    ///
+    /// - **Windows (WASAPI):** resolved from `IMMEndpoint::GetDataFlow`
+    ///   (`eRender` → [`Output`](DeviceKind::Output),
+    ///   `eCapture` → [`Input`](DeviceKind::Input)).
+    /// - **Linux (PipeWire):** maps the node's source/sink role. A device that
+    ///   is both a source and a sink (e.g. a monitor) reports
+    ///   [`Input`](DeviceKind::Input).
+    /// - **macOS (CoreAudio):** probed from the device's stream scope
+    ///   (`scopeInput` vs `scopeOutput`).
+    ///
+    /// # Errors
+    ///
+    /// Returns [`AudioError::PlatformNotSupported`] from the default
+    /// implementation. Backends that cannot determine a definite kind (for
+    /// example a CoreAudio device exposing no streams on either scope) return
+    /// an error rather than guessing.
+    ///
+    /// This is a **provided** method so external `AudioDevice` implementations
+    /// keep compiling without change; they inherit the
+    /// `PlatformNotSupported` default until they choose to override it.
+    fn kind(&self) -> AudioResult<DeviceKind> {
+        Err(AudioError::PlatformNotSupported {
+            feature: "device kind".to_string(),
+            platform: std::env::consts::OS.to_string(),
+        })
+    }
 
     /// Creates a new capturing stream from this device using the given configuration.
     ///
@@ -98,14 +129,14 @@ pub trait CapturingStream: Send + Sync {
     /// # Returns
     ///
     /// * `Ok(buffer)` — Audio data is available.
-    /// * `Err(`[`AudioError::StreamEnded`](crate::core::error::AudioError::StreamEnded)`)`
+    /// * `Err(`[`AudioError::StreamEnded`]`)`
     ///   — The stream has reached a terminal state (`Stopped` / `Closed` / `Error`)
     ///   and will produce no more data. This is **fatal** for the read loop
     ///   (`is_fatal() == true`); break out of it. As of
     ///   [ADR-0003](https://github.com/Codeseys-Labs/rust-crossplat-audio-capture/blob/master/docs/designs/0003-terminal-stream-error.md)
-    ///   this — not [`StreamReadError`](crate::core::error::AudioError::StreamReadError)
+    ///   this — not [`AudioError::StreamReadError`]
     ///   — is the clean end-of-stream signal.
-    /// * `Err(`[`AudioError::StreamReadError`](crate::core::error::AudioError::StreamReadError)`)`
+    /// * `Err(`[`AudioError::StreamReadError`]`)`
     ///   — A genuinely transient read failure (recoverable; retrying may succeed).
     ///
     /// # Dropped buffers
@@ -291,3 +322,50 @@ pub trait DeviceEnumerator: Send + Sync {
 
 // The AudioBuffer trait has been removed from this file.
 // It is now a concrete struct defined in src/core/buffer.rs.
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::core::error::ErrorKind;
+
+    /// A minimal `AudioDevice` that overrides nothing beyond the required
+    /// methods. It must inherit the provided `kind()` default unchanged,
+    /// proving the addition is additive/non-breaking for external impls.
+    struct MinimalDevice;
+
+    impl AudioDevice for MinimalDevice {
+        fn id(&self) -> DeviceId {
+            DeviceId("minimal".to_string())
+        }
+        fn name(&self) -> String {
+            "Minimal".to_string()
+        }
+        fn is_default(&self) -> bool {
+            false
+        }
+        fn supported_formats(&self) -> Vec<AudioFormat> {
+            Vec::new()
+        }
+        fn create_stream(&self, _config: &StreamConfig) -> AudioResult<Box<dyn CapturingStream>> {
+            Err(AudioError::PlatformNotSupported {
+                feature: "create_stream".to_string(),
+                platform: "test".to_string(),
+            })
+        }
+    }
+
+    /// The default `kind()` reports `PlatformNotSupported` (fatal, Platform
+    /// kind) without requiring the impl to override it.
+    #[test]
+    fn default_kind_is_platform_not_supported() {
+        let device = MinimalDevice;
+        let err = device.kind().expect_err("default kind() must be Err");
+        assert_eq!(err.kind(), ErrorKind::Platform);
+        match err {
+            AudioError::PlatformNotSupported { feature, .. } => {
+                assert_eq!(feature, "device kind");
+            }
+            other => panic!("expected PlatformNotSupported, got {other:?}"),
+        }
+    }
+}

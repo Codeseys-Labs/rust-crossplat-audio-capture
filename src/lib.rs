@@ -93,6 +93,7 @@ pub mod api;
 pub mod audio;
 pub mod bridge;
 pub mod core;
+pub mod prelude;
 pub mod sink;
 pub mod utils;
 
@@ -103,7 +104,9 @@ pub use crate::core::config::{
     ApplicationId, AudioCaptureConfig, AudioFormat, CaptureTarget, DeviceId, ProcessId,
     SampleFormat, StreamConfig,
 };
-pub use crate::core::error::{AudioError, AudioResult, BackendContext, ErrorKind, Recoverability};
+pub use crate::core::error::{
+    AudioError, AudioResult, BackendContext, ErrorKind, Recoverability, UserFacingError,
+};
 pub use crate::core::interface::{AudioDevice, CapturingStream, DeviceEnumerator, DeviceKind};
 
 // Audio module re-exports
@@ -112,7 +115,7 @@ pub use crate::audio::get_device_enumerator;
 // Introspection helpers (cross-platform source discovery)
 pub use crate::core::introspection::{
     check_audio_capture_permission, list_audio_applications, list_audio_sources, AudioSource,
-    AudioSourceKind, PermissionStatus, StreamStats,
+    AudioSourceKind, BackpressureReport, PermissionStatus, StreamStats,
 };
 
 // API types

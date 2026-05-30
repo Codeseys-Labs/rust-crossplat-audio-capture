@@ -22,6 +22,18 @@ import (
 
 //export goAudioCallback
 func goAudioCallback(bufferData *C.float, numSamples C.size_t, channels C.uint16_t, sampleRate C.uint32_t, userData unsafe.Pointer) {
+	// A panic must not escape this C->Go export: an unrecovered panic crossing
+	// the cgo boundary aborts the entire process. This recover covers BOTH a
+	// panicking user callback AND a cgo.Handle.Value() resolve of an
+	// already-Deleted handle. The latter is the residual #28 window: Close()
+	// (or a replacing SetCallback) may Delete the handle while this callback is
+	// in flight on the FFI delivery thread; cgo.Handle.Value() panics on a
+	// deleted handle, and recovering here turns that race into a dropped
+	// delivery instead of a use-after-free crash. The capture mutex orders the
+	// C-layer set_callback(NULL)+free before the Delete (see closeLocked), so
+	// this only ever fires for a delivery already in progress.
+	defer func() { _ = recover() }()
+
 	if userData == nil {
 		return
 	}
@@ -34,7 +46,8 @@ func goAudioCallback(bufferData *C.float, numSamples C.size_t, channels C.uint16
 	// The C contract (rsac_audio_callback_t) hands us the raw interleaved f32
 	// data directly — buffer_data/num_samples/channels/sample_rate — and the
 	// pointer is valid only for the duration of this call. Copy into Go-managed
-	// memory before invoking the user's callback.
+	// memory before invoking the user's callback so no Go AudioBuffer ever
+	// aliases the C buffer after this function returns.
 	n := int(numSamples)
 	ch := int(channels)
 	rate := int(sampleRate)
@@ -57,10 +70,6 @@ func goAudioCallback(bufferData *C.float, numSamples C.size_t, channels C.uint16
 		channels:   ch,
 		sampleRate: rate,
 	}
-	// A panic from the user callback must not escape this C->Go export: an
-	// unrecovered panic crossing the cgo boundary aborts the entire process.
-	// Recover and drop the failed delivery; the FFI pump keeps running.
-	defer func() { _ = recover() }()
 	fn(buf)
 }
 

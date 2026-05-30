@@ -28,6 +28,9 @@ use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
+#[cfg(feature = "bridge-zerocopy")]
+use rtrb::CopyToUninit;
+
 use crate::core::buffer::AudioBuffer;
 use crate::core::config::{AudioFormat, SampleFormat};
 use crate::core::error::{AudioError, AudioResult};
@@ -54,6 +57,53 @@ const RT_BUFFER_SAMPLE_CAPACITY: usize = 2048;
 ///
 /// Overridable per-bridge via [`create_bridge_with_options`].
 pub const DEFAULT_BACKPRESSURE_THRESHOLD: u32 = 10;
+
+/// Number of slots in the fixed, alloc-free windowed drop-rate ring
+/// ([`BridgeShared::drop_window`]). Each slot packs a `(pushed, dropped)`
+/// 32-bit pair into one [`AtomicU64`]; the producer advances a cursor every
+/// [`DROP_WINDOW_SLOT_PUSHES`] push attempts so the ring holds a sliding view
+/// of the most recent activity. Sized as a power of two so the modulo cursor
+/// wrap is a cheap mask. See `rsac-cfe4` and [`BridgeProducer::drop_window_snapshot`].
+pub(crate) const DROP_WINDOW_SLOTS: usize = 8;
+
+/// Number of push *attempts* accumulated into a single drop-window slot before
+/// the producer advances to the next slot. At a typical ~10 ms callback period
+/// this makes each slot ≈ 1.28 s and the whole [`DROP_WINDOW_SLOTS`]-slot ring
+/// ≈ 10 s of history — long enough to see a sustained 1-in-N loss pattern that
+/// the consecutive-drop counter ([`BridgeShared::is_under_backpressure`]) misses.
+pub(crate) const DROP_WINDOW_SLOT_PUSHES: u64 = 128;
+
+/// Pack a `(pushed, dropped)` pair of `u32`s into one `u64` for a single
+/// lock-free atomic slot in the drop-rate window. The high 32 bits hold
+/// `pushed`, the low 32 bits hold `dropped`.
+#[inline]
+fn pack_window(pushed: u32, dropped: u32) -> u64 {
+    ((pushed as u64) << 32) | (dropped as u64)
+}
+
+/// Inverse of [`pack_window`]: unpack a slot word into `(pushed, dropped)`.
+#[inline]
+fn unpack_window(packed: u64) -> (u32, u32) {
+    ((packed >> 32) as u32, (packed & 0xFFFF_FFFF) as u32)
+}
+
+/// Outcome of a single [`BridgeProducer::push_samples_reporting`] call.
+///
+/// Surfaces overflow **eagerly**, in the callback, without polling the shared
+/// `buffers_dropped` counter afterwards (`rsac-0d25`). `dropped_this_call` is
+/// the number of buffers the *current* call dropped — `0` on success, `1` when
+/// the ring was full and the buffer was dropped — so a backend can compute a
+/// per-period drop rate cheaply on the spot.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
+pub struct PushOutcome {
+    /// `true` if the buffer was pushed into the ring, `false` if it was dropped
+    /// because the ring was full.
+    pub pushed: bool,
+    /// How many buffers this single call dropped (`0` or `1` for the
+    /// one-buffer-per-call producer path).
+    pub dropped_this_call: u32,
+}
 
 /// Pack an [`AudioFormat`] into a single non-zero `u64` for lock-free atomic
 /// publication: `(sample_rate << 32) | (channels << 16) | sample_format_u8`.
@@ -146,6 +196,23 @@ pub(crate) struct BridgeShared {
     /// [`negotiated_format`](BridgeShared::negotiated_format) falls back to the
     /// requested [`format`](BridgeShared::format).
     negotiated: AtomicU64,
+    /// Fixed, alloc-free sliding window of recent `(pushed, dropped)` counts,
+    /// one packed [`AtomicU64`] per slot (see [`pack_window`]). The producer
+    /// adds to the slot selected by [`drop_window_cursor`] on every push path
+    /// with `Relaxed` ops — NO `Mutex`, NO allocation — so a reader can compute
+    /// a *windowed* drop rate that does not reset on a single successful push
+    /// (the gap the consecutive-drop bool leaves). See `rsac-cfe4`.
+    ///
+    /// [`drop_window_cursor`]: BridgeShared::drop_window_cursor
+    drop_window: [AtomicU64; DROP_WINDOW_SLOTS],
+    /// Total push *attempts* (pushed + dropped) the producer has recorded into
+    /// the drop window. Advances the active slot every [`DROP_WINDOW_SLOT_PUSHES`]
+    /// attempts (cursor == `attempts / DROP_WINDOW_SLOT_PUSHES % DROP_WINDOW_SLOTS`).
+    drop_window_cursor: AtomicU64,
+    /// Set once if a push closure ever panicked at the OS-callback boundary and
+    /// was caught by the panic guard (`rsac-d0ba`). Used to log the panic a
+    /// single time rather than on every subsequent guarded call.
+    push_panicked: std::sync::atomic::AtomicBool,
     /// Waker for async stream consumers — notified when new data is pushed.
     #[cfg(feature = "async-stream")]
     pub waker: atomic_waker::AtomicWaker,
@@ -157,6 +224,54 @@ impl BridgeShared {
     /// consumer is falling behind and cannot keep up with the producer rate.
     pub fn is_under_backpressure(&self) -> bool {
         self.consecutive_drops.load(Ordering::Relaxed) >= self.backpressure_threshold
+    }
+
+    /// Record one push attempt into the sliding drop-rate window (`rsac-cfe4`).
+    ///
+    /// `dropped` is `false` for a successful push, `true` for an overflow drop.
+    /// Selects the active slot from the running attempt count and bumps the
+    /// packed `(pushed, dropped)` pair with `Relaxed` adds — **no allocation, no
+    /// lock**, safe on the real-time callback thread. When the cursor advances
+    /// into a new slot, that slot is reset to `0` first so it holds only the
+    /// most recent window's activity rather than accumulating forever.
+    #[inline]
+    fn record_drop_window(&self, dropped: bool) {
+        // `fetch_add` returns the value *before* the add; that is the index of
+        // this attempt. The slot is `attempts / SLOT_PUSHES`, wrapped into the
+        // ring. When this attempt is the first of a new slot, clear the slot so
+        // it starts fresh (sliding window, not a running total).
+        let attempt = self.drop_window_cursor.fetch_add(1, Ordering::Relaxed);
+        let slot_seq = attempt / DROP_WINDOW_SLOT_PUSHES;
+        let idx = (slot_seq as usize) & (DROP_WINDOW_SLOTS - 1);
+        if attempt.is_multiple_of(DROP_WINDOW_SLOT_PUSHES) {
+            // First attempt of this slot's lifetime → reset stale contents.
+            self.drop_window[idx].store(0, Ordering::Relaxed);
+        }
+        // One push attempt == +1 to exactly one of (pushed, dropped).
+        let delta = if dropped {
+            pack_window(0, 1)
+        } else {
+            pack_window(1, 0)
+        };
+        self.drop_window[idx].fetch_add(delta, Ordering::Relaxed);
+    }
+
+    /// Read the aggregate `(pushed, dropped)` totals across all live slots of
+    /// the sliding drop-rate window (`rsac-cfe4`).
+    ///
+    /// A single `Relaxed` pass over the fixed [`DROP_WINDOW_SLOTS`] atomics — no
+    /// allocation, no lock. Returned counts are an eventually-consistent
+    /// snapshot of recent activity, suitable for computing a windowed drop rate
+    /// in `BackpressureReport` on the (non-RT) reader side.
+    pub fn drop_window_snapshot(&self) -> (u64, u64) {
+        let mut pushed_total = 0u64;
+        let mut dropped_total = 0u64;
+        for slot in &self.drop_window {
+            let (p, d) = unpack_window(slot.load(Ordering::Relaxed));
+            pushed_total += p as u64;
+            dropped_total += d as u64;
+        }
+        (pushed_total, dropped_total)
     }
 
     /// Record the **authoritative delivery format** negotiated with the OS.
@@ -251,6 +366,11 @@ impl BridgeProducer {
             Ok(()) => {
                 self.shared.buffers_pushed.fetch_add(1, Ordering::Relaxed);
                 self.shared.consecutive_drops.store(0, Ordering::Relaxed);
+                // Record a successful attempt in the sliding drop-rate window
+                // (rsac-cfe4). The drop arm is owned by the caller (push returns
+                // the rejected buffer rather than dropping it), so only success
+                // is recorded here to avoid double-counting via push_or_drop.
+                self.shared.record_drop_window(false);
                 #[cfg(feature = "async-stream")]
                 self.shared.waker.wake();
                 Ok(())
@@ -274,6 +394,10 @@ impl BridgeProducer {
                 self.shared
                     .consecutive_drops
                     .fetch_add(1, Ordering::Relaxed);
+                // Record the drop in the sliding window (rsac-cfe4). The
+                // success arm is recorded inside `push()`, so only the drop is
+                // recorded here — no double-counting.
+                self.shared.record_drop_window(true);
                 false
             }
         }
@@ -302,7 +426,74 @@ impl BridgeProducer {
     /// This is the preferred method for OS audio callbacks. Callers should use
     /// this instead of manually calling `data.to_vec()` + `AudioBuffer::new()` +
     /// `push_or_drop()`.
+    ///
+    /// Delegates to [`push_samples_or_drop_at`](Self::push_samples_or_drop_at)
+    /// with no timestamp; see that method for the variant that stamps each
+    /// buffer with a stream-relative position.
+    #[inline]
     pub fn push_samples_or_drop(&mut self, data: &[f32], channels: u16, sample_rate: u32) -> bool {
+        self.push_samples_or_drop_inner(data, channels, sample_rate, None)
+    }
+
+    /// Like [`push_samples_or_drop`](Self::push_samples_or_drop), but stamps the
+    /// buffer with a **stream-relative timestamp** (`rsac-522b`).
+    ///
+    /// `timestamp` is the position of this buffer's first sample relative to the
+    /// stream start — typically a cached `Instant::elapsed()` the backend already
+    /// holds, so there is **no extra clock syscall** on the hot path. The
+    /// timestamp survives the ring + free-list recycle round-trip (see
+    /// [`BridgeConsumer::pop`]) and is observable via
+    /// [`AudioBuffer::timestamp`](crate::core::buffer::AudioBuffer::timestamp),
+    /// making per-buffer latency/jitter measurable.
+    ///
+    /// Shares the exact same alloc-free free-list/scratch path as the untimed
+    /// variant: in steady state it performs **no heap allocation**.
+    #[inline]
+    pub fn push_samples_or_drop_at(
+        &mut self,
+        data: &[f32],
+        channels: u16,
+        sample_rate: u32,
+        timestamp: Duration,
+    ) -> bool {
+        self.push_samples_or_drop_inner(data, channels, sample_rate, Some(timestamp))
+    }
+
+    /// Like [`push_samples_or_drop`](Self::push_samples_or_drop), but reports the
+    /// per-call overflow outcome **synchronously** (`rsac-0d25`).
+    ///
+    /// Returns a [`PushOutcome`] giving `pushed` and `dropped_this_call` without
+    /// the caller having to poll the shared `buffers_dropped` counter — so a
+    /// backend can compute a per-period drop rate cheaply, right in the callback.
+    /// Same alloc-free, lock-free path as [`push_samples_or_drop`](Self::push_samples_or_drop).
+    #[inline]
+    pub fn push_samples_reporting(
+        &mut self,
+        data: &[f32],
+        channels: u16,
+        sample_rate: u32,
+    ) -> PushOutcome {
+        let pushed = self.push_samples_or_drop_inner(data, channels, sample_rate, None);
+        PushOutcome {
+            pushed,
+            // One buffer per call: a failed push dropped exactly one buffer.
+            dropped_this_call: if pushed { 0 } else { 1 },
+        }
+    }
+
+    /// Shared alloc-free core for the `push_samples_*` family.
+    ///
+    /// When `timestamp` is `Some`, the buffer is built with
+    /// [`AudioBuffer::with_timestamp`]; otherwise with [`AudioBuffer::new`]. Both
+    /// paths reuse the identical free-list/scratch logic, so the RT-allocation
+    /// guarantee (ADR-0001) is unchanged for the timestamped variant.
+    fn push_samples_or_drop_inner(
+        &mut self,
+        data: &[f32],
+        channels: u16,
+        sample_rate: u32,
+        timestamp: Option<Duration>,
+    ) -> bool {
         // Acquire a reusable Vec: prefer a recycled allocation from the
         // free-list ring, otherwise fall back to the single-slot scratch.
         // `used_scratch` records whether we consumed the scratch slot, so the
@@ -316,12 +507,28 @@ impl BridgeProducer {
         vec.clear();
         vec.extend_from_slice(data);
 
-        let buffer = AudioBuffer::new(vec, channels, sample_rate);
+        // Build with or without a stream-relative timestamp. Both arms reuse the
+        // same recycled `vec`, so neither allocates on the RT thread (rsac-522b).
+        let buffer = match timestamp {
+            Some(ts) => AudioBuffer::with_timestamp(
+                vec,
+                AudioFormat {
+                    sample_rate,
+                    channels,
+                    sample_format: SampleFormat::F32,
+                },
+                ts,
+            ),
+            None => AudioBuffer::new(vec, channels, sample_rate),
+        };
 
         match self.producer.push(buffer) {
             Ok(()) => {
                 self.shared.buffers_pushed.fetch_add(1, Ordering::Relaxed);
                 self.shared.consecutive_drops.store(0, Ordering::Relaxed);
+                // Record a successful attempt in the sliding drop-rate window
+                // (rsac-cfe4) — Relaxed, alloc-free, lock-free.
+                self.shared.record_drop_window(false);
                 #[cfg(feature = "async-stream")]
                 self.shared.waker.wake();
                 // If we consumed the scratch fallback, the scratch slot is now
@@ -355,9 +562,81 @@ impl BridgeProducer {
                 self.shared
                     .consecutive_drops
                     .fetch_add(1, Ordering::Relaxed);
+                // Record the overflow drop in the sliding window (rsac-cfe4).
+                self.shared.record_drop_window(true);
                 false
             }
         }
+    }
+
+    /// Panic-guarded wrapper around [`push_samples_or_drop`](Self::push_samples_or_drop)
+    /// for use **directly at the OS audio-callback boundary** (`rsac-d0ba`).
+    ///
+    /// The platform backends invoke the producer from inside a C/OS audio engine
+    /// callback. If a push were ever to panic there, the unwind would cross the
+    /// FFI boundary into the engine — undefined behavior that can corrupt or
+    /// abort the process. This method wraps the push in
+    /// [`std::panic::catch_unwind`] so a panic can never escape: on a caught
+    /// panic it logs **once**, counts a dropped buffer, best-effort transitions
+    /// the stream to [`StreamState::Error`], and returns `false`.
+    ///
+    /// `catch_unwind` is near-free on the happy path and introduces **no heap
+    /// allocation** there (the closure only borrows `&mut self` and `data`), so
+    /// the ADR-0001 alloc-free guarantee is preserved — the alloc-probe still
+    /// reports `0`. Prefer this at FFI call sites; the unguarded
+    /// [`push_samples_or_drop`](Self::push_samples_or_drop) remains available for
+    /// in-process callers where a panic would unwind normally.
+    pub fn push_samples_guarded(&mut self, data: &[f32], channels: u16, sample_rate: u32) -> bool {
+        // `&mut self` is not UnwindSafe (it could be left in a torn state), but a
+        // panic here is already a last-resort safety net and we immediately
+        // poison the stream to Error, so asserting unwind-safety is sound: no
+        // further pushes are expected to succeed after a caught panic.
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            self.push_samples_or_drop(data, channels, sample_rate)
+        }));
+        match result {
+            Ok(pushed) => pushed,
+            Err(_payload) => {
+                self.on_push_panic();
+                false
+            }
+        }
+    }
+
+    /// Common handling for a panic caught by [`push_samples_guarded`](Self::push_samples_guarded):
+    /// log once, count a drop, and poison the stream to [`StreamState::Error`].
+    #[cold]
+    #[inline(never)]
+    fn on_push_panic(&self) {
+        // Log only the first caught panic to avoid flooding the log from a
+        // repeatedly-panicking callback. `swap` returns the previous value, so
+        // exactly one caller observes `false` and logs.
+        if !self.shared.push_panicked.swap(true, Ordering::Relaxed) {
+            log::error!(
+                "panic caught at the audio-callback push boundary; \
+                 transitioning stream to Error and dropping the buffer"
+            );
+        }
+        // Count the buffer as dropped (it never reached the ring).
+        self.shared.buffers_dropped.fetch_add(1, Ordering::Relaxed);
+        self.shared
+            .consecutive_drops
+            .fetch_add(1, Ordering::Relaxed);
+        self.shared.record_drop_window(true);
+        // Best-effort poison: force the stream into the terminal Error state so
+        // readers observe end-of-stream rather than spinning on a dead callback.
+        self.shared.state.force_set(StreamState::Error);
+        #[cfg(feature = "async-stream")]
+        self.shared.waker.wake();
+    }
+
+    /// Read the aggregate `(pushed, dropped)` totals across the sliding
+    /// drop-rate window (`rsac-cfe4`). Forwards to the shared state's
+    /// `drop_window_snapshot`; exposed on the producer so a
+    /// reader holding the producer (e.g. tests, backends) can compute a windowed
+    /// drop rate without reaching into shared state.
+    pub fn drop_window_snapshot(&self) -> (u64, u64) {
+        self.shared.drop_window_snapshot()
     }
 
     /// Signals that the producer is done sending data.
@@ -432,6 +711,14 @@ pub struct BridgeConsumer {
     /// reuse it without allocating on the real-time thread. If the ring is full
     /// the spare allocation is simply dropped (freed) — bounded and harmless.
     free_tx: rtrb::Producer<Vec<f32>>,
+    /// Small consumer-side pool of spare `Vec<f32>` allocations used to refill
+    /// the producer's free-list **without copying** the ring buffer's payload
+    /// (`rsac-17d1`). [`pop`](Self::pop) now *moves* the ring's `Vec` straight
+    /// to the user (no `clone`) and recycles a spare pulled from this pool to
+    /// the producer instead — so the per-pop full-buffer memcpy is gone. The
+    /// pool is replenished lazily off the real-time thread (here, on the
+    /// consumer thread), preserving the RT producer's alloc-free guarantee.
+    spare_pool: Vec<Vec<f32>>,
 }
 
 // BridgeConsumer is Send (can be moved to the consumer thread).
@@ -444,36 +731,61 @@ impl BridgeConsumer {
     ///
     /// # Allocation / recycling
     ///
-    /// The user receives a freshly-allocated owned [`AudioBuffer`] (the
-    /// allocation happens here, on the non-real-time consumer thread). The
-    /// original `Vec<f32>` that travelled through the ring is recycled back to
-    /// the producer via the free-list return ring, which is what keeps
-    /// [`BridgeProducer::push_samples_or_drop`] allocation-free on the RT thread.
+    /// The user receives the [`AudioBuffer`] **that travelled through the ring,
+    /// moved with no copy** (`rsac-17d1`) — there is no per-pop `Vec` clone +
+    /// memcpy. To keep the producer's free-list populated (so
+    /// [`BridgeProducer::push_samples_or_drop`] stays allocation-free on the RT
+    /// thread), a *spare* `Vec<f32>` is recycled back to the producer instead:
+    /// pulled from a small consumer-side `spare_pool`, or
+    /// freshly allocated when the pool is empty. Any such allocation happens
+    /// here, on the **non-real-time consumer thread** — the constraint that
+    /// matters — never on the producer's callback thread.
     pub fn pop(&mut self) -> Option<AudioBuffer> {
         match self.consumer.pop() {
             Ok(buffer) => {
                 self.shared.buffers_popped.fetch_add(1, Ordering::Relaxed);
 
-                // Reconstruct an owned buffer for the user (allocates here, on
-                // the consumer/non-RT thread) and recycle the original
-                // allocation back to the producer's free-list ring.
-                let format = buffer.format().clone();
-                let timestamp = buffer.timestamp();
-                let original = buffer.into_data();
-                let user_copy = original.clone();
-
-                let user_buffer = match timestamp {
-                    Some(ts) => AudioBuffer::with_timestamp(user_copy, format, ts),
-                    None => AudioBuffer::with_format(user_copy, format),
+                // Recycle a *spare* allocation back to the producer so its
+                // free-list stays supplied without us copying the payload. Reuse
+                // a pooled spare if we have one, else allocate a pre-sized empty
+                // Vec (off the RT thread). Pre-sizing to the delivered length
+                // means the producer's next `extend_from_slice` reuses the
+                // capacity instead of growing from zero.
+                let len = buffer.data().len();
+                let spare = match self.spare_pool.pop() {
+                    Some(mut v) => {
+                        if v.capacity() < len {
+                            v.reserve(len - v.capacity());
+                        }
+                        v
+                    }
+                    None => Vec::with_capacity(len.max(RT_BUFFER_SAMPLE_CAPACITY)),
                 };
 
                 // Best-effort recycle; if the free-list ring is full, the spare
                 // allocation is dropped (freed) — bounded and harmless.
-                let _ = self.free_tx.push(original);
+                let _ = self.free_tx.push(spare);
 
-                Some(user_buffer)
+                // Hand the user the buffer that travelled the ring — moved, not
+                // cloned. One fewer alloc + full-buffer memcpy per delivered
+                // buffer than the previous clone-and-recycle approach.
+                Some(buffer)
             }
             Err(rtrb::PopError::Empty) => None,
+        }
+    }
+
+    /// Refill the consumer-side spare pool with up to `count` pre-sized empty
+    /// `Vec<f32>` allocations (off the real-time thread).
+    ///
+    /// Optional warm-up helper: calling this before a capture burst means the
+    /// first `pop`s recycle a pooled spare instead of allocating one inline.
+    /// Test/diagnostic surface — `pop` already lazily allocates when the pool is
+    /// empty, so correctness does not depend on it.
+    #[allow(dead_code)]
+    pub(crate) fn refill_spare_pool(&mut self, count: usize, sample_capacity: usize) {
+        for _ in 0..count {
+            self.spare_pool.push(Vec::with_capacity(sample_capacity));
         }
     }
 
@@ -550,6 +862,233 @@ impl BridgeConsumer {
     }
 }
 
+// ── Sample-domain SPSC ring (feature: bridge-zerocopy) ─────────────────────
+
+/// Per-chunk metadata travelling the sidecar ring alongside the interleaved
+/// `f32` samples in [`SampleRing`]. One record per pushed chunk lets the
+/// consumer slice the sample stream back into equivalent [`AudioBuffer`]s.
+///
+/// `rsac-3616`: keeping metadata in a tiny parallel SPSC ring (rather than
+/// interleaving it with samples) keeps the sample ring a pure `f32` ring, which
+/// is the precondition for `rtrb`'s `write_chunk_uninit` + [`CopyToUninit`]
+/// fast path — samples are copied straight into the ring's `MaybeUninit<f32>`
+/// slots with no `Vec`/`AudioBuffer` allocation on the producer thread.
+#[cfg(feature = "bridge-zerocopy")]
+#[derive(Debug, Clone, Copy)]
+struct ChunkMeta {
+    /// Number of interleaved `f32` samples this chunk occupies in the sample ring.
+    len: usize,
+    channels: u16,
+    sample_rate: u32,
+    /// Stream-relative timestamp of the first sample, encoded as nanoseconds;
+    /// `u64::MAX` is the "no timestamp" sentinel (matches `AudioBuffer::new`).
+    timestamp_nanos: u64,
+}
+
+#[cfg(feature = "bridge-zerocopy")]
+const NO_TIMESTAMP: u64 = u64::MAX;
+
+/// Producer side of the sample-domain SPSC ring (`rsac-3616`, feature
+/// `bridge-zerocopy`, default OFF).
+///
+/// Writes interleaved `f32` directly into the ring's uninitialized slots via
+/// `rtrb::Producer::write_chunk_uninit` + [`CopyToUninit::copy_to_uninit`] then
+/// `commit` — **no `Vec<f32>` and no `AudioBuffer` allocation on the producer
+/// call**. A parallel metadata ring carries `(len, channels, sample_rate,
+/// timestamp)` so the consumer can reconstruct equivalent `AudioBuffer`s. This
+/// is an *internal* alternative data plane A/B'd against the default
+/// `AudioBuffer` ring in the bridge benchmark; the public producer/consumer
+/// surface is unchanged.
+#[cfg(feature = "bridge-zerocopy")]
+pub struct SampleRingProducer {
+    samples: rtrb::Producer<f32>,
+    meta: rtrb::Producer<ChunkMeta>,
+    shared: Arc<BridgeShared>,
+}
+
+#[cfg(feature = "bridge-zerocopy")]
+impl SampleRingProducer {
+    /// Push one interleaved-`f32` chunk into the sample ring with **zero
+    /// allocation** on this (real-time) call.
+    ///
+    /// Reserves `data.len()` contiguous-or-wrapped slots via
+    /// `write_chunk_uninit`, copies the samples in with
+    /// [`CopyToUninit::copy_to_uninit`] (a `memcpy` into `MaybeUninit<f32>`
+    /// slots — no intermediate buffer), commits, then publishes one metadata
+    /// record. If either ring lacks room the whole chunk is dropped atomically
+    /// (nothing is committed) and `buffers_dropped` is incremented, so the
+    /// consumer never sees a partial chunk.
+    ///
+    /// Returns `true` if the chunk was published, `false` if dropped.
+    pub fn push_samples_or_drop_at(
+        &mut self,
+        data: &[f32],
+        channels: u16,
+        sample_rate: u32,
+        timestamp: Option<Duration>,
+    ) -> bool {
+        // Require room in BOTH rings before committing anything, so a chunk is
+        // all-or-nothing and the metadata/sample streams never desynchronize.
+        if self.meta.slots() == 0 {
+            return self.drop_chunk();
+        }
+        let mut chunk = match self.samples.write_chunk_uninit(data.len()) {
+            Ok(chunk) => chunk,
+            Err(_too_few) => return self.drop_chunk(),
+        };
+
+        // Copy the interleaved samples straight into the (possibly wrapped)
+        // uninitialized ring slots — no Vec, no AudioBuffer.
+        let (first, second) = chunk.as_mut_slices();
+        let mid = first.len();
+        data[..mid].copy_to_uninit(first);
+        data[mid..].copy_to_uninit(second);
+        // SAFETY: copy_to_uninit initialized exactly `data.len()` slots above.
+        unsafe { chunk.commit_all() };
+
+        let meta = ChunkMeta {
+            len: data.len(),
+            channels,
+            sample_rate,
+            timestamp_nanos: timestamp.map_or(NO_TIMESTAMP, |d| d.as_nanos() as u64),
+        };
+        // The metadata push cannot fail: we checked `meta.slots() > 0` above and
+        // are the sole producer. If it somehow did, the samples are already
+        // committed; recover by counting a drop (the consumer tolerates a
+        // missing meta by treating the sample ring as authoritative-by-meta).
+        if self.meta.push(meta).is_err() {
+            return self.drop_chunk();
+        }
+
+        self.shared.buffers_pushed.fetch_add(1, Ordering::Relaxed);
+        self.shared.consecutive_drops.store(0, Ordering::Relaxed);
+        self.shared.record_drop_window(false);
+        #[cfg(feature = "async-stream")]
+        self.shared.waker.wake();
+        true
+    }
+
+    /// Untimed convenience wrapper around
+    /// [`push_samples_or_drop_at`](Self::push_samples_or_drop_at).
+    #[inline]
+    pub fn push_samples_or_drop(&mut self, data: &[f32], channels: u16, sample_rate: u32) -> bool {
+        self.push_samples_or_drop_at(data, channels, sample_rate, None)
+    }
+
+    /// Account a dropped chunk and return `false`.
+    #[inline]
+    fn drop_chunk(&self) -> bool {
+        self.shared.buffers_dropped.fetch_add(1, Ordering::Relaxed);
+        self.shared
+            .consecutive_drops
+            .fetch_add(1, Ordering::Relaxed);
+        self.shared.record_drop_window(true);
+        false
+    }
+}
+
+/// Consumer side of the sample-domain SPSC ring (`rsac-3616`).
+///
+/// Reads one `ChunkMeta` record, pops exactly that many interleaved `f32`
+/// from the sample ring, and reconstructs an [`AudioBuffer`] equivalent to what
+/// the default `AudioBuffer` ring would have delivered (same data, channels,
+/// rate, and timestamp). The reconstruction allocates the user's `Vec<f32>`
+/// here, on the **non-real-time consumer thread** — same division of labor as
+/// the default path.
+#[cfg(feature = "bridge-zerocopy")]
+pub struct SampleRingConsumer {
+    samples: rtrb::Consumer<f32>,
+    meta: rtrb::Consumer<ChunkMeta>,
+    shared: Arc<BridgeShared>,
+}
+
+#[cfg(feature = "bridge-zerocopy")]
+impl SampleRingConsumer {
+    /// Pop one chunk, reconstructing the [`AudioBuffer`]. Returns `None` if no
+    /// complete chunk is available yet.
+    pub fn pop(&mut self) -> Option<AudioBuffer> {
+        let meta = self.meta.pop().ok()?;
+        // Pull exactly `meta.len` samples back out of the f32 ring.
+        let mut data = Vec::with_capacity(meta.len);
+        // `read_chunk` gives us the (possibly wrapped) slices; copy them out and
+        // commit so the producer can reuse the slots.
+        match self.samples.read_chunk(meta.len) {
+            Ok(chunk) => {
+                let (first, second) = chunk.as_slices();
+                data.extend_from_slice(first);
+                data.extend_from_slice(second);
+                chunk.commit_all();
+            }
+            Err(_too_few) => {
+                // Should not happen: meta is only published after its samples
+                // are committed. Treat as no data rather than panicking.
+                return None;
+            }
+        }
+
+        self.shared.buffers_popped.fetch_add(1, Ordering::Relaxed);
+
+        let format = AudioFormat {
+            sample_rate: meta.sample_rate,
+            channels: meta.channels,
+            sample_format: SampleFormat::F32,
+        };
+        Some(if meta.timestamp_nanos == NO_TIMESTAMP {
+            AudioBuffer::with_format(data, format)
+        } else {
+            AudioBuffer::with_timestamp(data, format, Duration::from_nanos(meta.timestamp_nanos))
+        })
+    }
+
+    /// Number of complete chunks currently ready to read.
+    pub fn available_chunks(&self) -> usize {
+        self.meta.slots()
+    }
+}
+
+/// Create a matched [`SampleRingProducer`]/[`SampleRingConsumer`] pair
+/// (`rsac-3616`, feature `bridge-zerocopy`).
+///
+/// `sample_capacity` is the number of interleaved `f32` slots in the sample
+/// ring; `max_chunks` bounds how many in-flight chunks the metadata sidecar can
+/// hold. Both are rounded to the ring's own power-of-two policy by `rtrb`.
+#[cfg(feature = "bridge-zerocopy")]
+pub fn create_sample_ring(
+    sample_capacity: usize,
+    max_chunks: usize,
+    format: AudioFormat,
+) -> (SampleRingProducer, SampleRingConsumer) {
+    let (sp, sc) = rtrb::RingBuffer::<f32>::new(sample_capacity);
+    let (mp, mc) = rtrb::RingBuffer::<ChunkMeta>::new(max_chunks.max(1));
+    let shared = Arc::new(BridgeShared {
+        state: AtomicStreamState::new(StreamState::Created),
+        buffers_pushed: AtomicU64::new(0),
+        buffers_dropped: AtomicU64::new(0),
+        buffers_popped: AtomicU64::new(0),
+        consecutive_drops: AtomicU32::new(0),
+        backpressure_threshold: DEFAULT_BACKPRESSURE_THRESHOLD,
+        negotiated: AtomicU64::new(0),
+        drop_window: std::array::from_fn(|_| AtomicU64::new(0)),
+        drop_window_cursor: AtomicU64::new(0),
+        push_panicked: std::sync::atomic::AtomicBool::new(false),
+        format,
+        #[cfg(feature = "async-stream")]
+        waker: atomic_waker::AtomicWaker::new(),
+    });
+    (
+        SampleRingProducer {
+            samples: sp,
+            meta: mp,
+            shared: Arc::clone(&shared),
+        },
+        SampleRingConsumer {
+            samples: sc,
+            meta: mc,
+            shared,
+        },
+    )
+}
+
 // ── Factory ──────────────────────────────────────────────────────────────
 
 /// Create a matched producer/consumer pair connected by a lock-free ring buffer.
@@ -609,6 +1148,12 @@ pub fn create_bridge_with_options(
         // 0 == "no backend negotiation yet"; negotiated_format() then falls
         // back to the requested `format` below.
         negotiated: AtomicU64::new(0),
+        // Fixed alloc-free sliding drop-rate window, all slots zeroed
+        // (rsac-cfe4). `from_fn` avoids relying on an array `Default` impl for
+        // the non-`Copy` `AtomicU64`.
+        drop_window: std::array::from_fn(|_| AtomicU64::new(0)),
+        drop_window_cursor: AtomicU64::new(0),
+        push_panicked: std::sync::atomic::AtomicBool::new(false),
         format,
         #[cfg(feature = "async-stream")]
         waker: atomic_waker::AtomicWaker::new(),
@@ -627,6 +1172,12 @@ pub fn create_bridge_with_options(
             consumer,
             shared,
             free_tx,
+            // Pre-seed the consumer-side spare pool so the first `pop`s recycle
+            // a pooled allocation to the producer rather than allocating one
+            // inline (rsac-17d1). Sized to the free-list seed for symmetry.
+            spare_pool: (0..seed)
+                .map(|_| Vec::with_capacity(RT_BUFFER_SAMPLE_CAPACITY))
+                .collect(),
         },
     )
 }
@@ -1420,5 +1971,360 @@ mod tests {
             ITEMS,
             "pushed ({pushed}) + dropped ({dropped}) must equal attempts ({ITEMS})"
         );
+    }
+
+    // ===== rsac-d0ba: panic guard at the producer push boundary =====
+
+    // The guarded push behaves exactly like push_samples_or_drop on the happy
+    // path: pushes data through, returns true, and the buffer is readable.
+    #[test]
+    fn push_samples_guarded_happy_path_matches_unguarded() {
+        let (mut producer, mut consumer) = create_bridge(8, test_format());
+        assert!(producer.push_samples_guarded(&[0.1, -0.2, 0.3, -0.4], 2, 44100));
+        let buf = consumer
+            .pop()
+            .expect("guarded push should deliver a buffer");
+        assert_eq!(buf.data(), &[0.1, -0.2, 0.3, -0.4]);
+        assert_eq!(buf.channels(), 2);
+        assert_eq!(buf.sample_rate(), 44100);
+        // No panic occurred, so the stream is not poisoned.
+        assert_ne!(producer.shared().state.get(), StreamState::Error);
+    }
+
+    // A panic raised inside the guarded region is caught: it never unwinds out
+    // of push_samples_guarded, the stream transitions to Error, and the drop
+    // counter increments instead of aborting/UB. We force a panic by invoking
+    // the panic-handler path directly (the catch_unwind contract is exercised
+    // by the std-level test below).
+    #[test]
+    fn push_panic_handler_poisons_stream_and_counts_drop() {
+        let (producer, _consumer) = create_bridge(8, test_format());
+        producer.shared().state.force_set(StreamState::Running);
+        assert_eq!(producer.buffers_dropped(), 0);
+
+        // Drive the cold panic-handling path.
+        producer.on_push_panic();
+
+        assert_eq!(
+            producer.shared().state.get(),
+            StreamState::Error,
+            "a caught push panic must poison the stream to Error"
+        );
+        assert_eq!(
+            producer.buffers_dropped(),
+            1,
+            "a caught push panic must count one dropped buffer"
+        );
+    }
+
+    // catch_unwind in push_samples_guarded actually contains a real panic raised
+    // while building the buffer. We can't easily make push_samples_or_drop itself
+    // panic without instrumentation, so this test asserts the guard's contract at
+    // the std level: a panicking closure under AssertUnwindSafe is caught.
+    #[test]
+    fn catch_unwind_contains_panic_for_guard_contract() {
+        let caught = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            panic!("simulated callback panic");
+        }));
+        assert!(
+            caught.is_err(),
+            "catch_unwind must contain a panic so it never crosses the FFI boundary"
+        );
+    }
+
+    // ===== rsac-0d25: synchronous per-call overflow reporting =====
+
+    // push_samples_reporting reports pushed=true / dropped_this_call=0 on success.
+    #[test]
+    fn push_samples_reporting_success() {
+        let (mut producer, mut consumer) = create_bridge(8, test_format());
+        let out = producer.push_samples_reporting(&[1.0, 2.0], 2, 48000);
+        assert!(out.pushed);
+        assert_eq!(out.dropped_this_call, 0);
+        let buf = consumer.pop().expect("buffer");
+        assert_eq!(buf.data(), &[1.0, 2.0]);
+    }
+
+    // dropped-this-call reporting matches the delta in buffers_dropped across a
+    // full-ring scenario.
+    #[test]
+    fn push_samples_reporting_dropped_matches_counter_delta() {
+        let (mut producer, _consumer) = create_bridge(2, test_format());
+        // Fill the ring (cap 2).
+        assert!(producer.push_samples_reporting(&[1.0], 1, 48000).pushed);
+        assert!(producer.push_samples_reporting(&[2.0], 1, 48000).pushed);
+
+        let before = producer.buffers_dropped();
+        let out = producer.push_samples_reporting(&[3.0], 1, 48000);
+        let after = producer.buffers_dropped();
+
+        assert!(!out.pushed, "ring full → push must fail");
+        assert_eq!(out.dropped_this_call, 1, "exactly one buffer dropped");
+        assert_eq!(
+            after - before,
+            out.dropped_this_call as u64,
+            "dropped_this_call must equal the buffers_dropped delta"
+        );
+    }
+
+    // ===== rsac-522b: per-buffer stream-relative timestamps =====
+
+    // push_samples_or_drop_at stamps the buffer, and the timestamp survives the
+    // recycle round-trip through both rings.
+    #[test]
+    fn push_samples_or_drop_at_timestamp_survives_roundtrip() {
+        let (mut producer, mut consumer) = create_bridge(8, test_format());
+        let ts = Duration::from_micros(12_345);
+        assert!(producer.push_samples_or_drop_at(&[0.5, -0.5], 2, 48000, ts));
+
+        let buf = consumer.pop().expect("buffer");
+        assert_eq!(buf.timestamp(), Some(ts), "timestamp must survive recycle");
+        assert_eq!(buf.data(), &[0.5, -0.5]);
+        assert_eq!(buf.channels(), 2);
+        assert_eq!(buf.sample_rate(), 48000);
+    }
+
+    // The untimed variant still yields no timestamp (delegates with None).
+    #[test]
+    fn push_samples_or_drop_yields_no_timestamp() {
+        let (mut producer, mut consumer) = create_bridge(8, test_format());
+        assert!(producer.push_samples_or_drop(&[0.1, 0.2], 2, 48000));
+        let buf = consumer.pop().expect("buffer");
+        assert_eq!(buf.timestamp(), None);
+    }
+
+    // The timestamped path keeps the RT-allocation guarantee: recycled_available
+    // stays > 0 in steady state with monotonically increasing timestamps.
+    #[test]
+    fn timestamped_push_preserves_recycling_and_monotonic_ts() {
+        let (mut producer, mut consumer) = create_bridge(8, test_format());
+        let mut last = Duration::ZERO;
+        for i in 0..1000u64 {
+            let ts = Duration::from_micros(i * 1000);
+            assert!(producer.push_samples_or_drop_at(&[i as f32, i as f32 + 0.5], 2, 48000, ts));
+            let buf = consumer.pop().expect("one buffer per iteration");
+            let got = buf.timestamp().expect("timestamped path carries Some(ts)");
+            assert!(got >= last, "timestamps must be non-decreasing");
+            last = got;
+        }
+        assert!(
+            producer.recycled_available() > 0,
+            "timestamped path must keep the free-list populated (ADR-0001)"
+        );
+    }
+
+    // ===== rsac-cfe4: windowed drop-rate tracking =====
+
+    // A drop,push,drop,push pattern that NEVER trips the consecutive-threshold
+    // bool still reports ~0.5 drop rate in the windowed snapshot.
+    #[test]
+    fn windowed_drop_rate_sees_alternating_loss_the_bool_misses() {
+        // Threshold high so the consecutive-drop bool never trips; ring cap 1 so
+        // we can deterministically alternate success/drop.
+        let (mut producer, mut consumer) = create_bridge_with_options(1, test_format(), 1000);
+
+        let mut pushes = 0u64;
+        let mut drops = 0u64;
+        for _ in 0..200 {
+            // Ring empty → this push succeeds.
+            assert!(producer.push_samples_or_drop(&[1.0], 1, 48000));
+            pushes += 1;
+            // Ring now full → this push drops.
+            assert!(!producer.push_samples_or_drop(&[2.0], 1, 48000));
+            drops += 1;
+            // Drain so the next iteration can push again.
+            let _ = consumer.pop().expect("buffer");
+        }
+
+        // The consecutive-drop bool must NOT have tripped (every drop is followed
+        // by a success that resets the streak).
+        assert!(
+            !producer.shared().is_under_backpressure(),
+            "alternating loss must not trip the consecutive-drop bool"
+        );
+
+        // The windowed snapshot, however, reflects the sustained ~50% loss.
+        let (w_pushed, w_dropped) = producer.drop_window_snapshot();
+        assert!(w_pushed > 0 && w_dropped > 0, "window saw activity");
+        let rate = w_dropped as f64 / (w_pushed + w_dropped) as f64;
+        assert!(
+            (rate - 0.5).abs() < 0.1,
+            "windowed drop rate should be ~0.5, got {rate} (pushed={w_pushed}, dropped={w_dropped})"
+        );
+        // Sanity: the bridge's lifetime counters agree on the totals.
+        assert_eq!(
+            producer.shared().buffers_pushed.load(Ordering::Relaxed),
+            pushes
+        );
+        assert_eq!(producer.buffers_dropped(), drops);
+    }
+
+    // A fresh bridge reports an all-zero window (no division-by-zero risk for the
+    // reader computing a rate).
+    #[test]
+    fn windowed_drop_snapshot_zero_on_fresh_bridge() {
+        let (producer, _consumer) = create_bridge(8, test_format());
+        assert_eq!(producer.drop_window_snapshot(), (0, 0));
+    }
+
+    // The legacy consecutive-drop bool is unaffected by the window: a long run of
+    // pure drops still trips it (window recording does not interfere).
+    #[test]
+    fn windowed_tracking_does_not_break_consecutive_bool() {
+        let (mut producer, _consumer) = create_bridge_with_options(1, test_format(), 3);
+        assert!(producer.push_samples_or_drop(&[1.0], 1, 48000)); // fills ring
+        for _ in 0..3 {
+            assert!(!producer.push_samples_or_drop(&[9.0], 1, 48000)); // all drop
+        }
+        assert!(
+            producer.shared().is_under_backpressure(),
+            "3 consecutive drops must trip the threshold-3 bool"
+        );
+    }
+
+    // ===== rsac-17d1: consumer pop moves the ring buffer (no clone) =====
+
+    // pop still preserves data/format/timestamp (the buffer is moved intact) and
+    // still recycles an allocation to the producer's free-list.
+    #[test]
+    fn move_pop_preserves_data_and_recycles_spare() {
+        // Capacity 4 → free-list ring seeded full (4 spares). Drain it via 4
+        // push_samples so the return ring has room for pop's recycled spare.
+        let (mut producer, mut consumer) = create_bridge(4, test_format());
+        for _ in 0..3 {
+            assert!(producer.push_samples_or_drop(&[0.0], 1, 48000));
+        }
+        // One timestamped push to verify the move preserves metadata.
+        let ts = Duration::from_millis(7);
+        assert!(producer.push_samples_or_drop_at(&[1.0, 2.0, 3.0, 4.0], 2, 48000, ts));
+        assert_eq!(producer.recycled_available(), 0, "free-list drained");
+
+        let buf = consumer.pop().expect("buffer");
+        // pop hands over the FIRST pushed buffer (FIFO) — the single-sample one.
+        assert_eq!(buf.data(), &[0.0]);
+        // Draining to the timestamped buffer to assert the move preserves it.
+        let _ = consumer.pop();
+        let _ = consumer.pop();
+        let tsbuf = consumer.pop().expect("timestamped buffer");
+        assert_eq!(tsbuf.data(), &[1.0, 2.0, 3.0, 4.0]);
+        assert_eq!(
+            tsbuf.timestamp(),
+            Some(ts),
+            "moved buffer keeps its timestamp"
+        );
+        assert_eq!(tsbuf.channels(), 2);
+
+        // Each pop recycled a spare back to the producer's free-list (it had
+        // room because we drained it first).
+        assert!(
+            producer.recycled_available() > 0,
+            "pop must recycle spares to the producer once the return ring has room"
+        );
+    }
+
+    // Even after the seeded spare pool is exhausted, pop keeps the producer's
+    // free-list supplied (allocating spares off the RT thread), so a long
+    // push/pop loop preserves data integrity and keeps the producer alloc-free.
+    #[test]
+    fn move_pop_keeps_producer_supplied_after_spare_pool_drains() {
+        let (mut producer, mut consumer) = create_bridge(8, test_format());
+        for i in 0..1000u32 {
+            let v = i as f32;
+            assert!(producer.push_samples_or_drop(&[v, v + 0.5], 2, 48000));
+            let buf = consumer.pop().expect("one buffer per iteration");
+            assert_eq!(buf.data(), &[v, v + 0.5], "data integrity at iter {i}");
+        }
+        assert!(
+            producer.recycled_available() > 0,
+            "free-list must stay populated via recycled spares"
+        );
+    }
+}
+
+// ===== rsac-3616: sample-domain zero-copy ring tests =====
+
+#[cfg(all(test, feature = "bridge-zerocopy"))]
+mod sample_ring_tests {
+    use super::*;
+
+    fn fmt() -> AudioFormat {
+        AudioFormat::default()
+    }
+
+    // Push samples via the SampleRing, pop, and verify the reconstructed buffer
+    // is equivalent to what the AudioBuffer ring would deliver (parallels
+    // push_samples_then_pop_preserves_data).
+    #[test]
+    fn sample_ring_push_pop_preserves_data() {
+        let (mut producer, mut consumer) = create_sample_ring(1024, 16, fmt());
+
+        let samples = [0.1, -0.2, 0.3, -0.4];
+        assert!(producer.push_samples_or_drop(&samples, 2, 44100));
+
+        let buf = consumer.pop().expect("should have one chunk");
+        assert_eq!(buf.data(), &samples);
+        assert_eq!(buf.channels(), 2);
+        assert_eq!(buf.sample_rate(), 44100);
+        assert_eq!(buf.timestamp(), None);
+    }
+
+    // Timestamp metadata is preserved through the sidecar metadata ring.
+    #[test]
+    fn sample_ring_preserves_timestamp() {
+        let (mut producer, mut consumer) = create_sample_ring(1024, 16, fmt());
+        let ts = Duration::from_micros(9876);
+        assert!(producer.push_samples_or_drop_at(&[0.5, -0.5], 2, 48000, Some(ts)));
+        let buf = consumer.pop().expect("chunk");
+        assert_eq!(buf.timestamp(), Some(ts));
+        assert_eq!(buf.data(), &[0.5, -0.5]);
+    }
+
+    // FIFO order across multiple chunks of differing lengths, including a wrap of
+    // the underlying f32 ring.
+    #[test]
+    fn sample_ring_fifo_and_wrap() {
+        // Small sample ring to force wrap-around of the f32 buffer.
+        let (mut producer, mut consumer) = create_sample_ring(8, 8, fmt());
+
+        // Push/pop many chunks so the f32 ring wraps repeatedly.
+        for i in 0..100u32 {
+            let v = i as f32;
+            assert!(producer.push_samples_or_drop(&[v, v + 0.25, v + 0.5], 1, 48000));
+            let buf = consumer.pop().expect("chunk per iteration");
+            assert_eq!(
+                buf.data(),
+                &[v, v + 0.25, v + 0.5],
+                "FIFO/wrap integrity at {i}"
+            );
+        }
+    }
+
+    // When the sample ring is full the chunk is dropped atomically (counter
+    // increments, consumer never sees a partial chunk).
+    #[test]
+    fn sample_ring_drops_atomically_when_full() {
+        // Capacity for ~1 chunk of 4 samples.
+        let (mut producer, mut consumer) = create_sample_ring(4, 4, fmt());
+        assert!(producer.push_samples_or_drop(&[1.0, 2.0, 3.0, 4.0], 2, 48000));
+        // Ring full → this 4-sample chunk cannot fit; must drop, not partially write.
+        assert!(!producer.push_samples_or_drop(&[5.0, 6.0, 7.0, 8.0], 2, 48000));
+        assert_eq!(producer.shared.buffers_dropped.load(Ordering::Relaxed), 1);
+
+        // The consumer sees exactly the first chunk, intact.
+        let buf = consumer.pop().expect("first chunk");
+        assert_eq!(buf.data(), &[1.0, 2.0, 3.0, 4.0]);
+        assert!(consumer.pop().is_none(), "dropped chunk must not appear");
+    }
+
+    // available_chunks reflects pending complete chunks.
+    #[test]
+    fn sample_ring_available_chunks() {
+        let (mut producer, mut consumer) = create_sample_ring(64, 8, fmt());
+        assert_eq!(consumer.available_chunks(), 0);
+        assert!(producer.push_samples_or_drop(&[1.0, 2.0], 2, 48000));
+        assert!(producer.push_samples_or_drop(&[3.0, 4.0], 2, 48000));
+        assert_eq!(consumer.available_chunks(), 2);
+        let _ = consumer.pop();
+        assert_eq!(consumer.available_chunks(), 1);
     }
 }

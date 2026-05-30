@@ -34,11 +34,15 @@ fn audio_err_to_napi(e: rsac::AudioError) -> napi::Error {
 ///
 /// Contains interleaved Float32 PCM samples along with format metadata.
 /// This is the primary data unit flowing through the JS capture pipeline.
+///
+/// `data` is a native JS `Float32Array` carrying the captured `f32` samples
+/// directly — there is no `f32` -> `f64` widening on the delivery path, so the
+/// values JS observes are bit-for-bit identical to the source samples.
 #[napi(object)]
-#[derive(Clone)]
 pub struct AudioChunk {
-    /// Interleaved Float32 PCM audio samples.
-    pub data: Vec<f64>,
+    /// Interleaved Float32 PCM audio samples (native `Float32Array`, no
+    /// precision widening).
+    pub data: Float32Array,
     /// Number of audio frames (samples per channel).
     pub num_frames: u32,
     /// Number of audio channels.
@@ -53,18 +57,23 @@ pub struct AudioChunk {
 
 impl AudioChunk {
     fn from_rsac_buffer(buf: &rsac::AudioBuffer) -> Self {
-        let data: Vec<f64> = buf.data().iter().map(|&s| s as f64).collect();
+        // Carry the interleaved f32 samples straight through to a native JS
+        // Float32Array. We take a single owned Vec<f32> (one allocation, same
+        // cost as the previous Vec<f64> collect but half the width) and hand
+        // it to napi's Float32Array, which adopts the buffer without any
+        // per-sample f32 -> f64 conversion.
+        let samples = buf.data().to_vec();
+        let length = samples.len() as u32;
         let num_frames = buf.num_frames() as u32;
         let channels = buf.channels() as u32;
         let sample_rate = buf.sample_rate();
-        let length = data.len() as u32;
         let duration = if sample_rate > 0 {
             num_frames as f64 / sample_rate as f64
         } else {
             0.0
         };
         AudioChunk {
-            data,
+            data: Float32Array::new(samples),
             num_frames,
             channels,
             sample_rate,

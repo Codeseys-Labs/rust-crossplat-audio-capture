@@ -37,6 +37,7 @@ use crate::core::config::AudioFormat;
 // is not accidentally tied to the gated import.
 use crate::core::config::AudioFormat as AudioFormatType;
 use crate::core::error::{AudioError, AudioResult};
+use crate::core::introspection::{BackpressureReport, StreamStats};
 use std::fmt;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc;
@@ -930,6 +931,90 @@ impl AudioCapture {
     pub fn format(&self) -> Option<AudioFormatType> {
         self.stream.as_ref().map(|s| s.format())
     }
+
+    /// Returns a point-in-time [`StreamStats`] snapshot of this capture.
+    ///
+    /// Bundles the bridge's diagnostic counters
+    /// ([`buffers_captured`](crate::core::interface::CapturingStream::buffers_captured) /
+    /// [`buffers_dropped`](crate::core::interface::CapturingStream::buffers_dropped) /
+    /// [`buffers_pushed`](crate::core::interface::CapturingStream::buffers_pushed) /
+    /// [`overrun_count`](crate::core::interface::CapturingStream::overrun_count))
+    /// with [`is_running()`](Self::is_running), [`uptime()`](Self::uptime), and a
+    /// human-readable description of the negotiated [`format()`](Self::format).
+    ///
+    /// All counters are read with cheap `Relaxed` loads on this (non-real-time)
+    /// query path — no allocation on or contention with the OS audio callback.
+    /// The format description string is built lazily here and is never stored
+    /// per-buffer.
+    ///
+    /// When no stream has been created (before [`start()`](Self::start), or after
+    /// [`stop()`](Self::stop)), this returns [`StreamStats::default()`]:
+    /// `is_running == false`, `uptime == Duration::ZERO`, zeroed counters, and an
+    /// empty `format_description`.
+    pub fn stream_stats(&self) -> StreamStats {
+        let stream = match self.stream.as_ref() {
+            Some(s) => s,
+            // No stream → default snapshot (is_running == false, ZERO uptime).
+            None => return StreamStats::default(),
+        };
+
+        let buffers_dropped = stream.buffers_dropped();
+        let format_description = self
+            .format()
+            .as_ref()
+            .map(format_description_string)
+            .unwrap_or_default();
+
+        StreamStats {
+            // `overruns` is the original field; keep it equal to buffers_dropped
+            // (its documented alias) so both read consistently.
+            overruns: buffers_dropped,
+            buffers_captured: stream.buffers_captured(),
+            buffers_dropped,
+            buffers_pushed: stream.buffers_pushed(),
+            uptime: self.uptime().unwrap_or(Duration::ZERO),
+            is_running: self.is_running(),
+            format_description,
+        }
+    }
+
+    /// Returns a windowed [`BackpressureReport`] for this capture.
+    ///
+    /// Unlike [`is_under_backpressure()`](Self::is_under_backpressure) — an
+    /// all-or-nothing flag that trips only on *consecutive* drops and resets on
+    /// any successful push — this report exposes a [`drop_rate`](BackpressureReport::drop_rate)
+    /// over recent push activity, so sustained partial loss (e.g. a steady 1-in-3
+    /// drop pattern) is visible. The legacy bool is carried unchanged inside the
+    /// report.
+    ///
+    /// Returns [`BackpressureReport::default()`] (all-zero, `drop_rate == 0.0`,
+    /// `is_under_backpressure == false`) when no stream has been created.
+    ///
+    /// # Windowing
+    ///
+    /// The canonical windowed implementation places a fixed-size, alloc-free ring
+    /// of per-window `(pushed, dropped)` snapshots in the bridge producer
+    /// (`bridge/ring_buffer.rs`, owned by the bridge-internals area). Until those
+    /// RT-side atomics are exposed, this read-side method derives the report from
+    /// the lifetime `buffers_pushed`/`buffers_dropped` counters plus the legacy
+    /// bool, reporting `window == Duration::ZERO` (a lifetime view). When the
+    /// windowed atomics land, this method swaps to reading them and sets a real
+    /// `window`; the public [`BackpressureReport`] shape does not change.
+    // TODO(rsac-cfe4): switch the (pushed, dropped) source to the bridge's
+    // windowed atomics and report the true window span once the bridge-internals
+    // area exposes them.
+    pub fn backpressure_report(&self) -> BackpressureReport {
+        let stream = match self.stream.as_ref() {
+            Some(s) => s,
+            None => return BackpressureReport::default(),
+        };
+        BackpressureReport::from_counts(
+            Duration::ZERO,
+            stream.buffers_pushed(),
+            stream.buffers_dropped(),
+            stream.is_under_backpressure(),
+        )
+    }
 }
 
 /// Formats an `AudioFormat` as a compact
@@ -1301,6 +1386,12 @@ mod tests {
         buffers: Mutex<std::collections::VecDeque<AudioBuffer>>,
         running: AtomicBool,
         overruns: AtomicU64,
+        /// Bridge counters mirrored for stream_stats()/backpressure_report():
+        /// buffers the producer enqueued, buffers delivered to the consumer.
+        pushed: AtomicU64,
+        captured: AtomicU64,
+        /// Legacy consecutive-drop backpressure flag the windowed report carries.
+        backpressure: AtomicBool,
         /// The format `format()` reports. Defaults to `AudioFormat::default()`;
         /// `set_negotiated_format()` overwrites it to mirror a backend that
         /// negotiated a different delivery format on the bridge producer.
@@ -1313,6 +1404,9 @@ mod tests {
                 buffers: Mutex::new(std::collections::VecDeque::new()),
                 running: AtomicBool::new(true),
                 overruns: AtomicU64::new(0),
+                pushed: AtomicU64::new(0),
+                captured: AtomicU64::new(0),
+                backpressure: AtomicBool::new(false),
                 format: Mutex::new(AudioFormat::default()),
             }
         }
@@ -1335,6 +1429,27 @@ mod tests {
         /// Simulate overruns by incrementing the counter.
         fn add_overruns(&self, count: u64) {
             self.overruns.fetch_add(count, Ordering::Relaxed);
+        }
+
+        /// Mirror a producer that enqueued `count` buffers (bumps buffers_pushed).
+        fn add_pushed(&self, count: u64) {
+            self.pushed.fetch_add(count, Ordering::Relaxed);
+        }
+
+        /// Mirror a consumer that popped `count` buffers (bumps buffers_captured).
+        fn add_captured(&self, count: u64) {
+            self.captured.fetch_add(count, Ordering::Relaxed);
+        }
+
+        /// Mirror the producer dropping `count` buffers to overflow: bumps the
+        /// drop/overrun counter (buffers_dropped is an alias of overrun_count).
+        fn add_dropped(&self, count: u64) {
+            self.overruns.fetch_add(count, Ordering::Relaxed);
+        }
+
+        /// Set the legacy consecutive-drop backpressure flag.
+        fn set_backpressure(&self, on: bool) {
+            self.backpressure.store(on, Ordering::SeqCst);
         }
 
         /// Signal the mock stream is stopped.
@@ -1390,6 +1505,23 @@ mod tests {
 
         fn overrun_count(&self) -> u64 {
             self.overruns.load(Ordering::Relaxed)
+        }
+
+        fn buffers_pushed(&self) -> u64 {
+            self.pushed.load(Ordering::Relaxed)
+        }
+
+        fn buffers_captured(&self) -> u64 {
+            self.captured.load(Ordering::Relaxed)
+        }
+
+        fn buffers_dropped(&self) -> u64 {
+            // Alias of overrun_count(), matching the BridgeStream contract.
+            self.overruns.load(Ordering::Relaxed)
+        }
+
+        fn is_under_backpressure(&self) -> bool {
+            self.backpressure.load(Ordering::SeqCst)
         }
     }
 
@@ -1881,5 +2013,152 @@ mod tests {
             sample_format: SampleFormat::I16,
         });
         assert_eq!(i16_desc, "1ch 44100Hz I16");
+    }
+
+    // ── stream_stats() tests (rsac-4c07) ──────────────────────────────
+
+    /// stream_stats() on a never-started capture (no stream) returns the default
+    /// snapshot: not running, ZERO uptime, zeroed counters, empty format, and
+    /// does not panic.
+    #[test]
+    fn stream_stats_default_when_no_stream() {
+        let capture = AudioCapture {
+            config: AudioCaptureConfig {
+                target: CaptureTarget::SystemDefault,
+                stream_config: StreamConfig::default(),
+            },
+            device: None,
+            stream: None,
+            callback: Mutex::new(None),
+            callback_pump: None,
+            start_instant: None,
+        };
+        let s = capture.stream_stats();
+        assert!(!s.is_running);
+        assert_eq!(s.uptime, Duration::ZERO);
+        assert_eq!(s.buffers_captured, 0);
+        assert_eq!(s.buffers_dropped, 0);
+        assert_eq!(s.buffers_pushed, 0);
+        assert_eq!(s.overruns, 0);
+        assert!(s.format_description.is_empty());
+        assert_eq!(s.dropped_ratio(), 0.0);
+    }
+
+    /// After pushing N, dropping M, popping K, stream_stats() reports
+    /// buffers_pushed==N, buffers_dropped==M, buffers_captured==K, is_running==true,
+    /// a non-empty format description, and a non-decreasing uptime across two reads.
+    #[test]
+    fn stream_stats_reflects_counters_and_running() {
+        let mock = Arc::new(MockCapturingStream::new());
+        mock.set_negotiated_format(44100, 1);
+        // N pushed, M dropped, K captured.
+        mock.add_pushed(10);
+        mock.add_dropped(4);
+        mock.add_captured(7);
+        let mut capture = make_mock_capture(Arc::clone(&mock));
+        // Mirror start()'s anchor so uptime() reports Some.
+        capture.start_instant = Some(Instant::now());
+
+        let s1 = capture.stream_stats();
+        assert!(s1.is_running, "mock stream is running");
+        assert_eq!(s1.buffers_pushed, 10);
+        assert_eq!(s1.buffers_dropped, 4);
+        assert_eq!(s1.buffers_captured, 7);
+        // overruns aliases buffers_dropped.
+        assert_eq!(s1.overruns, 4);
+        // dropped_ratio = 4 / (7 + 4) = 4/11.
+        assert!((s1.dropped_ratio() - 4.0 / 11.0).abs() < f64::EPSILON);
+        assert_eq!(s1.format_description, "1ch 44100Hz F32");
+        assert!(!s1.format_description.is_empty());
+
+        std::thread::sleep(std::time::Duration::from_millis(2));
+        let s2 = capture.stream_stats();
+        assert!(
+            s2.uptime >= s1.uptime,
+            "uptime must be non-decreasing across reads: {:?} < {:?}",
+            s2.uptime,
+            s1.uptime
+        );
+    }
+
+    /// After stop(), the stream is dropped, so stream_stats() falls back to the
+    /// default snapshot (not running, ZERO uptime).
+    #[test]
+    fn stream_stats_default_after_stop() {
+        let mock = Arc::new(MockCapturingStream::new());
+        mock.add_pushed(5);
+        let mut capture = make_mock_capture(mock);
+        capture.start_instant = Some(Instant::now());
+        assert!(capture.stream_stats().is_running);
+
+        capture.stop().unwrap();
+        let s = capture.stream_stats();
+        assert!(!s.is_running);
+        assert_eq!(s.uptime, Duration::ZERO);
+        assert_eq!(s.buffers_pushed, 0, "no stream → zeroed counters");
+    }
+
+    // ── backpressure_report() tests (rsac-cfe4) ───────────────────────
+
+    /// backpressure_report() on a capture with no stream is the all-zero default.
+    #[test]
+    fn backpressure_report_default_when_no_stream() {
+        let capture = AudioCapture {
+            config: AudioCaptureConfig {
+                target: CaptureTarget::SystemDefault,
+                stream_config: StreamConfig::default(),
+            },
+            device: None,
+            stream: None,
+            callback: Mutex::new(None),
+            callback_pump: None,
+            start_instant: None,
+        };
+        let r = capture.backpressure_report();
+        assert_eq!(r.pushed, 0);
+        assert_eq!(r.dropped, 0);
+        assert_eq!(r.drop_rate, 0.0);
+        assert!(!r.is_under_backpressure);
+    }
+
+    /// A drop,push,drop,push pattern that never trips the consecutive-threshold
+    /// bool (is_under_backpressure stays false) still reports drop_rate ~0.5 in
+    /// the windowed report — the core motivation of rsac-cfe4.
+    #[test]
+    fn backpressure_report_surfaces_partial_loss_bool_misses() {
+        let mock = Arc::new(MockCapturingStream::new());
+        // Interleaved drop,push,drop,push → 2 pushed, 2 dropped, and the legacy
+        // consecutive-drop bool never trips (each push resets the run).
+        mock.add_pushed(2);
+        mock.add_dropped(2);
+        mock.set_backpressure(false);
+        let capture = make_mock_capture(mock);
+
+        let r = capture.backpressure_report();
+        assert_eq!(r.pushed, 2);
+        assert_eq!(r.dropped, 2);
+        assert!(
+            (r.drop_rate - 0.5).abs() < f64::EPSILON,
+            "drop_rate should be ~0.5, got {}",
+            r.drop_rate
+        );
+        assert!(
+            !r.is_under_backpressure,
+            "consecutive-drop bool stays false while windowed drop_rate shows loss"
+        );
+    }
+
+    /// The legacy bool is carried through unchanged when it is set.
+    #[test]
+    fn backpressure_report_carries_legacy_bool() {
+        let mock = Arc::new(MockCapturingStream::new());
+        mock.add_pushed(1);
+        mock.add_dropped(9);
+        mock.set_backpressure(true);
+        let capture = make_mock_capture(mock);
+
+        let r = capture.backpressure_report();
+        assert!(r.is_under_backpressure, "legacy bool carried through");
+        assert!((r.drop_rate - 0.9).abs() < f64::EPSILON);
     }
 }

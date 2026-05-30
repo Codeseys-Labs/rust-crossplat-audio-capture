@@ -30,6 +30,17 @@ use crate::core::config::CaptureTarget;
 use crate::core::error::{AudioError, AudioResult};
 
 /// Upper bound on how long a caller will block waiting for the PipeWire thread
+/// to complete a registry/metadata *snapshot* (device enumeration / default
+/// resolution).
+///
+/// Unlike the capture handshake, a snapshot requires a `core.sync()`/`done`
+/// roundtrip with the daemon so the initial registry dump can settle before we
+/// read it. The roundtrip is normally a few event-loop iterations (≪1 s); the
+/// bounded wait turns a wedged daemon into [`AudioError::Timeout`] rather than
+/// an unbounded hang (mirrors `HANDSHAKE_TIMEOUT`).
+const SNAPSHOT_TIMEOUT: Duration = Duration::from_secs(5);
+
+/// Upper bound on how long a caller will block waiting for the PipeWire thread
 /// to acknowledge a `StartCapture` / `StopCapture` command.
 ///
 /// The handshake reply normally arrives within one event-loop iteration
@@ -73,6 +84,82 @@ pub(crate) enum ResolvedTarget {
     Serial(String),
 }
 
+// ── Snapshot types ─────────────────────────────────────────────────────────
+
+/// A single audio node discovered via the native PipeWire registry.
+///
+/// Produced on the PipeWire thread by walking the registry's `global`
+/// callbacks (audit finding H4 / `rsac-bfd8`), this replaces the per-line
+/// scrape of `pw-cli list-objects` / `pw-dump`.
+///
+/// # Identity contract
+///
+/// `id` is the node's `object.serial` (falling back to the registry global
+/// `id` when a node advertises no serial). This is the *same* identifier the
+/// capture path keys `TARGET_OBJECT` on, so a `DeviceId` built from it
+/// round-trips through [`CaptureTarget::Device`] → `PwNodeLookup::Device`
+/// without a second lookup (acceptance criterion: device ids are numeric
+/// `object.serial`).
+#[derive(Debug, Clone)]
+pub(crate) struct PwDeviceSnapshot {
+    /// Node `object.serial` (or registry global `id` if no serial) as a string.
+    pub id: String,
+    /// Human-readable name: `node.description`, then `node.nick`, then
+    /// `node.name`, then a generic placeholder.
+    pub name: String,
+    /// The raw `node.name` (e.g. `alsa_output.pci-...`), retained verbatim so
+    /// default-device resolution can match the *name* stored in `default`
+    /// metadata (which keys on `node.name`, not the friendlier description).
+    /// Empty when the node advertised no `node.name`.
+    pub node_name: String,
+    /// The node's `media.class` (e.g. `"Audio/Sink"`, `"Audio/Source"`).
+    pub media_class: String,
+}
+
+/// The default sink/source node *names* reported by the PipeWire `default`
+/// metadata object.
+///
+/// These are node **names** (e.g. `alsa_output.pci-...`), not numeric ids —
+/// the caller resolves them against the [`PwDeviceSnapshot`] list to recover a
+/// round-trippable `object.serial` (same contract the old
+/// `pw-metadata`-based path had).
+#[derive(Debug, Clone, Default)]
+pub(crate) struct PwDefaultSnapshot {
+    /// `default.audio.sink` node name, if the daemon reported one.
+    pub sink_name: Option<String>,
+    /// `default.audio.source` node name, if the daemon reported one.
+    pub source_name: Option<String>,
+}
+
+/// Mutable state populated by the registry + metadata listeners on the
+/// PipeWire thread. Wrapped in `Rc<RefCell<…>>` and shared (cloned) into the
+/// `Fn + 'static` global/property callbacks — the wiremix idiom. It never
+/// crosses a thread boundary: only *owned* `Vec`/`Option` copies are sent back
+/// over the mpsc reply channel.
+#[derive(Default)]
+struct RegistrySnapshot {
+    /// Audio nodes discovered so far, keyed by registry global id so a single
+    /// node is recorded once even if its `global` event arrives more than once.
+    devices: std::collections::BTreeMap<u32, PwDeviceSnapshot>,
+    /// Default sink/source names from the `default` metadata object.
+    default: PwDefaultSnapshot,
+}
+
+/// Extract the node *name* from a `default.audio.sink` / `default.audio.source`
+/// metadata value.
+///
+/// PipeWire stores these as a JSON object `{"name":"alsa_output.pci-..."}`. We
+/// pull out the `name` field; if the value is not JSON (older daemons may store
+/// a bare quoted string) we fall back to the de-quoted raw value. `None` input
+/// (property removed) maps to `None`.
+fn parse_default_metadata_name(value: Option<&str>) -> Option<String> {
+    let v = value?;
+    serde_json::from_str::<serde_json::Value>(v)
+        .ok()
+        .and_then(|j| j.get("name").and_then(|n| n.as_str()).map(str::to_owned))
+        .or_else(|| Some(v.trim_matches('"').to_owned()))
+}
+
 // ── PipeWireCommand ──────────────────────────────────────────────────────
 
 /// Commands sent from the caller thread to the dedicated PipeWire thread.
@@ -97,6 +184,24 @@ pub(crate) enum PipeWireCommand {
     /// Stop the current capture session and clean up PipeWire stream objects.
     StopCapture {
         response_tx: std_mpsc::Sender<AudioResult<()>>,
+    },
+
+    /// Snapshot the current set of audio nodes from the native registry.
+    ///
+    /// The handler waits for a `core.sync()`/`done` roundtrip so the initial
+    /// registry dump has settled before replying — otherwise it would race an
+    /// empty registry and report "no devices" on a healthy system.
+    SnapshotDevices {
+        response_tx: std_mpsc::Sender<AudioResult<Vec<PwDeviceSnapshot>>>,
+    },
+
+    /// Snapshot the default sink/source node names from the `default` metadata.
+    ///
+    /// Like [`SnapshotDevices`](PipeWireCommand::SnapshotDevices), the handler
+    /// waits for a sync/done roundtrip so the metadata listener has fired
+    /// before replying.
+    SnapshotDefault {
+        response_tx: std_mpsc::Sender<AudioResult<PwDefaultSnapshot>>,
     },
 
     /// Shut down the PipeWire thread entirely. No response needed — the thread exits.
@@ -298,6 +403,92 @@ impl PipeWireThread {
                 backend: "PipeWire".to_string(),
                 operation: "stop_capture".to_string(),
                 message: "PipeWire thread exited before responding to StopCapture".to_string(),
+                context: None,
+            }),
+        }
+    }
+
+    /// Snapshot the current audio nodes from the native PipeWire registry.
+    ///
+    /// Sends a [`SnapshotDevices`](PipeWireCommand::SnapshotDevices) command and
+    /// blocks (bounded by [`SNAPSHOT_TIMEOUT`]) for the reply. The PipeWire
+    /// thread waits for a `core.sync()`/`done` roundtrip before replying so the
+    /// initial registry dump has settled — the returned list is therefore the
+    /// real device set, never a racy empty snapshot.
+    ///
+    /// Only owned [`PwDeviceSnapshot`] values cross the channel; the registry
+    /// callbacks themselves run on the PipeWire loop thread.
+    ///
+    /// # Errors
+    ///
+    /// - [`AudioError::BackendError`] if the PipeWire thread is not running or
+    ///   exits without replying.
+    /// - [`AudioError::Timeout`] if the snapshot does not complete within
+    ///   [`SNAPSHOT_TIMEOUT`].
+    pub fn snapshot_devices(&self) -> AudioResult<Vec<PwDeviceSnapshot>> {
+        let (response_tx, response_rx) = std_mpsc::channel();
+
+        self.command_tx
+            .send(PipeWireCommand::SnapshotDevices { response_tx })
+            .map_err(|_| AudioError::BackendError {
+                backend: "PipeWire".to_string(),
+                operation: "snapshot_devices".to_string(),
+                message: "PipeWire thread is not running (command channel closed)".to_string(),
+                context: None,
+            })?;
+
+        match response_rx.recv_timeout(SNAPSHOT_TIMEOUT) {
+            Ok(result) => result,
+            Err(std_mpsc::RecvTimeoutError::Timeout) => Err(AudioError::Timeout {
+                operation: "PipeWire SnapshotDevices roundtrip".to_string(),
+                duration: SNAPSHOT_TIMEOUT,
+            }),
+            Err(std_mpsc::RecvTimeoutError::Disconnected) => Err(AudioError::BackendError {
+                backend: "PipeWire".to_string(),
+                operation: "snapshot_devices".to_string(),
+                message: "PipeWire thread exited before responding to SnapshotDevices".to_string(),
+                context: None,
+            }),
+        }
+    }
+
+    /// Snapshot the default sink/source node names from PipeWire `default`
+    /// metadata.
+    ///
+    /// Sends a [`SnapshotDefault`](PipeWireCommand::SnapshotDefault) command and
+    /// blocks (bounded by [`SNAPSHOT_TIMEOUT`]) for the reply, which the
+    /// PipeWire thread only sends after a sync/done roundtrip. The returned
+    /// names are node *names*; the caller resolves them to a round-trippable
+    /// `object.serial` against the device snapshot.
+    ///
+    /// # Errors
+    ///
+    /// - [`AudioError::BackendError`] if the PipeWire thread is not running or
+    ///   exits without replying.
+    /// - [`AudioError::Timeout`] if the snapshot does not complete within
+    ///   [`SNAPSHOT_TIMEOUT`].
+    pub fn snapshot_default(&self) -> AudioResult<PwDefaultSnapshot> {
+        let (response_tx, response_rx) = std_mpsc::channel();
+
+        self.command_tx
+            .send(PipeWireCommand::SnapshotDefault { response_tx })
+            .map_err(|_| AudioError::BackendError {
+                backend: "PipeWire".to_string(),
+                operation: "snapshot_default".to_string(),
+                message: "PipeWire thread is not running (command channel closed)".to_string(),
+                context: None,
+            })?;
+
+        match response_rx.recv_timeout(SNAPSHOT_TIMEOUT) {
+            Ok(result) => result,
+            Err(std_mpsc::RecvTimeoutError::Timeout) => Err(AudioError::Timeout {
+                operation: "PipeWire SnapshotDefault roundtrip".to_string(),
+                duration: SNAPSHOT_TIMEOUT,
+            }),
+            Err(std_mpsc::RecvTimeoutError::Disconnected) => Err(AudioError::BackendError {
+                backend: "PipeWire".to_string(),
+                operation: "snapshot_default".to_string(),
+                message: "PipeWire thread exited before responding to SnapshotDefault".to_string(),
                 context: None,
             }),
         }
@@ -833,10 +1024,16 @@ fn pw_thread_main(
     init_tx: std_mpsc::Sender<AudioResult<()>>,
     is_running: Arc<AtomicBool>,
 ) {
+    use std::cell::RefCell;
+    use std::rc::Rc;
+
     use pipewire::context::ContextBox;
     use pipewire::main_loop::MainLoopBox;
+    use pipewire::metadata::{Metadata, MetadataListener};
     use pipewire::properties::properties;
+    use pipewire::registry::Listener as RegistryListener;
     use pipewire::stream::{StreamBox, StreamFlags, StreamListener};
+    use pipewire::types::ObjectType;
 
     use libspa::param::audio::{AudioFormat as SpaAudioFormat, AudioInfoRaw};
     use libspa::param::format::{MediaSubtype, MediaType};
@@ -884,7 +1081,7 @@ fn pw_thread_main(
         }
     };
 
-    let _registry = match core.get_registry() {
+    let registry = match core.get_registry() {
         Ok(r) => r,
         Err(e) => {
             let _ = init_tx.send(Err(AudioError::BackendInitializationFailed {
@@ -896,12 +1093,202 @@ fn pw_thread_main(
         }
     };
 
+    // ── Native registry + metadata listeners (H4 / rsac-bfd8) ─────────
+    //
+    // Shared snapshot populated by the registry `global` callback (audio
+    // nodes) and the `default` metadata `property` callback (default
+    // sink/source names). Registry/metadata global callbacks are `Fn + 'static`,
+    // so we clone the `Rc<RefCell<…>>` into each closure (the wiremix idiom).
+    // All callbacks fire on THIS loop thread; nothing here touches the audio
+    // callback or crosses a thread boundary.
+    let snapshot: Rc<RefCell<RegistrySnapshot>> =
+        Rc::new(RefCell::new(RegistrySnapshot::default()));
+
+    // Registry global id of the `default` metadata object, recorded by the
+    // registry `global` callback. We bind the proxy on the loop thread (which
+    // has direct `&registry` access) rather than inside the `Fn` closure, so
+    // no unsafe registry reborrow is needed. `None` until the global appears.
+    let pending_default_meta_id: Rc<RefCell<Option<u32>>> = Rc::new(RefCell::new(None));
+
+    // The bound `default` Metadata proxy + its property listener. Kept alive
+    // for the thread's lifetime (the proxy owns the C listener registration).
+    let mut default_metadata: Option<(Metadata, MetadataListener)> = None;
+
+    // Bound with a leading underscore so the listener stays alive for the
+    // thread's lifetime (its C registration is released on drop) while not
+    // tripping the unused-variable lint.
+    let _registry_listener: RegistryListener = {
+        let snapshot = Rc::clone(&snapshot);
+        // Separate clone for the `global_remove` closure: the `global` closure
+        // below MOVES `snapshot`, so `global_remove` needs its own handle.
+        let snapshot_remove = Rc::clone(&snapshot);
+        let pending_default_meta_id = Rc::clone(&pending_default_meta_id);
+        registry
+            .add_listener_local()
+            .global(move |global| match global.type_ {
+                ObjectType::Node => {
+                    let Some(props) = global.props else {
+                        return;
+                    };
+                    let media_class = props.get("media.class").unwrap_or("");
+                    // Only physical audio sinks/sources are devices; per-app
+                    // `Stream/Output/Audio` nodes are capture *targets*, not
+                    // enumerable devices, so skip them here.
+                    if !(media_class.contains("Audio/Sink") || media_class.contains("Audio/Source"))
+                    {
+                        return;
+                    }
+                    // Identity = object.serial (round-trips through
+                    // PwNodeLookup::Device), falling back to the registry
+                    // global id when a node advertises no serial.
+                    let id = props
+                        .get("object.serial")
+                        .map(str::to_owned)
+                        .unwrap_or_else(|| global.id.to_string());
+                    let node_name = props.get("node.name").unwrap_or("").to_owned();
+                    let name = props
+                        .get("node.description")
+                        .or_else(|| props.get("node.nick"))
+                        .or_else(|| props.get("node.name"))
+                        .unwrap_or("PipeWire Device")
+                        .to_owned();
+                    snapshot.borrow_mut().devices.insert(
+                        global.id,
+                        PwDeviceSnapshot {
+                            id,
+                            name,
+                            node_name,
+                            media_class: media_class.to_owned(),
+                        },
+                    );
+                }
+                ObjectType::Metadata => {
+                    // Record the `default` metadata global id so the loop body
+                    // can bind a property listener for default sink/source.
+                    let is_default = global
+                        .props
+                        .and_then(|p| p.get("metadata.name"))
+                        .map(|n| n == "default")
+                        .unwrap_or(false);
+                    if is_default {
+                        *pending_default_meta_id.borrow_mut() = Some(global.id);
+                    }
+                }
+                _ => {}
+            })
+            .global_remove(move |id| {
+                // A node going away must not linger in the snapshot.
+                snapshot_remove.borrow_mut().devices.remove(&id);
+            })
+            .register()
+    };
+
     // Signal successful initialization back to the caller.
     if init_tx.send(Ok(())).is_err() {
         // Caller dropped the receiver — no point continuing.
         is_running.store(false, Ordering::SeqCst);
         return;
     }
+
+    // ── Snapshot roundtrip helper ────────────────────────────────────
+    //
+    // A snapshot of the registry/metadata state is only meaningful *after* the
+    // daemon has finished its initial dump. `core.sync()` posts a sequence to
+    // the server; when the matching `done` event comes back, every `global`
+    // (and metadata `property`) event posted before it has already been
+    // delivered. We register a one-shot `done` listener, fire `sync`, and pump
+    // the loop until the sequence completes (bounded by `SNAPSHOT_TIMEOUT`).
+    //
+    // Sequence: roundtrip (settle the registry dump so the `default` metadata
+    // global's id is known) → bind the metadata proxy → second roundtrip (settle
+    // its `property` callbacks) → read. Binding before the first roundtrip raced
+    // and left the default unresolved on the first call (rsac-bfd8).
+    let run_snapshot_roundtrip = |default_metadata: &mut Option<(Metadata, MetadataListener)>| {
+        // Pump one `core.sync()` roundtrip: post a sequence and iterate the loop
+        // until the matching `done` arrives (every `global`/metadata `property`
+        // event posted before it is then guaranteed delivered), bounded by
+        // SNAPSHOT_TIMEOUT.
+        let pump_sync = || {
+            let done = Rc::new(std::cell::Cell::new(false));
+            let pending = match core.sync(0) {
+                Ok(seq) => seq.seq(),
+                Err(e) => {
+                    log::debug!("PipeWire: core.sync failed: {}", e);
+                    return;
+                }
+            };
+            let done_cb = Rc::clone(&done);
+            let core_listener = core
+                .add_listener_local()
+                .done(move |id, seq| {
+                    if id == pipewire::core::PW_ID_CORE && seq.seq() >= pending {
+                        done_cb.set(true);
+                    }
+                })
+                .register();
+            let deadline = std::time::Instant::now() + SNAPSHOT_TIMEOUT;
+            while !done.get() && std::time::Instant::now() < deadline {
+                let _ = main_loop.loop_().iterate(Duration::from_millis(50));
+            }
+            drop(core_listener);
+        };
+
+        // ORDER MATTERS (rsac-bfd8 fix): on the first call `pending_default_meta_id`
+        // is unknown until the registry's initial dump has been delivered. So:
+        // (1) settle the registry dump so the `default` metadata global appears and
+        // its id is recorded; (2) THEN bind the metadata proxy; (3) THEN a second
+        // roundtrip so the proxy's `property` callbacks fire before we read.
+        // Binding before any roundtrip raced and left the default unresolved.
+        pump_sync();
+
+        // Bind the default metadata proxy (once) so its property callback can
+        // populate default sink/source. Binding happens here on the loop thread
+        // — never inside the `Fn` registry closure — so no unsafe reborrow.
+        if default_metadata.is_none() {
+            if let Some(meta_id) = *pending_default_meta_id.borrow() {
+                let object = pipewire::registry::GlobalObject {
+                    id: meta_id,
+                    permissions: pipewire::permissions::PermissionFlags::empty(),
+                    type_: ObjectType::Metadata,
+                    version: 0,
+                    props: None::<pipewire::properties::PropertiesBox>,
+                };
+                match registry.bind::<Metadata, _>(&object) {
+                    Ok(metadata) => {
+                        let snapshot = Rc::clone(&snapshot);
+                        let listener = metadata
+                            .add_listener_local()
+                            .property(move |_subject, key, _type, value| {
+                                // `default.audio.sink`/`.source` values are JSON
+                                // objects like {"name":"alsa_output..."}; pull out
+                                // the node name. `None` value = property removed.
+                                match key {
+                                    Some("default.audio.sink") => {
+                                        snapshot.borrow_mut().default.sink_name =
+                                            parse_default_metadata_name(value);
+                                    }
+                                    Some("default.audio.source") => {
+                                        snapshot.borrow_mut().default.source_name =
+                                            parse_default_metadata_name(value);
+                                    }
+                                    _ => {}
+                                }
+                                0
+                            })
+                            .register();
+                        *default_metadata = Some((metadata, listener));
+                    }
+                    Err(e) => {
+                        log::debug!("PipeWire: failed to bind default metadata: {}", e);
+                    }
+                }
+            }
+        }
+
+        // Second roundtrip: now that the metadata proxy is bound, settle its
+        // `property` callbacks (default sink/source) before the snapshot is read.
+        pump_sync();
+    };
 
     // ── Step 4: Enter the event loop ─────────────────────────────────
 
@@ -1222,6 +1609,30 @@ fn pw_thread_main(
                 let _ = response_tx.send(Ok(()));
             }
 
+            Ok(PipeWireCommand::SnapshotDevices { response_tx }) => {
+                log::debug!("PipeWire thread: SnapshotDevices received");
+                // Settle the registry dump before reading (else we race an
+                // empty registry and report "no devices" on a healthy system).
+                run_snapshot_roundtrip(&mut default_metadata);
+                let devices: Vec<PwDeviceSnapshot> =
+                    snapshot.borrow().devices.values().cloned().collect();
+                log::debug!(
+                    "PipeWire thread: SnapshotDevices → {} node(s)",
+                    devices.len()
+                );
+                // Only owned Vecs cross the channel.
+                let _ = response_tx.send(Ok(devices));
+            }
+
+            Ok(PipeWireCommand::SnapshotDefault { response_tx }) => {
+                log::debug!("PipeWire thread: SnapshotDefault received");
+                // Same settle: also gives the `default` metadata property
+                // callbacks a chance to fire after the proxy is bound.
+                run_snapshot_roundtrip(&mut default_metadata);
+                let default = snapshot.borrow().default.clone();
+                let _ = response_tx.send(Ok(default));
+            }
+
             Ok(PipeWireCommand::Shutdown) => {
                 log::debug!("PipeWire thread: Shutdown received, exiting event loop");
                 // Clean up any active capture before exiting.
@@ -1531,6 +1942,120 @@ mod tests {
                 assert!(message.contains("pw-dump"), "got: {}", message);
             }
             other => panic!("Expected DeviceNotFound or BackendError, got {:?}", other),
+        }
+    }
+
+    // ── parse_default_metadata_name (H4 / rsac-bfd8) ─────────────────
+
+    #[test]
+    fn test_parse_default_metadata_name_json_object() {
+        // PipeWire stores default sink/source as a JSON object with "name".
+        let v = r#"{"name":"alsa_output.pci-0000_00_1f.3.analog-stereo"}"#;
+        assert_eq!(
+            parse_default_metadata_name(Some(v)),
+            Some("alsa_output.pci-0000_00_1f.3.analog-stereo".to_string())
+        );
+    }
+
+    #[test]
+    fn test_parse_default_metadata_name_json_object_with_extra_fields() {
+        let v = r#"{"name":"my_sink","other":42}"#;
+        assert_eq!(
+            parse_default_metadata_name(Some(v)),
+            Some("my_sink".to_string())
+        );
+    }
+
+    #[test]
+    fn test_parse_default_metadata_name_bare_quoted_fallback() {
+        // Older daemons may store a bare quoted string rather than an object.
+        // We fall back to the de-quoted raw value.
+        assert_eq!(
+            parse_default_metadata_name(Some("\"bare_name\"")),
+            Some("bare_name".to_string())
+        );
+    }
+
+    #[test]
+    fn test_parse_default_metadata_name_none_is_removal() {
+        // `None` value (property removed) → `None`.
+        assert_eq!(parse_default_metadata_name(None), None);
+    }
+
+    #[test]
+    fn test_parse_default_metadata_name_non_json_raw() {
+        // A non-JSON, unquoted value falls back to itself.
+        assert_eq!(
+            parse_default_metadata_name(Some("plain_node_name")),
+            Some("plain_node_name".to_string())
+        );
+    }
+
+    // ── Snapshot type shape ──────────────────────────────────────────
+
+    #[test]
+    fn test_pw_device_snapshot_clone_and_fields() {
+        let snap = PwDeviceSnapshot {
+            id: "42".to_string(),
+            name: "Built-in Audio".to_string(),
+            node_name: "alsa_output.pci-0000_00_1f.3.analog-stereo".to_string(),
+            media_class: "Audio/Sink".to_string(),
+        };
+        let cloned = snap.clone();
+        assert_eq!(cloned.id, "42");
+        assert_eq!(cloned.name, "Built-in Audio");
+        assert_eq!(
+            cloned.node_name,
+            "alsa_output.pci-0000_00_1f.3.analog-stereo"
+        );
+        assert_eq!(cloned.media_class, "Audio/Sink");
+    }
+
+    #[test]
+    fn test_pw_default_snapshot_default_is_empty() {
+        let d = PwDefaultSnapshot::default();
+        assert!(d.sink_name.is_none());
+        assert!(d.source_name.is_none());
+    }
+
+    #[test]
+    fn test_registry_snapshot_dedups_by_global_id() {
+        // The registry keys devices by global id, so a re-announced node is
+        // recorded once. Exercise the BTreeMap-backed dedup directly.
+        let mut snap = RegistrySnapshot::default();
+        let dev = |id: &str| PwDeviceSnapshot {
+            id: id.to_string(),
+            name: "n".to_string(),
+            node_name: "n".to_string(),
+            media_class: "Audio/Sink".to_string(),
+        };
+        snap.devices.insert(7, dev("100"));
+        snap.devices.insert(7, dev("100")); // same global id → overwrite, not dup
+        snap.devices.insert(8, dev("200"));
+        assert_eq!(snap.devices.len(), 2);
+        snap.devices.remove(&7);
+        assert_eq!(snap.devices.len(), 1);
+        assert_eq!(snap.devices.values().next().unwrap().id, "200");
+    }
+
+    // ── Snapshot accessors honest-failure when daemon unavailable ────
+
+    #[test]
+    fn test_snapshot_devices_when_spawn_fails_is_backend_error() {
+        // We can't spawn a thread without a daemon in many CI sandboxes; if
+        // spawn fails it's a BackendInitializationFailed. If it succeeds,
+        // snapshot_devices must return Ok (possibly empty) or a bounded
+        // Timeout/BackendError — never a panic.
+        match PipeWireThread::spawn() {
+            Ok(thread) => match thread.snapshot_devices() {
+                Ok(_devices) => {}
+                Err(AudioError::Timeout { .. }) | Err(AudioError::BackendError { .. }) => {}
+                Err(e) => panic!("Unexpected snapshot_devices error: {:?}", e),
+            },
+            Err(AudioError::BackendInitializationFailed { backend, .. }) => {
+                assert_eq!(backend, "PipeWire");
+            }
+            Err(e) => panic!("Unexpected spawn error: {:?}", e),
         }
     }
 }

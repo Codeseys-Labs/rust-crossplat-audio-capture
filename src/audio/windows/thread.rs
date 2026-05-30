@@ -678,8 +678,10 @@ fn create_audio_client(config: &WindowsCaptureConfig) -> AudioResult<wasapi::Aud
 
 /// Find a WASAPI device by its ID string.
 ///
-/// Enumerates all audio devices and returns the one matching the given ID.
-/// Falls back to the default render device if the ID is empty or "default".
+/// Resolves the endpoint directly via wasapi 0.23's
+/// [`DeviceEnumerator::get_device`] (wrapping `IMMDeviceEnumerator::GetDevice`)
+/// instead of scanning the render collection by hand. Falls back to the
+/// default render device if the ID is empty or `"default"`.
 fn find_device_by_id(device_id: &str) -> AudioResult<wasapi::Device> {
     let enumerator = wasapi::DeviceEnumerator::new().map_err(|e| AudioError::BackendError {
         backend: "wasapi".to_string(),
@@ -699,35 +701,13 @@ fn find_device_by_id(device_id: &str) -> AudioResult<wasapi::Device> {
             });
     }
 
-    // Enumerate all render devices and find one matching the ID.
-    let collection = enumerator
-        .get_device_collection(&wasapi::Direction::Render)
-        .map_err(|e| AudioError::DeviceEnumerationError {
-            reason: format!("Failed to enumerate render devices: {}", e),
-            context: None,
-        })?;
-
-    let device_count =
-        collection
-            .get_nbr_devices()
-            .map_err(|e| AudioError::DeviceEnumerationError {
-                reason: format!("Failed to get device count: {}", e),
-                context: None,
-            })?;
-
-    for i in 0..device_count {
-        if let Ok(device) = collection.get_device_at_index(i) {
-            if let Ok(id) = device.get_id() {
-                if id == device_id {
-                    return Ok(device);
-                }
-            }
-        }
-    }
-
-    Err(AudioError::DeviceNotFound {
-        device_id: device_id.to_string(),
-    })
+    // Direct ID resolution via IMMDeviceEnumerator::GetDevice. A failed lookup
+    // (unknown / stale / removed endpoint) surfaces as DeviceNotFound.
+    enumerator
+        .get_device(device_id)
+        .map_err(|_| AudioError::DeviceNotFound {
+            device_id: device_id.to_string(),
+        })
 }
 
 // ── Process Name Resolution Helper ───────────────────────────────────────
@@ -1135,6 +1115,28 @@ mod tests {
             result.is_ok(),
             "Device(empty) should fall back to default: {:?}",
             result.err()
+        );
+    }
+
+    /// Test that `find_device_by_id` resolves a real device ID via the wasapi
+    /// 0.23 `get_device` path (round-trips the default render device's ID).
+    #[test]
+    fn test_find_device_by_id_roundtrip_real_id() {
+        let _hr = wasapi::initialize_mta();
+
+        let enumerator = wasapi::DeviceEnumerator::new().expect("create enumerator");
+        let default_dev = enumerator
+            .get_default_device(&wasapi::Direction::Render)
+            .expect("get default render device");
+        let real_id = default_dev.get_id().expect("get device id");
+
+        // Resolving that exact ID through find_device_by_id (which now uses
+        // get_device under the hood) must return a device with the same ID.
+        let resolved = find_device_by_id(&real_id).expect("find_device_by_id should resolve");
+        let resolved_id = resolved.get_id().expect("resolved device id");
+        assert_eq!(
+            resolved_id, real_id,
+            "find_device_by_id should round-trip the same device ID"
         );
     }
 
