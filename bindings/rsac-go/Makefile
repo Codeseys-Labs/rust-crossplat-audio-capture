@@ -35,7 +35,11 @@ ifeq ($(UNAME_S),Darwin)
                      -framework SystemConfiguration
 else ifeq ($(UNAME_S),Linux)
     STATIC_LIB := librsac_ffi.a
-    EXTRA_LDFLAGS := -lpipewire-0.3 -lspa-0.2 -lpthread -ldl -lm
+    # NOTE: no `-lspa-0.2` — SPA (libspa-0.2) is a header/plugin API with NO
+    # shared object to link against (`pkg-config --libs libspa-0.2` is empty),
+    # so `-lspa-0.2` makes ld fail with "cannot find -lspa-0.2". PipeWire itself
+    # is the only system .so the staticlib needs at link time.
+    EXTRA_LDFLAGS := -lpipewire-0.3 -lpthread -ldl -lm
 else
     # Windows (MSYS2/MinGW). Build rsac-ffi for the *-pc-windows-gnu target so
     # cargo emits librsac_ffi.a (GNU archive) that cgo's gcc can link.
@@ -43,10 +47,23 @@ else
     # WASAPI/COM libs plus the Win32 system libs the Rust std runtime pulls in.
     EXTRA_LDFLAGS := -lole32 -loleaut32 -lwinmm -lksuser -luuid \
                      -lbcrypt -lntdll -luserenv -lws2_32 -ladvapi32 -lkernel32
+    # cgo links through MinGW gcc/ld (GNU ABI). The DEFAULT Windows Rust target
+    # is MSVC (x86_64-pc-windows-msvc), whose staticlib references MSVC-only
+    # symbols (__chkstk, __CxxFrameHandler3, ??_7type_info@@6B@) that MinGW ld
+    # cannot resolve. So we MUST build the GNU target explicitly.
+    # `rustup target add x86_64-pc-windows-gnu` is a prerequisite.
+    RUST_TARGET := x86_64-pc-windows-gnu
 endif
 
-# Rust target directory.
-CARGO_TARGET := $(RSAC_ROOT)/target/release
+# When RUST_TARGET is set (Windows), build + read from target/<triple>/release;
+# otherwise use the default host target/release dir.
+ifeq ($(RUST_TARGET),)
+    CARGO_TARGET_FLAG :=
+    CARGO_TARGET := $(RSAC_ROOT)/target/release
+else
+    CARGO_TARGET_FLAG := --target $(RUST_TARGET)
+    CARGO_TARGET := $(RSAC_ROOT)/target/$(RUST_TARGET)/release
+endif
 
 # ── Targets ──────────────────────────────────────────────────────────────
 
@@ -61,7 +78,7 @@ build: rust-ffi go-build
 ## rust-ffi: Compile the Rust FFI crate as a static library.
 rust-ffi:
 	@echo "==> Building rsac-ffi static library..."
-	cd $(FFI_DIR) && cargo build --release
+	cd $(FFI_DIR) && cargo build --release $(CARGO_TARGET_FLAG)
 	@mkdir -p $(LIB_DIR)
 	@if [ -f "$(CARGO_TARGET)/librsac_ffi.a" ]; then \
 		cp "$(CARGO_TARGET)/librsac_ffi.a" "$(LIB_DIR)/librsac_ffi.a"; \
