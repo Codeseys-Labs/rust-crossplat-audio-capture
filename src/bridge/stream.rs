@@ -308,6 +308,14 @@ impl<S: PlatformStream + Sync + 'static> CapturingStream for BridgeStream<S> {
         self.shared.is_under_backpressure()
     }
 
+    // FH-5 waker contract: `BridgeStream` registers the waker into the
+    // lock-free `AtomicWaker` on the shared bridge state and returns `true`,
+    // committing to wake it. That promise is kept by `BridgeProducer`, which
+    // wakes the waker on every push (ring_buffer.rs) and on every state
+    // transition / `signal_done` / `signal_error` (the terminal path), so a
+    // parked `AsyncAudioStream` is always woken when data or a terminal state
+    // arrives. Returning `true` is therefore honest here; see
+    // `CapturingStream::register_waker` for the full contract.
     #[cfg(feature = "async-stream")]
     fn register_waker(&self, waker: &std::task::Waker) -> bool {
         self.shared.waker.register(waker);

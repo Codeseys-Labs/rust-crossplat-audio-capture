@@ -954,6 +954,72 @@ impl AudioCapture {
         stream.try_read_chunk()
     }
 
+    /// Reads a buffer of audio data non-blocking, **without** the
+    /// [`read_buffer`](Self::read_buffer) running-state short-circuit.
+    ///
+    /// This is the read path the binding pumps (Node/napi, Go via the FFI) and
+    /// the in-process consumers use when they must observe the stream's
+    /// *terminal* state. Unlike [`read_buffer`](Self::read_buffer) — which
+    /// returns a **recoverable** [`AudioError::StreamReadError`] as soon as the
+    /// stream leaves `Running`, and therefore can never surface the fatal
+    /// [`AudioError::StreamEnded`] — this method delegates straight to the
+    /// stream's `try_read_chunk`. That preserves the bridge's drain-on-stop
+    /// semantics:
+    ///
+    /// - `Ok(Some(buf))` while data remains (including the buffered tail that is
+    ///   still drainable while the stream is `Stopping`),
+    /// - `Ok(None)` when the ring is momentarily empty but the stream is not yet
+    ///   terminal,
+    /// - `Err(`[`AudioError::StreamEnded`]`)` — **fatal/terminal** — once the
+    ///   ring is empty *and* the stream has reached a terminal state.
+    ///
+    /// Consumers branch on [`AudioError::is_fatal`]/[`AudioError::recoverability`]:
+    /// a recoverable error must be retried (it must never end consumption), and
+    /// only a fatal terminal ends it cleanly. [`read_buffer`](Self::read_buffer)
+    /// keeps its `is_running()` guard for the simple pull API; this is the
+    /// terminal-observable sibling. The [`AudioBufferIterator`] and the callback
+    /// pump read via `try_read_chunk` for exactly this reason.
+    ///
+    /// Like [`read_buffer`](Self::read_buffer), this takes `&self` (it only reads
+    /// `self.stream` and calls the stream's own `&self` method), so it never
+    /// forms a `&mut` alias to the handle.
+    pub fn read_chunk_nonblocking(&self) -> AudioResult<Option<AudioBuffer>> {
+        let stream = self
+            .stream
+            .as_ref()
+            .ok_or_else(|| AudioError::StreamReadError {
+                reason: "Stream is not initialized. Call start() first.".to_string(),
+            })?;
+        stream.try_read_chunk()
+    }
+
+    /// Blocking read **without** the [`read_buffer_blocking`](Self::read_buffer_blocking)
+    /// running-state short-circuit — the *terminal-observable* blocking sibling.
+    ///
+    /// [`read_buffer_blocking`](Self::read_buffer_blocking) returns a
+    /// **recoverable** [`AudioError::StreamReadError`] the moment the stream
+    /// leaves `Running`, so it can never surface the fatal
+    /// [`AudioError::StreamEnded`]. This method delegates straight to the
+    /// stream's `read_chunk`, which blocks until either a buffer is available
+    /// (including the drainable tail while `Stopping`) or the stream reaches a
+    /// terminal state, in which case it returns `Err(`[`AudioError::StreamEnded`]`)`
+    /// **promptly** (a concurrent [`request_stop`](Self::request_stop) unblocks
+    /// it). This is the blocking read the C FFI (`rsac_capture_read`) and the Go
+    /// binding use so their pumps observe the terminal signal and end cleanly
+    /// instead of spinning on a downgraded recoverable error.
+    ///
+    /// Takes `&self` like the other read paths, so it never forms a `&mut` alias
+    /// (the #28 use-after-free precondition).
+    pub fn read_chunk_blocking(&self) -> AudioResult<AudioBuffer> {
+        let stream = self
+            .stream
+            .as_ref()
+            .ok_or_else(|| AudioError::StreamReadError {
+                reason: "Stream is not initialized. Call start() first.".to_string(),
+            })?;
+        stream.read_chunk()
+    }
+
     /// Reads a buffer of audio data, blocking until data is available.
     ///
     /// Uses `CapturingStream::read_chunk` which blocks until data arrives.
@@ -1131,7 +1197,14 @@ impl AudioCapture {
     /// from the same ring buffer. Avoid mixing `subscribe()` with manual buffer reads.
     ///
     /// The background thread exits automatically when:
-    /// - The stream is stopped or encounters an error
+    /// - The stream reaches a **fatal terminal** state (e.g.
+    ///   [`AudioError::StreamEnded`]) — the channel then disconnects, which the
+    ///   receiver observes as a [`RecvError`](std::sync::mpsc::RecvError). A
+    ///   **recoverable** read error (e.g. a transient
+    ///   [`AudioError::StreamReadError`]) is logged and retried — it does **not**
+    ///   end the subscription. (Use [`subscribe_with_errors`](Self::subscribe_with_errors)
+    ///   if you need to observe the terminal `AudioError` itself rather than a
+    ///   bare disconnect.)
     /// - The returned [`Receiver`](mpsc::Receiver) is dropped
     ///
     /// Multiple subscriptions are allowed but each subscriber competes for buffers.
@@ -1183,8 +1256,119 @@ impl AudioCapture {
                         // No data available, sleep briefly to avoid busy-spinning
                         std::thread::sleep(std::time::Duration::from_millis(1));
                     }
-                    Err(_) => {
-                        break; // Stream error (stopped, closed, etc.)
+                    // Only a FATAL terminal (e.g. StreamEnded) ends the
+                    // subscription — the channel then disconnects, which the
+                    // receiver observes as a RecvError. A recoverable read error
+                    // (transient StreamReadError, BufferOverrun/Underrun) must
+                    // NOT kill delivery; log and retry after a brief pause,
+                    // mirroring the callback pump (spawn_callback_pump) and the
+                    // iterator. This closes the prior bug where ANY error broke
+                    // the loop and silently ended the subscription (FH-1/BP-6).
+                    Err(e) if e.is_fatal() => break,
+                    Err(e) => {
+                        log::warn!("Subscribe thread read error (retrying): {:?}", e);
+                        std::thread::sleep(std::time::Duration::from_millis(1));
+                    }
+                }
+            })
+            .map_err(|e| AudioError::InternalError {
+                message: format!("Failed to spawn subscribe thread: {}", e),
+                source: None,
+            })?;
+
+        Ok(rx)
+    }
+
+    /// Like [`subscribe`](Self::subscribe), but delivers each item as an
+    /// [`AudioResult<AudioBuffer>`] so the **terminal** [`AudioError`] reaches
+    /// the consumer instead of only a bare channel disconnect.
+    ///
+    /// This is the error-carrying counterpart to [`subscribe`](Self::subscribe)
+    /// (the same `Stream` / `StreamWithErrors` split the Go binding exposes). The
+    /// background reader:
+    ///
+    /// - sends `Ok(buffer)` for each captured buffer,
+    /// - on a momentarily-empty ring, sleeps ~1 ms and retries,
+    /// - on a **recoverable** read error (transient
+    ///   [`AudioError::StreamReadError`], [`AudioError::BufferOverrun`],
+    ///   [`AudioError::BufferUnderrun`], …), logs and retries — a recoverable
+    ///   error never ends the subscription, and
+    /// - on a **fatal terminal** error (e.g. [`AudioError::StreamEnded`]) sends
+    ///   one final `Err(e)` **then** exits, so the consumer receives the terminal
+    ///   `AudioError` as the last item *before* the channel disconnects.
+    ///
+    /// The `Item` type matches the async stream
+    /// ([`AsyncAudioStream`](crate::bridge::AsyncAudioStream)) and the
+    /// [`AudioBufferIterator`] so a consumer can reuse
+    /// [`AudioError::is_fatal`]/[`AudioError::recoverability`] uniformly.
+    ///
+    /// Like [`subscribe`](Self::subscribe), the reader competes with
+    /// [`read_buffer`](Self::read_buffer) and the callback pump for buffers from
+    /// the same ring — do not mix it with manual reads.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the capture is not currently running. (Once running,
+    /// the terminal stream error is delivered as the final channel *item*, not as
+    /// the return value of this method.)
+    ///
+    /// # Backend caveat (FH-1)
+    ///
+    /// On Linux/macOS the producer-side terminal signal is only fully wired on
+    /// some backends; the final `Err(StreamEnded)` is end-to-end observable
+    /// wherever the producer drives the bridge to a terminal state (Windows, and
+    /// Linux/macOS once the producer-terminal-signal work lands). On a backend
+    /// that never reaches terminal, the subscription simply keeps delivering
+    /// until the receiver is dropped — the recoverable-vs-fatal branching here is
+    /// correct regardless.
+    pub fn subscribe_with_errors(&self) -> AudioResult<mpsc::Receiver<AudioResult<AudioBuffer>>> {
+        // Get the stream first — if there's no stream, we're not running.
+        let stream_ref = self
+            .stream
+            .as_ref()
+            .ok_or_else(|| AudioError::StreamReadError {
+                reason: "Stream is not initialized. Call start() first.".to_string(),
+            })?;
+
+        // Check running state via the stream itself — single source of truth.
+        if !stream_ref.is_running() {
+            return Err(AudioError::StreamReadError {
+                reason: "Stream is not running".to_string(),
+            });
+        }
+
+        let stream = Arc::clone(stream_ref);
+
+        let (tx, rx) = mpsc::channel();
+
+        std::thread::Builder::new()
+            .name("rsac-subscribe-err".into())
+            .spawn(move || loop {
+                match stream.try_read_chunk() {
+                    Ok(Some(buffer)) => {
+                        if tx.send(Ok(buffer)).is_err() {
+                            break; // Receiver dropped
+                        }
+                    }
+                    Ok(None) => {
+                        // No data available, sleep briefly to avoid busy-spinning
+                        std::thread::sleep(std::time::Duration::from_millis(1));
+                    }
+                    // Fatal terminal: forward the error as the FINAL item, THEN
+                    // exit. Send-then-break so the consumer always receives the
+                    // terminal AudioError before the channel disconnects (it never
+                    // has to race a bare RecvError to learn why the stream ended).
+                    Err(e) if e.is_fatal() => {
+                        let _ = tx.send(Err(e));
+                        break;
+                    }
+                    // Recoverable: surface it (best-effort) AND keep delivering —
+                    // a transient hiccup must not end the subscription.
+                    Err(e) => {
+                        if tx.send(Err(e)).is_err() {
+                            break; // Receiver dropped
+                        }
+                        std::thread::sleep(std::time::Duration::from_millis(1));
                     }
                 }
             })
@@ -1236,11 +1420,17 @@ impl AudioCapture {
     /// Returns the negotiated *delivery* `AudioFormat` the backend actually
     /// produces, or `None` before [`start()`](Self::start) creates a stream.
     ///
-    /// This is the authoritative format atomically published by the bridge once
-    /// a backend records it (see [`crate::bridge`]); it may differ from the
+    /// This is the authoritative format atomically published by the bridge: each
+    /// backend records the rate/channels it actually delivers at its negotiation
+    /// point — PipeWire from its `param_changed` callback, WASAPI at mix-format
+    /// open, CoreAudio when the AUHAL stream format is set (PU-1/PERF-07,
+    /// `rsac-2c56`; see [`crate::bridge`]). It can therefore differ from the
     /// requested config in [`config()`](Self::config) when the device forced a
-    /// negotiation. Reading it is a single `Acquire` load behind the underlying
-    /// stream's `format()` — no allocation and no lock on the data plane.
+    /// negotiation, and the reported `sample_format` is always `F32` because the
+    /// bridge payload is always interleaved f32 regardless of the endpoint's
+    /// native sample type. Reading it is a single `Acquire` load behind the
+    /// underlying stream's `format()` — no allocation and no lock on the data
+    /// plane.
     pub fn format(&self) -> Option<AudioFormatType> {
         self.stream.as_ref().map(|s| s.format())
     }
@@ -1731,6 +1921,11 @@ mod tests {
         /// not double-stop the *underlying* stream (stop() is a no-op once the
         /// AudioCapture has already dropped its Arc).
         stop_calls: AtomicU64,
+        /// One-shot RECOVERABLE read errors to inject ahead of buffered data.
+        /// Each `try_read_chunk`/`read_chunk` pops one off the front and returns
+        /// it as an `Err`, modeling a transient hiccup (StreamReadError) that
+        /// terminal-delivery consumers must RETRY rather than treat as the end.
+        recoverable_errors: Mutex<std::collections::VecDeque<AudioError>>,
     }
 
     impl MockCapturingStream {
@@ -1744,7 +1939,20 @@ mod tests {
                 backpressure: AtomicBool::new(false),
                 format: Mutex::new(AudioFormat::default()),
                 stop_calls: AtomicU64::new(0),
+                recoverable_errors: Mutex::new(std::collections::VecDeque::new()),
             }
+        }
+
+        /// Queue one RECOVERABLE error (e.g. a transient StreamReadError) to be
+        /// returned by the next read before any buffered data. Used by the
+        /// terminal-delivery tests to prove a recoverable error is retried, not
+        /// treated as end-of-stream.
+        fn inject_recoverable_error(&self, e: AudioError) {
+            debug_assert!(
+                e.is_recoverable(),
+                "inject_recoverable_error expects a recoverable variant"
+            );
+            self.recoverable_errors.lock().unwrap().push_back(e);
         }
 
         /// Number of times `stop()` was invoked on this stream.
@@ -1804,6 +2012,9 @@ mod tests {
             // Blocking: spin-wait until data or stopped. Mirrors the real bridge,
             // which returns the terminal StreamEnded (Fatal) once stopped.
             loop {
+                if let Some(e) = self.recoverable_errors.lock().unwrap().pop_front() {
+                    return Err(e);
+                }
                 if let Some(buf) = self.buffers.lock().unwrap().pop_front() {
                     return Ok(buf);
                 }
@@ -1817,6 +2028,12 @@ mod tests {
         }
 
         fn try_read_chunk(&self) -> AudioResult<Option<AudioBuffer>> {
+            // Surface any injected RECOVERABLE error first (a transient hiccup
+            // ahead of real data), so terminal-delivery consumers must retry it
+            // rather than end iteration.
+            if let Some(e) = self.recoverable_errors.lock().unwrap().pop_front() {
+                return Err(e);
+            }
             // Drain any buffered data first, even after stop, so the iterator's
             // drain-on-stop path (R2-2) is exercised; only report StreamEnded
             // once the buffer is empty AND the stream has stopped.
@@ -1959,6 +2176,201 @@ mod tests {
 
         // Clean up
         mock.signal_stop();
+    }
+
+    // ── terminal-error delivery tests (FH-1 / BP-6) ───────────────────
+
+    /// subscribe() must NOT end on a recoverable read error: a transient
+    /// StreamReadError ahead of real data is retried, and the queued buffer is
+    /// still delivered. Previously ANY Err broke the loop, silently ending the
+    /// subscription on a transient hiccup.
+    #[test]
+    fn subscribe_continues_past_recoverable_error() {
+        let mock = Arc::new(MockCapturingStream::new());
+        // One transient error, then a real buffer behind it.
+        mock.inject_recoverable_error(AudioError::StreamReadError {
+            reason: "transient hiccup".into(),
+        });
+        mock.push_buffer(AudioBuffer::new(vec![0.42; 4], 2, 48000));
+
+        let capture = make_mock_capture(Arc::clone(&mock));
+        let rx = capture.subscribe().expect("subscribe should succeed");
+
+        // The recoverable error is swallowed+retried, so the buffer behind it
+        // still arrives (subscribe() yields buffers only, not errors).
+        let buf = rx
+            .recv_timeout(std::time::Duration::from_secs(2))
+            .expect("buffer must arrive past the recoverable error");
+        assert_eq!(buf.data()[0], 0.42);
+
+        mock.signal_stop();
+    }
+
+    /// subscribe() ends (channel disconnects) only on a FATAL terminal. After
+    /// the mock stops and drains, the reader observes StreamEnded (fatal) and
+    /// exits, disconnecting the channel.
+    #[test]
+    fn subscribe_disconnects_on_fatal_terminal() {
+        let mock = Arc::new(MockCapturingStream::new());
+        let capture = make_mock_capture(Arc::clone(&mock));
+        let rx = capture.subscribe().expect("subscribe should succeed");
+
+        // Stop → next try_read_chunk returns StreamEnded (fatal) → thread breaks.
+        mock.signal_stop();
+
+        // The channel disconnects; recv must eventually fail.
+        std::thread::sleep(std::time::Duration::from_millis(50));
+        assert!(
+            rx.recv_timeout(std::time::Duration::from_millis(200))
+                .is_err(),
+            "channel must disconnect once the stream reaches a fatal terminal"
+        );
+    }
+
+    /// subscribe_with_errors() delivers buffers as Ok(_) and forwards a
+    /// recoverable error as an Err item WITHOUT ending the stream (the buffer
+    /// behind it still arrives).
+    #[test]
+    fn subscribe_with_errors_forwards_recoverable_then_continues() {
+        let mock = Arc::new(MockCapturingStream::new());
+        mock.inject_recoverable_error(AudioError::StreamReadError {
+            reason: "transient hiccup".into(),
+        });
+        mock.push_buffer(AudioBuffer::new(vec![0.7; 4], 2, 48000));
+
+        let capture = make_mock_capture(Arc::clone(&mock));
+        let rx = capture
+            .subscribe_with_errors()
+            .expect("subscribe_with_errors should succeed");
+
+        // First item: the recoverable error, surfaced but non-terminal.
+        match rx.recv_timeout(std::time::Duration::from_secs(2)) {
+            Ok(Err(e)) => {
+                assert!(e.is_recoverable(), "first item is the recoverable error");
+            }
+            other => panic!("expected a recoverable Err item first, got: {other:?}"),
+        }
+        // Second item: the buffer behind it — delivery continued past the error.
+        match rx.recv_timeout(std::time::Duration::from_secs(2)) {
+            Ok(Ok(buf)) => assert_eq!(buf.data()[0], 0.7),
+            other => panic!("expected the buffered Ok item next, got: {other:?}"),
+        }
+
+        mock.signal_stop();
+    }
+
+    /// subscribe_with_errors() forwards the FATAL terminal AudioError as the
+    /// FINAL item before the channel disconnects — the consumer learns *why* the
+    /// stream ended rather than racing a bare RecvError.
+    #[test]
+    fn subscribe_with_errors_delivers_terminal_before_disconnect() {
+        let mock = Arc::new(MockCapturingStream::new());
+        // Queue one buffer, then stop so the next read is the fatal StreamEnded.
+        mock.push_buffer(AudioBuffer::new(vec![1.0; 4], 2, 48000));
+        let capture = make_mock_capture(Arc::clone(&mock));
+        let rx = capture
+            .subscribe_with_errors()
+            .expect("subscribe_with_errors should succeed");
+
+        // The buffered item arrives as Ok.
+        match rx.recv_timeout(std::time::Duration::from_secs(2)) {
+            Ok(Ok(buf)) => assert_eq!(buf.data()[0], 1.0),
+            other => panic!("expected the buffered Ok item, got: {other:?}"),
+        }
+
+        // Stop → the next read is the fatal terminal, delivered as a final Err.
+        mock.signal_stop();
+        let mut saw_terminal = false;
+        // Drain until we either see the terminal Err or the channel disconnects.
+        loop {
+            match rx.recv_timeout(std::time::Duration::from_secs(2)) {
+                Ok(Ok(_)) => continue, // any straggler buffer
+                Ok(Err(e)) => {
+                    assert!(
+                        e.is_fatal(),
+                        "the final delivered Err must be the fatal terminal"
+                    );
+                    assert!(matches!(e, AudioError::StreamEnded { .. }));
+                    saw_terminal = true;
+                }
+                Err(_) => break, // disconnected
+            }
+        }
+        assert!(
+            saw_terminal,
+            "subscribe_with_errors must deliver the terminal Err before disconnect"
+        );
+    }
+
+    // ── read_chunk_nonblocking() tests (terminal-observable read) ─────
+
+    /// read_chunk_nonblocking() yields Ok(Some(buf)) when data is available and
+    /// Ok(None) when the (running) ring is momentarily empty.
+    #[test]
+    fn read_chunk_nonblocking_yields_data_then_none() {
+        let mock = Arc::new(MockCapturingStream::new());
+        mock.push_buffer(AudioBuffer::new(vec![0.3; 4], 2, 48000));
+        let capture = make_mock_capture(Arc::clone(&mock));
+
+        let first = capture
+            .read_chunk_nonblocking()
+            .expect("read ok")
+            .expect("a buffer is available");
+        assert_eq!(first.data()[0], 0.3);
+
+        // Ring now empty but still running → Ok(None), NOT an error.
+        assert!(
+            capture.read_chunk_nonblocking().expect("read ok").is_none(),
+            "empty-but-running ring must yield Ok(None), not an error"
+        );
+
+        mock.signal_stop();
+    }
+
+    /// Unlike read_buffer() (which short-circuits to a RECOVERABLE
+    /// StreamReadError once the stream leaves Running), read_chunk_nonblocking()
+    /// surfaces the FATAL terminal StreamEnded once the ring is empty AND the
+    /// stream has stopped — the property the napi/Go pumps depend on.
+    #[test]
+    fn read_chunk_nonblocking_surfaces_fatal_terminal() {
+        let mock = Arc::new(MockCapturingStream::new());
+        let capture = make_mock_capture(Arc::clone(&mock));
+        mock.signal_stop();
+
+        match capture.read_chunk_nonblocking() {
+            Err(e) => {
+                assert!(e.is_fatal(), "terminal read must be fatal");
+                assert!(matches!(e, AudioError::StreamEnded { .. }));
+            }
+            other => panic!("expected fatal StreamEnded, got: {other:?}"),
+        }
+    }
+
+    /// read_chunk_nonblocking() drains the buffered tail AFTER stop (Stopping
+    /// drain semantics) before reporting the fatal terminal — proving it does
+    /// not discard data the way read_buffer()'s is_running() guard would.
+    #[test]
+    fn read_chunk_nonblocking_drains_tail_then_reports_terminal() {
+        let mock = Arc::new(MockCapturingStream::new());
+        mock.push_buffer(AudioBuffer::new(vec![5.0; 2], 1, 48000));
+        mock.signal_stop(); // stopped, but buffered tail remains
+        let capture = make_mock_capture(Arc::clone(&mock));
+
+        // The tail is drained first.
+        let buf = capture
+            .read_chunk_nonblocking()
+            .expect("tail read ok")
+            .expect("buffered tail is drained after stop");
+        assert_eq!(buf.data()[0], 5.0);
+
+        // Then the fatal terminal.
+        assert!(
+            matches!(
+                capture.read_chunk_nonblocking(),
+                Err(AudioError::StreamEnded { .. })
+            ),
+            "terminal reported only after the tail is drained"
+        );
     }
 
     // ── overrun_count() tests ─────────────────────────────────────────
@@ -2333,6 +2745,45 @@ mod tests {
         assert_eq!(fmt.sample_rate, 44100);
         assert_eq!(fmt.channels, 1);
         assert_eq!(fmt.sample_format, SampleFormat::F32);
+    }
+
+    /// PU-1/PERF-07 (rsac-2c56): the consumer-observable contract that each
+    /// backend now wires via `producer.set_negotiated_format(...)` at its
+    /// negotiation point (PipeWire `param_changed`, WASAPI mix-format open,
+    /// CoreAudio AUHAL stream-format set). `format()` and
+    /// `stream_stats().format_description` must report the *delivered* format the
+    /// backend recorded, NOT the *requested* config — the exact regression where
+    /// they previously reported the requested format because no backend called
+    /// `set_negotiated_format`. Here the builder requested the 48k/2ch default
+    /// but the backend negotiated (delivered) 44100/1, so both reads track the
+    /// delivered values.
+    #[test]
+    fn format_reports_delivered_not_requested() {
+        let requested = StreamConfig::default(); // 48 kHz, 2ch
+        assert_eq!(requested.sample_rate, 48000);
+        assert_eq!(requested.channels, 2);
+
+        let mock = Arc::new(MockCapturingStream::new());
+        // Backend negotiates a different *delivery* rate/channels than requested.
+        mock.set_negotiated_format(44100, 1);
+        let mut capture = make_mock_capture(Arc::clone(&mock));
+        // The handle still carries the *requested* config unchanged...
+        assert_eq!(capture.config().stream_config.sample_rate, 48000);
+        assert_eq!(capture.config().stream_config.channels, 2);
+
+        // ...but format() reports the DELIVERED format, divergent from requested.
+        let delivered = capture.format().expect("format is Some once started");
+        assert_eq!(delivered.sample_rate, 44100);
+        assert_eq!(delivered.channels, 1);
+        assert_eq!(delivered.sample_format, SampleFormat::F32);
+        assert_ne!(
+            delivered.sample_rate, requested.sample_rate,
+            "format() must track delivered, not requested"
+        );
+
+        // And the stats description string is built from the delivered format.
+        capture.start_instant = Some(Instant::now());
+        assert_eq!(capture.stream_stats().format_description, "1ch 44100Hz F32");
     }
 
     /// format_description_string yields a non-empty 'Nch RHz FMT' string for

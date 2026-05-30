@@ -423,6 +423,23 @@ fn wasapi_capture_thread_main(
     let channels = config.channels;
     let sample_rate = config.sample_rate;
 
+    // PU-1/PERF-07 (rsac-2c56): publish the negotiated *delivery* format onto
+    // the bridge so `stream.format()` / `StreamStats.format_description` report
+    // what is actually delivered rather than only what was requested. WASAPI was
+    // opened with the explicit `desired_format` (32-bit float, `sample_rate`,
+    // `channels`): on the system/device-loopback path autoconvert resamples the
+    // endpoint mix format to it, and on the process-loopback path the client
+    // accepts it directly — so in both cases the bridge receives exactly these
+    // `channels`/`sample_rate` as interleaved f32 (the values used by the drain
+    // loop's `push_samples_or_drop`). The bridge normalizes `sample_format` to
+    // F32 internally, so the value passed here is ignored. One-time, off-RT,
+    // lock-free `Release` store on the setup path before the capture loop.
+    producer.set_negotiated_format(&crate::core::config::AudioFormat {
+        sample_rate,
+        channels,
+        sample_format: crate::core::config::SampleFormat::F32,
+    });
+
     // Pre-allocate reusable buffers outside the loop to avoid per-iteration allocations.
     // The VecDeque is reused for raw bytes from WASAPI, and the Vec<f32> for converted samples.
     let mut sample_queue = std::collections::VecDeque::with_capacity(48000 * 4 * 2 / 10); // ~100ms at 48kHz stereo f32

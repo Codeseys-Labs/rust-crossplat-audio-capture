@@ -18,6 +18,20 @@ Releases with no ABI change omit the subsection (or state "No C ABI changes").
 
 ## [Unreleased]
 
+### Added
+
+### Changed
+
+### Deprecated
+
+### Removed
+
+### Fixed
+
+### Security
+
+## [0.3.0] - 2026-05-30
+
 Two threads of work landed since 0.2.0. First, correctness-focused fixes from the
 2026-05-29 deep-dive audit (waves 1–2) closed the real-time-safety,
 callback-delivery, and error-classification findings. Second, a six-wave feature
@@ -124,6 +138,22 @@ the parallel ADR set.)
 
 ### Changed
 
+- **BREAKING (SemVer): four public enums are now `#[non_exhaustive]`** —
+  `AudioError`, `CaptureTarget`, `AudioSourceKind`, and `PermissionStatus`. They
+  are expected to grow, so downstream `match` expressions on them must now carry a
+  trailing wildcard (`_ =>`) arm; adding a variant in a future minor release will
+  no longer be a breaking change. The deliberately **closed** enums —
+  `SampleFormat`, `DeviceKind`, `ErrorKind`, and `Recoverability` — are documented
+  as stable, exhaustively-matchable sets that will not grow. In-crate exhaustive
+  matches (e.g. `AudioError::recoverability()` / `user_message()`) are unaffected
+  and intentionally remain exhaustive to keep forcing classification of every
+  variant.
+- **Terminal-read signaling now crosses the C FFI** (fixes a Wave-B/Wave-C
+  interaction): `rsac_capture_read` / `rsac_capture_try_read` now read via the
+  terminal-observable path so a stopped stream surfaces the fatal
+  `RSAC_ERROR_STREAM_FAILED` (from `StreamEnded`) once drained, instead of a
+  recoverable `RSAC_ERROR_STREAM_READ`. Binding pumps (Go/Node) that branch on
+  recoverability now end cleanly on stop instead of spinning.
 - **RT producer is now allocation-free in steady state** (ADR-0001). Fixed the
   `push_samples_or_drop` scratch-shrink bug (the scratch `Vec` could collapse to
   capacity 0 and then re-allocate on the audio callback thread) and sized the

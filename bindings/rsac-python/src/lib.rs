@@ -164,6 +164,14 @@ fn audio_error_to_pyerr(err: rsac::AudioError) -> PyErr {
         rsac::AudioError::Timeout { .. } => CaptureTimeoutError::new_err(msg),
 
         rsac::AudioError::InternalError { .. } => RsacError::new_err(msg),
+
+        // `rsac::AudioError` is `#[non_exhaustive]`: a future variant added in a
+        // minor release lands here rather than breaking the build. Surface it as
+        // the generic `RsacError` (still carrying the upstream message) so the
+        // Python exception mapping stays forward-compatible. Every variant known
+        // at this version is mapped explicitly above; this arm only fires for
+        // additions.
+        _ => RsacError::new_err(msg),
     }
 }
 
@@ -271,6 +279,13 @@ impl PyCaptureTarget {
             rsac::CaptureTarget::ProcessTree(pid) => {
                 format!("CaptureTarget.process_tree({})", pid.0)
             }
+            // `rsac::CaptureTarget` is `#[non_exhaustive]`: a future variant added
+            // in a minor release lands here rather than breaking the build. Fall
+            // back to the upstream canonical string form (its in-crate `Display`
+            // impl is exhaustive, so it renders any variant) so the repr stays
+            // forward-compatible. Every variant known at this version has a
+            // dedicated arm above; this only fires for additions.
+            other => format!("CaptureTarget.parse({:?})", other.to_string()),
         }
     }
 
@@ -1097,16 +1112,47 @@ impl PyAudioCapture {
             return Err(PyStopIteration::new_err("Capture stopped"));
         }
 
-        // Release GIL for the blocking read.
-        let result = py.allow_threads(|| capture.read_buffer_blocking());
+        // Terminal-error delivery (BP-2): this loop fixes the previously
+        // INVERTED mapping. A FATAL terminal (`is_fatal()`, which covers
+        // `StreamEnded` — the natural end of capture) must raise
+        // `StopIteration` so `for buf in capture:` ends cleanly. A RECOVERABLE
+        // hiccup (transient `StreamReadError`, `BufferOverrun`/`Underrun`) must
+        // NOT end iteration — retry the blocking read instead of surfacing a
+        // `StreamError`. Only a genuinely unexpected (non-recoverable,
+        // non-terminal) error propagates via `audio_error_to_pyerr`.
+        //
+        // The old code did the opposite: it raised `StopIteration` on the
+        // recoverable `StreamReadError` (cutting iteration short on a transient
+        // blip) and surfaced the fatal `StreamEnded` as a `StreamError`
+        // (raising on the natural end of capture).
+        loop {
+            // Release GIL for the blocking read.
+            let result = py.allow_threads(|| capture.read_buffer_blocking());
 
-        match result {
-            Ok(buf) => Ok(Some(PyAudioBuffer { inner: buf })),
-            Err(rsac::AudioError::StreamReadError { .. }) => {
-                // Stream ended — stop iteration
-                Err(PyStopIteration::new_err("Stream ended"))
+            match result {
+                Ok(buf) => return Ok(Some(PyAudioBuffer { inner: buf })),
+                // Natural end of capture / terminal: end iteration. `is_fatal()`
+                // is the single source of truth (ADR-0003: `StreamEnded` is
+                // Fatal); we do not match a specific variant so any fatal
+                // terminal ends cleanly.
+                Err(e) if e.is_fatal() => {
+                    return Err(PyStopIteration::new_err(e.to_string()));
+                }
+                // Recoverable hiccup: do NOT end iteration. But `read_buffer_blocking`
+                // returns a *recoverable* `StreamReadError` when the stream has
+                // left `Running` (e.g. an external `stop()`), so re-check the
+                // running state to avoid spinning forever after a stop — a stop
+                // mid-iteration ends it cleanly via `StopIteration`.
+                Err(e) if e.is_recoverable() => {
+                    if !capture.is_running() {
+                        return Err(PyStopIteration::new_err("Capture stopped"));
+                    }
+                    continue;
+                }
+                // Genuinely unexpected (neither recoverable nor a fatal terminal):
+                // surface it as the mapped Python exception.
+                Err(e) => return Err(audio_error_to_pyerr(e)),
             }
-            Err(e) => Err(audio_error_to_pyerr(e)),
         }
     }
 
@@ -1254,5 +1300,54 @@ mod tests {
         expected.extend_from_slice(&1.0f32.to_le_bytes());
         expected.extend_from_slice(&2.0f32.to_le_bytes());
         assert_eq!(bytes, expected);
+    }
+
+    // ── __next__ terminal-error classification (BP-2) ─────────────────
+    //
+    // `__next__` cannot be exercised here without a real device / PyO3 runtime,
+    // so these tests pin the *classification contract* the rewritten loop relies
+    // on: a fatal terminal → StopIteration, a recoverable hiccup → retry. They
+    // guard against re-introducing the inverted mapping (where the recoverable
+    // `StreamReadError` ended iteration and the fatal `StreamEnded` raised).
+
+    /// `StreamEnded` (the natural end of capture) is FATAL, so `__next__` raises
+    /// `StopIteration` on it — NOT a `StreamError`.
+    #[test]
+    fn stream_ended_is_fatal_so_next_raises_stop_iteration() {
+        let e = rsac::AudioError::StreamEnded {
+            reason: "capture ended".into(),
+        };
+        assert!(
+            e.is_fatal(),
+            "StreamEnded must be fatal → __next__ ends via StopIteration"
+        );
+        assert!(!e.is_recoverable());
+    }
+
+    /// A transient `StreamReadError` is RECOVERABLE, so `__next__` must retry it
+    /// rather than ending iteration (the old inverted bug raised StopIteration
+    /// here, cutting the stream short on a blip).
+    #[test]
+    fn stream_read_error_is_recoverable_so_next_retries() {
+        let e = rsac::AudioError::StreamReadError {
+            reason: "transient".into(),
+        };
+        assert!(
+            e.is_recoverable(),
+            "a transient StreamReadError must be recoverable → __next__ retries"
+        );
+        assert!(!e.is_fatal());
+    }
+
+    /// Buffer over/underruns are recoverable too — a momentary ring hiccup must
+    /// not end iteration.
+    #[test]
+    fn buffer_over_underrun_are_recoverable() {
+        assert!(rsac::AudioError::BufferOverrun { dropped_frames: 1 }.is_recoverable());
+        assert!(rsac::AudioError::BufferUnderrun {
+            requested: 1,
+            available: 0,
+        }
+        .is_recoverable());
     }
 }

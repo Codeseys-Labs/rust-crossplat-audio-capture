@@ -231,6 +231,13 @@ impl CaptureTarget {
                 format!("ApplicationByName({})", name)
             }
             rsac::CaptureTarget::ProcessTree(pid) => format!("ProcessTree({})", pid),
+            // `rsac::CaptureTarget` is `#[non_exhaustive]`: a future variant added
+            // in a minor release lands here rather than breaking the build. Fall
+            // back to the upstream canonical string form (its in-crate `Display`
+            // impl is exhaustive, so it renders any variant) so describe() stays
+            // forward-compatible. Every variant known at this version has a
+            // dedicated arm above; this only fires for additions.
+            other => other.to_string(),
         }
     }
 }
@@ -689,13 +696,21 @@ impl AudioCapture {
             .name("rsac-napi-pump".into())
             .spawn(move || {
                 while pump_active.load(Ordering::SeqCst) {
-                    // Try to read a buffer
+                    // Read via `read_chunk_nonblocking` (NOT `read_buffer`):
+                    // `read_buffer` short-circuits to a RECOVERABLE
+                    // `StreamReadError` the moment the stream leaves `Running`,
+                    // so it can NEVER surface the fatal `StreamEnded` — the pump
+                    // would loop on a recoverable error forever after stop.
+                    // `read_chunk_nonblocking` drains the buffered tail during
+                    // `Stopping` and yields the terminal `StreamEnded` (fatal)
+                    // once the ring is empty AND the stream is terminal, so we
+                    // can end cleanly on a real terminal (BP-3).
                     let maybe_buf = {
-                        let mut capture = match inner.lock() {
+                        let capture = match inner.lock() {
                             Ok(c) => c,
                             Err(_) => break, // Mutex poisoned, bail
                         };
-                        capture.read_buffer()
+                        capture.read_chunk_nonblocking()
                     };
 
                     match maybe_buf {
@@ -713,9 +728,22 @@ impl AudioCapture {
                             // No data available, yield briefly to avoid busy-spinning
                             std::thread::sleep(std::time::Duration::from_millis(1));
                         }
-                        Err(_) => {
-                            // Stream error — stop pumping
+                        // FATAL terminal (e.g. StreamEnded): the stream is done —
+                        // stop pumping cleanly. Log the terminal cause so the end
+                        // is never fully silent. (A consumer that needs the terminal
+                        // AudioError surfaced to JS should register an on-end/on-error
+                        // callback; the data pump itself ends here without erroring.)
+                        Err(ref e) if e.is_fatal() => {
+                            eprintln!("rsac-napi data pump ended (terminal): {}", e);
                             break;
+                        }
+                        // RECOVERABLE hiccup (transient StreamReadError,
+                        // BufferOverrun/Underrun): a transient error must NOT end
+                        // delivery. Log and retry after a brief pause, mirroring
+                        // the in-process callback pump and the subscribe loop.
+                        Err(e) => {
+                            eprintln!("rsac-napi data pump read error (retrying): {}", e);
+                            std::thread::sleep(std::time::Duration::from_millis(1));
                         }
                     }
                 }

@@ -15,6 +15,13 @@ use super::error::{AudioError, AudioResult};
 use crate::core::buffer::AudioBuffer;
 
 /// Represents the kind of an audio device.
+///
+/// # Stability
+///
+/// This enum is **deliberately not** `#[non_exhaustive]`: an audio endpoint is
+/// either an input or an output, a fixed binary classification callers match
+/// exhaustively. Keeping it closed is a stability guarantee — the set will not grow
+/// in a way that silently breaks exhaustive matches.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum DeviceKind {
     /// An input device, typically used for recording audio.
@@ -326,9 +333,35 @@ pub trait CapturingStream: Send + Sync {
         Ok(())
     }
 
-    /// Register an async waker to be notified when new audio data is available.
+    /// Register an async waker to be notified when new audio data (or a terminal
+    /// state) becomes available.
     ///
-    /// Returns `true` if the stream supports async notification, `false` otherwise.
+    /// # Contract (FH-5)
+    ///
+    /// The return value is a **promise**, not merely a capability flag:
+    ///
+    /// * `true` — the waker was registered and the producer **will** wake it
+    ///   when new data is pushed or the stream reaches a terminal state. A
+    ///   consumer that registered a waker and got `true` may safely park
+    ///   ([`Poll::Pending`](std::task::Poll::Pending)) and rely on being woken.
+    /// * `false` — the waker was **not** registered and will **never** be woken
+    ///   by this stream. A consumer that gets `false` **must not park** on the
+    ///   waker; doing so would hang forever. It must instead make progress
+    ///   another way (e.g. self-wake to re-poll, poll, or surface an error).
+    ///
+    /// The default implementation returns `false` (no async support), so the
+    /// trait stays additive: external backends keep compiling and are treated
+    /// as non-waking until they opt in by overriding this method and honouring
+    /// the wake promise.
+    ///
+    /// The shipped `BridgeStream` (`pub(crate)`) returns
+    /// `true` and wakes the registered waker from every state transition and on
+    /// every push (the wake itself is alloc-free and lock-free, per ADR-0001).
+    /// [`AsyncAudioStream`](crate::bridge::AsyncAudioStream) is the in-crate
+    /// consumer that depends on this contract; it falls back to a bounded
+    /// self-wake loop when a backend returns `false` so a non-waking backend can
+    /// never cause an async hang.
+    ///
     /// Used internally by `AsyncAudioStream`.
     #[cfg(feature = "async-stream")]
     fn register_waker(&self, waker: &std::task::Waker) -> bool {
@@ -336,10 +369,22 @@ pub trait CapturingStream: Send + Sync {
         false
     }
 
-    /// Returns `true` if the stream's producer is still active and may produce more data.
+    /// Returns `true` if the stream's producer is still active and may produce
+    /// more data.
     ///
-    /// Returns `false` once the producer has signaled completion.
-    /// Used internally by `AsyncAudioStream` to determine when to return `None`.
+    /// Returns `false` once the producer has signaled completion or reached a
+    /// terminal state, so no further data will arrive. Used internally by
+    /// [`AsyncAudioStream`](crate::bridge::AsyncAudioStream) to decide when to
+    /// end the stream (`Poll::Ready(None)`).
+    ///
+    /// # Relationship to the waker contract
+    ///
+    /// This is the companion of [`register_waker`](Self::register_waker): a
+    /// consumer that registered a waker (and got `true`) is woken on the
+    /// transition that flips this from `true` to `false`, so it can re-poll,
+    /// observe the terminal state, and end the stream rather than parking. The
+    /// default implementation returns `true` (always producing) for backends
+    /// that do not track producer liveness.
     #[cfg(feature = "async-stream")]
     fn is_stream_producing(&self) -> bool {
         true

@@ -187,6 +187,12 @@ fn map_rsac_error(err: &rsac::AudioError) -> rsac_error_t {
         AudioError::PermissionDenied { .. } => rsac_error_t::RSAC_ERROR_PERMISSION_DENIED,
         AudioError::Timeout { .. } => rsac_error_t::RSAC_ERROR_TIMEOUT,
         AudioError::InternalError { .. } => rsac_error_t::RSAC_ERROR_INTERNAL,
+        // `rsac::AudioError` is `#[non_exhaustive]`: a future variant added in a
+        // minor release lands here rather than breaking the build. Map any such
+        // unrecognized failure to the generic internal code so the C ABI stays
+        // forward-compatible. (Every variant known at this version is matched
+        // explicitly above; this arm only fires for additions.)
+        _ => rsac_error_t::RSAC_ERROR_INTERNAL,
     }
 }
 
@@ -780,12 +786,17 @@ pub unsafe extern "C" fn rsac_capture_try_read(
             return rsac_error_t::RSAC_ERROR_NULL_POINTER;
         }
         unsafe { *out = ptr::null_mut() };
-        // `read_buffer` now takes `&self`, so a shared `&*capture` suffices —
-        // this removes the `&mut`-aliasing UB the Go ReadBuffer/Close race
-        // (#28) relied on. The C ABI is unchanged (C symbols do not encode
-        // const), so this is source- and ABI-compatible for callers.
+        // Use the TERMINAL-OBSERVABLE read path (read_chunk_nonblocking), NOT
+        // read_buffer(): read_buffer() short-circuits to a *recoverable*
+        // StreamReadError as soon as the stream leaves Running, so the fatal
+        // StreamEnded could never cross the C ABI — and a binding pump that
+        // (correctly) retries recoverable errors would spin forever after a
+        // stop instead of ending. read_chunk_nonblocking drains the Stopping
+        // tail and yields Err(StreamEnded) -> RSAC_ERROR_STREAM_FAILED (fatal)
+        // once the ring is empty and the stream is terminal, so Go/Node pumps
+        // end cleanly. `&self` shares the capture (no `&mut` alias — fixes #28).
         let c = unsafe { &*capture };
-        match c.inner.read_buffer() {
+        match c.inner.read_chunk_nonblocking() {
             Ok(Some(buf)) => {
                 let handle = Box::new(RsacAudioBuffer { inner: buf });
                 unsafe { *out = Box::into_raw(handle) };
@@ -816,11 +827,16 @@ pub unsafe extern "C" fn rsac_capture_read(
             return rsac_error_t::RSAC_ERROR_NULL_POINTER;
         }
         unsafe { *out = ptr::null_mut() };
-        // `read_buffer_blocking` now takes `&self`; share via `&*capture`. A
-        // concurrent `rsac_capture_request_stop` can unblock this parked read
-        // without ever forming a `&mut` alias to the same capture (fixes #28).
+        // Use the TERMINAL-OBSERVABLE blocking read (read_chunk_blocking), NOT
+        // read_buffer_blocking(): the latter's is_running() guard downgrades the
+        // terminal StreamEnded to a recoverable StreamReadError, so a Go/Node
+        // pump that retries recoverable errors would spin forever after a stop.
+        // read_chunk_blocking blocks until data OR a terminal state, then yields
+        // Err(StreamEnded) -> RSAC_ERROR_STREAM_FAILED (fatal). A concurrent
+        // `rsac_capture_request_stop` unblocks this parked read without forming a
+        // `&mut` alias to the same capture (fixes #28).
         let c = unsafe { &*capture };
-        match c.inner.read_buffer_blocking() {
+        match c.inner.read_chunk_blocking() {
             Ok(buf) => {
                 let handle = Box::new(RsacAudioBuffer { inner: buf });
                 unsafe { *out = Box::into_raw(handle) };

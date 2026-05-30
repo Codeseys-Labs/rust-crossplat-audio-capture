@@ -37,7 +37,16 @@ pub struct AudioSource {
 }
 
 /// Classification of an audio source.
+///
+/// # Stability
+///
+/// This enum is `#[non_exhaustive]`: new source classifications may be added in a
+/// minor release. **Out-of-crate** code matching on `AudioSourceKind` must include
+/// a trailing wildcard (`_ =>`) arm. The in-crate [`AudioSource::to_capture_target`]
+/// match stays exhaustive so a new variant forces its capture-target mapping to be
+/// defined.
 #[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum AudioSourceKind {
     /// System default audio mix.
     SystemDefault,
@@ -262,7 +271,15 @@ fn list_audio_applications_into(_sources: &mut Vec<AudioSource>) {}
 // ── Permission helpers ──────────────────────────────────────────────────
 
 /// Describes the permission status for audio capture features.
+///
+/// # Stability
+///
+/// This enum is `#[non_exhaustive]`: new permission states may be added in a minor
+/// release (e.g. a platform that distinguishes "restricted by policy" from
+/// "denied"). **Out-of-crate** code matching on `PermissionStatus` must include a
+/// trailing wildcard (`_ =>`) arm.
 #[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum PermissionStatus {
     /// Permission is granted — the feature can be used.
     Granted,

@@ -138,6 +138,43 @@ func (e ErrorCode) String() string {
 	}
 }
 
+// IsRecoverable reports whether an error of this code is a transient hiccup the
+// caller should retry, rather than a fatal/terminal condition that ends the
+// stream. It mirrors the rsac core's recoverability classification (ADR-0003)
+// as projected onto the FFI error codes by map_rsac_error in
+// bindings/rsac-ffi/src/lib.rs:
+//
+//   - Recoverable: ErrStreamRead (transient read / over- or under-run),
+//     ErrTimeout, ErrBackend (TransientRetry).
+//   - Fatal: ErrStreamFailed (covers the terminal StreamEnded), and every
+//     other code (configuration, device, platform, internal, panic, …).
+//
+// Consumers (e.g. [AudioCapture.Stream]) continue past a recoverable error and
+// stop only on a fatal one.
+func (e ErrorCode) IsRecoverable() bool {
+	switch e {
+	case ErrStreamRead, ErrTimeout, ErrBackend:
+		return true
+	default:
+		return false
+	}
+}
+
+// IsRecoverable reports whether err is a recoverable rsac error (see
+// [ErrorCode.IsRecoverable]). It unwraps to the underlying *Error via
+// errors.As; a nil error or a non-rsac error is treated as not recoverable
+// (callers should already have handled nil before asking).
+func IsRecoverable(err error) bool {
+	if err == nil {
+		return false
+	}
+	var e *Error
+	if errors.As(err, &e) {
+		return e.Code.IsRecoverable()
+	}
+	return false
+}
+
 // Error represents an error returned by the rsac library.
 // It implements the error interface and supports errors.Is/As.
 type Error struct {
@@ -1017,7 +1054,17 @@ func (c *AudioCapture) streamLoop(ctx context.Context, ch chan<- AudioBuffer) {
 
 		buf, ok, err := c.TryReadBuffer()
 		if err != nil {
-			return // stream error, stop delivering
+			// A recoverable hiccup must NOT end the stream — yield and retry
+			// (mirrors the in-process subscribe loop and the napi pump). A
+			// fatal/terminal error (ErrStreamFailed for the terminal
+			// StreamEnded, or anything non-recoverable) stops delivery and
+			// closes the channel. ErrClosed (the capture was closed underneath
+			// us) always stops, even though its code is in the recoverable set.
+			if IsRecoverable(err) && !errors.Is(err, ErrClosed) {
+				runtime.Gosched()
+				continue
+			}
+			return // fatal terminal (or closed): stop delivering, close channel
 		}
 		if !ok {
 			// No data available. Yield briefly to avoid busy-spinning.
@@ -1044,6 +1091,16 @@ func (c *AudioCapture) streamLoopWithErrors(ctx context.Context, ch chan<- Strea
 
 		buf, ok, err := c.TryReadBuffer()
 		if err != nil {
+			// A recoverable hiccup must NOT be reported as a terminal error
+			// (that would mislead a `for r := range ch` consumer into stopping)
+			// — swallow it and keep delivering, matching the value-only
+			// Stream() loop. A fatal/terminal error (or ErrClosed) is delivered
+			// as the FINAL StreamResult{Err} and then closes the channel, so the
+			// consumer learns why the stream ended.
+			if IsRecoverable(err) && !errors.Is(err, ErrClosed) {
+				runtime.Gosched()
+				continue
+			}
 			select {
 			case ch <- StreamResult{Err: err}:
 			case <-ctx.Done():

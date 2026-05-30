@@ -50,7 +50,16 @@ impl std::fmt::Display for ProcessId {
 /// This enum specifies *what* audio should be captured. It replaces the old
 /// combination of `DeviceSelector` + PID/session fields with a single,
 /// explicit discriminated union.
+///
+/// # Stability
+///
+/// This enum is `#[non_exhaustive]`: new capture-target kinds may be added in a
+/// minor release. **Out-of-crate** code matching on `CaptureTarget` must include a
+/// trailing wildcard (`_ =>`) arm. The in-crate [`Display`](std::fmt::Display) and
+/// [`FromStr`](std::str::FromStr) impls stay exhaustive on purpose so a new variant
+/// forces its canonical string form to be defined.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Hash)]
+#[non_exhaustive]
 pub enum CaptureTarget {
     /// Capture from the system default audio device / mix.
     #[default]
@@ -187,6 +196,13 @@ impl TryFrom<&str> for CaptureTarget {
 /// All audio data is standardized to `f32` internally, but this enum
 /// describes the wire/storage format for configuration and capability
 /// negotiation.
+///
+/// # Stability
+///
+/// This enum is **deliberately not** `#[non_exhaustive]`: the four PCM sample
+/// formats are a fixed, intentional set callers match exhaustively (e.g. to size
+/// per-sample buffers). Keeping it closed is a stability guarantee — the set will
+/// not grow in a way that silently breaks exhaustive matches.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum SampleFormat {
     /// Signed 16-bit integer.

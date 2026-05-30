@@ -22,6 +22,13 @@ use std::fmt;
 // ── Supporting Types ─────────────────────────────────────────────────────
 
 /// Categorizes an [`AudioError`] into a high-level domain.
+///
+/// # Stability
+///
+/// This enum is **deliberately not** `#[non_exhaustive]`: its seven domains are a
+/// fixed, intentional classification axis that downstream code is meant to match
+/// exhaustively. Keeping it closed is a stability guarantee — the set will not
+/// grow in a way that silently breaks exhaustive matches.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum ErrorKind {
     Configuration,
@@ -48,6 +55,14 @@ impl fmt::Display for ErrorKind {
 }
 
 /// Three-state recoverability classification for [`AudioError`].
+///
+/// # Stability
+///
+/// This enum is **deliberately not** `#[non_exhaustive]`: the three recoverability
+/// states are a fixed, intentional classification axis callers branch on
+/// exhaustively (retry / abandon / continue). Keeping it closed is a stability
+/// guarantee — the set will not grow in a way that silently breaks exhaustive
+/// matches.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum Recoverability {
     /// The error is recoverable — the caller can continue normally.
@@ -104,7 +119,21 @@ impl fmt::Display for BackendContext {
 ///
 /// Organized into 7 categories with 22 total variants.
 /// Each variant carries structured context for diagnostics.
+///
+/// # Stability
+///
+/// This enum is `#[non_exhaustive]`: new failure modes may be added in a minor
+/// release without it being a breaking change. **Out-of-crate** code matching on
+/// `AudioError` must therefore include a trailing wildcard (`_ =>`) arm to stay
+/// forward-compatible; treat an unrecognized variant by consulting
+/// [`kind`](Self::kind) / [`recoverability`](Self::recoverability) /
+/// [`user_message`](Self::user_message) rather than the variant identity. The
+/// classification methods on this type ([`kind`](Self::kind),
+/// [`recoverability`](Self::recoverability), [`user_message`](Self::user_message))
+/// remain exhaustive **inside this crate** so every new variant is forced to
+/// declare its category, recoverability, and user-facing text deliberately.
 #[derive(Debug)]
+#[non_exhaustive]
 pub enum AudioError {
     // ── Configuration errors ─────────────────────────────────────────
     /// A parameter value is invalid.
@@ -2021,6 +2050,44 @@ mod tests {
         assert!(
             shown.contains("list_audio_sources"),
             "Display should append the remedy: {shown}"
+        );
+    }
+
+    // ── #[non_exhaustive] semantics (AEG-1 / rsac-4341) ──────────────────
+
+    /// `AudioError` is `#[non_exhaustive]`. Out-of-crate consumers must include a
+    /// trailing wildcard arm; the canonical forward-compatible path is to classify
+    /// an unrecognized variant via [`kind`]/[`recoverability`] rather than its
+    /// identity. This test models a *binding-style* match (the shape the three
+    /// binding crates use) — every named arm PLUS a `_ =>` fallback — and asserts
+    /// the wildcard is reachable as the classification default.
+    ///
+    /// In-crate this match would still compile without the `_` (the attribute is a
+    /// no-op for matches in the defining crate), but writing it here documents and
+    /// locks in the contract the binding crates depend on.
+    #[test]
+    fn non_exhaustive_match_uses_wildcard_classification() {
+        fn classify(err: &AudioError) -> Recoverability {
+            match err {
+                AudioError::StreamReadError { .. } => Recoverability::Recoverable,
+                // The trailing wildcard is REQUIRED out-of-crate because
+                // AudioError is #[non_exhaustive]; defer to the crate's own
+                // classification so a future variant is handled, not ignored.
+                other => other.recoverability(),
+            }
+        }
+
+        // A known arm.
+        assert_eq!(
+            classify(&AudioError::StreamReadError { reason: "x".into() }),
+            Recoverability::Recoverable
+        );
+        // An arm reached only through the wildcard.
+        assert_eq!(
+            classify(&AudioError::StreamEnded {
+                reason: "done".into()
+            }),
+            Recoverability::Fatal
         );
     }
 }

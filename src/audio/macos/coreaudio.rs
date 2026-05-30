@@ -515,6 +515,20 @@ impl AudioDevice for MacosAudioDevice {
             channels: format.channels,
         };
 
+        // PU-1/PERF-07 (rsac-2c56): publish the negotiated *delivery* format onto
+        // the bridge so `stream.format()` / `StreamStats.format_description` report
+        // what is actually delivered, not merely what was requested. The IO proc
+        // sets the AUHAL stream format to an interleaved-F32 ASBD built from
+        // `format.sample_rate`/`format.channels` (see `build_f32_asbd` /
+        // `create_macos_capture`), so CoreAudio's AUHAL converts and delivers
+        // exactly that rate/channels as f32 — which is what the input callback
+        // pushes via `push_samples_or_drop`. We record it here, before the
+        // `producer` is moved into `create_macos_capture`, because that is the
+        // negotiation point reachable from this owned file. The bridge normalizes
+        // `sample_format` to F32 internally, so that field is ignored. One-time,
+        // off-RT, lock-free `Release` store on the setup path.
+        producer.set_negotiated_format(&format);
+
         // 6. Create the CoreAudio capture (registers callback, starts AudioUnit).
         //    Producer-terminal-signal (FH-1 / ADR-0010): hand the platform stream
         //    a clone of the bridge's shared state so its stop/Drop choke point can

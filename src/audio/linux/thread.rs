@@ -1715,18 +1715,6 @@ fn pw_thread_main(
                         // correct metadata. This keeps PER-BUFFER metadata
                         // authoritative (`AudioBuffer::channels()/sample_rate()`
                         // reflect the negotiated values).
-                        //
-                        // M1 (Linux half): the bridge-level `stream.format()`
-                        // currently reports the *requested* format because
-                        // `BridgeShared.format` is immutable. Propagating the
-                        // negotiated values up to `stream.format()` requires an
-                        // atomic format field on `BridgeShared`, which is owned
-                        // by the bridge/core change in the same audit wave. Once
-                        // that atomic exists, write `negotiated_channels` /
-                        // `negotiated_rate` to it here (the producer already
-                        // lives in `user_data`). Until then, downstream consumers
-                        // should trust `AudioBuffer` metadata over
-                        // `stream.format()` for the true delivery format.
                         let negotiated_channels = user_data.format.channels();
                         let negotiated_rate = user_data.format.rate();
                         if negotiated_channels > 0 {
@@ -1735,6 +1723,24 @@ fn pw_thread_main(
                         if negotiated_rate > 0 {
                             user_data.sample_rate = negotiated_rate;
                         }
+
+                        // PU-1/PERF-07 (rsac-2c56): publish the negotiated
+                        // *delivery* format onto the bridge so `stream.format()`
+                        // and `StreamStats.format_description` report what is
+                        // actually delivered, not merely what was requested. The
+                        // bridge normalizes `sample_format` to F32 internally
+                        // (the process callback always pushes interleaved f32),
+                        // so the value passed here is ignored — only the
+                        // negotiated rate/channels carry through. Cheap, lock-free
+                        // (a single `Release` store), and called only on the
+                        // negotiation event, never the per-buffer hot path.
+                        user_data.producer.set_negotiated_format(
+                            &crate::core::config::AudioFormat {
+                                sample_rate: user_data.sample_rate,
+                                channels: user_data.channels,
+                                sample_format: crate::core::config::SampleFormat::F32,
+                            },
+                        );
 
                         log::debug!(
                             "PipeWire format negotiated: {:?}, {}ch @ {}Hz",

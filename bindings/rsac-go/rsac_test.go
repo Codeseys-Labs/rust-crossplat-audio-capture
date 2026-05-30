@@ -3,6 +3,7 @@ package rsac
 import (
 	"context"
 	"errors"
+	"fmt"
 	"math"
 	"runtime/cgo"
 	"sync"
@@ -69,6 +70,67 @@ func TestErrorCode_Discriminants(t *testing.T) {
 		if int(tt.code) != tt.want {
 			t.Errorf("ErrorCode discriminant = %d, want %d (%s)", int(tt.code), tt.want, tt.code)
 		}
+	}
+}
+
+// TestErrorCode_IsRecoverable pins the recoverability classification used by
+// the stream loops to continue-on-recoverable / stop-on-fatal. It must mirror
+// the rsac core (ADR-0003) as projected onto the FFI codes by map_rsac_error:
+// STREAM_READ / TIMEOUT / BACKEND are recoverable; STREAM_FAILED (the terminal
+// StreamEnded) and everything else are fatal. (BP-6.)
+func TestErrorCode_IsRecoverable(t *testing.T) {
+	recoverable := []ErrorCode{ErrStreamRead, ErrTimeout, ErrBackend}
+	fatal := []ErrorCode{
+		ErrOK, ErrNullPointer, ErrInvalidParameter, ErrDeviceNotFound,
+		ErrPlatformNotSupported, ErrStreamFailed, ErrConfiguration,
+		ErrAppNotFound, ErrPermissionDenied, ErrInternal, ErrPanic,
+		ErrorCode(9999),
+	}
+	for _, c := range recoverable {
+		if !c.IsRecoverable() {
+			t.Errorf("%s should be recoverable", c)
+		}
+	}
+	for _, c := range fatal {
+		if c.IsRecoverable() {
+			t.Errorf("%s should NOT be recoverable (fatal/terminal)", c)
+		}
+	}
+	// The terminal StreamEnded crosses the FFI as ErrStreamFailed; it must be
+	// classified fatal so the stream loops end (not retry) on natural end.
+	if ErrStreamFailed.IsRecoverable() {
+		t.Errorf("ErrStreamFailed (terminal StreamEnded) must be fatal")
+	}
+}
+
+// TestIsRecoverable checks the package-level helper that unwraps an error to
+// its *Error and classifies it. A nil or non-rsac error is not recoverable.
+func TestIsRecoverable(t *testing.T) {
+	if !IsRecoverable(&Error{Code: ErrStreamRead}) {
+		t.Error("a StreamRead *Error should be recoverable")
+	}
+	if !IsRecoverable(&Error{Code: ErrTimeout}) {
+		t.Error("a Timeout *Error should be recoverable")
+	}
+	if IsRecoverable(&Error{Code: ErrStreamFailed}) {
+		t.Error("a StreamFailed *Error should be fatal")
+	}
+	if IsRecoverable(nil) {
+		t.Error("nil error must not be classified recoverable")
+	}
+	if IsRecoverable(errors.New("plain non-rsac error")) {
+		t.Error("a non-rsac error must not be classified recoverable")
+	}
+	// Wrapped rsac error still unwraps via errors.As.
+	wrapped := fmt.Errorf("context: %w", &Error{Code: ErrBackend})
+	if !IsRecoverable(wrapped) {
+		t.Error("a wrapped recoverable *Error should still be recoverable")
+	}
+	// ErrClosed carries ErrStreamRead, so it is *code-recoverable*; the stream
+	// loops special-case it with errors.Is(err, ErrClosed) to stop anyway. This
+	// documents that IsRecoverable alone returns true for ErrClosed.
+	if !IsRecoverable(ErrClosed) {
+		t.Error("ErrClosed's code (ErrStreamRead) is recoverable; loops gate it via errors.Is")
 	}
 }
 
