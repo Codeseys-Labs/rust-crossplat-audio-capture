@@ -279,6 +279,98 @@ mod integration_tests {
         assert_eq!(stream.shared().state.get(), StreamState::Stopping);
         assert!(!stream.is_running());
     }
+
+    // ── PU-5 (rsac-efb4): wake-on-push through the BridgeStream surface ──────
+
+    /// A blocking `read_chunk()` (which delegates to `pop_blocking`) must wake
+    /// PROMPTLY when a producer pushes data on another thread and signals the
+    /// unconditional wake — it must NOT sleep out the stream's blocking timeout.
+    /// This exercises PU-5 end-to-end through the public `CapturingStream` read
+    /// surface, not just the raw consumer.
+    #[test]
+    fn read_chunk_wakes_promptly_on_push() {
+        use std::sync::Arc;
+        use std::time::Instant;
+
+        let format = test_format();
+        // A LONG default timeout: a pre-PU-5 1 ms-poll reader would still pass,
+        // but a regression that parks the full timeout (no wake) would hang well
+        // past our prompt-return assertion below.
+        let (mut producer, consumer) = create_bridge(16, format.clone());
+        consumer
+            .shared()
+            .state
+            .transition(StreamState::Created, StreamState::Running)
+            .unwrap();
+        let stream = Arc::new(BridgeStream::new(
+            consumer,
+            MockPlatformStream::new(),
+            format,
+            Duration::from_secs(10),
+        ));
+
+        let reader = Arc::clone(&stream);
+        let handle = std::thread::spawn(move || {
+            let start = Instant::now();
+            let buf = reader.read_chunk().expect("push must wake the reader");
+            (buf, start.elapsed())
+        });
+
+        // Let the reader park, then push + wake (Windows-producer style).
+        std::thread::sleep(Duration::from_millis(50));
+        producer.push(test_buffer(0.6)).expect("push");
+        producer.notify_consumers();
+
+        let (buf, elapsed) = handle.join().expect("reader thread panicked");
+        assert!((buf.data()[0] - 0.6).abs() < 1e-6);
+        assert!(
+            elapsed < Duration::from_secs(2),
+            "read_chunk must wake on the push, not sleep out the 10 s timeout \
+             (returned after {elapsed:?})"
+        );
+    }
+
+    /// `signal_error()` on a parked `read_chunk()` ends it with the Fatal
+    /// `StreamEnded` PROMPTLY (terminal Error). Proves a dead producer unblocks a
+    /// blocking reader through the stream surface, far before the long timeout.
+    #[test]
+    fn read_chunk_wakes_on_signal_error_with_fatal() {
+        use std::sync::Arc;
+        use std::time::Instant;
+
+        let format = test_format();
+        let (producer, consumer) = create_bridge(16, format.clone());
+        consumer
+            .shared()
+            .state
+            .transition(StreamState::Created, StreamState::Running)
+            .unwrap();
+        let stream = Arc::new(BridgeStream::new(
+            consumer,
+            MockPlatformStream::new(),
+            format,
+            Duration::from_secs(10),
+        ));
+
+        let reader = Arc::clone(&stream);
+        let handle = std::thread::spawn(move || {
+            let start = Instant::now();
+            let res = reader.read_chunk();
+            (res, start.elapsed())
+        });
+
+        std::thread::sleep(Duration::from_millis(50));
+        producer.signal_error();
+
+        let (res, elapsed) = handle.join().expect("reader thread panicked");
+        let err = res.expect_err("terminal Error must end the blocking read");
+        assert!(err.is_fatal(), "terminal-Error read must be Fatal");
+        assert!(
+            elapsed < Duration::from_secs(2),
+            "signal_error must wake the parked read_chunk, not sleep out the \
+             timeout (returned after {elapsed:?})"
+        );
+    }
 }
 
 // ── Async Stream Tests ───────────────────────────────────────────────────

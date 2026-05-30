@@ -25,6 +25,11 @@
 //! - **capacity_sweep** — `push_throughput` repeated across a range of ring
 //!   capacities from [`calculate_capacity`] ({16, 32, 64, 128, 256}) to show how
 //!   ring sizing affects the steady-state cost.
+//! - **wasapi_byte_decode** — the WASAPI capture hot-path byte→f32 conversion
+//!   (PU-7, seed `rsac-7876`), comparing the previous scalar `from_le_bytes`
+//!   loop against the new bulk `slice::align_to::<f32>()` reinterpret. Pure
+//!   conversion, no WASAPI/COM — so it builds and runs on any host. See the
+//!   `wasapi_byte_decode` group below for the measured before/after.
 //!
 //! All hot values flow through [`std::hint::black_box`] (re-exported by criterion)
 //! so the optimizer cannot elide the work being measured.
@@ -147,10 +152,85 @@ fn bench_capacity_sweep(c: &mut Criterion) {
     group.finish();
 }
 
+// ── PU-7: WASAPI byte→f32 conversion micro-benchmark ───────────────────────
+//
+// The WASAPI capture thread (`src/audio/windows/thread.rs`) reads raw interleaved
+// F32LE bytes from the device and must turn them into `&[f32]` before pushing to
+// the bridge. PU-7 (seed `rsac-7876`) replaced the per-sample scalar
+// `f32::from_le_bytes` loop (which also required a `VecDeque` + O(n)
+// `make_contiguous` upstream) with a single bulk `slice::align_to::<f32>()`
+// reinterpret, mirroring the Linux/PipeWire path.
+//
+// `slice::align_to` is used deliberately instead of `bytemuck::cast_slice`, which
+// would *panic* on a misaligned slice; `align_to` instead splits off any
+// unaligned head/tail (empty in practice, since the source is word-aligned).
+//
+// These two benches isolate exactly that conversion on a realistic packet, with
+// NO WASAPI/COM dependency (raw bytes are synthesized), so they build and run on
+// any host. They directly quantify the PU-7 before/after.
+
+/// A realistic WASAPI shared-mode packet: ~10ms at 48kHz stereo f32.
+/// 480 frames × 2 channels = 960 interleaved f32 = 3840 bytes.
+const WASAPI_PACKET_FRAMES: usize = 480;
+const WASAPI_PACKET_SAMPLES: usize = WASAPI_PACKET_FRAMES * CHANNELS as usize; // 960
+const WASAPI_PACKET_BYTES: usize = WASAPI_PACKET_SAMPLES * 4; // 3840
+
+/// Build a word-aligned `Vec<u8>` holding `WASAPI_PACKET_SAMPLES` little-endian
+/// f32 samples — the byte layout WASAPI delivers in shared mode. A `Vec<u8>`'s
+/// data pointer is at least word-aligned, matching the real capture buffer.
+fn make_wasapi_bytes() -> Vec<u8> {
+    let mut bytes = Vec::with_capacity(WASAPI_PACKET_BYTES);
+    for i in 0..WASAPI_PACKET_SAMPLES {
+        let sample = (i as f32) * 1e-4;
+        bytes.extend_from_slice(&sample.to_le_bytes());
+    }
+    bytes
+}
+
+/// PU-7 before/after: scalar `from_le_bytes` loop vs. bulk `align_to` reinterpret.
+///
+/// `old_scalar_from_le_bytes` reproduces the pre-PU-7 hot path: decode every 4
+/// bytes individually and push into a reused `Vec<f32>`. `new_align_to_bulk`
+/// reproduces the PU-7 path: one `slice::align_to::<f32>()` reinterpret with no
+/// per-sample work and no staging Vec. Both sum the samples through `black_box`
+/// so the optimizer cannot elide the decode.
+fn bench_wasapi_byte_decode(c: &mut Criterion) {
+    let bytes = make_wasapi_bytes();
+
+    let mut group = c.benchmark_group("wasapi_byte_decode");
+    // One iteration decodes WASAPI_PACKET_SAMPLES f32 values; report samples/sec.
+    group.throughput(Throughput::Elements(WASAPI_PACKET_SAMPLES as u64));
+
+    // Pre-PU-7: per-sample scalar decode into a reused Vec<f32>.
+    group.bench_function("old_scalar_from_le_bytes", |b| {
+        let mut samples: Vec<f32> = Vec::with_capacity(WASAPI_PACKET_SAMPLES);
+        b.iter(|| {
+            samples.clear();
+            for chunk in black_box(&bytes).chunks_exact(4) {
+                samples.push(f32::from_le_bytes([chunk[0], chunk[1], chunk[2], chunk[3]]));
+            }
+            black_box(samples.as_slice());
+        });
+    });
+
+    // PU-7: bulk reinterpret via slice::align_to — no per-sample work, no Vec.
+    group.bench_function("new_align_to_bulk", |b| {
+        b.iter(|| {
+            // SAFETY: every bit pattern is a valid f32, and the input bytes are
+            // fully initialized — same invariant as the WASAPI capture path.
+            let (_head, samples, _tail) = unsafe { black_box(&bytes[..]).align_to::<f32>() };
+            black_box(samples);
+        });
+    });
+
+    group.finish();
+}
+
 criterion_group!(
     benches,
     bench_push_throughput,
     bench_push_pop_roundtrip,
-    bench_capacity_sweep
+    bench_capacity_sweep,
+    bench_wasapi_byte_decode
 );
 criterion_main!(benches);

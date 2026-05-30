@@ -171,13 +171,22 @@ impl AudioCaptureBuilder {
         self
     }
 
-    /// Sets the desired buffer size in frames.
+    /// Sets the desired ring-buffer depth, in **buffers/slots** (not frames).
+    ///
+    /// This is the number of `AudioBuffer` slots in the SPSC bridge ring, i.e.
+    /// how many captured buffers can queue before the producer drops to
+    /// back-pressure — see [`StreamConfig::buffer_size`](crate::core::config::StreamConfig::buffer_size)
+    /// and ADR-0007. It is honored on **Windows** today; macOS and Linux
+    /// currently derive their ring capacity internally. `None` uses the backend
+    /// default.
     pub fn buffer_size(mut self, size: Option<usize>) -> Self {
         self.config.buffer_size = size;
         self
     }
 
-    /// Kept for backward compat — alias for `buffer_size`.
+    /// Historical name for [`buffer_size`](Self::buffer_size); the value is the
+    /// same ring **slot** count (the `_frames` suffix is a misnomer kept for
+    /// backward compatibility — it is not a frame count).
     pub fn buffer_size_frames(mut self, size: Option<u32>) -> Self {
         self.config.buffer_size = size.map(|s| s as usize);
         self
@@ -522,6 +531,176 @@ impl AudioCaptureBuilder {
 pub struct RunningCapture(AudioCapture);
 
 impl RunningCapture {
+    /// Drains captured audio into an [`AudioSink`](crate::sink::AudioSink) on a
+    /// dedicated background thread, returning a [`DrainHandle`] that owns it.
+    ///
+    /// This is the library's first path that actually *drives* the
+    /// [`AudioSink`](crate::sink::AudioSink) abstraction. It spawns a thread
+    /// (named `rsac-drain`) that **owns** `sink`, reads buffers from the same
+    /// ring the manual reads use via the *terminal-observable*
+    /// [`try_read_chunk`](crate::core::interface::CapturingStream::try_read_chunk)
+    /// path, and for each captured buffer calls
+    /// [`sink.write(&buf)`](crate::sink::AudioSink::write). When the stream
+    /// reaches a **fatal terminal** state (e.g. [`AudioError::StreamEnded`]) the
+    /// loop exits and the thread calls [`sink.flush()`](crate::sink::AudioSink::flush)
+    /// then [`sink.close()`](crate::sink::AudioSink::close) so the sink is
+    /// finalized exactly once.
+    ///
+    /// The pattern mirrors the callback pump (`spawn_callback_pump`): the sink
+    /// runs on this dedicated thread, **never** the OS real-time audio thread, so
+    /// a slow sink (disk I/O, encoding) only delays draining — it never stalls
+    /// the audio callback (ADR-0001).
+    ///
+    /// # Error handling inside the drain loop
+    ///
+    /// - A **recoverable** read error (transient
+    ///   [`AudioError::StreamReadError`], overrun/underrun) is logged and retried
+    ///   — it never ends draining.
+    /// - A **fatal** read error ends the loop, after which `flush()`/`close()`
+    ///   still run so a file sink's header is finalized.
+    /// - A **recoverable** `write()` error is logged and the loop continues; a
+    ///   **fatal** `write()` error (e.g. a `WavFileSink` format mismatch, or
+    ///   disk-full mapped to a fatal `AudioError`) ends the loop — but
+    ///   `flush()`/`close()` are still attempted so the sink is left in the
+    ///   most-finalized state possible.
+    ///
+    /// # Lifecycle
+    ///
+    /// The returned [`DrainHandle`] joins the thread on
+    /// [`shutdown()`](DrainHandle::shutdown) or `Drop` (signal + join,
+    /// self-join-guarded like the callback pump). Because the stream reaching a
+    /// terminal state ends the loop on its own, you do not have to call
+    /// `shutdown()` for the thread to exit — but doing so (or dropping the
+    /// handle) joins it deterministically and guarantees `flush()`/`close()` have
+    /// completed.
+    ///
+    /// # Competes with other readers
+    ///
+    /// The drain thread competes with [`read_buffer`](AudioCapture::read_buffer),
+    /// [`subscribe`](AudioCapture::subscribe), and the callback pump for buffers
+    /// from the same ring (a single logical consumer per buffer). **Do not** mix
+    /// `drain_to` with manual reads on the same capture.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`AudioError::StreamReadError`] if the capture has no stream or is
+    /// not running, or [`AudioError::InternalError`] if the drain thread cannot
+    /// be spawned. (`RunningCapture` is normally started, but the underlying
+    /// stream may have reached a terminal state by the time this is called.)
+    ///
+    /// # Example
+    ///
+    /// ```rust,no_run
+    /// # #[cfg(feature = "sink-wav")]
+    /// # fn main() -> Result<(), Box<dyn std::error::Error>> {
+    /// use rsac::{AudioCaptureBuilder, CaptureTarget};
+    /// use rsac::core::config::{AudioFormat, SampleFormat};
+    /// use rsac::sink::WavFileSink;
+    ///
+    /// let capture = AudioCaptureBuilder::new()
+    ///     .with_target(CaptureTarget::SystemDefault)
+    ///     .start()?;
+    /// let format = capture.format().unwrap_or(AudioFormat {
+    ///     sample_rate: 48000,
+    ///     channels: 2,
+    ///     sample_format: SampleFormat::F32,
+    /// });
+    /// let sink = WavFileSink::new("capture.wav", &format)?;
+    /// let drain = capture.drain_to(sink)?;
+    /// std::thread::sleep(std::time::Duration::from_secs(2));
+    /// drain.shutdown(); // flushes + closes the sink, joins the thread
+    /// # Ok(())
+    /// # }
+    /// # #[cfg(not(feature = "sink-wav"))]
+    /// # fn main() {}
+    /// ```
+    pub fn drain_to<S>(&self, mut sink: S) -> AudioResult<DrainHandle>
+    where
+        S: crate::sink::AudioSink + 'static,
+    {
+        // Require a live stream, exactly like subscribe(): a RunningCapture is
+        // normally started, but its stream may already have reached a terminal
+        // state. Read via `&self` (DerefMut not needed) so we never form a `&mut`
+        // alias to the handle — the drain thread only needs a stream Arc clone.
+        let stream_ref = self
+            .0
+            .stream
+            .as_ref()
+            .ok_or_else(|| AudioError::StreamReadError {
+                reason: "Stream is not initialized. Call start() first.".to_string(),
+            })?;
+        if !stream_ref.is_running() {
+            return Err(AudioError::StreamReadError {
+                reason: "Stream is not running".to_string(),
+            });
+        }
+        let stream = Arc::clone(stream_ref);
+
+        let stop_flag = Arc::new(AtomicBool::new(false));
+        let stop_flag_thread = Arc::clone(&stop_flag);
+        let handle = std::thread::Builder::new()
+            .name("rsac-drain".into())
+            .spawn(move || {
+                loop {
+                    if stop_flag_thread.load(Ordering::SeqCst) {
+                        break;
+                    }
+                    match stream.try_read_chunk() {
+                        // The drain thread OWNS `sink`, so no lock is held while
+                        // user sink code runs (it may block on I/O without
+                        // stalling anything else).
+                        Ok(Some(buffer)) => {
+                            if let Err(e) = sink.write(&buffer) {
+                                if e.is_fatal() {
+                                    log::error!(
+                                        "Drain sink write failed fatally; \
+                                         stopping drain: {:?}",
+                                        e
+                                    );
+                                    break;
+                                }
+                                // Recoverable write error: log and keep draining
+                                // (mirrors the read-side recoverable policy).
+                                log::warn!("Drain sink write error (continuing): {:?}", e);
+                            }
+                        }
+                        Ok(None) => {
+                            // No data right now — avoid busy-spinning. Mirrors
+                            // spawn_callback_pump's idle poll.
+                            std::thread::sleep(std::time::Duration::from_millis(1));
+                        }
+                        // Only a FATAL read error (e.g. StreamEnded — terminal)
+                        // ends the drain. A recoverable read error is logged and
+                        // retried, mirroring the callback pump and subscribe().
+                        Err(e) if e.is_fatal() => break,
+                        Err(e) => {
+                            log::warn!("Drain pump read error (retrying): {:?}", e);
+                            std::thread::sleep(std::time::Duration::from_millis(1));
+                        }
+                    }
+                }
+                // Loop exited (terminal stream, fatal write, or stop signal):
+                // finalize the sink. flush() then close() so a file sink's header
+                // is written even on the error paths. Both are best-effort here
+                // because the thread cannot return a Result; log any failure.
+                if let Err(e) = sink.flush() {
+                    log::error!("Drain sink flush failed: {:?}", e);
+                }
+                if let Err(e) = sink.close() {
+                    log::error!("Drain sink close failed: {:?}", e);
+                }
+            })
+            .map_err(|e| AudioError::InternalError {
+                message: format!("Failed to spawn drain thread: {}", e),
+                source: None,
+            })?;
+
+        Ok(DrainHandle {
+            stop_flag,
+            handle: Some(handle),
+        })
+    }
+
     /// Consumes the guard and returns the wrapped [`AudioCapture`], **without**
     /// stopping it.
     ///
@@ -570,6 +749,75 @@ impl Drop for RunningCapture {
 impl fmt::Debug for RunningCapture {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_tuple("RunningCapture").field(&self.0).finish()
+    }
+}
+
+/// Handle to the background thread spawned by
+/// [`RunningCapture::drain_to`](RunningCapture::drain_to).
+///
+/// The thread owns the [`AudioSink`](crate::sink::AudioSink) and drains captured
+/// buffers into it until the stream reaches a terminal state (or this handle is
+/// shut down / dropped). On exit the thread flushes and closes the sink, so a
+/// file sink's header is finalized exactly once.
+///
+/// Modeled on the callback pump's handle: it holds a stop flag and the thread's
+/// [`JoinHandle`](std::thread::JoinHandle), and joins on
+/// [`shutdown`](Self::shutdown) / [`Drop`] (self-join-guarded, so a join from the
+/// drain thread itself is skipped rather than dead-locking). Because the loop
+/// also exits on its own when the stream becomes terminal, you do not strictly
+/// have to call `shutdown()` for the thread to end — but doing so joins it
+/// deterministically and guarantees the sink's `flush()`/`close()` have run.
+pub struct DrainHandle {
+    stop_flag: Arc<AtomicBool>,
+    handle: Option<std::thread::JoinHandle<()>>,
+}
+
+impl DrainHandle {
+    /// Signal the drain thread to stop and join it. Idempotent.
+    ///
+    /// Sets the stop flag (so the loop breaks on its next pass, after which the
+    /// thread flushes + closes the sink) and joins the thread so the finalize
+    /// has completed by the time this returns. If called from the drain thread
+    /// itself the join is skipped — a thread cannot join itself — and the
+    /// `JoinHandle` is retained so a later `shutdown()`/`Drop` from another
+    /// thread can still join it (mirrors `CallbackPump::shutdown`).
+    pub fn shutdown(mut self) {
+        self.shutdown_inner();
+    }
+
+    /// Internal shutdown shared by [`shutdown`](Self::shutdown) and [`Drop`].
+    /// Takes `&mut self` so `Drop` can call it; the public `shutdown` consumes
+    /// the handle so it cannot be used after finalizing.
+    fn shutdown_inner(&mut self) {
+        self.stop_flag.store(true, Ordering::SeqCst);
+        if let Some(handle) = self.handle.take() {
+            if handle.thread().id() == std::thread::current().id() {
+                // Re-entrant teardown from the drain thread: don't join self.
+                // The stop flag is set; the loop will break on its next pass.
+                // Put the handle back so a later shutdown()/Drop from another
+                // thread can still join it deterministically.
+                self.handle = Some(handle);
+            } else {
+                let _ = handle.join();
+            }
+        }
+    }
+}
+
+impl Drop for DrainHandle {
+    fn drop(&mut self) {
+        // Deterministic teardown: signal + join (self-join-guarded). Ensures the
+        // drain thread is never leaked and the sink's flush()/close() have run.
+        self.shutdown_inner();
+    }
+}
+
+impl fmt::Debug for DrainHandle {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("DrainHandle")
+            .field("stopping", &self.stop_flag.load(Ordering::Relaxed))
+            .field("joined", &self.handle.is_none())
+            .finish()
     }
 }
 
@@ -3392,5 +3640,270 @@ mod tests {
             Err(AudioError::StreamEnded { .. }) => {}
             other => panic!("expected StreamEnded after request_stop, got: {other:?}"),
         }
+    }
+
+    // ── drain_to() tests (AEG-4 / FH-6) ───────────────────────────────
+
+    /// A test sink that records, behind shared atomics, how many buffers it
+    /// wrote and how many frames, and how many times flush()/close() were called.
+    /// The atomics let the test inspect counts after the sink has been moved into
+    /// (and dropped by) the drain thread. Optionally fails write() once with a
+    /// FATAL error to exercise the early-exit-still-finalizes path.
+    struct CountingSink {
+        writes: Arc<AtomicU64>,
+        frames: Arc<AtomicU64>,
+        flushes: Arc<AtomicU64>,
+        closes: Arc<AtomicU64>,
+        /// When true, the FIRST write() returns a fatal error (and is counted as
+        /// an attempt). Subsequent writes would succeed, but the drain loop should
+        /// have already broken out.
+        fail_first_write_fatal: bool,
+        first_write_seen: bool,
+    }
+
+    impl CountingSink {
+        fn shared() -> (
+            Arc<AtomicU64>,
+            Arc<AtomicU64>,
+            Arc<AtomicU64>,
+            Arc<AtomicU64>,
+        ) {
+            (
+                Arc::new(AtomicU64::new(0)),
+                Arc::new(AtomicU64::new(0)),
+                Arc::new(AtomicU64::new(0)),
+                Arc::new(AtomicU64::new(0)),
+            )
+        }
+    }
+
+    impl crate::sink::AudioSink for CountingSink {
+        fn write(&mut self, buffer: &AudioBuffer) -> AudioResult<()> {
+            if self.fail_first_write_fatal && !self.first_write_seen {
+                self.first_write_seen = true;
+                // A fatal write error: the drain loop must break but still
+                // flush()/close() afterwards.
+                return Err(AudioError::ConfigurationError {
+                    message: "simulated fatal sink write failure".into(),
+                });
+            }
+            self.writes.fetch_add(1, Ordering::SeqCst);
+            self.frames
+                .fetch_add(buffer.num_frames() as u64, Ordering::SeqCst);
+            Ok(())
+        }
+
+        fn flush(&mut self) -> AudioResult<()> {
+            self.flushes.fetch_add(1, Ordering::SeqCst);
+            Ok(())
+        }
+
+        fn close(&mut self) -> AudioResult<()> {
+            self.closes.fetch_add(1, Ordering::SeqCst);
+            Ok(())
+        }
+    }
+
+    /// drain_to() drives the sink: every buffered AudioBuffer is delivered via
+    /// sink.write(), and on the terminal stream the thread flushes + closes the
+    /// sink exactly once. This is the first path that drives AudioSink::write.
+    #[test]
+    fn drain_to_writes_all_buffers_then_flushes_and_closes() {
+        let mock = Arc::new(MockCapturingStream::new());
+        // Queue three buffers (2 frames each), then stop so the drain reaches a
+        // fatal terminal after draining the tail.
+        mock.push_buffer(AudioBuffer::new(vec![0.1; 4], 2, 48000));
+        mock.push_buffer(AudioBuffer::new(vec![0.2; 4], 2, 48000));
+        mock.push_buffer(AudioBuffer::new(vec![0.3; 4], 2, 48000));
+
+        let (writes, frames, flushes, closes) = CountingSink::shared();
+        let sink = CountingSink {
+            writes: Arc::clone(&writes),
+            frames: Arc::clone(&frames),
+            flushes: Arc::clone(&flushes),
+            closes: Arc::clone(&closes),
+            fail_first_write_fatal: false,
+            first_write_seen: false,
+        };
+
+        let capture = RunningCapture(make_mock_capture(Arc::clone(&mock)));
+        let drain = capture.drain_to(sink).expect("drain_to should succeed");
+
+        // POLL until the pump has drained all three buffered buffers, instead of
+        // a fixed sleep that raced the pump-thread start under a loaded parallel
+        // run. Bounded so a genuine hang still fails the test.
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        while writes.load(Ordering::SeqCst) < 3 && std::time::Instant::now() < deadline {
+            std::thread::sleep(std::time::Duration::from_millis(1));
+        }
+
+        // Now stop so the drain loop hits the fatal terminal and finalizes the
+        // sink (flush + close exactly once).
+        mock.signal_stop();
+
+        // shutdown() joins the thread, so all writes + the single flush/close
+        // have completed by the time it returns.
+        drain.shutdown();
+
+        assert_eq!(
+            writes.load(Ordering::SeqCst),
+            3,
+            "all three buffers written"
+        );
+        assert_eq!(frames.load(Ordering::SeqCst), 6, "2 frames per buffer × 3");
+        assert_eq!(
+            flushes.load(Ordering::SeqCst),
+            1,
+            "flush called exactly once"
+        );
+        assert_eq!(
+            closes.load(Ordering::SeqCst),
+            1,
+            "close called exactly once"
+        );
+    }
+
+    /// drain_to() returns an error when the underlying stream is not running
+    /// (mirrors subscribe()'s precondition).
+    #[test]
+    fn drain_to_errors_when_not_running() {
+        let mock = Arc::new(MockCapturingStream::new());
+        mock.signal_stop();
+        let capture = RunningCapture(make_mock_capture(mock));
+
+        let (writes, frames, flushes, closes) = CountingSink::shared();
+        let sink = CountingSink {
+            writes,
+            frames,
+            flushes,
+            closes,
+            fail_first_write_fatal: false,
+            first_write_seen: false,
+        };
+        let result = capture.drain_to(sink);
+        assert!(result.is_err());
+        match result.unwrap_err() {
+            AudioError::StreamReadError { reason } => assert!(reason.contains("not running")),
+            e => panic!("expected StreamReadError, got: {e:?}"),
+        }
+    }
+
+    /// A FATAL write() error ends the drain loop early, but flush() and close()
+    /// still run so the sink is finalized (e.g. a WAV header is written).
+    #[test]
+    fn drain_to_finalizes_sink_after_fatal_write() {
+        let mock = Arc::new(MockCapturingStream::new());
+        mock.push_buffer(AudioBuffer::new(vec![0.5; 4], 2, 48000));
+        mock.push_buffer(AudioBuffer::new(vec![0.6; 4], 2, 48000));
+
+        let (writes, frames, flushes, closes) = CountingSink::shared();
+        let sink = CountingSink {
+            writes: Arc::clone(&writes),
+            frames: Arc::clone(&frames),
+            flushes: Arc::clone(&flushes),
+            closes: Arc::clone(&closes),
+            fail_first_write_fatal: true,
+            first_write_seen: false,
+        };
+
+        let capture = RunningCapture(make_mock_capture(Arc::clone(&mock)));
+        let drain = capture.drain_to(sink).expect("drain_to should succeed");
+
+        std::thread::sleep(std::time::Duration::from_millis(20));
+        mock.signal_stop();
+        drain.shutdown();
+
+        // The first write failed fatally → loop broke immediately, so no
+        // successful writes recorded — but flush + close still ran.
+        assert_eq!(
+            writes.load(Ordering::SeqCst),
+            0,
+            "no successful writes after the fatal first write"
+        );
+        assert_eq!(
+            flushes.load(Ordering::SeqCst),
+            1,
+            "flush still runs on fatal exit"
+        );
+        assert_eq!(
+            closes.load(Ordering::SeqCst),
+            1,
+            "close still runs on fatal exit"
+        );
+    }
+
+    /// A recoverable read error ahead of buffered data must NOT end draining: the
+    /// buffer behind the transient hiccup is still written.
+    #[test]
+    fn drain_to_continues_past_recoverable_read_error() {
+        let mock = Arc::new(MockCapturingStream::new());
+        mock.inject_recoverable_error(AudioError::StreamReadError {
+            reason: "transient hiccup".into(),
+        });
+        mock.push_buffer(AudioBuffer::new(vec![0.9; 4], 2, 48000));
+
+        let (writes, frames, flushes, closes) = CountingSink::shared();
+        let sink = CountingSink {
+            writes: Arc::clone(&writes),
+            frames: Arc::clone(&frames),
+            flushes: Arc::clone(&flushes),
+            closes: Arc::clone(&closes),
+            fail_first_write_fatal: false,
+            first_write_seen: false,
+        };
+
+        let capture = RunningCapture(make_mock_capture(Arc::clone(&mock)));
+        let drain = capture.drain_to(sink).expect("drain_to should succeed");
+
+        std::thread::sleep(std::time::Duration::from_millis(20));
+        mock.signal_stop();
+        drain.shutdown();
+
+        assert_eq!(
+            writes.load(Ordering::SeqCst),
+            1,
+            "the buffer behind the recoverable error is still drained"
+        );
+        assert_eq!(closes.load(Ordering::SeqCst), 1);
+    }
+
+    /// drain_to() drains into the real bundled WavFileSink and produces a valid,
+    /// readable WAV file (the end-to-end round-trip the example relies on).
+    #[cfg(feature = "sink-wav")]
+    #[test]
+    fn drain_to_wav_round_trip_writes_valid_file() {
+        use crate::core::config::AudioFormat;
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("drain_round_trip.wav");
+
+        let mock = Arc::new(MockCapturingStream::new());
+        // Two stereo buffers, 2 frames each at 48k.
+        mock.push_buffer(AudioBuffer::new(vec![0.25, -0.25, 0.5, -0.5], 2, 48000));
+        mock.push_buffer(AudioBuffer::new(vec![0.1, -0.1, 0.2, -0.2], 2, 48000));
+
+        let format = AudioFormat {
+            sample_rate: 48000,
+            channels: 2,
+            sample_format: SampleFormat::F32,
+        };
+        let sink = crate::sink::WavFileSink::new(&path, &format).expect("sink");
+
+        let capture = RunningCapture(make_mock_capture(Arc::clone(&mock)));
+        let drain = capture.drain_to(sink).expect("drain_to should succeed");
+
+        std::thread::sleep(std::time::Duration::from_millis(20));
+        mock.signal_stop();
+        drain.shutdown(); // joins the thread → file flushed + finalized
+
+        // The WAV must be valid and contain all the samples we pushed.
+        let reader = hound::WavReader::open(&path).expect("valid WAV");
+        let spec = reader.spec();
+        assert_eq!(spec.channels, 2);
+        assert_eq!(spec.sample_rate, 48000);
+        let samples: Vec<f32> = reader.into_samples::<f32>().map(|s| s.unwrap()).collect();
+        assert_eq!(samples.len(), 8, "two 4-sample buffers");
+        assert!((samples[0] - 0.25).abs() < 1e-6);
+        assert!((samples[7] - (-0.2)).abs() < 1e-6);
     }
 }

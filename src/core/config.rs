@@ -276,8 +276,28 @@ pub struct StreamConfig {
     pub channels: u16,
     /// The desired sample format.
     pub sample_format: SampleFormat,
-    /// Optional desired buffer size in frames.
-    /// If `None`, the backend will choose a suitable default.
+    /// Optional ring-buffer depth, in **buffers/slots** (not frames).
+    ///
+    /// This is the number of [`AudioBuffer`](super::buffer::AudioBuffer) slots in
+    /// the bridge ring — i.e. how many callback periods of slack the consumer has
+    /// before the producer must drop. Each slot holds one whole interleaved callback
+    /// period, so this is a *slot count*, **not** a per-frame size; the field name is
+    /// historical. The value is passed straight into the bridge's
+    /// `calculate_capacity(requested, 4)` (rounded up to a power of two, min 4).
+    ///
+    /// If `None`, the backend uses the default depth (`calculate_capacity(None, 4)` = 64).
+    ///
+    /// # Platform support (current state)
+    ///
+    /// **Honored only on Windows (WASAPI) today.** The Linux (PipeWire) and macOS
+    /// (CoreAudio) backends hardcode `calculate_capacity(None, 4)` and ignore this
+    /// field, so setting it has no effect there — they always get the 64-slot default.
+    /// Threading the request (or a period-derived size) through every backend is
+    /// tracked in ADR-0007 (`docs/designs/0007-capacity-period-sizing.md`).
+    ///
+    /// The [`buffer_size_frames`](crate::api::AudioCaptureBuilder::buffer_size_frames)
+    /// builder setter is a backward-compat alias that writes this same field; its
+    /// "frames" name is likewise historical and denotes slots, not frames.
     pub buffer_size: Option<usize>,
     /// The capture target for this stream.
     /// Propagated from [`AudioCaptureBuilder`](crate::api::AudioCaptureBuilder) so backends know

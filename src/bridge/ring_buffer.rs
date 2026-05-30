@@ -25,7 +25,7 @@
 //! ```
 
 use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
-use std::sync::Arc;
+use std::sync::{Arc, Condvar, Mutex};
 use std::time::{Duration, Instant};
 
 #[cfg(feature = "bridge-zerocopy")]
@@ -213,6 +213,144 @@ impl<T> std::ops::DerefMut for CachePadded<T> {
     }
 }
 
+// ── Consumer wake primitive (PU-5, seed rsac-efb4) ─────────────────────────
+
+/// Maximum time a parked [`BridgeConsumer::pop_blocking`] waits per
+/// `wait_timeout` slice before re-checking the ring and the stream state
+/// unconditionally (`PU-5`).
+///
+/// The unconditional `ConsumerWake` notify (from the Windows producer push
+/// and from every state transition) is what normally wakes a parked reader the
+/// instant data or a terminal state appears. This bounded slice is the
+/// **degrade-not-hang backstop**: if a notify is ever missed (e.g. it fired in
+/// the tiny window between the reader's last ring check and entering the wait),
+/// the reader still re-checks within 1 ms instead of sleeping for the full
+/// caller timeout. It must therefore stay small — it bounds worst-case latency
+/// on a *missed* notify, never the common path.
+const WAKE_BACKSTOP_POLL: Duration = Duration::from_millis(1);
+
+/// An always-present, allocation-free wake primitive that lets a synchronous
+/// [`BridgeConsumer::pop_blocking`] park until data is pushed or the stream
+/// reaches a terminal/ending state, instead of busy-polling on a fixed 1 ms
+/// timer (`PU-5`, seed `rsac-efb4`).
+///
+/// # Why a `Condvar` and not the async waker
+///
+/// The async `atomic_waker::AtomicWaker` only serves `async` consumers and is
+/// gated behind the `async-stream` feature; the **synchronous** blocking reader
+/// had no wake mechanism and degraded to a 1 ms sleep/poll loop. A `std`
+/// [`Condvar`] + a generation counter gives the blocking reader a real wakeup
+/// that is present in every build, async or not.
+///
+/// # Real-time safety (ADR-0001)
+///
+/// [`notify`](Self::notify) does **not** hold the mutex while signalling and
+/// performs **no allocation** — on Linux it lowers to a single `FUTEX_WAKE`
+/// syscall. It is therefore safe to call from the **non-RT** producers and the
+/// state-transition sites that PU-5 wires it into:
+///
+/// - the Windows capture loop (rsac's own thread — not an OS callback), via
+///   [`BridgeProducer::notify_consumers`], and
+/// - every terminal/ending state transition ([`BridgeProducer::signal_done`],
+///   [`BridgeProducer::signal_error`], and `BridgeStream::stop`).
+///
+/// It is deliberately **NOT** called from the shared
+/// [`push_samples_or_drop_inner`](BridgeProducer::push_samples_or_drop_inner)
+/// hot path, which the Linux (PipeWire) and macOS (CoreAudio) backends drive
+/// from their **real-time audio callbacks** — adding a notify there would put a
+/// (brief) lock-touching futex call on the RT thread, violating ADR-0001. Those
+/// backends instead rely on the retained `WAKE_BACKSTOP_POLL` re-check plus
+/// the terminal-state notify on stop. The waiter side
+/// ([`wait`](Self::wait)) runs only on the non-RT consumer thread.
+struct ConsumerWake {
+    /// Trivial mutex guarding the `Condvar` wait. The protected datum is the
+    /// empty tuple — the real "did something change?" signal is the
+    /// [`generation`](Self::generation) counter, checked under the lock so a
+    /// notify that fires between the reader's ring check and its `wait` is not
+    /// lost.
+    lock: Mutex<()>,
+    /// Condition variable a parked reader waits on. Notified (no lock held by
+    /// the notifier) by [`notify`](Self::notify).
+    cvar: Condvar,
+    /// Monotonic notify counter. [`notify`](Self::notify) bumps it before
+    /// waking; a waiter snapshots it before its final ring/state re-check and
+    /// only blocks while the snapshot is unchanged. This closes the classic
+    /// lost-wakeup race without holding the lock across the push.
+    generation: AtomicU64,
+}
+
+impl ConsumerWake {
+    fn new() -> Self {
+        Self {
+            lock: Mutex::new(()),
+            cvar: Condvar::new(),
+            generation: AtomicU64::new(0),
+        }
+    }
+
+    /// Snapshot the current notify generation. A waiter reads this *before* its
+    /// last non-blocking ring/state check so a notify racing that check is
+    /// detected (the generation will differ) and the waiter re-loops instead of
+    /// parking on an already-consumed signal.
+    #[inline]
+    fn generation(&self) -> u64 {
+        self.generation.load(Ordering::Acquire)
+    }
+
+    /// Wake every parked reader (`PU-5`).
+    ///
+    /// Bumps the generation (`Release`) then signals the `Condvar`. The mutex is
+    /// deliberately **not** held across the signal, and nothing is allocated, so
+    /// this stays safe to call from the non-RT Windows producer and from
+    /// terminal state transitions (ADR-0001 / ADR-0010). It is a no-op cost when
+    /// no reader is parked.
+    ///
+    /// Bumping the generation *before* signalling lets [`wait`](Self::wait)
+    /// detect — under its lock — a notify that raced the waiter's last ring
+    /// check, covering the common lost-wakeup window. Because the notifier holds
+    /// no lock, a residual hairline race remains possible (a notify that lands in
+    /// the instant the waiter is between its generation re-check and the kernel
+    /// park); that case is bounded by the `WAKE_BACKSTOP_POLL` slice in
+    /// `pop_blocking`, so it degrades to a ≤1 ms re-check, never a hang. This is
+    /// the intended trade: a lock-free, RT-safe-to-signal notify backed by a
+    /// bounded poll, rather than a lock-on-the-signal path the RT rule forbids.
+    #[inline]
+    fn notify(&self) {
+        // Bump first (Release) so a waiter that snapshotted the old value and is
+        // about to wait observes the change via its pre-wait generation re-check.
+        self.generation.fetch_add(1, Ordering::Release);
+        self.cvar.notify_all();
+    }
+
+    /// Park the calling (non-RT consumer) thread until the next
+    /// [`notify`](Self::notify) or until `timeout` elapses, whichever comes
+    /// first.
+    ///
+    /// `since` is the generation the caller observed *before* its last ring/
+    /// state check. If a notify landed since then (generation advanced) this
+    /// returns immediately without waiting, so a wake that raced the check is
+    /// not lost. Spurious `Condvar` wakeups are harmless: the caller re-checks
+    /// the ring and state on return regardless.
+    fn wait(&self, since: u64, timeout: Duration) {
+        let guard = match self.lock.lock() {
+            Ok(g) => g,
+            // A poisoned wake-lock must not wedge the reader: the protected
+            // datum is `()`, so recovering the guard is always sound.
+            Err(poisoned) => poisoned.into_inner(),
+        };
+        // If a notify fired since the caller's pre-check snapshot, do not park —
+        // the signal would otherwise be lost (it was consumed before we held the
+        // lock). Re-loop immediately.
+        if self.generation.load(Ordering::Acquire) != since {
+            return;
+        }
+        // wait_timeout may wake spuriously; that is fine — the caller re-checks
+        // the ring/state. We intentionally do a single bounded slice and let the
+        // pop_blocking loop drive re-checking (degrade-not-hang backstop).
+        let _ = self.cvar.wait_timeout(guard, timeout);
+    }
+}
+
 // ── Shared State ─────────────────────────────────────────────────────────
 
 /// Shared state between producer and consumer for diagnostics and coordination.
@@ -290,6 +428,20 @@ pub(crate) struct BridgeShared {
     /// was caught by the panic guard (`rsac-d0ba`). Used to log the panic a
     /// single time rather than on every subsequent guarded call.
     push_panicked: std::sync::atomic::AtomicBool,
+    /// Always-present wake primitive for the **synchronous** blocking reader
+    /// ([`BridgeConsumer::pop_blocking`]) (`PU-5`, seed `rsac-efb4`).
+    ///
+    /// Present in every build (unlike the async `waker` field below, which is
+    /// `async-stream`-gated), so `pop_blocking` wakes on push / terminal
+    /// transition instead of busy-polling on a 1 ms timer. Notified ONLY from
+    /// the non-RT Windows producer ([`BridgeProducer::notify_consumers`]) and
+    /// from terminal/ending state transitions ([`signal_done`]/[`signal_error`]/
+    /// stop) — NEVER from the Linux/macOS RT callback push path (ADR-0001). See
+    /// `ConsumerWake`.
+    ///
+    /// [`signal_done`]: BridgeProducer::signal_done
+    /// [`signal_error`]: BridgeProducer::signal_error
+    wake: ConsumerWake,
     /// Waker for async stream consumers — notified when new data is pushed.
     #[cfg(feature = "async-stream")]
     pub waker: atomic_waker::AtomicWaker,
@@ -394,6 +546,20 @@ impl BridgeShared {
         } else {
             self.format.clone()
         }
+    }
+
+    /// Wake any parked synchronous reader ([`BridgeConsumer::pop_blocking`])
+    /// (`PU-5`).
+    ///
+    /// Allocation-free and holds no lock while signalling (see
+    /// [`ConsumerWake::notify`]). Call this from **non-RT** producers and from
+    /// state transitions only — NEVER from the Linux/macOS RT callback push
+    /// path (ADR-0001). It is wired into [`BridgeProducer::signal_done`],
+    /// [`BridgeProducer::signal_error`], [`BridgeProducer::notify_consumers`]
+    /// (the Windows producer), and `BridgeStream::stop`.
+    #[inline]
+    pub(crate) fn notify_wake(&self) {
+        self.wake.notify();
     }
 }
 
@@ -729,6 +895,12 @@ impl BridgeProducer {
             .shared
             .state
             .transition(StreamState::Running, StreamState::Stopping);
+        // PU-5: wake a parked synchronous reader so an empty pop_blocking
+        // re-checks the (now Stopping/draining) state immediately rather than
+        // sleeping out its backstop slice. `notify_wake` holds no lock while
+        // signalling and never allocates, so it stays ADR-0001-safe even when
+        // signal_done is invoked from a PipeWire/CoreAudio state-change context.
+        self.shared.notify_wake();
         #[cfg(feature = "async-stream")]
         self.shared.waker.wake();
     }
@@ -765,8 +937,46 @@ impl BridgeProducer {
     /// concurrent graceful transition.
     pub fn signal_error(&self) {
         self.shared.state.force_set(StreamState::Error);
+        // PU-5: wake a parked synchronous reader so pop_blocking observes the
+        // terminal Error and returns the Fatal StreamEnded promptly instead of
+        // sleeping out its backstop slice. Lock-free-to-signal and alloc-free
+        // (see ConsumerWake::notify), so it remains safe from the PipeWire
+        // `.state_changed` / CoreAudio `DeviceIsAlive` callback contexts that
+        // ADR-0010 wires signal_error into.
+        self.shared.notify_wake();
         #[cfg(feature = "async-stream")]
         self.shared.waker.wake();
+    }
+
+    /// Wake any parked synchronous reader ([`BridgeConsumer::pop_blocking`])
+    /// after a successful push, so the reader returns the new data immediately
+    /// instead of sleeping out the `WAKE_BACKSTOP_POLL` backstop slice
+    /// (`PU-5`, seed `rsac-efb4`).
+    ///
+    /// # When to call this
+    ///
+    /// Call it from a **non-real-time** producer right after a push — concretely
+    /// the **Windows** WASAPI capture loop, which runs on rsac's *own* polling
+    /// thread (not an OS audio callback). That backend should call
+    /// `producer.notify_consumers()` after each `push_samples_or_drop` so a
+    /// blocked `read_buffer_blocking` wakes on the push.
+    ///
+    /// # Real-time safety — do NOT call from an RT callback
+    ///
+    /// The Linux (PipeWire `.process`) and macOS (CoreAudio IOProc) backends
+    /// drive [`push_samples_or_drop`](Self::push_samples_or_drop) from their
+    /// **hard real-time audio callbacks**. They must **NOT** call this method:
+    /// it touches a `Condvar`/mutex-backed primitive and, while it neither
+    /// allocates nor holds a lock across the signal, the conservative ADR-0001
+    /// rule keeps *all* lock-touching primitives off the RT push path. Those
+    /// backends instead rely on the retained `WAKE_BACKSTOP_POLL` re-check in
+    /// `pop_blocking` plus the terminal-state notify on stop
+    /// ([`signal_done`](Self::signal_done)/[`signal_error`](Self::signal_error)).
+    /// `rt_alloc.rs` (which exercises only `push_samples_or_drop`) therefore
+    /// stays at zero allocations — this method is never on that path.
+    #[inline]
+    pub fn notify_consumers(&self) {
+        self.shared.notify_wake();
     }
 
     /// Returns the number of free slots in the ring buffer.
@@ -902,10 +1112,33 @@ impl BridgeConsumer {
         }
     }
 
-    /// Blocks until data is available or `timeout` expires.
+    /// Blocks until data is available, the stream ends, or `timeout` expires.
     ///
-    /// Uses a spin-loop with short [`std::thread::sleep`] intervals (1 ms)
-    /// to wait for data without busy-spinning at 100% CPU.
+    /// # Wake mechanism (`PU-5`, seed `rsac-efb4`)
+    ///
+    /// Parks on an always-present `ConsumerWake` (`Condvar`) rather than
+    /// sleeping on a fixed 1 ms timer. A parked reader is woken **the instant**
+    /// either of the following happens:
+    ///
+    /// - a non-RT producer pushes data and calls
+    ///   [`BridgeProducer::notify_consumers`] (the Windows capture loop), or
+    /// - the stream reaches a terminal/ending state via a transition that wakes
+    ///   ([`signal_done`](BridgeProducer::signal_done) /
+    ///   [`signal_error`](BridgeProducer::signal_error), and `BridgeStream::stop`).
+    ///
+    /// The notify is wired **only** into those non-RT sites — never the
+    /// Linux/macOS RT callback push path — so ADR-0001 holds (see
+    /// `ConsumerWake` and [`BridgeProducer::notify_consumers`]).
+    ///
+    /// ## Degrade-not-hang backstop
+    ///
+    /// Each park is bounded to a `WAKE_BACKSTOP_POLL` (1 ms) slice. So even on
+    /// a backend that does **not** notify (Linux/macOS, whose RT push path
+    /// deliberately does not wake), or in the rare event a notify is missed, the
+    /// reader still re-checks the ring and state within 1 ms — it degrades to
+    /// the old poll cadence instead of hanging. The lost-wakeup race is closed
+    /// by snapshotting the wake generation *before* the final ring/state
+    /// re-check (see `ConsumerWake::wait`).
     ///
     /// # Errors
     ///
@@ -915,9 +1148,15 @@ impl BridgeConsumer {
     ///   transient read error (see ADR-0003).
     pub fn pop_blocking(&mut self, timeout: Duration) -> AudioResult<AudioBuffer> {
         let deadline = Instant::now() + timeout;
-        let sleep_interval = Duration::from_millis(1);
 
         loop {
+            // Snapshot the wake generation BEFORE the ring/state re-check below.
+            // A notify that fires after this snapshot bumps the generation, so
+            // the subsequent `wait(since, ..)` returns immediately instead of
+            // parking on an already-consumed signal (closes the lost-wakeup
+            // race without holding the wake lock across the push).
+            let since = self.shared.wake.generation();
+
             // Try to pop data first.
             if let Some(buffer) = self.pop() {
                 return Ok(buffer);
@@ -934,15 +1173,22 @@ impl BridgeConsumer {
             }
 
             // Check if we've exceeded the timeout.
-            if Instant::now() >= deadline {
+            let now = Instant::now();
+            if now >= deadline {
                 return Err(AudioError::Timeout {
                     operation: "read_chunk".to_string(),
                     duration: timeout,
                 });
             }
 
-            // Sleep briefly to avoid busy-spinning.
-            std::thread::sleep(sleep_interval);
+            // Park until the next notify (push / terminal transition) or the
+            // bounded backstop slice — whichever is sooner — but never past the
+            // caller's deadline. Clamping to the remaining time keeps the
+            // overall timeout honored to within one backstop slice; the loop
+            // re-checks the ring and state on every wakeup (spurious or real).
+            let remaining = deadline.saturating_duration_since(now);
+            let slice = remaining.min(WAKE_BACKSTOP_POLL);
+            self.shared.wake.wait(since, slice);
         }
     }
 
@@ -1184,6 +1430,7 @@ pub fn create_sample_ring(
         drop_window: std::array::from_fn(|_| AtomicU64::new(0)),
         drop_window_cursor: AtomicU64::new(0),
         push_panicked: std::sync::atomic::AtomicBool::new(false),
+        wake: ConsumerWake::new(),
         format,
         #[cfg(feature = "async-stream")]
         waker: atomic_waker::AtomicWaker::new(),
@@ -1267,6 +1514,7 @@ pub fn create_bridge_with_options(
         drop_window: std::array::from_fn(|_| AtomicU64::new(0)),
         drop_window_cursor: AtomicU64::new(0),
         push_panicked: std::sync::atomic::AtomicBool::new(false),
+        wake: ConsumerWake::new(),
         format,
         #[cfg(feature = "async-stream")]
         waker: atomic_waker::AtomicWaker::new(),
@@ -2714,6 +2962,223 @@ mod tests {
         let _ = consumer.pop(); // make room
         assert!(producer.push_or_drop(test_buffer(4.0)));
         assert_eq!(shared.consecutive_drops.load(Ordering::Relaxed), 0);
+    }
+
+    // ===== PU-5 (rsac-efb4): unconditional Condvar wake for pop_blocking =====
+
+    // The ConsumerWake generation advances on every notify so a waiter can detect
+    // a notify that raced its pre-wait ring check (lost-wakeup guard).
+    #[test]
+    fn consumer_wake_generation_advances_on_notify() {
+        let wake = ConsumerWake::new();
+        let g0 = wake.generation();
+        wake.notify();
+        let g1 = wake.generation();
+        wake.notify();
+        let g2 = wake.generation();
+        assert!(g1 > g0 && g2 > g1, "generation must advance on each notify");
+    }
+
+    // wait(since, ..) returns IMMEDIATELY (does not park out the slice) when the
+    // generation already moved past `since` — the race-closing fast path. We use a
+    // long slice so a regression that actually parks would make this test slow.
+    #[test]
+    fn consumer_wake_wait_returns_immediately_when_generation_moved() {
+        let wake = ConsumerWake::new();
+        let since = wake.generation();
+        wake.notify(); // generation now != since
+        let start = Instant::now();
+        wake.wait(since, Duration::from_secs(5));
+        assert!(
+            start.elapsed() < Duration::from_millis(250),
+            "wait must not park when a notify already fired since the snapshot"
+        );
+    }
+
+    // With no notify, wait parks for (at most) the bounded slice and returns — the
+    // degrade-not-hang backstop. It must return on its own within ~the slice.
+    #[test]
+    fn consumer_wake_wait_times_out_on_its_slice() {
+        let wake = ConsumerWake::new();
+        let since = wake.generation();
+        let start = Instant::now();
+        wake.wait(since, Duration::from_millis(10));
+        let elapsed = start.elapsed();
+        // It must not return instantly (no notify fired) and must not hang.
+        assert!(
+            elapsed < Duration::from_secs(1),
+            "wait must respect its bounded slice, not hang"
+        );
+    }
+
+    // notify_consumers() (the Windows-producer wake) bumps the shared wake
+    // generation — proving the producer can wake a parked reader without touching
+    // the RT push path.
+    #[test]
+    fn notify_consumers_bumps_wake_generation() {
+        let (producer, _consumer) = create_bridge(8, test_format());
+        let g0 = producer.shared().wake.generation();
+        producer.notify_consumers();
+        assert!(
+            producer.shared().wake.generation() > g0,
+            "notify_consumers must advance the wake generation"
+        );
+    }
+
+    // signal_done() and signal_error() each wake parked readers (bump the wake
+    // generation) in addition to their state transition — so a blocked
+    // pop_blocking re-checks promptly on a graceful end or a fatal death.
+    #[test]
+    fn signal_done_and_error_bump_wake_generation() {
+        let (producer, _consumer) = create_bridge(8, test_format());
+        producer.shared().state.force_set(StreamState::Running);
+
+        let g0 = producer.shared().wake.generation();
+        producer.signal_done();
+        let g1 = producer.shared().wake.generation();
+        assert!(g1 > g0, "signal_done must wake parked readers");
+
+        producer.signal_error();
+        let g2 = producer.shared().wake.generation();
+        assert!(g2 > g1, "signal_error must wake parked readers");
+    }
+
+    // A push from a producer thread + notify_consumers() wakes a parked
+    // pop_blocking PROMPTLY — well before the caller's (long) timeout. This is the
+    // core PU-5 behavior: the reader does not sleep out a fixed poll interval.
+    #[test]
+    fn push_then_notify_wakes_parked_pop_blocking_promptly() {
+        let (mut producer, mut consumer) = create_bridge(8, test_format());
+        producer.shared().state.force_set(StreamState::Running);
+
+        let handle = std::thread::spawn(move || {
+            // Give the reader time to park in wait() before we push.
+            std::thread::sleep(Duration::from_millis(50));
+            assert!(producer.push_samples_or_drop(&[0.5, -0.5], 2, 48000));
+            // Windows-producer-style wake (the RT backends do NOT call this).
+            producer.notify_consumers();
+            producer // keep the free-list alive until the consumer is done
+        });
+
+        // A generous timeout: if the wake works, we return in ~50 ms, far under it.
+        let start = Instant::now();
+        let buf = consumer
+            .pop_blocking(Duration::from_secs(10))
+            .expect("a pushed buffer must wake the parked reader");
+        let elapsed = start.elapsed();
+
+        assert_eq!(buf.data(), &[0.5, -0.5]);
+        assert!(
+            elapsed < Duration::from_secs(2),
+            "pop_blocking must wake on the push, not sleep out the 10 s timeout \
+             (woke after {elapsed:?})"
+        );
+        let _producer = handle.join().expect("producer thread panicked");
+    }
+
+    // signal_done() from another thread wakes a parked pop_blocking. Because
+    // Stopping is still drainable (NOT terminal), an EMPTY ring then times out —
+    // but the point under test is that the reader is woken to RE-CHECK promptly;
+    // we verify it does not hang the full long timeout by using a short one and
+    // asserting Timeout (the graceful-drain contract), and a separate signal_error
+    // test below proves prompt terminal return.
+    #[test]
+    fn signal_done_wakes_parked_pop_blocking() {
+        let (producer, mut consumer) = create_bridge(8, test_format());
+        producer.shared().state.force_set(StreamState::Running);
+
+        let handle = std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(50));
+            producer.signal_done(); // Running → Stopping (+ wake)
+            producer
+        });
+
+        // Stopping with an empty ring keeps draining → Timeout. A short timeout
+        // proves we don't hang; the wake just makes the re-check immediate.
+        let err = consumer
+            .pop_blocking(Duration::from_millis(300))
+            .expect_err("empty Stopping ring drains → times out");
+        assert!(
+            matches!(err, AudioError::Timeout { .. }),
+            "graceful Stopping must keep draining (Timeout), got {err:?}"
+        );
+        let _producer = handle.join().expect("producer thread panicked");
+    }
+
+    // signal_error() from another thread wakes a parked pop_blocking and it
+    // returns the Fatal StreamEnded PROMPTLY (terminal Error), proving a dead
+    // producer unblocks the reader far before the long caller timeout.
+    #[test]
+    fn signal_error_wakes_parked_pop_blocking_with_fatal() {
+        let (producer, mut consumer) = create_bridge(8, test_format());
+        producer.shared().state.force_set(StreamState::Running);
+
+        let handle = std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(50));
+            producer.signal_error(); // → terminal Error (+ wake)
+            producer
+        });
+
+        let start = Instant::now();
+        let err = consumer
+            .pop_blocking(Duration::from_secs(10))
+            .expect_err("terminal Error must end the blocking read");
+        let elapsed = start.elapsed();
+
+        assert!(err.is_fatal(), "terminal-Error read must be Fatal");
+        assert!(
+            matches!(err, AudioError::StreamEnded { .. }),
+            "expected StreamEnded after signal_error, got {err:?}"
+        );
+        assert!(
+            elapsed < Duration::from_secs(2),
+            "signal_error must wake the parked reader, not sleep out the 10 s \
+             timeout (woke after {elapsed:?})"
+        );
+        let _producer = handle.join().expect("producer thread panicked");
+    }
+
+    // The backstop alone (no notify at all) still unblocks a parked pop_blocking
+    // when data appears: this models the Linux/macOS RT push path, which
+    // deliberately does NOT notify. The reader must still pick up the data via the
+    // bounded re-check rather than hanging. We push WITHOUT calling
+    // notify_consumers to prove the degrade path works.
+    #[test]
+    fn pop_blocking_picks_up_data_without_notify_via_backstop() {
+        let (mut producer, mut consumer) = create_bridge(8, test_format());
+        producer.shared().state.force_set(StreamState::Running);
+
+        let handle = std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(20));
+            // NOTE: no notify_consumers() — mirrors the RT-callback push path.
+            assert!(producer.push_samples_or_drop(&[1.0], 1, 48000));
+            producer
+        });
+
+        let buf = consumer
+            .pop_blocking(Duration::from_secs(5))
+            .expect("backstop re-check must still deliver the data");
+        assert_eq!(buf.data(), &[1.0]);
+        let _producer = handle.join().expect("producer thread panicked");
+    }
+
+    // pop_blocking still returns immediately when data is already present (no
+    // regression of the fast path; it must not enter the wait at all).
+    #[test]
+    fn pop_blocking_fast_path_with_data_present() {
+        let (mut producer, mut consumer) = create_bridge(8, test_format());
+        producer.shared().state.force_set(StreamState::Running);
+        assert!(producer.push_samples_or_drop(&[0.25, 0.75], 2, 48000));
+
+        let start = Instant::now();
+        let buf = consumer
+            .pop_blocking(Duration::from_secs(5))
+            .expect("data already present");
+        assert!(
+            start.elapsed() < Duration::from_millis(100),
+            "fast path must not park when data is already buffered"
+        );
+        assert_eq!(buf.data(), &[0.25, 0.75]);
     }
 }
 

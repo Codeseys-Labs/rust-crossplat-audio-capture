@@ -266,6 +266,14 @@ impl<S: PlatformStream + Sync + 'static> CapturingStream for BridgeStream<S> {
             .state
             .transition(StreamState::Stopping, StreamState::Stopped);
 
+        // Wake a consumer parked in a blocking read so it observes the terminal
+        // state promptly (PU-5). stop() drives Running→Stopping→Stopped directly
+        // (not via signal_done/signal_error, which wake on their own), so without
+        // this a quiet stream's blocked reader would only wake via the bounded
+        // backstop poll. Called from the non-RT stop path, so the notify is sound
+        // (ADR-0001 forbids notify only from the RT audio callbacks).
+        self.shared.notify_wake();
+
         result
     }
 

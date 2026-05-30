@@ -104,12 +104,11 @@ production default. The following details are recorded as load-bearing:
   unit test (`capacity_for_period_independent_of_channels`) locks this in: `512`-frame
   periods at 1/2/4/6/8 channels all return the same capacity.
 
-- **`StreamConfig::buffer_size` is a ring *slot* count, not frames.** Despite the field doc
-  saying "desired buffer size in frames", the value is passed straight into
-  `calculate_capacity(config.buffer_size, 4)` as the requested number of `AudioBuffer`
-  *slots*. The doc is misleading and should be corrected (to "ring-buffer depth in
-  buffers/slots", coordinated with the docs-reconciliation work); this ADR is the record
-  that slot-count is the real semantics.
+- **`StreamConfig::buffer_size` is a ring *slot* count, not frames.** The value is passed
+  straight into `calculate_capacity(config.buffer_size, 4)` as the requested number of
+  `AudioBuffer` *slots*. The field doc originally said "desired buffer size in frames",
+  which was misleading; it has since been corrected to "ring-buffer depth in
+  buffers/slots" (see §6). This ADR is the record that slot-count is the real semantics.
 
 - **`buffer_size` is honored only on Windows today (honest state).** Only the WASAPI
   backend threads the request through: `calculate_capacity(config.buffer_size, 4)`. The
@@ -142,14 +141,48 @@ production default. The following details are recorded as load-bearing:
 
 ## 6. Follow-up (tracked)
 
-- Thread the negotiated period into the macOS/Linux `create_bridge` calls (or adopt
-  `calculate_capacity_for_period` uniformly across WASAPI/PipeWire/CoreAudio once the
-  period is known), so ring sizing is period-aware on every platform.
-- Correct the `StreamConfig::buffer_size` doc from "in frames" to "ring-buffer depth in
-  buffers/slots" (docs-reconciliation work), and either honor it on Linux/macOS or keep
-  the Windows-only note.
+### Current state (as of this revision)
+
+- **`StreamConfig::buffer_size` doc — corrected (done).** The field doc in
+  `src/core/config.rs` previously said "desired buffer size in **frames**". It has been
+  rewritten to state the real semantics: a **ring-buffer depth in buffers/slots** (a slot
+  count, each slot holding one whole interleaved callback period), fed into
+  `calculate_capacity(requested, 4)`, and **honored only on Windows (WASAPI) today** — the
+  Linux (PipeWire) and macOS (CoreAudio) backends hardcode `calculate_capacity(None, 4)`
+  (= 64) and ignore the field. The doc also notes the
+  `AudioCaptureBuilder::buffer_size_frames` setter is a backward-compat alias whose
+  "frames" name is historical and likewise denotes slots, not frames. This was the
+  low-risk, doc-only half of the reconciliation; it touches **no** backend or sizing code.
+
+- **`calculate_capacity_for_period` — built and tested, but unwired (unchanged).** The
+  pure period-derived sizer exists in `src/bridge/ring_buffer.rs` and is fully unit-tested
+  (`capacity_for_period_*`), but **no backend calls it**; all three still use the static
+  `calculate_capacity`. Wiring it (and/or threading `buffer_size` through Linux/macOS) is a
+  separate, larger change that touches the three backend files (WASAPI `GetBufferSize`, the
+  PipeWire negotiated buffer size, the CoreAudio IOProc frame count) and is intentionally
+  **not** part of the doc-only correction above.
+
+### Remaining work (deferred)
+
+- **Thread the negotiated period into ring sizing on every backend.** Adopt
+  `calculate_capacity_for_period(period, channels)` (or at least thread `config.buffer_size`)
+  uniformly across WASAPI / PipeWire / CoreAudio once each backend can surface its
+  negotiated period, so ring sizing is period-aware (and `buffer_size` is honored) on every
+  platform rather than Windows-only.
 - If `bridge-zerocopy` (ADR-0006) is promoted, feed the same negotiated period into
   `create_sample_ring`'s `sample_capacity`/`max_chunks`.
+
+### Promote criteria (when to consider this fully resolved)
+
+1. At least the macOS and Linux backends size their bridge from the negotiated period
+   (via `calculate_capacity_for_period`) or honor `config.buffer_size`, so the
+   "Windows-only" caveat can be dropped from the field doc.
+2. The degenerate-input fallback contract (`period_frames == 0 || channels == 0 →`
+   `PERIOD_FALLBACK_CAPACITY` = 64) remains exercised by tests, guaranteeing no behavior
+   change for a backend that cannot learn its period.
+3. The static `calculate_capacity` default stays bit-for-bit unchanged for any backend that
+   has not migrated (regression-guarded by
+   `calculate_capacity_unchanged_alongside_period_variant`).
 
 ## 7. References
 

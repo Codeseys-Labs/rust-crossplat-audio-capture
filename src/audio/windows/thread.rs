@@ -251,12 +251,13 @@ impl PlatformStream for WindowsPlatformStream {
 /// # Audio Data Flow
 ///
 /// 1. WASAPI fills its internal buffer with captured audio
-/// 2. We read packets from the capture client
-/// 3. Convert raw bytes to `f32` samples
-/// 4. Create [`AudioBuffer`] and push via [`BridgeProducer::push_or_drop()`]
+/// 2. We read each packet's bytes into a reusable contiguous buffer
+/// 3. Reinterpret the F32LE bytes as `&[f32]` in bulk via [`slice::align_to`]
+///    (PU-7 — no per-sample scalar decode, mirroring the Linux path)
+/// 4. Push the samples via [`BridgeProducer::push_samples_or_drop`]
 ///
-/// The `push_or_drop()` call is lock-free and non-blocking, making it safe
-/// for the capture loop context.
+/// The `push_samples_or_drop()` call is lock-free and non-blocking, making it
+/// safe for the capture loop context.
 ///
 /// # Cleanup
 ///
@@ -440,10 +441,28 @@ fn wasapi_capture_thread_main(
         sample_format: crate::core::config::SampleFormat::F32,
     });
 
-    // Pre-allocate reusable buffers outside the loop to avoid per-iteration allocations.
-    // The VecDeque is reused for raw bytes from WASAPI, and the Vec<f32> for converted samples.
-    let mut sample_queue = std::collections::VecDeque::with_capacity(48000 * 4 * 2 / 10); // ~100ms at 48kHz stereo f32
-    let mut samples: Vec<f32> = Vec::with_capacity(48000 * 2 / 10); // ~100ms at 48kHz stereo
+    // PU-7 (rsac-7876): bytes per interleaved f32 frame for the negotiated
+    // delivery format. The client is opened with `desired_format` (32-bit float,
+    // `channels`), and both the autoconvert (system/device-loopback) and the
+    // process-loopback paths deliver exactly that — so a frame is `channels`
+    // little-endian f32 samples = `channels * 4` bytes. `channels` is `>= 1`
+    // (validated upstream), so this is non-zero.
+    let bytes_per_frame = channels as usize * std::mem::size_of::<f32>();
+
+    // PU-7: one reusable contiguous byte buffer for the raw WASAPI packet.
+    //
+    // This replaces the previous `VecDeque<u8>` + scalar `from_le_bytes` decode.
+    // `read_from_device` copies a packet's bytes into a `&mut [u8]` in a single
+    // `copy_from_slice` (vs. the deque path's per-byte `push_back`), and because
+    // the destination is already contiguous we drop the O(n) `make_contiguous`
+    // rotation. The bytes are then reinterpreted as `&[f32]` in bulk via
+    // `slice::align_to` (mirroring the Linux/PipeWire path), eliminating the
+    // per-sample scalar loop and the separate `Vec<f32>` staging buffer entirely.
+    //
+    // Pre-sized to ~100ms at 48kHz stereo f32 so steady-state reads never grow
+    // it; a larger packet grows it once (amortized, off the steady-state path).
+    // No allocation happens on the per-packet hot path once warmed.
+    let mut byte_buf: Vec<u8> = Vec::with_capacity(48000 * 4 * 2 / 10);
 
     loop {
         // Check stop flag before waiting.
@@ -495,43 +514,69 @@ fn wasapi_capture_thread_main(
                 break;
             }
 
-            // Read a single packet's raw bytes into the reused VecDeque.
-            sample_queue.clear();
-            match capture_client.read_from_device_to_deque(&mut sample_queue) {
-                Ok(_) => {}
+            // PU-7: read this packet's raw bytes into the reused contiguous
+            // buffer. `read_from_device` requires the destination to be large
+            // enough to hold the whole packet (else it errors and releases the
+            // WASAPI buffer), so ensure capacity for the predicted packet size.
+            // `resize` only allocates when a packet exceeds the high-water mark
+            // (off the steady-state path); thereafter it is a no-op length set.
+            let needed = packet_frames as usize * bytes_per_frame;
+            if byte_buf.len() < needed {
+                byte_buf.resize(needed, 0);
+            }
+
+            // Copy the packet's bytes in a single `copy_from_slice` (inside
+            // wasapi-rs), into a contiguous slice — no per-byte `push_back`, no
+            // `make_contiguous` rotation. `frames_read` is the authoritative
+            // count of frames actually delivered.
+            let frames_read = match capture_client.read_from_device(&mut byte_buf[..needed]) {
+                Ok((frames, _buffer_info)) => frames as usize,
                 Err(e) => {
-                    log::warn!("WASAPI thread: read_from_device_to_deque failed: {}", e);
+                    log::warn!("WASAPI thread: read_from_device failed: {}", e);
                     // Bail out of the drain loop on error; outer loop will
                     // re-check the stop flag and resume waiting.
                     break;
                 }
-            }
-
-            if sample_queue.is_empty() {
+            };
+            if frames_read == 0 {
                 continue;
             }
 
-            // Make the VecDeque contiguous, then decode the SINGLE resulting
-            // slice. Decoding `as_slices()`' (front, back) separately is unsound
-            // here: a sample's 4 bytes can straddle the wrap boundary, so
-            // `front.chunks_exact(4)` would drop front's trailing 1-3 bytes and
-            // `back` would re-align from byte 0 — losing the straddling f32 and
-            // byte-shifting every sample after it. `make_contiguous()` is an
-            // in-place rotation (no allocation) so the single slice is wrap-safe.
-            let bytes = sample_queue.make_contiguous();
+            // The valid region is exactly `frames_read` whole frames. Slicing to
+            // it keeps the conversion exact even if WASAPI delivered fewer frames
+            // than `get_next_packet_size` predicted.
+            let valid = &byte_buf[..frames_read * bytes_per_frame];
 
-            // Convert bytes to f32 samples (4 bytes per sample, little-endian).
-            // Reuse the samples Vec to avoid allocation on every iteration.
-            samples.clear();
-            for chunk in bytes.chunks_exact(4) {
-                samples.push(f32::from_le_bytes([chunk[0], chunk[1], chunk[2], chunk[3]]));
-            }
+            // Reinterpret the F32LE bytes as `&[f32]` in one bulk operation
+            // instead of a per-sample `from_le_bytes` loop, mirroring the
+            // Linux/PipeWire path. WASAPI's GetBuffer region is sample-aligned and
+            // `byte_buf` is a `Vec<u8>` whose data pointer is at least word-
+            // aligned, so `align_to`'s head/tail are normally empty; we consume
+            // the aligned run of whole samples and ignore any unaligned edge.
+            // (`align_to` is used deliberately over `bytemuck::cast_slice`, which
+            // would *panic* on a misaligned slice — see PU-7 blueprint.) On the
+            // little-endian hosts Windows runs on, the in-memory layout equals the
+            // F32LE byte layout, so this reinterpret is a no-op at the bit level.
+            //
+            // SAFETY: every bit pattern is a valid `f32`, and we only read the
+            // `frames_read * bytes_per_frame` bytes that `read_from_device` just
+            // initialized within `valid`.
+            let (_head, samples, _tail) = unsafe { valid.align_to::<f32>() };
 
             if !samples.is_empty() {
-                // Use push_samples_or_drop for zero-allocation on the capture
-                // thread. This uses the BridgeProducer's internal scratch
-                // buffer to avoid allocating a new Vec<f32> every iteration.
-                producer.push_samples_or_drop(&samples, channels, sample_rate);
+                // Push the borrowed sample view directly. `push_samples_or_drop`
+                // sources its backing buffer from the bridge free-list, so this
+                // is zero-allocation on the capture thread in steady state — and
+                // we no longer stage into an intermediate `Vec<f32>` at all.
+                producer.push_samples_or_drop(samples, channels, sample_rate);
+                // Wake a consumer parked in a blocking read (PU-5). This is sound
+                // here even though the producer push path is RT-disciplined: the
+                // WASAPI capture loop runs on rsac's OWN spawned polling thread
+                // (NOT an OS audio-callback context), so a Condvar notify is
+                // allowed (ADR-0001 forbids notify only from the Linux/macOS RT
+                // callbacks). Without this, a blocking reader only wakes via the
+                // bounded ≤1ms backstop poll.
+                producer.notify_consumers();
             }
         }
 
