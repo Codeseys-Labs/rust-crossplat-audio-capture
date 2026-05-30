@@ -582,4 +582,86 @@ mod async_stream_tests {
             }
         }
     }
+
+    /// 6. signal_error (FATAL producer death, FH-1 / ADR-0010) ends the async
+    ///    stream with None. This is the async EOS counterpart of
+    ///    test_async_stream_ends_on_signal_done, but driven by the fatal sibling.
+    ///
+    ///    NOTE the deliberate behavioral difference from signal_done: the terminal
+    ///    `Error` state is NOT readable (only Running/Stopping are), so
+    ///    `try_read_chunk` returns the Fatal StreamEnded rather than draining, and
+    ///    `poll_next` maps that to `Poll::Ready(None)` (because the stream is no
+    ///    longer producing). A dead producer ends the stream promptly; any
+    ///    still-buffered tail is moot once the producer has died. Contrast with
+    ///    test_async_stream_ends_on_signal_done, where graceful Stopping IS
+    ///    readable and drains the buffered tail before ending.
+    #[test]
+    fn test_signal_error_ends_async_stream() {
+        let (mut producer, bridge_stream) = create_test_stream();
+        let (waker, _test_waker) = make_test_waker();
+        let mut cx = Context::from_waker(&waker);
+
+        // Push some data, then the producer DIES (e.g. device unplug).
+        producer.push(test_buffer(3.0)).unwrap();
+        producer.push(test_buffer(4.0)).unwrap();
+        producer.signal_error();
+
+        let mut async_stream = AsyncAudioStream::new(&bridge_stream);
+
+        // Terminal Error → not readable → stream ends with None (no hang, no
+        // spurious error item leaking past the producer's death).
+        {
+            let pinned = Pin::new(&mut async_stream);
+            match pinned.poll_next(&mut cx) {
+                Poll::Ready(None) => {}
+                other => panic!(
+                    "Expected stream end (None) after signal_error, got {:?}",
+                    other
+                ),
+            }
+        }
+    }
+
+    /// 7. A pending async poll is woken by signal_error (the fatal sibling wakes
+    ///    the waker just like signal_done), and the next poll yields None.
+    #[test]
+    fn test_signal_error_wakes_waker() {
+        let (producer, bridge_stream) = create_test_stream();
+        let (waker, test_waker) = make_test_waker();
+        let mut cx = Context::from_waker(&waker);
+
+        let mut async_stream = AsyncAudioStream::new(&bridge_stream);
+
+        // Poll — Pending (no data, producer still alive), registers the waker.
+        {
+            let pinned = Pin::new(&mut async_stream);
+            match pinned.poll_next(&mut cx) {
+                Poll::Pending => {}
+                other => panic!("Expected Pending, got {:?}", other),
+            }
+        }
+        assert!(
+            !test_waker.woken.load(Ordering::SeqCst),
+            "Waker should NOT be triggered before signal_error"
+        );
+
+        // Producer dies → must wake the registered waker.
+        producer.signal_error();
+        assert!(
+            test_waker.woken.load(Ordering::SeqCst),
+            "Waker SHOULD be triggered after signal_error"
+        );
+
+        // Next poll — terminal Error, no data → None.
+        {
+            let pinned = Pin::new(&mut async_stream);
+            match pinned.poll_next(&mut cx) {
+                Poll::Ready(None) => {}
+                other => panic!(
+                    "Expected None (stream end) after signal_error, got {:?}",
+                    other
+                ),
+            }
+        }
+    }
 }

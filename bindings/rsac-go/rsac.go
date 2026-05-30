@@ -52,6 +52,18 @@ package rsac
 #cgo CFLAGS: -I${SRCDIR}
 #cgo LDFLAGS: -L${SRCDIR}/lib -lrsac_ffi
 
+// Per-OS system libraries the Rust std staticlib pulls in. The Makefile passes
+// these via CGO_LDFLAGS too, but declaring them here lets a bare `go build` /
+// `go test` (not driven by the Makefile) link as well.
+//   - Windows: WASAPI/COM + the Win32 libs Rust std needs (ws2_32/ntdll/bcrypt/…).
+//     cgo links via MinGW, so the rsac-ffi staticlib must be the *-pc-windows-gnu
+//     build (see Makefile / docs/CROSS_LANGUAGE_BINDINGS.md).
+//   - Linux: PipeWire + the usual pthread/dl/m.
+//   - macOS: the CoreAudio/AudioToolbox/CoreFoundation/Security frameworks.
+#cgo windows LDFLAGS: -lole32 -loleaut32 -lwinmm -lksuser -luuid -lbcrypt -lntdll -luserenv -lws2_32 -ladvapi32 -lkernel32
+#cgo linux LDFLAGS: -lpipewire-0.3 -lpthread -ldl -lm
+#cgo darwin LDFLAGS: -framework CoreAudio -framework AudioToolbox -framework CoreFoundation -framework Security -framework SystemConfiguration
+
 #include "rsac.h"
 #include <stdlib.h>
 */
@@ -63,6 +75,7 @@ import (
 	"math"
 	"runtime"
 	"sync"
+	"sync/atomic"
 	"unsafe"
 )
 
@@ -676,6 +689,18 @@ type AudioCapture struct {
 	handle   *C.RsacCapture
 	closed   bool
 	callback uintptr // backing cgo.Handle for the active callback, 0 if none
+
+	// reads tracks in-flight ReadBuffer/TryReadBuffer C calls so Close() can
+	// drain them before freeing the handle. Add(1) happens under c.mu (ordered
+	// before any Close observes closed=true), and Done() runs via defer after
+	// the C call returns. Close() releases c.mu, then reads.Wait() to drain.
+	reads sync.WaitGroup
+	// closing is set true (under c.mu, before closed) at the start of Close().
+	// A reader that has already taken the WaitGroup barrier re-checks it after
+	// dropping c.mu and bails before entering C if a close has begun. This is
+	// the #28 use-after-free fix: the handle is never freed underneath a parked
+	// read because Close() drains reads.Wait() before rsac_capture_free.
+	closing atomic.Bool
 }
 
 // Start begins audio capture. The underlying OS stream is created and begins
@@ -717,20 +742,35 @@ func (c *AudioCapture) Close() error {
 	return c.closeLocked()
 }
 
-// closeLocked frees the C handle. Must be called with c.mu held.
+// closeLocked frees the C handle. Must be called with c.mu held on entry; it
+// briefly RELEASES c.mu while draining in-flight reads (see below) and
+// re-acquires it before freeing, so on return c.mu is held again (Close's
+// deferred Unlock balances it).
 //
-// Ordering matters for the #28 callback use-after-free: the cgo.Handle backing
-// an active callback must never be Delete()d while a callback could still
-// resolve it on the FFI delivery thread. We therefore (1) clear the C-layer
-// callback and stop+free the capture — which tears down the delivery path and,
-// for any callback already dispatched, is the point past which no new
-// invocation can begin — and only then (2) Delete the cgo.Handle. The C ABI
-// guarantees rsac_capture_free stops the stream if running, so the explicit
-// set_callback(NULL) is belt-and-suspenders: it makes the "clear at the C layer
-// precedes handle Delete" ordering unconditional even on backends where free is
-// a thinner teardown. goAudioCallback additionally recovers from a resolve of an
-// already-deleted handle, closing the residual in-flight-callback window.
+// Ordering matters for two distinct use-after-free races:
+//
+//  1. Callback (#28, already fixed): the cgo.Handle backing an active callback
+//     must never be Delete()d while a callback could still resolve it on the
+//     FFI delivery thread. We clear the C-layer callback first, then free, then
+//     Delete the cgo.Handle (goAudioCallback also recovers from a resolve of an
+//     already-deleted handle).
+//
+//  2. Blocking-read (#28, this fix): a goroutine parked in C.rsac_capture_read
+//     holds no Go lock during the C call, so a naive free would yank the handle
+//     out from under it. The reads WaitGroup keeps the handle alive for the
+//     duration of every in-flight C read; we set closing+closed FIRST (so new
+//     reads bail), call rsac_capture_request_stop to UNBLOCK a parked reader
+//     (it observes a terminal stream and returns within ~1ms instead of waiting
+//     out the blocking-read timeout), then UNLOCK c.mu and reads.Wait() to
+//     drain, RE-LOCK, and only then free. Releasing c.mu during Wait() is
+//     mandatory: the parked reader's error path re-takes c.mu, so holding it
+//     across Wait() would deadlock.
 func (c *AudioCapture) closeLocked() error {
+	// Set closing BEFORE closed (both under c.mu). A reader either took the
+	// WaitGroup barrier before Close started (and we drain it) or it sees
+	// closed=true under c.mu and bails without Add — so reads.Add never races
+	// reads.Wait (the "Add after Wait" panic the sync docs warn about).
+	c.closing.Store(true)
 	c.closed = true
 	runtime.SetFinalizer(c, nil)
 	// Clear the C-layer callback first so the FFI pump stops dispatching to
@@ -738,6 +778,20 @@ func (c *AudioCapture) closeLocked() error {
 	if c.callback != 0 {
 		C.rsac_capture_set_callback(c.handle, nil, nil)
 	}
+	// Snapshot the handle for the unlocked drain window: request_stop only
+	// reads, so it is safe to call concurrently with the in-flight reads we are
+	// about to drain. It transitions the stream terminal, unblocking any parked
+	// rsac_capture_read so reads.Wait() returns promptly.
+	handle := c.handle
+	C.rsac_capture_request_stop(handle)
+
+	// Drain in-flight reads with c.mu released so parked readers can finish
+	// their C call and run their deferred reads.Done() (and, on error, re-take
+	// c.mu). After Wait() no read can be inside C against this handle.
+	c.mu.Unlock()
+	c.reads.Wait()
+	c.mu.Lock()
+
 	C.rsac_capture_free(c.handle)
 	c.handle = nil
 	// Now that delivery is torn down, it is safe to delete the cgo.Handle.
@@ -838,12 +892,26 @@ func (c *AudioCapture) ReadBuffer() (AudioBuffer, error) {
 		return AudioBuffer{}, ErrClosed
 	}
 	handle := c.handle
+	// Join the in-flight-read barrier UNDER c.mu, so the Add(1) is ordered
+	// before any Close() observes closed=true. Close() drains reads.Wait()
+	// before freeing the handle, so the handle cannot be freed while this C
+	// call is in flight (#28 fix). The matching Done() runs via defer below.
+	c.reads.Add(1)
 	c.mu.Unlock()
+	defer c.reads.Done()
 
-	// Note: ReadBuffer releases the lock during the blocking C call so that
-	// other goroutines can call IsRunning(), OverrunCount(), or Stop().
-	// The handle is safe to use without the lock because Close() only frees
-	// the handle, and we re-check closed afterward.
+	// A close may have started after we dropped c.mu (it sets closing first).
+	// Bail before entering C so we never park in a blocking read against a
+	// handle Close() is about to drain+free.
+	if c.closing.Load() {
+		return AudioBuffer{}, ErrClosed
+	}
+
+	// The barrier keeps the handle alive for the duration of this C read;
+	// Close() sets closing, signals rsac_capture_request_stop, then drains
+	// in-flight reads (reads.Wait) before rsac_capture_free, so the handle is
+	// never freed underneath a parked read. We re-check closed on the error
+	// path (a concurrent request_stop surfaces as a terminal stream error).
 	var cbuf *C.RsacAudioBuffer
 	rc := C.rsac_capture_read(handle, &cbuf)
 	if rc != C.RSAC_OK {
@@ -872,7 +940,16 @@ func (c *AudioCapture) TryReadBuffer() (AudioBuffer, bool, error) {
 		return AudioBuffer{}, false, ErrClosed
 	}
 	handle := c.handle
+	// Same in-flight-read barrier as ReadBuffer. The C call is non-blocking so
+	// the window is tiny, but the Add(1)/Done() span must still bracket it so a
+	// concurrent Close()+free cannot land mid-call (#28 fix).
+	c.reads.Add(1)
 	c.mu.Unlock()
+	defer c.reads.Done()
+
+	if c.closing.Load() {
+		return AudioBuffer{}, false, ErrClosed
+	}
 
 	var cbuf *C.RsacAudioBuffer
 	rc := C.rsac_capture_try_read(handle, &cbuf)

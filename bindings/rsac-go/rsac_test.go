@@ -5,6 +5,8 @@ import (
 	"errors"
 	"math"
 	"runtime/cgo"
+	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 )
@@ -623,6 +625,212 @@ func TestCaptureBuilder_WithTargetString(t *testing.T) {
 	}
 	if b.target.spec != "app:777" {
 		t.Errorf("WithTargetString spec = %q, want %q", b.target.spec, "app:777")
+	}
+}
+
+// ── Concurrent Close-during-Read barrier (issue #28, H2) ─────────────────
+//
+// These tests exercise the read/Close use-after-free barrier WITHOUT a real
+// audio device (CI is device-free), mirroring the device-free style of
+// TestStream_ContextCancellation. The production AudioCapture keeps its handle
+// alive across an in-flight C read via a sync.WaitGroup + a closing atomic.Bool,
+// and Close() signals request_stop then drains reads.Wait() before freeing.
+//
+// closeHarness reproduces that exact ordering against a stub that stands in for
+// the C handle + the rsac_capture_read / rsac_capture_request_stop / free FFI
+// calls, so `go test -race` validates that the handle is never touched after it
+// is "freed" while a read is in flight. It is a faithful copy of the real
+// rsac.go logic (same field names, same lock discipline), not the real cgo path.
+type closeHarness struct {
+	mu      sync.Mutex
+	closed  bool
+	closing atomic.Bool
+	reads   sync.WaitGroup
+
+	// freed models the freed C handle: set true only after reads.Wait() drains.
+	// The race detector flags any read of *handle after free; here we assert
+	// logically that no in-flight read observes freed==true.
+	freed atomic.Bool
+	// terminal models the bridge's terminal flag that request_stop sets so a
+	// parked stubRead returns promptly (StreamEnded-equivalent) rather than
+	// spinning out a long timeout.
+	terminal atomic.Bool
+}
+
+// stubRead stands in for C.rsac_capture_read: it parks (no data) until the
+// stream goes terminal (request_stop) or a bounded fallback elapses, then
+// returns ErrClosed. It asserts the "handle" is never freed while it runs.
+func (h *closeHarness) stubRead() error {
+	deadline := time.Now().Add(2 * time.Second)
+	for {
+		if h.freed.Load() {
+			// The whole point of the barrier: this must never happen.
+			return errors.New("USE-AFTER-FREE: read observed a freed handle")
+		}
+		if h.terminal.Load() {
+			return ErrClosed // request_stop unblocked us → terminal stream
+		}
+		if time.Now().After(deadline) {
+			return ErrClosed // safety net so a broken test can't hang CI
+		}
+		time.Sleep(time.Millisecond)
+	}
+}
+
+// ReadBuffer mirrors AudioCapture.ReadBuffer's barrier exactly.
+func (h *closeHarness) ReadBuffer() error {
+	h.mu.Lock()
+	if h.closed {
+		h.mu.Unlock()
+		return ErrClosed
+	}
+	h.reads.Add(1)
+	h.mu.Unlock()
+	defer h.reads.Done()
+
+	if h.closing.Load() {
+		return ErrClosed
+	}
+	return h.stubRead()
+}
+
+// Close mirrors AudioCapture.Close + closeLocked's drain-before-free ordering.
+func (h *closeHarness) Close() error {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	if h.closed {
+		return nil
+	}
+	h.closing.Store(true)
+	h.closed = true
+	// request_stop: flip terminal so parked stubRead returns promptly.
+	h.terminal.Store(true)
+	// Drain in-flight reads with the lock released (matches closeLocked).
+	h.mu.Unlock()
+	h.reads.Wait()
+	h.mu.Lock()
+	// Only now is it safe to "free" — every in-flight read has returned.
+	h.freed.Store(true)
+	return nil
+}
+
+// T1 + T2: N concurrent readers vs Close. Asserts no race, no UAF, Close
+// returns promptly (well under the 1s blocking-read timeout the real FFI uses),
+// and every in-flight read returns ErrClosed.
+func TestCloseDuringRead_NoUseAfterFree(t *testing.T) {
+	h := &closeHarness{}
+
+	const n = 16
+	var wg sync.WaitGroup
+	errs := make([]error, n)
+	for i := 0; i < n; i++ {
+		wg.Add(1)
+		go func(idx int) {
+			defer wg.Done()
+			errs[idx] = h.ReadBuffer()
+		}(i)
+	}
+
+	// Let the readers park in stubRead.
+	time.Sleep(20 * time.Millisecond)
+
+	start := time.Now()
+	if err := h.Close(); err != nil {
+		t.Fatalf("Close returned error: %v", err)
+	}
+	elapsed := time.Since(start)
+	// T2: request_stop must unblock parked readers, so Close returns fast.
+	if elapsed > 500*time.Millisecond {
+		t.Errorf("Close took %v; request_stop should unblock reads promptly", elapsed)
+	}
+
+	wg.Wait()
+	for i, err := range errs {
+		if err == nil {
+			continue // a read that completed before Close is fine
+		}
+		if !errors.Is(err, ErrClosed) {
+			t.Errorf("reader %d: unexpected error %v (want ErrClosed)", i, err)
+		}
+	}
+	if !h.freed.Load() {
+		t.Error("handle should be freed after Close drains in-flight reads")
+	}
+}
+
+// T2 (focused): Close does not deadlock against a single parked reader and
+// returns promptly because request_stop (terminal flag) unblocks it.
+func TestCloseDuringRead_NoDeadlock(t *testing.T) {
+	h := &closeHarness{}
+	done := make(chan error, 1)
+	go func() { done <- h.ReadBuffer() }()
+
+	time.Sleep(20 * time.Millisecond)
+
+	closed := make(chan struct{})
+	go func() {
+		_ = h.Close()
+		close(closed)
+	}()
+	select {
+	case <-closed:
+	case <-time.After(1 * time.Second):
+		t.Fatal("Close deadlocked against a parked reader")
+	}
+
+	select {
+	case err := <-done:
+		if !errors.Is(err, ErrClosed) {
+			t.Errorf("parked read returned %v, want ErrClosed", err)
+		}
+	case <-time.After(1 * time.Second):
+		t.Fatal("parked reader did not return after Close")
+	}
+}
+
+// T4: idempotent Close (twice → nil both times) and Close-then-Read → ErrClosed.
+func TestClose_IdempotentAndReadAfterClose(t *testing.T) {
+	h := &closeHarness{}
+	if err := h.Close(); err != nil {
+		t.Fatalf("first Close: %v", err)
+	}
+	if err := h.Close(); err != nil {
+		t.Fatalf("second Close should be a no-op nil, got %v", err)
+	}
+	if err := h.ReadBuffer(); !errors.Is(err, ErrClosed) {
+		t.Errorf("ReadBuffer after Close = %v, want ErrClosed", err)
+	}
+}
+
+// T3-ish: many concurrent Close + Read interleavings stress the barrier under
+// the race detector (mirrors the GC-finalizer/explicit-Close coexistence: both
+// route through the same closing/closed-guarded path).
+func TestCloseDuringRead_ConcurrentClosersAndReaders(t *testing.T) {
+	h := &closeHarness{}
+	var wg sync.WaitGroup
+
+	for i := 0; i < 8; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			_ = h.ReadBuffer()
+		}()
+	}
+	for i := 0; i < 4; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			_ = h.Close()
+		}()
+	}
+	wg.Wait()
+
+	if !h.freed.Load() {
+		t.Error("handle should be freed after all Close calls")
+	}
+	// A post-drain read must cleanly report closed, never touch a freed handle.
+	if err := h.ReadBuffer(); !errors.Is(err, ErrClosed) {
+		t.Errorf("post-close ReadBuffer = %v, want ErrClosed", err)
 	}
 }
 

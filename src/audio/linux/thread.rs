@@ -24,7 +24,8 @@ use std::sync::mpsc as std_mpsc;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
-use crate::bridge::ring_buffer::BridgeProducer;
+use crate::bridge::ring_buffer::{BridgeProducer, BridgeShared};
+use crate::bridge::state::StreamState;
 use crate::bridge::stream::PlatformStream;
 use crate::core::config::CaptureTarget;
 use crate::core::error::{AudioError, AudioResult};
@@ -1254,6 +1255,11 @@ fn pw_thread_main(
     use pipewire::properties::properties;
     use pipewire::registry::Listener as RegistryListener;
     use pipewire::stream::{StreamBox, StreamFlags, StreamListener};
+    // PipeWire's own stream-state enum (the `.state_changed` callback arg),
+    // aliased to avoid clashing with the bridge's `StreamState`
+    // (`crate::bridge::state::StreamState`) used by the clean-exit teardown
+    // transition below. See ADR-0010.
+    use pipewire::stream::StreamState as PwStreamState;
     use pipewire::types::ObjectType;
 
     use libspa::param::audio::{AudioFormat as SpaAudioFormat, AudioInfoRaw};
@@ -1555,6 +1561,16 @@ fn pw_thread_main(
     // listener before the stream in all cleanup paths.
     let mut capture_stream: Option<StreamBox> = None;
     let mut capture_listener: Option<StreamListener<CaptureStreamData>> = None;
+    // Producer-terminal-signal (FH-1 / ADR-0010): a clone of the active session's
+    // `BridgeShared`, retained on THIS thread so every capture-loop teardown path
+    // (StopCapture, Shutdown, command-channel disconnect, final loop exit) can
+    // drive the bridge to a terminal/ending state instead of leaving a Linux
+    // reader hung. Set together with `capture_stream`/`capture_listener` in the
+    // StartCapture arm and cleared together in StopCapture so a later StartCapture
+    // on the same thread never transitions a stale prior session. The `.process`
+    // / `.state_changed` callbacks own the spontaneous-death path (signal_error);
+    // this Arc owns the GRACEFUL clean-exit path (signal_done → Stopping).
+    let mut active_shared: Option<Arc<BridgeShared>> = None;
 
     loop {
         // Pump PipeWire events. The `process` callback fires during iterate()
@@ -1627,6 +1643,12 @@ fn pw_thread_main(
 
                 // ── Build user data for stream callbacks ──
 
+                // Producer-terminal-signal (FH-1 / ADR-0010): retain a clone of
+                // this session's `BridgeShared` for the GRACEFUL clean-exit
+                // teardown transition below, BEFORE `producer` is moved into the
+                // listener's user data (cloning the Arc is cheap and lock-free).
+                let session_shared = Arc::clone(producer.shared());
+
                 let user_data = CaptureStreamData {
                     format: AudioInfoRaw::new(),
                     producer,
@@ -1638,6 +1660,28 @@ fn pw_thread_main(
 
                 let listener = match stream
                     .add_local_listener_with_user_data(user_data)
+                    .state_changed(|_stream, user_data, _old, new| {
+                        // Producer-terminal-signal (FH-1 / ADR-0010): catch
+                        // SPONTANEOUS producer death that never flows through the
+                        // `.process` data callback — daemon/proxy death (Error)
+                        // and node removal / disconnect (Unconnected). Drive the
+                        // bridge to the terminal Error state so a parked Linux
+                        // reader observes StreamEnded instead of hanging forever.
+                        //
+                        // RT-context note: PipeWire may invoke this from the loop
+                        // thread; `signal_error()` is lock-free + alloc-free (a
+                        // single atomic state store + a waker wake, ADR-0001), so
+                        // it is safe regardless of which thread fires it. Benign
+                        // transitions (Connecting / Paused / Streaming) and the
+                        // normal connect handshake MUST NOT poison the stream, so
+                        // only Error / Unconnected signal.
+                        match new {
+                            PwStreamState::Error(_) | PwStreamState::Unconnected => {
+                                user_data.producer.signal_error();
+                            }
+                            _ => {}
+                        }
+                    })
                     .param_changed(|_stream, user_data, id, param| {
                         // Format negotiation callback.
                         // PipeWire calls this when the actual stream format is
@@ -1851,12 +1895,24 @@ fn pw_thread_main(
                 // cleanup paths.
                 capture_stream = Some(stream);
                 capture_listener = Some(listener);
+                // Producer-terminal-signal (FH-1 / ADR-0010): retain the session
+                // handle so the graceful teardown paths below can end the stream.
+                active_shared = Some(session_shared);
 
                 let _ = response_tx.send(Ok(()));
             }
 
             Ok(PipeWireCommand::StopCapture { response_tx }) => {
                 log::debug!("PipeWire thread: StopCapture received");
+
+                // Producer-terminal-signal (FH-1 / ADR-0010): drive the bridge to
+                // a graceful ending state BEFORE tearing down the stream, so a
+                // parked Linux reader unblocks promptly. Running → Stopping (the
+                // graceful sibling) keeps any buffered tail drainable; the
+                // subsequent `BridgeStream::stop` path completes Stopping →
+                // Stopped. Idempotent: the CAS no-ops if a `.state_changed`
+                // spontaneous-death already poisoned the stream to Error.
+                signal_session_graceful_end(active_shared.take());
 
                 // Drop listener first (unregisters callbacks from the C stream),
                 // then drop the stream (destroys the C stream object).
@@ -2080,6 +2136,9 @@ fn pw_thread_main(
 
             Ok(PipeWireCommand::Shutdown) => {
                 log::debug!("PipeWire thread: Shutdown received, exiting event loop");
+                // Producer-terminal-signal (FH-1 / ADR-0010): end any active
+                // session before tearing it down so a parked reader unblocks.
+                signal_session_graceful_end(active_shared.take());
                 // Clean up any active capture before exiting.
                 // Drop listener before stream — listener callbacks reference stream internals.
                 drop(capture_listener.take());
@@ -2094,6 +2153,9 @@ fn pw_thread_main(
             Err(std_mpsc::TryRecvError::Disconnected) => {
                 // Command channel closed — caller is gone, exit gracefully.
                 log::debug!("PipeWire thread: command channel disconnected, exiting");
+                // Producer-terminal-signal (FH-1 / ADR-0010): end any active
+                // session before tearing it down so a parked reader unblocks.
+                signal_session_graceful_end(active_shared.take());
                 // Drop listener before stream — listener callbacks reference stream internals.
                 drop(capture_listener.take());
                 drop(capture_stream.take());
@@ -2102,10 +2164,39 @@ fn pw_thread_main(
         }
     }
 
+    // Producer-terminal-signal (FH-1 / ADR-0010): final safety net — if the loop
+    // exits via any path that did not already end the session, drive the bridge
+    // to a terminal/ending state here so no Linux reader is left hung. `take()`
+    // makes this a no-op when a teardown arm above already consumed the handle.
+    signal_session_graceful_end(active_shared.take());
+
     // Cleanup: PipeWire objects are dropped via RAII when this function returns.
     // The MainLoop, Context, Core, and Registry are all dropped here.
     is_running.store(false, Ordering::SeqCst);
     log::debug!("PipeWire thread: exited cleanly");
+}
+
+/// Drive a capture session's bridge to a graceful ending state on clean loop
+/// teardown (producer-terminal-signal, FH-1 / ADR-0010).
+///
+/// Mirrors [`BridgeProducer::signal_done`]: a best-effort `Running → Stopping`
+/// CAS plus an async waker wake. `Stopping` is the GRACEFUL sibling — it keeps
+/// any buffered tail drainable (it is not terminal), which is correct for a
+/// clean capture-loop exit; spontaneous producer death is handled separately by
+/// the `.state_changed` `signal_error()` path (`Running → Error`, terminal).
+///
+/// Idempotent and lock-free: the CAS no-ops if the state already advanced past
+/// `Running` (e.g. a prior `signal_error()` poisoned it to `Error`), and the
+/// whole call is a single atomic store + a waker wake — no allocation, no lock.
+/// A `None` handle (no active session) is a no-op.
+fn signal_session_graceful_end(shared: Option<Arc<BridgeShared>>) {
+    if let Some(shared) = shared {
+        let _ = shared
+            .state
+            .transition(StreamState::Running, StreamState::Stopping);
+        #[cfg(feature = "async-stream")]
+        shared.waker.wake();
+    }
 }
 
 // ── Device-change watcher (M10 Linux arm / rsac-b92e) ─────────────────────

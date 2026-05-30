@@ -208,6 +208,17 @@ rsac_error_t rsac_capture_start(RsacCapture* capture);
 rsac_error_t rsac_capture_stop(RsacCapture* capture);
 
 /**
+ * Best-effort unblock of a parked rsac_capture_read by transitioning the
+ * stream to a terminal state. Idempotent; a no-op when no stream exists or it
+ * is already stopped. Safe to call concurrently with an in-flight
+ * rsac_capture_read / rsac_capture_try_read to unblock it. NOT safe to call
+ * concurrently with rsac_capture_free — order request_stop + drain of
+ * in-flight reads BEFORE free. Returns RSAC_ERROR_NULL_POINTER if capture is
+ * null, else RSAC_OK.
+ */
+rsac_error_t rsac_capture_request_stop(const RsacCapture* capture);
+
+/**
  * Returns 1 if the capture is running, 0 if stopped, -1 on error (null).
  */
 int32_t rsac_capture_is_running(const RsacCapture* capture);
@@ -245,15 +256,23 @@ void rsac_capture_free(RsacCapture* capture);
  * Non-blocking read. On success with data, *out receives a buffer handle.
  * On success with no data available, *out is null and RSAC_OK is returned.
  * The buffer must be freed with rsac_audio_buffer_free().
+ *
+ * Takes a const capture: it only reads, so it may run concurrently with
+ * rsac_capture_request_stop. Still NOT safe against a concurrent
+ * rsac_capture_free (free the handle only after draining in-flight reads).
  */
-rsac_error_t rsac_capture_try_read(RsacCapture* capture,
+rsac_error_t rsac_capture_try_read(const RsacCapture* capture,
                                     RsacAudioBuffer** out);
 
 /**
  * Blocking read. Blocks until an audio buffer is available.
  * The buffer must be freed with rsac_audio_buffer_free().
+ *
+ * Takes a const capture: a concurrent rsac_capture_request_stop can unblock a
+ * thread parked here. Still NOT safe against a concurrent rsac_capture_free —
+ * drain in-flight reads before freeing the handle.
  */
-rsac_error_t rsac_capture_read(RsacCapture* capture,
+rsac_error_t rsac_capture_read(const RsacCapture* capture,
                                 RsacAudioBuffer** out);
 
 /* ── Callback-based capture ─────────────────────────────────────────── */

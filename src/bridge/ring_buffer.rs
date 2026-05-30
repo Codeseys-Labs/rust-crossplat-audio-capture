@@ -702,9 +702,9 @@ impl BridgeProducer {
         self.shared.record_drop_window(true);
         // Best-effort poison: force the stream into the terminal Error state so
         // readers observe end-of-stream rather than spinning on a dead callback.
-        self.shared.state.force_set(StreamState::Error);
-        #[cfg(feature = "async-stream")]
-        self.shared.waker.wake();
+        // Shares the exact terminal-poison tail with `signal_error()` (state
+        // force_set to Error + waker wake) so there is a single poison path.
+        self.signal_error();
     }
 
     /// Read the aggregate `(pushed, dropped)` totals across the sliding
@@ -729,6 +729,42 @@ impl BridgeProducer {
             .shared
             .state
             .transition(StreamState::Running, StreamState::Stopping);
+        #[cfg(feature = "async-stream")]
+        self.shared.waker.wake();
+    }
+
+    /// Signals that the producer has **died** and no more data will ever arrive
+    /// (the FATAL sibling of [`signal_done`](Self::signal_done)).
+    ///
+    /// Unconditionally forces the stream into the terminal [`StreamState::Error`]
+    /// state and wakes any async consumer. Use this when the producer stops for a
+    /// reason other than a graceful end — a device unplug, a daemon/proxy death,
+    /// or a backend that can no longer deliver — so that **both** readers observe
+    /// end-of-stream:
+    ///
+    /// - the **blocking** reader ([`BridgeConsumer::pop_blocking`]) returns the
+    ///   Fatal [`AudioError::StreamEnded`] because `Error` is terminal
+    ///   ([`is_terminal`](super::state::AtomicStreamState::is_terminal)); and
+    /// - the **async** reader ends with `Poll::Ready(None)` because the state is
+    ///   no longer producing.
+    ///
+    /// This is the crucial distinction from [`signal_done`](Self::signal_done):
+    /// the graceful `Stopping` state keeps `pop_blocking` *draining* indefinitely
+    /// (it is not terminal — buffered data may still be read), which is correct
+    /// for a clean end but would hang `read_buffer_blocking` forever on a dead
+    /// producer. `Error` is sticky/terminal for both, so only call this once no
+    /// further data can ever be produced.
+    ///
+    /// # Real-time safety
+    ///
+    /// Mutates only the shared `state` (a `BridgeShared` field) via a single `Release` store and wakes
+    /// the (lock-free) async waker — **no allocation, no lock, no blocking**. It is
+    /// therefore safe to call from a platform callback context such as PipeWire's
+    /// `.state_changed` handler or a CoreAudio property listener (ADR-0001,
+    /// ADR-0010). `force_set` is last-writer-wins, so it is idempotent against any
+    /// concurrent graceful transition.
+    pub fn signal_error(&self) {
+        self.shared.state.force_set(StreamState::Error);
         #[cfg(feature = "async-stream")]
         self.shared.waker.wake();
     }
@@ -1646,6 +1682,96 @@ mod tests {
 
         assert_eq!(producer.shared().state.get(), StreamState::Stopping);
         assert!(consumer.is_producer_done());
+    }
+
+    // 15b. signal_error drives the stream to the terminal Error state (FH-1 /
+    //      ADR-0010). Unlike signal_done (Running → Stopping, still drainable),
+    //      signal_error is the FATAL sibling: Error is terminal for BOTH readers.
+    #[test]
+    fn test_signal_error_sets_terminal_error() {
+        let (producer, consumer) = create_bridge(8, test_format());
+
+        // Start from Running, as a live capture would be.
+        producer
+            .shared()
+            .state
+            .transition(StreamState::Created, StreamState::Running)
+            .unwrap();
+        assert!(producer.shared().state.is_running());
+
+        producer.signal_error();
+
+        assert_eq!(producer.shared().state.get(), StreamState::Error);
+        assert!(
+            producer.shared().state.is_terminal(),
+            "Error must be a terminal state so blocking reads end with StreamEnded"
+        );
+        // The consumer agrees the producer is done.
+        assert!(consumer.is_producer_done());
+    }
+
+    // 15c. signal_error is callable from ANY state (it force_sets, not a CAS),
+    //      mirroring a spontaneous death that can race a graceful stop. It is
+    //      sticky/idempotent: a later signal_done CAS cannot un-terminalize it.
+    #[test]
+    fn test_signal_error_is_sticky_against_signal_done() {
+        let (producer, _consumer) = create_bridge(8, test_format());
+        producer.shared().state.force_set(StreamState::Running);
+
+        producer.signal_error();
+        assert_eq!(producer.shared().state.get(), StreamState::Error);
+
+        // A graceful stop after a fatal death must NOT downgrade Error → Stopping
+        // (signal_done's CAS is Running→Stopping; state is Error, so it no-ops).
+        producer.signal_done();
+        assert_eq!(
+            producer.shared().state.get(),
+            StreamState::Error,
+            "terminal Error must be sticky — a late graceful signal cannot revive the stream"
+        );
+    }
+
+    // 15d. After signal_error, a blocking read returns the Fatal StreamEnded
+    //      (terminal), proving the dead-producer hang is removed (FH-1).
+    #[test]
+    fn test_signal_error_ends_blocking_read_with_fatal() {
+        let (producer, mut consumer) = create_bridge(8, test_format());
+        producer.shared().state.force_set(StreamState::Running);
+
+        producer.signal_error();
+
+        let result = consumer.pop_blocking(Duration::from_secs(5));
+        let err = result.expect_err("terminal Error must end the blocking read");
+        assert!(
+            err.is_fatal(),
+            "a terminal-Error read must be Fatal (StreamEnded), not a recoverable hiccup"
+        );
+        match err {
+            AudioError::StreamEnded { .. } => {}
+            other => panic!("Expected StreamEnded after signal_error, got: {:?}", other),
+        }
+    }
+
+    // 15e. Contrast guard: signal_done (graceful Stopping) keeps pop_blocking
+    //      DRAINING — an empty ring times out rather than ending — proving the
+    //      Error-vs-Stopping distinction signal_error relies on (FH-1 / ADR-0010).
+    #[test]
+    fn test_signal_done_keeps_blocking_read_draining_not_terminal() {
+        let (producer, mut consumer) = create_bridge(8, test_format());
+        producer.shared().state.force_set(StreamState::Running);
+
+        producer.signal_done(); // Running → Stopping (NOT terminal)
+        assert_eq!(producer.shared().state.get(), StreamState::Stopping);
+
+        // No data + Stopping (drainable) → the read must time out, NOT StreamEnded.
+        let err = consumer
+            .pop_blocking(Duration::from_millis(10))
+            .expect_err("empty Stopping ring should time out");
+        assert!(
+            matches!(err, AudioError::Timeout { .. }),
+            "graceful Stopping must keep draining (Timeout), not terminate (got {:?})",
+            err
+        );
     }
 
     // ===== K5.2: Ring Buffer Edge Case Tests =====

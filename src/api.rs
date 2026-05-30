@@ -927,7 +927,13 @@ impl AudioCapture {
     ///
     /// Uses `CapturingStream::try_read_chunk` for non-blocking reads.
     /// Returns `Ok(None)` if no data is currently available.
-    pub fn read_buffer(&mut self) -> AudioResult<Option<AudioBuffer>> {
+    ///
+    /// Takes `&self` (not `&mut self`): this path only reads `self.stream` and
+    /// calls the stream's own `&self` methods, mutating no field of the handle.
+    /// Sharing it behind `&self` lets a concurrent [`request_stop`](Self::request_stop)
+    /// unblock a parked reader without forming a `&mut` alias to the same handle
+    /// (the use-after-free precondition the C/Go bindings previously relied on).
+    pub fn read_buffer(&self) -> AudioResult<Option<AudioBuffer>> {
         // Get the stream first — if there's no stream, we're not running.
         let stream = self
             .stream
@@ -951,7 +957,15 @@ impl AudioCapture {
     /// Reads a buffer of audio data, blocking until data is available.
     ///
     /// Uses `CapturingStream::read_chunk` which blocks until data arrives.
-    pub fn read_buffer_blocking(&mut self) -> AudioResult<AudioBuffer> {
+    ///
+    /// Takes `&self` (not `&mut self`) for the same reason as
+    /// [`read_buffer`](Self::read_buffer): no field of the handle is mutated, so
+    /// a parked `read_buffer_blocking` can be unblocked by a concurrent
+    /// [`request_stop`](Self::request_stop) without ever aliasing the handle
+    /// mutably. When the stream reaches a terminal state the underlying
+    /// `read_chunk` returns [`AudioError::StreamEnded`] promptly instead of
+    /// blocking forever.
+    pub fn read_buffer_blocking(&self) -> AudioResult<AudioBuffer> {
         // Get the stream first — if there's no stream, we're not running.
         let stream = self
             .stream
@@ -968,6 +982,32 @@ impl AudioCapture {
         }
 
         stream.read_chunk()
+    }
+
+    /// Best-effort request to stop capture, used as the *unblock primitive* for a
+    /// parked [`read_buffer_blocking`](Self::read_buffer_blocking).
+    ///
+    /// Transitions the underlying stream toward its terminal state (via the
+    /// stream's own idempotent `stop()`), which flips the bridge to a terminal
+    /// state so a blocked `read_buffer_blocking` returns
+    /// [`AudioError::StreamEnded`] within roughly a millisecond instead of waiting
+    /// out the blocking-read timeout. It is **idempotent** and a no-op when no
+    /// stream has been created (or the stream is already stopped).
+    ///
+    /// Unlike [`stop`](Self::stop), this takes `&self`: it does not tear down the
+    /// callback pump, drop the stream `Arc`, or clear the uptime anchor — it only
+    /// signals the stream. That makes it safe to call **concurrently with an
+    /// in-flight read** (it forms no `&mut` alias). It is **not** safe to call
+    /// concurrently with dropping/freeing the handle: callers (e.g. the C/Go
+    /// bindings) must order `request_stop` + drain of in-flight reads **before**
+    /// freeing the handle.
+    pub fn request_stop(&self) {
+        if let Some(stream) = self.stream.as_ref() {
+            // CapturingStream::stop is &self and idempotent (already-terminal
+            // streams no-op). Ignore the result: this is a best-effort unblock,
+            // and a stop error on an already-dying stream is not actionable here.
+            let _ = stream.stop();
+        }
     }
 
     /// Returns an iterator over synchronously captured audio buffers.
@@ -2731,12 +2771,18 @@ mod tests {
         let stats = guard.stream_stats();
         assert!(stats.is_running);
 
-        // Through DerefMut: read_buffer() takes &mut self.
+        // read_buffer() now takes &self; it is reachable through Deref. A
+        // DerefMut caller (a &mut guard) can still invoke a &self method, so the
+        // narrowing is source-compatible.
         let buf = guard
             .read_buffer()
             .expect("read ok")
             .expect("a buffer is available");
         assert_eq!(buf.data()[0], 0.7);
+
+        // Exercise a &mut-self method through DerefMut so `mut guard` is genuinely
+        // required — proving the guard forwards both &self and &mut self methods.
+        let _ = guard.stop();
 
         mock.signal_stop();
     }
@@ -2814,5 +2860,86 @@ mod tests {
             1,
             "leaving scope must stop the capture exactly once"
         );
+    }
+
+    // ── request_stop() tests (H2 / #28) ───────────────────────────────
+
+    /// request_stop() signals the underlying stream (via its idempotent stop)
+    /// so a parked read_buffer_blocking observes a terminal state. We assert it
+    /// stops the mock stream exactly once.
+    #[test]
+    fn request_stop_signals_stream_once() {
+        let mock = Arc::new(MockCapturingStream::new());
+        let capture = make_mock_capture(Arc::clone(&mock));
+        assert!(mock.is_running());
+        assert_eq!(mock.stop_calls(), 0);
+
+        // Takes &self — no &mut alias to the handle.
+        capture.request_stop();
+        assert_eq!(mock.stop_calls(), 1, "request_stop must signal stop once");
+        assert!(
+            !mock.is_running(),
+            "stream is no longer running after request_stop"
+        );
+    }
+
+    /// request_stop() is idempotent: a second call after the stream is already
+    /// stopped still succeeds (no panic) — it just re-signals the idempotent
+    /// stream stop.
+    #[test]
+    fn request_stop_is_idempotent() {
+        let mock = Arc::new(MockCapturingStream::new());
+        let capture = make_mock_capture(Arc::clone(&mock));
+        capture.request_stop();
+        capture.request_stop();
+        // The mock counts each stop() call; both are accepted without panic.
+        assert_eq!(mock.stop_calls(), 2);
+        assert!(!mock.is_running());
+    }
+
+    /// request_stop() on a capture with no stream is a no-op (does not panic).
+    #[test]
+    fn request_stop_no_stream_is_noop() {
+        let capture = AudioCapture {
+            config: AudioCaptureConfig {
+                target: CaptureTarget::SystemDefault,
+                stream_config: StreamConfig::default(),
+            },
+            device: None,
+            stream: None,
+            callback: Mutex::new(None),
+            callback_pump: None,
+            start_instant: None,
+        };
+        // Must not panic when there is no stream to signal.
+        capture.request_stop();
+    }
+
+    /// request_stop() unblocks a parked read_buffer_blocking(): a reader blocked
+    /// on an empty-but-running mock returns the terminal StreamEnded once
+    /// request_stop transitions the stream. Drives the real read path through
+    /// &self (proving the narrowing lets a concurrent request_stop run while a
+    /// read is in flight, with no &mut alias).
+    #[test]
+    fn request_stop_unblocks_parked_blocking_read() {
+        let mock = Arc::new(MockCapturingStream::new());
+        // No buffers queued, but the mock reports running, so read_chunk() spins.
+        let capture = Arc::new(make_mock_capture(Arc::clone(&mock)));
+
+        let reader = {
+            let capture = Arc::clone(&capture);
+            std::thread::spawn(move || capture.read_buffer_blocking())
+        };
+
+        // Give the reader a moment to park in read_chunk's spin-wait.
+        std::thread::sleep(std::time::Duration::from_millis(20));
+        // Concurrently signal a stop through &self — no &mut alias to the handle.
+        capture.request_stop();
+
+        let result = reader.join().expect("reader thread joins");
+        match result {
+            Err(AudioError::StreamEnded { .. }) => {}
+            other => panic!("expected StreamEnded after request_stop, got: {other:?}"),
+        }
     }
 }

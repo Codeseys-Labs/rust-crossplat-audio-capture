@@ -23,9 +23,10 @@
 #![cfg(target_os = "macos")]
 
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex};
 
-use crate::bridge::ring_buffer::BridgeProducer;
+use crate::bridge::ring_buffer::{BridgeProducer, BridgeShared};
+use crate::bridge::state::StreamState;
 use crate::bridge::stream::PlatformStream;
 use crate::core::config::CaptureTarget;
 use crate::core::error::{AudioError, AudioResult};
@@ -107,6 +108,17 @@ pub(crate) struct MacosPlatformStream {
     process_tap: Option<CoreAudioProcessTap>,
     /// Atomic flag: `true` while CoreAudio callbacks are active.
     is_active: AtomicBool,
+    /// Producer-terminal-signal handle (FH-1 / ADR-0010): a clone of the bridge's
+    /// shared state, used by [`stop_audio_unit`](Self::stop_audio_unit) to drive
+    /// the bridge to a terminal/ending state once `AudioOutputUnitStop` has
+    /// synchronously halted the IO proc — so a parked reader observes
+    /// end-of-stream instead of hanging on a stopped/dropped CoreAudio stream.
+    ///
+    /// **Declared LAST** on purpose: the struct has a documented Drop-order
+    /// contract (`audio_unit` before `process_tap`); an `Arc<BridgeShared>` has no
+    /// teardown ordering requirement, so placing it after the ordered fields
+    /// leaves that contract undisturbed.
+    terminal: Arc<BridgeShared>,
 }
 
 impl MacosPlatformStream {
@@ -129,6 +141,31 @@ impl MacosPlatformStream {
             })?;
         au.stop().map_err(map_ca_error)?;
         self.is_active.store(false, Ordering::SeqCst);
+
+        // Producer-terminal-signal (FH-1 / ADR-0010): now that the IO proc has
+        // SYNCHRONOUSLY stopped (`AudioOutputUnitStop` returns only after no
+        // further input callbacks can fire), drive the bridge to a graceful
+        // ending state so a parked reader unblocks promptly instead of hanging
+        // on a stopped stream. This MUST come after `au.stop()` — signaling
+        // before it could let an in-flight callback push a buffer past the
+        // declared end. Reached by both `stop_capture()` and `Drop` via this
+        // single choke point, so dropping the handle (not just calling stop())
+        // also lands the stream terminal.
+        //
+        // `Running → Stopping` is the graceful sibling (matches
+        // `BridgeStream::stop` semantics: the consumer-side stop then completes
+        // `Stopping → Stopped`); a buffered tail stays drainable. Idempotent and
+        // lock-free: the CAS no-ops if the state already advanced past `Running`
+        // (e.g. `BridgeStream::stop` already moved it to Stopping/Stopped), and
+        // the call is a single atomic store + a waker wake — no alloc, no lock,
+        // safe even though it shares the choke point with `Drop` (ADR-0001).
+        let _ = self
+            .terminal
+            .state
+            .transition(StreamState::Running, StreamState::Stopping);
+        #[cfg(feature = "async-stream")]
+        self.terminal.waker.wake();
+
         Ok(())
     }
 }
@@ -177,6 +214,10 @@ impl Drop for MacosPlatformStream {
 ///
 /// * `config` — Resolved capture parameters.
 /// * `producer` — The `BridgeProducer` to push captured audio into.
+/// * `terminal` — A clone of the bridge's `BridgeShared` (producer-terminal-signal,
+///   FH-1 / ADR-0010). Stored on the returned [`MacosPlatformStream`] so its
+///   `stop_capture`/`Drop` choke point can drive the bridge to a terminal/ending
+///   state once the IO proc has stopped, preventing a parked reader from hanging.
 ///
 /// # Errors
 ///
@@ -185,6 +226,7 @@ impl Drop for MacosPlatformStream {
 pub(crate) fn create_macos_capture(
     config: MacosCaptureConfig,
     mut producer: BridgeProducer,
+    terminal: Arc<BridgeShared>,
 ) -> AudioResult<MacosPlatformStream> {
     // ── Step 1: Resolve target to device ID and optional ProcessTap ──
 
@@ -306,6 +348,7 @@ pub(crate) fn create_macos_capture(
         audio_unit: Mutex::new(audio_unit),
         process_tap,
         is_active: AtomicBool::new(true),
+        terminal,
     })
 }
 
@@ -822,7 +865,13 @@ mod tests {
 
         let format = AudioFormat::default();
         let capacity = calculate_capacity(None, 4);
-        let (producer, _consumer) = create_bridge(capacity, format);
+        let (producer, consumer) = create_bridge(capacity, format);
+
+        // Producer-terminal-signal (FH-1 / ADR-0010): the platform stream needs a
+        // clone of the bridge's shared state. Bring the session to Running so the
+        // graceful `stop_capture` transition (Running → Stopping) below applies.
+        let terminal = Arc::clone(consumer.shared());
+        terminal.state.force_set(StreamState::Running);
 
         let config = MacosCaptureConfig {
             target: CaptureTarget::SystemDefault,
@@ -830,7 +879,7 @@ mod tests {
             channels: 2,
         };
 
-        let result = create_macos_capture(config, producer);
+        let result = create_macos_capture(config, producer, terminal);
         assert!(
             result.is_ok(),
             "create_macos_capture should succeed: {:?}",
@@ -846,6 +895,13 @@ mod tests {
         assert!(
             !stream.is_active(),
             "stream should not be active after stop"
+        );
+        // Producer-terminal-signal: stop_capture drove the bridge to a terminal/
+        // ending state (Running → Stopping) so a parked reader unblocks.
+        assert_eq!(
+            consumer.shared().state.get(),
+            StreamState::Stopping,
+            "stop_capture must drive the bridge to the graceful Stopping state (FH-1)"
         );
     }
 

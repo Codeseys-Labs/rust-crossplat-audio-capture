@@ -399,7 +399,7 @@ enum Rsacrsac_error_t rsac_capture_format(const struct RsacRsacCapture *capture,
  * The buffer must be freed with `rsac_audio_buffer_free()`.
  */
 
-enum Rsacrsac_error_t rsac_capture_try_read(struct RsacRsacCapture *capture,
+enum Rsacrsac_error_t rsac_capture_try_read(const struct RsacRsacCapture *capture,
                                             struct RsacRsacAudioBuffer **out)
 ;
 
@@ -410,9 +410,31 @@ enum Rsacrsac_error_t rsac_capture_try_read(struct RsacRsacCapture *capture,
  * with `rsac_audio_buffer_free()`.
  */
 
-enum Rsacrsac_error_t rsac_capture_read(struct RsacRsacCapture *capture,
+enum Rsacrsac_error_t rsac_capture_read(const struct RsacRsacCapture *capture,
                                         struct RsacRsacAudioBuffer **out)
 ;
+
+/**
+ * Best-effort request to stop the capture, used to **unblock a parked
+ * [`rsac_capture_read`]**.
+ *
+ * Transitions the underlying stream toward its terminal state so a thread
+ * blocked in `rsac_capture_read` returns promptly (with a terminal stream
+ * error) instead of waiting out the blocking-read timeout. It is idempotent
+ * and a no-op when no stream has been created (or it is already stopped).
+ *
+ * # Safety / ordering
+ *
+ * - Takes `*const RsacCapture`: it is **safe to call concurrently with an
+ *   in-flight `rsac_capture_read` / `rsac_capture_try_read`** to unblock it
+ *   (it forms no `&mut` alias to the capture).
+ * - It is **NOT** safe to call concurrently with `rsac_capture_free`. The
+ *   caller must order `request_stop` + a drain of in-flight reads **before**
+ *   freeing the handle (the sqlite3_interrupt contract).
+ *
+ * Returns `RSAC_ERROR_NULL_POINTER` if `capture` is null, else `RSAC_OK`.
+ */
+ enum Rsacrsac_error_t rsac_capture_request_stop(const struct RsacRsacCapture *capture) ;
 
 /**
  * Sets a callback for push-based audio delivery.

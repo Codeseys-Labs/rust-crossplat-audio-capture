@@ -767,7 +767,7 @@ pub unsafe extern "C" fn rsac_capture_free(capture: *mut RsacCapture) {
 /// The buffer must be freed with `rsac_audio_buffer_free()`.
 #[no_mangle]
 pub unsafe extern "C" fn rsac_capture_try_read(
-    capture: *mut RsacCapture,
+    capture: *const RsacCapture,
     out: *mut *mut RsacAudioBuffer,
 ) -> rsac_error_t {
     catch(|| {
@@ -780,7 +780,11 @@ pub unsafe extern "C" fn rsac_capture_try_read(
             return rsac_error_t::RSAC_ERROR_NULL_POINTER;
         }
         unsafe { *out = ptr::null_mut() };
-        let c = unsafe { &mut *capture };
+        // `read_buffer` now takes `&self`, so a shared `&*capture` suffices —
+        // this removes the `&mut`-aliasing UB the Go ReadBuffer/Close race
+        // (#28) relied on. The C ABI is unchanged (C symbols do not encode
+        // const), so this is source- and ABI-compatible for callers.
+        let c = unsafe { &*capture };
         match c.inner.read_buffer() {
             Ok(Some(buf)) => {
                 let handle = Box::new(RsacAudioBuffer { inner: buf });
@@ -799,7 +803,7 @@ pub unsafe extern "C" fn rsac_capture_try_read(
 /// with `rsac_audio_buffer_free()`.
 #[no_mangle]
 pub unsafe extern "C" fn rsac_capture_read(
-    capture: *mut RsacCapture,
+    capture: *const RsacCapture,
     out: *mut *mut RsacAudioBuffer,
 ) -> rsac_error_t {
     catch(|| {
@@ -812,7 +816,10 @@ pub unsafe extern "C" fn rsac_capture_read(
             return rsac_error_t::RSAC_ERROR_NULL_POINTER;
         }
         unsafe { *out = ptr::null_mut() };
-        let c = unsafe { &mut *capture };
+        // `read_buffer_blocking` now takes `&self`; share via `&*capture`. A
+        // concurrent `rsac_capture_request_stop` can unblock this parked read
+        // without ever forming a `&mut` alias to the same capture (fixes #28).
+        let c = unsafe { &*capture };
         match c.inner.read_buffer_blocking() {
             Ok(buf) => {
                 let handle = Box::new(RsacAudioBuffer { inner: buf });
@@ -821,6 +828,37 @@ pub unsafe extern "C" fn rsac_capture_read(
             }
             Err(e) => handle_rsac_error(e),
         }
+    })
+}
+
+/// Best-effort request to stop the capture, used to **unblock a parked
+/// [`rsac_capture_read`]**.
+///
+/// Transitions the underlying stream toward its terminal state so a thread
+/// blocked in `rsac_capture_read` returns promptly (with a terminal stream
+/// error) instead of waiting out the blocking-read timeout. It is idempotent
+/// and a no-op when no stream has been created (or it is already stopped).
+///
+/// # Safety / ordering
+///
+/// - Takes `*const RsacCapture`: it is **safe to call concurrently with an
+///   in-flight `rsac_capture_read` / `rsac_capture_try_read`** to unblock it
+///   (it forms no `&mut` alias to the capture).
+/// - It is **NOT** safe to call concurrently with `rsac_capture_free`. The
+///   caller must order `request_stop` + a drain of in-flight reads **before**
+///   freeing the handle (the sqlite3_interrupt contract).
+///
+/// Returns `RSAC_ERROR_NULL_POINTER` if `capture` is null, else `RSAC_OK`.
+#[no_mangle]
+pub unsafe extern "C" fn rsac_capture_request_stop(capture: *const RsacCapture) -> rsac_error_t {
+    catch(|| {
+        if capture.is_null() {
+            set_last_error("capture is null");
+            return rsac_error_t::RSAC_ERROR_NULL_POINTER;
+        }
+        let c = unsafe { &*capture };
+        c.inner.request_stop();
+        rsac_error_t::RSAC_OK
     })
 }
 
@@ -1455,6 +1493,15 @@ mod tests {
         // Dangling-but-non-null capture: never dereferenced (null-`out` returns first).
         let cap = ptr::dangling::<RsacCapture>();
         let code = unsafe { rsac_capture_format(cap, ptr::null_mut()) };
+        assert_eq!(code, rsac_error_t::RSAC_ERROR_NULL_POINTER);
+    }
+
+    // ── request_stop null contract (H2 / #28) ──────────────────────────────
+
+    #[test]
+    fn request_stop_rejects_null_capture() {
+        // The unblock primitive must null-check like every other capture fn.
+        let code = unsafe { rsac_capture_request_stop(ptr::null()) };
         assert_eq!(code, rsac_error_t::RSAC_ERROR_NULL_POINTER);
     }
 
