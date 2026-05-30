@@ -21,10 +21,12 @@ use std::os::raw::{c_char, c_void};
 use std::panic::{self, AssertUnwindSafe};
 use std::ptr;
 
-use rsac::{
-    ApplicationId, AudioBuffer, AudioCapture, AudioCaptureBuilder, CaptureTarget, DeviceId,
-    PlatformCapabilities, ProcessId,
-};
+// Pull the everyday capture surface (AudioBuffer, AudioCapture,
+// AudioCaptureBuilder, CaptureTarget, PlatformCapabilities, …) from the prelude
+// in one line (rsac-8e6c); the capture-target ID newtypes are not in the prelude
+// (they are constructed only at the FFI boundary), so import them explicitly.
+use rsac::prelude::*;
+use rsac::{ApplicationId, DeviceId, ProcessId};
 
 // ── Error codes ──────────────────────────────────────────────────────────
 

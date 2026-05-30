@@ -28,6 +28,28 @@ cgo and linked as a static library.
 - Platform build dependencies for the active rsac backend. See
   [`docs/features.md`](../../docs/features.md).
 
+### Per-platform prerequisites
+
+The cgo link pulls in the active backend's system libraries, so each host
+needs that backend's dev packages installed before `make build`:
+
+| Platform | Toolchain / target | System dependencies |
+|----------|--------------------|---------------------|
+| **Linux** (x86_64, aarch64) | host `cc` + `clang`/`libclang` (bindgen) | `libpipewire-0.3-dev`, `libspa-0.2-dev`, `pkg-config` |
+| **macOS** (arm64, x86_64) | Xcode command-line tools | CoreAudio / AudioToolbox / CoreFoundation / Security / SystemConfiguration frameworks (ship with macOS — no install) |
+| **Windows** (x86_64) | MinGW gcc **and** the `x86_64-pc-windows-gnu` Rust target (`rustup target add x86_64-pc-windows-gnu`) | WASAPI/COM system libs (ship with Windows) |
+
+> **Windows / cgo note:** cgo links through MinGW `gcc`, which consumes the
+> GNU-archive `librsac_ffi.a`. An MSVC-built `rsac_ffi.lib` will **not** link,
+> so the FFI crate must be built for the `*-pc-windows-gnu` target (the Makefile
+> copies whichever archive cargo emits, but only the GNU `.a` links under cgo).
+
+These are exercised in CI: the `Go Bindings (<os>)` job builds the staticlib and
+runs `make test-pure` natively on Linux x86_64, Windows, and macOS arm64, and
+`Go Bindings ARM64 Staticlib Check` compile-checks the aarch64 staticlib. The
+per-platform `librsac_ffi.a` is **never committed** — it is built in CI (and by
+`make` locally) from `bindings/rsac-ffi`.
+
 ## Build
 
 The `Makefile` handles both the Rust staticlib build and the cgo link.

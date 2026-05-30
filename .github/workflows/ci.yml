@@ -297,6 +297,108 @@ jobs:
           PYO3_USE_ABI3_FORWARD_COMPATIBILITY: "1"
         run: cargo check -p rsac-python
 
+  # ── Go bindings: build the FFI staticlib + run device-free tests ─────
+  # rsac-go links librsac_ffi.a (built by bindings/rsac-go/Makefile) via cgo.
+  # This matrix builds that staticlib natively on each platform and runs
+  # `make test-pure` (the no-audio-device logic tests), so the cgo link +
+  # the Go wrappers stay green across linux/windows/macos. Windows uses the
+  # *-pc-windows-gnu toolchain because cgo links through MinGW gcc, which
+  # consumes the GNU-archive .a (an MSVC .lib would not link). (rsac-9728)
+  go-bindings:
+    name: Go Bindings (${{ matrix.os }})
+    timeout-minutes: 25
+    needs: lint
+    strategy:
+      fail-fast: false
+      matrix:
+        os:
+          - blacksmith-4vcpu-ubuntu-2404
+          - blacksmith-4vcpu-windows-2025
+          - blacksmith-6vcpu-macos-15
+    runs-on: ${{ matrix.os }}
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5
+        with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@e081816240890017053eacbb1bdf337761dc5582 # 1.95.0
+      - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
+      - uses: actions/setup-go@41dfa10bad2bb2ae585af6ee5bb4d7d973ad74ed # v5
+        with:
+          go-version: '1.22'
+
+      - name: Install PipeWire dev libraries (Linux)
+        if: runner.os == 'Linux'
+        run: |
+          sudo add-apt-repository ppa:pipewire-debian/pipewire-upstream -y
+          sudo apt-get update
+          sudo apt-get install -y libpipewire-0.3-dev libspa-0.2-dev pkg-config libclang-dev
+
+      # cgo links through MinGW gcc on Windows, which needs the GNU .a — so the
+      # FFI crate must be built for the *-pc-windows-gnu target. Add it here.
+      - name: Add windows-gnu Rust target (Windows)
+        if: runner.os == 'Windows'
+        run: rustup target add x86_64-pc-windows-gnu
+
+      # Build the FFI staticlib + run the Go-only (device-free) logic tests.
+      # `make test-pure` builds rsac-ffi (release) and runs the no-device test
+      # subset; the cgo link exercises every new FFI symbol.
+      - name: Build FFI staticlib + run Go device-free tests
+        working-directory: bindings/rsac-go
+        run: make test-pure
+
+      - name: go vet
+        working-directory: bindings/rsac-go
+        run: |
+          CGO_ENABLED=1 \
+          CGO_LDFLAGS="-L$(pwd)/lib -lrsac_ffi" \
+          go vet ./... || true
+
+  # ── Go ARM64 cross-compile check (staticlib only) ────────────────────
+  # The pipewire-debian PPA publishes no arm64 binaries, so a full aarch64
+  # link+test is not possible here (matching cross-compile-linux-arm64).
+  # We compile-check the FFI staticlib for aarch64 so the Go-linked artifact
+  # does not bit-rot on ARM; full ARM Go tests run on native ARM elsewhere.
+  go-bindings-arm64-check:
+    name: Go Bindings ARM64 Staticlib Check
+    timeout-minutes: 20
+    needs: lint
+    runs-on: blacksmith-4vcpu-ubuntu-2404
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5
+        with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@e081816240890017053eacbb1bdf337761dc5582 # 1.95.0
+        with:
+          targets: aarch64-unknown-linux-gnu
+      - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
+
+      - name: Install cross toolchain + host PipeWire dev libs
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y gcc-aarch64-linux-gnu g++-aarch64-linux-gnu
+          sudo add-apt-repository ppa:pipewire-debian/pipewire-upstream -y
+          sudo apt-get update
+          sudo apt-get install -y libpipewire-0.3-dev libspa-0.2-dev pkg-config libclang-dev
+
+      - name: Cross-compile rsac-ffi staticlib (aarch64, compile-only)
+        run: |
+          # Compile-only check (no arm64 PipeWire link libs in the PPA). A real
+          # rustc error fails the job; expected link/pkg-config noise is ignored.
+          set -o pipefail
+          cargo build -p rsac-ffi --release \
+            --target aarch64-unknown-linux-gnu 2>&1 | tee go-arm64.log || true
+          if grep -E 'error(\[|:)' go-arm64.log; then
+            echo "FAIL: rustc reported errors building rsac-ffi for aarch64"
+            exit 1
+          fi
+          echo "OK: aarch64 rsac-ffi staticlib produced no rustc compilation errors"
+
   # ── Feature-combo compile + doctests (Linux) ────────────────────────
   # The async-stream / sink-wav / test-utils features are not exercised by
   # any other job (they're off in the default --features feat_<platform>
