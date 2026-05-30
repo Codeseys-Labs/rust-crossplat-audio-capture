@@ -126,6 +126,24 @@ what alternative was rejected. Wrap at ~72 cols.>
 
 Examples in `git log` are plentiful. Avoid editorialising; avoid emoji.
 
+### Code review dispositions
+
+Before a PR merges, **every** review comment (human, CodeRabbit, or agent) must
+be either *fixed in the PR* or *captured in a GitHub issue* — a finding must
+never silently disappear into a merged PR thread. Triage each comment:
+
+- **fix-now** — fix it; reply on the thread noting the fix.
+- **already-addressed** — reply pointing at the code that handles it.
+- **valid-defer** — open a tracking issue (label `deferred-review` + a domain
+  label such as `bug`/`tech-debt`/`ci`), then reply `📌 Tracked in #N`.
+- **invalid** / **wont-fix** — record the decision in an issue (one consolidated
+  per-PR "review dispositions" issue is fine; label `invalid`/`wontfix`; close it
+  as *not planned* — it's a searchable decision record, not open work) and reply
+  with the rationale + link.
+
+Always reply on the originating comment so the thread can be resolved. See
+[`AGENTS.md` §6](../AGENTS.md) (Code review dispositions) for the full rule.
+
 ## 7. Release procedure
 
 Releases are driven by `scripts/bump-version.sh`, which keeps five
@@ -166,6 +184,9 @@ checks and post-publish verification is in
 - [ ] Commit messages are imperative and scoped.
 - [ ] Any behaviour change is mentioned in `CHANGELOG.md` under
       `[Unreleased]`.
+- [ ] Every review comment is resolved: fixed in the PR, or captured in a
+      tracking issue (`deferred-review`) / decision-record issue — none left to
+      vanish on merge (see §6 → Code review dispositions).
 
 ## 9. Reporting bugs
 
