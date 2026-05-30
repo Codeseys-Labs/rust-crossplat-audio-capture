@@ -32,6 +32,7 @@ use crate::core::config::{CaptureTarget, SampleFormat, StreamConfig};
 use crate::core::config::AudioFormat;
 use crate::core::error::{AudioError, AudioResult};
 use std::fmt;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc;
 use std::sync::{Arc, Mutex};
 
@@ -284,7 +285,8 @@ impl AudioCaptureBuilder {
             config: capture_config,
             device: Some(selected_device),
             stream: None,
-            callback: Arc::new(Mutex::new(None)),
+            callback: Mutex::new(None),
+            callback_pump: None,
         })
     }
 }
@@ -381,12 +383,62 @@ mod format_negotiation_tests {
 ///
 /// Created via [`AudioCaptureBuilder::build()`]. Provides methods to start/stop
 /// audio capture and read audio data via a pull-based streaming model.
+/// The user audio callback type. Boxed `FnMut` invoked once per captured buffer.
+type AudioCallback = Box<dyn FnMut(&AudioBuffer) + Send + 'static>;
+
+/// A registered-but-not-yet-running callback, stored in [`AudioCapture`] until
+/// [`start()`](AudioCapture::start) moves it into a pump thread. Held behind a
+/// `Mutex<Option<...>>` only so `&self`-style set/clear can mutate it before the
+/// pump owns it — the pump thread does **not** lock this while invoking the
+/// callback (it takes ownership), so a callback can freely re-enter the handle.
+type PendingCallback = Mutex<Option<AudioCallback>>;
+
+/// Handle to a running callback pump thread.
+///
+/// The pump *owns* the callback (it was moved out of [`PendingCallback`] at
+/// [`start()`](AudioCapture::start)), so no lock is held while the user closure
+/// runs — a callback may call back into `AudioCapture` without deadlocking. The
+/// pump exits when `stop_flag` is set or the stream errors; the [`JoinHandle`]
+/// lets `stop()`/`Drop` join it deterministically rather than leaking the thread.
+struct CallbackPump {
+    stop_flag: Arc<AtomicBool>,
+    handle: Option<std::thread::JoinHandle<()>>,
+}
+
+impl CallbackPump {
+    /// Signal the pump to stop and join it. Idempotent.
+    ///
+    /// If called from the pump's own thread (i.e. the user closure re-entered
+    /// `AudioCapture` and triggered teardown), the join is skipped — a thread
+    /// cannot join itself — and only the stop flag is set; the pump will exit at
+    /// the next loop iteration. This makes "clear the callback from within the
+    /// callback" safe rather than a self-join deadlock.
+    fn shutdown(&mut self) {
+        self.stop_flag.store(true, Ordering::SeqCst);
+        if let Some(handle) = self.handle.take() {
+            if handle.thread().id() == std::thread::current().id() {
+                // Re-entrant teardown from the pump thread: don't join self.
+                // The stop flag is set; the loop will break on its next pass.
+                // Put the handle back so a later stop()/Drop from another thread
+                // can still join it.
+                self.handle = Some(handle);
+            } else {
+                let _ = handle.join();
+            }
+        }
+    }
+}
+
 pub struct AudioCapture {
     config: AudioCaptureConfig,
     device: Option<Box<dyn crate::core::interface::AudioDevice>>,
     stream: Option<Arc<dyn crate::core::interface::CapturingStream + 'static>>,
-    #[allow(clippy::type_complexity)]
-    callback: Arc<Mutex<Option<Box<dyn FnMut(&AudioBuffer) + Send + 'static>>>>,
+    /// Callback registered via [`set_callback`](AudioCapture::set_callback)
+    /// before the capture starts. Moved into the pump thread on `start()`.
+    callback: PendingCallback,
+    /// Active callback pump, if a callback was set when `start()` ran. `None`
+    /// means no pump is running (so `start()` will never double-spawn).
+    callback_pump: Option<CallbackPump>,
 }
 
 impl AudioCapture {
@@ -417,7 +469,7 @@ impl AudioCapture {
         }
 
         // Verify stream is available
-        let _stream_ref = self
+        let stream_ref = self
             .stream
             .as_ref()
             .ok_or_else(|| AudioError::StreamCreationFailed {
@@ -425,7 +477,72 @@ impl AudioCapture {
                 context: None,
             })?;
 
+        // If a callback was registered via set_callback() AND no pump is already
+        // running, spawn a pump thread that delivers captured buffers to it.
+        // Without this the stored closure is never invoked (the callback
+        // delivery mode would silently do nothing). See
+        // docs/designs/0002-callback-delivery.md.
+        //
+        // Guarding on `self.callback_pump.is_none()` makes a second start() a
+        // no-op for the pump — two pumps must never race for the same ring. The
+        // callback is *moved* into the pump (taken out of the pending slot), so
+        // the pump never holds a lock while running the user closure.
+        if self.callback_pump.is_none() {
+            let taken = self.callback.lock().ok().and_then(|mut g| g.take());
+            if let Some(callback) = taken {
+                let pump = Self::spawn_callback_pump(Arc::clone(stream_ref), callback)?;
+                self.callback_pump = Some(pump);
+            }
+        }
+
         Ok(())
+    }
+
+    /// Spawns the callback pump thread and returns a [`CallbackPump`] handle.
+    ///
+    /// The pump **owns** `callback` (moved in), reads buffers from `stream`, and
+    /// invokes the closure on this dedicated thread — **not** the OS real-time
+    /// audio thread — so a slow callback only delays delivery, it never stalls
+    /// the audio callback, and the closure may freely call back into
+    /// `AudioCapture` (no lock is held during invocation). The thread exits when:
+    /// - `stop_flag` is set (via [`stop`](Self::stop)/[`clear_callback`](Self::clear_callback)/`Drop`), or
+    /// - the stream stops or errors (`try_read_chunk` returns `Err`).
+    ///
+    /// The pump competes with [`read_buffer`](Self::read_buffer) and
+    /// [`subscribe`](Self::subscribe) for buffers from the same ring; avoid
+    /// mixing a callback with manual reads.
+    fn spawn_callback_pump(
+        stream: Arc<dyn crate::core::interface::CapturingStream + 'static>,
+        mut callback: AudioCallback,
+    ) -> AudioResult<CallbackPump> {
+        let stop_flag = Arc::new(AtomicBool::new(false));
+        let stop_flag_thread = Arc::clone(&stop_flag);
+        let handle = std::thread::Builder::new()
+            .name("rsac-callback".into())
+            .spawn(move || loop {
+                if stop_flag_thread.load(Ordering::SeqCst) {
+                    break;
+                }
+                match stream.try_read_chunk() {
+                    // No lock held: the pump owns `callback`, so the user closure
+                    // can re-enter AudioCapture (e.g. clear_callback) without
+                    // deadlocking, and a panic here cannot poison a shared mutex.
+                    Ok(Some(buffer)) => callback(&buffer),
+                    Ok(None) => {
+                        // No data right now — avoid busy-spinning.
+                        std::thread::sleep(std::time::Duration::from_millis(1));
+                    }
+                    Err(_) => break, // stream stopped / closed / errored
+                }
+            })
+            .map_err(|e| AudioError::InternalError {
+                message: format!("Failed to spawn callback pump thread: {}", e),
+                source: None,
+            })?;
+        Ok(CallbackPump {
+            stop_flag,
+            handle: Some(handle),
+        })
     }
 
     /// Stops the audio capture stream.
@@ -437,6 +554,14 @@ impl AudioCapture {
     /// has stopped. The underlying stream is released when all references
     /// (including subscriber threads) are dropped.
     pub fn stop(&mut self) -> AudioResult<()> {
+        // Shut down the callback pump first (signal + join) so it stops
+        // consuming buffers and releases its stream clone before we drop ours.
+        // Joining here makes stop() authoritative for the pump thread rather
+        // than leaking it until try_read_chunk happens to observe the stop.
+        if let Some(mut pump) = self.callback_pump.take() {
+            pump.shutdown();
+        }
+
         // Nothing to stop if there is no stream (idempotent).
         if self.stream.is_none() {
             return Ok(());
@@ -444,7 +569,7 @@ impl AudioCapture {
 
         if let Some(stream) = self.stream.as_ref() {
             if let Err(e) = stream.stop() {
-                eprintln!("Error stopping stream: {:?}", e);
+                log::warn!("Error stopping stream: {:?}", e);
             }
         }
         // Drop our Arc reference. The stream will be fully deallocated once all
@@ -596,7 +721,19 @@ impl AudioCapture {
     }
 
     /// Clears the registered audio callback.
+    ///
+    /// If a capture is running with an active callback pump, this signals the
+    /// pump to stop and joins it (so delivery ceases promptly), in addition to
+    /// clearing any pending (not-yet-started) callback. It is safe to call from
+    /// outside the callback. Calling it *from within* the callback signals the
+    /// pump but does not self-join (the pump only joins on `stop()`/`Drop`),
+    /// avoiding a self-join deadlock.
     pub fn clear_callback(&mut self) -> AudioResult<()> {
+        // Tear down a running pump (the callback now lives inside it).
+        if let Some(mut pump) = self.callback_pump.take() {
+            pump.shutdown();
+        }
+        // Also clear any pending callback registered before start().
         match self.callback.lock() {
             Ok(mut guard) => {
                 *guard = None;
@@ -713,13 +850,26 @@ impl<'a> Iterator for AudioBufferIterator<'a> {
     type Item = AudioResult<AudioBuffer>;
 
     fn next(&mut self) -> Option<Self::Item> {
-        if !self.capture.is_running() {
-            return None;
-        }
-        match self.capture.read_buffer() {
-            Ok(Some(buffer)) => Some(Ok(buffer)),
-            Ok(None) => None,
-            Err(e) => Some(Err(e)),
+        // `read_buffer()` returns `Ok(None)` to mean "no data *right now*" — a
+        // transient condition on a live stream, NOT end-of-stream. Mapping that
+        // straight to `None` (the previous behavior) ended the iterator the first
+        // time the ring was momentarily empty, which on a running capture is
+        // almost immediately. Instead, retry on transient empties and only end
+        // the iteration when the stream actually stops.
+        loop {
+            if !self.capture.is_running() {
+                return None;
+            }
+            match self.capture.read_buffer() {
+                Ok(Some(buffer)) => return Some(Ok(buffer)),
+                Ok(None) => {
+                    // No data yet — yield the OS a moment, then re-check whether
+                    // the stream is still running and try again.
+                    std::thread::sleep(std::time::Duration::from_millis(1));
+                    continue;
+                }
+                Err(e) => return Some(Err(e)),
+            }
         }
     }
 }
@@ -728,13 +878,18 @@ impl<'a> Iterator for AudioBufferIterator<'a> {
 
 impl Drop for AudioCapture {
     fn drop(&mut self) {
+        // Tear down the callback pump first (signal + join) so its thread stops
+        // touching the stream before we drop it, and is never leaked.
+        if let Some(mut pump) = self.callback_pump.take() {
+            pump.shutdown();
+        }
         // Best-effort stop of whatever stream we still hold. The stream's own
         // state machine decides whether this is a no-op (already stopped) or
         // a real stop; stop() is idempotent on the stream side.
         if let Some(stream) = self.stream.as_ref() {
             if stream.is_running() {
                 if let Err(e) = stream.stop() {
-                    eprintln!("Error stopping audio stream during drop: {:?}", e);
+                    log::warn!("Error stopping audio stream during drop: {:?}", e);
                 }
             }
         }
@@ -758,7 +913,15 @@ impl fmt::Debug for AudioCapture {
             .field("device_name", &device_name)
             .field("stream_is_some", &self.stream.is_some())
             .field("is_running", &self.is_running())
-            .field("callback_is_some", &self.callback.lock().unwrap().is_some())
+            // Never panic inside Debug: a poisoned callback mutex must not take
+            // down an infallible formatter. Fall back to reporting the poison.
+            .field(
+                "callback_is_some",
+                &match self.callback.try_lock() {
+                    Ok(guard) => guard.is_some(),
+                    Err(_) => false,
+                },
+            )
             .finish()
     }
 }
@@ -1094,7 +1257,8 @@ mod tests {
             },
             device: None,
             stream: Some(mock),
-            callback: Arc::new(Mutex::new(None)),
+            callback: Mutex::new(None),
+            callback_pump: None,
         }
     }
 
@@ -1188,7 +1352,8 @@ mod tests {
             },
             device: None,
             stream: None,
-            callback: Arc::new(Mutex::new(None)),
+            callback: Mutex::new(None),
+            callback_pump: None,
         };
         assert_eq!(capture.overrun_count(), 0);
     }
@@ -1227,5 +1392,144 @@ mod tests {
 
         // After stop, stream is None, so overrun_count returns 0
         assert_eq!(capture.overrun_count(), 0);
+    }
+
+    // ── buffers_iter() tests (H2) ─────────────────────────────────────
+
+    /// Regression (audit H2): the iterator must NOT end on a transient empty
+    /// poll. With buffers queued, `next()` yields them in order; an interleaved
+    /// empty poll (Ok(None)) is retried, not treated as end-of-stream.
+    #[test]
+    fn buffers_iter_yields_queued_then_continues_past_empty() {
+        let mock = Arc::new(MockCapturingStream::new());
+        mock.push_buffer(AudioBuffer::new(vec![0.1; 8], 2, 48000));
+        mock.push_buffer(AudioBuffer::new(vec![0.2; 8], 2, 48000));
+        let mut capture = make_mock_capture(Arc::clone(&mock));
+
+        // First two next() calls must return the queued buffers, even though the
+        // mock's try_read_chunk returns Ok(None) once the queue drains (the old
+        // iterator would have stopped at the first None instead of these items).
+        let mut it = capture.buffers_iter();
+        let b1 = it.next().expect("first item").expect("ok");
+        assert_eq!(b1.data()[0], 0.1);
+        let b2 = it.next().expect("second item").expect("ok");
+        assert_eq!(b2.data()[0], 0.2);
+        // Queue now empty but stream still running → the iterator is retrying on
+        // Ok(None). Stop the stream from another thread so next() observes
+        // !is_running and terminates rather than spinning forever.
+        let mock2 = Arc::clone(&mock);
+        let stopper = std::thread::spawn(move || {
+            std::thread::sleep(std::time::Duration::from_millis(20));
+            mock2.signal_stop();
+        });
+        assert!(it.next().is_none(), "iterator must end once the stream stops");
+        stopper.join().unwrap();
+    }
+
+    /// The iterator ends (returns None) when the capture is not running and there
+    /// is no stream, rather than panicking or looping.
+    #[test]
+    fn buffers_iter_ends_when_not_running() {
+        let mock = Arc::new(MockCapturingStream::new());
+        mock.signal_stop();
+        let mut capture = make_mock_capture(mock);
+        let mut it = capture.buffers_iter();
+        assert!(it.next().is_none());
+    }
+
+    // ── callback delivery tests (H1 / ADR-0002) ──────────────────────
+
+    /// Regression (audit H1): a registered callback must actually be invoked.
+    /// We drive the pump helper directly against a mock stream and assert the
+    /// closure observes the pushed buffers, then that clearing the callback
+    /// stops delivery.
+    #[test]
+    fn callback_pump_invokes_registered_callback() {
+        use std::sync::atomic::{AtomicU64, Ordering};
+
+        let mock = Arc::new(MockCapturingStream::new());
+        mock.push_buffer(AudioBuffer::new(vec![0.5; 4], 2, 48000));
+        mock.push_buffer(AudioBuffer::new(vec![0.6; 4], 2, 48000));
+
+        let seen = Arc::new(AtomicU64::new(0));
+        let seen_cb = Arc::clone(&seen);
+        // The pump now OWNS the callback (moved in), so no shared mutex.
+        let callback: AudioCallback = Box::new(move |buf: &AudioBuffer| {
+            // Encode the first sample (scaled) so we can assert we saw real data.
+            seen_cb.fetch_add((buf.data()[0] * 10.0) as u64, Ordering::SeqCst);
+        });
+
+        let stream: Arc<dyn CapturingStream> = mock.clone();
+        let mut pump = AudioCapture::spawn_callback_pump(stream, callback).expect("pump spawns");
+
+        // Wait until both buffers (0.5*10 + 0.6*10 = 5 + 6 = 11) are delivered.
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+        while seen.load(Ordering::SeqCst) < 11 && std::time::Instant::now() < deadline {
+            std::thread::sleep(std::time::Duration::from_millis(2));
+        }
+        assert_eq!(
+            seen.load(Ordering::SeqCst),
+            11,
+            "callback should have been invoked with both buffers"
+        );
+
+        // Shut the pump down → it stops consuming; further pushes are not seen.
+        pump.shutdown();
+        mock.push_buffer(AudioBuffer::new(vec![9.9; 4], 2, 48000));
+        std::thread::sleep(std::time::Duration::from_millis(30));
+        assert_eq!(
+            seen.load(Ordering::SeqCst),
+            11,
+            "no further delivery after pump shutdown"
+        );
+        mock.signal_stop();
+    }
+
+    /// The pump thread exits when the stream stops (try_read_chunk → Err), and
+    /// shutdown() is safe to call afterwards (idempotent join).
+    #[test]
+    fn callback_pump_exits_when_stream_stops() {
+        let mock = Arc::new(MockCapturingStream::new());
+        let callback: AudioCallback = Box::new(|_: &AudioBuffer| {});
+        let stream: Arc<dyn CapturingStream> = mock.clone();
+        let mut pump = AudioCapture::spawn_callback_pump(stream, callback).expect("pump spawns");
+        // Stopping the mock makes try_read_chunk return Err → pump breaks.
+        mock.signal_stop();
+        std::thread::sleep(std::time::Duration::from_millis(20));
+        // Joining a pump whose thread already exited must not hang or panic.
+        pump.shutdown();
+    }
+
+    /// Regression (wave-1 review R1-#3): a callback that re-enters the capture
+    /// handle must not deadlock. Here the callback increments a counter and, on
+    /// the first invocation, flips a flag — proving the pump holds no lock across
+    /// the user closure (the closure could otherwise not run arbitrary code).
+    #[test]
+    fn callback_pump_holds_no_lock_during_invocation() {
+        use std::sync::atomic::{AtomicU64, Ordering};
+
+        let mock = Arc::new(MockCapturingStream::new());
+        for _ in 0..3 {
+            mock.push_buffer(AudioBuffer::new(vec![1.0; 2], 2, 48000));
+        }
+        let count = Arc::new(AtomicU64::new(0));
+        let count_cb = Arc::clone(&count);
+        // The closure does real work (sleep) to widen any lock-held window; if
+        // the pump held a lock across this, a concurrent shutdown join would
+        // stall. We assert delivery proceeds and shutdown completes promptly.
+        let callback: AudioCallback = Box::new(move |_buf: &AudioBuffer| {
+            count_cb.fetch_add(1, Ordering::SeqCst);
+            std::thread::sleep(std::time::Duration::from_millis(1));
+        });
+        let stream: Arc<dyn CapturingStream> = mock.clone();
+        let mut pump = AudioCapture::spawn_callback_pump(stream, callback).expect("pump");
+
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+        while count.load(Ordering::SeqCst) < 3 && std::time::Instant::now() < deadline {
+            std::thread::sleep(std::time::Duration::from_millis(2));
+        }
+        assert_eq!(count.load(Ordering::SeqCst), 3, "all three buffers delivered");
+        pump.shutdown();
+        mock.signal_stop();
     }
 }

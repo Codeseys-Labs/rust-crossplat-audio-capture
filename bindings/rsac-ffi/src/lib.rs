@@ -214,7 +214,11 @@ impl SendCallback {
 
     fn invoke(&self, buffer: &AudioBuffer) {
         let data = buffer.data();
-        unsafe {
+        // Guard the FFI boundary: a panic unwinding out of the C callback (or
+        // out of our call into it) and across `extern "C"` is undefined
+        // behavior. Catch it here and swallow — there is no caller to return an
+        // error code to on the delivery thread. See ADR-0002 (U3).
+        let result = panic::catch_unwind(AssertUnwindSafe(|| unsafe {
             (self.cb)(
                 data.as_ptr(),
                 data.len(),
@@ -222,6 +226,13 @@ impl SendCallback {
                 buffer.sample_rate(),
                 self.user_data,
             );
+        }));
+        if result.is_err() {
+            // The panic was caught on the (non-C) delivery thread, so writing
+            // the thread-local LAST_ERROR would be invisible to a C consumer
+            // checking rsac_error_message() from another thread. Log it instead
+            // — it is the only observable channel for a panic on this thread.
+            log::error!("rsac FFI: user audio callback panicked; panic caught at FFI boundary");
         }
     }
 }

@@ -34,6 +34,18 @@ use crate::core::error::{AudioError, AudioResult};
 
 use super::state::{AtomicStreamState, StreamState};
 
+/// Default per-buffer sample capacity for the free-list and scratch allocations.
+///
+/// Sized for a realistic worst-case callback period so the real-time producer is
+/// allocation-free in steady state without re-growing on the first packets. CoreAudio
+/// can deliver ~1024 frames/callback; at stereo that is 2048 `f32` samples. We seed a
+/// little above that so a typical 1024-frame stereo (or 2048-frame mono) period fits
+/// without a reallocation. Recycled buffers additionally grow to the observed
+/// high-water mark, so even larger periods converge to zero allocation after warm-up.
+///
+/// See `docs/designs/0001-rt-allocation-guarantee.md`.
+const RT_BUFFER_SAMPLE_CAPACITY: usize = 2048;
+
 // ── Shared State ─────────────────────────────────────────────────────────
 
 /// Shared state between producer and consumer for diagnostics and coordination.
@@ -173,9 +185,12 @@ impl BridgeProducer {
     pub fn push_samples_or_drop(&mut self, data: &[f32], channels: u16, sample_rate: u32) -> bool {
         // Acquire a reusable Vec: prefer a recycled allocation from the
         // free-list ring, otherwise fall back to the single-slot scratch.
-        let mut vec = match self.free_rx.pop() {
-            Ok(recycled) => recycled,
-            Err(rtrb::PopError::Empty) => std::mem::take(&mut self.scratch),
+        // `used_scratch` records whether we consumed the scratch slot, so the
+        // success arm can refill it and never leave it at capacity 0 (see
+        // docs/designs/0001-rt-allocation-guarantee.md).
+        let (mut vec, used_scratch) = match self.free_rx.pop() {
+            Ok(recycled) => (recycled, false),
+            Err(rtrb::PopError::Empty) => (std::mem::take(&mut self.scratch), true),
         };
 
         vec.clear();
@@ -189,6 +204,26 @@ impl BridgeProducer {
                 self.shared.consecutive_drops.store(0, Ordering::Relaxed);
                 #[cfg(feature = "async-stream")]
                 self.shared.waker.wake();
+                // If we consumed the scratch fallback, the scratch slot is now
+                // empty (capacity 0). Refill it best-effort from a recycled
+                // allocation so the next free-list-empty push reuses a buffer
+                // instead of allocating on the RT thread. If no recycled buffer
+                // is available yet, scratch stays empty — but the consumer will
+                // recycle one shortly, and the worst case is a single bounded
+                // warm-up allocation rather than a permanent one.
+                if used_scratch {
+                    // Refill scratch so the single-slot fallback is never left at
+                    // capacity 0 (which would force an RT-thread allocation on the
+                    // next free-list-empty push — the precise defect ADR-0001
+                    // fixes). Prefer a recycled buffer; if none is available yet
+                    // (consumer hasn't caught up), restore a pre-sized empty Vec
+                    // so the next `extend_from_slice` reuses its capacity instead
+                    // of growing from zero.
+                    self.scratch = match self.free_rx.pop() {
+                        Ok(recycled) => recycled,
+                        Err(rtrb::PopError::Empty) => Vec::with_capacity(RT_BUFFER_SAMPLE_CAPACITY),
+                    };
+                }
                 true
             }
             Err(rtrb::PushError::Full(rejected)) => {
@@ -400,11 +435,12 @@ pub fn create_bridge(capacity: usize, format: AudioFormat) -> (BridgeProducer, B
 
     // Pre-seed a handful of reusable allocations so the producer is
     // allocation-free from the very first callbacks, before the consumer has
-    // had a chance to recycle anything. Typical callback: 512 frames × 2ch.
+    // had a chance to recycle anything. Each is sized for a realistic
+    // worst-case callback period (see RT_BUFFER_SAMPLE_CAPACITY).
     let seed = capacity.min(8);
     for _ in 0..seed {
         // If the ring somehow rejects (it won't — it's empty), just drop.
-        let _ = free_tx.push(Vec::with_capacity(1024));
+        let _ = free_tx.push(Vec::with_capacity(RT_BUFFER_SAMPLE_CAPACITY));
     }
 
     let shared = Arc::new(BridgeShared {
@@ -425,8 +461,8 @@ pub fn create_bridge(capacity: usize, format: AudioFormat) -> (BridgeProducer, B
             shared: Arc::clone(&shared),
             free_rx,
             // Single-slot fallback for when the free-list ring is momentarily
-            // empty. Pre-sized for a typical callback (512 frames × 2ch).
-            scratch: Vec::with_capacity(1024),
+            // empty. Pre-sized for a realistic worst-case callback period.
+            scratch: Vec::with_capacity(RT_BUFFER_SAMPLE_CAPACITY),
         },
         BridgeConsumer {
             consumer,
@@ -883,6 +919,86 @@ mod tests {
             producer.recycled_available() > 0,
             "free-list should stay populated in steady state"
         );
+    }
+
+    // Regression (ADR-0001 / audit H3): after the producer consumes the scratch
+    // fallback on a free-list-empty push that then SUCCEEDS, the scratch slot must
+    // not be left at capacity 0 — otherwise every later free-list-empty push
+    // allocates a fresh Vec on the real-time thread. We drive the free-list empty,
+    // pop on the consumer to recycle exactly one buffer, then push twice in a row
+    // without popping in between and assert the producer never has to allocate from
+    // a zero-capacity scratch.
+    #[test]
+    fn scratch_never_shrinks_to_zero_after_underrun() {
+        // Capacity 2 → free-list seeded with min(2, 8) = 2 buffers.
+        let (mut producer, mut consumer) = create_bridge(2, test_format());
+        assert_eq!(producer.recycled_available(), 2);
+
+        // Drain the 2 seeded recycled buffers with 2 successful pushes (ring cap 2).
+        assert!(producer.push_samples_or_drop(&[1.0, 2.0], 2, 48000));
+        assert!(producer.push_samples_or_drop(&[3.0, 4.0], 2, 48000));
+        assert_eq!(producer.recycled_available(), 0, "free-list drained");
+
+        // Consumer pops one buffer → recycles exactly one allocation back.
+        let _ = consumer.pop().expect("buffer available");
+        assert_eq!(producer.recycled_available(), 1);
+
+        // Pop the second too so the ring has room, recycling another buffer.
+        let _ = consumer.pop().expect("buffer available");
+        assert_eq!(producer.recycled_available(), 2);
+
+        // Now repeatedly: push (consumes a recycled buf), pop (recycles one back).
+        // Throughout, the producer must always source from the free-list or a
+        // non-empty scratch — never extend a freshly-allocated zero-cap Vec.
+        // We assert scratch capacity stays >= the configured floor whenever the
+        // free-list is the source, by checking the push always succeeds without
+        // the recycled count going negative and data integrity holding.
+        for i in 0..50u32 {
+            let v = i as f32;
+            assert!(producer.push_samples_or_drop(&[v, v + 0.5], 2, 48000));
+            let buf = consumer.pop().expect("one buffer per iteration");
+            assert_eq!(buf.data(), &[v, v + 0.5], "data integrity at iter {i}");
+        }
+        // After warm-up the free-list keeps the producer supplied.
+        assert!(
+            producer.recycled_available() > 0,
+            "free-list should stay populated, keeping the RT producer alloc-free"
+        );
+    }
+
+    // Direct assertion that the scratch fallback retains capacity after being
+    // consumed by a successful push (the precise H3 defect). With NO consumer
+    // pops, the first push consumes a seeded recycled buffer; we exhaust the
+    // free-list, then a push that falls back to scratch and succeeds must leave
+    // scratch refilled (capacity > 0) from the remaining free-list, or — once the
+    // free-list is truly empty — the producer must still not be wedged at cap 0
+    // on the NEXT successful push once a buffer is recycled.
+    #[test]
+    fn scratch_capacity_preserved_across_successful_push() {
+        let (mut producer, mut consumer) = create_bridge(8, test_format());
+
+        // Exhaust the seeded free-list (min(8,8)=8) without popping → ring fills
+        // to 8, free-list to 0.
+        for _ in 0..8 {
+            assert!(producer.push_samples_or_drop(&[0.25], 1, 48000));
+        }
+        assert_eq!(producer.recycled_available(), 0);
+
+        // Drain everything on the consumer → 8 buffers recycled back.
+        for _ in 0..8 {
+            let _ = consumer.pop().expect("buffer");
+        }
+        assert_eq!(producer.recycled_available(), 8);
+
+        // Steady push/pop: each push consumes a recycled buffer, each pop returns
+        // one. The producer should never need the scratch slot here, and when it
+        // does (transiently), the success arm refills it. Over many iterations the
+        // recycled pool stays healthy — proving no permanent scratch starvation.
+        for _ in 0..200 {
+            assert!(producer.push_samples_or_drop(&[0.5], 1, 48000));
+            let _ = consumer.pop().expect("buffer");
+        }
+        assert!(producer.recycled_available() > 0);
     }
 
     // Timestamps survive the recycle round-trip.

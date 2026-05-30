@@ -277,11 +277,16 @@ impl AudioBuffer {
     }
 }
 
-// AudioBuffer only contains Vec<f32>, AudioFormat, and Option<Duration>,
-// all of which are Send + Sync, so auto-derive is sufficient.
-// Explicit impls below kept for clarity and to match the old code.
-unsafe impl Send for AudioBuffer {}
-unsafe impl Sync for AudioBuffer {}
+// `AudioBuffer` holds only `Vec<f32>`, `AudioFormat`, and `Option<Duration>`,
+// all of which are `Send + Sync`, so the compiler derives both auto-traits.
+// We deliberately do NOT hand-write `unsafe impl Send/Sync`: doing so would
+// suppress the compiler's safety net if a non-`Send`/`Sync` field were ever
+// added (e.g. a raw pointer or `Rc`), silently making the type unsound. The
+// compile-time assertion below keeps the guarantee explicit without `unsafe`.
+const _: () = {
+    const fn _assert_send_sync<T: Send + Sync>() {}
+    _assert_send_sync::<AudioBuffer>();
+};
 
 #[cfg(test)]
 mod tests {
