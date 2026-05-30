@@ -1031,8 +1031,9 @@ impl DeviceEnumerator for MacosDeviceEnumerator {
         // registration fails, unregister the ones that already succeeded and bail
         // — leaving no dangling listener and freeing the context (it drops at the
         // end of scope).
-        let mut registered: usize = 0;
-        for address in WATCH_ADDRESSES.iter() {
+        // `i` doubles as the count of listeners registered BEFORE this one, so on
+        // a mid-loop failure the rollback unregisters exactly indices `0..i`.
+        for (i, address) in WATCH_ADDRESSES.iter().enumerate() {
             let status = unsafe {
                 AudioObjectAddPropertyListener(
                     kAudioObjectSystemObject,
@@ -1042,8 +1043,8 @@ impl DeviceEnumerator for MacosDeviceEnumerator {
                 )
             };
             if status != 0 {
-                // Roll back the listeners registered so far, then fail.
-                for prior in WATCH_ADDRESSES.iter().take(registered) {
+                // Roll back the listeners registered so far (indices 0..i), fail.
+                for prior in WATCH_ADDRESSES.iter().take(i) {
                     unsafe {
                         AudioObjectRemovePropertyListener(
                             kAudioObjectSystemObject,
@@ -1067,7 +1068,6 @@ impl DeviceEnumerator for MacosDeviceEnumerator {
                     }),
                 });
             }
-            registered += 1;
         }
 
         // Helper thread: drain the channel and invoke the user handler. It exits
