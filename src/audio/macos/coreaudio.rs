@@ -1304,14 +1304,13 @@ mod tests {
                 );
             }
         }
-        // The first entry should equal the current stream format when probing
-        // succeeded for it.
-        if let Some(current) = device.current_stream_format() {
-            assert_eq!(
-                formats[0], current,
-                "current stream format should be returned first (stable ordering)"
-            );
-        }
+        // The "current stream format is returned first" ordering is an internal
+        // guarantee of `MacosAudioDevice::current_stream_format` (a private
+        // inherent helper). `default_device()` hands back a `Box<dyn AudioDevice>`,
+        // through which that helper is not reachable, so it is exercised by the
+        // dedicated unit test below rather than re-checked here through the trait
+        // object. This test asserts the trait-level contract: a non-empty,
+        // duplicate-free format list.
     }
 
     #[test]
