@@ -33,16 +33,16 @@ pub fn audio_infrastructure_available() -> bool {
 
 /// Whether the test environment provides a *deterministic* audio source.
 ///
-/// Set by CI (`RSAC_CI_AUDIO_DETERMINISTIC=1`) only on platforms where the
-/// audio path is fully reproducible — currently the Linux PipeWire null sink
-/// + a known 440 Hz / 0.8-amplitude sine tone player. When this returns
-/// `true`, capture tests upgrade their soft "⚠ WARNING" non-silence checks
-/// into HARD ASSERTS: a deterministic source that yields silence is a real
-/// regression, not CI flakiness.
+/// Set by CI (`RSAC_CI_AUDIO_DETERMINISTIC=1`) on platforms where the audio
+/// path is fully reproducible: the Linux PipeWire null sink with a known
+/// 440 Hz / 0.8-amplitude sine tone player, and the Windows VB-CABLE tier
+/// (which feeds the same deterministic fixture). When this returns `true`,
+/// capture tests upgrade their soft non-silence checks into HARD ASSERTS — a
+/// deterministic source that yields silence is a real regression, not flakiness.
 ///
-/// When unset (Windows VB-CABLE, macOS BlackHole/TCC — less deterministic or
-/// permission-gated), tests keep the existing soft-warn behavior so they do
-/// not flake on non-reproducible hosts.
+/// When unset (e.g. macOS BlackHole/TCC — permission-gated and less
+/// reproducible), tests keep the soft-warn behavior so they do not flake on
+/// non-reproducible hosts.
 pub fn deterministic_audio_env() -> bool {
     std::env::var("RSAC_CI_AUDIO_DETERMINISTIC").is_ok()
 }

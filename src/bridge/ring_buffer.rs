@@ -24,12 +24,12 @@
 //! }
 //! ```
 
-use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicU16, AtomicU32, AtomicU64, AtomicU8, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use crate::core::buffer::AudioBuffer;
-use crate::core::config::AudioFormat;
+use crate::core::config::{AudioFormat, SampleFormat};
 use crate::core::error::{AudioError, AudioResult};
 
 use super::state::{AtomicStreamState, StreamState};
@@ -45,6 +45,41 @@ use super::state::{AtomicStreamState, StreamState};
 ///
 /// See `docs/designs/0001-rt-allocation-guarantee.md`.
 const RT_BUFFER_SAMPLE_CAPACITY: usize = 2048;
+
+/// Default back-pressure threshold: the number of *consecutive* dropped buffers
+/// (with no successful push in between) before `is_under_backpressure`
+/// returns true. At a typical ~10 ms callback period, 10 consecutive drops is
+/// roughly 100 ms of sustained data loss — long enough to be a real signal that
+/// the consumer cannot keep up, short enough to react before a long stall.
+///
+/// Overridable per-bridge via [`create_bridge_with_options`].
+pub const DEFAULT_BACKPRESSURE_THRESHOLD: u32 = 10;
+
+/// Encode a [`SampleFormat`] as a `u8` for lock-free atomic storage.
+///
+/// Paired with [`sample_format_from_atomic`]. The mapping is stable and
+/// internal — it only needs to round-trip, not match any wire format.
+fn sample_format_to_atomic(sf: SampleFormat) -> u8 {
+    match sf {
+        SampleFormat::I16 => 0,
+        SampleFormat::I24 => 1,
+        SampleFormat::I32 => 2,
+        SampleFormat::F32 => 3,
+    }
+}
+
+/// Decode a `u8` written by [`sample_format_to_atomic`] back into a
+/// [`SampleFormat`]. Any unknown value falls back to [`SampleFormat::F32`]
+/// (the library's internal standard), which is the value written by the
+/// "no negotiated format yet" sentinel.
+fn sample_format_from_atomic(v: u8) -> SampleFormat {
+    match v {
+        0 => SampleFormat::I16,
+        1 => SampleFormat::I24,
+        2 => SampleFormat::I32,
+        _ => SampleFormat::F32,
+    }
+}
 
 // ── Shared State ─────────────────────────────────────────────────────────
 
@@ -65,12 +100,34 @@ pub(crate) struct BridgeShared {
     /// Used to detect sustained backpressure without relying on total drop rate.
     pub consecutive_drops: AtomicU32,
     /// Threshold above which `is_under_backpressure()` returns true.
-    /// Default: 10 consecutive drops ≈ 100ms of data loss at typical rates.
+    /// Default: [`DEFAULT_BACKPRESSURE_THRESHOLD`] consecutive drops
+    /// (≈100ms of data loss at typical rates). Configurable per-bridge via
+    /// [`create_bridge_with_options`].
     pub backpressure_threshold: u32,
-    /// Audio format for this bridge (immutable after creation).
-    /// Stored for diagnostics and future format-aware consumers.
+    /// Audio format **requested** when the bridge was constructed.
+    /// This is the fallback returned by [`negotiated_format`] until a backend
+    /// records what the OS actually delivered (see [`negotiated_*`] fields).
+    ///
+    /// [`negotiated_format`]: BridgeShared::negotiated_format
+    /// [`negotiated_*`]: BridgeShared::set_negotiated_format
     #[allow(dead_code)]
     pub format: AudioFormat,
+    /// `true` once a backend has recorded an authoritative *delivery* format via
+    /// [`BridgeProducer::set_negotiated_format`]. Until then, [`negotiated_format`]
+    /// falls back to the requested [`format`].
+    ///
+    /// [`format`]: BridgeShared::format
+    /// [`negotiated_format`]: BridgeShared::negotiated_format
+    negotiated_set: std::sync::atomic::AtomicBool,
+    /// Delivery sample rate recorded by the backend (valid only when
+    /// `negotiated_set` is true).
+    negotiated_sample_rate: AtomicU32,
+    /// Delivery channel count recorded by the backend (valid only when
+    /// `negotiated_set` is true).
+    negotiated_channels: AtomicU16,
+    /// Delivery sample format recorded by the backend, encoded via
+    /// [`sample_format_to_atomic`] (valid only when `negotiated_set` is true).
+    negotiated_sample_format: AtomicU8,
     /// Waker for async stream consumers — notified when new data is pushed.
     #[cfg(feature = "async-stream")]
     pub waker: atomic_waker::AtomicWaker,
@@ -82,6 +139,52 @@ impl BridgeShared {
     /// consumer is falling behind and cannot keep up with the producer rate.
     pub fn is_under_backpressure(&self) -> bool {
         self.consecutive_drops.load(Ordering::Relaxed) >= self.backpressure_threshold
+    }
+
+    /// Record the **authoritative delivery format** negotiated with the OS.
+    ///
+    /// Platform backends call this (via [`BridgeProducer::set_negotiated_format`])
+    /// once they know the format the OS audio callback will actually deliver,
+    /// which can differ from the requested format (e.g. the system mix format
+    /// when autoconvert is unavailable). It is lock-free and cheap — three
+    /// relaxed stores plus a `Release` flag store so a consumer that observes
+    /// `negotiated_set == true` also sees the field writes.
+    ///
+    /// Safe to call more than once; the most recent values win. Reads go through
+    /// [`negotiated_format`](BridgeShared::negotiated_format).
+    pub fn set_negotiated_format(&self, format: &AudioFormat) {
+        self.negotiated_sample_rate
+            .store(format.sample_rate, Ordering::Relaxed);
+        self.negotiated_channels
+            .store(format.channels, Ordering::Relaxed);
+        self.negotiated_sample_format.store(
+            sample_format_to_atomic(format.sample_format),
+            Ordering::Relaxed,
+        );
+        // Release so that a consumer observing the flag (Acquire) also sees the
+        // three field stores above.
+        self.negotiated_set.store(true, Ordering::Release);
+    }
+
+    /// Returns the authoritative **delivery** format if a backend has recorded
+    /// one via `set_negotiated_format`, otherwise the requested format the
+    /// bridge was constructed with.
+    ///
+    /// This is what `BridgeStream::format` surfaces, so consumers always see
+    /// what they are actually receiving.
+    pub fn negotiated_format(&self) -> AudioFormat {
+        // Acquire pairs with the Release in `set_negotiated_format`.
+        if self.negotiated_set.load(Ordering::Acquire) {
+            AudioFormat {
+                sample_rate: self.negotiated_sample_rate.load(Ordering::Relaxed),
+                channels: self.negotiated_channels.load(Ordering::Relaxed),
+                sample_format: sample_format_from_atomic(
+                    self.negotiated_sample_format.load(Ordering::Relaxed),
+                ),
+            }
+        } else {
+            self.format.clone()
+        }
     }
 }
 
@@ -267,6 +370,21 @@ impl BridgeProducer {
         self.shared.buffers_dropped.load(Ordering::Relaxed)
     }
 
+    /// Record the **authoritative delivery format** the OS will actually feed
+    /// this producer (M1).
+    ///
+    /// Platform backends (PipeWire / CoreAudio / WASAPI) call this once
+    /// negotiation completes — typically right after they learn the endpoint
+    /// mix format — so that `BridgeStream::format` reflects what is
+    /// **delivered**, not merely what was **requested**.
+    ///
+    /// Lock-free and cheap (delegates to the shared state). It is
+    /// safe to call from the setup path before the capture loop starts; calling
+    /// it from the hot callback is also allowed but unnecessary in steady state.
+    pub fn set_negotiated_format(&self, format: &AudioFormat) {
+        self.shared.set_negotiated_format(format);
+    }
+
     /// Returns a reference to the shared state.
     /// Part of the bridge API surface for platform backends and diagnostics.
     #[allow(dead_code)]
@@ -430,6 +548,22 @@ impl BridgeConsumer {
 /// A `(BridgeProducer, BridgeConsumer)` pair. The producer should be moved to the
 /// OS callback thread; the consumer stays on the reader thread.
 pub fn create_bridge(capacity: usize, format: AudioFormat) -> (BridgeProducer, BridgeConsumer) {
+    create_bridge_with_options(capacity, format, DEFAULT_BACKPRESSURE_THRESHOLD)
+}
+
+/// Like [`create_bridge`], but lets the caller pick the back-pressure threshold.
+///
+/// `backpressure_threshold` is the number of *consecutive* dropped buffers (no
+/// successful push in between) before `is_under_backpressure`
+/// reports `true`. A value of `0` means "report back-pressure on the very first
+/// drop". Most callers should use [`create_bridge`], which applies
+/// [`DEFAULT_BACKPRESSURE_THRESHOLD`]; this variant exists so a backend or
+/// builder that knows its callback cadence can tune the sensitivity (L6).
+pub fn create_bridge_with_options(
+    capacity: usize,
+    format: AudioFormat,
+    backpressure_threshold: u32,
+) -> (BridgeProducer, BridgeConsumer) {
     let (producer, consumer) = rtrb::RingBuffer::<AudioBuffer>::new(capacity);
 
     // Free-list return ring: carries drained `Vec<f32>` allocations from the
@@ -453,7 +587,13 @@ pub fn create_bridge(capacity: usize, format: AudioFormat) -> (BridgeProducer, B
         buffers_dropped: AtomicU64::new(0),
         buffers_popped: AtomicU64::new(0),
         consecutive_drops: AtomicU32::new(0),
-        backpressure_threshold: 10,
+        backpressure_threshold,
+        // Seed the atomic delivery-format mirror with the requested format so a
+        // read before any backend negotiation still returns sensible values.
+        negotiated_set: std::sync::atomic::AtomicBool::new(false),
+        negotiated_sample_rate: AtomicU32::new(format.sample_rate),
+        negotiated_channels: AtomicU16::new(format.channels),
+        negotiated_sample_format: AtomicU8::new(sample_format_to_atomic(format.sample_format)),
         format,
         #[cfg(feature = "async-stream")]
         waker: atomic_waker::AtomicWaker::new(),
@@ -505,7 +645,7 @@ pub fn calculate_capacity(requested: Option<usize>, min_capacity: usize) -> usiz
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::core::config::AudioFormat;
+    use crate::core::config::{AudioFormat, SampleFormat};
 
     /// Creates a test [`AudioBuffer`] filled with `value` — 10 ms of stereo 48 kHz audio.
     fn test_buffer(value: f32) -> AudioBuffer {
@@ -1006,6 +1146,133 @@ mod tests {
             let _ = consumer.pop().expect("buffer");
         }
         assert!(producer.recycled_available() > 0);
+    }
+
+    // ===== M1: negotiated (delivery) format tests =====
+    // `SampleFormat` is imported explicitly in this test module's `use` block.
+
+    // sample_format <-> atomic round-trips for every variant.
+    #[test]
+    fn sample_format_atomic_roundtrip() {
+        for sf in [
+            SampleFormat::I16,
+            SampleFormat::I24,
+            SampleFormat::I32,
+            SampleFormat::F32,
+        ] {
+            assert_eq!(sample_format_from_atomic(sample_format_to_atomic(sf)), sf);
+        }
+        // Unknown encodings decode to the F32 fallback.
+        assert_eq!(sample_format_from_atomic(200), SampleFormat::F32);
+    }
+
+    // Before any backend negotiation, negotiated_format() returns the requested
+    // format the bridge was constructed with.
+    #[test]
+    fn negotiated_format_defaults_to_requested() {
+        let requested = AudioFormat {
+            sample_rate: 44100,
+            channels: 1,
+            sample_format: SampleFormat::I16,
+        };
+        let (_producer, consumer) = create_bridge(8, requested.clone());
+        assert_eq!(consumer.shared().negotiated_format(), requested);
+    }
+
+    // After the producer records a delivery format, negotiated_format() reflects
+    // it (NOT the requested format) — the M1 invariant.
+    #[test]
+    fn set_negotiated_format_overrides_requested() {
+        let requested = AudioFormat::default(); // 48k/2ch/F32
+        let (producer, consumer) = create_bridge(8, requested.clone());
+
+        let delivered = AudioFormat {
+            sample_rate: 44100,
+            channels: 1,
+            sample_format: SampleFormat::I24,
+        };
+        producer.set_negotiated_format(&delivered);
+
+        let observed = consumer.shared().negotiated_format();
+        assert_eq!(observed, delivered);
+        assert_ne!(observed, requested, "must reflect delivery, not request");
+    }
+
+    // The most recent set_negotiated_format wins (idempotent / last-writer).
+    #[test]
+    fn set_negotiated_format_last_writer_wins() {
+        let (producer, consumer) = create_bridge(8, AudioFormat::default());
+        producer.set_negotiated_format(&AudioFormat {
+            sample_rate: 96000,
+            channels: 4,
+            sample_format: SampleFormat::I32,
+        });
+        let final_fmt = AudioFormat {
+            sample_rate: 22050,
+            channels: 2,
+            sample_format: SampleFormat::F32,
+        };
+        producer.set_negotiated_format(&final_fmt);
+        assert_eq!(consumer.shared().negotiated_format(), final_fmt);
+    }
+
+    // ===== L6: configurable back-pressure threshold tests =====
+
+    // create_bridge uses the documented default threshold.
+    #[test]
+    fn default_backpressure_threshold_applied() {
+        let (mut producer, _consumer) = create_bridge(2, test_format());
+        // Fill the ring (cap 2), then drive (DEFAULT - 1) extra drops — still
+        // below threshold.
+        assert!(producer.push_or_drop(test_buffer(1.0)));
+        assert!(producer.push_or_drop(test_buffer(1.0)));
+        for _ in 0..(DEFAULT_BACKPRESSURE_THRESHOLD - 1) {
+            assert!(!producer.push_or_drop(test_buffer(9.0)));
+        }
+        assert!(
+            !producer.shared().is_under_backpressure(),
+            "should NOT trip one drop below the default threshold"
+        );
+        // One more drop reaches the threshold.
+        assert!(!producer.push_or_drop(test_buffer(9.0)));
+        assert!(
+            producer.shared().is_under_backpressure(),
+            "should trip at exactly the default threshold"
+        );
+    }
+
+    // A custom (lower) threshold trips sooner; a successful push resets it.
+    #[test]
+    fn custom_backpressure_threshold_trips_and_resets() {
+        // Threshold 2: trips after 2 consecutive drops.
+        let (mut producer, mut consumer) = create_bridge_with_options(2, test_format(), 2);
+        assert!(producer.push_or_drop(test_buffer(1.0)));
+        assert!(producer.push_or_drop(test_buffer(1.0)));
+
+        assert!(!producer.push_or_drop(test_buffer(9.0))); // drop 1
+        assert!(!producer.shared().is_under_backpressure());
+        assert!(!producer.push_or_drop(test_buffer(9.0))); // drop 2 → trips
+        assert!(producer.shared().is_under_backpressure());
+
+        // Draining a slot lets the next push succeed, which resets the streak.
+        let _ = consumer.pop();
+        assert!(producer.push_or_drop(test_buffer(2.0)));
+        assert!(
+            !producer.shared().is_under_backpressure(),
+            "a successful push must clear consecutive-drop backpressure"
+        );
+    }
+
+    // A zero threshold reports back-pressure on the very first drop.
+    #[test]
+    fn zero_backpressure_threshold_trips_on_first_drop() {
+        let (mut producer, _consumer) = create_bridge_with_options(1, test_format(), 0);
+        // Threshold 0 means is_under_backpressure() is true even before any drop
+        // (0 consecutive drops >= 0). After a drop it stays true.
+        assert!(producer.shared().is_under_backpressure());
+        assert!(producer.push_or_drop(test_buffer(1.0)));
+        assert!(!producer.push_or_drop(test_buffer(9.0)));
+        assert!(producer.shared().is_under_backpressure());
     }
 
     // Timestamps survive the recycle round-trip.

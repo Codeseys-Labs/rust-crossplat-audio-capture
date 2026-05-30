@@ -55,7 +55,7 @@ impl PlatformCapabilities {
     /// backend modules are gated on `all(target_os = X, feature = feat_X)`
     /// (see `src/audio/mod.rs`), so when the OS matches but its feature is not
     /// enabled there is no backend to back the report — we must return
-    /// [`Self::unsupported()`] rather than claim support a capture call would
+    /// the all-false `unsupported` capabilities rather than claim support a capture call would
     /// then refuse with `PlatformNotSupported`. Gating only on `target_os`
     /// (the previous behavior) made `--no-default-features --features
     /// feat_windows` on Linux falsely report full support.

@@ -38,6 +38,14 @@
 // that respects context cancellation. For lower-level control, use
 // [AudioCapture.ReadBuffer] (blocking) or [AudioCapture.TryReadBuffer]
 // (non-blocking).
+//
+// # ABI
+//
+// The binding tracks the rsac-ffi C ABI declared in rsac.h (kept in lockstep
+// with bindings/rsac-ffi/include/rsac.h). Fallible C functions return an
+// rsac_error_t and deliver any produced handle through an out-pointer; pure
+// accessors return their value directly with -1 (int32) or 0 used as the
+// "null handle" sentinel.
 package rsac
 
 /*
@@ -46,9 +54,6 @@ package rsac
 
 #include "rsac.h"
 #include <stdlib.h>
-
-// Bridge function for the C callback — calls back into Go.
-extern void goAudioCallback(const rsac_audio_buffer_t* buffer, void* user_data);
 */
 import "C"
 import (
@@ -62,35 +67,25 @@ import (
 
 // ── Error Types ─────────────────────────────────────────────────────────
 
-// ErrorCode represents a categorized error from the rsac library.
+// ErrorCode represents a categorized error from the rsac library. The values
+// match the rsac_error_t discriminants in the rsac-ffi C ABI.
 type ErrorCode int
 
 const (
 	ErrOK                   ErrorCode = C.RSAC_OK
-	ErrInvalidParameter     ErrorCode = C.RSAC_ERROR_INVALID_PARAMETER
-	ErrUnsupportedFormat    ErrorCode = C.RSAC_ERROR_UNSUPPORTED_FORMAT
-	ErrConfiguration        ErrorCode = C.RSAC_ERROR_CONFIGURATION
-	ErrDeviceNotFound       ErrorCode = C.RSAC_ERROR_DEVICE_NOT_FOUND
-	ErrDeviceNotAvailable   ErrorCode = C.RSAC_ERROR_DEVICE_NOT_AVAILABLE
-	ErrDeviceEnumeration    ErrorCode = C.RSAC_ERROR_DEVICE_ENUMERATION
-	ErrStreamCreation       ErrorCode = C.RSAC_ERROR_STREAM_CREATION
-	ErrStreamStart          ErrorCode = C.RSAC_ERROR_STREAM_START
-	ErrStreamStop           ErrorCode = C.RSAC_ERROR_STREAM_STOP
-	ErrStreamRead           ErrorCode = C.RSAC_ERROR_STREAM_READ
-	ErrBufferOverrun        ErrorCode = C.RSAC_ERROR_BUFFER_OVERRUN
-	ErrBufferUnderrun       ErrorCode = C.RSAC_ERROR_BUFFER_UNDERRUN
-	ErrBackend              ErrorCode = C.RSAC_ERROR_BACKEND
-	ErrBackendNotAvailable  ErrorCode = C.RSAC_ERROR_BACKEND_NOT_AVAILABLE
-	ErrBackendInit          ErrorCode = C.RSAC_ERROR_BACKEND_INIT
-	ErrAppNotFound          ErrorCode = C.RSAC_ERROR_APP_NOT_FOUND
-	ErrAppCaptureFailed     ErrorCode = C.RSAC_ERROR_APP_CAPTURE_FAILED
-	ErrPlatformNotSupported ErrorCode = C.RSAC_ERROR_PLATFORM_NOT_SUPPORTED
-	ErrPermissionDenied     ErrorCode = C.RSAC_ERROR_PERMISSION_DENIED
-	ErrInternal             ErrorCode = C.RSAC_ERROR_INTERNAL
-	ErrTimeout              ErrorCode = C.RSAC_ERROR_TIMEOUT
 	ErrNullPointer          ErrorCode = C.RSAC_ERROR_NULL_POINTER
-	ErrNotRunning           ErrorCode = C.RSAC_ERROR_NOT_RUNNING
-	ErrAlreadyRunning       ErrorCode = C.RSAC_ERROR_ALREADY_RUNNING
+	ErrInvalidParameter     ErrorCode = C.RSAC_ERROR_INVALID_PARAMETER
+	ErrDeviceNotFound       ErrorCode = C.RSAC_ERROR_DEVICE_NOT_FOUND
+	ErrPlatformNotSupported ErrorCode = C.RSAC_ERROR_PLATFORM_NOT_SUPPORTED
+	ErrStreamFailed         ErrorCode = C.RSAC_ERROR_STREAM_FAILED
+	ErrStreamRead           ErrorCode = C.RSAC_ERROR_STREAM_READ
+	ErrConfiguration        ErrorCode = C.RSAC_ERROR_CONFIGURATION
+	ErrAppNotFound          ErrorCode = C.RSAC_ERROR_APPLICATION_NOT_FOUND
+	ErrBackend              ErrorCode = C.RSAC_ERROR_BACKEND
+	ErrPermissionDenied     ErrorCode = C.RSAC_ERROR_PERMISSION_DENIED
+	ErrTimeout              ErrorCode = C.RSAC_ERROR_TIMEOUT
+	ErrInternal             ErrorCode = C.RSAC_ERROR_INTERNAL
+	ErrPanic                ErrorCode = C.RSAC_ERROR_PANIC
 )
 
 // String returns the human-readable name of the error code.
@@ -98,54 +93,32 @@ func (e ErrorCode) String() string {
 	switch e {
 	case ErrOK:
 		return "OK"
-	case ErrInvalidParameter:
-		return "InvalidParameter"
-	case ErrUnsupportedFormat:
-		return "UnsupportedFormat"
-	case ErrConfiguration:
-		return "Configuration"
-	case ErrDeviceNotFound:
-		return "DeviceNotFound"
-	case ErrDeviceNotAvailable:
-		return "DeviceNotAvailable"
-	case ErrDeviceEnumeration:
-		return "DeviceEnumeration"
-	case ErrStreamCreation:
-		return "StreamCreation"
-	case ErrStreamStart:
-		return "StreamStart"
-	case ErrStreamStop:
-		return "StreamStop"
-	case ErrStreamRead:
-		return "StreamRead"
-	case ErrBufferOverrun:
-		return "BufferOverrun"
-	case ErrBufferUnderrun:
-		return "BufferUnderrun"
-	case ErrBackend:
-		return "Backend"
-	case ErrBackendNotAvailable:
-		return "BackendNotAvailable"
-	case ErrBackendInit:
-		return "BackendInit"
-	case ErrAppNotFound:
-		return "AppNotFound"
-	case ErrAppCaptureFailed:
-		return "AppCaptureFailed"
-	case ErrPlatformNotSupported:
-		return "PlatformNotSupported"
-	case ErrPermissionDenied:
-		return "PermissionDenied"
-	case ErrInternal:
-		return "Internal"
-	case ErrTimeout:
-		return "Timeout"
 	case ErrNullPointer:
 		return "NullPointer"
-	case ErrNotRunning:
-		return "NotRunning"
-	case ErrAlreadyRunning:
-		return "AlreadyRunning"
+	case ErrInvalidParameter:
+		return "InvalidParameter"
+	case ErrDeviceNotFound:
+		return "DeviceNotFound"
+	case ErrPlatformNotSupported:
+		return "PlatformNotSupported"
+	case ErrStreamFailed:
+		return "StreamFailed"
+	case ErrStreamRead:
+		return "StreamRead"
+	case ErrConfiguration:
+		return "Configuration"
+	case ErrAppNotFound:
+		return "AppNotFound"
+	case ErrBackend:
+		return "Backend"
+	case ErrPermissionDenied:
+		return "PermissionDenied"
+	case ErrTimeout:
+		return "Timeout"
+	case ErrInternal:
+		return "Internal"
+	case ErrPanic:
+		return "Panic"
 	default:
 		return fmt.Sprintf("Unknown(%d)", int(e))
 	}
@@ -177,6 +150,7 @@ func (e *Error) Is(target error) bool {
 
 // Sentinel errors for use with errors.Is.
 var (
+	// ErrClosed is returned by operations on a closed [AudioCapture].
 	ErrClosed = &Error{Code: ErrStreamRead, Message: "capture closed"}
 )
 
@@ -196,21 +170,16 @@ func newError(code C.rsac_error_t) error {
 	}
 }
 
-// newErrorMsg creates an Error with a Go-side message.
-func newErrorMsg(code ErrorCode, msg string) error {
-	return &Error{Code: code, Message: msg}
-}
-
 // ── Capture Target ──────────────────────────────────────────────────────
 
 // CaptureTarget specifies what audio to capture.
 // Use the constructor functions to create targets.
 type CaptureTarget struct {
-	kind    targetKind
-	name    string
-	pid     uint32
-	devID   string
-	appID   string
+	kind  targetKind
+	name  string
+	pid   uint32
+	devID string
+	appID string
 }
 
 type targetKind int
@@ -291,10 +260,10 @@ func (b AudioBuffer) SampleRate() int {
 
 // NumSamples returns the total number of samples (NumFrames * Channels).
 func (b AudioBuffer) NumSamples() int {
-	return b.numFrames * b.channels
+	return len(b.data)
 }
 
-// Duration returns the duration of the audio data in this buffer.
+// Duration returns the duration of the audio data in this buffer, in seconds.
 func (b AudioBuffer) Duration() float64 {
 	if b.sampleRate == 0 {
 		return 0
@@ -309,7 +278,7 @@ func (b AudioBuffer) IsEmpty() bool {
 
 // audioBufferFromC copies data from a C audio buffer into a Go AudioBuffer,
 // then frees the C buffer. The returned AudioBuffer is fully Go-managed.
-func audioBufferFromC(cbuf *C.rsac_audio_buffer_t) AudioBuffer {
+func audioBufferFromC(cbuf *C.RsacAudioBuffer) AudioBuffer {
 	if cbuf == nil {
 		return AudioBuffer{}
 	}
@@ -318,7 +287,7 @@ func audioBufferFromC(cbuf *C.rsac_audio_buffer_t) AudioBuffer {
 	numFrames := int(C.rsac_audio_buffer_num_frames(cbuf))
 	channels := int(C.rsac_audio_buffer_channels(cbuf))
 	sampleRate := int(C.rsac_audio_buffer_sample_rate(cbuf))
-	numSamples := int(C.rsac_audio_buffer_num_samples(cbuf))
+	numSamples := int(C.rsac_audio_buffer_len(cbuf))
 
 	// Copy the sample data into Go memory.
 	cdata := C.rsac_audio_buffer_data(cbuf)
@@ -359,11 +328,10 @@ type CaptureBuilder struct {
 	target     CaptureTarget
 	sampleRate uint32
 	channels   uint16
-	bufferSize uint32 // 0 = platform default
 }
 
 // NewCaptureBuilder creates a new builder with default settings:
-// system default target, 48000 Hz, 2 channels, platform-default buffer size.
+// system default target, 48000 Hz, 2 channels.
 func NewCaptureBuilder() *CaptureBuilder {
 	return &CaptureBuilder{
 		target:     SystemDefault(),
@@ -421,18 +389,14 @@ func (b *CaptureBuilder) Channels(ch uint16) *CaptureBuilder {
 	return b
 }
 
-// BufferSize sets the desired buffer size in frames.
-// Pass 0 to use the platform default.
-func (b *CaptureBuilder) BufferSize(frames uint32) *CaptureBuilder {
-	b.bufferSize = frames
-	return b
-}
-
 // Build validates the configuration and creates an [AudioCapture] instance.
 // Returns an error if the configuration is invalid or the platform does not
 // support the requested capture target.
 func (b *CaptureBuilder) Build() (*AudioCapture, error) {
-	cbuilder := C.rsac_builder_new()
+	var cbuilder *C.RsacBuilder
+	if rc := C.rsac_builder_new(&cbuilder); rc != C.RSAC_OK {
+		return nil, newError(rc)
+	}
 	if cbuilder == nil {
 		return nil, newError(C.RSAC_ERROR_INTERNAL)
 	}
@@ -455,7 +419,7 @@ func (b *CaptureBuilder) Build() (*AudioCapture, error) {
 	case targetApplication:
 		cid := C.CString(b.target.appID)
 		defer C.free(unsafe.Pointer(cid))
-		rc = C.rsac_builder_set_target_app_by_pid(cbuilder, cid)
+		rc = C.rsac_builder_set_target_app_by_id(cbuilder, cid)
 	}
 	if rc != C.RSAC_OK {
 		C.rsac_builder_free(cbuilder)
@@ -471,15 +435,12 @@ func (b *CaptureBuilder) Build() (*AudioCapture, error) {
 		C.rsac_builder_free(cbuilder)
 		return nil, newError(rc)
 	}
-	if b.bufferSize > 0 {
-		if rc = C.rsac_builder_set_buffer_size(cbuilder, C.uint32_t(b.bufferSize)); rc != C.RSAC_OK {
-			C.rsac_builder_free(cbuilder)
-			return nil, newError(rc)
-		}
-	}
 
-	// Build the capture. This consumes the builder.
-	ccapture := C.rsac_builder_build(cbuilder)
+	// Build the capture. This consumes (and frees) the builder regardless of outcome.
+	var ccapture *C.RsacCapture
+	if rc = C.rsac_builder_build(cbuilder, &ccapture); rc != C.RSAC_OK {
+		return nil, newError(rc)
+	}
 	if ccapture == nil {
 		return nil, newError(C.RSAC_ERROR_INTERNAL)
 	}
@@ -503,9 +464,10 @@ func (b *CaptureBuilder) Build() (*AudioCapture, error) {
 // The caller must call [AudioCapture.Close] when done to release resources.
 // A finalizer is registered as a safety net, but explicit Close() is preferred.
 type AudioCapture struct {
-	mu     sync.Mutex
-	handle *C.rsac_capture_t
-	closed bool
+	mu       sync.Mutex
+	handle   *C.RsacCapture
+	closed   bool
+	callback uintptr // backing cgo.Handle for the active callback, 0 if none
 }
 
 // Start begins audio capture. The underlying OS stream is created and begins
@@ -553,6 +515,7 @@ func (c *AudioCapture) closeLocked() error {
 	runtime.SetFinalizer(c, nil)
 	C.rsac_capture_free(c.handle)
 	c.handle = nil
+	c.clearCallbackHandleLocked()
 	return nil
 }
 
@@ -569,7 +532,8 @@ func (c *AudioCapture) IsRunning() bool {
 	if c.closed {
 		return false
 	}
-	return bool(C.rsac_capture_is_running(c.handle))
+	// rsac_capture_is_running returns 1 (running), 0 (stopped), or -1 (null).
+	return C.rsac_capture_is_running(c.handle) == 1
 }
 
 // OverrunCount returns the number of audio buffers dropped due to ring buffer
@@ -600,16 +564,21 @@ func (c *AudioCapture) ReadBuffer() (AudioBuffer, error) {
 	// Note: ReadBuffer releases the lock during the blocking C call so that
 	// other goroutines can call IsRunning(), OverrunCount(), or Stop().
 	// The handle is safe to use without the lock because Close() only frees
-	// the handle, and we check closed before and after.
-	cbuf := C.rsac_capture_read(handle)
-	if cbuf == nil {
+	// the handle, and we re-check closed afterward.
+	var cbuf *C.RsacAudioBuffer
+	rc := C.rsac_capture_read(handle, &cbuf)
+	if rc != C.RSAC_OK {
 		c.mu.Lock()
 		defer c.mu.Unlock()
 		if c.closed {
 			return AudioBuffer{}, ErrClosed
 		}
-		lastErr := C.rsac_capture_last_error(handle)
-		return AudioBuffer{}, newError(lastErr)
+		return AudioBuffer{}, newError(rc)
+	}
+	if cbuf == nil {
+		// RSAC_OK with no buffer should not happen for a blocking read, but
+		// guard against it rather than dereferencing nil.
+		return AudioBuffer{}, nil
 	}
 	return audioBufferFromC(cbuf), nil
 }
@@ -626,19 +595,19 @@ func (c *AudioCapture) TryReadBuffer() (AudioBuffer, bool, error) {
 	handle := c.handle
 	c.mu.Unlock()
 
-	cbuf := C.rsac_capture_try_read(handle)
-	if cbuf == nil {
+	var cbuf *C.RsacAudioBuffer
+	rc := C.rsac_capture_try_read(handle, &cbuf)
+	if rc != C.RSAC_OK {
 		c.mu.Lock()
 		defer c.mu.Unlock()
 		if c.closed {
 			return AudioBuffer{}, false, ErrClosed
 		}
-		lastErr := C.rsac_capture_last_error(handle)
-		if lastErr == C.RSAC_OK {
-			// No data available (not an error).
-			return AudioBuffer{}, false, nil
-		}
-		return AudioBuffer{}, false, newError(lastErr)
+		return AudioBuffer{}, false, newError(rc)
+	}
+	if cbuf == nil {
+		// RSAC_OK with a null buffer means "no data available" (not an error).
+		return AudioBuffer{}, false, nil
 	}
 	return audioBufferFromC(cbuf), true, nil
 }
@@ -753,37 +722,33 @@ type Capabilities struct {
 	BackendName string
 	// MaxChannels is the maximum number of audio channels supported.
 	MaxChannels int
-	// MinSampleRate is the minimum supported sample rate in Hz.
-	MinSampleRate int
-	// MaxSampleRate is the maximum supported sample rate in Hz.
-	MaxSampleRate int
 }
 
 // PlatformCapabilities queries and returns the audio capabilities of the
 // current platform. This is a static query that does not require an active
 // capture session.
 func PlatformCapabilities() (Capabilities, error) {
-	ccaps := C.rsac_capabilities_query()
+	var ccaps *C.RsacCapabilities
+	if rc := C.rsac_capabilities_query(&ccaps); rc != C.RSAC_OK {
+		return Capabilities{}, newError(rc)
+	}
 	if ccaps == nil {
 		return Capabilities{}, newError(C.RSAC_ERROR_INTERNAL)
 	}
 	defer C.rsac_capabilities_free(ccaps)
 
-	backendNameC := C.rsac_capabilities_backend_name(ccaps)
 	backendName := ""
-	if backendNameC != nil {
-		backendName = C.GoString(backendNameC)
+	if cname := C.rsac_capabilities_backend_name(ccaps); cname != nil {
+		backendName = C.GoString(cname)
 	}
 
 	return Capabilities{
-		SupportsSystemCapture:   bool(C.rsac_capabilities_supports_system_capture(ccaps)),
-		SupportsAppCapture:      bool(C.rsac_capabilities_supports_app_capture(ccaps)),
-		SupportsProcessTree:     bool(C.rsac_capabilities_supports_process_tree(ccaps)),
-		SupportsDeviceSelection: bool(C.rsac_capabilities_supports_device_selection(ccaps)),
+		SupportsSystemCapture:   C.rsac_capabilities_supports_system_capture(ccaps) == 1,
+		SupportsAppCapture:      C.rsac_capabilities_supports_app_capture(ccaps) == 1,
+		SupportsProcessTree:     C.rsac_capabilities_supports_process_tree(ccaps) == 1,
+		SupportsDeviceSelection: C.rsac_capabilities_supports_device_selection(ccaps) == 1,
 		BackendName:             backendName,
 		MaxChannels:             int(C.rsac_capabilities_max_channels(ccaps)),
-		MinSampleRate:           int(C.rsac_capabilities_min_sample_rate(ccaps)),
-		MaxSampleRate:           int(C.rsac_capabilities_max_sample_rate(ccaps)),
 	}, nil
 }
 
@@ -794,9 +759,9 @@ type DeviceKind int
 
 const (
 	// DeviceInput is an audio input (recording) device.
-	DeviceInput DeviceKind = 0
+	DeviceInput DeviceKind = C.RSAC_DEVICE_INPUT
 	// DeviceOutput is an audio output (playback) device.
-	DeviceOutput DeviceKind = 1
+	DeviceOutput DeviceKind = C.RSAC_DEVICE_OUTPUT
 )
 
 // AudioDevice describes an audio device discovered by the platform backend.
@@ -809,59 +774,11 @@ type AudioDevice struct {
 	IsDefault bool
 }
 
-// ListDevices enumerates all audio devices available on the current platform.
-func ListDevices() ([]AudioDevice, error) {
-	cenum := C.rsac_device_enumerator_new()
-	if cenum == nil {
-		return nil, newError(C.RSAC_ERROR_INTERNAL)
-	}
-	defer C.rsac_device_enumerator_free(cenum)
-
-	clist := C.rsac_enumerate_devices(cenum)
-	if clist == nil {
-		return nil, newError(C.RSAC_ERROR_DEVICE_ENUMERATION)
-	}
-	defer C.rsac_device_list_free(clist)
-
-	count := int(C.rsac_device_list_count(clist))
-	devices := make([]AudioDevice, 0, count)
-	for i := 0; i < count; i++ {
-		cdev := C.rsac_device_list_get(clist, C.uint32_t(i))
-		if cdev == nil {
-			continue
-		}
-		dev := AudioDevice{
-			IsDefault: bool(C.rsac_device_is_default(cdev)),
-		}
-		if cid := C.rsac_device_id(cdev); cid != nil {
-			dev.ID = C.GoString(cid)
-		}
-		if cname := C.rsac_device_name(cdev); cname != nil {
-			dev.Name = C.GoString(cname)
-		}
-		devices = append(devices, dev)
-		// Note: devices from rsac_device_list_get are borrowed from the list;
-		// they are freed when the list is freed. Do NOT call rsac_device_free.
-	}
-	return devices, nil
-}
-
-// DefaultDevice returns the default audio device of the given kind.
-func DefaultDevice(kind DeviceKind) (AudioDevice, error) {
-	cenum := C.rsac_device_enumerator_new()
-	if cenum == nil {
-		return AudioDevice{}, newError(C.RSAC_ERROR_INTERNAL)
-	}
-	defer C.rsac_device_enumerator_free(cenum)
-
-	cdev := C.rsac_default_device(cenum, C.uint32_t(kind))
-	if cdev == nil {
-		return AudioDevice{}, newError(C.RSAC_ERROR_DEVICE_NOT_FOUND)
-	}
-	defer C.rsac_device_free(cdev)
-
+// deviceFromC reads the fields of a C device handle into a Go AudioDevice.
+// It does not free the handle.
+func deviceFromC(cdev *C.RsacDevice) AudioDevice {
 	dev := AudioDevice{
-		IsDefault: bool(C.rsac_device_is_default(cdev)),
+		IsDefault: C.rsac_device_is_default(cdev) == 1,
 	}
 	if cid := C.rsac_device_id(cdev); cid != nil {
 		dev.ID = C.GoString(cid)
@@ -869,5 +786,66 @@ func DefaultDevice(kind DeviceKind) (AudioDevice, error) {
 	if cname := C.rsac_device_name(cdev); cname != nil {
 		dev.Name = C.GoString(cname)
 	}
-	return dev, nil
+	return dev
+}
+
+// ListDevices enumerates all audio devices available on the current platform.
+func ListDevices() ([]AudioDevice, error) {
+	var cenum *C.RsacDeviceEnumerator
+	if rc := C.rsac_device_enumerator_new(&cenum); rc != C.RSAC_OK {
+		return nil, newError(rc)
+	}
+	if cenum == nil {
+		return nil, newError(C.RSAC_ERROR_INTERNAL)
+	}
+	defer C.rsac_device_enumerator_free(cenum)
+
+	var clist *C.RsacDeviceList
+	if rc := C.rsac_device_list_new(cenum, &clist); rc != C.RSAC_OK {
+		return nil, newError(rc)
+	}
+	if clist == nil {
+		return nil, newError(C.RSAC_ERROR_INTERNAL)
+	}
+	defer C.rsac_device_list_free(clist)
+
+	count := int(C.rsac_device_list_count(clist))
+	devices := make([]AudioDevice, 0, count)
+	for i := 0; i < count; i++ {
+		var cdev *C.RsacDevice
+		if rc := C.rsac_device_list_get(clist, C.size_t(i), &cdev); rc != C.RSAC_OK || cdev == nil {
+			continue
+		}
+		devices = append(devices, deviceFromC(cdev))
+		// Devices returned by rsac_device_list_get are owned snapshots and
+		// must be freed individually.
+		C.rsac_device_free(cdev)
+	}
+	return devices, nil
+}
+
+// DefaultDevice returns the default audio device of the given kind.
+//
+// NOTE: the kind argument is currently advisory — every backend returns the
+// default output device used for loopback capture.
+func DefaultDevice(kind DeviceKind) (AudioDevice, error) {
+	var cenum *C.RsacDeviceEnumerator
+	if rc := C.rsac_device_enumerator_new(&cenum); rc != C.RSAC_OK {
+		return AudioDevice{}, newError(rc)
+	}
+	if cenum == nil {
+		return AudioDevice{}, newError(C.RSAC_ERROR_INTERNAL)
+	}
+	defer C.rsac_device_enumerator_free(cenum)
+
+	var cdev *C.RsacDevice
+	if rc := C.rsac_default_device(cenum, C.rsac_device_kind_t(kind), &cdev); rc != C.RSAC_OK {
+		return AudioDevice{}, newError(rc)
+	}
+	if cdev == nil {
+		return AudioDevice{}, newError(C.RSAC_ERROR_DEVICE_NOT_FOUND)
+	}
+	defer C.rsac_device_free(cdev)
+
+	return deviceFromC(cdev), nil
 }

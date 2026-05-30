@@ -1,21 +1,39 @@
 //! Linux audio backend: PipeWire monitor streams.
 //!
 //! The Linux backend wraps [PipeWire](https://pipewire.org) 0.3.44+ behind
-//! the common [`BridgeStream`](crate::bridge::stream::BridgeStream) adapter.
+//! the common `BridgeStream` adapter (in `crate::bridge::stream`).
 //! All PipeWire `Rc`-typed handles (`MainLoop`, `Context`, `Core`, `Stream`)
-//! are `!Send`, so ownership lives on a dedicated
-//! [`PipeWireThread`](thread::PipeWireThread); user code communicates with
-//! it via a command/response channel.
+//! are `!Send`, so ownership lives on a dedicated `PipeWireThread`
+//! (in `thread`); user code communicates with it via a command/response channel.
 //!
 //! ## Capture strategy
 //!
-//! - `SystemDefault` — attach a monitor stream to the default sink node.
-//! - `Device(DeviceId)` — attach to the named sink node by `object.serial`.
-//! - `Application(ApplicationId)` / `ApplicationByName` — resolve the
-//!   app's PipeWire node via `pw-dump` (matching `application.process.id`
-//!   or `application.name`), then attach a monitor stream to that node.
-//! - `ProcessTree(ProcessId)` — walk the process tree with `sysinfo`, then
-//!   resolve each child PID to a PipeWire node as above.
+//! Every non-default target is resolved to a PipeWire node `object.serial`
+//! **on the caller thread** (in `thread::PipeWireThread::start_capture`) before
+//! the work is handed to the PipeWire event loop, so the event loop never
+//! blocks on `pw-dump` or a `/proc` walk while pumping audio.
+//!
+//! - `SystemDefault` — attach a monitor stream to the default sink node
+//!   (no `TARGET_OBJECT`; `STREAM_CAPTURE_SINK` + `STREAM_MONITOR` route it).
+//! - `Device(DeviceId)` — the `DeviceId` is a PipeWire node `id`/`object.serial`;
+//!   it is validated against `pw-dump` and normalised to the node's
+//!   `object.serial`. A missing device yields `DeviceNotFound`.
+//! - `Application(ApplicationId)` — like the Windows/macOS backends, the
+//!   `ApplicationId` carries a **numeric PID string**. It is parsed to a PID
+//!   and resolved to the app's audio-output node via `pw-dump` (matching
+//!   `application.process.id`), exactly as `ApplicationByName` does for names.
+//! - `ApplicationByName` — resolve the app's node via `pw-dump`, matching
+//!   `application.name` / `application.process.binary`.
+//! - `ProcessTree(ProcessId)` — walk `/proc` for the PID's descendants, then
+//!   match any tree member's audio-output node via `pw-dump`.
+//!
+//! ## Format negotiation
+//!
+//! PipeWire negotiates the concrete stream format at connect time, so the
+//! per-device `supported_formats()` query returns an empty list rather than
+//! guessing: the authoritative format is the one PipeWire reports back through
+//! the `param_changed` callback, which the backend writes into each delivered
+//! [`AudioBuffer`](crate::core::buffer::AudioBuffer)'s metadata.
 //!
 //! ## System requirements
 //!
@@ -267,7 +285,15 @@ impl LinuxDeviceEnumerator {
         None
     }
 
-    /// Parse default device from pw-metadata output
+    /// Parse default device from pw-metadata output.
+    ///
+    /// Note: `default.audio.sink` / `default.audio.source` metadata holds a
+    /// node **name** (e.g. `alsa_output.pci-...`), so the returned device's
+    /// `id` is that name rather than a numeric node id / `object.serial`. The
+    /// `Device` capture path (see `thread::PwNodeLookup::Device`) matches on
+    /// node `id` / `object.serial`; enumerated devices (`get_pipewire_devices`)
+    /// carry the numeric node id and round-trip cleanly, whereas this
+    /// metadata-derived id is intended for display/default selection.
     fn parse_default_device(
         &self,
         output: &str,
@@ -329,7 +355,14 @@ impl crate::core::interface::AudioDevice for LinuxAudioDevice {
     }
 
     fn supported_formats(&self) -> Vec<crate::core::config::AudioFormat> {
-        // TODO: Query actual supported formats from PipeWire
+        // Empty by design (audit finding L2): PipeWire performs format
+        // negotiation at stream-connect time, picking a concrete format from
+        // what we request plus what the graph supports. Enumerating a fixed
+        // "supported" set up front would be a guess that PipeWire may override.
+        // The authoritative delivered format is reported via the stream's
+        // `param_changed` callback and stamped onto each `AudioBuffer`. Callers
+        // requesting a specific format pass it through `StreamConfig`; PipeWire
+        // negotiates the closest match.
         vec![]
     }
 
@@ -410,23 +443,32 @@ impl crate::core::interface::DeviceEnumerator for LinuxDeviceEnumerator {
     fn enumerate_devices(
         &self,
     ) -> crate::core::error::Result<Vec<Box<dyn crate::core::interface::AudioDevice>>> {
-        let mut devices: Vec<Box<dyn crate::core::interface::AudioDevice>> = Vec::new();
+        // Query PipeWire. Propagate any enumeration error to the caller rather
+        // than swallowing it.
+        let pw_devices = self.get_pipewire_devices()?;
 
-        // Try to get devices from PipeWire
-        if let Ok(pw_devices) = self.get_pipewire_devices() {
-            for d in pw_devices {
-                devices.push(Box::new(d));
-            }
+        // An empty result means both `pw-cli list-objects` and `pw-dump`
+        // produced no audio nodes — almost certainly "PipeWire unavailable"
+        // (daemon down, tools missing, permission/timeout) rather than a
+        // machine with zero audio devices. Surface it as a `BackendError`
+        // instead of fabricating a synthetic "default" device with an invalid
+        // `TARGET_OBJECT` (audit finding L4) — this matches the Windows/macOS
+        // error shape so callers get a consistent, honest signal.
+        if pw_devices.is_empty() {
+            return Err(crate::core::error::AudioError::BackendError {
+                backend: "PipeWire".into(),
+                operation: "enumerate_devices".into(),
+                message: "Failed to enumerate PipeWire audio nodes via pw-cli and pw-dump; \
+                          is PipeWire running?"
+                    .into(),
+                context: None,
+            });
         }
 
-        // If no devices found, add a fallback default
-        if devices.is_empty() {
-            devices.push(Box::new(LinuxAudioDevice {
-                id: "default".to_string(),
-                name: "Default Linux Audio Device".to_string(),
-                is_input: true,
-                is_output: false,
-            }));
+        let mut devices: Vec<Box<dyn crate::core::interface::AudioDevice>> =
+            Vec::with_capacity(pw_devices.len());
+        for d in pw_devices {
+            devices.push(Box::new(d));
         }
 
         Ok(devices)
@@ -435,21 +477,15 @@ impl crate::core::interface::DeviceEnumerator for LinuxDeviceEnumerator {
     fn default_device(
         &self,
     ) -> crate::core::error::Result<Box<dyn crate::core::interface::AudioDevice>> {
-        // Try to get the actual default output device from PipeWire
-        // (output is most relevant for audio capture / loopback)
-        if let Ok(device) =
-            self.get_pipewire_default_device(crate::core::interface::DeviceKind::Output)
-        {
-            return Ok(Box::new(device));
-        }
-
-        // Fallback to a generic default
-        Ok(Box::new(LinuxAudioDevice {
-            id: "default".to_string(),
-            name: "Default Linux Audio Device".to_string(),
-            is_input: false,
-            is_output: true,
-        }))
+        // Resolve the actual default output device from PipeWire (output is the
+        // relevant side for loopback capture). `get_pipewire_default_device`
+        // already returns a `BackendError` when PipeWire is unavailable and
+        // `DeviceNotFound` when no suitable device exists — propagate either
+        // rather than fabricating a synthetic default with an invalid
+        // `TARGET_OBJECT` (audit finding L4).
+        let device =
+            self.get_pipewire_default_device(crate::core::interface::DeviceKind::Output)?;
+        Ok(Box::new(device))
     }
 }
 
@@ -558,6 +594,7 @@ mod tests {
     }
 
     #[test]
+    #[allow(clippy::default_constructed_unit_structs)] // intentionally exercises the Default impl
     fn test_linux_device_enumerator_default() {
         let _enumerator = LinuxDeviceEnumerator::default();
         // Verify Default impl works
@@ -567,20 +604,30 @@ mod tests {
     fn test_linux_device_enumerator_enumerate_devices_does_not_panic() {
         let enumerator = LinuxDeviceEnumerator::new();
         let result = enumerator.enumerate_devices();
-        // Should always succeed (falls back to a default device)
+        // L4: no synthetic fallback. Either we enumerated real devices (every
+        // one with a non-empty name), or PipeWire was unavailable and we get a
+        // BackendError. Both outcomes are valid; what must NOT happen is a
+        // fabricated "default" device or a panic.
         match result {
             Ok(devices) => {
                 assert!(
                     !devices.is_empty(),
-                    "Should have at least the fallback device"
+                    "Ok must mean real devices, never an empty/fabricated list"
                 );
-                // Verify all returned devices have non-empty names
                 for device in &devices {
                     assert!(!device.name().is_empty());
+                    assert_ne!(
+                        device.id().to_string(),
+                        "default",
+                        "must not fabricate a synthetic 'default' device id"
+                    );
                 }
             }
+            Err(crate::core::error::AudioError::BackendError { backend, .. }) => {
+                assert_eq!(backend, "PipeWire");
+            }
             Err(e) => {
-                panic!("enumerate_devices should not fail (has fallback): {}", e);
+                panic!("Unexpected error from enumerate_devices: {:?}", e);
             }
         }
     }
@@ -589,13 +636,24 @@ mod tests {
     fn test_linux_device_enumerator_default_device_does_not_panic() {
         let enumerator = LinuxDeviceEnumerator::new();
         let result = enumerator.default_device();
-        // Should always succeed (falls back to generic default)
+        // L4: no synthetic fallback. Either a real default device, or an honest
+        // error (BackendError when PipeWire is down, DeviceNotFound when no
+        // output device exists). Never a fabricated default; never a panic.
         match result {
             Ok(device) => {
                 assert!(!device.name().is_empty());
+                assert_ne!(
+                    device.id().to_string(),
+                    "default",
+                    "must not fabricate a synthetic 'default' device id"
+                );
+            }
+            Err(crate::core::error::AudioError::BackendError { .. })
+            | Err(crate::core::error::AudioError::DeviceNotFound { .. }) => {
+                // Expected when PipeWire is unavailable in the test environment.
             }
             Err(e) => {
-                panic!("default_device should not fail (has fallback): {}", e);
+                panic!("Unexpected error from default_device: {:?}", e);
             }
         }
     }
@@ -803,7 +861,7 @@ mod pipewire_integration_tests {
                     match stream.try_read_chunk() {
                         Ok(Some(buffer)) => {
                             chunks_read += 1;
-                            assert!(buffer.len() > 0, "Buffer should have samples");
+                            assert!(!buffer.is_empty(), "Buffer should have samples");
                             assert_eq!(buffer.channels(), 2);
                             assert_eq!(buffer.sample_rate(), 48000);
                         }

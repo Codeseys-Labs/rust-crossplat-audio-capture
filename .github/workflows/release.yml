@@ -11,10 +11,16 @@
 # Required GitHub secret:
 #   CARGO_REGISTRY_TOKEN — crates.io API token with publish-update scope for `rsac`
 #
-# TODO(future): wire bindings/ publish once manifests exist — rsac-napi to npm
-# (needs NPM_TOKEN + NAPI-RS per-platform build matrix) and rsac-python to PyPI
-# via maturin (needs MATURIN_PYPI_TOKEN + maturin-action wheel matrix). Docs
-# note these bindings are placeholder dirs without package.json/pyproject.toml.
+# Scope: this workflow publishes ONLY the Rust crate to crates.io. The
+# bindings are released by their own tag-triggered workflows (they now have
+# real manifests, so the old "placeholder dirs without package.json/
+# pyproject.toml" note no longer applies):
+#   • rsac-napi  → npm  via .github/workflows/release-npm.yml
+#                  (bindings/rsac-napi/package.json; needs NPM_TOKEN)
+#   • rsac-python → PyPI via .github/workflows/release-pypi.yml
+#                  (bindings/rsac-python/pyproject.toml; PyPI Trusted
+#                  Publishing / OIDC — no long-lived token)
+# All three fire on the same semver tag; bump every manifest in lockstep.
 
 name: Release
 
@@ -73,9 +79,9 @@ jobs:
             device_test_filter: ''
     runs-on: ${{ matrix.os }}
     steps:
-      - uses: actions/checkout@v5 # TODO: pin to SHA
+      - uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5
       - uses: dtolnay/rust-toolchain@1.95.0
-      - uses: useblacksmith/rust-cache@v1 # TODO: pin to SHA
+      - uses: useblacksmith/rust-cache@81d053bdb0871dcd3f10763c8cc60d0adc41762b # v1 branch head (no v1 tag exists upstream)
 
       - name: Install PipeWire dev libraries (Linux)
         if: matrix.install_deps
@@ -117,9 +123,9 @@ jobs:
     permissions:
       contents: read
     steps:
-      - uses: actions/checkout@v5 # TODO: pin to SHA
+      - uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5
       - uses: dtolnay/rust-toolchain@1.95.0
-      - uses: useblacksmith/rust-cache@v1 # TODO: pin to SHA
+      - uses: useblacksmith/rust-cache@81d053bdb0871dcd3f10763c8cc60d0adc41762b # v1 branch head (no v1 tag exists upstream)
 
       - name: Install PipeWire dev libraries
         run: |
@@ -162,7 +168,7 @@ jobs:
     permissions:
       contents: write
     steps:
-      - uses: actions/checkout@v5 # TODO: pin to SHA
+      - uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5
 
       - name: Extract version from tag
         id: version
@@ -192,7 +198,7 @@ jobs:
           cat release_body.md
 
       - name: Create GitHub Release
-        uses: softprops/action-gh-release@v2 # TODO: pin to SHA
+        uses: softprops/action-gh-release@3bb12739c298aeb8a4eeaf626c5b8d85266b0e65 # v2
         with:
           tag_name: ${{ steps.version.outputs.tag }}
           name: rsac ${{ steps.version.outputs.version }}

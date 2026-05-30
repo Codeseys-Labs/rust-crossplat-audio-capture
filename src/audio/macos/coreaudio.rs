@@ -14,7 +14,7 @@
 
 // ── New API imports ──────────────────────────────────────────────────────
 use crate::core::config::{AudioFormat, DeviceId, SampleFormat, StreamConfig};
-use crate::core::error::{AudioError, AudioResult};
+use crate::core::error::{AudioError, AudioResult, BackendContext};
 use crate::core::interface::{AudioDevice, CapturingStream, DeviceEnumerator};
 
 // ── Bridge imports ───────────────────────────────────────────────────────
@@ -326,7 +326,13 @@ pub(crate) fn map_ca_error(err: CAError) -> AudioError {
         backend: "CoreAudio".into(),
         operation: category.to_string(),
         message: format!("CoreAudio error ({}): OSStatus {}", category, os_status),
-        context: None,
+        // M6: surface the raw OSStatus so callers can match on it machine-readably.
+        // OSStatus is an i32; sign-extend to i64 for the BackendContext field.
+        context: Some(BackendContext {
+            backend_name: "CoreAudio".into(),
+            os_error_code: Some(os_status as i64),
+            os_error_message: Some(format!("OSStatus {} ({})", os_status, category)),
+        }),
     }
 }
 
@@ -687,6 +693,33 @@ mod tests {
             "Expected BackendError, got: {:?}",
             err
         );
+    }
+
+    #[test]
+    fn map_ca_error_populates_os_error_code() {
+        // M6: BackendError should carry the raw OSStatus in os_error_code so it's
+        // machine-readable, not just embedded in the human-readable message.
+        let err = map_ca_error(CAError::Unknown(-50));
+        match err {
+            AudioError::BackendError {
+                context: Some(ctx), ..
+            } => {
+                assert_eq!(ctx.backend_name, "CoreAudio");
+                assert_eq!(
+                    ctx.os_error_code,
+                    Some(-50i64),
+                    "OSStatus should be sign-extended into os_error_code"
+                );
+                assert!(
+                    ctx.os_error_message.is_some(),
+                    "os_error_message should be populated"
+                );
+            }
+            other => panic!(
+                "Expected BackendError with populated context, got: {:?}",
+                other
+            ),
+        }
     }
 
     // ── Device construction tests (require audio hardware) ───────────

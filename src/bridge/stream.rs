@@ -89,7 +89,10 @@ pub(crate) struct BridgeStream<S: PlatformStream> {
     consumer: Mutex<BridgeConsumer>,
     /// Shared state (lifecycle + diagnostics) — cloned from the consumer's Arc.
     shared: Arc<BridgeShared>,
-    /// Audio format of data flowing through this stream.
+    /// Audio format **requested** when the stream was created. Used only as the
+    /// fallback for [`format`](CapturingStream::format) until a backend records
+    /// the authoritative delivery format on the shared state (M1). The shared
+    /// negotiated format is the source of truth; this field is the seed value.
     format: AudioFormat,
     /// Platform-specific stream handle, protected by Mutex for &self access.
     platform_stream: Mutex<S>,
@@ -253,7 +256,12 @@ impl<S: PlatformStream + Sync + 'static> CapturingStream for BridgeStream<S> {
     }
 
     fn format(&self) -> AudioFormat {
-        self.format.clone()
+        // M1: surface the *delivery* format, not just the requested one. If a
+        // backend has called `BridgeProducer::set_negotiated_format`, that
+        // authoritative format is returned; otherwise this falls back to the
+        // requested format the stream was constructed with (which is also the
+        // seed value stored in shared state).
+        self.shared.negotiated_format()
     }
 
     fn is_running(&self) -> bool {
@@ -455,6 +463,39 @@ mod tests {
             matches!(try_result.unwrap_err(), AudioError::StreamEnded { .. }),
             "try_read_chunk after stop must also be StreamEnded"
         );
+    }
+
+    // M1: format() reflects the negotiated *delivery* format once a backend
+    // records it via the producer, not just the requested format.
+    #[test]
+    fn test_format_reflects_negotiated_delivery_format() {
+        let requested = AudioFormat::default(); // 48k/2ch/F32
+        let (producer, consumer) = create_bridge(8, requested.clone());
+        consumer
+            .shared()
+            .state
+            .transition(StreamState::Created, StreamState::Running)
+            .unwrap();
+        let stream = BridgeStream::new(
+            consumer,
+            MockPlatformStream::new(),
+            requested.clone(),
+            Duration::from_secs(1),
+        );
+
+        // Before negotiation, format() == requested.
+        assert_eq!(stream.format(), requested);
+
+        // Backend negotiates a different delivery format.
+        let delivered = AudioFormat {
+            sample_rate: 44100,
+            channels: 1,
+            sample_format: crate::core::config::SampleFormat::I16,
+        };
+        producer.set_negotiated_format(&delivered);
+
+        // Now format() must report what is actually delivered.
+        assert_eq!(stream.format(), delivered);
     }
 
     // 8. Verify format() returns correct AudioFormat

@@ -1,5 +1,22 @@
 # API Documentation
 
+> ⚠️ **HISTORICAL / OBSOLETE — DOES NOT DESCRIBE THE CURRENT API.**
+> Every type, trait, and signature below predates the current architecture and
+> describes an API that **was never shipped** (`AudioCapture` as a trait,
+> `WasapiCapture`, `AsyncAudioCapture`, the `audio_capture::` crate name, a
+> `thiserror`-derived `AudioError` with `DeviceInitError` / `CaptureError` /
+> `ConfigError` variants — none of these exist). **The code is the source of
+> truth.** For the real, current API use:
+> - The crate rustdoc (`cargo doc --open`) / [docs.rs/rsac](https://docs.rs/rsac).
+> - [`docs/ARCHITECTURE.md`](ARCHITECTURE.md) for the layering and data flow.
+> - [`README.md`](../README.md) for a working quick-start
+>   (`AudioCaptureBuilder → AudioCapture → read_buffer()`).
+> - [`src/core/error.rs`](../src/core/error.rs) for the real `AudioError`
+>   (22 manual-`Display` variants, not `Clone`, 7 `ErrorKind` categories).
+>
+> This file is kept only as a historical artifact and will be removed in a
+> future cleanup.
+
 ## Core Types and Traits
 
 ### AudioCapture Trait

@@ -773,6 +773,17 @@ impl AudioCapture {
     ///
     /// Multiple subscriptions are allowed but each subscriber competes for buffers.
     ///
+    /// # Latency floor (audit L5)
+    ///
+    /// The background thread polls with a 1 ms sleep when the ring buffer is
+    /// momentarily empty (rather than parking on the async waker), so delivery
+    /// of the *first* buffer after an idle period can be delayed by up to ~1 ms.
+    /// For most capture workloads (10–20 ms callback periods) this is negligible,
+    /// but latency-critical consumers should read via
+    /// [`read_buffer_blocking()`](Self::read_buffer_blocking) or the async stream
+    /// API (`feature = "async-stream"`), which is waker-driven and has no fixed
+    /// poll-interval floor.
+    ///
     /// # Errors
     ///
     /// Returns an error if the capture is not currently running.
@@ -1449,7 +1460,10 @@ mod tests {
             std::thread::sleep(std::time::Duration::from_millis(20));
             mock2.signal_stop();
         });
-        assert!(it.next().is_none(), "iterator must end once the stream stops");
+        assert!(
+            it.next().is_none(),
+            "iterator must end once the stream stops"
+        );
         stopper.join().unwrap();
     }
 
@@ -1566,7 +1580,10 @@ mod tests {
         let mock = Arc::new(MockCapturingStream::new()); // starts running
         let mut capture = make_mock_capture(mock);
         assert!(capture.start().is_ok());
-        assert!(capture.start().is_ok(), "second start() on running stream is Ok");
+        assert!(
+            capture.start().is_ok(),
+            "second start() on running stream is Ok"
+        );
     }
 
     /// The pump thread exits when the stream stops (try_read_chunk → Err), and
@@ -1612,7 +1629,11 @@ mod tests {
         while count.load(Ordering::SeqCst) < 3 && std::time::Instant::now() < deadline {
             std::thread::sleep(std::time::Duration::from_millis(2));
         }
-        assert_eq!(count.load(Ordering::SeqCst), 3, "all three buffers delivered");
+        assert_eq!(
+            count.load(Ordering::SeqCst),
+            3,
+            "all three buffers delivered"
+        );
         pump.shutdown();
         mock.signal_stop();
     }

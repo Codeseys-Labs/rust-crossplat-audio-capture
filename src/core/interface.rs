@@ -77,10 +77,14 @@ pub trait AudioDevice: Send + Sync {
 /// # Example
 ///
 /// ```rust,ignore
-/// // Blocking read loop
-/// while stream.is_running() {
-///     let buffer = stream.read_chunk()?;
-///     process_audio(&buffer);
+/// // Blocking read loop. read_chunk() returns AudioError::StreamEnded (Fatal)
+/// // once the stream is terminal, so break on a fatal error.
+/// loop {
+///     match stream.read_chunk() {
+///         Ok(buffer) => process_audio(&buffer),
+///         Err(e) if e.is_fatal() => break, // StreamEnded: producer is done
+///         Err(_) => continue,              // transient read hiccup; retry
+///     }
 /// }
 /// stream.stop()?;
 /// ```
@@ -94,8 +98,25 @@ pub trait CapturingStream: Send + Sync {
     /// # Returns
     ///
     /// * `Ok(buffer)` — Audio data is available.
-    /// * `Err(AudioError::StreamClosed)` — Stream was closed.
-    /// * `Err(AudioError::BufferOverrun { .. })` — Data was lost due to slow consumption.
+    /// * `Err(`[`AudioError::StreamEnded`](crate::core::error::AudioError::StreamEnded)`)`
+    ///   — The stream has reached a terminal state (`Stopped` / `Closed` / `Error`)
+    ///   and will produce no more data. This is **fatal** for the read loop
+    ///   (`is_fatal() == true`); break out of it. As of
+    ///   [ADR-0003](https://github.com/Codeseys-Labs/rust-crossplat-audio-capture/blob/master/docs/designs/0003-terminal-stream-error.md)
+    ///   this — not [`StreamReadError`](crate::core::error::AudioError::StreamReadError)
+    ///   — is the clean end-of-stream signal.
+    /// * `Err(`[`AudioError::StreamReadError`](crate::core::error::AudioError::StreamReadError)`)`
+    ///   — A genuinely transient read failure (recoverable; retrying may succeed).
+    ///
+    /// # Dropped buffers
+    ///
+    /// Ring-buffer overflow does **not** surface as an error from this method.
+    /// When the consumer cannot keep up, the producer drops buffers and bumps the
+    /// [`overrun_count()`](Self::overrun_count) counter; poll that counter (or
+    /// [`is_under_backpressure()`](Self::is_under_backpressure)) to detect loss.
+    /// (The [`BufferOverrun`](crate::core::error::AudioError::BufferOverrun) and
+    /// [`BufferUnderrun`](crate::core::error::AudioError::BufferUnderrun) variants
+    /// exist in the taxonomy but are not constructed by the production read path.)
     fn read_chunk(&self) -> AudioResult<AudioBuffer>;
 
     /// Attempts to read audio data without blocking.

@@ -3,7 +3,7 @@
 #![cfg(target_os = "windows")]
 
 use crate::core::config::{AudioFormat, StreamConfig};
-use crate::core::error::{AudioError, Result as AudioResult};
+use crate::core::error::{AudioError, BackendContext, Result as AudioResult};
 use crate::core::interface::{AudioDevice, CapturingStream, DeviceEnumerator, DeviceKind};
 
 use std::ffi::OsStr;
@@ -33,8 +33,60 @@ const E_NOTFOUND: windows::core::HRESULT = windows::core::HRESULT(-2147024894i32
 const RPC_E_CHANGED_MODE: windows::core::HRESULT = windows::core::HRESULT(-2147417850i32); // 0x80010106
 const VT_LPWSTR: u16 = 31;
 
+/// Build a [`BackendContext`] carrying the WASAPI `HRESULT` as the structured
+/// `os_error_code` (M6).
+///
+/// The `HRESULT.0` is an `i32`; we widen to `i64` for `os_error_code`. The raw
+/// (signed) value is preserved so the high error bit is not lost — callers
+/// reading the code back can reinterpret as `u32` / `0x{:08X}` if they want the
+/// conventional hex `HRESULT` rendering. The human-readable message from the
+/// `windows` crate is attached when available.
+fn wasapi_backend_context(hr: windows::core::HRESULT) -> BackendContext {
+    BackendContext {
+        backend_name: "WASAPI".to_string(),
+        os_error_code: Some(hr.0 as i64),
+        // `HRESULT::message()` already returns an owned `String`.
+        os_error_message: Some(hr.message()),
+    }
+}
+
+/// Build a [`BackendContext`] from a [`windows::core::Error`] (M6).
+///
+/// COM wrapper calls (e.g. `IMMDevice::GetId`) return `windows::core::Result`,
+/// whose error carries an `HRESULT` via [`windows::core::Error::code`]. This
+/// extracts that code into the structured `os_error_code` alongside the error's
+/// message, so failures from the `windows` crate's typed wrappers get the same
+/// structured context as the raw-`HRESULT` sites.
+fn wasapi_backend_context_err(err: &windows::core::Error) -> BackendContext {
+    BackendContext {
+        backend_name: "WASAPI".to_string(),
+        os_error_code: Some(err.code().0 as i64),
+        // `windows::core::Error::message()` already returns an owned `String`.
+        os_error_message: Some(err.message()),
+    }
+}
+
 /// Windows-specific application capture using wasapi-rs library
 /// Based on wasapi-rs examples/record_application.rs for simplicity and reliability
+///
+/// # Legacy / RT-safety warning (audit L13)
+///
+/// This type predates the canonical capture pipeline and duplicates the WASAPI
+/// loopback logic that now lives in
+/// [`WindowsCaptureThread`](super::thread::WindowsCaptureThread). More
+/// importantly, its [`start_capture`](Self::start_capture) /
+/// [`start_capture_with_stop_flag`](Self::start_capture_with_stop_flag) methods
+/// invoke a **user-supplied callback directly on the WASAPI capture thread**.
+/// Any allocation, lock, or blocking call inside that callback runs on the
+/// real-time audio thread and can cause glitches/xruns — exactly the footgun
+/// the `BridgeProducer`/`BridgeStream` data plane exists to prevent.
+///
+/// Prefer the canonical path: build an `AudioCapture` targeting an application
+/// (`CaptureTarget::Application` / `ProcessTree`) and read via the
+/// [`CapturingStream`] API, which delivers buffers on a non-real-time consumer
+/// thread. The static helpers ([`find_process_by_name`](Self::find_process_by_name),
+/// [`list_audio_processes`](Self::list_audio_processes)) remain useful for
+/// process discovery and are not deprecated.
 pub struct WindowsApplicationCapture {
     process_id: u32,
     include_tree: bool,
@@ -113,9 +165,20 @@ impl WindowsApplicationCapture {
 
     /// Start capturing audio from the target process using wasapi-rs
     ///
+    /// # Deprecated — RT-unsafe (audit L13)
+    ///
+    /// `callback` is invoked **on the WASAPI capture (real-time) thread**. Doing
+    /// any allocation/lock/blocking work there risks audio glitches. Use the
+    /// canonical `AudioCapture` + [`CapturingStream`] path instead, which
+    /// delivers audio on a non-real-time consumer thread via the bridge ring
+    /// buffer. See the type-level docs on [`WindowsApplicationCapture`].
+    ///
     /// # Implementation Notes
     /// - Uses wasapi-rs for simplified audio capture
     /// - Based on wasapi-rs examples for reliability
+    #[deprecated(
+        note = "RT-unsafe: invokes the callback on the capture thread. Use AudioCapture + CapturingStream (BridgeStream) instead. See L13."
+    )]
     pub fn start_capture<F>(
         &mut self,
         callback: F,
@@ -123,10 +186,21 @@ impl WindowsApplicationCapture {
     where
         F: Fn(&[f32]) + Send + 'static,
     {
+        // Internal delegation to the (also deprecated) stop-flag variant.
+        #[allow(deprecated)]
         self.start_capture_with_stop_flag(callback, None)
     }
 
-    /// Start capturing audio with an external stop flag
+    /// Start capturing audio with an external stop flag.
+    ///
+    /// # Deprecated — RT-unsafe (audit L13)
+    ///
+    /// As with [`start_capture`](Self::start_capture), `callback` runs on the
+    /// real-time WASAPI capture thread. Prefer the canonical `AudioCapture` +
+    /// [`CapturingStream`] pipeline. See the type-level docs.
+    #[deprecated(
+        note = "RT-unsafe: invokes the callback on the capture thread. Use AudioCapture + CapturingStream (BridgeStream) instead. See L13."
+    )]
     pub fn start_capture_with_stop_flag<F>(
         &mut self,
         callback: F,
@@ -351,14 +425,14 @@ impl ComInitializer {
                     "Already initialized with a different concurrency model (HRESULT: {:?})",
                     hr
                 ),
-                context: None,
+                context: Some(wasapi_backend_context(hr)),
             })
         } else {
             Err(AudioError::BackendError {
                 backend: "wasapi".to_string(),
                 operation: "com_init".to_string(),
                 message: format!("COM initialization failed (HRESULT: {:?})", hr),
-                context: None,
+                context: Some(wasapi_backend_context(hr)),
             })
         }
     }
@@ -538,7 +612,7 @@ impl WindowsAudioDevice {
                 backend: "wasapi".to_string(),
                 operation: "query_supported_formats".to_string(),
                 message: format!("Failed to get device ID (HRESULT: {:?})", hr),
-                context: None,
+                context: Some(wasapi_backend_context_err(&hr)),
             })?;
             let device_id = if !id_pwstr.is_null() {
                 let id = Self::pwstr_to_string(id_pwstr).unwrap_or_default();
@@ -639,7 +713,7 @@ impl WindowsAudioDevice {
                         backend: "wasapi".to_string(),
                         operation: "get_device_name".to_string(),
                         message: format!("IMMDevice::OpenPropertyStore failed (HRESULT: {:?})", hr),
-                        context: None,
+                        context: Some(wasapi_backend_context_err(&hr)),
                     }
                 })?;
 
@@ -652,7 +726,7 @@ impl WindowsAudioDevice {
                         "IPropertyStore::GetValue for PKEY_Device_FriendlyName failed (HRESULT: {:?})",
                         hr
                     ),
-                    context: None,
+                    context: Some(wasapi_backend_context_err(&hr)),
                 })?;
 
             let name = if prop_variant.vt() == windows::Win32::System::Variant::VARENUM(VT_LPWSTR) {
@@ -679,7 +753,7 @@ impl WindowsAudioDevice {
                 "Failed to cast IMMDevice to IMMEndpoint (HRESULT: {:?})",
                 hr
             ),
-            context: None,
+            context: Some(wasapi_backend_context_err(&hr)),
         })?;
 
         unsafe {
@@ -689,7 +763,7 @@ impl WindowsAudioDevice {
                     backend: "wasapi".to_string(),
                     operation: "get_device_kind".to_string(),
                     message: format!("IMMEndpoint::GetDataFlow failed (HRESULT: {:?})", hr),
-                    context: None,
+                    context: Some(wasapi_backend_context_err(&hr)),
                 })?;
 
             // EDataFlow is a newtype struct (e.g. EDataFlow(0)), not a Rust enum.
@@ -734,7 +808,7 @@ impl WindowsDeviceEnumerator {
             backend: "wasapi".to_string(),
             operation: "create_device_enumerator".to_string(),
             message: format!("Failed to create IMMDeviceEnumerator (HRESULT: {:?})", hr),
-            context: None,
+            context: Some(wasapi_backend_context_err(&hr)),
         })?;
 
         Ok(Self {
@@ -762,7 +836,7 @@ impl DeviceEnumerator for WindowsDeviceEnumerator {
         }
         .map_err(|hr| AudioError::DeviceEnumerationError {
             reason: format!("Failed to enumerate audio endpoints (HRESULT: {:?})", hr),
-            context: None,
+            context: Some(wasapi_backend_context_err(&hr)),
         })?;
 
         // SAFETY: Calling GetCount on a valid IMMDeviceCollection.
@@ -772,7 +846,7 @@ impl DeviceEnumerator for WindowsDeviceEnumerator {
                     "Failed to get device count from collection (HRESULT: {:?})",
                     hr
                 ),
-                context: None,
+                context: Some(wasapi_backend_context_err(&hr)),
             })?;
 
         let mut devices: Vec<Box<dyn AudioDevice>> = Vec::with_capacity(count as usize);
@@ -784,7 +858,7 @@ impl DeviceEnumerator for WindowsDeviceEnumerator {
                         "Failed to get device item {} from collection (HRESULT: {:?})",
                         i, hr
                     ),
-                    context: None,
+                    context: Some(wasapi_backend_context_err(&hr)),
                 })?;
             devices.push(Box::new(WindowsAudioDevice::new(
                 imm_device,
@@ -809,7 +883,7 @@ impl DeviceEnumerator for WindowsDeviceEnumerator {
             }),
             Err(hr) => Err(AudioError::DeviceEnumerationError {
                 reason: format!("Failed to get default audio endpoint (HRESULT: {:?})", hr),
-                context: None,
+                context: Some(wasapi_backend_context_err(&hr)),
             }),
         }
     }
@@ -1003,7 +1077,7 @@ pub fn enumerate_application_audio_sessions() -> AudioResult<Vec<ApplicationAudi
                         "CoCreateInstance(MMDeviceEnumerator) failed (HRESULT: {:?})",
                         hr
                     ),
-                    context: None,
+                    context: Some(wasapi_backend_context_err(&hr)),
                 }
             })?;
 
@@ -1019,7 +1093,7 @@ pub fn enumerate_application_audio_sessions() -> AudioResult<Vec<ApplicationAudi
                         backend: "wasapi".to_string(),
                         operation: "enumerate_audio_sessions".to_string(),
                         message: format!("GetDefaultAudioEndpoint failed (HRESULT: {:?})", hr),
-                        context: None,
+                        context: Some(wasapi_backend_context_err(&hr)),
                     }
                 }
             })?;
@@ -1033,7 +1107,7 @@ pub fn enumerate_application_audio_sessions() -> AudioResult<Vec<ApplicationAudi
                     "IMMDevice::Activate(IAudioSessionManager2) failed (HRESULT: {:?})",
                     hr
                 ),
-                context: None,
+                context: Some(wasapi_backend_context_err(&hr)),
             })?;
 
         let session_enumerator: IAudioSessionEnumerator = session_manager
@@ -1045,7 +1119,7 @@ pub fn enumerate_application_audio_sessions() -> AudioResult<Vec<ApplicationAudi
                     "IAudioSessionManager2::GetSessionEnumerator failed (HRESULT: {:?})",
                     hr
                 ),
-                context: None,
+                context: Some(wasapi_backend_context_err(&hr)),
             })?;
 
         let count = session_enumerator
@@ -1057,7 +1131,7 @@ pub fn enumerate_application_audio_sessions() -> AudioResult<Vec<ApplicationAudi
                     "IAudioSessionEnumerator::GetCount failed (HRESULT: {:?})",
                     hr
                 ),
-                context: None,
+                context: Some(wasapi_backend_context_err(&hr)),
             })?;
 
         for i in 0..count {
@@ -1217,6 +1291,31 @@ mod tests {
     use super::*;
     use crate::core::config::StreamConfig;
     use crate::core::interface::DeviceEnumerator;
+
+    // ── M6: BackendContext os_error_code population ──────────────────
+
+    /// `wasapi_backend_context` carries the raw HRESULT as `os_error_code`.
+    #[test]
+    fn test_wasapi_backend_context_carries_hresult() {
+        // E_NOTFOUND = 0x80070002, which as i32 is negative.
+        let ctx = wasapi_backend_context(E_NOTFOUND);
+        assert_eq!(ctx.backend_name, "WASAPI");
+        assert_eq!(ctx.os_error_code, Some(E_NOTFOUND.0 as i64));
+        assert!(
+            ctx.os_error_message.is_some(),
+            "should attach an OS error message"
+        );
+    }
+
+    /// `wasapi_backend_context_err` extracts the HRESULT from a
+    /// `windows::core::Error` into `os_error_code`.
+    #[test]
+    fn test_wasapi_backend_context_err_carries_code() {
+        let err = windows::core::Error::from(RPC_E_CHANGED_MODE);
+        let ctx = wasapi_backend_context_err(&err);
+        assert_eq!(ctx.backend_name, "WASAPI");
+        assert_eq!(ctx.os_error_code, Some(RPC_E_CHANGED_MODE.0 as i64));
+    }
 
     // ── ComInitializer Tests ─────────────────────────────────────────
 

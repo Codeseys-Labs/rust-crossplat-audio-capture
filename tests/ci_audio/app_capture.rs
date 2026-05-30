@@ -253,17 +253,48 @@ fn test_app_capture_by_pipewire_node_id() {
 fn test_app_capture_nonexistent_target() {
     require_app_capture!();
 
+    // A node ID / PID string that cannot correspond to any real audio source.
+    let bogus_id = "99999999";
     let result = AudioCaptureBuilder::new()
         .with_target(CaptureTarget::Application(ApplicationId(
-            "99999999".to_string(),
+            bogus_id.to_string(),
         )))
         .sample_rate(48000)
         .channels(2)
         .build();
 
-    // We accept either build error or successful build with no audio
+    // Three legitimate outcomes, each with a SPECIFIC contract:
+    //   1. build() errors → must be an application/backend rejection variant,
+    //      NOT some unrelated error (e.g. InvalidParameter would mean the
+    //      builder mis-validated a perfectly valid sample rate/channels).
+    //   2. start() errors → same application/backend rejection variants
+    //      (macOS parses the id as a PID and CoreAudioProcessTap::new fails).
+    //   3. start() succeeds but yields silence → the PipeWire path, where a
+    //      bogus TARGET_OBJECT routes no audio (asserted below).
+    //
+    // `is_expected_rejection` pins which variants count as a clean rejection
+    // so an unrelated error type fails the test instead of passing silently.
+    fn is_expected_rejection(e: &rsac::AudioError) -> bool {
+        use rsac::AudioError::*;
+        matches!(
+            e,
+            ApplicationNotFound { .. }
+                | ApplicationCaptureFailed { .. }
+                | BackendError { .. }
+                | BackendInitializationFailed { .. }
+                | StreamCreationFailed { .. }
+                | StreamStartFailed { .. }
+                | InternalError { .. }
+        )
+    }
+
     match result {
         Err(e) => {
+            assert!(
+                is_expected_rejection(&e),
+                "build() rejected nonexistent app '{bogus_id}' with an unexpected \
+                 error variant (expected an Application*/Backend*/Stream* rejection): {e:?}"
+            );
             eprintln!(
                 "[ci_audio] ✅ Build correctly rejected nonexistent app ID: {:?}",
                 e
@@ -274,6 +305,11 @@ fn test_app_capture_nonexistent_target() {
             // just means no audio routes to us
             match capture.start() {
                 Err(e) => {
+                    assert!(
+                        is_expected_rejection(&e),
+                        "start() rejected nonexistent app '{bogus_id}' with an \
+                         unexpected error variant: {e:?}"
+                    );
                     eprintln!(
                         "[ci_audio] ✅ Start correctly rejected nonexistent app: {:?}",
                         e

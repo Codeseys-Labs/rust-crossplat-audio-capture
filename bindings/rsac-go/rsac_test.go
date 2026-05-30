@@ -3,6 +3,7 @@ package rsac
 import (
 	"context"
 	"errors"
+	"runtime/cgo"
 	"testing"
 	"time"
 )
@@ -15,19 +16,55 @@ func TestErrorCode_String(t *testing.T) {
 		want string
 	}{
 		{ErrOK, "OK"},
+		{ErrNullPointer, "NullPointer"},
 		{ErrInvalidParameter, "InvalidParameter"},
 		{ErrDeviceNotFound, "DeviceNotFound"},
+		{ErrStreamFailed, "StreamFailed"},
 		{ErrStreamRead, "StreamRead"},
+		{ErrConfiguration, "Configuration"},
 		{ErrAppNotFound, "AppNotFound"},
+		{ErrBackend, "Backend"},
 		{ErrPlatformNotSupported, "PlatformNotSupported"},
 		{ErrPermissionDenied, "PermissionDenied"},
 		{ErrInternal, "Internal"},
 		{ErrTimeout, "Timeout"},
+		{ErrPanic, "Panic"},
 		{ErrorCode(9999), "Unknown(9999)"},
 	}
 	for _, tt := range tests {
 		if got := tt.code.String(); got != tt.want {
 			t.Errorf("ErrorCode(%d).String() = %q, want %q", int(tt.code), got, tt.want)
+		}
+	}
+}
+
+// TestErrorCode_Discriminants pins the numeric values of every error code to
+// the rsac_error_t discriminants in bindings/rsac-ffi/src/lib.rs. These MUST
+// match the Rust enum exactly — a mismatch silently mislabels every error that
+// crosses the FFI boundary. (Audit finding C1.)
+func TestErrorCode_Discriminants(t *testing.T) {
+	tests := []struct {
+		code ErrorCode
+		want int
+	}{
+		{ErrOK, 0},
+		{ErrNullPointer, 1},
+		{ErrInvalidParameter, 2},
+		{ErrDeviceNotFound, 3},
+		{ErrPlatformNotSupported, 4},
+		{ErrStreamFailed, 5},
+		{ErrStreamRead, 6},
+		{ErrConfiguration, 7},
+		{ErrAppNotFound, 8},
+		{ErrBackend, 9},
+		{ErrPermissionDenied, 10},
+		{ErrTimeout, 11},
+		{ErrInternal, 12},
+		{ErrPanic, 99},
+	}
+	for _, tt := range tests {
+		if int(tt.code) != tt.want {
+			t.Errorf("ErrorCode discriminant = %d, want %d (%s)", int(tt.code), tt.want, tt.code)
 		}
 	}
 }
@@ -196,9 +233,6 @@ func TestCaptureBuilder_Defaults(t *testing.T) {
 	if b.channels != 2 {
 		t.Errorf("default channels = %d, want 2", b.channels)
 	}
-	if b.bufferSize != 0 {
-		t.Errorf("default bufferSize = %d, want 0", b.bufferSize)
-	}
 	if b.target.kind != targetSystemDefault {
 		t.Errorf("default target.kind = %v, want %v", b.target.kind, targetSystemDefault)
 	}
@@ -208,8 +242,7 @@ func TestCaptureBuilder_FluentAPI(t *testing.T) {
 	b := NewCaptureBuilder().
 		WithApplicationByName("Chrome").
 		SampleRate(44100).
-		Channels(1).
-		BufferSize(1024)
+		Channels(1)
 
 	if b.target.kind != targetApplicationByName {
 		t.Error("target kind should be applicationByName")
@@ -222,9 +255,6 @@ func TestCaptureBuilder_FluentAPI(t *testing.T) {
 	}
 	if b.channels != 1 {
 		t.Errorf("channels = %d, want 1", b.channels)
-	}
-	if b.bufferSize != 1024 {
-		t.Errorf("bufferSize = %d, want 1024", b.bufferSize)
 	}
 }
 
@@ -320,20 +350,25 @@ func TestStream_ContextCancellation(t *testing.T) {
 	}
 }
 
-// ── Callback Registry Tests (pure Go) ───────────────────────────────────
+// ── Callback Handle Bridge Tests ─────────────────────────────────────────
 
-func TestCallbackRegistry_RegisterAndLookup(t *testing.T) {
+// The FFI callback closure is bridged across the C boundary via a
+// runtime/cgo.Handle stored as the void* user_data. These tests cover the
+// handle round-trip and the per-handle isolation that the SetCallback /
+// goAudioCallback pair relies on.
+
+func TestCallbackHandle_RoundTrip(t *testing.T) {
 	called := false
 	fn := func(buf AudioBuffer) {
 		called = true
 	}
 
-	id := registerCallback(fn)
-	defer unregisterCallback(id)
+	h := cgo.NewHandle(fn)
+	defer h.Delete()
 
-	got, ok := lookupCallback(id)
+	got, ok := h.Value().(func(AudioBuffer))
 	if !ok {
-		t.Fatal("lookupCallback should find registered callback")
+		t.Fatal("handle value should resolve to func(AudioBuffer)")
 	}
 	got(AudioBuffer{})
 	if !called {
@@ -341,27 +376,20 @@ func TestCallbackRegistry_RegisterAndLookup(t *testing.T) {
 	}
 }
 
-func TestCallbackRegistry_UnregisterRemoves(t *testing.T) {
-	fn := func(buf AudioBuffer) {}
-	id := registerCallback(fn)
-	unregisterCallback(id)
-
-	_, ok := lookupCallback(id)
-	if ok {
-		t.Error("lookupCallback should not find unregistered callback")
-	}
-}
-
-func TestCallbackRegistry_MultipleCallbacks(t *testing.T) {
+func TestCallbackHandle_MultipleHandles(t *testing.T) {
 	count1 := 0
 	count2 := 0
-	id1 := registerCallback(func(buf AudioBuffer) { count1++ })
-	id2 := registerCallback(func(buf AudioBuffer) { count2++ })
-	defer unregisterCallback(id1)
-	defer unregisterCallback(id2)
+	h1 := cgo.NewHandle(func(buf AudioBuffer) { count1++ })
+	h2 := cgo.NewHandle(func(buf AudioBuffer) { count2++ })
+	defer h1.Delete()
+	defer h2.Delete()
 
-	fn1, _ := lookupCallback(id1)
-	fn2, _ := lookupCallback(id2)
+	if h1 == h2 {
+		t.Fatal("distinct callbacks must get distinct handles")
+	}
+
+	fn1 := h1.Value().(func(AudioBuffer))
+	fn2 := h2.Value().(func(AudioBuffer))
 	fn1(AudioBuffer{})
 	fn2(AudioBuffer{})
 	fn1(AudioBuffer{})

@@ -21,6 +21,24 @@ use std::time::{Duration, Instant};
 
 use rsac::{AudioCaptureBuilder, AudioError, CaptureTarget};
 
+use crate::helpers;
+
+/// Setup-failure policy shared by the live-capture tests in this file.
+///
+/// Under a deterministic source (`RSAC_CI_AUDIO_DETERMINISTIC=1`, Linux null
+/// sink + 440 Hz tone) the backend is guaranteed present, so a build/start
+/// failure is a real regression and must HARD-FAIL. On non-deterministic
+/// hosts the same failure is tolerated CI flakiness and we soft-skip.
+fn fail_or_skip(label: &str, detail: &str) {
+    if helpers::deterministic_audio_env() {
+        panic!(
+            "deterministic source: {label} failed ({detail}) — capture must work \
+             under RSAC_CI_AUDIO_DETERMINISTIC=1"
+        );
+    }
+    eprintln!("[ci_audio] subscribe: {label} failed (non-deterministic host): {detail}; skipping");
+}
+
 /// End-to-end happy path: a real capture + subscribe() must deliver at
 /// least one `AudioBuffer` on the mpsc channel within a bounded timeout.
 ///
@@ -42,13 +60,13 @@ fn subscribe_delivers_buffers_from_live_capture() {
     {
         Ok(c) => c,
         Err(e) => {
-            eprintln!("[ci_audio] subscribe live: build failed: {:?}", e);
+            fail_or_skip("subscribe live build", &format!("{e:?}"));
             return;
         }
     };
 
     if let Err(e) = capture.start() {
-        eprintln!("[ci_audio] subscribe live: start failed: {:?}", e);
+        fail_or_skip("subscribe live start", &format!("{e:?}"));
         return;
     }
 
@@ -99,9 +117,17 @@ fn subscribe_delivers_buffers_from_live_capture() {
     let _ = capture.stop();
 
     if buffers_received == 0 {
+        // A deterministic source feeds the null sink a known tone, so the
+        // subscribe channel MUST deliver buffers — zero means the
+        // try_read_chunk → tx.send loop is broken end-to-end. Hard-fail.
+        assert!(
+            !helpers::deterministic_audio_env(),
+            "deterministic source: subscribe() delivered 0 buffers within 5s — \
+             the live capture → channel path is broken"
+        );
         eprintln!(
             "[ci_audio] ⚠ subscribe live: no buffers within 5s \
-             (CI limitation — backend may be idle)"
+             (non-deterministic host — backend may be idle)"
         );
     } else {
         eprintln!(
@@ -134,7 +160,7 @@ fn subscribe_errors_when_not_started() {
     {
         Ok(c) => c,
         Err(e) => {
-            eprintln!("[ci_audio] subscribe-not-started: build failed: {:?}", e);
+            fail_or_skip("subscribe-not-started build", &format!("{e:?}"));
             return;
         }
     };
@@ -178,13 +204,13 @@ fn subscribe_receiver_disconnects_after_stop() {
     {
         Ok(c) => c,
         Err(e) => {
-            eprintln!("[ci_audio] subscribe-after-stop: build failed: {:?}", e);
+            fail_or_skip("subscribe-after-stop build", &format!("{e:?}"));
             return;
         }
     };
 
     if let Err(e) = capture.start() {
-        eprintln!("[ci_audio] subscribe-after-stop: start failed: {:?}", e);
+        fail_or_skip("subscribe-after-stop start", &format!("{e:?}"));
         return;
     }
 
@@ -247,13 +273,13 @@ fn subscribe_allows_multiple_subscribers() {
     {
         Ok(c) => c,
         Err(e) => {
-            eprintln!("[ci_audio] multi-subscribe: build failed: {:?}", e);
+            fail_or_skip("multi-subscribe build", &format!("{e:?}"));
             return;
         }
     };
 
     if let Err(e) = capture.start() {
-        eprintln!("[ci_audio] multi-subscribe: start failed: {:?}", e);
+        fail_or_skip("multi-subscribe start", &format!("{e:?}"));
         return;
     }
 
@@ -278,10 +304,18 @@ fn subscribe_allows_multiple_subscribers() {
     let _ = capture.stop();
 
     if total == 0 {
+        // Both subscribe() calls succeeded (asserted above). Under a
+        // deterministic source at least one subscriber must also observe the
+        // tone, proving the second subscription didn't starve the pipeline.
+        assert!(
+            !helpers::deterministic_audio_env(),
+            "deterministic source: two competing subscribers received 0 combined \
+             buffers in 3s — the fan-out path is broken"
+        );
         eprintln!(
             "[ci_audio] ⚠ multi-subscribe: 0 combined buffers in 3s \
-             (CI may be silent). Both subscribe() calls succeeded — \
-             contract locked."
+             (non-deterministic host may be silent). Both subscribe() calls \
+             succeeded — contract locked."
         );
     } else {
         eprintln!(
@@ -314,13 +348,13 @@ fn subscribe_thread_exits_on_receiver_drop() {
     {
         Ok(c) => c,
         Err(e) => {
-            eprintln!("[ci_audio] subscribe-drop: build failed: {:?}", e);
+            fail_or_skip("subscribe-drop build", &format!("{e:?}"));
             return;
         }
     };
 
     if let Err(e) = capture.start() {
-        eprintln!("[ci_audio] subscribe-drop: start failed: {:?}", e);
+        fail_or_skip("subscribe-drop start", &format!("{e:?}"));
         return;
     }
 
@@ -346,7 +380,7 @@ fn subscribe_thread_exits_on_receiver_drop() {
     // empty is fine, disconnected would indicate the scaffolding broke.
     match rx2.try_recv() {
         Ok(_) | Err(mpsc::TryRecvError::Empty) => {
-            eprintln!("[ci_audio] ✅ subscribe-drop: stream healthy after receiver drop");
+            eprintln!("[ci_audio] subscribe-drop: fresh channel connected after receiver drop");
         }
         Err(mpsc::TryRecvError::Disconnected) => {
             let _ = capture.stop();
@@ -354,5 +388,36 @@ fn subscribe_thread_exits_on_receiver_drop() {
         }
     }
 
+    // Strengthen the "stream healthy" claim under a deterministic source: a
+    // not-disconnected channel proves the scaffolding survived, but only an
+    // actually-delivered buffer proves the new subscribe thread is reading
+    // live audio (i.e. the prior thread's exit didn't break the producer or
+    // leave a poisoned consumer). On non-deterministic hosts the stream may
+    // be silent, so we keep the connected-only check there.
+    if helpers::deterministic_audio_env() {
+        let deadline = Instant::now() + Duration::from_secs(5);
+        let mut delivered = false;
+        while Instant::now() < deadline {
+            match rx2.recv_timeout(Duration::from_millis(250)) {
+                Ok(_) => {
+                    delivered = true;
+                    break;
+                }
+                Err(mpsc::RecvTimeoutError::Timeout) => {}
+                Err(mpsc::RecvTimeoutError::Disconnected) => break,
+            }
+        }
+        let _ = capture.stop();
+        assert!(
+            delivered,
+            "deterministic source: fresh subscribe() after a receiver drop \
+             delivered no buffers within 5s — the prior thread's exit broke the \
+             live capture pipeline"
+        );
+        eprintln!("[ci_audio] ✅ subscribe-drop: fresh subscriber received live audio");
+        return;
+    }
+
+    eprintln!("[ci_audio] ✅ subscribe-drop: stream healthy after receiver drop");
     let _ = capture.stop();
 }

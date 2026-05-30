@@ -1,6 +1,18 @@
 # Architecture Overview — `rsac` (Rust Cross-Platform Audio Capture)
 
-> **Status:** Master Architecture Document — Subtask B4
+> ⚠️ **ASPIRATIONAL / HISTORICAL DESIGN — NOT THE SOURCE OF TRUTH.**
+> This master design document captures the original architecture plan. The
+> shipped code diverged from it in several spots, and **the code is the source of
+> truth.** For a user-facing, accurate overview see
+> [`docs/ARCHITECTURE.md`](../ARCHITECTURE.md); for what changed and why, see the
+> ADRs in [`docs/designs/`](../designs/). Notably: the streaming consumption
+> methods are `read_buffer()` / `subscribe()` / `audio_data_stream()` (not
+> `async_stream` / `pipe_to`); `AudioError` has **22** variants (this doc's "21
+> variants" predates ADR-0003's `StreamEnded`); and `ResolvedConfig` /
+> `AudioBufferRef` / `rsac::prelude` referenced in the dependent design docs do
+> not exist in the code.
+>
+> **Status:** Master Architecture Document — Subtask B4 (historical)
 > **Depends on:**
 > - [API_DESIGN.md](API_DESIGN.md) (B1) — Public API surface
 > - [ERROR_CAPABILITY_DESIGN.md](ERROR_CAPABILITY_DESIGN.md) (B2) — Error taxonomy & capability model
@@ -231,7 +243,7 @@ These variants are referenced in macOS backend code but never existed in the err
 
 | File | Type | Kind | Purpose |
 |---|---|---|---|
-| `core/error.rs` | `AudioError` | enum (21 variants) | Canonical error type with categorization |
+| `core/error.rs` | `AudioError` | enum (22 variants in the shipped code; "21" here is pre-ADR-0003) | Canonical error type with categorization |
 | `core/error.rs` | `ErrorKind` | enum | Category-level matching |
 | `core/error.rs` | `Recoverability` | enum | Recoverable / Fatal / UserError classification |
 | `core/error.rs` | `BackendContext` | struct | Structured OS error wrapping (operation + message + code) |

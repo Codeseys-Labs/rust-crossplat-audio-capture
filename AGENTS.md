@@ -25,14 +25,26 @@
 
 ## 2. Architecture Overview
 
-The architecture is documented in detail across four canonical documents, plus a comprehensive reference analysis:
+> **Source of truth = the code.** The documents under `docs/architecture/` are
+> early *design* documents (the `*_DESIGN.md` / `ARCHITECTURE_OVERVIEW.md` set).
+> The shipped implementation intentionally diverged from them in several places,
+> so they are **historical/aspirational, not canonical or guaranteed-matching**.
+> Each carries a banner listing its known divergences. When a design doc and the
+> code disagree, **the code wins** — read the rustdoc, the modules under
+> [`src/`](src/), and the ADRs in [`docs/designs/`](docs/designs/). For an
+> accurate user-facing overview see [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md).
+
+The architecture is described in detail across the original design documents,
+plus a comprehensive reference analysis:
 
 | Document | Purpose |
 |---|---|
-| [Architecture Overview](docs/architecture/ARCHITECTURE_OVERVIEW.md) | Master architecture overview |
-| [API Design](docs/architecture/API_DESIGN.md) | Canonical public API surface |
-| [Error & Capability Design](docs/architecture/ERROR_CAPABILITY_DESIGN.md) | Error taxonomy + platform capabilities |
-| [Backend Contract](docs/architecture/BACKEND_CONTRACT.md) | Internal backend traits + module architecture |
+| [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) | **Accurate** user-facing architecture overview (start here) |
+| [Architecture Overview](docs/architecture/ARCHITECTURE_OVERVIEW.md) | Master architecture *design* doc (historical) |
+| [API Design](docs/architecture/API_DESIGN.md) | Original public API *design* (historical — see banner) |
+| [Error & Capability Design](docs/architecture/ERROR_CAPABILITY_DESIGN.md) | Error taxonomy + platform capabilities *design* (historical) |
+| [Backend Contract](docs/architecture/BACKEND_CONTRACT.md) | Internal backend traits + module architecture (design) |
+| [ADRs](docs/designs/) | Architecture Decision Records (0001–0003) — accepted decisions |
 | [Reference Analysis](reference/REFERENCE_ANALYSIS.md) | Analysis of 10 reference repos mapped to rsac's architecture |
 | [Local Testing Guide](docs/LOCAL_TESTING_GUIDE.md) | How to test on physical macOS, Windows, and Linux machines |
 | [macOS Version Compatibility](docs/MACOS_VERSION_COMPATIBILITY.md) | macOS API compatibility matrix, version-specific fallbacks, known issues |
@@ -58,7 +70,7 @@ The architecture is documented in detail across four canonical documents, plus a
       ProcessTree(ProcessId),
   }
   ```
-- **Error model**: 21 categorized error variants with three-state recoverability (`Recoverable`, `TransientRetry`, `Fatal`). See [`src/core/error.rs`](src/core/error.rs).
+- **Error model**: 22 categorized error variants (across 7 `ErrorKind` categories) with three-state recoverability (`Recoverable`, `TransientRetry`, `Fatal`). The `recoverability()` match is exhaustive (no catch-all) so a new variant must be classified or the crate won't compile. See [`src/core/error.rs`](src/core/error.rs).
 - **Platform capabilities**: [`PlatformCapabilities`](src/core/capabilities.rs) struct for honest reporting of what each backend supports — never pretend a platform can do something it cannot. On macOS, capabilities are determined at runtime using [`get_macos_version()`](src/core/capabilities.rs:175) (sysctl-based, no subprocess) to detect Process Tap availability (requires macOS 14.4+).
 - **Sink adapters**: [`AudioSink`](src/sink/traits.rs) trait with three implementations:
   - [`NullSink`](src/sink/null.rs) — discards data (testing/benchmarking)
@@ -96,7 +108,7 @@ All three backends are wired through `BridgeStream<S>`:
 |---|---|---|---|
 | **Windows** | WASAPI | [`src/audio/windows/thread.rs`](src/audio/windows/thread.rs) | ✅ Wired via `WindowsPlatformStream` |
 | **Linux** | PipeWire | [`src/audio/linux/thread.rs`](src/audio/linux/thread.rs) | ✅ Wired via `LinuxPlatformStream` |
-| **macOS** | CoreAudio | [`src/audio/macos/thread.rs`](src/audio/macos/thread.rs) | ✅ Wired via `MacosPlatformStream` — tested on macOS 26 Tahoe (289 unit tests + 12 integration tests) |
+| **macOS** | CoreAudio | [`src/audio/macos/thread.rs`](src/audio/macos/thread.rs) | ✅ Wired via `MacosPlatformStream` — tested on macOS 26 Tahoe (full unit suite + integration tests) |
 
 ### Demo apps (Phase 4 — Done ✅)
 
@@ -146,7 +158,7 @@ src/
 │   ├── capabilities.rs     # PlatformCapabilities
 │   ├── config.rs           # CaptureTarget, StreamConfig, AudioFormat, SampleFormat,
 │   │                       #   DeviceId, ApplicationId, ProcessId newtypes
-│   ├── error.rs            # AudioError (21 variants), ErrorKind, Recoverability,
+│   ├── error.rs            # AudioError (22 variants), ErrorKind, Recoverability,
 │   │                       #   BackendContext
 │   ├── interface.rs        # CapturingStream, AudioDevice, DeviceEnumerator traits
 │   ├── introspection.rs    # Cross-platform source discovery, permission checks,
@@ -204,7 +216,7 @@ bindings/
 apps/
 └── audio-graph/            # Tauri v2 desktop app (submodule — Codeseys-Labs/audio-graph)
 docs/
-├── architecture/           # Canonical architecture documents (source of truth)
+├── architecture/           # Original architecture *design* docs (historical; code is source of truth)
 ├── OBJC2_MIGRATION_PLAN.md # objc2 migration plan (completed)
 ├── CROSS_LANGUAGE_BINDINGS.md # Cross-language binding research + design
 ├── LOCAL_TESTING_GUIDE.md
@@ -237,7 +249,7 @@ docker/                     # Docker-based cross-platform testing
 - All audio data standardized to **`f32`** internally
 - [`SampleFormat`](src/core/config.rs) enum: `I16`, `I24`, `I32`, `F32`
 - [`AudioFormat`](src/core/config.rs) struct: `sample_rate`, `channels`, `sample_format`
-- Error type: [`AudioError`](src/core/error.rs) (21 categorized variants)
+- Error type: [`AudioError`](src/core/error.rs) (22 categorized variants)
 - Result type: `AudioResult<T> = Result<T, AudioError>`
 
 ### Patterns
@@ -319,18 +331,27 @@ All three platforms are verified:
 
 | Platform | Verification | Test Results |
 |---|---|---|
-| **Linux** | ✅ CI (PipeWire) | 258 platform-independent unit tests pass |
+| **Linux** | ✅ CI (PipeWire) | Full platform-independent unit suite passes |
 | **Windows** | ✅ Real hardware | WASAPI capture tested with all capture modes |
-| **macOS** | ✅ Real hardware (macOS 26 Tahoe) | 289 unit tests + 12 integration tests pass |
+| **macOS** | ✅ Real hardware (macOS 26 Tahoe) | Full unit suite + integration tests pass |
 
-**Latest local test run (macOS 26.4):** 298 unit tests + 18 integration tests = **316 total, 0 failures**.
+The library unit suite is **300+ tests** (the exact count varies by platform and
+enabled features — e.g. the Windows `--lib` suite is larger than the
+platform-independent Linux subset, so don't pin a brittle exact number) plus the
+`ci_audio` integration suite (~40+ tests), all passing with 0 failures on the
+verified platforms.
 
 - Docker-based testing available for cross-platform validation (see `docker/`)
 - macOS backend includes compatibility with macOS 14.4–15 (Sonoma/Sequoia) and macOS 26 (Tahoe) via 3-path API fallback. See [macOS Version Compatibility](docs/MACOS_VERSION_COMPATIBILITY.md).
 
 ### Architecture alignment
 
-All implementation decisions must align with the canonical documents in `docs/architecture/`. If you believe a design doc needs updating, propose the change explicitly — do not silently diverge.
+The **code is the source of truth.** The documents in `docs/architecture/` are
+early design docs that the implementation has diverged from — treat them as
+historical context, not a spec to conform to. Durable design decisions are
+recorded as ADRs in [`docs/designs/`](docs/designs/); add a new ADR when you
+make one. If you spot a design doc that contradicts the code, fix the doc (or
+note the divergence in its banner) rather than changing the code to match it.
 
 ### Task management
 
@@ -357,7 +378,7 @@ all contributors and AI agents working in this repo.
 | Hold locks or allocate on real-time audio callback threads | Use lock-free ring buffers (`rtrb`) via `BridgeProducer`; use [`push_samples_or_drop()`](src/bridge/ring_buffer.rs:159) for alloc-free RT callbacks (free-list return ring) |
 | Add new `AudioError` variants without categorizing them | Every variant must have an `ErrorKind` and recoverability classification |
 | Bypass `BridgeStream<S>` for new backends | All backends must use `BridgeStream` + `PlatformStream` trait |
-| Silently diverge from architecture docs | Propose changes explicitly if the design needs updating |
+| Treat `docs/architecture/*_DESIGN.md` as the spec | They are historical design docs; the **code is the source of truth**. Record durable decisions as ADRs in `docs/designs/` |
 | Import from `src/audio/core.rs` | File was deleted in Phase 0 |
 | Add `Co-Authored-By:` trailers or tool bylines to commit messages | This repo requires plain commit messages — no co-author trailers, no "Generated with …" lines (see §6 Git commit conventions) |
 
@@ -396,7 +417,7 @@ all contributors and AI agents working in this repo.
 - ✅ Test helpers for app capture: `require_app_capture!()`, `spawn_audio_player_get_pid()`, `find_pipewire_node_for_pid()`
 - ✅ Platform-specific capability unit tests fixed for cross-platform CI (5 tests with `#[cfg]` guards + Windows/macOS variants)
 - ✅ **macOS fully tested on real hardware (macOS 26 Tahoe)**:
-  - 289 unit tests + 12 integration tests passing
+  - Full unit suite + integration tests passing
   - System capture, application capture, process tree capture all verified
   - macOS 26 compatibility: 3-path API fallback in [`create_process_tap_description()`](src/audio/macos/tap.rs:774)
     - Path 1: `initStereoMixdownOfProcesses:` with AudioObjectIDs (macOS 26+)
@@ -553,7 +574,7 @@ impl PlatformStream for MyPlatformStream {
 
 ## 11. For AI Agents Specifically
 
-1. **The architecture is implemented.** Phases 0–4 are complete. The four documents in `docs/architecture/` are the source of truth, and the code now *matches* them. Do not treat the codebase as "in transition" — the new API is the only API.
+1. **The architecture is implemented.** Phases 0–4 are complete. **The code is the source of truth** — the four design documents in `docs/architecture/` are historical and have known divergences from the shipped code (each has a banner; see §2). Do not treat the codebase as "in transition" — the new API is the only API. When in doubt, read the rustdoc and `src/`, not the design docs.
 2. **The old API is gone.** Do not reference `AudioCaptureBackend`, `AudioCaptureStream`, `get_audio_backend()`, `src/audio/core.rs`, or any of the 14 removed types. They do not exist.
 3. **All backends use `BridgeStream<S>`.** If adding a new backend, implement the `PlatformStream` trait and wrap with `BridgeStream`. Do not create a custom `CapturingStream` implementation.
 4. **Scope changes tightly.** Prefer small, focused changes that move one thing forward over sweeping refactors.

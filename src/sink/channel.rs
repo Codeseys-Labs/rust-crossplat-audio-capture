@@ -247,7 +247,9 @@ mod tests {
     fn bounded_channel_sink_delivers_within_capacity() {
         let (mut sink, rx) = ChannelSink::bounded(4);
         for i in 0..4 {
-            assert!(sink.write(&AudioBuffer::new(vec![i as f32], 1, 48000)).is_ok());
+            assert!(sink
+                .write(&AudioBuffer::new(vec![i as f32], 1, 48000))
+                .is_ok());
         }
         for i in 0..4 {
             assert_eq!(rx.try_recv().unwrap().data(), &[i as f32]);

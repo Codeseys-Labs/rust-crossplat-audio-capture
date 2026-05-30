@@ -23,6 +23,10 @@ LIB_DIR   := $(GO_DIR)/lib
 # Detect OS for platform-specific library names and linker flags.
 UNAME_S := $(shell uname -s)
 
+# cgo always links through the GNU toolchain (gcc/MinGW on Windows), which
+# consumes GNU-archive static libs — librsac_ffi.a — so that is the preferred
+# artifact on every platform. The Windows path also accepts rsac_ffi.lib as a
+# fallback for an MSVC-built staticlib, but cgo can only link the GNU .a.
 ifeq ($(UNAME_S),Darwin)
     STATIC_LIB := librsac_ffi.a
     # macOS needs frameworks for CoreAudio, Security, etc.
@@ -33,9 +37,12 @@ else ifeq ($(UNAME_S),Linux)
     STATIC_LIB := librsac_ffi.a
     EXTRA_LDFLAGS := -lpipewire-0.3 -lspa-0.2 -lpthread -ldl -lm
 else
-    # Windows (MSYS2/MinGW)
-    STATIC_LIB := rsac_ffi.lib
-    EXTRA_LDFLAGS := -lole32 -loleaut32 -lwinmm -lksuser -luuid
+    # Windows (MSYS2/MinGW). Build rsac-ffi for the *-pc-windows-gnu target so
+    # cargo emits librsac_ffi.a (GNU archive) that cgo's gcc can link.
+    STATIC_LIB := librsac_ffi.a
+    # WASAPI/COM libs plus the Win32 system libs the Rust std runtime pulls in.
+    EXTRA_LDFLAGS := -lole32 -loleaut32 -lwinmm -lksuser -luuid \
+                     -lbcrypt -lntdll -luserenv -lws2_32 -ladvapi32 -lkernel32
 endif
 
 # Rust target directory.
@@ -56,12 +63,16 @@ rust-ffi:
 	@echo "==> Building rsac-ffi static library..."
 	cd $(FFI_DIR) && cargo build --release
 	@mkdir -p $(LIB_DIR)
-	@if [ -f "$(CARGO_TARGET)/$(STATIC_LIB)" ]; then \
-		cp "$(CARGO_TARGET)/$(STATIC_LIB)" "$(LIB_DIR)/"; \
-		echo "==> Copied $(STATIC_LIB) to $(LIB_DIR)/"; \
+	@if [ -f "$(CARGO_TARGET)/librsac_ffi.a" ]; then \
+		cp "$(CARGO_TARGET)/librsac_ffi.a" "$(LIB_DIR)/librsac_ffi.a"; \
+		echo "==> Copied librsac_ffi.a to $(LIB_DIR)/"; \
+	elif [ -f "$(CARGO_TARGET)/rsac_ffi.lib" ]; then \
+		cp "$(CARGO_TARGET)/rsac_ffi.lib" "$(LIB_DIR)/librsac_ffi.a"; \
+		echo "==> Copied rsac_ffi.lib to $(LIB_DIR)/librsac_ffi.a (note: cgo links via the GNU toolchain; an MSVC .lib may not link — prefer the *-pc-windows-gnu target)"; \
 	else \
-		echo "ERROR: $(CARGO_TARGET)/$(STATIC_LIB) not found."; \
-		echo "       Make sure bindings/rsac-ffi/Cargo.toml has crate-type = [\"staticlib\"]"; \
+		echo "ERROR: neither librsac_ffi.a nor rsac_ffi.lib found in $(CARGO_TARGET)."; \
+		echo "       bindings/rsac-ffi/Cargo.toml must set crate-type to include \"staticlib\","; \
+		echo "       and on Windows you must build the *-pc-windows-gnu target for cgo."; \
 		exit 1; \
 	fi
 
@@ -79,10 +90,17 @@ test: rust-ffi
 	CGO_LDFLAGS="-L$(LIB_DIR) -lrsac_ffi $(EXTRA_LDFLAGS)" \
 	go test -v -count=1 ./...
 
-## test-pure: Run only pure Go tests (no CGo/FFI dependency).
-test-pure:
-	@echo "==> Running pure Go tests (no CGo)..."
-	go test -v -count=1 -run 'TestErrorCode|TestError_|TestCaptureTarget|TestAudioBuffer|TestCaptureBuilder|TestDeviceKind|TestStream_Context|TestCallback|TestStreamResult|TestErrClosed' ./...
+## test-pure: Run the Go-only logic tests (no real audio infrastructure).
+##
+## NOTE: this package imports "C", so the test binary still links librsac_ffi
+## even when only pure-Go logic tests are selected — hence the dependency on
+## rust-ffi and the CGO_LDFLAGS. The -run filter merely restricts which tests
+## execute (skipping the ones that need a live audio device).
+test-pure: rust-ffi
+	@echo "==> Running Go-only logic tests..."
+	CGO_ENABLED=1 \
+	CGO_LDFLAGS="-L$(LIB_DIR) -lrsac_ffi $(EXTRA_LDFLAGS)" \
+	go test -v -count=1 -run 'TestErrorCode|TestError_|TestErr|TestCaptureTarget|TestAudioBuffer|TestCaptureBuilder|TestDeviceKind|TestStream_Context|TestCallbackHandle|TestStreamResult' ./...
 
 ## lint: Run golangci-lint on the Go package.
 lint:

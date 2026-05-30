@@ -12,11 +12,11 @@
 //! `push_or_drop`/`push_samples_or_drop` start dropping and bumping the
 //! overrun counter. After enough wall-clock time the count must be > 0.
 //!
-//! Determinism gate: under `RSAC_CI_AUDIO_DETERMINISTIC=1` (Linux null sink
-//! + 440 Hz tone) the producer is guaranteed to be running, so we HARD
-//! ASSERT `overrun_count() > 0`. On non-deterministic hosts (a genuinely
-//! idle backend may never push enough buffers to overflow) we soft-skip with
-//! a diagnostic.
+//! Determinism gate: under `RSAC_CI_AUDIO_DETERMINISTIC=1` (Linux null sink or
+//! Windows VB-CABLE feeding a 440 Hz tone) the producer is guaranteed to be
+//! running, so we HARD ASSERT `overrun_count() > 0`. On non-deterministic hosts
+//! (a genuinely idle backend may never push enough buffers to overflow) we
+//! soft-skip with a diagnostic.
 
 use std::time::{Duration, Instant};
 
@@ -41,21 +41,45 @@ fn overrun_count_increments_when_consumer_stalls() {
     {
         Ok(c) => c,
         Err(e) => {
-            eprintln!("[ci_audio] overrun: build failed: {:?}", e);
+            // Under a deterministic source the backend is guaranteed present;
+            // a build failure here is a real regression, not host flakiness, so
+            // HARD-FAIL instead of silently masking it. Clean up first.
             if let Some(p) = player {
                 helpers::stop_player(p);
             }
             cleanup(&wav_path);
+            if helpers::deterministic_audio_env() {
+                panic!(
+                    "deterministic source: SystemDefault build failed — the backend \
+                     must be available under RSAC_CI_AUDIO_DETERMINISTIC=1: {:?}",
+                    e
+                );
+            }
+            eprintln!(
+                "[ci_audio] overrun: build failed (non-deterministic host): {:?}",
+                e
+            );
             return;
         }
     };
 
     if let Err(e) = capture.start() {
-        eprintln!("[ci_audio] overrun: start failed: {:?}", e);
+        // Same rationale as the build arm: a deterministic source must start.
         if let Some(p) = player {
             helpers::stop_player(p);
         }
         cleanup(&wav_path);
+        if helpers::deterministic_audio_env() {
+            panic!(
+                "deterministic source: SystemDefault start failed — capture must \
+                 start under RSAC_CI_AUDIO_DETERMINISTIC=1: {:?}",
+                e
+            );
+        }
+        eprintln!(
+            "[ci_audio] overrun: start failed (non-deterministic host): {:?}",
+            e
+        );
         return;
     }
 

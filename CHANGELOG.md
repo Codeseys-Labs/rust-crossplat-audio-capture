@@ -7,15 +7,56 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+Correctness-focused fixes from the 2026-05-29 deep-dive audit (waves 1–2),
+closing the real-time-safety, callback-delivery, and error-classification
+findings. Three Architecture Decision Records were recorded alongside the code:
+[ADR-0001 (RT-allocation guarantee)](docs/designs/0001-rt-allocation-guarantee.md),
+[ADR-0002 (callback delivery)](docs/designs/0002-callback-delivery.md), and
+[ADR-0003 (terminal stream error)](docs/designs/0003-terminal-stream-error.md).
+
 ### Added
 
+- `AudioError::StreamEnded { reason }` (ADR-0003) — a `Fatal`, `ErrorKind::Stream`
+  variant emitted when a read is attempted on a stream that has reached a terminal
+  state (`Stopped` / `Closed` / `Error`). Distinguishes a clean end-of-stream from
+  the recoverable `StreamReadError`, so read loops that break on `is_fatal()`
+  terminate instead of busy-waiting. `AudioError` now has **22** variants (was 21).
+- Push-callback delivery is now wired (ADR-0002): a callback registered via
+  `set_callback` is invoked from a dedicated non-RT pump thread spawned by
+  `start()` (mirroring `subscribe()`). The FFI trampoline is wrapped in
+  `catch_unwind` so a panicking C callback cannot unwind across the boundary.
+
 ### Changed
+
+- **RT producer is now allocation-free in steady state** (ADR-0001). Fixed the
+  `push_samples_or_drop` scratch-shrink bug (the scratch `Vec` could collapse to
+  capacity 0 and then re-allocate on the audio callback thread) and sized the
+  seed/scratch buffers from a named worst-case-period constant so recycled buffers
+  converge to zero allocation. Documented the guarantee precisely: allocation-free
+  in steady state, with bounded one-time growth during warm-up or when the period
+  grows.
+- `PlatformCapabilities::query()` is now gated on the `feat_*` features so it
+  cannot claim support for a backend that was not compiled in.
+- `recoverability()` now uses an exhaustive `match` (no `_` catch-all): adding a
+  new `AudioError` variant forces a compile error until its recoverability is
+  classified deliberately.
+
+### Fixed
+
+- `buffers_iter()` no longer terminates prematurely on a transient empty read,
+  and no longer drops buffers still queued in the ring after `stop()` — the
+  buffered tail is drained before the iterator ends.
+- `ChannelSink` is now bounded (back-pressure instead of unbounded memory growth),
+  and `WavFileSink` finalizes the WAV header on drop.
+- Removed the unsound manual `Send`/`Sync` impls on `AudioBuffer` (it is auto-`Send`/
+  `Sync` via its fields) and replaced ad-hoc `eprintln!` diagnostics with the `log`
+  facade.
+- Removed a reachable `panic!` in the `AudioCapture` `Debug` impl; calling `start()`
+  on an already-stopped stream now returns an error instead of misbehaving.
 
 ### Deprecated
 
 ### Removed
-
-### Fixed
 
 ### Security
 

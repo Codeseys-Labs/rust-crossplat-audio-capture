@@ -20,7 +20,7 @@ A streaming-first audio capture library for Rust. Captures system audio, per-app
 
 rsac is a capture library, not a DSP or playback library. For downstream concerns, reach for:
 
-- **Mixing** → `rodio::Source::mix`, or a 3-line `f32 + f32` adder over rsac's `AudioBuffer.data`
+- **Mixing** → `rodio::Source::mix`, or a 3-line `f32 + f32` adder over rsac's `AudioBuffer.data()`
 - **Resampling** → `rubato` / `samplerate`
 - **Encoding** → `hound` (WAV) / `symphonia` / `opus`
 - **Playback** → `cpal` / `rodio`

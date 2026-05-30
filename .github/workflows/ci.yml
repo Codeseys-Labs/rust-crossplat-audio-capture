@@ -61,14 +61,12 @@ jobs:
         if: matrix.os == 'linux'
         run: cargo fmt --all -- --check
 
-      # Clippy lints --lib --bins for the active platform. NOTE: scoped to
-      # --lib --bins rather than --all-targets because pre-existing clippy
-      # warnings live in out-of-scope files owned by other agents:
-      #   - examples/basic_capture.rs (clippy::manual_is_multiple_of)
-      #   - tests/ci_audio/helpers.rs (dead_code, doc_lazy_continuation)
-      # Once those are fixed by their owners, widen this to --all-targets.
+      # rsac L14(a): clippy now lints --all-targets (lib + bins + examples +
+      # tests + benches) for the active platform, so example/test/bench code is
+      # held to the same -D warnings bar as the library and demo binaries —
+      # previously they were exempt and could accumulate lint debt silently.
       - name: Run Clippy
-        run: cargo clippy --lib --bins --no-default-features --features ${{ matrix.feature }} -- -D warnings
+        run: cargo clippy --all-targets --no-default-features --features ${{ matrix.feature }} -- -D warnings
 
   # ── Linux unit tests ────────────────────────────────────────────────
   test-linux:
@@ -315,6 +313,41 @@ jobs:
         # Build doctests with the same feature set so doc examples that touch
         # async-stream / sink-wav APIs are exercised too.
         run: cargo test --doc --no-default-features --features feat_linux,async-stream,sink-wav,test-utils
+
+  # ── docs.rs render gate (cargo doc) ─────────────────────────────────
+  # rsac L14(b): Cargo.toml carries a [package.metadata.docs.rs] block
+  # (all-features = true, rustdoc-args = ["--cfg", "docsrs"]) but nothing in
+  # CI exercised it, so a broken intra-doc link or a `#[cfg_attr(docsrs, …)]`
+  # mistake would only surface as a RED docs.rs build *after* publish. This job
+  # reproduces the docs.rs invocation as closely as a single Linux runner can:
+  #   • --all-features matches docs.rs `all-features = true`. The macOS/Windows
+  #     backends are gated `all(target_os = "X", feature = "feat_X")`, so on a
+  #     Linux runner they stay cfg-disabled even with every feature on — only
+  #     the Linux backend + the non-platform features (async-stream, sink-wav,
+  #     test-utils) are documented here. (Per-OS rendering is docs.rs's job.)
+  #   • RUSTDOCFLAGS="--cfg docsrs -D warnings" turns broken-doc-link / bad-doc
+  #     warnings into a hard failure and enables the `docsrs` cfg the metadata
+  #     block sets, so `#[cfg_attr(docsrs, doc(...))]` annotations are exercised.
+  docs:
+    name: Docs (cargo doc, docs.rs config)
+    timeout-minutes: 20
+    needs: lint
+    runs-on: blacksmith-4vcpu-ubuntu-2404
+    steps:
+      - uses: actions/checkout@v5
+      - uses: dtolnay/rust-toolchain@1.95.0
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Install PipeWire dev libraries
+        run: |
+          sudo add-apt-repository ppa:pipewire-debian/pipewire-upstream -y
+          sudo apt-get update
+          sudo apt-get install -y libpipewire-0.3-dev libspa-0.2-dev pkg-config
+
+      - name: cargo doc (no-deps, all-features, docs.rs flags)
+        env:
+          RUSTDOCFLAGS: "--cfg docsrs -D warnings"
+        run: cargo doc --no-deps --all-features
 
   # ── Supply-chain audit (cargo-deny) ─────────────────────────────────
   # cargo-deny is chosen over cargo-audit because it covers advisories AND

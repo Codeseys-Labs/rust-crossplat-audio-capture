@@ -1,6 +1,22 @@
 # Error Taxonomy & Capability Model Design — `rsac`
 
-> **Status:** Design Document — Subtask B2
+> ⚠️ **ASPIRATIONAL / HISTORICAL DESIGN — NOT THE SOURCE OF TRUTH.**
+> This is an early design document. **The code is the source of truth** — see
+> [`src/core/error.rs`](../../src/core/error.rs) and
+> [`src/core/capabilities.rs`](../../src/core/capabilities.rs), plus the ADRs in
+> [`docs/designs/`](../designs/). Known divergences this document still describes
+> incorrectly:
+> - The shipped `AudioError` has **22 variants** (the "21 well-defined variants"
+>   figure below predates ADR-0003, which added `StreamEnded`), grouped into **7**
+>   `ErrorKind` categories (`Configuration`, `Device`, `Stream`, `Backend`,
+>   `Application`, `Platform`, `Internal` — note the `Internal` category is real,
+>   covering `InternalError` + `Timeout`).
+> - `AudioError` uses a **manual** `Display`/`std::error::Error` impl, **not** the
+>   `thiserror` derive shown below, and is **not** `Clone`.
+> - `Recoverability` has **3** states in the code (`Recoverable`, `TransientRetry`,
+>   `Fatal`). Any `UserError` state described below does not exist.
+>
+> **Status:** Design Document — Subtask B2 (historical)
 > **Depends on:** [API_DESIGN.md](API_DESIGN.md) (Subtask B1)
 > **Priority Order:** Correctness → UX → Breadth
 
@@ -1301,6 +1317,11 @@ If the device cannot produce ANY supported format, `UnsupportedFormat` is return
 | 21 | `Io` | Generic | Fatal | Sink operations | I/O failure |
 
 **Total: 21 well-defined variants** (down from 28 + duplicates + ghost variants)
+
+> ⚠️ **Outdated — see the banner at the top of this file.** The shipped enum has
+> **22** variants (ADR-0003 added `StreamEnded`), and the variant *names* below do
+> not all match the code (e.g. `PlatformRequirementNotMet` and `Io` do not exist;
+> the real list is in [`src/core/error.rs`](../../src/core/error.rs)).
 
 ---
 

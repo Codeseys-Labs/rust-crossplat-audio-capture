@@ -52,16 +52,19 @@ pipeline.
 
 ### The output contract
 
-- `CapturingStream::subscribe() -> mpsc::Receiver<AudioBuffer>` — the
-  canonical pull-model interface. Downstream consumers can:
-  - Record to disk (write `AudioBuffer.data` as WAV/FLAC via `hound`,
-    `symphonia`, etc.)
+- `AudioCapture::read_buffer() -> AudioResult<Option<AudioBuffer>>` — the
+  canonical pull-model interface (consumer asks; producer fills the ring).
+  `AudioCapture::subscribe() -> mpsc::Receiver<AudioBuffer>` provides the
+  push-based delivery mode on top of the same ring. Downstream consumers can:
+  - Record to disk (write `AudioBuffer::data()` samples as WAV/FLAC via
+    `hound`, `symphonia`, etc.)
   - Stream to a transcription service (Whisper, Deepgram, AssemblyAI,
     Gemini Live)
   - Run DSP in-flight (filtering, VAD, feature extraction)
   - Forward over WebSocket / gRPC
-- `BridgeStream<S>::is_under_backpressure() -> bool` — lets consumers
-  throttle / switch downstreams when the ring buffer is filling.
+- `CapturingStream::is_under_backpressure() -> bool` (also exposed as
+  `AudioCapture::is_under_backpressure()`) — lets consumers throttle /
+  switch downstreams when the ring buffer is filling.
 - Zero-copy where the backend allows it (ring buffer → consumer
   without intermediate Vec).
 
@@ -103,10 +106,11 @@ are explicitly deferred to downstream crates:
 Mixing requires downstream-specific decisions: (a) what sample-rate
 to mix at (resampling cost), (b) per-source gain, (c) clipping /
 limiter strategy, (d) real-time vs. buffered. These belong to the
-application, not the capture layer. rsac exposes `AudioBuffer.data: Vec<f32>` —
-if you want to mix two captures, it's 3 lines:
+application, not the capture layer. rsac exposes the interleaved samples
+through the `AudioBuffer::data() -> &[f32]` accessor — if you want to mix two
+captures, it's 3 lines:
 ```rust
-let mixed: Vec<f32> = buf_a.data.iter().zip(&buf_b.data).map(|(a, b)| a + b).collect();
+let mixed: Vec<f32> = buf_a.data().iter().zip(buf_b.data()).map(|(a, b)| a + b).collect();
 ```
 
 If a downstream crate like `rsac-mixer` emerges, we'll link it from
@@ -134,19 +138,21 @@ Each of these has a GitHub issue on `Codeseys-Labs/rust-crossplat-audio-capture`
 
 - **Default matrix** (`.github/workflows/ci.yml`): 3 platforms × (lint
   + unit tests + bindings check + downstream audio-graph build).
-  All 298+ library tests + 22 ci_audio integration tests
-  (subscribe, process_tree, ApplicationByName, ApplicationByPID)
-  gated to `#[ignore]` or `require_audio!()` so CI doesn't need real
-  audio hardware.
+  The library unit suite (300+ tests — exact count varies by platform
+  and feature set) plus the `ci_audio` integration suite (~40+ tests
+  across subscribe, process_tree, ApplicationByName, ApplicationByPID,
+  device enumeration, overrun, multi-source, lifecycle) are gated behind
+  `require_audio!()` / `#[ignore]` so CI doesn't need real audio hardware.
 
 ### Integration tests with real audio (gated)
 
-- **`.github/workflows/ci-audio-tests.yml`** (846 lines): 9-job
-  matrix (3 platforms × 3 modes: system / device / process) with
-  virtual audio sources (PipeWire dummy sink on Linux, VB-CABLE on
-  Windows, loopback via BlackHole or platform-native on macOS).
-- Runs on `workflow_dispatch` + tagged releases (not every push —
-  slow, requires audio runtime).
+- **`.github/workflows/ci-audio-tests.yml`**: 9-job matrix
+  (3 platforms × 3 modes: system / device / process) with virtual
+  audio sources (PipeWire dummy sink on Linux, VB-CABLE on Windows,
+  loopback via BlackHole or platform-native on macOS).
+- Triggered on push to `main`/`master`, pull requests, and
+  `workflow_dispatch` (it provisions a virtual audio runtime per job, so
+  it is heavier than the default unit-test matrix).
 
 ### Runner-specific
 

@@ -693,7 +693,10 @@ mod tests {
             reason: "Stream stopped".into(),
         };
         assert_eq!(e.kind(), ErrorKind::Stream);
-        assert!(e.is_fatal(), "StreamEnded must be Fatal so read loops terminate");
+        assert!(
+            e.is_fatal(),
+            "StreamEnded must be Fatal so read loops terminate"
+        );
         assert!(!e.is_recoverable());
     }
 

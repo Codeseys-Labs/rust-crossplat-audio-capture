@@ -86,51 +86,74 @@ fn select_by_exact_name_binds_source() {
     }
 }
 
-/// Asserts the builder returns `AudioError::ApplicationNotFound` with
-/// the unknown name embedded in the error's `identifier` field when no
-/// running app matches. This exercises the error path inside
-/// `resolve_capture_target` — the enumeration succeeds but the
-/// `.find()` returns `None`.
+/// Asserts capture resolution returns `AudioError::ApplicationNotFound`
+/// with the unknown name embedded in the error's `identifier` field when
+/// no running app matches. This exercises the error path inside
+/// `resolve_capture_target` — `enumerate_audio_applications()` succeeds
+/// (possibly with zero apps) but the `.find()` returns `None`.
 ///
-/// Does not require audio hardware: NSWorkspace enumeration works in
-/// any GUI session, and the test only validates the error shape. Still
-/// `#[ignore]` because NSWorkspace may not be available in a
-/// fully-headless CI runner.
+/// # Where the error surfaces
+///
+/// Name resolution happens on the capture thread inside
+/// `create_macos_capture` → `resolve_capture_target`, which runs at
+/// `start()` — NOT at `build()` (build only validates capability and
+/// resolves the default output device). So the `ApplicationNotFound`
+/// must be asserted against `start()`, not `build()`.
+///
+/// # Gating
+///
+/// Runs on capable runners (was `#[ignore]`). This path short-circuits at
+/// the `.find()` failure BEFORE any `CoreAudioProcessTap::new` call, so it
+/// does NOT touch the `kTCCServiceAudioCapture` gate and cannot hang on the
+/// 10-minute Process Tap path. It only needs NSWorkspace, which returns an
+/// (possibly empty) list in any session. We still skip on backends without
+/// application-capture capability via `skip_if_unsupported()`.
 #[test]
-#[ignore = "requires a macOS user session (NSWorkspace must be available)"]
 fn select_by_missing_name_returns_error() {
     if skip_if_unsupported() {
         return;
     }
 
-    let result = AudioCaptureBuilder::new()
+    // build() succeeds (resolves the default output device); the name lookup
+    // and its ApplicationNotFound error happen at start().
+    let mut capture = match AudioCaptureBuilder::new()
         .with_target(CaptureTarget::ApplicationByName(
             MISSING_APP_NAME.to_string(),
         ))
         .sample_rate(48000)
         .channels(2)
-        .build();
+        .build()
+    {
+        Ok(c) => c,
+        Err(AudioError::ApplicationNotFound { identifier }) => {
+            // Acceptable if build() ever grows a name precheck — still the
+            // documented variant, embedding the missing name.
+            assert!(
+                identifier.contains(MISSING_APP_NAME),
+                "error identifier should contain the missing name, got: {identifier}"
+            );
+            eprintln!("[ci_audio] ✅ Got ApplicationNotFound at build(): {identifier}");
+            return;
+        }
+        Err(other) => panic!(
+            "build() for a missing app name must succeed or return \
+             ApplicationNotFound; got: {other:?}"
+        ),
+    };
 
-    match result {
+    match capture.start() {
         Err(AudioError::ApplicationNotFound { identifier }) => {
             assert!(
                 identifier.contains(MISSING_APP_NAME),
-                "error identifier should contain the missing name, got: {}",
-                identifier
+                "error identifier should contain the missing name, got: {identifier}"
             );
-            eprintln!(
-                "[ci_audio] ✅ Got expected ApplicationNotFound: {}",
-                identifier
-            );
+            eprintln!("[ci_audio] ✅ Got expected ApplicationNotFound at start(): {identifier}");
         }
-        Err(other) => panic!(
-            "Expected ApplicationNotFound for missing app, got: {:?}",
-            other
-        ),
-        Ok(_) => panic!(
-            "Expected ApplicationNotFound for '{}', but build succeeded",
-            MISSING_APP_NAME
-        ),
+        Err(other) => panic!("Expected ApplicationNotFound for missing app, got: {other:?}"),
+        Ok(()) => {
+            let _ = capture.stop();
+            panic!("Expected ApplicationNotFound for '{MISSING_APP_NAME}', but start() succeeded");
+        }
     }
 }
 

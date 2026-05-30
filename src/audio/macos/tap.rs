@@ -22,7 +22,7 @@
 #![cfg(target_os = "macos")]
 
 use super::coreaudio::map_ca_error;
-use crate::core::error::{AudioError, AudioResult};
+use crate::core::error::{AudioError, AudioResult, BackendContext};
 use core_foundation::base::TCFType;
 use core_foundation::boolean::CFBoolean;
 use core_foundation::dictionary::CFMutableDictionary;
@@ -210,15 +210,7 @@ impl CoreAudioProcessTap {
             if agg_status != sys::noErr as OSStatus {
                 // Clean up: destroy the already-created tap before returning error
                 AudioHardwareDestroyProcessTap(tap_id);
-                return Err(AudioError::BackendError {
-                    backend: "CoreAudio".into(),
-                    operation: "create_aggregate_device".into(),
-                    message: format!(
-                        "AudioHardwareCreateAggregateDevice failed: OSStatus {}",
-                        agg_status
-                    ),
-                    context: None,
-                });
+                return Err(aggregate_device_error(agg_status));
             }
 
             log::info!(
@@ -369,15 +361,7 @@ impl CoreAudioProcessTap {
             if agg_status != sys::noErr as OSStatus {
                 // Clean up: destroy the already-created tap before returning error
                 AudioHardwareDestroyProcessTap(tap_id);
-                return Err(AudioError::BackendError {
-                    backend: "CoreAudio".into(),
-                    operation: "create_aggregate_device".into(),
-                    message: format!(
-                        "AudioHardwareCreateAggregateDevice failed: OSStatus {}",
-                        agg_status
-                    ),
-                    context: None,
-                });
+                return Err(aggregate_device_error(agg_status));
             }
 
             log::info!(
@@ -519,15 +503,7 @@ impl CoreAudioProcessTap {
             if agg_status != sys::noErr as OSStatus {
                 // Clean up: destroy the already-created tap before returning error
                 AudioHardwareDestroyProcessTap(tap_id);
-                return Err(AudioError::BackendError {
-                    backend: "CoreAudio".into(),
-                    operation: "create_aggregate_device".into(),
-                    message: format!(
-                        "AudioHardwareCreateAggregateDevice failed: OSStatus {}",
-                        agg_status
-                    ),
-                    context: None,
-                });
+                return Err(aggregate_device_error(agg_status));
             }
 
             log::info!(
@@ -987,7 +963,8 @@ unsafe fn get_default_output_device_uid() -> AudioResult<CFString> {
                 "Failed to get device UID for device {}: OSStatus {}",
                 default_device_id, status
             ),
-            context: None,
+            // M6: surface the raw OSStatus machine-readably.
+            context: Some(backend_context_for_status(status)),
         });
     }
 
@@ -1000,8 +977,18 @@ unsafe fn get_default_output_device_uid() -> AudioResult<CFString> {
         });
     }
 
-    // Convert CFStringRef to owned CFString (Get Rule: the system owns it, we retain)
-    Ok(CFString::wrap_under_get_rule(uid_ref))
+    // Convert CFStringRef to owned CFString.
+    //
+    // `AudioObjectGetPropertyData` for `kAudioDevicePropertyDeviceUID` returns a
+    // +1-retained ("Create Rule") CFStringRef: the property is a `CFStringRef`
+    // out-parameter populated by the framework, and per Apple's Core Foundation
+    // Ownership Policy any value obtained from a function with "Copy" or "Create"
+    // semantics (which this property follows) is owned by the caller, who must
+    // release it. `wrap_under_create_rule` adopts that existing +1 (no extra
+    // retain) and releases it on drop, so the count balances. Using
+    // `wrap_under_get_rule` here would add a second retain that is never
+    // released, leaking one CFString per capture session (audit L1).
+    Ok(CFString::wrap_under_create_rule(uid_ref))
 }
 
 /// Build the `CFDictionary` for `AudioHardwareCreateAggregateDevice`.
@@ -1160,6 +1147,33 @@ unsafe fn msg_send_responds_to(obj: *mut AnyObject, sel: Sel) -> bool {
     msg_send![obj, respondsToSelector: sel]
 }
 
+/// Build a [`BackendContext`] for a CoreAudio `OSStatus` (M6).
+///
+/// `OSStatus` is an `i32`; it is sign-extended into the `i64`
+/// [`BackendContext::os_error_code`] field so negative status codes
+/// (e.g. `-50` = `paramErr`) round-trip exactly.
+fn backend_context_for_status(status: OSStatus) -> BackendContext {
+    BackendContext {
+        backend_name: "CoreAudio".into(),
+        os_error_code: Some(status as i64),
+        os_error_message: Some(format!("OSStatus {}", status)),
+    }
+}
+
+/// Build a `BackendError` for an `AudioHardwareCreateAggregateDevice` failure,
+/// populating the machine-readable `OSStatus` (M6).
+fn aggregate_device_error(status: OSStatus) -> AudioError {
+    AudioError::BackendError {
+        backend: "CoreAudio".into(),
+        operation: "create_aggregate_device".into(),
+        message: format!(
+            "AudioHardwareCreateAggregateDevice failed: OSStatus {}",
+            status
+        ),
+        context: Some(backend_context_for_status(status)),
+    }
+}
+
 // ══════════════════════════════════════════════════════════════════════════
 // Tests
 // ══════════════════════════════════════════════════════════════════════════
@@ -1167,6 +1181,32 @@ unsafe fn msg_send_responds_to(obj: *mut AnyObject, sel: Sel) -> bool {
 #[cfg(all(test, target_os = "macos"))]
 mod tests {
     use super::*;
+
+    /// M6: `backend_context_for_status` sign-extends an OSStatus into the
+    /// i64 os_error_code field (pure Rust, no CoreAudio calls).
+    #[test]
+    fn backend_context_for_status_sign_extends() {
+        let ctx = backend_context_for_status(-50);
+        assert_eq!(ctx.backend_name, "CoreAudio");
+        assert_eq!(ctx.os_error_code, Some(-50i64));
+        assert!(ctx.os_error_message.is_some());
+    }
+
+    /// M6: aggregate-device failures carry the OSStatus machine-readably.
+    #[test]
+    fn aggregate_device_error_populates_os_error_code() {
+        match aggregate_device_error(-66748) {
+            AudioError::BackendError {
+                operation,
+                context: Some(ctx),
+                ..
+            } => {
+                assert_eq!(operation, "create_aggregate_device");
+                assert_eq!(ctx.os_error_code, Some(-66748i64));
+            }
+            other => panic!("Expected BackendError with context, got: {:?}", other),
+        }
+    }
 
     /// Test that we can enumerate audio process objects from CoreAudio.
     /// This is a prerequisite for system-wide capture.

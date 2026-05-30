@@ -14,7 +14,7 @@
 //!
 //! These three concerns have clean interfaces between them.
 
-use crate::core::config::{CaptureTarget, DeviceId, ProcessId};
+use crate::core::config::{ApplicationId, CaptureTarget, DeviceId, ProcessId};
 use crate::core::error::AudioResult;
 
 // ── AudioSource ─────────────────────────────────────────────────────────
@@ -51,13 +51,27 @@ pub enum AudioSourceKind {
 
 impl AudioSource {
     /// Converts this source into a [`CaptureTarget`] suitable for `AudioCaptureBuilder`.
+    ///
+    /// A discovered [`AudioSourceKind::Application`] maps to
+    /// [`CaptureTarget::Application`] — capturing **that single application's
+    /// audio session**, not its descendants (L17). Selecting one discovered app
+    /// from a source list and getting the whole process tree (children included)
+    /// was surprising and over-broad; callers who specifically want the subtree
+    /// can still construct [`CaptureTarget::pid`]/[`CaptureTarget::ProcessTree`]
+    /// explicitly.
+    ///
+    /// The application's PID is carried as the [`ApplicationId`] string, which is
+    /// how the platform backends parse it back into a numeric PID (see the
+    /// `CaptureTarget::Application` arm of each backend's audio-client creation).
     pub fn to_capture_target(&self) -> CaptureTarget {
         match &self.kind {
             AudioSourceKind::SystemDefault => CaptureTarget::SystemDefault,
             AudioSourceKind::Device { device_id, .. } => {
                 CaptureTarget::Device(DeviceId(device_id.clone()))
             }
-            AudioSourceKind::Application { pid, .. } => CaptureTarget::ProcessTree(ProcessId(*pid)),
+            AudioSourceKind::Application { pid, .. } => {
+                CaptureTarget::Application(ApplicationId(pid.to_string()))
+            }
         }
     }
 }
@@ -350,6 +364,9 @@ mod tests {
         };
         assert_eq!(source.to_capture_target(), CaptureTarget::SystemDefault);
 
+        // L17: a discovered single application maps to Application(pid),
+        // capturing that app's session only — NOT ProcessTree (the whole
+        // subtree). The PID is carried as the ApplicationId string.
         let source = AudioSource {
             id: "app:1234".to_string(),
             name: "Firefox".to_string(),
@@ -360,6 +377,11 @@ mod tests {
             },
         };
         assert_eq!(
+            source.to_capture_target(),
+            CaptureTarget::Application(ApplicationId("1234".to_string()))
+        );
+        // And explicitly NOT the over-broad process-tree capture.
+        assert_ne!(
             source.to_capture_target(),
             CaptureTarget::ProcessTree(ProcessId(1234))
         );

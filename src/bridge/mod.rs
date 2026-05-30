@@ -14,7 +14,11 @@ pub mod async_stream;
 pub mod mock;
 
 // Re-exports for internal use
-pub use ring_buffer::{calculate_capacity, create_bridge, BridgeConsumer, BridgeProducer};
+#[allow(unused_imports)]
+pub use ring_buffer::{
+    calculate_capacity, create_bridge, create_bridge_with_options, BridgeConsumer, BridgeProducer,
+    DEFAULT_BACKPRESSURE_THRESHOLD,
+};
 pub use state::{AtomicStreamState, StreamState};
 // Platform-conditional: used by platform backends when features are enabled,
 // and by integration tests in this module.

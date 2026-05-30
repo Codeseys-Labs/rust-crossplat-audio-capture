@@ -40,17 +40,21 @@ make test-pure   # Go-only tests that don't need real audio
 make clean
 ```
 
-Behind the scenes, `make rust-ffi` runs `cargo build --release -p
-rsac-ffi` at the repo root and copies `librsac_ffi.a` (macOS/Linux) or
-`rsac_ffi.lib` (Windows) into `bindings/rsac-go/lib/`. `make go-build`
-then sets `CGO_LDFLAGS` to include the platform-specific system
-libraries:
+Behind the scenes, `make rust-ffi` runs `cargo build --release` in
+`bindings/rsac-ffi/` and copies the GNU static archive `librsac_ffi.a`
+into `bindings/rsac-go/lib/` (cgo links through the GNU toolchain on
+every platform — on Windows build the `*-pc-windows-gnu` target so cargo
+emits `librsac_ffi.a` rather than an MSVC `rsac_ffi.lib`). `make
+go-build` then sets `CGO_LDFLAGS` to include the platform-specific
+system libraries:
 
 - macOS: `-framework CoreAudio -framework AudioToolbox
   -framework CoreFoundation -framework Security -framework
   SystemConfiguration`
 - Linux: `-lpipewire-0.3 -lspa-0.2 -lpthread -ldl -lm`
 - Windows (MinGW): `-lole32 -loleaut32 -lwinmm -lksuser -luuid`
+  plus the Win32 libs the Rust std runtime needs
+  (`-lbcrypt -lntdll -luserenv -lws2_32 -ladvapi32 -lkernel32`)
 
 ## Quick start
 

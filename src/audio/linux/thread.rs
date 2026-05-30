@@ -29,6 +29,16 @@ use crate::bridge::stream::PlatformStream;
 use crate::core::config::CaptureTarget;
 use crate::core::error::{AudioError, AudioResult};
 
+/// Upper bound on how long a caller will block waiting for the PipeWire thread
+/// to acknowledge a `StartCapture` / `StopCapture` command.
+///
+/// The handshake reply normally arrives within one event-loop iteration
+/// (≤50 ms), but `StartCapture` also creates and connects a PipeWire stream.
+/// A bounded wait (audit findings M2/M3) ensures a wedged or dead PipeWire
+/// thread surfaces as [`AudioError::Timeout`] instead of hanging the caller
+/// on an unbounded `recv()`.
+const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(5);
+
 // ── CaptureConfig ────────────────────────────────────────────────────────
 
 /// Resolved capture parameters passed to the PipeWire thread.
@@ -45,6 +55,24 @@ pub(crate) struct CaptureConfig {
     pub channels: u16,
 }
 
+/// A [`CaptureTarget`] whose PipeWire `TARGET_OBJECT` has already been resolved.
+///
+/// Resolution (running `pw-dump` and walking `/proc`) is performed on the
+/// **caller thread** inside [`PipeWireThread::start_capture`], *before* the
+/// `StartCapture` command is sent to the PipeWire event-loop thread. This keeps
+/// the event loop responsive: it never blocks on a subprocess or filesystem
+/// walk while audio buffers are being pumped (audit findings M2/M3).
+///
+/// The event-loop handler only has to translate this into stream properties —
+/// a pure, non-blocking operation.
+#[derive(Debug)]
+pub(crate) enum ResolvedTarget {
+    /// Capture the default sink monitor — no `TARGET_OBJECT`.
+    SystemDefault,
+    /// Attach to a node identified by the given `object.serial` string.
+    Serial(String),
+}
+
 // ── PipeWireCommand ──────────────────────────────────────────────────────
 
 /// Commands sent from the caller thread to the dedicated PipeWire thread.
@@ -59,6 +87,9 @@ pub(crate) enum PipeWireCommand {
     /// into the ring buffer.
     StartCapture {
         config: CaptureConfig,
+        /// `TARGET_OBJECT` resolved on the caller thread (M2/M3): the PipeWire
+        /// event loop must not run `pw-dump`/`/proc` resolution itself.
+        resolved: ResolvedTarget,
         producer: BridgeProducer,
         response_tx: std_mpsc::Sender<AudioResult<()>>,
     },
@@ -180,20 +211,35 @@ impl PipeWireThread {
     /// This creates a PipeWire stream, registers listener callbacks (param_changed
     /// for format negotiation, process for audio data), and connects the stream.
     ///
+    /// The capture target is resolved to an `object.serial` on the calling
+    /// thread (M2/M3) before the command is dispatched, so `pw-dump`/`/proc`
+    /// work never runs on the PipeWire event loop.
+    ///
     /// # Errors
     ///
+    /// - [`AudioError::ApplicationNotFound`] / [`AudioError::DeviceNotFound`] if
+    ///   target resolution fails (no matching node / unparseable PID).
     /// - [`AudioError::BackendError`] if the PipeWire thread is not running or
-    ///   does not respond, or if stream creation/connection fails.
+    ///   exits without replying, or if stream creation/connection fails.
+    /// - [`AudioError::Timeout`] if the PipeWire thread does not acknowledge the
+    ///   command within [`HANDSHAKE_TIMEOUT`].
     pub fn start_capture(
         &self,
         config: CaptureConfig,
         producer: BridgeProducer,
     ) -> AudioResult<()> {
+        // Resolve the capture target on THIS (caller) thread — running pw-dump
+        // and walking /proc must not happen on the PipeWire event loop, which
+        // would block audio buffer delivery (audit findings M2/M3). The event
+        // loop only ever receives a fully-resolved TARGET_OBJECT.
+        let resolved = resolve_capture_target(&config.target)?;
+
         let (response_tx, response_rx) = std_mpsc::channel();
 
         self.command_tx
             .send(PipeWireCommand::StartCapture {
                 config,
+                resolved,
                 producer,
                 response_tx,
             })
@@ -204,12 +250,19 @@ impl PipeWireThread {
                 context: None,
             })?;
 
-        response_rx.recv().map_err(|_| AudioError::BackendError {
-            backend: "PipeWire".to_string(),
-            operation: "start_capture".to_string(),
-            message: "PipeWire thread did not respond to StartCapture".to_string(),
-            context: None,
-        })?
+        match response_rx.recv_timeout(HANDSHAKE_TIMEOUT) {
+            Ok(result) => result,
+            Err(std_mpsc::RecvTimeoutError::Timeout) => Err(AudioError::Timeout {
+                operation: "PipeWire StartCapture handshake".to_string(),
+                duration: HANDSHAKE_TIMEOUT,
+            }),
+            Err(std_mpsc::RecvTimeoutError::Disconnected) => Err(AudioError::BackendError {
+                backend: "PipeWire".to_string(),
+                operation: "start_capture".to_string(),
+                message: "PipeWire thread exited before responding to StartCapture".to_string(),
+                context: None,
+            }),
+        }
     }
 
     /// Send a `StopCapture` command to the PipeWire thread and wait for the response.
@@ -220,7 +273,9 @@ impl PipeWireThread {
     /// # Errors
     ///
     /// - [`AudioError::BackendError`] if the PipeWire thread is not running or
-    ///   does not respond.
+    ///   exits without replying.
+    /// - [`AudioError::Timeout`] if the PipeWire thread does not acknowledge the
+    ///   command within [`HANDSHAKE_TIMEOUT`].
     pub fn stop_capture(&self) -> AudioResult<()> {
         let (response_tx, response_rx) = std_mpsc::channel();
 
@@ -233,12 +288,19 @@ impl PipeWireThread {
                 context: None,
             })?;
 
-        response_rx.recv().map_err(|_| AudioError::BackendError {
-            backend: "PipeWire".to_string(),
-            operation: "stop_capture".to_string(),
-            message: "PipeWire thread did not respond to StopCapture".to_string(),
-            context: None,
-        })?
+        match response_rx.recv_timeout(HANDSHAKE_TIMEOUT) {
+            Ok(result) => result,
+            Err(std_mpsc::RecvTimeoutError::Timeout) => Err(AudioError::Timeout {
+                operation: "PipeWire StopCapture handshake".to_string(),
+                duration: HANDSHAKE_TIMEOUT,
+            }),
+            Err(std_mpsc::RecvTimeoutError::Disconnected) => Err(AudioError::BackendError {
+                backend: "PipeWire".to_string(),
+                operation: "stop_capture".to_string(),
+                message: "PipeWire thread exited before responding to StopCapture".to_string(),
+                context: None,
+            }),
+        }
     }
 
     /// Returns `true` if the PipeWire thread is still alive.
@@ -431,18 +493,34 @@ enum PwNodeLookup<'a> {
     /// or `application.process.binary`).
     ByAppName(&'a str),
     /// Match by process ID (exact match against `application.process.id`).
-    #[allow(dead_code)] // API surface for future single-PID lookup; currently ByPidSet is used
+    /// Used to resolve [`CaptureTarget::Application`], which — like Windows and
+    /// macOS — carries a numeric PID string in its [`ApplicationId`].
+    ///
+    /// [`ApplicationId`]: crate::core::config::ApplicationId
     ByPid(u32),
     /// Match by any PID in a set (for process tree capture).
     /// Searches for the first audio output node whose `application.process.id`
     /// matches any PID in the provided set.
     ByPidSet(&'a [u32]),
+    /// Match a *device/sink* node by its [`DeviceId`] string.
+    ///
+    /// Device enumeration (see `mod.rs`) emits the PipeWire node `id`, whereas
+    /// every capture path keys `TARGET_OBJECT` on `object.serial`. This variant
+    /// normalises the two: it matches a node whose top-level `id` **or**
+    /// `object.serial` equals the supplied string and whose `media.class` names
+    /// an `Audio/Sink` or `Audio/Source`, then returns that node's
+    /// `object.serial` (audit finding M8).
+    ///
+    /// [`DeviceId`]: crate::core::config::DeviceId
+    Device(&'a str),
 }
 
 /// Runs `pw-dump`, parses the JSON output, and finds the `object.serial` of
 /// the first PipeWire node that:
 /// - has `type == "PipeWire:Interface:Node"`
-/// - has `info.props.media.class` containing `"Stream/Output/Audio"`
+/// - has a matching `info.props.media.class`: `"Stream/Output/Audio"` for the
+///   application/process lookups, or `"Audio/Sink"`/`"Audio/Source"` for the
+///   [`PwNodeLookup::Device`] lookup
 /// - matches the given [`PwNodeLookup`] criteria
 ///
 /// Returns the `object.serial` as a `String` suitable for use as `TARGET_OBJECT`.
@@ -451,7 +529,10 @@ enum PwNodeLookup<'a> {
 ///
 /// - [`AudioError::BackendError`] if `pw-dump` cannot be executed or returns
 ///   non-zero, or if the output cannot be parsed as JSON.
-/// - [`AudioError::ApplicationNotFound`] if no matching node is found.
+/// - [`AudioError::ApplicationNotFound`] if no matching application/process node
+///   is found.
+/// - [`AudioError::DeviceNotFound`] if no matching device node is found
+///   ([`PwNodeLookup::Device`]).
 fn find_pipewire_node_serial(lookup: &PwNodeLookup<'_>) -> AudioResult<String> {
     // Run pw-dump and capture its JSON output.
     let output = std::process::Command::new("pw-dump")
@@ -521,12 +602,21 @@ fn find_pipewire_node_serial(lookup: &PwNodeLookup<'_>) -> AudioResult<String> {
             None => continue,
         };
 
-        // Filter: media.class must indicate an audio output stream.
+        // Filter: media.class must match the expected node category for this
+        // lookup kind. Application/process captures attach to per-application
+        // output *streams* (`Stream/Output/Audio`), whereas a device target
+        // names a sink/source *device* node (`Audio/Sink` / `Audio/Source`).
         let media_class = props
             .get("media.class")
             .and_then(|v| v.as_str())
             .unwrap_or("");
-        if !media_class.contains("Stream/Output/Audio") {
+        let class_ok = match lookup {
+            PwNodeLookup::Device(_) => {
+                media_class.contains("Audio/Sink") || media_class.contains("Audio/Source")
+            }
+            _ => media_class.contains("Stream/Output/Audio"),
+        };
+        if !class_ok {
             continue;
         }
 
@@ -556,6 +646,21 @@ fn find_pipewire_node_serial(lookup: &PwNodeLookup<'_>) -> AudioResult<String> {
                     .and_then(|v| v.as_str())
                     .unwrap_or("");
                 pid_set_strings.iter().any(|s| s.as_str() == proc_id)
+            }
+            PwNodeLookup::Device(device_id) => {
+                // Match against the top-level node `id` (what enumeration emits)
+                // OR the `object.serial` (what TARGET_OBJECT expects), so a
+                // DeviceId produced by either convention resolves correctly.
+                let top_id = entry
+                    .get("id")
+                    .and_then(|v| v.as_u64())
+                    .map(|n| n.to_string());
+                let serial = props.get("object.serial").and_then(|v| {
+                    v.as_str()
+                        .map(|s| s.to_string())
+                        .or_else(|| v.as_u64().map(|n| n.to_string()))
+                });
+                top_id.as_deref() == Some(*device_id) || serial.as_deref() == Some(*device_id)
             }
         };
 
@@ -596,6 +701,99 @@ fn find_pipewire_node_serial(lookup: &PwNodeLookup<'_>) -> AudioResult<String> {
         PwNodeLookup::ByPidSet(pids) => Err(AudioError::ApplicationNotFound {
             identifier: format!("process tree PIDs {:?}", pids),
         }),
+        PwNodeLookup::Device(device_id) => Err(AudioError::DeviceNotFound {
+            device_id: device_id.to_string(),
+        }),
+    }
+}
+
+/// Resolve a [`CaptureTarget`] into a ready-to-use [`ResolvedTarget`].
+///
+/// This is the off-the-event-loop resolution step (audit findings M2/M3): it
+/// runs `pw-dump` and walks `/proc` on the **caller** thread so the PipeWire
+/// event loop never blocks on a subprocess or filesystem traversal while it is
+/// pumping audio. The returned [`ResolvedTarget`] carries only a plain
+/// `object.serial` string (or "no target" for the default sink monitor).
+///
+/// # Target semantics
+///
+/// - [`SystemDefault`](CaptureTarget::SystemDefault) — no `TARGET_OBJECT`.
+/// - [`Device`](CaptureTarget::Device) — the [`DeviceId`] is a PipeWire node
+///   `id`/`object.serial`; validated against `pw-dump` and normalised to the
+///   node's `object.serial`. Returns [`AudioError::DeviceNotFound`] if absent.
+/// - [`Application`](CaptureTarget::Application) — the [`ApplicationId`] is a
+///   **numeric PID string**, matching the Windows/macOS contract. Resolved to
+///   the application's audio-output node serial via `pw-dump`.
+/// - [`ApplicationByName`](CaptureTarget::ApplicationByName) — resolved by name.
+/// - [`ProcessTree`](CaptureTarget::ProcessTree) — `/proc` is walked for the
+///   PID's descendants, then any tree member's audio-output node is matched.
+///
+/// [`DeviceId`]: crate::core::config::DeviceId
+/// [`ApplicationId`]: crate::core::config::ApplicationId
+fn resolve_capture_target(target: &CaptureTarget) -> AudioResult<ResolvedTarget> {
+    match target {
+        CaptureTarget::SystemDefault => Ok(ResolvedTarget::SystemDefault),
+        CaptureTarget::Device(device_id) => {
+            // Validate the node exists and normalise to its object.serial so we
+            // never silently connect to a non-existent TARGET_OBJECT (M8).
+            let serial = find_pipewire_node_serial(&PwNodeLookup::Device(device_id.0.as_str()))?;
+            log::debug!(
+                "PipeWire: Device '{}' validated, resolved to node serial={}",
+                device_id.0,
+                serial
+            );
+            Ok(ResolvedTarget::Serial(serial))
+        }
+        CaptureTarget::Application(app_id) => {
+            // ApplicationId carries a numeric PID string — same contract as the
+            // Windows/macOS backends (audit finding M7). Resolve PID → node
+            // serial via pw-dump, mirroring ApplicationByName.
+            let pid: u32 = app_id
+                .0
+                .parse()
+                .map_err(|_| AudioError::ApplicationNotFound {
+                    identifier: format!(
+                        "Cannot parse PID from ApplicationId '{}': expected numeric PID",
+                        app_id.0
+                    ),
+                })?;
+            let serial = find_pipewire_node_serial(&PwNodeLookup::ByPid(pid))?;
+            log::debug!(
+                "PipeWire: Application PID {} resolved to node serial={}",
+                pid,
+                serial
+            );
+            Ok(ResolvedTarget::Serial(serial))
+        }
+        CaptureTarget::ApplicationByName(name) => {
+            let serial = find_pipewire_node_serial(&PwNodeLookup::ByAppName(name))?;
+            log::debug!(
+                "PipeWire: ApplicationByName '{}' resolved to node serial={}",
+                name,
+                serial
+            );
+            Ok(ResolvedTarget::Serial(serial))
+        }
+        CaptureTarget::ProcessTree(pid) => {
+            // Walk /proc for the full descendant set (falls back to the single
+            // PID when /proc is unavailable), then match any tree member's
+            // audio-output node.
+            let tree_pids = discover_process_tree_pids(pid.0);
+            log::debug!(
+                "PipeWire: ProcessTree PID {} — discovered {} PIDs in tree: {:?}",
+                pid.0,
+                tree_pids.len(),
+                tree_pids
+            );
+            let serial = find_pipewire_node_serial(&PwNodeLookup::ByPidSet(&tree_pids))?;
+            log::debug!(
+                "PipeWire: ProcessTree PID {} resolved to node serial={} (searched {} PIDs)",
+                pid.0,
+                serial,
+                tree_pids.len()
+            );
+            Ok(ResolvedTarget::Serial(serial))
+        }
     }
 }
 
@@ -619,11 +817,14 @@ fn find_pipewire_node_serial(lookup: &PwNodeLookup<'_>) -> AudioResult<String> {
 /// # Audio Data Flow
 ///
 /// When a `StartCapture` command is received, the thread:
-/// 1. Creates a PipeWire `Stream` with properties matching the [`CaptureTarget`]
-/// 2. Registers a **process callback** that converts raw PipeWire audio data
+/// 1. Translates the already-resolved [`ResolvedTarget`] into stream properties
+///    (the `pw-dump`/`/proc` resolution happened on the caller thread, M2/M3, so
+///    the event loop never blocks on a subprocess here)
+/// 2. Creates a PipeWire `Stream` with those properties
+/// 3. Registers a **process callback** that converts raw PipeWire audio data
 ///    (F32LE bytes) into [`AudioBuffer`]s and pushes them to the [`BridgeProducer`]
-/// 3. Registers a **param_changed callback** for format negotiation
-/// 4. Connects the stream with `AUTOCONNECT | MAP_BUFFERS` flags
+/// 4. Registers a **param_changed callback** for format negotiation
+/// 5. Connects the stream with `AUTOCONNECT | MAP_BUFFERS` flags
 ///
 /// The `BridgeProducer::push_or_drop()` call in the process callback is lock-free
 /// and non-blocking, making it safe for the real-time PipeWire callback context.
@@ -720,6 +921,7 @@ fn pw_thread_main(
         match command_rx.try_recv() {
             Ok(PipeWireCommand::StartCapture {
                 config,
+                resolved,
                 producer,
                 response_tx,
             }) => {
@@ -737,7 +939,12 @@ fn pw_thread_main(
                     capture_stream = None;
                 }
 
-                // ── Build PipeWire stream properties based on CaptureTarget ──
+                // ── Build PipeWire stream properties from the resolved target ──
+                //
+                // Resolution (pw-dump / /proc) already happened on the caller
+                // thread in `start_capture()` (M2/M3): here we only translate
+                // the pre-computed `object.serial` into stream properties, which
+                // never blocks the event loop.
 
                 let mut props = properties! {
                     *pipewire::keys::NODE_NAME => "rsac-capture",
@@ -745,89 +952,17 @@ fn pw_thread_main(
                     *pipewire::keys::STREAM_MONITOR => "true",
                 };
 
-                match &config.target {
-                    CaptureTarget::SystemDefault => {
+                match &resolved {
+                    ResolvedTarget::SystemDefault => {
                         // No TARGET_OBJECT — captures from the default output
                         // sink monitor. STREAM_CAPTURE_SINK + STREAM_MONITOR
                         // handle the routing.
                         log::debug!("PipeWire: SystemDefault — no TARGET_OBJECT");
                     }
-                    CaptureTarget::Device(device_id) => {
-                        // TARGET_OBJECT = the device's PipeWire node ID or serial.
-                        props.insert(*pipewire::keys::TARGET_OBJECT, device_id.0.as_str());
-                        log::debug!("PipeWire: Device target — TARGET_OBJECT={}", device_id.0);
-                    }
-                    CaptureTarget::Application(app_id) => {
-                        // TARGET_OBJECT = the application's PipeWire node ID.
-                        // The ApplicationId string should contain the PW node
-                        // ID or serial assigned by the caller.
-                        props.insert(*pipewire::keys::TARGET_OBJECT, app_id.0.as_str());
-                        log::debug!("PipeWire: Application target — TARGET_OBJECT={}", app_id.0);
-                    }
-                    CaptureTarget::ApplicationByName(name) => {
-                        // Resolve application name → PipeWire node object.serial
-                        // via pw-dump. TARGET_OBJECT requires a serial, not a name.
-                        let serial = match find_pipewire_node_serial(&PwNodeLookup::ByAppName(name))
-                        {
-                            Ok(s) => s,
-                            Err(e) => {
-                                log::warn!(
-                                    "PipeWire: ApplicationByName '{}' — node lookup failed: {}",
-                                    name,
-                                    e
-                                );
-                                let _ = response_tx.send(Err(e));
-                                continue;
-                            }
-                        };
+                    ResolvedTarget::Serial(serial) => {
+                        // TARGET_OBJECT = the resolved node `object.serial`.
                         props.insert(*pipewire::keys::TARGET_OBJECT, serial.as_str());
-                        log::debug!(
-                            "PipeWire: ApplicationByName '{}' resolved to node serial={}",
-                            name,
-                            serial
-                        );
-                    }
-                    CaptureTarget::ProcessTree(pid) => {
-                        // ── Step 1: Discover the full process tree ──
-                        // Walk /proc to find all child/descendant PIDs of the
-                        // target process. Falls back to single PID if /proc
-                        // is unavailable.
-                        let tree_pids = discover_process_tree_pids(pid.0);
-
-                        log::debug!(
-                            "PipeWire: ProcessTree PID {} — discovered {} PIDs in tree: {:?}",
-                            pid.0,
-                            tree_pids.len(),
-                            tree_pids
-                        );
-
-                        // ── Step 2: Find PipeWire node for any PID in the tree ──
-                        // Search pw-dump for the first audio output node belonging
-                        // to any process in the tree. This handles the common case
-                        // where a parent process (e.g., browser main) spawns a
-                        // child that does the actual audio output (e.g., renderer).
-                        let serial = match find_pipewire_node_serial(&PwNodeLookup::ByPidSet(
-                            &tree_pids,
-                        )) {
-                            Ok(s) => s,
-                            Err(e) => {
-                                log::warn!(
-                                    "PipeWire: ProcessTree PID {} — node lookup failed for {} PIDs: {}",
-                                    pid.0,
-                                    tree_pids.len(),
-                                    e
-                                );
-                                let _ = response_tx.send(Err(e));
-                                continue;
-                            }
-                        };
-                        props.insert(*pipewire::keys::TARGET_OBJECT, serial.as_str());
-                        log::debug!(
-                            "PipeWire: ProcessTree PID {} resolved to node serial={} (searched {} PIDs)",
-                            pid.0,
-                            serial,
-                            tree_pids.len()
-                        );
+                        log::debug!("PipeWire: TARGET_OBJECT={}", serial);
                     }
                 }
 
@@ -889,7 +1024,21 @@ fn pw_thread_main(
 
                         // Update channels/sample_rate from the negotiated format
                         // so the process callback creates AudioBuffers with the
-                        // correct metadata.
+                        // correct metadata. This keeps PER-BUFFER metadata
+                        // authoritative (`AudioBuffer::channels()/sample_rate()`
+                        // reflect the negotiated values).
+                        //
+                        // M1 (Linux half): the bridge-level `stream.format()`
+                        // currently reports the *requested* format because
+                        // `BridgeShared.format` is immutable. Propagating the
+                        // negotiated values up to `stream.format()` requires an
+                        // atomic format field on `BridgeShared`, which is owned
+                        // by the bridge/core change in the same audit wave. Once
+                        // that atomic exists, write `negotiated_channels` /
+                        // `negotiated_rate` to it here (the producer already
+                        // lives in `user_data`). Until then, downstream consumers
+                        // should trust `AudioBuffer` metadata over
+                        // `stream.format()` for the true delivery format.
                         let negotiated_channels = user_data.format.channels();
                         let negotiated_rate = user_data.format.rate();
                         if negotiated_channels > 0 {
@@ -1264,6 +1413,124 @@ mod tests {
             Err(e) => {
                 panic!("Unexpected error type: {:?}", e);
             }
+        }
+    }
+
+    // ── resolve_capture_target ───────────────────────────────────────
+    // `CaptureTarget` is already in scope via `super::*`.
+    use crate::core::config::{ApplicationId, DeviceId, ProcessId};
+
+    #[test]
+    fn test_resolve_capture_target_system_default_no_pw_dump() {
+        // SystemDefault must resolve to ResolvedTarget::SystemDefault without
+        // invoking pw-dump at all (so it works even with PipeWire absent).
+        let resolved = resolve_capture_target(&CaptureTarget::SystemDefault)
+            .expect("SystemDefault should always resolve");
+        match resolved {
+            ResolvedTarget::SystemDefault => {}
+            other => panic!("Expected SystemDefault, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn test_resolve_capture_target_application_non_numeric_is_app_not_found() {
+        // ApplicationId carries a numeric PID string (Windows/macOS contract,
+        // M7). A non-numeric id must fail fast with ApplicationNotFound BEFORE
+        // any pw-dump call.
+        let target = CaptureTarget::Application(ApplicationId("not_a_pid".to_string()));
+        match resolve_capture_target(&target) {
+            Err(AudioError::ApplicationNotFound { identifier }) => {
+                assert!(
+                    identifier.contains("not_a_pid"),
+                    "error should echo the bad id: {}",
+                    identifier
+                );
+                assert!(
+                    identifier.contains("PID"),
+                    "error should mention PID expectation: {}",
+                    identifier
+                );
+            }
+            other => panic!("Expected ApplicationNotFound, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn test_resolve_capture_target_application_numeric_pid_uses_pw_dump() {
+        // A numeric ApplicationId parses to a PID and then goes through pw-dump.
+        // Without a matching node it is ApplicationNotFound; without pw-dump it
+        // is a BackendError. Either is acceptable — what matters is that the
+        // numeric id is NOT inserted verbatim as TARGET_OBJECT (the M7 bug).
+        let target = CaptureTarget::Application(ApplicationId("424242".to_string()));
+        match resolve_capture_target(&target) {
+            Err(AudioError::ApplicationNotFound { identifier }) => {
+                assert!(
+                    identifier.contains("424242"),
+                    "lookup error should reference the PID: {}",
+                    identifier
+                );
+            }
+            Err(AudioError::BackendError { message, .. }) => {
+                assert!(
+                    message.contains("pw-dump"),
+                    "expected pw-dump-related backend error: {}",
+                    message
+                );
+            }
+            Ok(ResolvedTarget::Serial(_)) => {
+                // A node for PID 424242 actually existed — fine.
+            }
+            other => panic!("Unexpected resolve result: {:?}", other),
+        }
+    }
+
+    #[test]
+    fn test_resolve_capture_target_device_missing_is_device_not_found() {
+        // A device id that cannot exist must surface as DeviceNotFound (M8),
+        // not a silent connect-to-nothing. If pw-dump is unavailable we get a
+        // BackendError instead — also acceptable.
+        let target = CaptureTarget::Device(DeviceId("rsac-no-such-device".to_string()));
+        match resolve_capture_target(&target) {
+            Err(AudioError::DeviceNotFound { device_id }) => {
+                assert_eq!(device_id, "rsac-no-such-device");
+            }
+            Err(AudioError::BackendError { message, .. }) => {
+                assert!(
+                    message.contains("pw-dump"),
+                    "expected pw-dump-related backend error: {}",
+                    message
+                );
+            }
+            other => panic!("Expected DeviceNotFound or BackendError, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn test_resolve_capture_target_process_tree_walks_proc() {
+        // ProcessTree should walk /proc (always available on Linux CI) and then
+        // attempt pw-dump resolution. Result is ApplicationNotFound (no node) or
+        // BackendError (no pw-dump); never a panic and never a verbatim PID.
+        let target = CaptureTarget::ProcessTree(ProcessId(std::process::id()));
+        match resolve_capture_target(&target) {
+            Err(AudioError::ApplicationNotFound { .. })
+            | Err(AudioError::BackendError { .. })
+            | Ok(ResolvedTarget::Serial(_)) => {}
+            other => panic!("Unexpected resolve result: {:?}", other),
+        }
+    }
+
+    #[test]
+    fn test_find_node_device_missing_returns_device_not_found() {
+        // Direct lookup-level check that the Device variant maps a no-match to
+        // DeviceNotFound (and not ApplicationNotFound).
+        match find_pipewire_node_serial(&PwNodeLookup::Device("definitely-not-here")) {
+            Err(AudioError::DeviceNotFound { device_id }) => {
+                assert_eq!(device_id, "definitely-not-here");
+            }
+            Err(AudioError::BackendError { message, .. }) => {
+                assert!(message.contains("pw-dump"), "got: {}", message);
+            }
+            other => panic!("Expected DeviceNotFound or BackendError, got {:?}", other),
         }
     }
 }

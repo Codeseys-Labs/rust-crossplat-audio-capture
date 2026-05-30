@@ -1,6 +1,29 @@
 # Canonical Public API Design — `rsac` (Rust Cross-Platform Audio Capture)
 
-> **Status:** Design Document — Subtask B1  
+> ⚠️ **ASPIRATIONAL / HISTORICAL DESIGN — NOT THE SOURCE OF TRUTH.**
+> This is an early design document. The shipped code intentionally diverged
+> from it in several places, and **the code is the source of truth**, not this
+> file. Read the rustdoc and the modules under [`src/`](../../src/) (and the
+> ADRs in [`docs/designs/`](../designs/)) for what `rsac` actually does. Known
+> divergences this document still describes incorrectly:
+> - Streaming method names: this doc uses `read_chunk(Duration)` / `async_stream` /
+>   `to_async_stream` / `pipe_to`. The real API is
+>   [`AudioCapture::read_buffer()`](../../src/api.rs), `audio_data_stream()`
+>   (behind `async-stream`), and `subscribe()`; the trait method is
+>   `CapturingStream::read_chunk()` (no `Duration` arg).
+> - `AudioError` is a **manual** `Display`/`Error` enum (no `thiserror` derive,
+>   **not** `Clone`), with **22** variants (since ADR-0003 added `StreamEnded`) and
+>   **3** recoverability states (`Recoverable`, `TransientRetry`, `Fatal` — there is
+>   no `UserError`). See [`src/core/error.rs`](../../src/core/error.rs).
+> - Supported sample rates are **6** (`22050, 32000, 44100, 48000, 88200, 96000`),
+>   not the 11 listed here.
+> - `ResolvedConfig`, `AudioBufferRef`, `ApplicationEnumerator::enumerate_applications`,
+>   and the `rsac::prelude` module described below **do not exist** in the code.
+> - `CaptureTarget` variants are tuple/newtype (`Device(DeviceId)`,
+>   `Application(ApplicationId)`, `ProcessTree(ProcessId)`, `ApplicationByName(String)`),
+>   not the struct-variant forms shown in places below.
+>
+> **Status:** Design Document — Subtask B1 (historical)
 > **Priority Order:** Correctness → UX → Breadth  
 > **Guiding Principle:** Streaming-first, pull-model with ring-buffer bridge from OS callbacks
 

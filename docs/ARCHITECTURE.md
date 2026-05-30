@@ -88,7 +88,11 @@ Created ──▶ Running ──▶ Stopping ──▶ Stopped ──▶ Closed
 - The producer signals "done" by moving `Running → Stopping`. The consumer
   is still permitted to drain buffers in `Stopping`.
 - `stop()` is idempotent: calling it twice is not an error.
-- Reading a buffer after `Stopped` yields `AudioError::StreamError`.
+- Reading a buffer after the stream reaches a terminal state
+  (`Stopped` / `Closed` / `Error`) yields `AudioError::StreamEnded`
+  (Fatal — see [ADR-0003](designs/0003-terminal-stream-error.md)), so read loops
+  that break on `is_fatal()` terminate cleanly. Genuinely transient read hiccups
+  surface as the recoverable `AudioError::StreamReadError`.
 
 ## 3. Capture-target resolution
 
@@ -172,14 +176,15 @@ Every fallible operation returns `AudioResult<T>` (alias for
 - [`ErrorKind`](../src/core/error.rs) — one of
   `Configuration`, `Device`, `Stream`, `Backend`, `Application`,
   `Platform`, `Internal`.
-- [`Recoverability`](../src/core/error.rs) — `Recoverable`,
-  `TransientRetry`, `Fatal`, or `UserError`.
+- [`Recoverability`](../src/core/error.rs) — one of `Recoverable`,
+  `TransientRetry`, or `Fatal` (three states).
 - Optional [`BackendContext`](../src/core/error.rs) — a structured
-  wrapper for OS-level error codes and the name of the failing operation.
+  wrapper for OS-level error codes and the name of the failing operation,
+  carried inside the variants that wrap a backend failure.
 
-Call `AudioError::kind()`, `AudioError::recoverability()`, and
-`AudioError::backend_context()` to drive retry / fallback logic. The full
-taxonomy lives in
+Call `AudioError::kind()`, `AudioError::recoverability()`, and the
+`is_recoverable()` / `is_fatal()` helpers to drive retry / fallback logic. The
+full taxonomy lives in
 [`docs/architecture/ERROR_CAPABILITY_DESIGN.md`](architecture/ERROR_CAPABILITY_DESIGN.md).
 
 ## 6. Thread safety contract
