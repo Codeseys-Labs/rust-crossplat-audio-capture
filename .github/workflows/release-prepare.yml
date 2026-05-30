@@ -164,9 +164,10 @@ jobs:
             Automated release preparation (`${{ inputs.bump }}` bump) from
             `${{ steps.next.outputs.current }}` → `${{ steps.next.outputs.version }}`.
 
-            This PR bumps the five lockstep manifests and rotates the CHANGELOG:
+            This PR bumps the six lockstep manifests and rotates the CHANGELOG:
 
             - `Cargo.toml`
+            - `bindings/rsac-ffi/Cargo.toml`
             - `bindings/rsac-napi/Cargo.toml`
             - `bindings/rsac-napi/package.json`
             - `bindings/rsac-python/Cargo.toml`

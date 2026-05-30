@@ -1409,7 +1409,10 @@ pub unsafe extern "C" fn rsac_capabilities_backend_name(
 /// The returned pointer is a static string valid for the lifetime of the library.
 #[no_mangle]
 pub extern "C" fn rsac_version() -> *const c_char {
-    static VERSION: &[u8] = b"0.1.0\0";
+    // Use the crate's own version (kept in lockstep with the workspace by
+    // scripts/bump-version.sh + ci.yml's version-lockstep gate). `concat!` keeps
+    // the NUL-terminated &[u8] a valid C string with no runtime allocation.
+    const VERSION: &[u8] = concat!(env!("CARGO_PKG_VERSION"), "\0").as_bytes();
     VERSION.as_ptr() as *const c_char
 }
 

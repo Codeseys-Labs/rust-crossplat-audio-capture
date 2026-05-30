@@ -1,6 +1,9 @@
 [package]
 name = "rsac-ffi"
-version = "0.1.0"
+# In lockstep with the workspace version (rsac + napi + python). Bumped from
+# 0.1.0 to align with the 0.2.0 line — ci.yml's version-lockstep gate and
+# scripts/bump-version.sh treat all six manifests as one version.
+version = "0.2.0"
 edition = "2021"
 # Mirror the parent crate's MSRV floor (1.87): rsac-ffi builds against rsac and
 # must not require a newer toolchain than the library it wraps.

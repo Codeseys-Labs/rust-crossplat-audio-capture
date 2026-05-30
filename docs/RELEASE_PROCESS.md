@@ -175,14 +175,26 @@ of the automated flows fails.
 
 ---
 
-## Automated minor/patch release (release-please style)
+## Automated release (GitHub-only for now)
 
 This is the **recommended** way to cut a `minor` or `patch` release. It
 is a two-workflow, release-please-style flow: a maintainer kicks off a
 *prepare* workflow that opens a reviewable release PR, and merging that
-PR triggers a *tag* workflow that creates and pushes the `vX.Y.Z` tag.
-**No bot ever pushes to `master` directly** — every byte that ships is
-reviewed in a normal PR first.
+PR triggers a *tag* workflow that creates the `vX.Y.Z` tag **and the
+GitHub Release**. **No bot ever pushes to `master` directly** — every byte
+that ships is reviewed in a normal PR first.
+
+> ### ⚠️ Scope: GitHub-only — registry publishing is still MANUAL
+> The automated flow currently produces the **git tag + a GitHub Release**
+> and nothing more. It does **not** automatically publish to crates.io /
+> npm / PyPI. The reason is a deliberate GitHub Actions rule: a tag pushed
+> with the default `GITHUB_TOKEN` does **not** re-trigger the
+> `on: push: tags:` publish workflows (`release.yml` / `release-npm.yml` /
+> `release-pypi.yml`), and this repo has no PAT / GitHub App token wired
+> yet. So after the automated GitHub Release lands, **publish to the
+> registries by hand** (see "Step 4" below). When a triggering token is
+> added later, the tag push will fan out automatically and this caveat
+> goes away.
 
 ```
  ┌──────────────────────────┐   human runs from Actions tab, picks bump=minor|patch
@@ -193,17 +205,19 @@ reviewed in a normal PR first.
               │  scripts/bump-version.sh, opens a PR
               ▼
  ┌──────────────────────────┐   human reviews + SQUASH-MERGES
- │  PR: "release: vX.Y.Z"    │   (CI version-lockstep gate must be green)
- └────────────┬─────────────┘
-              │  squash commit subject == "release: vX.Y.Z" lands on master
+ │  PR: "release: vX.Y.Z"    │   (CI version-lockstep gate must be green;
+ └────────────┬─────────────┘    it now also runs at tag time)
+              │  squash commit subject == "release: vX.Y.Z (#N)" lands on master
               ▼
- ┌──────────────────────────┐   detects the release commit, creates +
- │  Release Tag on Merge     │   pushes annotated tag vX.Y.Z
+ ┌──────────────────────────┐   detects the release commit, creates the
+ │  Release Tag on Merge     │   annotated tag vX.Y.Z AND a GitHub Release
  │  (push: master)           │   (.github/workflows/release-tag.yml)
  └────────────┬─────────────┘
-              │  tag push
+              │  GitHub Release published.
+              │  (GITHUB_TOKEN tag push does NOT auto-trigger the registry
+              │   publishes — do Step 4 manually.)
               ▼
-   release.yml / release-npm.yml / release-pypi.yml   (the publish fan-out above)
+   Step 4 (manual): run release.yml / release-npm.yml / release-pypi.yml
 ```
 
 ### Step 1 — run the "Release Prepare" workflow
@@ -287,19 +301,44 @@ push it:
    never re-tags**.
 5. **Creates + pushes the annotated tag** — `git tag -a vX.Y.Z -m
    "Release X.Y.Z"` on HEAD (the reviewed, lockstep-passing squash commit)
-   and `git push origin vX.Y.Z`. **That push is the sole action** of this
-   workflow — it does **not** duplicate any publish logic; the tag push is
-   what fans out to `release.yml` / `release-npm.yml` / `release-pypi.yml`
-   (the three publish workflows documented under "Automated Release Flow").
+   and `git push origin vX.Y.Z`.
+6. **Publishes the GitHub Release** — extracts the `## [X.Y.Z]` section
+   from `CHANGELOG.md` as the release notes and creates the GitHub Release
+   for the tag (via `softprops/action-gh-release`). The default
+   `GITHUB_TOKEN` is allowed to create tags and releases.
+7. **Emits a manual-publish reminder** — a `::warning::` instructing the
+   maintainer to run the registry publishes (Step 4), because the
+   `GITHUB_TOKEN`-pushed tag does **not** auto-trigger them.
 
-This job is also repo-guarded to
+This job is repo-guarded to
 `Codeseys-Labs/rust-crossplat-audio-capture` (a fork that merges a
-`release:` commit must never tag + publish), serialised via a
+`release:` commit must never tag + release), serialised via a
 `concurrency` group, and runs with least-privilege `permissions: contents:
-write` (it only pushes a tag). Because the tagged commit already passed
-`version-lockstep` as part of the merged PR, and `release.yml` re-runs
-the tag↔manifest check on the tag, the version is verified at three
-points.
+write` (tag + release only). The version is verified at three points: the
+merged PR's `version-lockstep` gate, the same gate re-running at tag time
+(ci.yml now triggers on `v*.*.*` tags), and `release-tag.yml`'s own
+manifest defense.
+
+### Step 4 — publish to the registries (MANUAL, for now)
+
+The automated flow above stops at the **git tag + GitHub Release**. To
+publish the crate and bindings to crates.io / npm / PyPI, trigger the
+publish workflows by hand after the GitHub Release appears:
+
+- **crates.io** — Actions → **Release** (`release.yml`) → *Run workflow*
+  (it has a `workflow_dispatch` with a `dry_run` toggle; set `dry_run:
+  false` to publish for real). Needs the `CARGO_REGISTRY_TOKEN` secret.
+- **npm** (`@rsac/audio`) — `release-npm.yml` triggers only on a tag push.
+  Until a triggering token is added, re-push the tag from a machine/token
+  that re-triggers workflows, or add a temporary `workflow_dispatch`.
+- **PyPI** (`rsac`) — `release-pypi.yml`, same as npm (tag-triggered;
+  publishes via PyPI Trusted Publishing / OIDC).
+
+**Why this is manual:** a tag pushed with the default `GITHUB_TOKEN` does
+not re-trigger `on: push: tags:` workflows (GitHub's anti-recursion rule),
+and this repo has no PAT / GitHub App token configured yet. When one is
+added to `release-tag.yml`'s checkout, Step 4 becomes automatic and this
+section can be deleted. See `release-tag.yml`'s header for the wiring TODO.
 
 ### What the automated flow will NOT do (use the manual path instead)
 

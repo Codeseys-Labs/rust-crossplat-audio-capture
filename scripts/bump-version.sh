@@ -2,6 +2,7 @@
 #
 # Bump the rsac workspace version across the five files that must agree:
 #   - Cargo.toml                              (root `rsac` crate)
+#   - bindings/rsac-ffi/Cargo.toml            (C FFI crate)
 #   - bindings/rsac-napi/Cargo.toml           (napi crate)
 #   - bindings/rsac-napi/package.json         (npm package)
 #   - bindings/rsac-python/Cargo.toml         (pyo3 crate)
@@ -76,13 +77,14 @@ REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "$REPO_ROOT"
 
 ROOT_CARGO="Cargo.toml"
+FFI_CARGO="bindings/rsac-ffi/Cargo.toml"
 NAPI_CARGO="bindings/rsac-napi/Cargo.toml"
 NAPI_PKG="bindings/rsac-napi/package.json"
 PY_CARGO="bindings/rsac-python/Cargo.toml"
 PY_PYPROJ="bindings/rsac-python/pyproject.toml"
 CHANGELOG="CHANGELOG.md"
 
-for f in "$ROOT_CARGO" "$NAPI_CARGO" "$NAPI_PKG" "$PY_CARGO" "$PY_PYPROJ" "$CHANGELOG"; do
+for f in "$ROOT_CARGO" "$FFI_CARGO" "$NAPI_CARGO" "$NAPI_PKG" "$PY_CARGO" "$PY_PYPROJ" "$CHANGELOG"; do
     [ -f "$f" ] || { err "missing required file: $f"; exit 1; }
 done
 
@@ -186,6 +188,7 @@ extract_or_die() {
 }
 
 CUR_ROOT=$(extract_or_die       "root crate"   "$ROOT_CARGO" cargo_package_version)
+CUR_FFI_CARGO=$(extract_or_die  "rsac-ffi"     "$FFI_CARGO"  cargo_package_version)
 CUR_NAPI_CARGO=$(extract_or_die "rsac-napi"    "$NAPI_CARGO" cargo_package_version)
 CUR_NAPI_PKG=$(extract_or_die   "rsac-napi pkg" "$NAPI_PKG"   json_version)
 CUR_PY_CARGO=$(extract_or_die   "rsac-python"  "$PY_CARGO"   cargo_package_version)
@@ -194,6 +197,7 @@ CUR_PY_PYPROJ=$(extract_or_die  "rsac-python pyproject" "$PY_PYPROJ" cargo_packa
 info "target version:  $NEW_VERSION"
 info "current versions:"
 printf '  %-42s %s\n' "$ROOT_CARGO"  "$CUR_ROOT"
+printf '  %-42s %s\n' "$FFI_CARGO"   "$CUR_FFI_CARGO"
 printf '  %-42s %s\n' "$NAPI_CARGO"  "$CUR_NAPI_CARGO"
 printf '  %-42s %s\n' "$NAPI_PKG"    "$CUR_NAPI_PKG"
 printf '  %-42s %s\n' "$PY_CARGO"    "$CUR_PY_CARGO"
@@ -203,6 +207,7 @@ printf '  %-42s %s\n' "$PY_PYPROJ"   "$CUR_PY_PYPROJ"
 # touching the changelog either (rotating a changelog that's already been
 # rotated would create a duplicate ## [X.Y.Z] header).
 if [ "$CUR_ROOT" = "$NEW_VERSION" ] && \
+   [ "$CUR_FFI_CARGO" = "$NEW_VERSION" ] && \
    [ "$CUR_NAPI_CARGO" = "$NEW_VERSION" ] && \
    [ "$CUR_NAPI_PKG" = "$NEW_VERSION" ] && \
    [ "$CUR_PY_CARGO" = "$NEW_VERSION" ] && \
@@ -214,6 +219,7 @@ fi
 # Plan per-file changes.
 CHANGES=()
 [ "$CUR_ROOT" != "$NEW_VERSION" ]       && CHANGES+=("$ROOT_CARGO")
+[ "$CUR_FFI_CARGO" != "$NEW_VERSION" ]  && CHANGES+=("$FFI_CARGO")
 [ "$CUR_NAPI_CARGO" != "$NEW_VERSION" ] && CHANGES+=("$NAPI_CARGO")
 [ "$CUR_NAPI_PKG" != "$NEW_VERSION" ]   && CHANGES+=("$NAPI_PKG")
 [ "$CUR_PY_CARGO" != "$NEW_VERSION" ]   && CHANGES+=("$PY_CARGO")
@@ -247,6 +253,7 @@ fi
 
 # ── apply ────────────────────────────────────────────────────────────
 [ "$CUR_ROOT"       != "$NEW_VERSION" ] && rewrite_cargo_version "$ROOT_CARGO"  "$NEW_VERSION"
+[ "$CUR_FFI_CARGO"  != "$NEW_VERSION" ] && rewrite_cargo_version "$FFI_CARGO"   "$NEW_VERSION"
 [ "$CUR_NAPI_CARGO" != "$NEW_VERSION" ] && rewrite_cargo_version "$NAPI_CARGO"  "$NEW_VERSION"
 [ "$CUR_NAPI_PKG"   != "$NEW_VERSION" ] && rewrite_json_version  "$NAPI_PKG"    "$NEW_VERSION"
 [ "$CUR_PY_CARGO"   != "$NEW_VERSION" ] && rewrite_cargo_version "$PY_CARGO"    "$NEW_VERSION"

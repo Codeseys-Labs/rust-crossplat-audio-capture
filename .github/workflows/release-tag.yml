@@ -1,6 +1,6 @@
 # Release-tag-on-merge: the second half of the release-please-style flow.
 #
-# The first half (.github/workflows/release-please.yml) is a manual
+# The first half (.github/workflows/release-prepare.yml) is a manual
 # workflow_dispatch that computes the next NON-MAJOR version, runs
 # scripts/bump-version.sh, and opens a "release: vX.Y.Z" PR (bump + CHANGELOG
 # rotation) via peter-evans/create-pull-request. A human reviews and
@@ -8,33 +8,48 @@
 #
 # This workflow runs on every push to master, detects the squash-merge of a
 # release PR by the HEAD commit SUBJECT (`release: vX.Y.Z`), and — if the
-# manifest agrees and the tag does not already exist — creates and pushes an
-# annotated `vX.Y.Z` tag. That tag push is the single fan-out trigger for the
-# three existing publish workflows:
-#   • release.yml       → crates.io   (Rust crate)
-#   • release-npm.yml    → npm         (@rsac/audio, napi bindings)
-#   • release-pypi.yml   → PyPI        (rsac, PyO3/maturin bindings)
-# This workflow MUST NOT duplicate any of their publish logic — it only
-# creates and pushes the tag.
+# manifest agrees and the tag does not already exist — creates + pushes an
+# annotated `vX.Y.Z` tag AND publishes a GitHub Release for it.
+#
+# ─────────────────────────────────────────────────────────────────────────
+#  SCOPE: GitHub-only for now (tag + GitHub Release). Registry publishing
+#  (crates.io / npm / PyPI) is DEFERRED and stays MANUAL — see below.
+# ─────────────────────────────────────────────────────────────────────────
+#
+# Why registry fan-out is NOT automatic here:
+#   The existing publish workflows (release.yml → crates.io, release-npm.yml →
+#   npm, release-pypi.yml → PyPI) trigger ONLY on `push: tags: v*.*.*`. But a
+#   tag pushed using the default GITHUB_TOKEN does **not** re-trigger other
+#   workflows (GitHub Actions' deliberate anti-recursion rule), and no PAT /
+#   GitHub App token is configured in this repo yet. So if this workflow's tag
+#   push were relied upon to fan out, those publishes would SILENTLY never run.
+#   Rather than broaden token scope prematurely, this workflow is intentionally
+#   GitHub-only: it creates the tag + the GitHub Release (both of which the
+#   default GITHUB_TOKEN CAN do), and tells the maintainer to run the registry
+#   publishes manually (release.yml has workflow_dispatch; npm/pypi currently
+#   need a manual re-tag or a dispatch trigger added).
+#
+#   FUTURE: when the registry paths are wired, add an
+#   actions/create-github-app-token (or fine-grained PAT) to the checkout so the
+#   tag push re-triggers release.yml / release-npm.yml / release-pypi.yml. See
+#   docs/RELEASE_PROCESS.md "Automated release (GitHub-only for now)".
 #
 # Detection rationale (primary, robust signal):
 #   A squash merge collapses the release PR into a single commit whose subject
-#   is the PR title — "release: vX.Y.Z". Matching the HEAD commit subject with
-#   `git log -1 --format=%s` is branch/merge-strategy independent and needs no
-#   API call. (A PR `release` label could be an additional signal but is not
-#   required; the commit-subject match is the gate.)
+#   is the PR title — "release: vX.Y.Z" (GitHub appends " (#N)"). Matching the
+#   HEAD commit subject with `git log -1 --format=%s` is branch/merge-strategy
+#   independent and needs no API call.
 #
 # Safety:
 #   • Repo-guarded to Codeseys-Labs/rust-crossplat-audio-capture so a fork that
-#     merges a "release:" commit never tags + publishes.
+#     merges a "release:" commit never tags + releases.
 #   • Manifest defense: refuses if Cargo.toml version != the parsed version.
 #   • Major guard: refuses if the parsed major != the current Cargo.toml major
-#     (a major bump stays fully manual — release-please.yml never produces one,
+#     (a major bump stays fully manual — release-prepare.yml never produces one,
 #     but this is belt-and-suspenders against a hand-crafted release commit).
 #   • Idempotent: never re-tags an existing local OR remote vX.Y.Z tag.
 #   • The tagged commit is the squash-merge commit on master, which already
-#     passed ci.yml's version-lockstep gate as part of the merged PR; the
-#     downstream release.yml / lockstep re-checks it again on the tag.
+#     passed ci.yml's version-lockstep gate as part of the merged PR.
 
 name: Release Tag on Merge
 
@@ -166,11 +181,14 @@ jobs:
             echo "Tag ${TAG} does not exist yet — will create."
           fi
 
-      # Create + push the annotated tag. This is the SOLE action of this
-      # workflow that mutates the repo; the push is the fan-out trigger for
-      # release.yml / release-npm.yml / release-pypi.yml. We tag HEAD (the
-      # squash-merge release commit) so the published artifacts come from the
-      # exact reviewed + version-lockstep-passing commit on master.
+      # Create + push the annotated tag at HEAD (the squash-merge release
+      # commit), so any artifacts come from the exact reviewed +
+      # version-lockstep-passing commit on master.
+      #
+      # NOTE: pushed with the default GITHUB_TOKEN, this tag does NOT re-trigger
+      # the on:push:tags publish workflows (anti-recursion). That is intentional
+      # for now — see the header. Registry publishing is manual until a PAT/App
+      # token is added.
       - name: Create and push annotated tag
         if: steps.detect.outputs.is_release == 'true' && steps.exists.outputs.exists == 'false'
         shell: bash
@@ -183,4 +201,50 @@ jobs:
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
           git tag -a "${TAG}" -m "Release ${VERSION}"
           git push origin "${TAG}"
-          echo "::notice::Pushed annotated tag ${TAG} — release.yml / release-npm.yml / release-pypi.yml will fan out from this tag."
+          echo "::notice::Pushed annotated tag ${TAG}."
+
+      # Extract this version's CHANGELOG section for the GitHub Release body.
+      # Pulls the lines between "## [X.Y.Z]" and the next "## [" heading.
+      - name: Extract CHANGELOG section
+        if: steps.detect.outputs.is_release == 'true' && steps.exists.outputs.exists == 'false'
+        id: notes
+        shell: bash
+        env:
+          VERSION: ${{ steps.detect.outputs.version }}
+        run: |
+          set -euo pipefail
+          SECTION="$(awk -v ver="$VERSION" '
+            $0 ~ "^## \\[" ver "\\]" { capture = 1; next }
+            capture && /^## \[/ { exit }
+            capture { print }
+          ' CHANGELOG.md)"
+          if [ -z "${SECTION// /}" ]; then
+            SECTION="Release ${VERSION}. See CHANGELOG.md."
+          fi
+          {
+            echo "body<<__RSAC_NOTES__"
+            echo "$SECTION"
+            echo "__RSAC_NOTES__"
+          } >> "$GITHUB_OUTPUT"
+
+      # Create the GitHub Release for the tag. The default GITHUB_TOKEN CAN
+      # create releases (only cross-workflow TRIGGERING is blocked), so this is
+      # the GitHub-only deliverable. softprops/action-gh-release is pinned.
+      - name: Create GitHub Release
+        if: steps.detect.outputs.is_release == 'true' && steps.exists.outputs.exists == 'false'
+        uses: softprops/action-gh-release@c95fe1489396fe8a9eb87c0abf8aa5b2ef267fda # v2.0.8
+        with:
+          tag_name: ${{ steps.detect.outputs.tag }}
+          name: ${{ steps.detect.outputs.tag }}
+          body: ${{ steps.notes.outputs.body }}
+          draft: false
+          prerelease: false
+
+      # Loud reminder that registry publishing is NOT automatic yet.
+      - name: Registry-publish reminder (manual until a triggering token is added)
+        if: steps.detect.outputs.is_release == 'true' && steps.exists.outputs.exists == 'false'
+        shell: bash
+        env:
+          TAG: ${{ steps.detect.outputs.tag }}
+        run: |
+          echo "::warning::Tag ${TAG} + GitHub Release created. Registry publishing is NOT automatic (GITHUB_TOKEN-pushed tags do not trigger the on:push:tags publish workflows). To publish: run the 'Release' workflow (release.yml) via workflow_dispatch for crates.io, and trigger release-npm.yml / release-pypi.yml manually (e.g. re-push the tag with a PAT, or add a workflow_dispatch). See docs/RELEASE_PROCESS.md."

@@ -6,6 +6,13 @@ name: CI
 on:
   push:
     branches: [main, master]
+    # Also run on stable semver tags so the version-lockstep job's tag-time
+    # hard-gate (which asserts all six manifests equal the tag) actually fires
+    # at the point of no return — it was previously dead code (ci.yml had no
+    # tags: trigger). Pre-release shapes (v*-rc.1) are excluded.
+    tags:
+      - 'v*.*.*'
+      - '!v*-*'
   pull_request:
     branches: [main, master]
   workflow_dispatch:
