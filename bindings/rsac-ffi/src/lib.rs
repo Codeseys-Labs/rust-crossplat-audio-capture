@@ -70,6 +70,78 @@ pub enum rsac_device_kind_t {
     RSAC_DEVICE_OUTPUT = 1,
 }
 
+/// Sample wire/storage format, mirroring [`rsac::SampleFormat`].
+///
+/// All audio data is delivered as interleaved `f32` regardless of this value;
+/// it describes the negotiated wire format the backend reports.
+#[repr(C)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum rsac_sample_format_t {
+    /// Signed 16-bit integer.
+    RSAC_SAMPLE_FORMAT_I16 = 0,
+    /// Signed 24-bit integer (packed in a 32-bit container).
+    RSAC_SAMPLE_FORMAT_I24 = 1,
+    /// Signed 32-bit integer.
+    RSAC_SAMPLE_FORMAT_I32 = 2,
+    /// 32-bit IEEE 754 floating-point (the library's internal standard).
+    RSAC_SAMPLE_FORMAT_F32 = 3,
+}
+
+impl From<rsac::SampleFormat> for rsac_sample_format_t {
+    fn from(f: rsac::SampleFormat) -> Self {
+        match f {
+            rsac::SampleFormat::I16 => rsac_sample_format_t::RSAC_SAMPLE_FORMAT_I16,
+            rsac::SampleFormat::I24 => rsac_sample_format_t::RSAC_SAMPLE_FORMAT_I24,
+            rsac::SampleFormat::I32 => rsac_sample_format_t::RSAC_SAMPLE_FORMAT_I32,
+            rsac::SampleFormat::F32 => rsac_sample_format_t::RSAC_SAMPLE_FORMAT_F32,
+        }
+    }
+}
+
+/// A point-in-time snapshot of a capture's stream statistics.
+///
+/// Filled by [`rsac_capture_stream_stats`] from [`AudioCapture::stream_stats`].
+/// This is a plain C-ABI value type (no heap, no free required). It mirrors the
+/// counters in [`rsac::StreamStats`]; `is_running` is `1` when capturing, else `0`.
+///
+/// When no stream has been created (before start, or after stop) every counter
+/// is `0`, `uptime_secs` is `0.0`, and `is_running` is `0`.
+#[repr(C)]
+#[derive(Debug, Clone, Copy)]
+pub struct RsacStreamStats {
+    /// Buffers delivered to the consumer (popped off the ring) since start.
+    pub buffers_captured: u64,
+    /// Buffers dropped due to ring-buffer overflow since start.
+    pub buffers_dropped: u64,
+    /// Buffers enqueued by the producer (the OS audio callback) since start.
+    pub buffers_pushed: u64,
+    /// Ring-buffer overruns. Equal to `buffers_dropped` (retained alias).
+    pub overruns: u64,
+    /// How long the stream has been running, in seconds. `0.0` when not started.
+    pub uptime_secs: f64,
+    /// Fraction of accounted-for buffers lost to overflow, in `0.0..=1.0`.
+    pub dropped_ratio: f64,
+    /// `1` if the stream is currently capturing, `0` otherwise.
+    pub is_running: i32,
+}
+
+/// A point-in-time snapshot of a capture's negotiated delivery format.
+///
+/// Filled by [`rsac_capture_format`] from [`AudioCapture::format`]. Plain C-ABI
+/// value type (no heap, no free required).
+#[repr(C)]
+#[derive(Debug, Clone, Copy)]
+pub struct RsacAudioFormat {
+    /// Samples per second (e.g. 44100, 48000).
+    pub sample_rate: u32,
+    /// Number of audio channels (e.g. 1 mono, 2 stereo).
+    pub channels: u16,
+    /// The negotiated sample wire format.
+    pub sample_format: rsac_sample_format_t,
+    /// Bits per sample for `sample_format` (16, 24, or 32).
+    pub bits_per_sample: u16,
+}
+
 // ── Thread-local error message storage ───────────────────────────────────
 
 thread_local! {
@@ -535,6 +607,93 @@ pub unsafe extern "C" fn rsac_capture_overrun_count(capture: *const RsacCapture)
     }
     let c = unsafe { &*capture };
     c.inner.overrun_count()
+}
+
+/// Fills `*out` with a point-in-time [`RsacStreamStats`] snapshot of the capture.
+///
+/// The snapshot bundles the bridge's diagnostic counters with the running state,
+/// uptime, and overflow ratio. Reading it never allocates on or blocks the OS
+/// audio callback thread.
+///
+/// When no stream has been created (before start, or after stop), `*out` is
+/// filled with an all-zero snapshot (`is_running == 0`).
+///
+/// Returns `RSAC_ERROR_NULL_POINTER` if `capture` or `out` is null; otherwise
+/// `RSAC_OK`. `out` is an out-parameter, not a handle: there is nothing to free.
+#[no_mangle]
+pub unsafe extern "C" fn rsac_capture_stream_stats(
+    capture: *const RsacCapture,
+    out: *mut RsacStreamStats,
+) -> rsac_error_t {
+    catch(|| {
+        if capture.is_null() {
+            set_last_error("capture is null");
+            return rsac_error_t::RSAC_ERROR_NULL_POINTER;
+        }
+        if out.is_null() {
+            set_last_error("out pointer is null");
+            return rsac_error_t::RSAC_ERROR_NULL_POINTER;
+        }
+        let c = unsafe { &*capture };
+        let stats = c.inner.stream_stats();
+        let c_stats = RsacStreamStats {
+            buffers_captured: stats.buffers_captured,
+            buffers_dropped: stats.buffers_dropped,
+            buffers_pushed: stats.buffers_pushed,
+            overruns: stats.overruns,
+            uptime_secs: stats.uptime.as_secs_f64(),
+            dropped_ratio: stats.dropped_ratio(),
+            is_running: i32::from(stats.is_running),
+        };
+        unsafe { *out = c_stats };
+        rsac_error_t::RSAC_OK
+    })
+}
+
+/// Fills `*out` with the negotiated delivery [`RsacAudioFormat`] of the capture.
+///
+/// This is the format the backend actually produces, atomically published by the
+/// bridge once a stream is created. Returns `RSAC_ERROR_STREAM_FAILED` when no
+/// stream has been created yet (before start, or after stop), leaving `*out`
+/// untouched — call this only on a started capture, or after checking
+/// [`rsac_capture_is_running`].
+///
+/// Returns `RSAC_ERROR_NULL_POINTER` if `capture` or `out` is null. `out` is an
+/// out-parameter, not a handle: there is nothing to free.
+#[no_mangle]
+pub unsafe extern "C" fn rsac_capture_format(
+    capture: *const RsacCapture,
+    out: *mut RsacAudioFormat,
+) -> rsac_error_t {
+    catch(|| {
+        if capture.is_null() {
+            set_last_error("capture is null");
+            return rsac_error_t::RSAC_ERROR_NULL_POINTER;
+        }
+        if out.is_null() {
+            set_last_error("out pointer is null");
+            return rsac_error_t::RSAC_ERROR_NULL_POINTER;
+        }
+        let c = unsafe { &*capture };
+        match c.inner.format() {
+            Some(fmt) => {
+                let c_fmt = RsacAudioFormat {
+                    sample_rate: fmt.sample_rate,
+                    channels: fmt.channels,
+                    sample_format: rsac_sample_format_t::from(fmt.sample_format),
+                    bits_per_sample: fmt.sample_format.bits_per_sample(),
+                };
+                unsafe { *out = c_fmt };
+                rsac_error_t::RSAC_OK
+            }
+            None => {
+                set_last_error(
+                    "no negotiated format available (stream not started, or already stopped)",
+                );
+                rsac_error_t::RSAC_ERROR_STREAM_FAILED
+            }
+        }
+    })
 }
 
 /// Frees a capture handle. Stops the stream if running. No-op if null.
@@ -1141,4 +1300,136 @@ pub unsafe extern "C" fn rsac_capabilities_backend_name(
 pub extern "C" fn rsac_version() -> *const c_char {
     static VERSION: &[u8] = b"0.1.0\0";
     VERSION.as_ptr() as *const c_char
+}
+
+// ── Tests ────────────────────────────────────────────────────────────────
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::mem::MaybeUninit;
+    use std::time::Duration;
+
+    // ── Null-pointer contract: stats/format reject null capture & out ──────
+
+    #[test]
+    fn stream_stats_rejects_null_capture() {
+        let mut out = MaybeUninit::<RsacStreamStats>::uninit();
+        let code = unsafe { rsac_capture_stream_stats(ptr::null(), out.as_mut_ptr()) };
+        assert_eq!(code, rsac_error_t::RSAC_ERROR_NULL_POINTER);
+    }
+
+    #[test]
+    fn stream_stats_rejects_null_out() {
+        // A null capture is checked first, so pass a (dangling-but-non-null)
+        // capture pointer to exercise the null-`out` branch specifically. The
+        // pointer is never dereferenced (the null-`out` check returns first).
+        let cap = ptr::dangling::<RsacCapture>();
+        let code = unsafe { rsac_capture_stream_stats(cap, ptr::null_mut()) };
+        assert_eq!(code, rsac_error_t::RSAC_ERROR_NULL_POINTER);
+    }
+
+    #[test]
+    fn format_rejects_null_capture() {
+        let mut out = MaybeUninit::<RsacAudioFormat>::uninit();
+        let code = unsafe { rsac_capture_format(ptr::null(), out.as_mut_ptr()) };
+        assert_eq!(code, rsac_error_t::RSAC_ERROR_NULL_POINTER);
+    }
+
+    #[test]
+    fn format_rejects_null_out() {
+        // Dangling-but-non-null capture: never dereferenced (null-`out` returns first).
+        let cap = ptr::dangling::<RsacCapture>();
+        let code = unsafe { rsac_capture_format(cap, ptr::null_mut()) };
+        assert_eq!(code, rsac_error_t::RSAC_ERROR_NULL_POINTER);
+    }
+
+    // ── Sample-format mapping round-trip ───────────────────────────────────
+
+    #[test]
+    fn sample_format_maps_every_variant() {
+        let cases = [
+            (
+                rsac::SampleFormat::I16,
+                rsac_sample_format_t::RSAC_SAMPLE_FORMAT_I16,
+                16u16,
+            ),
+            (
+                rsac::SampleFormat::I24,
+                rsac_sample_format_t::RSAC_SAMPLE_FORMAT_I24,
+                24,
+            ),
+            (
+                rsac::SampleFormat::I32,
+                rsac_sample_format_t::RSAC_SAMPLE_FORMAT_I32,
+                32,
+            ),
+            (
+                rsac::SampleFormat::F32,
+                rsac_sample_format_t::RSAC_SAMPLE_FORMAT_F32,
+                32,
+            ),
+        ];
+        for (rust_fmt, c_fmt, bits) in cases {
+            assert_eq!(rsac_sample_format_t::from(rust_fmt), c_fmt);
+            assert_eq!(rust_fmt.bits_per_sample(), bits);
+        }
+    }
+
+    // ── StreamStats → RsacStreamStats field round-trip ─────────────────────
+    //
+    // Mirrors the mapping inside `rsac_capture_stream_stats` without needing a
+    // live audio device (which CI lacks). Constructing the capture is what
+    // requires a device; the value-level translation is what this asserts.
+
+    #[test]
+    fn stream_stats_struct_round_trip() {
+        let mut stats = rsac::StreamStats::default();
+        stats.buffers_captured = 30;
+        stats.buffers_dropped = 10;
+        stats.buffers_pushed = 100;
+        stats.overruns = 10;
+        stats.uptime = Duration::from_millis(2500);
+        stats.is_running = true;
+
+        let c_stats = RsacStreamStats {
+            buffers_captured: stats.buffers_captured,
+            buffers_dropped: stats.buffers_dropped,
+            buffers_pushed: stats.buffers_pushed,
+            overruns: stats.overruns,
+            uptime_secs: stats.uptime.as_secs_f64(),
+            dropped_ratio: stats.dropped_ratio(),
+            is_running: i32::from(stats.is_running),
+        };
+
+        assert_eq!(c_stats.buffers_captured, 30);
+        assert_eq!(c_stats.buffers_dropped, 10);
+        assert_eq!(c_stats.buffers_pushed, 100);
+        assert_eq!(c_stats.overruns, 10);
+        assert!((c_stats.uptime_secs - 2.5).abs() < 1e-9);
+        // 10 dropped of (30 captured + 10 dropped) accounted-for == 0.25.
+        assert!((c_stats.dropped_ratio - 0.25).abs() < 1e-9);
+        assert_eq!(c_stats.is_running, 1);
+    }
+
+    #[test]
+    fn stream_stats_default_is_zeroed() {
+        let stats = rsac::StreamStats::default();
+        let c_stats = RsacStreamStats {
+            buffers_captured: stats.buffers_captured,
+            buffers_dropped: stats.buffers_dropped,
+            buffers_pushed: stats.buffers_pushed,
+            overruns: stats.overruns,
+            uptime_secs: stats.uptime.as_secs_f64(),
+            dropped_ratio: stats.dropped_ratio(),
+            is_running: i32::from(stats.is_running),
+        };
+        assert_eq!(c_stats.buffers_captured, 0);
+        assert_eq!(c_stats.buffers_dropped, 0);
+        assert_eq!(c_stats.buffers_pushed, 0);
+        assert_eq!(c_stats.overruns, 0);
+        assert_eq!(c_stats.uptime_secs, 0.0);
+        assert_eq!(c_stats.dropped_ratio, 0.0);
+        assert_eq!(c_stats.is_running, 0);
+    }
 }

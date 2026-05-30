@@ -58,6 +58,49 @@ typedef enum {
     RSAC_DEVICE_OUTPUT = 1,
 } rsac_device_kind_t;
 
+/* ── Sample format ──────────────────────────────────────────────────── */
+
+/**
+ * Sample wire/storage format. All audio data is delivered as interleaved
+ * f32 regardless of this value; it describes the negotiated wire format.
+ */
+typedef enum {
+    RSAC_SAMPLE_FORMAT_I16 = 0,
+    RSAC_SAMPLE_FORMAT_I24 = 1,
+    RSAC_SAMPLE_FORMAT_I32 = 2,
+    RSAC_SAMPLE_FORMAT_F32 = 3,
+} rsac_sample_format_t;
+
+/* ── Value (out-parameter) types ────────────────────────────────────── */
+
+/**
+ * Point-in-time snapshot of a capture's stream statistics.
+ *
+ * Filled by rsac_capture_stream_stats(). Plain value type — no heap, no free.
+ * Before start (or after stop) every field is zero and is_running is 0.
+ */
+typedef struct {
+    uint64_t buffers_captured; /**< Buffers delivered to the consumer. */
+    uint64_t buffers_dropped;  /**< Buffers dropped to ring overflow. */
+    uint64_t buffers_pushed;   /**< Buffers enqueued by the OS callback. */
+    uint64_t overruns;         /**< Ring overruns (== buffers_dropped). */
+    double   uptime_secs;      /**< Seconds running; 0.0 when not started. */
+    double   dropped_ratio;    /**< Lost fraction in 0.0..=1.0. */
+    int32_t  is_running;       /**< 1 if capturing, else 0. */
+} RsacStreamStats;
+
+/**
+ * Point-in-time snapshot of a capture's negotiated delivery format.
+ *
+ * Filled by rsac_capture_format(). Plain value type — no heap, no free.
+ */
+typedef struct {
+    uint32_t             sample_rate;     /**< Samples per second. */
+    uint16_t             channels;        /**< Number of channels. */
+    rsac_sample_format_t sample_format;   /**< Negotiated wire format. */
+    uint16_t             bits_per_sample; /**< 16, 24, or 32. */
+} RsacAudioFormat;
+
 /* ── Opaque handle types ────────────────────────────────────────────── */
 
 /** Opaque handle to an AudioCaptureBuilder. */
@@ -165,6 +208,24 @@ int32_t rsac_capture_is_running(const RsacCapture* capture);
  * Returns 0 if the capture handle is null or no stream exists.
  */
 uint64_t rsac_capture_overrun_count(const RsacCapture* capture);
+
+/**
+ * Fills *out with a point-in-time stream-statistics snapshot.
+ * *out is an out-parameter (not a handle) — nothing to free.
+ * Before start (or after stop) the snapshot is all-zero (is_running == 0).
+ * Returns RSAC_ERROR_NULL_POINTER if capture or out is null, else RSAC_OK.
+ */
+rsac_error_t rsac_capture_stream_stats(const RsacCapture* capture,
+                                       RsacStreamStats* out);
+
+/**
+ * Fills *out with the negotiated delivery format.
+ * *out is an out-parameter (not a handle) — nothing to free.
+ * Returns RSAC_ERROR_STREAM_FAILED (leaving *out untouched) when no stream
+ * has been created yet; RSAC_ERROR_NULL_POINTER if capture or out is null.
+ */
+rsac_error_t rsac_capture_format(const RsacCapture* capture,
+                                 RsacAudioFormat* out);
 
 /** Frees a capture handle. Stops the stream if running. No-op if null. */
 void rsac_capture_free(RsacCapture* capture);

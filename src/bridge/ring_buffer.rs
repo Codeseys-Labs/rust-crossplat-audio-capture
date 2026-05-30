@@ -156,24 +156,101 @@ fn sample_format_from_atomic(v: u8) -> SampleFormat {
     }
 }
 
+// ── Cache-line padding (rsac-9348) ─────────────────────────────────────────
+
+/// Cache-line size (bytes) the padding targets. 64 bytes is the line size on
+/// every mainstream 64-bit target rsac builds for (x86-64, aarch64 — Apple
+/// silicon's 128-byte line is a pair of 64-byte lines, so 64-byte alignment
+/// still separates the wrapped values onto distinct lines in practice). Used
+/// only for the `#[repr(align(..))]` on [`CachePadded`].
+///
+/// `#[repr(align(N))]` requires an integer **literal**, so `CachePadded` hard-codes
+/// `64` rather than referencing this constant; it exists to pin that literal in the
+/// alignment regression tests, hence the `#[cfg(test)]` gate (no runtime use).
+#[cfg(test)]
+pub(crate) const CACHE_LINE_BYTES: usize = 64;
+
+/// A value forced onto its own cache line so that writes to it do not
+/// false-share with adjacent fields (`rsac-9348`).
+///
+/// `BridgeShared` keeps diagnostic atomics the **producer** writes on every
+/// audio callback (`buffers_pushed`, `buffers_dropped`, `consecutive_drops`)
+/// physically adjacent to the one the **consumer** writes on every pop
+/// (`buffers_popped`). On many-core machines those two writers land on the same
+/// 64-byte cache line and ping-pong it between cores (false sharing), adding p99
+/// jitter to the real-time push. Wrapping the producer-hot and consumer-hot
+/// groups in `CachePadded` puts them on distinct lines so neither writer
+/// invalidates the other's line.
+///
+/// This is a transparent, zero-cost wrapper: it derefs to the inner value, so
+/// every existing `self.field.load(..)` / `.fetch_add(..)` / `.store(..)` call
+/// site compiles unchanged. `rtrb` already pads its own head/tail this way; this
+/// is the same pattern for rsac's *extended* counters, avoiding a new dependency
+/// (a tiny internal newtype was preferred per the seed's acceptance criteria).
+#[repr(align(64))]
+pub(crate) struct CachePadded<T>(pub(crate) T);
+
+impl<T> CachePadded<T> {
+    /// Wrap `value`, forcing it onto its own cache line.
+    #[inline]
+    pub(crate) const fn new(value: T) -> Self {
+        Self(value)
+    }
+}
+
+impl<T> std::ops::Deref for CachePadded<T> {
+    type Target = T;
+    #[inline]
+    fn deref(&self) -> &T {
+        &self.0
+    }
+}
+
+impl<T> std::ops::DerefMut for CachePadded<T> {
+    #[inline]
+    fn deref_mut(&mut self) -> &mut T {
+        &mut self.0
+    }
+}
+
 // ── Shared State ─────────────────────────────────────────────────────────
 
 /// Shared state between producer and consumer for diagnostics and coordination.
 ///
 /// Both [`BridgeProducer`] and [`BridgeConsumer`] hold an `Arc<BridgeShared>`
 /// to access stream lifecycle state and diagnostic counters without locks.
+///
+/// # Cache-line layout (`rsac-9348`)
+///
+/// The counters are grouped by **which thread writes them** and each group is
+/// wrapped in [`CachePadded`] so the producer-written set (`buffers_pushed`,
+/// `buffers_dropped`, `consecutive_drops`) and the consumer-written
+/// `buffers_popped` sit on distinct cache lines. This removes the false-sharing
+/// ping-pong that otherwise adds tail latency to the real-time push on
+/// many-core systems.
 pub(crate) struct BridgeShared {
     /// Stream lifecycle state (atomic, lock-free).
     pub state: AtomicStreamState,
     /// Total buffers successfully pushed by the producer.
-    pub buffers_pushed: AtomicU64,
+    ///
+    /// Producer-written every callback; [`CachePadded`] keeps it off the
+    /// consumer's [`buffers_popped`](Self::buffers_popped) cache line (`rsac-9348`).
+    pub buffers_pushed: CachePadded<AtomicU64>,
     /// Total buffers dropped due to the ring buffer being full.
-    pub buffers_dropped: AtomicU64,
+    ///
+    /// Producer-written; cache-padded off the consumer counter (`rsac-9348`).
+    pub buffers_dropped: CachePadded<AtomicU64>,
     /// Total buffers successfully popped by the consumer.
-    pub buffers_popped: AtomicU64,
+    ///
+    /// The **only** consumer-written counter; [`CachePadded`] isolates it on its
+    /// own cache line so popping never invalidates the producer's hot counters
+    /// (`rsac-9348`).
+    pub buffers_popped: CachePadded<AtomicU64>,
     /// Consecutive drop count — resets to 0 on successful push.
     /// Used to detect sustained backpressure without relying on total drop rate.
-    pub consecutive_drops: AtomicU32,
+    ///
+    /// Producer-written; cache-padded off the consumer counter (`rsac-9348`).
+    pub consecutive_drops: CachePadded<AtomicU32>,
     /// Threshold above which `is_under_backpressure()` returns true.
     /// Default: [`DEFAULT_BACKPRESSURE_THRESHOLD`] consecutive drops
     /// (≈100ms of data loss at typical rates). Configurable per-bridge via
@@ -1062,10 +1139,10 @@ pub fn create_sample_ring(
     let (mp, mc) = rtrb::RingBuffer::<ChunkMeta>::new(max_chunks.max(1));
     let shared = Arc::new(BridgeShared {
         state: AtomicStreamState::new(StreamState::Created),
-        buffers_pushed: AtomicU64::new(0),
-        buffers_dropped: AtomicU64::new(0),
-        buffers_popped: AtomicU64::new(0),
-        consecutive_drops: AtomicU32::new(0),
+        buffers_pushed: CachePadded::new(AtomicU64::new(0)),
+        buffers_dropped: CachePadded::new(AtomicU64::new(0)),
+        buffers_popped: CachePadded::new(AtomicU64::new(0)),
+        consecutive_drops: CachePadded::new(AtomicU32::new(0)),
         backpressure_threshold: DEFAULT_BACKPRESSURE_THRESHOLD,
         negotiated: AtomicU64::new(0),
         drop_window: std::array::from_fn(|_| AtomicU64::new(0)),
@@ -1140,10 +1217,10 @@ pub fn create_bridge_with_options(
 
     let shared = Arc::new(BridgeShared {
         state: AtomicStreamState::new(StreamState::Created),
-        buffers_pushed: AtomicU64::new(0),
-        buffers_dropped: AtomicU64::new(0),
-        buffers_popped: AtomicU64::new(0),
-        consecutive_drops: AtomicU32::new(0),
+        buffers_pushed: CachePadded::new(AtomicU64::new(0)),
+        buffers_dropped: CachePadded::new(AtomicU64::new(0)),
+        buffers_popped: CachePadded::new(AtomicU64::new(0)),
+        consecutive_drops: CachePadded::new(AtomicU32::new(0)),
         backpressure_threshold,
         // 0 == "no backend negotiation yet"; negotiated_format() then falls
         // back to the requested `format` below.
@@ -1204,6 +1281,104 @@ pub fn create_bridge_with_options(
 pub fn calculate_capacity(requested: Option<usize>, min_capacity: usize) -> usize {
     let raw = requested.unwrap_or(64).max(min_capacity);
     raw.next_power_of_two()
+}
+
+/// Number of callback periods of headroom a period-derived ring buffer aims to
+/// hold (`rsac-b655`). Each ring slot carries exactly one callback period's
+/// [`AudioBuffer`], so the slot count *is* the number of periods of slack the
+/// consumer has before back-pressure. ~12 periods is the middle of the 8–16×
+/// band the design targets: enough to ride out a scheduling hiccup on the
+/// reader thread without buffering so much that end-to-end latency balloons.
+pub(crate) const PERIOD_HEADROOM_BUFFERS: usize = 12;
+
+/// Fallback ring capacity when the negotiated callback period is unknown or
+/// degenerate (`rsac-b655`). Matches the historical static default of
+/// [`calculate_capacity`] so backends that cannot learn their period behave
+/// exactly as before.
+pub(crate) const PERIOD_FALLBACK_CAPACITY: usize = 64;
+
+/// Lower / upper bounds (in ring slots) for a period-derived capacity
+/// (`rsac-b655`). The floor keeps even very large periods from producing a
+/// uselessly small ring; the ceiling caps memory/latency for tiny periods that
+/// would otherwise demand a huge slot count.
+pub(crate) const PERIOD_MIN_CAPACITY: usize = 8;
+pub(crate) const PERIOD_MAX_CAPACITY: usize = 1024;
+
+/// Derive a ring-buffer capacity (in [`AudioBuffer`] slots) from the negotiated
+/// device callback period (`rsac-b655`).
+///
+/// Backends learn the period the OS audio engine will actually deliver
+/// (WASAPI `GetBufferSize`, the PipeWire negotiated buffer size, the CoreAudio
+/// IOProc frame count). Sizing the ring to **cover several such periods of
+/// headroom** — rather than a one-size static 64 — lets the consumer absorb
+/// scheduling jitter without the producer dropping buffers, while keeping the
+/// ring small for large periods where 64 slots would be wasteful.
+///
+/// This is a **pure function**: it does no I/O and touches no backend state, so
+/// it is trivially testable and the platform backends adopt it separately.
+///
+/// # Sizing model
+///
+/// Each ring slot holds one callback period, so the natural slot count is just
+/// `PERIOD_HEADROOM_BUFFERS` periods of slack. Tiny periods, however, fire
+/// callbacks far more often (a 64-frame period at 48 kHz is ~1.3 ms, vs ~21 ms
+/// for 1024 frames), so a fixed slot count gives them far less wall-clock slack.
+/// To compensate, the headroom is scaled up for periods smaller than the tuned
+/// reference (`RT_BUFFER_SAMPLE_CAPACITY` frames-equivalent) and left flat for
+/// larger ones, then the result is:
+///
+/// 1. clamped to the `PERIOD_MIN_CAPACITY ..= PERIOD_MAX_CAPACITY` band, and
+/// 2. rounded **up** to the next power of two (the ring's preferred sizing, see
+///    [`calculate_capacity`]).
+///
+/// # Fallback
+///
+/// Returns `PERIOD_FALLBACK_CAPACITY` (64) when the period is unknown or
+/// degenerate — `period_frames == 0` or `channels == 0` — so a backend that
+/// cannot determine its period gets exactly the historical default.
+///
+/// # Arguments
+///
+/// * `period_frames` — Frames per OS callback period (per channel). `0` ⇒ fallback.
+/// * `channels` — Channel count of the delivered stream. `0` ⇒ fallback.
+///
+/// # Examples
+///
+/// ```rust,ignore
+/// // Unknown period → historical default.
+/// assert_eq!(calculate_capacity_for_period(0, 2), 64);
+/// // A typical 1024-frame stereo period → ~12 periods, rounded to a power of two.
+/// let cap = calculate_capacity_for_period(1024, 2);
+/// assert!(cap.is_power_of_two() && (8..=1024).contains(&cap));
+/// ```
+pub fn calculate_capacity_for_period(period_frames: usize, channels: usize) -> usize {
+    // Degenerate / unknown period: fall back to the historical static default.
+    if period_frames == 0 || channels == 0 {
+        return PERIOD_FALLBACK_CAPACITY;
+    }
+
+    // Reference period (in frames-per-channel) the bridge is tuned around. The
+    // free-list buffers are sized for `RT_BUFFER_SAMPLE_CAPACITY` interleaved
+    // f32 (see ADR-0001); dividing by a 2-channel reference recovers the
+    // frames-per-channel that capacity was chosen for.
+    const REFERENCE_FRAMES: usize = RT_BUFFER_SAMPLE_CAPACITY / 2; // 1024
+
+    // Smaller-than-reference periods fire callbacks proportionally more often,
+    // so scale the per-period headroom up to keep roughly constant wall-clock
+    // slack. `div_ceil` rounds the multiplier up so a period at/above the
+    // reference keeps the base headroom (multiplier 1), never less.
+    //
+    // `channels` is part of the signature so callers pass the negotiated
+    // stream shape; the per-channel `period_frames` already determines callback
+    // cadence, so the slot count does not additionally multiply by channels
+    // (each slot already holds the whole interleaved period regardless of width).
+    let _ = channels;
+    let scale = REFERENCE_FRAMES.div_ceil(period_frames).max(1);
+    let raw = PERIOD_HEADROOM_BUFFERS.saturating_mul(scale);
+
+    // Clamp to the sane band, then round up to the ring's power-of-two policy.
+    let clamped = raw.clamp(PERIOD_MIN_CAPACITY, PERIOD_MAX_CAPACITY);
+    clamped.next_power_of_two()
 }
 
 // ── Tests ────────────────────────────────────────────────────────────────
@@ -2238,6 +2413,181 @@ mod tests {
             producer.recycled_available() > 0,
             "free-list must stay populated via recycled spares"
         );
+    }
+
+    // ===== rsac-b655: period-derived ring capacity =====
+
+    // Degenerate inputs (unknown period / zero channels) fall back to the
+    // historical static default of 64, so a backend that cannot learn its
+    // period behaves exactly as before.
+    #[test]
+    fn capacity_for_period_falls_back_when_unknown() {
+        assert_eq!(
+            calculate_capacity_for_period(0, 2),
+            PERIOD_FALLBACK_CAPACITY
+        );
+        assert_eq!(
+            calculate_capacity_for_period(1024, 0),
+            PERIOD_FALLBACK_CAPACITY
+        );
+        assert_eq!(
+            calculate_capacity_for_period(0, 0),
+            PERIOD_FALLBACK_CAPACITY
+        );
+        assert_eq!(PERIOD_FALLBACK_CAPACITY, 64);
+    }
+
+    // The result is always a power of two within the configured band, for a wide
+    // range of realistic and adversarial periods and channel counts.
+    #[test]
+    fn capacity_for_period_is_power_of_two_and_clamped() {
+        for &frames in &[1usize, 16, 32, 64, 128, 256, 512, 1024, 2048, 4096, 65536] {
+            for &ch in &[1usize, 2, 6, 8] {
+                let cap = calculate_capacity_for_period(frames, ch);
+                assert!(
+                    cap.is_power_of_two(),
+                    "cap {cap} not power of two (frames={frames}, ch={ch})"
+                );
+                assert!(
+                    (PERIOD_MIN_CAPACITY..=PERIOD_MAX_CAPACITY).contains(&cap),
+                    "cap {cap} out of [{PERIOD_MIN_CAPACITY}, {PERIOD_MAX_CAPACITY}] band (frames={frames}, ch={ch})"
+                );
+            }
+        }
+    }
+
+    // A reference-sized period (1024 frames) gets the base headroom: ~12 periods
+    // rounded up to the next power of two = 16. Larger periods stay flat at the
+    // base (never scaled below 1×).
+    #[test]
+    fn capacity_for_period_reference_and_large_periods() {
+        // 1024 frames == reference → base headroom 12 → next_pow2 = 16.
+        assert_eq!(calculate_capacity_for_period(1024, 2), 16);
+        // Larger-than-reference periods do not scale headroom below the base, so
+        // they also land at 16 (12 → 16).
+        assert_eq!(calculate_capacity_for_period(2048, 2), 16);
+        assert_eq!(calculate_capacity_for_period(4096, 6), 16);
+    }
+
+    // Smaller-than-reference periods fire callbacks more often, so the headroom
+    // scales up monotonically (more slots) as the period shrinks — never fewer
+    // slots than a larger period.
+    #[test]
+    fn capacity_for_period_scales_up_for_small_periods() {
+        let big = calculate_capacity_for_period(1024, 2); // base
+        let mid = calculate_capacity_for_period(256, 2); // 4× more callbacks
+        let small = calculate_capacity_for_period(64, 2); // 16× more callbacks
+        assert!(
+            small >= mid && mid >= big,
+            "smaller periods must not yield a smaller ring: 64f={small} 256f={mid} 1024f={big}"
+        );
+        // A very small 64-frame period: scale = ceil(1024/64) = 16, raw = 12*16 =
+        // 192, clamped (<=1024) → 192 → next_pow2 = 256.
+        assert_eq!(small, 256);
+    }
+
+    // Channel count is part of the signature (callers pass the negotiated stream
+    // shape) but does not, by itself, change the slot count: each slot holds the
+    // whole interleaved period regardless of width.
+    #[test]
+    fn capacity_for_period_independent_of_channels() {
+        let base = calculate_capacity_for_period(512, 1);
+        for &ch in &[2usize, 4, 6, 8] {
+            assert_eq!(
+                calculate_capacity_for_period(512, ch),
+                base,
+                "channel count must not change the period-derived slot count"
+            );
+        }
+    }
+
+    // The new period-aware calculator does not perturb the existing
+    // `calculate_capacity` contract (regression guard for the two living
+    // side-by-side).
+    #[test]
+    fn calculate_capacity_unchanged_alongside_period_variant() {
+        assert_eq!(calculate_capacity(None, 4), 64);
+        assert_eq!(calculate_capacity(Some(100), 4), 128);
+        assert_eq!(calculate_capacity(Some(2), 4), 4);
+    }
+
+    // ===== rsac-9348: cache-line padding of producer/consumer counters =====
+
+    // The CachePadded wrapper forces >= 64-byte alignment so wrapped counters
+    // land on their own cache line (the false-sharing fix's core invariant).
+    #[test]
+    fn cache_padded_is_cache_line_aligned() {
+        assert_eq!(CACHE_LINE_BYTES, 64);
+        assert!(
+            std::mem::align_of::<CachePadded<AtomicU64>>() >= CACHE_LINE_BYTES,
+            "CachePadded<AtomicU64> must be >= cache-line aligned"
+        );
+        assert!(
+            std::mem::align_of::<CachePadded<AtomicU32>>() >= CACHE_LINE_BYTES,
+            "CachePadded<AtomicU32> must be >= cache-line aligned"
+        );
+        // The padding also rounds the size up to a full line so two adjacent
+        // wrapped values cannot occupy the same line.
+        assert!(std::mem::size_of::<CachePadded<AtomicU64>>() >= CACHE_LINE_BYTES);
+    }
+
+    // The producer-written counters and the consumer-written counter occupy
+    // DISTINCT cache lines in a live BridgeShared, so writes from the two threads
+    // never invalidate each other's line (false sharing eliminated). We check
+    // that each pair of (producer-hot, consumer-hot) counters is at least one
+    // cache line apart in memory.
+    #[test]
+    fn producer_and_consumer_counters_on_distinct_cache_lines() {
+        let (producer, _consumer) = create_bridge(8, test_format());
+        let shared = producer.shared();
+
+        let line = CACHE_LINE_BYTES as isize;
+        let pushed = &*shared.buffers_pushed as *const AtomicU64 as isize;
+        let dropped = &*shared.buffers_dropped as *const AtomicU64 as isize;
+        let consec = &*shared.consecutive_drops as *const AtomicU32 as isize;
+        let popped = &*shared.buffers_popped as *const AtomicU64 as isize;
+
+        // buffers_popped (consumer-written) must be on a different cache line
+        // than each producer-written counter.
+        for (name, p) in [
+            ("pushed", pushed),
+            ("dropped", dropped),
+            ("consecutive", consec),
+        ] {
+            let same_line = (popped / line) == (p / line);
+            assert!(
+                !same_line,
+                "buffers_popped shares a cache line with {name}: false sharing not eliminated"
+            );
+        }
+    }
+
+    // Wrapping the counters in CachePadded must not change their observable
+    // behavior: a push/drop/pop sequence updates each counter exactly as before
+    // (Deref-through access is transparent).
+    #[test]
+    fn cache_padded_counters_behave_identically() {
+        let (mut producer, mut consumer) = create_bridge(2, test_format());
+
+        // Two successful pushes (fills the ring), one drop, then one pop.
+        assert!(producer.push_or_drop(test_buffer(1.0)));
+        assert!(producer.push_or_drop(test_buffer(2.0)));
+        assert!(!producer.push_or_drop(test_buffer(3.0))); // ring full → drop
+        let _ = consumer.pop().expect("buffer");
+
+        // Clone the Arc so the handle is independent of `producer`'s borrow
+        // (lets us keep reading counters across the later `&mut producer` push).
+        let shared = Arc::clone(producer.shared());
+        assert_eq!(shared.buffers_pushed.load(Ordering::Relaxed), 2);
+        assert_eq!(shared.buffers_dropped.load(Ordering::Relaxed), 1);
+        assert_eq!(shared.buffers_popped.load(Ordering::Relaxed), 1);
+        // consecutive_drops is 1 (the single drop after the last success).
+        assert_eq!(shared.consecutive_drops.load(Ordering::Relaxed), 1);
+
+        // A subsequent successful push resets the consecutive-drop streak.
+        let _ = consumer.pop(); // make room
+        assert!(producer.push_or_drop(test_buffer(4.0)));
+        assert_eq!(shared.consecutive_drops.load(Ordering::Relaxed), 0);
     }
 }
 

@@ -39,6 +39,8 @@ use crate::core::config::AudioFormat as AudioFormatType;
 use crate::core::error::{AudioError, AudioResult};
 use crate::core::introspection::{BackpressureReport, StreamStats};
 use std::fmt;
+use std::ops::{Deref, DerefMut};
+use std::str::FromStr;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc;
 use std::sync::{Arc, Mutex};
@@ -47,6 +49,18 @@ use std::time::{Duration, Instant};
 // Re-export AudioCaptureConfig from core::config so downstream code
 // that uses `crate::api::AudioCaptureConfig` still resolves.
 pub use crate::core::config::AudioCaptureConfig;
+
+/// The whitelist of sample rates the builder accepts. Shared by
+/// [`AudioCaptureBuilder::preflight`] and [`AudioCaptureBuilder::build`] (which
+/// calls `preflight`) so the two cannot drift. Device negotiation may still
+/// land on a different rate the *hardware* advertises; this gate is purely the
+/// config-time contract.
+const SUPPORTED_SAMPLE_RATES: [u32; 6] = [22050, 32000, 44100, 48000, 88200, 96000];
+
+/// The maximum channel count the builder accepts at config time (the valid
+/// range is `1..=MAX_CHANNELS`). Mirrors the most permissive backend's ceiling;
+/// a narrower per-platform limit is enforced later by `PlatformCapabilities`.
+const MAX_CHANNELS: u16 = 32;
 
 /// A builder for creating [`AudioCapture`] instances.
 ///
@@ -139,8 +153,96 @@ impl AudioCaptureBuilder {
         self
     }
 
-    /// Validates settings and constructs an [`AudioCapture`] instance.
-    pub fn build(self) -> AudioResult<AudioCapture> {
+    /// Sets the capture target from a canonical string, parsing it via
+    /// [`CaptureTarget`]'s [`FromStr`] implementation.
+    ///
+    /// This is the string-driven counterpart to
+    /// [`with_target`](Self::with_target): it lets a CLI flag or config value
+    /// (e.g. `"system"`, `"app:1234"`, `"device:hw:0,0"`, `"name:VLC"`,
+    /// `"tree:42"`) feed straight into the builder without hand-rolling the
+    /// match. The grammar (and its case-insensitive scheme matching) is exactly
+    /// the one documented on [`CaptureTarget`]'s `FromStr` impl.
+    ///
+    /// # Errors
+    ///
+    /// Returns the parse error ([`AudioError::InvalidParameter`] with
+    /// `param == "capture_target"`) for an unrecognized scheme or a malformed
+    /// pid. On error the builder's target is **left unchanged** (the method
+    /// consumes `self` and only returns the mutated builder on success), so a
+    /// caller that ignores the error keeps the previously configured target.
+    ///
+    /// # Example
+    ///
+    /// ```rust,no_run
+    /// # use rsac::api::AudioCaptureBuilder;
+    /// # fn main() -> Result<(), Box<dyn std::error::Error>> {
+    /// let capture = AudioCaptureBuilder::new()
+    ///     .target_str("app:1234")?
+    ///     .sample_rate(48000)
+    ///     .build()?;
+    /// # Ok(())
+    /// # }
+    /// ```
+    pub fn target_str(self, s: &str) -> AudioResult<Self> {
+        // Parse first; only mutate the builder on success so a failed parse
+        // never silently changes the target out from under the caller.
+        let target = CaptureTarget::from_str(s)?;
+        Ok(self.with_target(target))
+    }
+
+    /// Infallible variant of [`target_str`](Self::target_str): parses `s` and,
+    /// on a parse failure, returns the builder **unchanged** (the bad string is
+    /// ignored) rather than surfacing the error.
+    ///
+    /// Use this when a caller wants "best effort" target selection from a string
+    /// and is content to fall back to whatever target was already configured
+    /// (the [`CaptureTarget::SystemDefault`] default for a fresh builder). When
+    /// the error matters, prefer [`target_str`](Self::target_str).
+    pub fn try_target_str(self, s: &str) -> Self {
+        match CaptureTarget::from_str(s) {
+            Ok(target) => self.with_target(target),
+            Err(_) => self,
+        }
+    }
+
+    /// Runs the cheap, device-independent validations that
+    /// [`build`](Self::build) performs **before** it opens a device.
+    ///
+    /// This lets a caller fail fast on a misconfigured builder (unsupported
+    /// platform feature, out-of-range sample rate or channel count) without
+    /// paying for — or requiring — device enumeration / stream creation. It is
+    /// the single source of truth for those checks: `build()` calls it first,
+    /// so `preflight()` returning `Ok(())` guarantees the configuration will not
+    /// be rejected for any of these reasons later (it may still fail at the
+    /// device-resolution or format-negotiation step that needs hardware).
+    ///
+    /// The checks are config-time only and have no real-time impact.
+    ///
+    /// # Errors
+    ///
+    /// - [`AudioError::PlatformNotSupported`] when the target is
+    ///   [`Application`](CaptureTarget::Application) /
+    ///   [`ApplicationByName`](CaptureTarget::ApplicationByName) but the platform
+    ///   reports `!supports_application_capture`, or
+    ///   [`ProcessTree`](CaptureTarget::ProcessTree) but
+    ///   `!supports_process_tree_capture`.
+    /// - [`AudioError::InvalidParameter`] (`param == "sample_rate"`) when the
+    ///   sample rate is not one of the supported rates
+    ///   (22050, 32000, 44100, 48000, 88200, 96000).
+    /// - [`AudioError::ConfigurationError`] when the channel count is `0` or
+    ///   exceeds the maximum (32).
+    ///
+    /// # Example
+    ///
+    /// ```rust,no_run
+    /// # use rsac::api::AudioCaptureBuilder;
+    /// # fn main() -> Result<(), Box<dyn std::error::Error>> {
+    /// let builder = AudioCaptureBuilder::new().sample_rate(48000).channels(2);
+    /// builder.preflight()?; // validates without touching any device
+    /// # Ok(())
+    /// # }
+    /// ```
+    pub fn preflight(&self) -> AudioResult<()> {
         // ── Validate target against platform capabilities ────────────
         let caps = PlatformCapabilities::query();
         match &self.target {
@@ -162,7 +264,6 @@ impl AudioCaptureBuilder {
         }
 
         // ── Validate sample rate ────────────────────────────────────
-        const SUPPORTED_SAMPLE_RATES: [u32; 6] = [22050, 32000, 44100, 48000, 88200, 96000];
         if !SUPPORTED_SAMPLE_RATES.contains(&self.config.sample_rate) {
             return Err(AudioError::InvalidParameter {
                 param: "sample_rate".into(),
@@ -179,7 +280,6 @@ impl AudioCaptureBuilder {
                 message: "Channels must be greater than 0.".to_string(),
             });
         }
-        const MAX_CHANNELS: u16 = 32;
         if self.config.channels > MAX_CHANNELS {
             return Err(AudioError::ConfigurationError {
                 message: format!(
@@ -188,6 +288,19 @@ impl AudioCaptureBuilder {
                 ),
             });
         }
+
+        Ok(())
+    }
+
+    /// Validates settings and constructs an [`AudioCapture`] instance.
+    ///
+    /// Runs [`preflight`](Self::preflight) first (capability + sample-rate +
+    /// channel-count checks), then resolves the device and negotiates the
+    /// format. The device-independent validations are single-sourced in
+    /// `preflight()` so the two entry points cannot drift apart.
+    pub fn build(self) -> AudioResult<AudioCapture> {
+        // ── Device-independent validation (single-sourced) ──────────
+        self.preflight()?;
 
         // ── Build capture config ────────────────────────────────────
         let mut stream_config = self.config;
@@ -297,6 +410,136 @@ impl AudioCaptureBuilder {
             callback_pump: None,
             start_instant: None,
         })
+    }
+
+    /// Builds **and** starts a capture in one call, returning a
+    /// [`RunningCapture`] RAII guard.
+    ///
+    /// This collapses the usual two-step (`let mut c = builder.build()?;
+    /// c.start()?;`) into a single fallible call. The returned guard
+    /// [`Deref`]s/[`DerefMut`]s to the wrapped [`AudioCapture`], so every read /
+    /// subscribe / stats method (e.g. [`read_buffer`](AudioCapture::read_buffer),
+    /// [`stream_stats`](AudioCapture::stream_stats),
+    /// [`is_running`](AudioCapture::is_running)) is reachable through it, and
+    /// dropping the guard stops the capture deterministically.
+    ///
+    /// [`build`](Self::build) and [`AudioCapture::start`] remain public and
+    /// unchanged for callers who want to hold the capture themselves or defer
+    /// `start()`.
+    ///
+    /// # Errors
+    ///
+    /// Surfaces any error from [`build`](Self::build) (validation, device
+    /// resolution, format negotiation) or from
+    /// [`AudioCapture::start`] (stream creation / callback-pump spawn). On a
+    /// `start()` failure the partially built [`AudioCapture`] is dropped, whose
+    /// `Drop` best-effort stops any stream it managed to create — so a failed
+    /// `start()` does not leak a half-running stream.
+    ///
+    /// # Example
+    ///
+    /// ```rust,no_run
+    /// # use rsac::api::AudioCaptureBuilder;
+    /// # use rsac::core::config::CaptureTarget;
+    /// # fn main() -> Result<(), Box<dyn std::error::Error>> {
+    /// let mut capture = AudioCaptureBuilder::new()
+    ///     .with_target(CaptureTarget::SystemDefault)
+    ///     .start()?; // builds, starts, and wraps in a RAII guard
+    /// // `capture` derefs to AudioCapture (DerefMut for &mut self methods):
+    /// if let Some(buffer) = capture.read_buffer()? {
+    ///     let _frames = buffer.data().len();
+    /// }
+    /// // Dropping `capture` stops the stream automatically.
+    /// # Ok(())
+    /// # }
+    /// ```
+    pub fn start(self) -> AudioResult<RunningCapture> {
+        let mut capture = self.build()?;
+        // If start() fails, `capture` drops here; its Drop best-effort stops any
+        // stream that was created, so we never leak a half-started capture.
+        capture.start()?;
+        Ok(RunningCapture(capture))
+    }
+}
+
+/// An RAII guard wrapping a started [`AudioCapture`].
+///
+/// Returned by [`AudioCaptureBuilder::start()`]. It exists so that the common
+/// "build, start, then use" path is a single call whose result also tears the
+/// capture down deterministically when it goes out of scope.
+///
+/// # Deref
+///
+/// `RunningCapture` implements [`Deref`]`<Target = `[`AudioCapture`]`>` and
+/// [`DerefMut`], so the full [`AudioCapture`] surface (reads, subscriptions,
+/// stats, `stop`, …) is callable directly on the guard. There is no wrapper
+/// boilerplate to keep in sync — new `AudioCapture` methods are reachable
+/// automatically.
+///
+/// # Drop
+///
+/// Dropping the guard calls [`AudioCapture::stop`] once. `stop()` is idempotent
+/// and `Drop`-safe (calling it explicitly *and* then dropping does not error
+/// and does not double-stop the underlying stream — the second call is a no-op
+/// once the stream is gone). The guard uses a plain [`Drop`] impl rather than
+/// keeping the inner capture in a `ManuallyDrop` and reconstructing teardown by
+/// hand: the wrapped `AudioCapture`'s own `Drop` already best-effort stops the
+/// stream, and this guard's `Drop` simply makes the stop explicit and
+/// authoritative on the ergonomic path.
+///
+/// Use [`into_inner`](Self::into_inner) to take ownership of the wrapped
+/// [`AudioCapture`] without triggering the guard's stop.
+pub struct RunningCapture(AudioCapture);
+
+impl RunningCapture {
+    /// Consumes the guard and returns the wrapped [`AudioCapture`], **without**
+    /// stopping it.
+    ///
+    /// Use this to escape the RAII lifecycle — e.g. to move the capture into a
+    /// longer-lived owner or to manage `stop()` manually. Because the returned
+    /// `AudioCapture` is moved out before the guard's [`Drop`] runs, the guard
+    /// does **not** stop the capture; the caller becomes responsible for its
+    /// lifecycle (the `AudioCapture`'s own `Drop` still best-effort stops it).
+    pub fn into_inner(self) -> AudioCapture {
+        // Move the AudioCapture out of the guard without running RunningCapture's
+        // Drop (which would stop the still-running capture). We destructure via
+        // ptr::read under ManuallyDrop so the guard's Drop is suppressed but the
+        // AudioCapture itself is NOT dropped — it is returned to the caller.
+        let this = std::mem::ManuallyDrop::new(self);
+        // SAFETY: `this` is a ManuallyDrop, so RunningCapture::drop never runs.
+        // We read the single field out exactly once and never touch `this.0`
+        // again, so there is no double-move and no double-drop. `this` itself is
+        // a ManuallyDrop wrapping a now-moved-from value, so it is never dropped.
+        unsafe { std::ptr::read(&this.0) }
+    }
+}
+
+impl Deref for RunningCapture {
+    type Target = AudioCapture;
+
+    fn deref(&self) -> &Self::Target {
+        &self.0
+    }
+}
+
+impl DerefMut for RunningCapture {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        &mut self.0
+    }
+}
+
+impl Drop for RunningCapture {
+    fn drop(&mut self) {
+        // Deterministic teardown. `stop()` is idempotent and Drop-safe, so an
+        // explicit `stop()` before this drop (or the wrapped AudioCapture's own
+        // Drop running afterwards) does not double-stop or error.
+        let _ = self.0.stop();
+    }
+}
+
+impl fmt::Debug for RunningCapture {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_tuple("RunningCapture").field(&self.0).finish()
     }
 }
 
@@ -1396,6 +1639,11 @@ mod tests {
         /// `set_negotiated_format()` overwrites it to mirror a backend that
         /// negotiated a different delivery format on the bridge producer.
         format: Mutex<AudioFormat>,
+        /// Count of `stop()` calls — lets RunningCapture tests assert that the
+        /// guard's Drop stops exactly once and that an explicit stop + drop does
+        /// not double-stop the *underlying* stream (stop() is a no-op once the
+        /// AudioCapture has already dropped its Arc).
+        stop_calls: AtomicU64,
     }
 
     impl MockCapturingStream {
@@ -1408,7 +1656,13 @@ mod tests {
                 captured: AtomicU64::new(0),
                 backpressure: AtomicBool::new(false),
                 format: Mutex::new(AudioFormat::default()),
+                stop_calls: AtomicU64::new(0),
             }
+        }
+
+        /// Number of times `stop()` was invoked on this stream.
+        fn stop_calls(&self) -> u64 {
+            self.stop_calls.load(Ordering::SeqCst)
         }
 
         /// Mirror the real bridge's `BridgeProducer::set_negotiated_format`:
@@ -1491,6 +1745,7 @@ mod tests {
         }
 
         fn stop(&self) -> AudioResult<()> {
+            self.stop_calls.fetch_add(1, Ordering::SeqCst);
             self.running.store(false, Ordering::SeqCst);
             Ok(())
         }
@@ -2160,5 +2415,357 @@ mod tests {
         let r = capture.backpressure_report();
         assert!(r.is_under_backpressure, "legacy bool carried through");
         assert!((r.drop_rate - 0.9).abs() < f64::EPSILON);
+    }
+
+    // ── target_str() tests (rsac-0f75) ────────────────────────────────
+
+    /// target_str("system") parses to SystemDefault and the builder carries it.
+    #[test]
+    fn target_str_system_sets_system_default() {
+        let builder = AudioCaptureBuilder::new()
+            .target_str("system")
+            .expect("'system' parses");
+        assert_eq!(builder.target, CaptureTarget::SystemDefault);
+    }
+
+    /// target_str("app:55") → Application(ApplicationId("55")).
+    #[test]
+    fn target_str_app_sets_application() {
+        let builder = AudioCaptureBuilder::new()
+            .target_str("app:55")
+            .expect("'app:55' parses");
+        assert_eq!(
+            builder.target,
+            CaptureTarget::Application(crate::core::config::ApplicationId("55".to_string()))
+        );
+    }
+
+    /// target_str("name:VLC") → ApplicationByName("VLC").
+    #[test]
+    fn target_str_name_sets_application_by_name() {
+        let builder = AudioCaptureBuilder::new()
+            .target_str("name:VLC")
+            .expect("'name:VLC' parses");
+        assert_eq!(
+            builder.target,
+            CaptureTarget::ApplicationByName("VLC".to_string())
+        );
+    }
+
+    /// A device string with embedded colons round-trips (first-colon split).
+    #[test]
+    fn target_str_device_preserves_colons() {
+        let builder = AudioCaptureBuilder::new()
+            .target_str("device:hw:0,0")
+            .expect("'device:hw:0,0' parses");
+        assert_eq!(
+            builder.target,
+            CaptureTarget::Device(crate::core::config::DeviceId("hw:0,0".to_string()))
+        );
+    }
+
+    /// target_str("garbage") returns InvalidParameter and (because the method
+    /// consumes self and only returns the builder on success) the caller's
+    /// builder is untouched — we verify the error shape and that a fresh
+    /// builder still defaults to SystemDefault.
+    #[test]
+    fn target_str_garbage_errors_and_does_not_mutate_target() {
+        let builder = AudioCaptureBuilder::new();
+        // Sanity: starts at the default target.
+        assert_eq!(builder.target, CaptureTarget::SystemDefault);
+
+        let result = builder.target_str("garbage");
+        assert!(result.is_err(), "unknown scheme must error");
+        match result.unwrap_err() {
+            AudioError::InvalidParameter { param, .. } => {
+                assert_eq!(param, "capture_target");
+            }
+            e => panic!("Expected InvalidParameter, got: {e:?}"),
+        }
+
+        // The builder was consumed by the failed call; a freshly created one
+        // still carries the default target (no global mutation occurred).
+        assert_eq!(
+            AudioCaptureBuilder::new().target,
+            CaptureTarget::SystemDefault
+        );
+    }
+
+    /// target_str is chainable (returns AudioResult<Self>) and composes with the
+    /// other setters.
+    #[test]
+    fn target_str_is_chainable() {
+        let builder = AudioCaptureBuilder::new()
+            .sample_rate(44100)
+            .target_str("app:7")
+            .expect("parses")
+            .channels(1);
+        assert_eq!(
+            builder.target,
+            CaptureTarget::Application(crate::core::config::ApplicationId("7".to_string()))
+        );
+        assert_eq!(builder.config.sample_rate, 44100);
+        assert_eq!(builder.config.channels, 1);
+    }
+
+    /// The infallible try_target_str applies a valid string and silently keeps
+    /// the prior target for an invalid one.
+    #[test]
+    fn try_target_str_applies_valid_keeps_prior_on_invalid() {
+        // Valid → applied.
+        let ok = AudioCaptureBuilder::new().try_target_str("name:Spotify");
+        assert_eq!(
+            ok.target,
+            CaptureTarget::ApplicationByName("Spotify".to_string())
+        );
+
+        // Invalid → unchanged. Pre-set a non-default target, feed garbage, and
+        // assert the prior target survives.
+        let kept = AudioCaptureBuilder::new()
+            .with_target(CaptureTarget::pid(99))
+            .try_target_str("garbage");
+        assert_eq!(
+            kept.target,
+            CaptureTarget::ProcessTree(crate::core::config::ProcessId(99))
+        );
+    }
+
+    // ── preflight() tests (rsac-b65a) ─────────────────────────────────
+
+    /// preflight() passes for a valid SystemDefault/48000/2ch config, without
+    /// enumerating any device.
+    #[test]
+    fn preflight_ok_for_valid_default_config() {
+        let builder = AudioCaptureBuilder::new()
+            .with_target(CaptureTarget::SystemDefault)
+            .sample_rate(48000)
+            .channels(2);
+        assert!(
+            builder.preflight().is_ok(),
+            "valid config must pass preflight"
+        );
+    }
+
+    /// preflight() rejects an unsupported sample rate with
+    /// InvalidParameter{param:"sample_rate"} and does NOT touch a device.
+    #[test]
+    fn preflight_rejects_unsupported_sample_rate() {
+        let builder = AudioCaptureBuilder::new().sample_rate(11025);
+        match builder.preflight().unwrap_err() {
+            AudioError::InvalidParameter { param, reason } => {
+                assert_eq!(param, "sample_rate");
+                assert!(reason.contains("11025"));
+            }
+            e => panic!("Expected InvalidParameter, got: {e:?}"),
+        }
+    }
+
+    /// preflight() rejects channels == 0 with ConfigurationError.
+    #[test]
+    fn preflight_rejects_zero_channels() {
+        let builder = AudioCaptureBuilder::new().channels(0);
+        match builder.preflight().unwrap_err() {
+            AudioError::ConfigurationError { message } => {
+                assert_eq!(message, "Channels must be greater than 0.");
+            }
+            e => panic!("Expected ConfigurationError, got: {e:?}"),
+        }
+    }
+
+    /// preflight() rejects channels > 32 (MAX_CHANNELS) with ConfigurationError.
+    #[test]
+    fn preflight_rejects_channels_above_max() {
+        let builder = AudioCaptureBuilder::new().channels(33);
+        match builder.preflight().unwrap_err() {
+            AudioError::ConfigurationError { message } => {
+                assert!(
+                    message.contains("33") && message.contains("32"),
+                    "unexpected message: {message}"
+                );
+            }
+            e => panic!("Expected ConfigurationError, got: {e:?}"),
+        }
+    }
+
+    /// preflight() accepts the channel-count boundaries 1 and 32.
+    #[test]
+    fn preflight_accepts_channel_boundaries() {
+        assert!(AudioCaptureBuilder::new().channels(1).preflight().is_ok());
+        assert!(AudioCaptureBuilder::new().channels(32).preflight().is_ok());
+    }
+
+    /// preflight() accepts every rate in the supported whitelist.
+    #[test]
+    fn preflight_accepts_all_supported_sample_rates() {
+        for rate in SUPPORTED_SAMPLE_RATES {
+            assert!(
+                AudioCaptureBuilder::new()
+                    .sample_rate(rate)
+                    .preflight()
+                    .is_ok(),
+                "rate {rate} should pass preflight"
+            );
+        }
+    }
+
+    /// On a platform whose backend does not support application capture,
+    /// preflight() with an Application target returns PlatformNotSupported —
+    /// the same error build() raises. We assert the capability-gated behavior
+    /// matches PlatformCapabilities::query() on whatever platform runs the test.
+    #[test]
+    fn preflight_application_matches_capability_gate() {
+        let caps = PlatformCapabilities::query();
+        let builder = AudioCaptureBuilder::new()
+            .with_target(CaptureTarget::Application(
+                crate::core::config::ApplicationId("1234".to_string()),
+            ))
+            .sample_rate(48000)
+            .channels(2);
+
+        let result = builder.preflight();
+        if caps.supports_application_capture {
+            // The capability check must pass (any later failure would be from a
+            // step preflight does not perform; preflight itself returns Ok).
+            assert!(
+                result.is_ok(),
+                "preflight must pass app capability when supported"
+            );
+        } else {
+            match result.unwrap_err() {
+                AudioError::PlatformNotSupported { feature, platform } => {
+                    assert_eq!(feature, "application capture");
+                    assert_eq!(platform, caps.backend_name);
+                }
+                e => panic!("Expected PlatformNotSupported, got: {e:?}"),
+            }
+        }
+    }
+
+    /// The refactor is behavior-preserving: build() still rejects the same
+    /// configs preflight() does, with the same error variants (proving build()
+    /// routes through preflight()). Mirrors the existing builder_fails_* tests.
+    #[test]
+    fn build_routes_through_preflight_same_errors() {
+        // Zero channels → ConfigurationError, before any device work.
+        match AudioCaptureBuilder::new().channels(0).build().unwrap_err() {
+            AudioError::ConfigurationError { .. } => {}
+            e => panic!("Expected ConfigurationError from build(), got: {e:?}"),
+        }
+        // Unsupported rate → InvalidParameter{sample_rate}, before any device work.
+        match AudioCaptureBuilder::new()
+            .sample_rate(11025)
+            .build()
+            .unwrap_err()
+        {
+            AudioError::InvalidParameter { param, .. } => assert_eq!(param, "sample_rate"),
+            e => panic!("Expected InvalidParameter from build(), got: {e:?}"),
+        }
+    }
+
+    // ── RunningCapture / builder.start() tests (rsac-9175) ─────────────
+
+    /// Build a RunningCapture directly from a mock-backed AudioCapture (the
+    /// builder.start() path needs a device the mock layer bypasses, so we wrap
+    /// the capture the same way builder.start() would).
+    fn make_running_capture(mock: Arc<MockCapturingStream>) -> RunningCapture {
+        RunningCapture(make_mock_capture(mock))
+    }
+
+    /// RunningCapture derefs to AudioCapture: read/stats/state methods are all
+    /// reachable through Deref/DerefMut on the guard.
+    #[test]
+    fn running_capture_derefs_to_audio_capture() {
+        let mock = Arc::new(MockCapturingStream::new());
+        mock.push_buffer(AudioBuffer::new(vec![0.7; 4], 2, 48000));
+        let mut guard = make_running_capture(Arc::clone(&mock));
+
+        // Through Deref: is_running() and stream_stats().
+        assert!(guard.is_running());
+        let stats = guard.stream_stats();
+        assert!(stats.is_running);
+
+        // Through DerefMut: read_buffer() takes &mut self.
+        let buf = guard
+            .read_buffer()
+            .expect("read ok")
+            .expect("a buffer is available");
+        assert_eq!(buf.data()[0], 0.7);
+
+        mock.signal_stop();
+    }
+
+    /// Dropping a RunningCapture stops the capture exactly once (the guard's
+    /// Drop calls AudioCapture::stop, which stops the underlying stream once;
+    /// the AudioCapture's own Drop then finds no stream and does not re-stop).
+    #[test]
+    fn running_capture_drop_stops_once() {
+        let mock = Arc::new(MockCapturingStream::new());
+        let guard = make_running_capture(Arc::clone(&mock));
+        assert_eq!(mock.stop_calls(), 0, "not stopped before drop");
+
+        drop(guard);
+        assert_eq!(
+            mock.stop_calls(),
+            1,
+            "guard Drop must stop the underlying stream exactly once"
+        );
+    }
+
+    /// into_inner() returns the wrapped AudioCapture WITHOUT triggering the
+    /// guard's stop. The returned capture is still running; stopping it later
+    /// is the caller's responsibility.
+    #[test]
+    fn running_capture_into_inner_does_not_stop() {
+        let mock = Arc::new(MockCapturingStream::new());
+        let guard = make_running_capture(Arc::clone(&mock));
+
+        let mut capture = guard.into_inner();
+        assert_eq!(mock.stop_calls(), 0, "into_inner must not stop the capture");
+        assert!(
+            capture.is_running(),
+            "capture still running after into_inner"
+        );
+
+        // The caller can now stop it explicitly.
+        capture.stop().expect("explicit stop ok");
+        assert_eq!(mock.stop_calls(), 1);
+    }
+
+    /// No double-stop: an explicit stop() followed by dropping the guard does
+    /// not error and does not stop the underlying stream a second time (after
+    /// the explicit stop, the AudioCapture has dropped its Arc, so the guard's
+    /// Drop stop() is a no-op on the stream).
+    #[test]
+    fn running_capture_explicit_stop_then_drop_no_double_stop() {
+        let mock = Arc::new(MockCapturingStream::new());
+        let mut guard = make_running_capture(Arc::clone(&mock));
+
+        guard.stop().expect("explicit stop ok");
+        assert_eq!(mock.stop_calls(), 1, "explicit stop hit the stream once");
+
+        // Dropping after an explicit stop must not panic, error, or re-stop the
+        // underlying stream (the AudioCapture already released its Arc).
+        drop(guard);
+        assert_eq!(
+            mock.stop_calls(),
+            1,
+            "drop after explicit stop must not double-stop the stream"
+        );
+    }
+
+    /// The RAII guard ties teardown to scope: leaving a block drops the guard
+    /// and stops the capture.
+    #[test]
+    fn running_capture_stops_at_scope_end() {
+        let mock = Arc::new(MockCapturingStream::new());
+        {
+            let _guard = make_running_capture(Arc::clone(&mock));
+            assert_eq!(mock.stop_calls(), 0);
+        }
+        assert_eq!(
+            mock.stop_calls(),
+            1,
+            "leaving scope must stop the capture exactly once"
+        );
     }
 }

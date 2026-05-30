@@ -73,7 +73,8 @@ fn wasapi_backend_context_err(err: &windows::core::Error) -> BackendContext {
 ///
 /// This type predates the canonical capture pipeline and duplicates the WASAPI
 /// loopback logic that now lives in
-/// [`WindowsCaptureThread`](super::thread::WindowsCaptureThread). More
+/// `WindowsCaptureThread` (`super::thread`; `pub(crate)`, so referenced by name
+/// to keep the public-docs build clean). More
 /// importantly, its [`start_capture`](Self::start_capture) /
 /// [`start_capture_with_stop_flag`](Self::start_capture_with_stop_flag) methods
 /// invoke a **user-supplied callback directly on the WASAPI capture thread**.
@@ -303,7 +304,7 @@ impl WindowsApplicationCapture {
         self.audio_client.is_some()
     }
 
-    /// Stop capturing audio (alias for [`stop_capture`]).
+    /// Stop capturing audio (alias for [`stop_capture`](Self::stop_capture)).
     pub fn stop(&mut self) -> std::result::Result<(), Box<dyn std::error::Error>> {
         self.stop_capture()
     }

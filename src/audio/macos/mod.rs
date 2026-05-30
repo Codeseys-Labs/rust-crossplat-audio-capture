@@ -27,5 +27,6 @@ pub(crate) mod thread;
 // Re-export public types for convenience
 #[cfg(target_os = "macos")]
 pub use coreaudio::{
-    enumerate_audio_applications, ApplicationInfo, MacosAudioDevice, MacosDeviceEnumerator,
+    enumerate_audio_applications, enumerate_audio_applications_all, ApplicationInfo,
+    MacosAudioDevice, MacosDeviceEnumerator,
 };

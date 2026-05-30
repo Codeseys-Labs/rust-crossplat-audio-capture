@@ -95,6 +95,11 @@ pub mod bridge;
 pub mod core;
 pub mod prelude;
 pub mod sink;
+// Internal structured-instrumentation shim. Declared before the modules that use
+// `rsac_event!`/`rsac_span!` so the `#[macro_export]`ed macros are in scope crate-wide.
+// The macros land at the crate root (macro_export); `trace::install_default_tracing`
+// is re-exported below behind the `tracing` feature.
+pub mod trace;
 pub mod utils;
 
 // Core types
@@ -135,6 +140,12 @@ pub use crate::sink::WavFileSink;
 // Async stream support
 #[cfg(feature = "async-stream")]
 pub use crate::bridge::AsyncAudioStream;
+
+// Optional `tracing` integration: best-effort default subscriber installer for
+// binaries/examples. The `rsac_event!`/`rsac_span!` macros are always available
+// at the crate root (they fall back to `log::` when this feature is off).
+#[cfg(feature = "tracing")]
+pub use crate::trace::install_default_tracing;
 
 // Re-export test utils if the feature is enabled
 #[cfg(feature = "test-utils")]

@@ -66,6 +66,11 @@ sink-wav = []                        # WavFileSink sink adapter (hound is always
 # allocation on the producer's RT thread. Default OFF — the AudioBuffer ring
 # remains the default path; this is A/B'd in benches/bridge.rs.
 bridge-zerocopy = []
+# rsac-624c: opt-in structured instrumentation. Default OFF — with the feature
+# off, rsac_event!/rsac_span! fall back to `log::` (behavior-identical, no extra
+# deps). With it on, they emit tracing events/spans and `install_default_tracing`
+# becomes available. Pulls in only the `tracing` facade (no tracing-subscriber).
+tracing = ["dep:tracing"]
 
 [dependencies]
 # Core dependencies
@@ -74,6 +79,7 @@ rtrb = "0.3.4"                                               # Lock-free SPSC ri
 atomic-waker = { version = "1.1.2", optional = true }           # Async waker for ring buffer notification (behind async-stream feature)
 thiserror = "2.0.18"                                       # For error handling
 log = "0.4.29"                                                 # For logging
+tracing = { version = "0.1.41", optional = true }              # Optional structured instrumentation (behind the `tracing` feature; rsac_event!/rsac_span! fall back to `log::` when off)
 
 hound = "3.5.1"
 clap = { version = "4.5.60", features = ["derive"] }

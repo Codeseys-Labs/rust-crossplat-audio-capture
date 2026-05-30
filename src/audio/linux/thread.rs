@@ -116,6 +116,44 @@ pub(crate) struct PwDeviceSnapshot {
     pub media_class: String,
 }
 
+/// A single audio-producing **application** discovered via the native PipeWire
+/// registry.
+///
+/// Produced on the PipeWire thread by walking the registry's `global` callbacks
+/// (audit finding H4 part 2 / `rsac-8ebb`), this replaces the `pw-dump`
+/// subprocess scrape that `list_audio_applications` previously performed.
+///
+/// # Predicate (parity with the old subprocess parser)
+///
+/// A node becomes an application source when its `media.class` contains
+/// `"Stream"` (i.e. a per-application `Stream/Output/Audio` /
+/// `Stream/Input/Audio` node, not a device sink/source) **and** it advertises a
+/// parseable numeric `application.process.id`. Nodes without a usable PID are
+/// skipped — exactly the `pid == 0` filter the subprocess parser applied.
+///
+/// # Identity contract
+///
+/// `pid` is the application's `application.process.id`; it is the same numeric
+/// PID the capture path keys on, so an [`ApplicationId`] built from it
+/// round-trips through [`CaptureTarget::Application`] →
+/// `PwNodeLookup::ByPid` without a second lookup. `node_serial` carries the
+/// node's `object.serial` (falling back to the registry global `id` when a node
+/// advertises no serial) for callers that want to attach directly to the
+/// stream node.
+///
+/// [`ApplicationId`]: crate::core::config::ApplicationId
+/// [`CaptureTarget::Application`]: crate::core::config::CaptureTarget::Application
+#[derive(Debug, Clone)]
+pub(crate) struct PwAppSnapshot {
+    /// The application's `application.process.id`.
+    pub pid: u32,
+    /// Human-readable application name: `application.name`, then
+    /// `application.process.binary`, then a generic placeholder.
+    pub app_name: String,
+    /// Node `object.serial` (or registry global `id` if no serial) as a string.
+    pub node_serial: String,
+}
+
 /// The default sink/source node *names* reported by the PipeWire `default`
 /// metadata object.
 ///
@@ -141,6 +179,12 @@ struct RegistrySnapshot {
     /// Audio nodes discovered so far, keyed by registry global id so a single
     /// node is recorded once even if its `global` event arrives more than once.
     devices: std::collections::BTreeMap<u32, PwDeviceSnapshot>,
+    /// Per-application audio stream nodes discovered so far, keyed by registry
+    /// global id so re-announcement of the same node is idempotent. PID-level
+    /// deduplication (one entry per process even when an app has several stream
+    /// nodes) is applied when the owned snapshot is built — see
+    /// [`PipeWireThread::snapshot_applications`].
+    applications: std::collections::BTreeMap<u32, PwAppSnapshot>,
     /// Default sink/source names from the `default` metadata object.
     default: PwDefaultSnapshot,
 }
@@ -202,6 +246,18 @@ pub(crate) enum PipeWireCommand {
     /// before replying.
     SnapshotDefault {
         response_tx: std_mpsc::Sender<AudioResult<PwDefaultSnapshot>>,
+    },
+
+    /// Snapshot the set of audio-producing applications from the native
+    /// registry (H4 part 2 / `rsac-8ebb`).
+    ///
+    /// Like [`SnapshotDevices`](PipeWireCommand::SnapshotDevices), the handler
+    /// waits for a `core.sync()`/`done` roundtrip so the registry's initial
+    /// dump has settled before replying — otherwise it would race an empty
+    /// registry and report "no applications" on a host that is actively playing
+    /// audio. The returned list is PID-deduplicated.
+    SnapshotApplications {
+        response_tx: std_mpsc::Sender<AudioResult<Vec<PwAppSnapshot>>>,
     },
 
     /// Shut down the PipeWire thread entirely. No response needed — the thread exits.
@@ -489,6 +545,53 @@ impl PipeWireThread {
                 backend: "PipeWire".to_string(),
                 operation: "snapshot_default".to_string(),
                 message: "PipeWire thread exited before responding to SnapshotDefault".to_string(),
+                context: None,
+            }),
+        }
+    }
+
+    /// Snapshot the audio-producing applications from the native PipeWire
+    /// registry (H4 part 2 / `rsac-8ebb`).
+    ///
+    /// Sends a [`SnapshotApplications`](PipeWireCommand::SnapshotApplications)
+    /// command and blocks (bounded by [`SNAPSHOT_TIMEOUT`]) for the reply. The
+    /// PipeWire thread waits for a `core.sync()`/`done` roundtrip before
+    /// replying so the initial registry dump has settled — the returned list is
+    /// therefore the real application set, never a racy empty snapshot, and it
+    /// is PID-deduplicated (one entry per process).
+    ///
+    /// Only owned [`PwAppSnapshot`] values cross the channel; the registry
+    /// callbacks themselves run on the PipeWire loop thread.
+    ///
+    /// # Errors
+    ///
+    /// - [`AudioError::BackendError`] if the PipeWire thread is not running or
+    ///   exits without replying.
+    /// - [`AudioError::Timeout`] if the snapshot does not complete within
+    ///   [`SNAPSHOT_TIMEOUT`].
+    pub fn snapshot_applications(&self) -> AudioResult<Vec<PwAppSnapshot>> {
+        let (response_tx, response_rx) = std_mpsc::channel();
+
+        self.command_tx
+            .send(PipeWireCommand::SnapshotApplications { response_tx })
+            .map_err(|_| AudioError::BackendError {
+                backend: "PipeWire".to_string(),
+                operation: "snapshot_applications".to_string(),
+                message: "PipeWire thread is not running (command channel closed)".to_string(),
+                context: None,
+            })?;
+
+        match response_rx.recv_timeout(SNAPSHOT_TIMEOUT) {
+            Ok(result) => result,
+            Err(std_mpsc::RecvTimeoutError::Timeout) => Err(AudioError::Timeout {
+                operation: "PipeWire SnapshotApplications roundtrip".to_string(),
+                duration: SNAPSHOT_TIMEOUT,
+            }),
+            Err(std_mpsc::RecvTimeoutError::Disconnected) => Err(AudioError::BackendError {
+                backend: "PipeWire".to_string(),
+                operation: "snapshot_applications".to_string(),
+                message: "PipeWire thread exited before responding to SnapshotApplications"
+                    .to_string(),
                 context: None,
             }),
         }
@@ -1131,36 +1234,67 @@ fn pw_thread_main(
                         return;
                     };
                     let media_class = props.get("media.class").unwrap_or("");
-                    // Only physical audio sinks/sources are devices; per-app
-                    // `Stream/Output/Audio` nodes are capture *targets*, not
-                    // enumerable devices, so skip them here.
-                    if !(media_class.contains("Audio/Sink") || media_class.contains("Audio/Source"))
-                    {
-                        return;
+
+                    if media_class.contains("Audio/Sink") || media_class.contains("Audio/Source") {
+                        // Physical audio sink/source = an enumerable *device*.
+                        // Identity = object.serial (round-trips through
+                        // PwNodeLookup::Device), falling back to the registry
+                        // global id when a node advertises no serial.
+                        let id = props
+                            .get("object.serial")
+                            .map(str::to_owned)
+                            .unwrap_or_else(|| global.id.to_string());
+                        let node_name = props.get("node.name").unwrap_or("").to_owned();
+                        let name = props
+                            .get("node.description")
+                            .or_else(|| props.get("node.nick"))
+                            .or_else(|| props.get("node.name"))
+                            .unwrap_or("PipeWire Device")
+                            .to_owned();
+                        snapshot.borrow_mut().devices.insert(
+                            global.id,
+                            PwDeviceSnapshot {
+                                id,
+                                name,
+                                node_name,
+                                media_class: media_class.to_owned(),
+                            },
+                        );
+                    } else if media_class.contains("Stream") {
+                        // A per-application stream node (e.g.
+                        // `Stream/Output/Audio`). It is an enumerable
+                        // *application* source iff it advertises a parseable
+                        // numeric `application.process.id` — the same predicate
+                        // the old `pw-dump` parser used (media.class contains
+                        // "Stream" + a non-zero PID). Nodes without a usable PID
+                        // are skipped (the old `pid == 0` filter).
+                        let Some(pid) = props
+                            .get("application.process.id")
+                            .and_then(|s| s.parse::<u32>().ok())
+                            .filter(|&p| p != 0)
+                        else {
+                            return;
+                        };
+                        let app_name = props
+                            .get("application.name")
+                            .or_else(|| props.get("application.process.binary"))
+                            .unwrap_or("Unknown")
+                            .to_owned();
+                        // node_serial mirrors the device-identity contract:
+                        // object.serial, falling back to the registry global id.
+                        let node_serial = props
+                            .get("object.serial")
+                            .map(str::to_owned)
+                            .unwrap_or_else(|| global.id.to_string());
+                        snapshot.borrow_mut().applications.insert(
+                            global.id,
+                            PwAppSnapshot {
+                                pid,
+                                app_name,
+                                node_serial,
+                            },
+                        );
                     }
-                    // Identity = object.serial (round-trips through
-                    // PwNodeLookup::Device), falling back to the registry
-                    // global id when a node advertises no serial.
-                    let id = props
-                        .get("object.serial")
-                        .map(str::to_owned)
-                        .unwrap_or_else(|| global.id.to_string());
-                    let node_name = props.get("node.name").unwrap_or("").to_owned();
-                    let name = props
-                        .get("node.description")
-                        .or_else(|| props.get("node.nick"))
-                        .or_else(|| props.get("node.name"))
-                        .unwrap_or("PipeWire Device")
-                        .to_owned();
-                    snapshot.borrow_mut().devices.insert(
-                        global.id,
-                        PwDeviceSnapshot {
-                            id,
-                            name,
-                            node_name,
-                            media_class: media_class.to_owned(),
-                        },
-                    );
                 }
                 ObjectType::Metadata => {
                     // Record the `default` metadata global id so the loop body
@@ -1177,8 +1311,13 @@ fn pw_thread_main(
                 _ => {}
             })
             .global_remove(move |id| {
-                // A node going away must not linger in the snapshot.
-                snapshot_remove.borrow_mut().devices.remove(&id);
+                // A node going away must not linger in the snapshot — clear it
+                // from both the device and the application maps (a given global
+                // id is only ever in one of them, so the extra remove is a
+                // cheap no-op when it isn't an application node).
+                let mut snap = snapshot_remove.borrow_mut();
+                snap.devices.remove(&id);
+                snap.applications.remove(&id);
             })
             .register()
     };
@@ -1633,6 +1772,32 @@ fn pw_thread_main(
                 let _ = response_tx.send(Ok(default));
             }
 
+            Ok(PipeWireCommand::SnapshotApplications { response_tx }) => {
+                log::debug!("PipeWire thread: SnapshotApplications received");
+                // Settle the registry dump before reading (else we race an
+                // empty registry and report "no applications" on a host that is
+                // actively playing audio).
+                run_snapshot_roundtrip(&mut default_metadata);
+                // PID-deduplicate: an application may own several stream nodes
+                // (each a distinct registry global), but it is a single source.
+                // The first node seen for a PID wins, mirroring the old
+                // subprocess parser's "skip if app:<pid> already present".
+                let mut seen_pids: std::collections::BTreeSet<u32> =
+                    std::collections::BTreeSet::new();
+                let mut apps: Vec<PwAppSnapshot> = Vec::new();
+                for app in snapshot.borrow().applications.values() {
+                    if seen_pids.insert(app.pid) {
+                        apps.push(app.clone());
+                    }
+                }
+                log::debug!(
+                    "PipeWire thread: SnapshotApplications → {} application(s)",
+                    apps.len()
+                );
+                // Only owned Vecs cross the channel.
+                let _ = response_tx.send(Ok(apps));
+            }
+
             Ok(PipeWireCommand::Shutdown) => {
                 log::debug!("PipeWire thread: Shutdown received, exiting event loop");
                 // Clean up any active capture before exiting.
@@ -2036,6 +2201,102 @@ mod tests {
         snap.devices.remove(&7);
         assert_eq!(snap.devices.len(), 1);
         assert_eq!(snap.devices.values().next().unwrap().id, "200");
+    }
+
+    // ── Application snapshot (H4 part 2 / rsac-8ebb) ─────────────────
+
+    #[test]
+    fn test_pw_app_snapshot_clone_and_fields() {
+        let app = PwAppSnapshot {
+            pid: 4242,
+            app_name: "Firefox".to_string(),
+            node_serial: "1234".to_string(),
+        };
+        let cloned = app.clone();
+        assert_eq!(cloned.pid, 4242);
+        assert_eq!(cloned.app_name, "Firefox");
+        assert_eq!(cloned.node_serial, "1234");
+    }
+
+    /// Build the owned, PID-deduplicated application Vec exactly as the
+    /// `SnapshotApplications` handler does, so the dedup contract is testable
+    /// without a live daemon.
+    fn dedup_apps(snap: &RegistrySnapshot) -> Vec<PwAppSnapshot> {
+        let mut seen_pids: std::collections::BTreeSet<u32> = std::collections::BTreeSet::new();
+        let mut apps: Vec<PwAppSnapshot> = Vec::new();
+        for app in snap.applications.values() {
+            if seen_pids.insert(app.pid) {
+                apps.push(app.clone());
+            }
+        }
+        apps
+    }
+
+    #[test]
+    fn test_application_snapshot_dedups_by_pid() {
+        // One application can own several stream nodes (distinct registry global
+        // ids) but must collapse to a single PID-keyed source — the same dedup
+        // the old `pw-dump` parser applied via the `app:<pid>` set.
+        let mut snap = RegistrySnapshot::default();
+        let app = |pid: u32, name: &str, serial: &str| PwAppSnapshot {
+            pid,
+            app_name: name.to_string(),
+            node_serial: serial.to_string(),
+        };
+        // PID 100 appears on two different global ids; PID 200 on one.
+        snap.applications.insert(10, app(100, "Firefox", "1000"));
+        snap.applications.insert(11, app(100, "Firefox", "1001"));
+        snap.applications.insert(12, app(200, "Spotify", "1002"));
+
+        let deduped = dedup_apps(&snap);
+        assert_eq!(deduped.len(), 2, "two distinct PIDs after dedup");
+        let pids: Vec<u32> = deduped.iter().map(|a| a.pid).collect();
+        assert!(pids.contains(&100));
+        assert!(pids.contains(&200));
+        // First node seen for a PID wins (BTreeMap iterates by ascending key,
+        // so global id 10 — serial "1000" — represents PID 100).
+        let fx = deduped.iter().find(|a| a.pid == 100).unwrap();
+        assert_eq!(fx.node_serial, "1000");
+    }
+
+    #[test]
+    fn test_application_snapshot_removal_clears_entry() {
+        // A node going away (global_remove) must drop the entry from the
+        // application map, mirroring the device map behaviour.
+        let mut snap = RegistrySnapshot::default();
+        snap.applications.insert(
+            10,
+            PwAppSnapshot {
+                pid: 100,
+                app_name: "App".to_string(),
+                node_serial: "1000".to_string(),
+            },
+        );
+        assert_eq!(dedup_apps(&snap).len(), 1);
+        // global_remove on a node clears both maps; applications loses its entry.
+        snap.devices.remove(&10);
+        snap.applications.remove(&10);
+        assert!(dedup_apps(&snap).is_empty());
+    }
+
+    #[test]
+    fn test_snapshot_applications_when_spawn_fails_is_backend_error() {
+        // Mirror of test_snapshot_devices_when_spawn_fails_is_backend_error for
+        // the application path: in a sandbox without a daemon, spawn fails with
+        // BackendInitializationFailed; when it succeeds, snapshot_applications
+        // must return Ok (possibly empty) or a bounded Timeout/BackendError —
+        // never a panic.
+        match PipeWireThread::spawn() {
+            Ok(thread) => match thread.snapshot_applications() {
+                Ok(_apps) => {}
+                Err(AudioError::Timeout { .. }) | Err(AudioError::BackendError { .. }) => {}
+                Err(e) => panic!("Unexpected snapshot_applications error: {:?}", e),
+            },
+            Err(AudioError::BackendInitializationFailed { backend, .. }) => {
+                assert_eq!(backend, "PipeWire");
+            }
+            Err(e) => panic!("Unexpected spawn error: {:?}", e),
+        }
     }
 
     // ── Snapshot accessors honest-failure when daemon unavailable ────

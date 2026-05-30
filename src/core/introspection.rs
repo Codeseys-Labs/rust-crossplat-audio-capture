@@ -16,6 +16,7 @@
 
 use crate::core::config::{ApplicationId, CaptureTarget, DeviceId, ProcessId};
 use crate::core::error::AudioResult;
+use crate::core::interface::DeviceKind;
 use std::time::Duration;
 
 // ── AudioSource ─────────────────────────────────────────────────────────
@@ -41,7 +42,17 @@ pub enum AudioSourceKind {
     /// System default audio mix.
     SystemDefault,
     /// A specific audio device (input or output).
-    Device { device_id: String, is_default: bool },
+    ///
+    /// `kind` is the device's endpoint direction when it could be resolved, or
+    /// `None` when probing failed or is unsupported. It is `Option` because
+    /// [`AudioDevice::kind`](crate::core::interface::AudioDevice::kind) is
+    /// fallible (e.g. a backend that cannot determine the direction returns an
+    /// error, which is mapped to `None` here via `.ok()`).
+    Device {
+        device_id: String,
+        is_default: bool,
+        kind: Option<DeviceKind>,
+    },
     /// An application producing audio.
     Application {
         pid: u32,
@@ -145,6 +156,9 @@ pub fn list_audio_sources() -> AudioResult<Vec<AudioSource>> {
                         kind: AudioSourceKind::Device {
                             device_id: dev.id().to_string(),
                             is_default: dev.is_default(),
+                            // Fallible probe → Option: None when the backend
+                            // cannot resolve the endpoint direction (mx-a481).
+                            kind: dev.kind().ok(),
                         },
                     });
                 }
@@ -503,6 +517,59 @@ mod tests {
             source.to_capture_target(),
             CaptureTarget::ProcessTree(ProcessId(1234))
         );
+    }
+
+    /// The additive `kind` field on `AudioSourceKind::Device` does not affect
+    /// `to_capture_target()` — the arm ignores it via `..` — and a `Device`
+    /// source still maps to `CaptureTarget::Device`.
+    #[test]
+    fn device_source_with_kind_maps_to_capture_target() {
+        let source = AudioSource {
+            id: "device:speakers".to_string(),
+            name: "Speakers".to_string(),
+            kind: AudioSourceKind::Device {
+                device_id: "speakers".to_string(),
+                is_default: true,
+                kind: Some(DeviceKind::Output),
+            },
+        };
+        assert_eq!(
+            source.to_capture_target(),
+            CaptureTarget::Device(DeviceId("speakers".to_string()))
+        );
+
+        // A None kind (probe failed / unsupported) maps identically — the new
+        // field is purely informational for to_capture_target().
+        let unknown = AudioSource {
+            id: "device:mic".to_string(),
+            name: "Mic".to_string(),
+            kind: AudioSourceKind::Device {
+                device_id: "mic".to_string(),
+                is_default: false,
+                kind: None,
+            },
+        };
+        assert_eq!(
+            unknown.to_capture_target(),
+            CaptureTarget::Device(DeviceId("mic".to_string()))
+        );
+    }
+
+    /// The `kind` field round-trips through pattern matching, including the
+    /// `None` (indeterminate) case.
+    #[test]
+    fn device_source_kind_field_round_trips() {
+        let with_kind = AudioSourceKind::Device {
+            device_id: "d0".to_string(),
+            is_default: false,
+            kind: Some(DeviceKind::Input),
+        };
+        match with_kind {
+            AudioSourceKind::Device { kind, .. } => {
+                assert_eq!(kind, Some(DeviceKind::Input));
+            }
+            other => panic!("expected Device, got {other:?}"),
+        }
     }
 
     #[test]

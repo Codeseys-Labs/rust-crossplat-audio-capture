@@ -44,6 +44,72 @@
 #[cfg(feature = "feat_linux")]
 pub(crate) mod thread;
 
+// ── Application enumeration facade (H4 part 2 / rsac-8ebb) ────────────────
+
+/// A running application that is producing audio, discovered via the native
+/// in-process PipeWire registry.
+///
+/// This mirrors the macOS `ApplicationInfo` / Windows
+/// `ApplicationAudioSessionInfo` shape so the cross-platform
+/// `list_audio_applications` arm in `core::introspection` can map every backend
+/// uniformly. `process_id` is the application's PID — usable directly with
+/// [`CaptureTarget::Application`] (the Linux backend resolves the PID to the
+/// app's audio-output node).
+///
+/// (The macOS/Windows sibling types live behind their own `target_os` gate, so
+/// they are referenced by name rather than as intra-doc links to keep the
+/// `--all-features` docs build clean on every host.)
+///
+/// [`CaptureTarget::Application`]: crate::core::config::CaptureTarget::Application
+#[derive(Debug, Clone)]
+pub struct LinuxApplicationInfo {
+    /// The application's process id (`application.process.id`).
+    pub process_id: u32,
+    /// Human-readable application name (`application.name`, falling back to
+    /// `application.process.binary`, then `"Unknown"`).
+    pub name: String,
+    /// The audio stream node's `object.serial` (or registry global id when the
+    /// node advertises no serial), for callers that want to attach directly to
+    /// the per-application node.
+    pub node_serial: String,
+}
+
+/// Enumerate running applications producing audio via the **native** in-process
+/// PipeWire registry (H4 part 2 / `rsac-8ebb`) — no `pw-dump` subprocess.
+///
+/// Spawns a short-lived `PipeWireThread`, snapshots the registry after a
+/// `core.sync()`/`done` roundtrip, and maps each PID-deduplicated
+/// `PwAppSnapshot` to a [`LinuxApplicationInfo`]. (`PipeWireThread` and
+/// `PwAppSnapshot` are `pub(crate)`, so they are referenced by name rather than
+/// as intra-doc links to keep the `--all-features` docs build clean on every
+/// host.) This is the sibling of the
+/// macOS `enumerate_audio_applications` / Windows
+/// `enumerate_application_audio_sessions` facade helpers that
+/// `core::introspection::list_audio_applications` calls per platform, so the
+/// `core` crate reaches application discovery through the `crate::audio` facade
+/// (the module DAG is preserved — `core` never depends on `audio` internals).
+///
+/// Returns an error if the PipeWire thread cannot be spawned or the snapshot
+/// roundtrip fails; the caller may then fall back to the subprocess path. An
+/// empty-but-successful snapshot returns `Ok(vec![])` (no apps are currently
+/// producing audio).
+#[cfg(feature = "feat_linux")]
+pub fn enumerate_audio_applications() -> crate::core::error::Result<Vec<LinuxApplicationInfo>> {
+    use crate::audio::linux::thread::PipeWireThread;
+
+    let pw_thread = PipeWireThread::spawn()?;
+    let apps = pw_thread.snapshot_applications()?;
+
+    Ok(apps
+        .into_iter()
+        .map(|a| LinuxApplicationInfo {
+            process_id: a.pid,
+            name: a.app_name,
+            node_serial: a.node_serial,
+        })
+        .collect())
+}
+
 pub struct LinuxDeviceEnumerator;
 
 impl Default for LinuxDeviceEnumerator {
@@ -1174,6 +1240,68 @@ mod pipewire_integration_tests {
             match target {
                 crate::core::config::CaptureTarget::Device(id) => {
                     assert_eq!(id.0, d.id, "DeviceId must round-trip the snapshot id");
+                }
+                _ => unreachable!(),
+            }
+        }
+    }
+
+    // ── Native application enumeration (H4 part 2 / rsac-8ebb) ───────
+
+    #[test]
+    fn test_native_enumerate_applications_shape_or_skip() {
+        // Acceptance: with PipeWire running the native path returns audio
+        // application sources with NO pw-dump subprocess. When unavailable,
+        // spawning fails and we skip — never a fabricated entry.
+        if !pipewire_thread_spawnable() {
+            eprintln!("Skipping test_native_enumerate_applications_shape_or_skip: PipeWire bindings cannot connect");
+            return;
+        }
+
+        let apps = super::enumerate_audio_applications()
+            .expect("native application enumeration should not error when daemon is reachable");
+
+        println!("Native snapshot found {} audio application(s):", apps.len());
+        // PID-dedup contract: at most one entry per process id, and every entry
+        // carries a usable (non-zero) PID and a non-empty name — exactly the
+        // predicate the old subprocess parser enforced.
+        let mut seen = std::collections::BTreeSet::new();
+        for a in &apps {
+            println!(
+                "  - {} (pid: {}, serial: {})",
+                a.name, a.process_id, a.node_serial
+            );
+            assert_ne!(a.process_id, 0, "application PID must be non-zero");
+            assert!(!a.name.is_empty(), "application name must be non-empty");
+            assert!(
+                seen.insert(a.process_id),
+                "application list must be PID-deduplicated; saw {} twice",
+                a.process_id
+            );
+        }
+    }
+
+    #[test]
+    fn test_native_application_pid_round_trips_capture_target() {
+        // Every enumerated PID must round-trip through CaptureTarget::Application
+        // (numeric PID-string contract shared with Windows/macOS).
+        if !pipewire_thread_spawnable() {
+            eprintln!("Skipping test_native_application_pid_round_trips_capture_target: PipeWire bindings cannot connect");
+            return;
+        }
+
+        let apps = super::enumerate_audio_applications().expect("native app enumeration");
+        for a in &apps {
+            let target = crate::core::config::CaptureTarget::Application(
+                crate::core::config::ApplicationId(a.process_id.to_string()),
+            );
+            match target {
+                crate::core::config::CaptureTarget::Application(id) => {
+                    assert_eq!(
+                        id.0,
+                        a.process_id.to_string(),
+                        "ApplicationId must round-trip the snapshot PID"
+                    );
                 }
                 _ => unreachable!(),
             }

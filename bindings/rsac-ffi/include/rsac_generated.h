@@ -79,6 +79,31 @@ typedef enum Rsacrsac_error_t {
 } Rsacrsac_error_t;
 
 /**
+ * Sample wire/storage format, mirroring [`rsac::SampleFormat`].
+ *
+ * All audio data is delivered as interleaved `f32` regardless of this value;
+ * it describes the negotiated wire format the backend reports.
+ */
+typedef enum Rsacrsac_sample_format_t {
+    /**
+     * Signed 16-bit integer.
+     */
+    RSAC_SAMPLE_FORMAT_I16 = 0,
+    /**
+     * Signed 24-bit integer (packed in a 32-bit container).
+     */
+    RSAC_SAMPLE_FORMAT_I24 = 1,
+    /**
+     * Signed 32-bit integer.
+     */
+    RSAC_SAMPLE_FORMAT_I32 = 2,
+    /**
+     * 32-bit IEEE 754 floating-point (the library's internal standard).
+     */
+    RSAC_SAMPLE_FORMAT_F32 = 3,
+} Rsacrsac_sample_format_t;
+
+/**
  * Opaque handle to an `AudioBuffer`.
  */
 typedef struct RsacRsacAudioBuffer RsacRsacAudioBuffer;
@@ -112,6 +137,72 @@ typedef struct RsacRsacDeviceEnumerator RsacRsacDeviceEnumerator;
  * Opaque handle to a list of audio devices.
  */
 typedef struct RsacRsacDeviceList RsacRsacDeviceList;
+
+/**
+ * A point-in-time snapshot of a capture's stream statistics.
+ *
+ * Filled by [`rsac_capture_stream_stats`] from [`AudioCapture::stream_stats`].
+ * This is a plain C-ABI value type (no heap, no free required). It mirrors the
+ * counters in [`rsac::StreamStats`]; `is_running` is `1` when capturing, else `0`.
+ *
+ * When no stream has been created (before start, or after stop) every counter
+ * is `0`, `uptime_secs` is `0.0`, and `is_running` is `0`.
+ */
+typedef struct RsacRsacStreamStats {
+    /**
+     * Buffers delivered to the consumer (popped off the ring) since start.
+     */
+    uint64_t buffers_captured;
+    /**
+     * Buffers dropped due to ring-buffer overflow since start.
+     */
+    uint64_t buffers_dropped;
+    /**
+     * Buffers enqueued by the producer (the OS audio callback) since start.
+     */
+    uint64_t buffers_pushed;
+    /**
+     * Ring-buffer overruns. Equal to `buffers_dropped` (retained alias).
+     */
+    uint64_t overruns;
+    /**
+     * How long the stream has been running, in seconds. `0.0` when not started.
+     */
+    double uptime_secs;
+    /**
+     * Fraction of accounted-for buffers lost to overflow, in `0.0..=1.0`.
+     */
+    double dropped_ratio;
+    /**
+     * `1` if the stream is currently capturing, `0` otherwise.
+     */
+    int32_t is_running;
+} RsacRsacStreamStats;
+
+/**
+ * A point-in-time snapshot of a capture's negotiated delivery format.
+ *
+ * Filled by [`rsac_capture_format`] from [`AudioCapture::format`]. Plain C-ABI
+ * value type (no heap, no free required).
+ */
+typedef struct RsacRsacAudioFormat {
+    /**
+     * Samples per second (e.g. 44100, 48000).
+     */
+    uint32_t sample_rate;
+    /**
+     * Number of audio channels (e.g. 1 mono, 2 stereo).
+     */
+    uint16_t channels;
+    /**
+     * The negotiated sample wire format.
+     */
+    enum Rsacrsac_sample_format_t sample_format;
+    /**
+     * Bits per sample for `sample_format` (16, 24, or 32).
+     */
+    uint16_t bits_per_sample;
+} RsacRsacAudioFormat;
 
 /**
  * C callback type for audio data.
@@ -236,6 +327,41 @@ enum Rsacrsac_error_t rsac_builder_build(struct RsacRsacBuilder *builder,
  * Returns 0 if the capture handle is null or no stream exists.
  */
  uint64_t rsac_capture_overrun_count(const struct RsacRsacCapture *capture) ;
+
+/**
+ * Fills `*out` with a point-in-time [`RsacStreamStats`] snapshot of the capture.
+ *
+ * The snapshot bundles the bridge's diagnostic counters with the running state,
+ * uptime, and overflow ratio. Reading it never allocates on or blocks the OS
+ * audio callback thread.
+ *
+ * When no stream has been created (before start, or after stop), `*out` is
+ * filled with an all-zero snapshot (`is_running == 0`).
+ *
+ * Returns `RSAC_ERROR_NULL_POINTER` if `capture` or `out` is null; otherwise
+ * `RSAC_OK`. `out` is an out-parameter, not a handle: there is nothing to free.
+ */
+
+enum Rsacrsac_error_t rsac_capture_stream_stats(const struct RsacRsacCapture *capture,
+                                                struct RsacRsacStreamStats *out)
+;
+
+/**
+ * Fills `*out` with the negotiated delivery [`RsacAudioFormat`] of the capture.
+ *
+ * This is the format the backend actually produces, atomically published by the
+ * bridge once a stream is created. Returns `RSAC_ERROR_STREAM_FAILED` when no
+ * stream has been created yet (before start, or after stop), leaving `*out`
+ * untouched — call this only on a started capture, or after checking
+ * [`rsac_capture_is_running`].
+ *
+ * Returns `RSAC_ERROR_NULL_POINTER` if `capture` or `out` is null. `out` is an
+ * out-parameter, not a handle: there is nothing to free.
+ */
+
+enum Rsacrsac_error_t rsac_capture_format(const struct RsacRsacCapture *capture,
+                                          struct RsacRsacAudioFormat *out)
+;
 
 /**
  * Frees a capture handle. Stops the stream if running. No-op if null.

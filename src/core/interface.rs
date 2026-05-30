@@ -23,6 +23,45 @@ pub enum DeviceKind {
     Output,
 }
 
+/// A cheap, owned snapshot of an [`AudioDevice`]'s metadata.
+///
+/// `DeviceInfo` bundles the four metadata accessors of [`AudioDevice`]
+/// (`id`, `name`, `is_default`, `kind`) together with the device's preferred
+/// audio format into a single, plain-data value that is easy to clone, store,
+/// log, or send across a channel without holding a `Box<dyn AudioDevice>`.
+///
+/// Obtain one via [`AudioDevice::describe`].
+///
+/// # `default_format`
+///
+/// `default_format` is the first entry of `supported_formats()`, or `None`
+/// when the backend reports no formats. On **Linux (PipeWire)** the native
+/// backend intentionally returns an empty `supported_formats()` list (format
+/// negotiation happens at stream-open time), so `default_format` is `None`
+/// there by design (L2) — its absence is expected, not an error.
+///
+/// # Stability
+///
+/// This struct is `#[non_exhaustive]`: new metadata fields may be added in a
+/// minor release. Match it with a trailing `..` and do not construct it by
+/// struct literal outside this crate; use [`AudioDevice::describe`] instead.
+#[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
+pub struct DeviceInfo {
+    /// The unique platform-specific identifier for the device.
+    pub id: DeviceId,
+    /// The human-readable device name.
+    pub name: String,
+    /// Whether the device is an input or output endpoint.
+    pub kind: DeviceKind,
+    /// Whether the device is the system default.
+    pub is_default: bool,
+    /// The device's preferred format (the first entry of
+    /// `supported_formats()`), or `None` when none are reported — including on
+    /// Linux/PipeWire by design (see the type-level note).
+    pub default_format: Option<AudioFormat>,
+}
+
 /// A trait representing an audio device.
 ///
 /// Provides a platform-agnostic interface to query device information
@@ -80,6 +119,37 @@ pub trait AudioDevice: Send + Sync {
             feature: "device kind".to_string(),
             platform: std::env::consts::OS.to_string(),
         })
+    }
+
+    /// Returns an owned [`DeviceInfo`] snapshot of this device's metadata.
+    ///
+    /// This is a **provided** method composed entirely from the existing
+    /// accessors — [`id`](Self::id), [`name`](Self::name),
+    /// [`is_default`](Self::is_default), [`kind`](Self::kind), and
+    /// [`supported_formats`](Self::supported_formats) — so every backend and
+    /// external implementation inherits it without change.
+    ///
+    /// Field mapping:
+    ///
+    /// - `default_format` is `supported_formats().into_iter().next()` — the
+    ///   first reported format, or `None` when the list is empty (the Linux
+    ///   PipeWire case by design; see [`DeviceInfo`]).
+    /// - `kind` is taken from [`kind`](Self::kind) when it resolves. When
+    ///   `kind()` returns an error (e.g. the `PlatformNotSupported` default, or
+    ///   a backend that cannot determine the endpoint direction), `describe`
+    ///   falls back to [`DeviceKind::Input`] — the capture-oriented default for
+    ///   this capture-only library — so the snapshot stays infallible. Callers
+    ///   that need to distinguish "known input" from "indeterminate" should call
+    ///   [`kind`](Self::kind) directly and inspect the error.
+    fn describe(&self) -> DeviceInfo {
+        let kind = self.kind().unwrap_or(DeviceKind::Input);
+        DeviceInfo {
+            id: self.id(),
+            name: self.name(),
+            kind,
+            is_default: self.is_default(),
+            default_format: self.supported_formats().into_iter().next(),
+        }
     }
 
     /// Creates a new capturing stream from this device using the given configuration.
@@ -326,6 +396,7 @@ pub trait DeviceEnumerator: Send + Sync {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::core::config::SampleFormat;
     use crate::core::error::ErrorKind;
 
     /// A minimal `AudioDevice` that overrides nothing beyond the required
@@ -367,5 +438,81 @@ mod tests {
             }
             other => panic!("expected PlatformNotSupported, got {other:?}"),
         }
+    }
+
+    /// A richer device that overrides `kind()` (as a real backend does) and
+    /// reports a couple of supported formats, exercising the populated arms of
+    /// `describe()`.
+    struct OutputDevice;
+
+    impl AudioDevice for OutputDevice {
+        fn id(&self) -> DeviceId {
+            DeviceId("speakers".to_string())
+        }
+        fn name(&self) -> String {
+            "Speakers".to_string()
+        }
+        fn is_default(&self) -> bool {
+            true
+        }
+        fn supported_formats(&self) -> Vec<AudioFormat> {
+            // First entry must become `default_format`; the second proves we
+            // pick the head, not the tail.
+            vec![
+                AudioFormat {
+                    sample_rate: 48_000,
+                    channels: 2,
+                    sample_format: SampleFormat::F32,
+                },
+                AudioFormat {
+                    sample_rate: 44_100,
+                    channels: 1,
+                    sample_format: SampleFormat::F32,
+                },
+            ]
+        }
+        fn kind(&self) -> AudioResult<DeviceKind> {
+            Ok(DeviceKind::Output)
+        }
+        fn create_stream(&self, _config: &StreamConfig) -> AudioResult<Box<dyn CapturingStream>> {
+            Err(AudioError::PlatformNotSupported {
+                feature: "create_stream".to_string(),
+                platform: "test".to_string(),
+            })
+        }
+    }
+
+    /// `describe()` on a device that does not override `kind()` falls back to
+    /// `Input` (the capture-only default), reports an empty `supported_formats`
+    /// as `default_format == None`, and carries the other accessors verbatim.
+    #[test]
+    fn describe_default_falls_back_to_input_and_no_format() {
+        let info = MinimalDevice.describe();
+        assert_eq!(info.id, DeviceId("minimal".to_string()));
+        assert_eq!(info.name, "Minimal");
+        assert!(!info.is_default);
+        // kind() errored (PlatformNotSupported default) → Input fallback.
+        assert_eq!(info.kind, DeviceKind::Input);
+        // Empty supported_formats() → no preferred format.
+        assert_eq!(info.default_format, None);
+    }
+
+    /// `describe()` honors an overridden `kind()` and takes the FIRST supported
+    /// format as `default_format`.
+    #[test]
+    fn describe_uses_kind_and_first_supported_format() {
+        let info = OutputDevice.describe();
+        assert_eq!(info.id, DeviceId("speakers".to_string()));
+        assert_eq!(info.name, "Speakers");
+        assert!(info.is_default);
+        assert_eq!(info.kind, DeviceKind::Output);
+        assert_eq!(
+            info.default_format,
+            Some(AudioFormat {
+                sample_rate: 48_000,
+                channels: 2,
+                sample_format: SampleFormat::F32,
+            })
+        );
     }
 }

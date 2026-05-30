@@ -6,8 +6,8 @@
 //! per-process-tree capture. COM is initialized on a dedicated MTA thread
 //! by a [`ComInitializer`] RAII guard, and audio data crosses from that
 //! thread into the consumer thread through the common
-//! [`BridgeStream`](crate::bridge::stream::BridgeStream) ring-buffer
-//! adapter.
+//! `BridgeStream` ring-buffer adapter (`crate::bridge::stream`; `pub(crate)`,
+//! so referenced by name to keep the `--all-features` docs build clean).
 //!
 //! ## Capture strategy
 //!
