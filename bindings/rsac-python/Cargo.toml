@@ -15,8 +15,25 @@ crate-type = ["cdylib"]
 [dependencies]
 pyo3 = { version = "0.24", features = ["extension-module"] }
 
-# Path dependency to the rsac library crate
-[dependencies.rsac]
+# Path dependency to the rsac library crate.
+#
+# rsac gates each platform backend behind a `feat_<os>` feature, and enabling a
+# backend on the wrong OS does not compile. We therefore select the backend
+# per-target: each table enables exactly the one backend that matches the host
+# platform, with `default-features = false` so the other two backends (and their
+# OS-only system deps) are never pulled in. This lets `rsac-python` build on all
+# three platforms. (Mirrors the per-target backend selection rsac itself uses.)
+[target.'cfg(windows)'.dependencies.rsac]
+path = "../.."
+default-features = false
+features = ["feat_windows"]
+
+[target.'cfg(target_os = "linux")'.dependencies.rsac]
+path = "../.."
+default-features = false
+features = ["feat_linux"]
+
+[target.'cfg(target_os = "macos")'.dependencies.rsac]
 path = "../.."
 default-features = false
 features = ["feat_macos"]

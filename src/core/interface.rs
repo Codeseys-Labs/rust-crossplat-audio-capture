@@ -154,6 +154,50 @@ pub trait CapturingStream: Send + Sync {
         0
     }
 
+    /// Returns the cumulative number of audio buffers **delivered to the
+    /// consumer** (i.e. popped off the ring buffer by `read_chunk()` /
+    /// `try_read_chunk()`) since the stream started.
+    ///
+    /// This is the "successfully captured and handed to the caller" tally,
+    /// distinct from [`buffers_pushed()`](Self::buffers_pushed) (what the OS
+    /// callback enqueued) and [`buffers_dropped()`](Self::buffers_dropped)
+    /// (what was lost to overflow). The default implementation returns 0 for
+    /// backends that do not track this counter.
+    fn buffers_captured(&self) -> u64 {
+        0
+    }
+
+    /// Returns the cumulative number of audio buffers **enqueued by the
+    /// producer** (the OS audio callback) since the stream started.
+    ///
+    /// Together with [`buffers_dropped()`](Self::buffers_dropped) this accounts
+    /// for everything the OS produced: `pushed + dropped` is the total the
+    /// callback attempted to deliver. The default implementation returns 0 for
+    /// backends that do not track this counter.
+    fn buffers_pushed(&self) -> u64 {
+        0
+    }
+
+    /// Returns the cumulative number of audio buffers **dropped due to ring
+    /// buffer overflow** since the stream started.
+    ///
+    /// This is an alias of [`overrun_count()`](Self::overrun_count), provided so
+    /// the three bridge counters (`buffers_pushed` / `buffers_dropped` /
+    /// `buffers_captured`) read uniformly. The default implementation returns 0
+    /// for backends that do not track buffer loss.
+    fn buffers_dropped(&self) -> u64 {
+        0
+    }
+
+    /// Returns `true` if the stream's producer is actively producing data.
+    ///
+    /// This is a convenience alias of [`is_running()`](Self::is_running) for
+    /// callers reasoning about producer activity. The default implementation
+    /// delegates to `is_running()`.
+    fn is_producing(&self) -> bool {
+        self.is_running()
+    }
+
     /// Returns true if the stream's producer is experiencing sustained
     /// backpressure (consecutive ring buffer overflows above a threshold).
     ///

@@ -272,6 +272,24 @@ impl<S: PlatformStream + Sync + 'static> CapturingStream for BridgeStream<S> {
         self.shared.buffers_dropped.load(Ordering::Relaxed)
     }
 
+    fn buffers_captured(&self) -> u64 {
+        // Buffers delivered to the consumer == popped off the ring buffer.
+        self.shared.buffers_popped.load(Ordering::Relaxed)
+    }
+
+    fn buffers_pushed(&self) -> u64 {
+        self.shared.buffers_pushed.load(Ordering::Relaxed)
+    }
+
+    fn buffers_dropped(&self) -> u64 {
+        // Alias of overrun_count(): both report ring-buffer-overflow drops.
+        self.shared.buffers_dropped.load(Ordering::Relaxed)
+    }
+
+    fn is_producing(&self) -> bool {
+        self.shared.state.is_running()
+    }
+
     fn is_under_backpressure(&self) -> bool {
         self.shared.is_under_backpressure()
     }
@@ -673,6 +691,74 @@ mod tests {
         }
         let stream: Box<dyn CapturingStream> = Box::new(MinimalStream);
         assert_eq!(stream.overrun_count(), 0);
+        // New trait counters also default to zero / delegate to is_running().
+        assert_eq!(stream.buffers_captured(), 0);
+        assert_eq!(stream.buffers_pushed(), 0);
+        assert_eq!(stream.buffers_dropped(), 0);
+        assert!(!stream.is_producing()); // MinimalStream::is_running() == false
+    }
+
+    // ===== rsac-713b: bridge counters surfaced through CapturingStream =====
+
+    // buffers_pushed / buffers_dropped / buffers_captured on the
+    // CapturingStream trait must read the BridgeShared atomics after a
+    // scripted push / drop / pop sequence.
+    #[test]
+    fn test_trait_counters_reflect_push_drop_pop() {
+        let format = test_format();
+        let (mut producer, consumer) = create_bridge(4, format.clone());
+        consumer
+            .shared()
+            .state
+            .transition(StreamState::Created, StreamState::Running)
+            .unwrap();
+        // Access through the trait object so we exercise the overrides, not
+        // the inherent BridgeStream methods.
+        let stream: Box<dyn CapturingStream> = Box::new(BridgeStream::new(
+            consumer,
+            MockPlatformStream::new(),
+            format,
+            Duration::from_secs(1),
+        ));
+
+        // Fresh stream: all counters zero and the producer is producing.
+        assert_eq!(stream.buffers_pushed(), 0);
+        assert_eq!(stream.buffers_dropped(), 0);
+        assert_eq!(stream.buffers_captured(), 0);
+        assert!(stream.is_producing());
+
+        // Push 4 buffers — exactly fills the ring (capacity 4); all succeed.
+        for _ in 0..4 {
+            assert!(producer.push_or_drop(test_buffer(1.0)));
+        }
+        assert_eq!(stream.buffers_pushed(), 4, "4 successful pushes");
+        assert_eq!(stream.buffers_dropped(), 0, "nothing dropped yet");
+        assert_eq!(stream.buffers_captured(), 0, "nothing popped yet");
+
+        // Push 2 more while full — both are dropped.
+        assert!(!producer.push_or_drop(test_buffer(2.0)));
+        assert!(!producer.push_or_drop(test_buffer(3.0)));
+        assert_eq!(
+            stream.buffers_pushed(),
+            4,
+            "pushed count unchanged by drops"
+        );
+        assert_eq!(stream.buffers_dropped(), 2, "2 dropped pushes");
+        // buffers_dropped is an alias of overrun_count.
+        assert_eq!(stream.buffers_dropped(), stream.overrun_count());
+
+        // Pop 3 buffers — buffers_captured tracks delivered-to-consumer.
+        for _ in 0..3 {
+            assert!(stream.try_read_chunk().unwrap().is_some());
+        }
+        assert_eq!(stream.buffers_captured(), 3, "3 buffers delivered");
+        assert_eq!(stream.buffers_pushed(), 4, "pushed unaffected by pops");
+        assert_eq!(stream.buffers_dropped(), 2, "dropped unaffected by pops");
+
+        // is_producing tracks the running state; stop() ends production.
+        assert!(stream.is_producing());
+        stream.stop().unwrap();
+        assert!(!stream.is_producing());
     }
 
     // 13. Stop from Created state returns error

@@ -30,11 +30,18 @@ use crate::core::config::{CaptureTarget, SampleFormat, StreamConfig};
 // the Linux build stays warning-clean under `-D warnings`.
 #[cfg(not(target_os = "linux"))]
 use crate::core::config::AudioFormat;
+// `format()`/`uptime()` and their helpers must compile on every platform
+// (including Linux), but the `AudioFormat` import above is gated to keep the
+// Linux build warning-clean for `pick_supported_format`. Reference the fully
+// qualified path through this always-available alias so the public read path
+// is not accidentally tied to the gated import.
+use crate::core::config::AudioFormat as AudioFormatType;
 use crate::core::error::{AudioError, AudioResult};
 use std::fmt;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc;
 use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant};
 
 // Re-export AudioCaptureConfig from core::config so downstream code
 // that uses `crate::api::AudioCaptureConfig` still resolves.
@@ -287,6 +294,7 @@ impl AudioCaptureBuilder {
             stream: None,
             callback: Mutex::new(None),
             callback_pump: None,
+            start_instant: None,
         })
     }
 }
@@ -439,6 +447,12 @@ pub struct AudioCapture {
     /// Active callback pump, if a callback was set when `start()` ran. `None`
     /// means no pump is running (so `start()` will never double-spawn).
     callback_pump: Option<CallbackPump>,
+    /// Monotonic timestamp captured the first time `start()` actually creates
+    /// the OS stream. `Some` while a stream is live; reset to `None` by
+    /// `stop()`/`Drop` when the stream is torn down. Set exactly once on the
+    /// non-RT control path (a single `Instant` store), never on an idempotent
+    /// restart of an already-running stream. Drives [`uptime`](AudioCapture::uptime).
+    start_instant: Option<Instant>,
 }
 
 impl AudioCapture {
@@ -477,6 +491,11 @@ impl AudioCapture {
                     })?;
             let capturing_stream_obj = device_ref.create_stream(&self.config.stream_config)?;
             self.stream = Some(Arc::from(capturing_stream_obj));
+            // Record the start time exactly once, the first time a real stream
+            // is created. The idempotent-restart paths above (running → Ok,
+            // stopped → Err) return before reaching here, so a second start()
+            // on a live stream never resets this. Single non-RT Instant store.
+            self.start_instant = Some(Instant::now());
         }
 
         // Verify stream is available
@@ -607,6 +626,8 @@ impl AudioCapture {
         // Drop our Arc reference. The stream will be fully deallocated once all
         // subscriber threads also drop their clones.
         self.stream.take();
+        // The stream is gone, so there is no longer an uptime to report.
+        self.start_instant = None;
 
         Ok(())
     }
@@ -884,6 +905,47 @@ impl AudioCapture {
             .map(|s| s.is_under_backpressure())
             .unwrap_or(false)
     }
+
+    /// Returns how long the capture has been running, or `None` if it has not
+    /// been started (or has been stopped).
+    ///
+    /// The clock is anchored the first time [`start()`](Self::start) actually
+    /// creates the OS stream and is cleared by [`stop()`](Self::stop)/`Drop`.
+    /// A second `start()` on an already-running stream does not reset it, so a
+    /// long-lived capture reports a continuously increasing uptime. Backed by a
+    /// monotonic [`Instant`], so the value never goes backwards even if the
+    /// wall clock is adjusted.
+    pub fn uptime(&self) -> Option<Duration> {
+        self.start_instant.map(|t| t.elapsed())
+    }
+
+    /// Returns the negotiated *delivery* `AudioFormat` the backend actually
+    /// produces, or `None` before [`start()`](Self::start) creates a stream.
+    ///
+    /// This is the authoritative format atomically published by the bridge once
+    /// a backend records it (see [`crate::bridge`]); it may differ from the
+    /// requested config in [`config()`](Self::config) when the device forced a
+    /// negotiation. Reading it is a single `Acquire` load behind the underlying
+    /// stream's `format()` — no allocation and no lock on the data plane.
+    pub fn format(&self) -> Option<AudioFormatType> {
+        self.stream.as_ref().map(|s| s.format())
+    }
+}
+
+/// Formats an `AudioFormat` as a compact
+/// human-readable string, e.g. `"2ch 48000Hz F32"`.
+///
+/// Computed lazily on the query path (e.g. by a future `stream_stats()`),
+/// never stored per-buffer, so it allocates only when actually called.
+#[allow(dead_code)] // Consumed by stream_stats() / diagnostics on the query path.
+fn format_description_string(fmt: &AudioFormatType) -> String {
+    let sample_fmt = match fmt.sample_format {
+        SampleFormat::I16 => "I16",
+        SampleFormat::I24 => "I24",
+        SampleFormat::I32 => "I32",
+        SampleFormat::F32 => "F32",
+    };
+    format!("{}ch {}Hz {}", fmt.channels, fmt.sample_rate, sample_fmt)
 }
 
 // AudioDataStreamWrapper has been removed — async streaming will be
@@ -954,6 +1016,8 @@ impl Drop for AudioCapture {
         }
         // Drop the Arc reference (stream fully deallocated when last clone is dropped).
         self.stream.take();
+        // Clear the uptime anchor alongside the stream teardown.
+        self.start_instant = None;
     }
 }
 
@@ -1237,6 +1301,10 @@ mod tests {
         buffers: Mutex<std::collections::VecDeque<AudioBuffer>>,
         running: AtomicBool,
         overruns: AtomicU64,
+        /// The format `format()` reports. Defaults to `AudioFormat::default()`;
+        /// `set_negotiated_format()` overwrites it to mirror a backend that
+        /// negotiated a different delivery format on the bridge producer.
+        format: Mutex<AudioFormat>,
     }
 
     impl MockCapturingStream {
@@ -1245,7 +1313,18 @@ mod tests {
                 buffers: Mutex::new(std::collections::VecDeque::new()),
                 running: AtomicBool::new(true),
                 overruns: AtomicU64::new(0),
+                format: Mutex::new(AudioFormat::default()),
             }
+        }
+
+        /// Mirror the real bridge's `BridgeProducer::set_negotiated_format`:
+        /// record the authoritative delivery format the backend produces.
+        fn set_negotiated_format(&self, sample_rate: u32, channels: u16) {
+            *self.format.lock().unwrap() = AudioFormat {
+                sample_rate,
+                channels,
+                sample_format: SampleFormat::F32,
+            };
         }
 
         /// Push a buffer for the mock to serve on the next try_read_chunk call.
@@ -1302,7 +1381,7 @@ mod tests {
         }
 
         fn format(&self) -> AudioFormat {
-            AudioFormat::default()
+            self.format.lock().unwrap().clone()
         }
 
         fn is_running(&self) -> bool {
@@ -1325,6 +1404,7 @@ mod tests {
             stream: Some(mock),
             callback: Mutex::new(None),
             callback_pump: None,
+            start_instant: None,
         }
     }
 
@@ -1420,6 +1500,7 @@ mod tests {
             stream: None,
             callback: Mutex::new(None),
             callback_pump: None,
+            start_instant: None,
         };
         assert_eq!(capture.overrun_count(), 0);
     }
@@ -1664,5 +1745,141 @@ mod tests {
         );
         pump.shutdown();
         mock.signal_stop();
+    }
+
+    // ── uptime() tests (rsac-76dc) ────────────────────────────────────
+
+    /// Before any start(), there is no stream and therefore no uptime.
+    #[test]
+    fn uptime_is_none_before_start() {
+        let capture = AudioCapture {
+            config: AudioCaptureConfig {
+                target: CaptureTarget::SystemDefault,
+                stream_config: StreamConfig::default(),
+            },
+            device: None,
+            stream: None,
+            callback: Mutex::new(None),
+            callback_pump: None,
+            start_instant: None,
+        };
+        assert!(capture.uptime().is_none());
+    }
+
+    /// After a real start (mock has a stream and we set the anchor as start()
+    /// would), uptime() is Some and monotonically non-decreasing across two
+    /// reads. We construct the capture with start_instant already set to mirror
+    /// the post-start() state (start() itself needs a device to create a
+    /// stream, which the mock path bypasses).
+    #[test]
+    fn uptime_is_some_and_nondecreasing_after_start() {
+        let mock = Arc::new(MockCapturingStream::new());
+        let mut capture = make_mock_capture(mock);
+        // Mirror what start() does on first real stream creation.
+        capture.start_instant = Some(Instant::now());
+
+        let first = capture.uptime().expect("uptime is Some after start");
+        std::thread::sleep(std::time::Duration::from_millis(2));
+        let second = capture.uptime().expect("uptime is Some after start");
+        assert!(
+            second >= first,
+            "uptime must be monotonically non-decreasing: {second:?} < {first:?}"
+        );
+    }
+
+    /// stop() tears down the stream and clears the uptime anchor, so uptime()
+    /// returns None afterwards.
+    #[test]
+    fn uptime_is_none_after_stop() {
+        let mock = Arc::new(MockCapturingStream::new());
+        let mut capture = make_mock_capture(mock);
+        capture.start_instant = Some(Instant::now());
+        assert!(capture.uptime().is_some());
+
+        capture.stop().unwrap();
+        assert!(
+            capture.uptime().is_none(),
+            "uptime must be None after stop() drops the stream"
+        );
+    }
+
+    /// A second start() on an already-running stream must NOT reset the uptime
+    /// anchor (idempotent restart). We seed an anchor, call start() (the mock
+    /// stream is running, so start() returns Ok without touching the anchor),
+    /// and assert the original anchor is preserved.
+    #[test]
+    fn uptime_anchor_not_reset_on_idempotent_restart() {
+        let mock = Arc::new(MockCapturingStream::new()); // running
+        let mut capture = make_mock_capture(mock);
+        let anchor = Instant::now();
+        capture.start_instant = Some(anchor);
+
+        // start() on a running stream is a no-op and returns early, before the
+        // is_none() branch that would re-anchor start_instant.
+        capture
+            .start()
+            .expect("idempotent start on running stream is Ok");
+        assert_eq!(
+            capture.start_instant,
+            Some(anchor),
+            "idempotent restart must not reset the uptime anchor"
+        );
+    }
+
+    // ── format() tests (rsac-574d) ────────────────────────────────────
+
+    /// Before start() there is no stream, so format() reports None.
+    #[test]
+    fn format_is_none_before_start() {
+        let capture = AudioCapture {
+            config: AudioCaptureConfig {
+                target: CaptureTarget::SystemDefault,
+                stream_config: StreamConfig::default(),
+            },
+            device: None,
+            stream: None,
+            callback: Mutex::new(None),
+            callback_pump: None,
+            start_instant: None,
+        };
+        assert!(capture.format().is_none());
+    }
+
+    /// Once started, format() returns Some(negotiated AudioFormat). A backend
+    /// that called set_negotiated_format(44100, 1) makes AudioCapture::format()
+    /// report sample_rate 44100, channels 1, normalized F32 — mirroring
+    /// test_format_reflects_negotiated_delivery_format in stream.rs.
+    #[test]
+    fn format_reflects_negotiated_delivery_format() {
+        let mock = Arc::new(MockCapturingStream::new());
+        mock.set_negotiated_format(44100, 1);
+        let capture = make_mock_capture(mock);
+
+        let fmt = capture.format().expect("format is Some once started");
+        assert_eq!(fmt.sample_rate, 44100);
+        assert_eq!(fmt.channels, 1);
+        assert_eq!(fmt.sample_format, SampleFormat::F32);
+    }
+
+    /// format_description_string yields a non-empty 'Nch RHz FMT' string for
+    /// use by stream_stats() on the query path.
+    #[test]
+    fn format_description_string_is_well_formed() {
+        let fmt = AudioFormat {
+            sample_rate: 48000,
+            channels: 2,
+            sample_format: SampleFormat::F32,
+        };
+        let desc = format_description_string(&fmt);
+        assert_eq!(desc, "2ch 48000Hz F32");
+        assert!(!desc.is_empty());
+
+        // Sanity-check the other sample formats render their tags.
+        let i16_desc = format_description_string(&AudioFormat {
+            sample_rate: 44100,
+            channels: 1,
+            sample_format: SampleFormat::I16,
+        });
+        assert_eq!(i16_desc, "1ch 44100Hz I16");
     }
 }

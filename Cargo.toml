@@ -199,6 +199,22 @@ name = "ci_audio"
 path = "tests/ci_audio/main.rs"
 harness = true
 
+# rsac-e40c: allocation-counting integration test for the RT bridge producer.
+# Its own binary because it installs a process-wide #[global_allocator]; run
+# single-threaded (the default for one #[test] per binary). harness = true so the
+# standard libtest harness drives it.
+[[test]]
+name = "rt_alloc"
+path = "tests/rt_alloc.rs"
+harness = true
+
+# rsac-603b: criterion benchmark harness for the bridge data plane. harness =
+# false hands main() to criterion_main!; does not affect cargo build/cargo test.
+[[bench]]
+name = "bridge"
+path = "benches/bridge.rs"
+harness = false
+
 [workspace]
 members = ["bindings/rsac-python", "bindings/rsac-ffi", "bindings/rsac-napi"]
 exclude = ["apps/audio-graph/src-tauri"]
