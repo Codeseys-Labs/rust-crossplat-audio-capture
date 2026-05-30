@@ -53,10 +53,57 @@ pub struct AudioChunk {
     pub length: u32,
     /// Duration of this chunk in seconds.
     pub duration: f64,
+    /// Root-mean-square (RMS) level across **all** samples/channels, in linear
+    /// `0.0..=1.0`. Computed once (alloc-free) by rsac core; `0.0` for silence
+    /// or an empty chunk, never `NaN`.
+    pub rms: f64,
+    /// Peak (maximum absolute) level across all samples/channels, in linear
+    /// `0.0..=1.0`. `0.0` for an empty chunk, never `NaN`.
+    pub peak: f64,
+    /// RMS level in dBFS (`20·log10(rms)`). `-Infinity` at silence; `0.0` dBFS
+    /// is full scale. Computed by rsac core.
+    pub rms_dbfs: f64,
+    /// Peak level in dBFS (`20·log10(peak)`). `-Infinity` at silence; `0.0` dBFS
+    /// is full scale. Computed by rsac core.
+    pub peak_dbfs: f64,
+    /// Per-channel RMS levels, one entry per channel in channel order, linear
+    /// `0.0..=1.0`. `channelRms[ch]` is the RMS of channel `ch`. Empty when the
+    /// chunk reports `0` channels. Computed once by rsac core's strided,
+    /// alloc-free `channel_rms` (a channel with no finite samples is `0.0`).
+    pub channel_rms: Vec<f64>,
+    /// Per-channel peak levels, one entry per channel in channel order, linear
+    /// `0.0..=1.0`. `channelPeak[ch]` is the peak of channel `ch`. Empty when
+    /// the chunk reports `0` channels. Computed once by rsac core's strided,
+    /// alloc-free `channel_peak`.
+    pub channel_peak: Vec<f64>,
 }
 
 impl AudioChunk {
     fn from_rsac_buffer(buf: &rsac::AudioBuffer) -> Self {
+        // Pre-compute the whole-buffer metering scalars via rsac core's
+        // alloc-free, NaN-safe meters *before* we move the samples out — the
+        // values JS sees are exactly what core measured (no re-derivation in JS,
+        // no precision loss beyond the f32 -> f64 widen of a single scalar).
+        let rms = buf.rms() as f64;
+        let peak = buf.peak() as f64;
+        let rms_dbfs = buf.rms_dbfs() as f64;
+        let peak_dbfs = buf.peak_dbfs() as f64;
+
+        // Per-channel meters. rsac core's `channel_rms(ch)`/`channel_peak(ch)`
+        // are parameterized, and a `#[napi(object)]` is a plain JS object that
+        // cannot carry methods — and the package entry point re-exports a fixed
+        // symbol set, so free functions would be unreachable. So materialize a
+        // small per-channel array (one f64 per channel) here. Core returns
+        // `None` only for an out-of-range index, which cannot happen for
+        // `0..channels`, so `unwrap_or(0.0)` is a defensive no-op.
+        let channels = buf.channels() as u32;
+        let mut channel_rms = Vec::with_capacity(channels as usize);
+        let mut channel_peak = Vec::with_capacity(channels as usize);
+        for ch in 0..channels {
+            channel_rms.push(buf.channel_rms(ch as u16).unwrap_or(0.0) as f64);
+            channel_peak.push(buf.channel_peak(ch as u16).unwrap_or(0.0) as f64);
+        }
+
         // Carry the interleaved f32 samples straight through to a native JS
         // Float32Array. We take a single owned Vec<f32> (one allocation, same
         // cost as the previous Vec<f64> collect but half the width) and hand
@@ -65,7 +112,6 @@ impl AudioChunk {
         let samples = buf.data().to_vec();
         let length = samples.len() as u32;
         let num_frames = buf.num_frames() as u32;
-        let channels = buf.channels() as u32;
         let sample_rate = buf.sample_rate();
         let duration = if sample_rate > 0 {
             num_frames as f64 / sample_rate as f64
@@ -79,6 +125,12 @@ impl AudioChunk {
             sample_rate,
             length,
             duration,
+            rms,
+            peak,
+            rms_dbfs,
+            peak_dbfs,
+            channel_rms,
+            channel_peak,
         }
     }
 }
@@ -140,6 +192,32 @@ impl CaptureTarget {
         CaptureTarget {
             inner: rsac::CaptureTarget::ProcessTree(rsac::ProcessId(pid)),
         }
+    }
+
+    /// Parse a capture target from its canonical string form.
+    ///
+    /// Accepts the cross-binding grammar (the scheme is case-insensitive):
+    /// - `"system"` / `"default"` → system default mix
+    /// - `"device:<id>"` → a specific device (the id may itself contain colons,
+    ///   e.g. `"device:hw:0,0"`)
+    /// - `"app:<id>"` → a specific application session
+    /// - `"name:<name>"` → the first application matching `<name>`
+    /// - `"tree:<pid>"` / `"pid:<pid>"` → a process and its children
+    ///
+    /// Throws a JS `Error` (code `ERR_RSAC_CONFIGURATION`) on an unknown scheme
+    /// or a non-numeric / out-of-range pid. Never panics.
+    ///
+    /// ```js
+    /// CaptureTarget.parse("system")
+    /// CaptureTarget.parse("name:Firefox")
+    /// CaptureTarget.parse("pid:1234")
+    /// ```
+    #[napi(factory)]
+    pub fn parse(spec: String) -> Result<Self> {
+        // Parses via rsac's CaptureTarget::FromStr; an invalid spec surfaces as
+        // AudioError::InvalidParameter, mapped to a thrown JS Error.
+        let inner: rsac::CaptureTarget = spec.parse().map_err(audio_err_to_napi)?;
+        Ok(CaptureTarget { inner })
     }
 
     /// Returns a string description of this capture target.
@@ -477,6 +555,122 @@ impl AudioCapture {
         })?;
         Ok(inner.overrun_count() as u32)
     }
+
+    /// Returns a point-in-time snapshot of the stream's diagnostic counters.
+    ///
+    /// Maps rsac's `#[non_exhaustive]` `StreamStats` field-by-field into a plain
+    /// JS object (see `StreamStats` in the type definitions). All counters are
+    /// read with cheap relaxed loads on this non-real-time query path — calling
+    /// this never allocates on or blocks the OS audio callback thread.
+    ///
+    /// Before `start()` (or after `stop()`) this returns a zeroed snapshot with
+    /// `isRunning === false` and `uptimeSecs === 0`.
+    #[napi]
+    pub fn stream_stats(&self) -> Result<JsStreamStats> {
+        let inner = self.inner.lock().map_err(|e| {
+            napi::Error::new(
+                napi::Status::GenericFailure,
+                format!("Lock poisoned: {}", e),
+            )
+        })?;
+        let s = inner.stream_stats();
+        // Map field-by-field; `dropped_ratio()` is a derived accessor on the
+        // Rust side, surfaced here as a precomputed field for JS convenience.
+        Ok(JsStreamStats {
+            overruns: bigint_from_u64(s.overruns),
+            buffers_captured: bigint_from_u64(s.buffers_captured),
+            buffers_dropped: bigint_from_u64(s.buffers_dropped),
+            buffers_pushed: bigint_from_u64(s.buffers_pushed),
+            uptime_secs: s.uptime.as_secs_f64(),
+            dropped_ratio: s.dropped_ratio(),
+            is_running: s.is_running,
+            format_description: s.format_description.clone(),
+        })
+    }
+
+    /// The negotiated *delivery* format the backend actually produces, or `null`
+    /// before `start()` creates a stream.
+    ///
+    /// This is the authoritative format published by the bridge once a backend
+    /// records it; it may differ from the requested settings when the device
+    /// forced a negotiation. Reading it does not allocate or lock the data plane.
+    #[napi(getter)]
+    pub fn format(&self) -> Result<Option<JsAudioFormat>> {
+        let inner = self.inner.lock().map_err(|e| {
+            napi::Error::new(
+                napi::Status::GenericFailure,
+                format!("Lock poisoned: {}", e),
+            )
+        })?;
+        Ok(inner.format().map(|f| JsAudioFormat {
+            sample_rate: f.sample_rate,
+            channels: f.channels as u32,
+            sample_format: sample_format_name(f.sample_format).to_string(),
+        }))
+    }
+}
+
+// ── Stream statistics + format (read-side observability) ─────────────────
+
+/// Widen a Rust `u64` counter to a JS `BigInt`.
+///
+/// rsac's stream counters are `u64`; JS `number` is an IEEE-754 double that
+/// loses integer precision past 2^53. Carrying them as `BigInt` is the honest
+/// typing — a long-running capture can legitimately exceed `Number.MAX_SAFE_INTEGER`.
+#[inline]
+fn bigint_from_u64(v: u64) -> BigInt {
+    BigInt::from(v)
+}
+
+/// Map an rsac `SampleFormat` to its short uppercase name (matches core's
+/// `format_description_string`).
+#[inline]
+fn sample_format_name(fmt: rsac::SampleFormat) -> &'static str {
+    match fmt {
+        rsac::SampleFormat::I16 => "I16",
+        rsac::SampleFormat::I24 => "I24",
+        rsac::SampleFormat::I32 => "I32",
+        rsac::SampleFormat::F32 => "F32",
+    }
+}
+
+/// A point-in-time snapshot of an [`AudioCapture`]'s diagnostic counters.
+///
+/// Field-by-field mirror of rsac's `#[non_exhaustive]` `StreamStats`. Counters
+/// are `BigInt` (u64) to avoid silent precision loss on long-running captures;
+/// `uptimeSecs` and `droppedRatio` are doubles.
+#[napi(object)]
+pub struct JsStreamStats {
+    /// Buffers dropped due to ring-buffer overflow (alias of `buffersDropped`,
+    /// kept for backward compatibility with `overrunCount`).
+    pub overruns: BigInt,
+    /// Cumulative buffers delivered to the consumer (popped off the ring).
+    pub buffers_captured: BigInt,
+    /// Cumulative buffers dropped due to ring-buffer overflow.
+    pub buffers_dropped: BigInt,
+    /// Cumulative buffers enqueued by the producer (the OS audio callback).
+    pub buffers_pushed: BigInt,
+    /// How long the stream has been running, in seconds. `0` when not started.
+    pub uptime_secs: f64,
+    /// Fraction of accounted-for buffers lost to overflow, in `0.0..=1.0`
+    /// (`buffersDropped / (buffersCaptured + buffersDropped)`; `0.0` when none).
+    pub dropped_ratio: f64,
+    /// Whether the stream is currently capturing.
+    pub is_running: bool,
+    /// Compact human-readable description of the negotiated format
+    /// (e.g. `"2ch 48000Hz F32"`); empty before the stream starts.
+    pub format_description: String,
+}
+
+/// The negotiated audio delivery format.
+#[napi(object)]
+pub struct JsAudioFormat {
+    /// Samples per second (e.g. 48000).
+    pub sample_rate: u32,
+    /// Number of interleaved channels (e.g. 2 for stereo).
+    pub channels: u32,
+    /// Sample format name: one of `"I16"`, `"I24"`, `"I32"`, `"F32"`.
+    pub sample_format: String,
 }
 
 // ── AudioCapture private helpers ─────────────────────────────────────────
@@ -644,5 +838,156 @@ pub fn platform_capabilities() -> JsPlatformCapabilities {
         min_sample_rate: caps.sample_rate_range.0,
         max_sample_rate: caps.sample_rate_range.1,
         backend_name: caps.backend_name.to_string(),
+    }
+}
+
+// ── Tests ─────────────────────────────────────────────────────────────────
+//
+// These exercise the napi-environment-independent logic only (string-target
+// parsing via rsac, the strided per-channel metering math, and the field-map
+// helpers). The JS-facing `#[napi]` surface (Float32Array I/O, ThreadsafeFn) is
+// validated at the node-build / inspection tier.
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // ── rsac-28ee: CaptureTarget.parse round-trip ────────────────────────
+
+    /// Valid specs round-trip through rsac's FromStr into the right variant —
+    /// the same parse `CaptureTarget::parse(spec)` performs. Covers the bare
+    /// scheme, a colon-bearing device id, name, app, and both pid spellings.
+    #[test]
+    fn parse_valid_specs_round_trip() {
+        let cases: &[(&str, rsac::CaptureTarget)] = &[
+            ("system", rsac::CaptureTarget::SystemDefault),
+            ("DEFAULT", rsac::CaptureTarget::SystemDefault), // case-insensitive
+            (
+                "device:hw:0,0",
+                rsac::CaptureTarget::Device(rsac::DeviceId("hw:0,0".to_string())),
+            ),
+            (
+                "app:session-7",
+                rsac::CaptureTarget::Application(rsac::ApplicationId("session-7".to_string())),
+            ),
+            (
+                "name:Firefox",
+                rsac::CaptureTarget::ApplicationByName("Firefox".to_string()),
+            ),
+            (
+                "pid:1234",
+                rsac::CaptureTarget::ProcessTree(rsac::ProcessId(1234)),
+            ),
+            (
+                "tree:1234",
+                rsac::CaptureTarget::ProcessTree(rsac::ProcessId(1234)),
+            ),
+        ];
+        for (spec, expected) in cases {
+            let parsed: rsac::CaptureTarget = spec
+                .parse()
+                .unwrap_or_else(|e| panic!("'{spec}' should parse: {e}"));
+            assert_eq!(&parsed, expected, "spec '{spec}'");
+        }
+    }
+
+    /// Invalid specs surface an `AudioError` (mapped to a thrown JS Error by
+    /// `CaptureTarget::parse`) without panicking.
+    #[test]
+    fn parse_invalid_specs_error_not_panic() {
+        for bad in ["bogus", "pid:not-a-number", "tree:-1", "device"] {
+            // "device" has no colon → unknown target; the others are bad scheme/pid.
+            let res: std::result::Result<rsac::CaptureTarget, _> = bad.parse();
+            assert!(res.is_err(), "'{bad}' should be rejected");
+        }
+    }
+
+    // ── rsac-fd16: metering exposed via AudioChunk fields ────────────────
+
+    /// The eager scalar + per-channel meters on `AudioChunk` come straight from
+    /// rsac core's `AudioBuffer` meters. Assert the source methods agree with
+    /// hand-computed values for a known interleaved stereo buffer:
+    /// L = [1.0, -1.0] → rms 1.0, peak 1.0; R = [0.5, -0.5] → rms 0.5, peak 0.5.
+    #[test]
+    fn channel_metering_matches_known_values() {
+        // interleaved L,R,L,R
+        let buf = rsac::AudioBuffer::new(vec![1.0f32, 0.5, -1.0, -0.5], 2, 48_000);
+        let rms_l = buf.channel_rms(0).unwrap();
+        let rms_r = buf.channel_rms(1).unwrap();
+        let peak_l = buf.channel_peak(0).unwrap();
+        let peak_r = buf.channel_peak(1).unwrap();
+        assert!((rms_l - 1.0).abs() < 1e-6, "L rms {rms_l}");
+        assert!((rms_r - 0.5).abs() < 1e-6, "R rms {rms_r}");
+        assert!((peak_l - 1.0).abs() < 1e-6, "L peak {peak_l}");
+        assert!((peak_r - 0.5).abs() < 1e-6, "R peak {peak_r}");
+    }
+
+    /// Out-of-range channel → None in core (the napi field path materializes
+    /// exactly `0..channels`, so that index is never produced).
+    #[test]
+    fn channel_metering_edge_cases() {
+        let buf = rsac::AudioBuffer::new(vec![1.0f32, 0.5, -1.0, -0.5], 2, 48_000);
+        assert_eq!(buf.channel_rms(2), None); // out of range
+        assert_eq!(buf.channel_peak(5), None);
+    }
+
+    /// The eager whole-buffer scalars on `AudioChunk` come straight from rsac
+    /// core's `AudioBuffer` meters — assert the source methods agree with the
+    /// expected values for a known buffer (the napi `from_rsac_buffer` copy is
+    /// exercised at the node tier).
+    #[test]
+    fn audio_buffer_scalar_meters_agree_with_core() {
+        let buf = rsac::AudioBuffer::new(vec![1.0f32, -1.0, 1.0, -1.0], 2, 48_000);
+        assert!((buf.rms() - 1.0).abs() < 1e-6);
+        assert!((buf.peak() - 1.0).abs() < 1e-6);
+        assert!((buf.peak_dbfs() - 0.0).abs() < 1e-6); // full scale → 0 dBFS
+                                                       // Silence → NEG_INFINITY dBFS (carried to JS as -Infinity).
+        let silent = rsac::AudioBuffer::new(vec![0.0f32; 4], 2, 48_000);
+        assert_eq!(silent.rms(), 0.0);
+        assert!(silent.rms_dbfs().is_infinite() && silent.rms_dbfs() < 0.0);
+    }
+
+    // ── rsac-fe6e: stats/format field mapping ────────────────────────────
+
+    /// `sample_format_name` maps every rsac SampleFormat variant to the short
+    /// uppercase name used in the JS `AudioFormat.sampleFormat` field.
+    #[test]
+    fn sample_format_name_maps_all_variants() {
+        assert_eq!(sample_format_name(rsac::SampleFormat::I16), "I16");
+        assert_eq!(sample_format_name(rsac::SampleFormat::I24), "I24");
+        assert_eq!(sample_format_name(rsac::SampleFormat::I32), "I32");
+        assert_eq!(sample_format_name(rsac::SampleFormat::F32), "F32");
+    }
+
+    /// A zeroed `StreamStats` (the pre-start snapshot) maps to a JS object with
+    /// `isRunning == false`, zero counters/uptime, and `droppedRatio == 0.0` —
+    /// i.e. every field the JS `StreamStats` interface declares is populated.
+    #[test]
+    fn stream_stats_default_maps_field_by_field() {
+        let s = rsac::StreamStats::default();
+        assert_eq!(s.overruns, 0);
+        assert_eq!(s.buffers_captured, 0);
+        assert_eq!(s.buffers_dropped, 0);
+        assert_eq!(s.buffers_pushed, 0);
+        assert_eq!(s.uptime, std::time::Duration::ZERO);
+        assert!(!s.is_running);
+        assert_eq!(s.dropped_ratio(), 0.0);
+        assert!(s.format_description.is_empty());
+        // The counters widen losslessly to BigInt (u64 -> BigInt) for JS.
+        // get_u64() -> (sign_negative, value, lossless).
+        let (neg, val, lossless) = bigint_from_u64(u64::MAX).get_u64();
+        assert!(!neg && lossless);
+        assert_eq!(val, u64::MAX);
+    }
+
+    /// `overruns` is the documented alias of `buffers_dropped`, so a JS caller's
+    /// `streamStats().overruns` and `overrunCount` agree (Go test parity).
+    ///
+    /// `StreamStats` is `#[non_exhaustive]`, so it can only be obtained via
+    /// `Default` outside its defining crate — which is exactly how the JS path
+    /// reads it (the live snapshot comes from `AudioCapture::stream_stats`).
+    #[test]
+    fn stream_stats_overruns_aliases_buffers_dropped() {
+        let s = rsac::StreamStats::default();
+        assert_eq!(s.overruns, s.buffers_dropped);
     }
 }

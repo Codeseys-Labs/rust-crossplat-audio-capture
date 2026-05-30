@@ -483,6 +483,58 @@ pub unsafe extern "C" fn rsac_builder_set_target_process_tree(
     })
 }
 
+/// Sets the capture target by parsing a canonical target string.
+///
+/// `spec` uses the [`CaptureTarget`] string grammar (case-insensitive scheme):
+/// `system`, `device:<id>`, `app:<pid-or-id>`, `name:<name>`, or `tree:<pid>`.
+/// Parsing goes through `CaptureTarget::from_str` (the same path
+/// [`AudioCaptureBuilder::target_str`] uses), so it round-trips with
+/// [`rsac::CaptureTarget`]'s `Display`.
+///
+/// A malformed string is reported as `RSAC_ERROR_INVALID_PARAMETER` and the
+/// builder's existing target is left unchanged (parse-then-commit). This is a
+/// convenience over the typed `rsac_builder_set_target_*` setters, which remain
+/// available.
+///
+/// Returns `RSAC_ERROR_NULL_POINTER` if `builder` or `spec` is null, and
+/// `RSAC_ERROR_INVALID_PARAMETER` if `spec` is not valid UTF-8 or not a valid
+/// target string.
+#[no_mangle]
+pub unsafe extern "C" fn rsac_builder_set_target_str(
+    builder: *mut RsacBuilder,
+    spec: *const c_char,
+) -> rsac_error_t {
+    catch(|| {
+        if builder.is_null() {
+            set_last_error("builder is null");
+            return rsac_error_t::RSAC_ERROR_NULL_POINTER;
+        }
+        if spec.is_null() {
+            set_last_error("spec is null");
+            return rsac_error_t::RSAC_ERROR_NULL_POINTER;
+        }
+        let spec_str = match unsafe { CStr::from_ptr(spec) }.to_str() {
+            Ok(s) => s,
+            Err(_) => {
+                set_last_error("spec is not valid UTF-8");
+                return rsac_error_t::RSAC_ERROR_INVALID_PARAMETER;
+            }
+        };
+        let b = unsafe { &mut *builder };
+        // target_str() parses via CaptureTarget::from_str and only commits the
+        // new target on success (the builder is unchanged on a parse error). It
+        // returns AudioError::InvalidParameter on a bad string, which
+        // map_rsac_error maps to RSAC_ERROR_INVALID_PARAMETER.
+        match b.inner.clone().target_str(spec_str) {
+            Ok(updated) => {
+                b.inner = updated;
+                rsac_error_t::RSAC_OK
+            }
+            Err(e) => handle_rsac_error(e),
+        }
+    })
+}
+
 /// Sets the desired sample rate in Hz.
 #[no_mangle]
 pub unsafe extern "C" fn rsac_builder_set_sample_rate(
@@ -874,6 +926,63 @@ pub unsafe extern "C" fn rsac_audio_buffer_sample_rate(buffer: *const RsacAudioB
     }
     let b = unsafe { &*buffer };
     b.inner.sample_rate()
+}
+
+/// Returns the root-mean-square (RMS) level across all samples/channels.
+///
+/// Wraps [`rsac::AudioBuffer::rms`]: `sqrt(mean(xᵢ²))` over the interleaved
+/// data. Non-finite samples are skipped; a silent or empty buffer yields `0.0`
+/// (never `NaN`). Read-only measurement — no allocation, RT-callback safe.
+/// Returns `0.0` if the buffer is null.
+#[no_mangle]
+pub unsafe extern "C" fn rsac_audio_buffer_rms(buffer: *const RsacAudioBuffer) -> f32 {
+    if buffer.is_null() {
+        return 0.0;
+    }
+    let b = unsafe { &*buffer };
+    b.inner.rms()
+}
+
+/// Returns the peak (maximum absolute) level across all samples/channels.
+///
+/// Wraps [`rsac::AudioBuffer::peak`]: `max(|xᵢ|)`. Non-finite samples are
+/// skipped; a silent or empty buffer yields `0.0` (never `NaN`). Read-only
+/// measurement — no allocation. Returns `0.0` if the buffer is null.
+#[no_mangle]
+pub unsafe extern "C" fn rsac_audio_buffer_peak(buffer: *const RsacAudioBuffer) -> f32 {
+    if buffer.is_null() {
+        return 0.0;
+    }
+    let b = unsafe { &*buffer };
+    b.inner.peak()
+}
+
+/// Returns the RMS level in dBFS: `20 · log10(rms())`.
+///
+/// Wraps [`rsac::AudioBuffer::rms_dbfs`]. Returns negative infinity for silence
+/// or an empty buffer, and **also** negative infinity if the buffer is null
+/// (there is no level to report). Full scale (RMS `1.0`) maps to `0.0` dBFS.
+#[no_mangle]
+pub unsafe extern "C" fn rsac_audio_buffer_rms_dbfs(buffer: *const RsacAudioBuffer) -> f32 {
+    if buffer.is_null() {
+        return f32::NEG_INFINITY;
+    }
+    let b = unsafe { &*buffer };
+    b.inner.rms_dbfs()
+}
+
+/// Returns the peak level in dBFS: `20 · log10(peak())`.
+///
+/// Wraps [`rsac::AudioBuffer::peak_dbfs`]. Returns negative infinity for silence
+/// or an empty buffer, and **also** negative infinity if the buffer is null.
+/// A full-scale signal (peak `1.0`) maps to `0.0` dBFS.
+#[no_mangle]
+pub unsafe extern "C" fn rsac_audio_buffer_peak_dbfs(buffer: *const RsacAudioBuffer) -> f32 {
+    if buffer.is_null() {
+        return f32::NEG_INFINITY;
+    }
+    let b = unsafe { &*buffer };
+    b.inner.peak_dbfs()
 }
 
 /// Frees an audio buffer handle. No-op if null.
@@ -1410,6 +1519,94 @@ mod tests {
         // 10 dropped of (30 captured + 10 dropped) accounted-for == 0.25.
         assert!((c_stats.dropped_ratio - 0.25).abs() < 1e-9);
         assert_eq!(c_stats.is_running, 1);
+    }
+
+    // ── set_target_str: null/invalid-utf8/parse contract ──────────────────
+
+    #[test]
+    fn set_target_str_rejects_null_builder() {
+        let spec = CString::new("system").unwrap();
+        let code = unsafe { rsac_builder_set_target_str(ptr::null_mut(), spec.as_ptr()) };
+        assert_eq!(code, rsac_error_t::RSAC_ERROR_NULL_POINTER);
+    }
+
+    #[test]
+    fn set_target_str_rejects_null_spec() {
+        // A null builder is checked first, so pass a dangling-but-non-null
+        // builder to reach the null-`spec` branch (the builder is never
+        // dereferenced before that check returns).
+        let b = ptr::dangling_mut::<RsacBuilder>();
+        let code = unsafe { rsac_builder_set_target_str(b, ptr::null()) };
+        assert_eq!(code, rsac_error_t::RSAC_ERROR_NULL_POINTER);
+    }
+
+    #[test]
+    fn set_target_str_accepts_valid_spec() {
+        let mut builder: *mut RsacBuilder = ptr::null_mut();
+        assert_eq!(
+            unsafe { rsac_builder_new(&mut builder) },
+            rsac_error_t::RSAC_OK
+        );
+        assert!(!builder.is_null());
+        let spec = CString::new("name:Firefox").unwrap();
+        let code = unsafe { rsac_builder_set_target_str(builder, spec.as_ptr()) };
+        assert_eq!(code, rsac_error_t::RSAC_OK);
+        unsafe { rsac_builder_free(builder) };
+    }
+
+    #[test]
+    fn set_target_str_rejects_garbage_spec() {
+        let mut builder: *mut RsacBuilder = ptr::null_mut();
+        assert_eq!(
+            unsafe { rsac_builder_new(&mut builder) },
+            rsac_error_t::RSAC_OK
+        );
+        // An unknown scheme is not a valid target string; map to INVALID_PARAMETER.
+        let spec = CString::new("not-a-real-scheme:whatever").unwrap();
+        let code = unsafe { rsac_builder_set_target_str(builder, spec.as_ptr()) };
+        assert_eq!(code, rsac_error_t::RSAC_ERROR_INVALID_PARAMETER);
+        unsafe { rsac_builder_free(builder) };
+    }
+
+    // ── AudioBuffer metering accessors: null + synthetic-signal values ─────
+
+    #[test]
+    fn buffer_metering_rejects_null() {
+        assert_eq!(unsafe { rsac_audio_buffer_rms(ptr::null()) }, 0.0);
+        assert_eq!(unsafe { rsac_audio_buffer_peak(ptr::null()) }, 0.0);
+        assert_eq!(
+            unsafe { rsac_audio_buffer_rms_dbfs(ptr::null()) },
+            f32::NEG_INFINITY
+        );
+        assert_eq!(
+            unsafe { rsac_audio_buffer_peak_dbfs(ptr::null()) },
+            f32::NEG_INFINITY
+        );
+    }
+
+    #[test]
+    fn buffer_metering_full_scale_signal() {
+        // A constant ±1.0 signal: RMS == 1.0, peak == 1.0, both 0.0 dBFS.
+        let buf = RsacAudioBuffer {
+            inner: rsac::AudioBuffer::new(vec![1.0, -1.0, 1.0, -1.0], 2, 48_000),
+        };
+        let p: *const RsacAudioBuffer = &buf;
+        assert!((unsafe { rsac_audio_buffer_rms(p) } - 1.0).abs() < 1e-6);
+        assert!((unsafe { rsac_audio_buffer_peak(p) } - 1.0).abs() < 1e-6);
+        assert!(unsafe { rsac_audio_buffer_rms_dbfs(p) }.abs() < 1e-4);
+        assert!(unsafe { rsac_audio_buffer_peak_dbfs(p) }.abs() < 1e-4);
+    }
+
+    #[test]
+    fn buffer_metering_silence_is_neg_infinity_dbfs() {
+        let buf = RsacAudioBuffer {
+            inner: rsac::AudioBuffer::new(vec![0.0; 8], 2, 48_000),
+        };
+        let p: *const RsacAudioBuffer = &buf;
+        assert_eq!(unsafe { rsac_audio_buffer_rms(p) }, 0.0);
+        assert_eq!(unsafe { rsac_audio_buffer_peak(p) }, 0.0);
+        assert_eq!(unsafe { rsac_audio_buffer_rms_dbfs(p) }, f32::NEG_INFINITY);
+        assert_eq!(unsafe { rsac_audio_buffer_peak_dbfs(p) }, f32::NEG_INFINITY);
     }
 
     #[test]

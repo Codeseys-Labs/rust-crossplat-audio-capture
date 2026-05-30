@@ -3,6 +3,7 @@ package rsac
 import (
 	"context"
 	"errors"
+	"math"
 	"runtime/cgo"
 	"testing"
 	"time"
@@ -421,6 +422,207 @@ func TestStreamResult_Values(t *testing.T) {
 	}
 	if sr2.Err == nil {
 		t.Error("StreamResult.Err should be set")
+	}
+}
+
+// ── AudioBuffer Metering Tests (pure Go, no C dependency) ────────────────
+
+func TestAudioBuffer_Metering_FullScale(t *testing.T) {
+	// A constant ±1.0 signal: RMS == 1.0, peak == 1.0, both 0.0 dBFS.
+	buf := AudioBuffer{
+		data:       []float32{1, -1, 1, -1},
+		numFrames:  2,
+		channels:   2,
+		sampleRate: 48000,
+	}
+	if got := buf.RMS(); absf32(got-1.0) > 1e-6 {
+		t.Errorf("RMS() = %v, want 1.0", got)
+	}
+	if got := buf.Peak(); absf32(got-1.0) > 1e-6 {
+		t.Errorf("Peak() = %v, want 1.0", got)
+	}
+	if got := buf.RMSDbfs(); absf32(got) > 1e-4 {
+		t.Errorf("RMSDbfs() = %v, want 0.0", got)
+	}
+	if got := buf.PeakDbfs(); absf32(got) > 1e-4 {
+		t.Errorf("PeakDbfs() = %v, want 0.0", got)
+	}
+}
+
+func TestAudioBuffer_Metering_HalfScale(t *testing.T) {
+	// Constant 0.5 magnitude: RMS == 0.5, peak == 0.5, dBFS ≈ -6.0206.
+	buf := AudioBuffer{
+		data:       []float32{0.5, -0.5, 0.5, -0.5},
+		numFrames:  2,
+		channels:   2,
+		sampleRate: 48000,
+	}
+	if got := buf.RMS(); absf32(got-0.5) > 1e-6 {
+		t.Errorf("RMS() = %v, want 0.5", got)
+	}
+	if got := buf.Peak(); absf32(got-0.5) > 1e-6 {
+		t.Errorf("Peak() = %v, want 0.5", got)
+	}
+	if got := buf.PeakDbfs(); absf32(got-(-6.0206)) > 1e-3 {
+		t.Errorf("PeakDbfs() = %v, want ≈ -6.0206", got)
+	}
+}
+
+func TestAudioBuffer_Metering_SilenceIsNegInf(t *testing.T) {
+	buf := AudioBuffer{data: []float32{0, 0, 0, 0}, numFrames: 2, channels: 2, sampleRate: 48000}
+	if got := buf.RMS(); got != 0 {
+		t.Errorf("RMS() = %v, want 0", got)
+	}
+	if got := buf.Peak(); got != 0 {
+		t.Errorf("Peak() = %v, want 0", got)
+	}
+	if got := buf.RMSDbfs(); !math.IsInf(float64(got), -1) {
+		t.Errorf("RMSDbfs() = %v, want -Inf", got)
+	}
+	if got := buf.PeakDbfs(); !math.IsInf(float64(got), -1) {
+		t.Errorf("PeakDbfs() = %v, want -Inf", got)
+	}
+}
+
+func TestAudioBuffer_Metering_Empty(t *testing.T) {
+	buf := AudioBuffer{}
+	if got := buf.RMS(); got != 0 {
+		t.Errorf("empty RMS() = %v, want 0", got)
+	}
+	if got := buf.Peak(); got != 0 {
+		t.Errorf("empty Peak() = %v, want 0", got)
+	}
+	if got := buf.RMSDbfs(); !math.IsInf(float64(got), -1) {
+		t.Errorf("empty RMSDbfs() = %v, want -Inf", got)
+	}
+}
+
+func TestAudioBuffer_Metering_NaNSafe(t *testing.T) {
+	// Non-finite samples are skipped: only the finite ±1.0 contribute.
+	inf := float32(math.Inf(1))
+	nan := float32(math.NaN())
+	buf := AudioBuffer{data: []float32{1, nan, -1, inf}, numFrames: 2, channels: 2, sampleRate: 48000}
+	if got := buf.RMS(); absf32(got-1.0) > 1e-6 {
+		t.Errorf("NaN-safe RMS() = %v, want 1.0", got)
+	}
+	if got := buf.Peak(); absf32(got-1.0) > 1e-6 {
+		t.Errorf("NaN-safe Peak() = %v, want 1.0", got)
+	}
+}
+
+func absf32(v float32) float32 {
+	if v < 0 {
+		return -v
+	}
+	return v
+}
+
+// ── SampleFormat / AudioFormat / StreamStats value tests (pure Go) ───────
+
+func TestSampleFormat_String(t *testing.T) {
+	tests := []struct {
+		f    SampleFormat
+		want string
+	}{
+		{SampleFormatI16, "I16"},
+		{SampleFormatI24, "I24"},
+		{SampleFormatI32, "I32"},
+		{SampleFormatF32, "F32"},
+		{SampleFormat(42), "Unknown(42)"},
+	}
+	for _, tt := range tests {
+		if got := tt.f.String(); got != tt.want {
+			t.Errorf("SampleFormat(%d).String() = %q, want %q", int(tt.f), got, tt.want)
+		}
+	}
+}
+
+func TestSampleFormat_Discriminants(t *testing.T) {
+	// Pin the Go constants to the rsac_sample_format_t discriminants.
+	if SampleFormatI16 != 0 || SampleFormatI24 != 1 || SampleFormatI32 != 2 || SampleFormatF32 != 3 {
+		t.Errorf("SampleFormat discriminants drifted: %d %d %d %d",
+			SampleFormatI16, SampleFormatI24, SampleFormatI32, SampleFormatF32)
+	}
+}
+
+func TestStreamStats_ZeroValue(t *testing.T) {
+	var s StreamStats
+	if s.BuffersCaptured != 0 || s.Overruns != 0 || s.IsRunning || s.UptimeSecs != 0 {
+		t.Errorf("zero StreamStats should be all-zero/false, got %+v", s)
+	}
+}
+
+func TestAudioFormat_ZeroValue(t *testing.T) {
+	var f AudioFormat
+	if f.SampleRate != 0 || f.Channels != 0 || f.BitsPerSample != 0 || f.SampleFormat != SampleFormatI16 {
+		t.Errorf("zero AudioFormat should be all-zero, got %+v", f)
+	}
+}
+
+// ── Target String Tests (require the C library) ──────────────────────────
+
+func TestParseTarget_ValidGrammar(t *testing.T) {
+	valid := []string{
+		"system",
+		"name:Firefox",
+		"app:1234",
+		"device:hw:0,0",
+		"tree:4321",
+	}
+	for _, spec := range valid {
+		ct, err := ParseTarget(spec)
+		if err != nil {
+			t.Errorf("ParseTarget(%q) returned error: %v", spec, err)
+			continue
+		}
+		if ct.kind != targetString {
+			t.Errorf("ParseTarget(%q).kind = %v, want targetString", spec, ct.kind)
+		}
+		if ct.spec != spec {
+			t.Errorf("ParseTarget(%q).spec = %q, want round-trip", spec, ct.spec)
+		}
+	}
+}
+
+func TestParseTarget_InvalidGrammar(t *testing.T) {
+	_, err := ParseTarget("not-a-real-scheme:whatever")
+	if err == nil {
+		t.Fatal("ParseTarget should reject an unknown scheme")
+	}
+	var rsacErr *Error
+	if !errors.As(err, &rsacErr) {
+		t.Fatalf("ParseTarget error should be *Error, got %T", err)
+	}
+	if rsacErr.Code != ErrInvalidParameter {
+		t.Errorf("ParseTarget invalid spec code = %v, want InvalidParameter", rsacErr.Code)
+	}
+}
+
+func TestCaptureBuilder_SetTargetString(t *testing.T) {
+	b := NewCaptureBuilder()
+	if err := b.SetTargetString("name:Spotify"); err != nil {
+		t.Fatalf("SetTargetString(valid) returned error: %v", err)
+	}
+	if b.target.kind != targetString || b.target.spec != "name:Spotify" {
+		t.Errorf("SetTargetString did not store the spec: %+v", b.target)
+	}
+
+	// An invalid spec must not mutate the previously-set target.
+	if err := b.SetTargetString("garbage::bad"); err == nil {
+		t.Error("SetTargetString(invalid) should return an error")
+	}
+	if b.target.spec != "name:Spotify" {
+		t.Errorf("SetTargetString(invalid) mutated target to %+v", b.target)
+	}
+}
+
+func TestCaptureBuilder_WithTargetString(t *testing.T) {
+	b := NewCaptureBuilder().WithTargetString("app:777")
+	if b.target.kind != targetString {
+		t.Errorf("WithTargetString kind = %v, want targetString", b.target.kind)
+	}
+	if b.target.spec != "app:777" {
+		t.Errorf("WithTargetString spec = %q, want %q", b.target.spec, "app:777")
 	}
 }
 

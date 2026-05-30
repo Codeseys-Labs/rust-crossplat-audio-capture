@@ -1,6 +1,6 @@
 """Type stubs for rsac — Rust Cross-Platform Audio Capture."""
 
-from typing import Iterator, Optional
+from typing import Awaitable, Iterator, Optional
 
 __version__: str
 
@@ -79,6 +79,18 @@ class CaptureTarget:
         """Capture audio from a process and its child processes by PID."""
         ...
 
+    @staticmethod
+    def parse(spec: str) -> CaptureTarget:
+        """Parse a capture target from its canonical string grammar.
+
+        Grammar (case-insensitive scheme): ``"system"``, ``"device:<id>"``,
+        ``"app:<id>"``, ``"name:<n>"``, ``"tree:<pid>"``.
+
+        Raises:
+            ConfigurationError: If ``spec`` is not a valid target string.
+        """
+        ...
+
 # ── AudioBuffer ───────────────────────────────────────────────────────────
 
 class AudioBuffer:
@@ -137,7 +149,23 @@ class AudioBuffer:
         ...
 
     def peak(self) -> float:
-        """Return the peak absolute sample value."""
+        """Return the peak absolute sample value across all channels."""
+        ...
+
+    def rms_dbfs(self) -> float:
+        """RMS level in dBFS. Returns ``-inf`` for digital silence."""
+        ...
+
+    def peak_dbfs(self) -> float:
+        """Peak level in dBFS. Returns ``-inf`` for digital silence."""
+        ...
+
+    def channel_rms(self, channel: int) -> Optional[float]:
+        """RMS level of a single channel (0-indexed), or None if out of range."""
+        ...
+
+    def channel_peak(self, channel: int) -> Optional[float]:
+        """Peak sample value of a single channel (0-indexed), or None if out of range."""
         ...
 
     def __len__(self) -> int: ...
@@ -196,13 +224,90 @@ class PlatformCapabilities:
 
     def __repr__(self) -> str: ...
 
+# ── StreamStats ───────────────────────────────────────────────────────────
+
+class StreamStats:
+    """A point-in-time snapshot of stream statistics.
+
+    Returned by :meth:`AudioCapture.stream_stats`. Read-only.
+    """
+
+    @property
+    def overruns(self) -> int:
+        """Buffers dropped due to ring-buffer overflow."""
+        ...
+
+    @property
+    def buffers_captured(self) -> int:
+        """Buffers delivered to the consumer since the stream started."""
+        ...
+
+    @property
+    def buffers_dropped(self) -> int:
+        """Buffers dropped due to overflow (alias of ``overruns``)."""
+        ...
+
+    @property
+    def buffers_pushed(self) -> int:
+        """Buffers enqueued by the OS audio callback since the stream started."""
+        ...
+
+    @property
+    def uptime_secs(self) -> float:
+        """Seconds the stream has been running (0.0 when stopped)."""
+        ...
+
+    @property
+    def is_running(self) -> bool:
+        """Whether the stream is currently capturing."""
+        ...
+
+    @property
+    def format_description(self) -> str:
+        """Human-readable description of the audio format being captured."""
+        ...
+
+    def dropped_ratio(self) -> float:
+        """Fraction of buffers lost to overflow, in 0.0..=1.0 (0.0 when none)."""
+        ...
+
+    def __repr__(self) -> str: ...
+
+# ── AudioFormat ───────────────────────────────────────────────────────────
+
+class AudioFormat:
+    """The negotiated audio delivery format of a running capture.
+
+    Returned by the :attr:`AudioCapture.format` getter. Read-only.
+    """
+
+    @property
+    def sample_rate(self) -> int:
+        """Samples per second (Hz)."""
+        ...
+
+    @property
+    def channels(self) -> int:
+        """Number of interleaved channels."""
+        ...
+
+    @property
+    def sample_format(self) -> str:
+        """Sample type as a string: "f32", "i16", "i24", or "i32"."""
+        ...
+
+    def __repr__(self) -> str: ...
+
 # ── AudioCapture ──────────────────────────────────────────────────────────
 
 class AudioCapture:
     """The main audio capture class.
 
-    Supports context manager protocol (__enter__/__exit__) and
-    iterator protocol (__iter__/__next__) for streaming audio.
+    Supports the synchronous (__enter__/__exit__) and asynchronous
+    (__aenter__/__aexit__) context-manager protocols, plus the iterator
+    protocol (__iter__/__next__) for streaming audio. A finalizer
+    (__del__) stops any still-running OS stream if the capture is dropped
+    without an explicit close.
 
     Args:
         target: What to capture (default: CaptureTarget.system_default()).
@@ -252,14 +357,30 @@ class AudioCapture:
         """Number of audio buffers dropped due to ring buffer overflow."""
         ...
 
+    def stream_stats(self) -> StreamStats:
+        """Return a point-in-time snapshot of stream statistics.
+
+        On a closed capture, returns a default snapshot (all counters zero,
+        ``is_running == False``).
+        """
+        ...
+
+    @property
+    def format(self) -> Optional[AudioFormat]:
+        """The negotiated audio delivery format, or None if not running."""
+        ...
+
     def close(self) -> None:
         """Close the capture and release all resources."""
         ...
 
     def __enter__(self) -> AudioCapture: ...
     def __exit__(self, exc_type: type | None, exc_val: BaseException | None, exc_tb: object | None) -> bool: ...
+    def __aenter__(self) -> Awaitable[AudioCapture]: ...
+    def __aexit__(self, exc_type: type | None, exc_val: BaseException | None, exc_tb: object | None) -> Awaitable[None]: ...
     def __iter__(self) -> Iterator[AudioBuffer]: ...
     def __next__(self) -> AudioBuffer: ...
+    def __del__(self) -> None: ...
     def __repr__(self) -> str: ...
 
 # ── Module-level functions ────────────────────────────────────────────────

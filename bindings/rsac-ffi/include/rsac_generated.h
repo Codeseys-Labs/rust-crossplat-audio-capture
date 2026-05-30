@@ -279,6 +279,29 @@ enum Rsacrsac_error_t rsac_builder_set_target_process_tree(struct RsacRsacBuilde
 ;
 
 /**
+ * Sets the capture target by parsing a canonical target string.
+ *
+ * `spec` uses the [`CaptureTarget`] string grammar (case-insensitive scheme):
+ * `system`, `device:<id>`, `app:<pid-or-id>`, `name:<name>`, or `tree:<pid>`.
+ * Parsing goes through `CaptureTarget::from_str` (the same path
+ * [`AudioCaptureBuilder::target_str`] uses), so it round-trips with
+ * [`rsac::CaptureTarget`]'s `Display`.
+ *
+ * A malformed string is reported as `RSAC_ERROR_INVALID_PARAMETER` and the
+ * builder's existing target is left unchanged (parse-then-commit). This is a
+ * convenience over the typed `rsac_builder_set_target_*` setters, which remain
+ * available.
+ *
+ * Returns `RSAC_ERROR_NULL_POINTER` if `builder` or `spec` is null, and
+ * `RSAC_ERROR_INVALID_PARAMETER` if `spec` is not valid UTF-8 or not a valid
+ * target string.
+ */
+
+enum Rsacrsac_error_t rsac_builder_set_target_str(struct RsacRsacBuilder *builder,
+                                                  const char *spec)
+;
+
+/**
  * Sets the desired sample rate in Hz.
  */
 
@@ -441,6 +464,43 @@ enum Rsacrsac_error_t rsac_capture_set_callback(struct RsacRsacCapture *capture,
  * Returns 0 if the buffer is null.
  */
  uint32_t rsac_audio_buffer_sample_rate(const struct RsacRsacAudioBuffer *buffer) ;
+
+/**
+ * Returns the root-mean-square (RMS) level across all samples/channels.
+ *
+ * Wraps [`rsac::AudioBuffer::rms`]: `sqrt(mean(xᵢ²))` over the interleaved
+ * data. Non-finite samples are skipped; a silent or empty buffer yields `0.0`
+ * (never `NaN`). Read-only measurement — no allocation, RT-callback safe.
+ * Returns `0.0` if the buffer is null.
+ */
+ float rsac_audio_buffer_rms(const struct RsacRsacAudioBuffer *buffer) ;
+
+/**
+ * Returns the peak (maximum absolute) level across all samples/channels.
+ *
+ * Wraps [`rsac::AudioBuffer::peak`]: `max(|xᵢ|)`. Non-finite samples are
+ * skipped; a silent or empty buffer yields `0.0` (never `NaN`). Read-only
+ * measurement — no allocation. Returns `0.0` if the buffer is null.
+ */
+ float rsac_audio_buffer_peak(const struct RsacRsacAudioBuffer *buffer) ;
+
+/**
+ * Returns the RMS level in dBFS: `20 · log10(rms())`.
+ *
+ * Wraps [`rsac::AudioBuffer::rms_dbfs`]. Returns negative infinity for silence
+ * or an empty buffer, and **also** negative infinity if the buffer is null
+ * (there is no level to report). Full scale (RMS `1.0`) maps to `0.0` dBFS.
+ */
+ float rsac_audio_buffer_rms_dbfs(const struct RsacRsacAudioBuffer *buffer) ;
+
+/**
+ * Returns the peak level in dBFS: `20 · log10(peak())`.
+ *
+ * Wraps [`rsac::AudioBuffer::peak_dbfs`]. Returns negative infinity for silence
+ * or an empty buffer, and **also** negative infinity if the buffer is null.
+ * A full-scale signal (peak `1.0`) maps to `0.0` dBFS.
+ */
+ float rsac_audio_buffer_peak_dbfs(const struct RsacRsacAudioBuffer *buffer) ;
 
 /**
  * Frees an audio buffer handle. No-op if null.

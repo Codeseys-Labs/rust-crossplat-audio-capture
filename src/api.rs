@@ -55,7 +55,14 @@ pub use crate::core::config::AudioCaptureConfig;
 /// calls `preflight`) so the two cannot drift. Device negotiation may still
 /// land on a different rate the *hardware* advertises; this gate is purely the
 /// config-time contract.
-const SUPPORTED_SAMPLE_RATES: [u32; 6] = [22050, 32000, 44100, 48000, 88200, 96000];
+///
+/// This is an alias for the canonical
+/// [`PlatformCapabilities::SUPPORTED_SAMPLE_RATES`] so the builder and the
+/// publicly queryable list are a single source of truth — callers can
+/// pre-validate against `PlatformCapabilities::SUPPORTED_SAMPLE_RATES` (or
+/// [`PlatformCapabilities::supported_sample_rates()`]) and get exactly what
+/// `build()` enforces.
+const SUPPORTED_SAMPLE_RATES: [u32; 6] = PlatformCapabilities::SUPPORTED_SAMPLE_RATES;
 
 /// The maximum channel count the builder accepts at config time (the valid
 /// range is `1..=MAX_CHANNELS`). Mirrors the most permissive backend's ceiling;
@@ -113,6 +120,29 @@ impl AudioCaptureBuilder {
     pub fn with_target(mut self, target: CaptureTarget) -> Self {
         self.target = target;
         self
+    }
+
+    // ── Read-only accessors ──────────────────────────────────────────
+
+    /// Returns the capture target configured so far.
+    ///
+    /// Read-only view of the builder's current target (the
+    /// [`CaptureTarget::SystemDefault`] default for a fresh builder). Useful for
+    /// inspecting a builder assembled by the [`capture!`](crate::capture) macro
+    /// or for pre-flight UI without consuming the builder.
+    pub fn target(&self) -> &CaptureTarget {
+        &self.target
+    }
+
+    /// Returns the desired [`StreamConfig`] configured so far.
+    ///
+    /// Read-only view of the builder's current sample rate / channels / sample
+    /// format / buffer-size preference (the [`StreamConfig::default()`] values
+    /// until overridden). The `capture_target` field of the returned config is
+    /// not populated until [`build`](Self::build); use [`target`](Self::target)
+    /// for the configured target.
+    pub fn config(&self) -> &StreamConfig {
+        &self.config
     }
 
     /// Sets the desired stream config in one shot.
@@ -1509,6 +1539,23 @@ mod tests {
         // 11025 is a valid audio rate but not in the supported list
         let result = AudioCaptureBuilder::new().sample_rate(11025).build();
         assert!(result.is_err());
+    }
+
+    /// rsac-c957: the builder's config-time whitelist is the *same* array as the
+    /// public [`PlatformCapabilities::SUPPORTED_SAMPLE_RATES`] — a single source
+    /// of truth, so a caller pre-validating against the public const sees exactly
+    /// what `build()`/`preflight()` enforce.
+    #[test]
+    fn builder_whitelist_is_platform_capabilities_const() {
+        assert_eq!(
+            SUPPORTED_SAMPLE_RATES,
+            PlatformCapabilities::SUPPORTED_SAMPLE_RATES
+        );
+        // And the slice accessor agrees with what preflight checks against.
+        assert_eq!(
+            PlatformCapabilities::supported_sample_rates(),
+            &SUPPORTED_SAMPLE_RATES
+        );
     }
 
     #[test]

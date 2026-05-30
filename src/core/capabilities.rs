@@ -48,6 +48,30 @@ pub struct PlatformCapabilities {
 }
 
 impl PlatformCapabilities {
+    /// The whitelist of sample rates the [`AudioCaptureBuilder`] accepts at
+    /// configuration time, as a single source of truth.
+    ///
+    /// This is the *config-time contract* — the exact set
+    /// [`AudioCaptureBuilder::build`] / `preflight` validate the requested rate
+    /// against — and is intentionally narrower than the per-platform
+    /// [`sample_rate_range`](Self::sample_rate_range) a device may negotiate to.
+    /// Callers can pre-validate a rate against this list (e.g. populating a UI
+    /// drop-down) without constructing a builder, and the builder references the
+    /// same const so the two cannot drift.
+    ///
+    /// [`AudioCaptureBuilder`]: crate::api::AudioCaptureBuilder
+    /// [`AudioCaptureBuilder::build`]: crate::api::AudioCaptureBuilder::build
+    pub const SUPPORTED_SAMPLE_RATES: [u32; 6] = [22050, 32000, 44100, 48000, 88200, 96000];
+
+    /// Returns the builder's config-time sample-rate whitelist as a slice.
+    ///
+    /// A borrowed view of [`SUPPORTED_SAMPLE_RATES`](Self::SUPPORTED_SAMPLE_RATES)
+    /// for callers that prefer a `&[u32]` (e.g. to `contains` / iterate without
+    /// naming the array length). The contents are identical to the const.
+    pub fn supported_sample_rates() -> &'static [u32] {
+        &Self::SUPPORTED_SAMPLE_RATES
+    }
+
     /// Query the capabilities of the current platform's audio backend.
     ///
     /// Determined at compile time from BOTH the target OS *and* the matching
@@ -690,5 +714,31 @@ mod tests {
         assert_eq!(parse_version_string("14"), Some((14, 0, 0)));
         assert_eq!(parse_version_string(""), None);
         assert_eq!(parse_version_string("abc"), None);
+    }
+
+    // ── SUPPORTED_SAMPLE_RATES const / supported_sample_rates() (rsac-c957) ──
+
+    /// The promoted public const is the canonical config-time whitelist and must
+    /// equal the documented six rates exactly.
+    #[test]
+    fn supported_sample_rates_const_is_canonical() {
+        assert_eq!(
+            PlatformCapabilities::SUPPORTED_SAMPLE_RATES,
+            [22050, 32000, 44100, 48000, 88200, 96000]
+        );
+    }
+
+    /// `supported_sample_rates()` returns a slice over the same const: 48000 is
+    /// present, 11025 (a valid audio rate that is *not* whitelisted) is absent.
+    #[test]
+    fn supported_sample_rates_slice_membership() {
+        let rates = PlatformCapabilities::supported_sample_rates();
+        assert!(rates.contains(&48000), "48000 must be in the whitelist");
+        assert!(
+            !rates.contains(&11025),
+            "11025 is not a whitelisted config-time rate"
+        );
+        // The slice is a borrowed view of the const — identical contents/length.
+        assert_eq!(rates, &PlatformCapabilities::SUPPORTED_SAMPLE_RATES);
     }
 }

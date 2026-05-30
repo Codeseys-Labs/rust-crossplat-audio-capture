@@ -28,8 +28,10 @@ from rsac._rsac import (
     AudioCapture,
     AudioBuffer,
     AudioDevice,
+    AudioFormat,
     CaptureTarget,
     PlatformCapabilities,
+    StreamStats,
     # Module-level functions
     list_devices,
     platform_capabilities,
@@ -53,8 +55,10 @@ __all__ = [
     "AudioCapture",
     "AudioBuffer",
     "AudioDevice",
+    "AudioFormat",
     "CaptureTarget",
     "PlatformCapabilities",
+    "StreamStats",
     # Module-level functions
     "list_devices",
     "platform_capabilities",

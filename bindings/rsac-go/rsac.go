@@ -60,6 +60,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"math"
 	"runtime"
 	"sync"
 	"unsafe"
@@ -180,6 +181,9 @@ type CaptureTarget struct {
 	pid   uint32
 	devID string
 	appID string
+	// spec is the raw canonical target string for a targetString target,
+	// applied via rsac_builder_set_target_str at Build time.
+	spec string
 }
 
 type targetKind int
@@ -190,6 +194,7 @@ const (
 	targetApplication
 	targetApplicationByName
 	targetProcessTree
+	targetString
 )
 
 // SystemDefault returns a CaptureTarget for the system default audio device/mix.
@@ -219,6 +224,41 @@ func Device(id string) CaptureTarget {
 // identified by its platform-specific application ID.
 func Application(id string) CaptureTarget {
 	return CaptureTarget{kind: targetApplication, appID: id}
+}
+
+// ParseTarget parses a canonical target string into a CaptureTarget using the
+// rsac CaptureTarget grammar (the same parser the Rust core uses, reached
+// through the FFI — no grammar is reimplemented in Go):
+//
+//	"system"            → the system default mix
+//	"device:<id>"       → a specific device by ID
+//	"app:<pid-or-id>"   → an application session
+//	"name:<name>"       → an application matched by name
+//	"tree:<pid>"        → a process tree rooted at <pid>
+//
+// The scheme is case-insensitive. A malformed string returns an *Error with
+// code ErrInvalidParameter; ParseTarget never panics. The returned target can
+// be passed to [CaptureBuilder.WithTarget] or applied directly via
+// [CaptureBuilder.WithTargetString].
+func ParseTarget(spec string) (CaptureTarget, error) {
+	// Validate the spec now (fail fast at parse time) by routing it through a
+	// throwaway builder. The grammar lives entirely in the Rust core, so this
+	// is the single source of truth — Go does not duplicate the parser.
+	var cbuilder *C.RsacBuilder
+	if rc := C.rsac_builder_new(&cbuilder); rc != C.RSAC_OK {
+		return CaptureTarget{}, newError(rc)
+	}
+	if cbuilder == nil {
+		return CaptureTarget{}, newError(C.RSAC_ERROR_INTERNAL)
+	}
+	defer C.rsac_builder_free(cbuilder)
+
+	cspec := C.CString(spec)
+	defer C.free(unsafe.Pointer(cspec))
+	if rc := C.rsac_builder_set_target_str(cbuilder, cspec); rc != C.RSAC_OK {
+		return CaptureTarget{}, newError(rc)
+	}
+	return CaptureTarget{kind: targetString, spec: spec}, nil
 }
 
 // ── Audio Buffer ────────────────────────────────────────────────────────
@@ -276,6 +316,71 @@ func (b AudioBuffer) IsEmpty() bool {
 	return len(b.data) == 0
 }
 
+// RMS returns the root-mean-square level across all samples and channels:
+// sqrt(mean(x^2)). Non-finite samples (NaN/±Inf) are skipped; an empty or
+// all-non-finite buffer yields 0 (never NaN). This mirrors the rsac core
+// AudioBuffer::rms metering on the Go-owned sample copy (read-only measurement).
+func (b AudioBuffer) RMS() float32 {
+	var sumSq float64
+	var count uint64
+	for _, x := range b.data {
+		v := float64(x)
+		if isFinite(v) {
+			sumSq += v * v
+			count++
+		}
+	}
+	if count == 0 {
+		return 0
+	}
+	return float32(math.Sqrt(sumSq / float64(count)))
+}
+
+// Peak returns the peak (maximum absolute) level across all samples and
+// channels: max(|x|). Non-finite samples are skipped; an empty or
+// all-non-finite buffer yields 0 (never NaN). Mirrors core AudioBuffer::peak.
+func (b AudioBuffer) Peak() float32 {
+	var peak float32
+	for _, x := range b.data {
+		v := float64(x)
+		if isFinite(v) {
+			a := float32(math.Abs(v))
+			if a > peak {
+				peak = a
+			}
+		}
+	}
+	return peak
+}
+
+// RMSDbfs returns the RMS level in dBFS: 20*log10(RMS()). Returns negative
+// infinity for silence or an empty buffer; full scale (RMS 1.0) maps to 0 dBFS.
+// Mirrors core AudioBuffer::rms_dbfs.
+func (b AudioBuffer) RMSDbfs() float32 {
+	return linToDbfs(b.RMS())
+}
+
+// PeakDbfs returns the peak level in dBFS: 20*log10(Peak()). Returns negative
+// infinity for silence or an empty buffer; a full-scale signal (peak 1.0) maps
+// to 0 dBFS. Mirrors core AudioBuffer::peak_dbfs.
+func (b AudioBuffer) PeakDbfs() float32 {
+	return linToDbfs(b.Peak())
+}
+
+// isFinite reports whether v is neither NaN nor ±Inf.
+func isFinite(v float64) bool {
+	return !math.IsNaN(v) && !math.IsInf(v, 0)
+}
+
+// linToDbfs converts a linear amplitude to dBFS, returning negative infinity at
+// or below 0 (silence) to match the core metering's NEG_INFINITY convention.
+func linToDbfs(lin float32) float32 {
+	if lin <= 0 {
+		return float32(math.Inf(-1))
+	}
+	return float32(20 * math.Log10(float64(lin)))
+}
+
 // audioBufferFromC copies data from a C audio buffer into a Go AudioBuffer,
 // then frees the C buffer. The returned AudioBuffer is fully Go-managed.
 func audioBufferFromC(cbuf *C.RsacAudioBuffer) AudioBuffer {
@@ -310,6 +415,77 @@ func audioBufferFromC(cbuf *C.RsacAudioBuffer) AudioBuffer {
 		channels:   channels,
 		sampleRate: sampleRate,
 	}
+}
+
+// ── Stream Statistics ─────────────────────────────────────────────────────
+
+// StreamStats is a point-in-time snapshot of a capture's diagnostic counters.
+// It mirrors the C-ABI RsacStreamStats out-parameter filled by the FFI; it is a
+// plain value (nothing to free). Obtain one via [AudioCapture.StreamStats].
+type StreamStats struct {
+	// BuffersCaptured is the number of buffers delivered to the consumer
+	// (popped off the ring) since Start.
+	BuffersCaptured uint64
+	// BuffersDropped is the number of buffers dropped to ring overflow since Start.
+	BuffersDropped uint64
+	// BuffersPushed is the number of buffers enqueued by the OS callback since Start.
+	BuffersPushed uint64
+	// Overruns counts ring-buffer overruns; equal to BuffersDropped (retained alias).
+	Overruns uint64
+	// UptimeSecs is how long the stream has been running, in seconds (0 when not started).
+	UptimeSecs float64
+	// DroppedRatio is the fraction of accounted-for buffers lost to overflow, in 0.0..=1.0.
+	DroppedRatio float64
+	// IsRunning is true when the stream is currently capturing.
+	IsRunning bool
+}
+
+// ── Audio Format ──────────────────────────────────────────────────────────
+
+// SampleFormat is the negotiated wire/storage format the backend reports.
+// All audio data is still delivered as interleaved float32 regardless of this
+// value. The discriminants match rsac_sample_format_t in the C ABI.
+type SampleFormat int
+
+const (
+	// SampleFormatI16 is signed 16-bit integer.
+	SampleFormatI16 SampleFormat = C.RSAC_SAMPLE_FORMAT_I16
+	// SampleFormatI24 is signed 24-bit integer (packed in a 32-bit container).
+	SampleFormatI24 SampleFormat = C.RSAC_SAMPLE_FORMAT_I24
+	// SampleFormatI32 is signed 32-bit integer.
+	SampleFormatI32 SampleFormat = C.RSAC_SAMPLE_FORMAT_I32
+	// SampleFormatF32 is 32-bit IEEE 754 floating-point (the library's internal standard).
+	SampleFormatF32 SampleFormat = C.RSAC_SAMPLE_FORMAT_F32
+)
+
+// String returns the human-readable name of the sample format.
+func (f SampleFormat) String() string {
+	switch f {
+	case SampleFormatI16:
+		return "I16"
+	case SampleFormatI24:
+		return "I24"
+	case SampleFormatI32:
+		return "I32"
+	case SampleFormatF32:
+		return "F32"
+	default:
+		return fmt.Sprintf("Unknown(%d)", int(f))
+	}
+}
+
+// AudioFormat describes a capture's negotiated delivery format. It mirrors the
+// C-ABI RsacAudioFormat out-parameter; it is a plain value (nothing to free).
+// Obtain one via [AudioCapture.Format].
+type AudioFormat struct {
+	// SampleRate is samples per second (e.g. 44100, 48000).
+	SampleRate uint32
+	// Channels is the number of audio channels (e.g. 1 mono, 2 stereo).
+	Channels uint16
+	// SampleFormat is the negotiated sample wire format.
+	SampleFormat SampleFormat
+	// BitsPerSample is the bits per sample for SampleFormat (16, 24, or 32).
+	BitsPerSample uint16
 }
 
 // ── Capture Builder ─────────────────────────────────────────────────────
@@ -376,6 +552,34 @@ func (b *CaptureBuilder) WithApplication(appID string) *CaptureBuilder {
 	return b
 }
 
+// WithTargetString sets the capture target from a canonical target string (see
+// [ParseTarget] for the grammar). The string is validated immediately; an
+// invalid spec is reported by [SetTargetString], whereas this fluent setter
+// stores the (unvalidated) spec and defers any error to [CaptureBuilder.Build].
+//
+// For fail-fast validation in a fluent chain, prefer [SetTargetString] or
+// [ParseTarget] + [CaptureBuilder.WithTarget].
+func (b *CaptureBuilder) WithTargetString(spec string) *CaptureBuilder {
+	b.target = CaptureTarget{kind: targetString, spec: spec}
+	return b
+}
+
+// SetTargetString parses and sets the capture target from a canonical target
+// string (see [ParseTarget] for the grammar), validating it immediately. A
+// malformed string returns an *Error with code ErrInvalidParameter and leaves
+// the builder's current target unchanged; it never panics.
+//
+// Unlike the fluent [CaptureBuilder.WithTargetString], this returns an error so
+// callers can react to a bad spec at configuration time rather than at Build().
+func (b *CaptureBuilder) SetTargetString(spec string) error {
+	target, err := ParseTarget(spec)
+	if err != nil {
+		return err
+	}
+	b.target = target
+	return nil
+}
+
 // SampleRate sets the desired sample rate in Hz.
 // Common values: 22050, 32000, 44100, 48000, 88200, 96000.
 func (b *CaptureBuilder) SampleRate(rate uint32) *CaptureBuilder {
@@ -420,6 +624,10 @@ func (b *CaptureBuilder) Build() (*AudioCapture, error) {
 		cid := C.CString(b.target.appID)
 		defer C.free(unsafe.Pointer(cid))
 		rc = C.rsac_builder_set_target_app_by_id(cbuilder, cid)
+	case targetString:
+		cspec := C.CString(b.target.spec)
+		defer C.free(unsafe.Pointer(cspec))
+		rc = C.rsac_builder_set_target_str(cbuilder, cspec)
 	}
 	if rc != C.RSAC_OK {
 		C.rsac_builder_free(cbuilder)
@@ -563,6 +771,59 @@ func (c *AudioCapture) OverrunCount() uint64 {
 		return 0
 	}
 	return uint64(C.rsac_capture_overrun_count(c.handle))
+}
+
+// StreamStats returns a point-in-time snapshot of the capture's diagnostic
+// counters bundled with running state, uptime, and the overflow ratio. Reading
+// it never allocates on or blocks the OS audio callback thread.
+//
+// Before Start (or after Stop) every counter is zero, UptimeSecs is 0, and
+// IsRunning is false. Returns ErrClosed if the capture has been closed.
+//
+// OverrunCount() and StreamStats().Overruns report the same ring-overflow count.
+func (c *AudioCapture) StreamStats() (StreamStats, error) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if c.closed {
+		return StreamStats{}, ErrClosed
+	}
+	var cs C.RsacStreamStats
+	if rc := C.rsac_capture_stream_stats(c.handle, &cs); rc != C.RSAC_OK {
+		return StreamStats{}, newError(rc)
+	}
+	return StreamStats{
+		BuffersCaptured: uint64(cs.buffers_captured),
+		BuffersDropped:  uint64(cs.buffers_dropped),
+		BuffersPushed:   uint64(cs.buffers_pushed),
+		Overruns:        uint64(cs.overruns),
+		UptimeSecs:      float64(cs.uptime_secs),
+		DroppedRatio:    float64(cs.dropped_ratio),
+		IsRunning:       cs.is_running != 0,
+	}, nil
+}
+
+// Format returns the negotiated delivery format the backend actually produces,
+// atomically published once a stream is created.
+//
+// Returns an *Error with code ErrStreamFailed when no stream has been created
+// yet (before Start, or after Stop) — call this only on a started capture, or
+// after checking IsRunning(). Returns ErrClosed if the capture has been closed.
+func (c *AudioCapture) Format() (AudioFormat, error) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if c.closed {
+		return AudioFormat{}, ErrClosed
+	}
+	var cf C.RsacAudioFormat
+	if rc := C.rsac_capture_format(c.handle, &cf); rc != C.RSAC_OK {
+		return AudioFormat{}, newError(rc)
+	}
+	return AudioFormat{
+		SampleRate:    uint32(cf.sample_rate),
+		Channels:      uint16(cf.channels),
+		SampleFormat:  SampleFormat(cf.sample_format),
+		BitsPerSample: uint16(cf.bits_per_sample),
+	}, nil
 }
 
 // ReadBuffer reads the next chunk of audio data, blocking until data is

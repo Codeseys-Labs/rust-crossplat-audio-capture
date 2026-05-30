@@ -224,11 +224,30 @@ name = "rt_alloc"
 path = "tests/rt_alloc.rs"
 harness = true
 
+# rsac-1d02: cross-platform "honest failure" enumeration test matrix (audit L4).
+# Asserts non-empty-or-classified-AudioError (never Ok(empty)/no fabricated
+# default) + DeviceInfo round-trip + default-device kind() + the Linux native
+# (pw-dump-free) path. Passes headless via graceful skip / honest-failure arm.
+# harness = true so the standard libtest harness drives the #[test] fns.
+[[test]]
+name = "enumeration_matrix"
+path = "tests/enumeration_matrix.rs"
+harness = true
+
 # rsac-603b: criterion benchmark harness for the bridge data plane. harness =
 # false hands main() to criterion_main!; does not affect cargo build/cargo test.
 [[bench]]
 name = "bridge"
 path = "benches/bridge.rs"
+harness = false
+
+# rsac-03a5: criterion benchmark for the consumer-side observability read path
+# (stream_stats / backpressure_report assembly + AudioBuffer level meters). Proves
+# these are cheap, non-locking, alloc-free reads and embeds an RT-safety
+# regression guard. harness = false hands main() to criterion_main!.
+[[bench]]
+name = "observability"
+path = "benches/observability.rs"
 harness = false
 
 [workspace]

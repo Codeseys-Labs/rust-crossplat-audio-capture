@@ -8,6 +8,7 @@
 use pyo3::exceptions::{PyOSError, PyRuntimeError, PyStopIteration, PyValueError};
 use pyo3::prelude::*;
 use pyo3::types::PyBytes;
+use std::str::FromStr;
 use std::sync::Mutex;
 
 // ── Error Hierarchy ──────────────────────────────────────────────────────
@@ -177,6 +178,14 @@ fn audio_error_to_pyerr(err: rsac::AudioError) -> PyErr {
 ///     CaptureTarget.application(app_id)
 ///     CaptureTarget.application_by_name("Firefox")
 ///     CaptureTarget.process_tree(pid)
+///
+/// Or parse the canonical string grammar with `CaptureTarget.parse`:
+///
+///     CaptureTarget.parse("system")
+///     CaptureTarget.parse("device:<id>")
+///     CaptureTarget.parse("app:<pid>")
+///     CaptureTarget.parse("name:<n>")
+///     CaptureTarget.parse("tree:<pid>")
 #[pyclass(name = "CaptureTarget", module = "rsac._rsac", frozen)]
 #[derive(Clone, Debug)]
 struct PyCaptureTarget {
@@ -223,6 +232,30 @@ impl PyCaptureTarget {
         PyCaptureTarget {
             inner: rsac::CaptureTarget::ProcessTree(rsac::ProcessId(pid)),
         }
+    }
+
+    /// Parse a capture target from its canonical string grammar.
+    ///
+    /// The grammar (case-insensitive scheme) is:
+    ///
+    /// * ``"system"`` → system default
+    /// * ``"device:<id>"`` → a specific device
+    /// * ``"app:<id>"`` → an application by session/application id
+    /// * ``"name:<n>"`` → the first application whose name matches
+    /// * ``"tree:<pid>"`` → a process and its children by PID
+    ///
+    /// Mirrors the typed constructors (:meth:`system_default`,
+    /// :meth:`device`, :meth:`application`, :meth:`application_by_name`,
+    /// :meth:`process_tree`), giving downstreams a single string entry point
+    /// so they no longer hand-roll target parsing.
+    ///
+    /// Raises:
+    ///     ConfigurationError: If ``spec`` is not a valid target string.
+    #[staticmethod]
+    fn parse(spec: &str) -> PyResult<Self> {
+        rsac::CaptureTarget::from_str(spec)
+            .map(|inner| PyCaptureTarget { inner })
+            .map_err(audio_error_to_pyerr)
     }
 
     fn __repr__(&self) -> String {
@@ -278,6 +311,10 @@ fn f32_slice_to_le_bytes(samples: &[f32]) -> Vec<u8> {
 ///     channel_data(ch): Extract samples for a single channel.
 ///     rms(): Compute the RMS (root mean square) level.
 ///     peak(): Return the peak absolute sample value.
+///     rms_dbfs(): RMS level in dBFS (-inf at silence).
+///     peak_dbfs(): Peak level in dBFS (-inf at silence).
+///     channel_rms(ch): Per-channel RMS, or None if out of range.
+///     channel_peak(ch): Per-channel peak, or None if out of range.
 #[pyclass(name = "AudioBuffer", module = "rsac._rsac", frozen)]
 struct PyAudioBuffer {
     inner: rsac::AudioBuffer,
@@ -348,25 +385,52 @@ impl PyAudioBuffer {
 
     /// Compute the RMS (root mean square) level of all samples.
     ///
-    /// Returns 0.0 for an empty buffer.
+    /// Delegates to the core, NaN-safe `AudioBuffer::rms` so the value
+    /// matches every other rsac binding. Returns 0.0 for an empty buffer.
     fn rms(&self) -> f32 {
-        let data = self.inner.data();
-        if data.is_empty() {
-            return 0.0;
-        }
-        let sum_sq: f64 = data.iter().map(|&s| (s as f64) * (s as f64)).sum();
-        (sum_sq / data.len() as f64).sqrt() as f32
+        self.inner.rms()
     }
 
-    /// Return the peak absolute sample value.
+    /// Return the peak absolute sample value across all channels.
     ///
-    /// Returns 0.0 for an empty buffer.
+    /// Delegates to the core, NaN-safe `AudioBuffer::peak`. Returns 0.0
+    /// for an empty buffer.
     fn peak(&self) -> f32 {
-        self.inner
-            .data()
-            .iter()
-            .map(|s| s.abs())
-            .fold(0.0f32, f32::max)
+        self.inner.peak()
+    }
+
+    /// Full-scale RMS level in decibels (dBFS).
+    ///
+    /// Returns negative infinity for digital silence (an all-zero or empty
+    /// buffer). 0 dBFS corresponds to a full-scale sine/RMS of 1.0.
+    fn rms_dbfs(&self) -> f32 {
+        self.inner.rms_dbfs()
+    }
+
+    /// Peak level in decibels relative to full scale (dBFS).
+    ///
+    /// Returns negative infinity for digital silence (an all-zero or empty
+    /// buffer). 0 dBFS corresponds to a peak sample magnitude of 1.0.
+    fn peak_dbfs(&self) -> f32 {
+        self.inner.peak_dbfs()
+    }
+
+    /// RMS level of a single channel (0-indexed).
+    ///
+    /// Returns None if the channel index is out of range. Returns 0.0 for an
+    /// empty (but in-range) channel.
+    #[pyo3(signature = (channel))]
+    fn channel_rms(&self, channel: u16) -> Option<f32> {
+        self.inner.channel_rms(channel)
+    }
+
+    /// Peak absolute sample value of a single channel (0-indexed).
+    ///
+    /// Returns None if the channel index is out of range. Returns 0.0 for an
+    /// empty (but in-range) channel.
+    #[pyo3(signature = (channel))]
+    fn channel_peak(&self, channel: u16) -> Option<f32> {
+        self.inner.channel_peak(channel)
     }
 
     fn __repr__(&self) -> String {
@@ -504,6 +568,184 @@ impl PyPlatformCapabilities {
             self.inner.max_channels,
             self.inner.sample_rate_range,
         )
+    }
+}
+
+// ── StreamStats ──────────────────────────────────────────────────────────
+
+/// Return the canonical lowercase string name for a sample format.
+///
+/// `SampleFormat` has no `Display`, so we map it explicitly rather than rely
+/// on `Debug`, keeping the wire string stable for downstream consumers.
+fn sample_format_name(fmt: rsac::SampleFormat) -> &'static str {
+    match fmt {
+        rsac::SampleFormat::I16 => "i16",
+        rsac::SampleFormat::I24 => "i24",
+        rsac::SampleFormat::I32 => "i32",
+        rsac::SampleFormat::F32 => "f32",
+    }
+}
+
+/// A point-in-time snapshot of stream statistics.
+///
+/// Returned by :meth:`AudioCapture.stream_stats`. Frozen / read-only.
+///
+/// Attributes:
+///     overruns: Buffers dropped due to ring-buffer overflow.
+///     buffers_captured: Buffers delivered to the consumer.
+///     buffers_dropped: Buffers dropped due to overflow (alias of overruns).
+///     buffers_pushed: Buffers enqueued by the OS audio callback.
+///     uptime_secs: Seconds the stream has been running (0.0 if stopped).
+///     is_running: Whether the stream is currently capturing.
+///     format_description: Human-readable description of the captured format.
+#[pyclass(name = "StreamStats", module = "rsac._rsac", frozen)]
+struct PyStreamStats {
+    inner: rsac::StreamStats,
+}
+
+#[pymethods]
+impl PyStreamStats {
+    /// Buffers dropped due to ring-buffer overflow.
+    #[getter]
+    fn overruns(&self) -> u64 {
+        self.inner.overruns
+    }
+
+    /// Buffers delivered to the consumer since the stream started.
+    #[getter]
+    fn buffers_captured(&self) -> u64 {
+        self.inner.buffers_captured
+    }
+
+    /// Buffers dropped due to ring-buffer overflow (alias of `overruns`).
+    #[getter]
+    fn buffers_dropped(&self) -> u64 {
+        self.inner.buffers_dropped
+    }
+
+    /// Buffers enqueued by the OS audio callback since the stream started.
+    #[getter]
+    fn buffers_pushed(&self) -> u64 {
+        self.inner.buffers_pushed
+    }
+
+    /// Seconds the stream has been running (0.0 when stopped / never started).
+    #[getter]
+    fn uptime_secs(&self) -> f64 {
+        self.inner.uptime.as_secs_f64()
+    }
+
+    /// Whether the stream is currently capturing.
+    #[getter]
+    fn is_running(&self) -> bool {
+        self.inner.is_running
+    }
+
+    /// Human-readable description of the audio format being captured.
+    #[getter]
+    fn format_description(&self) -> &str {
+        &self.inner.format_description
+    }
+
+    /// Fraction of buffers lost to overflow, in 0.0..=1.0 (0.0 when none yet).
+    fn dropped_ratio(&self) -> f64 {
+        self.inner.dropped_ratio()
+    }
+
+    fn __repr__(&self) -> String {
+        format!(
+            "StreamStats(overruns={}, buffers_captured={}, buffers_dropped={}, buffers_pushed={}, uptime_secs={:.3}, is_running={})",
+            self.inner.overruns,
+            self.inner.buffers_captured,
+            self.inner.buffers_dropped,
+            self.inner.buffers_pushed,
+            self.inner.uptime.as_secs_f64(),
+            self.inner.is_running,
+        )
+    }
+}
+
+// ── AudioFormat ──────────────────────────────────────────────────────────
+
+/// The negotiated audio delivery format of a running capture.
+///
+/// Returned by the :attr:`AudioCapture.format` getter. Frozen / read-only.
+///
+/// Attributes:
+///     sample_rate: Samples per second (Hz).
+///     channels: Number of interleaved channels.
+///     sample_format: Sample type as a string ("f32", "i16", "i24", "i32").
+#[pyclass(name = "AudioFormat", module = "rsac._rsac", frozen)]
+struct PyAudioFormat {
+    inner: rsac::AudioFormat,
+}
+
+#[pymethods]
+impl PyAudioFormat {
+    /// Samples per second (Hz).
+    #[getter]
+    fn sample_rate(&self) -> u32 {
+        self.inner.sample_rate
+    }
+
+    /// Number of interleaved channels.
+    #[getter]
+    fn channels(&self) -> u16 {
+        self.inner.channels
+    }
+
+    /// Sample type as a string: "f32", "i16", "i24", or "i32".
+    #[getter]
+    fn sample_format(&self) -> &'static str {
+        sample_format_name(self.inner.sample_format)
+    }
+
+    fn __repr__(&self) -> String {
+        format!(
+            "AudioFormat(sample_rate={}, channels={}, sample_format={:?})",
+            self.inner.sample_rate,
+            self.inner.channels,
+            sample_format_name(self.inner.sample_format),
+        )
+    }
+}
+
+// ── Completed awaitable ──────────────────────────────────────────────────
+
+/// A minimal already-resolved awaitable wrapping a single result value.
+///
+/// `AudioCapture.__aenter__` / `__aexit__` do their (non-blocking) work
+/// synchronously and hand back one of these so the `async with` protocol is
+/// satisfied without pulling in an async runtime or `asyncio`. Awaiting it
+/// completes immediately with the stored value: `__await__` returns an
+/// iterator that raises `StopIteration(value)` on its first `__next__`, which
+/// is exactly the coroutine-completion protocol the event loop expects.
+#[pyclass(module = "rsac._rsac")]
+struct CompletedAwaitable {
+    value: Option<PyObject>,
+}
+
+#[pymethods]
+impl CompletedAwaitable {
+    fn __await__(slf: Py<Self>) -> Py<Self> {
+        slf
+    }
+
+    fn __iter__(slf: Py<Self>) -> Py<Self> {
+        slf
+    }
+
+    fn __next__(&mut self, py: Python<'_>) -> PyResult<()> {
+        // Hand the stored value back as StopIteration(value); awaiting an
+        // already-complete coroutine yields nothing and stops immediately.
+        let value = self.value.take().unwrap_or_else(|| py.None());
+        Err(PyStopIteration::new_err(value))
+    }
+}
+
+impl CompletedAwaitable {
+    fn new(py: Python<'_>, value: PyObject) -> PyResult<Py<Self>> {
+        Py::new(py, CompletedAwaitable { value: Some(value) })
     }
 }
 
@@ -683,6 +925,39 @@ impl PyAudioCapture {
         Ok(guard.as_ref().map(|c| c.overrun_count()).unwrap_or(0))
     }
 
+    /// Return a point-in-time snapshot of stream statistics.
+    ///
+    /// Returns a frozen :class:`StreamStats` (overruns, buffers_captured,
+    /// buffers_dropped, buffers_pushed, uptime_secs, is_running,
+    /// format_description). On a closed capture, returns a default snapshot
+    /// (all counters zero, ``is_running == False``).
+    fn stream_stats(&self) -> PyResult<PyStreamStats> {
+        let guard = self
+            .inner
+            .lock()
+            .map_err(|e| PyRuntimeError::new_err(format!("Lock poisoned: {}", e)))?;
+        let inner = guard.as_ref().map(|c| c.stream_stats()).unwrap_or_default();
+        Ok(PyStreamStats { inner })
+    }
+
+    /// The negotiated audio delivery format, or None if not running.
+    ///
+    /// Returns an :class:`AudioFormat` (sample_rate, channels, sample_format)
+    /// once the stream has started and negotiated a format with the backend;
+    /// None before start, after close, or when the backend has not yet
+    /// reported a format.
+    #[getter]
+    fn format(&self) -> PyResult<Option<PyAudioFormat>> {
+        let guard = self
+            .inner
+            .lock()
+            .map_err(|e| PyRuntimeError::new_err(format!("Lock poisoned: {}", e)))?;
+        Ok(guard
+            .as_ref()
+            .and_then(|c| c.format())
+            .map(|inner| PyAudioFormat { inner }))
+    }
+
     /// Close the capture and release all resources.
     ///
     /// After closing, the capture cannot be used. This is called automatically
@@ -720,6 +995,66 @@ impl PyAudioCapture {
     ) -> PyResult<bool> {
         self.close(py)?;
         Ok(false) // Don't suppress exceptions
+    }
+
+    // ── Async Context Manager Protocol ───────────────────────────────
+
+    /// Enter as an async context manager: start capture, return ``self``.
+    ///
+    /// Start is non-blocking, so the returned awaitable is already complete;
+    /// ``await``-ing it yields ``self`` immediately. Mirrors :meth:`__enter__`.
+    fn __aenter__(slf: Py<Self>, py: Python<'_>) -> PyResult<Py<CompletedAwaitable>> {
+        slf.borrow(py).start(py)?;
+        CompletedAwaitable::new(py, slf.into_any())
+    }
+
+    /// Exit as an async context manager: close the capture (best-effort).
+    ///
+    /// If the ``async with`` body raised (``exc_type`` is not None), any error
+    /// from closing the stream is swallowed so it cannot mask the original
+    /// exception; the awaitable resolves to ``False`` and the body exception
+    /// propagates. With no exception in flight, a close failure is surfaced so
+    /// callers still learn about teardown problems.
+    #[pyo3(signature = (exc_type=None, _exc_val=None, _exc_tb=None))]
+    fn __aexit__(
+        &self,
+        py: Python<'_>,
+        exc_type: Option<Bound<'_, PyAny>>,
+        _exc_val: Option<Bound<'_, PyAny>>,
+        _exc_tb: Option<Bound<'_, PyAny>>,
+    ) -> PyResult<Py<CompletedAwaitable>> {
+        let close_result = self.close(py);
+        match close_result {
+            // No error closing → done; never suppress a body exception.
+            Ok(()) => CompletedAwaitable::new(py, py.None()),
+            // Error closing while an exception is already propagating → swallow
+            // the teardown error so it does not mask the in-flight exception.
+            Err(_) if exc_type.is_some() => CompletedAwaitable::new(py, py.None()),
+            // Error closing with no exception in flight → surface it.
+            Err(e) => Err(e),
+        }
+    }
+
+    // ── Finalizer safety net ─────────────────────────────────────────
+
+    /// Garbage-collection safety net: stop a still-running OS stream.
+    ///
+    /// Ensures a capture that was dropped without an explicit
+    /// :meth:`close` / ``with`` / ``async with`` never leaks a running OS
+    /// audio stream. Idempotent (a closed capture is a no-op) and never
+    /// raises or panics — `__del__` must not propagate exceptions.
+    fn __del__(&self, py: Python<'_>) {
+        // Best-effort: take the capture and stop it, swallowing all errors.
+        // A poisoned lock or already-closed capture simply means there is
+        // nothing left to tear down.
+        if let Ok(mut guard) = self.inner.lock() {
+            if let Some(mut capture) = guard.take() {
+                py.allow_threads(|| {
+                    let _ = capture.stop();
+                    drop(capture);
+                });
+            }
+        }
     }
 
     // ── Iterator Protocol ────────────────────────────────────────────
@@ -849,7 +1184,11 @@ fn _rsac(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<PyAudioBuffer>()?;
     m.add_class::<PyAudioDevice>()?;
     m.add_class::<PyPlatformCapabilities>()?;
+    m.add_class::<PyStreamStats>()?;
+    m.add_class::<PyAudioFormat>()?;
     m.add_class::<PyAudioCapture>()?;
+    // Internal awaitable returned by AudioCapture.__aenter__/__aexit__.
+    m.add_class::<CompletedAwaitable>()?;
 
     // Register module-level functions
     m.add_function(wrap_pyfunction!(list_devices, m)?)?;
@@ -866,7 +1205,16 @@ fn _rsac(m: &Bound<'_, PyModule>) -> PyResult<()> {
 
 #[cfg(test)]
 mod tests {
-    use super::f32_slice_to_le_bytes;
+    use super::{f32_slice_to_le_bytes, sample_format_name};
+
+    #[test]
+    fn sample_format_name_maps_every_variant() {
+        // Exhaustive: a new SampleFormat variant must extend the mapping.
+        assert_eq!(sample_format_name(rsac::SampleFormat::I16), "i16");
+        assert_eq!(sample_format_name(rsac::SampleFormat::I24), "i24");
+        assert_eq!(sample_format_name(rsac::SampleFormat::I32), "i32");
+        assert_eq!(sample_format_name(rsac::SampleFormat::F32), "f32");
+    }
 
     #[test]
     fn to_le_bytes_length_is_four_per_sample() {

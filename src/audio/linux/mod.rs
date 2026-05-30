@@ -545,15 +545,65 @@ impl crate::core::interface::AudioDevice for LinuxAudioDevice {
     }
 
     fn supported_formats(&self) -> Vec<crate::core::config::AudioFormat> {
-        // Empty by design (audit finding L2): PipeWire performs format
-        // negotiation at stream-connect time, picking a concrete format from
-        // what we request plus what the graph supports. Enumerating a fixed
-        // "supported" set up front would be a guess that PipeWire may override.
-        // The authoritative delivered format is reported via the stream's
-        // `param_changed` callback and stamped onto each `AudioBuffer`. Callers
-        // requesting a specific format pass it through `StreamConfig`; PipeWire
-        // negotiates the closest match.
-        vec![]
+        // ADVISORY DISCOVERY ONLY (audit finding L2 / EF-3, PR-5 / rsac-7469).
+        //
+        // PipeWire performs the *authoritative* format negotiation at
+        // stream-connect time: it picks a concrete format from what we request
+        // (`StreamConfig`) plus what the graph supports, and reports the result
+        // through the stream's `param_changed` callback, which the backend
+        // stamps onto every delivered [`AudioBuffer`](crate::core::buffer::AudioBuffer).
+        // That negotiated, per-buffer format is the single source of truth for
+        // the delivered audio.
+        //
+        // The list returned here is a *hint* for callers (e.g. populating
+        // `DeviceInfo::default_format`): it reports the formats the node
+        // advertises via its `SPA_PARAM_EnumFormat` parameters, queried natively
+        // through a short-lived `PipeWireThread` (referenced by name — it is
+        // `pub(crate)`, so an intra-doc link would trip the `--all-features`
+        // docs gate). It does NOT — and must not — change what PipeWire
+        // negotiates or delivers; a caller cannot force one of these formats
+        // merely because it appears here.
+        //
+        // A node that advertises no `EnumFormat`, a node that can't be resolved
+        // or bound, or a host without PipeWire all yield an empty `Vec` rather
+        // than a fabricated guess — preserving the documented-empty contract.
+        #[cfg(feature = "feat_linux")]
+        {
+            use crate::audio::linux::thread::PipeWireThread;
+
+            // `self.id` is the node's `object.serial` (the round-trippable
+            // identifier the native enumeration path emits — see
+            // `get_pipewire_devices_native`). Spawn a short-lived thread, ask it
+            // to enumerate the node's advertised formats, and fall back to empty
+            // on any failure (advisory discovery is best-effort, never fatal).
+            match PipeWireThread::spawn() {
+                Ok(pw_thread) => pw_thread
+                    .enum_node_formats(&self.id)
+                    .inspect_err(|e| {
+                        log::debug!(
+                            "PipeWire: supported_formats enum for node '{}' failed ({}); \
+                             reporting empty (advisory discovery)",
+                            self.id,
+                            e
+                        );
+                    })
+                    .unwrap_or_default(),
+                Err(e) => {
+                    log::debug!(
+                        "PipeWire: supported_formats could not spawn thread ({}); \
+                         reporting empty (advisory discovery)",
+                        e
+                    );
+                    Vec::new()
+                }
+            }
+        }
+
+        #[cfg(not(feature = "feat_linux"))]
+        {
+            // No in-process PipeWire bindings: nothing to enumerate.
+            Vec::new()
+        }
     }
 
     fn create_stream(
@@ -779,14 +829,22 @@ mod tests {
 
     #[test]
     fn test_linux_audio_device_supported_formats_empty() {
-        // supported_formats() currently returns empty (TODO in implementation)
+        // supported_formats() is ADVISORY discovery (L2 / rsac-7469): it queries
+        // the node's SPA_PARAM_EnumFormat params natively. A synthetic id like
+        // "test" is never a real registry `object.serial`, so the serial → node
+        // resolution finds nothing and the documented-empty fallback returns
+        // `vec![]` — regardless of whether PipeWire is running. (Without the
+        // `feat_linux` bindings there is no enumeration path at all, also empty.)
         let device = LinuxAudioDevice {
-            id: "test".to_string(),
+            id: "rsac-synthetic-no-such-serial".to_string(),
             name: "Test".to_string(),
             is_input: true,
             is_output: false,
         };
-        assert!(device.supported_formats().is_empty());
+        assert!(
+            device.supported_formats().is_empty(),
+            "an unknown/synthetic node serial must yield the empty advisory list, never a guess"
+        );
     }
 
     #[test]
@@ -1145,6 +1203,62 @@ mod pipewire_integration_tests {
         if let Ok(stream2) = device.create_stream(&config) {
             assert!(stream2.is_running());
             let _ = stream2.stop();
+        }
+    }
+
+    #[test]
+    fn test_supported_formats_is_advisory_and_does_not_alter_delivered_format() {
+        // Acceptance (L2 / EF-3, rsac-7469): supported_formats() is ADVISORY
+        // discovery — it queries the node's EnumFormat params but must NOT change
+        // the authoritative connect-time negotiation. We prove this by:
+        //   1. enumerating the default device's advisory formats, then
+        //   2. opening a stream against that same device and confirming the
+        //      delivered/negotiated format is governed by StreamConfig +
+        //      PipeWire's negotiation, NOT by the advisory list.
+        if !pipewire_available() {
+            eprintln!(
+                "Skipping test_supported_formats_is_advisory...: PipeWire daemon not running"
+            );
+            return;
+        }
+
+        let enumerator = LinuxDeviceEnumerator::new();
+        let device = enumerator
+            .default_device()
+            .expect("should get default device");
+
+        // Advisory discovery: every reported format is a recognised PCM family.
+        // An empty list is also valid (node advertises no EnumFormat) — that is
+        // the documented-empty contract, not a failure.
+        let advisory = device.supported_formats();
+        println!("Advisory supported_formats(): {:?}", advisory);
+        for fmt in &advisory {
+            assert!(fmt.sample_rate > 0, "advisory format must pin a rate");
+            assert!(fmt.channels > 0, "advisory format must pin channels");
+        }
+
+        // The delivered format is whatever the stream negotiates from the
+        // request — independent of the advisory list above.
+        let config = StreamConfig::default(); // 48k / 2ch / F32
+        match device.create_stream(&config) {
+            Ok(stream) => {
+                let fmt = stream.format();
+                // The connect-time format reflects the request (M1 Linux half:
+                // stream.format() reports the requested format), NOT a value the
+                // advisory list dictated. This is the authoritative path.
+                assert_eq!(
+                    fmt.sample_rate, config.sample_rate,
+                    "delivered format is governed by negotiation, not supported_formats()"
+                );
+                assert_eq!(fmt.channels, config.channels);
+                let _ = stream.stop();
+            }
+            Err(e) => {
+                eprintln!(
+                    "create_stream failed (PipeWire might be misconfigured): {}",
+                    e
+                );
+            }
         }
     }
 

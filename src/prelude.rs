@@ -32,7 +32,13 @@
 //! ```
 
 // ── Capture lifecycle: the builder/handle facade ───────────────────────────
-pub use crate::api::{AudioCapture, AudioCaptureBuilder};
+pub use crate::api::{AudioCapture, AudioCaptureBuilder, RunningCapture};
+
+// The `capture!` one-line builder macro. `#[macro_export]` places it at the
+// crate root; re-exporting it here makes `use rsac::prelude::*;` bring it into
+// scope too, matching the prelude's "everyday capture surface in one import"
+// contract (rsac-44dc).
+pub use crate::capture;
 
 // ── Capture target + audio format configuration ────────────────────────────
 pub use crate::core::config::{AudioFormat, CaptureTarget, SampleFormat};
@@ -45,7 +51,7 @@ pub use crate::core::error::{AudioError, AudioResult, ErrorKind, Recoverability,
 
 // ── Capabilities + device/source introspection ────────────────────────────
 pub use crate::core::capabilities::PlatformCapabilities;
-pub use crate::core::interface::{AudioDevice, DeviceKind};
+pub use crate::core::interface::{AudioDevice, DeviceInfo, DeviceKind};
 pub use crate::core::introspection::{
     AudioSource, AudioSourceKind, BackpressureReport, StreamStats,
 };

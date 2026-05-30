@@ -177,6 +177,21 @@ rsac_error_t rsac_builder_set_target_app_by_id(RsacBuilder* builder,
 rsac_error_t rsac_builder_set_target_process_tree(RsacBuilder* builder,
                                                    uint32_t pid);
 
+/**
+ * Sets the capture target by parsing a canonical target string.
+ *
+ * `spec` uses the CaptureTarget string grammar (case-insensitive scheme):
+ *   "system" | "device:<id>" | "app:<pid-or-id>" | "name:<name>" | "tree:<pid>"
+ * Convenience over the typed rsac_builder_set_target_* setters (which remain).
+ *
+ * A malformed string returns RSAC_ERROR_INVALID_PARAMETER and leaves the
+ * builder's existing target unchanged (parse-then-commit). Returns
+ * RSAC_ERROR_NULL_POINTER if builder or spec is null, and
+ * RSAC_ERROR_INVALID_PARAMETER if spec is not valid UTF-8 or not a valid spec.
+ */
+rsac_error_t rsac_builder_set_target_str(RsacBuilder* builder,
+                                         const char* spec);
+
 /** Sets the desired sample rate in Hz. */
 rsac_error_t rsac_builder_set_sample_rate(RsacBuilder* builder,
                                           uint32_t sample_rate);
@@ -281,6 +296,32 @@ uint16_t rsac_audio_buffer_channels(const RsacAudioBuffer* buffer);
 
 /** Returns the sample rate in Hz. 0 if null. */
 uint32_t rsac_audio_buffer_sample_rate(const RsacAudioBuffer* buffer);
+
+/**
+ * Returns the RMS level across all samples/channels: sqrt(mean(x^2)).
+ * Non-finite samples are skipped; silence/empty yields 0.0 (never NaN).
+ * Read-only measurement. Returns 0.0 if buffer is null.
+ */
+float rsac_audio_buffer_rms(const RsacAudioBuffer* buffer);
+
+/**
+ * Returns the peak (max absolute) level across all samples/channels: max(|x|).
+ * Non-finite samples are skipped; silence/empty yields 0.0 (never NaN).
+ * Read-only measurement. Returns 0.0 if buffer is null.
+ */
+float rsac_audio_buffer_peak(const RsacAudioBuffer* buffer);
+
+/**
+ * Returns the RMS level in dBFS: 20*log10(rms). Full scale (RMS 1.0) == 0.0 dBFS.
+ * Returns -infinity for silence/empty, and also -infinity if buffer is null.
+ */
+float rsac_audio_buffer_rms_dbfs(const RsacAudioBuffer* buffer);
+
+/**
+ * Returns the peak level in dBFS: 20*log10(peak). Full scale (peak 1.0) == 0.0 dBFS.
+ * Returns -infinity for silence/empty, and also -infinity if buffer is null.
+ */
+float rsac_audio_buffer_peak_dbfs(const RsacAudioBuffer* buffer);
 
 /** Frees an audio buffer handle. No-op if null. */
 void rsac_audio_buffer_free(RsacAudioBuffer* buffer);

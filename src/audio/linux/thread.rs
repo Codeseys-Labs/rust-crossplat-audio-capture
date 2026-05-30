@@ -260,8 +260,68 @@ pub(crate) enum PipeWireCommand {
         response_tx: std_mpsc::Sender<AudioResult<Vec<PwAppSnapshot>>>,
     },
 
+    /// Enumerate the `SPA_PARAM_EnumFormat` parameters a node advertises and map
+    /// each to a [`crate::core::config::AudioFormat`] (PR-5 / `rsac-7469`).
+    ///
+    /// `serial` is a node's `object.serial` (the same identifier
+    /// [`PwDeviceSnapshot::id`] carries). The handler resolves it to the node's
+    /// registry global id, binds a `Node` proxy on the loop thread, registers a
+    /// `param` listener, fires `enum_params(EnumFormat)`, and — like
+    /// [`SnapshotDevices`](PipeWireCommand::SnapshotDevices) — waits for a
+    /// `core.sync()`/`done` roundtrip so every emitted `param` event has settled
+    /// before replying.
+    ///
+    /// This is **advisory discovery only** (L2 / EF-3): it never alters the
+    /// authoritative connect-time format that `param_changed` negotiates and
+    /// stamps onto each delivered [`AudioBuffer`](crate::core::buffer::AudioBuffer).
+    /// A node that advertises no `EnumFormat` (or that cannot be resolved/bound)
+    /// yields `Ok(vec![])` — never a fabricated guess.
+    EnumNodeFormats {
+        serial: String,
+        response_tx: std_mpsc::Sender<AudioResult<Vec<crate::core::config::AudioFormat>>>,
+    },
+
     /// Shut down the PipeWire thread entirely. No response needed — the thread exits.
     Shutdown,
+}
+
+// ── SPA → rsac format mapping ────────────────────────────────────────────
+
+/// Map a negotiated/advertised SPA audio format to the rsac
+/// [`SampleFormat`](crate::core::config::SampleFormat), or `None` for formats
+/// rsac does not model (compressed, planar, unsigned, exotic widths, …).
+///
+/// Only the interleaved signed-integer and 32-bit float PCM families rsac
+/// understands are mapped (the brief's `S16 / S24 / S32 / F32` set, including
+/// each family's little-endian and host-native spellings). The `S24_32`
+/// variants are 24-bit samples carried in a 32-bit container, which is exactly
+/// how rsac documents [`SampleFormat::I24`](crate::core::config::SampleFormat::I24)
+/// ("packed in 32-bit container"), so they map there too. Anything else returns
+/// `None` so the caller simply omits it from the advisory list rather than
+/// guessing — keeping the documented-empty contract honest.
+#[cfg(feature = "feat_linux")]
+fn spa_audio_format_to_sample_format(
+    fmt: libspa::param::audio::AudioFormat,
+) -> Option<crate::core::config::SampleFormat> {
+    use crate::core::config::SampleFormat;
+    use libspa::param::audio::AudioFormat as Spa;
+
+    // `AudioFormat` derives `PartialEq`, so compare against the associated
+    // constants directly. `S16`/`S24`/`S32` are the host-native aliases (LE on
+    // the little-endian hosts PipeWire runs on); the explicit `*LE` spellings
+    // cover daemons that report the canonical little-endian variant. There is
+    // no plain `F32` constant in libspa, so only `F32LE` is matched for float.
+    if fmt == Spa::S16 || fmt == Spa::S16LE {
+        Some(SampleFormat::I16)
+    } else if fmt == Spa::S24 || fmt == Spa::S24LE || fmt == Spa::S24_32LE {
+        Some(SampleFormat::I24)
+    } else if fmt == Spa::S32 || fmt == Spa::S32LE {
+        Some(SampleFormat::I32)
+    } else if fmt == Spa::F32LE {
+        Some(SampleFormat::F32)
+    } else {
+        None
+    }
 }
 
 // ── CaptureStreamData ────────────────────────────────────────────────────
@@ -592,6 +652,63 @@ impl PipeWireThread {
                 operation: "snapshot_applications".to_string(),
                 message: "PipeWire thread exited before responding to SnapshotApplications"
                     .to_string(),
+                context: None,
+            }),
+        }
+    }
+
+    /// Enumerate the audio formats a node advertises via its
+    /// `SPA_PARAM_EnumFormat` parameters (PR-5 / `rsac-7469`).
+    ///
+    /// Sends an [`EnumNodeFormats`](PipeWireCommand::EnumNodeFormats) command for
+    /// the node whose `object.serial` is `serial` and blocks (bounded by
+    /// [`SNAPSHOT_TIMEOUT`]) for the reply. The PipeWire thread binds the node,
+    /// fires `enum_params`, and waits for a `core.sync()`/`done` roundtrip so the
+    /// emitted `param` events have settled before replying.
+    ///
+    /// This is **advisory discovery only** (L2 / EF-3): the returned list does
+    /// not change the connect-time format the backend actually negotiates and
+    /// delivers (that remains whatever `param_changed` reports). A node with no
+    /// `EnumFormat` — or one that cannot be resolved/bound — yields `Ok(vec![])`
+    /// rather than a guess.
+    ///
+    /// Only owned [`crate::core::config::AudioFormat`] values cross the channel;
+    /// the node proxy + its `param` listener live on the PipeWire loop thread.
+    ///
+    /// # Errors
+    ///
+    /// - [`AudioError::BackendError`] if the PipeWire thread is not running or
+    ///   exits without replying.
+    /// - [`AudioError::Timeout`] if the enumeration does not complete within
+    ///   [`SNAPSHOT_TIMEOUT`].
+    pub fn enum_node_formats(
+        &self,
+        serial: &str,
+    ) -> AudioResult<Vec<crate::core::config::AudioFormat>> {
+        let (response_tx, response_rx) = std_mpsc::channel();
+
+        self.command_tx
+            .send(PipeWireCommand::EnumNodeFormats {
+                serial: serial.to_string(),
+                response_tx,
+            })
+            .map_err(|_| AudioError::BackendError {
+                backend: "PipeWire".to_string(),
+                operation: "enum_node_formats".to_string(),
+                message: "PipeWire thread is not running (command channel closed)".to_string(),
+                context: None,
+            })?;
+
+        match response_rx.recv_timeout(SNAPSHOT_TIMEOUT) {
+            Ok(result) => result,
+            Err(std_mpsc::RecvTimeoutError::Timeout) => Err(AudioError::Timeout {
+                operation: "PipeWire EnumNodeFormats roundtrip".to_string(),
+                duration: SNAPSHOT_TIMEOUT,
+            }),
+            Err(std_mpsc::RecvTimeoutError::Disconnected) => Err(AudioError::BackendError {
+                backend: "PipeWire".to_string(),
+                operation: "enum_node_formats".to_string(),
+                message: "PipeWire thread exited before responding to EnumNodeFormats".to_string(),
                 context: None,
             }),
         }
@@ -1133,6 +1250,7 @@ fn pw_thread_main(
     use pipewire::context::ContextBox;
     use pipewire::main_loop::MainLoopBox;
     use pipewire::metadata::{Metadata, MetadataListener};
+    use pipewire::node::Node;
     use pipewire::properties::properties;
     use pipewire::registry::Listener as RegistryListener;
     use pipewire::stream::{StreamBox, StreamFlags, StreamListener};
@@ -1798,6 +1916,168 @@ fn pw_thread_main(
                 let _ = response_tx.send(Ok(apps));
             }
 
+            Ok(PipeWireCommand::EnumNodeFormats {
+                serial,
+                response_tx,
+            }) => {
+                log::debug!(
+                    "PipeWire thread: EnumNodeFormats received (serial={})",
+                    serial
+                );
+
+                // The advertised formats are discovered by binding the node and
+                // pumping `enum_params(EnumFormat)`; the `param` callbacks fire
+                // on THIS loop thread and accumulate into this cell. Only the
+                // owned Vec crosses the channel. ADVISORY ONLY (L2 / EF-3):
+                // this never touches the capture stream's negotiated format.
+                let formats: Rc<RefCell<Vec<crate::core::config::AudioFormat>>> =
+                    Rc::new(RefCell::new(Vec::new()));
+
+                // Settle the registry's initial dump first so the serial →
+                // global-id resolution below sees every audio node (the same
+                // race SnapshotDevices guards against).
+                run_snapshot_roundtrip(&mut default_metadata);
+
+                // Resolve the requested object.serial to its registry global id.
+                // The device snapshot keys nodes by global id and stores the
+                // object.serial in `PwDeviceSnapshot::id`; we invert that here.
+                let global_id = snapshot
+                    .borrow()
+                    .devices
+                    .iter()
+                    .find(|(_, dev)| dev.id == serial)
+                    .map(|(&gid, _)| gid);
+
+                let Some(global_id) = global_id else {
+                    // Unknown serial (node gone, or never an enumerable device):
+                    // documented-empty fallback, not an error.
+                    log::debug!(
+                        "PipeWire thread: EnumNodeFormats serial={} not in registry — empty",
+                        serial
+                    );
+                    let _ = response_tx.send(Ok(Vec::new()));
+                    continue;
+                };
+
+                // Bind the Node proxy on the loop thread (direct `&registry`
+                // access — never inside a `Fn` closure, so no unsafe reborrow).
+                let object = pipewire::registry::GlobalObject {
+                    id: global_id,
+                    permissions: pipewire::permissions::PermissionFlags::empty(),
+                    type_: ObjectType::Node,
+                    version: 0,
+                    props: None::<pipewire::properties::PropertiesBox>,
+                };
+                let node = match registry.bind::<Node, _>(&object) {
+                    Ok(n) => n,
+                    Err(e) => {
+                        // Cannot bind (permissions, node vanished): empty, not a
+                        // hard error — discovery is best-effort/advisory.
+                        log::debug!(
+                            "PipeWire thread: EnumNodeFormats bind(global_id={}) failed: {}",
+                            global_id,
+                            e
+                        );
+                        let _ = response_tx.send(Ok(Vec::new()));
+                        continue;
+                    }
+                };
+
+                // Register a `param` listener that parses each emitted
+                // EnumFormat pod and records the mapped rsac AudioFormat.
+                let formats_cb = Rc::clone(&formats);
+                let _node_listener = node
+                    .add_listener_local()
+                    .param(move |_seq, param_type, _index, _next, param| {
+                        // Compare via `as_raw()` for parity with the
+                        // `param_changed` path (which matches on the raw id) and
+                        // to avoid relying on `ParamType: PartialEq`.
+                        if param_type.as_raw() != ParamType::EnumFormat.as_raw() {
+                            return;
+                        }
+                        let Some(param) = param else {
+                            return;
+                        };
+                        // Only raw audio formats are mappable.
+                        match format_utils::parse_format(param) {
+                            Ok((MediaType::Audio, MediaSubtype::Raw)) => {}
+                            _ => return,
+                        }
+                        // Reuse the negotiation parser: `AudioInfoRaw::parse`
+                        // pulls the default value out of any SPA choice
+                        // (enum/range) the node advertises, mirroring what the
+                        // `param_changed` capture path does.
+                        let mut info = AudioInfoRaw::new();
+                        if info.parse(param).is_err() {
+                            return;
+                        }
+                        let Some(sample_format) = spa_audio_format_to_sample_format(info.format())
+                        else {
+                            return;
+                        };
+                        let rate = info.rate();
+                        let channels = info.channels();
+                        // A choice may not pin rate/channels to a usable default
+                        // (0 = "any"); skip those rather than fabricate a 0-Hz /
+                        // 0-channel format.
+                        if rate == 0 || channels == 0 {
+                            return;
+                        }
+                        let candidate = crate::core::config::AudioFormat {
+                            sample_rate: rate,
+                            channels: channels as u16,
+                            sample_format,
+                        };
+                        let mut list = formats_cb.borrow_mut();
+                        if !list.contains(&candidate) {
+                            list.push(candidate);
+                        }
+                    })
+                    .register();
+
+                // Kick off enumeration of ALL EnumFormat params, then settle.
+                node.enum_params(0, Some(ParamType::EnumFormat), 0, u32::MAX);
+
+                // Pump a `core.sync()`/`done` roundtrip so every `param` event
+                // posted by `enum_params` is delivered before we read (bounded
+                // by SNAPSHOT_TIMEOUT — a wedged daemon yields an empty list, not
+                // a hang). Mirrors the snapshot roundtrip's `pump_sync`.
+                {
+                    let done = Rc::new(std::cell::Cell::new(false));
+                    if let Ok(seq) = core.sync(0) {
+                        let pending = seq.seq();
+                        let done_cb = Rc::clone(&done);
+                        let core_listener = core
+                            .add_listener_local()
+                            .done(move |id, seq| {
+                                if id == pipewire::core::PW_ID_CORE && seq.seq() >= pending {
+                                    done_cb.set(true);
+                                }
+                            })
+                            .register();
+                        let deadline = std::time::Instant::now() + SNAPSHOT_TIMEOUT;
+                        while !done.get() && std::time::Instant::now() < deadline {
+                            let _ = main_loop.loop_().iterate(Duration::from_millis(50));
+                        }
+                        drop(core_listener);
+                    }
+                }
+
+                // Drop the node listener before the node proxy (the C listener
+                // registration references the proxy). Both go out of scope at
+                // the end of the arm, but make the order explicit for parity
+                // with the stream listener/stream teardown ordering.
+                drop(_node_listener);
+                let result: Vec<crate::core::config::AudioFormat> = formats.borrow().clone();
+                drop(node);
+                log::debug!(
+                    "PipeWire thread: EnumNodeFormats serial={} → {} format(s)",
+                    serial,
+                    result.len()
+                );
+                let _ = response_tx.send(Ok(result));
+            }
+
             Ok(PipeWireCommand::Shutdown) => {
                 log::debug!("PipeWire thread: Shutdown received, exiting event loop");
                 // Clean up any active capture before exiting.
@@ -2312,6 +2592,90 @@ mod tests {
                 Ok(_devices) => {}
                 Err(AudioError::Timeout { .. }) | Err(AudioError::BackendError { .. }) => {}
                 Err(e) => panic!("Unexpected snapshot_devices error: {:?}", e),
+            },
+            Err(AudioError::BackendInitializationFailed { backend, .. }) => {
+                assert_eq!(backend, "PipeWire");
+            }
+            Err(e) => panic!("Unexpected spawn error: {:?}", e),
+        }
+    }
+
+    // ── SPA → rsac format mapping (PR-5 / rsac-7469) ─────────────────
+
+    #[test]
+    fn test_spa_audio_format_maps_integer_and_float_families() {
+        use crate::core::config::SampleFormat;
+        use libspa::param::audio::AudioFormat as Spa;
+
+        // S16 family → I16.
+        assert_eq!(
+            spa_audio_format_to_sample_format(Spa::S16),
+            Some(SampleFormat::I16)
+        );
+        assert_eq!(
+            spa_audio_format_to_sample_format(Spa::S16LE),
+            Some(SampleFormat::I16)
+        );
+        // S24 family (incl. 24-in-32 container) → I24.
+        assert_eq!(
+            spa_audio_format_to_sample_format(Spa::S24),
+            Some(SampleFormat::I24)
+        );
+        assert_eq!(
+            spa_audio_format_to_sample_format(Spa::S24LE),
+            Some(SampleFormat::I24)
+        );
+        assert_eq!(
+            spa_audio_format_to_sample_format(Spa::S24_32LE),
+            Some(SampleFormat::I24)
+        );
+        // S32 family → I32.
+        assert_eq!(
+            spa_audio_format_to_sample_format(Spa::S32),
+            Some(SampleFormat::I32)
+        );
+        assert_eq!(
+            spa_audio_format_to_sample_format(Spa::S32LE),
+            Some(SampleFormat::I32)
+        );
+        // F32 (little-endian) → F32.
+        assert_eq!(
+            spa_audio_format_to_sample_format(Spa::F32LE),
+            Some(SampleFormat::F32)
+        );
+    }
+
+    #[test]
+    fn test_spa_audio_format_unmapped_families_are_none() {
+        use libspa::param::audio::AudioFormat as Spa;
+
+        // Formats rsac does not model must map to None (so the caller omits
+        // them from the advisory list rather than guessing): unknown, unsigned,
+        // 8-bit, 64-bit float, big-endian, and planar layouts.
+        assert!(spa_audio_format_to_sample_format(Spa::Unknown).is_none());
+        assert!(spa_audio_format_to_sample_format(Spa::U8).is_none());
+        assert!(spa_audio_format_to_sample_format(Spa::U16LE).is_none());
+        assert!(spa_audio_format_to_sample_format(Spa::F64LE).is_none());
+        assert!(spa_audio_format_to_sample_format(Spa::F32BE).is_none());
+        assert!(spa_audio_format_to_sample_format(Spa::F32P).is_none());
+    }
+
+    #[test]
+    fn test_enum_node_formats_unknown_serial_or_unavailable_is_empty_or_honest() {
+        // EnumNodeFormats is advisory discovery: an unknown serial yields an
+        // empty Vec, never a fabricated format. In a sandbox without a daemon,
+        // spawn fails with BackendInitializationFailed; when it succeeds, asking
+        // for a serial that is not in the registry must return Ok(vec![]) (or a
+        // bounded Timeout/BackendError) — never a panic, never a guess.
+        match PipeWireThread::spawn() {
+            Ok(thread) => match thread.enum_node_formats("rsac-no-such-serial") {
+                Ok(formats) => assert!(
+                    formats.is_empty(),
+                    "unknown serial must enumerate to an empty advisory list, got {:?}",
+                    formats
+                ),
+                Err(AudioError::Timeout { .. }) | Err(AudioError::BackendError { .. }) => {}
+                Err(e) => panic!("Unexpected enum_node_formats error: {:?}", e),
             },
             Err(AudioError::BackendInitializationFailed { backend, .. }) => {
                 assert_eq!(backend, "PipeWire");
