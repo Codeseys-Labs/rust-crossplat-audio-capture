@@ -1,31 +1,17 @@
 # Canonical Public API Design — `rsac` (Rust Cross-Platform Audio Capture)
 
-> ⚠️ **ASPIRATIONAL / HISTORICAL DESIGN — NOT THE SOURCE OF TRUTH.**
-> This is an early design document. The shipped code intentionally diverged
-> from it in several places, and **the code is the source of truth**, not this
-> file. Read the rustdoc and the modules under [`src/`](../../src/) (and the
-> ADRs in [`docs/designs/`](../designs/)) for what `rsac` actually does. Known
-> divergences this document still describes incorrectly:
-> - Streaming method names: this doc uses `read_chunk(Duration)` / `async_stream` /
->   `to_async_stream` / `pipe_to`. The real API is
->   [`AudioCapture::read_buffer()`](../../src/api.rs), `audio_data_stream()`
->   (behind `async-stream`), and `subscribe()`; the trait method is
->   `CapturingStream::read_chunk()` (no `Duration` arg).
-> - `AudioError` is a **manual** `Display`/`Error` enum (no `thiserror` derive,
->   **not** `Clone`), with **22** variants (since ADR-0003 added `StreamEnded`) and
->   **3** recoverability states (`Recoverable`, `TransientRetry`, `Fatal` — there is
->   no `UserError`). See [`src/core/error.rs`](../../src/core/error.rs).
-> - Supported sample rates are **6** (`22050, 32000, 44100, 48000, 88200, 96000`),
->   not the 11 listed here.
-> - `ResolvedConfig`, `AudioBufferRef`, `ApplicationEnumerator::enumerate_applications`,
->   and the `rsac::prelude` module described below **do not exist** in the code.
-> - `CaptureTarget` variants are tuple/newtype (`Device(DeviceId)`,
->   `Application(ApplicationId)`, `ProcessTree(ProcessId)`, `ApplicationByName(String)`),
->   not the struct-variant forms shown in places below.
+> **Status:** Living design doc — reconciled with shipped code (2026-05-30).
+> **Source of truth:** the rustdoc and the modules under [`src/`](../../src/).
+> Every signature below is grounded against the current code (file references
+> in prose use symbol names so they survive refactors). Where a previously
+> documented surface does **not** exist in code, it is called out explicitly as
+> **Not implemented** rather than presented as shipped.
 >
-> **Status:** Design Document — Subtask B1 (historical)
-> **Priority Order:** Correctness → UX → Breadth  
-> **Guiding Principle:** Streaming-first, pull-model with ring-buffer bridge from OS callbacks
+> **Priority order:** Correctness → UX → Breadth.
+> **Guiding principle:** streaming-first, pull-model with a lock-free ring-buffer
+> bridge from the OS callback to the consumer. rsac is **capture-only** — see
+> [`VISION.md`](../../VISION.md) for the explicit non-goals (no DSP, mixing,
+> resampling, encoding, playback, VAD, or AEC).
 
 ---
 
@@ -34,1693 +20,951 @@
 1. [Design Overview](#1-design-overview)
 2. [Error Handling](#2-error-handling)
 3. [CaptureTarget — Unified Target Model](#3-capturetarget--unified-target-model)
-4. [AudioFormat and StreamConfig](#4-audioformat-and-streamconfig)
+4. [AudioFormat, SampleFormat, and StreamConfig](#4-audioformat-sampleformat-and-streamconfig)
 5. [AudioCaptureBuilder](#5-audiocapturebuilder)
-6. [AudioCapture — Lifecycle Manager](#6-audiocapture--lifecycle-manager)
+6. [AudioCapture and RunningCapture](#6-audiocapture-and-runningcapture)
 7. [CapturingStream — The Core Streaming Trait](#7-capturingstream--the-core-streaming-trait)
-8. [AudioBuffer — Data Container](#8-audiobuffer--data-container)
-9. [DeviceEnumerator Trait](#9-deviceenumerator-trait)
-10. [ApplicationEnumerator Trait](#10-applicationenumerator-trait)
+8. [AudioBuffer — Data Container and Metering](#8-audiobuffer--data-container-and-metering)
+9. [Device Enumeration, DeviceInfo, and Device Watching](#9-device-enumeration-deviceinfo-and-device-watching)
+10. [Source Introspection and Diagnostics](#10-source-introspection-and-diagnostics)
 11. [Streaming Consumption Modes](#11-streaming-consumption-modes)
-12. [AudioSink Trait — Downstream Consumers](#12-audiosink-trait--downstream-consumers)
-13. [Public Exports and Prelude](#13-public-exports-and-prelude)
-14. [Platform Mapping Notes](#14-platform-mapping-notes)
-15. [Ring Buffer Bridge Architecture](#15-ring-buffer-bridge-architecture)
-16. [Design Rationale](#16-design-rationale)
-17. [Migration from Current API](#17-migration-from-current-api)
+12. [The `capture!` Macro](#12-the-capture-macro)
+13. [AudioSink — Downstream Consumers](#13-audiosink--downstream-consumers)
+14. [Public Exports and Prelude](#14-public-exports-and-prelude)
+15. [Thread-Safety Contract](#15-thread-safety-contract)
+16. [Not Yet Implemented / Tracked](#16-not-yet-implemented--tracked)
 
 ---
 
 ## 1. Design Overview
 
+The public API follows a **builder → handle → stream** pipeline:
+
 ```mermaid
 graph TD
     A[AudioCaptureBuilder] -->|.build| B[AudioCapture]
-    B -->|.start| C[CapturingStream]
-    C -->|read_chunk| D[AudioBuffer]
-    C -->|try_read_chunk| D
-    C -->|to_async_stream| E[Stream of AudioBuffer]
-    C -->|buffers_iter| F[Iterator of AudioBuffer]
-    B -->|.set_callback| G[Callback Push Mode]
-    B -->|.pipe_to| H[AudioSink]
+    A -->|.start| R[RunningCapture RAII guard]
+    R -->|Deref/DerefMut| B
+    B -->|.read_buffer / .read_buffer_blocking| D[AudioBuffer]
+    B -->|.buffers_iter| F[Iterator of AudioResult-AudioBuffer]
+    B -->|.subscribe| G[mpsc Receiver of AudioBuffer]
+    B -->|.audio_data_stream feature=async-stream| E[AsyncAudioStream]
+    B -->|.set_callback| H[Callback pump thread]
 
-    I[DeviceEnumerator] -->|enumerate_devices| J[DeviceInfo]
-    K[ApplicationEnumerator] -->|list_capturable_apps| L[CapturableApplication]
+    I[DeviceEnumerator] -->|.enumerate_devices| J[Box dyn AudioDevice]
+    J -->|.describe| K[DeviceInfo]
+    I -->|.watch| W[DeviceWatcher RAII guard]
 
     M[CaptureTarget] --> A
-    J --> A
-    L --> A
 ```
 
-The canonical API follows a **builder → session → stream** pipeline:
-
-1. **Configure** via `AudioCaptureBuilder` with a `CaptureTarget`
-2. **Build** to get an `AudioCapture` session — validates config, resolves platform resources
-3. **Start** to activate the OS audio pipeline
-4. **Consume** audio via pull, async, iterator, callback, or sink adapters
-5. **Stop/Drop** to release all resources
-
-### Thread Safety Contract
-
-All public types are `Send + Sync`. The library never requires the user to interact on a specific thread.
+1. **Configure** with [`AudioCaptureBuilder`](../../src/api.rs) (`with_target` /
+   `target_str` / `sample_rate` / `channels` / `sample_format` / `buffer_size`),
+   or the [`capture!`](../../src/lib.rs) macro for a one-line declarative builder.
+2. **Build** to an [`AudioCapture`](../../src/api.rs) handle via `build()`
+   (validates config, resolves the device, negotiates the format), or call
+   `start()` on the builder to build-and-start in one step, returning a
+   [`RunningCapture`](../../src/api.rs) RAII guard.
+3. **Start** with `AudioCapture::start()` to create the OS stream.
+4. **Consume** audio via pull (`read_buffer` / `read_buffer_blocking`), a
+   blocking iterator (`buffers_iter`), a channel (`subscribe`), an async stream
+   (`audio_data_stream`, behind the `async-stream` feature), or a callback
+   (`set_callback`).
+5. **Stop/Drop** — `stop()` tears the OS stream down; `Drop` on `AudioCapture`
+   (and on the `RunningCapture` guard) best-effort stops it.
 
 ---
 
 ## 2. Error Handling
 
-### AudioError
+The canonical error type is [`AudioError`](../../src/core/error.rs), and every
+fallible operation returns `AudioResult<T>` (alias for `Result<T, AudioError>`).
+
+### Shipped shape (grounded against `core/error.rs`)
+
+- `AudioError` is a **manually implemented** `Display` / `std::error::Error`
+  enum — there is **no** `thiserror` derive and it is **not** `Clone`.
+- It has **22 variants** organized into **7** [`ErrorKind`] categories:
+  `Configuration`, `Device`, `Stream`, `Backend`, `Application`, `Platform`,
+  `Internal`.
+- Recoverability has **three** in-use states on the `Recoverability` enum —
+  `Recoverable`, `TransientRetry`, `Fatal`. (A `UserError` value is named in the
+  `core::error` module doc; the public `Recoverability` enum itself defines the
+  three above.)
+- Every variant has an exhaustive (`_`-free) `recoverability()`, `kind()`,
+  `user_message()`, and `Display` arm, so adding a variant is a compile error
+  until it is classified.
+- Convenience predicates `is_fatal()` / `is_recoverable()` give consumers a
+  clean retry-vs-surface decision. The end-of-stream terminal signal is
+  `AudioError::StreamEnded` (Fatal, `ErrorKind::Stream`) — see
+  [ADR-0003](../designs/0003-terminal-stream-error.md).
+
+Representative variants (carry structured fields, not bare strings):
 
 ```rust
-/// The canonical error type for all audio operations.
-#[derive(Debug, Clone, thiserror::Error)]
 pub enum AudioError {
-    // === Configuration Errors (fail at build time) ===
-    
-    #[error("invalid configuration: {0}")]
-    InvalidConfig(String),
-    
-    #[error("unsupported sample rate: {rate} Hz")]
-    UnsupportedSampleRate { rate: u32 },
-    
-    #[error("unsupported audio format: {0}")]
-    UnsupportedFormat(String),
-
-    // === Device/Target Errors (fail at build or start time) ===
-    
-    #[error("device not found: {0}")]
-    DeviceNotFound(String),
-    
-    #[error("application not found: {0}")]
-    ApplicationNotFound(String),
-    
-    #[error("device busy: {0}")]
-    DeviceBusy(String),
-
-    // === Runtime Errors (fail during streaming) ===
-    
-    #[error("stream not started")]
-    StreamNotStarted,
-    
-    #[error("stream already running")]
-    StreamAlreadyRunning,
-    
-    #[error("stream closed")]
-    StreamClosed,
-    
-    #[error("buffer overrun: consumer too slow")]
-    BufferOverrun,
-    
-    #[error("timeout waiting for audio data")]
-    Timeout,
-
-    // === Platform Errors ===
-    
-    #[error("platform not supported: {0}")]
-    PlatformNotSupported(String),
-    
-    #[error("backend error: {0}")]
-    Backend(String),
-    
-    #[error("permission denied: {0}")]
-    PermissionDenied(String),
-    
-    // === Generic ===
-    
-    #[error("I/O error: {0}")]
-    Io(String),
+    // Configuration
+    InvalidParameter { param: String, reason: String },
+    UnsupportedFormat { format: String, context: Option<BackendContext> },
+    ConfigurationError { message: String },
+    // Device
+    DeviceNotFound { device_id: String },
+    DeviceNotAvailable { device_id: String, reason: String },
+    DeviceEnumerationError { reason: String, context: Option<BackendContext> },
+    // Stream (StreamCreationFailed / StreamStartFailed / StreamStopFailed /
+    //         StreamReadError / StreamEnded / BufferOverrun / BufferUnderrun …)
+    StreamEnded { reason: String },
+    // Platform / Backend / Application / Internal …
+    PlatformNotSupported { feature: String, platform: String },
+    InternalError { message: String, source: Option<…> },
+    // … 22 variants total
 }
-
-/// Result alias used throughout the library.
-pub type AudioResult<T> = Result<T, AudioError>;
 ```
 
-### Design Rationale
-
-- **`thiserror`-derived**: automatic `Display`, `Error` impls without boilerplate.
-- **Category-separated variants**: users can match on config vs runtime vs platform errors.
-- **String payloads** instead of boxes: `Clone` is required for `AudioError` to be usable across thread boundaries without `Arc`. Platform backends wrap their native errors into the `Backend` variant.
-- **Removed redundancy**: the current codebase has overlapping variants like `DeviceNotFound` / `DeviceNotFoundError`, `Timeout` / `TimeoutError`. The new design deduplicates.
+> **Known limitation (tracked, critique API-ERG-01):** `AudioError` is **not**
+> `#[non_exhaustive]`, unlike the recently-added public types
+> ([`StreamStats`], [`BackpressureReport`], [`DeviceInfo`], [`DeviceEvent`]).
+> Downstream exhaustive matches are therefore a SemVer hazard; external code
+> should already match with a trailing `_ =>` arm and lean on
+> `kind()`/`recoverability()`/`is_fatal()` for classification.
 
 ---
 
 ## 3. CaptureTarget — Unified Target Model
 
+[`CaptureTarget`](../../src/core/config.rs) is the single concept that selects
+*what* audio to capture. It uses **tuple/newtype** variants (not the
+struct-variant forms shown in older drafts of this doc):
+
 ```rust
-/// Specifies what audio to capture.
-///
-/// This is the single entry point for all capture targeting decisions.
-/// The builder resolves a `CaptureTarget` to the correct platform mechanism.
-#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, Hash)]
 pub enum CaptureTarget {
-    /// Capture the default system audio output (loopback).
-    ///
-    /// - **Windows:** WASAPI loopback on the default render endpoint
-    /// - **Linux:** PipeWire monitor of the default sink
-    /// - **macOS:** CoreAudio aggregate device with process tap (all processes)
+    #[default]
     SystemDefault,
-
-    /// Capture from a specific audio device by its platform-specific ID.
-    ///
-    /// The `id` is an opaque string obtained from `DeviceEnumerator`.
-    ///
-    /// - **Windows:** WASAPI endpoint ID string
-    /// - **Linux:** PipeWire node ID (as string, e.g., "42")
-    /// - **macOS:** CoreAudio AudioDeviceID (as string)
-    Device { id: String },
-
-    /// Capture audio from a specific application by its process ID.
-    ///
-    /// - **Windows:** WASAPI Process Loopback Capture (Win10 21H1+)
-    /// - **Linux:** PipeWire monitor stream targeting the application's node
-    /// - **macOS:** CoreAudio Process Tap with CATapDescription targeting the PID
-    Application { pid: u32 },
-
-    /// Capture audio from a specific application by its executable name.
-    ///
-    /// The library resolves the name to a PID at build time. If multiple processes
-    /// match, the first active audio producer is selected.
-    ///
-    /// - **Windows:** Resolves via WASAPI audio session enumeration
-    /// - **Linux:** Resolves via PipeWire node properties (application.name)
-    /// - **macOS:** Resolves via NSRunningApplication / process list
-    ApplicationByName { name: String },
-
-    /// Capture audio from a process and all its child processes.
-    ///
-    /// - **Windows:** WASAPI Process Loopback with `PROCESS_LOOPBACK_MODE_INCLUDE_TARGET_PROCESS_TREE`
-    /// - **Linux:** PipeWire monitors for root PID + children discovered via /proc
-    /// - **macOS:** CoreAudio Process Tap with multiple PIDs in CATapDescription
-    ProcessTree { root_pid: u32 },
-}
-
-impl Default for CaptureTarget {
-    fn default() -> Self {
-        CaptureTarget::SystemDefault
-    }
+    Device(DeviceId),                 // DeviceId(pub String)
+    Application(ApplicationId),       // ApplicationId(pub String)
+    ApplicationByName(String),
+    ProcessTree(ProcessId),           // ProcessId(pub u32)
 }
 ```
 
-### Platform Mapping Table
+> `CaptureTarget` is intentionally **not** `#[non_exhaustive]` today although the
+> variant set is expected to grow (critique OBS-API-ERG); treat the
+> `#[non_exhaustive]` decision as open.
 
-| CaptureTarget | Windows (WASAPI) | Linux (PipeWire) | macOS (CoreAudio) |
-|---|---|---|---|
-| `SystemDefault` | Loopback on default render endpoint | Monitor of default sink | Process Tap with all-process aggregate device |
-| `Device { id }` | Endpoint by ID | PipeWire node by serial/ID | AudioDevice by AudioDeviceID |
-| `Application { pid }` | Process Loopback Capture | Monitor stream on app node | Process Tap targeting PID via CATapDescription |
-| `ApplicationByName` | Resolve via audio session enumeration → Process Loopback | Resolve via `application.name` property → monitor | NSRunningApplication lookup → Process Tap |
-| `ProcessTree { root_pid }` | Process Loopback with tree mode | Multiple monitors (root + children via /proc) | Process Tap with multiple PIDs |
+### Convenience constructors (`core/introspection.rs`)
+
+```rust
+CaptureTarget::app("Firefox")        // == ApplicationByName("Firefox")
+CaptureTarget::pid(1234)             // == ProcessTree(ProcessId(1234))
+CaptureTarget::device("hw:0,0")      // == Device(DeviceId("hw:0,0"))
+```
+
+### String round-trip — `FromStr` / `TryFrom<&str>` / `Display`
+
+`CaptureTarget` implements `FromStr`, `TryFrom<&str>`, and `Display`, and the
+two are exact inverses: `t.to_string().parse::<CaptureTarget>() == Ok(t)` for
+every variant (property-tested for empty ids, `u32::MAX`, and embedded colons).
+
+Grammar (scheme prefix matched **case-insensitively**; body preserved verbatim):
+
+| String form                         | Parses to                                   |
+|-------------------------------------|---------------------------------------------|
+| `system` / `default`                | `SystemDefault`                             |
+| `device:<id>`                       | `Device(DeviceId(<id>))` — split on the **first** colon, so `device:hw:0,0` keeps `hw:0,0` |
+| `app:<id>`                          | `Application(ApplicationId(<id>))`          |
+| `name:<name>`                       | `ApplicationByName(<name>)`                 |
+| `tree:<pid>` / `pid:<pid>`          | `ProcessTree(ProcessId(<pid>))` (`<pid>` a `u32`) |
+
+An unknown scheme or a non-numeric / out-of-range pid returns
+`AudioError::InvalidParameter { param: "capture_target", .. }` and never panics.
+
+### Platform mapping
+
+| CaptureTarget        | Windows (WASAPI)                         | Linux (PipeWire)                  | macOS (CoreAudio Process Tap, 14.4+) |
+|----------------------|------------------------------------------|-----------------------------------|--------------------------------------|
+| `SystemDefault`      | Loopback on the default render endpoint  | Monitor of the default sink       | Process tap over all processes       |
+| `Device(id)`         | Endpoint by ID                           | Node by serial/object id          | `AudioDeviceID` by UID               |
+| `Application(id)`    | Process Loopback Capture                 | Monitor stream on the app's node  | `CATapDescription` targeting the PID |
+| `ApplicationByName`  | Resolve name → session → Process Loopback | Resolve `application.name` → monitor | Resolve name → PID → process tap   |
+| `ProcessTree(pid)`   | Process Loopback (tree mode)             | Root PID + children via `/proc`   | `CATapDescription` with the PID set  |
 
 ---
 
-## 4. AudioFormat and StreamConfig
+## 4. AudioFormat, SampleFormat, and StreamConfig
 
-### SampleFormat (simplified)
+### SampleFormat — 4 variants (`core/config.rs`)
 
 ```rust
-/// Specifies the format of audio samples in an AudioBuffer.
-///
-/// The canonical API normalizes all audio to f32 internally.
-/// This enum describes what the user *requests* or what the OS *provides*.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default)]
-pub enum SampleFormat {
-    /// Signed 16-bit integer, native endian
-    I16,
-    /// Signed 24-bit integer (packed in 32 bits), native endian
-    I24,
-    /// Signed 32-bit integer, native endian
-    I32,
-    /// 32-bit float, native endian — the canonical internal format
-    #[default]
-    F32,
-}
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum SampleFormat { I16, I24, I32, F32 }  // Default = F32
+// SampleFormat::bits_per_sample() → 16 | 24 | 32 | 32
 ```
+
+All audio is normalized to interleaved `f32` internally; `SampleFormat`
+describes the wire/storage format for configuration and capability negotiation.
 
 ### AudioFormat
 
 ```rust
-/// Describes the format of an audio stream.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct AudioFormat {
-    /// Samples per second (e.g., 44100, 48000)
-    pub sample_rate: u32,
-    /// Number of channels (1 = mono, 2 = stereo)
-    pub channels: u16,
-    /// Sample format
-    pub sample_format: SampleFormat,
-}
-
-impl Default for AudioFormat {
-    fn default() -> Self {
-        AudioFormat {
-            sample_rate: 48000,
-            channels: 2,
-            sample_format: SampleFormat::F32,
-        }
-    }
+    pub sample_rate: u32,    // default 48000
+    pub channels: u16,       // default 2
+    pub sample_format: SampleFormat, // default F32
 }
 ```
 
-### StreamConfig
+### StreamConfig — the **actual** field set (`core/config.rs`)
 
 ```rust
-/// Configuration for how the audio stream operates.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct StreamConfig {
-    /// Desired audio format. If `None`, the device's native format is used.
-    pub format: Option<AudioFormat>,
-
-    /// Preferred buffer size in frames. If `None`, the backend chooses.
-    /// Smaller = lower latency, higher CPU. Typical: 256–4096 frames.
-    pub buffer_size_frames: Option<u32>,
-
-    /// Size of the internal ring buffer (in frames) bridging OS callbacks
-    /// to the consumer. Default: 16384. Must be > buffer_size_frames.
-    pub ring_buffer_frames: Option<u32>,
+    pub sample_rate: u32,             // default 48000
+    pub channels: u16,                // default 2
+    pub sample_format: SampleFormat,  // default F32
+    pub buffer_size: Option<usize>,   // desired buffer size; None → backend default
+    pub capture_target: CaptureTarget,// propagated from the builder on build()
 }
-
-impl Default for StreamConfig {
-    fn default() -> Self {
-        StreamConfig {
-            format: None,  // Use device native format
-            buffer_size_frames: None,  // Backend default
-            ring_buffer_frames: None,  // Library default (16384)
-        }
-    }
-}
+// StreamConfig::to_audio_format() → AudioFormat
 ```
 
-### Design Rationale — Simplified SampleFormat
+> **Corrections vs. older drafts of this doc:**
+> - There is **no** `format: Option<AudioFormat>` field — `sample_rate`,
+>   `channels`, and `sample_format` are flat fields.
+> - There is **no** `ring_buffer_frames` field and **no** `buffer_size_frames`
+>   field; the builder exposes a `buffer_size_frames(Option<u32>)` *setter* that
+>   writes into `buffer_size`, but the struct field is `buffer_size`.
+> - There is **no** `latency_mode` field. A `LatencyMode` enum exists in
+>   `core/config.rs` but it is **not** wired into `StreamConfig` or the builder —
+>   see [§16](#16-not-yet-implemented--tracked).
 
-The current codebase has 18 `SampleFormat` variants encoding endianness. This is unnecessary complexity because:
+#### Supported sample rates
 
-1. Audio buffers in the canonical API are always `Vec<f32>` (native endian).
-2. Endianness is a serialization concern (file writing), not an API concern.
-3. Users should specify the *logical* format; the backend handles conversion.
-
-The `bits_per_sample` field is **removed** — it is fully determined by `SampleFormat`.
+`build()`/`preflight()` accept exactly **6** rates:
+`22050, 32000, 44100, 48000, 88200, 96000`. This whitelist is the same array as
+the public `PlatformCapabilities::SUPPORTED_SAMPLE_RATES` (single source of
+truth), so a caller can pre-validate against the public const and get exactly
+what `build()` enforces. Device negotiation may still land on a different rate
+the hardware advertises; the whitelist is the config-time contract only.
 
 ---
 
 ## 5. AudioCaptureBuilder
 
+[`AudioCaptureBuilder`](../../src/api.rs) configures a capture session. It holds
+a `CaptureTarget` plus a `StreamConfig`; all fields default
+(`SystemDefault`, 48 kHz / 2ch / F32, no buffer-size preference).
+
+### Setters and accessors
+
 ```rust
-/// Builder for constructing an AudioCapture session.
-///
-/// Follows the builder pattern. All fields have sensible defaults.
-/// At minimum, only a `CaptureTarget` is needed — everything else
-/// has defaults that work for most use cases.
-///
-/// # Examples
-///
-/// ```rust
-/// use rsac::prelude::*;
-///
-/// // Minimal: capture system audio with platform defaults
-/// let capture = AudioCaptureBuilder::new()
-///     .build()?;
-///
-/// // Capture a specific application by PID
-/// let capture = AudioCaptureBuilder::new()
-///     .target(CaptureTarget::Application { pid: 12345 })
-///     .build()?;
-///
-/// // Fully configured capture
-/// let capture = AudioCaptureBuilder::new()
-///     .target(CaptureTarget::ApplicationByName {
-///         name: "firefox".into(),
-///     })
-///     .sample_rate(48000)
-///     .channels(2)
-///     .sample_format(SampleFormat::F32)
-///     .buffer_size(1024)
-///     .build()?;
-/// ```
-#[derive(Debug, Clone)]
-pub struct AudioCaptureBuilder {
-    target: CaptureTarget,
-    sample_rate: Option<u32>,
-    channels: Option<u16>,
-    sample_format: Option<SampleFormat>,
-    buffer_size_frames: Option<u32>,
-    ring_buffer_frames: Option<u32>,
-}
-
-impl Default for AudioCaptureBuilder {
-    fn default() -> Self {
-        Self::new()
-    }
-}
-
 impl AudioCaptureBuilder {
-    /// Creates a new builder targeting SystemDefault.
-    pub fn new() -> Self {
-        AudioCaptureBuilder {
-            target: CaptureTarget::SystemDefault,
-            sample_rate: None,
-            channels: None,
-            sample_format: None,
-            buffer_size_frames: None,
-            ring_buffer_frames: None,
-        }
-    }
+    pub fn new() -> Self;                                   // == default()
+    pub fn with_target(self, target: CaptureTarget) -> Self;
+    pub fn with_config(self, config: StreamConfig) -> Self;
+    pub fn sample_rate(self, rate: u32) -> Self;
+    pub fn channels(self, channels: u16) -> Self;
+    pub fn sample_format(self, format: SampleFormat) -> Self;
+    pub fn buffer_size(self, size: Option<usize>) -> Self;
+    pub fn buffer_size_frames(self, size: Option<u32>) -> Self; // compat alias → buffer_size
 
-    /// Sets what audio to capture.
-    pub fn target(mut self, target: CaptureTarget) -> Self {
-        self.target = target;
-        self
-    }
+    // Read-only views (useful for inspecting a capture!-assembled builder)
+    pub fn target(&self) -> &CaptureTarget;
+    pub fn config(&self) -> &StreamConfig;
 
-    /// Sets the desired sample rate in Hz.
-    ///
-    /// Common values: 44100, 48000, 96000.
-    /// If not set, the device's native sample rate is used.
-    pub fn sample_rate(mut self, rate: u32) -> Self {
-        self.sample_rate = Some(rate);
-        self
-    }
+    // String-driven targeting
+    pub fn target_str(self, s: &str) -> AudioResult<Self>;  // fallible; builder unchanged on error
+    pub fn try_target_str(self, s: &str) -> Self;           // infallible; keeps prior target on error
 
-    /// Sets the desired number of channels.
-    ///
-    /// If not set, the device's native channel count is used.
-    pub fn channels(mut self, channels: u16) -> Self {
-        self.channels = Some(channels);
-        self
-    }
-
-    /// Sets the desired sample format.
-    ///
-    /// If not set, defaults to `SampleFormat::F32`.
-    pub fn sample_format(mut self, format: SampleFormat) -> Self {
-        self.sample_format = Some(format);
-        self
-    }
-
-    /// Sets the preferred buffer size in frames for OS-level callbacks.
-    ///
-    /// Smaller buffers = lower latency, higher CPU. The backend may choose
-    /// a different size if the requested size is not supported.
-    pub fn buffer_size(mut self, frames: u32) -> Self {
-        self.buffer_size_frames = Some(frames);
-        self
-    }
-
-    /// Sets the ring buffer capacity (in frames) for the internal SPSC buffer.
-    ///
-    /// This controls how much audio data can be buffered between the OS callback
-    /// thread and the consumer. Default: 16384 frames (~341ms at 48kHz).
-    /// Increase if the consumer is bursty.
-    pub fn ring_buffer_size(mut self, frames: u32) -> Self {
-        self.ring_buffer_frames = Some(frames);
-        self
-    }
-
-    /// Validates configuration and creates an AudioCapture session.
-    ///
-    /// ## Validation performed at build time:
-    /// - `sample_rate` must be in {8000, 11025, 16000, 22050, 32000, 44100, 48000, 88200, 96000, 176400, 192000} if set
-    /// - `channels` must be 1..=32 if set
-    /// - `buffer_size_frames` must be 16..=65536 if set
-    /// - `ring_buffer_frames` must be > `buffer_size_frames` if both are set
-    /// - `CaptureTarget::Application { pid }` — PID existence is checked
-    /// - `CaptureTarget::ApplicationByName { name }` — resolution to PID is attempted
-    /// - `CaptureTarget::Device { id }` — device existence is validated
-    ///
-    /// ## Validation deferred to start time:
-    /// - Device format support (the device might negotiate a different format)
-    /// - OS permission checks (macOS Process Tap permissions)
-    /// - Hardware availability (device may become unavailable between build and start)
-    ///
-    /// # Errors
-    ///
-    /// Returns `AudioError::InvalidConfig` for parameter validation failures.
-    /// Returns `AudioError::DeviceNotFound` or `AudioError::ApplicationNotFound`
-    /// if the target cannot be resolved.
-    pub fn build(self) -> AudioResult<AudioCapture> {
-        // ... validation and platform resource resolution ...
-    }
+    pub fn preflight(&self) -> AudioResult<()>;             // device-independent validation
+    pub fn build(self) -> AudioResult<AudioCapture>;        // validate + resolve device + negotiate
+    pub fn start(self) -> AudioResult<RunningCapture>;      // build + start + RAII guard
 }
 ```
 
-### Key Design Decisions
+### `target_str` / `try_target_str`
 
-1. **`CaptureTarget` replaces `DeviceSelector` + `target_application_pid` + `target_application_session_identifier`** — one unified concept instead of three partially-overlapping fields.
-2. **All fields except `target` are optional** — the builder defaults to `SystemDefault` capture with native device settings. This eliminates the current API's requirement to specify `sample_rate`, `channels`, `sample_format`, and `bits_per_sample` before you can build.
-3. **`bits_per_sample` is removed** — `SampleFormat` already encodes this information.
-4. **Session identifier removed** — Windows session IDs are not user-facing; PID is sufficient.
+`target_str(s)` parses `s` via `CaptureTarget::from_str` (the canonical grammar
+in [§3](#3-capturetarget--unified-target-model)). On a parse failure it returns
+`AudioError::InvalidParameter { param: "capture_target", .. }` and, because the
+method consumes `self` and only returns the builder on success, the caller's
+previously configured target is unchanged. `try_target_str(s)` is the infallible
+best-effort variant: a malformed string is ignored and the prior target kept.
+
+```rust
+let capture = AudioCaptureBuilder::new()
+    .target_str("app:1234")?      // CLI flag / config value straight into the builder
+    .sample_rate(48000)
+    .build()?;
+```
+
+### `preflight`
+
+`preflight()` runs the **cheap, device-independent** validations that `build()`
+performs first, without enumerating any device — so a caller can fail fast on a
+misconfigured builder. `build()` calls it first, so the two cannot drift. It
+returns:
+
+- `AudioError::PlatformNotSupported` when the target needs application or
+  process-tree capture the platform reports it does not support.
+- `AudioError::InvalidParameter { param: "sample_rate", .. }` when the rate is
+  not one of the 6 supported rates.
+- `AudioError::ConfigurationError` when `channels == 0` or `channels > 32`.
+
+```rust
+let builder = AudioCaptureBuilder::new().sample_rate(48000).channels(2);
+builder.preflight()?; // validates without touching any device
+```
+
+### `build` and format negotiation
+
+`build()` resolves the device for the target and, on **non-Linux** platforms,
+negotiates the format: if the device advertises formats and the exact requested
+one is absent, it picks the closest supported format (preferring F32 at the
+requested sample rate, then F32 at the requested channel count, then any F32,
+then the device's first format) rather than hard-failing. It errors with
+`UnsupportedFormat` only when the device advertises no formats at all. On Linux
+(PipeWire) negotiation happens at stream-open time, so `build()` does not
+negotiate there.
+
+### `start` — build-and-start ergonomics
+
+`AudioCaptureBuilder::start()` collapses `let mut c = builder.build()?;
+c.start()?;` into one fallible call returning a [`RunningCapture`](#6-audiocapture-and-runningcapture)
+RAII guard. On a `start()` failure the partially-built `AudioCapture` is dropped,
+and its `Drop` best-effort stops any stream it created — so a failed `start()`
+never leaks a half-running stream.
 
 ---
 
-## 6. AudioCapture — Lifecycle Manager
+## 6. AudioCapture and RunningCapture
+
+### AudioCapture — the lifecycle handle
+
+[`AudioCapture`](../../src/api.rs) is created by `build()`. It owns the resolved
+config, the selected device, the active stream (`Arc<dyn CapturingStream>`), a
+pending callback, an optional callback-pump handle, and a monotonic
+`start_instant`.
 
 ```rust
-/// An active audio capture session.
-///
-/// Created by `AudioCaptureBuilder::build()`. Controls the lifecycle of
-/// audio capture and provides access to the audio data stream.
-///
-/// # Lifecycle
-///
-/// ```text
-/// Builder → build() → AudioCapture (Created)
-///                        │
-///                        ├─ start() → AudioCapture (Running)
-///                        │              │
-///                        │              ├─ stream() → &dyn CapturingStream
-///                        │              ├─ read_chunk() → AudioBuffer
-///                        │              ├─ async_stream() → Stream<AudioBuffer>
-///                        │              ├─ buffers_iter() → Iterator<AudioBuffer>
-///                        │              │
-///                        │              └─ stop() → AudioCapture (Stopped)
-///                        │                           │
-///                        │                           └─ start() → (can restart)
-///                        │
-///                        └─ drop → (automatic cleanup)
-/// ```
-///
-/// # Thread Safety
-///
-/// `AudioCapture` is `Send + Sync`. All methods take `&self` where possible,
-/// using interior mutability for state management.
-///
-/// # Examples
-///
-/// ```rust
-/// use rsac::prelude::*;
-///
-/// let capture = AudioCaptureBuilder::new()
-///     .target(CaptureTarget::SystemDefault)
-///     .build()?;
-///
-/// capture.start()?;
-///
-/// // Pull mode
-/// while let Some(buffer) = capture.read_chunk(Duration::from_millis(100))? {
-///     process_audio(&buffer);
-/// }
-///
-/// capture.stop()?;
-/// ```
-pub struct AudioCapture {
-    // -- Internal fields (not public) --
-    config: ResolvedConfig,
-    target: CaptureTarget,
-    state: Arc<AtomicState>,        // Created | Running | Stopped | Closed
-    stream: Mutex<Option<Box<dyn CapturingStream>>>,
-    // Platform-specific device handle (type-erased)
-    device_handle: Box<dyn Any + Send + Sync>,
-}
-
-// Marker: AudioCapture is Send + Sync
-unsafe impl Send for AudioCapture {}
-unsafe impl Sync for AudioCapture {}
-
-/// The resolved and validated configuration, available after build().
-#[derive(Debug, Clone)]
-pub struct ResolvedConfig {
-    /// The capture target that was requested.
-    pub target: CaptureTarget,
-    /// The actual audio format that will be used (may differ from requested).
-    pub format: AudioFormat,
-    /// The actual buffer size in frames.
-    pub buffer_size_frames: u32,
-    /// The ring buffer size in frames.
-    pub ring_buffer_frames: u32,
-}
-
 impl AudioCapture {
-    /// Returns the resolved configuration for this capture session.
-    pub fn config(&self) -> &ResolvedConfig { ... }
+    // Lifecycle (take &mut self)
+    pub fn start(&mut self) -> AudioResult<()>;
+    pub fn stop(&mut self) -> AudioResult<()>;
 
-    /// Returns the capture target.
-    pub fn target(&self) -> &CaptureTarget { ... }
+    // State / config (take &self)
+    pub fn is_running(&self) -> bool;
+    pub fn config(&self) -> &AudioCaptureConfig;
+    pub fn uptime(&self) -> Option<Duration>;
+    pub fn format(&self) -> Option<AudioFormat>; // negotiated delivery format, or None pre-start
 
-    /// Returns `true` if the capture stream is currently running.
-    pub fn is_running(&self) -> bool { ... }
+    // Reads (take &mut self)
+    pub fn read_buffer(&mut self) -> AudioResult<Option<AudioBuffer>>;     // non-blocking
+    pub fn read_buffer_blocking(&mut self) -> AudioResult<AudioBuffer>;    // blocking
+    pub fn buffers_iter(&mut self) -> AudioBufferIterator<'_>;             // blocking iterator
 
-    /// Starts the audio capture.
-    ///
-    /// Creates the platform-specific stream and begins filling the ring buffer.
-    /// After this call, audio data is available via `read_chunk()`,
-    /// `async_stream()`, `buffers_iter()`, or a registered callback.
-    ///
-    /// Can be called after `stop()` to restart capture.
-    ///
-    /// # Errors
-    ///
-    /// - `AudioError::StreamAlreadyRunning` if already started
-    /// - `AudioError::Backend(...)` if the OS stream cannot be created
-    /// - `AudioError::PermissionDenied(...)` on macOS if Process Tap is denied
-    pub fn start(&self) -> AudioResult<()> { ... }
+    // Channel / async / callback (subscribe & async take &self; set/clear take &mut self)
+    pub fn subscribe(&self) -> AudioResult<mpsc::Receiver<AudioBuffer>>;
+    #[cfg(feature = "async-stream")]
+    pub fn audio_data_stream(&self) -> AudioResult<AsyncAudioStream<'_>>;
+    pub fn set_callback<F>(&mut self, callback: F) -> AudioResult<()>
+        where F: FnMut(&AudioBuffer) + Send + 'static;
+    pub fn clear_callback(&mut self) -> AudioResult<()>;
 
-    /// Stops audio capture.
-    ///
-    /// The OS audio pipeline is torn down and the ring buffer is drained.
-    /// The session can be restarted with `start()`.
-    ///
-    /// No-op if already stopped.
-    pub fn stop(&self) -> AudioResult<()> { ... }
-
-    /// Reads the next chunk of audio data, blocking up to `timeout`.
-    ///
-    /// Convenience method that delegates to the internal `CapturingStream`.
-    ///
-    /// # Returns
-    ///
-    /// - `Ok(Some(buffer))` — audio data available
-    /// - `Ok(None)` — timeout elapsed, no data
-    /// - `Err(AudioError::StreamNotStarted)` — `start()` not called
-    /// - `Err(AudioError::StreamClosed)` — stream was closed/dropped
-    pub fn read_chunk(&self, timeout: Duration) -> AudioResult<Option<AudioBuffer>> { ... }
-
-    /// Attempts to read audio data without blocking.
-    ///
-    /// # Returns
-    ///
-    /// - `Ok(Some(buffer))` — data was available
-    /// - `Ok(None)` — no data currently available (try again later)
-    /// - `Err(...)` — stream error
-    pub fn try_read_chunk(&self) -> AudioResult<Option<AudioBuffer>> { ... }
-
-    /// Returns an async stream of audio buffers.
-    ///
-    /// The stream yields `AudioResult<AudioBuffer>` items. It completes
-    /// when `stop()` is called or the capture session is dropped.
-    ///
-    /// Requires the stream to be started.
-    ///
-    /// # Example
-    ///
-    /// ```rust
-    /// use futures_util::StreamExt;
-    ///
-    /// let capture = AudioCaptureBuilder::new().build()?;
-    /// capture.start()?;
-    ///
-    /// let mut stream = capture.async_stream()?;
-    /// while let Some(result) = stream.next().await {
-    ///     let buffer = result?;
-    ///     println!("Got {} frames", buffer.num_frames());
-    /// }
-    /// ```
-    pub fn async_stream(&self) -> AudioResult<AudioStream> { ... }
-
-    /// Returns a blocking iterator over audio buffers.
-    ///
-    /// Each call to `next()` blocks until data is available.
-    /// The iterator terminates when `stop()` is called.
-    ///
-    /// # Example
-    ///
-    /// ```rust
-    /// let capture = AudioCaptureBuilder::new().build()?;
-    /// capture.start()?;
-    ///
-    /// for result in capture.buffers_iter() {
-    ///     let buffer = result?;
-    ///     println!("Got {} frames", buffer.num_frames());
-    /// }
-    /// ```
-    pub fn buffers_iter(&self) -> AudioBufferIterator { ... }
-
-    /// Registers a callback invoked on each audio buffer.
-    ///
-    /// The callback runs on a dedicated thread, not the OS audio callback thread.
-    /// Only one callback can be active at a time; setting a new one replaces the old.
-    ///
-    /// The callback must be registered *before* calling `start()`.
-    ///
-    /// # Example
-    ///
-    /// ```rust
-    /// let capture = AudioCaptureBuilder::new().build()?;
-    ///
-    /// capture.set_callback(|buffer: &AudioBuffer| {
-    ///     let rms = compute_rms(buffer.samples());
-    ///     println!("RMS level: {:.4}", rms);
-    /// })?;
-    ///
-    /// capture.start()?;
-    /// ```
-    pub fn set_callback<F>(&self, callback: F) -> AudioResult<()>
-    where
-        F: FnMut(&AudioBuffer) + Send + 'static,
-    { ... }
-
-    /// Removes the currently registered callback, if any.
-    pub fn clear_callback(&self) -> AudioResult<()> { ... }
-
-    /// Pipes all captured audio to the given sink.
-    ///
-    /// The sink runs on a dedicated thread. Audio is read from the ring buffer
-    /// and forwarded to the sink's `write()` method.
-    ///
-    /// Must be configured *before* calling `start()`.
-    ///
-    /// # Example
-    ///
-    /// ```rust
-    /// use rsac::sink::WavFileSink;
-    ///
-    /// let capture = AudioCaptureBuilder::new().build()?;
-    /// let sink = WavFileSink::new("output.wav")?;
-    /// capture.pipe_to(sink)?;
-    /// capture.start()?;
-    /// // ... audio is written to output.wav ...
-    /// capture.stop()?; // finalizes the WAV file
-    /// ```
-    pub fn pipe_to<S: AudioSink + 'static>(&self, sink: S) -> AudioResult<()> { ... }
-}
-
-impl Drop for AudioCapture {
-    fn drop(&mut self) {
-        // Stop stream if running, close OS resources.
-        // Errors are logged, not propagated (cannot panic in Drop).
-    }
+    // Diagnostics (take &self)
+    pub fn overrun_count(&self) -> u64;
+    pub fn is_under_backpressure(&self) -> bool;
+    pub fn stream_stats(&self) -> StreamStats;
+    pub fn backpressure_report(&self) -> BackpressureReport;
 }
 ```
 
-### Key Design Decisions
+#### `&mut self` vs `&self` — the honest nuance
 
-1. **`&self` methods** — `start()`, `stop()`, `read_chunk()` all take `&self` using interior mutability. This makes `AudioCapture` shareable across threads without external `Mutex`.
-2. **No mutual exclusivity enforcement** — the current API has complex `is_internally_processing` / `is_externally_streaming` flags. In the new design, the ring buffer is the single source of truth. Multiple consumers (callback + read_chunk) can coexist by each getting their own view, or the library can document that only one consumption mode should be used at a time.
-3. **Restartable** — `stop()` + `start()` is allowed. The stream is re-created on each `start()`.
-4. **`AudioCapture` is not generic** — unlike the current `AudioCapture` which stores `Box<dyn AudioDevice<DeviceId = String>>`, the new design uses `Box<dyn Any + Send + Sync>` for the platform handle, keeping the public type concrete and simple.
+The module doc states `AudioCapture` is `Send + Sync` and shareable behind an
+`Arc`. In practice the **read** methods (`read_buffer`, `read_buffer_blocking`,
+`buffers_iter`) and the lifecycle/callback methods (`start`, `stop`,
+`set_callback`, `clear_callback`) take **`&mut self`**, while `subscribe`,
+`is_under_backpressure`, `stream_stats`, `backpressure_report`, `format`,
+`uptime`, `overrun_count`, and `config` take **`&self`**. The underlying
+`CapturingStream::try_read_chunk` is already `&self`, so a future change could
+move the read path to `&self`; until then, sharing one `AudioCapture` across
+threads for reads requires external synchronization (e.g. `Arc<Mutex<…>>`).
+
+> **Known limitation (tracked, critique DF-03):** there is **no** compile-time
+> `Send + Sync` assertion for `AudioCapture` in `api.rs` (unlike
+> [`AudioBuffer`](../../src/core/buffer.rs), which has
+> `_assert_send_sync::<AudioBuffer>()`). The guarantee is asserted only in the
+> module doc, so downstreams have guessed wrong (e.g. assuming `!Sync`). Adding
+> the assertion is tracked.
+
+#### Lifecycle semantics (grounded)
+
+- `start()` creates the OS stream on first call and records `start_instant`. A
+  second `start()` on an already-**running** stream is a no-op (`Ok`); a
+  `start()` on a stream that has **stopped** returns `StreamStartFailed` — a
+  stopped stream cannot be restarted, build a new `AudioCapture`.
+- `stop()` shuts the callback pump down (signal + join), stops the stream,
+  drops the `Arc`, and clears `start_instant`. It is idempotent.
+- `Drop` tears down the callback pump and best-effort stops a running stream.
+- `set_callback()` must be called **before** `start()` (it errors with
+  `ConfigurationError` while running); `start()` then moves the closure into a
+  dedicated **callback pump thread** (never the OS audio thread) — see
+  [ADR-0002](../designs/0002-callback-delivery.md). The pump owns the closure, so
+  no lock is held during invocation and the closure may re-enter `AudioCapture`.
+- `format()` returns the negotiated *delivery* format the backend publishes, or
+  `None` before `start()`. (Note: today no production backend calls
+  `set_negotiated_format`, so this reflects the requested format in practice —
+  critique PERF-07.)
+- `uptime()` is anchored on first real stream creation and cleared by
+  `stop()`/`Drop`; it is monotonic (`Instant`-backed).
+
+### RunningCapture — RAII guard
+
+[`RunningCapture`](../../src/api.rs) is returned by `AudioCaptureBuilder::start()`.
+
+- It implements `Deref<Target = AudioCapture>` **and** `DerefMut`, so the full
+  `AudioCapture` surface (including the `&mut self` reads) is reachable directly
+  on the guard — no wrapper boilerplate, new `AudioCapture` methods are reachable
+  automatically.
+- `Drop` calls `AudioCapture::stop()` exactly once; `stop()` is idempotent, so an
+  explicit `stop()` followed by drop does not double-stop or error.
+- `into_inner()` takes ownership of the wrapped `AudioCapture` **without**
+  triggering the guard's stop (the caller becomes responsible for the lifecycle;
+  the `AudioCapture`'s own `Drop` still best-effort stops it).
+
+```rust
+let mut capture = AudioCaptureBuilder::new()
+    .with_target(CaptureTarget::SystemDefault)
+    .start()?; // builds, starts, and wraps in a RAII guard
+if let Some(buffer) = capture.read_buffer()? {  // through DerefMut
+    let _frames = buffer.num_frames();
+}
+// Dropping `capture` stops the stream automatically.
+```
 
 ---
 
 ## 7. CapturingStream — The Core Streaming Trait
 
+[`CapturingStream`](../../src/core/interface.rs) is the platform-agnostic
+contract every backend implements (consumers rarely call it directly; the
+`AudioCapture` facade wires it up). All implementations are `Send + Sync`.
+
 ```rust
-/// The core trait for reading captured audio data.
-///
-/// `CapturingStream` is the bridge between OS audio callbacks and the user.
-/// It is implemented by platform-specific backends and exposed via `AudioCapture`.
-///
-/// All implementations must be `Send + Sync`.
-///
-/// # Consumption Model
-///
-/// The stream operates on a **pull model**: the consumer calls `read_chunk()` or
-/// `try_read_chunk()` to retrieve audio data. Internally, the OS pushes audio
-/// into a lock-free SPSC ring buffer; these methods read from the consumer side.
 pub trait CapturingStream: Send + Sync {
-    /// Starts the audio stream. OS audio callbacks begin filling the ring buffer.
-    fn start(&self) -> AudioResult<()>;
-
-    /// Stops the audio stream. OS audio callbacks are halted.
-    /// The ring buffer retains any unread data.
+    fn read_chunk(&self) -> AudioResult<AudioBuffer>;             // blocking
+    fn try_read_chunk(&self) -> AudioResult<Option<AudioBuffer>>; // non-blocking
     fn stop(&self) -> AudioResult<()>;
-
-    /// Closes the stream and releases all OS resources.
-    ///
-    /// After `close()`, the stream cannot be restarted. Any subsequent
-    /// method calls return `AudioError::StreamClosed`.
-    fn close(&mut self) -> AudioResult<()>;
-
-    /// Returns `true` if the stream is currently capturing audio.
+    fn format(&self) -> AudioFormat;
     fn is_running(&self) -> bool;
 
-    /// Reads the next chunk of audio data, blocking up to `timeout`.
-    ///
-    /// # Arguments
-    /// * `timeout` — Maximum time to wait for data. Use `Duration::ZERO` for
-    ///   non-blocking behavior (equivalent to `try_read_chunk()`).
-    ///
-    /// # Returns
-    /// * `Ok(Some(buffer))` — Audio data is available.
-    /// * `Ok(None)` — Timeout elapsed with no data available.
-    /// * `Err(AudioError::StreamNotStarted)` — Stream not started.
-    /// * `Err(AudioError::StreamClosed)` — Stream was closed.
-    /// * `Err(AudioError::BufferOverrun)` — Data was lost due to slow consumption.
-    fn read_chunk(&self, timeout: Duration) -> AudioResult<Option<AudioBuffer>>;
+    // Diagnostics (default-0 / default-false provided methods)
+    fn overrun_count(&self) -> u64 { 0 }
+    fn buffers_captured(&self) -> u64 { 0 }
+    fn buffers_pushed(&self) -> u64 { 0 }
+    fn buffers_dropped(&self) -> u64 { 0 }   // alias of overrun_count
+    fn is_producing(&self) -> bool { self.is_running() }
+    fn is_under_backpressure(&self) -> bool { false }
 
-    /// Attempts to read audio data without blocking.
-    ///
-    /// Equivalent to `read_chunk(Duration::ZERO)`.
-    ///
-    /// # Returns
-    /// * `Ok(Some(buffer))` — Data was available.
-    /// * `Ok(None)` — No data currently available.
-    fn try_read_chunk(&self) -> AudioResult<Option<AudioBuffer>> {
-        self.read_chunk(Duration::ZERO)
-    }
+    // Deprecated; cleanup happens in Drop
+    #[deprecated] fn close(self: Box<Self>) -> AudioResult<()> { Ok(()) }
 
-    /// Returns an async `Stream` that yields audio buffers.
-    ///
-    /// The returned stream is woken via a `Waker` registered with the ring buffer.
-    /// When the OS callback writes data and the consumer side has a pending waker,
-    /// the waker is notified, causing the async runtime to poll for the next item.
-    ///
-    /// The stream yields `Err(...)` on errors and terminates when the
-    /// capturing stream is stopped or closed.
-    fn to_async_stream(&self) -> AudioResult<
-        Pin<Box<dyn Stream<Item = AudioResult<AudioBuffer>> + Send + '_>>
-    >;
-
-    /// Returns the actual audio format being produced by the stream.
-    ///
-    /// This may differ from the requested format if the backend negotiated
-    /// a different format with the OS.
-    fn format(&self) -> &AudioFormat;
-
-    /// Returns estimated latency in frames, if available.
-    fn latency_frames(&self) -> Option<u64>;
+    #[cfg(feature = "async-stream")]
+    fn register_waker(&self, waker: &std::task::Waker) -> bool { false }
+    #[cfg(feature = "async-stream")]
+    fn is_stream_producing(&self) -> bool { true }
 }
 ```
 
-### Changes from Current CapturingStream
+> **Corrections vs. older drafts:** the real `read_chunk(&self)` takes **no**
+> `Duration` argument and the blocking/non-blocking split is `read_chunk` vs.
+> `try_read_chunk` (both `&self`). There is no `latency_frames()` and no
+> `to_async_stream()` on the trait; async streaming lives on
+> `AudioCapture::audio_data_stream()` (behind `async-stream`).
 
-| Current | New | Rationale |
-|---|---|---|
-| `read_chunk(&mut self, timeout_ms: Option<u32>)` | `read_chunk(&self, timeout: Duration)` | `&self` for thread safety; `Duration` is idiomatic Rust |
-| `to_async_stream(&mut self)` returns `+ Sync + 'a` | `to_async_stream(&self)` returns `+ Send + '_` | `Sync` on async streams is unusual; `Send` suffices for cross-task usage |
-| No `try_read_chunk` | Added `try_read_chunk(&self)` | Explicit non-blocking path with default impl |
-| No `format()` method | Added `format(&self) -> &AudioFormat` | Consumers need to know the actual format |
-| `start(&mut self)` | `start(&self)` | Interior mutability — allows shared access |
+### End-of-stream contract (ADR-0003)
+
+`read_chunk()` returns `AudioError::StreamEnded` (Fatal, `ErrorKind::Stream`)
+once the stream is terminal — that, not `StreamReadError`, is the clean
+end-of-stream signal. Ring-buffer overflow does **not** surface as an error: the
+producer drops buffers and bumps `overrun_count()`; poll that (or
+`is_under_backpressure()`) to detect loss. The `BufferOverrun`/`BufferUnderrun`
+variants exist in the taxonomy but are not constructed by the production read
+path.
 
 ---
 
-## 8. AudioBuffer — Data Container
+## 8. AudioBuffer — Data Container and Metering
+
+[`AudioBuffer`](../../src/core/buffer.rs) owns interleaved `f32` samples plus
+`AudioFormat` metadata and an optional timestamp. It is `Clone`, and a
+compile-time assertion enforces `Send + Sync`.
+
+### Construction and access
 
 ```rust
-/// A chunk of captured audio data with metadata.
-///
-/// Audio samples are always stored as interleaved `f32` values.
-/// platform backends convert from native formats (i16, i24, i32) to f32.
-///
-/// # Memory Model
-///
-/// `AudioBuffer` owns its sample data (`Vec<f32>`). When reading from the
-/// ring buffer, samples are copied into a new `Vec`. This ensures the buffer
-/// is safe to send across threads and hold indefinitely.
-///
-/// For zero-copy access within a processing callback, use `AudioBufferRef`.
-#[derive(Debug, Clone)]
-pub struct AudioBuffer {
-    /// Interleaved f32 audio samples.
-    samples: Vec<f32>,
-    /// Audio format describing this buffer's data.
-    format: AudioFormat,
-    /// Timestamp: offset from stream start, in frames.
-    /// Monotonically increasing.
-    frame_offset: u64,
-    /// Wall-clock timestamp when this buffer was captured by the OS.
-    /// `None` if the platform does not provide timestamps.
-    timestamp: Option<Duration>,
-    /// Sequence number for detecting gaps/overruns.
-    sequence: u64,
-}
+AudioBuffer::new(data: Vec<f32>, channels: u16, sample_rate: u32) -> Self; // F32
+AudioBuffer::with_format(data, format) -> Self;
+AudioBuffer::with_timestamp(data, format, ts) -> Self;
+AudioBuffer::empty(channels, sample_rate) -> Self;
+AudioBuffer::from_interleaved(samples, channels, sample_rate) -> Self;     // alias of new
 
-impl AudioBuffer {
-    // === Construction ===
-
-    /// Creates a new AudioBuffer.
-    pub fn new(
-        samples: Vec<f32>,
-        format: AudioFormat,
-        frame_offset: u64,
-        timestamp: Option<Duration>,
-        sequence: u64,
-    ) -> Self { ... }
-
-    // === Sample Access ===
-
-    /// Returns the raw interleaved sample data as a slice.
-    pub fn samples(&self) -> &[f32] { &self.samples }
-
-    /// Returns the raw interleaved sample data as a mutable slice.
-    pub fn samples_mut(&mut self) -> &mut [f32] { &mut self.samples }
-
-    /// Consumes the buffer and returns the owned sample data.
-    pub fn into_samples(self) -> Vec<f32> { self.samples }
-
-    // === Metadata ===
-
-    /// Returns the audio format of this buffer.
-    pub fn format(&self) -> &AudioFormat { &self.format }
-
-    /// Returns the number of channels.
-    pub fn channels(&self) -> u16 { self.format.channels }
-
-    /// Returns the sample rate in Hz.
-    pub fn sample_rate(&self) -> u32 { self.format.sample_rate }
-
-    /// Returns the number of audio frames in this buffer.
-    /// One frame = one sample per channel.
-    pub fn num_frames(&self) -> usize {
-        if self.format.channels == 0 { 0 }
-        else { self.samples.len() / self.format.channels as usize }
-    }
-
-    /// Returns the number of individual samples (frames × channels).
-    pub fn num_samples(&self) -> usize { self.samples.len() }
-
-    /// Returns the duration of audio in this buffer.
-    pub fn duration(&self) -> Duration {
-        Duration::from_secs_f64(
-            self.num_frames() as f64 / self.format.sample_rate as f64
-        )
-    }
-
-    /// Returns the frame offset from stream start.
-    pub fn frame_offset(&self) -> u64 { self.frame_offset }
-
-    /// Returns the capture timestamp, if available.
-    pub fn timestamp(&self) -> Option<Duration> { self.timestamp }
-
-    /// Returns the sequence number. Gaps in sequence numbers
-    /// indicate dropped buffers (overruns).
-    pub fn sequence(&self) -> u64 { self.sequence }
-
-    // === Channel Access ===
-
-    /// Returns samples for a specific channel (0-indexed).
-    ///
-    /// Returns an iterator that yields every Nth sample where N = channels.
-    pub fn channel(&self, channel: u16) -> impl Iterator<Item = f32> + '_ {
-        let ch = channel as usize;
-        let num_ch = self.format.channels as usize;
-        self.samples.iter()
-            .skip(ch)
-            .step_by(num_ch)
-            .copied()
-    }
-
-    /// Returns `true` if all samples are zero (silence).
-    pub fn is_silent(&self) -> bool {
-        self.samples.iter().all(|&s| s == 0.0)
-    }
-}
-
-// AudioBuffer is trivially Send + Sync (Vec<f32> is Send + Sync)
+buf.data() -> &[f32];          buf.into_data() -> Vec<f32>;
+buf.as_slice() -> &[f32];      buf.as_mut_slice() -> &mut [f32];   buf.interleaved() -> &[f32];
+buf.format() -> &AudioFormat;  buf.channels() -> u16;   buf.sample_rate() -> u32;
+buf.timestamp() -> Option<Duration>;
+buf.len() / is_empty() / samples_per_channel() / num_frames() / duration();
+buf.channel_data(ch: u16) -> Option<Vec<f32>>; // allocating de-interleave
 ```
 
-### AudioBufferRef — Zero-Copy Access (Future Extension)
+> **Known limitation (tracked, critique DF-01):** `timestamp()` is always `None`
+> in production — every backend uses the non-timestamping push path. Treat
+> `timestamp()` as reserved until a backend wires a producer-side stamp.
+
+### Level metering (RT-safe, allocation-free)
+
+These are **read-only observability metrics** over the existing samples (VU
+meters, clip detection, silence gating) — **not** DSP. Each is `#[inline]`,
+allocation-free, and lock-free (safe on the audio callback thread). Non-finite
+samples (`NaN`/`±inf`) are skipped so one poisoned sample cannot corrupt a meter.
 
 ```rust
-/// A borrowed view of audio data, avoiding allocation.
-///
-/// Used in performance-critical paths like OS callbacks or processing chains.
-/// Cannot be sent across threads or stored beyond the callback scope.
-pub struct AudioBufferRef<'a> {
-    samples: &'a [f32],
-    format: &'a AudioFormat,
-    frame_offset: u64,
-    timestamp: Option<Duration>,
-    sequence: u64,
-}
-
-impl<'a> AudioBufferRef<'a> {
-    /// Copies the data into an owned AudioBuffer.
-    pub fn to_owned(&self) -> AudioBuffer { ... }
-
-    // Same accessor methods as AudioBuffer (samples, format, etc.)
-}
+buf.rms() -> f32;        buf.peak() -> f32;        // 0.0 for empty/silence; never NaN
+buf.rms_dbfs() -> f32;   buf.peak_dbfs() -> f32;   // NEG_INFINITY at silence; 0.0 dBFS at full scale
+buf.channel_rms(ch: u16) -> Option<f32>;           // strided, no allocation; None if ch out of range
+buf.channel_peak(ch: u16) -> Option<f32>;          // Some(0.0) for an empty-but-existing channel
 ```
-
-### Changes from Current AudioBuffer
-
-| Current | New | Rationale |
-|---|---|---|
-| Public `data: Vec<f32>` field | Private `samples` with `samples()` accessor | Encapsulation; prevents accidental replacement |
-| Separate `channels`, `sample_rate`, `format` fields | Single `format: AudioFormat` + derived accessors | Avoids duplication; format is the canonical source |
-| `timestamp: Duration` (always present) | `timestamp: Option<Duration>` | Not all platforms provide timestamps |
-| No `frame_offset` | Added `frame_offset: u64` | Critical for gap detection and timing |
-| No `sequence` | Added `sequence: u64` | Enables overrun detection |
-| `unsafe impl Send/Sync` | Not needed (`Vec<f32>` is auto Send+Sync) | Current unsafe impls are unnecessary |
 
 ---
 
-## 9. DeviceEnumerator Trait
+## 9. Device Enumeration, DeviceInfo, and Device Watching
+
+### DeviceEnumerator + AudioDevice (`core/interface.rs`)
 
 ```rust
-/// Information about an audio device.
-#[derive(Debug, Clone)]
-pub struct DeviceInfo {
-    /// Unique platform-specific device ID.
-    /// Use this value in `CaptureTarget::Device { id }`.
-    pub id: String,
-
-    /// Human-readable device name.
-    pub name: String,
-
-    /// Whether this is an input, output, or loopback device.
-    pub kind: DeviceKind,
-
-    /// Whether this device is the system default for its kind.
-    pub is_default: bool,
-
-    /// Native audio format, if known.
-    pub default_format: Option<AudioFormat>,
-
-    /// All supported formats, if enumerable.
-    pub supported_formats: Vec<AudioFormat>,
-
-    /// Whether the device is currently active/connected.
-    pub is_active: bool,
-}
-
-/// Device direction/role.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-pub enum DeviceKind {
-    /// Input device (microphone, line-in)
-    Input,
-    /// Output device (speakers, headphones)
-    Output,
-    /// Loopback/monitor (captures output audio)
-    Loopback,
-}
-
-/// Trait for enumerating audio devices on the system.
-///
-/// Platform backends implement this trait. The user obtains an implementation
-/// via `enumerate_devices()` (free function) or `DeviceEnumerator::new()`.
 pub trait DeviceEnumerator: Send + Sync {
-    /// Lists all available audio devices.
-    fn enumerate_devices(&self) -> AudioResult<Vec<DeviceInfo>>;
-
-    /// Returns the default input device, if any.
-    fn default_input(&self) -> AudioResult<Option<DeviceInfo>>;
-
-    /// Returns the default output device, if any.
-    fn default_output(&self) -> AudioResult<Option<DeviceInfo>>;
-
-    /// Finds a device by its ID.
-    fn device_by_id(&self, id: &str) -> AudioResult<Option<DeviceInfo>>;
-
-    /// Finds devices matching a name pattern (case-insensitive substring).
-    fn devices_by_name(&self, pattern: &str) -> AudioResult<Vec<DeviceInfo>>;
+    fn enumerate_devices(&self) -> AudioResult<Vec<Box<dyn AudioDevice>>>;
+    fn default_device(&self) -> AudioResult<Box<dyn AudioDevice>>;
+    fn watch(&self, on_event: DeviceEventHandler) -> AudioResult<DeviceWatcher>; // provided; default PlatformNotSupported
 }
 
-/// Creates a platform-specific device enumerator.
-///
-/// # Example
-///
-/// ```rust
-/// use rsac::enumerate_devices;
-///
-/// let enumerator = enumerate_devices()?;
-/// for device in enumerator.enumerate_devices()? {
-///     println!("{}: {} ({:?})", device.id, device.name, device.kind);
-/// }
-/// ```
-pub fn enumerate_devices() -> AudioResult<Box<dyn DeviceEnumerator>> { ... }
+pub trait AudioDevice: Send + Sync {
+    fn id(&self) -> DeviceId;
+    fn name(&self) -> String;
+    fn is_default(&self) -> bool;
+    fn supported_formats(&self) -> Vec<AudioFormat>;
+    fn kind(&self) -> AudioResult<DeviceKind>;   // provided; default PlatformNotSupported
+    fn describe(&self) -> DeviceInfo;            // provided; composed from the accessors
+    fn create_stream(&self, config: &StreamConfig) -> AudioResult<Box<dyn CapturingStream>>;
+}
 ```
 
-### Changes from Current DeviceEnumerator
+Obtain an enumerator via the [`get_device_enumerator()`](../../src/audio/mod.rs)
+facade. The concrete facade method to fetch the default is `get_default_device()`
+(the trait method is `default_device()` — a known naming divergence, critique
+API-ERG).
 
-| Current | New | Rationale |
-|---|---|---|
-| Associated type `Device: AudioDevice` | Returns `DeviceInfo` (plain struct) | No more associated types = object-safe, no generic propagation |
-| `AudioDevice` trait with many methods | Flat `DeviceInfo` struct | Simpler; devices are just data, not active objects |
-| `get_device_by_id` takes `&<Self::Device as AudioDevice>::DeviceId` | `device_by_id(&self, id: &str)` | IDs are always strings in practice; removes the associated type |
-| No name search | Added `devices_by_name()` | Common use case |
+### DeviceInfo — owned metadata snapshot
+
+```rust
+#[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
+pub struct DeviceInfo {
+    pub id: DeviceId,
+    pub name: String,
+    pub kind: DeviceKind,            // Input | Output
+    pub is_default: bool,
+    pub default_format: Option<AudioFormat>, // first supported_formats() entry, or None
+}
+```
+
+`AudioDevice::describe()` builds a `DeviceInfo` from the existing accessors; it
+is infallible, falling back to `DeviceKind::Input` when `kind()` errors (the
+capture-oriented default), so callers that need to distinguish "known input"
+from "indeterminate" should call `kind()` directly. On Linux/PipeWire
+`supported_formats()` is intentionally empty (negotiation at stream-open), so
+`default_format` is `None` there by design.
+
+### Device watching — DeviceEvent + DeviceWatcher
+
+`DeviceEnumerator::watch(handler)` subscribes to device hot-plug / default-change
+notifications, returning a [`DeviceWatcher`](../../src/core/interface.rs) RAII
+guard.
+
+```rust
+#[non_exhaustive]
+pub enum DeviceEvent {
+    DeviceAdded   { id: DeviceId, name: String, kind: DeviceKind },
+    DeviceRemoved { id: DeviceId },
+    DefaultChanged{ id: DeviceId, kind: DeviceKind },
+    StateChanged  { id: DeviceId, available: bool },
+}
+pub type DeviceEventHandler = Box<dyn FnMut(DeviceEvent) + Send + 'static>;
+```
+
+- The handler runs on the backend's **OS notification thread** (the WASAPI
+  `IMMNotificationClient` callback, the CoreAudio property-listener thread, or
+  the PipeWire loop thread) — **never** the real-time audio callback thread — so
+  the handler may allocate and lock.
+- Dropping the `DeviceWatcher` unregisters the OS listener and joins the notify
+  thread; the handler will not run after `drop` returns. `Drop` is best-effort
+  and never panics.
+- `watch()` is a **provided** trait method defaulting to `PlatformNotSupported`;
+  backends whose `PlatformCapabilities::supports_device_change_notifications` is
+  `true` override it.
+
+> **Per-platform divergence (documented, tracked, critique ADR-R1):** Windows and
+> macOS hand events off via a bounded `sync_channel(64)` + dedicated helper
+> thread (drop-on-full backpressure), so the user handler never runs on the OS
+> notify thread. **Linux** invokes the handler **directly on the PipeWire loop
+> thread** (no channel, no helper thread, no bounded backpressure) because
+> PipeWire's `!Send` `Rc` loop objects make same-thread invocation natural. The
+> trait contract above ("OS notification thread, never the RT audio thread")
+> holds on all three, but the threading model, channel bound, and event-loss
+> policy differ. A device-watch threading ADR captures this decision.
 
 ---
 
-## 10. ApplicationEnumerator Trait
+## 10. Source Introspection and Diagnostics
+
+### Source discovery (`core/introspection.rs`)
 
 ```rust
-/// Information about a capturable application.
-#[derive(Debug, Clone)]
-pub struct CapturableApplication {
-    /// The process ID. Use with `CaptureTarget::Application { pid }`.
-    pub pid: u32,
+pub fn list_audio_sources() -> AudioResult<Vec<AudioSource>>;        // system default + devices + apps
+pub fn list_audio_applications() -> AudioResult<Vec<AudioSource>>;   // best-effort; empty if unsupported
+pub fn check_audio_capture_permission() -> PermissionStatus;        // Granted/NotDetermined/Denied/NotRequired
 
-    /// Application/process name.
-    pub name: String,
-
-    /// Whether the application is currently producing audio.
-    pub is_producing_audio: bool,
-
-    /// Platform-specific metadata.
-    pub platform: PlatformAppInfo,
+pub struct AudioSource { pub id: String, pub name: String, pub kind: AudioSourceKind }
+pub enum AudioSourceKind {
+    SystemDefault,
+    Device { device_id: String, is_default: bool, kind: Option<DeviceKind> },
+    Application { pid: u32, app_name: String, bundle_id: Option<String> },
 }
-
-/// Platform-specific application metadata.
-#[derive(Debug, Clone)]
-pub enum PlatformAppInfo {
-    /// No extra info available.
-    Generic,
-
-    /// Windows-specific info.
-    Windows {
-        /// Executable path.
-        exe_path: Option<String>,
-        /// Audio session identifier.
-        session_id: Option<String>,
-    },
-
-    /// Linux-specific info (PipeWire).
-    Linux {
-        /// PipeWire node ID.
-        node_id: Option<u32>,
-        /// PipeWire media class (e.g., "Stream/Output/Audio").
-        media_class: Option<String>,
-        /// Application name reported by PipeWire.
-        pipewire_app_name: Option<String>,
-    },
-
-    /// macOS-specific info.
-    MacOS {
-        /// Bundle identifier (e.g., "com.apple.Safari").
-        bundle_id: Option<String>,
-    },
-}
-
-/// Trait for discovering applications that can be captured.
-pub trait ApplicationEnumerator: Send + Sync {
-    /// Lists all applications currently producing audio.
-    fn list_capturable(&self) -> AudioResult<Vec<CapturableApplication>>;
-
-    /// Lists ALL running applications, whether or not they are producing audio.
-    /// The `is_producing_audio` field indicates current audio status.
-    fn list_all(&self) -> AudioResult<Vec<CapturableApplication>>;
-
-    /// Finds a capturable application by PID.
-    fn find_by_pid(&self, pid: u32) -> AudioResult<Option<CapturableApplication>>;
-
-    /// Finds capturable applications by name (case-insensitive substring match).
-    fn find_by_name(&self, pattern: &str) -> AudioResult<Vec<CapturableApplication>>;
-}
-
-/// Creates a platform-specific application enumerator.
-///
-/// # Example
-///
-/// ```rust
-/// use rsac::enumerate_applications;
-///
-/// let enumerator = enumerate_applications()?;
-/// for app in enumerator.list_capturable()? {
-///     println!("PID {}: {} (producing audio: {})",
-///         app.pid, app.name, app.is_producing_audio);
-/// }
-/// ```
-pub fn enumerate_applications() -> AudioResult<Box<dyn ApplicationEnumerator>> { ... }
+// AudioSource::to_capture_target() — an Application source maps to
+// CaptureTarget::Application (that session only), NOT ProcessTree.
 ```
 
-### Changes from Current Application Discovery
+> **Known limitation (tracked, critique DAG-001/002):** `list_audio_sources` /
+> `list_audio_applications` live in `core` but reach **up** into `crate::audio::*`
+> backend functions, violating the documented `core` → `audio` layering DAG. This
+> is a code fix tracked separately; the public re-export paths
+> (`rsac::list_audio_sources`) are stable regardless of where the impl lands.
 
-| Current | New | Rationale |
-|---|---|---|
-| `ApplicationCapture` trait (push-model `Fn(&[f32])`) | Removed — `AudioCapture` subsumes this role | Unified API; no separate capture trait for apps |
-| `ApplicationCaptureFactory` | `enumerate_applications()` + `CaptureTarget::Application` | Factory is split: discovery vs capture |
-| `ApplicationInfo` with `PlatformSpecificInfo` enum | `CapturableApplication` with `PlatformAppInfo` | Renamed for clarity; same concept |
-| `AudioSourceDiscovery` class with hardcoded app lists | `ApplicationEnumerator` trait backed by real platform APIs | The current discovery module uses hardcoded app lists and mock data |
+### StreamStats / BackpressureReport
+
+`AudioCapture::stream_stats()` returns a cheap point-in-time snapshot; counters
+are `Relaxed` loads on the non-RT query path (no allocation on / contention with
+the audio callback). Both types are `#[non_exhaustive]` — construct via
+`Default` + field assignment and match with `..`.
+
+```rust
+#[non_exhaustive]
+pub struct StreamStats {
+    pub overruns: u64,           // alias of buffers_dropped
+    pub buffers_captured: u64,   // delivered to the consumer
+    pub buffers_dropped: u64,    // lost to ring-buffer overflow
+    pub buffers_pushed: u64,     // enqueued by the producer
+    pub uptime: Duration,        // ZERO when not started
+    pub is_running: bool,
+    pub format_description: String, // e.g. "2ch 48000Hz F32"; lazily built, never per-buffer
+}
+// StreamStats::dropped_ratio() = dropped / (captured + dropped), zero-guarded.
+
+#[non_exhaustive]
+pub struct BackpressureReport {
+    pub window: Duration,        // ZERO today (lifetime totals; windowed atomics tracked)
+    pub pushed: u64,
+    pub dropped: u64,
+    pub drop_rate: f64,          // dropped / (pushed + dropped), zero-guarded
+    pub is_under_backpressure: bool, // legacy consecutive-drop bool, carried unchanged
+}
+```
+
+`backpressure_report()` surfaces sustained **partial** loss (a steady drop_rate)
+that the legacy consecutive-drop `is_under_backpressure` bool misses. The
+`window` is `Duration::ZERO` today because the implementation derives the report
+from lifetime `buffers_pushed`/`buffers_dropped` counters; when the bridge
+exposes per-window atomics the method swaps source and reports a real window
+without changing the public shape (tracked, `rsac-cfe4`).
 
 ---
 
 ## 11. Streaming Consumption Modes
 
-All modes operate on the same underlying ring buffer. They are not mutually exclusive in the new design — but using multiple consumers concurrently means they compete for the same data. The recommended usage is one primary consumer.
+All modes read from the same ring buffer; mixing them means they compete for the
+same data. Recommended: one primary consumer.
 
-### 11.1 Pull/Sync — Blocking Read
+### 11.1 Non-blocking pull
 
 ```rust
-// Read one chunk at a time with a timeout
-let capture = AudioCaptureBuilder::new().build()?;
+let mut capture = AudioCaptureBuilder::new().build()?;
 capture.start()?;
-
 loop {
-    match capture.read_chunk(Duration::from_millis(100))? {
+    match capture.read_buffer()? {           // &mut self, non-blocking
         Some(buffer) => process(&buffer),
-        None => {
-            // Timeout — no data yet. Check if we should stop.
+        None => {                            // no data yet
+            std::thread::sleep(std::time::Duration::from_millis(1));
             if should_stop() { break; }
         }
     }
 }
-
 capture.stop()?;
 ```
 
-### 11.2 Non-Blocking — Try Read
+`read_buffer()` errors if the stream is not initialized or not running; it does
+not signal clean end-of-stream itself. Handle `Ok(None)` with a short sleep and
+break on a fatal error (`e.is_fatal()`); retry on recoverable errors.
+
+### 11.2 Blocking pull
 
 ```rust
-// Poll for data without blocking (useful in game loops, GUI event loops)
-loop {
-    if let Some(buffer) = capture.try_read_chunk()? {
-        process(&buffer);
-    }
-    
-    // Do other work...
-    do_game_loop_tick();
-}
+let buffer = capture.read_buffer_blocking()?; // &mut self; blocks until data
 ```
 
-### 11.3 Async — futures::Stream
+### 11.3 Blocking iterator
+
+```rust
+for result in capture.buffers_iter() {       // &mut self
+    let buffer = result?;                     // yields AudioResult<AudioBuffer>
+    process(&buffer);
+}
+// Ends (None) on StreamEnded after draining the buffered tail; surfaces other errors.
+```
+
+### 11.4 Channel subscription
+
+```rust
+let rx: mpsc::Receiver<AudioBuffer> = capture.subscribe()?; // &self
+while let Ok(buffer) = rx.recv() { process(&buffer); }
+```
+
+`subscribe()` spawns a background `rsac-subscribe` thread that reads from the
+stream and sends over an `mpsc` channel; it exits when the stream stops/errors or
+the `Receiver` is dropped. It polls with a ~1 ms sleep on an empty ring (so the
+first buffer after an idle period can be delayed up to ~1 ms) and delivers
+`AudioBuffer` (the terminating error is not delivered — critique API-ERG; for
+latency-critical or error-aware consumers prefer the blocking read or the async
+stream). The reader thread is detached and is **not** reclaimed by `stop()`/`Drop`
+(critique CT) — holding a `Receiver` keeps reading until the stream stops.
+
+### 11.5 Async stream (feature `async-stream`)
 
 ```rust
 use futures_util::StreamExt;
-
-let capture = AudioCaptureBuilder::new().build()?;
-capture.start()?;
-
-let mut stream = capture.async_stream()?;
+let mut stream = capture.audio_data_stream()?;  // AsyncAudioStream<'_>; waker-driven
 while let Some(result) = stream.next().await {
     let buffer = result?;
     process_async(&buffer).await;
 }
 ```
 
-### 11.4 Iterator — Sync Iteration
+Without the `async-stream` feature, `audio_data_stream()` returns
+`PlatformNotSupported`.
+
+### 11.6 Callback (push)
 
 ```rust
-let capture = AudioCaptureBuilder::new().build()?;
-capture.start()?;
-
-// Blocking iterator — blocks on each next() until data arrives
-for result in capture.buffers_iter() {
-    let buffer = result?;
-    process(&buffer);
-}
-```
-
-### 11.5 Callback — Push Mode
-
-```rust
-let capture = AudioCaptureBuilder::new().build()?;
-
-capture.set_callback(|buffer: &AudioBuffer| {
-    // Called on a dedicated reader thread, NOT the OS audio thread.
-    // Safe to do moderate work here (no allocation-heavy or blocking I/O).
-    let rms = compute_rms(buffer.samples());
-    log::info!("RMS: {:.4}", rms);
+let mut capture = AudioCaptureBuilder::new().build()?;
+capture.set_callback(|buffer: &AudioBuffer| {     // before start(); &mut self
+    let level = buffer.rms_dbfs();                // use the RT-safe metering API
+    log::info!("RMS: {level:.1} dBFS");
 })?;
-
-capture.start()?;
-
-// Audio is processed in the background.
-// Block until user wants to stop.
-wait_for_ctrl_c();
+capture.start()?;                                 // moves the closure into a pump thread
+// … later …
 capture.stop()?;
 ```
 
-### 11.6 Sink Adapters — Piped Output
+The callback runs on a dedicated **callback pump thread** (not the OS audio
+thread). A fatal read (`StreamEnded`) stops the pump; transient/recoverable read
+errors are logged and retried. See [ADR-0002](../designs/0002-callback-delivery.md).
+
+---
+
+## 12. The `capture!` Macro
+
+[`capture!`](../../src/lib.rs) builds an `AudioCaptureBuilder` in one expression
+with named, order-independent fields. It **always evaluates to an
+`AudioCaptureBuilder`** (never a `Result`), so the caller chooses the terminal
+step — `.build()` for the handle or `.start()` for a `RunningCapture`. It is
+`#[macro_export]`ed (reachable as `rsac::capture!` and via the prelude) and only
+calls public builder methods, so it works unchanged in downstream crates.
+
+### Grammar
+
+Target forms (shorthand or explicit key):
+
+| Form                         | Equivalent                                              |
+|------------------------------|---------------------------------------------------------|
+| `capture!(system)`           | `with_target(CaptureTarget::SystemDefault)`             |
+| `capture!(device: id)`       | `Device(DeviceId(id.to_string()))` (any `Display`)      |
+| `capture!(app: pid)`         | `Application(ApplicationId(pid.to_string()))`           |
+| `capture!(name: n)`          | `ApplicationByName(n.to_string())`                      |
+| `capture!(tree: pid)`        | `ProcessTree` via `CaptureTarget::pid(pid)` (a `u32`)   |
+| `capture!(target: t)`        | `with_target(t)` (a `CaptureTarget` expr)               |
+| `capture!(target_str: s)`    | `try_target_str(s)` (infallible; keeps default on error)|
+
+Config keys: `sample_rate:` (alias `rate:`), `channels:`, `sample_format:`,
+`buffer_size:`. Every field is optional; omitting one keeps the default
+(system-default target, 48 kHz, 2ch, F32). Fields may appear in any order,
+comma-separated.
 
 ```rust
-use rsac::sink::{WavFileSink, ChannelSink};
+use rsac::capture;
+let builder = capture!(system, rate: 48000, channels: 2);
+let app     = capture!(app: 1234);
+let dev     = capture!(sample_format: SampleFormat::I16, device: "hw:0,0");
 
-// Write to WAV file
-let capture = AudioCaptureBuilder::new().build()?;
-capture.pipe_to(WavFileSink::new("output.wav")?)?;
-capture.start()?;
-std::thread::sleep(Duration::from_secs(10));
-capture.stop()?; // Finalizes WAV header
-
-// Send buffers over a channel
-let (tx, rx) = std::sync::mpsc::channel();
-capture.pipe_to(ChannelSink::new(tx))?;
-capture.start()?;
-
-// Receive on another thread
-while let Ok(buffer) = rx.recv() {
-    process(&buffer);
-}
-```
-
-### AudioStream Type (Async)
-
-```rust
-/// An asynchronous stream of audio buffers.
-///
-/// Created by `AudioCapture::async_stream()`.
-/// Implements `futures_core::Stream<Item = AudioResult<AudioBuffer>>`.
-pub struct AudioStream {
-    // Internal: reads from ring buffer, woken by OS callback via Waker
-    inner: Pin<Box<dyn Stream<Item = AudioResult<AudioBuffer>> + Send>>,
-}
-
-impl Stream for AudioStream {
-    type Item = AudioResult<AudioBuffer>;
-
-    fn poll_next(
-        self: Pin<&mut Self>,
-        cx: &mut Context<'_>,
-    ) -> Poll<Option<Self::Item>> {
-        self.get_mut().inner.as_mut().poll_next(cx)
-    }
-}
-```
-
-### AudioBufferIterator Type (Sync)
-
-```rust
-/// A blocking iterator over audio buffers.
-///
-/// Created by `AudioCapture::buffers_iter()`.
-/// Each call to `next()` blocks until data is available or the stream ends.
-pub struct AudioBufferIterator {
-    // Internal: reference to the capturing stream
-    capture: Arc<AudioCaptureInner>,
-}
-
-impl Iterator for AudioBufferIterator {
-    type Item = AudioResult<AudioBuffer>;
-
-    fn next(&mut self) -> Option<Self::Item> {
-        if !self.capture.is_running() {
-            return None;
-        }
-        match self.capture.read_chunk(Duration::from_secs(1)) {
-            Ok(Some(buffer)) => Some(Ok(buffer)),
-            Ok(None) => {
-                // Timeout — check if still running
-                if self.capture.is_running() {
-                    self.next() // Retry
-                } else {
-                    None
-                }
-            }
-            Err(AudioError::StreamClosed) => None,
-            Err(e) => Some(Err(e)),
-        }
-    }
-}
+// Straight to a running capture (prelude in scope):
+let mut running = capture!(system, rate: 44100).start()?;
 ```
 
 ---
 
-## 12. AudioSink Trait — Downstream Consumers
+## 13. AudioSink — Downstream Consumers
+
+[`AudioSink`](../../src/sink/traits.rs) is the trait for consuming captured
+buffers. It and the bundled sinks **exist** and are exported, but the user wires
+them manually — see the [§16](#16-not-yet-implemented--tracked) note on
+`pipe_to()`.
 
 ```rust
-/// A destination for captured audio data.
-///
-/// Sinks are the counterpart to the capture stream. They receive
-/// `AudioBuffer` values and write them to a destination (file, network,
-/// channel, analysis pipeline, etc.).
-pub trait AudioSink: Send + 'static {
-    /// Writes a buffer of audio data to the sink.
-    ///
-    /// Called on a dedicated reader thread.
+pub trait AudioSink: Send {                       // Send (not Send + 'static)
     fn write(&mut self, buffer: &AudioBuffer) -> AudioResult<()>;
-
-    /// Flushes any buffered data. Called when the stream stops.
-    fn flush(&mut self) -> AudioResult<()> {
-        Ok(()) // Default no-op
-    }
-
-    /// Closes the sink, releasing resources. Called when the capture session drops.
-    fn close(&mut self) -> AudioResult<()> {
-        self.flush()
-    }
-}
-
-// === Built-in Sinks ===
-
-/// Writes audio to a WAV file.
-pub struct WavFileSink { ... }
-
-impl WavFileSink {
-    pub fn new(path: impl AsRef<Path>) -> AudioResult<Self> { ... }
-}
-
-impl AudioSink for WavFileSink {
-    fn write(&mut self, buffer: &AudioBuffer) -> AudioResult<()> { ... }
-    fn flush(&mut self) -> AudioResult<()> { ... }
-    fn close(&mut self) -> AudioResult<()> { ... }
-}
-
-/// Sends audio buffers over a channel.
-pub struct ChannelSink {
-    tx: std::sync::mpsc::Sender<AudioBuffer>,
-}
-
-impl ChannelSink {
-    pub fn new(tx: std::sync::mpsc::Sender<AudioBuffer>) -> Self { ... }
-}
-
-impl AudioSink for ChannelSink {
-    fn write(&mut self, buffer: &AudioBuffer) -> AudioResult<()> {
-        self.tx.send(buffer.clone())
-            .map_err(|_| AudioError::StreamClosed)?;
-        Ok(())
-    }
-}
-
-/// Sends audio buffers over a tokio channel.
-pub struct TokioChannelSink {
-    tx: tokio::sync::mpsc::Sender<AudioBuffer>,
-}
-
-impl AudioSink for TokioChannelSink {
-    fn write(&mut self, buffer: &AudioBuffer) -> AudioResult<()> {
-        self.tx.blocking_send(buffer.clone())
-            .map_err(|_| AudioError::StreamClosed)?;
-        Ok(())
-    }
-}
-
-/// Discards all audio data. Useful for benchmarking.
-pub struct NullSink;
-
-impl AudioSink for NullSink {
-    fn write(&mut self, _buffer: &AudioBuffer) -> AudioResult<()> { Ok(()) }
+    fn flush(&mut self) -> AudioResult<()> { Ok(()) }
+    fn close(&mut self) -> AudioResult<()> { self.flush() }
 }
 ```
 
----
-
-## 13. Public Exports and Prelude
-
-### `lib.rs` — Top-Level Exports
+Bundled sinks (real signatures — note these differ from older drafts):
 
 ```rust
-//! # rsac — Rust Cross-Platform Audio Capture
-//!
-//! A library for capturing system audio and application-specific audio
-//! on Windows (WASAPI), Linux (PipeWire), and macOS (CoreAudio Process Tap).
-//!
-//! ## Quick Start
-//!
-//! ```rust
-//! use rsac::prelude::*;
-//!
-//! let capture = AudioCaptureBuilder::new()
-//!     .target(CaptureTarget::SystemDefault)
-//!     .build()?;
-//!
-//! capture.start()?;
-//!
-//! for result in capture.buffers_iter().take(100) {
-//!     let buffer = result?;
-//!     println!("Captured {} frames", buffer.num_frames());
-//! }
-//!
-//! capture.stop()?;
-//! ```
+// Discards audio (benchmarking / smoke tests).
+NullSink::new() -> NullSink;
 
-// ===== Core modules =====
-mod core;
-mod api;
-mod audio;   // Platform backends (private)
+// Sends buffers over an mpsc channel; new() returns BOTH the sink and the receiver.
+let (sink, rx): (ChannelSink, mpsc::Receiver<AudioBuffer>) = ChannelSink::new();
 
-// ===== Public re-exports =====
-
-// Builder and session
-pub use api::{AudioCaptureBuilder, AudioCapture, ResolvedConfig};
-
-// Types
-pub use core::target::CaptureTarget;
-pub use core::config::{AudioFormat, SampleFormat, StreamConfig};
-pub use core::buffer::{AudioBuffer, AudioBufferRef};
-pub use core::error::{AudioError, AudioResult};
-
-// Traits
-pub use core::stream::CapturingStream;
-pub use core::enumerator::{
-    DeviceEnumerator, DeviceInfo, DeviceKind,
-    ApplicationEnumerator, CapturableApplication, PlatformAppInfo,
-};
-pub use core::sink::AudioSink;
-
-// Streaming types
-pub use api::stream::{AudioStream, AudioBufferIterator};
-
-// Factory functions
-pub use api::enumerate_devices;
-pub use api::enumerate_applications;
-
-// Sink implementations
-pub mod sink {
-    pub use crate::core::sink::{
-        WavFileSink, ChannelSink, TokioChannelSink, NullSink,
-    };
-}
-
-/// The prelude — import everything you typically need.
-///
-/// ```rust
-/// use rsac::prelude::*;
-/// ```
-pub mod prelude {
-    pub use crate::{
-        AudioCaptureBuilder, AudioCapture,
-        CaptureTarget, AudioFormat, SampleFormat,
-        AudioBuffer, AudioError, AudioResult,
-        CapturingStream, DeviceEnumerator, ApplicationEnumerator,
-        AudioSink,
-        enumerate_devices, enumerate_applications,
-    };
-    
-    // Re-export Stream trait for async usage
-    pub use futures_core::Stream;
-    
-    // Re-export Duration for timeout parameters
-    pub use std::time::Duration;
-}
+// Writes a WAV file (feature `sink-wav`); needs the format up front.
+let sink = WavFileSink::new("output.wav", &format)?; // AudioResult<WavFileSink>
 ```
 
-### What Gets *Removed* from lib.rs
-
-The following current exports are deprecated/removed in the canonical API:
-
-- `get_audio_backend`, `AudioCaptureBackend`, `AudioCaptureStream` — old API dead code
-- `AudioApplication` — replaced by `CapturableApplication`
-- `AudioStream` trait — replaced by `CapturingStream` (the old `AudioStream` with `open/start/pause/resume/stop/close` is over-engineered for capture)
-- `DeviceSelector` — replaced by `CaptureTarget`
-- `SampleType` — replaced by `SampleFormat`
-- `StreamDataCallback` — replaced by `AudioCapture::set_callback()`
-- `AudioProcessor` / `ProcessError` — replaced by `AudioSink` trait (processing is the user's concern, not the library's)
-- `AudioFileFormat` — internalized into `WavFileSink`
-- Platform-specific type re-exports (`WasapiBackend`, `PipeWireBackend`, `CoreAudioBackend`, `WindowsDeviceEnumerator`, etc.) — backends are private; only traits are public
-
----
-
-## 14. Platform Mapping Notes
-
-### Windows (WASAPI)
-
-| Concept | WASAPI Mechanism |
-|---|---|
-| System Default | `IAudioClient` in loopback mode on default render endpoint |
-| Device by ID | `IMMDeviceEnumerator::GetDevice(id)` |
-| Application PID | `ActivateAudioInterfaceAsync` with `AUDIOCLIENT_ACTIVATION_PARAMS` + `PROCESS_LOOPBACK_MODE_INCLUDE_TARGET_PROCESS_TREE` |
-| Process Tree | Same as above with tree flag |
-| Ring buffer bridge | WASAPI `IAudioCaptureClient::GetBuffer` → `rtrb::Producer::write_chunk()` |
-| Device enumeration | `IMMDeviceEnumerator::EnumAudioEndpoints` |
-| App enumeration | `IAudioSessionManager2::GetSessionEnumerator` → iterate sessions |
-
-### Linux (PipeWire)
-
-| Concept | PipeWire Mechanism |
-|---|---|
-| System Default | Monitor stream on the default sink |
-| Device by ID | PipeWire node by serial/object.id |
-| Application PID | Find node with matching `application.process.id` → create monitor stream |
-| Application by Name | Find node with matching `application.name` → create monitor stream |
-| Process Tree | Monitor multiple nodes (root PID + children via /proc) |
-| Ring buffer bridge | PipeWire callback → spa_buffer → convert to f32 → `rtrb::Producer::write_chunk()` |
-| Device enumeration | Registry listener for nodes with `media.class = Audio/Sink` or `Audio/Source` |
-| App enumeration | Registry listener for nodes with `media.class = Stream/Output/Audio` |
-| **Key issue** | PipeWire objects are `Rc` (not `Send`). All PipeWire interaction must happen on the PipeWire thread. The `CapturingStream` impl must communicate with the PipeWire thread via channels. |
-
-### macOS (CoreAudio)
-
-| Concept | CoreAudio Mechanism |
-|---|---|
-| System Default | `AudioHardwareCreateProcessTap` with all-process tap → aggregate device |
-| Device by ID | `AudioObjectGetPropertyData` with `kAudioHardwarePropertyDevices` → find by UID |
-| Application PID | `CATapDescription` with target PID → `AudioHardwareCreateProcessTap` → aggregate device → `AudioUnit` |
-| Application by Name | Resolve name to PID via `NSWorkspace.runningApplications` → same as above |
-| Process Tree | `CATapDescription` with multiple PIDs |
-| Ring buffer bridge | `AudioUnit` render callback → `rtrb::Producer::write_chunk()` |
-| Device enumeration | `AudioObjectGetPropertyData` on `kAudioObjectSystemObject` |
-| App enumeration | `NSWorkspace.runningApplications` + check for active audio sessions |
-| **Key requirement** | macOS 14.4+ for Process Tap. `NSAudioCaptureUsageDescription` in Info.plist. |
-
----
-
-## 15. Ring Buffer Bridge Architecture
-
-All platforms use the same bridge pattern:
-
-```mermaid
-graph LR
-    A[OS Audio Callback] -->|real-time thread| B[f32 conversion]
-    B --> C[rtrb::Producer write_chunk_uninit]
-    C --> D[SPSC Ring Buffer]
-    D --> E[rtrb::Consumer read_chunk]
-    E --> F[AudioBuffer construction]
-    
-    D -->|Waker notify| G[Async Stream poll_next]
-    
-    H[Overrun counter] -.-> D
-```
+There is **no** `TokioChannelSink`. Wiring a sink is the consumer's job today:
 
 ```rust
-/// Internal bridge between OS audio callback and consumer.
-///
-/// One instance per CapturingStream. Not exposed publicly.
-struct RingBufferBridge {
-    /// Lock-free SPSC ring buffer.
-    producer: rtrb::Producer<f32>,
-    consumer: rtrb::Consumer<f32>,
-    
-    /// Waker for the async stream consumer.
-    /// Set by `poll_next()`, triggered by the OS callback after writing.
-    waker: Arc<AtomicWaker>,
-    
-    /// Format of the audio in the ring buffer.
-    format: AudioFormat,
-    
-    /// Monotonic frame counter (written by producer).
-    frame_count: Arc<AtomicU64>,
-    
-    /// Sequence counter (incremented per chunk written).
-    sequence: Arc<AtomicU64>,
-    
-    /// Overrun counter — incremented when producer overwrites unconsumed data.
-    overruns: Arc<AtomicU64>,
-}
-```
-
-### Why `rtrb`?
-
-- **Lock-free SPSC queue** — exactly the right primitive for one-producer (OS callback), one-consumer (user) scenarios.
-- **No allocation on the hot path** — critical for real-time audio.
-- **`read_chunk()` / `write_chunk_uninit()`** — efficient batch operations matching how audio APIs deliver data in frames.
-- **Already exists in the Rust ecosystem** — well-tested, no-std compatible.
-
----
-
-## 16. Design Rationale
-
-### R1: Why CaptureTarget instead of DeviceSelector + PID fields?
-
-The current API has `device_selector`, `target_application_pid`, and `target_application_session_identifier` as separate concerns with complex interaction rules (if PID is set, device must be output, device is force-overridden, etc.). `CaptureTarget` unifies these into a single discriminated union where each variant is self-contained.
-
-### R2: Why make all builder fields optional?
-
-The current builder requires `sample_rate`, `channels`, `sample_format`, and `bits_per_sample`. This forces users to know implementation details before they can capture anything. Most users want "just capture system audio" — the new API allows:
-
-```rust
-AudioCaptureBuilder::new().build()?;
-```
-
-The library queries the device for its native format and uses that.
-
-### R3: Why `&self` methods on AudioCapture?
-
-The current API uses `&mut self` for `start()`, `stop()`, and `read_buffer()`. This forces the user to have exclusive ownership, preventing sharing across threads without wrapping in `Arc<Mutex<...>>`. By using `&self` with internal `Mutex` / `AtomicBool`, the library manages synchronization internally, letting users `Arc<AudioCapture>` freely.
-
-### R4: Why owned `Vec<f32>` in AudioBuffer?
-
-Two alternatives were considered:
-
-1. **Borrowed `&[f32]`** — zero-copy from the ring buffer, but the borrow pins the ring buffer, blocking the OS callback from writing. Not viable for streaming.
-2. **Pool/recycled buffers** — returns a handle that, when dropped, returns the buffer to a pool. Complex, and premature optimization. Can be added later behind the same API by having `AudioBuffer::into_samples()` return to a pool.
-
-Owned `Vec<f32>` is simple, correct, and `Send`. The copy from ring buffer to `Vec` is fast (memcpy of contiguous f32s).
-
-### R5: Why remove `AudioProcessor` trait?
-
-The current `AudioProcessor` trait in the library is essentially a callback:
-
-```rust
-trait AudioProcessor: Send + 'static {
-    fn process(&mut self, buffer: &AudioBuffer) -> Result<(), ProcessError>;
-}
-```
-
-This is just `FnMut(&AudioBuffer) -> Result<()>`. The library should not own a processing pipeline concept — that is the user's domain. The `set_callback()` and `AudioSink` trait provide the same capability without a library-owned abstraction. Users who need chains can compose closures or use their own trait.
-
-### R6: Why remove endianness from SampleFormat?
-
-Audio in the library is always in native endian f32. Endianness matters only for:
-1. File I/O (WAV = little-endian) — handled by `WavFileSink`
-2. Network protocols — user's concern
-3. FFI with OS APIs — handled internally by backends
-
-Exposing `S16LE` / `S16BE` / `F32LE` / `F32BE` as a public API concept adds 14 variants of complexity for zero user benefit.
-
----
-
-## 17. Migration from Current API
-
-### Builder
-
-```rust
-// BEFORE (current API)
-AudioCaptureBuilder::new()
-    .device(DeviceSelector::DefaultInput)
-    .sample_rate(48000)
-    .channels(2)
-    .sample_format(SampleFormat::F32LE)
-    .bits_per_sample(32)
-    .target_application_pid(1234)
-    .build()?;
-
-// AFTER (new API)
-AudioCaptureBuilder::new()
-    .target(CaptureTarget::Application { pid: 1234 })
-    .sample_rate(48000)
-    .channels(2)
-    .build()?;
-```
-
-### Reading Audio
-
-```rust
-// BEFORE
-let mut capture = builder.build()?;
+// Manual drain into a sink (the library does not own a sink pump).
+let mut sink = WavFileSink::new("out.wav", &capture.format().unwrap_or_default())?;
 capture.start()?;
-match capture.read_buffer(Some(100)) {
-    Ok(Some(buffer)) => { /* ... */ }
-    Ok(None) => { /* timeout */ }
-    Err(e) => { /* error */ }
+while let Some(buffer) = capture.read_buffer()? {
+    sink.write(&buffer)?;
 }
-capture.stop()?;
-
-// AFTER
-let capture = builder.build()?;
-capture.start()?;
-match capture.read_chunk(Duration::from_millis(100))? {
-    Some(buffer) => { /* ... */ }
-    None => { /* timeout */ }
-}
+sink.flush()?;
 capture.stop()?;
 ```
 
-### Application Capture
+---
+
+## 14. Public Exports and Prelude
+
+### Crate root (`lib.rs` re-exports)
+
+- Builder/handle: `AudioCaptureBuilder`, `AudioCapture`, `RunningCapture`.
+- Macro: `capture!` (at the crate root via `#[macro_export]`).
+- Config: `CaptureTarget`, `AudioFormat`, `SampleFormat`, `StreamConfig`,
+  `AudioCaptureConfig`, `DeviceId`, `ApplicationId`, `ProcessId`.
+- Data: `AudioBuffer`.
+- Errors: `AudioError`, `AudioResult`, `ErrorKind`, `Recoverability`,
+  `UserFacingError`, `BackendContext`.
+- Traits/types: `AudioDevice`, `CapturingStream`, `DeviceEnumerator`,
+  `DeviceEvent`, `DeviceEventHandler`, `DeviceInfo`, `DeviceKind`,
+  `DeviceWatcher`.
+- Capabilities: `PlatformCapabilities`.
+- Introspection: `list_audio_sources`, `list_audio_applications`,
+  `check_audio_capture_permission`, `AudioSource`, `AudioSourceKind`,
+  `PermissionStatus`, `StreamStats`, `BackpressureReport`.
+- Enumeration facade: `get_device_enumerator`.
+- Bridge: `StreamState`, `AtomicStreamState`; `AsyncAudioStream` (feature
+  `async-stream`).
+- Sinks: `AudioSink`, `ChannelSink`, `NullSink`; `WavFileSink` (feature
+  `sink-wav`).
+- `install_default_tracing` (feature `tracing`).
+
+### `rsac::prelude`
+
+The [prelude](../../src/prelude.rs) is purely additive (every name is also at the
+crate root) and re-exports the everyday capture surface:
 
 ```rust
-// BEFORE (standalone API)
-let mut app_capture = ApplicationCaptureFactory::create_for_process_id(1234)?;
-app_capture.start_capture(|samples: &[f32]| {
-    // Push-model callback
-    process(samples);
-})?;
-
-// AFTER (unified API)
-let capture = AudioCaptureBuilder::new()
-    .target(CaptureTarget::Application { pid: 1234 })
-    .build()?;
-capture.set_callback(|buffer: &AudioBuffer| {
-    process(buffer.samples());
-})?;
-capture.start()?;
+use rsac::prelude::*;
 ```
 
-### Device Enumeration
-
-```rust
-// BEFORE
-let enumerator = get_device_enumerator()?;
-let devices = enumerator.enumerate_devices()?;
-for device in devices {
-    let name = device.get_name();
-    let id = format!("{:?}", device.get_id());
-}
-
-// AFTER
-let enumerator = enumerate_devices()?;
-for device in enumerator.enumerate_devices()? {
-    println!("{}: {}", device.id, device.name);
-}
-```
+It brings in: `AudioCapture`, `AudioCaptureBuilder`, `RunningCapture`, `capture!`;
+`AudioFormat`, `CaptureTarget`, `SampleFormat`; `AudioBuffer`; `AudioError`,
+`AudioResult`, `ErrorKind`, `Recoverability`, `UserFacingError`;
+`PlatformCapabilities`, `AudioDevice`, `DeviceInfo`, `DeviceKind`; `AudioSource`,
+`AudioSourceKind`, `BackpressureReport`, `StreamStats`; `AudioSink`,
+`ChannelSink`, `NullSink`; `WavFileSink` (feature `sink-wav`); `AsyncAudioStream`
+(feature `async-stream`). It does **not** re-export `DeviceEvent`/`DeviceWatcher`
+or `StreamConfig` — name those from the crate root when needed.
 
 ---
 
-*End of API Design Document*
+## 15. Thread-Safety Contract
+
+- `AudioBuffer` is `Send + Sync` (compile-time-asserted; only `Vec<f32>`,
+  `AudioFormat`, `Option<Duration>` fields).
+- `CapturingStream`, `AudioDevice`, `DeviceEnumerator` all require `Send + Sync`.
+- `AudioCapture` is documented as `Send + Sync` (state behind `Arc<Mutex<…>>`,
+  data plane lock-free), but see the [§6](#6-audiocapture-and-runningcapture)
+  caveats: there is no compile-time assertion (tracked), and the read methods
+  take `&mut self`, so cross-thread *read* sharing needs external sync.
+- The OS audio callback thread never runs user code: callbacks are pumped on a
+  dedicated thread (ADR-0002), and device-watch events are delivered on the OS
+  notification thread (with a per-platform divergence — see
+  [§9](#9-device-enumeration-deviceinfo-and-device-watching)).
+
+---
+
+## 16. Not Yet Implemented / Tracked
+
+These surfaces were described in earlier drafts of this design but are **not**
+present in the shipped code. They are listed here so the doc neither hides the
+gap nor presents them as available.
+
+- **`AudioCapture::pipe_to()` / library-driven sink wiring — NOT IMPLEMENTED.**
+  There is no `pipe_to` (or `RunningCapture::drain_to`) method on `AudioCapture`.
+  The `AudioSink` trait and `NullSink`/`ChannelSink`/`WavFileSink` exist and are
+  exported, but the consumer must drive them by hand (read in a loop and call
+  `sink.write()`), as shown in [§13](#13-audiosink--downstream-consumers). The
+  crate's own `examples/record_to_file.rs` writes WAV directly rather than
+  through `WavFileSink`. (Critique API-ERG-03.)
+- **`LatencyMode` as a config field — NOT WIRED.** The `LatencyMode` enum exists
+  in `core/config.rs` (and is re-exported), but it is never set, read, or
+  threaded into `StreamConfig` or the builder. The `core/config.rs` module doc
+  still mentions "latency mode" although `StreamConfig` has no such field.
+  (Critique VS-2.)
+- **`AudioFileFormat` — VESTIGIAL.** `core/config.rs` defines
+  `enum AudioFileFormat { Wav }` with a doc mentioning "recording", but it is
+  never constructed or consumed. Encoding/format selection is a downstream-sink
+  concern and an explicit non-goal; this surface should be removed or
+  `#[deprecated]`. (Critique VS-1.)
+- **`buffer_size` honored only on Windows.** `StreamConfig::buffer_size` is
+  threaded into the WASAPI ring-capacity calculation but ignored by the macOS and
+  Linux backends (they use a fixed capacity today). It is also consumed as a ring
+  **slot** count, not a frame count. (Critique DF-04.)
+- **`format()` reports the requested, not delivered, format in practice.** No
+  production backend calls `set_negotiated_format`, so `AudioCapture::format()`
+  falls back to the requested config. (Critique PERF-07.)
+- **`AudioBuffer::timestamp()` always `None`** in production (see
+  [§8](#8-audiobuffer--data-container-and-metering)). (Critique DF-01.)
+- **No `AudioCapture` compile-time `Send + Sync` assertion** (see
+  [§6](#6-audiocapture-and-runningcapture)). (Critique DF-03.)
+
+The following types from older drafts **do not exist** at all and were removed
+from this document: `ResolvedConfig`, `AudioBufferRef`, an `ApplicationEnumerator`
+trait, `TokioChannelSink`, `read_chunk(Duration)`, and `to_async_stream()`.
+
+---
+
+*End of API Design Document.*

@@ -55,17 +55,25 @@ Each cell is a separate CI job visible in the [Actions tab](https://github.com/C
 - **System-wide capture** on all three platforms
 - **Per-application capture** by PID or name (WASAPI process loopback, PipeWire node mapping, CoreAudio Process Tap)
 - **Process-tree capture** for child process hierarchies
-- **Lock-free ring buffers** (`rtrb` SPSC) bridging OS callback threads to consumer threads
+- **One-line ergonomics** — the `capture!` macro and `rsac::prelude::*`; `AudioCaptureBuilder::start()` returns a `RunningCapture` RAII guard (`Deref`s to `AudioCapture`, stops on `Drop`)
+- **String targets** — `CaptureTarget` round-trips through `FromStr` / `TryFrom<&str>` / `Display`; the builder takes `target_str()` / `try_target_str()`
+- **RT-safe level metering** — `AudioBuffer::rms()` / `peak()` / `rms_dbfs()` / `peak_dbfs()` and per-channel `channel_rms()` / `channel_peak()` (allocation-free, callback-thread safe)
+- **Lock-free ring buffers** (`rtrb` SPSC) bridging OS callback threads to consumer threads; alloc-free on the producer hot path in steady state
 - **Push-based subscription** (`subscribe()` returns `mpsc::Receiver<AudioBuffer>`)
+- **Stream diagnostics** — `stream_stats()` (`StreamStats`: buffers pushed/captured/dropped, uptime, negotiated format) and `backpressure_report()` (`BackpressureReport`)
+- **Device-change watching** — `DeviceEnumerator::watch()` returns a `DeviceWatcher` RAII guard delivering `DeviceEvent`s off the RT thread (Windows/macOS via a bounded helper-thread channel; Linux directly on the PipeWire loop thread)
+- **Device introspection** — `AudioDevice::describe()` → `DeviceInfo` and `supported_formats()` on all three backends
 - **Overflow monitoring** (`overrun_count()` tracks dropped buffers)
 - **Backpressure signaling** (`is_under_backpressure()` on the `CapturingStream` trait — returns `true` when sustained consecutive frame drops indicate the consumer cannot keep up; use to throttle, warn, or switch providers)
-- **Sink adapters** — `NullSink`, `ChannelSink`, `WavFileSink`
+- **Sink adapters** — `NullSink`, `ChannelSink`, `WavFileSink` (note: the `pipe_to()` driver is not yet implemented — drive sinks from your own read/subscribe loop)
 - **Platform capability reporting** — `PlatformCapabilities::query()` for honest feature detection
+- **Language bindings at parity** — C/Go, Python (PyO3, single `cp39-abi3` wheel), and Node (napi), all exposing metering, `stream_stats`, format query, string targets, and idiomatic context managers / RAII
 
 ## Quick Start
 
 ```rust
 use rsac::{AudioCaptureBuilder, CaptureTarget};
+use std::time::Duration;
 
 let mut capture = AudioCaptureBuilder::new()
     .with_target(CaptureTarget::SystemDefault)
@@ -75,16 +83,58 @@ let mut capture = AudioCaptureBuilder::new()
 
 capture.start()?;
 
-// Streaming-first: read audio chunks in a loop
+// Streaming-first: read audio chunks in a loop.
+//
+// read_buffer() returns AudioResult<Option<AudioBuffer>>:
+//   Ok(Some(buf)) — a chunk is ready
+//   Ok(None)      — no data *yet* (do NOT treat as end-of-stream; back off briefly)
+//   Err(e)        — break only if e.is_fatal(); recoverable errors are transient
 loop {
-    if let Some(buffer) = capture.read_buffer()? {
-        let samples: &[f32] = buffer.data();
-        let frames = buffer.num_frames();
-        // process audio...
+    match capture.read_buffer() {
+        Ok(Some(buffer)) => {
+            let samples: &[f32] = buffer.data();
+            let frames = buffer.num_frames();
+            // RT-safe metering — no hand-rolled RMS needed:
+            let level_dbfs = buffer.rms_dbfs();
+            let _ = (samples, frames, level_dbfs); // process audio...
+        }
+        Ok(None) => {
+            // Ring is momentarily empty — avoid busy-spinning.
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        Err(e) if e.is_fatal() => {
+            eprintln!("capture ended: {e}");
+            break;
+        }
+        Err(e) => {
+            // Recoverable (e.g. a transient read hiccup) — log and keep going.
+            eprintln!("transient read error: {e}");
+        }
     }
 }
 
 capture.stop()?;
+```
+
+> The `?` operator on `read_buffer()` is a footgun in a capture loop: it would
+> terminate the whole function on a *recoverable* error. Match on the result and
+> branch on `AudioError::is_fatal()` instead, as above.
+
+### One-liner with the prelude + `capture!` macro
+
+```rust
+use rsac::prelude::*;
+
+# fn main() -> Result<(), Box<dyn std::error::Error>> {
+// `start()` returns a RunningCapture RAII guard: it Derefs to AudioCapture and
+// calls stop() on Drop, so there is nothing to tear down by hand.
+let mut running = capture!(system, rate: 48000, channels: 2).start()?;
+
+if let Ok(Some(buffer)) = running.read_buffer() {
+    println!("level: {:.1} dBFS", buffer.rms_dbfs());
+}
+# Ok(())
+# } // `running` drops here → capture stops automatically
 ```
 
 ### Application Capture
@@ -107,6 +157,30 @@ let devices = enumerator.enumerate_devices()?;
 let default = enumerator.get_default_device()?;
 ```
 
+### Device-Change Notifications
+
+```rust
+use rsac::{get_device_enumerator, DeviceEvent};
+
+let enumerator = get_device_enumerator()?;
+
+// `on_event` runs on the OS notification thread (never the RT audio thread),
+// so it may allocate and lock. Hold the returned guard alive for as long as you
+// want events; dropping it unregisters the listener.
+let _watcher = enumerator.watch(Box::new(|event: DeviceEvent| match event {
+    DeviceEvent::DeviceAdded { name, .. } => println!("added: {name}"),
+    DeviceEvent::DeviceRemoved { id } => println!("removed: {id:?}"),
+    DeviceEvent::DefaultChanged { .. } => println!("default device changed"),
+    _ => {}
+}))?;
+```
+
+> **Platform divergence (by design):** on Windows and macOS the handler runs on a
+> dedicated helper thread fed by a bounded channel (events drop if it overflows);
+> on Linux it runs directly on the PipeWire loop thread. Backends that have not
+> wired an OS listener return `AudioError::PlatformNotSupported`, matching their
+> `PlatformCapabilities::supports_device_change_notifications` flag.
+
 ## CLI Demo
 
 The binary is a thin demo over the library API:
@@ -124,8 +198,8 @@ rsac capture
 # Capture a specific app by name
 rsac capture --app firefox
 
-# Record to WAV file
-rsac record --duration 30 --output recording.wav
+# Record to WAV file (output path is a positional argument)
+rsac record recording.wav --duration 30
 ```
 
 ## Capture Mode Support
@@ -140,7 +214,7 @@ rsac record --duration 30 --output recording.wav
 
 ### macOS Enumeration Scope
 
-On macOS, enumeration returns a superset of what is actually capturable — the audio graph is opaque until a Process Tap is installed. `list_audio_sources()` / `list_audio_applications()` use `NSWorkspace.runningApplications`, which reports every running app with a GUI activation policy, *not* only apps currently producing audio. Callers cannot distinguish "silent" from "playing" before attempting capture; most apps in the returned list will have no audio output at the moment of enumeration. By contrast, Windows (WASAPI session enumeration) and Linux (PipeWire stream nodes via `pw-dump`) report only endpoints with an active audio session, so those lists are closer to a true "currently producing audio" set.
+On **macOS 14.4+**, `list_audio_sources()` / `list_audio_applications()` return apps that are **actually producing audio**: the implementation intersects the `NSWorkspace.runningApplications` list (for the localized name + bundle id) with the set of PIDs CoreAudio reports as live audio processes via `kAudioHardwarePropertyProcessObjectList`, filtering out the large mass of GUI apps that aren't currently playing audio. On **macOS &lt; 14.4** (where the audio-process-object API and Process Taps are unavailable) it transparently falls back to the full, unfiltered `NSWorkspace` list. This matches Windows (WASAPI session enumeration) and Linux (PipeWire stream nodes via `pw-dump`), which also report only endpoints with an active audio session — so on supported OS versions all three platforms surface a "currently producing audio" set.
 
 Device enumeration on macOS (`enumerate_devices()`) lists all CoreAudio output devices the process can see, which is comparable to the other platforms. What is *not* enumerable from rsac on macOS: the live per-process audio signal graph (which PIDs are routing to which device at this instant) — that information is not exposed outside Core Audio, and Process Tap attachment is the only way to observe per-app audio. Screen Recording permission (TCC) is required at capture time; `check_audio_capture_permission()` returns `NotDetermined` until the OS prompt has been answered, because macOS does not expose a reliable pre-flight query on supported versions.
 

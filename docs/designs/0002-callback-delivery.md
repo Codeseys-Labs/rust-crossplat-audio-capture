@@ -62,15 +62,36 @@ the FFI boundary.
 
 ## 5. Consequences
 
-- `start()` gains a "spawn callback pump if set" step; the pump exits on stream stop or
-  callback-cleared.
+- `start()` gains a "spawn callback pump if set" step (`AudioCapture::start` →
+  `AudioCapture::spawn_callback_pump`); the pump exits on stream stop or
+  callback-cleared. The pump is guarded on `self.callback_pump.is_none()` so a second
+  `start()` never double-spawns two pumps racing for the same ring.
 - `set_callback` while running stays rejected (existing guard) — callback is bound at
   `start()`.
 - Test via a mock `CapturingStream` asserting the closure observes pushed buffers.
 - FFI `invoke()` gets `catch_unwind` (closes U3 before it becomes reachable).
 
+### Lifecycle asymmetry: pump vs. `subscribe()` (CT-2)
+
+The callback pump is a **tracked, lifecycle-owned** thread: `AudioCapture` holds a
+`CallbackPump { stop_flag, handle: Option<JoinHandle> }`, and `stop()`/`clear_callback`/
+`Drop` signal the flag and join it (with a self-join guard for re-entrant teardown from
+inside the user closure — `CallbackPump::shutdown`). The older `subscribe()` channel
+path, by contrast, spawns a **detached** `"rsac-subscribe"` thread and discards its
+`JoinHandle`; it terminates on its own when the stream stops or the `Receiver` is
+dropped, but is *not* signalled or joined by `stop()`/`Drop`. This is a deliberate
+divergence — holding a `Receiver` pins the stream — but it means the two push-style
+delivery modes have different teardown stories. Unifying `subscribe()` onto the same
+tracked-handle model is tracked separately; this ADR governs only the callback pump.
+
 ## 6. References
 
 - Audit findings H1, U3 (2026-05-29 deep-dive).
-- `src/api.rs:577-610` (set/clear), `:398-429` (start), `:631-675` (subscribe pattern).
-- `bindings/rsac-ffi/src/lib.rs:184-227` (callback trampoline).
+- `AudioCapture::set_callback` / `AudioCapture::clear_callback` (store/tear-down),
+  `AudioCapture::start` (spawns the pump when a callback is pending),
+  `AudioCapture::spawn_callback_pump` and the `CallbackPump` struct
+  (`CallbackPump::shutdown` self-join guard), and `AudioCapture::subscribe` (the
+  detached channel-pump pattern the callback path mirrors) — all in `src/api.rs`.
+- `SendCallback::invoke` (the `extern "C"` callback trampoline, wrapped in
+  `catch_unwind`) and `rsac_capture_set_callback`, both in
+  `bindings/rsac-ffi/src/lib.rs`.

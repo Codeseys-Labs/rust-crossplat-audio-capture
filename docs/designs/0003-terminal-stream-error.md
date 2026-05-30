@@ -10,9 +10,12 @@ classified `Recoverable` for genuinely transient read failures.
 ## 1. Context
 
 `AudioError::recoverability()` classifies `StreamReadError` as **Recoverable**
-(`error.rs:232-234`). But the bridge emits `StreamReadError { reason: "Stream stopped" }`
-precisely when the stream has reached a *terminal* state — `Stopped`/`Closed`/`Error`
-(`ring_buffer.rs:331-335`, `stream.rs:160-167`). Terminal is permanent.
+(see the `StreamReadError` arm of `AudioError::recoverability` in
+`src/core/error.rs`). But the bridge emitted `StreamReadError { reason: "Stream
+stopped" }` precisely when the stream had reached a *terminal* state —
+`Stopped`/`Closed`/`Error` (the non-readable / terminal-read path in
+`src/bridge/stream.rs`, which consults the `BridgeShared` stream-state in
+`src/bridge/ring_buffer.rs`). Terminal is permanent.
 
 The audit (finding M11) showed the consequence: a consumer that loops
 `while let Err(e) = read { if e.is_fatal() { break } }` — exactly the pattern used in the
@@ -65,13 +68,30 @@ helpers to treat `StreamEnded` as clean termination.
    (coordinated with the docs-reconciliation task).
 - `recoverability()`'s catch-all is replaced with an explicit exhaustive match (also
    closes audit L10) so future variants can't silently default to Fatal.
-- FFI: add `RSAC_ERROR_STREAM_ENDED` (or map to existing `RSAC_ERROR_STREAM_READ` with a
-   distinct code) — chosen: reuse `RSAC_ERROR_STREAM_READ` group to avoid ABI churn, but
-   document the distinction; revisit if a separate code is needed.
+- FFI mapping (as shipped — supersedes the original proposal). The original draft
+   proposed reusing the **recoverable** `RSAC_ERROR_STREAM_READ` group to avoid ABI
+   churn. The implementation instead maps `StreamEnded` to the **fatal**
+   `RSAC_ERROR_STREAM_FAILED` group (alongside `StreamCreationFailed`/`StreamStartFailed`/
+   `StreamStopFailed`), explicitly **not** the recoverable `RSAC_ERROR_STREAM_READ`
+   group (which keeps `StreamReadError`/`BufferOverrun`/`BufferUnderrun`). This is the
+   better decision and the one in `rsac::map_rsac_error` (see
+   `bindings/rsac-ffi/src/lib.rs`): grouping the terminal signal with the recoverable
+   read errors would have told C callers to *retry* a stream that is permanently done —
+   re-introducing at the FFI boundary the exact busy-wait this ADR fixes in Rust.
+   Mapping it to the fatal group lets a C consumer tell "done, stop" (`STREAM_FAILED`)
+   from "transient, retry" (`STREAM_READ`) using the existing ABI codes, so **no new
+   code or ABI churn was needed** — the original ABI-stability goal is met *and* the
+   recoverability semantics are correct. (A dedicated `RSAC_ERROR_STREAM_ENDED` code, or
+   a companion `rsac_error_recoverability()` accessor for finer fidelity, remains a
+   possible future enhancement.)
 - Tests assert a stopped stream yields `StreamEnded` and `is_fatal() == true`.
 
 ## 6. References
 
-- Audit findings M11, L10 (2026-05-29 deep-dive).
-- `src/core/error.rs:108-242`, `src/bridge/ring_buffer.rs:320-348`,
-   `src/bridge/stream.rs:159-198`.
+- Audit findings M11, L10 (2026-05-29 deep-dive); FFI-mapping amendment from the
+   2026-05-30 architecture critique (ADR-R2 / adr-review row 0003).
+- `AudioError::StreamEnded` and `AudioError::recoverability` in `src/core/error.rs`;
+   the terminal-state emit sites in `BridgeConsumer::pop_blocking`
+   (`src/bridge/ring_buffer.rs`) and `BridgeStream::read_chunk`/`try_read_chunk`
+   (`src/bridge/stream.rs`); the FFI mapping in `rsac::map_rsac_error`
+   (`bindings/rsac-ffi/src/lib.rs`).

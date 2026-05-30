@@ -12,6 +12,8 @@ This document enumerates every Cargo feature exposed by `rsac`, what it enables,
 | `default` | — | all | Meta-feature: `["feat_windows", "feat_linux", "feat_macos"]` | Each enabled backend's requirements above. |
 | `async-stream` | no | all | `AudioCapture::audio_data_stream()` returning a `futures_core::Stream<Item = AudioResult<AudioBuffer>>`; also required by `examples/async_capture.rs` | Pulls in `atomic-waker` dep. Consumer needs an async runtime (Tokio, smol, etc.). |
 | `sink-wav` | no | all | `WavFileSink` adapter (writes captured audio to a WAV file through the `AudioSink` trait) | `hound` is always a hard dependency, so no extra install — the gate is API-surface only. |
+| `tracing` | **no** | all | Routes the internal `rsac_event!` / `rsac_span!` instrumentation macros to the [`tracing`](https://docs.rs/tracing) facade and makes `rsac::install_default_tracing()` available. With the feature **off**, the same macros expand to `log::` calls (behavior-identical), so logging works either way — this flag only changes the *backend*. | Pulls in the `tracing` facade crate only (no `tracing-subscriber`); the consumer installs their own subscriber. |
+| `bridge-zerocopy` | **no** | all | Compiles the opt-in sample-domain SPSC ring (`SampleRing` producer/consumer) that writes interleaved `f32` straight into the ring via `rtrb`'s `write_chunk_uninit` + `CopyToUninit`, avoiding the per-buffer `Vec`/`AudioBuffer` allocation. **Currently A/B-benchmarked only** — see the note below. | None extra (uses the existing `rtrb` dep). |
 | `test-utils` | no | all | Re-exports test helpers used by integration tests and external binding crates | None. Used internally by `tests/` and the `bindings/rsac-*` workspace members. |
 
 ## Platform-feature semantics
@@ -23,6 +25,43 @@ Consequences:
 - Building on Linux with `--no-default-features --features feat_windows` compiles nothing from `src/audio/windows/` (the `target_os` check fails), so `get_device_enumerator()` will return `AudioError::PlatformNotSupported`.
 - Cross-compiling to a target without the matching feature enabled produces the same error.
 - On the correct host, disabling all three feature flags yields a library that compiles but cannot enumerate or capture — `get_device_enumerator()` always errors. This is only useful for doc/test builds.
+
+## Data-plane and observability features
+
+### `bridge-zerocopy` — opt-in sample-domain ring (benchmark-only today)
+
+`bridge-zerocopy` compiles a second, parallel data plane: `SampleRingProducer` /
+`SampleRingConsumer` (in `src/bridge/ring_buffer.rs`, all gated behind
+`#[cfg(feature = "bridge-zerocopy")]`). Instead of allocating one `AudioBuffer`
+(a `Vec<f32>`) per callback, the producer copies the interleaved `f32` samples
+directly into the ring's uninitialised slots with `rtrb`'s `write_chunk_uninit`
++ `CopyToUninit`, with no per-buffer allocation.
+
+**Honest status: implemented and tested, but not wired into any backend.** No
+code in `src/audio/` constructs a `SampleRing` — the WASAPI, PipeWire, and
+CoreAudio capture threads all push into the default `AudioBuffer` ring. The
+zero-copy plane is exercised only by the A/B comparison in `benches/bridge.rs`.
+Enabling the feature therefore compiles the extra types but does **not** change
+the runtime path of a real capture. The default path is *allocation-free in
+steady state* (see ADR-0001 and [`PERFORMANCE.md`](PERFORMANCE.md)); the
+literal *zero-copy* promise is delivered only by this not-yet-wired plane.
+
+### `tracing` — structured instrumentation backend switch
+
+rsac instruments its non-RT control paths with two internal macros,
+`rsac_event!` and `rsac_span!` (defined in `src/trace.rs`). They are a
+dual-backend shim:
+
+- **Feature off (default):** the macros expand to `log::` calls. No extra
+  dependency beyond `log`, which is always present.
+- **Feature on:** the macros emit `tracing` events/spans, and
+  `rsac::install_default_tracing()` becomes available. rsac depends on the
+  `tracing` *facade* only — it deliberately does **not** pull in
+  `tracing-subscriber`; the consumer installs whatever subscriber/filter they
+  want (the built-in default uses `NoSubscriber`).
+
+Either way, these macros are for control-plane events (build, start, stop,
+device-watch) and must never be invoked on the RT audio-callback thread.
 
 ## Recommended invocations
 
@@ -39,8 +78,14 @@ cargo test --lib --no-default-features --features feat_linux
 # Enable async Stream API for Tokio consumers
 cargo build --features async-stream
 
-# Full feature surface (async + WAV sink)
-cargo build --features "async-stream sink-wav"
+# Structured tracing instead of `log`
+cargo build --features tracing
+
+# A/B-benchmark the opt-in zero-copy sample ring
+cargo bench --bench bridge --features bridge-zerocopy
+
+# Full feature surface (async + WAV sink + tracing)
+cargo build --features "async-stream sink-wav tracing"
 ```
 
 ## Binding feature-resolution convention (canonical)
