@@ -169,6 +169,54 @@ rewrite_json_version() {
     mv "$file.tmp" "$file"
 }
 
+# Read the version pin from an internal `rsac = { ... version = "X.Y.Z" ... }`
+# dependency line in a binding manifest. Only the *internal* rsac dep is matched
+# (the line must mention a relative `path = "../..` to the workspace root), so an
+# unrelated crate named `rsac-foo` or a registry dep can never be picked up.
+# Emits nothing if the manifest has no versioned internal rsac dep (path-only
+# deps — rsac-napi, rsac-python — legitimately omit the version requirement).
+internal_rsac_dep_version() {
+    awk '
+        /^[[:space:]]*rsac[[:space:]]*=[[:space:]]*\{/ && /path[[:space:]]*=[[:space:]]*"\.\.\// {
+            # Pull the value out of the first `version = "..."` key on the line.
+            if (match($0, /version[[:space:]]*=[[:space:]]*"[^"]+"/)) {
+                kv = substr($0, RSTART, RLENGTH)
+                match(kv, /"[^"]+"/)
+                print substr(kv, RSTART + 1, RLENGTH - 2)
+            }
+            exit
+        }
+    ' "$1"
+}
+
+# In-place rewrite of the version pin on an internal `rsac = { ... }` inline-table
+# dependency so a binding crate that records a version requirement (today only
+# rsac-ffi) stays in lockstep with the workspace `[package].version`. Without
+# this, a bump rewrites rsac-ffi's own `[package].version` but leaves its
+# `rsac = { path = "../../", version = "<old>" }` pin stale, which breaks the
+# workspace build until hand-fixed (seed rsac-0d58).
+#
+# Targets only the internal dep (the line must also carry a `path = "../..` to the
+# workspace root) and rewrites only the value of the existing `version = "..."`
+# key on that line, preserving every other key (`default-features`, `features`,
+# …) and the inline-table form. A path-only internal dep (no `version` key) is
+# left untouched — there is nothing to keep in lockstep.
+rewrite_internal_rsac_dep_version() {
+    local file="$1" new="$2"
+    awk -v new="$new" '
+        BEGIN { done = 0 }
+        !done && /^[[:space:]]*rsac[[:space:]]*=[[:space:]]*\{/ && /path[[:space:]]*=[[:space:]]*"\.\.\// {
+            # Replace only the literal inside the existing version key; the rest
+            # of the inline table (keys, ordering, spacing) is preserved.
+            if (sub(/version[[:space:]]*=[[:space:]]*"[^"]+"/, "version = \"" new "\"")) {
+                done = 1
+            }
+        }
+        { print }
+    ' "$file" > "$file.tmp"
+    mv "$file.tmp" "$file"
+}
+
 # ── plan ─────────────────────────────────────────────────────────────
 # Wraps an extractor call so an empty result becomes a fatal error rather
 # than silently propagating an empty string into later comparisons (which
@@ -194,6 +242,24 @@ CUR_NAPI_PKG=$(extract_or_die   "rsac-napi pkg" "$NAPI_PKG"   json_version)
 CUR_PY_CARGO=$(extract_or_die   "rsac-python"  "$PY_CARGO"   cargo_package_version)
 CUR_PY_PYPROJ=$(extract_or_die  "rsac-python pyproject" "$PY_PYPROJ" cargo_package_version)
 
+# Internal `rsac = { ..., version = "X.Y.Z" }` dep pins in the binding manifests
+# (seed rsac-0d58). These must track the root crate version so a published
+# binding resolves the matching rsac release and the workspace build stays
+# self-consistent after a bump. We scan every binding Cargo.toml and remember
+# the ones that actually carry a versioned internal rsac dep — path-only deps
+# (no version requirement) are skipped, not an error. Today only rsac-ffi pins a
+# version, but driving this off detection means a new versioned pin in any
+# binding manifest is picked up automatically.
+INTERNAL_DEP_MANIFESTS=("$FFI_CARGO" "$NAPI_CARGO" "$PY_CARGO")
+INTERNAL_DEP_FILES=()    # manifests with a stale internal pin to rewrite
+for m in "${INTERNAL_DEP_MANIFESTS[@]}"; do
+    cur_pin=$(internal_rsac_dep_version "$m")
+    [ -z "$cur_pin" ] && continue          # path-only internal dep — nothing to pin
+    if [ "$cur_pin" != "$NEW_VERSION" ]; then
+        INTERNAL_DEP_FILES+=("$m")
+    fi
+done
+
 info "target version:  $NEW_VERSION"
 info "current versions:"
 printf '  %-42s %s\n' "$ROOT_CARGO"  "$CUR_ROOT"
@@ -203,15 +269,18 @@ printf '  %-42s %s\n' "$NAPI_PKG"    "$CUR_NAPI_PKG"
 printf '  %-42s %s\n' "$PY_CARGO"    "$CUR_PY_CARGO"
 printf '  %-42s %s\n' "$PY_PYPROJ"   "$CUR_PY_PYPROJ"
 
-# Idempotency guard: if every target already matches, exit cleanly without
-# touching the changelog either (rotating a changelog that's already been
-# rotated would create a duplicate ## [X.Y.Z] header).
+# Idempotency guard: if every target already matches — including the internal
+# rsac dep pins — exit cleanly without touching the changelog either (rotating a
+# changelog that's already been rotated would create a duplicate ## [X.Y.Z]
+# header). A stale internal pin (a non-empty INTERNAL_DEP_FILES) still counts as
+# work to do, so this stays correct after the rsac-0d58 fix.
 if [ "$CUR_ROOT" = "$NEW_VERSION" ] && \
    [ "$CUR_FFI_CARGO" = "$NEW_VERSION" ] && \
    [ "$CUR_NAPI_CARGO" = "$NEW_VERSION" ] && \
    [ "$CUR_NAPI_PKG" = "$NEW_VERSION" ] && \
    [ "$CUR_PY_CARGO" = "$NEW_VERSION" ] && \
-   [ "$CUR_PY_PYPROJ" = "$NEW_VERSION" ]; then
+   [ "$CUR_PY_PYPROJ" = "$NEW_VERSION" ] && \
+   [ "${#INTERNAL_DEP_FILES[@]}" -eq 0 ]; then
     ok "already at version $NEW_VERSION — nothing to do"
     exit 0
 fi
@@ -224,6 +293,12 @@ CHANGES=()
 [ "$CUR_NAPI_PKG" != "$NEW_VERSION" ]   && CHANGES+=("$NAPI_PKG")
 [ "$CUR_PY_CARGO" != "$NEW_VERSION" ]   && CHANGES+=("$PY_CARGO")
 [ "$CUR_PY_PYPROJ" != "$NEW_VERSION" ]  && CHANGES+=("$PY_PYPROJ")
+
+# Internal rsac dep-pin rewrites (rsac-0d58). Listed distinctly so the plan is
+# honest even when the same manifest also gets a [package].version bump (FFI).
+for m in "${INTERNAL_DEP_FILES[@]}"; do
+    CHANGES+=("$m (internal rsac dep pin → $NEW_VERSION)")
+done
 
 # Changelog rotation is planned if there's an "## [Unreleased]" section
 # *and* no "## [$NEW_VERSION]" header already exists (idempotent).
@@ -258,6 +333,12 @@ fi
 [ "$CUR_NAPI_PKG"   != "$NEW_VERSION" ] && rewrite_json_version  "$NAPI_PKG"    "$NEW_VERSION"
 [ "$CUR_PY_CARGO"   != "$NEW_VERSION" ] && rewrite_cargo_version "$PY_CARGO"    "$NEW_VERSION"
 [ "$CUR_PY_PYPROJ"  != "$NEW_VERSION" ] && rewrite_cargo_version "$PY_PYPROJ"   "$NEW_VERSION"
+
+# Internal rsac dep pins (rsac-0d58) — rewrite after the [package].version pass
+# so a manifest that gets both (FFI) ends up fully self-consistent.
+for m in "${INTERNAL_DEP_FILES[@]}"; do
+    rewrite_internal_rsac_dep_version "$m" "$NEW_VERSION"
+done
 
 # ── changelog rotation ───────────────────────────────────────────────
 if [ "$CHANGELOG_ROTATE" -eq 1 ]; then

@@ -94,7 +94,15 @@ impl CrossPlatformDeviceEnumerator {
     /// All platform backends (WASAPI, PipeWire, CoreAudio) return the default
     /// output device here, since rsac is a loopback-capture library and the
     /// output device is what consumers need for system audio capture.
-    pub fn get_default_device(
+    ///
+    /// This is the canonical facade name, matching the
+    /// [`DeviceEnumerator::default_device`]
+    /// trait method and the sibling [`enumerate_devices`](Self::enumerate_devices)
+    /// (AEG-3, rsac-0113). The historical
+    /// [`get_default_device`](Self::get_default_device) name is retained as a
+    /// thin alias for one release so existing callers and bindings keep
+    /// compiling while they migrate.
+    pub fn default_device(
         &self,
     ) -> crate::core::error::Result<Box<dyn crate::core::interface::AudioDevice>> {
         match self {
@@ -120,6 +128,29 @@ impl CrossPlatformDeviceEnumerator {
                 platform: std::env::consts::OS.to_string(),
             }),
         }
+    }
+
+    /// Deprecated alias for [`default_device`](Self::default_device).
+    ///
+    /// AEG-3 (rsac-0113) renamed the facade to `default_device()` to match the
+    /// [`DeviceEnumerator`](crate::core::interface::DeviceEnumerator) trait
+    /// method and the sibling [`enumerate_devices`](Self::enumerate_devices) —
+    /// `default_device` was the lone `get_`-prefixed divergence. This alias is
+    /// kept for one release so existing callers and bindings migrate without a
+    /// hard break; prefer [`default_device`](Self::default_device) in new code.
+    ///
+    /// It is intentionally **not** annotated `#[deprecated]`: the crate's own
+    /// targets (the demo binary, examples, and the integration tests) and CI's
+    /// `cargo clippy --all-targets -- -D warnings` gate would otherwise turn the
+    /// deprecation lint into a hard build failure for callers outside this
+    /// module while they migrate. The doc-level deprecation conveys the intent
+    /// without breaking the `-D warnings` build; the attribute can be added once
+    /// every in-crate caller has moved to `default_device()`.
+    #[doc(hidden)]
+    pub fn get_default_device(
+        &self,
+    ) -> crate::core::error::Result<Box<dyn crate::core::interface::AudioDevice>> {
+        self.default_device()
     }
 
     /// Subscribe to device hot-plug / default-change notifications.
@@ -208,5 +239,49 @@ pub fn get_device_enumerator() -> Result<CrossPlatformDeviceEnumerator, AudioErr
             feature: "audio capture".to_string(),
             platform: std::env::consts::OS.to_string(),
         })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// AEG-3 (rsac-0113): the deprecated `get_default_device()` alias must
+    /// forward to the canonical `default_device()` and return an
+    /// observably-equivalent result. We construct an enumerator only where the
+    /// active platform feature makes one available; on a backend-less build the
+    /// factory errors and there is nothing to compare, so the test is a no-op
+    /// there. The comparison is device-free-tolerant: it asserts the two names
+    /// agree on success-vs-failure and, when both fail, that they surface the
+    /// same `AudioError` discriminant — never that hardware is present.
+    #[test]
+    fn get_default_device_alias_matches_default_device() {
+        let enumerator = match get_device_enumerator() {
+            Ok(e) => e,
+            // No backend on this build (or no platform feature): nothing to
+            // compare. The alias-forwarding is still proven to compile.
+            Err(_) => return,
+        };
+
+        let canonical = enumerator.default_device();
+        let aliased = enumerator.get_default_device();
+
+        assert_eq!(
+            canonical.is_ok(),
+            aliased.is_ok(),
+            "get_default_device() (alias) and default_device() (canonical) must \
+             agree on success vs failure"
+        );
+
+        // When both fail (e.g. a device-free CI box), they must fail the same
+        // way — the alias is a pure forward, so it cannot change the error.
+        if let (Err(c), Err(a)) = (&canonical, &aliased) {
+            assert_eq!(
+                std::mem::discriminant(c),
+                std::mem::discriminant(a),
+                "alias must surface the same AudioError variant as the canonical \
+                 method (canonical={c:?}, alias={a:?})"
+            );
+        }
     }
 }

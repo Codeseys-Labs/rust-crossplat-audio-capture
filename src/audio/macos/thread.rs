@@ -313,17 +313,31 @@ pub(crate) fn create_macos_capture(
                 coreaudio::audio_unit::render_callback::data::Interleaved<f32>,
             >| {
                 // REAL-TIME SAFETY:
-                // - BridgeProducer::push_samples_or_drop() is lock-free (rtrb)
+                // - BridgeProducer::push_samples_guarded() is lock-free (rtrb)
                 // - Uses internal scratch buffer to avoid heap allocation when
                 //   ring buffer is full (back-pressure). On successful push,
                 //   one copy from the callback slice into a Vec is unavoidable
                 //   since AudioBuffer owns its data.
                 // - No locks, no blocking I/O
+                //
+                // FFI-BOUNDARY PANIC GUARD (PS-4 / rsac-5a48): this closure runs
+                // on CoreAudio's own real-time IO proc — a *foreign* C callback
+                // context. A panic unwinding out of here would cross the FFI
+                // boundary back into the CoreAudio engine, which is undefined
+                // behavior (it can corrupt or abort the process). So we use the
+                // panic-GUARDED push: `push_samples_guarded` wraps the push in
+                // `catch_unwind`, so a panic can never escape into the C frame —
+                // on a caught panic it logs once, counts a drop, and poisons the
+                // stream to Error (a parked reader then observes end-of-stream).
+                // The guard is alloc-free on the happy path (the closure only
+                // borrows `&mut producer` and `data`), so ADR-0001 is preserved.
+                // Windows runs the equivalent push on rsac's *own* Rust thread,
+                // where an unwind is well-defined, so it stays unguarded.
 
                 let data: &[f32] = args.data.buffer;
 
                 if !data.is_empty() {
-                    producer.push_samples_or_drop(data, channels, sample_rate);
+                    producer.push_samples_guarded(data, channels, sample_rate);
                 }
 
                 Ok(())

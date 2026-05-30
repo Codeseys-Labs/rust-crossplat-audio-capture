@@ -204,10 +204,50 @@ export declare class AudioCapture {
   onData(callback: (chunk: AudioChunk) => void): void;
 
   /**
+   * Register a callback that fires exactly once when push-based delivery
+   * (`onData`) ends, carrying *why* it ended.
+   *
+   * The data pump ends in one of two ways a plain `onData` consumer cannot
+   * otherwise distinguish:
+   *
+   * - **Terminal (fatal):** the backend stream reached its terminal state
+   *   (e.g. the capture ended). `error` is the formatted terminal error
+   *   message (a non-null `string`).
+   * - **Clean stop:** the pump was torn down by `stop()` / `offData()`.
+   *   `error` is `null`.
+   *
+   * This is the Node parity for the Rust `subscribe_with_errors` and Go
+   * `StreamWithErrors` APIs — an `onData` consumer registers `onEnd` to learn
+   * the terminal reason instead of the end being silent. Optional and
+   * independent of `onData`. Invoked at most once per capture session (the pump
+   * clears it after firing); a recoverable hiccup never fires it. Calling
+   * `onEnd()` again replaces the previous callback.
+   *
+   * @example
+   * ```ts
+   * capture.onData((chunk) => process(chunk));
+   * capture.onEnd((err) => {
+   *   if (err) console.error(`capture ended: ${err}`);
+   *   else console.log('capture stopped cleanly');
+   * });
+   * capture.start();
+   * ```
+   */
+  onEnd(callback: (error: string | null) => void): void;
+
+  /**
    * Remove the registered data callback.
-   * Stops the data pump thread if running.
+   * Stops the data pump thread if running. A callback registered via `onEnd`
+   * is left registered for a later session; use `offEnd()` to clear it.
    */
   offData(): void;
+
+  /**
+   * Remove the registered terminal-observability callback (see `onEnd`).
+   * After this, the data pump's end is no longer reported to JS. Does not stop
+   * the pump.
+   */
+  offEnd(): void;
 
   /**
    * Number of audio buffers dropped due to ring buffer overflow.

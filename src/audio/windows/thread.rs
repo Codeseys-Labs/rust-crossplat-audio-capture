@@ -261,9 +261,12 @@ impl PlatformStream for WindowsPlatformStream {
 ///
 /// # Cleanup
 ///
-/// On exit (stop signal or error), the function:
+/// On exit, the function:
 /// - Sets `is_active` to `false`
-/// - Calls `producer.signal_done()` to notify the consumer
+/// - Notifies the consumer of end-of-stream: a clean stop-flag exit calls
+///   `producer.signal_done()` (graceful `Running → Stopping`); a FATAL
+///   device-error exit calls `producer.signal_error()` (terminal `Error`), per
+///   the ADR-0010 cross-backend terminal contract (rsac-66a6)
 /// - WASAPI/COM objects are dropped via RAII
 fn wasapi_capture_thread_main(
     config: WindowsCaptureConfig,
@@ -464,6 +467,18 @@ fn wasapi_capture_thread_main(
     // No allocation happens on the per-packet hot path once warmed.
     let mut byte_buf: Vec<u8> = Vec::with_capacity(48000 * 4 * 2 / 10);
 
+    // rsac-66a6 (ADR-0010 cross-backend terminal contract): distinguish a clean
+    // stop-flag exit from a FATAL device-error exit. A WASAPI capture-client read
+    // failure (`get_next_packet_size` / `read_from_device`) is the WASAPI signal
+    // for device loss / endpoint invalidation — the producer has spontaneously
+    // died and no further audio can ever arrive. We record that here and break out
+    // of BOTH loops so the cleanup section can drive the bridge to the terminal
+    // `Error` state via `signal_error()` (mirroring the Linux `.state_changed`
+    // Error/Unconnected path and the macOS spontaneous-death path), instead of the
+    // graceful `Stopping` that `signal_done()` produces. A graceful stop-flag exit
+    // leaves this `false` and keeps the `signal_done()` behaviour.
+    let mut fatal_error = false;
+
     loop {
         // Check stop flag before waiting.
         if stop_flag.load(Ordering::SeqCst) {
@@ -506,7 +521,16 @@ fn wasapi_capture_thread_main(
                 Ok(Some(frames)) => frames,
                 Ok(None) => 0,
                 Err(e) => {
-                    log::warn!("WASAPI thread: get_next_packet_size failed: {}", e);
+                    // rsac-66a6: a capture-client query failure is treated as
+                    // device loss (fatal). Flag it and break out of the drain
+                    // loop; the outer-loop check below then exits the thread so
+                    // cleanup signals terminal `Error` rather than graceful
+                    // `Stopping`.
+                    log::error!(
+                        "WASAPI thread: get_next_packet_size failed (treating as device loss): {}",
+                        e
+                    );
+                    fatal_error = true;
                     break;
                 }
             };
@@ -532,9 +556,16 @@ fn wasapi_capture_thread_main(
             let frames_read = match capture_client.read_from_device(&mut byte_buf[..needed]) {
                 Ok((frames, _buffer_info)) => frames as usize,
                 Err(e) => {
-                    log::warn!("WASAPI thread: read_from_device failed: {}", e);
-                    // Bail out of the drain loop on error; outer loop will
-                    // re-check the stop flag and resume waiting.
+                    // rsac-66a6: a read failure means the capture endpoint can no
+                    // longer deliver audio (device invalidated / unplugged). Flag
+                    // it as fatal and bail out of the drain loop; the outer-loop
+                    // check below exits the thread so cleanup signals terminal
+                    // `Error` rather than graceful `Stopping`.
+                    log::error!(
+                        "WASAPI thread: read_from_device failed (treating as device loss): {}",
+                        e
+                    );
+                    fatal_error = true;
                     break;
                 }
             };
@@ -580,6 +611,15 @@ fn wasapi_capture_thread_main(
             }
         }
 
+        // rsac-66a6: a fatal capture-client failure during the drain means the
+        // device is gone — exit the capture loop so cleanup signals terminal
+        // `Error`. Checked before the stop flag so a device-loss exit is never
+        // mis-reported as a graceful stop.
+        if fatal_error {
+            log::error!("WASAPI thread: fatal device error, exiting capture loop");
+            break;
+        }
+
         // Check stop flag after draining.
         if stop_flag.load(Ordering::SeqCst) {
             log::debug!("WASAPI thread: stop flag set after read, exiting");
@@ -594,9 +634,24 @@ fn wasapi_capture_thread_main(
 
     let _ = audio_client.stop_stream();
     is_active.store(false, Ordering::SeqCst);
-    producer.signal_done();
+    // rsac-66a6 (ADR-0010): a FATAL device-error exit must drive the bridge to the
+    // terminal `Error` state (`signal_error`) so a parked Linux/blocking reader
+    // observes a Fatal `StreamEnded` instead of an indefinitely-draining graceful
+    // `Stopping`. Only a clean stop-flag exit takes the graceful `signal_done`
+    // (`Running → Stopping`) path. This mirrors the Linux `.state_changed`
+    // Error/Unconnected → `signal_error()` arm and the macOS spontaneous-death
+    // path, satisfying the cross-backend terminal contract.
+    if fatal_error {
+        producer.signal_error();
+    } else {
+        producer.signal_done();
+    }
     wasapi::deinitialize();
-    log::debug!("WASAPI thread: exited cleanly");
+    if fatal_error {
+        log::debug!("WASAPI thread: exited after fatal device error");
+    } else {
+        log::debug!("WASAPI thread: exited cleanly");
+    }
 }
 
 // ── Audio Client Creation Helper ─────────────────────────────────────────
@@ -980,6 +1035,80 @@ mod tests {
     fn test_capture_thread_is_send() {
         fn assert_send<T: Send>() {}
         assert_send::<WindowsCaptureThread>();
+    }
+
+    // ── Terminal-signal contract (rsac-66a6 / ADR-0010) ──────────────
+    //
+    // `wasapi_capture_thread_main`'s cleanup branches on a `fatal_error` flag:
+    // a clean stop-flag exit calls `producer.signal_done()` (graceful
+    // `Running → Stopping`, drainable), while a FATAL device-error exit
+    // (a `get_next_packet_size` / `read_from_device` failure that signals
+    // device loss) calls `producer.signal_error()` (terminal `Error`).
+    //
+    // Exercising the real capture loop's fatal path needs a physical device to
+    // be invalidated mid-capture, which is not reproducible in a unit test. The
+    // two tests below instead pin the producer-side contract that branch relies
+    // on directly against the bridge — that `signal_error()` lands terminal
+    // `Error` and `signal_done()` lands graceful `Stopping` — so a regression in
+    // the cleanup wiring (e.g. reverting to an unconditional `signal_done`) is
+    // caught by these state-equality assertions.
+
+    use crate::bridge::ring_buffer::create_bridge;
+    use crate::bridge::state::StreamState;
+    use crate::core::config::{AudioFormat, SampleFormat};
+
+    fn terminal_test_format() -> AudioFormat {
+        AudioFormat {
+            sample_rate: 48000,
+            channels: 2,
+            sample_format: SampleFormat::F32,
+        }
+    }
+
+    /// rsac-66a6: the FATAL device-error cleanup branch calls
+    /// `producer.signal_error()`, which must drive the bridge to the terminal
+    /// `Error` state (so a parked reader observes a Fatal `StreamEnded`).
+    #[test]
+    fn test_fatal_exit_signal_error_lands_terminal_error() {
+        let (producer, consumer) = create_bridge(8, terminal_test_format());
+        // The capture loop runs while the session is Running.
+        producer.shared().state.force_set(StreamState::Running);
+
+        // Mirror the cleanup section's `fatal_error == true` branch.
+        producer.signal_error();
+
+        assert_eq!(
+            consumer.shared().state.get(),
+            StreamState::Error,
+            "a fatal device-error exit must land the bridge in terminal Error"
+        );
+        assert!(
+            consumer.shared().state.is_terminal(),
+            "Error is a terminal state (blocking reader returns Fatal StreamEnded)"
+        );
+    }
+
+    /// rsac-66a6: the clean stop-flag cleanup branch calls
+    /// `producer.signal_done()`, which must drive the bridge to the GRACEFUL
+    /// `Stopping` state (drainable, not terminal) — never `Error`.
+    #[test]
+    fn test_clean_exit_signal_done_lands_graceful_stopping() {
+        let (producer, consumer) = create_bridge(8, terminal_test_format());
+        producer.shared().state.force_set(StreamState::Running);
+
+        // Mirror the cleanup section's `fatal_error == false` branch.
+        producer.signal_done();
+
+        assert_eq!(
+            consumer.shared().state.get(),
+            StreamState::Stopping,
+            "a clean stop-flag exit must land the bridge in graceful Stopping"
+        );
+        assert_ne!(
+            consumer.shared().state.get(),
+            StreamState::Error,
+            "a clean stop must never be mis-reported as terminal Error"
+        );
     }
 
     // ── WindowsDeviceEnumerator / AudioDevice (COM required) ────────

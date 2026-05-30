@@ -100,10 +100,25 @@ impl AtomicStreamState {
     }
 
     /// Read the current state (Acquire ordering).
+    ///
+    /// Only valid `StreamState` discriminants are ever stored, so the
+    /// round-trip always succeeds in practice. To uphold the no-panics-in-lib
+    /// rule, a stray discriminant (which would indicate memory corruption or a
+    /// future variant written by mismatched code) degrades to the terminal
+    /// [`StreamState::Error`] instead of aborting the process: callers already
+    /// treat `Error` as a fatal terminal, so a corrupt read fails closed rather
+    /// than panicking on the lock-free read path. A `debug_assert!` still trips
+    /// in debug/test builds so the invariant violation is caught loudly during
+    /// development.
     pub fn get(&self) -> StreamState {
         let raw = self.state.load(Ordering::Acquire);
-        // SAFETY: We only ever store valid StreamState discriminants.
-        StreamState::from_u8(raw).expect("AtomicStreamState contains invalid discriminant")
+        StreamState::from_u8(raw).unwrap_or_else(|| {
+            debug_assert!(
+                false,
+                "AtomicStreamState contains invalid discriminant: {raw}"
+            );
+            StreamState::Error
+        })
     }
 
     /// Attempt a compare-and-swap transition from `from` to `to`.
@@ -124,8 +139,17 @@ impl AtomicStreamState {
             .compare_exchange(from as u8, to as u8, Ordering::AcqRel, Ordering::Acquire)
         {
             Ok(_) => Ok(()),
-            Err(actual) => Err(StreamState::from_u8(actual)
-                .expect("AtomicStreamState contains invalid discriminant")),
+            // A stray discriminant in the CAS-failure read degrades to the
+            // terminal `Error` rather than panicking (no-panics-in-lib); the
+            // caller observes a failed transition into a fatal terminal. A
+            // `debug_assert!` still trips in debug/test builds.
+            Err(actual) => Err(StreamState::from_u8(actual).unwrap_or_else(|| {
+                debug_assert!(
+                    false,
+                    "AtomicStreamState contains invalid discriminant: {actual}"
+                );
+                StreamState::Error
+            })),
         }
     }
 
@@ -533,5 +557,61 @@ mod tests {
         // Values > 5 should fail to convert
         assert!(StreamState::from_u8(6).is_none());
         assert!(StreamState::from_u8(255).is_none());
+    }
+
+    // ===== PS-3: stray-discriminant degrades to terminal Error (no panic) =====
+
+    /// PS-3 (rsac-0d10): if the atomic ever holds an invalid discriminant,
+    /// `get()` must degrade to the terminal [`StreamState::Error`] instead of
+    /// panicking (no-panics-in-lib). In debug/test builds the `debug_assert!`
+    /// would trip first, so this release-path behavior is asserted only when
+    /// debug assertions are disabled.
+    #[cfg(not(debug_assertions))]
+    #[test]
+    fn get_degrades_invalid_discriminant_to_error() {
+        let state = AtomicStreamState::new(StreamState::Running);
+        // Poke a value outside the valid 0..=5 range directly into the atomic.
+        state.state.store(200, Ordering::Release);
+        assert_eq!(
+            state.get(),
+            StreamState::Error,
+            "an invalid discriminant must degrade to terminal Error, not panic"
+        );
+        // Terminal-Error means callers see a fatal, non-running, non-readable
+        // stream — the fail-closed contract.
+        assert!(state.is_terminal());
+        assert!(!state.is_running());
+        assert!(!state.is_readable());
+    }
+
+    /// PS-3 (rsac-0d10): the CAS-failure read path also degrades a stray
+    /// discriminant to terminal `Error` rather than panicking. We seed an
+    /// invalid value, then attempt a transition whose `from` cannot match, so
+    /// `transition()` takes its `Err(actual)` branch and must map the corrupt
+    /// `actual` to `Error`.
+    #[cfg(not(debug_assertions))]
+    #[test]
+    fn transition_failure_degrades_invalid_discriminant_to_error() {
+        let state = AtomicStreamState::new(StreamState::Created);
+        state.state.store(200, Ordering::Release);
+        let result = state.transition(StreamState::Created, StreamState::Running);
+        assert_eq!(
+            result,
+            Err(StreamState::Error),
+            "a stray discriminant on the CAS-failure path must degrade to Error"
+        );
+    }
+
+    /// PS-3 (rsac-0d10): in debug/test builds the `debug_assert!` fires loudly
+    /// on a stray discriminant, so `get()` panics in development. This proves
+    /// the invariant is still caught during testing (the release path is
+    /// covered by `get_degrades_invalid_discriminant_to_error`).
+    #[cfg(debug_assertions)]
+    #[test]
+    #[should_panic(expected = "invalid discriminant")]
+    fn get_debug_asserts_on_invalid_discriminant() {
+        let state = AtomicStreamState::new(StreamState::Running);
+        state.state.store(200, Ordering::Release);
+        let _ = state.get();
     }
 }

@@ -271,6 +271,11 @@ pub struct AudioCapture {
     inner: Arc<Mutex<rsac::AudioCapture>>,
     /// Active data callback (ThreadsafeFunction). Held here to prevent GC.
     callback: Arc<Mutex<Option<ThreadsafeFunction<AudioChunk, ErrorStrategy::Fatal>>>>,
+    /// Optional terminal-observability callback (ThreadsafeFunction). Fires once
+    /// when the data pump ends, carrying the terminal cause so a JS `onData`
+    /// consumer can observe *why* delivery stopped — parity with Rust
+    /// `subscribe_with_errors` / Go `StreamWithErrors`. Held here to prevent GC.
+    end_callback: Arc<Mutex<Option<ThreadsafeFunction<Option<String>, ErrorStrategy::Fatal>>>>,
     /// Whether the push-model data pump thread is running.
     pump_active: Arc<AtomicBool>,
 }
@@ -288,6 +293,7 @@ impl AudioCapture {
         Ok(AudioCapture {
             inner: Arc::new(Mutex::new(capture)),
             callback: Arc::new(Mutex::new(None)),
+            end_callback: Arc::new(Mutex::new(None)),
             pump_active: Arc::new(AtomicBool::new(false)),
         })
     }
@@ -322,6 +328,7 @@ impl AudioCapture {
         Ok(AudioCapture {
             inner: Arc::new(Mutex::new(capture)),
             callback: Arc::new(Mutex::new(None)),
+            end_callback: Arc::new(Mutex::new(None)),
             pump_active: Arc::new(AtomicBool::new(false)),
         })
     }
@@ -399,7 +406,8 @@ impl AudioCapture {
     /// Throws if the capture is not running.
     #[napi]
     pub fn read(&self) -> Result<Option<AudioChunk>> {
-        let mut inner = self.inner.lock().map_err(|e| {
+        // `read_buffer` takes `&self` now, so the guard does not need `mut`.
+        let inner = self.inner.lock().map_err(|e| {
             napi::Error::new(
                 napi::Status::GenericFailure,
                 format!("Lock poisoned: {}", e),
@@ -417,7 +425,8 @@ impl AudioCapture {
     /// with appropriate yielding.
     #[napi]
     pub fn read_blocking(&self) -> Result<AudioChunk> {
-        let mut inner = self.inner.lock().map_err(|e| {
+        // `read_buffer_blocking` takes `&self` now, so the guard does not need `mut`.
+        let inner = self.inner.lock().map_err(|e| {
             napi::Error::new(
                 napi::Status::GenericFailure,
                 format!("Lock poisoned: {}", e),
@@ -438,7 +447,8 @@ impl AudioCapture {
 
         let result =
             tokio::task::spawn_blocking(move || -> napi::Result<Option<rsac::AudioBuffer>> {
-                let mut capture = inner.lock().map_err(|e| {
+                // `read_buffer` takes `&self`, so the guard does not need `mut`.
+                let capture = inner.lock().map_err(|e| {
                     napi::Error::new(
                         napi::Status::GenericFailure,
                         format!("Lock poisoned: {}", e),
@@ -466,7 +476,8 @@ impl AudioCapture {
         let inner = self.inner.clone();
 
         let result = tokio::task::spawn_blocking(move || -> napi::Result<rsac::AudioBuffer> {
-            let mut capture = inner.lock().map_err(|e| {
+            // `read_buffer_blocking` takes `&self`, so the guard does not need `mut`.
+            let capture = inner.lock().map_err(|e| {
                 napi::Error::new(
                     napi::Status::GenericFailure,
                     format!("Lock poisoned: {}", e),
@@ -531,14 +542,66 @@ impl AudioCapture {
         Ok(())
     }
 
+    /// Register a callback that fires exactly once when push-based delivery ends,
+    /// carrying *why* it ended.
+    ///
+    /// The data pump started by `onData` ends in one of two ways, and a plain
+    /// `onData` consumer cannot otherwise distinguish them:
+    ///
+    /// - **Terminal (fatal):** the backend stream reached its terminal state
+    ///   (e.g. `StreamEnded`). The callback's `error` argument is the formatted
+    ///   terminal `AudioError` message (a non-null string).
+    /// - **Clean stop:** the pump was torn down by `stop` / `offData`, or the
+    ///   read mutex was poisoned. The callback's `error` argument is `null`.
+    ///
+    /// This is the Node parity for Rust's `subscribe_with_errors` and Go's
+    /// `StreamWithErrors`: an `onData` consumer registers `onEnd` to learn the
+    /// terminal reason instead of the pump silently logging it. Registering an
+    /// `onEnd` callback is optional and independent of `onData`; it is invoked at
+    /// most once per pump run (the pump clears it after firing). Calling `onEnd`
+    /// again replaces the previous callback. A recoverable hiccup never fires it
+    /// — only the single terminal end does.
+    #[napi(ts_args_type = "callback: (error: string | null) => void")]
+    pub fn on_end(
+        &self,
+        callback: ThreadsafeFunction<Option<String>, ErrorStrategy::Fatal>,
+    ) -> Result<()> {
+        let mut cb_guard = self.end_callback.lock().map_err(|e| {
+            napi::Error::new(
+                napi::Status::GenericFailure,
+                format!("Lock poisoned: {}", e),
+            )
+        })?;
+        *cb_guard = Some(callback);
+        Ok(())
+    }
+
     /// Remove the registered data callback.
     ///
-    /// Stops the data pump thread if running.
+    /// Stops the data pump thread if running. The terminal-observability
+    /// callback registered via `onEnd` is left registered for a later session;
+    /// use `offEnd` to clear it.
     #[napi]
     pub fn off_data(&self) -> Result<()> {
         self.pump_active.store(false, Ordering::SeqCst);
 
         let mut cb_guard = self.callback.lock().map_err(|e| {
+            napi::Error::new(
+                napi::Status::GenericFailure,
+                format!("Lock poisoned: {}", e),
+            )
+        })?;
+        *cb_guard = None;
+        Ok(())
+    }
+
+    /// Remove the registered terminal-observability callback (see `onEnd`).
+    ///
+    /// After this, the data pump's end is no longer reported to JS (it falls back
+    /// to a log line). Does not stop the pump.
+    #[napi]
+    pub fn off_end(&self) -> Result<()> {
+        let mut cb_guard = self.end_callback.lock().map_err(|e| {
             napi::Error::new(
                 napi::Status::GenericFailure,
                 format!("Lock poisoned: {}", e),
@@ -688,6 +751,7 @@ impl AudioCapture {
     fn start_data_pump(&self) -> Result<()> {
         let inner = self.inner.clone();
         let callback = self.callback.clone();
+        let end_callback = self.end_callback.clone();
         let pump_active = self.pump_active.clone();
 
         pump_active.store(true, Ordering::SeqCst);
@@ -695,6 +759,11 @@ impl AudioCapture {
         std::thread::Builder::new()
             .name("rsac-napi-pump".into())
             .spawn(move || {
+                // The terminal reason this pump ended with: `Some(msg)` on a fatal
+                // terminal (the formatted `AudioError`), `None` on a clean stop /
+                // poisoned mutex. Fired to the JS `onEnd` callback exactly once
+                // after the loop exits (see the `end_callback` notification below).
+                let mut end_reason: Option<String> = None;
                 while pump_active.load(Ordering::SeqCst) {
                     // Read via `read_chunk_nonblocking` (NOT `read_buffer`):
                     // `read_buffer` short-circuits to a RECOVERABLE
@@ -708,7 +777,7 @@ impl AudioCapture {
                     let maybe_buf = {
                         let capture = match inner.lock() {
                             Ok(c) => c,
-                            Err(_) => break, // Mutex poisoned, bail
+                            Err(_) => break, // Mutex poisoned, bail (clean: None)
                         };
                         capture.read_chunk_nonblocking()
                     };
@@ -729,12 +798,14 @@ impl AudioCapture {
                             std::thread::sleep(std::time::Duration::from_millis(1));
                         }
                         // FATAL terminal (e.g. StreamEnded): the stream is done —
-                        // stop pumping cleanly. Log the terminal cause so the end
-                        // is never fully silent. (A consumer that needs the terminal
-                        // AudioError surfaced to JS should register an on-end/on-error
-                        // callback; the data pump itself ends here without erroring.)
+                        // stop pumping cleanly. Capture the terminal cause so it is
+                        // surfaced to a registered `onEnd` callback (and logged), so
+                        // the end is never fully silent. (A consumer that needs the
+                        // terminal AudioError surfaced to JS registers `onEnd`; the
+                        // data pump itself ends here without erroring.)
                         Err(ref e) if e.is_fatal() => {
                             eprintln!("rsac-napi data pump ended (terminal): {}", e);
+                            end_reason = Some(e.to_string());
                             break;
                         }
                         // RECOVERABLE hiccup (transient StreamReadError,
@@ -748,6 +819,17 @@ impl AudioCapture {
                     }
                 }
                 pump_active.store(false, Ordering::SeqCst);
+
+                // Notify the JS consumer (if it registered `onEnd`) *why* delivery
+                // stopped — the terminal `AudioError` message on a fatal terminal,
+                // or `null` on a clean stop. Fired once here, then cleared so a
+                // later pump run cannot re-fire a stale callback. This is the Node
+                // parity for `subscribe_with_errors` / `StreamWithErrors`.
+                if let Ok(mut guard) = end_callback.lock() {
+                    if let Some(tsfn) = guard.take() {
+                        tsfn.call(end_reason, ThreadsafeFunctionCallMode::NonBlocking);
+                    }
+                }
             })
             .map_err(|e| {
                 napi::Error::new(
@@ -1017,5 +1099,59 @@ mod tests {
     fn stream_stats_overruns_aliases_buffers_dropped() {
         let s = rsac::StreamStats::default();
         assert_eq!(s.overruns, s.buffers_dropped);
+    }
+
+    // ── rsac-cbda: onEnd terminal-observability classification ───────────
+    //
+    // The `onEnd` ThreadsafeFunction path cannot be driven without a node
+    // runtime + a real device, so these pin the *classification contract* the
+    // data pump's `end_reason` computation relies on: only a FATAL terminal
+    // produces a non-null reason (the formatted `AudioError`), and the formatted
+    // message is what gets surfaced to JS; a RECOVERABLE hiccup never ends the
+    // pump and so never fires `onEnd`. This mirrors the Python `__next__` and Go
+    // `StreamWithErrors` terminal-classification tests.
+
+    /// A fatal terminal (`StreamEnded`, ADR-0003) is what the pump surfaces to
+    /// `onEnd` as a non-null reason — and the reason is exactly `e.to_string()`,
+    /// the same formatted message the pump logs.
+    #[test]
+    fn on_end_fatal_terminal_surfaces_formatted_reason() {
+        let e = rsac::AudioError::StreamEnded {
+            reason: "capture ended".into(),
+        };
+        assert!(
+            e.is_fatal(),
+            "StreamEnded must be fatal → pump ends and fires onEnd with Some(reason)"
+        );
+        // The pump stores `Some(e.to_string())` as the end reason; the JS callback
+        // receives exactly this string (non-empty, carries the upstream cause).
+        let end_reason: Option<String> = Some(e.to_string());
+        let surfaced = end_reason.expect("fatal terminal yields a reason");
+        assert!(!surfaced.is_empty());
+        assert_eq!(surfaced, e.to_string());
+    }
+
+    /// A recoverable hiccup (transient `StreamReadError`, `BufferOverrun`/
+    /// `Underrun`) is NOT fatal, so the pump retries instead of ending — it never
+    /// fires `onEnd`. Pin the classification so a future change can't silently
+    /// turn a transient blip into a terminal `onEnd`.
+    #[test]
+    fn on_end_recoverable_does_not_terminate_pump() {
+        for e in [
+            rsac::AudioError::StreamReadError {
+                reason: "transient".into(),
+            },
+            rsac::AudioError::BufferOverrun { dropped_frames: 1 },
+            rsac::AudioError::BufferUnderrun {
+                requested: 1,
+                available: 0,
+            },
+        ] {
+            assert!(
+                !e.is_fatal(),
+                "{e} is recoverable → pump retries, onEnd not fired"
+            );
+            assert!(e.is_recoverable());
+        }
     }
 }

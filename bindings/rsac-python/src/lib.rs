@@ -1125,24 +1125,36 @@ impl PyAudioCapture {
         // recoverable `StreamReadError` (cutting iteration short on a transient
         // blip) and surfaced the fatal `StreamEnded` as a `StreamError`
         // (raising on the natural end of capture).
+        //
+        // We read via `read_chunk_blocking` (the *terminal-observable* path),
+        // NOT `read_buffer_blocking`. `read_buffer_blocking` short-circuits to a
+        // RECOVERABLE `StreamReadError` the moment the stream leaves `Running`,
+        // so its `is_running()` guard makes the fatal `StreamEnded` arm here
+        // UNREACHABLE — iteration would always end via the "Capture stopped"
+        // `StopIteration` below and never surface the true terminal reason.
+        // `read_chunk_blocking` drains the buffered tail while `Stopping` and
+        // returns the fatal `StreamEnded` once the ring is empty AND the stream
+        // is terminal, so the real terminal cause flows into the `is_fatal()`
+        // arm (mirrors the napi pump and Go `StreamWithErrors`).
         loop {
             // Release GIL for the blocking read.
-            let result = py.allow_threads(|| capture.read_buffer_blocking());
+            let result = py.allow_threads(|| capture.read_chunk_blocking());
 
             match result {
                 Ok(buf) => return Ok(Some(PyAudioBuffer { inner: buf })),
-                // Natural end of capture / terminal: end iteration. `is_fatal()`
-                // is the single source of truth (ADR-0003: `StreamEnded` is
-                // Fatal); we do not match a specific variant so any fatal
-                // terminal ends cleanly.
+                // Natural end of capture / terminal: end iteration carrying the
+                // true terminal reason. `is_fatal()` is the single source of
+                // truth (ADR-0003: `StreamEnded` is Fatal); we do not match a
+                // specific variant so any fatal terminal ends cleanly.
                 Err(e) if e.is_fatal() => {
                     return Err(PyStopIteration::new_err(e.to_string()));
                 }
-                // Recoverable hiccup: do NOT end iteration. But `read_buffer_blocking`
-                // returns a *recoverable* `StreamReadError` when the stream has
-                // left `Running` (e.g. an external `stop()`), so re-check the
-                // running state to avoid spinning forever after a stop — a stop
-                // mid-iteration ends it cleanly via `StopIteration`.
+                // Recoverable hiccup: do NOT end iteration. `read_chunk_blocking`
+                // can still surface a *recoverable* `StreamReadError` (e.g. the
+                // stream is not yet initialized, or a transient backend hiccup),
+                // so re-check the running state to avoid spinning forever after a
+                // stop — a stop mid-iteration that has not yet reached the fatal
+                // terminal ends cleanly via `StopIteration`.
                 Err(e) if e.is_recoverable() => {
                     if !capture.is_running() {
                         return Err(PyStopIteration::new_err("Capture stopped"));
@@ -1309,9 +1321,20 @@ mod tests {
     // on: a fatal terminal → StopIteration, a recoverable hiccup → retry. They
     // guard against re-introducing the inverted mapping (where the recoverable
     // `StreamReadError` ended iteration and the fatal `StreamEnded` raised).
+    //
+    // `__next__` reads via `read_chunk_blocking` (the terminal-observable path),
+    // NOT `read_buffer_blocking`. The latter's `is_running()` guard downgrades
+    // every post-`Running` read to a *recoverable* `StreamReadError`, which made
+    // the fatal `StreamEnded` arm UNREACHABLE — iteration always ended via the
+    // "Capture stopped" `StopIteration` and never surfaced the true terminal
+    // reason. `read_chunk_blocking` lets the fatal terminal flow through, so the
+    // `is_fatal()` arm below is now reachable and carries the real cause.
 
     /// `StreamEnded` (the natural end of capture) is FATAL, so `__next__` raises
-    /// `StopIteration` on it — NOT a `StreamError`.
+    /// `StopIteration` on it — NOT a `StreamError`. With `read_chunk_blocking`
+    /// this arm is reachable (it was dead under `read_buffer_blocking`'s
+    /// `is_running()` guard), and the `StopIteration` carries the terminal
+    /// reason string so a caller can observe *why* iteration ended.
     #[test]
     fn stream_ended_is_fatal_so_next_raises_stop_iteration() {
         let e = rsac::AudioError::StreamEnded {
@@ -1322,6 +1345,9 @@ mod tests {
             "StreamEnded must be fatal → __next__ ends via StopIteration"
         );
         assert!(!e.is_recoverable());
+        // The terminal reason is surfaced as the StopIteration payload
+        // (`e.to_string()`), so it is non-empty and carries the upstream cause.
+        assert!(!e.to_string().is_empty());
     }
 
     /// A transient `StreamReadError` is RECOVERABLE, so `__next__` must retry it

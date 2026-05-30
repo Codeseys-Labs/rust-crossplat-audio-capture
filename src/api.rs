@@ -351,13 +351,57 @@ impl AudioCaptureBuilder {
         };
 
         // ── Resolve device from target ──────────────────────────────
-        let enumerator = get_device_enumerator()?;
+        let selected_device = Self::resolve_target_device(&capture_config.target)?;
 
-        let selected_device = match &capture_config.target {
+        // ── Format negotiation (non-Linux) ──────────────────────────
+        // Devices advertise a fixed set of formats via WASAPI / CoreAudio. If
+        // the exact requested format isn't on offer, negotiate to the closest
+        // supported one (prefer the requested sample rate, then an F32 sample
+        // type) instead of hard-failing — consumers resample/downmix
+        // downstream anyway, and the alternative is that perfectly capturable
+        // devices (e.g. a virtual surround endpoint that only advertises
+        // 8ch/96000, or a 44.1kHz-only interface) are unusable. Only error if
+        // the device advertises no formats at all. Single-sourced with
+        // `negotiated_format()` via `negotiate_device_format()` so the format a
+        // pre-build query reports cannot drift from the one `build()` applies.
+        #[cfg(not(target_os = "linux"))]
+        {
+            let requested = capture_config.stream_config.to_audio_format();
+            let negotiated = negotiate_device_format(selected_device.as_ref(), &requested)?;
+            if negotiated != requested {
+                capture_config.stream_config.sample_rate = negotiated.sample_rate;
+                capture_config.stream_config.channels = negotiated.channels;
+                capture_config.stream_config.sample_format = negotiated.sample_format;
+            }
+        }
+
+        Ok(AudioCapture {
+            config: capture_config,
+            device: Some(selected_device),
+            stream: None,
+            callback: Mutex::new(None),
+            callback_pump: None,
+            start_instant: None,
+        })
+    }
+
+    /// Resolves the [`AudioDevice`](crate::core::interface::AudioDevice) a given
+    /// [`CaptureTarget`] maps to, exactly as [`build`](Self::build) does.
+    ///
+    /// Shared by [`build`](Self::build) and [`negotiated_format`](Self::negotiated_format)
+    /// so the two cannot diverge on which device a target selects. Takes the
+    /// target by reference and returns the boxed device; does not mutate the
+    /// builder. This is device enumeration / resolution only — no stream is
+    /// created and no real-time path is touched.
+    fn resolve_target_device(
+        target: &CaptureTarget,
+    ) -> AudioResult<Box<dyn crate::core::interface::AudioDevice>> {
+        let enumerator = get_device_enumerator()?;
+        let selected_device = match target {
             CaptureTarget::SystemDefault => {
                 // All backends return the default output device (used for loopback capture).
                 enumerator
-                    .get_default_device()
+                    .default_device()
                     .map_err(|e| AudioError::DeviceEnumerationError {
                         reason: format!("Failed to get default device: {}", e),
                         context: None,
@@ -388,7 +432,7 @@ impl AudioCaptureBuilder {
             | CaptureTarget::ProcessTree(_) => {
                 // Application capture typically uses the default output device
                 enumerator
-                    .get_default_device()
+                    .default_device()
                     .map_err(|e| AudioError::DeviceEnumerationError {
                         reason: format!(
                             "Failed to get default output device for app capture: {}",
@@ -398,57 +442,86 @@ impl AudioCaptureBuilder {
                     })?
             }
         };
+        Ok(selected_device)
+    }
 
-        // ── Format negotiation (non-Linux) ──────────────────────────
-        // Devices advertise a fixed set of formats via WASAPI / CoreAudio. If
-        // the exact requested format isn't on offer, negotiate to the closest
-        // supported one (prefer the requested sample rate, then an F32 sample
-        // type) instead of hard-failing — consumers resample/downmix
-        // downstream anyway, and the alternative is that perfectly capturable
-        // devices (e.g. a virtual surround endpoint that only advertises
-        // 8ch/96000, or a 44.1kHz-only interface) are unusable. Only error if
-        // the device advertises no formats at all.
+    /// Returns the [`AudioFormat`] that
+    /// [`build`](Self::build) would deliver for this configuration **without**
+    /// constructing an [`AudioCapture`] or opening a stream (AEG-8, rsac-0113).
+    ///
+    /// This lets a downstream learn the *resolved* delivery format ahead of time
+    /// — e.g. to pre-size resamplers or downmix tables — without re-enumerating
+    /// devices and re-implementing the negotiation policy. It runs the same
+    /// [`preflight`](Self::preflight) checks, resolves the same device via the
+    /// shared `resolve_target_device` helper, and applies the same
+    /// closest-match negotiation (`negotiate_device_format`) that `build()`
+    /// uses, so the two cannot drift.
+    ///
+    /// The returned `sample_format` reflects the *device-advertised* format
+    /// chosen at negotiation. Note that the bridge always delivers interleaved
+    /// f32 at runtime, so the post-`start()` observable
+    /// [`AudioCapture::format`] reports `F32`; this pre-build query instead
+    /// reports the endpoint's advertised sample type for the negotiated
+    /// rate/channels, which is the input to that conversion.
+    ///
+    /// # Platform behaviour (negotiation timing)
+    ///
+    /// - **Windows (WASAPI) / macOS (CoreAudio):** the device advertises a fixed
+    ///   set of formats, so negotiation is resolvable at config time and this
+    ///   returns the negotiated [`AudioFormat`].
+    /// - **Linux (PipeWire):** the delivered format is negotiated at
+    ///   **stream-open** (in the `param_changed` callback), *after* `build()`,
+    ///   so it cannot be known pre-build. This method returns
+    ///   [`AudioError::PlatformNotSupported`] there; query
+    ///   [`AudioCapture::format`] after [`start`](AudioCapture::start) instead.
+    ///
+    /// # Errors
+    ///
+    /// - Any error [`preflight`](Self::preflight) raises (unsupported platform
+    ///   feature, out-of-range sample rate or channel count).
+    /// - [`AudioError::DeviceEnumerationError`] / [`AudioError::DeviceNotFound`]
+    ///   if the target device cannot be resolved.
+    /// - [`AudioError::UnsupportedFormat`] if the resolved device advertises no
+    ///   usable formats at all (the same hard-fail `build()` would hit).
+    /// - [`AudioError::PlatformNotSupported`] on Linux (see above).
+    ///
+    /// # Example
+    ///
+    /// ```rust,no_run
+    /// # use rsac::api::AudioCaptureBuilder;
+    /// # fn main() -> Result<(), Box<dyn std::error::Error>> {
+    /// let _builder = AudioCaptureBuilder::new().sample_rate(48000).channels(2);
+    /// # #[cfg(not(target_os = "linux"))]
+    /// let _resolved = _builder.negotiated_format()?; // no AudioCapture built
+    /// # Ok(())
+    /// # }
+    /// ```
+    pub fn negotiated_format(&self) -> AudioResult<AudioFormatType> {
+        // Same device-independent validation build() runs first.
+        self.preflight()?;
+
         #[cfg(not(target_os = "linux"))]
         {
-            let requested = capture_config.stream_config.to_audio_format();
-            let supported = selected_device.supported_formats();
-            if !supported.is_empty() && !supported.contains(&requested) {
-                match pick_supported_format(&supported, &requested) {
-                    Some(f) => {
-                        log::warn!(
-                            "Device '{}' does not support requested format {:?}; \
-                             negotiated to {:?}",
-                            selected_device.name(),
-                            requested,
-                            f
-                        );
-                        capture_config.stream_config.sample_rate = f.sample_rate;
-                        capture_config.stream_config.channels = f.channels;
-                        capture_config.stream_config.sample_format = f.sample_format;
-                    }
-                    None => {
-                        return Err(AudioError::UnsupportedFormat {
-                            format: format!(
-                                "The selected device '{}' advertises no usable audio formats \
-                                 (requested {:?})",
-                                selected_device.name(),
-                                requested
-                            ),
-                            context: None,
-                        });
-                    }
-                }
-            }
+            // to_audio_format() reads only rate/channels/sample_format, so the
+            // builder's config gives the requested format directly — no need to
+            // stamp capture_target first (build() does that only for the stored
+            // AudioCaptureConfig, which this query does not construct).
+            let requested = self.config.to_audio_format();
+            let selected_device = Self::resolve_target_device(&self.target)?;
+            negotiate_device_format(selected_device.as_ref(), &requested)
         }
 
-        Ok(AudioCapture {
-            config: capture_config,
-            device: Some(selected_device),
-            stream: None,
-            callback: Mutex::new(None),
-            callback_pump: None,
-            start_instant: None,
-        })
+        // On Linux the delivered format is only known at stream-open; document
+        // and surface that rather than guessing a pre-build value.
+        #[cfg(target_os = "linux")]
+        {
+            Err(AudioError::PlatformNotSupported {
+                feature: "pre-build negotiated_format query (Linux negotiates at \
+                          stream-open; read AudioCapture::format() after start())"
+                    .to_string(),
+                platform: "linux".to_string(),
+            })
+        }
     }
 
     /// Builds **and** starts a capture in one call, returning a
@@ -821,6 +894,63 @@ impl fmt::Debug for DrainHandle {
     }
 }
 
+/// Resolve the delivery [`AudioFormat`] a device will produce for `requested`,
+/// applying the same closest-match negotiation [`build`](AudioCaptureBuilder::build)
+/// uses.
+///
+/// Single source of truth shared by [`build`](AudioCaptureBuilder::build) and
+/// [`negotiated_format`](AudioCaptureBuilder::negotiated_format) so a pre-build
+/// query and the actual build cannot drift:
+///
+/// - If the device advertises no formats at all, returns the requested format
+///   unchanged (the backend will open with the request as-is; nothing to
+///   negotiate against).
+/// - If the device advertises the exact requested format, returns it.
+/// - Otherwise returns the closest supported format per
+///   [`pick_supported_format`]'s preference order.
+/// - Returns [`AudioError::UnsupportedFormat`] only when the device advertises
+///   some formats but [`pick_supported_format`] still finds nothing usable
+///   (which it does not for a non-empty list, but the hard-fail is preserved to
+///   match `build()`'s contract exactly).
+///
+/// The device name is read via the trait object only for the error/log
+/// message; this is a config-time path and touches no real-time code.
+#[cfg(not(target_os = "linux"))]
+fn negotiate_device_format(
+    device: &dyn crate::core::interface::AudioDevice,
+    requested: &AudioFormat,
+) -> AudioResult<AudioFormat> {
+    let supported = device.supported_formats();
+    // No advertised formats → nothing to negotiate against; the backend opens
+    // with the request as-is. (build() only hard-fails on a non-empty list that
+    // yields no usable pick, which pick_supported_format never does.)
+    if supported.is_empty() {
+        return Ok(requested.clone());
+    }
+    if supported.contains(requested) {
+        return Ok(requested.clone());
+    }
+    match pick_supported_format(&supported, requested) {
+        Some(f) => {
+            log::warn!(
+                "Device '{}' does not support requested format {:?}; negotiated to {:?}",
+                device.name(),
+                requested,
+                f
+            );
+            Ok(f)
+        }
+        None => Err(AudioError::UnsupportedFormat {
+            format: format!(
+                "The selected device '{}' advertises no usable audio formats (requested {:?})",
+                device.name(),
+                requested
+            ),
+            context: None,
+        }),
+    }
+}
+
 /// Pick a device-supported format closest to `requested`.
 ///
 /// Used by [`AudioCaptureBuilder::build()`] to negotiate when a device does
@@ -907,6 +1037,85 @@ mod format_negotiation_tests {
         let chosen = pick_supported_format(&supported, &fmt(48000, 2, SampleFormat::F32)).unwrap();
         assert_eq!(chosen, fmt(48000, 2, SampleFormat::F32));
     }
+
+    // ── negotiate_device_format() tests (AEG-8, rsac-0113) ────────────
+
+    /// A minimal AudioDevice whose `supported_formats()` is configurable, so we
+    /// can exercise `negotiate_device_format` (the shared build()/
+    /// negotiated_format() helper) without hardware.
+    struct MockDevice {
+        formats: Vec<AudioFormat>,
+    }
+
+    impl crate::core::interface::AudioDevice for MockDevice {
+        fn id(&self) -> crate::core::config::DeviceId {
+            crate::core::config::DeviceId("mock".to_string())
+        }
+        fn name(&self) -> String {
+            "MockDevice".to_string()
+        }
+        fn is_default(&self) -> bool {
+            true
+        }
+        fn supported_formats(&self) -> Vec<AudioFormat> {
+            self.formats.clone()
+        }
+        fn create_stream(
+            &self,
+            _config: &StreamConfig,
+        ) -> AudioResult<Box<dyn crate::core::interface::CapturingStream>> {
+            Err(AudioError::StreamCreationFailed {
+                reason: "mock device cannot create a stream".to_string(),
+                context: None,
+            })
+        }
+    }
+
+    /// An exact-match request passes through unchanged.
+    #[test]
+    fn negotiate_returns_requested_when_exact_match() {
+        let dev = MockDevice {
+            formats: vec![fmt(48000, 2, SampleFormat::F32)],
+        };
+        let requested = fmt(48000, 2, SampleFormat::F32);
+        let got = negotiate_device_format(&dev, &requested).expect("ok");
+        assert_eq!(got, requested);
+    }
+
+    /// A device advertising NO formats negotiates to the requested format
+    /// unchanged — mirroring build()'s prior behavior (it skipped negotiation
+    /// entirely when supported_formats() was empty). This is the property the
+    /// build()/negotiated_format() single-sourcing depends on.
+    #[test]
+    fn negotiate_empty_formats_returns_requested() {
+        let dev = MockDevice { formats: vec![] };
+        let requested = fmt(44100, 1, SampleFormat::F32);
+        let got = negotiate_device_format(&dev, &requested).expect("ok");
+        assert_eq!(
+            got, requested,
+            "empty advertisement must pass the request through (no hard-fail)"
+        );
+    }
+
+    /// The field-failure case: a surround-only endpoint negotiates the request
+    /// to its advertised 8ch/96000 F32 — proving negotiate_device_format applies
+    /// the same closest-match policy pick_supported_format does.
+    #[test]
+    fn negotiate_surround_only_device() {
+        let dev = MockDevice {
+            formats: vec![
+                fmt(96000, 8, SampleFormat::F32),
+                fmt(96000, 8, SampleFormat::I16),
+            ],
+        };
+        let requested = fmt(48000, 2, SampleFormat::F32);
+        let got = negotiate_device_format(&dev, &requested).expect("ok");
+        assert_eq!(got, fmt(96000, 8, SampleFormat::F32));
+        assert_ne!(
+            got, requested,
+            "a forced negotiation diverges from requested"
+        );
+    }
 }
 
 /// Represents an active audio capture session.
@@ -976,6 +1185,36 @@ pub struct AudioCapture {
     /// restart of an already-running stream. Drives [`uptime`](AudioCapture::uptime).
     start_instant: Option<Instant>,
 }
+
+// ── Send + Sync assertion (AEG-5, rsac-6f1f) ──────────────────────────────
+//
+// `AudioCapture` holds only `Send + Sync` parts: an owned `AudioCaptureConfig`;
+// `Option<Box<dyn AudioDevice>>` and `Option<Arc<dyn CapturingStream>>` whose
+// trait objects are bounded `Send + Sync` (see `crate::core::interface`); a
+// `Mutex<Option<Box<dyn FnMut(&AudioBuffer) + Send>>>` (a `Mutex` of a `Send`
+// payload is `Send + Sync`); an `Option<CallbackPump>` (an `Arc<AtomicBool>`
+// plus a `JoinHandle<()>`, both `Send + Sync`); and an `Option<Instant>`. The
+// compiler therefore derives both auto-traits.
+//
+// We deliberately do NOT hand-write `unsafe impl Send/Sync`: that would suppress
+// the compiler's safety net if a non-`Send`/`Sync` field were ever added (e.g. a
+// raw pointer or `Rc`), silently making the handle unsound to share. The
+// compile-time assertion below pins the type-level guarantee the module doc
+// promises (and that downstreams previously had to guess at — some assumed
+// `!Sync`) without `unsafe`. Mirrors `buffer.rs`'s `_assert_send_sync`.
+//
+// All public read paths (`read_buffer`, `read_buffer_blocking`,
+// `read_chunk_nonblocking`, `read_chunk_blocking`, `subscribe`,
+// `subscribe_with_errors`, `request_stop`, stats/format) take `&self` and reach
+// the underlying stream through its own `&self` methods, so an `Arc<AudioCapture>`
+// shared across threads needs no external lock for reads. The only `&mut self`
+// entry points are lifecycle mutators (`start`/`stop`/`set_callback`/
+// `clear_callback`) and `buffers_iter`, whose iterator holds a `&mut AudioCapture`
+// borrow; none of these contradict the `Send + Sync` guarantee.
+const _: () = {
+    const fn _assert_send_sync<T: Send + Sync>() {}
+    _assert_send_sync::<AudioCapture>();
+};
 
 impl AudioCapture {
     /// Starts the audio capture stream.
@@ -2146,6 +2385,52 @@ mod tests {
         assert_eq!(builder.config.sample_format, SampleFormat::I32);
     }
 
+    // ── negotiated_format() tests (AEG-8, rsac-0113) ──────────────────
+
+    /// On Linux, negotiated_format() is intentionally unsupported pre-build
+    /// (PipeWire negotiates at stream-open). It must return PlatformNotSupported
+    /// rather than guessing a value — and must still run preflight first, so an
+    /// invalid config surfaces its config error before the platform gate.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn negotiated_format_unsupported_on_linux() {
+        let builder = AudioCaptureBuilder::new().sample_rate(48000).channels(2);
+        match builder.negotiated_format() {
+            Err(AudioError::PlatformNotSupported { platform, .. }) => {
+                assert_eq!(platform, "linux");
+            }
+            other => panic!("expected PlatformNotSupported on Linux, got: {other:?}"),
+        }
+    }
+
+    /// negotiated_format() runs preflight() first on every platform: an invalid
+    /// config (unsupported sample rate) is rejected with the same
+    /// InvalidParameter error build() would raise, before any device work.
+    #[test]
+    fn negotiated_format_runs_preflight_first() {
+        let builder = AudioCaptureBuilder::new().sample_rate(11025); // unsupported
+        match builder.negotiated_format() {
+            Err(AudioError::InvalidParameter { param, .. }) => {
+                assert_eq!(param, "sample_rate");
+            }
+            other => panic!("expected InvalidParameter from preflight, got: {other:?}"),
+        }
+    }
+
+    /// On non-Linux platforms negotiated_format() resolves a real device. With
+    /// no hardware it surfaces an honest enumeration/format error; with hardware
+    /// it returns a format. Either way it must NOT panic — this asserts the
+    /// pre-build query is callable and well-behaved on a device-free CI box.
+    #[cfg(not(target_os = "linux"))]
+    #[test]
+    fn negotiated_format_is_callable_and_does_not_panic() {
+        let builder = AudioCaptureBuilder::new().sample_rate(48000).channels(2);
+        // Valid config → preflight passes; device resolution may succeed (real
+        // hardware) or fail (device-free CI). Both are acceptable; a panic is
+        // not.
+        let _ = builder.negotiated_format();
+    }
+
     // ── Mock CapturingStream for subscribe/overrun_count tests ────────
 
     /// A mock CapturingStream that serves buffers from an internal Mutex<VecDeque>
@@ -2345,6 +2630,53 @@ mod tests {
             callback_pump: None,
             start_instant: None,
         }
+    }
+
+    // ── Send + Sync / Arc-shareable tests (AEG-5, rsac-6f1f) ──────────
+
+    /// AEG-5: `AudioCapture` is `Send + Sync` at the type level (the compile-time
+    /// `_assert_send_sync` const proves it; this test makes the guarantee visible
+    /// in the test surface so a regression that flips it shows up as a failing
+    /// test, not just a build break).
+    #[test]
+    fn audio_capture_is_send_and_sync() {
+        fn assert_send<T: Send>() {}
+        fn assert_sync<T: Sync>() {}
+        assert_send::<AudioCapture>();
+        assert_sync::<AudioCapture>();
+        // RunningCapture wraps it, so it inherits both.
+        assert_send::<RunningCapture>();
+        assert_sync::<RunningCapture>();
+    }
+
+    /// AEG-5: an `Arc<AudioCapture>` can be shared across threads and read
+    /// concurrently through `&self` with no external lock — the contract the
+    /// type-level `Send + Sync` claim makes good on. Two threads read from the
+    /// same shared handle via the `&self` read path; both succeed without a
+    /// `Mutex<AudioCapture>` wrapper.
+    #[test]
+    fn audio_capture_arc_shared_reads_need_no_external_lock() {
+        let mock = Arc::new(MockCapturingStream::new());
+        for _ in 0..8 {
+            mock.push_buffer(AudioBuffer::new(vec![0.25; 4], 2, 48000));
+        }
+        let capture = Arc::new(make_mock_capture(Arc::clone(&mock)));
+
+        let mut handles = Vec::new();
+        for _ in 0..2 {
+            let capture = Arc::clone(&capture);
+            handles.push(std::thread::spawn(move || {
+                // &self read path through a shared Arc — no Mutex<AudioCapture>.
+                let _ = capture.read_chunk_nonblocking();
+                // Other &self queries are reachable on the shared handle too.
+                let _ = capture.is_running();
+                let _ = capture.stream_stats();
+            }));
+        }
+        for h in handles {
+            h.join().expect("reader thread joins");
+        }
+        mock.signal_stop();
     }
 
     // ── subscribe() tests ─────────────────────────────────────────────
@@ -3621,18 +3953,33 @@ mod tests {
     /// read is in flight, with no &mut alias).
     #[test]
     fn request_stop_unblocks_parked_blocking_read() {
+        use std::sync::atomic::AtomicBool;
         let mock = Arc::new(MockCapturingStream::new());
         // No buffers queued, but the mock reports running, so read_chunk() spins.
         let capture = Arc::new(make_mock_capture(Arc::clone(&mock)));
 
+        // Barrier instead of a fixed sleep: the reader flips `entered` right
+        // before it enters the blocking read, so the stop is signalled only once
+        // the read is genuinely in flight — deterministic under parallel load.
+        let entered = Arc::new(AtomicBool::new(false));
         let reader = {
             let capture = Arc::clone(&capture);
-            std::thread::spawn(move || capture.read_buffer_blocking())
+            let entered = Arc::clone(&entered);
+            std::thread::spawn(move || {
+                entered.store(true, Ordering::SeqCst);
+                capture.read_buffer_blocking()
+            })
         };
 
-        // Give the reader a moment to park in read_chunk's spin-wait.
-        std::thread::sleep(std::time::Duration::from_millis(20));
-        // Concurrently signal a stop through &self — no &mut alias to the handle.
+        // Wait (bounded) until the reader has entered the blocking read, so a
+        // genuine hang still fails the test rather than spinning forever.
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        while !entered.load(Ordering::SeqCst) && std::time::Instant::now() < deadline {
+            std::thread::yield_now();
+        }
+        // Brief settle so the reader reaches read_chunk's spin-wait, then signal
+        // a stop through &self — no &mut alias to the handle.
+        std::thread::sleep(std::time::Duration::from_millis(5));
         capture.request_stop();
 
         let result = reader.join().expect("reader thread joins");
@@ -3855,7 +4202,13 @@ mod tests {
         let capture = RunningCapture(make_mock_capture(Arc::clone(&mock)));
         let drain = capture.drain_to(sink).expect("drain_to should succeed");
 
-        std::thread::sleep(std::time::Duration::from_millis(20));
+        // Poll until the pump has retried past the recoverable error and drained
+        // the one buffer behind it, instead of a fixed sleep that raced the
+        // pump-thread start under parallel load. Bounded so a hang still fails.
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        while writes.load(Ordering::SeqCst) < 1 && std::time::Instant::now() < deadline {
+            std::thread::sleep(std::time::Duration::from_millis(1));
+        }
         mock.signal_stop();
         drain.shutdown();
 

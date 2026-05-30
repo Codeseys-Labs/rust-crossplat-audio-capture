@@ -1754,11 +1754,29 @@ fn pw_thread_main(
                         // context during main_loop.iterate().
                         //
                         // REAL-TIME SAFETY:
-                        // - No heap allocation: `push_samples_or_drop` sources its
+                        // - No heap allocation: `push_samples_guarded` sources its
                         //   buffer from the bridge's free-list return ring, so the
                         //   only work here is a bulk reinterpret + the copy that
-                        //   `push_samples_or_drop` performs internally.
+                        //   the push performs internally.
                         // - Lock-free (rtrb), no blocking, no I/O, no logging.
+                        //
+                        // FFI-BOUNDARY PANIC GUARD (PS-4 / rsac-5a48): this
+                        // `.process` closure is registered as a C callback against
+                        // the PipeWire stream and is invoked from inside
+                        // `main_loop.iterate()`, so a panic unwinding out of here
+                        // would cross PipeWire's C frames — undefined behavior. We
+                        // therefore use the panic-GUARDED push below
+                        // (`push_samples_guarded`), which wraps the push in
+                        // `catch_unwind` so a panic can never escape into the C
+                        // frame: on a caught panic it logs once, counts a drop, and
+                        // poisons the stream to Error so a parked reader observes
+                        // end-of-stream instead of spinning on a dead callback. The
+                        // guard is alloc-free on the happy path (its closure only
+                        // borrows the producer and the sample slice), so ADR-0001's
+                        // steady-state zero-allocation guarantee is preserved.
+                        // Windows runs the equivalent push on rsac's *own* Rust
+                        // thread, where an unwind is well-defined, so it stays on
+                        // the unguarded `push_samples_or_drop`.
 
                         let Some(mut buffer) = stream.dequeue_buffer() else {
                             return;
@@ -1806,10 +1824,14 @@ fn pw_thread_main(
                             let (_head, samples, _tail) = unsafe { valid.align_to::<f32>() };
 
                             if !samples.is_empty() {
-                                // Push to the ring buffer. If full, the data is
-                                // silently dropped (back-pressure) and the overrun
-                                // counter is incremented.
-                                user_data.producer.push_samples_or_drop(
+                                // Push to the ring buffer through the FFI-boundary
+                                // panic guard (see the REAL-TIME SAFETY note above).
+                                // If the ring is full the data is silently dropped
+                                // (back-pressure) and the overrun counter is
+                                // incremented; a panic, if one ever occurred, is
+                                // contained rather than unwinding into PipeWire's C
+                                // frames.
+                                user_data.producer.push_samples_guarded(
                                     samples,
                                     channels,
                                     sample_rate,
@@ -1911,19 +1933,34 @@ fn pw_thread_main(
             Ok(PipeWireCommand::StopCapture { response_tx }) => {
                 log::debug!("PipeWire thread: StopCapture received");
 
-                // Producer-terminal-signal (FH-1 / ADR-0010): drive the bridge to
-                // a graceful ending state BEFORE tearing down the stream, so a
-                // parked Linux reader unblocks promptly. Running → Stopping (the
+                // rsac-78b2 (force_set-vs-graceful ordering): tear down the
+                // listener+stream FIRST, then signal the graceful end. The
+                // `.state_changed` arm calls the UNGUARDED `signal_error()`
+                // (`force_set(Error)`, last-writer-wins), so destroying the stream
+                // can synchronously deliver a `StreamState::Unconnected` transition
+                // whose callback writes terminal `Error`. If the graceful
+                // `Running → Stopping` CAS ran first (the previous order), that
+                // synchronous `Unconnected` during the drop would DOWNGRADE the
+                // just-set graceful `Stopping` to `Error`, mis-reporting a clean
+                // stop as a fatal one. Dropping the listener first removes its hook
+                // (`StreamListener::drop` → `hook::remove`), so no further
+                // `.state_changed` callback can fire; the graceful CAS that follows
+                // then runs with no racing writer.
+                //
+                // Teardown order within this block is unchanged: listener before
+                // stream (the listener's C callbacks reference the stream pointer).
+                capture_listener = None;
+                capture_stream = None;
+
+                // Producer-terminal-signal (FH-1 / ADR-0010): now that no callback
+                // can race us, drive the bridge to a graceful ending state so a
+                // parked Linux reader unblocks promptly. `Running → Stopping` (the
                 // graceful sibling) keeps any buffered tail drainable; the
                 // subsequent `BridgeStream::stop` path completes Stopping →
                 // Stopped. Idempotent: the CAS no-ops if a `.state_changed`
-                // spontaneous-death already poisoned the stream to Error.
+                // spontaneous-death already poisoned the stream to `Error` during
+                // the drop above — a genuine error correctly wins over the stop.
                 signal_session_graceful_end(active_shared.take());
-
-                // Drop listener first (unregisters callbacks from the C stream),
-                // then drop the stream (destroys the C stream object).
-                capture_listener = None;
-                capture_stream = None;
 
                 let _ = response_tx.send(Ok(()));
             }
@@ -2142,13 +2179,21 @@ fn pw_thread_main(
 
             Ok(PipeWireCommand::Shutdown) => {
                 log::debug!("PipeWire thread: Shutdown received, exiting event loop");
-                // Producer-terminal-signal (FH-1 / ADR-0010): end any active
-                // session before tearing it down so a parked reader unblocks.
-                signal_session_graceful_end(active_shared.take());
-                // Clean up any active capture before exiting.
+                // rsac-78b2 (force_set-vs-graceful ordering): tear down the
+                // listener+stream BEFORE the graceful signal (same race as the
+                // StopCapture arm). Destroying the stream can synchronously deliver
+                // a `StreamState::Unconnected` whose `.state_changed` callback calls
+                // the unguarded `signal_error()` (`force_set(Error)`); doing the
+                // graceful `Running → Stopping` CAS first would let that downgrade a
+                // clean shutdown to terminal `Error`. Dropping the listener first
+                // removes its hook so no callback can race the CAS below.
                 // Drop listener before stream — listener callbacks reference stream internals.
                 drop(capture_listener.take());
                 drop(capture_stream.take());
+                // Producer-terminal-signal (FH-1 / ADR-0010): now end any active
+                // session so a parked reader unblocks. Idempotent: a genuine error
+                // recorded during the drop above correctly wins over the stop.
+                signal_session_graceful_end(active_shared.take());
                 break;
             }
 
@@ -2159,12 +2204,20 @@ fn pw_thread_main(
             Err(std_mpsc::TryRecvError::Disconnected) => {
                 // Command channel closed — caller is gone, exit gracefully.
                 log::debug!("PipeWire thread: command channel disconnected, exiting");
-                // Producer-terminal-signal (FH-1 / ADR-0010): end any active
-                // session before tearing it down so a parked reader unblocks.
-                signal_session_graceful_end(active_shared.take());
+                // rsac-78b2 (force_set-vs-graceful ordering): tear down the
+                // listener+stream BEFORE the graceful signal (same race as the
+                // StopCapture/Shutdown arms): a synchronous `Unconnected` from the
+                // stream destroy would otherwise let the unguarded `signal_error()`
+                // downgrade the graceful `Stopping` to terminal `Error`. Dropping
+                // the listener first removes its hook so no callback can race the
+                // CAS below.
                 // Drop listener before stream — listener callbacks reference stream internals.
                 drop(capture_listener.take());
                 drop(capture_stream.take());
+                // Producer-terminal-signal (FH-1 / ADR-0010): now end any active
+                // session so a parked reader unblocks. Idempotent: a genuine error
+                // recorded during the drop above correctly wins over the stop.
+                signal_session_graceful_end(active_shared.take());
                 break;
             }
         }
@@ -3217,5 +3270,81 @@ mod tests {
             }
             Err(e) => panic!("Unexpected spawn error: {:?}", e),
         }
+    }
+
+    // ── force_set-vs-graceful ordering (rsac-78b2) ───────────────────
+    //
+    // The StopCapture / Shutdown / channel-disconnect teardown arms now drop the
+    // stream listener+stream BEFORE calling `signal_session_graceful_end`. The
+    // reason: the `.state_changed` arm invokes the UNGUARDED `signal_error()`
+    // (`force_set(StreamState::Error)`, last-writer-wins), so destroying the
+    // stream can synchronously deliver a `StreamState::Unconnected` whose callback
+    // writes terminal `Error`. If the graceful `Running → Stopping` CAS ran first,
+    // that synchronous `Unconnected` during the drop would DOWNGRADE the just-set
+    // graceful `Stopping` to `Error`, mis-reporting a clean stop as fatal.
+    //
+    // The synchronous disconnect delivery needs a live daemon + real stream and is
+    // not deterministically reproducible in a unit test. These tests instead pin
+    // the two invariants the ordering relies on, exercised directly against the
+    // bridge via the real `signal_session_graceful_end` helper:
+    //   1. From `Running`, the graceful end lands `Stopping` (clean-stop path).
+    //   2. `Error` is STICKY: a graceful end issued AFTER `Error` was force-set
+    //      (the simulated synchronous `signal_error()` during the drop) does NOT
+    //      downgrade it — proving WHY the drop must precede the graceful CAS, and
+    //      that a genuine error correctly wins over a concurrent stop.
+
+    use crate::bridge::ring_buffer::create_bridge;
+
+    fn ordering_test_format() -> crate::core::config::AudioFormat {
+        crate::core::config::AudioFormat {
+            sample_rate: 48000,
+            channels: 2,
+            sample_format: crate::core::config::SampleFormat::F32,
+        }
+    }
+
+    #[test]
+    fn test_graceful_end_from_running_lands_stopping() {
+        let (producer, consumer) = create_bridge(8, ordering_test_format());
+        // A live session is Running while capturing.
+        producer.shared().state.force_set(StreamState::Running);
+
+        // Clean stop with no racing `.state_changed` Error: the helper used by the
+        // StopCapture/Shutdown/disconnect arms drives Running → Stopping.
+        signal_session_graceful_end(Some(Arc::clone(producer.shared())));
+
+        assert_eq!(
+            consumer.shared().state.get(),
+            StreamState::Stopping,
+            "a clean stop must land the bridge in graceful Stopping"
+        );
+    }
+
+    #[test]
+    fn test_graceful_end_does_not_downgrade_terminal_error() {
+        let (producer, consumer) = create_bridge(8, ordering_test_format());
+        producer.shared().state.force_set(StreamState::Running);
+
+        // Simulate the synchronous `.state_changed(Unconnected)` → `signal_error()`
+        // that can fire WHILE the listener/stream is being dropped: terminal Error
+        // is force-set first. With the corrected ordering (drop BEFORE graceful
+        // signal), this is exactly the state the subsequent graceful CAS sees.
+        producer.signal_error();
+        assert_eq!(consumer.shared().state.get(), StreamState::Error);
+
+        // The graceful end must NOT downgrade a genuine terminal Error: its CAS is
+        // `Running → Stopping`, which no-ops because the state is Error, not
+        // Running. A real device-loss error correctly wins over the stop.
+        signal_session_graceful_end(Some(Arc::clone(producer.shared())));
+
+        assert_eq!(
+            consumer.shared().state.get(),
+            StreamState::Error,
+            "a graceful end must never downgrade terminal Error to Stopping"
+        );
+        assert!(
+            consumer.shared().state.is_terminal(),
+            "Error remains terminal so a blocking reader returns Fatal StreamEnded"
+        );
     }
 }

@@ -826,9 +826,20 @@ impl BridgeProducer {
     /// `catch_unwind` is near-free on the happy path and introduces **no heap
     /// allocation** there (the closure only borrows `&mut self` and `data`), so
     /// the ADR-0001 alloc-free guarantee is preserved — the alloc-probe still
-    /// reports `0`. Prefer this at FFI call sites; the unguarded
-    /// [`push_samples_or_drop`](Self::push_samples_or_drop) remains available for
-    /// in-process callers where a panic would unwind normally.
+    /// reports `0`.
+    ///
+    /// # Call sites (PS-4 / `rsac-5a48`)
+    ///
+    /// This is the production push at the two **foreign C-callback** boundaries,
+    /// where an unwind would be UB:
+    ///
+    /// - the macOS CoreAudio IOProc (`set_input_callback`, `src/audio/macos/thread.rs`), and
+    /// - the Linux PipeWire `.process` callback (`src/audio/linux/thread.rs`),
+    ///   invoked from inside `main_loop.iterate()`.
+    ///
+    /// The Windows WASAPI capture loop runs on rsac's **own** thread (not a foreign
+    /// callback), where an unwind is well-defined, so it keeps the unguarded
+    /// [`push_samples_or_drop`](Self::push_samples_or_drop). See ADR-0001 §5a.
     pub fn push_samples_guarded(&mut self, data: &[f32], channels: u16, sample_rate: u32) -> bool {
         // `&mut self` is not UnwindSafe (it could be left in a torn state), but a
         // panic here is already a last-resort safety net and we immediately
@@ -2578,6 +2589,44 @@ mod tests {
         assert!(
             caught.is_err(),
             "catch_unwind must contain a panic so it never crosses the FFI boundary"
+        );
+    }
+
+    // PS-4 (rsac-5a48): the FFI-boundary panic guard is now the production push
+    // at the macOS/Linux foreign-callback sites, so it MUST keep the ADR-0001
+    // alloc-free guarantee on the happy path. Mirroring
+    // `scratch_never_shrinks_to_zero_after_underrun`, we drive a warm push/pop
+    // cycle THROUGH `push_samples_guarded` and assert the producer keeps sourcing
+    // from the recycled free-list (never collapsing to a zero-capacity scratch
+    // that would force an RT-thread allocation). The process-wide counting-
+    // allocator probe in `tests/rt_alloc.rs` covers the shared core both entry
+    // points funnel into; this guards the guarded wrapper specifically.
+    #[test]
+    fn push_samples_guarded_is_alloc_free_on_happy_path() {
+        let (mut producer, mut consumer) = create_bridge(8, test_format());
+        // Warm-up: a steady stream of guarded push + pop. `pop` recycles a spare
+        // back to the producer's free-list, so after warm-up the guarded push
+        // sources from recycled buffers — no allocation on the (RT) push.
+        for i in 0..256u32 {
+            let v = i as f32;
+            assert!(
+                producer.push_samples_guarded(&[v, v + 0.5], 2, 48000),
+                "guarded push should succeed every steady-state iteration (iter {i})"
+            );
+            let buf = consumer.pop().expect("one buffer per iteration");
+            assert_eq!(buf.data(), &[v, v + 0.5], "data integrity at iter {i}");
+        }
+        // No panic occurred, so the stream is never poisoned by the guard.
+        assert_ne!(
+            producer.shared().state.get(),
+            StreamState::Error,
+            "the happy-path guarded push must not poison the stream"
+        );
+        // The free-list stays populated, which is what keeps the guarded RT push
+        // allocation-free (recycled buffers are reused rather than re-allocated).
+        assert!(
+            producer.recycled_available() > 0,
+            "free-list should stay populated under the guarded push, keeping it alloc-free"
         );
     }
 

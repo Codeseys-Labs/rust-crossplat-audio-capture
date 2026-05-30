@@ -140,14 +140,30 @@ func (e ErrorCode) String() string {
 
 // IsRecoverable reports whether an error of this code is a transient hiccup the
 // caller should retry, rather than a fatal/terminal condition that ends the
-// stream. It mirrors the rsac core's recoverability classification (ADR-0003)
-// as projected onto the FFI error codes by map_rsac_error in
+// stream. It approximates the rsac core's recoverability classification
+// (ADR-0003) as projected onto the FFI error codes by map_rsac_error in
 // bindings/rsac-ffi/src/lib.rs:
 //
 //   - Recoverable: ErrStreamRead (transient read / over- or under-run),
-//     ErrTimeout, ErrBackend (TransientRetry).
+//     ErrTimeout, ErrBackend.
 //   - Fatal: ErrStreamFailed (covers the terminal StreamEnded), and every
 //     other code (configuration, device, platform, internal, panic, …).
+//
+// Caveat — lossy FFI projection on ErrBackend: the C ABI collapses three
+// distinct core variants onto the single ErrBackend code (map_rsac_error maps
+// BackendError, BackendNotAvailable, and BackendInitializationFailed all to
+// RSAC_ERROR_BACKEND). In the core, only BackendError is recoverable
+// (TransientRetry); BackendNotAvailable and BackendInitializationFailed are
+// Fatal. Because the Go layer only sees the merged code, ErrBackend is reported
+// recoverable — which agrees with the core for BackendError but NOT for the two
+// fatal Backend variants. This is acceptable in practice because of narrow
+// reachability: BackendNotAvailable / BackendInitializationFailed are
+// build/start-time failures surfaced by Build() / Start(), not by the
+// read/stream path where IsRecoverable is consulted; the only ErrBackend a
+// streaming loop is expected to encounter mid-stream is the recoverable
+// BackendError. A caller that needs the exact core classification of a
+// build/start error should inspect that error at Build()/Start() time rather
+// than relying on the merged ErrBackend code here.
 //
 // Consumers (e.g. [AudioCapture.Stream]) continue past a recoverable error and
 // stop only on a fatal one.
