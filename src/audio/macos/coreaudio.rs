@@ -1114,6 +1114,13 @@ impl DeviceEnumerator for MacosDeviceEnumerator {
         // THEN drop the context (frees event_tx, which signals the helper to
         // exit by disconnecting the channel), THEN join the helper thread.
         let teardown: Box<dyn FnOnce() + Send> = Box::new(move || {
+            // Rebind the WHOLE `SendContextPtr` as a unit. Under Rust 2021's
+            // disjoint closure captures, writing `send_ctx.0` directly would
+            // capture only the `*mut WatchListenerContext` FIELD — which is
+            // `!Send` — bypassing the wrapper's `unsafe impl Send` and making
+            // this teardown closure `!Send` (it must be `FnOnce() + Send`).
+            // Capturing `send_ctx` whole preserves the Send assertion.
+            let send_ctx = send_ctx;
             // `send_ctx` aliases the heap allocation owned by the moved-in
             // `context` Box; the Box keeps it alive (and at a stable address)
             // until we explicitly drop it below, after the listeners are gone.
