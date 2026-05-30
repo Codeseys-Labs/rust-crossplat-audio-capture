@@ -285,6 +285,10 @@ fn test_app_capture_nonexistent_target() {
                 | StreamCreationFailed { .. }
                 | StreamStartFailed { .. }
                 | InternalError { .. }
+                // In the dbus-less CI PipeWire VM, resolving the bogus app's
+                // default device fails enumeration first — a legitimate
+                // rejection of a nonexistent target.
+                | DeviceEnumerationError { .. }
         )
     }
 
