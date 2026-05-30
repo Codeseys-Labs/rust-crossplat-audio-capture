@@ -96,6 +96,7 @@ fn map_rsac_error(err: &rsac::AudioError) -> rsac_error_t {
         | AudioError::StreamStartFailed { .. }
         | AudioError::StreamStopFailed { .. } => rsac_error_t::RSAC_ERROR_STREAM_FAILED,
         AudioError::StreamReadError { .. }
+        | AudioError::StreamEnded { .. }
         | AudioError::BufferOverrun { .. }
         | AudioError::BufferUnderrun { .. } => rsac_error_t::RSAC_ERROR_STREAM_READ,
         AudioError::BackendError { .. }

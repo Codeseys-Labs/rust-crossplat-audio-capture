@@ -111,9 +111,19 @@ impl AudioSink for WavFileSink {
 
 impl Drop for WavFileSink {
     fn drop(&mut self) {
-        // Best-effort finalize on drop
+        // Best-effort finalize on drop. If the caller never called close(),
+        // this is the last chance to write the WAV header/length fields — a
+        // failure here leaves a corrupt/truncated file, so log it rather than
+        // swallowing it silently (audit M9). We cannot return an error from
+        // Drop, but a log line gives operators a signal.
         if let Some(writer) = self.writer.take() {
-            let _ = writer.finalize();
+            if let Err(e) = writer.finalize() {
+                log::error!(
+                    "WavFileSink: failed to finalize WAV file on drop (file may be \
+                     corrupt; call close() explicitly to surface this error): {}",
+                    e
+                );
+            }
         }
     }
 }

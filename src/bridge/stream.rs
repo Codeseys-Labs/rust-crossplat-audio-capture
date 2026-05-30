@@ -156,14 +156,30 @@ impl<S: PlatformStream> BridgeStream<S> {
 
 // ── CapturingStream Implementation ───────────────────────────────────────
 
+/// Maps a non-readable [`StreamState`] to the right error: a terminal state
+/// (`Stopped`/`Closed`/`Error`) is end-of-stream → the Fatal
+/// [`AudioError::StreamEnded`]; a pre-start state (`Created`) is a usage error
+/// the caller can recover from by starting the stream → the recoverable
+/// [`AudioError::StreamReadError`]. See ADR-0003.
+fn non_readable_error(state: StreamState) -> AudioError {
+    match state {
+        StreamState::Stopped | StreamState::Closed | StreamState::Error => {
+            AudioError::StreamEnded {
+                reason: format!("Stream is in {} state, no more data", state),
+            }
+        }
+        _ => AudioError::StreamReadError {
+            reason: format!("Stream is in {} state, cannot read", state),
+        },
+    }
+}
+
 impl<S: PlatformStream + Sync + 'static> CapturingStream for BridgeStream<S> {
     fn read_chunk(&self) -> AudioResult<AudioBuffer> {
         // Check state — must be readable (Running or Stopping).
         if !self.shared.state.is_readable() {
             let state = self.shared.state.get();
-            return Err(AudioError::StreamReadError {
-                reason: format!("Stream is in {} state, cannot read", state),
-            });
+            return Err(non_readable_error(state));
         }
 
         let mut consumer = self
@@ -181,9 +197,7 @@ impl<S: PlatformStream + Sync + 'static> CapturingStream for BridgeStream<S> {
         // Check state — must be readable (Running or Stopping).
         if !self.shared.state.is_readable() {
             let state = self.shared.state.get();
-            return Err(AudioError::StreamReadError {
-                reason: format!("Stream is in {} state, cannot read", state),
-            });
+            return Err(non_readable_error(state));
         }
 
         let mut consumer = self
@@ -420,7 +434,7 @@ mod tests {
         assert_eq!(stream.shared().state.get(), StreamState::Stopped);
     }
 
-    // 7. Reading after stop returns error
+    // 7. Reading after stop returns the terminal StreamEnded error (ADR-0003).
     #[test]
     fn test_read_after_stop() {
         let (_producer, stream) = create_test_stream();
@@ -429,14 +443,18 @@ mod tests {
         let result = stream.read_chunk();
         assert!(result.is_err());
         match result.unwrap_err() {
-            AudioError::StreamReadError { reason } => {
+            AudioError::StreamEnded { reason } => {
                 assert!(reason.contains("Stopped"));
             }
-            other => panic!("Expected StreamReadError, got: {:?}", other),
+            other => panic!("Expected StreamEnded, got: {:?}", other),
         }
 
         let try_result = stream.try_read_chunk();
         assert!(try_result.is_err());
+        assert!(
+            matches!(try_result.unwrap_err(), AudioError::StreamEnded { .. }),
+            "try_read_chunk after stop must also be StreamEnded"
+        );
     }
 
     // 8. Verify format() returns correct AudioFormat

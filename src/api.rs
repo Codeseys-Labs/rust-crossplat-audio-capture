@@ -448,11 +448,22 @@ impl AudioCapture {
     /// the capture as running. In the new `CapturingStream` contract, the
     /// stream starts producing data upon creation.
     pub fn start(&mut self) -> AudioResult<()> {
-        // If a stream already exists and is running, this is a no-op.
+        // If a stream already exists, decide based on its state:
+        // - running  → no-op (idempotent restart of an active capture).
+        // - stopped  → error. A stream cannot be restarted (the OS capture
+        //   thread has exited); the docs direct callers to build a new
+        //   AudioCapture. Previously this fell through and spawned a callback
+        //   pump on a dead stream, then read_buffer() would fail confusingly
+        //   (audit L8).
         if let Some(stream) = self.stream.as_ref() {
             if stream.is_running() {
                 return Ok(());
             }
+            return Err(AudioError::StreamStartFailed {
+                reason: "Stream already created and is no longer running; a stopped \
+                         stream cannot be restarted — create a new AudioCapture."
+                    .to_string(),
+            });
         }
 
         if self.stream.is_none() {
@@ -850,24 +861,33 @@ impl<'a> Iterator for AudioBufferIterator<'a> {
     type Item = AudioResult<AudioBuffer>;
 
     fn next(&mut self) -> Option<Self::Item> {
-        // `read_buffer()` returns `Ok(None)` to mean "no data *right now*" — a
-        // transient condition on a live stream, NOT end-of-stream. Mapping that
-        // straight to `None` (the previous behavior) ended the iterator the first
-        // time the ring was momentarily empty, which on a running capture is
-        // almost immediately. Instead, retry on transient empties and only end
-        // the iteration when the stream actually stops.
+        // Read directly from the stream (not via read_buffer(), which refuses to
+        // read once the stream leaves the Running state). The stream remains
+        // *readable* while Stopping, so reading directly lets us DRAIN the buffered
+        // tail after stop() rather than discarding it (audit R2-2).
+        //
+        // Semantics of try_read_chunk():
+        //   Ok(Some(buf)) → yield it.
+        //   Ok(None)      → no data right now (Running or Stopping with empty ring)
+        //                   → wait briefly and retry.
+        //   Err(StreamEnded) → terminal (Stopped/Closed/Error) AND nothing more to
+        //                   read → end the iterator (return None). Other Err →
+        //                   surface to the caller.
+        let stream = self.capture.stream.as_ref()?; // no stream → iteration done
         loop {
-            if !self.capture.is_running() {
-                return None;
-            }
-            match self.capture.read_buffer() {
+            match stream.try_read_chunk() {
                 Ok(Some(buffer)) => return Some(Ok(buffer)),
                 Ok(None) => {
-                    // No data yet — yield the OS a moment, then re-check whether
-                    // the stream is still running and try again.
+                    // No data yet. If the stream is no longer readable (terminal)
+                    // the next try_read_chunk will return StreamEnded; otherwise
+                    // we're Running/Stopping with a momentarily-empty ring — wait
+                    // and retry so we don't busy-spin.
                     std::thread::sleep(std::time::Duration::from_millis(1));
                     continue;
                 }
+                // Terminal end-of-stream: drained and done.
+                Err(AudioError::StreamEnded { .. }) => return None,
+                // Any other error is surfaced once.
                 Err(e) => return Some(Err(e)),
             }
         }
@@ -1207,13 +1227,14 @@ mod tests {
 
     impl CapturingStream for MockCapturingStream {
         fn read_chunk(&self) -> AudioResult<AudioBuffer> {
-            // Blocking: spin-wait until data or stopped
+            // Blocking: spin-wait until data or stopped. Mirrors the real bridge,
+            // which returns the terminal StreamEnded (Fatal) once stopped.
             loop {
                 if let Some(buf) = self.buffers.lock().unwrap().pop_front() {
                     return Ok(buf);
                 }
                 if !self.running.load(Ordering::SeqCst) {
-                    return Err(AudioError::StreamReadError {
+                    return Err(AudioError::StreamEnded {
                         reason: "Mock stream stopped".into(),
                     });
                 }
@@ -1222,12 +1243,18 @@ mod tests {
         }
 
         fn try_read_chunk(&self) -> AudioResult<Option<AudioBuffer>> {
+            // Drain any buffered data first, even after stop, so the iterator's
+            // drain-on-stop path (R2-2) is exercised; only report StreamEnded
+            // once the buffer is empty AND the stream has stopped.
+            if let Some(buf) = self.buffers.lock().unwrap().pop_front() {
+                return Ok(Some(buf));
+            }
             if !self.running.load(Ordering::SeqCst) {
-                return Err(AudioError::StreamReadError {
+                return Err(AudioError::StreamEnded {
                     reason: "Mock stream stopped".into(),
                 });
             }
-            Ok(self.buffers.lock().unwrap().pop_front())
+            Ok(None)
         }
 
         fn stop(&self) -> AudioResult<()> {
@@ -1437,6 +1464,30 @@ mod tests {
         assert!(it.next().is_none());
     }
 
+    /// Regression (review R2-2): the iterator must DRAIN buffered data after the
+    /// stream stops, not discard the tail. We queue 5 buffers, stop the stream,
+    /// then iterate — all 5 must be yielded before the iterator ends.
+    #[test]
+    fn buffers_iter_drains_buffered_tail_after_stop() {
+        let mock = Arc::new(MockCapturingStream::new());
+        for i in 0..5 {
+            mock.push_buffer(AudioBuffer::new(vec![i as f32], 1, 48000));
+        }
+        // Stop BEFORE iterating — the buffered data must still be drained.
+        mock.signal_stop();
+        let mut capture = make_mock_capture(mock);
+
+        let collected: Vec<f32> = capture
+            .buffers_iter()
+            .map(|r| r.expect("buffered reads are Ok").data()[0])
+            .collect();
+        assert_eq!(
+            collected,
+            vec![0.0, 1.0, 2.0, 3.0, 4.0],
+            "iterator must drain all buffered frames after stop, then end"
+        );
+    }
+
     // ── callback delivery tests (H1 / ADR-0002) ──────────────────────
 
     /// Regression (audit H1): a registered callback must actually be invoked.
@@ -1483,6 +1534,39 @@ mod tests {
             "no further delivery after pump shutdown"
         );
         mock.signal_stop();
+    }
+
+    // ── start() lifecycle tests (L8) ─────────────────────────────────
+
+    /// Regression (audit L8): start() on an existing-but-stopped stream must
+    /// return an error rather than silently succeeding (a stopped stream cannot
+    /// be restarted). We simulate a stopped stream by signalling the mock.
+    #[test]
+    fn start_on_stopped_stream_errors() {
+        let mock = Arc::new(MockCapturingStream::new());
+        mock.signal_stop(); // stream exists but is not running
+        let mut capture = make_mock_capture(mock);
+
+        let result = capture.start();
+        assert!(result.is_err(), "start() on a stopped stream must error");
+        match result.unwrap_err() {
+            AudioError::StreamStartFailed { reason } => {
+                assert!(
+                    reason.contains("restart") || reason.contains("no longer running"),
+                    "unexpected reason: {reason}"
+                );
+            }
+            other => panic!("Expected StreamStartFailed, got: {other:?}"),
+        }
+    }
+
+    /// start() on an already-running stream is a no-op (idempotent), returning Ok.
+    #[test]
+    fn start_on_running_stream_is_noop() {
+        let mock = Arc::new(MockCapturingStream::new()); // starts running
+        let mut capture = make_mock_capture(mock);
+        assert!(capture.start().is_ok());
+        assert!(capture.start().is_ok(), "second start() on running stream is Ok");
     }
 
     /// The pump thread exits when the stream stops (try_read_chunk → Err), and

@@ -1061,31 +1061,33 @@ pub fn enumerate_application_audio_sessions() -> AudioResult<Vec<ApplicationAudi
             })?;
 
         for i in 0..count {
-            let session_control: IAudioSessionControl =
-                session_enumerator
-                    .GetSession(i)
-                    .map_err(|hr| AudioError::BackendError {
-                        backend: "wasapi".to_string(),
-                        operation: "enumerate_audio_sessions".to_string(),
-                        message: format!(
-                            "IAudioSessionEnumerator::GetSession({}) failed (HRESULT: {:?})",
-                            i, hr
-                        ),
-                        context: None,
-                    })?;
+            // Per-session errors must NOT abort the whole enumeration — a single
+            // transient COM failure on one session would otherwise drop every
+            // discovered app (audit M9). Skip the offending session and continue.
+            let session_control: IAudioSessionControl = match session_enumerator.GetSession(i) {
+                Ok(sc) => sc,
+                Err(hr) => {
+                    log::warn!(
+                        "wasapi: IAudioSessionEnumerator::GetSession({}) failed, skipping (HRESULT: {:?})",
+                        i,
+                        hr
+                    );
+                    continue;
+                }
+            };
 
             // Check session state — only include active sessions
-            let state = session_control
-                .GetState()
-                .map_err(|hr| AudioError::BackendError {
-                    backend: "wasapi".to_string(),
-                    operation: "enumerate_audio_sessions".to_string(),
-                    message: format!(
-                        "IAudioSessionControl::GetState for session {} failed (HRESULT: {:?})",
-                        i, hr
-                    ),
-                    context: None,
-                })?;
+            let state = match session_control.GetState() {
+                Ok(s) => s,
+                Err(hr) => {
+                    log::warn!(
+                        "wasapi: IAudioSessionControl::GetState for session {} failed, skipping (HRESULT: {:?})",
+                        i,
+                        hr
+                    );
+                    continue;
+                }
+            };
             if state != AudioSessionStateActive {
                 continue;
             }
@@ -1093,26 +1095,26 @@ pub fn enumerate_application_audio_sessions() -> AudioResult<Vec<ApplicationAudi
             let session_control2: IAudioSessionControl2 = match session_control.cast() {
                 Ok(sc2) => sc2,
                 Err(hr) => {
-                    // Log or skip if IAudioSessionControl2 is not available for this session
-                    eprintln!(
-                        "Warning: Could not cast IAudioSessionControl to IAudioSessionControl2 for session {}: {:?}",
+                    // Skip if IAudioSessionControl2 is not available for this session
+                    log::warn!(
+                        "wasapi: could not cast IAudioSessionControl to IAudioSessionControl2 for session {}, skipping: {:?}",
                         i, hr
                     );
                     continue;
                 }
             };
 
-            let pid = session_control2
-                .GetProcessId()
-                .map_err(|hr| AudioError::BackendError {
-                    backend: "wasapi".to_string(),
-                    operation: "enumerate_audio_sessions".to_string(),
-                    message: format!(
-                        "IAudioSessionControl2::GetProcessId for session {} failed (HRESULT: {:?})",
-                        i, hr
-                    ),
-                    context: None,
-                })?;
+            let pid = match session_control2.GetProcessId() {
+                Ok(p) => p,
+                Err(hr) => {
+                    log::warn!(
+                        "wasapi: IAudioSessionControl2::GetProcessId for session {} failed, skipping (HRESULT: {:?})",
+                        i,
+                        hr
+                    );
+                    continue;
+                }
+            };
 
             if pid == 0 {
                 // Skip system sounds or non-application sessions

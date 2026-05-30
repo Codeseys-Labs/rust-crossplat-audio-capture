@@ -350,8 +350,9 @@ impl BridgeConsumer {
     /// # Errors
     ///
     /// - [`AudioError::Timeout`] if the timeout expires before data arrives.
-    /// - [`AudioError::StreamReadError`] if the stream state becomes terminal
-    ///   (Stopped, Closed, or Error) during the wait.
+    /// - [`AudioError::StreamEnded`] (Fatal) if the stream state becomes terminal
+    ///   (Stopped, Closed, or Error) during the wait — end-of-stream, not a
+    ///   transient read error (see ADR-0003).
     pub fn pop_blocking(&mut self, timeout: Duration) -> AudioResult<AudioBuffer> {
         let deadline = Instant::now() + timeout;
         let sleep_interval = Duration::from_millis(1);
@@ -362,9 +363,12 @@ impl BridgeConsumer {
                 return Ok(buffer);
             }
 
-            // Check if the stream is in a terminal state.
+            // Check if the stream is in a terminal state. This is end-of-stream,
+            // not a transient read error — return the Fatal StreamEnded so a
+            // read loop branching on is_fatal()/is_recoverable() terminates
+            // instead of busy-waiting a dead stream (see ADR-0003).
             if self.shared.state.is_terminal() {
-                return Err(AudioError::StreamReadError {
+                return Err(AudioError::StreamEnded {
                     reason: "Stream stopped".to_string(),
                 });
             }
@@ -636,7 +640,8 @@ mod tests {
         assert!(elapsed >= Duration::from_millis(5));
     }
 
-    // 9. pop_blocking returns StreamReadError when state becomes terminal
+    // 9. pop_blocking returns the terminal StreamEnded when state becomes
+    //    terminal (ADR-0003 — distinct from the recoverable StreamReadError).
     #[test]
     fn test_pop_blocking_stream_stopped() {
         let (_producer, mut consumer) = create_bridge(16, test_format());
@@ -646,11 +651,13 @@ mod tests {
 
         let result = consumer.pop_blocking(Duration::from_secs(5));
         assert!(result.is_err());
-        match result.unwrap_err() {
-            AudioError::StreamReadError { reason } => {
+        let err = result.unwrap_err();
+        assert!(err.is_fatal(), "terminal-state read must be Fatal");
+        match err {
+            AudioError::StreamEnded { reason } => {
                 assert!(reason.contains("stopped") || reason.contains("Stream"));
             }
-            other => panic!("Expected StreamReadError, got: {:?}", other),
+            other => panic!("Expected StreamEnded, got: {:?}", other),
         }
     }
 

@@ -139,7 +139,17 @@ pub enum AudioError {
     /// Failed to stop an audio stream.
     StreamStopFailed { reason: String },
     /// An error occurred while reading audio data from a stream.
+    ///
+    /// This is a **transient/recoverable** read failure (e.g. a momentary
+    /// internal hiccup) — NOT end-of-stream. When a read fails because the
+    /// stream has reached a terminal state, [`StreamEnded`](AudioError::StreamEnded)
+    /// is returned instead, so callers can distinguish "retry" from "done".
     StreamReadError { reason: String },
+    /// The stream has ended: a read was attempted on a stream that has reached
+    /// a terminal state (Stopped / Closed / Error). This is **fatal** for the
+    /// read loop — the stream will produce no more data and should not be
+    /// retried. Distinct from the recoverable [`StreamReadError`](AudioError::StreamReadError).
+    StreamEnded { reason: String },
     /// The ring buffer overflowed — audio frames were dropped.
     BufferOverrun { dropped_frames: usize },
     /// The ring buffer underran — not enough data was available.
@@ -204,6 +214,7 @@ impl AudioError {
             | AudioError::StreamStartFailed { .. }
             | AudioError::StreamStopFailed { .. }
             | AudioError::StreamReadError { .. }
+            | AudioError::StreamEnded { .. }
             | AudioError::BufferOverrun { .. }
             | AudioError::BufferUnderrun { .. } => ErrorKind::Stream,
 
@@ -226,7 +237,11 @@ impl AudioError {
     ///
     /// - `Recoverable`: `BufferOverrun`, `BufferUnderrun`, `StreamReadError`
     /// - `TransientRetry`: `DeviceNotAvailable`, `Timeout`, `BackendError`
-    /// - `Fatal`: everything else
+    /// - `Fatal`: everything else (including `StreamEnded` — the stream is done)
+    ///
+    /// This match is **exhaustive** (no `_` catch-all) on purpose: adding a new
+    /// `AudioError` variant forces a compile error here so its recoverability is
+    /// classified deliberately rather than silently defaulting to `Fatal`.
     pub fn recoverability(&self) -> Recoverability {
         match self {
             AudioError::BufferOverrun { .. }
@@ -237,7 +252,24 @@ impl AudioError {
             | AudioError::Timeout { .. }
             | AudioError::BackendError { .. } => Recoverability::TransientRetry,
 
-            _ => Recoverability::Fatal,
+            // Fatal: the operation should be abandoned. StreamEnded is fatal for
+            // a read loop — the stream will produce no more data.
+            AudioError::InvalidParameter { .. }
+            | AudioError::UnsupportedFormat { .. }
+            | AudioError::ConfigurationError { .. }
+            | AudioError::DeviceNotFound { .. }
+            | AudioError::DeviceEnumerationError { .. }
+            | AudioError::StreamCreationFailed { .. }
+            | AudioError::StreamStartFailed { .. }
+            | AudioError::StreamStopFailed { .. }
+            | AudioError::StreamEnded { .. }
+            | AudioError::BackendNotAvailable { .. }
+            | AudioError::BackendInitializationFailed { .. }
+            | AudioError::ApplicationNotFound { .. }
+            | AudioError::ApplicationCaptureFailed { .. }
+            | AudioError::PlatformNotSupported { .. }
+            | AudioError::PermissionDenied { .. }
+            | AudioError::InternalError { .. } => Recoverability::Fatal,
         }
     }
 
@@ -306,6 +338,9 @@ impl fmt::Display for AudioError {
             }
             AudioError::StreamReadError { reason } => {
                 write!(f, "Stream read error: {}", reason)
+            }
+            AudioError::StreamEnded { reason } => {
+                write!(f, "Stream ended: {}", reason)
             }
             AudioError::BufferOverrun { dropped_frames } => {
                 write!(f, "Buffer overrun: {} frames dropped", dropped_frames)
@@ -498,6 +533,9 @@ mod tests {
             AudioError::StreamReadError {
                 reason: "timeout".into(),
             },
+            AudioError::StreamEnded {
+                reason: "stream stopped".into(),
+            },
             AudioError::BufferOverrun { dropped_frames: 42 },
             AudioError::BufferUnderrun {
                 requested: 1024,
@@ -545,9 +583,10 @@ mod tests {
     // ── Construction ─────────────────────────────────────────────────
 
     #[test]
-    fn all_21_variants_constructible() {
+    fn all_variants_constructible() {
         let variants = make_all_variants();
-        assert_eq!(variants.len(), 21, "Must have exactly 21 variants");
+        // 22 variants since ADR-0003 added StreamEnded (was 21).
+        assert_eq!(variants.len(), 22, "Must have exactly 22 variants");
     }
 
     // ── ErrorKind: Configuration ─────────────────────────────────────
@@ -644,6 +683,29 @@ mod tests {
             .kind(),
             ErrorKind::Stream
         );
+    }
+
+    // ── StreamEnded semantics (ADR-0003) ─────────────────────────────
+
+    #[test]
+    fn stream_ended_is_fatal_and_stream_kind() {
+        let e = AudioError::StreamEnded {
+            reason: "Stream stopped".into(),
+        };
+        assert_eq!(e.kind(), ErrorKind::Stream);
+        assert!(e.is_fatal(), "StreamEnded must be Fatal so read loops terminate");
+        assert!(!e.is_recoverable());
+    }
+
+    #[test]
+    fn stream_read_error_stays_recoverable() {
+        // The transient read error must remain Recoverable — only StreamEnded is
+        // the terminal signal (ADR-0003).
+        let e = AudioError::StreamReadError {
+            reason: "hiccup".into(),
+        };
+        assert!(e.is_recoverable());
+        assert!(!e.is_fatal());
     }
 
     // ── ErrorKind: Backend ───────────────────────────────────────────
