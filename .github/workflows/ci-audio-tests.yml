@@ -53,6 +53,12 @@ jobs:
     name: "Linux | System Capture"
     runs-on: blacksmith-4vcpu-ubuntu-2404
     timeout-minutes: 15
+    # Use the `bash` keyword shell (`-eo pipefail`) instead of the Actions
+    # default (`bash -e`, no pipefail) so a failing `cargo test` propagates
+    # through the `| tee log` pipe instead of being masked by tee's exit 0.
+    defaults:
+      run:
+        shell: bash
     steps:
       - uses: actions/checkout@v5
       - uses: dtolnay/rust-toolchain@1.95.0
@@ -128,12 +134,14 @@ jobs:
           SINK_COUNT="$(pactl list short sinks | grep -c .)"
           echo "default sink='${DEFAULT_SINK}' sink_count=${SINK_COUNT}"
           echo "RSAC_CI_AUDIO_AVAILABLE=1" >> "$GITHUB_ENV"
-          if [ "$DEFAULT_SINK" = "ci_test_sink" ] || [ "$SINK_COUNT" = "1" ]; then
-            echo "OK: ci_test_sink is the effective default — enabling deterministic hard asserts."
-            echo "RSAC_CI_AUDIO_DETERMINISTIC=1" >> "$GITHUB_ENV"
-          else
-            echo "WARNING: ci_test_sink not clearly default (default='${DEFAULT_SINK}', sinks=${SINK_COUNT}); capture enabled, deterministic hard-asserts disabled."
-          fi
+          # NOTE: RSAC_CI_AUDIO_DETERMINISTIC is intentionally NOT set on Linux.
+          # The dbus-less Firecracker PipeWire here does not actually route
+          # monitor capture (SystemDefault yields 0 buffers), so we cannot make
+          # hard non-silence/tone claims. Capture *content* is verified on real
+          # hardware and on the deterministic Windows VB-CABLE runner; here the
+          # capture tests run but honestly SKIP their content asserts on 0
+          # buffers (see helpers / per-test skip paths) rather than false-pass.
+          echo "Linux CI: capture content asserts are SOFT (see note above)."
 
       - name: Run system capture tests
         env:
@@ -212,6 +220,10 @@ jobs:
     name: "Linux | Device Capture"
     runs-on: blacksmith-4vcpu-ubuntu-2404
     timeout-minutes: 15
+    # `bash` keyword shell (`-eo pipefail`) so cargo failures aren't masked by tee.
+    defaults:
+      run:
+        shell: bash
     steps:
       - uses: actions/checkout@v5
       - uses: dtolnay/rust-toolchain@1.95.0
@@ -265,12 +277,14 @@ jobs:
           SINK_COUNT="$(pactl list short sinks | grep -c .)"
           echo "default sink='${DEFAULT_SINK}' sink_count=${SINK_COUNT}"
           echo "RSAC_CI_AUDIO_AVAILABLE=1" >> "$GITHUB_ENV"
-          if [ "$DEFAULT_SINK" = "ci_test_sink" ] || [ "$SINK_COUNT" = "1" ]; then
-            echo "OK: ci_test_sink is the effective default — enabling deterministic hard asserts."
-            echo "RSAC_CI_AUDIO_DETERMINISTIC=1" >> "$GITHUB_ENV"
-          else
-            echo "WARNING: ci_test_sink not clearly default (default='${DEFAULT_SINK}', sinks=${SINK_COUNT}); capture enabled, deterministic hard-asserts disabled."
-          fi
+          # NOTE: RSAC_CI_AUDIO_DETERMINISTIC is intentionally NOT set on Linux.
+          # The dbus-less Firecracker PipeWire here does not actually route
+          # monitor capture (SystemDefault yields 0 buffers), so we cannot make
+          # hard non-silence/tone claims. Capture *content* is verified on real
+          # hardware and on the deterministic Windows VB-CABLE runner; here the
+          # capture tests run but honestly SKIP their content asserts on 0
+          # buffers (see helpers / per-test skip paths) rather than false-pass.
+          echo "Linux CI: capture content asserts are SOFT (see note above)."
 
       - name: Run device capture tests
         env:
@@ -307,6 +321,10 @@ jobs:
     name: "Linux | Process Capture"
     runs-on: blacksmith-4vcpu-ubuntu-2404
     timeout-minutes: 15
+    # `bash` keyword shell (`-eo pipefail`) so cargo failures aren't masked by tee.
+    defaults:
+      run:
+        shell: bash
     steps:
       - uses: actions/checkout@v5
       - uses: dtolnay/rust-toolchain@1.95.0
@@ -360,12 +378,14 @@ jobs:
           SINK_COUNT="$(pactl list short sinks | grep -c .)"
           echo "default sink='${DEFAULT_SINK}' sink_count=${SINK_COUNT}"
           echo "RSAC_CI_AUDIO_AVAILABLE=1" >> "$GITHUB_ENV"
-          if [ "$DEFAULT_SINK" = "ci_test_sink" ] || [ "$SINK_COUNT" = "1" ]; then
-            echo "OK: ci_test_sink is the effective default — enabling deterministic hard asserts."
-            echo "RSAC_CI_AUDIO_DETERMINISTIC=1" >> "$GITHUB_ENV"
-          else
-            echo "WARNING: ci_test_sink not clearly default (default='${DEFAULT_SINK}', sinks=${SINK_COUNT}); capture enabled, deterministic hard-asserts disabled."
-          fi
+          # NOTE: RSAC_CI_AUDIO_DETERMINISTIC is intentionally NOT set on Linux.
+          # The dbus-less Firecracker PipeWire here does not actually route
+          # monitor capture (SystemDefault yields 0 buffers), so we cannot make
+          # hard non-silence/tone claims. Capture *content* is verified on real
+          # hardware and on the deterministic Windows VB-CABLE runner; here the
+          # capture tests run but honestly SKIP their content asserts on 0
+          # buffers (see helpers / per-test skip paths) rather than false-pass.
+          echo "Linux CI: capture content asserts are SOFT (see note above)."
 
       - name: Run application capture tests
         env:
