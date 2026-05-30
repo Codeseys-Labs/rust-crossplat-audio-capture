@@ -208,6 +208,17 @@ jobs:
             --no-default-features --features feat_linux \
             -- --test-threads=1 --nocapture 2>&1 | tee -a ci-audio-output.log
 
+      # CI-4: enumeration_matrix's "no silent empty list" (audit L4) assertion
+      # only has teeth when audio_available() is true. RSAC_CI_AUDIO_AVAILABLE=1
+      # is exported in the setup step above, so running it HERE (on a runner with
+      # a real virtual sink) is the only place that arm actually executes — the
+      # default unit-test matrix runs it headless, where it correctly self-skips.
+      - name: Run enumeration_matrix against real devices (L4 non-empty assertion)
+        run: |
+          cargo test --test enumeration_matrix \
+            --no-default-features --features feat_linux \
+            -- --nocapture 2>&1 | tee -a ci-audio-output.log
+
       - name: Diagnostics on failure
         if: failure()
         run: |

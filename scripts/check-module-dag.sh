@@ -47,8 +47,10 @@
 # broaden a key to a whole file or a whole layer.
 #
 # Usage:
-#   scripts/check-module-dag.sh          # scan, print offenders, exit 1 if any
-#   scripts/check-module-dag.sh --list   # print the allowlist and exit 0
+#   scripts/check-module-dag.sh             # scan, print offenders, exit 1 if any
+#   scripts/check-module-dag.sh --list      # print the allowlist and exit 0
+#   scripts/check-module-dag.sh --self-test # prove the guard FLAGS a deliberate
+#                                            # reverse edge (CI-5 regression guard)
 #   scripts/check-module-dag.sh -h|--help
 #
 # Exit status: 0 = clean (only allowlisted edges remain); 1 = NEW violation(s);
@@ -122,7 +124,12 @@ fi
 scan_layer() {
   local target="$1"      # repo-relative dir (e.g. src/core) OR file (src/api.rs)
   local alt="$2"         # e.g. "audio|api|sink"
-  local pattern="crate::(${alt})::"
+  # CI-5: match BOTH the symbol form `crate::audio::Foo` AND the bare
+  # module-level form `crate::audio` (e.g. `use crate::audio;` / `crate::audio::`)
+  # with a word boundary so `crate::audiox` is not a false hit. The trailing
+  # `(::|\b)` makes the `::` optional so a module-level reverse edge is caught.
+  # Relative `super::`-qualified reverse edges are normalised + scanned below.
+  local pattern="crate::(${alt})(::|\b)"
 
   local raw
   if [[ "${have_rg}" -eq 1 ]]; then
@@ -155,6 +162,9 @@ scan_layer() {
     stripped="$(printf '%s' "${code}" | sed -E 's#([^:])//.*#\1#; s#^[[:space:]]*//.*##')"
 
     # Re-test the code-only portion; bail if the reference was comment-only.
+    # Capture the symbol path when present (crate::audio::Foo::bar) OR the bare
+    # module reference (crate::audio) so a module-level `use crate::audio;` edge
+    # is reported, not silently dropped.
     local matched
     matched="$(printf '%s' "${stripped}" | grep -oE "crate::(${alt})(::[A-Za-z0-9_]+)*" | head -n1 || true)"
     [[ -z "${matched}" ]] && continue
@@ -179,6 +189,34 @@ is_allowed() {
   done
   return 1
 }
+
+# ── --self-test: prove the guard FLAGS a deliberate reverse edge (CI-5) ───────
+# Copies the fixture (tests/fixtures/dag_violation_sample.rs.txt) into src/core/
+# as a temp .rs, re-runs THIS script, and asserts it exits non-zero. Guards
+# against the guard silently regressing to a false-negative (e.g. a pattern that
+# no longer catches a bare module-level `use crate::audio;` edge).
+if [[ "${1:-}" == "--self-test" ]]; then
+  fixture="${REPO_ROOT}/tests/fixtures/dag_violation_sample.rs.txt"
+  tmp="${REPO_ROOT}/src/core/__dag_selftest_tmp.rs"
+  if [[ ! -f "${fixture}" ]]; then
+    echo "self-test FAIL: fixture missing: ${fixture}" >&2
+    exit 2
+  fi
+  cp "${fixture}" "${tmp}"
+  # Re-invoke the normal scan (no --self-test) and capture its exit status.
+  set +e
+  "${BASH_SOURCE[0]}" >/dev/null 2>&1
+  rc=$?
+  set -e
+  rm -f "${tmp}"
+  if [[ "${rc}" -ne 0 ]]; then
+    echo "self-test OK: the guard correctly FLAGGED the injected core->audio reverse edge (exit ${rc})."
+    exit 0
+  else
+    echo "self-test FAIL: the guard did NOT flag the injected core->audio reverse edge — it has regressed to a false-negative." >&2
+    exit 1
+  fi
+fi
 
 echo "==> rsac module-DAG reverse-edge guard (DAG-004)"
 echo "    chain: core -> bridge -> audio -> api (-> sink)"

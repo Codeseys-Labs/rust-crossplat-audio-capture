@@ -77,6 +77,13 @@ jobs:
       - name: Run Clippy
         run: cargo clippy --all-targets --no-default-features --features ${{ matrix.feature }} -- -D warnings
 
+      # FH-2: the bare `--no-default-features` build (NO platform feature) must
+      # still compile. It broke on Windows (E0432) because a bin gated only on
+      # target_os pulled in a feature-gated module. Run it on all three runners —
+      # the failure only manifests where target_os is true but the feat_* is off.
+      - name: Build with no default features (bare-build smoke)
+        run: cargo build --no-default-features
+
   # ── Linux unit tests ────────────────────────────────────────────────
   test-linux:
     name: Linux Unit Tests
@@ -581,6 +588,11 @@ jobs:
           persist-credentials: false
       - name: Check for reverse module-DAG edges
         run: bash scripts/check-module-dag.sh
+      # CI-5 regression guard: prove the scanner still FLAGS a deliberate
+      # core->audio reverse edge (catches the guard silently degrading to a
+      # false-negative, e.g. a pattern that misses a bare `use crate::audio;`).
+      - name: Self-test the module-DAG guard
+        run: bash scripts/check-module-dag.sh --self-test
 
   supply-chain:
     name: Supply Chain (cargo-deny)
