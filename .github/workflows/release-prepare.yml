@@ -1,0 +1,188 @@
+# Release PREPARE — release-please-style version-bump PR opener.
+#
+# This is step 1 of the two-step release automation (see
+# docs/RELEASE_PROCESS.md). It does NOT publish anything and NEVER pushes to
+# master directly:
+#
+#   1. release-prepare.yml (THIS FILE)  — workflow_dispatch; computes the next
+#      non-major version, runs scripts/bump-version.sh, and opens a reviewable
+#      "release: vX.Y.Z" PR (bump of the 5 manifests + CHANGELOG rotation).
+#   2. release-tag.yml                  — on push to master, detects a merged
+#      "release: v…" squash commit and creates + pushes the annotated tag.
+#   3. release.yml / release-npm.yml / release-pypi.yml — fan out off that tag.
+#
+# A human reviews + SQUASH-MERGES the PR this workflow opens. No bot ever pushes
+# to master here, and a MAJOR bump is deliberately impossible from this
+# workflow (the `bump` input offers only minor/patch and the major is asserted
+# unchanged) — major releases stay fully manual.
+
+name: Release Prepare
+
+on:
+  workflow_dispatch:
+    inputs:
+      bump:
+        description: 'Version bump kind (major is intentionally NOT offered — major releases stay fully manual).'
+        type: choice
+        required: true
+        default: minor
+        options:
+          - minor
+          - patch
+
+env:
+  CARGO_TERM_COLOR: always
+  RUST_BACKTRACE: 1
+
+# Least-privilege: this workflow only needs to push a release branch and open a
+# PR. contents:write — peter-evans/create-pull-request pushes the
+# `release/vX.Y.Z` branch; pull-requests:write — it opens the PR. It never
+# writes to master.
+permissions:
+  contents: write
+  pull-requests: write
+
+# Serialise prepare runs so two dispatches can't race on the same branch / open
+# duplicate release PRs.
+concurrency:
+  group: release-prepare-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  prepare:
+    name: Open release PR
+    timeout-minutes: 15
+    # Guard against forks opening bogus release PRs (mirrors release.yml).
+    if: github.repository == 'Codeseys-Labs/rust-crossplat-audio-capture'
+    runs-on: blacksmith-4vcpu-ubuntu-2404
+    steps:
+      # persist-credentials defaults to true here (unlike the read-only CI
+      # jobs): peter-evans/create-pull-request pushes the release branch using
+      # the checkout's stored token, so the credentials must remain configured.
+      - uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5
+        with:
+          # Fetch tags + full history so the idempotency guard below can see an
+          # already-released vX.Y.Z (the default shallow checkout fetches no
+          # tags, which would make `git rev-parse refs/tags/vNEXT` a dead no-op).
+          fetch-depth: 0
+          fetch-tags: true
+
+      # Compute the next NON-major version from Cargo.toml's [package].version.
+      #   minor => X.(Y+1).0   patch => X.Y.(Z+1)
+      # Hard-fails if parsing fails or if the computed major != current major.
+      - name: Compute next version
+        id: next
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          BUMP='${{ inputs.bump }}'
+          case "$BUMP" in
+            minor|patch) ;;
+            *)
+              echo "::error::unsupported bump kind '$BUMP' (only minor/patch are allowed; major is manual)"
+              exit 1
+              ;;
+          esac
+
+          # Extract the first `version = "X.Y.Z"` inside the [package] section
+          # of the root Cargo.toml. Mirrors the extractor in
+          # scripts/bump-version.sh / ci.yml's version-lockstep job.
+          CURRENT="$(awk '
+            /^\[package\][[:space:]]*$/ { in_sec = 1; next }
+            /^\[/ { if ($0 !~ /^\[package\][[:space:]]*$/) in_sec = 0 }
+            in_sec && /^[[:space:]]*version[[:space:]]*=[[:space:]]*"[^"]+"[[:space:]]*$/ {
+              match($0, /"[^"]+"/); print substr($0, RSTART + 1, RLENGTH - 2); exit
+            }
+          ' Cargo.toml)"
+
+          if [ -z "$CURRENT" ]; then
+            echo "::error::could not extract [package].version from Cargo.toml"
+            exit 1
+          fi
+          echo "current version: $CURRENT"
+
+          # Strict X.Y.Z parse (no pre-release shapes — releases off this path
+          # are always plain semver). Rejects anything that isn't 3 integers.
+          if ! [[ "$CURRENT" =~ ^([0-9]+)\.([0-9]+)\.([0-9]+)$ ]]; then
+            echo "::error::Cargo.toml version '$CURRENT' is not a plain X.Y.Z — refusing to compute a bump"
+            exit 1
+          fi
+          MAJOR="${BASH_REMATCH[1]}"
+          MINOR="${BASH_REMATCH[2]}"
+          PATCH="${BASH_REMATCH[3]}"
+
+          case "$BUMP" in
+            minor) NEXT="${MAJOR}.$((MINOR + 1)).0" ;;
+            patch) NEXT="${MAJOR}.${MINOR}.$((PATCH + 1))" ;;
+          esac
+          echo "next version:    $NEXT (bump=$BUMP)"
+
+          # Belt-and-suspenders: the computed major MUST equal the current
+          # major. minor/patch can never change it, but assert anyway so a
+          # future edit to the arithmetic above can't silently ship a major.
+          NEXT_MAJOR="${NEXT%%.*}"
+          if [ "$NEXT_MAJOR" != "$MAJOR" ]; then
+            echo "::error::computed version $NEXT changes the major from $MAJOR — refusing (major releases are manual)"
+            exit 1
+          fi
+
+          # Refuse to re-prepare a tag that already exists.
+          if git rev-parse -q --verify "refs/tags/v${NEXT}" >/dev/null 2>&1; then
+            echo "::error::tag v${NEXT} already exists — nothing to prepare"
+            exit 1
+          fi
+
+          {
+            echo "current=${CURRENT}"
+            echo "version=${NEXT}"
+            echo "bump=${BUMP}"
+          } >> "$GITHUB_OUTPUT"
+
+      # Bump the 5 manifests + rotate the CHANGELOG. The script computes its own
+      # UTC date (date -u +%Y-%m-%d) for the dated CHANGELOG header; we run it
+      # under an explicit UTC TZ so that date is unambiguous on the runner.
+      - name: Apply version bump (5 manifests + CHANGELOG rotation)
+        env:
+          TZ: UTC
+        run: bash scripts/bump-version.sh "${{ steps.next.outputs.version }}"
+
+      # Open (or update) the release PR off a `release/vX.Y.Z` branch against
+      # master. No direct push to master — a human reviews + squash-merges this.
+      - name: Open release PR
+        uses: peter-evans/create-pull-request@67ccf781d68cd99b580ae25a5c18a1cc84ffff1f # v7.0.8
+        with:
+          branch: release/v${{ steps.next.outputs.version }}
+          base: master
+          commit-message: "release: v${{ steps.next.outputs.version }}"
+          title: "release: v${{ steps.next.outputs.version }}"
+          labels: release
+          delete-branch: true
+          body: |
+            ## Release v${{ steps.next.outputs.version }}
+
+            Automated release preparation (`${{ inputs.bump }}` bump) from
+            `${{ steps.next.outputs.current }}` → `${{ steps.next.outputs.version }}`.
+
+            This PR bumps the five lockstep manifests and rotates the CHANGELOG:
+
+            - `Cargo.toml`
+            - `bindings/rsac-napi/Cargo.toml`
+            - `bindings/rsac-napi/package.json`
+            - `bindings/rsac-python/Cargo.toml`
+            - `bindings/rsac-python/pyproject.toml`
+            - `CHANGELOG.md` (`[Unreleased]` → `[${{ steps.next.outputs.version }}]`)
+
+            ### Merge to release
+
+            Review the diff, then **squash-merge** this PR. The
+            `release-tag.yml` workflow will detect the merged
+            `release: v${{ steps.next.outputs.version }}` commit on `master`,
+            create + push the annotated tag `v${{ steps.next.outputs.version }}`,
+            and that tag fans out to the publish workflows
+            (`release.yml` / `release-npm.yml` / `release-pypi.yml`).
+
+            The CI `version-lockstep` gate must be green before tagging.
+
+            > Generated by `.github/workflows/release-prepare.yml` —
+            > do **not** push to `master` directly.

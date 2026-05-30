@@ -1348,7 +1348,14 @@ mod tests {
     /// Test that new_system() creates a valid system-wide tap.
     /// Uses std::panic::catch_unwind to catch ObjC exceptions (now that
     /// the objc crate's "exception" feature is enabled).
+    ///
+    /// Ignored by default: `AudioHardwareCreateProcessTap` requires audio
+    /// hardware + Screen-Recording (TCC) permission and can BLOCK indefinitely
+    /// on a headless / TCC-less CI runner (Blacksmith macOS VMs have neither),
+    /// so running it unguarded in the unit job risks a multi-minute hang. Run
+    /// locally on a real macOS 14.4+ desktop with `cargo test -- --ignored`.
     #[test]
+    #[ignore = "requires macOS 14.4+ audio hardware + Screen-Recording (TCC) permission; can hang on headless CI"]
     fn test_new_system_creates_tap() {
         let result = std::panic::catch_unwind(CoreAudioProcessTap::new_system);
 

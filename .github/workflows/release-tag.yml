@@ -1,0 +1,186 @@
+# Release-tag-on-merge: the second half of the release-please-style flow.
+#
+# The first half (.github/workflows/release-please.yml) is a manual
+# workflow_dispatch that computes the next NON-MAJOR version, runs
+# scripts/bump-version.sh, and opens a "release: vX.Y.Z" PR (bump + CHANGELOG
+# rotation) via peter-evans/create-pull-request. A human reviews and
+# SQUASH-MERGES that PR to master.
+#
+# This workflow runs on every push to master, detects the squash-merge of a
+# release PR by the HEAD commit SUBJECT (`release: vX.Y.Z`), and — if the
+# manifest agrees and the tag does not already exist — creates and pushes an
+# annotated `vX.Y.Z` tag. That tag push is the single fan-out trigger for the
+# three existing publish workflows:
+#   • release.yml       → crates.io   (Rust crate)
+#   • release-npm.yml    → npm         (@rsac/audio, napi bindings)
+#   • release-pypi.yml   → PyPI        (rsac, PyO3/maturin bindings)
+# This workflow MUST NOT duplicate any of their publish logic — it only
+# creates and pushes the tag.
+#
+# Detection rationale (primary, robust signal):
+#   A squash merge collapses the release PR into a single commit whose subject
+#   is the PR title — "release: vX.Y.Z". Matching the HEAD commit subject with
+#   `git log -1 --format=%s` is branch/merge-strategy independent and needs no
+#   API call. (A PR `release` label could be an additional signal but is not
+#   required; the commit-subject match is the gate.)
+#
+# Safety:
+#   • Repo-guarded to Codeseys-Labs/rust-crossplat-audio-capture so a fork that
+#     merges a "release:" commit never tags + publishes.
+#   • Manifest defense: refuses if Cargo.toml version != the parsed version.
+#   • Major guard: refuses if the parsed major != the current Cargo.toml major
+#     (a major bump stays fully manual — release-please.yml never produces one,
+#     but this is belt-and-suspenders against a hand-crafted release commit).
+#   • Idempotent: never re-tags an existing local OR remote vX.Y.Z tag.
+#   • The tagged commit is the squash-merge commit on master, which already
+#     passed ci.yml's version-lockstep gate as part of the merged PR; the
+#     downstream release.yml / lockstep re-checks it again on the tag.
+
+name: Release Tag on Merge
+
+on:
+  push:
+    branches: [master]
+
+env:
+  CARGO_TERM_COLOR: always
+  RUST_BACKTRACE: 1
+
+# Least privilege: this workflow only pushes a tag to its own repo.
+permissions:
+  contents: write
+
+# Serialise tag creation per ref so two quick merges can't race to tag.
+concurrency:
+  group: release-tag-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  tag:
+    name: Tag release commit
+    timeout-minutes: 10
+    # Repo guard: only the canonical repo may create release tags. A fork that
+    # merges a "release:" commit must never fan out to the publish workflows.
+    if: github.repository == 'Codeseys-Labs/rust-crossplat-audio-capture'
+    runs-on: blacksmith-4vcpu-ubuntu-2404
+    steps:
+      # Full history + persisted credentials: we need the merged commit's
+      # subject and the ability to push an annotated tag back to origin.
+      - uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5
+        with:
+          fetch-depth: 0
+          persist-credentials: true
+
+      # Gate: is HEAD a release commit? `git log -1 --format=%s` yields the
+      # squash-merge subject (== the release PR title). Only a subject of the
+      # exact shape `release: vX.Y.Z` proceeds; anything else is a normal merge
+      # and the remaining steps no-op via the `is_release` output.
+      - name: Detect release commit
+        id: detect
+        shell: bash
+        run: |
+          set -euo pipefail
+          SUBJECT="$(git log -1 --format=%s)"
+          echo "HEAD subject: ${SUBJECT}"
+          # Match "release: vX.Y.Z" with an OPTIONAL trailing " (#N)" — GitHub's
+          # default squash-merge subject is the PR title plus a " (#123)" PR-number
+          # suffix, so the anchor must tolerate it. Still rejects pre-release
+          # shapes (v0.3.0-rc.1), a bare "0.3.0", and non-release subjects.
+          if [[ "${SUBJECT}" =~ ^release:\ v([0-9]+)\.([0-9]+)\.([0-9]+)([[:space:]]+\(#[0-9]+\))?$ ]]; then
+            MAJOR="${BASH_REMATCH[1]}"
+            MINOR="${BASH_REMATCH[2]}"
+            PATCH="${BASH_REMATCH[3]}"
+            VERSION="${MAJOR}.${MINOR}.${PATCH}"
+            echo "is_release=true"   >> "$GITHUB_OUTPUT"
+            echo "version=${VERSION}" >> "$GITHUB_OUTPUT"
+            echo "major=${MAJOR}"     >> "$GITHUB_OUTPUT"
+            echo "tag=v${VERSION}"    >> "$GITHUB_OUTPUT"
+            echo "Detected release commit for v${VERSION}"
+          else
+            echo "is_release=false" >> "$GITHUB_OUTPUT"
+            echo "Not a release commit — nothing to tag."
+          fi
+
+      # Manifest defense: the version parsed from the commit subject MUST match
+      # Cargo.toml on this exact commit. A mismatch means the bump and the PR
+      # title disagree — refuse rather than tag a wrong version. (Mirrors the
+      # extractor in scripts/bump-version.sh / ci.yml version-lockstep.)
+      - name: Verify Cargo.toml matches parsed version
+        if: steps.detect.outputs.is_release == 'true'
+        shell: bash
+        env:
+          PARSED_VERSION: ${{ steps.detect.outputs.version }}
+          PARSED_MAJOR: ${{ steps.detect.outputs.major }}
+        run: |
+          set -euo pipefail
+          MANIFEST="$(awk '
+            /^\[package\][[:space:]]*$/ { in_sec = 1; next }
+            /^\[/ { if ($0 !~ /^\[package\][[:space:]]*$/) in_sec = 0 }
+            in_sec && /^[[:space:]]*version[[:space:]]*=[[:space:]]*"[^"]+"[[:space:]]*$/ {
+              match($0, /"[^"]+"/); print substr($0, RSTART + 1, RLENGTH - 2); exit
+            }
+          ' Cargo.toml)"
+          echo "parsed version: ${PARSED_VERSION}  Cargo.toml version: ${MANIFEST}"
+          if [ -z "${MANIFEST}" ]; then
+            echo "::error::could not extract a version from Cargo.toml"
+            exit 1
+          fi
+          if [ "${PARSED_VERSION}" != "${MANIFEST}" ]; then
+            echo "::error::release commit version (${PARSED_VERSION}) does not match Cargo.toml version (${MANIFEST}) — refusing to tag"
+            exit 1
+          fi
+          # Major guard: a major bump must never be auto-tagged. The current
+          # major is the manifest major (== parsed major after the check above);
+          # asserting equality here is defense against a hand-crafted release
+          # commit that crosses a major boundary relative to the tree.
+          MANIFEST_MAJOR="${MANIFEST%%.*}"
+          if [ "${PARSED_MAJOR}" != "${MANIFEST_MAJOR}" ]; then
+            echo "::error::major version mismatch (parsed ${PARSED_MAJOR} vs Cargo.toml ${MANIFEST_MAJOR}) — major bumps are manual, refusing to tag"
+            exit 1
+          fi
+          echo "OK: version + major match Cargo.toml"
+
+      # Idempotency: never re-tag. Check both the local tag set and the remote
+      # (a previous run, or a manual tag, may already exist). If present, skip
+      # cleanly with a notice — the tag push has already fanned out (or will).
+      - name: Check tag does not already exist
+        if: steps.detect.outputs.is_release == 'true'
+        id: exists
+        shell: bash
+        env:
+          TAG: ${{ steps.detect.outputs.tag }}
+        run: |
+          set -euo pipefail
+          EXISTS=false
+          if git rev-parse -q --verify "refs/tags/${TAG}" >/dev/null 2>&1; then
+            EXISTS=true
+            echo "Local tag ${TAG} already exists."
+          elif git ls-remote --tags origin "refs/tags/${TAG}" | grep -q "refs/tags/${TAG}"; then
+            EXISTS=true
+            echo "Remote tag ${TAG} already exists."
+          fi
+          echo "exists=${EXISTS}" >> "$GITHUB_OUTPUT"
+          if [ "${EXISTS}" = "true" ]; then
+            echo "::notice::Tag ${TAG} already exists — skipping (idempotent, never re-tag)."
+          else
+            echo "Tag ${TAG} does not exist yet — will create."
+          fi
+
+      # Create + push the annotated tag. This is the SOLE action of this
+      # workflow that mutates the repo; the push is the fan-out trigger for
+      # release.yml / release-npm.yml / release-pypi.yml. We tag HEAD (the
+      # squash-merge release commit) so the published artifacts come from the
+      # exact reviewed + version-lockstep-passing commit on master.
+      - name: Create and push annotated tag
+        if: steps.detect.outputs.is_release == 'true' && steps.exists.outputs.exists == 'false'
+        shell: bash
+        env:
+          TAG: ${{ steps.detect.outputs.tag }}
+          VERSION: ${{ steps.detect.outputs.version }}
+        run: |
+          set -euo pipefail
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git tag -a "${TAG}" -m "Release ${VERSION}"
+          git push origin "${TAG}"
+          echo "::notice::Pushed annotated tag ${TAG} — release.yml / release-npm.yml / release-pypi.yml will fan out from this tag."

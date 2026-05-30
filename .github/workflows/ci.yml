@@ -100,6 +100,23 @@ jobs:
       - name: Cargo test (unit tests)
         run: cargo test --lib --no-default-features --features feat_linux
 
+      # TC-01: ADR-0001's headline alloc-free producer guarantee is proved ONLY
+      # by tests/rt_alloc.rs, which is an integration test and so was never run
+      # by the `--lib` job above. Allocation behaviour can differ per target, so
+      # it runs on every per-OS unit job. It installs a process-wide
+      # #[global_allocator] (CountingAllocator) and must therefore be its OWN
+      # test binary; we pin --test-threads=1 so the global counter is never
+      # perturbed by a parallel test in the same process.
+      - name: Cargo test (rt_alloc — ADR-0001 alloc-free proof)
+        run: cargo test --test rt_alloc --no-default-features --features feat_linux -- --test-threads=1
+
+      # TC-02: the enumeration honest-failure contract (tests/enumeration_matrix.rs)
+      # is device-free / graceful-skip (it asserts non-empty-or-classified-error
+      # and skips the hardware assertions on a headless runner), but it was dead
+      # in CI because the matrix only ran `--lib`. Wire it in per-OS.
+      - name: Cargo test (enumeration_matrix — honest-failure contract)
+        run: cargo test --test enumeration_matrix --no-default-features --features feat_linux
+
   # ── Windows unit tests ──────────────────────────────────────────────
   test-windows:
     name: Windows Unit Tests
@@ -120,12 +137,41 @@ jobs:
       - name: Build all targets
         run: cargo build --all-targets --no-default-features --features feat_windows
 
-      - name: Cargo test (unit tests)
-        # Blacksmith Windows VMs have no audio subsystem (AudioSrv absent).
-        # WASAPI tests that try to open devices will fail. The compilation
-        # check above is the important gate; test failures here are expected.
+      # TC-07: the Windows unit step used to be continue-on-error on the WHOLE
+      # `cargo test --lib` run, so the ~40 inline wasapi.rs tests + 21 thread.rs
+      # tests + the device-free DeviceWatcher lifecycle tests could regress
+      # without ever gating CI. We now PARTITION the suite exactly like
+      # release.yml's verify job: the platform-independent + non-audio tests
+      # HARD-FAIL here (a real Windows unit regression blocks CI), while ONLY the
+      # device-touching subset (the create_audio_client_* tests in
+      # src/audio/windows/thread.rs, which open a real WASAPI client) is excluded
+      # via --skip and re-run as a tolerated step below. The filter substring
+      # mirrors release.yml's device_test_filter — keep the two in lockstep and
+      # as narrow as possible if device-dependent test names change.
+      - name: Cargo test (unit tests, hard-fail)
+        shell: bash
+        run: cargo test --lib --no-default-features --features feat_windows -- --test-threads=1 --skip create_audio_client
+
+      # Device-dependent subset ONLY. Tolerated because the Blacksmith Windows
+      # runner has no audio endpoints (AudioSrv absent — see AGENTS.md §6). This
+      # step runs ONLY the create_audio_client_* tests, so it can never mask the
+      # hard-fail partition above. Mirrors release.yml's tolerated device step.
+      - name: Cargo test (device-dependent tests, tolerated)
         continue-on-error: true
-        run: cargo test --lib --no-default-features --features feat_windows
+        shell: bash
+        run: cargo test --lib --no-default-features --features feat_windows -- --test-threads=1 create_audio_client
+
+      # TC-01: ADR-0001 alloc-free producer proof (process-wide allocator, own
+      # binary, single-threaded). Device-free, so it HARD-FAILS like Linux —
+      # an allocation regression on Windows now blocks CI.
+      - name: Cargo test (rt_alloc — ADR-0001 alloc-free proof)
+        shell: bash
+        run: cargo test --test rt_alloc --no-default-features --features feat_windows -- --test-threads=1
+
+      # TC-02: device-free enumeration honest-failure contract (graceful-skip).
+      - name: Cargo test (enumeration_matrix — honest-failure contract)
+        shell: bash
+        run: cargo test --test enumeration_matrix --no-default-features --features feat_windows
 
       - name: Report audio service status
         if: always()
@@ -178,8 +224,30 @@ jobs:
       - name: Build all targets
         run: cargo build --all-targets --no-default-features --features feat_macos
 
+      # TC-03: src/audio/macos/tap.rs has process-tap tests that are NOT
+      # #[ignore]d (e.g. test_new_system_creates_tap at tap.rs:1352 calls
+      # CoreAudioProcessTap::new_system -> AudioHardwareCreateProcessTap, which
+      # the project's own docs note can BLOCK 10+ minutes without a
+      # kTCCServiceAudioCapture grant — unavailable on Blacksmith macOS). The
+      # job-level timeout-minutes: 25 already bounds the worst case, but a
+      # step-level timeout fails THIS step fast (5 min) so a hang surfaces as a
+      # clear failure here rather than eating the whole job budget. The proper
+      # fix is to #[ignore] those tests in src/ — flagged as a follow-up for the
+      # orchestrator since this job may not edit src/.
       - name: Cargo test (unit tests)
+        timeout-minutes: 5
         run: cargo test --lib --no-default-features --features feat_macos
+
+      # TC-01: ADR-0001 alloc-free producer proof (process-wide allocator, own
+      # binary, single-threaded). Device-free, so it HARD-FAILS like Linux.
+      - name: Cargo test (rt_alloc — ADR-0001 alloc-free proof)
+        timeout-minutes: 5
+        run: cargo test --test rt_alloc --no-default-features --features feat_macos -- --test-threads=1
+
+      # TC-02: device-free enumeration honest-failure contract (graceful-skip).
+      - name: Cargo test (enumeration_matrix — honest-failure contract)
+        timeout-minutes: 5
+        run: cargo test --test enumeration_matrix --no-default-features --features feat_macos
 
       # OPTION B (existence check): Blacksmith macOS runners lack TCC grants for
       # Process Tap capture (see macos-process job in ci-audio-tests.yml —
@@ -474,6 +542,24 @@ jobs:
   # deny.toml is conservative: hard-fail on security advisories + disallowed
   # licenses, warn-only on duplicate versions so a benign version skew doesn't
   # break CI on day one.
+  # ── Module-DAG reverse-edge guard (DAG-004) ─────────────────────────
+  # Enforce the layering invariant core -> bridge -> audio -> api -> lib by
+  # failing on any NEW reverse import edge (e.g. core importing crate::audio).
+  # The one known, tracked exception (core/introspection.rs -> crate::audio for
+  # cross-platform enumeration) is allowlisted inside the script. No toolchain
+  # needed — it is a pure ripgrep/grep source scan.
+  module-dag:
+    name: Module DAG (reverse-edge guard)
+    timeout-minutes: 5
+    needs: lint
+    runs-on: blacksmith-4vcpu-ubuntu-2404
+    steps:
+      - uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5
+        with:
+          persist-credentials: false
+      - name: Check for reverse module-DAG edges
+        run: bash scripts/check-module-dag.sh
+
   supply-chain:
     name: Supply Chain (cargo-deny)
     timeout-minutes: 20
