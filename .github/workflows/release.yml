@@ -68,11 +68,14 @@ jobs:
             # AGENTS.md §6). Only the WASAPI tests that actually open an
             # audio client/device need a device; those are isolated below
             # into a SEPARATE tolerated step. Everything else hard-fails.
-            # Filter substring matches the device-touching unit tests in
-            # src/audio/windows/thread.rs (create_audio_client_* open a
-            # real WASAPI client). Tune this list if device-dependent test
-            # names change — it must stay as narrow as possible.
-            device_test_filter: 'create_audio_client'
+            # Space-separated substrings matching the device-dependent unit
+            # tests that open a real WASAPI client / default endpoint /
+            # IMMNotificationClient (need Audiosrv + an endpoint, ABSENT on the
+            # Blacksmith Windows runner — they fail RPC-unavailable 0x800706BA /
+            # service-not-installed 0x80070424). MUST stay in lockstep with
+            # ci.yml's test-windows DEVICE_SKIPS. Everything not listed here is
+            # pure logic and hard-fails.
+            device_test_filter: 'enumerate default_device device_enumeration device_id device_supported_formats audio_device_ create_stream find_device watch_ create_audio_client'
           - os: blacksmith-6vcpu-macos-15
             features: feat_macos
             install_deps: false
@@ -101,19 +104,27 @@ jobs:
         shell: bash
         run: |
           if [ -n "${{ matrix.device_test_filter }}" ]; then
-            cargo test --lib --no-default-features --features ${{ matrix.features }} -- --test-threads=1 --skip ${{ matrix.device_test_filter }}
+            # Build a --skip arg per device-test substring so the device-
+            # dependent families are EXCLUDED from this hard-fail partition.
+            SKIPS=""
+            for f in ${{ matrix.device_test_filter }}; do SKIPS="$SKIPS --skip $f"; done
+            cargo test --lib --no-default-features --features ${{ matrix.features }} -- --test-threads=1 $SKIPS
           else
             cargo test --lib --no-default-features --features ${{ matrix.features }} -- --test-threads=1
           fi
 
       # Device-dependent subset only. Tolerated because the Blacksmith
-      # Windows runner has no audio endpoints (AGENTS.md §6). This step
-      # runs ONLY the filtered tests — it never masks the suite above.
+      # Windows runner has no audio endpoints (AGENTS.md §6). Runs ONLY the
+      # filtered families (one cargo invocation each, union), so it never
+      # masks the hard-fail partition above.
       - name: Cargo test (device-dependent tests, tolerated)
         if: matrix.device_test_filter != ''
         continue-on-error: true
         shell: bash
-        run: cargo test --lib --no-default-features --features ${{ matrix.features }} -- --test-threads=1 ${{ matrix.device_test_filter }}
+        run: |
+          for f in ${{ matrix.device_test_filter }}; do
+            cargo test --lib --no-default-features --features ${{ matrix.features }} -- --test-threads=1 "$f" || true
+          done
 
   # ── Publish: cargo publish to crates.io ─────────────────────────────
   publish:
