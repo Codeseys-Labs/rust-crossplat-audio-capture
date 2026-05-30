@@ -90,7 +90,13 @@ libc = "0.2.183"
 env_logger = "0.11.9"
 
 serde = { version = "1.0.228", features = ["derive"] }
-serde_json = "1.0.149"
+# serde_json: hard library dep on the native Linux PipeWire path — it parses the
+# `default.audio.sink`/`.source` metadata JSON object in `audio/linux/thread.rs`
+# (`parse_default_metadata_name`), which the in-process native registry listener
+# (post-H4) emits, not just the `pw-dump` subprocess fallback. So it stays a
+# library dependency on Linux and is NOT cfg-gated to diagnostics-only (rsac-3ff4).
+# Patch-pinned to the latest compatible 1.0.x; no major/minor bump.
+serde_json = "1.0.150"
 
 # Platform-specific audio capture
 [target.'cfg(target_os = "windows")'.dependencies]

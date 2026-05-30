@@ -769,6 +769,36 @@ impl crate::core::interface::DeviceEnumerator for LinuxDeviceEnumerator {
         let device = self.get_pipewire_default_device(kind)?;
         Ok(Box::new(device))
     }
+
+    /// Subscribe to PipeWire device hot-plug / default-change notifications
+    /// (M10 Linux arm / `rsac-b92e`).
+    ///
+    /// Spawns a **persistent** PipeWire main-loop + registry + `default`
+    /// metadata listener thread (distinct from the short-lived per-call snapshot
+    /// threads in `thread`). Registry `global`/`global_remove` events for
+    /// `Audio/Sink` / `Audio/Source` nodes become
+    /// [`DeviceEvent::DeviceAdded`](crate::core::interface::DeviceEvent::DeviceAdded)
+    /// /
+    /// [`DeviceEvent::DeviceRemoved`](crate::core::interface::DeviceEvent::DeviceRemoved),
+    /// and `default.audio.sink` / `default.audio.source` metadata changes become
+    /// [`DeviceEvent::DefaultChanged`](crate::core::interface::DeviceEvent::DefaultChanged).
+    /// `on_event` runs on that loop thread — never the real-time audio callback
+    /// thread — so it may allocate and lock.
+    ///
+    /// The returned
+    /// [`DeviceWatcher`](crate::core::interface::DeviceWatcher)'s `Drop` signals
+    /// the loop thread to stop and joins it (no leaked thread, no hang).
+    ///
+    /// Without the `feat_linux` PipeWire bindings there is no in-process
+    /// listener, so this falls back to the trait default
+    /// ([`AudioError::PlatformNotSupported`](crate::core::error::AudioError::PlatformNotSupported)).
+    #[cfg(feature = "feat_linux")]
+    fn watch(
+        &self,
+        on_event: crate::core::interface::DeviceEventHandler,
+    ) -> crate::core::error::Result<crate::core::interface::DeviceWatcher> {
+        crate::audio::linux::thread::spawn_device_watcher(on_event)
+    }
 }
 
 // ── Tests ────────────────────────────────────────────────────────────────
@@ -1063,6 +1093,26 @@ id 42, type PipeWire:Interface:Node/3
                 assert_eq!(platform, "linux");
             }
             other => panic!("Expected PlatformNotSupported, got: {:?}", other),
+        }
+    }
+
+    // ── watch() without the pipewire feature ────────────────────────
+
+    #[cfg(not(feature = "feat_linux"))]
+    #[test]
+    fn test_watch_without_pipewire_feature_is_platform_not_supported() {
+        // Without `feat_linux` there is no in-process listener, so the
+        // LinuxDeviceEnumerator does NOT override watch() — it inherits the
+        // trait default, which honestly reports PlatformNotSupported rather than
+        // claiming a notification source it cannot back.
+        let enumerator = LinuxDeviceEnumerator::new();
+        let result = enumerator.watch(Box::new(|_ev| {}));
+        match result {
+            Err(crate::core::error::AudioError::PlatformNotSupported { feature, .. }) => {
+                assert_eq!(feature, "device change notifications");
+            }
+            Ok(_) => panic!("watch() must not succeed without the feat_linux backend"),
+            Err(other) => panic!("Expected PlatformNotSupported, got: {:?}", other),
         }
     }
 }
@@ -1451,5 +1501,125 @@ mod pipewire_integration_tests {
             }
             Err(e) => panic!("Unexpected error from native default_device: {:?}", e),
         }
+    }
+
+    // ── Device-change watcher (M10 Linux arm / rsac-b92e) ────────────────
+
+    use crate::core::interface::DeviceEvent;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::{Arc, Mutex};
+
+    /// Whether a `PipeWireThread` can be spawned — a proxy for "the in-process
+    /// bindings can reach the daemon", which is exactly what the watch thread
+    /// needs too. When false we skip (headless CI / no daemon) rather than fail.
+    fn watch_spawnable() -> bool {
+        use crate::audio::linux::thread::PipeWireThread;
+        PipeWireThread::spawn().is_ok()
+    }
+
+    #[test]
+    fn test_watch_registers_and_drops_cleanly_or_skips() {
+        // Acceptance: register a watcher, let the initial registry dump deliver
+        // any current-device events, then drop it — the drop must signal the
+        // loop thread and join it (no hang, no leaked thread). When PipeWire is
+        // unreachable, watch() returns an honest error and we assert that shape
+        // instead — never a panic.
+        let enumerator = LinuxDeviceEnumerator::new();
+
+        if !watch_spawnable() {
+            // No reachable daemon: watch() must surface a bounded init failure
+            // (BackendInitializationFailed / Timeout), never hang or panic.
+            match enumerator.watch(Box::new(|_ev| {})) {
+                Ok(_watcher) => {
+                    // Unexpectedly spawnable after all — fine; dropping here
+                    // must still not hang.
+                }
+                Err(crate::core::error::AudioError::BackendInitializationFailed {
+                    backend,
+                    ..
+                }) => {
+                    assert_eq!(backend, "PipeWire");
+                }
+                Err(crate::core::error::AudioError::Timeout { .. }) => {}
+                Err(e) => panic!("Unexpected watch() error when daemon unavailable: {:?}", e),
+            }
+            return;
+        }
+
+        let count = Arc::new(AtomicUsize::new(0));
+        let count_cb = Arc::clone(&count);
+        let watcher = enumerator
+            .watch(Box::new(move |_ev: DeviceEvent| {
+                count_cb.fetch_add(1, Ordering::SeqCst);
+            }))
+            .expect("watch() should succeed when the daemon is reachable");
+
+        // Give the initial registry dump a moment to deliver any current-device
+        // DeviceAdded events. We don't assert a specific count — a headless box
+        // may legitimately expose zero audio nodes — only that the watcher is
+        // alive and delivery happens on its own thread without us pumping.
+        std::thread::sleep(std::time::Duration::from_millis(200));
+        let _ = count.load(Ordering::SeqCst);
+
+        // The critical contract: Drop signals the loop to quit and joins the
+        // thread. If this hung or leaked, the test harness would time out.
+        drop(watcher);
+    }
+
+    #[test]
+    fn test_watch_drop_is_prompt_and_thread_joins_or_skips() {
+        // The teardown closure joins the watch thread, so `drop` must return
+        // promptly (within a few loop ticks ≈ tens of ms, well under the 5 s
+        // init bound). We bound the drop wall-time generously to catch a hang
+        // regression without flaking on a busy CI box.
+        let enumerator = LinuxDeviceEnumerator::new();
+        if !watch_spawnable() {
+            eprintln!("Skipping test_watch_drop_is_prompt...: PipeWire bindings cannot connect");
+            return;
+        }
+
+        let watcher = enumerator
+            .watch(Box::new(|_ev| {}))
+            .expect("watch() should succeed when the daemon is reachable");
+
+        let start = std::time::Instant::now();
+        drop(watcher);
+        let elapsed = start.elapsed();
+        assert!(
+            elapsed < std::time::Duration::from_secs(2),
+            "DeviceWatcher drop should join promptly, took {:?}",
+            elapsed
+        );
+    }
+
+    #[test]
+    fn test_watch_handler_runs_only_on_watch_thread_or_skips() {
+        // The user FnMut must be invoked on the watch thread (the PW loop
+        // thread), NEVER the caller thread. We capture the calling thread id on
+        // each invocation and assert none of them is the test thread.
+        let enumerator = LinuxDeviceEnumerator::new();
+        if !watch_spawnable() {
+            eprintln!("Skipping test_watch_handler_runs_only_on_watch_thread...: no daemon");
+            return;
+        }
+
+        let test_tid = std::thread::current().id();
+        let seen_test_tid = Arc::new(Mutex::new(false));
+        let flag = Arc::clone(&seen_test_tid);
+        let watcher = enumerator
+            .watch(Box::new(move |_ev: DeviceEvent| {
+                if std::thread::current().id() == test_tid {
+                    *flag.lock().unwrap() = true;
+                }
+            }))
+            .expect("watch() should succeed when the daemon is reachable");
+
+        std::thread::sleep(std::time::Duration::from_millis(200));
+        drop(watcher);
+
+        assert!(
+            !*seen_test_tid.lock().unwrap(),
+            "device-change handler must never run on the caller thread"
+        );
     }
 }

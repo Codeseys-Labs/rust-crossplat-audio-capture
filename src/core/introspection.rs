@@ -222,62 +222,32 @@ fn list_audio_applications_into(sources: &mut Vec<AudioSource>) {
 
 #[cfg(all(target_os = "linux", feature = "feat_linux"))]
 fn list_audio_applications_into(sources: &mut Vec<AudioSource>) {
-    // Linux PipeWire application discovery via pw-dump
-    if let Ok(output) = std::process::Command::new("pw-dump").output() {
-        if let Ok(json_str) = String::from_utf8(output.stdout) {
-            if let Ok(nodes) = serde_json::from_str::<Vec<serde_json::Value>>(&json_str) {
-                for node in &nodes {
-                    if node.get("type").and_then(|t| t.as_str()) != Some("PipeWire:Interface:Node")
-                    {
-                        continue;
-                    }
-                    let info = match node.get("info") {
-                        Some(i) => i,
-                        None => continue,
-                    };
-                    let props = match info.get("props") {
-                        Some(p) => p,
-                        None => continue,
-                    };
-                    // Only include audio stream nodes (not device nodes)
-                    let media_class = props
-                        .get("media.class")
-                        .and_then(|v| v.as_str())
-                        .unwrap_or("");
-                    if !media_class.contains("Stream") {
-                        continue;
-                    }
-                    let app_name = props
-                        .get("application.name")
-                        .and_then(|v| v.as_str())
-                        .unwrap_or("Unknown");
-                    let pid = props
-                        .get("application.process.id")
-                        .and_then(|v| v.as_str())
-                        .and_then(|s| s.parse::<u32>().ok())
-                        .unwrap_or(0);
-
-                    if pid == 0 {
-                        continue;
-                    }
-
-                    // Deduplicate by PID
-                    let id = format!("app:{}", pid);
-                    if sources.iter().any(|s| s.id == id) {
-                        continue;
-                    }
-
-                    sources.push(AudioSource {
-                        id,
-                        name: app_name.to_string(),
-                        kind: AudioSourceKind::Application {
-                            pid,
-                            app_name: app_name.to_string(),
-                            bundle_id: None,
-                        },
-                    });
-                }
+    // Linux PipeWire application discovery via the **native** in-process registry
+    // (H4 part 2 / rsac-8ebb), reached through the `crate::audio` facade exactly
+    // like the macOS / Windows arms above. This replaces the former `pw-dump`
+    // subprocess + `serde_json` JSON parse on this `core` library path (rsac-3ff4);
+    // the subprocess `pw-dump` JSON fallback now lives only in the platform
+    // backend (`audio/linux/thread.rs`, for node-serial resolution), not here.
+    //
+    // Errors are swallowed (empty result) to match macOS/Windows: discovery is
+    // best-effort and must never fail `list_audio_sources`. PID dedup is handled
+    // natively (`PwAppSnapshot` is keyed by PID), but we still guard against an
+    // id already present in `sources` for parity with the other backends.
+    if let Ok(apps) = crate::audio::linux::enumerate_audio_applications() {
+        for app in apps {
+            let id = format!("app:{}", app.process_id);
+            if sources.iter().any(|s| s.id == id) {
+                continue;
             }
+            sources.push(AudioSource {
+                id,
+                name: app.name.clone(),
+                kind: AudioSourceKind::Application {
+                    pid: app.process_id,
+                    app_name: app.name,
+                    bundle_id: None,
+                },
+            });
         }
     }
 }
@@ -579,6 +549,47 @@ mod tests {
             .iter()
             .any(|s| s.kind == AudioSourceKind::SystemDefault));
         assert!(sources.iter().any(|s| s.id == "system-default"));
+    }
+
+    /// `list_audio_applications()` is best-effort: on every platform it must
+    /// return `Ok` (an empty list when discovery is unsupported or the audio
+    /// daemon is unavailable) and never panic. This exercises the Linux native
+    /// PipeWire arm — which now reaches `crate::audio::linux::enumerate_audio_applications`
+    /// instead of the former `pw-dump` + `serde_json` subprocess parse (rsac-3ff4)
+    /// — in a headless / device-free CI run (it degrades to an empty list when
+    /// PipeWire cannot connect), and the macOS / Windows / unsupported arms too.
+    #[test]
+    fn list_audio_applications_is_best_effort_and_well_formed() {
+        let apps = list_audio_applications().expect("list_audio_applications is infallible");
+
+        // Every discovered application source must be shaped as an
+        // `app:<pid>`-prefixed `Application`, must carry the same PID in its id
+        // and kind, and must be PID-deduplicated across the returned list.
+        let mut seen_ids = std::collections::HashSet::new();
+        for source in &apps {
+            assert!(
+                source.id.starts_with("app:"),
+                "application source id must be `app:<pid>`-prefixed, got {:?}",
+                source.id
+            );
+            match &source.kind {
+                AudioSourceKind::Application { pid, .. } => {
+                    assert_eq!(
+                        source.id,
+                        format!("app:{pid}"),
+                        "id must encode the same PID as the kind"
+                    );
+                    assert!(
+                        seen_ids.insert(source.id.clone()),
+                        "application sources must be PID-deduplicated; saw {:?} twice",
+                        source.id
+                    );
+                }
+                other => {
+                    panic!("list_audio_applications yielded a non-Application source: {other:?}")
+                }
+            }
+        }
     }
 
     // ── StreamStats (rsac-4c07) ───────────────────────────────────────

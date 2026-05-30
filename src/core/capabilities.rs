@@ -143,8 +143,8 @@ impl PlatformCapabilities {
             supports_application_capture: true, // WASAPI session capture
             supports_process_tree_capture: true, // WASAPI include_tree=true
             supports_device_selection: true,
-            // Flipped to true when the IMMNotificationClient watch() arm lands (rsac-e360).
-            supports_device_change_notifications: false,
+            // IMMNotificationClient watch() arm is implemented (rsac-e360).
+            supports_device_change_notifications: true,
             supported_sample_formats: vec![
                 SampleFormat::I16,
                 SampleFormat::I24,
@@ -168,8 +168,9 @@ impl PlatformCapabilities {
             supports_application_capture: has_process_tap, // CoreAudio Process Tap (14.4+)
             supports_process_tree_capture: has_process_tap, // Multi-PID tap via sysinfo child discovery (14.4+)
             supports_device_selection: true,
-            // Flipped to true when the AudioObjectPropertyListener watch() arm lands (rsac-3093).
-            supports_device_change_notifications: false,
+            // CoreAudio AudioObjectPropertyListener watch() arm landed (rsac-3093):
+            // device-list + default-output/input change notifications are wired up.
+            supports_device_change_notifications: true,
             supported_sample_formats: vec![SampleFormat::I16, SampleFormat::I32, SampleFormat::F32],
             sample_rate_range: (8000, 192000),
             max_channels: 8,
@@ -184,8 +185,11 @@ impl PlatformCapabilities {
             supports_application_capture: true, // PipeWire node targeting
             supports_process_tree_capture: true, // /proc-based child PID discovery + pw-dump node lookup
             supports_device_selection: true,
-            // Flipped to true when the PipeWire registry-listener watch() arm lands (rsac-b92e).
-            supports_device_change_notifications: false,
+            // PipeWire registry-listener watch() arm landed (rsac-b92e):
+            // LinuxDeviceEnumerator::watch spawns a persistent registry +
+            // `default` metadata listener thread that delivers DeviceAdded /
+            // DeviceRemoved / DefaultChanged.
+            supports_device_change_notifications: true,
             supported_sample_formats: vec![SampleFormat::I16, SampleFormat::I32, SampleFormat::F32],
             sample_rate_range: (8000, 384000),
             max_channels: 32, // PipeWire supports many channels
@@ -342,6 +346,8 @@ mod tests {
             assert!(caps.supports_application_capture);
             assert!(caps.supports_process_tree_capture);
             assert!(caps.supports_device_selection);
+            // watch() arm landed for Linux (rsac-b92e).
+            assert!(caps.supports_device_change_notifications);
             assert_eq!(caps.max_channels, 32);
             assert_eq!(caps.sample_rate_range, (8000, 384000));
             assert!(!caps.supported_sample_formats.is_empty());
@@ -662,6 +668,19 @@ mod tests {
     fn query_process_tree_supported_on_windows() {
         let caps = PlatformCapabilities::query();
         assert!(caps.supports_process_tree_capture);
+    }
+
+    #[test]
+    #[cfg(all(target_os = "macos", feature = "feat_macos"))]
+    fn macos_reports_device_change_notifications_supported() {
+        // rsac-3093: the CoreAudio AudioObjectPropertyListener watch() arm is
+        // implemented, so macOS must now honestly advertise device-change
+        // notification support (no longer the false stub).
+        let caps = PlatformCapabilities::query();
+        assert!(
+            caps.supports_device_change_notifications,
+            "macOS should report device-change notification support once watch() is wired up"
+        );
     }
 
     #[test]

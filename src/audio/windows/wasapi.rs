@@ -4,13 +4,17 @@
 
 use crate::core::config::{AudioFormat, StreamConfig};
 use crate::core::error::{AudioError, BackendContext, Result as AudioResult};
-use crate::core::interface::{AudioDevice, CapturingStream, DeviceEnumerator, DeviceKind};
+use crate::core::interface::{
+    AudioDevice, CapturingStream, DeviceEnumerator, DeviceEvent, DeviceEventHandler, DeviceKind,
+    DeviceWatcher,
+};
 
 use std::ffi::OsStr;
 use std::sync::{
     atomic::{AtomicBool, Ordering},
-    Arc,
+    mpsc, Arc,
 };
+use std::time::Duration;
 
 use sysinfo::{ProcessesToUpdate, System};
 use wasapi::{self, initialize_mta};
@@ -801,6 +805,218 @@ impl WindowsAudioDevice {
     }
 }
 
+// ── Device-change notifications (M10 watch() — rsac-e360) ─────────────────
+//
+// WASAPI delivers hot-plug / default-change notifications through an
+// `IMMNotificationClient` COM object registered via
+// `IMMDeviceEnumerator::RegisterEndpointNotificationCallback`. The MMDevice API
+// invokes those callbacks on an internal system thread that holds COM locks; the
+// docs are explicit that the callback must return quickly and must not block,
+// wait on another thread, or call back into the enumerator in a way that can
+// re-enter the audio engine. Invoking an arbitrary user `FnMut` directly there
+// risks deadlock and COM re-entrancy.
+//
+// Hand-off pattern (matches the canonical Windows/macOS design in the M10
+// surface and cpal/CamillaDSP): the COM callback only *translates* the event and
+// pushes a [`DeviceEvent`] into a bounded channel — alloc/lock on this thread is
+// permitted (it is NOT the real-time audio callback thread), but it never runs
+// user code. A dedicated helper thread owned by the returned [`DeviceWatcher`]
+// pops events and invokes the user handler. Teardown unregisters the COM client,
+// signals the helper thread, and joins it — no leak, no hang.
+
+/// Bound on the channel between the COM notification thread and the helper
+/// thread that runs the user handler.
+///
+/// Device-change events are rare (hot-plug, default switch), so a small bound is
+/// ample. If the user handler stalls and the buffer fills, the COM callback drops
+/// the oldest-unqueued event rather than block the system notification thread —
+/// dropping a redundant notification is far better than deadlocking COM.
+const DEVICE_EVENT_CHANNEL_BOUND: usize = 64;
+
+/// How long the helper thread blocks waiting for the next event before
+/// re-checking the shutdown flag. Keeps teardown latency bounded without busy
+/// spinning.
+const NOTIFY_THREAD_POLL_INTERVAL: Duration = Duration::from_millis(100);
+
+/// Map a WASAPI [`EDataFlow`] to the rsac [`DeviceKind`].
+///
+/// `eRender` → [`DeviceKind::Output`], `eCapture` → [`DeviceKind::Input`].
+/// `eAll` (or any unexpected value) has no single direction; callers treat
+/// `None` as "kind unknown" and skip kind-specific events.
+fn data_flow_to_kind(flow: EDataFlow) -> Option<DeviceKind> {
+    if flow == eRender {
+        Some(DeviceKind::Output)
+    } else if flow == eCapture {
+        Some(DeviceKind::Input)
+    } else {
+        None
+    }
+}
+
+/// Resolve a device's friendly name and kind from its endpoint id, using the
+/// enumerator that is already valid on the COM notification thread.
+///
+/// Best-effort: returns `("", None)`-ish fallbacks rather than failing, because a
+/// `DeviceAdded` event must still be delivered even if the brand-new endpoint
+/// cannot be fully probed yet (it may still be initializing). Runs on the COM
+/// notification thread, which already has a valid MTA apartment — no extra COM
+/// init needed.
+fn resolve_added_device(enumerator: &IMMDeviceEnumerator, device_id: &str) -> (String, DeviceKind) {
+    // SAFETY: `enumerator` is a live IMMDeviceEnumerator; GetDevice takes a
+    // null-terminated wide string. We build one from `device_id`.
+    let wide: Vec<u16> = device_id.encode_utf16().chain(std::iter::once(0)).collect();
+    let device: Option<IMMDevice> = unsafe { enumerator.GetDevice(PCWSTR(wide.as_ptr())) }.ok();
+
+    let Some(device) = device else {
+        // Endpoint not resolvable (already gone / not ready). Default to Input so
+        // the event is still self-consistent; name unknown.
+        return (String::new(), DeviceKind::Input);
+    };
+
+    // Kind via IMMEndpoint::GetDataFlow.
+    let kind = device
+        .cast::<IMMEndpoint>()
+        .ok()
+        .and_then(|endpoint| unsafe { endpoint.GetDataFlow() }.ok())
+        .and_then(data_flow_to_kind)
+        .unwrap_or(DeviceKind::Input);
+
+    // Friendly name via the property store (mirrors get_name_internal).
+    let name = unsafe { friendly_name_of(&device) }.unwrap_or_default();
+
+    (name, kind)
+}
+
+/// Read `PKEY_Device_FriendlyName` from an `IMMDevice`'s property store.
+///
+/// # Safety
+/// `device` must be a valid `IMMDevice`. Caller must hold a COM apartment.
+unsafe fn friendly_name_of(device: &IMMDevice) -> Option<String> {
+    let store: IPropertyStore = device.OpenPropertyStore(STGM_READ).ok()?;
+    let prop = store
+        .GetValue(&PKEY_Device_FriendlyName as *const _ as *const _)
+        .ok()?;
+    if prop.vt() == windows::Win32::System::Variant::VARENUM(VT_LPWSTR) {
+        let pwstr = prop.Anonymous.Anonymous.Anonymous.pwszVal;
+        WindowsAudioDevice::pwstr_to_string(pwstr).ok()
+    } else {
+        None
+    }
+}
+
+/// COM notification client that forwards WASAPI endpoint changes onto a channel.
+///
+/// Registered with `IMMDeviceEnumerator::RegisterEndpointNotificationCallback`.
+/// Its methods run on the MMDevice system notification thread; they only
+/// translate and enqueue events (never run user code) — see the module comment
+/// above for the deadlock rationale.
+#[implement(IMMNotificationClient)]
+struct WatcherNotificationClient {
+    /// Bounded sender to the helper thread. `try_send` so a stalled consumer can
+    /// never block the COM notification thread.
+    tx: mpsc::SyncSender<DeviceEvent>,
+    /// Enumerator clone used to resolve name/kind for `OnDeviceAdded`. Valid on
+    /// the COM notification thread (free-threaded MTA object).
+    enumerator: IMMDeviceEnumerator,
+}
+
+impl WatcherNotificationClient {
+    /// Enqueue an event without ever blocking the COM notification thread.
+    /// A full buffer means the consumer is behind; we drop the event (a device
+    /// change is idempotent — the consumer can re-enumerate) rather than stall
+    /// COM. A disconnected receiver means the watcher is being torn down.
+    fn emit(&self, event: DeviceEvent) {
+        match self.tx.try_send(event) {
+            Ok(()) => {}
+            Err(mpsc::TrySendError::Full(ev)) => {
+                log::warn!(
+                    "wasapi: device-event channel full, dropping notification: {:?}",
+                    ev
+                );
+            }
+            Err(mpsc::TrySendError::Disconnected(_)) => {
+                // Helper thread gone (teardown in progress) — nothing to do.
+            }
+        }
+    }
+}
+
+// The MMDevice notification callbacks. Each maps a WASAPI endpoint change to a
+// `DeviceEvent` and enqueues it. They must return `Ok(())` quickly.
+#[allow(non_snake_case)]
+impl IMMNotificationClient_Impl for WatcherNotificationClient_Impl {
+    fn OnDeviceStateChanged(
+        &self,
+        pwstrdeviceid: &PCWSTR,
+        dwnewstate: DEVICE_STATE,
+    ) -> windows::core::Result<()> {
+        let id = unsafe { pwstrdeviceid.to_string() }.unwrap_or_default();
+        // `available` == is the endpoint usable for capture right now.
+        let available = dwnewstate == DEVICE_STATE_ACTIVE;
+        self.emit(DeviceEvent::StateChanged {
+            id: DeviceId(id),
+            available,
+        });
+        Ok(())
+    }
+
+    fn OnDeviceAdded(&self, pwstrdeviceid: &PCWSTR) -> windows::core::Result<()> {
+        let id = unsafe { pwstrdeviceid.to_string() }.unwrap_or_default();
+        let (name, kind) = resolve_added_device(&self.enumerator, &id);
+        self.emit(DeviceEvent::DeviceAdded {
+            id: DeviceId(id),
+            name,
+            kind,
+        });
+        Ok(())
+    }
+
+    fn OnDeviceRemoved(&self, pwstrdeviceid: &PCWSTR) -> windows::core::Result<()> {
+        let id = unsafe { pwstrdeviceid.to_string() }.unwrap_or_default();
+        self.emit(DeviceEvent::DeviceRemoved { id: DeviceId(id) });
+        Ok(())
+    }
+
+    fn OnDefaultDeviceChanged(
+        &self,
+        flow: EDataFlow,
+        role: ERole,
+        pwstrdefaultdeviceid: &PCWSTR,
+    ) -> windows::core::Result<()> {
+        // Collapse the three roles (console/multimedia/communications) onto a
+        // single per-direction default. We key off the Console role to avoid
+        // emitting three near-identical events for one user-visible change.
+        if role != eConsole {
+            return Ok(());
+        }
+        let Some(kind) = data_flow_to_kind(flow) else {
+            return Ok(());
+        };
+        // A null id means "no default device for this role" (e.g. last endpoint
+        // unplugged). `to_string` on a null PCWSTR yields an empty string.
+        let id = if pwstrdefaultdeviceid.is_null() {
+            String::new()
+        } else {
+            unsafe { pwstrdefaultdeviceid.to_string() }.unwrap_or_default()
+        };
+        self.emit(DeviceEvent::DefaultChanged {
+            id: DeviceId(id),
+            kind,
+        });
+        Ok(())
+    }
+
+    fn OnPropertyValueChanged(
+        &self,
+        _pwstrdeviceid: &PCWSTR,
+        _key: &PROPERTYKEY,
+    ) -> windows::core::Result<()> {
+        // Property churn (volume, format tweaks) is far too noisy to surface as a
+        // DeviceEvent and has no corresponding variant. Intentionally ignored.
+        Ok(())
+    }
+}
+
 /// Enumerates audio devices available on a Windows system using WASAPI.
 #[derive(Debug)]
 pub struct WindowsDeviceEnumerator {
@@ -903,7 +1119,170 @@ impl DeviceEnumerator for WindowsDeviceEnumerator {
             }),
         }
     }
+
+    /// Subscribe to WASAPI device hot-plug / default-change notifications
+    /// (M10 `watch()` — rsac-e360).
+    ///
+    /// Registers an [`IMMNotificationClient`] via
+    /// `IMMDeviceEnumerator::RegisterEndpointNotificationCallback`. The COM
+    /// callbacks (run on the MMDevice system notification thread) translate each
+    /// change into a [`DeviceEvent`] and push it onto a bounded channel; a
+    /// dedicated helper thread owned by the returned [`DeviceWatcher`] pops events
+    /// and invokes `on_event`. The user handler therefore **never** runs on the
+    /// COM notification thread, avoiding COM re-entrancy / deadlock (the canonical
+    /// thread hand-off pattern; see the module-level notes by
+    /// `WatcherNotificationClient`, the crate-private COM callback object).
+    ///
+    /// Dropping the [`DeviceWatcher`] unregisters the COM client, signals the
+    /// helper thread, and joins it — no thread leak, no hang. After `drop`
+    /// returns, `on_event` is guaranteed not to be called again.
+    fn watch(&self, on_event: DeviceEventHandler) -> AudioResult<DeviceWatcher> {
+        // Bounded hand-off channel: COM notification thread → helper thread.
+        let (tx, rx) = mpsc::sync_channel::<DeviceEvent>(DEVICE_EVENT_CHANNEL_BOUND);
+
+        // Build the COM notification client and obtain its IMMNotificationClient
+        // interface. `enumerator.clone()` is a ref-count bump on the same
+        // free-threaded MTA object, used inside the callback to resolve added
+        // devices' name/kind.
+        let client: IMMNotificationClient = WatcherNotificationClient {
+            tx,
+            enumerator: self.enumerator.clone(),
+        }
+        .into();
+
+        // Register the callback. From here on, COM may invoke `client` on its
+        // notification thread.
+        // SAFETY: `self.enumerator` is a valid IMMDeviceEnumerator; `client` is a
+        // live IMMNotificationClient we own a reference to.
+        unsafe {
+            self.enumerator
+                .RegisterEndpointNotificationCallback(&client)
+        }
+        .map_err(|hr| AudioError::BackendError {
+            backend: "wasapi".to_string(),
+            operation: "register_endpoint_notification_callback".to_string(),
+            message: format!(
+                "RegisterEndpointNotificationCallback failed (HRESULT: {:?})",
+                hr
+            ),
+            context: Some(wasapi_backend_context_err(&hr)),
+        })?;
+
+        // Shutdown flag observed by the helper thread's recv loop.
+        let shutdown = Arc::new(AtomicBool::new(false));
+        let thread_shutdown = shutdown.clone();
+
+        // Helper thread: owns the receiver + the user handler. Pops events and
+        // invokes `on_event` off the COM thread. Exits when the shutdown flag is
+        // set (teardown) or the channel disconnects.
+        let mut on_event = on_event;
+        let notify_thread = std::thread::Builder::new()
+            .name("rsac-wasapi-device-watch".to_string())
+            .spawn(move || loop {
+                match rx.recv_timeout(NOTIFY_THREAD_POLL_INTERVAL) {
+                    Ok(event) => on_event(event),
+                    Err(mpsc::RecvTimeoutError::Timeout) => {
+                        if thread_shutdown.load(Ordering::Acquire) {
+                            break;
+                        }
+                    }
+                    Err(mpsc::RecvTimeoutError::Disconnected) => break,
+                }
+            })
+            .map_err(|e| {
+                // Spawn failed — unregister so we do not leave a dangling COM
+                // callback registered with no consumer.
+                // SAFETY: same valid enumerator + client as the registration.
+                let _ = unsafe {
+                    self.enumerator
+                        .UnregisterEndpointNotificationCallback(&client)
+                };
+                AudioError::BackendError {
+                    backend: "wasapi".to_string(),
+                    operation: "spawn_device_watch_thread".to_string(),
+                    message: format!("Failed to spawn device-watch helper thread: {}", e),
+                    context: None,
+                }
+            })?;
+
+        // Move the COM objects needed for teardown into a Send holder. Both are
+        // free-threaded MTA objects, so using them (incl. Unregister) from the
+        // thread that drops the DeviceWatcher is sound.
+        //
+        // The `com_initializer` clone PINS the COM apartment for the watcher's
+        // whole lifetime. `watch(&self)` is dispatched on a *borrowed* enumerator
+        // (see `CrossPlatformDeviceEnumerator::watch`), so the legal
+        // `get_enumerator()?.watch(handler)?` pattern drops the
+        // `WindowsDeviceEnumerator` — and its `Arc<ComInitializer>` — as soon as
+        // `watch` returns. Without holding our own `Arc` clone here, that drop
+        // could run `CoUninitialize()` while the IMMNotificationClient is still
+        // registered and before this teardown's `Unregister`, tearing down the
+        // MTA out from under a live callback. Keeping the clone alive until the
+        // teardown closure finishes guarantees ordering: Unregister + join the
+        // helper thread first, then release the apartment. (This mirrors why
+        // `WindowsAudioDevice` also holds the initializer.)
+        let teardown_state = SendWatcherTeardown {
+            enumerator: self.enumerator.clone(),
+            client,
+            com_initializer: self.com_initializer.clone(),
+        };
+
+        let teardown = Box::new(move || {
+            // 1. Stop new events: unregister the COM callback first, so no further
+            //    OnDevice* fires after this returns. Best-effort — a failed
+            //    unregister must not panic in Drop.
+            // SAFETY: free-threaded MTA enumerator + the client we registered.
+            let _ = unsafe {
+                teardown_state
+                    .enumerator
+                    .UnregisterEndpointNotificationCallback(&teardown_state.client)
+            };
+            // 2. Signal the helper thread to exit, then join. Setting the flag
+            //    plus dropping nothing else: the sender lives inside `client`,
+            //    which is dropped when `teardown_state` drops at end of closure;
+            //    the recv_timeout loop notices the flag within one poll interval.
+            shutdown.store(true, Ordering::Release);
+            // Join: bounded by NOTIFY_THREAD_POLL_INTERVAL after the flag is set.
+            // Ignore a poisoned-thread join error — never panic in Drop.
+            let _ = notify_thread.join();
+            // `teardown_state` (enumerator + client + com_initializer, holding the
+            // SyncSender) drops here, after the consumer thread has been joined —
+            // so the COM apartment is released only after Unregister + join, never
+            // before.
+            drop(teardown_state);
+        });
+
+        Ok(DeviceWatcher::from_teardown(teardown))
+    }
 }
+
+/// `Send` holder for the COM objects a [`DeviceWatcher`] teardown closure needs.
+///
+/// `IMMDeviceEnumerator` / `IMMNotificationClient` are not `Send` in the
+/// `windows` crate, but rsac creates them in a Multi-Threaded Apartment
+/// (`COINIT_MULTITHREADED`), where COM objects are free-threaded and may be used
+/// from any thread. The teardown closure must be `Send` (it is boxed as
+/// `FnOnce() + Send` in [`DeviceWatcher`]), so we assert that here, scoped to
+/// exactly these MTA objects.
+struct SendWatcherTeardown {
+    enumerator: IMMDeviceEnumerator,
+    client: IMMNotificationClient,
+    /// Keeps the COM apartment (MTA) initialized for the watcher's whole
+    /// lifetime, independent of the `WindowsDeviceEnumerator` that created it.
+    /// Dropped last (at the end of the teardown closure), after Unregister +
+    /// helper-thread join, so `CoUninitialize()` can never race a live callback.
+    ///
+    /// Held purely for its `Drop` (RAII lifetime extension) — never read — hence
+    /// `#[allow(dead_code)]`: the value's *existence* is the contract, and
+    /// removing it would reintroduce the apartment-teardown race.
+    #[allow(dead_code)]
+    com_initializer: Arc<ComInitializer>,
+}
+
+// SAFETY: see the type doc — both wrapped interfaces are MTA free-threaded
+// objects (created under COINIT_MULTITHREADED), safe to use from any thread.
+// `Arc<ComInitializer>` is `Send` already; it is listed for documentation.
+unsafe impl Send for SendWatcherTeardown {}
 
 /// Information about an active audio session associated with an application.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -1799,5 +2178,118 @@ mod tests {
 
         // Clean up.
         stream.stop().expect("stop failed");
+    }
+
+    // ── Device-change notifications: watch() (M10 — rsac-e360) ───────────
+
+    /// `data_flow_to_kind` maps WASAPI render/capture flows to rsac kinds and
+    /// returns `None` for anything else (e.g. `eAll`).
+    #[test]
+    fn test_data_flow_to_kind_mapping() {
+        assert_eq!(data_flow_to_kind(eRender), Some(DeviceKind::Output));
+        assert_eq!(data_flow_to_kind(eCapture), Some(DeviceKind::Input));
+        assert_eq!(data_flow_to_kind(eAll), None);
+    }
+
+    /// `watch()` registers an IMMNotificationClient and returns a DeviceWatcher
+    /// over a short live window, then drops it cleanly.
+    ///
+    /// We cannot deterministically force a real hot-plug / default-device change
+    /// in CI, so this asserts the register → live-window → clean-drop lifecycle:
+    /// no panic, no hang, and the helper thread is joined on drop. If any
+    /// spurious device events do arrive during the window, the handler increments
+    /// a counter — exercising the COM-thread → helper-thread → user-FnMut path
+    /// without requiring a change to occur.
+    #[test]
+    fn test_watch_register_and_clean_drop() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use std::sync::Arc;
+
+        let enumerator = WindowsDeviceEnumerator::new().expect("new() failed");
+
+        let count = Arc::new(AtomicUsize::new(0));
+        let count_cb = count.clone();
+
+        let watcher = enumerator
+            .watch(Box::new(move |_event: DeviceEvent| {
+                // Runs on the helper thread, never the COM notification thread.
+                count_cb.fetch_add(1, Ordering::Relaxed);
+            }))
+            .expect("watch() should register a notification client on Windows");
+
+        // Hold the subscription briefly so the COM client is live.
+        std::thread::sleep(std::time::Duration::from_millis(200));
+
+        // Drop unregisters the COM callback and joins the helper thread. This
+        // must return promptly (no hang) and must not panic.
+        drop(watcher);
+
+        // After drop, the helper thread is joined; the handler will not run again.
+        // The observed count is environment-dependent (usually 0 in headless CI),
+        // so we only assert the lifecycle completed without deadlock.
+        let _observed = count.load(Ordering::Relaxed);
+    }
+
+    /// Registering and dropping multiple watchers in sequence must each tear down
+    /// cleanly (no accumulated COM registrations, no leaked threads).
+    #[test]
+    fn test_watch_repeated_register_unregister() {
+        let enumerator = WindowsDeviceEnumerator::new().expect("new() failed");
+        for _ in 0..3 {
+            let watcher = enumerator
+                .watch(Box::new(|_event: DeviceEvent| {}))
+                .expect("watch() should succeed");
+            // Immediate drop exercises the unregister+join path back-to-back.
+            drop(watcher);
+        }
+    }
+
+    /// Two concurrent watchers from independent enumerators can coexist and both
+    /// drop cleanly — validates that registration/unregistration is per-client.
+    #[test]
+    fn test_watch_two_concurrent_watchers() {
+        let enum_a = WindowsDeviceEnumerator::new().expect("new() failed");
+        let enum_b = WindowsDeviceEnumerator::new().expect("new() failed");
+
+        let w_a = enum_a
+            .watch(Box::new(|_event: DeviceEvent| {}))
+            .expect("watch A failed");
+        let w_b = enum_b
+            .watch(Box::new(|_event: DeviceEvent| {}))
+            .expect("watch B failed");
+
+        std::thread::sleep(std::time::Duration::from_millis(50));
+
+        // Drop in reverse order; both must tear down without hang/panic.
+        drop(w_b);
+        drop(w_a);
+    }
+
+    /// Dropping the `WindowsDeviceEnumerator` while its `DeviceWatcher` is still
+    /// alive must remain sound. This is the `get_enumerator()?.watch(h)?`
+    /// pattern: `watch(&self)` is dispatched on a borrowed enumerator, so the
+    /// enumerator (and its `Arc<ComInitializer>`) drops as soon as `watch`
+    /// returns. The watcher pins its own `Arc<ComInitializer>` clone, so the COM
+    /// apartment stays initialized until the watcher's teardown (Unregister +
+    /// join) completes. Regression guard for the apartment-lifetime fix; before
+    /// it, this would `CoUninitialize()` with a live registered callback.
+    #[test]
+    fn test_watch_outlives_enumerator_drop() {
+        let watcher = {
+            let enumerator = WindowsDeviceEnumerator::new().expect("new() failed");
+            let w = enumerator
+                .watch(Box::new(|_event: DeviceEvent| {}))
+                .expect("watch() should succeed");
+            // `enumerator` drops HERE, at end of block — its Arc<ComInitializer>
+            // refcount decrements but the watcher holds another clone.
+            w
+        };
+
+        // The COM client is still registered and the apartment still live.
+        std::thread::sleep(std::time::Duration::from_millis(100));
+
+        // Clean teardown after the enumerator is already gone: no panic, no hang,
+        // no use-after-CoUninitialize.
+        drop(watcher);
     }
 }

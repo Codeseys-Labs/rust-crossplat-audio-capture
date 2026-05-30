@@ -2108,6 +2108,444 @@ fn pw_thread_main(
     log::debug!("PipeWire thread: exited cleanly");
 }
 
+// ── Device-change watcher (M10 Linux arm / rsac-b92e) ─────────────────────
+//
+// `DeviceEnumerator::watch` needs a *persistent* PipeWire main-loop + registry
+// + `default` metadata listener that lives for as long as the caller holds the
+// returned `DeviceWatcher` — distinct from the short-lived per-call snapshot
+// threads above (which spawn, settle one roundtrip, and exit). The OS
+// notification callbacks fire on this watch thread's loop; we invoke the user
+// `FnMut` from there (never the audio callback thread), satisfying the
+// thread-handoff contract: the persistent loop thread IS the delivery thread.
+
+/// Upper bound on how long [`spawn_device_watcher`] blocks waiting for the
+/// watch thread to report PipeWire init success or failure (mirrors the
+/// `PipeWireThread::spawn` init handshake).
+const WATCH_INIT_TIMEOUT: Duration = Duration::from_secs(5);
+
+/// Spawn a persistent PipeWire registry + `default` metadata listener thread
+/// and return a [`DeviceWatcher`] whose `Drop` tears it down (M10 Linux arm /
+/// `rsac-b92e`).
+///
+/// The spawned thread owns its own `MainLoop`/`Context`/`Core`/`Registry`
+/// (all `Rc`/`!Send`, so they must live on one thread) plus a bound `default`
+/// metadata proxy. Its registry `global`/`global_remove` callbacks translate
+/// audio `Audio/Sink` / `Audio/Source` node arrivals/departures into
+/// [`DeviceEvent::DeviceAdded`] / [`DeviceEvent::DeviceRemoved`], and the
+/// `default` metadata `property` callback translates `default.audio.sink` /
+/// `default.audio.source` changes into [`DeviceEvent::DefaultChanged`]. Each
+/// event is handed to the user `on_event` closure **on this loop thread**.
+///
+/// # Real-time safety
+///
+/// The watch thread is a plain notification thread — it is *not* the audio
+/// callback thread, so allocating / locking / invoking the user closure here is
+/// fine. The audio `process` callback (in [`pw_thread_main`]) is untouched.
+///
+/// # Lifecycle
+///
+/// The loop is pumped manually via `iterate(50 ms)` (the same idiom
+/// [`pw_thread_main`] uses) so a thread-safe shutdown can be signalled without
+/// the `!Send` `MainLoop::quit`: the returned watcher's teardown sets a shared
+/// `AtomicBool` and joins the thread. `Drop` therefore unregisters the OS
+/// listeners (their `Rc`-owned C registrations drop when the thread's locals
+/// drop) and joins — no leaked thread, no hang.
+///
+/// # Errors
+///
+/// - [`AudioError::BackendInitializationFailed`] if the thread cannot be
+///   spawned or PipeWire initialization fails on it.
+/// - [`AudioError::Timeout`] if init does not complete within
+///   [`WATCH_INIT_TIMEOUT`] (a wedged daemon surfaces as an error, never a
+///   hang).
+#[cfg(feature = "feat_linux")]
+pub(crate) fn spawn_device_watcher(
+    on_event: crate::core::interface::DeviceEventHandler,
+) -> AudioResult<crate::core::interface::DeviceWatcher> {
+    use crate::core::interface::DeviceWatcher;
+
+    let (init_tx, init_rx) = std_mpsc::channel::<AudioResult<()>>();
+    let shutdown = Arc::new(AtomicBool::new(false));
+    let shutdown_thread = Arc::clone(&shutdown);
+
+    let thread_handle = std::thread::Builder::new()
+        .name("rsac-pw-watch".to_string())
+        .spawn(move || {
+            watch_thread_main(on_event, init_tx, shutdown_thread);
+        })
+        .map_err(|e| AudioError::BackendInitializationFailed {
+            backend: "PipeWire".to_string(),
+            reason: format!("Failed to spawn PipeWire watch thread: {}", e),
+        })?;
+
+    // Block (bounded) until the watch thread reports init success or failure.
+    // A wedged daemon must surface as Timeout, not an unbounded recv() hang.
+    // Each non-Ok path JOINS the thread and RETURNS, so `thread_handle` is moved
+    // only on a single path (no use-after-move) and no failure leaks a thread.
+    match init_rx.recv_timeout(WATCH_INIT_TIMEOUT) {
+        // The thread reported a PipeWire init error; it has already exited (or
+        // is exiting). Signal + join so the failure path leaves no thread.
+        Ok(Err(e)) => {
+            shutdown.store(true, Ordering::SeqCst);
+            let _ = thread_handle.join();
+            return Err(e);
+        }
+        // Init succeeded — fall through to build the watcher.
+        Ok(Ok(())) => {}
+        Err(std_mpsc::RecvTimeoutError::Timeout) => {
+            // Signal the thread to stop and join it so we never leak it on the
+            // timeout path, then report the timeout.
+            shutdown.store(true, Ordering::SeqCst);
+            let _ = thread_handle.join();
+            return Err(AudioError::Timeout {
+                operation: "PipeWire watch init".to_string(),
+                duration: WATCH_INIT_TIMEOUT,
+            });
+        }
+        Err(std_mpsc::RecvTimeoutError::Disconnected) => {
+            // Thread exited before reporting — join to reap it, then error.
+            let _ = thread_handle.join();
+            return Err(AudioError::BackendInitializationFailed {
+                backend: "PipeWire".to_string(),
+                reason: "PipeWire watch thread exited before reporting init status".to_string(),
+            });
+        }
+    }
+
+    // Build the RAII teardown: flip the shared flag (the loop notices on its
+    // next 50 ms iterate tick and exits) and join the thread exactly once. The
+    // closure is the single owner of the JoinHandle, so it cannot be joined
+    // twice; `DeviceWatcher::drop` already guarantees it runs at most once.
+    let mut handle = Some(thread_handle);
+    let teardown: Box<dyn FnOnce() + Send> = Box::new(move || {
+        shutdown.store(true, Ordering::SeqCst);
+        if let Some(handle) = handle.take() {
+            // Best-effort join: a panicked watch thread must not panic the
+            // teardown (it runs in Drop, possibly while unwinding).
+            let _ = handle.join();
+        }
+    });
+
+    Ok(DeviceWatcher::from_teardown(teardown))
+}
+
+/// A device the watch thread is tracking, keyed by registry global id.
+///
+/// Retained so `global_remove` (which only carries the registry global id) can
+/// emit a [`DeviceEvent::DeviceRemoved`] with the *same* [`DeviceId`] the
+/// matching [`DeviceEvent::DeviceAdded`] carried, and so a `default` metadata
+/// change (which carries a node *name*) can be resolved back to that id.
+#[cfg(feature = "feat_linux")]
+struct WatchedDevice {
+    /// The `DeviceId` string (`object.serial`, falling back to global id) — the
+    /// same identity contract the snapshot path uses. Re-emitted verbatim in the
+    /// matching [`DeviceEvent::DeviceRemoved`] / [`DeviceEvent::DefaultChanged`].
+    id: String,
+    /// Verbatim `node.name`, matched against `default.audio.sink/source` values
+    /// so a default change resolves back to this device's `id`.
+    node_name: String,
+}
+
+/// Body of the persistent device-watch thread (M10 / `rsac-b92e`).
+///
+/// Owns the PipeWire `Rc`/`!Send` objects, registers the registry + `default`
+/// metadata listeners, reports init status over `init_tx`, then pumps the loop
+/// via `iterate(50 ms)` until `shutdown` is set (by the watcher teardown).
+#[cfg(feature = "feat_linux")]
+fn watch_thread_main(
+    on_event: crate::core::interface::DeviceEventHandler,
+    init_tx: std_mpsc::Sender<AudioResult<()>>,
+    shutdown: Arc<AtomicBool>,
+) {
+    use std::cell::RefCell;
+    use std::collections::BTreeMap;
+    use std::rc::Rc;
+
+    use pipewire::context::ContextBox;
+    use pipewire::main_loop::MainLoopBox;
+    use pipewire::metadata::{Metadata, MetadataListener};
+    use pipewire::registry::Listener as RegistryListener;
+    use pipewire::types::ObjectType;
+
+    use crate::core::config::DeviceId;
+    use crate::core::interface::{DeviceEvent, DeviceKind};
+
+    // Macro-free init failure helper: report the error and bail. The thread
+    // exits; `spawn_device_watcher` joins it on the error path.
+    macro_rules! init_fail {
+        ($reason:expr) => {{
+            let _ = init_tx.send(Err(AudioError::BackendInitializationFailed {
+                backend: "PipeWire".to_string(),
+                reason: $reason,
+            }));
+            return;
+        }};
+    }
+
+    // Step 1: init PipeWire + build the loop/context/core/registry.
+    pipewire::init();
+
+    let main_loop = match MainLoopBox::new(None) {
+        Ok(ml) => ml,
+        Err(e) => init_fail!(format!("Failed to create MainLoop: {}", e)),
+    };
+    let context = match ContextBox::new(main_loop.loop_(), None) {
+        Ok(ctx) => ctx,
+        Err(e) => init_fail!(format!("Failed to create PipeWire Context: {}", e)),
+    };
+    let core = match context.connect(None) {
+        Ok(c) => c,
+        Err(e) => init_fail!(format!("Failed to connect to PipeWire daemon: {}", e)),
+    };
+    let registry = match core.get_registry() {
+        Ok(r) => r,
+        Err(e) => init_fail!(format!("Failed to get PipeWire registry: {}", e)),
+    };
+
+    // Shared user closure. It is `Send` but used only on THIS thread; the
+    // registry `global`/`global_remove` and metadata `property` callbacks are
+    // each `Fn + 'static`, so the closure lives behind `Rc<RefCell<…>>` and we
+    // clone the handle once per callback (the !Send PW idiom; heed the
+    // Rc-clone-per-closure gotcha — every closure that MOVES a handle needs its
+    // own clone). `RefCell` guards against re-entrancy: these callbacks fire
+    // sequentially from a single loop thread, so no borrow overlaps in practice.
+    let on_event: Rc<RefCell<crate::core::interface::DeviceEventHandler>> =
+        Rc::new(RefCell::new(on_event));
+
+    // Tracked devices, keyed by registry global id — so `global_remove` and
+    // `default` metadata resolution can recover the DeviceId/kind/name. Lives on
+    // this thread only; shared (cloned) into the callbacks.
+    let devices: Rc<RefCell<BTreeMap<u32, WatchedDevice>>> = Rc::new(RefCell::new(BTreeMap::new()));
+
+    // Records the `default` metadata global id when its registry global appears,
+    // so the loop body can bind the proxy on the loop thread (direct `&registry`
+    // access — never inside the `Fn` closure, so no unsafe reborrow). `None`
+    // until the global is announced.
+    let pending_default_meta_id: Rc<RefCell<Option<u32>>> = Rc::new(RefCell::new(None));
+
+    // The bound `default` metadata proxy + its property listener, kept alive for
+    // the thread's lifetime (the proxy owns the C listener registration).
+    let mut default_metadata: Option<(Metadata, MetadataListener)> = None;
+
+    // ── Registry listener: emit DeviceAdded / DeviceRemoved ──────────────
+    let _registry_listener: RegistryListener = {
+        // Per the Rc-clone-per-closure gotcha: the `global` closure MOVES these
+        // handles, so `global_remove` gets its own separate clones below.
+        let devices_add = Rc::clone(&devices);
+        let on_event_add = Rc::clone(&on_event);
+        let pending_default_meta_id = Rc::clone(&pending_default_meta_id);
+
+        let devices_remove = Rc::clone(&devices);
+        let on_event_remove = Rc::clone(&on_event);
+
+        registry
+            .add_listener_local()
+            .global(move |global| match global.type_ {
+                ObjectType::Node => {
+                    let Some(props) = global.props else {
+                        return;
+                    };
+                    let media_class = props.get("media.class").unwrap_or("");
+                    let is_source = media_class.contains("Audio/Source");
+                    let is_sink = media_class.contains("Audio/Sink");
+                    if !is_source && !is_sink {
+                        // Not an enumerable audio device (e.g. a Stream node).
+                        return;
+                    }
+
+                    // Identity contract (parity with PwDeviceSnapshot): id =
+                    // object.serial, falling back to the registry global id.
+                    let id = props
+                        .get("object.serial")
+                        .map(str::to_owned)
+                        .unwrap_or_else(|| global.id.to_string());
+                    let node_name = props.get("node.name").unwrap_or("").to_owned();
+                    let name = props
+                        .get("node.description")
+                        .or_else(|| props.get("node.nick"))
+                        .or_else(|| props.get("node.name"))
+                        .unwrap_or("PipeWire Device")
+                        .to_owned();
+                    // A device that is both source and sink (e.g. a monitor)
+                    // reports Input, matching AudioDevice::kind's documented
+                    // Linux behaviour.
+                    let kind = if is_source {
+                        DeviceKind::Input
+                    } else {
+                        DeviceKind::Output
+                    };
+
+                    // Record it so global_remove / default-resolution can find
+                    // it later. Re-announcement of the same global id overwrites
+                    // (idempotent), but we only emit DeviceAdded the first time
+                    // to avoid duplicate notifications.
+                    let first_seen = devices_add
+                        .borrow_mut()
+                        .insert(
+                            global.id,
+                            WatchedDevice {
+                                id: id.clone(),
+                                node_name,
+                            },
+                        )
+                        .is_none();
+
+                    if first_seen {
+                        (on_event_add.borrow_mut())(DeviceEvent::DeviceAdded {
+                            id: DeviceId(id),
+                            name,
+                            kind,
+                        });
+                    }
+                }
+                ObjectType::Metadata => {
+                    // Record the `default` metadata global id so the loop body
+                    // can bind a property listener for default sink/source.
+                    let is_default = global
+                        .props
+                        .and_then(|p| p.get("metadata.name"))
+                        .map(|n| n == "default")
+                        .unwrap_or(false);
+                    if is_default {
+                        *pending_default_meta_id.borrow_mut() = Some(global.id);
+                    }
+                }
+                _ => {}
+            })
+            .global_remove(move |id| {
+                // A node going away: drop it from the tracking map and, if it
+                // was a device we had announced, emit DeviceRemoved with the
+                // same DeviceId. Non-device globals are not in the map, so the
+                // lookup is a cheap no-op for them.
+                let removed = devices_remove.borrow_mut().remove(&id);
+                if let Some(dev) = removed {
+                    (on_event_remove.borrow_mut())(DeviceEvent::DeviceRemoved {
+                        id: DeviceId(dev.id),
+                    });
+                }
+            })
+            .register()
+    };
+
+    // ── Settle the initial registry dump, then bind `default` metadata ───
+    //
+    // Pump one `core.sync()`/`done` roundtrip so the daemon's initial registry
+    // dump (and thus the `default` metadata global's id) is delivered before we
+    // bind the metadata proxy. Binding before the dump settles raced and left
+    // the default unresolved (mirrors the rsac-bfd8 ordering in pw_thread_main).
+    //
+    // NOTE: the initial dump's `global` events fire DeviceAdded for every device
+    // already present when watch() is called — i.e. the watcher reports the
+    // current device set as it comes up, then live changes thereafter.
+    let pump_sync = |main_loop: &MainLoopBox| {
+        let done = Rc::new(std::cell::Cell::new(false));
+        let pending = match core.sync(0) {
+            Ok(seq) => seq.seq(),
+            Err(e) => {
+                log::debug!("PipeWire watch: core.sync failed: {}", e);
+                return;
+            }
+        };
+        let done_cb = Rc::clone(&done);
+        let core_listener = core
+            .add_listener_local()
+            .done(move |id, seq| {
+                if id == pipewire::core::PW_ID_CORE && seq.seq() >= pending {
+                    done_cb.set(true);
+                }
+            })
+            .register();
+        let deadline = std::time::Instant::now() + SNAPSHOT_TIMEOUT;
+        while !done.get() && std::time::Instant::now() < deadline {
+            let _ = main_loop.loop_().iterate(Duration::from_millis(50));
+        }
+        drop(core_listener);
+    };
+
+    pump_sync(&main_loop);
+
+    // Bind the `default` metadata proxy (once) on the loop thread. Its property
+    // callback emits DefaultChanged whenever default.audio.sink/source changes.
+    if let Some(meta_id) = *pending_default_meta_id.borrow() {
+        let object = pipewire::registry::GlobalObject {
+            id: meta_id,
+            permissions: pipewire::permissions::PermissionFlags::empty(),
+            type_: ObjectType::Metadata,
+            version: 0,
+            props: None::<pipewire::properties::PropertiesBox>,
+        };
+        match registry.bind::<Metadata, _>(&object) {
+            Ok(metadata) => {
+                let devices_meta = Rc::clone(&devices);
+                let on_event_meta = Rc::clone(&on_event);
+                let listener = metadata
+                    .add_listener_local()
+                    .property(move |_subject, key, _type, value| {
+                        let kind = match key {
+                            Some("default.audio.sink") => DeviceKind::Output,
+                            Some("default.audio.source") => DeviceKind::Input,
+                            _ => return 0,
+                        };
+                        // `value` is a JSON object {"name":"..."} (or a bare
+                        // quoted string on older daemons); pull the node name.
+                        // `None` (property removed) → nothing to report.
+                        let Some(name) = parse_default_metadata_name(value) else {
+                            return 0;
+                        };
+                        // Resolve the node *name* to the round-trippable DeviceId
+                        // (the metadata keys on node.name, devices store it
+                        // verbatim). If we can't resolve it yet (e.g. the node's
+                        // global hasn't been seen), skip rather than emit an
+                        // unusable id.
+                        let resolved = devices_meta
+                            .borrow()
+                            .values()
+                            .find(|d| d.node_name == name)
+                            .map(|d| d.id.clone());
+                        if let Some(id) = resolved {
+                            (on_event_meta.borrow_mut())(DeviceEvent::DefaultChanged {
+                                id: DeviceId(id),
+                                kind,
+                            });
+                        }
+                        0
+                    })
+                    .register();
+                default_metadata = Some((metadata, listener));
+            }
+            Err(e) => {
+                log::debug!("PipeWire watch: failed to bind default metadata: {}", e);
+            }
+        }
+    }
+
+    // Settle the metadata proxy's initial `property` callbacks (so the current
+    // default is reflected) before we report init success.
+    pump_sync(&main_loop);
+
+    // Init done — tell the caller we are live. If the caller is already gone
+    // (dropped the watcher synchronously), stop now.
+    if init_tx.send(Ok(())).is_err() {
+        return;
+    }
+
+    // ── Step: pump the loop until shutdown is signalled ──────────────────
+    //
+    // Manual `iterate(50 ms)` (not `run()`) so the teardown can stop us via the
+    // shared AtomicBool without the `!Send` `MainLoop::quit`. Each tick delivers
+    // any pending registry/metadata events (firing the user closure on THIS
+    // thread), then we re-check the flag.
+    while !shutdown.load(Ordering::SeqCst) {
+        let _ = main_loop.loop_().iterate(Duration::from_millis(50));
+    }
+
+    // Drop the metadata proxy/listener first (its C registration references the
+    // proxy), then the rest of the PipeWire objects via RAII as the function
+    // returns. The user closure is dropped here too — it will not run again.
+    drop(default_metadata.take());
+    log::debug!("PipeWire watch thread: exited cleanly");
+}
+
 // ── Compile-time assertions ──────────────────────────────────────────────
 
 /// Assert that `LinuxPlatformStream` is `Send` (required by `PlatformStream`).
