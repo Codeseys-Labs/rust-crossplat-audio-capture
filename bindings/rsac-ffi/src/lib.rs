@@ -94,9 +94,13 @@ fn map_rsac_error(err: &rsac::AudioError) -> rsac_error_t {
         | AudioError::DeviceEnumerationError { .. } => rsac_error_t::RSAC_ERROR_DEVICE_NOT_FOUND,
         AudioError::StreamCreationFailed { .. }
         | AudioError::StreamStartFailed { .. }
-        | AudioError::StreamStopFailed { .. } => rsac_error_t::RSAC_ERROR_STREAM_FAILED,
+        | AudioError::StreamStopFailed { .. }
+        // StreamEnded is the FATAL terminal-read signal (ADR-0003): the stream
+        // is done and must not be retried. Map it to the (fatal) STREAM_FAILED
+        // group, NOT the recoverable STREAM_READ group, so C callers can tell
+        // "done" from "retry". Reuses the existing code — ABI-stable.
+        | AudioError::StreamEnded { .. } => rsac_error_t::RSAC_ERROR_STREAM_FAILED,
         AudioError::StreamReadError { .. }
-        | AudioError::StreamEnded { .. }
         | AudioError::BufferOverrun { .. }
         | AudioError::BufferUnderrun { .. } => rsac_error_t::RSAC_ERROR_STREAM_READ,
         AudioError::BackendError { .. }
@@ -860,14 +864,13 @@ pub unsafe extern "C" fn rsac_device_list_free(list: *mut RsacDeviceList) {
 #[no_mangle]
 pub unsafe extern "C" fn rsac_default_device(
     enumerator: *const RsacDeviceEnumerator,
-    _kind: rsac_device_kind_t,
+    kind: rsac_device_kind_t,
     out: *mut *mut RsacDevice,
 ) -> rsac_error_t {
-    // NOTE: The `_kind` parameter is currently ignored. All platform
-    // backends return the default *output* device (used for loopback
-    // capture); kind-based selection was never implemented. Preserved in
-    // the C ABI so existing consumers don't need to recompile. Future
-    // major versions may remove the parameter.
+    // rsac is a loopback (output) capture library: only the default OUTPUT
+    // device is meaningful. Rather than silently ignoring `kind` and returning
+    // the output device for an INPUT request (a lying ABI), reject any non-
+    // output kind explicitly so callers get an honest error.
     catch(|| {
         if enumerator.is_null() {
             set_last_error("enumerator is null");
@@ -876,6 +879,14 @@ pub unsafe extern "C" fn rsac_default_device(
         if out.is_null() {
             set_last_error("out pointer is null");
             return rsac_error_t::RSAC_ERROR_NULL_POINTER;
+        }
+        if kind != rsac_device_kind_t::RSAC_DEVICE_OUTPUT {
+            set_last_error(
+                "rsac_default_device: only RSAC_DEVICE_OUTPUT is supported \
+                 (rsac is a loopback capture library)",
+            );
+            unsafe { *out = ptr::null_mut() };
+            return rsac_error_t::RSAC_ERROR_INVALID_PARAMETER;
         }
         unsafe { *out = ptr::null_mut() };
         let e = unsafe { &*enumerator };

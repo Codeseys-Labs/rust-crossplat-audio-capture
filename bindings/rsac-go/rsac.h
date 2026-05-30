@@ -259,8 +259,9 @@ void rsac_device_list_free(RsacDeviceList* list);
 
 /**
  * Gets the default audio device. On success *out receives a device handle
- * that must be freed with rsac_device_free(). The kind parameter is currently
- * advisory — all backends return the default output device used for loopback.
+ * that must be freed with rsac_device_free(). Only RSAC_DEVICE_OUTPUT is
+ * supported (rsac is a loopback capture library); RSAC_DEVICE_INPUT returns
+ * RSAC_ERROR_INVALID_PARAMETER.
  */
 rsac_error_t rsac_default_device(const RsacDeviceEnumerator* enumerator,
                                  rsac_device_kind_t kind,

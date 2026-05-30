@@ -24,7 +24,7 @@
 //! }
 //! ```
 
-use std::sync::atomic::{AtomicU16, AtomicU32, AtomicU64, AtomicU8, Ordering};
+use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -54,6 +54,31 @@ const RT_BUFFER_SAMPLE_CAPACITY: usize = 2048;
 ///
 /// Overridable per-bridge via [`create_bridge_with_options`].
 pub const DEFAULT_BACKPRESSURE_THRESHOLD: u32 = 10;
+
+/// Pack an [`AudioFormat`] into a single non-zero `u64` for lock-free atomic
+/// publication: `(sample_rate << 32) | (channels << 16) | sample_format_u8`.
+///
+/// The packed value is always non-zero for any real format (a valid stream has
+/// `sample_rate > 0`), so `0` is reserved as the "unset" sentinel (see
+/// [`unpack_format`]). Storing the whole format in one word means a reader can
+/// never observe a torn mix of an old field with a new one.
+fn pack_format(f: &AudioFormat) -> u64 {
+    ((f.sample_rate as u64) << 32)
+        | ((f.channels as u64) << 16)
+        | (sample_format_to_atomic(f.sample_format) as u64)
+}
+
+/// Inverse of [`pack_format`]. Returns `None` for the `0` ("unset") sentinel.
+fn unpack_format(packed: u64) -> Option<AudioFormat> {
+    if packed == 0 {
+        return None;
+    }
+    Some(AudioFormat {
+        sample_rate: (packed >> 32) as u32,
+        channels: ((packed >> 16) & 0xFFFF) as u16,
+        sample_format: sample_format_from_atomic((packed & 0xFF) as u8),
+    })
+}
 
 /// Encode a [`SampleFormat`] as a `u8` for lock-free atomic storage.
 ///
@@ -112,22 +137,15 @@ pub(crate) struct BridgeShared {
     /// [`negotiated_*`]: BridgeShared::set_negotiated_format
     #[allow(dead_code)]
     pub format: AudioFormat,
-    /// `true` once a backend has recorded an authoritative *delivery* format via
-    /// [`BridgeProducer::set_negotiated_format`]. Until then, [`negotiated_format`]
-    /// falls back to the requested [`format`].
-    ///
-    /// [`format`]: BridgeShared::format
-    /// [`negotiated_format`]: BridgeShared::negotiated_format
-    negotiated_set: std::sync::atomic::AtomicBool,
-    /// Delivery sample rate recorded by the backend (valid only when
-    /// `negotiated_set` is true).
-    negotiated_sample_rate: AtomicU32,
-    /// Delivery channel count recorded by the backend (valid only when
-    /// `negotiated_set` is true).
-    negotiated_channels: AtomicU16,
-    /// Delivery sample format recorded by the backend, encoded via
-    /// [`sample_format_to_atomic`] (valid only when `negotiated_set` is true).
-    negotiated_sample_format: AtomicU8,
+    /// Authoritative *delivery* format recorded by a backend, packed into a
+    /// single atomic word so a reader can never observe a torn snapshot (a
+    /// mix of an old rate with a new channel count). Encoding (0 == unset):
+    /// `(sample_rate as u64) << 32 | (channels as u64) << 16 | sample_format_u8`.
+    /// Published with one `Release` store / read with one `Acquire` load. Until
+    /// a backend calls [`BridgeProducer::set_negotiated_format`], this is 0 and
+    /// [`negotiated_format`](BridgeShared::negotiated_format) falls back to the
+    /// requested [`format`](BridgeShared::format).
+    negotiated: AtomicU64,
     /// Waker for async stream consumers — notified when new data is pushed.
     #[cfg(feature = "async-stream")]
     pub waker: atomic_waker::AtomicWaker,
@@ -146,24 +164,27 @@ impl BridgeShared {
     /// Platform backends call this (via [`BridgeProducer::set_negotiated_format`])
     /// once they know the format the OS audio callback will actually deliver,
     /// which can differ from the requested format (e.g. the system mix format
-    /// when autoconvert is unavailable). It is lock-free and cheap — three
-    /// relaxed stores plus a `Release` flag store so a consumer that observes
-    /// `negotiated_set == true` also sees the field writes.
+    /// when autoconvert is unavailable). Lock-free and cheap: a single
+    /// `Release` store of the packed word, so a reader either sees the whole
+    /// new format or the whole old one — never a torn mix.
+    ///
+    /// The reported `sample_format` is **always normalized to F32**: the bridge
+    /// payload (`AudioBuffer`) is always interleaved f32 regardless of the OS
+    /// endpoint's native sample type, so reporting anything else would
+    /// misdescribe what consumers actually receive. The negotiated
+    /// `sample_rate`/`channels` are preserved as delivered.
     ///
     /// Safe to call more than once; the most recent values win. Reads go through
     /// [`negotiated_format`](BridgeShared::negotiated_format).
     pub fn set_negotiated_format(&self, format: &AudioFormat) {
-        self.negotiated_sample_rate
-            .store(format.sample_rate, Ordering::Relaxed);
-        self.negotiated_channels
-            .store(format.channels, Ordering::Relaxed);
-        self.negotiated_sample_format.store(
-            sample_format_to_atomic(format.sample_format),
-            Ordering::Relaxed,
-        );
-        // Release so that a consumer observing the flag (Acquire) also sees the
-        // three field stores above.
-        self.negotiated_set.store(true, Ordering::Release);
+        // Normalize sample_format to F32 — the bridge always delivers f32.
+        let normalized = AudioFormat {
+            sample_rate: format.sample_rate,
+            channels: format.channels,
+            sample_format: SampleFormat::F32,
+        };
+        self.negotiated
+            .store(pack_format(&normalized), Ordering::Release);
     }
 
     /// Returns the authoritative **delivery** format if a backend has recorded
@@ -171,17 +192,13 @@ impl BridgeShared {
     /// bridge was constructed with.
     ///
     /// This is what `BridgeStream::format` surfaces, so consumers always see
-    /// what they are actually receiving.
+    /// what they are actually receiving. The read is a single `Acquire` load of
+    /// the packed word, so the returned format is always internally consistent.
     pub fn negotiated_format(&self) -> AudioFormat {
         // Acquire pairs with the Release in `set_negotiated_format`.
-        if self.negotiated_set.load(Ordering::Acquire) {
-            AudioFormat {
-                sample_rate: self.negotiated_sample_rate.load(Ordering::Relaxed),
-                channels: self.negotiated_channels.load(Ordering::Relaxed),
-                sample_format: sample_format_from_atomic(
-                    self.negotiated_sample_format.load(Ordering::Relaxed),
-                ),
-            }
+        let packed = self.negotiated.load(Ordering::Acquire);
+        if let Some(fmt) = unpack_format(packed) {
+            fmt
         } else {
             self.format.clone()
         }
@@ -555,8 +572,9 @@ pub fn create_bridge(capacity: usize, format: AudioFormat) -> (BridgeProducer, B
 ///
 /// `backpressure_threshold` is the number of *consecutive* dropped buffers (no
 /// successful push in between) before `is_under_backpressure`
-/// reports `true`. A value of `0` means "report back-pressure on the very first
-/// drop". Most callers should use [`create_bridge`], which applies
+/// reports `true`. A value of `0` is degenerate: `is_under_backpressure`
+/// reports `true` immediately (`0 >= 0`), even before any drop has occurred.
+/// Most callers should use [`create_bridge`], which applies
 /// [`DEFAULT_BACKPRESSURE_THRESHOLD`]; this variant exists so a backend or
 /// builder that knows its callback cadence can tune the sensitivity (L6).
 pub fn create_bridge_with_options(
@@ -588,12 +606,9 @@ pub fn create_bridge_with_options(
         buffers_popped: AtomicU64::new(0),
         consecutive_drops: AtomicU32::new(0),
         backpressure_threshold,
-        // Seed the atomic delivery-format mirror with the requested format so a
-        // read before any backend negotiation still returns sensible values.
-        negotiated_set: std::sync::atomic::AtomicBool::new(false),
-        negotiated_sample_rate: AtomicU32::new(format.sample_rate),
-        negotiated_channels: AtomicU16::new(format.channels),
-        negotiated_sample_format: AtomicU8::new(sample_format_to_atomic(format.sample_format)),
+        // 0 == "no backend negotiation yet"; negotiated_format() then falls
+        // back to the requested `format` below.
+        negotiated: AtomicU64::new(0),
         format,
         #[cfg(feature = "async-stream")]
         waker: atomic_waker::AtomicWaker::new(),
@@ -1180,12 +1195,16 @@ mod tests {
     }
 
     // After the producer records a delivery format, negotiated_format() reflects
-    // it (NOT the requested format) — the M1 invariant.
+    // the delivered sample_rate/channels (NOT the requested ones), with the
+    // sample_format normalized to F32 (the bridge always delivers f32).
     #[test]
     fn set_negotiated_format_overrides_requested() {
         let requested = AudioFormat::default(); // 48k/2ch/F32
         let (producer, consumer) = create_bridge(8, requested.clone());
 
+        // Backend reports the endpoint's native type (I24), but the bridge
+        // converts to f32 — so negotiated_format() must report F32 at the
+        // delivered rate/channels.
         let delivered = AudioFormat {
             sample_rate: 44100,
             channels: 1,
@@ -1194,11 +1213,21 @@ mod tests {
         producer.set_negotiated_format(&delivered);
 
         let observed = consumer.shared().negotiated_format();
-        assert_eq!(observed, delivered);
-        assert_ne!(observed, requested, "must reflect delivery, not request");
+        assert_eq!(observed.sample_rate, 44100);
+        assert_eq!(observed.channels, 1);
+        assert_eq!(
+            observed.sample_format,
+            SampleFormat::F32,
+            "bridge payload is always f32; reported format must be normalized"
+        );
+        assert_ne!(
+            observed, requested,
+            "must reflect delivery rate/channels, not request"
+        );
     }
 
-    // The most recent set_negotiated_format wins (idempotent / last-writer).
+    // The most recent set_negotiated_format wins (idempotent / last-writer);
+    // sample_format is always normalized to F32.
     #[test]
     fn set_negotiated_format_last_writer_wins() {
         let (producer, consumer) = create_bridge(8, AudioFormat::default());
@@ -1213,6 +1242,7 @@ mod tests {
             sample_format: SampleFormat::F32,
         };
         producer.set_negotiated_format(&final_fmt);
+        // final_fmt is already F32, so it round-trips exactly.
         assert_eq!(consumer.shared().negotiated_format(), final_fmt);
     }
 
@@ -1263,9 +1293,10 @@ mod tests {
         );
     }
 
-    // A zero threshold reports back-pressure on the very first drop.
+    // A zero threshold reports back-pressure immediately (0 >= 0), even before
+    // any drop, and stays true after a drop.
     #[test]
-    fn zero_backpressure_threshold_trips_on_first_drop() {
+    fn zero_backpressure_threshold_trips_immediately() {
         let (mut producer, _consumer) = create_bridge_with_options(1, test_format(), 0);
         // Threshold 0 means is_under_backpressure() is true even before any drop
         // (0 consecutive drops >= 0). After a drop it stays true.

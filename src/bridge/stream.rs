@@ -486,7 +486,9 @@ mod tests {
         // Before negotiation, format() == requested.
         assert_eq!(stream.format(), requested);
 
-        // Backend negotiates a different delivery format.
+        // Backend negotiates a different delivery rate/channels. It reports the
+        // endpoint's native sample type (I16), but the bridge converts to f32,
+        // so format() must report the delivered rate/channels with F32.
         let delivered = AudioFormat {
             sample_rate: 44100,
             channels: 1,
@@ -494,8 +496,14 @@ mod tests {
         };
         producer.set_negotiated_format(&delivered);
 
-        // Now format() must report what is actually delivered.
-        assert_eq!(stream.format(), delivered);
+        let reported = stream.format();
+        assert_eq!(reported.sample_rate, 44100);
+        assert_eq!(reported.channels, 1);
+        assert_eq!(
+            reported.sample_format,
+            crate::core::config::SampleFormat::F32,
+            "bridge delivers f32; reported sample_format must be normalized"
+        );
     }
 
     // 8. Verify format() returns correct AudioFormat

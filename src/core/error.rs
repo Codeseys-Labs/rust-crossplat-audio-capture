@@ -102,7 +102,7 @@ impl fmt::Display for BackendContext {
 
 /// Represents all errors that can occur during audio operations.
 ///
-/// Organized into 7 categories with 21 total variants.
+/// Organized into 7 categories with 22 total variants.
 /// Each variant carries structured context for diagnostics.
 #[derive(Debug)]
 pub enum AudioError {

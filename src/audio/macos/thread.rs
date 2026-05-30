@@ -363,16 +363,20 @@ fn resolve_capture_target(
                     log::debug!("CoreAudio: Device target → input device_id={}", id);
                     Ok((id, None))
                 }
-                Ok(false) => Err(AudioError::UnsupportedFormat {
-                    format: format!(
-                        "device {} has no input streams: direct AUHAL capture from an \
-                         output-only device is not supported on macOS (the input callback \
-                         never fires). Use CaptureTarget::SystemDefault for system-audio \
-                         loopback (routed through a CoreAudio Process Tap), or select a \
-                         device that exposes input streams",
+                // This is a platform-capability limitation, not a format
+                // mismatch — use PlatformNotSupported (ErrorKind::Platform) so
+                // callers branching on kind()/recoverability() classify it
+                // correctly, rather than UnsupportedFormat (Configuration).
+                Ok(false) => Err(AudioError::PlatformNotSupported {
+                    feature: format!(
+                        "capturing device {} directly: it has no input streams, and direct \
+                         AUHAL capture from an output-only device is not supported on macOS \
+                         (the input callback never fires). Use CaptureTarget::SystemDefault \
+                         for system-audio loopback (routed through a CoreAudio Process Tap), \
+                         or select a device that exposes input streams",
                         id
                     ),
-                    context: None,
+                    platform: "CoreAudio".to_string(),
                 }),
                 Err(e) => {
                     // Could not probe the device's stream configuration. Surface
@@ -713,15 +717,15 @@ mod tests {
 
         let result = resolve_capture_target(&config);
         match result {
-            Err(AudioError::UnsupportedFormat { format, .. }) => {
+            Err(AudioError::PlatformNotSupported { feature, .. }) => {
                 assert!(
-                    format.contains("no input streams"),
+                    feature.contains("no input streams"),
                     "error should explain the output-only device problem, got: {}",
-                    format
+                    feature
                 );
             }
             other => panic!(
-                "Expected UnsupportedFormat for output-only device, got: {:?}",
+                "Expected PlatformNotSupported for output-only device, got: {:?}",
                 other
             ),
         }

@@ -66,10 +66,11 @@ impl ChannelSink {
 
     /// Create a **bounded** ChannelSink holding at most `capacity` queued buffers.
     ///
-    /// `write()` drops the buffer (returning `Ok(())`) when the channel is full,
-    /// providing audio-appropriate back-pressure: a slow consumer loses the
-    /// oldest-uncaught frames rather than causing unbounded memory growth or
-    /// stalling the capture/writer thread. Disconnection still returns an error.
+    /// `write()` drops the *incoming* buffer (returning `Ok(())`) when the channel
+    /// is full — [`mpsc::SyncSender::try_send`] discards the new frame rather than
+    /// evicting the oldest queued one — providing audio-appropriate back-pressure
+    /// without unbounded memory growth or stalling the capture/writer thread.
+    /// Disconnection still returns an error.
     pub fn bounded(capacity: usize) -> (Self, mpsc::Receiver<AudioBuffer>) {
         let (sender, receiver) = mpsc::sync_channel(capacity);
         (

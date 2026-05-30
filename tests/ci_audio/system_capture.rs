@@ -29,11 +29,16 @@ fn test_system_capture_receives_audio() {
     {
         Ok(c) => c,
         Err(e) => {
-            eprintln!("[ci_audio] Failed to build capture: {:?}", e);
             if let Some(p) = player {
                 helpers::stop_player(p);
             }
-            // Don't fail hard — this might be an environment issue
+            // On a deterministic source, build() must succeed — a failure here
+            // is a real regression in the pre-streaming path, not an
+            // environment quirk, so hard-fail instead of silently skipping.
+            if helpers::deterministic_audio_env() {
+                panic!("deterministic source: capture build failed: {:?}", e);
+            }
+            eprintln!("[ci_audio] Failed to build capture: {:?}", e);
             eprintln!("[ci_audio] SKIPPING: Capture build failed (not a test logic error)");
             return;
         }
@@ -41,10 +46,14 @@ fn test_system_capture_receives_audio() {
 
     // Start capture
     if let Err(e) = capture.start() {
-        eprintln!("[ci_audio] Failed to start capture: {:?}", e);
         if let Some(p) = player {
             helpers::stop_player(p);
         }
+        // Same rationale as build(): a deterministic source must start cleanly.
+        if helpers::deterministic_audio_env() {
+            panic!("deterministic source: capture start failed: {:?}", e);
+        }
+        eprintln!("[ci_audio] Failed to start capture: {:?}", e);
         eprintln!("[ci_audio] SKIPPING: Capture start failed (not a test logic error)");
         return;
     }
@@ -199,21 +208,27 @@ fn test_capture_format_correct() {
     {
         Ok(c) => c,
         Err(e) => {
-            eprintln!("[ci_audio] Failed to build capture: {:?}", e);
-            eprintln!("[ci_audio] SKIPPING: Capture build failed");
             if let Some(p) = player {
                 helpers::stop_player(p);
             }
+            if helpers::deterministic_audio_env() {
+                panic!("deterministic source: capture build failed: {:?}", e);
+            }
+            eprintln!("[ci_audio] Failed to build capture: {:?}", e);
+            eprintln!("[ci_audio] SKIPPING: Capture build failed");
             return;
         }
     };
 
     if let Err(e) = capture.start() {
-        eprintln!("[ci_audio] Failed to start capture: {:?}", e);
-        eprintln!("[ci_audio] SKIPPING: Capture start failed");
         if let Some(p) = player {
             helpers::stop_player(p);
         }
+        if helpers::deterministic_audio_env() {
+            panic!("deterministic source: capture start failed: {:?}", e);
+        }
+        eprintln!("[ci_audio] Failed to start capture: {:?}", e);
+        eprintln!("[ci_audio] SKIPPING: Capture start failed");
         return;
     }
 

@@ -109,6 +109,7 @@ limiter strategy, (d) real-time vs. buffered. These belong to the
 application, not the capture layer. rsac exposes the interleaved samples
 through the `AudioBuffer::data() -> &[f32]` accessor — if you want to mix two
 captures, it's 3 lines:
+
 ```rust
 let mixed: Vec<f32> = buf_a.data().iter().zip(buf_b.data()).map(|(a, b)| a + b).collect();
 ```
@@ -140,7 +141,7 @@ Each of these has a GitHub issue on `Codeseys-Labs/rust-crossplat-audio-capture`
   + unit tests + bindings check + downstream audio-graph build).
   The library unit suite (300+ tests — exact count varies by platform
   and feature set) plus the `ci_audio` integration suite (~40+ tests
-  across subscribe, process_tree, ApplicationByName, ApplicationByPID,
+  across subscribe, process_tree, application_by_name, application_by_pid,
   device enumeration, overrun, multi-source, lifecycle) are gated behind
   `require_audio!()` / `#[ignore]` so CI doesn't need real audio hardware.
 

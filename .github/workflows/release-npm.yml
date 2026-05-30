@@ -139,6 +139,8 @@ jobs:
         working-directory: bindings/rsac-napi
     steps:
       - uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5
+        with:
+          persist-credentials: false
 
       - uses: dtolnay/rust-toolchain@1.95.0
         with:
@@ -241,6 +243,8 @@ jobs:
         working-directory: bindings/rsac-napi
     steps:
       - uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5
+        with:
+          persist-credentials: false
 
       # Tag↔manifest version guard: the pushed tag must match the version
       # in package.json before we publish to npm. Tag events only.

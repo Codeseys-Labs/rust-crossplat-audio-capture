@@ -494,21 +494,19 @@ fn wasapi_capture_thread_main(
                 continue;
             }
 
-            // Make the VecDeque contiguous so we can access it as a slice.
-            // This is O(n) worst case but typically a no-op if the deque
-            // hasn't wrapped.
-            let (front, back) = sample_queue.as_slices();
+            // Make the VecDeque contiguous, then decode the SINGLE resulting
+            // slice. Decoding `as_slices()`' (front, back) separately is unsound
+            // here: a sample's 4 bytes can straddle the wrap boundary, so
+            // `front.chunks_exact(4)` would drop front's trailing 1-3 bytes and
+            // `back` would re-align from byte 0 — losing the straddling f32 and
+            // byte-shifting every sample after it. `make_contiguous()` is an
+            // in-place rotation (no allocation) so the single slice is wrap-safe.
+            let bytes = sample_queue.make_contiguous();
 
             // Convert bytes to f32 samples (4 bytes per sample, little-endian).
             // Reuse the samples Vec to avoid allocation on every iteration.
             samples.clear();
-
-            // Process the front slice
-            for chunk in front.chunks_exact(4) {
-                samples.push(f32::from_le_bytes([chunk[0], chunk[1], chunk[2], chunk[3]]));
-            }
-            // Process the back slice (non-empty when VecDeque has wrapped)
-            for chunk in back.chunks_exact(4) {
+            for chunk in bytes.chunks_exact(4) {
                 samples.push(f32::from_le_bytes([chunk[0], chunk[1], chunk[2], chunk[3]]));
             }
 

@@ -104,6 +104,15 @@ jobs:
           # Fail-fast on sink creation (no `|| true`): a missing sink used to
           # masquerade as "audio available" because RSAC_CI_AUDIO_AVAILABLE was
           # hardcoded later. Now we create, then VERIFY, then export the env.
+          #
+          # Wait for the pipewire-pulse Pulse socket to actually accept pactl
+          # before loading the sink. The `sleep 2` above is a fixed delay, not a
+          # readiness gate, and can race a slow pipewire-pulse startup.
+          for _ in $(seq 1 20); do
+            pactl info >/dev/null 2>&1 && break
+            sleep 1
+          done
+          pactl info >/dev/null 2>&1 || { echo "ERROR: pipewire-pulse (pactl) not ready"; exit 1; }
           pactl load-module module-null-sink \
             sink_name=ci_test_sink \
             sink_properties=device.description="CI_Test_Sink" \
@@ -258,6 +267,13 @@ jobs:
 
       - name: Create and verify virtual audio sink
         run: |
+          # Wait for the pipewire-pulse Pulse socket before loading the sink
+          # (readiness gate, not a fixed sleep).
+          for _ in $(seq 1 20); do
+            pactl info >/dev/null 2>&1 && break
+            sleep 1
+          done
+          pactl info >/dev/null 2>&1 || { echo "ERROR: pipewire-pulse (pactl) not ready"; exit 1; }
           pactl load-module module-null-sink \
             sink_name=ci_test_sink \
             sink_properties=device.description="CI_Test_Sink" \
@@ -359,6 +375,13 @@ jobs:
 
       - name: Create and verify virtual audio sink
         run: |
+          # Wait for the pipewire-pulse Pulse socket before loading the sink
+          # (readiness gate, not a fixed sleep).
+          for _ in $(seq 1 20); do
+            pactl info >/dev/null 2>&1 && break
+            sleep 1
+          done
+          pactl info >/dev/null 2>&1 || { echo "ERROR: pipewire-pulse (pactl) not ready"; exit 1; }
           pactl load-module module-null-sink \
             sink_name=ci_test_sink \
             sink_properties=device.description="CI_Test_Sink" \

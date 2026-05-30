@@ -499,7 +499,18 @@ impl AudioCapture {
         // callback is *moved* into the pump (taken out of the pending slot), so
         // the pump never holds a lock while running the user closure.
         if self.callback_pump.is_none() {
-            let taken = self.callback.lock().ok().and_then(|mut g| g.take());
+            // A poisoned callback mutex must NOT silently drop a registered
+            // callback (which would leave start() returning Ok with no
+            // delivery); surface it like set_callback/clear_callback do.
+            let taken = match self.callback.lock() {
+                Ok(mut guard) => guard.take(),
+                Err(poisoned) => {
+                    return Err(AudioError::InternalError {
+                        message: format!("Failed to lock callback mutex: {}", poisoned),
+                        source: None,
+                    });
+                }
+            };
             if let Some(callback) = taken {
                 let pump = Self::spawn_callback_pump(Arc::clone(stream_ref), callback)?;
                 self.callback_pump = Some(pump);
@@ -517,7 +528,9 @@ impl AudioCapture {
     /// the audio callback, and the closure may freely call back into
     /// `AudioCapture` (no lock is held during invocation). The thread exits when:
     /// - `stop_flag` is set (via [`stop`](Self::stop)/[`clear_callback`](Self::clear_callback)/`Drop`), or
-    /// - the stream stops or errors (`try_read_chunk` returns `Err`).
+    /// - the stream reaches a terminal state (a **fatal** read error such as
+    ///   [`AudioError::StreamEnded`]). Transient/recoverable read errors are
+    ///   logged and retried — they must not permanently stop delivery.
     ///
     /// The pump competes with [`read_buffer`](Self::read_buffer) and
     /// [`subscribe`](Self::subscribe) for buffers from the same ring; avoid
@@ -543,7 +556,15 @@ impl AudioCapture {
                         // No data right now — avoid busy-spinning.
                         std::thread::sleep(std::time::Duration::from_millis(1));
                     }
-                    Err(_) => break, // stream stopped / closed / errored
+                    // Only a FATAL error (e.g. StreamEnded — terminal) stops the
+                    // pump. A transient/recoverable read error (StreamReadError,
+                    // BufferOverrun/Underrun) must NOT kill delivery — mirror the
+                    // iterator/read-loop contract and retry after a brief pause.
+                    Err(e) if e.is_fatal() => break,
+                    Err(e) => {
+                        log::warn!("Callback pump read error (retrying): {:?}", e);
+                        std::thread::sleep(std::time::Duration::from_millis(1));
+                    }
                 }
             })
             .map_err(|e| AudioError::InternalError {
@@ -743,6 +764,13 @@ impl AudioCapture {
         // Tear down a running pump (the callback now lives inside it).
         if let Some(mut pump) = self.callback_pump.take() {
             pump.shutdown();
+            // If shutdown() ran re-entrantly (called from inside the pump's own
+            // callback), it could not self-join and left the JoinHandle in place
+            // for a later join. Re-store the pump so stop()/Drop can still join it
+            // deterministically instead of detaching the thread (ADR-0002).
+            if pump.handle.is_some() {
+                self.callback_pump = Some(pump);
+            }
         }
         // Also clear any pending callback registered before start().
         match self.callback.lock() {

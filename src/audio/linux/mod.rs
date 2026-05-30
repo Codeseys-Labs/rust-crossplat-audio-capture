@@ -97,8 +97,24 @@ impl LinuxDeviceEnumerator {
         {
             if output.status.success() {
                 let output_str = String::from_utf8_lossy(&output.stdout);
-                if let Some(device) = self.parse_default_device(&output_str, kind) {
-                    return Ok(device);
+                if let Some(meta) = self.parse_default_device(&output_str, kind) {
+                    // `meta.id` is the PipeWire metadata default node *name*
+                    // (e.g. "alsa_output.pci-..."), NOT a numeric node id /
+                    // object.serial. The capture path (PwNodeLookup::Device)
+                    // matches on the numeric id/serial, so returning the name as
+                    // a DeviceId would NOT round-trip through
+                    // CaptureTarget::Device. Resolve the name against the
+                    // enumerated nodes to recover a real, round-trippable id; if
+                    // it can't be resolved, fall through to the kind-based
+                    // fallback below rather than hand back an unusable id.
+                    if let Ok(devices) = self.get_pipewire_devices() {
+                        if let Some(resolved) = devices
+                            .into_iter()
+                            .find(|d| d.name == meta.id || d.id == meta.id)
+                        {
+                            return Ok(resolved);
+                        }
+                    }
                 }
             }
         }

@@ -826,9 +826,13 @@ func ListDevices() ([]AudioDevice, error) {
 
 // DefaultDevice returns the default audio device of the given kind.
 //
-// NOTE: the kind argument is currently advisory — every backend returns the
-// default output device used for loopback capture.
+// NOTE: rsac is a loopback (output) capture library; only DeviceOutput is
+// supported. Any other kind returns ErrPlatformNotSupported rather than
+// silently returning the default output device.
 func DefaultDevice(kind DeviceKind) (AudioDevice, error) {
+	if kind != DeviceOutput {
+		return AudioDevice{}, newError(C.RSAC_ERROR_PLATFORM_NOT_SUPPORTED)
+	}
 	var cenum *C.RsacDeviceEnumerator
 	if rc := C.rsac_device_enumerator_new(&cenum); rc != C.RSAC_OK {
 		return AudioDevice{}, newError(rc)

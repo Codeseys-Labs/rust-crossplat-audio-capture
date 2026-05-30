@@ -57,6 +57,10 @@ func goAudioCallback(bufferData *C.float, numSamples C.size_t, channels C.uint16
 		channels:   ch,
 		sampleRate: rate,
 	}
+	// A panic from the user callback must not escape this C->Go export: an
+	// unrecovered panic crossing the cgo boundary aborts the entire process.
+	// Recover and drop the failed delivery; the FFI pump keeps running.
+	defer func() { _ = recover() }()
 	fn(buf)
 }
 

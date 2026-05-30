@@ -44,7 +44,10 @@ pub fn audio_infrastructure_available() -> bool {
 /// reproducible), tests keep the soft-warn behavior so they do not flake on
 /// non-reproducible hosts.
 pub fn deterministic_audio_env() -> bool {
-    std::env::var("RSAC_CI_AUDIO_DETERMINISTIC").is_ok()
+    matches!(
+        std::env::var("RSAC_CI_AUDIO_DETERMINISTIC").as_deref(),
+        Ok("1")
+    )
 }
 
 fn runtime_detect_audio() -> bool {
