@@ -144,6 +144,7 @@ fn audio_error_to_pyerr(err: rsac::AudioError) -> PyErr {
         | rsac::AudioError::StreamStartFailed { .. }
         | rsac::AudioError::StreamStopFailed { .. }
         | rsac::AudioError::StreamReadError { .. }
+        | rsac::AudioError::StreamEnded { .. }
         | rsac::AudioError::BufferOverrun { .. }
         | rsac::AudioError::BufferUnderrun { .. } => StreamError::new_err(msg),
 
