@@ -205,8 +205,14 @@ jobs:
 
       # Extract this version's CHANGELOG section for the GitHub Release body.
       # Pulls the lines between "## [X.Y.Z]" and the next "## [" heading.
+      #
+      # NOTE: this is gated ONLY on is_release, NOT on exists=='false'. The
+      # GitHub Release creation below must run even when the tag already exists,
+      # so that a rerun after a partial failure (tag pushed, but the Release step
+      # errored) still produces the Release body — otherwise we'd be left with a
+      # published tag and no GitHub Release for that version.
       - name: Extract CHANGELOG section
-        if: steps.detect.outputs.is_release == 'true' && steps.exists.outputs.exists == 'false'
+        if: steps.detect.outputs.is_release == 'true'
         id: notes
         shell: bash
         env:
@@ -227,11 +233,18 @@ jobs:
             echo "__RSAC_NOTES__"
           } >> "$GITHUB_OUTPUT"
 
-      # Create the GitHub Release for the tag. The default GITHUB_TOKEN CAN
-      # create releases (only cross-workflow TRIGGERING is blocked), so this is
-      # the GitHub-only deliverable. softprops/action-gh-release is pinned.
+      # Create (or update) the GitHub Release for the tag. The default
+      # GITHUB_TOKEN CAN create releases (only cross-workflow TRIGGERING is
+      # blocked), so this is the GitHub-only deliverable. softprops/action-gh-release
+      # is pinned and idempotent: it updates an existing Release rather than
+      # erroring, so this step is DECOUPLED from the tag-existence check
+      # (gated only on is_release). That makes a rerun after a partial failure —
+      # tag pushed but a later step errored — recreate/repair the Release instead
+      # of skipping it and leaving a tag with no Release body. The tag itself is
+      # taken from the existing ref when exists=='true' (the create-tag step
+      # above is the one that stays gated on exists=='false', never re-tagging).
       - name: Create GitHub Release
-        if: steps.detect.outputs.is_release == 'true' && steps.exists.outputs.exists == 'false'
+        if: steps.detect.outputs.is_release == 'true'
         uses: softprops/action-gh-release@c95fe1489396fe8a9eb87c0abf8aa5b2ef267fda # v2.0.8
         with:
           tag_name: ${{ steps.detect.outputs.tag }}
@@ -240,9 +253,10 @@ jobs:
           draft: false
           prerelease: false
 
-      # Loud reminder that registry publishing is NOT automatic yet.
+      # Loud reminder that registry publishing is NOT automatic yet. Gated only
+      # on is_release (like the Release step), so a rerun still surfaces it.
       - name: Registry-publish reminder (manual until a triggering token is added)
-        if: steps.detect.outputs.is_release == 'true' && steps.exists.outputs.exists == 'false'
+        if: steps.detect.outputs.is_release == 'true'
         shell: bash
         env:
           TAG: ${{ steps.detect.outputs.tag }}

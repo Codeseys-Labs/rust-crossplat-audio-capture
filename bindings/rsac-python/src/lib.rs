@@ -991,10 +991,19 @@ impl PyAudioCapture {
             .map_err(|e| PyRuntimeError::new_err(format!("Lock poisoned: {}", e)))?;
 
         if let Some(mut capture) = guard.take() {
-            py.allow_threads(|| {
-                let _ = capture.stop();
+            // Take the capture out and stop it. The capture is ALWAYS dropped
+            // (close is idempotent and must not leave a half-open stream), but
+            // the stop() error is propagated rather than swallowed, so callers —
+            // notably __aexit__, whose contract surfaces teardown failures when no
+            // body exception is in flight — actually learn about a failed
+            // teardown. Previously this discarded the error (`let _ =`), making
+            // __aexit__'s Err arms unreachable for stop failures.
+            let stop_result = py.allow_threads(|| {
+                let r = capture.stop();
                 drop(capture);
+                r
             });
+            stop_result.map_err(audio_error_to_pyerr)?;
         }
 
         Ok(())
@@ -1106,19 +1115,6 @@ impl PyAudioCapture {
     }
 
     fn __next__(&self, py: Python<'_>) -> PyResult<Option<PyAudioBuffer>> {
-        let mut guard = self
-            .inner
-            .lock()
-            .map_err(|e| PyRuntimeError::new_err(format!("Lock poisoned: {}", e)))?;
-        let capture = match guard.as_mut() {
-            Some(c) => c,
-            None => return Err(PyStopIteration::new_err("Capture closed")),
-        };
-
-        if !capture.is_running() {
-            return Err(PyStopIteration::new_err("Capture stopped"));
-        }
-
         // Terminal-error delivery (BP-2): this loop fixes the previously
         // INVERTED mapping. A FATAL terminal (`is_fatal()`, which covers
         // `StreamEnded` — the natural end of capture) must raise
@@ -1143,11 +1139,36 @@ impl PyAudioCapture {
         // returns the fatal `StreamEnded` once the ring is empty AND the stream
         // is terminal, so the real terminal cause flows into the `is_fatal()`
         // arm (mirrors the napi pump and Go `StreamWithErrors`).
+        //
+        // LOCK DISCIPLINE: the `self.inner` mutex is acquired *per iteration* and
+        // dropped before the recoverable-retry backoff (and at every return), so
+        // a concurrent `stop()` / `close()` / `__del__()` can always acquire it
+        // to tear the stream down. Holding it across the retry loop would let an
+        // immediate recoverable error busy-spin while wedging teardown.
         loop {
-            // Release GIL for the blocking read.
-            let result = py.allow_threads(|| capture.read_chunk_blocking());
+            // Acquire, validate, and read inside a scope so the guard is dropped
+            // the moment we leave it (before any retry sleep / between attempts).
+            let outcome = {
+                let mut guard = self
+                    .inner
+                    .lock()
+                    .map_err(|e| PyRuntimeError::new_err(format!("Lock poisoned: {}", e)))?;
+                let capture = match guard.as_mut() {
+                    Some(c) => c,
+                    None => return Err(PyStopIteration::new_err("Capture closed")),
+                };
+                if !capture.is_running() {
+                    return Err(PyStopIteration::new_err("Capture stopped"));
+                }
+                // Release GIL for the blocking read. The `self.inner` guard is
+                // still held here (it must be — `capture` borrows it), so a single
+                // blocking read can be interrupted by `capture.stop()`, which
+                // signals the stream terminal so this read returns promptly.
+                py.allow_threads(|| capture.read_chunk_blocking())
+                // `guard` drops at the end of this block.
+            };
 
-            match result {
+            match outcome {
                 Ok(buf) => return Ok(Some(PyAudioBuffer { inner: buf })),
                 // Natural end of capture / terminal: end iteration carrying the
                 // true terminal reason. `is_fatal()` is the single source of
@@ -1158,14 +1179,16 @@ impl PyAudioCapture {
                 }
                 // Recoverable hiccup: do NOT end iteration. `read_chunk_blocking`
                 // can still surface a *recoverable* `StreamReadError` (e.g. the
-                // stream is not yet initialized, or a transient backend hiccup),
-                // so re-check the running state to avoid spinning forever after a
-                // stop — a stop mid-iteration that has not yet reached the fatal
-                // terminal ends cleanly via `StopIteration`.
+                // stream is not yet initialized, or a transient backend hiccup).
+                // The guard is already dropped here, so a bounded backoff yields
+                // the lock + GIL to a concurrent stop()/close() rather than
+                // busy-spinning while holding the mutex. The next iteration
+                // re-locks and re-checks `is_running()`, so a stop that has not
+                // yet reached the fatal terminal ends cleanly via `StopIteration`.
                 Err(e) if e.is_recoverable() => {
-                    if !capture.is_running() {
-                        return Err(PyStopIteration::new_err("Capture stopped"));
-                    }
+                    py.allow_threads(|| {
+                        std::thread::sleep(std::time::Duration::from_millis(1));
+                    });
                     continue;
                 }
                 // Genuinely unexpected (neither recoverable nor a fatal terminal):

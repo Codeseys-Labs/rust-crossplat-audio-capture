@@ -11,28 +11,38 @@ target version where appropriate.
 
 ## Automated Release Flow
 
-A single `vX.Y.Z` tag push fans out to **three registry workflows**.
-They all key on the same `v*.*.*` tag push and run in parallel — each
-publishes to one registry, and the GitHub Release is created once the
-crates.io flow finishes.
+Three registry workflows (`release.yml`, `release-npm.yml`, `release-pypi.yml`)
+are *wired* to the same `v*.*.*` tag push and would run in parallel — each
+publishing to one registry. **Whether they actually fire depends on HOW the tag
+was pushed** (see the two paths below): a tag pushed with the default
+`GITHUB_TOKEN` does **not** re-trigger them (GitHub's anti-recursion rule), so
+the automated path is **GitHub-only for now** (tag + GitHub Release, no registry
+publish) until a PAT / GitHub App token is wired. A tag pushed manually (local
+git, or a PAT) **does** trigger the full fan-out.
 
-There are **two ways** that `vX.Y.Z` tag gets created, and they share
-this exact same publish fan-out:
+There are **two ways** that `vX.Y.Z` tag gets created, and they differ in
+whether the publish fan-out fires:
 
 1. **Automated, release-please style (recommended for minor/patch).** A
    maintainer runs the **Release Prepare** workflow from the Actions tab;
    it opens a `release: vX.Y.Z` PR (version bump + CHANGELOG rotation), a
    maintainer squash-merges it, and `release-tag.yml` then auto-creates
-   and pushes the tag. See
+   and pushes the tag **using the default `GITHUB_TOKEN`**. Because of GitHub's
+   anti-recursion rule, that tag push does **NOT** trigger the three registry
+   workflows — so this path is **GitHub-only**: it stops at the git tag + the
+   GitHub Release. Registry publishing is a manual follow-up (Step 4). See
    [§ Automated minor/patch release (release-please style)](#automated-minorpatch-release-release-please-style).
 2. **Manual tag push.** A maintainer bumps the manifests + CHANGELOG by
    hand (via `scripts/bump-version.sh`), commits, and pushes an annotated
-   `vX.Y.Z` tag directly. This is the **only** supported path for a
-   **MAJOR** bump (the automated path refuses to change the major) and the
-   fallback whenever the automation is unavailable. See §1–§9 below.
+   `vX.Y.Z` tag directly (local git or a PAT). This tag push is **not** from a
+   workflow's `GITHUB_TOKEN`, so it **DOES** trigger the full registry fan-out
+   below. It is also the **only** supported path for a **MAJOR** bump (the
+   automated path refuses to change the major) and the fallback whenever the
+   automation is unavailable. See §1–§9 below.
 
-Either way, the three publish workflows below are what actually run once
-the tag lands — they never trigger off anything but a `v*.*.*` tag push.
+The three publish workflows below run when a tag is pushed by something OTHER
+than a workflow's `GITHUB_TOKEN` (i.e. path 2, or once a PAT/App token is wired
+for path 1) — they never trigger off anything but a `v*.*.*` tag push.
 
 | Workflow | Registry | Matrix | Key jobs | Required secret |
 |---|---|---|---|---|
@@ -267,8 +277,9 @@ napi `package.json`, and the python `pyproject.toml`) carry the same version.
 Because this gate runs on the PR/master push that subsequently gets tagged, the
 tagged commit is already lockstep-verified before `release-tag.yml` tags it. (At
 *tag* time, `release.yml` additionally re-checks the tag matches the root
-`Cargo.toml`; the full six-manifest lockstep runs on push/PR, not the tag, since
-`ci.yml` has no `tags:` trigger.)
+`Cargo.toml`, and `ci.yml` *also* re-runs on the `v*.*.*` tag push — its `on:`
+block includes a `tags: ['v*.*.*', '!v*-*']` trigger — so the full six-manifest
+lockstep gate runs again at tag time as well as on push/PR.)
 
 > **Merge it as a SQUASH merge, and do NOT edit the commit subject.** The
 > tag automation in step 3 keys on the squash-merge commit *subject* being
@@ -406,9 +417,10 @@ push to `master`, this gate runs — and must be green — on the exact commit t
 `release-tag.yml` then tags, so a mismatched manifest never reaches the tag.
 At *tag* time, `release.yml`'s `verify` job independently re-checks the pushed
 tag against the root `Cargo.toml` before publishing (a second, registry-side
-gate); the full six-manifest lockstep itself runs on the push/PR, not the tag
-(`ci.yml` has no `tags:` trigger). A mismatched manifest must never reach a
-registry.
+gate), and `ci.yml` re-runs its full six-manifest lockstep on the `v*.*.*` tag
+push too (its `on:` block has a `tags: ['v*.*.*', '!v*-*']` trigger), so the
+lockstep gate covers push/PR *and* tag time. A mismatched manifest must never
+reach a registry.
 
 > Mid-cycle skew is tolerated by CI (warning only) so a binding can lag
 > the root crate between releases, but it must be reconciled before
@@ -936,12 +948,15 @@ risking a real upload:
 
 Tracked here so follow-up release-automation tasks can pick them up:
 
-- **Minor/patch releases are now fully automated** via the
+- **Minor/patch releases are automated up to the GitHub Release** via the
   release-please-style two-workflow flow (`release-prepare.yml` +
   `release-tag.yml`) — see §"Automated minor/patch release (release-please
   style)". Run **Release Prepare** from the Actions tab, squash-merge the
-  `release: vX.Y.Z` PR (keeping that exact subject), and the tag is pushed
-  automatically. **MAJOR bumps stay manual** (the automation refuses to
+  `release: vX.Y.Z` PR (keeping that exact subject), and the tag + GitHub
+  Release are created automatically. **Registry publishing is NOT part of this
+  automation** (the `GITHUB_TOKEN`-pushed tag does not trigger the publish
+  workflows — see Step 4); it remains a manual follow-up until a PAT / GitHub
+  App token is wired. **MAJOR bumps stay manual** (the automation refuses to
   change the major): use `scripts/bump-version.sh` + a hand-pushed tag per
   §3–§4. The manual §1–§9 flow remains the fallback whenever the
   automation is unavailable or a maintainer needs to override it.
@@ -951,13 +966,12 @@ Tracked here so follow-up release-automation tasks can pick them up:
   must be set under **Settings → Secrets and variables → Actions**.
   Missing secrets fail only the affected `publish-*` job; the other
   flows continue. Fall back to §2–§6 for the affected registry.
-- `scripts/bump-version.sh X.Y.Z` rewrites the root `Cargo.toml`,
-  `bindings/rsac-napi/{Cargo.toml,package.json}`, and
-  `bindings/rsac-python/{Cargo.toml,pyproject.toml}` and rotates the
-  CHANGELOG. It does **not** yet touch `bindings/rsac-ffi/Cargo.toml`
-  (bring it to the target version by hand in the same commit) and cannot
-  tag `rsac-go` (push `bindings/rsac-go/vX.Y.Z` separately — see
-  §"Versioning & ABI contract" (c)). The `version-lockstep` CI job in
+- `scripts/bump-version.sh X.Y.Z` rewrites all six manifests — the root
+  `Cargo.toml`, `bindings/rsac-ffi/Cargo.toml` (including its internal `rsac`
+  dependency version pin), `bindings/rsac-napi/{Cargo.toml,package.json}`, and
+  `bindings/rsac-python/{Cargo.toml,pyproject.toml}` — and rotates the
+  CHANGELOG. It cannot tag `rsac-go` (push `bindings/rsac-go/vX.Y.Z`
+  separately — see §"Versioning & ABI contract" (c)). The `version-lockstep` CI job in
   `ci.yml` catches any manifest that drifts: it warns on push/PR and
   hard-fails on a release tag.
 - `release-npm.yml` builds five napi-rs triples; other targets
