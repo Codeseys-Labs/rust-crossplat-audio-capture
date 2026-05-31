@@ -1985,7 +1985,7 @@ impl AudioCapture {
     /// The producer maintains a fixed-size, alloc-free ring of per-window
     /// `(pushed, dropped)` snapshots in the bridge (`bridge/ring_buffer.rs`); this
     /// method reads that **windowed** view via
-    /// [`CapturingStream::drop_window_snapshot`], so the report reflects a
+    /// `CapturingStream::drop_window_snapshot`, so the report reflects a
     /// *recent* loss pattern — including a sustained 1-in-N drop that the
     /// consecutive-drop bool resets away — rather than lifetime totals.
     ///
@@ -1994,8 +1994,7 @@ impl AudioCapture {
     /// (`buffer_size` frames at the negotiated `sample_rate`). When the buffer
     /// size or rate is unknown (no stream / not yet negotiated, or a zero rate),
     /// `window` falls back to [`Duration::ZERO`] — the tallies are still valid,
-    /// only their span is unattributed. The legacy
-    /// [`is_under_backpressure`](CapturingStream::is_under_backpressure) bool is
+    /// only their span is unattributed. The legacy `is_under_backpressure` bool is
     /// carried unchanged inside the report.
     pub fn backpressure_report(&self) -> BackpressureReport {
         let stream = match self.stream.as_ref() {

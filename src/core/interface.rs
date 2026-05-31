@@ -328,7 +328,7 @@ pub trait CapturingStream: Send + Sync {
     ///
     /// The default returns `(0, 0)` for backends that do not track a window;
     /// the bridge-backed [`BridgeStream`](crate::bridge::stream) overrides it.
-    /// Consumed read-side by [`AudioCapture::backpressure_report`].
+    /// Consumed read-side by `AudioCapture::backpressure_report`.
     fn drop_window_snapshot(&self) -> (u64, u64) {
         (0, 0)
     }

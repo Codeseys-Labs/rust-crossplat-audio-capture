@@ -412,7 +412,7 @@ pub struct BackpressureReport {
     pub drop_rate: f64,
     /// The legacy consecutive-drop backpressure flag, carried unchanged so callers
     /// that relied on it keep working. See
-    /// [`CapturingStream::is_under_backpressure`](crate::core::interface::CapturingStream::is_under_backpressure).
+    /// `CapturingStream::is_under_backpressure`.
     pub is_under_backpressure: bool,
 }
 
@@ -423,7 +423,7 @@ impl BackpressureReport {
     /// `window` is the span the tallies cover; pass [`Duration::ZERO`] when the
     /// counts are lifetime totals rather than a bounded window.
     ///
-    /// [`AudioCapture::backpressure_report`] builds this from the bridge's
+    /// `AudioCapture::backpressure_report` builds this from the bridge's
     /// fixed-size ring of per-window `(pushed, dropped)` snapshots (rsac-cfe4's
     /// alloc-free RT-side counters in `bridge/ring_buffer.rs`, read via
     /// `CapturingStream::drop_window_snapshot`), so the counts are a bounded
