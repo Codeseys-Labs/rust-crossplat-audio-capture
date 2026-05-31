@@ -386,6 +386,18 @@ jobs:
       - name: Check rsac-ffi (C FFI)
         run: cargo check -p rsac-ffi
 
+      # rsac-3e24: clippy the binding crates under -D warnings. The root lint job
+      # only lints the workspace default member (feat_<os>), so binding-crate
+      # clippy errors (e.g. manual_is_multiple_of, type_complexity) previously
+      # reached CI only as a `cargo check` pass. Lint all three to the same bar.
+      - name: Clippy binding crates (-D warnings)
+        env:
+          PYO3_USE_ABI3_FORWARD_COMPATIBILITY: "1"
+        run: |
+          cargo clippy -p rsac-ffi --all-targets -- -D warnings
+          cargo clippy -p rsac-napi --all-targets -- -D warnings
+          cargo clippy -p rsac-python --all-targets -- -D warnings
+
       # rsac-1413 / BP-5: the curated include/rsac.h (which rsac-go links against)
       # must never silently drift from the cbindgen-generated twin. build.rs runs
       # cbindgen on every build and writes include/rsac_generated.h. Here we build
@@ -585,6 +597,15 @@ jobs:
 
       - name: Check feature combination (async-stream + sink-wav + test-utils)
         run: cargo check --no-default-features --features feat_linux,async-stream,sink-wav,test-utils
+
+      # rsac-3e24: clippy the optional features under -D warnings. The root lint
+      # job lints only feat_<os>, so a lint that fires solely under bridge-zerocopy
+      # (e.g. drop_non_drop on the SampleRing path) never gated CI. Lint the full
+      # optional-feature set + bridge-zerocopy here.
+      - name: Clippy optional features (-D warnings)
+        run: |
+          cargo clippy --all-targets --no-default-features --features feat_linux,async-stream,sink-wav,test-utils -- -D warnings
+          cargo clippy --all-targets --no-default-features --features feat_linux,bridge-zerocopy -- -D warnings
 
       - name: Run doctests
         # Build doctests with the same feature set so doc examples that touch

@@ -592,7 +592,7 @@ fn wasapi_capture_thread_main(
             // SAFETY: every bit pattern is a valid `f32`, and we only read the
             // `frames_read * bytes_per_frame` bytes that `read_from_device` just
             // initialized within `valid`.
-            let (_head, samples, _tail) = unsafe { valid.align_to::<f32>() };
+            let samples = bytes_to_f32_aligned(valid);
 
             if !samples.is_empty() {
                 // Push the borrowed sample view directly. `push_samples_or_drop`
@@ -908,6 +908,33 @@ fn _assert_windows_capture_thread_send() {
     _assert::<WindowsCaptureThread>();
 }
 
+/// Reinterpret a run of F32LE bytes as `&[f32]` in one bulk operation (PU-7).
+///
+/// WASAPI's `GetBuffer` region is sample-aligned and the backing `Vec<u8>` data
+/// pointer is at least word-aligned, so `align_to::<f32>()`'s head/tail are
+/// normally empty and we consume the aligned run of whole samples. `align_to` is
+/// used deliberately over `bytemuck::cast_slice`, which would *panic* on a
+/// misaligned slice. On the little-endian hosts Windows runs on the in-memory
+/// layout equals the F32LE byte layout, so the reinterpret is a bit-level no-op.
+/// A non-empty head/tail (a misaligned region) means whole samples would be
+/// dropped — a `debug_assert` flags it in test/dev builds; in release we still
+/// return the safe aligned run rather than panicking on the audio path.
+///
+/// SAFETY of the caller: `bytes` must be fully initialized (the caller passes the
+/// exact region `read_from_device` just wrote). Every `f32` bit pattern is valid.
+#[inline]
+fn bytes_to_f32_aligned(bytes: &[u8]) -> &[f32] {
+    // SAFETY: see the doc — initialized bytes, all bit patterns valid f32.
+    let (head, samples, tail) = unsafe { bytes.align_to::<f32>() };
+    debug_assert!(
+        head.is_empty() && tail.is_empty(),
+        "WASAPI byte buffer was not 4-byte aligned: head={} tail={} bytes (whole samples would be dropped)",
+        head.len(),
+        tail.len()
+    );
+    samples
+}
+
 // ── Tests ────────────────────────────────────────────────────────────────
 //
 // These tests are automatically Windows-only because this file has
@@ -918,6 +945,36 @@ fn _assert_windows_capture_thread_send() {
 mod tests {
     use super::*;
     use crate::core::config::{ApplicationId, CaptureTarget, DeviceId, ProcessId};
+
+    /// PU-7: the bulk F32LE byte->f32 reinterpret round-trips bit-exactly on the
+    /// little-endian hosts WASAPI runs on (device-free).
+    #[test]
+    fn bytes_to_f32_aligned_round_trips_f32le() {
+        // 1.0f32 = 0x3F800000 little-endian = [0x00,0x00,0x80,0x3F]; -0.5 = 0xBF000000.
+        let samples_in: [f32; 4] = [1.0, -0.5, 0.0, 0.25];
+        let mut bytes = Vec::with_capacity(16);
+        for s in samples_in {
+            bytes.extend_from_slice(&s.to_le_bytes());
+        }
+        let out = bytes_to_f32_aligned(&bytes);
+        assert_eq!(out, &samples_in, "F32LE bytes must reinterpret bit-exactly");
+    }
+
+    /// An exact multiple of 4 bytes yields all whole samples and an empty
+    /// head/tail (the normal WASAPI case).
+    #[test]
+    fn bytes_to_f32_aligned_consumes_whole_samples() {
+        let bytes = vec![0u8; 4 * 8]; // 8 f32 of silence
+        let out = bytes_to_f32_aligned(&bytes);
+        assert_eq!(out.len(), 8);
+        assert!(out.iter().all(|&s| s == 0.0));
+    }
+
+    /// An empty slice yields an empty sample run (no panic, no head/tail assert).
+    #[test]
+    fn bytes_to_f32_aligned_empty_is_empty() {
+        assert!(bytes_to_f32_aligned(&[]).is_empty());
+    }
 
     // ── WindowsCaptureConfig Construction Tests ──────────────────────
 
