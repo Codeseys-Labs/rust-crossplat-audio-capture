@@ -119,6 +119,22 @@ pub(crate) struct MacosPlatformStream {
     /// teardown ordering requirement, so placing it after the ordered fields
     /// leaves that contract undisturbed.
     terminal: Arc<BridgeShared>,
+    /// The captured device id (or process-tap aggregate id), kept so teardown can
+    /// remove the device-is-alive listener (rsac-ead3).
+    device_id: AudioDeviceID,
+    /// Leaked [`DeviceAliveContext`] pointer for the `kAudioDevicePropertyDeviceIsAlive`
+    /// listener (rsac-ead3 / ADR-0010), or `None` if registration failed. The
+    /// listener drives the bridge terminal on spontaneous device death so a parked
+    /// reader does not hang. Removed (best-effort, context intentionally leaked)
+    /// at teardown; see [`super::coreaudio::register_device_alive_listener`].
+    ///
+    /// SAFETY (for the existing `unsafe impl Send/Sync` below): this raw pointer
+    /// is only ever read by CoreAudio's listener thread via the FFI cookie and
+    /// passed to `AudioObjectRemovePropertyListener` at teardown; rsac code never
+    /// derefs it across threads. Its pointee's fields (`AudioObjectID`,
+    /// `Arc<BridgeShared>`) are `Send`/`Sync`, so it does not change the existing
+    /// thread-safety story.
+    device_alive_ctx: Option<*mut super::coreaudio::DeviceAliveContext>,
 }
 
 impl MacosPlatformStream {
@@ -187,6 +203,19 @@ impl Drop for MacosPlatformStream {
     /// (`audio_unit` then `process_tap`) then disposes the unit before the tap's
     /// own `Drop` tears down the aggregate device and the tap.
     fn drop(&mut self) {
+        // rsac-ead3: remove the device-is-alive listener FIRST, so an app-driven
+        // teardown does not race the death-watch proc. Best-effort + the context
+        // is intentionally NOT freed (CoreAudio gives no in-flight-proc barrier);
+        // see `remove_device_alive_listener`. A normal stop signals the terminal
+        // via `stop_audio_unit` below — the death watch is only for the
+        // no-stop/no-Drop spontaneous-death case.
+        if let Some(ctx) = self.device_alive_ctx.take() {
+            // SAFETY: `ctx` came from `register_device_alive_listener` for
+            // `self.device_id` and has not been removed before (we `take()` it).
+            unsafe {
+                super::coreaudio::remove_device_alive_listener(self.device_id, ctx);
+            }
+        }
         if self.is_active.load(Ordering::SeqCst) {
             if let Err(e) = self.stop_audio_unit() {
                 log::warn!("MacosPlatformStream::drop: AudioUnit stop failed: {:?}", e);
@@ -356,13 +385,24 @@ pub(crate) fn create_macos_capture(
         config.channels
     );
 
-    // ── Step 6: Return the platform stream handle ──
+    // ── Step 6: Register the device-is-alive listener (rsac-ead3 / ADR-0010) ──
+    // So a spontaneous device/tap death with NO stop()/Drop drives the bridge
+    // terminal and unblocks a parked reader instead of hanging. Best-effort: on
+    // failure the stream still works (it just won't auto-catch a death), so we
+    // do NOT propagate the error. Uses a clone of `terminal` before it is moved
+    // into the struct below.
+    let device_alive_ctx =
+        super::coreaudio::register_device_alive_listener(device_id, terminal.clone());
+
+    // ── Step 7: Return the platform stream handle ──
 
     Ok(MacosPlatformStream {
         audio_unit: Mutex::new(audio_unit),
         process_tap,
         is_active: AtomicBool::new(true),
         terminal,
+        device_id,
+        device_alive_ctx,
     })
 }
 

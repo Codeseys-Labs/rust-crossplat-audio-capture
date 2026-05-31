@@ -801,6 +801,159 @@ fn rollback_range(failed_at: usize) -> std::ops::Range<usize> {
     0..failed_at
 }
 
+// ── Device-is-alive listener (rsac-ead3 / ADR-0010) ──────────────────────────
+//
+// A captured device (or process-tap aggregate) can die WITHOUT the app calling
+// stop()/Drop — e.g. the user unplugs the interface. Without a signal, a reader
+// parked in a blocking read hangs forever (the IO proc simply stops firing).
+// We register a `kAudioDevicePropertyDeviceIsAlive` listener on the captured
+// device so that a spontaneous death drives the bridge to the terminal Error
+// state via `signal_error()`, and the parked reader observes a Fatal
+// `StreamEnded` instead of hanging. This closes the ADR-0010 known limitation.
+
+/// `kAudioDevicePropertyDeviceIsAlive` selector = the four-char code `'aliv'`.
+/// Defined here as the literal so we don't depend on whether `coreaudio_sys`
+/// re-exports this particular constant.
+const K_AUDIO_DEVICE_PROPERTY_DEVICE_IS_ALIVE: u32 = 0x616c_6976; // 'a''l''i''v'
+
+/// Decode the `IsAlive` property value: `0` means the device is dead, any
+/// non-zero value means alive. Pure + device-free so the decision is unit-tested
+/// without a real device (rsac-ead3).
+#[inline]
+fn is_device_alive(value: u32) -> bool {
+    value != 0
+}
+
+/// Property address for `kAudioDevicePropertyDeviceIsAlive` on a device.
+const fn device_alive_address() -> AudioObjectPropertyAddress {
+    AudioObjectPropertyAddress {
+        mSelector: K_AUDIO_DEVICE_PROPERTY_DEVICE_IS_ALIVE,
+        mScope: kAudioObjectPropertyScopeGlobal,
+        mElement: KAUDIO_OBJECT_PROPERTY_ELEMENT_MAIN,
+    }
+}
+
+/// Listener-proc context for the device-is-alive watch. Like
+/// [`WatchListenerContext`], it is **intentionally leaked** (`Box::into_raw`,
+/// never reclaimed on the success path) because CoreAudio gives no barrier that
+/// an in-flight proc has finished when its listener is removed — so a late deref
+/// must stay sound. The leak is one tiny struct (an `AudioObjectID` + an
+/// `Arc<BridgeShared>` clone) per capture stream, reclaimed only on the
+/// registration-failure path where no proc can be in flight.
+pub(crate) struct DeviceAliveContext {
+    device_id: AudioObjectID,
+    terminal: std::sync::Arc<crate::bridge::ring_buffer::BridgeShared>,
+}
+
+/// CoreAudio listener proc for `kAudioDevicePropertyDeviceIsAlive`. Runs on a
+/// CoreAudio internal thread (NOT the RT audio callback), so the alloc-free
+/// `signal_error()` is safe here. On device death it drives the bridge terminal;
+/// while still alive it no-ops.
+///
+/// # Safety
+/// `client_data` must point to a live [`DeviceAliveContext`] (guaranteed by the
+/// intentional leak — the context outlives every possible proc invocation).
+unsafe extern "C" fn device_alive_listener_proc(
+    _object_id: AudioObjectID,
+    _num_addresses: u32,
+    _addresses: *const AudioObjectPropertyAddress,
+    client_data: *mut std::ffi::c_void,
+) -> OSStatus {
+    if client_data.is_null() {
+        return 0;
+    }
+    let context = unsafe { &*(client_data as *const DeviceAliveContext) };
+
+    // Read the current IsAlive value. If the device is gone the read may fail;
+    // a failed read on a death notification is itself treated as "dead".
+    let address = device_alive_address();
+    let mut is_alive_value: u32 = 0;
+    let mut size = std::mem::size_of::<u32>() as u32;
+    let status = unsafe {
+        AudioObjectGetPropertyData(
+            context.device_id,
+            &address,
+            0,
+            std::ptr::null(),
+            &mut size,
+            &mut is_alive_value as *mut u32 as *mut std::ffi::c_void,
+        )
+    };
+
+    let dead = status != 0 || !is_device_alive(is_alive_value);
+    if dead {
+        // Spontaneous device/tap death with no stop()/Drop: drive the bridge to
+        // the terminal Error state so a parked reader unblocks with a Fatal
+        // StreamEnded. signal_error() is idempotent (Error is sticky) and
+        // alloc-free/lock-free (ADR-0010), safe from this CoreAudio thread.
+        context.terminal.signal_error();
+    }
+    0
+}
+
+/// Register the device-is-alive listener on `device_id`. Returns the leaked
+/// context pointer on success (to be removed at teardown), or `None` if
+/// registration failed (logged; the stream still works, it just won't catch a
+/// spontaneous death — the pre-ead3 behaviour). The context is reclaimed on the
+/// failure path only (no proc can be in flight there).
+pub(crate) fn register_device_alive_listener(
+    device_id: AudioObjectID,
+    terminal: std::sync::Arc<crate::bridge::ring_buffer::BridgeShared>,
+) -> Option<*mut DeviceAliveContext> {
+    let context_ptr: *mut DeviceAliveContext = Box::into_raw(Box::new(DeviceAliveContext {
+        device_id,
+        terminal,
+    }));
+    let address = device_alive_address();
+    let status = unsafe {
+        AudioObjectAddPropertyListener(
+            device_id,
+            &address,
+            Some(device_alive_listener_proc),
+            context_ptr as *mut std::ffi::c_void,
+        )
+    };
+    if status != 0 {
+        // Reclaim the context: the add failed, so no listener (and thus no proc)
+        // references it. SAFETY: came from Box::into_raw above, not yet freed,
+        // referenced by no live listener.
+        unsafe {
+            drop(Box::from_raw(context_ptr));
+        }
+        log::warn!(
+            "CoreAudio: failed to register DeviceIsAlive listener (OSStatus {status}) on \
+             device {device_id}; spontaneous device death will not be auto-signalled"
+        );
+        return None;
+    }
+    Some(context_ptr)
+}
+
+/// Remove the device-is-alive listener registered by
+/// [`register_device_alive_listener`]. Best-effort: CoreAudio gives no barrier
+/// that an in-flight proc has finished, so the `context_ptr` is **intentionally
+/// NOT freed** (it was leaked at registration for exactly this reason). Called
+/// at stream teardown.
+///
+/// # Safety
+/// `context_ptr` must be a value returned by [`register_device_alive_listener`]
+/// (i.e. from `Box::into_raw`) for the same `device_id`.
+pub(crate) unsafe fn remove_device_alive_listener(
+    device_id: AudioObjectID,
+    context_ptr: *mut DeviceAliveContext,
+) {
+    let address = device_alive_address();
+    unsafe {
+        AudioObjectRemovePropertyListener(
+            device_id,
+            &address,
+            Some(device_alive_listener_proc),
+            context_ptr as *mut std::ffi::c_void,
+        );
+    }
+    // Do NOT free context_ptr (intentional leak — see the doc note).
+}
+
 /// Context shared between the CoreAudio listener proc and the watch helper
 /// thread. Boxed and passed to `AudioObjectAddPropertyListener` as the
 /// `inClientData` cookie.
@@ -2232,6 +2385,23 @@ mod tests {
             ctx.event_tx.lock().unwrap().take().is_none(),
             "take must be idempotent after the channel is disconnected"
         );
+    }
+
+    /// rsac-ead3: `is_device_alive` decodes the IsAlive property — `0` is dead,
+    /// any non-zero value is alive. Device-free (the listener lifecycle needs a
+    /// real device unplug, but the decision is pure and unit-tested here).
+    #[test]
+    fn is_device_alive_decodes_zero_as_dead() {
+        assert!(!is_device_alive(0), "0 must decode as dead");
+        assert!(is_device_alive(1), "1 must decode as alive");
+        assert!(is_device_alive(u32::MAX), "non-zero must decode as alive");
+        // The death-watch address targets the documented selector on the global
+        // scope / main element.
+        let addr = device_alive_address();
+        assert_eq!(addr.mSelector, K_AUDIO_DEVICE_PROPERTY_DEVICE_IS_ALIVE);
+        assert_eq!(addr.mSelector, 0x616c_6976, "'aliv' four-char code");
+        assert_eq!(addr.mScope, kAudioObjectPropertyScopeGlobal);
+        assert_eq!(addr.mElement, KAUDIO_OBJECT_PROPERTY_ELEMENT_MAIN);
     }
 
     /// `OSStatus`'s `noErr` is `0`, the value the listener proc returns; guard
