@@ -5,6 +5,13 @@
 //! enabler — the Python API exposes streaming as first-class (iterators,
 //! callbacks, context managers), not just file capture.
 
+// `rsac::AudioError` is intentionally large (it carries structured BackendContext
+// etc.), so closures/fns returning `Result<_, AudioError>` trip
+// clippy::result_large_err. The core crate allows it crate-wide for the same
+// reason (src/lib.rs:1); mirror that here so the new binding-crate clippy gate
+// (rsac-3e24) does not flag an upstream design choice the binding can't change.
+#![allow(clippy::result_large_err)]
+
 use pyo3::exceptions::{PyOSError, PyRuntimeError, PyStopIteration, PyValueError};
 use pyo3::prelude::*;
 use pyo3::types::PyBytes;
@@ -1291,7 +1298,15 @@ mod tests {
 
     #[test]
     fn to_le_bytes_round_trips_via_from_le_bytes() {
-        let samples = [0.0f32, 1.0, -1.5, 3.14159, f32::MIN, f32::MAX, -0.0];
+        let samples = [
+            0.0f32,
+            1.0,
+            -1.5,
+            std::f32::consts::PI,
+            f32::MIN,
+            f32::MAX,
+            -0.0,
+        ];
         let bytes = f32_slice_to_le_bytes(&samples);
         assert_eq!(bytes.len(), samples.len() * 4);
         let decoded: Vec<f32> = bytes
