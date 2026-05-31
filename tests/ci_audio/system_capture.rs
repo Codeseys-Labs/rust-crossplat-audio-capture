@@ -253,10 +253,12 @@ fn test_capture_format_correct() {
                     buffer.num_frames()
                 );
 
-                assert!(
-                    helpers::verify_format(&buffer, expected_sample_rate, expected_channels),
-                    "Audio format should match requested configuration"
-                );
+                // rsac does not resample: the delivered format equals the
+                // *request* only under a deterministic source. On an arbitrary
+                // host the device negotiates its own mix format, so we assert
+                // self-consistency and only require exact equality where the
+                // source format is controlled. See `helpers::assert_buffer_format`.
+                helpers::assert_buffer_format(&buffer, expected_sample_rate, expected_channels);
 
                 // Monotonic non-decreasing overrun_count check — property
                 // assertion alongside the no-panic backbone.

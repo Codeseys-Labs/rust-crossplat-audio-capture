@@ -100,10 +100,12 @@ fn subscribe_delivers_buffers_from_live_capture() {
                     buf.sample_rate(),
                 );
                 // Guard against silent-wrong-output regressions in the
-                // subscribe path: the builder configured 48000/2, so any
-                // buffer arriving via subscribe() must reflect that.
-                assert_eq!(buf.sample_rate(), 48000);
-                assert_eq!(buf.channels(), 2);
+                // subscribe path. The builder *requested* 48000/2, but rsac
+                // does not resample, so a shared-mode backend delivers the
+                // device's negotiated format; equality with the request only
+                // holds under a deterministic source. See
+                // `helpers::assert_buffer_format`.
+                helpers::assert_buffer_format(&buf, 48000, 2);
             }
             Err(mpsc::RecvTimeoutError::Timeout) => {
                 // Still live — loop until deadline.

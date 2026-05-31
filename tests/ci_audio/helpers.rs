@@ -521,30 +521,84 @@ pub fn verify_tone_present(buffer: &AudioBuffer, target_hz: f32) -> bool {
     dominates
 }
 
-/// Verify the audio format matches expectations.
-pub fn verify_format(
+/// Assert the invariants a delivered `AudioBuffer` must satisfy, choosing the
+/// right strength for the host.
+///
+/// rsac is **capture-only with no resampling** (see `VISION.md`): the builder's
+/// `sample_rate`/`channels` are a *request*, but a shared-mode backend (WASAPI
+/// shared, PipeWire, the CoreAudio process tap) delivers the device's
+/// **negotiated mix format**, which may differ (e.g. a 96 kHz / 8-channel HDMI
+/// or pro interface). So two tiers of invariant apply:
+///
+/// * **Always** (every host): the buffer is *self-consistent* — positive rate
+///   and channel count, and interleaved `data.len() == num_frames * channels`.
+///   This catches genuine silent-wrong-output regressions (bogus-but-well-formed
+///   buffers) on any hardware.
+/// * **Deterministic source only** (`RSAC_CI_AUDIO_DETERMINISTIC=1`, the Linux
+///   null sink / Windows VB-CABLE runner, both pinned to the requested format):
+///   the delivered format must *equal* the requested `expected_*`. On an
+///   arbitrary developer host the device picks the format, so equality is not a
+///   valid invariant — asserting it there is the bug this helper replaces.
+///
+/// Note we intentionally do **not** assert the buffer equals `capture.format()`:
+/// the negotiated format is not always recorded on the consumer side yet (the
+/// `set_negotiated_format` limitation noted in `docs/CROSS_LANGUAGE_BINDINGS.md`
+/// / `PERFORMANCE.md`), so `format()` can still echo the request while the buffer
+/// carries the real delivered rate.
+pub fn assert_buffer_format(
     buffer: &AudioBuffer,
     expected_sample_rate: u32,
     expected_channels: u16,
-) -> bool {
-    let format = buffer.format();
-    let sr_ok = format.sample_rate == expected_sample_rate;
-    let ch_ok = format.channels == expected_channels;
+) {
+    // Tier 1 — self-consistency, enforced on every host.
+    assert!(
+        buffer.sample_rate() > 0,
+        "delivered buffer must have a positive sample rate, got {}",
+        buffer.sample_rate()
+    );
+    assert!(
+        buffer.channels() > 0,
+        "delivered buffer must have a positive channel count, got {}",
+        buffer.channels()
+    );
+    assert_eq!(
+        buffer.num_frames() * buffer.channels() as usize,
+        buffer.data().len(),
+        "interleaved data length must equal num_frames * channels \
+         (rate={}, channels={}, frames={}, data.len={})",
+        buffer.sample_rate(),
+        buffer.channels(),
+        buffer.num_frames(),
+        buffer.data().len()
+    );
 
-    if !sr_ok {
+    // Tier 2 — exact match, only where the source format is controlled.
+    if deterministic_audio_env() {
+        assert_eq!(
+            buffer.sample_rate(),
+            expected_sample_rate,
+            "deterministic source: delivered sample_rate must equal the configured \
+             request (the null sink / VB-CABLE is pinned to it)"
+        );
+        assert_eq!(
+            buffer.channels(),
+            expected_channels,
+            "deterministic source: delivered channels must equal the configured request"
+        );
+    } else if buffer.sample_rate() != expected_sample_rate || buffer.channels() != expected_channels
+    {
+        // Non-deterministic host: divergence is expected (no resampling), just
+        // record it so a surprising format is still visible in the test log.
         eprintln!(
-            "[ci_audio] Sample rate mismatch: expected {}, got {}",
-            expected_sample_rate, format.sample_rate
+            "[ci_audio] note: delivered format {}Hz/{}ch differs from requested \
+             {}Hz/{}ch — expected on a host whose device negotiates its own mix \
+             format (rsac does not resample)",
+            buffer.sample_rate(),
+            buffer.channels(),
+            expected_sample_rate,
+            expected_channels
         );
     }
-    if !ch_ok {
-        eprintln!(
-            "[ci_audio] Channel count mismatch: expected {}, got {}",
-            expected_channels, format.channels
-        );
-    }
-
-    sr_ok && ch_ok
 }
 
 // ---------------------------------------------------------------------------
