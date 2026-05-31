@@ -187,6 +187,9 @@ checks and post-publish verification is in
 - [ ] Every review comment is resolved: fixed in the PR, or captured in a
       tracking issue (`deferred-review`) / decision-record issue — none left to
       vanish on merge (see §6 → Code review dispositions).
+- [ ] A large change that layers along the module DAG is split into a **stack of
+      small PRs** (one layer per PR, merged bottom-up) rather than one
+      hard-to-review mega-PR — see [`STACKED_PRS.md`](STACKED_PRS.md).
 
 ## 9. Reporting bugs
 

@@ -388,6 +388,25 @@ durable, searchable backlog; PR threads are ephemeral.
 Reply to the originating comment in every case so the reviewer (and the bot) can
 see the outcome and resolve the thread.
 
+### Stacked pull requests — split big changes along the DAG
+
+A change that layers along the module DAG (`core → bridge → audio → api → lib`)
+and would otherwise become a large, hard-to-review PR should ship as a **stack of
+small PRs**, one layer per PR, merged **bottom-up**. We do this **gh-native**
+(plain `git` + `gh`, no Graphite/spr/ghstack). Each child PR's base is its *parent
+branch* (not `master`), so each layer's diff stays small and independently
+reviewable — which also keeps CodeRabbit under its size limit (the 167-file PR #27
+auto-paused its review; a stack would have kept each layer reviewable).
+
+The one hazard is our **squash-merge** culture: after the bottom PR squash-merges,
+recover each child with `git rebase --onto origin/master <old-parent> <child>` —
+**never** a plain rebase (that re-replays the already-merged commits). Always pass
+`--delete-branch` to `gh pr merge` (the repo has `deleteBranchOnMerge=false`, so
+that flag is what retargets the child), and `--force-with-lease`, never `--force`.
+
+Full playbook (when to stack vs parallel PRs, exact commands, pitfalls):
+[`docs/STACKED_PRS.md`](docs/STACKED_PRS.md).
+
 ---
 
 ## 7. What NOT to Do
