@@ -307,12 +307,23 @@ fn test_capture_format_correct() {
         helpers::stop_player(p);
     }
 
-    // If NO buffer arrived, this is almost certainly the "no working
-    // loopback environment" case (VB-CABLE installed but no audio
-    // actually playing through it, or test-tone player unavailable).
-    // Skip with a diagnostic rather than failing loudly, matching the
-    // skip-philosophy of the rest of the ci_audio suite.
+    // If NO buffer arrived: under a deterministic source the tone is
+    // guaranteed to flow (Linux null sink / Windows VB-CABLE), so zero
+    // buffers means the producer stopped pushing — a real regression, not
+    // flakiness. Hard-fail there, mirroring the sibling
+    // `test_system_capture_receives_audio` (above). On non-deterministic
+    // hosts this is the "no functional loopback" case, so skip honestly.
+    // Without this branch the deterministic run was a vacuous PASS: it could
+    // return without ever examining a buffer.
     if !format_verified {
+        if helpers::deterministic_audio_env() {
+            panic!(
+                "deterministic source: no buffer arrived within {:?} — the \
+                 format-path capture producer stopped pushing under the \
+                 null sink / VB-CABLE (real regression, not flakiness)",
+                timeout
+            );
+        }
         eprintln!(
             "[ci_audio] test_capture_format_correct: no buffer arrived \
              within {:?}; environment lacks a functional audio loopback — \
