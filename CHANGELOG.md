@@ -20,15 +20,48 @@ Releases with no ABI change omit the subsection (or state "No C ABI changes").
 
 ### Added
 
+- **Windowed backpressure report (`backpressure_report()`).** A bounded,
+  recent-window view of producer drop activity, complementing the lifetime
+  counters in `stream_stats()`. Unlike the consecutive-drop
+  `is_under_backpressure` flag (which resets on any successful push), the
+  windowed `drop_rate` surfaces a *sustained* 1-in-N loss pattern. Backed by an
+  alloc-free, lock-free fixed ring of `(pushed, dropped)` slots the producer
+  advances on every push path (rsac-cfe4). Exposed across the whole surface:
+  - Rust: `AudioCapture::backpressure_report() -> BackpressureReport`
+    (`window`, `pushed`, `dropped`, `drop_rate`, `is_under_backpressure`).
+  - C FFI: `rsac_capture_backpressure_report()` filling `RsacBackpressureReport`.
+  - Go: `capture.BackpressureReport()`; Python: `capture.backpressure_report()`;
+    Node: `capture.backpressureReport()`.
+- **macOS spontaneous device-death detection (ADR-0010).** A
+  `kAudioDevicePropertyDeviceIsAlive` listener on the captured device drives the
+  bridge to a terminal `Error` state when a device/tap dies *without* a
+  `stop()`/`Drop` (e.g. the interface is unplugged), so a parked blocking reader
+  observes a fatal `StreamEnded` instead of hanging indefinitely (rsac-ead3).
+
 ### Changed
 
-### Deprecated
-
-### Removed
+- `AudioCapture::backpressure_report()` now reports a *windowed* view with a
+  populated `window` span (estimated from the buffer size and negotiated sample
+  rate), instead of lifetime counters with a zero `window`. The public
+  `BackpressureReport` shape is unchanged.
 
 ### Fixed
 
-### Security
+- `cargo doc --all-features` is clean again: cross-module/cfg-divergent doc
+  references now use plain backticks rather than intra-doc method-path links
+  that require the target type to be in scope.
+- CI: the `softprops/action-gh-release` SHA is now unified across `release.yml`
+  and `release-tag.yml` (#33); `subscribe()` integration coverage hard-asserts
+  the 440 Hz tone content under a deterministic source (#34).
+
+### C ABI changes
+
+- **Added** (backward compatible — new symbol, no removals or layout changes):
+  `rsac_capture_backpressure_report(const RsacCapture*, RsacBackpressureReport*)`
+  and the `RsacBackpressureReport` value type (`window_secs`, `pushed`,
+  `dropped`, `drop_rate`, `is_under_backpressure`). Existing symbols are
+  unchanged, so consumers pinning the `.so`/`.dll`/`.dylib` need not recompile;
+  this is a **MINOR** bump for the FFI surface.
 
 ## [0.3.0] - 2026-05-30
 
