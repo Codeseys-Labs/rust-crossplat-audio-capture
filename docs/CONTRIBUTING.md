@@ -159,12 +159,12 @@ Plus `CHANGELOG.md` (it rotates the `[Unreleased]` section into a dated
 heading and re-seeds an empty `[Unreleased]`).
 
 ```bash
-bash scripts/bump-version.sh 0.3.0 --dry-run   # preview
-bash scripts/bump-version.sh 0.3.0             # apply
+# Substitute the target version for X.Y.Z (e.g. the current release is 0.4.0).
+bash scripts/bump-version.sh X.Y.Z --dry-run   # preview
+bash scripts/bump-version.sh X.Y.Z             # apply
 git diff                                        # review
-git add -A && git commit -m "chore: release 0.3.0"
-git tag -a v0.3.0 -m "Release 0.3.0"
-git push origin master v0.3.0
+git add -A && git commit -m "release: vX.Y.Z"   # subject triggers release-tag.yml
+# (release-tag.yml then tags + creates the GitHub Release; see RELEASE_PROCESS.md)
 ```
 
 Pushing the tag triggers `release.yml` (crates.io), `release-npm.yml`

@@ -1,10 +1,11 @@
 # rsac Cross-Language Bindings
 
-> **Status (0.2.0 line):** C FFI, Python, Node.js, and Go bindings are
-> **shipped and at feature parity** for the core capture surface. Swift/Kotlin
-> (UniFFI) and WASM remain research-only — see [§ Not yet implemented](#not-yet-implemented).
-> rsac is, as far as we know, the first Rust audio-capture crate with
-> cross-language bindings.
+> **Status (shipped since the 0.2.0 line; current release 0.4.0):** C FFI,
+> Python, Node.js, and Go bindings are **shipped and at feature parity** for the
+> core capture surface — including the windowed `backpressure_report()` added in
+> 0.4.0. Swift/Kotlin (UniFFI) and WASM remain research-only — see
+> [§ Not yet implemented](#not-yet-implemented). rsac is, as far as we know, the
+> first Rust audio-capture crate with cross-language bindings.
 
 ## Summary
 
@@ -146,7 +147,8 @@ are now **resolved** in 0.3.0; recorded here so the history is clear:
   end-of-capture. (rsac-python `src/lib.rs`.)
 - **C FFI `rsac_version()` reports the real version (was BFFI-04 — RESOLVED
   0.3.0).** It now returns `concat!(env!("CARGO_PKG_VERSION"), "\0")` and
-  `rsac-ffi` is in version lockstep with the workspace (0.3.0).
+  `rsac-ffi` is in version lockstep with the workspace (enforced by the
+  `version-lockstep` CI gate across all six manifests).
 - **Go `ReadBuffer`/`TryReadBuffer` concurrent-`Close()` is safe (was BFFI-02 /
   #28 — RESOLVED 0.3.0).** `Close()` sets a `closing` flag, calls
   `rsac_capture_request_stop` to unblock a parked read, and drains a
