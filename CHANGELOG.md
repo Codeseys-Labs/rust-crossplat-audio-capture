@@ -20,6 +20,20 @@ Releases with no ABI change omit the subsection (or state "No C ABI changes").
 
 ### Added
 
+### Changed
+
+### Deprecated
+
+### Removed
+
+### Fixed
+
+### Security
+
+## [0.4.0] - 2026-05-31
+
+### Added
+
 - **Windowed backpressure report (`backpressure_report()`).** A bounded,
   recent-window view of producer drop activity, complementing the lifetime
   counters in `stream_stats()`. Unlike the consecutive-drop

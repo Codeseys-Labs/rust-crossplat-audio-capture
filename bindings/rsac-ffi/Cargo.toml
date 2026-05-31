@@ -3,7 +3,7 @@ name = "rsac-ffi"
 # In lockstep with the workspace version (rsac + napi + python) — ci.yml's
 # version-lockstep gate and scripts/bump-version.sh treat all six manifests as
 # one version.
-version = "0.3.0"
+version = "0.4.0"
 edition = "2021"
 # Mirror the parent crate's MSRV floor (1.87): rsac-ffi builds against rsac and
 # must not require a newer toolchain than the library it wraps.
@@ -37,7 +37,7 @@ sink-wav = ["rsac/sink-wav"]
 # requirement is what `cargo publish` records (crates.io ignores `path`). Keep
 # the version in lockstep with the parent crate's `[package].version` so a
 # published rsac-ffi resolves the matching rsac release. See README.
-rsac = { path = "../../", version = "0.3.0", default-features = false }
+rsac = { path = "../../", version = "0.4.0", default-features = false }
 log = "0.4"
 
 [build-dependencies]

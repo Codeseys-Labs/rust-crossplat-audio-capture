@@ -1,6 +1,6 @@
 [package]
 name = "rsac"
-version = "0.3.0"
+version = "0.4.0"
 edition = "2021"
 # Explicit MSRV floor. wasapi 0.23 bumps its own MSRV to 1.76; declaring it here
 # makes the minimum supported Rust version visible (under the pinned 1.95
