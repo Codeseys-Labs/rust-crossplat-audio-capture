@@ -884,9 +884,18 @@ unsafe extern "C" fn device_alive_listener_proc(
     if dead {
         // Spontaneous device/tap death with no stop()/Drop: drive the bridge to
         // the terminal Error state so a parked reader unblocks with a Fatal
-        // StreamEnded. signal_error() is idempotent (Error is sticky) and
-        // alloc-free/lock-free (ADR-0010), safe from this CoreAudio thread.
-        context.terminal.signal_error();
+        // StreamEnded. This mirrors `BridgeProducer::signal_error`'s body
+        // directly on `BridgeShared` (which is what we hold here): a sticky
+        // last-writer-wins `force_set(Error)` + wake the parked sync reader and
+        // the async waker. All alloc-free / lock-free, safe from this CoreAudio
+        // listener thread (ADR-0001, ADR-0010).
+        context
+            .terminal
+            .state
+            .force_set(crate::bridge::state::StreamState::Error);
+        context.terminal.notify_wake();
+        #[cfg(feature = "async-stream")]
+        context.terminal.waker.wake();
     }
     0
 }

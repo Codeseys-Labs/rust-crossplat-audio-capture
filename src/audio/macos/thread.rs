@@ -137,6 +137,21 @@ pub(crate) struct MacosPlatformStream {
     device_alive_ctx: Option<*mut super::coreaudio::DeviceAliveContext>,
 }
 
+// SAFETY: `MacosPlatformStream` carries a raw `*mut DeviceAliveContext` (the
+// leaked device-is-alive listener cookie), which makes the struct non-`Send`/
+// `Sync` by default — but `PlatformStream: Send` and `BridgeStream<S>` require
+// it. The pointer is only ever (a) read by CoreAudio's listener thread through
+// the FFI cookie (the pointee is a heap `DeviceAliveContext` whose fields —
+// `AudioObjectID` + `Arc<BridgeShared>` — are themselves `Send`/`Sync`) and
+// (b) passed to `AudioObjectRemovePropertyListener` at teardown; rsac code never
+// derefs it across threads. The rest of the struct (`Mutex<AudioUnit>`,
+// `Option<CoreAudioProcessTap>`, `AtomicBool`, `Arc<BridgeShared>`,
+// `AudioObjectID`) is already `Send`/`Sync`, so carrying the raw pointer does not
+// change the thread-safety story. Mirrors the `SendContextPtr` discipline in
+// `coreaudio.rs`.
+unsafe impl Send for MacosPlatformStream {}
+unsafe impl Sync for MacosPlatformStream {}
+
 impl MacosPlatformStream {
     /// Synchronously stops the AudioUnit, best-effort. Returns the `OSStatus`
     /// mapping error if the stop call failed. Idempotent: stopping an
