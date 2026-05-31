@@ -83,6 +83,23 @@ typedef struct {
 } RsacStreamStats;
 
 /**
+ * Point-in-time WINDOWED backpressure snapshot.
+ *
+ * Filled by rsac_capture_backpressure_report(). Plain value type — no heap, no
+ * free. Unlike RsacStreamStats' lifetime counters, pushed/dropped cover a
+ * bounded recent window, so drop_rate surfaces a sustained 1-in-N loss the
+ * consecutive-drop flag resets away. window_secs is 0.0 when the span cannot be
+ * attributed (unknown buffer size/rate); the tallies are still valid.
+ */
+typedef struct {
+    double   window_secs;          /**< Span the tallies cover; 0.0 if unattributed. */
+    uint64_t pushed;               /**< Buffers pushed within the window. */
+    uint64_t dropped;              /**< Buffers dropped within the window. */
+    double   drop_rate;            /**< Lost fraction in 0.0..=1.0. */
+    int32_t  is_under_backpressure;/**< 1 if the legacy consecutive-drop flag is set. */
+} RsacBackpressureReport;
+
+/**
  * Point-in-time snapshot of a capture's negotiated delivery format.
  *
  * Filled by rsac_capture_format(). Plain value type — no heap, no free.
@@ -237,6 +254,16 @@ uint64_t rsac_capture_overrun_count(const RsacCapture* capture);
  */
 rsac_error_t rsac_capture_stream_stats(const RsacCapture* capture,
                                        RsacStreamStats* out);
+
+/**
+ * Fills *out with a point-in-time WINDOWED backpressure report.
+ * *out is an out-parameter (not a handle) — nothing to free.
+ * Unlike rsac_capture_stream_stats' lifetime counters, drop_rate here reflects
+ * a bounded recent window. Before start (or after stop) the report is all-zero.
+ * Returns RSAC_ERROR_NULL_POINTER if capture or out is null, else RSAC_OK.
+ */
+rsac_error_t rsac_capture_backpressure_report(const RsacCapture* capture,
+                                              RsacBackpressureReport* out);
 
 /**
  * Fills *out with the negotiated delivery format.

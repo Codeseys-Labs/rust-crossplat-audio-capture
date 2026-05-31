@@ -99,6 +99,21 @@ with rsac.AudioCapture() as cap:
         print(fmt.sample_rate, fmt.channels, fmt.sample_format)  # e.g. 48000 2 'f32'
 ```
 
+`stream_stats()` reports **lifetime** counters (cumulative since the stream
+opened). For the **windowed** drop-rate view — bounded to a recent window, so it
+surfaces a sustained 1-in-N loss that the lifetime totals dilute — use
+`backpressure_report()`:
+
+```python
+with rsac.AudioCapture() as cap:
+    cap.read()
+    bp = cap.backpressure_report()
+    print(bp.window_secs, bp.pushed, bp.dropped)   # window_secs: float seconds
+    print(bp.drop_rate)                             # 0.0..=1.0 over the window
+    if bp.is_under_backpressure:
+        print("sustained drops right now")
+```
+
 ## Async usage
 
 `AudioCapture` is also an async context manager (`async with`). `__aexit__`

@@ -76,6 +76,7 @@ import (
 	"runtime"
 	"sync"
 	"sync/atomic"
+	"time"
 	"unsafe"
 )
 
@@ -529,6 +530,27 @@ type StreamStats struct {
 	IsRunning bool
 }
 
+// BackpressureReport is a point-in-time WINDOWED backpressure snapshot. Unlike
+// [StreamStats]' lifetime counters, Pushed/Dropped cover a bounded recent
+// window, so DropRate surfaces a sustained 1-in-N loss the consecutive-drop
+// flag resets away. It mirrors the C-ABI RsacBackpressureReport out-parameter
+// filled by the FFI; it is a plain value (nothing to free). Obtain one via
+// [AudioCapture.BackpressureReport].
+type BackpressureReport struct {
+	// Window is the span the tallies cover; 0 when the span cannot be
+	// attributed (unknown buffer size/rate), in which case the tallies are
+	// still valid.
+	Window time.Duration
+	// Pushed is the number of buffers pushed within the window.
+	Pushed uint64
+	// Dropped is the number of buffers dropped within the window.
+	Dropped uint64
+	// DropRate is the fraction of window buffers lost to overflow, in 0.0..=1.0.
+	DropRate float64
+	// IsUnderBackpressure is true when the legacy consecutive-drop flag is set.
+	IsUnderBackpressure bool
+}
+
 // ── Audio Format ──────────────────────────────────────────────────────────
 
 // SampleFormat is the negotiated wire/storage format the backend reports.
@@ -929,6 +951,35 @@ func (c *AudioCapture) StreamStats() (StreamStats, error) {
 		UptimeSecs:      float64(cs.uptime_secs),
 		DroppedRatio:    float64(cs.dropped_ratio),
 		IsRunning:       cs.is_running != 0,
+	}, nil
+}
+
+// BackpressureReport returns a point-in-time WINDOWED backpressure snapshot.
+// Unlike [AudioCapture.StreamStats]' lifetime counters, DropRate here reflects a
+// bounded recent window, so a sustained 1-in-N loss stays visible even after the
+// consecutive-drop flag resets. Reading it never allocates on or blocks the OS
+// audio callback thread.
+//
+// Before Start (or after Stop) every counter is zero, Window is 0, DropRate is
+// 0, and IsUnderBackpressure is false. Window is also 0 when the span cannot be
+// attributed (unknown buffer size/rate); the tallies remain valid. Returns
+// ErrClosed if the capture has been closed.
+func (c *AudioCapture) BackpressureReport() (BackpressureReport, error) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if c.closed {
+		return BackpressureReport{}, ErrClosed
+	}
+	var cr C.RsacBackpressureReport
+	if rc := C.rsac_capture_backpressure_report(c.handle, &cr); rc != C.RSAC_OK {
+		return BackpressureReport{}, newError(rc)
+	}
+	return BackpressureReport{
+		Window:              time.Duration(float64(cr.window_secs) * float64(time.Second)),
+		Pushed:              uint64(cr.pushed),
+		Dropped:             uint64(cr.dropped),
+		DropRate:            float64(cr.drop_rate),
+		IsUnderBackpressure: cr.is_under_backpressure != 0,
 	}, nil
 }
 

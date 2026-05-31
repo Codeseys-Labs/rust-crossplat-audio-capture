@@ -310,6 +310,31 @@ export declare class AudioCapture {
   streamStats(): StreamStats;
 
   /**
+   * A windowed snapshot of the stream's recent backpressure.
+   *
+   * Unlike the all-or-nothing `isUnderBackpressure` flag — which trips only on a
+   * run of *consecutive* drops and resets on any successful push — `dropRate` is
+   * computed over a recent window of push activity, so a sustained partial loss
+   * (e.g. a steady 1-in-3 drop pattern) is visible. The legacy bool is carried
+   * through unchanged.
+   *
+   * Reading this never allocates on or blocks the OS audio callback thread.
+   * Before `start()` (or after `stop()`) the snapshot is the all-zero default
+   * with `windowSecs === 0`, `dropRate === 0.0`, and
+   * `isUnderBackpressure === false`.
+   *
+   * @example
+   * ```ts
+   * const r = capture.backpressureReport();
+   * if (r.dropRate > 0.01) {
+   *   console.warn(`losing ${(r.dropRate * 100).toFixed(1)}% of buffers ` +
+   *                `(pushed=${r.pushed} dropped=${r.dropped})`);
+   * }
+   * ```
+   */
+  backpressureReport(): BackpressureReport;
+
+  /**
    * The negotiated *delivery* format the backend actually produces, or `null`
    * before `start()` creates a stream. May differ from the requested settings
    * when the device forced a negotiation.
@@ -343,6 +368,35 @@ export interface StreamStats {
   /** Compact human-readable format description (e.g. `"2ch 48000Hz F32"`);
    * empty before the stream starts. */
   formatDescription: string;
+}
+
+/**
+ * A windowed snapshot of an {@link AudioCapture}'s recent backpressure.
+ *
+ * Unlike the all-or-nothing {@link isUnderBackpressure} flag — which trips only
+ * on a run of *consecutive* drops and resets on any successful push —
+ * {@link dropRate} is computed over a recent window of push activity, so a
+ * sustained partial loss (e.g. a steady 1-in-3 drop pattern) is visible.
+ *
+ * The `pushed`/`dropped` tallies are `bigint` (Rust `u64`) so they do not
+ * silently lose precision past `Number.MAX_SAFE_INTEGER` on a long-running
+ * capture.
+ */
+export interface BackpressureReport {
+  /** The wall-clock span the `pushed`/`dropped` tallies cover, in seconds. `0`
+   * when the span cannot be attributed (no stream / not yet negotiated). */
+  windowSecs: number;
+  /** Buffers successfully pushed by the producer within the window. */
+  pushed: bigint;
+  /** Buffers dropped due to ring-buffer overflow within the window. */
+  dropped: bigint;
+  /** Fraction of buffers lost within the window, in `0.0..=1.0`
+   * (`dropped / (pushed + dropped)`; `0.0` when nothing has been pushed or
+   * dropped). Surfaces sustained partial loss the legacy bool misses. */
+  dropRate: number;
+  /** The legacy consecutive-drop backpressure flag, carried unchanged: trips
+   * only on a run of consecutive drops and resets on any successful push. */
+  isUnderBackpressure: boolean;
 }
 
 /**

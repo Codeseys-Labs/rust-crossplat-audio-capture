@@ -656,6 +656,29 @@ func TestStreamStats_ZeroValue(t *testing.T) {
 	}
 }
 
+func TestBackpressureReport_ZeroValue(t *testing.T) {
+	var r BackpressureReport
+	if r.Window != 0 || r.Pushed != 0 || r.Dropped != 0 || r.DropRate != 0 || r.IsUnderBackpressure {
+		t.Errorf("zero BackpressureReport should be all-zero/false, got %+v", r)
+	}
+}
+
+// TestBackpressureReport_Closed pins the closed-capture guard: like
+// StreamStats(), BackpressureReport() must short-circuit to ErrClosed (and a
+// zero-value report) before touching the freed/nil C handle. This is device-free
+// — it constructs an already-closed AudioCapture (in-package), so it never opens
+// a real stream.
+func TestBackpressureReport_Closed(t *testing.T) {
+	c := &AudioCapture{closed: true}
+	r, err := c.BackpressureReport()
+	if !errors.Is(err, ErrClosed) {
+		t.Errorf("BackpressureReport on closed capture = %v, want ErrClosed", err)
+	}
+	if (r != BackpressureReport{}) {
+		t.Errorf("closed BackpressureReport should be the zero value, got %+v", r)
+	}
+}
+
 func TestAudioFormat_ZeroValue(t *testing.T) {
 	var f AudioFormat
 	if f.SampleRate != 0 || f.Channels != 0 || f.BitsPerSample != 0 || f.SampleFormat != SampleFormatI16 {

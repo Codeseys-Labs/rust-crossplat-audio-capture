@@ -206,6 +206,26 @@ after it stops) it reports an all-zero snapshot with `is_running == 0`.
 been created (the negotiated format is only known once the backend opens it),
 so call it after `rsac_capture_start()`.
 
+`rsac_capture_stream_stats()` exposes **lifetime** counters (cumulative since
+the stream opened). A third out-parameter accessor,
+`rsac_capture_backpressure_report()`, fills a stack `RsacBackpressureReport` with
+the **windowed** drop-rate view — `pushed`/`dropped`/`drop_rate` measured over a
+bounded recent window, so it surfaces a sustained 1-in-N loss that the lifetime
+totals dilute. Like the others it allocates nothing and the result needs no
+freeing.
+
+```c
+RsacBackpressureReport bp;
+if (rsac_capture_backpressure_report(capture, &bp) == RSAC_OK) {
+    printf("window %.1fs: pushed=%llu dropped=%llu (%.1f%% over window), backpressure=%d\n",
+           bp.window_secs,
+           (unsigned long long)bp.pushed,
+           (unsigned long long)bp.dropped,
+           bp.drop_rate * 100.0,
+           bp.is_under_backpressure);
+}
+```
+
 ## Publishing to crates.io
 
 This crate is publish-ready: it declares `description`, `license`,

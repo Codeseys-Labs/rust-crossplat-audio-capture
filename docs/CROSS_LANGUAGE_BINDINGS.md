@@ -30,6 +30,7 @@ semantics are identical.
 | Capability | Rust core | Python (`rsac`) | Node (`@rsac/audio`) | Go (`rsac`) |
 |---|---|---|---|---|
 | Diagnostic counters snapshot | `AudioCapture::stream_stats()` | `capture.stream_stats()` → `StreamStats` | `capture.streamStats()` | `capture.StreamStats()` |
+| Windowed backpressure report | `AudioCapture::backpressure_report()` | `capture.backpressure_report()` → `BackpressureReport` | `capture.backpressureReport()` | `capture.BackpressureReport()` |
 | Negotiated delivery format | `AudioCapture::format()` | `capture.format()` → `AudioFormat \| None` | `capture.format` (getter) → `AudioFormat \| null` | `capture.Format()` |
 | Buffer RMS / peak (linear) | `AudioBuffer::rms()` / `peak()` | `buffer.rms()` / `buffer.peak()` | fields `chunk.rms` / `chunk.peak` | `buf.RMS()` / `buf.Peak()` |
 | Buffer RMS / peak (dBFS) | `rms_dbfs()` / `peak_dbfs()` | `buffer.rms_dbfs()` / `peak_dbfs()` | `chunk.rmsDbfs` / `peakDbfs` | `buf.RMSDbfs()` / `PeakDbfs()` |
@@ -47,6 +48,19 @@ Notes per row:
   reflects what the backend negotiated where the backend records it — see the
   `set_negotiated_format` note in [`PERFORMANCE.md`](PERFORMANCE.md) for the
   current limitation that backends fall back to the requested format.)
+- **`backpressure_report`.** A second cheap, non-locking consumer-side read
+  that returns a `BackpressureReport { window: Duration, pushed, dropped,
+  drop_rate, is_under_backpressure }`. Where `stream_stats` exposes the bridge's
+  **lifetime** counters (cumulative since the stream opened), this is the
+  **windowed** view: `pushed`/`dropped`/`drop_rate` are measured over a bounded
+  recent window, so it surfaces *sustained* loss — a steady 1-in-N drop rate —
+  that lifetime totals dilute and that the consecutive-drop `is_under_backpressure`
+  bool on the lifetime stats can miss (rsac-cfe4). Use `stream_stats` for "how
+  much have we dropped overall?" and `backpressure_report` for "are we dropping
+  *right now*?". Spellings: Rust `backpressure_report()`, Python
+  `capture.backpressure_report()`, Node `capture.backpressureReport()`, Go
+  `capture.BackpressureReport()`, C FFI `rsac_capture_backpressure_report()`
+  filling an `RsacBackpressureReport`.
 - **Metering.** The meters wrap the core's alloc-free `rms`/`peak`/dBFS/
   per-channel reductions (see [`PERFORMANCE.md`](PERFORMANCE.md)). napi widens
   the per-channel meters into `Float32Array`-style number arrays; Go re-derives

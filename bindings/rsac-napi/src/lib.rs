@@ -686,6 +686,41 @@ impl AudioCapture {
         })
     }
 
+    /// Returns a windowed snapshot of the stream's recent backpressure.
+    ///
+    /// Maps rsac's `#[non_exhaustive]` `BackpressureReport` field-by-field into a
+    /// plain JS object (see `BackpressureReport` in the type definitions). Unlike
+    /// the all-or-nothing `isUnderBackpressure` flag — which trips only on a run of
+    /// *consecutive* drops and resets on any successful push — `dropRate` is
+    /// computed over a recent window of push activity, so a sustained partial loss
+    /// (e.g. a steady 1-in-3 drop pattern) is visible. The legacy bool is carried
+    /// through unchanged. Reading these counters never allocates on or blocks the
+    /// OS audio callback thread.
+    ///
+    /// Before `start()` (or after `stop()`) this returns the all-zero default with
+    /// `windowSecs === 0`, `dropRate === 0.0`, and `isUnderBackpressure === false`.
+    #[napi]
+    pub fn backpressure_report(&self) -> Result<JsBackpressureReport> {
+        let inner = self.inner.lock().map_err(|e| {
+            napi::Error::new(
+                napi::Status::GenericFailure,
+                format!("Lock poisoned: {}", e),
+            )
+        })?;
+        let r = inner.backpressure_report();
+        // Map field-by-field; `window` is a Rust `Duration` surfaced here as a
+        // f64 of seconds (`windowSecs`), matching how `stream_stats` surfaces
+        // `uptime`. The `pushed`/`dropped` u64 tallies widen to BigInt for the
+        // same precision reason as the `StreamStats` counters.
+        Ok(JsBackpressureReport {
+            window_secs: r.window.as_secs_f64(),
+            pushed: bigint_from_u64(r.pushed),
+            dropped: bigint_from_u64(r.dropped),
+            drop_rate: r.drop_rate,
+            is_under_backpressure: r.is_under_backpressure,
+        })
+    }
+
     /// The negotiated *delivery* format the backend actually produces, or `null`
     /// before `start()` creates a stream.
     ///
@@ -758,6 +793,30 @@ pub struct JsStreamStats {
     /// Compact human-readable description of the negotiated format
     /// (e.g. `"2ch 48000Hz F32"`); empty before the stream starts.
     pub format_description: String,
+}
+
+/// A windowed snapshot of an [`AudioCapture`]'s recent backpressure.
+///
+/// Field-by-field mirror of rsac's `#[non_exhaustive]` `BackpressureReport`. The
+/// `pushed`/`dropped` tallies are `BigInt` (u64) to avoid silent precision loss on
+/// long-running captures; `windowSecs` and `dropRate` are doubles, and
+/// `isUnderBackpressure` is the legacy consecutive-drop flag carried unchanged.
+#[napi(object)]
+pub struct JsBackpressureReport {
+    /// The wall-clock span the `pushed`/`dropped` tallies cover, in seconds. `0`
+    /// when the span cannot be attributed (no stream / not yet negotiated).
+    pub window_secs: f64,
+    /// Buffers successfully pushed by the producer within the window.
+    pub pushed: BigInt,
+    /// Buffers dropped due to ring-buffer overflow within the window.
+    pub dropped: BigInt,
+    /// Fraction of buffers lost within the window, in `0.0..=1.0`
+    /// (`dropped / (pushed + dropped)`; `0.0` when nothing has been pushed or
+    /// dropped). Surfaces sustained partial loss the legacy bool misses.
+    pub drop_rate: f64,
+    /// The legacy consecutive-drop backpressure flag, carried unchanged: trips only
+    /// on a run of consecutive drops and resets on any successful push.
+    pub is_under_backpressure: bool,
 }
 
 /// The negotiated audio delivery format.

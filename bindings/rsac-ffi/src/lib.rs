@@ -127,6 +127,32 @@ pub struct RsacStreamStats {
     pub is_running: i32,
 }
 
+/// A point-in-time **windowed** backpressure snapshot.
+///
+/// Filled by [`rsac_capture_backpressure_report`] from
+/// [`AudioCapture::backpressure_report`]. Plain C-ABI value type (no heap, no
+/// free required). Unlike the lifetime counters in [`RsacStreamStats`], the
+/// `pushed`/`dropped` here cover a bounded recent window, so `drop_rate`
+/// surfaces a sustained 1-in-N loss the consecutive-drop flag resets away.
+///
+/// When no stream has been created every field is `0`/`0.0`/`false`.
+/// `window_secs` is `0.0` when the span cannot be attributed (unknown buffer
+/// size or sample rate); the `pushed`/`dropped` tallies are still valid.
+#[repr(C)]
+#[derive(Debug, Clone, Copy)]
+pub struct RsacBackpressureReport {
+    /// Wall-clock span the tallies cover, in seconds. `0.0` when unattributed.
+    pub window_secs: f64,
+    /// Buffers successfully pushed by the producer within the window.
+    pub pushed: u64,
+    /// Buffers dropped due to ring-buffer overflow within the window.
+    pub dropped: u64,
+    /// Fraction of buffers lost within the window, in `0.0..=1.0`.
+    pub drop_rate: f64,
+    /// `1` if the legacy consecutive-drop flag is set, `0` otherwise.
+    pub is_under_backpressure: i32,
+}
+
 /// A point-in-time snapshot of a capture's negotiated delivery format.
 ///
 /// Filled by [`rsac_capture_format`] from [`AudioCapture::format`]. Plain C-ABI
@@ -706,6 +732,45 @@ pub unsafe extern "C" fn rsac_capture_stream_stats(
             is_running: i32::from(stats.is_running),
         };
         unsafe { *out = c_stats };
+        rsac_error_t::RSAC_OK
+    })
+}
+
+/// Fills `*out` with a point-in-time **windowed** [`RsacBackpressureReport`].
+///
+/// Unlike [`rsac_capture_stream_stats`]' lifetime counters, this reports a
+/// bounded recent window, so `drop_rate` reflects a sustained 1-in-N loss that
+/// the consecutive-drop flag resets away. Reading it never allocates on or
+/// blocks the OS audio callback thread.
+///
+/// When no stream has been created, `*out` is filled with an all-zero report.
+///
+/// Returns `RSAC_ERROR_NULL_POINTER` if `capture` or `out` is null; otherwise
+/// `RSAC_OK`. `out` is an out-parameter, not a handle: there is nothing to free.
+#[no_mangle]
+pub unsafe extern "C" fn rsac_capture_backpressure_report(
+    capture: *const RsacCapture,
+    out: *mut RsacBackpressureReport,
+) -> rsac_error_t {
+    catch(|| {
+        if capture.is_null() {
+            set_last_error("capture is null");
+            return rsac_error_t::RSAC_ERROR_NULL_POINTER;
+        }
+        if out.is_null() {
+            set_last_error("out pointer is null");
+            return rsac_error_t::RSAC_ERROR_NULL_POINTER;
+        }
+        let c = unsafe { &*capture };
+        let report = c.inner.backpressure_report();
+        let c_report = RsacBackpressureReport {
+            window_secs: report.window.as_secs_f64(),
+            pushed: report.pushed,
+            dropped: report.dropped,
+            drop_rate: report.drop_rate,
+            is_under_backpressure: i32::from(report.is_under_backpressure),
+        };
+        unsafe { *out = c_report };
         rsac_error_t::RSAC_OK
     })
 }

@@ -74,6 +74,18 @@ const fmt = capture.format // AudioFormat | null (null before start())
 if (fmt) console.log(`${fmt.channels}ch ${fmt.sampleRate}Hz ${fmt.sampleFormat}`)
 ```
 
+`streamStats()` carries **lifetime** counters (cumulative since `start()`). For
+the **windowed** drop-rate view — bounded to a recent window, so it surfaces a
+sustained 1-in-N loss that the lifetime totals dilute — use
+`backpressureReport()`:
+
+```ts
+const bp = capture.backpressureReport()
+// pushed/dropped are bigint (Rust u64); windowSecs is the span in seconds
+console.log(`windowSecs=${bp.windowSecs} pushed=${bp.pushed} dropped=${bp.dropped} ` +
+            `dropRate=${bp.dropRate.toFixed(4)} underBackpressure=${bp.isUnderBackpressure}`)
+```
+
 ### Capture a specific application
 
 ```ts

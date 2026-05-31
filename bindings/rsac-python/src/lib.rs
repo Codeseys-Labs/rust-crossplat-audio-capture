@@ -687,6 +687,74 @@ impl PyStreamStats {
     }
 }
 
+// ── BackpressureReport ─────────────────────────────────────────────────────
+
+/// A windowed snapshot of producer backpressure.
+///
+/// Returned by :meth:`AudioCapture.backpressure_report`. Frozen / read-only.
+///
+/// Unlike the all-or-nothing :attr:`is_under_backpressure` flag (which trips
+/// only on *consecutive* drops and resets on any successful push), this report
+/// exposes a :attr:`drop_rate` over recent push activity, so sustained partial
+/// loss (e.g. a steady 1-in-3 drop pattern) is visible.
+///
+/// Attributes:
+///     window_secs: Wall-clock span the tallies cover, in seconds (0.0 when the
+///         span is unattributed or no stream exists).
+///     pushed: Buffers successfully pushed by the producer within the window.
+///     dropped: Buffers dropped due to ring-buffer overflow within the window.
+///     drop_rate: Fraction of buffers lost within the window, in 0.0..=1.0
+///         (0.0 when nothing has been pushed or dropped).
+///     is_under_backpressure: The legacy consecutive-drop backpressure flag.
+#[pyclass(name = "BackpressureReport", module = "rsac._rsac", frozen)]
+struct PyBackpressureReport {
+    inner: rsac::BackpressureReport,
+}
+
+#[pymethods]
+impl PyBackpressureReport {
+    /// Wall-clock span the tallies cover, in seconds (0.0 when unattributed).
+    #[getter]
+    fn window_secs(&self) -> f64 {
+        self.inner.window.as_secs_f64()
+    }
+
+    /// Buffers successfully pushed by the producer within the window.
+    #[getter]
+    fn pushed(&self) -> u64 {
+        self.inner.pushed
+    }
+
+    /// Buffers dropped due to ring-buffer overflow within the window.
+    #[getter]
+    fn dropped(&self) -> u64 {
+        self.inner.dropped
+    }
+
+    /// Fraction of buffers lost within the window, in 0.0..=1.0 (0.0 when none).
+    #[getter]
+    fn drop_rate(&self) -> f64 {
+        self.inner.drop_rate
+    }
+
+    /// The legacy consecutive-drop backpressure flag.
+    #[getter]
+    fn is_under_backpressure(&self) -> bool {
+        self.inner.is_under_backpressure
+    }
+
+    fn __repr__(&self) -> String {
+        format!(
+            "BackpressureReport(window_secs={:.3}, pushed={}, dropped={}, drop_rate={:.4}, is_under_backpressure={})",
+            self.inner.window.as_secs_f64(),
+            self.inner.pushed,
+            self.inner.dropped,
+            self.inner.drop_rate,
+            self.inner.is_under_backpressure,
+        )
+    }
+}
+
 // ── AudioFormat ──────────────────────────────────────────────────────────
 
 /// The negotiated audio delivery format of a running capture.
@@ -960,6 +1028,25 @@ impl PyAudioCapture {
             .map_err(|e| PyRuntimeError::new_err(format!("Lock poisoned: {}", e)))?;
         let inner = guard.as_ref().map(|c| c.stream_stats()).unwrap_or_default();
         Ok(PyStreamStats { inner })
+    }
+
+    /// Return a windowed snapshot of producer backpressure.
+    ///
+    /// Returns a frozen :class:`BackpressureReport` (window_secs, pushed,
+    /// dropped, drop_rate, is_under_backpressure). Unlike the all-or-nothing
+    /// backpressure flag, ``drop_rate`` surfaces sustained partial loss. On a
+    /// closed capture, returns a default report (all counters zero, ``drop_rate
+    /// == 0.0``, ``is_under_backpressure == False``).
+    fn backpressure_report(&self) -> PyResult<PyBackpressureReport> {
+        let guard = self
+            .inner
+            .lock()
+            .map_err(|e| PyRuntimeError::new_err(format!("Lock poisoned: {}", e)))?;
+        let inner = guard
+            .as_ref()
+            .map(|c| c.backpressure_report())
+            .unwrap_or_default();
+        Ok(PyBackpressureReport { inner })
     }
 
     /// The negotiated audio delivery format, or None if not running.
@@ -1273,6 +1360,7 @@ fn _rsac(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<PyAudioDevice>()?;
     m.add_class::<PyPlatformCapabilities>()?;
     m.add_class::<PyStreamStats>()?;
+    m.add_class::<PyBackpressureReport>()?;
     m.add_class::<PyAudioFormat>()?;
     m.add_class::<PyAudioCapture>()?;
     // Internal awaitable returned by AudioCapture.__aenter__/__aexit__.

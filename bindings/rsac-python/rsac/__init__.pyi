@@ -273,6 +273,44 @@ class StreamStats:
 
     def __repr__(self) -> str: ...
 
+# ── BackpressureReport ──────────────────────────────────────────────────────
+
+class BackpressureReport:
+    """A windowed snapshot of producer backpressure.
+
+    Returned by :meth:`AudioCapture.backpressure_report`. Read-only.
+
+    Unlike the all-or-nothing :attr:`is_under_backpressure` flag, ``drop_rate``
+    surfaces sustained partial loss (e.g. a steady 1-in-3 drop pattern).
+    """
+
+    @property
+    def window_secs(self) -> float:
+        """Wall-clock span the tallies cover, in seconds (0.0 when unattributed)."""
+        ...
+
+    @property
+    def pushed(self) -> int:
+        """Buffers successfully pushed by the producer within the window."""
+        ...
+
+    @property
+    def dropped(self) -> int:
+        """Buffers dropped due to ring-buffer overflow within the window."""
+        ...
+
+    @property
+    def drop_rate(self) -> float:
+        """Fraction of buffers lost within the window, in 0.0..=1.0 (0.0 when none)."""
+        ...
+
+    @property
+    def is_under_backpressure(self) -> bool:
+        """The legacy consecutive-drop backpressure flag."""
+        ...
+
+    def __repr__(self) -> str: ...
+
 # ── AudioFormat ───────────────────────────────────────────────────────────
 
 class AudioFormat:
@@ -362,6 +400,14 @@ class AudioCapture:
 
         On a closed capture, returns a default snapshot (all counters zero,
         ``is_running == False``).
+        """
+        ...
+
+    def backpressure_report(self) -> BackpressureReport:
+        """Return a windowed snapshot of producer backpressure.
+
+        On a closed capture, returns a default report (all counters zero,
+        ``drop_rate == 0.0``, ``is_under_backpressure == False``).
         """
         ...
 

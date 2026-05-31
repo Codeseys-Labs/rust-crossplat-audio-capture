@@ -2195,7 +2195,10 @@ mod tests {
         assert_eq!(rollback_range(2).collect::<Vec<_>>(), vec![0, 1]);
         // Fail at the last index → roll back all prior, never the failed one.
         let n = WATCH_ADDRESSES.len();
-        assert_eq!(rollback_range(n).collect::<Vec<_>>(), (0..n).collect::<Vec<_>>());
+        assert_eq!(
+            rollback_range(n).collect::<Vec<_>>(),
+            (0..n).collect::<Vec<_>>()
+        );
         // The range never includes the failed index itself (that add did not
         // succeed, so there is no listener there to remove).
         assert!(!rollback_range(2).contains(&2));
