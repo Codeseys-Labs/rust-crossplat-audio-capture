@@ -791,6 +791,16 @@ static WATCH_ADDRESSES: [AudioObjectPropertyAddress; 3] = [
     watch_address(kAudioHardwarePropertyDefaultInputDevice),
 ];
 
+/// The range of `WATCH_ADDRESSES` indices to UNREGISTER when listener
+/// registration fails at index `i` (i.e. listeners `0..i` were already
+/// registered). Extracted as a pure function so the rollback bookkeeping is
+/// unit-testable (rsac-af31) without driving CoreAudio to fail a real
+/// registration — the only way to exercise the rollback path live.
+#[inline]
+fn rollback_range(failed_at: usize) -> std::ops::Range<usize> {
+    0..failed_at
+}
+
 /// Context shared between the CoreAudio listener proc and the watch helper
 /// thread. Boxed and passed to `AudioObjectAddPropertyListener` as the
 /// `inClientData` cookie.
@@ -1130,8 +1140,10 @@ impl DeviceEnumerator for MacosDeviceEnumerator {
                 )
             };
             if status != 0 {
-                // Roll back the listeners registered so far (indices 0..i), fail.
-                for prior in WATCH_ADDRESSES.iter().take(i) {
+                // Roll back the listeners registered so far (indices `0..i` —
+                // see `rollback_range`, which encodes this for the unit test),
+                // then fail.
+                for prior in WATCH_ADDRESSES.iter().take(rollback_range(i).end) {
                     unsafe {
                         AudioObjectRemovePropertyListener(
                             kAudioObjectSystemObject,
@@ -2165,6 +2177,58 @@ mod tests {
             assert_eq!(addr.mScope, kAudioObjectPropertyScopeGlobal);
             assert_eq!(addr.mElement, KAUDIO_OBJECT_PROPERTY_ELEMENT_MAIN);
         }
+    }
+
+    /// rsac-af31: the mid-loop add-failure rollback unregisters exactly the
+    /// listeners already registered (`0..failed_at`). Exercising the real
+    /// rollback needs CoreAudio to FAIL a registration, so we unit-test the
+    /// extracted bookkeeping that drives `WATCH_ADDRESSES.iter().take(..)`.
+    #[test]
+    fn rollback_range_unregisters_only_prior_listeners() {
+        // Fail at index 0 → nothing was registered → roll back nothing.
+        assert_eq!(rollback_range(0), 0..0);
+        assert_eq!(rollback_range(0).count(), 0);
+        // Fail at index 1 → listener 0 was registered → roll back [0].
+        assert_eq!(rollback_range(1), 0..1);
+        assert_eq!(rollback_range(1).collect::<Vec<_>>(), vec![0]);
+        // Fail at index 2 → listeners 0,1 registered → roll back [0,1].
+        assert_eq!(rollback_range(2).collect::<Vec<_>>(), vec![0, 1]);
+        // Fail at the last index → roll back all prior, never the failed one.
+        let n = WATCH_ADDRESSES.len();
+        assert_eq!(rollback_range(n).collect::<Vec<_>>(), (0..n).collect::<Vec<_>>());
+        // The range never includes the failed index itself (that add did not
+        // succeed, so there is no listener there to remove).
+        assert!(!rollback_range(2).contains(&2));
+    }
+
+    /// rsac-af31: the listener context's `event_tx` is a `Mutex<Option<…>>` taken
+    /// exactly once at teardown to disconnect the channel WITHOUT freeing the
+    /// (intentionally leaked) context. Pin the single-take / idempotent semantics
+    /// device-free, without registering a real listener or spawning the helper.
+    #[test]
+    fn watch_listener_context_single_take_invariant() {
+        let (tx, _rx) = std::sync::mpsc::sync_channel::<DeviceEvent>(WATCH_CHANNEL_CAP);
+        let ctx = WatchListenerContext {
+            event_tx: std::sync::Mutex::new(Some(tx)),
+            previous_devices: std::sync::Mutex::new(std::collections::HashSet::new()),
+        };
+
+        // First take yields the sender.
+        assert!(
+            ctx.event_tx.lock().unwrap().take().is_some(),
+            "first take must yield Some(sender)"
+        );
+        // Second take yields None — the take is persistent (teardown disconnected
+        // the channel; a re-entrant proc must observe the channel as gone).
+        assert!(
+            ctx.event_tx.lock().unwrap().take().is_none(),
+            "second take must yield None (single-take invariant)"
+        );
+        // Third take stays None — idempotent.
+        assert!(
+            ctx.event_tx.lock().unwrap().take().is_none(),
+            "take must be idempotent after the channel is disconnected"
+        );
     }
 
     /// `OSStatus`'s `noErr` is `0`, the value the listener proc returns; guard
