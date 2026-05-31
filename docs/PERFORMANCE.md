@@ -106,9 +106,13 @@ non-locking, and allocation-free.
 `StreamStats` and `BackpressureReport` (`src/core/introspection.rs`) are
 `#[non_exhaustive]` snapshots assembled from `Relaxed` atomic counters
 (frames/buffers delivered, overruns, drops). Reading them does not lock the data
-plane and does not allocate. They honestly document their current
-*lifetime-window* limitation (counters are cumulative, not windowed) rather than
-fabricating windowed rates.
+plane and does not allocate. `StreamStats` carries **lifetime** totals;
+`BackpressureReport` is, since 0.4.0 (rsac-cfe4), a **windowed** view —
+`pushed`/`dropped`/`drop_rate` are summed over the producer's fixed, alloc-free
+sliding ring of `(pushed, dropped)` slots (advanced on every push path with
+`Relaxed` adds, so the RT producer stays lock-free/alloc-free), with `window`
+estimated from the buffer size and negotiated rate. This surfaces a sustained
+1-in-N loss the consecutive-drop bool resets away, without fabricating rates.
 
 ## Per-platform capture-thread notes
 

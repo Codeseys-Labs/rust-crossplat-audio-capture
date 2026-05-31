@@ -674,9 +674,9 @@ pub struct StreamStats {
 
 #[non_exhaustive]
 pub struct BackpressureReport {
-    pub window: Duration,        // ZERO today (lifetime totals; windowed atomics tracked)
-    pub pushed: u64,
-    pub dropped: u64,
+    pub window: Duration,        // recent-window span (est. buffers×size÷rate); ZERO only if unattributable
+    pub pushed: u64,             // windowed (0.4.0+, rsac-cfe4): summed over the producer's sliding ring
+    pub dropped: u64,            // windowed
     pub drop_rate: f64,          // dropped / (pushed + dropped), zero-guarded
     pub is_under_backpressure: bool, // legacy consecutive-drop bool, carried unchanged
 }

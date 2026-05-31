@@ -298,14 +298,20 @@ let _ = stats.dropped_ratio();      // dropped / (captured + dropped), zero-guar
 let _ = stats.uptime;               // ZERO when not started
 
 let bp: BackpressureReport = capture.backpressure_report();
-let _ = bp.drop_rate;               // surfaces partial loss the legacy bool misses
+let _ = bp.window;                  // recent-window span the tallies cover
+let _ = bp.drop_rate;               // surfaces sustained loss the legacy bool misses
 let _ = bp.is_under_backpressure;   // legacy consecutive-drop flag, carried unchanged
 ```
 
 `StreamStats` and `BackpressureReport` are `#[non_exhaustive]`; build them via
 `Default` + field assignment and match with `..`. Counters are cheap `Relaxed`
-loads on the non-RT query path. `BackpressureReport::window` is `Duration::ZERO`
-today (lifetime totals; a true window is tracked).
+loads on the non-RT query path. As of 0.4.0, `BackpressureReport` is a **windowed**
+view (rsac-cfe4): `pushed`/`dropped`/`drop_rate` cover a bounded recent window read
+from the producer's alloc-free sliding ring, so a sustained 1-in-N loss the
+consecutive-drop bool resets away is still surfaced. `window` is an estimate of the
+span those tallies cover (buffer size × count ÷ negotiated rate), falling back to
+`Duration::ZERO` only when the span cannot be attributed (no stream, or unknown
+buffer size / sample rate).
 
 ## Errors
 

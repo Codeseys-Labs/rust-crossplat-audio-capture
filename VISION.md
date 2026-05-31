@@ -84,10 +84,11 @@ pipeline.
   switch downstreams when the ring buffer is filling. `AudioCapture::stream_stats()
   -> StreamStats` is a cheap point-in-time snapshot (buffers pushed / captured /
   dropped, uptime, running state, negotiated-format description) and
-  `backpressure_report() -> BackpressureReport` adds cumulative drop accounting
-  (lifetime pushed / dropped counts, a lifetime drop-rate ratio, and the carried
-  consecutive-drop backpressure flag) — counters are cumulative, not windowed.
-  Both are `#[non_exhaustive]`.
+  `backpressure_report() -> BackpressureReport` adds a **windowed** drop-rate view
+  (since 0.4.0, rsac-cfe4): `pushed` / `dropped` / `drop_rate` over a bounded recent
+  window read from the producer's alloc-free sliding ring, an estimated `window`
+  span, and the carried consecutive-drop flag — so a sustained 1-in-N loss the
+  consecutive bool resets away is still surfaced. Both are `#[non_exhaustive]`.
 - **Device-change watching** — `DeviceEnumerator::watch(on_event) ->
   DeviceWatcher` (reachable from the `CrossPlatformDeviceEnumerator` facade)
   delivers `DeviceEvent`s (add / remove / default-changed) on the backend's OS

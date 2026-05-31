@@ -17,6 +17,11 @@ cgo and linked as a static library.
   - `capture.ReadBuffer()` / `capture.TryReadBuffer()` — blocking /
     non-blocking reads for lower-level control.
 - A callback API for push-style consumers.
+- Diagnostics that mirror the Rust surface: `capture.StreamStats()` (lifetime
+  counters), `capture.BackpressureReport()` (windowed drop-rate — surfaces
+  sustained loss the consecutive-drop flag resets away), and `capture.Format()`
+  (negotiated delivery format). See the parity matrix in
+  [`docs/CROSS_LANGUAGE_BINDINGS.md`](../../docs/CROSS_LANGUAGE_BINDINGS.md).
 - A typed `ErrorCode` enum mapped from `rsac_error_t`.
 
 ## Prerequisites

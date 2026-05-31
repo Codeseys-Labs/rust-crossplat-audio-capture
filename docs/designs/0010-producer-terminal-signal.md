@@ -128,13 +128,19 @@ Per-backend hooks:
   in-flight callback push past the declared end. Dropping the handle (not just calling
   `stop()`) therefore also lands the stream terminal.
 
-  *Optional follow-up (not in this change):* registering an
-  `AudioObjectAddPropertyListener` on `kAudioDevicePropertyDeviceIsAlive` for the
-  device/aggregate id and calling `signal_error()` on the not-alive callback would also
-  cover spontaneous device/tap death **without** a `stop()` call. Until then, that rare
-  case (a device dies while the user neither stops nor drops the handle) remains a
-  documented known limitation; the `stop_capture`/`Drop` hook already removes the common
-  teardown hang.
+  *Spontaneous device/tap death (implemented in 0.4.0, rsac-ead3):* a
+  `AudioObjectAddPropertyListener` on `kAudioDevicePropertyDeviceIsAlive` is now
+  registered for the captured device/aggregate id at capture start
+  (`register_device_alive_listener` in `coreaudio.rs`). When the device dies its
+  proc reads the not-alive value and drives the bridge terminal directly
+  (`state.force_set(Error)` + `notify_wake()` + the async waker — the same
+  alloc-free, lock-free, sticky terminal `signal_error()` produces), so a reader
+  parked in a blocking read observes a Fatal `StreamEnded` instead of hanging even
+  when the user neither stops nor drops the handle. The listener context is
+  intentionally leaked (CoreAudio gives no in-flight-proc barrier on removal),
+  mirroring the device-watch discipline; it is removed (best-effort) before
+  `stop_audio_unit` in `Drop`. This **closes** the former known limitation; the
+  `stop_capture`/`Drop` hook still covers the common explicit-teardown path.
 
 `signal_error()`/`signal_done()`/the Linux teardown transition/the macOS transition are
 all **idempotent** (`force_set` is last-writer-wins; the `transition` CAS no-ops if the
@@ -157,8 +163,9 @@ harmless.
 - No public/FFI signature change: `signal_error()` is a new `pub` method on the internal
   `BridgeProducer`, the Linux `active_shared`/`session_shared` and macOS `terminal`
   field are internal plumbing, and `create_macos_capture` is `pub(crate)`.
-- The remaining macOS spontaneous-death-without-stop case is a documented known
-  limitation pending the optional `DeviceIsAlive` listener.
+- The macOS spontaneous-death-without-stop case is now covered (0.4.0, rsac-ead3)
+  by the `kAudioDevicePropertyDeviceIsAlive` listener that drives the bridge
+  terminal directly — no longer a known limitation.
 
 ## 6. References
 
