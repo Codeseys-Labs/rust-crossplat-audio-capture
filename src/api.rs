@@ -445,7 +445,7 @@ impl AudioCaptureBuilder {
         Ok(selected_device)
     }
 
-    /// Returns the [`AudioFormat`] that
+    /// Returns the `AudioFormat` that
     /// [`build`](Self::build) would deliver for this configuration **without**
     /// constructing an [`AudioCapture`] or opening a stream (AEG-8, rsac-0113).
     ///
@@ -468,7 +468,7 @@ impl AudioCaptureBuilder {
     ///
     /// - **Windows (WASAPI) / macOS (CoreAudio):** the device advertises a fixed
     ///   set of formats, so negotiation is resolvable at config time and this
-    ///   returns the negotiated [`AudioFormat`].
+    ///   returns the negotiated `AudioFormat`.
     /// - **Linux (PipeWire):** the delivered format is negotiated at
     ///   **stream-open** (in the `param_changed` callback), *after* `build()`,
     ///   so it cannot be known pre-build. This method returns
