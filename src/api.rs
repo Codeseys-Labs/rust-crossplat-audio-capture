@@ -3560,6 +3560,80 @@ mod tests {
         );
     }
 
+    /// rsac-cfe4: `estimate_window_span` derives the report's `window` from the
+    /// buffer size and negotiated rate, falling back to ZERO when unattributable.
+    #[test]
+    fn estimate_window_span_derives_and_falls_back() {
+        // The mock's format() reports the negotiated rate, which takes precedence
+        // over config.sample_rate; set it so the two agree on 48000.
+        let mock = Arc::new(MockCapturingStream::new());
+        mock.format.lock().unwrap().sample_rate = 48000;
+        let mut cap = make_mock_capture(mock);
+        cap.config.stream_config.buffer_size = Some(1024);
+        cap.config.stream_config.sample_rate = 48000;
+
+        // Known buffer_size + rate → exact span: 100 buffers × 1024 frames @ 48000.
+        let span = cap.estimate_window_span(100);
+        let expected = 100.0 * 1024.0 / 48000.0; // ≈ 2.133s
+        assert!(
+            (span.as_secs_f64() - expected).abs() < 1e-6,
+            "span {} should equal {}",
+            span.as_secs_f64(),
+            expected
+        );
+
+        // Zero buffers → zero span (no fabricated duration).
+        assert_eq!(cap.estimate_window_span(0), Duration::ZERO);
+
+        // Unknown buffer_size → ZERO (span unattributable).
+        cap.config.stream_config.buffer_size = None;
+        assert_eq!(cap.estimate_window_span(100), Duration::ZERO);
+    }
+
+    /// rsac-cfe4: when neither the negotiated format nor the config carries a
+    /// usable rate, `estimate_window_span` falls back to ZERO (div-by-zero guard)
+    /// rather than fabricating a span.
+    #[test]
+    fn estimate_window_span_zero_rate_falls_back() {
+        let mock = Arc::new(MockCapturingStream::new());
+        // Negotiated format rate 0 AND config rate 0 → no usable rate anywhere.
+        mock.format.lock().unwrap().sample_rate = 0;
+        let mut cap = make_mock_capture(mock);
+        cap.config.stream_config.buffer_size = Some(512);
+        cap.config.stream_config.sample_rate = 0;
+        assert_eq!(cap.estimate_window_span(100), Duration::ZERO);
+    }
+
+    /// rsac-cfe4: `backpressure_report()` reports a non-zero `window` when the
+    /// buffer size and rate are known, matching `estimate_window_span`.
+    #[test]
+    fn backpressure_report_populates_window_span() {
+        let mock = Arc::new(MockCapturingStream::new());
+        mock.add_pushed(10);
+        mock.add_dropped(2);
+        mock.format.lock().unwrap().sample_rate = 48000;
+        let mut cap = make_mock_capture(mock);
+        cap.config.stream_config.buffer_size = Some(960);
+        cap.config.stream_config.sample_rate = 48000;
+
+        let r = cap.backpressure_report();
+        assert_eq!(r.pushed, 10);
+        assert_eq!(r.dropped, 2);
+        // window == (pushed + dropped=12) × 960 / 48000 = 0.24s, NOT Duration::ZERO.
+        let expected = 12.0 * 960.0 / 48000.0;
+        assert!(
+            (r.window.as_secs_f64() - expected).abs() < 1e-6,
+            "window {} should equal {}",
+            r.window.as_secs_f64(),
+            expected
+        );
+        assert_ne!(
+            r.window,
+            Duration::ZERO,
+            "window must be populated, not lifetime-ZERO"
+        );
+    }
+
     /// The legacy bool is carried through unchanged when it is set.
     #[test]
     fn backpressure_report_carries_legacy_bool() {

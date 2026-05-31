@@ -2491,6 +2491,74 @@ mod tests {
         );
     }
 
+    // rsac-cfe4: pack_window/unpack_window are the bit-layout primitive behind
+    // every windowed slot; a layout regression would silently corrupt every
+    // drop-rate report. Pin the round-trip and the bit positions.
+    #[test]
+    fn pack_unpack_window_round_trips_and_pins_bit_layout() {
+        // Round-trip a representative pair.
+        assert_eq!(unpack_window(pack_window(123, 456)), (123, 456));
+        // Boundaries: max in each half, and zero.
+        assert_eq!(
+            unpack_window(pack_window(u32::MAX, u32::MAX)),
+            (u32::MAX, u32::MAX)
+        );
+        assert_eq!(unpack_window(pack_window(0, 0)), (0, 0));
+        // Bit layout: pushed in the HIGH 32 bits, dropped in the LOW 32 bits.
+        assert_eq!(
+            pack_window(1, 0),
+            1u64 << 32,
+            "pushed must occupy the high half"
+        );
+        assert_eq!(pack_window(0, 1), 1u64, "dropped must occupy the low half");
+        // Unpacking an all-ones word yields both halves saturated.
+        assert_eq!(unpack_window(u64::MAX), (u32::MAX, u32::MAX));
+        // The two halves never bleed into each other.
+        assert_eq!(
+            unpack_window(pack_window(0xDEAD_BEEF, 0x0BAD_F00D)),
+            (0xDEAD_BEEF, 0x0BAD_F00D)
+        );
+    }
+
+    // rsac-cfe4: the cursor advances slots every DROP_WINDOW_SLOT_PUSHES attempts
+    // and resets each slot on first touch, so after a full sweep the ring holds
+    // only the most recent DROP_WINDOW_SLOTS slots' worth — proving wraparound +
+    // per-slot reset both work (an unreset slot would over-count).
+    #[test]
+    fn drop_window_cursor_wraps_and_resets_slots() {
+        let (mut producer, mut consumer) = create_bridge_with_options(1, test_format(), 1000);
+
+        // Push enough successful buffers to sweep the entire ring exactly twice.
+        // Each iteration: push into the empty slot (success), then drain. All
+        // pushes succeed, so every recorded window entry is a (1,0).
+        let total_attempts = DROP_WINDOW_SLOT_PUSHES * DROP_WINDOW_SLOTS as u64 * 2;
+        for _ in 0..total_attempts {
+            assert!(producer.push_or_drop(test_buffer(1.0)));
+            let _ = consumer.pop();
+        }
+
+        // The window holds at most DROP_WINDOW_SLOTS * DROP_WINDOW_SLOT_PUSHES
+        // pushes (a fully-swept ring of all-success slots) — NOT the full
+        // `total_attempts`. If slots were never reset on wrap, the snapshot would
+        // keep growing past the ring capacity.
+        let (w_pushed, w_dropped) = producer.drop_window_snapshot();
+        let ring_capacity = DROP_WINDOW_SLOTS as u64 * DROP_WINDOW_SLOT_PUSHES;
+        assert_eq!(
+            w_dropped, 0,
+            "all pushes succeeded; window must show zero drops"
+        );
+        assert!(
+            w_pushed <= ring_capacity,
+            "windowed pushed ({w_pushed}) must be bounded by the ring capacity \
+             ({ring_capacity}) — a slot that wasn't reset on wrap would over-count \
+             toward {total_attempts}"
+        );
+        assert!(
+            w_pushed > 0,
+            "the most-recent slots must still hold the recent successful pushes"
+        );
+    }
+
     // A zero threshold reports back-pressure immediately (0 >= 0), even before
     // any drop, and stays true after a drop.
     #[test]
