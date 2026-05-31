@@ -423,14 +423,13 @@ impl BackpressureReport {
     /// `window` is the span the tallies cover; pass [`Duration::ZERO`] when the
     /// counts are lifetime totals rather than a bounded window.
     ///
-    /// Until the bridge exposes a fixed-size ring of per-window snapshots
-    /// (rsac-cfe4's RT-side counters live in `bridge/ring_buffer.rs`, owned by the
-    /// bridge-internals area), [`AudioCapture::backpressure_report`] builds this
-    /// from the lifetime `buffers_pushed`/`buffers_dropped` counters and reports a
-    /// zero `window`. When the windowed atomics land, swap the source counters and
-    /// set `window` to the snapshot span — the public shape here does not change.
-    // TODO(rsac-cfe4): consume the bridge's windowed (pushed,dropped) atomics once
-    // the bridge-internals area exposes them; until then this is a lifetime view.
+    /// [`AudioCapture::backpressure_report`] builds this from the bridge's
+    /// fixed-size ring of per-window `(pushed, dropped)` snapshots (rsac-cfe4's
+    /// alloc-free RT-side counters in `bridge/ring_buffer.rs`, read via
+    /// `CapturingStream::drop_window_snapshot`), so the counts are a bounded
+    /// recent window rather than lifetime totals. The `window` span is estimated
+    /// read-side from the buffer size and negotiated rate, falling back to
+    /// [`Duration::ZERO`] only when the span cannot be attributed.
     pub(crate) fn from_counts(
         window: Duration,
         pushed: u64,

@@ -2444,6 +2444,53 @@ mod tests {
         );
     }
 
+    // rsac-cfe4 ACCEPTANCE: a sustained drop,push,drop,push pattern NEVER trips
+    // the consecutive-drop bool (each drop is immediately followed by a
+    // successful push that resets the streak), yet the *windowed* snapshot must
+    // still surface the ~50% loss the bool is blind to.
+    #[test]
+    fn windowed_snapshot_catches_sustained_loss_the_bool_misses() {
+        // Capacity 1 so the ring holds exactly one buffer: after one successful
+        // push, the next push drops; popping makes room for the next success.
+        // Threshold 2 so a single isolated drop never trips the consecutive bool.
+        let (mut producer, mut consumer) = create_bridge_with_options(1, test_format(), 2);
+
+        let mut pushes = 0u64;
+        let mut drops = 0u64;
+        // Alternate push (succeeds, resets streak) / drop (ring full) across many
+        // window slots so the pattern spans the sliding ring, not a single slot.
+        for _ in 0..256 {
+            // push into the empty slot — succeeds
+            assert!(producer.push_or_drop(test_buffer(1.0)));
+            pushes += 1;
+            // ring is now full → this push drops (consecutive_drops becomes 1,
+            // never reaching the threshold of 2 because the next iteration's
+            // successful push resets it)
+            assert!(!producer.push_or_drop(test_buffer(9.0)));
+            drops += 1;
+            // drain so the next iteration's first push succeeds again
+            let _ = consumer.pop();
+            // The consecutive-drop bool must NEVER trip under this pattern.
+            assert!(
+                !producer.shared().is_under_backpressure(),
+                "drop,push,drop,push must never trip the consecutive-drop bool"
+            );
+        }
+
+        // The windowed snapshot, by contrast, reflects the sustained ~50% loss.
+        let (w_pushed, w_dropped) = producer.drop_window_snapshot();
+        assert!(
+            w_pushed > 0 && w_dropped > 0,
+            "windowed snapshot must record both pushes and drops (got {w_pushed} pushed, {w_dropped} dropped)"
+        );
+        let drop_rate = w_dropped as f64 / (w_pushed + w_dropped) as f64;
+        assert!(
+            (0.4..=0.6).contains(&drop_rate),
+            "windowed drop_rate must be ~0.5 for a 1:1 drop:push pattern, got {drop_rate} \
+             (window pushed={w_pushed} dropped={w_dropped}; lifetime pushed={pushes} dropped={drops})"
+        );
+    }
+
     // A zero threshold reports back-pressure immediately (0 >= 0), even before
     // any drop, and stays true after a drop.
     #[test]

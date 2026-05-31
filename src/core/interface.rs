@@ -316,6 +316,23 @@ pub trait CapturingStream: Send + Sync {
         false
     }
 
+    /// Aggregate `(pushed, dropped)` totals across the producer's sliding
+    /// drop-rate window (`rsac-cfe4`).
+    ///
+    /// Unlike the lifetime `buffers_pushed`/`buffers_dropped` counters, this is a
+    /// bounded, *recent* view: it sums a fixed ring of per-window snapshots that
+    /// the producer advances as it runs, so it reflects a sustained loss pattern
+    /// (e.g. a steady 1-in-3 drop) that the consecutive-drop
+    /// [`is_under_backpressure`](Self::is_under_backpressure) bool resets away on
+    /// any single successful push. Reading it is alloc-free and lock-free.
+    ///
+    /// The default returns `(0, 0)` for backends that do not track a window;
+    /// the bridge-backed [`BridgeStream`](crate::bridge::stream) overrides it.
+    /// Consumed read-side by [`AudioCapture::backpressure_report`].
+    fn drop_window_snapshot(&self) -> (u64, u64) {
+        (0, 0)
+    }
+
     /// Closes the stream and releases all OS resources.
     ///
     /// **Deprecated.** All real cleanup happens in the stream's `Drop` impl

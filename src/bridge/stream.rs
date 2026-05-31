@@ -155,20 +155,6 @@ impl<S: PlatformStream> BridgeStream<S> {
     pub fn buffers_read(&self) -> u64 {
         self.shared.buffers_popped.load(Ordering::Relaxed)
     }
-
-    /// Aggregate `(pushed, dropped)` totals across the bridge's sliding
-    /// drop-rate window (`rsac-cfe4`).
-    ///
-    /// This is the windowed view that does **not** reset on a single successful
-    /// push (unlike [`is_under_backpressure`](CapturingStream::is_under_backpressure)),
-    /// so it surfaces sustained 1-in-N loss the consecutive-drop bool misses.
-    /// The `AudioCapture`/`BackpressureReport` layer (stats area) reads this to
-    /// compute a windowed `drop_rate`; exposed here so it can reach the bridge
-    /// atomics through the stream without touching producer internals.
-    #[allow(dead_code)]
-    pub fn drop_window_snapshot(&self) -> (u64, u64) {
-        self.shared.drop_window_snapshot()
-    }
 }
 
 // ── CapturingStream Implementation ───────────────────────────────────────
@@ -314,6 +300,14 @@ impl<S: PlatformStream + Sync + 'static> CapturingStream for BridgeStream<S> {
 
     fn is_under_backpressure(&self) -> bool {
         self.shared.is_under_backpressure()
+    }
+
+    fn drop_window_snapshot(&self) -> (u64, u64) {
+        // rsac-cfe4: the windowed (pushed, dropped) view, summed alloc-free over
+        // the producer's fixed drop-rate ring. Surfaces sustained 1-in-N loss
+        // that the consecutive-drop bool resets away. Read by
+        // AudioCapture::backpressure_report() to compute a windowed drop_rate.
+        self.shared.drop_window_snapshot()
     }
 
     // FH-5 waker contract: `BridgeStream` registers the waker into the

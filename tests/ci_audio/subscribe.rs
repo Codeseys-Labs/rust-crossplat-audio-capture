@@ -52,6 +52,14 @@ fn fail_or_skip(label: &str, detail: &str) {
 fn subscribe_delivers_buffers_from_live_capture() {
     require_audio!();
 
+    // #34: feed a known 440 Hz tone through SystemDefault loopback so the
+    // subscribe path can be CONTENT-verified (not just liveness-verified) on a
+    // deterministic source. Mirrors system_capture.rs. On a non-deterministic
+    // host the player may be unavailable; that path still soft-skips below.
+    let wav_path = helpers::generate_test_wav(5.0, 48000, 2);
+    let player = helpers::spawn_test_tone_player(&wav_path);
+    std::thread::sleep(Duration::from_millis(500));
+
     let mut capture = match AudioCaptureBuilder::new()
         .with_target(CaptureTarget::SystemDefault)
         .sample_rate(48000)
@@ -60,12 +68,18 @@ fn subscribe_delivers_buffers_from_live_capture() {
     {
         Ok(c) => c,
         Err(e) => {
+            if let Some(p) = player {
+                helpers::stop_player(p);
+            }
             fail_or_skip("subscribe live build", &format!("{e:?}"));
             return;
         }
     };
 
     if let Err(e) = capture.start() {
+        if let Some(p) = player {
+            helpers::stop_player(p);
+        }
         fail_or_skip("subscribe live start", &format!("{e:?}"));
         return;
     }
@@ -74,6 +88,9 @@ fn subscribe_delivers_buffers_from_live_capture() {
         Ok(rx) => rx,
         Err(e) => {
             let _ = capture.stop();
+            if let Some(p) = player {
+                helpers::stop_player(p);
+            }
             panic!(
                 "subscribe() on a running capture must succeed; got: {:?}",
                 e
@@ -83,22 +100,29 @@ fn subscribe_delivers_buffers_from_live_capture() {
 
     // 5s ceiling matches `stream_lifecycle` timeout — generous enough for
     // cold-start latency on headless VMs while still bounding total test time.
+    // Collect for up to 5s. We need MORE than 3 buffers now: content checks
+    // (RMS/tone) want enough audio to clear cold-start silence, so accumulate
+    // until we have a confident content observation or the deadline hits.
     let deadline = Instant::now() + Duration::from_secs(5);
     let mut buffers_received = 0usize;
+    let mut got_non_silence = false;
+    let mut got_tone = false;
 
-    while Instant::now() < deadline && buffers_received < 3 {
+    while Instant::now() < deadline && !(got_non_silence && got_tone) {
         // recv_timeout so we can break on deadline rather than blocking
         // indefinitely on a silent system.
         match rx.recv_timeout(Duration::from_millis(500)) {
             Ok(buf) => {
                 buffers_received += 1;
-                eprintln!(
-                    "[ci_audio] subscribe live: buffer {} — {} frames, {}ch @ {}Hz",
-                    buffers_received,
-                    buf.num_frames(),
-                    buf.channels(),
-                    buf.sample_rate(),
-                );
+                if buffers_received <= 3 {
+                    eprintln!(
+                        "[ci_audio] subscribe live: buffer {} — {} frames, {}ch @ {}Hz",
+                        buffers_received,
+                        buf.num_frames(),
+                        buf.channels(),
+                        buf.sample_rate(),
+                    );
+                }
                 // Guard against silent-wrong-output regressions in the
                 // subscribe path. The builder *requested* 48000/2, but rsac
                 // does not resample, so a shared-mode backend delivers the
@@ -106,6 +130,16 @@ fn subscribe_delivers_buffers_from_live_capture() {
                 // holds under a deterministic source. See
                 // `helpers::assert_buffer_format`.
                 helpers::assert_buffer_format(&buf, 48000, 2);
+
+                // #34: CONTENT verification — the subscribe path must carry the
+                // real 440 Hz tone, not just well-formed silence. Accumulate
+                // observations; asserted (hard) under a deterministic source below.
+                if !got_non_silence && helpers::verify_non_silence(&buf, 0.001) {
+                    got_non_silence = true;
+                }
+                if !got_tone && helpers::verify_tone_present(&buf, 440.0) {
+                    got_tone = true;
+                }
             }
             Err(mpsc::RecvTimeoutError::Timeout) => {
                 // Still live — loop until deadline.
@@ -117,6 +151,10 @@ fn subscribe_delivers_buffers_from_live_capture() {
     }
 
     let _ = capture.stop();
+    if let Some(p) = player {
+        helpers::stop_player(p);
+    }
+    let _ = std::fs::remove_file(&wav_path);
 
     if buffers_received == 0 {
         // A deterministic source feeds the null sink a known tone, so the
@@ -131,9 +169,30 @@ fn subscribe_delivers_buffers_from_live_capture() {
             "[ci_audio] ⚠ subscribe live: no buffers within 5s \
              (non-deterministic host — backend may be idle)"
         );
-    } else {
-        eprintln!(
-            "[ci_audio] ✅ subscribe live: received {} buffers via channel",
+        return;
+    }
+
+    eprintln!(
+        "[ci_audio] ✅ subscribe live: received {} buffers (non_silence={}, tone={})",
+        buffers_received, got_non_silence, got_tone
+    );
+
+    // #34: under a deterministic source the 440 Hz tone is guaranteed to flow,
+    // so the subscribe path must deliver NON-SILENT audio carrying that tone.
+    // Anything else is a silent-wrong-output regression (the channel delivers
+    // empty/garbage buffers), not host flakiness. On a non-deterministic host
+    // these stay soft (logged above) since real routing can be silent.
+    if helpers::deterministic_audio_env() {
+        assert!(
+            got_non_silence,
+            "deterministic source: subscribe() delivered only silence across {} buffers — \
+             the live capture → channel path is dropping signal",
+            buffers_received
+        );
+        assert!(
+            got_tone,
+            "deterministic source: subscribe() never carried the 440 Hz tone across {} buffers — \
+             the channel is delivering wrong-content audio",
             buffers_received
         );
     }

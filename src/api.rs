@@ -1982,28 +1982,57 @@ impl AudioCapture {
     ///
     /// # Windowing
     ///
-    /// The canonical windowed implementation places a fixed-size, alloc-free ring
-    /// of per-window `(pushed, dropped)` snapshots in the bridge producer
-    /// (`bridge/ring_buffer.rs`, owned by the bridge-internals area). Until those
-    /// RT-side atomics are exposed, this read-side method derives the report from
-    /// the lifetime `buffers_pushed`/`buffers_dropped` counters plus the legacy
-    /// bool, reporting `window == Duration::ZERO` (a lifetime view). When the
-    /// windowed atomics land, this method swaps to reading them and sets a real
-    /// `window`; the public [`BackpressureReport`] shape does not change.
-    // TODO(rsac-cfe4): switch the (pushed, dropped) source to the bridge's
-    // windowed atomics and report the true window span once the bridge-internals
-    // area exposes them.
+    /// The producer maintains a fixed-size, alloc-free ring of per-window
+    /// `(pushed, dropped)` snapshots in the bridge (`bridge/ring_buffer.rs`); this
+    /// method reads that **windowed** view via
+    /// [`CapturingStream::drop_window_snapshot`], so the report reflects a
+    /// *recent* loss pattern — including a sustained 1-in-N drop that the
+    /// consecutive-drop bool resets away — rather than lifetime totals.
+    ///
+    /// The reported `window` is an honest estimate of the wall-clock the windowed
+    /// tallies cover: `(pushed + dropped)` buffers × the per-buffer duration
+    /// (`buffer_size` frames at the negotiated `sample_rate`). When the buffer
+    /// size or rate is unknown (no stream / not yet negotiated, or a zero rate),
+    /// `window` falls back to [`Duration::ZERO`] — the tallies are still valid,
+    /// only their span is unattributed. The legacy
+    /// [`is_under_backpressure`](CapturingStream::is_under_backpressure) bool is
+    /// carried unchanged inside the report.
     pub fn backpressure_report(&self) -> BackpressureReport {
         let stream = match self.stream.as_ref() {
             Some(s) => s,
             None => return BackpressureReport::default(),
         };
+        let (pushed, dropped) = stream.drop_window_snapshot();
         BackpressureReport::from_counts(
-            Duration::ZERO,
-            stream.buffers_pushed(),
-            stream.buffers_dropped(),
+            self.estimate_window_span(pushed + dropped),
+            pushed,
+            dropped,
             stream.is_under_backpressure(),
         )
+    }
+
+    /// Estimate the wall-clock span covered by `buffers` push attempts, from the
+    /// configured buffer size and the negotiated (or requested) sample rate.
+    ///
+    /// Returns [`Duration::ZERO`] when the span cannot be attributed — an unknown
+    /// buffer size or a zero/unknown sample rate — so a caller never reads a
+    /// fabricated span. Each push delivers one `buffer_size`-frame buffer, so the
+    /// window is `buffers × buffer_size / sample_rate` seconds.
+    fn estimate_window_span(&self, buffers: u64) -> Duration {
+        let frames_per_buffer = match self.config.stream_config.buffer_size {
+            Some(n) if n > 0 => n as u64,
+            _ => return Duration::ZERO,
+        };
+        let sample_rate = self
+            .format()
+            .map(|f| f.sample_rate)
+            .filter(|&r| r > 0)
+            .unwrap_or(self.config.stream_config.sample_rate);
+        if sample_rate == 0 {
+            return Duration::ZERO;
+        }
+        let total_frames = buffers.saturating_mul(frames_per_buffer);
+        Duration::from_secs_f64(total_frames as f64 / sample_rate as f64)
     }
 }
 
@@ -2614,6 +2643,17 @@ mod tests {
 
         fn is_under_backpressure(&self) -> bool {
             self.backpressure.load(Ordering::SeqCst)
+        }
+
+        fn drop_window_snapshot(&self) -> (u64, u64) {
+            // The mock has no real sliding ring; its lifetime pushed/dropped
+            // counters stand in as the windowed view so backpressure_report()
+            // tests can drive a known (pushed, dropped) pair through the same
+            // read path BridgeStream uses.
+            (
+                self.pushed.load(Ordering::Relaxed),
+                self.overruns.load(Ordering::Relaxed),
+            )
         }
     }
 
