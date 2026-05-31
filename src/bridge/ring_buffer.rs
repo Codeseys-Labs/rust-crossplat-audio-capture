@@ -1281,15 +1281,24 @@ impl SampleRingProducer {
     /// Push one interleaved-`f32` chunk into the sample ring with **zero
     /// allocation** on this (real-time) call.
     ///
-    /// Reserves `data.len()` contiguous-or-wrapped slots via
-    /// `write_chunk_uninit`, copies the samples in with
-    /// [`CopyToUninit::copy_to_uninit`] (a `memcpy` into `MaybeUninit<f32>`
-    /// slots — no intermediate buffer), commits, then publishes one metadata
-    /// record. If either ring lacks room the whole chunk is dropped atomically
-    /// (nothing is committed) and `buffers_dropped` is incremented, so the
-    /// consumer never sees a partial chunk.
+    /// Reserves `data.len()` contiguous-or-wrapped sample slots **and** one
+    /// metadata slot via `write_chunk_uninit` *before committing either*, copies
+    /// the samples in with [`CopyToUninit::copy_to_uninit`] (a `memcpy` into
+    /// `MaybeUninit<f32>` slots — no intermediate buffer), writes the metadata
+    /// record into its reserved slot, then commits **both** together. If either
+    /// ring lacks room the whole chunk is dropped atomically — both reservations
+    /// are released uncommitted, nothing is orphaned — and `buffers_dropped` is
+    /// incremented, so the meta-authoritative consumer never sees a partial or
+    /// desynchronized chunk (FH-4).
     ///
     /// Returns `true` if the chunk was published, `false` if dropped.
+    //
+    // The failure paths `drop(sample_chunk)`/`drop(meta_chunk)` explicitly end the
+    // `&mut self.samples`/`self.meta` borrows (releasing the rtrb reservations
+    // UNCOMMITTED) before the `&self` `drop_chunk()` reborrow. `WriteChunkUninit`
+    // has no `Drop` impl, so clippy's `drop_non_drop` fires — but the drop is for
+    // borrow-scope/intent, not a Drop side effect, so it is allowed here.
+    #[allow(clippy::drop_non_drop)]
     pub fn push_samples_or_drop_at(
         &mut self,
         data: &[f32],
@@ -1297,38 +1306,69 @@ impl SampleRingProducer {
         sample_rate: u32,
         timestamp: Option<Duration>,
     ) -> bool {
-        // Require room in BOTH rings before committing anything, so a chunk is
-        // all-or-nothing and the metadata/sample streams never desynchronize.
-        if self.meta.slots() == 0 {
-            return self.drop_chunk();
-        }
-        let mut chunk = match self.samples.write_chunk_uninit(data.len()) {
+        // FH-4: RESERVE a slot in BOTH rings before committing EITHER, so a
+        // chunk is genuinely all-or-nothing. The consumer is meta-AUTHORITATIVE:
+        // `SampleRingConsumer::pop` reads one `ChunkMeta` then pops exactly
+        // `meta.len` samples, so an orphaned run of committed samples with no
+        // matching meta would shift EVERY later read window — a permanent stream
+        // desync, not a single-chunk loss. The previous ordering committed the
+        // samples first and could not un-commit them if the meta push failed; we
+        // now hold both reservations open and commit them together (or neither).
+        let mut sample_chunk = match self.samples.write_chunk_uninit(data.len()) {
             Ok(chunk) => chunk,
             Err(_too_few) => return self.drop_chunk(),
+        };
+        // Reserve the metadata slot *while still holding* the (uncommitted)
+        // sample reservation. If the meta ring is full, BOTH reservations are
+        // dropped without committing — the sample slots are released untouched,
+        // so nothing is orphaned. The reservations borrow `self.samples` /
+        // `self.meta`, so on the failure paths below we must `drop` the live
+        // reservation(s) BEFORE calling `drop_chunk(&self)` (which reborrows
+        // `self`); dropping a `WriteChunkUninit` releases its slots uncommitted.
+        let mut meta_chunk = match self.meta.write_chunk_uninit(1) {
+            Ok(chunk) => chunk,
+            Err(_too_few) => {
+                drop(sample_chunk); // release the uncommitted sample slots
+                return self.drop_chunk();
+            }
         };
 
         // Copy the interleaved samples straight into the (possibly wrapped)
         // uninitialized ring slots — no Vec, no AudioBuffer.
-        let (first, second) = chunk.as_mut_slices();
+        let (first, second) = sample_chunk.as_mut_slices();
         let mid = first.len();
         data[..mid].copy_to_uninit(first);
         data[mid..].copy_to_uninit(second);
-        // SAFETY: copy_to_uninit initialized exactly `data.len()` slots above.
-        unsafe { chunk.commit_all() };
 
+        // Initialize the single reserved metadata slot.
         let meta = ChunkMeta {
             len: data.len(),
             channels,
             sample_rate,
             timestamp_nanos: timestamp.map_or(NO_TIMESTAMP, |d| d.as_nanos() as u64),
         };
-        // The metadata push cannot fail: we checked `meta.slots() > 0` above and
-        // are the sole producer. If it somehow did, the samples are already
-        // committed; recover by counting a drop (the consumer tolerates a
-        // missing meta by treating the sample ring as authoritative-by-meta).
-        if self.meta.push(meta).is_err() {
+        let (meta_first, _meta_second) = meta_chunk.as_mut_slices();
+        // `write_chunk_uninit(1)` reserved exactly one slot; rtrb places a single
+        // contiguous slot in `meta_first` (the second slice is empty). Degrade to
+        // an atomic drop rather than panic if that invariant is ever violated.
+        if meta_first.is_empty() {
+            debug_assert!(false, "write_chunk_uninit(1) yielded an empty first slice");
+            // Drop both reservations uncommitted — nothing is orphaned.
+            drop(meta_chunk);
+            drop(sample_chunk);
             return self.drop_chunk();
         }
+        meta_first[0].write(meta);
+
+        // Both reservations are filled and neither is committed yet. Commit them
+        // together so the sample run and its meta become visible atomically (the
+        // consumer reads meta then samples, so committing samples first is fine —
+        // the meta commit is what publishes the chunk).
+        // SAFETY: `copy_to_uninit` initialized exactly `data.len()` sample slots
+        // and `meta_first[0].write(meta)` initialized the one reserved meta slot
+        // above.
+        unsafe { sample_chunk.commit_all() };
+        unsafe { meta_chunk.commit_all() };
 
         self.shared.buffers_pushed.fetch_add(1, Ordering::Relaxed);
         self.shared.consecutive_drops.store(0, Ordering::Relaxed);
@@ -3304,6 +3344,67 @@ mod sample_ring_tests {
         let buf = consumer.pop().expect("first chunk");
         assert_eq!(buf.data(), &[1.0, 2.0, 3.0, 4.0]);
         assert!(consumer.pop().is_none(), "dropped chunk must not appear");
+    }
+
+    // FH-4 regression: when the META ring is full but the SAMPLE ring still has
+    // room, the chunk must be dropped ATOMICALLY — the samples must NOT be
+    // committed-then-orphaned. The consumer is meta-authoritative (it reads one
+    // ChunkMeta then pops exactly meta.len samples), so an orphaned sample run
+    // would shift every later read window and permanently desync the stream.
+    // This test would FAIL with the old commit-samples-then-push-meta ordering:
+    // the dropped chunk's samples would be left in the f32 ring and the next
+    // popped chunk would read the WRONG samples (the orphaned run instead of its
+    // own), corrupting the data.
+    #[test]
+    fn sample_ring_meta_full_does_not_orphan_samples() {
+        // Roomy sample ring, but only ONE meta slot — so the second push fails
+        // on the meta reservation while the sample ring still has capacity.
+        let (mut producer, mut consumer) = create_sample_ring(64, 1, fmt());
+
+        // First push consumes the single meta slot and 4 sample slots.
+        assert!(producer.push_samples_or_drop(&[1.0, 2.0, 3.0, 4.0], 2, 48000));
+
+        // Second push: sample ring has room (60 free slots) but meta ring is
+        // full. Must drop atomically — NOTHING committed to the sample ring.
+        assert!(
+            !producer.push_samples_or_drop(&[5.0, 6.0, 7.0, 8.0], 2, 48000),
+            "meta-full push must report a drop"
+        );
+        assert_eq!(
+            producer.shared.buffers_dropped.load(Ordering::Relaxed),
+            1,
+            "exactly one chunk dropped"
+        );
+
+        // The f32 sample ring must hold ONLY the first chunk's 4 samples — if the
+        // second chunk's samples had been orphaned, this would be 8.
+        assert_eq!(
+            producer.samples.slots(),
+            64 - 4,
+            "no orphaned samples may remain committed in the f32 ring"
+        );
+
+        // Consume the one real chunk: it must read its OWN samples, intact.
+        let buf = consumer.pop().expect("first chunk");
+        assert_eq!(
+            buf.data(),
+            &[1.0, 2.0, 3.0, 4.0],
+            "consumer must read the correct (non-desynced) sample window"
+        );
+        assert!(
+            consumer.pop().is_none(),
+            "the dropped chunk must not appear"
+        );
+
+        // After draining, the meta slot is free again: a fresh push then pop must
+        // line up correctly, proving the stream is not permanently desynced.
+        assert!(producer.push_samples_or_drop(&[9.0, 10.0], 1, 48000));
+        let buf2 = consumer.pop().expect("post-drain chunk");
+        assert_eq!(
+            buf2.data(),
+            &[9.0, 10.0],
+            "stream realigns cleanly after a meta-full drop — no permanent desync"
+        );
     }
 
     // available_chunks reflects pending complete chunks.

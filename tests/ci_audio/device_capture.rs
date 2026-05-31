@@ -26,7 +26,7 @@ fn test_capture_from_selected_device() {
         }
     };
 
-    let default_device = match enumerator.get_default_device() {
+    let default_device = match enumerator.default_device() {
         Ok(d) => d,
         Err(e) => {
             eprintln!("[ci_audio] Failed to get default device: {:?}", e);

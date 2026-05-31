@@ -1214,7 +1214,7 @@ pub unsafe extern "C" fn rsac_default_device(
         }
         unsafe { *out = ptr::null_mut() };
         let e = unsafe { &*enumerator };
-        match e.inner.get_default_device() {
+        match e.inner.default_device() {
             Ok(device) => {
                 let handle = Box::new(RsacDevice { inner: device });
                 unsafe { *out = Box::into_raw(handle) };

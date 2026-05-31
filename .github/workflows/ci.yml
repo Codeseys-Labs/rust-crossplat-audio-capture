@@ -386,6 +386,70 @@ jobs:
       - name: Check rsac-ffi (C FFI)
         run: cargo check -p rsac-ffi
 
+      # rsac-1413 / BP-5: the curated include/rsac.h (which rsac-go links against)
+      # must never silently drift from the cbindgen-generated twin. build.rs runs
+      # cbindgen on every build and writes include/rsac_generated.h. Here we build
+      # rsac-ffi to (re)generate that twin, then diff its SYMBOL SET — every
+      # typedef/struct/enum type name plus every exported `rsac_*` function name —
+      # against the curated header. We compare the symbol SET, not the byte stream,
+      # so the headers may legitimately differ in layout, doc comments, and the
+      # tagged-vs-anonymous typedef style (`typedef enum X {…} X;` vs
+      # `typedef enum {…} X;`) — only a genuinely added / renamed / removed symbol
+      # fails the job. A failure means: regenerate rsac_generated.h, then update the
+      # curated rsac.h (NEVER point cbindgen --output at rsac.h).
+      - name: Header drift check (curated rsac.h vs generated)
+        shell: bash
+        run: |
+          set -euo pipefail
+          # build.rs runs cbindgen and writes include/rsac_generated.h.
+          cargo build -p rsac-ffi
+          cd bindings/rsac-ffi/include
+
+          CURATED="rsac.h"
+          GENERATED="rsac_generated.h"
+          for h in "$CURATED" "$GENERATED"; do
+            [ -f "$h" ] || { echo "::error::expected header $h not found"; exit 1; }
+          done
+
+          # Extract the canonical symbol set from a C header:
+          #   • value typedefs   ->  trailing "} NAME;"  (enum/struct, either style)
+          #   • opaque typedefs  ->  "typedef struct X NAME;"
+          #   • fn-ptr typedefs  ->  "(*NAME)("
+          #   • exported fns     ->  "rsac_<name>("
+          # This is style-tolerant: a tagged `typedef enum X {…} X;` and an
+          # anonymous `typedef enum {…} X;` both reduce to the name `X`.
+          symbols() {
+            local f="$1"
+            {
+              grep -oE '^\}[[:space:]]*[A-Za-z_][A-Za-z0-9_]*[[:space:]]*;' "$f" \
+                | sed -E 's/^\}[[:space:]]*//; s/[[:space:]]*;//'
+              grep -oE 'typedef[[:space:]]+struct[[:space:]]+[A-Za-z_][A-Za-z0-9_]*[[:space:]]+[A-Za-z_][A-Za-z0-9_]*[[:space:]]*;' "$f" \
+                | sed -E 's/.*[[:space:]]([A-Za-z_][A-Za-z0-9_]*)[[:space:]]*;/\1/'
+              grep -oE '\(\*[A-Za-z_][A-Za-z0-9_]*\)' "$f" | sed -E 's/\(\*//; s/\)//'
+              grep -oE '\brsac_[A-Za-z0-9_]*\(' "$f" | sed -E 's/\($//'
+            } | sort -u
+          }
+
+          symbols "$CURATED" > curated-symbols.txt
+          symbols "$GENERATED" > generated-symbols.txt
+
+          echo "curated  symbols: $(wc -l < curated-symbols.txt)"
+          echo "generated symbols: $(wc -l < generated-symbols.txt)"
+
+          # Guard against an extractor that silently matched nothing.
+          if [ ! -s curated-symbols.txt ] || [ ! -s generated-symbols.txt ]; then
+            echo "::error::symbol extraction yielded an empty set — the header format may have changed; fix the extractor in ci.yml"
+            exit 1
+          fi
+
+          if ! diff -u curated-symbols.txt generated-symbols.txt; then
+            echo "::error::cbindgen-generated header symbol set has DRIFTED from the curated include/rsac.h."
+            echo "::error::'-' lines are only in curated rsac.h; '+' lines are only in generated rsac_generated.h."
+            echo "::error::Reconcile: regenerate rsac_generated.h, then update the curated rsac.h to match (NEVER cbindgen --output rsac.h)."
+            exit 1
+          fi
+          echo "OK: curated rsac.h and generated rsac_generated.h share an identical symbol set ($(wc -l < curated-symbols.txt) symbols)."
+
       - name: Check rsac-napi (Node.js/TypeScript)
         run: cargo check -p rsac-napi
 

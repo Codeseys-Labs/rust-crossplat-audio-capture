@@ -63,38 +63,94 @@ Notes per row:
   `runtime.SetFinalizer` safety net but documents explicit `Close()` (idempotent)
   as preferred; the finalizer is cleared on explicit close.
 
-### Known binding limitations (tracked)
+### Terminal-error & recoverable-error delivery
 
-These are real, current behaviours — documented here rather than papered over.
-They are tracked code fixes, not doc fixes.
+rsac distinguishes a **recoverable** read error (a transient hiccup — a momentary
+over-/under-run, timeout, or backend blip) from a **fatal/terminal** one (the
+stream is over: `AudioError::StreamEnded` and the other Fatal variants). The
+classification lives in the core and is recorded in
+[ADR-0003](designs/0003-terminal-stream-error.md); every binding projects it
+through `is_fatal()`/`is_recoverable()` (Go reads it off the FFI error code via
+`ErrorCode.IsRecoverable`). All error-aware streaming surfaces honour **two
+invariants**:
 
-- **Python iterator raises on natural end-of-capture (tracked, critique
-  BFFI-03).** `PyAudioCapture.__next__` maps only `AudioError::StreamReadError`
-  to `StopIteration`. The bridge's *terminal* signal is `StreamEnded` (Fatal per
-  [ADR-0003](designs/0003-terminal-stream-error.md)), which falls through to the
-  general error mapping and is raised as a `StreamError` exception. So iterating
-  `for buf in capture:` to the natural end of a capture currently raises instead
-  of stopping cleanly. The fix is to end iteration on any terminal stream signal
-  (`StreamEnded`, or branch on `is_fatal()`); until then, callers should catch
-  the terminal error. Sync/async context managers and `read_buffer` itself are
-  unaffected.
-- **C FFI `rsac_version()` is hardcoded (tracked, critique BFFI-04).**
-  `rsac_version()` in `bindings/rsac-ffi/src/lib.rs` returns a static
-  `"0.1.0"`, while the workspace crate and the Python/Node bindings are `0.2.0`
-  (`rsac-python` reports `env!("CARGO_PKG_VERSION")`). Go's C ABI therefore
-  reports a wrong version string. The fix is to return `env!("CARGO_PKG_VERSION")`
-  and bump `rsac-ffi`'s package version to align with the workspace. Do **not**
-  rely on `rsac_version()` for version gating until this lands.
-- **Go `ReadBuffer`/`TryReadBuffer` concurrent-`Close()` UAF (tracked, critique
-  BFFI-02).** These methods snapshot the handle, drop the mutex, then call the C
-  read; a concurrent `Close()` can free the handle mid-read. This is a
-  memory-safety bug fixed separately — the in-source comment claiming it is
-  "safe to use without the lock" is misleading. Until fixed, do not call
-  `Close()` concurrently with an in-flight `ReadBuffer`.
-- **Python `CaptureTarget.__str__` is not the canonical target string.** It
+1. **A recoverable error never ends the stream.** The consumption loop yields and
+   retries; a transient hiccup is not a reason to stop delivering audio.
+2. **The stream ends cleanly on, and only on, the fatal terminal.** On the
+   **error-carrying** surfaces (`subscribe_with_errors()`, Go `StreamWithErrors()`,
+   the Node `onEnd`/`onError` callback, Python's `StopIteration`) the terminal
+   cause is delivered, so a consumer learns *why* the stream ended rather than
+   racing a bare close. The **value-only** surfaces (`subscribe()`, Go `Stream()`,
+   the `AsyncAudioStream`/`buffers_iter()` items) simply finish (channel close /
+   `None`) and do **not** carry the terminal `AudioError` — read it off an
+   error-carrying surface if the reason matters. (Producer-side, the backend
+   signals this terminal once the capture loop exits — see
+   [ADR-0010](designs/0010-producer-terminal-signal.md).)
+
+Within those invariants the bindings **deliberately diverge on whether a
+recoverable error is *delivered* to the consumer or *swallowed*** before the
+retry. This is an intentional, documented difference — not a bug — and it only
+affects whether a consumer *observes* transient hiccups; it never affects when a
+stream ends:
+
+| Surface | Recoverable error | Fatal/terminal error |
+|---|---|---|
+| Rust `AudioCapture::subscribe_with_errors()` (`mpsc::Receiver<AudioResult<…>>`) | **Forwarded** as a non-terminal `Err` item, then continues | Forwarded as the FINAL `Err` item, then the `Sender` drops (channel disconnects) |
+| Rust `AudioCapture::subscribe()` (`mpsc::Receiver<AudioBuffer>`) | Swallowed (logged + retried) | Channel closes (the bare disconnect *is* the terminal signal; no error carried) |
+| Rust async (`AsyncAudioStream`) / `buffers_iter()` (`AudioResult<AudioBuffer>` items) | Forwarded as an `Err` item, then continues | **Stream-end only** — `poll_next`/`next` return `None` (the iterator/stream simply finishes); the terminal `AudioError` is **not** carried. Read it off `subscribe_with_errors()` if you need the reason. |
+| Go `StreamWithErrors()` (`<-chan StreamResult`) | **Swallowed** (`runtime.Gosched()` + retry; nothing sent) | Delivered as the FINAL `StreamResult{Err}`, then the channel is closed |
+| Go `Stream()` (`<-chan AudioBuffer`) | Swallowed (yield + retry) | Channel closes (no error carried) |
+| Node `onData()` pump | Swallowed *(intended)* — the pump branches on `is_fatal()` (rsac-napi `src/lib.rs`) | Pump stops and fires `onEnd`/`onError` with the terminal cause |
+| Python `for buf in capture:` iterator | Swallowed (retried) | Raises `StopIteration` on the fatal terminal (ships today — rsac-python `src/lib.rs`) |
+
+The two **error-carrying** surfaces — Rust `subscribe_with_errors()` and Go
+`StreamWithErrors()` — agree on both invariants but differ on the recoverable
+case: Rust **forwards** each recoverable `Err` (so an `mpsc` consumer can meter
+the hiccups), whereas Go **swallows** it (so a `for r := range ch` consumer is
+never tempted to `break` on a transient error it can do nothing about). Go's
+swallow matches its own value-only `Stream()` loop, the napi `onData` pump, and
+the blueprint's "logs + sleeps + continues" note; Rust's forwarding is the more
+informative outlier. A Go consumer that needs to *see* transient hiccups should
+poll [`AudioCapture.StreamStats`](#shipped-binding-parity-020) (`Overruns` /
+`BuffersDropped`) rather than expecting them on the channel.
+
+> **Note (Go `ErrClosed`):** `ErrClosed` carries a recoverable code
+> (`ErrStreamRead`) but always stops the Go loops — it means the capture was
+> closed underneath the consumer, which is terminal for that consumer. The loops
+> gate it with `errors.Is(err, ErrClosed)` so it bypasses the recoverable-retry
+> path.
+
+### Binding behaviours (current)
+
+The following items were tracked binding limitations in earlier 0.2.x drafts and
+are now **resolved** in 0.3.0; recorded here so the history is clear:
+
+- **Python iterator ends cleanly on terminal (was BFFI-03 — RESOLVED 0.3.0).**
+  `PyAudioCapture.__next__` reads via the terminal-observable path and raises
+  `StopIteration` on the fatal terminal (`StreamEnded`/`is_fatal()`), retrying
+  only genuine recoverable hiccups — so `for buf in capture:` stops cleanly at
+  end-of-capture. (rsac-python `src/lib.rs`.)
+- **C FFI `rsac_version()` reports the real version (was BFFI-04 — RESOLVED
+  0.3.0).** It now returns `concat!(env!("CARGO_PKG_VERSION"), "\0")` and
+  `rsac-ffi` is in version lockstep with the workspace (0.3.0).
+- **Go `ReadBuffer`/`TryReadBuffer` concurrent-`Close()` is safe (was BFFI-02 /
+  #28 — RESOLVED 0.3.0).** `Close()` sets a `closing` flag, calls
+  `rsac_capture_request_stop` to unblock a parked read, and drains a
+  `sync.WaitGroup` of in-flight reads **before** freeing the handle. The
+  misleading "safe without the lock" comment was removed.
+
+Genuine current behaviours (by design, not bugs):
+
+- **Python `CaptureTarget.__str__` is the repr, not the canonical string.** It
   returns the constructor-style repr (`CaptureTarget.device(...)`), not the
   round-trippable `device:<id>` grammar accepted by `CaptureTarget.parse`. Use
   the grammar literals directly when you need a parseable string.
+- **Go `ErrorCode.IsRecoverable()` is a lossy projection of the FFI codes.** The
+  C ABI collapses the core's recoverable `BackendError` and the fatal
+  `BackendNotAvailable`/`BackendInitializationFailed` onto one
+  `RSAC_ERROR_BACKEND` code, which `IsRecoverable()` reports as recoverable. This
+  is only reachable at `Build()`/`Start()` (never the streaming read loop), so it
+  does not affect stream termination; documented in `rsac.go`.
 
 ### Python packaging: single abi3 wheel per platform
 
@@ -215,10 +271,11 @@ as `Float32Array`, both to avoid IEEE-754 double precision loss. The push path
 maps rsac's read loop onto a napi-rs `ThreadsafeFunction`, so it integrates with
 the Node/Bun event loop and works in Electron's main process.
 
-> **Caveat (tracked, critique BFFI-07):** the `onData` background pump currently
-> breaks on *any* read error, including recoverable transient ones, rather than
-> branching on `is_fatal()`/recoverability — a transient hiccup can silently
-> stop push delivery. Code fix tracked separately.
+> **Resolved (was BFFI-07, 0.3.0):** the `onData` background pump now branches on
+> `is_fatal()`/recoverability — it retries recoverable transient errors and stops
+> only on the fatal terminal, then fires `onEnd`/`onError` with the terminal
+> cause (rsac-napi `src/lib.rs`). A transient hiccup no longer silently stops
+> push delivery.
 
 **For Tauri apps:** use rsac as a direct Rust dependency instead — no napi-rs needed.
 

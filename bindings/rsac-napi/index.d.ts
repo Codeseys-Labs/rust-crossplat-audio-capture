@@ -169,6 +169,16 @@ export declare class AudioCapture {
    * Read a single audio chunk synchronously (non-blocking).
    * Returns `null` if no data is currently available.
    * Throws if the capture is not running.
+   *
+   * **Not terminal-observable.** The pull readers (`read`, `readBlocking`,
+   * `readAsync`, `readBlockingAsync`) route through rsac's `read_buffer*`, which
+   * short-circuits to a *recoverable* read error the moment the stream leaves
+   * the running state — it never surfaces the terminal "stream ended" cause. So
+   * a pull consumer cannot distinguish a transient hiccup from a real terminal
+   * end via the thrown error. Only the push pump (`onData`) drains the terminal
+   * state and reports *why* it ended via `onEnd`. To observe the terminal cause,
+   * use `onData` + `onEnd`; with the pull API, treat `stop()`/`isRunning` as the
+   * end-of-stream signal and a thrown read error as retryable.
    */
   read(): AudioChunk | null;
 
@@ -176,6 +186,11 @@ export declare class AudioCapture {
    * Read a single audio chunk, blocking until data is available.
    * WARNING: This blocks the Node.js event loop. Use `readBlockingAsync()`
    * or `onData()` in production.
+   *
+   * Like `read()`, this is **not terminal-observable** — it routes through
+   * `read_buffer_blocking` and surfaces only recoverable errors, never the
+   * terminal "stream ended" cause. Use `onData` + `onEnd` to observe the
+   * terminal reason.
    */
   readBlocking(): AudioChunk;
 
@@ -183,12 +198,19 @@ export declare class AudioCapture {
    * Read a single audio chunk asynchronously (non-blocking, off main thread).
    * Returns `null` if no data is currently available.
    * Throws if the capture is not running.
+   *
+   * Like `read()`, this is **not terminal-observable** (it routes through
+   * `read_buffer`). Use `onData` + `onEnd` to observe the terminal reason.
    */
   readAsync(): Promise<AudioChunk | null>;
 
   /**
    * Read a single audio chunk asynchronously, blocking the worker thread
    * until data is available. Does not block the Node.js event loop.
+   *
+   * Like `read()`, this is **not terminal-observable** (it routes through
+   * `read_buffer_blocking`). Use `onData` + `onEnd` to observe the terminal
+   * reason.
    */
   readBlockingAsync(): Promise<AudioChunk>;
 
@@ -219,9 +241,13 @@ export declare class AudioCapture {
    * This is the Node parity for the Rust `subscribe_with_errors` and Go
    * `StreamWithErrors` APIs — an `onData` consumer registers `onEnd` to learn
    * the terminal reason instead of the end being silent. Optional and
-   * independent of `onData`. Invoked at most once per capture session (the pump
-   * clears it after firing); a recoverable hiccup never fires it. Calling
-   * `onEnd()` again replaces the previous callback.
+   * independent of `onData`.
+   *
+   * The registration **persists across multiple `start()`/`stop()` sessions**,
+   * exactly like `onData`: it fires once per session (when that session's data
+   * pump ends) and stays armed for the next `start()`. It is cleared only by
+   * `offEnd()`, or replaced by calling `onEnd()` again. A recoverable hiccup
+   * never fires it — only the terminal end (fatal) or a clean stop does.
    *
    * @example
    * ```ts
@@ -231,6 +257,8 @@ export declare class AudioCapture {
    *   else console.log('capture stopped cleanly');
    * });
    * capture.start();
+   * capture.stop();   // fires onEnd(null)
+   * capture.start();  // onEnd still armed — fires again at the next stop
    * ```
    */
   onEnd(callback: (error: string | null) => void): void;
@@ -244,8 +272,10 @@ export declare class AudioCapture {
 
   /**
    * Remove the registered terminal-observability callback (see `onEnd`).
-   * After this, the data pump's end is no longer reported to JS. Does not stop
-   * the pump.
+   * This is the only way to clear an `onEnd` registration — the pump leaves it
+   * armed across sessions. After this, the pump's end is no longer reported to
+   * JS (a fatal terminal still emits a throttled stderr log; a clean stop is
+   * silent). Does not stop the pump.
    */
   offEnd(): void;
 

@@ -1,5 +1,18 @@
 # cbindgen configuration for rsac-ffi
-# Generate C header: cbindgen --config cbindgen.toml --crate rsac-ffi --output rsac.h
+#
+# Regenerate the GENERATED twin header (never the curated rsac.h):
+#   cbindgen --config cbindgen.toml --crate rsac-ffi --output include/rsac_generated.h
+#
+# Naming contract (rsac-1413 / BP-5): the Rust FFI types are ALREADY in their
+# final C-ABI form — opaque structs are named `Rsac*` (RsacBuilder, RsacCapture,
+# …) and enums/callback typedefs are named in snake_case with a `rsac_` prefix
+# (rsac_error_t, rsac_device_kind_t, rsac_audio_callback_t). A global
+# `prefix = "Rsac"` would STACK on those names and emit double-prefixed garbage
+# (RsacRsacBuilder, Rsacrsac_error_t), diverging from the curated include/rsac.h
+# that rsac-go links against. We therefore do NOT set an [export] prefix: every
+# exported name passes through verbatim and the generated symbol set matches the
+# curated header (verified by the header-drift check in ci.yml's check-bindings
+# job). Functions use #[no_mangle], so no prefix ever applied to them.
 
 language = "C"
 include_guard = "RSAC_H"
@@ -14,17 +27,14 @@ style = "both"  # Generate both tag and typedef names
 "target_os = linux" = "__linux__"
 
 [export]
-prefix = "Rsac"
+# Intentionally NO `prefix`: the Rust types already carry their final C names
+# (Rsac* opaque structs, rsac_*_t enums/typedefs). A prefix would double it up
+# (RsacRsacBuilder / Rsacrsac_error_t) and drift from the curated rsac.h.
 include = []
 exclude = []
-renaming_overrides_prefixing = true
-
-[export.rename]
-"RsacError" = "rsac_error_t"
-"RsacDeviceKind" = "rsac_device_kind_t"
-"RsacCaptureTargetKind" = "rsac_capture_target_kind_t"
-"RsacRecoverability" = "rsac_recoverability_t"
-"RsacErrorKind" = "rsac_error_kind_t"
+# No [export.rename] is needed — names pass through verbatim. (The previous
+# rename keys — "RsacError", "RsacDeviceKind", … — never matched any real type
+# in this crate, so the prefix double-applied unchecked. Removed in rsac-1413.)
 
 [fn]
 prefix = ""

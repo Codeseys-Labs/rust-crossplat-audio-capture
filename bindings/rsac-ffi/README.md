@@ -154,13 +154,26 @@ The rules are spelled out in the crate-level Rust doc. Summary:
 curated `include/rsac.h` is hand-maintained and should track the
 generated file; use it as the consumer-facing header.
 
-To run cbindgen manually:
+To run cbindgen manually, target **`rsac_generated.h`** — never the curated
+`rsac.h`, which is hand-maintained and linked against by `rsac-go`:
 
 ```bash
 cbindgen --config bindings/rsac-ffi/cbindgen.toml \
          --crate rsac-ffi \
-         --output bindings/rsac-ffi/include/rsac.h
+         --output bindings/rsac-ffi/include/rsac_generated.h
 ```
+
+> **Do not** point `--output` at `include/rsac.h`. Overwriting the curated
+> header with the generated twin would clobber its hand-written documentation
+> and ABI grouping. The two are kept honest by CI: the `check-bindings` job
+> builds `rsac-ffi` (which runs cbindgen via `build.rs`) and diffs the
+> generated header's **symbol set** — every `typedef`/`struct`/`enum` name plus
+> every exported function name — against the curated `rsac.h`, tolerating only
+> the tagged-vs-anonymous typedef style difference. Any genuine drift (a new,
+> renamed, or removed symbol) fails CI, so the curated header can never silently
+> fall behind the generated one. The generated header carries the same C names
+> as the curated header because the Rust types are already named in their final
+> C-ABI form (no cbindgen prefix is applied — see `cbindgen.toml`).
 
 ## Stream statistics and negotiated format
 

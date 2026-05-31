@@ -325,6 +325,58 @@ fn spa_audio_format_to_sample_format(
     }
 }
 
+/// Decode every **complete** little-endian `f32` from a byte slice whose start
+/// is not 4-byte-aligned, into the caller-supplied reusable `scratch` (#30).
+///
+/// This is the fallback path for the rare case where the SPA chunk's valid
+/// region (`[offset, offset + size)`) is *not* word-aligned — i.e.
+/// `bytes.align_to::<f32>()` yields a non-empty head/tail. The zero-copy
+/// `align_to` fast path would silently skip those edge bytes (dropping up to a
+/// whole sample), so this routine instead reads the bytes in 4-byte groups via
+/// `from_le_bytes` (which has no alignment requirement) so **no whole sample is
+/// lost** regardless of the start offset.
+///
+/// # Real-time safety (ADR-0001)
+///
+/// `scratch` is owned by [`CaptureStreamData`] and pre-sized off the RT thread,
+/// so in steady state this only `clear()`s and re-fills it — **no allocation**.
+/// `clear()` retains the existing capacity, so the per-sample `push`es below
+/// reuse it; the `Vec` can only grow if a period larger than every
+/// previously-seen period arrives (a bounded, transient warm-up cost, identical
+/// in spirit to the bridge's scratch grow). It performs no locking and no I/O.
+///
+/// # Return value
+///
+/// Returns the number of **trailing bytes** that did not form a complete `f32`
+/// (`bytes.len() % 4`) and were therefore not decodable into a whole sample.
+/// For a correctly-framed f32 stream this is `0`; a non-zero value means the
+/// chunk's byte length was not a multiple of 4 (a genuinely truncated final
+/// sample, which no realignment can recover). Callers can surface this for
+/// visibility.
+#[cfg(feature = "feat_linux")]
+fn decode_unaligned_f32_le(bytes: &[u8], scratch: &mut Vec<f32>) -> usize {
+    scratch.clear();
+    let mut chunks = bytes.chunks_exact(4);
+    // `chunks_exact` yields only complete 4-byte groups; each is a valid f32 bit
+    // pattern. `from_le_bytes` reads unaligned bytes safely (no `align_to`).
+    for c in chunks.by_ref() {
+        // `try_into` on a 4-byte `chunks_exact` slice cannot fail.
+        let arr: [u8; 4] = match c.try_into() {
+            Ok(a) => a,
+            // Unreachable: `chunks_exact(4)` always yields 4-byte slices. Degrade
+            // (skip the group) rather than panic, per the no-panics rule.
+            Err(_) => {
+                debug_assert!(false, "chunks_exact(4) yielded a non-4-byte slice");
+                continue;
+            }
+        };
+        scratch.push(f32::from_le_bytes(arr));
+    }
+    // The remainder is a partial (truncated) final sample with no whole f32 to
+    // recover — report its byte length so the caller can flag the truncation.
+    chunks.remainder().len()
+}
+
 // ── CaptureStreamData ────────────────────────────────────────────────────
 
 /// User data stored inside the PipeWire stream listener.
@@ -348,6 +400,19 @@ struct CaptureStreamData {
     channels: u16,
     /// Sample rate in Hz (updated from negotiated format, falls back to requested).
     sample_rate: u32,
+    /// Reusable scratch for the **misaligned-edge** fallback in the `process`
+    /// callback (#30). PipeWire buffers are normally word-aligned, so
+    /// `align_to::<f32>()` consumes the whole valid region with no head/tail and
+    /// this stays untouched. If a chunk's valid region ever starts on a
+    /// non-4-byte boundary, [`decode_unaligned_f32_le`] re-decodes it into this
+    /// pre-sized `Vec` so no whole sample is silently dropped — reusing the
+    /// existing capacity keeps the RT push allocation-free in steady state
+    /// (ADR-0001).
+    realign_scratch: Vec<f32>,
+    /// One-shot latch so the rare non-word-aligned chunk is logged **once**
+    /// rather than on every callback, making otherwise-silent data realignment
+    /// (or a truncated trailing sample) visible without flooding the log (#30).
+    misaligned_logged: bool,
 }
 
 // ── PipeWireThread ───────────────────────────────────────────────────────
@@ -1654,6 +1719,12 @@ fn pw_thread_main(
                     producer,
                     channels: config.channels,
                     sample_rate: config.sample_rate,
+                    // Pre-size the misaligned-edge fallback scratch off the RT
+                    // thread so the rare realignment path (#30) reuses capacity
+                    // rather than allocating in the `.process` callback. Matches
+                    // the bridge's worst-case stereo period seed (ADR-0001).
+                    realign_scratch: Vec::with_capacity(2048),
+                    misaligned_logged: false,
                 };
 
                 // ── Register stream listener with callbacks ──
@@ -1815,27 +1886,73 @@ fn pw_thread_main(
                             // instead of a per-sample `from_le_bytes` loop. On the
                             // little-endian hosts PipeWire runs on, the in-memory
                             // representation equals the F32LE byte layout. PipeWire
-                            // audio buffers are word-aligned, so `align_to`'s head
-                            // and tail are normally empty; we consume the aligned
-                            // run of whole samples and ignore any unaligned edge.
+                            // audio buffers are normally word-aligned, so the
+                            // `head`/`tail` `align_to` yields are empty and we take
+                            // the zero-copy fast path consuming the whole aligned
+                            // run of samples.
                             //
                             // SAFETY: every bit pattern is a valid `f32`, and we
                             // only read initialized bytes within `valid`.
-                            let (_head, samples, _tail) = unsafe { valid.align_to::<f32>() };
+                            let (head, samples, tail) = unsafe { valid.align_to::<f32>() };
 
-                            if !samples.is_empty() {
-                                // Push to the ring buffer through the FFI-boundary
-                                // panic guard (see the REAL-TIME SAFETY note above).
-                                // If the ring is full the data is silently dropped
-                                // (back-pressure) and the overrun counter is
-                                // incremented; a panic, if one ever occurred, is
-                                // contained rather than unwinding into PipeWire's C
-                                // frames.
-                                user_data.producer.push_samples_guarded(
-                                    samples,
-                                    channels,
-                                    sample_rate,
+                            if head.is_empty() && tail.is_empty() {
+                                // Fast path: the valid region is word-aligned, so
+                                // `samples` covers it whole with no copy.
+                                if !samples.is_empty() {
+                                    // Push to the ring buffer through the
+                                    // FFI-boundary panic guard (see the REAL-TIME
+                                    // SAFETY note above). If the ring is full the
+                                    // data is dropped (back-pressure) and the
+                                    // overrun counter is incremented; a panic, if
+                                    // one ever occurred, is contained rather than
+                                    // unwinding into PipeWire's C frames.
+                                    user_data.producer.push_samples_guarded(
+                                        samples,
+                                        channels,
+                                        sample_rate,
+                                    );
+                                }
+                            } else {
+                                // Misaligned-edge fallback (#30): the valid region
+                                // does NOT start on a 4-byte boundary, so `align_to`
+                                // left bytes in `head`/`tail` that the fast path
+                                // would SILENTLY DROP (up to a whole sample). Re-decode
+                                // every complete f32 from the raw bytes via
+                                // `from_le_bytes` into the pre-sized reusable scratch
+                                // (alloc-free in steady state — ADR-0001) so no whole
+                                // sample is lost regardless of the start offset. Only a
+                                // genuinely truncated trailing partial sample (byte
+                                // length not a multiple of 4) is unrecoverable.
+                                debug_assert!(
+                                    head.len() < std::mem::size_of::<f32>()
+                                        && tail.len() < std::mem::size_of::<f32>(),
+                                    "align_to head/tail must each be a sub-sample edge"
                                 );
+                                let truncated_bytes =
+                                    decode_unaligned_f32_le(valid, &mut user_data.realign_scratch);
+                                // Surface the otherwise-invisible realignment ONCE so
+                                // a recurring misalignment (or a truncated tail) is
+                                // diagnosable, without flooding the RT log.
+                                if !user_data.misaligned_logged {
+                                    user_data.misaligned_logged = true;
+                                    log::warn!(
+                                        "PipeWire delivered a non-word-aligned audio chunk \
+                                         (offset {offset}, {} bytes); realigning via copy. \
+                                         {truncated_bytes} trailing byte(s) form a truncated \
+                                         partial sample and were not recoverable.",
+                                        valid.len()
+                                    );
+                                }
+                                if !user_data.realign_scratch.is_empty() {
+                                    // Disjoint field borrows: `realign_scratch` is read
+                                    // immutably while `producer` is used — allowed.
+                                    let realigned = user_data.realign_scratch.as_slice();
+                                    user_data.producer.push_samples_guarded(
+                                        realigned,
+                                        channels,
+                                        sample_rate,
+                                    );
+                                }
                             }
                         }
 
@@ -3246,6 +3363,106 @@ mod tests {
         assert!(spa_audio_format_to_sample_format(Spa::F64LE).is_none());
         assert!(spa_audio_format_to_sample_format(Spa::F32BE).is_none());
         assert!(spa_audio_format_to_sample_format(Spa::F32P).is_none());
+    }
+
+    // ── Misaligned-edge f32 realignment (#30) ────────────────────────
+
+    /// Build a byte vector that, when sliced at `start_offset`, presents the
+    /// `f32` samples in LE form but with a non-word-aligned start so the
+    /// `.process` fast path's `align_to` leaves a non-empty head.
+    fn le_bytes(samples: &[f32]) -> Vec<u8> {
+        let mut v = Vec::with_capacity(samples.len() * 4);
+        for s in samples {
+            v.extend_from_slice(&s.to_le_bytes());
+        }
+        v
+    }
+
+    #[test]
+    fn test_decode_unaligned_f32_le_recovers_every_whole_sample() {
+        // Whole, complete f32 stream — no truncation regardless of how the
+        // backing slice happens to be aligned. Force a misaligned VIEW by
+        // prepending one filler byte and decoding the bytes AFTER it.
+        let samples = [0.0f32, 1.0, -2.5, 1234.5, f32::MIN, f32::MAX];
+        let mut backing = vec![0xAAu8]; // 1-byte filler → guarantees misalignment
+        backing.extend_from_slice(&le_bytes(&samples));
+        let valid = &backing[1..]; // starts at byte offset 1 (not 4-aligned)
+
+        let mut scratch = Vec::new();
+        let truncated = decode_unaligned_f32_le(valid, &mut scratch);
+
+        assert_eq!(truncated, 0, "a multiple-of-4 byte run has no partial tail");
+        assert_eq!(
+            scratch.as_slice(),
+            samples.as_slice(),
+            "every whole sample must be recovered bit-for-bit, none dropped"
+        );
+    }
+
+    #[test]
+    fn test_decode_unaligned_f32_le_reports_truncated_tail() {
+        // A byte run whose length is not a multiple of 4: the final partial
+        // sample is genuinely truncated and unrecoverable, but ALL preceding
+        // whole samples must still be decoded (no whole sample silently lost).
+        let samples = [3.0f32, 4.0, 5.0];
+        let mut bytes = le_bytes(&samples);
+        bytes.push(0x01); // one extra byte → a 1-byte truncated trailing sample
+        bytes.push(0x02); // two extra bytes total
+
+        let mut scratch = Vec::new();
+        let truncated = decode_unaligned_f32_le(&bytes, &mut scratch);
+
+        assert_eq!(truncated, 2, "two trailing bytes do not form a whole f32");
+        assert_eq!(
+            scratch.as_slice(),
+            samples.as_slice(),
+            "the three whole samples must survive even with a truncated tail"
+        );
+    }
+
+    #[test]
+    fn test_decode_unaligned_f32_le_reuses_scratch_capacity() {
+        // The realign scratch is reused across callbacks: a second decode must
+        // clear the previous contents and must NOT grow capacity when the new
+        // chunk is no larger than the first (RT-safety: alloc-free in steady
+        // state, ADR-0001).
+        let mut scratch = Vec::new();
+
+        let first = [1.0f32, 2.0, 3.0, 4.0];
+        decode_unaligned_f32_le(&le_bytes(&first), &mut scratch);
+        assert_eq!(scratch.as_slice(), first.as_slice());
+        let cap_after_first = scratch.capacity();
+        assert!(cap_after_first >= first.len());
+
+        let second = [9.0f32, 8.0];
+        decode_unaligned_f32_le(&le_bytes(&second), &mut scratch);
+        assert_eq!(
+            scratch.as_slice(),
+            second.as_slice(),
+            "scratch must be cleared and refilled, not appended"
+        );
+        assert_eq!(
+            scratch.capacity(),
+            cap_after_first,
+            "a smaller follow-up chunk must reuse capacity, not reallocate"
+        );
+    }
+
+    #[test]
+    fn test_decode_unaligned_f32_le_empty_and_sub_sample_inputs() {
+        let mut scratch = Vec::new();
+
+        // Empty input → no samples, no truncation.
+        assert_eq!(decode_unaligned_f32_le(&[], &mut scratch), 0);
+        assert!(scratch.is_empty());
+
+        // Fewer than 4 bytes → the whole thing is a truncated partial sample.
+        let truncated = decode_unaligned_f32_le(&[0x01, 0x02, 0x03], &mut scratch);
+        assert_eq!(truncated, 3);
+        assert!(
+            scratch.is_empty(),
+            "no whole sample can be formed from 3 bytes"
+        );
     }
 
     #[test]

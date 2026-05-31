@@ -1095,6 +1095,40 @@ func (c *AudioCapture) streamLoop(ctx context.Context, ch chan<- AudioBuffer) {
 	}
 }
 
+// streamLoopWithErrors is the goroutine body behind [AudioCapture.StreamWithErrors].
+//
+// # Terminal-error & recoverable-error delivery contract
+//
+// This loop honours the rsac terminal-error contract (see
+// docs/CROSS_LANGUAGE_BINDINGS.md § "Terminal-error & recoverable-error
+// delivery"). Two invariants hold across every rsac binding:
+//
+//   - A recoverable hiccup (IsRecoverable, e.g. a transient ErrStreamRead /
+//     ErrTimeout / ErrBackend) NEVER ends the stream — the loop yields and
+//     retries.
+//   - The stream ends cleanly on, and only on, a fatal/terminal error: the
+//     terminal AudioError is delivered as the FINAL StreamResult{Err} before the
+//     channel is closed, so the consumer learns exactly why the stream ended
+//     instead of racing a bare channel-close.
+//
+// Within that shared contract, Go is on the **SWALLOW** side of a deliberate,
+// documented divergence in how recoverable errors are *delivered*:
+//
+//   - Go (this loop) SWALLOWS recoverable errors: it logs nothing and forwards
+//     nothing — it just runtime.Gosched()es and retries. A `for r := range ch`
+//     consumer therefore never observes a transient hiccup as a StreamResult{Err}
+//     it would otherwise mistake for a terminal error and break on. This matches
+//     the value-only Stream() loop and the napi onData pump, and the blueprint's
+//     "logs + sleeps + continues" note.
+//   - Rust subscribe_with_errors() instead FORWARDS each recoverable error to
+//     the consumer as a non-terminal Err item and then continues, so an mpsc
+//     consumer can observe (and meter) transient hiccups it never has to act on.
+//
+// Both are conformant: neither ends on a recoverable error and both end on the
+// fatal terminal. The only observable difference is whether the consumer SEES
+// the transient hiccups. ErrClosed (the capture was closed underneath us) carries
+// a code in the recoverable set but always stops the loop — it is gated via
+// errors.Is below, matching the value-only Stream() loop.
 func (c *AudioCapture) streamLoopWithErrors(ctx context.Context, ch chan<- StreamResult) {
 	defer close(ch)
 	for {
@@ -1109,10 +1143,14 @@ func (c *AudioCapture) streamLoopWithErrors(ctx context.Context, ch chan<- Strea
 		if err != nil {
 			// A recoverable hiccup must NOT be reported as a terminal error
 			// (that would mislead a `for r := range ch` consumer into stopping)
-			// — swallow it and keep delivering, matching the value-only
-			// Stream() loop. A fatal/terminal error (or ErrClosed) is delivered
-			// as the FINAL StreamResult{Err} and then closes the channel, so the
-			// consumer learns why the stream ended.
+			// — SWALLOW it and keep delivering, matching the value-only
+			// Stream() loop and the napi onData pump. (Rust's
+			// subscribe_with_errors forwards recoverable errors as non-terminal
+			// Err items instead; see the doc-comment above and
+			// docs/CROSS_LANGUAGE_BINDINGS.md for the cross-binding contract.)
+			// A fatal/terminal error (or ErrClosed) is delivered as the FINAL
+			// StreamResult{Err} and then closes the channel, so the consumer
+			// learns why the stream ended.
 			if IsRecoverable(err) && !errors.Is(err, ErrClosed) {
 				runtime.Gosched()
 				continue

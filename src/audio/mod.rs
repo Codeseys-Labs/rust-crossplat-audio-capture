@@ -133,20 +133,24 @@ impl CrossPlatformDeviceEnumerator {
     /// Deprecated alias for [`default_device`](Self::default_device).
     ///
     /// AEG-3 (rsac-0113) renamed the facade to `default_device()` to match the
-    /// [`DeviceEnumerator`](crate::core::interface::DeviceEnumerator) trait
+    /// [`DeviceEnumerator`] trait
     /// method and the sibling [`enumerate_devices`](Self::enumerate_devices) —
     /// `default_device` was the lone `get_`-prefixed divergence. This alias is
     /// kept for one release so existing callers and bindings migrate without a
     /// hard break; prefer [`default_device`](Self::default_device) in new code.
     ///
-    /// It is intentionally **not** annotated `#[deprecated]`: the crate's own
-    /// targets (the demo binary, examples, and the integration tests) and CI's
-    /// `cargo clippy --all-targets -- -D warnings` gate would otherwise turn the
-    /// deprecation lint into a hard build failure for callers outside this
-    /// module while they migrate. The doc-level deprecation conveys the intent
-    /// without breaking the `-D warnings` build; the attribute can be added once
-    /// every in-crate caller has moved to `default_device()`.
-    #[doc(hidden)]
+    /// AEG-3 finish (rsac-9d51): every in-crate caller (the demo binary,
+    /// `smoke_alpine`, the examples, the integration tests, and the FFI/napi
+    /// bindings) has been migrated to [`default_device`](Self::default_device),
+    /// so the `#[deprecated]` attribute can now be applied without tripping CI's
+    /// `cargo clippy --all-targets -- -D warnings` gate (no in-crate call site
+    /// emits the lint). The remaining in-crate use is the alias-forwarding test
+    /// below, which suppresses the lint locally with `#[allow(deprecated)]`.
+    #[deprecated(
+        since = "0.3.0",
+        note = "renamed to default_device() to match the DeviceEnumerator trait; \
+                this alias will be removed in a future release"
+    )]
     pub fn get_default_device(
         &self,
     ) -> crate::core::error::Result<Box<dyn crate::core::interface::AudioDevice>> {
@@ -254,7 +258,12 @@ mod tests {
     /// there. The comparison is device-free-tolerant: it asserts the two names
     /// agree on success-vs-failure and, when both fail, that they surface the
     /// same `AudioError` discriminant — never that hardware is present.
+    // The deprecated `get_default_device()` alias is exercised here on purpose:
+    // this test exists to prove the alias still forwards correctly for the one
+    // release it remains in the public API. The `#[allow(deprecated)]` keeps the
+    // intentional call from tripping CI's `-D warnings` gate.
     #[test]
+    #[allow(deprecated)]
     fn get_default_device_alias_matches_default_device() {
         let enumerator = match get_device_enumerator() {
             Ok(e) => e,

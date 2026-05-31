@@ -406,13 +406,13 @@ fn default_device_kind_resolves_on_backend() {
         }
     };
 
-    let default = match enumerator.get_default_device() {
+    let default = match enumerator.default_device() {
         Ok(d) => d,
         Err(ref e) => {
             // A missing default must itself be an honest, classified failure.
             assert!(
                 is_honest_enumeration_failure(e),
-                "get_default_device() failed with an un-classified error: {e:?}"
+                "default_device() failed with an un-classified error: {e:?}"
             );
             eprintln!(
                 "[enumeration_matrix] SKIPPED default kind() check: no default device \

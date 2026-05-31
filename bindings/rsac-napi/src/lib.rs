@@ -266,16 +266,24 @@ impl CaptureTarget {
 /// // ... later ...
 /// capture.stop();
 /// ```
+/// The per-buffer data callback held behind an `Arc<Mutex<Option<…>>>` (to
+/// prevent GC + allow re-registration). Aliased to keep the struct field within
+/// clippy's `type_complexity` bar.
+type DataCallback = Arc<Mutex<Option<ThreadsafeFunction<AudioChunk, ErrorStrategy::Fatal>>>>;
+/// The terminal-observability callback, carrying the optional terminal cause
+/// string. Same storage shape as [`DataCallback`].
+type EndCallback = Arc<Mutex<Option<ThreadsafeFunction<Option<String>, ErrorStrategy::Fatal>>>>;
+
 #[napi]
 pub struct AudioCapture {
     inner: Arc<Mutex<rsac::AudioCapture>>,
     /// Active data callback (ThreadsafeFunction). Held here to prevent GC.
-    callback: Arc<Mutex<Option<ThreadsafeFunction<AudioChunk, ErrorStrategy::Fatal>>>>,
+    callback: DataCallback,
     /// Optional terminal-observability callback (ThreadsafeFunction). Fires once
     /// when the data pump ends, carrying the terminal cause so a JS `onData`
     /// consumer can observe *why* delivery stopped — parity with Rust
     /// `subscribe_with_errors` / Go `StreamWithErrors`. Held here to prevent GC.
-    end_callback: Arc<Mutex<Option<ThreadsafeFunction<Option<String>, ErrorStrategy::Fatal>>>>,
+    end_callback: EndCallback,
     /// Whether the push-model data pump thread is running.
     pump_active: Arc<AtomicBool>,
 }
@@ -404,6 +412,14 @@ impl AudioCapture {
     ///
     /// Returns `null` if no data is currently available.
     /// Throws if the capture is not running.
+    ///
+    /// Not terminal-observable: this (and `read_blocking`/`read_async`/
+    /// `read_blocking_async`) routes through rsac's `read_buffer`, which
+    /// short-circuits to a *recoverable* `StreamReadError` the moment the stream
+    /// leaves `Running` and never surfaces the terminal `StreamEnded`. Only the
+    /// push pump started by `on_data` drains the terminal state and reports it via
+    /// `on_end`. A pull consumer should treat `stop`/`is_running` as the
+    /// end-of-stream signal and a thrown read error as retryable.
     #[napi]
     pub fn read(&self) -> Result<Option<AudioChunk>> {
         // `read_buffer` takes `&self` now, so the guard does not need `mut`.
@@ -423,6 +439,11 @@ impl AudioCapture {
     /// WARNING: This blocks the calling thread. In Node.js, prefer
     /// `onData()` for push-based streaming or use `read()` in a loop
     /// with appropriate yielding.
+    ///
+    /// Like `read`, this is not terminal-observable: it routes through
+    /// `read_buffer_blocking` and surfaces only recoverable errors, never the
+    /// terminal `StreamEnded`. Use `on_data` + `on_end` to observe the terminal
+    /// reason.
     #[napi]
     pub fn read_blocking(&self) -> Result<AudioChunk> {
         // `read_buffer_blocking` takes `&self` now, so the guard does not need `mut`.
@@ -557,10 +578,14 @@ impl AudioCapture {
     /// This is the Node parity for Rust's `subscribe_with_errors` and Go's
     /// `StreamWithErrors`: an `onData` consumer registers `onEnd` to learn the
     /// terminal reason instead of the pump silently logging it. Registering an
-    /// `onEnd` callback is optional and independent of `onData`; it is invoked at
-    /// most once per pump run (the pump clears it after firing). Calling `onEnd`
-    /// again replaces the previous callback. A recoverable hiccup never fires it
-    /// — only the single terminal end does.
+    /// `onEnd` callback is optional and independent of `onData`.
+    ///
+    /// The registration persists across multiple `start`/`stop` sessions on the
+    /// same `AudioCapture`, exactly like `onData`: it fires once per session (at
+    /// each pump run's end) and stays armed for the next session. The pump fires a
+    /// *clone* and leaves the registered callback in place; it is cleared only by
+    /// `offEnd` or replaced by a later `onEnd` call. A recoverable hiccup never
+    /// fires it — only the single terminal end (fatal) or a clean stop does.
     #[napi(ts_args_type = "callback: (error: string | null) => void")]
     pub fn on_end(
         &self,
@@ -597,8 +622,11 @@ impl AudioCapture {
 
     /// Remove the registered terminal-observability callback (see `onEnd`).
     ///
-    /// After this, the data pump's end is no longer reported to JS (it falls back
-    /// to a log line). Does not stop the pump.
+    /// This is the *only* way to clear an `onEnd` registration — unlike a
+    /// one-shot, the pump leaves it armed across sessions. After this, the pump's
+    /// end is no longer reported to JS; a *fatal* terminal still falls back to a
+    /// (throttled) stderr log line, while a clean stop ends silently. Does not
+    /// stop the pump.
     #[napi]
     pub fn off_end(&self) -> Result<()> {
         let mut cb_guard = self.end_callback.lock().map_err(|e| {
@@ -743,6 +771,29 @@ pub struct JsAudioFormat {
     pub sample_format: String,
 }
 
+// ── Data-pump recoverable-error log throttle ─────────────────────────────
+
+/// How often the data pump logs a *sustained* run of recoverable read errors.
+///
+/// The pump logs the first error in a streak eagerly, then only every
+/// `RECOVERABLE_LOG_EVERY`th after that, so a backend stuck returning a
+/// recoverable error on every ~1 ms poll cannot flood stderr at ~1000 lines/sec.
+const RECOVERABLE_LOG_EVERY: u64 = 1000;
+
+/// Whether the `count`-th (0-based) consecutive recoverable read error should be
+/// logged, given [`RECOVERABLE_LOG_EVERY`].
+///
+/// Returns `true` for the first error in a streak (`count == 0`) and then once
+/// per `RECOVERABLE_LOG_EVERY` errors. Pure arithmetic so the throttle policy is
+/// unit-testable without a node runtime; the pump increments the count on each
+/// recoverable error and resets it to `0` on a successful read.
+#[inline]
+fn should_log_recoverable(count: u64) -> bool {
+    // is_multiple_of (stable 1.87 = pinned MSRV) — clippy::manual_is_multiple_of
+    // rejects the `% N == 0` form under -D warnings.
+    count.is_multiple_of(RECOVERABLE_LOG_EVERY)
+}
+
 // ── AudioCapture private helpers ─────────────────────────────────────────
 
 impl AudioCapture {
@@ -764,6 +815,16 @@ impl AudioCapture {
                 // poisoned mutex. Fired to the JS `onEnd` callback exactly once
                 // after the loop exits (see the `end_callback` notification below).
                 let mut end_reason: Option<String> = None;
+                // Recoverable-read-error log throttle. A sustained transient (e.g. a
+                // backend that returns a recoverable `StreamReadError` on every poll)
+                // would otherwise spam stderr ~1000 lines/sec (one per 1 ms retry).
+                // We log the FIRST occurrence eagerly, then only every
+                // `RECOVERABLE_LOG_EVERY`th thereafter (see `should_log_recoverable`)
+                // — annotated with how many were suppressed since the last line — so a
+                // stuck stream leaves a bounded, legible trail instead of a flood.
+                // Counting is a plain `u64` on this thread (no alloc, no lock), and the
+                // counter resets whenever a read succeeds so an isolated blip logs.
+                let mut recoverable_errors: u64 = 0;
                 while pump_active.load(Ordering::SeqCst) {
                     // Read via `read_chunk_nonblocking` (NOT `read_buffer`):
                     // `read_buffer` short-circuits to a RECOVERABLE
@@ -784,6 +845,10 @@ impl AudioCapture {
 
                     match maybe_buf {
                         Ok(Some(buf)) => {
+                            // A successful read clears the transient-error streak so a
+                            // later isolated blip is logged eagerly again (the throttle
+                            // only suppresses a *sustained* run of recoverable errors).
+                            recoverable_errors = 0;
                             let chunk = AudioChunk::from_rsac_buffer(&buf);
                             let cb = match callback.lock() {
                                 Ok(c) => c,
@@ -811,9 +876,24 @@ impl AudioCapture {
                         // RECOVERABLE hiccup (transient StreamReadError,
                         // BufferOverrun/Underrun): a transient error must NOT end
                         // delivery. Log and retry after a brief pause, mirroring
-                        // the in-process callback pump and the subscribe loop.
+                        // the in-process callback pump and the subscribe loop. The
+                        // log is throttled (first occurrence, then every
+                        // `RECOVERABLE_LOG_EVERY`th) so a stuck stream cannot flood
+                        // stderr at ~1000 lines/sec.
                         Err(e) => {
-                            eprintln!("rsac-napi data pump read error (retrying): {}", e);
+                            if should_log_recoverable(recoverable_errors) {
+                                if recoverable_errors == 0 {
+                                    eprintln!("rsac-napi data pump read error (retrying): {}", e);
+                                } else {
+                                    eprintln!(
+                                        "rsac-napi data pump read error (retrying; \
+                                         {} more suppressed since last line): {}",
+                                        RECOVERABLE_LOG_EVERY - 1,
+                                        e
+                                    );
+                                }
+                            }
+                            recoverable_errors = recoverable_errors.saturating_add(1);
                             std::thread::sleep(std::time::Duration::from_millis(1));
                         }
                     }
@@ -822,13 +902,25 @@ impl AudioCapture {
 
                 // Notify the JS consumer (if it registered `onEnd`) *why* delivery
                 // stopped — the terminal `AudioError` message on a fatal terminal,
-                // or `null` on a clean stop. Fired once here, then cleared so a
-                // later pump run cannot re-fire a stale callback. This is the Node
-                // parity for `subscribe_with_errors` / `StreamWithErrors`.
-                if let Ok(mut guard) = end_callback.lock() {
-                    if let Some(tsfn) = guard.take() {
-                        tsfn.call(end_reason, ThreadsafeFunctionCallMode::NonBlocking);
-                    }
+                // or `null` on a clean stop. This is the Node parity for
+                // `subscribe_with_errors` / `StreamWithErrors`.
+                //
+                // The callback is *cloned* (not taken) so it survives across
+                // multiple start/stop sessions on the same `AudioCapture`, exactly
+                // like the `onData` callback. A `ThreadsafeFunction` is internally
+                // ref-counted, so the clone shares the same underlying JS function;
+                // firing this run's clone leaves the canonical copy registered in
+                // `end_callback` for the next pump run to re-arm automatically. The
+                // registration is cleared only by an explicit `offEnd` (or replaced
+                // by a later `onEnd`), so `onEnd` and `onData` are now symmetric:
+                // both fire once per session and both persist until explicitly
+                // cleared. (Fires at most once per pump run.)
+                let end_tsfn = match end_callback.lock() {
+                    Ok(guard) => guard.clone(),
+                    Err(_) => None,
+                };
+                if let Some(tsfn) = end_tsfn {
+                    tsfn.call(end_reason, ThreadsafeFunctionCallMode::NonBlocking);
                 }
             })
             .map_err(|e| {
@@ -892,7 +984,7 @@ pub async fn list_devices() -> Result<Vec<JsAudioDevice>> {
 pub async fn get_default_device() -> Result<JsAudioDevice> {
     tokio::task::spawn_blocking(|| -> napi::Result<JsAudioDevice> {
         let enumerator = rsac::get_device_enumerator().map_err(audio_err_to_napi)?;
-        let device = enumerator.get_default_device().map_err(audio_err_to_napi)?;
+        let device = enumerator.default_device().map_err(audio_err_to_napi)?;
 
         Ok(JsAudioDevice {
             id: device.id().to_string(),
@@ -1125,8 +1217,7 @@ mod tests {
         );
         // The pump stores `Some(e.to_string())` as the end reason; the JS callback
         // receives exactly this string (non-empty, carries the upstream cause).
-        let end_reason: Option<String> = Some(e.to_string());
-        let surfaced = end_reason.expect("fatal terminal yields a reason");
+        let surfaced = e.to_string();
         assert!(!surfaced.is_empty());
         assert_eq!(surfaced, e.to_string());
     }
@@ -1153,5 +1244,64 @@ mod tests {
             );
             assert!(e.is_recoverable());
         }
+    }
+
+    // ── rsac-2587: data-pump recoverable-error log throttle ──────────────
+    //
+    // The pump cannot be driven without a node runtime + a real device, so
+    // these pin the *throttle policy* the pump's logging decision relies on:
+    // the first error in a streak logs, then only every `RECOVERABLE_LOG_EVERY`th
+    // thereafter, so a sustained transient cannot flood stderr at ~1000 lines/sec.
+
+    /// The first error in a streak (`count == 0`) always logs, so an isolated
+    /// blip is never silently swallowed.
+    #[test]
+    fn recoverable_throttle_logs_first_occurrence() {
+        assert!(should_log_recoverable(0));
+    }
+
+    /// Within the first window, errors `1..RECOVERABLE_LOG_EVERY` are suppressed
+    /// (only the boundary multiples log), so a sustained transient at the pump's
+    /// ~1 ms retry cadence produces at most ~1 line per `RECOVERABLE_LOG_EVERY`
+    /// errors instead of one per error.
+    #[test]
+    fn recoverable_throttle_suppresses_within_window() {
+        for count in 1..RECOVERABLE_LOG_EVERY {
+            assert!(
+                !should_log_recoverable(count),
+                "count {count} should be suppressed (not a multiple of {RECOVERABLE_LOG_EVERY})"
+            );
+        }
+    }
+
+    /// Logging recurs exactly on each `RECOVERABLE_LOG_EVERY` boundary, so a
+    /// stuck stream still leaves a bounded, periodic trail (a flat-zero rate
+    /// would hide a genuinely wedged backend).
+    #[test]
+    fn recoverable_throttle_logs_on_each_boundary() {
+        assert!(should_log_recoverable(RECOVERABLE_LOG_EVERY));
+        assert!(should_log_recoverable(RECOVERABLE_LOG_EVERY * 2));
+        assert!(should_log_recoverable(RECOVERABLE_LOG_EVERY * 7));
+        // ...and the off-by-one neighbours of a boundary are still suppressed.
+        assert!(!should_log_recoverable(RECOVERABLE_LOG_EVERY - 1));
+        assert!(!should_log_recoverable(RECOVERABLE_LOG_EVERY + 1));
+    }
+
+    /// Over a long sustained streak, the number of *logged* lines is bounded by
+    /// `streak / RECOVERABLE_LOG_EVERY + 1` — the property that makes the flood
+    /// impossible. Assert it directly for a streak far larger than one window.
+    #[test]
+    fn recoverable_throttle_bounds_logged_lines() {
+        let streak = RECOVERABLE_LOG_EVERY * 5 + 123; // not a clean multiple
+        let logged = (0..streak).filter(|&c| should_log_recoverable(c)).count() as u64;
+        let upper_bound = streak / RECOVERABLE_LOG_EVERY + 1;
+        assert!(
+            logged <= upper_bound,
+            "logged {logged} lines over a {streak}-error streak exceeds the \
+             {upper_bound}-line bound"
+        );
+        // Concretely: 5 full windows + a partial → exactly 6 logged lines
+        // (counts 0, EVERY, 2·EVERY, 3·EVERY, 4·EVERY, 5·EVERY).
+        assert_eq!(logged, 6);
     }
 }

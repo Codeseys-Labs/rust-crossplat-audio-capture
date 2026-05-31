@@ -11,15 +11,15 @@
 /**
  * Device kind for enumeration.
  */
-typedef enum Rsacrsac_device_kind_t {
+typedef enum rsac_device_kind_t {
     RSAC_DEVICE_INPUT = 0,
     RSAC_DEVICE_OUTPUT = 1,
-} Rsacrsac_device_kind_t;
+} rsac_device_kind_t;
 
 /**
  * Error codes returned by all rsac FFI functions.
  */
-typedef enum Rsacrsac_error_t {
+typedef enum rsac_error_t {
     /**
      * Operation succeeded.
      */
@@ -76,7 +76,7 @@ typedef enum Rsacrsac_error_t {
      * A Rust panic was caught (should not happen in normal use).
      */
     RSAC_ERROR_PANIC = 99,
-} Rsacrsac_error_t;
+} rsac_error_t;
 
 /**
  * Sample wire/storage format, mirroring [`rsac::SampleFormat`].
@@ -84,7 +84,7 @@ typedef enum Rsacrsac_error_t {
  * All audio data is delivered as interleaved `f32` regardless of this value;
  * it describes the negotiated wire format the backend reports.
  */
-typedef enum Rsacrsac_sample_format_t {
+typedef enum rsac_sample_format_t {
     /**
      * Signed 16-bit integer.
      */
@@ -101,42 +101,42 @@ typedef enum Rsacrsac_sample_format_t {
      * 32-bit IEEE 754 floating-point (the library's internal standard).
      */
     RSAC_SAMPLE_FORMAT_F32 = 3,
-} Rsacrsac_sample_format_t;
+} rsac_sample_format_t;
 
 /**
  * Opaque handle to an `AudioBuffer`.
  */
-typedef struct RsacRsacAudioBuffer RsacRsacAudioBuffer;
+typedef struct RsacAudioBuffer RsacAudioBuffer;
 
 /**
  * Opaque handle to an `AudioCaptureBuilder`.
  */
-typedef struct RsacRsacBuilder RsacRsacBuilder;
+typedef struct RsacBuilder RsacBuilder;
 
 /**
  * Opaque handle to platform capabilities.
  */
-typedef struct RsacRsacCapabilities RsacRsacCapabilities;
+typedef struct RsacCapabilities RsacCapabilities;
 
 /**
  * Opaque handle to an `AudioCapture` session.
  */
-typedef struct RsacRsacCapture RsacRsacCapture;
+typedef struct RsacCapture RsacCapture;
 
 /**
  * Opaque handle to a single audio device.
  */
-typedef struct RsacRsacDevice RsacRsacDevice;
+typedef struct RsacDevice RsacDevice;
 
 /**
  * Opaque handle to a device enumerator.
  */
-typedef struct RsacRsacDeviceEnumerator RsacRsacDeviceEnumerator;
+typedef struct RsacDeviceEnumerator RsacDeviceEnumerator;
 
 /**
  * Opaque handle to a list of audio devices.
  */
-typedef struct RsacRsacDeviceList RsacRsacDeviceList;
+typedef struct RsacDeviceList RsacDeviceList;
 
 /**
  * A point-in-time snapshot of a capture's stream statistics.
@@ -148,7 +148,7 @@ typedef struct RsacRsacDeviceList RsacRsacDeviceList;
  * When no stream has been created (before start, or after stop) every counter
  * is `0`, `uptime_secs` is `0.0`, and `is_running` is `0`.
  */
-typedef struct RsacRsacStreamStats {
+typedef struct RsacStreamStats {
     /**
      * Buffers delivered to the consumer (popped off the ring) since start.
      */
@@ -177,7 +177,7 @@ typedef struct RsacRsacStreamStats {
      * `1` if the stream is currently capturing, `0` otherwise.
      */
     int32_t is_running;
-} RsacRsacStreamStats;
+} RsacStreamStats;
 
 /**
  * A point-in-time snapshot of a capture's negotiated delivery format.
@@ -185,7 +185,7 @@ typedef struct RsacRsacStreamStats {
  * Filled by [`rsac_capture_format`] from [`AudioCapture::format`]. Plain C-ABI
  * value type (no heap, no free required).
  */
-typedef struct RsacRsacAudioFormat {
+typedef struct RsacAudioFormat {
     /**
      * Samples per second (e.g. 44100, 48000).
      */
@@ -197,12 +197,12 @@ typedef struct RsacRsacAudioFormat {
     /**
      * The negotiated sample wire format.
      */
-    enum Rsacrsac_sample_format_t sample_format;
+    enum rsac_sample_format_t sample_format;
     /**
      * Bits per sample for `sample_format` (16, 24, or 32).
      */
     uint16_t bits_per_sample;
-} RsacRsacAudioFormat;
+} RsacAudioFormat;
 
 /**
  * C callback type for audio data.
@@ -214,11 +214,11 @@ typedef struct RsacRsacAudioFormat {
  * - `sample_rate`: sample rate in Hz
  * - `user_data`: opaque pointer passed to `rsac_capture_set_callback`
  */
-typedef void (*Rsacrsac_audio_callback_t)(const float *buffer_data,
-                                          uintptr_t num_samples,
-                                          uint16_t channels,
-                                          uint32_t sample_rate,
-                                          void *user_data);
+typedef void (*rsac_audio_callback_t)(const float *buffer_data,
+                                      uintptr_t num_samples,
+                                      uint16_t channels,
+                                      uint32_t sample_rate,
+                                      void *user_data);
 
 /**
  * Returns a pointer to the last error message for the current thread.
@@ -234,49 +234,46 @@ typedef void (*Rsacrsac_audio_callback_t)(const float *buffer_data,
  * Returns a handle that must be freed with `rsac_builder_free()`.
  * On failure, `*out` is set to null.
  */
- enum Rsacrsac_error_t rsac_builder_new(struct RsacRsacBuilder **out) ;
+ enum rsac_error_t rsac_builder_new(struct RsacBuilder **out) ;
 
 /**
  * Frees a builder handle. No-op if null.
  */
- void rsac_builder_free(struct RsacRsacBuilder *builder) ;
+ void rsac_builder_free(struct RsacBuilder *builder) ;
 
 /**
  * Sets the capture target to system default audio.
  */
- enum Rsacrsac_error_t rsac_builder_set_target_system(struct RsacRsacBuilder *builder) ;
+ enum rsac_error_t rsac_builder_set_target_system(struct RsacBuilder *builder) ;
 
 /**
  * Sets the capture target to a specific device by ID.
  */
 
-enum Rsacrsac_error_t rsac_builder_set_target_device(struct RsacRsacBuilder *builder,
-                                                     const char *device_id)
+enum rsac_error_t rsac_builder_set_target_device(struct RsacBuilder *builder,
+                                                 const char *device_id)
 ;
 
 /**
  * Sets the capture target to an application by name.
  */
 
-enum Rsacrsac_error_t rsac_builder_set_target_app_by_name(struct RsacRsacBuilder *builder,
-                                                          const char *app_name)
+enum rsac_error_t rsac_builder_set_target_app_by_name(struct RsacBuilder *builder,
+                                                      const char *app_name)
 ;
 
 /**
  * Sets the capture target to an application by ID.
  */
 
-enum Rsacrsac_error_t rsac_builder_set_target_app_by_id(struct RsacRsacBuilder *builder,
-                                                        const char *app_id)
+enum rsac_error_t rsac_builder_set_target_app_by_id(struct RsacBuilder *builder,
+                                                    const char *app_id)
 ;
 
 /**
  * Sets the capture target to a process tree by PID.
  */
-
-enum Rsacrsac_error_t rsac_builder_set_target_process_tree(struct RsacRsacBuilder *builder,
-                                                           uint32_t pid)
-;
+ enum rsac_error_t rsac_builder_set_target_process_tree(struct RsacBuilder *builder, uint32_t pid) ;
 
 /**
  * Sets the capture target by parsing a canonical target string.
@@ -296,26 +293,17 @@ enum Rsacrsac_error_t rsac_builder_set_target_process_tree(struct RsacRsacBuilde
  * `RSAC_ERROR_INVALID_PARAMETER` if `spec` is not valid UTF-8 or not a valid
  * target string.
  */
-
-enum Rsacrsac_error_t rsac_builder_set_target_str(struct RsacRsacBuilder *builder,
-                                                  const char *spec)
-;
+ enum rsac_error_t rsac_builder_set_target_str(struct RsacBuilder *builder, const char *spec) ;
 
 /**
  * Sets the desired sample rate in Hz.
  */
-
-enum Rsacrsac_error_t rsac_builder_set_sample_rate(struct RsacRsacBuilder *builder,
-                                                   uint32_t sample_rate)
-;
+ enum rsac_error_t rsac_builder_set_sample_rate(struct RsacBuilder *builder, uint32_t sample_rate) ;
 
 /**
  * Sets the desired number of audio channels.
  */
-
-enum Rsacrsac_error_t rsac_builder_set_channels(struct RsacRsacBuilder *builder,
-                                                uint16_t channels)
-;
+ enum rsac_error_t rsac_builder_set_channels(struct RsacBuilder *builder, uint16_t channels) ;
 
 /**
  * Builds an `AudioCapture` from the builder configuration.
@@ -324,32 +312,29 @@ enum Rsacrsac_error_t rsac_builder_set_channels(struct RsacRsacBuilder *builder,
  * and freed. On failure, `*out` is null and the builder is also consumed
  * (Rust ownership semantics — create a new builder to retry).
  */
-
-enum Rsacrsac_error_t rsac_builder_build(struct RsacRsacBuilder *builder,
-                                         struct RsacRsacCapture **out)
-;
+ enum rsac_error_t rsac_builder_build(struct RsacBuilder *builder, struct RsacCapture **out) ;
 
 /**
  * Starts the audio capture stream.
  */
- enum Rsacrsac_error_t rsac_capture_start(struct RsacRsacCapture *capture) ;
+ enum rsac_error_t rsac_capture_start(struct RsacCapture *capture) ;
 
 /**
  * Stops the audio capture stream.
  */
- enum Rsacrsac_error_t rsac_capture_stop(struct RsacRsacCapture *capture) ;
+ enum rsac_error_t rsac_capture_stop(struct RsacCapture *capture) ;
 
 /**
  * Returns 1 if the capture stream is currently running, 0 otherwise.
  * Returns -1 if the capture handle is null.
  */
- int32_t rsac_capture_is_running(const struct RsacRsacCapture *capture) ;
+ int32_t rsac_capture_is_running(const struct RsacCapture *capture) ;
 
 /**
  * Returns the number of ring buffer overruns (dropped buffers).
  * Returns 0 if the capture handle is null or no stream exists.
  */
- uint64_t rsac_capture_overrun_count(const struct RsacRsacCapture *capture) ;
+ uint64_t rsac_capture_overrun_count(const struct RsacCapture *capture) ;
 
 /**
  * Fills `*out` with a point-in-time [`RsacStreamStats`] snapshot of the capture.
@@ -365,8 +350,8 @@ enum Rsacrsac_error_t rsac_builder_build(struct RsacRsacBuilder *builder,
  * `RSAC_OK`. `out` is an out-parameter, not a handle: there is nothing to free.
  */
 
-enum Rsacrsac_error_t rsac_capture_stream_stats(const struct RsacRsacCapture *capture,
-                                                struct RsacRsacStreamStats *out)
+enum rsac_error_t rsac_capture_stream_stats(const struct RsacCapture *capture,
+                                            struct RsacStreamStats *out)
 ;
 
 /**
@@ -382,14 +367,14 @@ enum Rsacrsac_error_t rsac_capture_stream_stats(const struct RsacRsacCapture *ca
  * out-parameter, not a handle: there is nothing to free.
  */
 
-enum Rsacrsac_error_t rsac_capture_format(const struct RsacRsacCapture *capture,
-                                          struct RsacRsacAudioFormat *out)
+enum rsac_error_t rsac_capture_format(const struct RsacCapture *capture,
+                                      struct RsacAudioFormat *out)
 ;
 
 /**
  * Frees a capture handle. Stops the stream if running. No-op if null.
  */
- void rsac_capture_free(struct RsacRsacCapture *capture) ;
+ void rsac_capture_free(struct RsacCapture *capture) ;
 
 /**
  * Attempts a non-blocking read of audio data.
@@ -399,8 +384,8 @@ enum Rsacrsac_error_t rsac_capture_format(const struct RsacRsacCapture *capture,
  * The buffer must be freed with `rsac_audio_buffer_free()`.
  */
 
-enum Rsacrsac_error_t rsac_capture_try_read(const struct RsacRsacCapture *capture,
-                                            struct RsacRsacAudioBuffer **out)
+enum rsac_error_t rsac_capture_try_read(const struct RsacCapture *capture,
+                                        struct RsacAudioBuffer **out)
 ;
 
 /**
@@ -410,8 +395,8 @@ enum Rsacrsac_error_t rsac_capture_try_read(const struct RsacRsacCapture *captur
  * with `rsac_audio_buffer_free()`.
  */
 
-enum Rsacrsac_error_t rsac_capture_read(const struct RsacRsacCapture *capture,
-                                        struct RsacRsacAudioBuffer **out)
+enum rsac_error_t rsac_capture_read(const struct RsacCapture *capture,
+                                    struct RsacAudioBuffer **out)
 ;
 
 /**
@@ -434,7 +419,7 @@ enum Rsacrsac_error_t rsac_capture_read(const struct RsacRsacCapture *capture,
  *
  * Returns `RSAC_ERROR_NULL_POINTER` if `capture` is null, else `RSAC_OK`.
  */
- enum Rsacrsac_error_t rsac_capture_request_stop(const struct RsacRsacCapture *capture) ;
+ enum rsac_error_t rsac_capture_request_stop(const struct RsacCapture *capture) ;
 
 /**
  * Sets a callback for push-based audio delivery.
@@ -451,9 +436,9 @@ enum Rsacrsac_error_t rsac_capture_read(const struct RsacRsacCapture *capture,
  * - The callback must not call any rsac functions (to avoid deadlocks).
  */
 
-enum Rsacrsac_error_t rsac_capture_set_callback(struct RsacRsacCapture *capture,
-                                                Rsacrsac_audio_callback_t callback,
-                                                void *user_data)
+enum rsac_error_t rsac_capture_set_callback(struct RsacCapture *capture,
+                                            rsac_audio_callback_t callback,
+                                            void *user_data)
 ;
 
 /**
@@ -461,31 +446,31 @@ enum Rsacrsac_error_t rsac_capture_set_callback(struct RsacRsacCapture *capture,
  *
  * The pointer is valid until the buffer is freed. Returns null if the buffer is null.
  */
- const float *rsac_audio_buffer_data(const struct RsacRsacAudioBuffer *buffer) ;
+ const float *rsac_audio_buffer_data(const struct RsacAudioBuffer *buffer) ;
 
 /**
  * Returns the total number of f32 samples in the buffer (all channels).
  * Returns 0 if the buffer is null.
  */
- uintptr_t rsac_audio_buffer_len(const struct RsacRsacAudioBuffer *buffer) ;
+ uintptr_t rsac_audio_buffer_len(const struct RsacAudioBuffer *buffer) ;
 
 /**
  * Returns the number of audio frames in the buffer.
  * Returns 0 if the buffer is null.
  */
- uintptr_t rsac_audio_buffer_num_frames(const struct RsacRsacAudioBuffer *buffer) ;
+ uintptr_t rsac_audio_buffer_num_frames(const struct RsacAudioBuffer *buffer) ;
 
 /**
  * Returns the number of channels in the buffer.
  * Returns 0 if the buffer is null.
  */
- uint16_t rsac_audio_buffer_channels(const struct RsacRsacAudioBuffer *buffer) ;
+ uint16_t rsac_audio_buffer_channels(const struct RsacAudioBuffer *buffer) ;
 
 /**
  * Returns the sample rate of the buffer in Hz.
  * Returns 0 if the buffer is null.
  */
- uint32_t rsac_audio_buffer_sample_rate(const struct RsacRsacAudioBuffer *buffer) ;
+ uint32_t rsac_audio_buffer_sample_rate(const struct RsacAudioBuffer *buffer) ;
 
 /**
  * Returns the root-mean-square (RMS) level across all samples/channels.
@@ -495,7 +480,7 @@ enum Rsacrsac_error_t rsac_capture_set_callback(struct RsacRsacCapture *capture,
  * (never `NaN`). Read-only measurement — no allocation, RT-callback safe.
  * Returns `0.0` if the buffer is null.
  */
- float rsac_audio_buffer_rms(const struct RsacRsacAudioBuffer *buffer) ;
+ float rsac_audio_buffer_rms(const struct RsacAudioBuffer *buffer) ;
 
 /**
  * Returns the peak (maximum absolute) level across all samples/channels.
@@ -504,7 +489,7 @@ enum Rsacrsac_error_t rsac_capture_set_callback(struct RsacRsacCapture *capture,
  * skipped; a silent or empty buffer yields `0.0` (never `NaN`). Read-only
  * measurement — no allocation. Returns `0.0` if the buffer is null.
  */
- float rsac_audio_buffer_peak(const struct RsacRsacAudioBuffer *buffer) ;
+ float rsac_audio_buffer_peak(const struct RsacAudioBuffer *buffer) ;
 
 /**
  * Returns the RMS level in dBFS: `20 · log10(rms())`.
@@ -513,7 +498,7 @@ enum Rsacrsac_error_t rsac_capture_set_callback(struct RsacRsacCapture *capture,
  * or an empty buffer, and **also** negative infinity if the buffer is null
  * (there is no level to report). Full scale (RMS `1.0`) maps to `0.0` dBFS.
  */
- float rsac_audio_buffer_rms_dbfs(const struct RsacRsacAudioBuffer *buffer) ;
+ float rsac_audio_buffer_rms_dbfs(const struct RsacAudioBuffer *buffer) ;
 
 /**
  * Returns the peak level in dBFS: `20 · log10(peak())`.
@@ -522,12 +507,12 @@ enum Rsacrsac_error_t rsac_capture_set_callback(struct RsacRsacCapture *capture,
  * or an empty buffer, and **also** negative infinity if the buffer is null.
  * A full-scale signal (peak `1.0`) maps to `0.0` dBFS.
  */
- float rsac_audio_buffer_peak_dbfs(const struct RsacRsacAudioBuffer *buffer) ;
+ float rsac_audio_buffer_peak_dbfs(const struct RsacAudioBuffer *buffer) ;
 
 /**
  * Frees an audio buffer handle. No-op if null.
  */
- void rsac_audio_buffer_free(struct RsacRsacAudioBuffer *buffer) ;
+ void rsac_audio_buffer_free(struct RsacAudioBuffer *buffer) ;
 
 /**
  * Creates a new device enumerator.
@@ -535,12 +520,12 @@ enum Rsacrsac_error_t rsac_capture_set_callback(struct RsacRsacCapture *capture,
  * On success, `*out` receives the enumerator handle. Must be freed with
  * `rsac_device_enumerator_free()`.
  */
- enum Rsacrsac_error_t rsac_device_enumerator_new(struct RsacRsacDeviceEnumerator **out) ;
+ enum rsac_error_t rsac_device_enumerator_new(struct RsacDeviceEnumerator **out) ;
 
 /**
  * Frees a device enumerator handle. No-op if null.
  */
- void rsac_device_enumerator_free(struct RsacRsacDeviceEnumerator *enumerator) ;
+ void rsac_device_enumerator_free(struct RsacDeviceEnumerator *enumerator) ;
 
 /**
  * Enumerates all audio devices into a device list.
@@ -549,15 +534,15 @@ enum Rsacrsac_error_t rsac_capture_set_callback(struct RsacRsacCapture *capture,
  * `rsac_device_list_free()`.
  */
 
-enum Rsacrsac_error_t rsac_device_list_new(const struct RsacRsacDeviceEnumerator *enumerator,
-                                           struct RsacRsacDeviceList **out)
+enum rsac_error_t rsac_device_list_new(const struct RsacDeviceEnumerator *enumerator,
+                                       struct RsacDeviceList **out)
 ;
 
 /**
  * Returns the number of devices in the list.
  * Returns 0 if the list is null.
  */
- uintptr_t rsac_device_list_count(const struct RsacRsacDeviceList *list) ;
+ uintptr_t rsac_device_list_count(const struct RsacDeviceList *list) ;
 
 /**
  * Gets a device from the list by index.
@@ -569,15 +554,15 @@ enum Rsacrsac_error_t rsac_device_list_new(const struct RsacRsacDeviceEnumerator
  * and default status, but cannot be used to create streams directly.
  */
 
-enum Rsacrsac_error_t rsac_device_list_get(const struct RsacRsacDeviceList *list,
-                                           uintptr_t index,
-                                           struct RsacRsacDevice **out)
+enum rsac_error_t rsac_device_list_get(const struct RsacDeviceList *list,
+                                       uintptr_t index,
+                                       struct RsacDevice **out)
 ;
 
 /**
  * Frees a device list handle. No-op if null.
  */
- void rsac_device_list_free(struct RsacRsacDeviceList *list) ;
+ void rsac_device_list_free(struct RsacDeviceList *list) ;
 
 /**
  * Gets the default audio device.
@@ -586,9 +571,9 @@ enum Rsacrsac_error_t rsac_device_list_get(const struct RsacRsacDeviceList *list
  * `rsac_device_free()`.
  */
 
-enum Rsacrsac_error_t rsac_default_device(const struct RsacRsacDeviceEnumerator *enumerator,
-                                          enum Rsacrsac_device_kind_t kind,
-                                          struct RsacRsacDevice **out)
+enum rsac_error_t rsac_default_device(const struct RsacDeviceEnumerator *enumerator,
+                                      enum rsac_device_kind_t kind,
+                                      struct RsacDevice **out)
 ;
 
 /**
@@ -597,7 +582,7 @@ enum Rsacrsac_error_t rsac_default_device(const struct RsacRsacDeviceEnumerator 
  * The returned pointer is valid until the next call to `rsac_device_name()` or
  * `rsac_device_id()` on the same thread. Returns null if the device handle is null.
  */
- const char *rsac_device_name(const struct RsacRsacDevice *device) ;
+ const char *rsac_device_name(const struct RsacDevice *device) ;
 
 /**
  * Returns the device ID as a C string.
@@ -605,18 +590,18 @@ enum Rsacrsac_error_t rsac_default_device(const struct RsacRsacDeviceEnumerator 
  * The returned pointer is valid until the next call to `rsac_device_name()` or
  * `rsac_device_id()` on the same thread. Returns null if the device handle is null.
  */
- const char *rsac_device_id(const struct RsacRsacDevice *device) ;
+ const char *rsac_device_id(const struct RsacDevice *device) ;
 
 /**
  * Returns 1 if the device is the system default, 0 otherwise.
  * Returns -1 if the device handle is null.
  */
- int32_t rsac_device_is_default(const struct RsacRsacDevice *device) ;
+ int32_t rsac_device_is_default(const struct RsacDevice *device) ;
 
 /**
  * Frees a device handle. No-op if null.
  */
- void rsac_device_free(struct RsacRsacDevice *device) ;
+ void rsac_device_free(struct RsacDevice *device) ;
 
 /**
  * Queries platform capabilities.
@@ -624,42 +609,42 @@ enum Rsacrsac_error_t rsac_default_device(const struct RsacRsacDeviceEnumerator 
  * On success, `*out` receives a capabilities handle. Must be freed with
  * `rsac_capabilities_free()`.
  */
- enum Rsacrsac_error_t rsac_capabilities_query(struct RsacRsacCapabilities **out) ;
+ enum rsac_error_t rsac_capabilities_query(struct RsacCapabilities **out) ;
 
 /**
  * Frees a capabilities handle. No-op if null.
  */
- void rsac_capabilities_free(struct RsacRsacCapabilities *caps) ;
+ void rsac_capabilities_free(struct RsacCapabilities *caps) ;
 
 /**
  * Returns 1 if system capture is supported, 0 otherwise.
  * Returns -1 if the handle is null.
  */
- int32_t rsac_capabilities_supports_system_capture(const struct RsacRsacCapabilities *caps) ;
+ int32_t rsac_capabilities_supports_system_capture(const struct RsacCapabilities *caps) ;
 
 /**
  * Returns 1 if application capture is supported, 0 otherwise.
  * Returns -1 if the handle is null.
  */
- int32_t rsac_capabilities_supports_app_capture(const struct RsacRsacCapabilities *caps) ;
+ int32_t rsac_capabilities_supports_app_capture(const struct RsacCapabilities *caps) ;
 
 /**
  * Returns 1 if process tree capture is supported, 0 otherwise.
  * Returns -1 if the handle is null.
  */
- int32_t rsac_capabilities_supports_process_tree(const struct RsacRsacCapabilities *caps) ;
+ int32_t rsac_capabilities_supports_process_tree(const struct RsacCapabilities *caps) ;
 
 /**
  * Returns 1 if device selection is supported, 0 otherwise.
  * Returns -1 if the handle is null.
  */
- int32_t rsac_capabilities_supports_device_selection(const struct RsacRsacCapabilities *caps) ;
+ int32_t rsac_capabilities_supports_device_selection(const struct RsacCapabilities *caps) ;
 
 /**
  * Returns the maximum number of channels supported.
  * Returns 0 if the handle is null.
  */
- uint16_t rsac_capabilities_max_channels(const struct RsacRsacCapabilities *caps) ;
+ uint16_t rsac_capabilities_max_channels(const struct RsacCapabilities *caps) ;
 
 /**
  * Returns the backend name (e.g., "WASAPI", "CoreAudio", "PipeWire") as a C string.
@@ -667,7 +652,7 @@ enum Rsacrsac_error_t rsac_default_device(const struct RsacRsacDeviceEnumerator 
  * The returned pointer is valid until the next call to `rsac_capabilities_backend_name()`
  * on the same thread. Returns null if the handle is null.
  */
- const char *rsac_capabilities_backend_name(const struct RsacRsacCapabilities *caps) ;
+ const char *rsac_capabilities_backend_name(const struct RsacCapabilities *caps) ;
 
 /**
  * Returns the rsac-ffi version string.

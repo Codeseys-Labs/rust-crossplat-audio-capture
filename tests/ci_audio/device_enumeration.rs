@@ -47,13 +47,13 @@ fn test_default_device_exists() {
 
     let enumerator = get_device_enumerator().expect("Failed to create device enumerator");
 
-    let default_device = match enumerator.get_default_device() {
+    let default_device = match enumerator.default_device() {
         Ok(d) => d,
         Err(e) => {
             // Native PipeWire connectivity is unavailable in the dbus-less CI
             // VM; verified on real hardware + Windows/macOS CI. Skip honestly.
             eprintln!(
-                "[ci_audio] SKIPPED: get_default_device() unavailable in this environment: {e:?}"
+                "[ci_audio] SKIPPED: default_device() unavailable in this environment: {e:?}"
             );
             return;
         }
