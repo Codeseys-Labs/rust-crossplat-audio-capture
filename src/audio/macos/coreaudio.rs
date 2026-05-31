@@ -2366,33 +2366,42 @@ mod tests {
         assert!(!rollback_range(2).contains(&2));
     }
 
-    /// rsac-af31: the listener context's `event_tx` is a `Mutex<Option<…>>` taken
-    /// exactly once at teardown to disconnect the channel WITHOUT freeing the
-    /// (intentionally leaked) context. Pin the single-take / idempotent semantics
-    /// device-free, without registering a real listener or spawning the helper.
+    /// rsac-af31: after teardown disconnects the channel (sets `event_tx = None`,
+    /// the production teardown's exact operation — WITHOUT freeing the
+    /// intentionally-leaked context), a re-entrant listener proc must OBSERVE the
+    /// channel as gone and no-op. This exercises rsac's own `try_push_event`
+    /// disconnect path (not just `Option::take`): we push an event, drain it,
+    /// then teardown-disconnect and assert a subsequent push delivers NOTHING.
     #[test]
-    fn watch_listener_context_single_take_invariant() {
-        let (tx, _rx) = std::sync::mpsc::sync_channel::<DeviceEvent>(WATCH_CHANNEL_CAP);
+    fn try_push_event_noops_after_teardown_disconnect() {
+        let (tx, rx) = std::sync::mpsc::sync_channel::<DeviceEvent>(WATCH_CHANNEL_CAP);
         let ctx = WatchListenerContext {
             event_tx: std::sync::Mutex::new(Some(tx)),
             previous_devices: std::sync::Mutex::new(std::collections::HashSet::new()),
         };
 
-        // First take yields the sender.
+        let event = || DeviceEvent::DefaultChanged {
+            id: DeviceId("test-default".to_string()),
+            kind: DeviceKind::Output,
+        };
+
+        // Before teardown: a pushed event is delivered through the channel.
+        try_push_event(&ctx, event());
         assert!(
-            ctx.event_tx.lock().unwrap().take().is_some(),
-            "first take must yield Some(sender)"
+            matches!(rx.try_recv(), Ok(DeviceEvent::DefaultChanged { .. })),
+            "before teardown, try_push_event must deliver the event"
         );
-        // Second take yields None — the take is persistent (teardown disconnected
-        // the channel; a re-entrant proc must observe the channel as gone).
+
+        // Teardown disconnects the channel exactly as production does: take the
+        // sender out (set the slot to None) without freeing the leaked context.
+        *ctx.event_tx.lock().unwrap() = None;
+
+        // After teardown: a re-entrant proc's push must no-op (sender gone), so
+        // nothing reaches the receiver and the call does not panic/block.
+        try_push_event(&ctx, event());
         assert!(
-            ctx.event_tx.lock().unwrap().take().is_none(),
-            "second take must yield None (single-take invariant)"
-        );
-        // Third take stays None — idempotent.
-        assert!(
-            ctx.event_tx.lock().unwrap().take().is_none(),
-            "take must be idempotent after the channel is disconnected"
+            rx.try_recv().is_err(),
+            "after teardown-disconnect, try_push_event must deliver NOTHING"
         );
     }
 

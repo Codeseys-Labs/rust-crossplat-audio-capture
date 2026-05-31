@@ -2457,8 +2457,10 @@ mod tests {
 
         let mut pushes = 0u64;
         let mut drops = 0u64;
-        // Alternate push (succeeds, resets streak) / drop (ring full) across many
-        // window slots so the pattern spans the sliding ring, not a single slot.
+        // Alternate push (succeeds, resets streak) / drop (ring full). 256 iters ×
+        // 2 attempts = 512 attempts, which at DROP_WINDOW_SLOT_PUSHES=128/slot
+        // spans 4 of the 8 ring slots — multiple slots, not a single one (full-ring
+        // wraparound is proven separately by drop_window_cursor_wraps_and_resets_slots).
         for _ in 0..256 {
             // push into the empty slot — succeeds
             assert!(producer.push_or_drop(test_buffer(1.0)));
