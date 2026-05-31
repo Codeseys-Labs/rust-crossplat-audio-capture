@@ -175,15 +175,37 @@ const WASAPI_PACKET_FRAMES: usize = 480;
 const WASAPI_PACKET_SAMPLES: usize = WASAPI_PACKET_FRAMES * CHANNELS as usize; // 960
 const WASAPI_PACKET_BYTES: usize = WASAPI_PACKET_SAMPLES * 4; // 3840
 
-/// Build a word-aligned `Vec<u8>` holding `WASAPI_PACKET_SAMPLES` little-endian
-/// f32 samples — the byte layout WASAPI delivers in shared mode. A `Vec<u8>`'s
-/// data pointer is at least word-aligned, matching the real capture buffer.
-fn make_wasapi_bytes() -> Vec<u8> {
-    let mut bytes = Vec::with_capacity(WASAPI_PACKET_BYTES);
+/// Build the f32-aligned backing buffer for a realistic WASAPI shared-mode
+/// packet, holding `WASAPI_PACKET_SAMPLES` little-endian f32 samples — the byte
+/// layout WASAPI delivers in shared mode.
+///
+/// The buffer is allocated as a `Vec<f32>` (whose data pointer is 4-byte
+/// aligned), not a `Vec<u8>` (alignment 1, no f32-alignment guarantee). Viewing
+/// its bytes via [`wasapi_bytes`] then guarantees `align_to::<f32>()` yields an
+/// empty head/tail, matching the real capture path; otherwise the bench could
+/// split off a non-empty head and measure a different path than production
+/// (whose head/tail are always empty — see `bytes_to_f32_aligned` in
+/// `src/audio/windows/thread.rs`).
+fn make_wasapi_samples() -> Vec<f32> {
+    let mut samples: Vec<f32> = Vec::with_capacity(WASAPI_PACKET_SAMPLES);
     for i in 0..WASAPI_PACKET_SAMPLES {
-        let sample = (i as f32) * 1e-4;
-        bytes.extend_from_slice(&sample.to_le_bytes());
+        samples.push((i as f32) * 1e-4);
     }
+    samples
+}
+
+/// Reinterpret the f32-aligned fixture as the little-endian byte buffer WASAPI
+/// delivers. On the little-endian hosts WASAPI runs on this is the exact F32LE
+/// layout; because the source is a `Vec<f32>`, the returned slice is 4-byte
+/// aligned with no head/tail under `align_to::<f32>()`.
+fn wasapi_bytes(samples: &[f32]) -> &[u8] {
+    // SAFETY: every f32 is fully initialized and any bit pattern is a valid u8.
+    let (head, bytes, tail) = unsafe { samples.align_to::<u8>() };
+    debug_assert!(
+        head.is_empty() && tail.is_empty(),
+        "f32 slice reinterprets to bytes with no head/tail"
+    );
+    debug_assert_eq!(bytes.len(), WASAPI_PACKET_BYTES);
     bytes
 }
 
@@ -195,7 +217,8 @@ fn make_wasapi_bytes() -> Vec<u8> {
 /// per-sample work and no staging Vec. Both sum the samples through `black_box`
 /// so the optimizer cannot elide the decode.
 fn bench_wasapi_byte_decode(c: &mut Criterion) {
-    let bytes = make_wasapi_bytes();
+    let samples_fixture = make_wasapi_samples();
+    let bytes = wasapi_bytes(&samples_fixture);
 
     let mut group = c.benchmark_group("wasapi_byte_decode");
     // One iteration decodes WASAPI_PACKET_SAMPLES f32 values; report samples/sec.
@@ -206,7 +229,7 @@ fn bench_wasapi_byte_decode(c: &mut Criterion) {
         let mut samples: Vec<f32> = Vec::with_capacity(WASAPI_PACKET_SAMPLES);
         b.iter(|| {
             samples.clear();
-            for chunk in black_box(&bytes).chunks_exact(4) {
+            for chunk in black_box(bytes).chunks_exact(4) {
                 samples.push(f32::from_le_bytes([chunk[0], chunk[1], chunk[2], chunk[3]]));
             }
             black_box(samples.as_slice());
@@ -218,7 +241,7 @@ fn bench_wasapi_byte_decode(c: &mut Criterion) {
         b.iter(|| {
             // SAFETY: every bit pattern is a valid f32, and the input bytes are
             // fully initialized — same invariant as the WASAPI capture path.
-            let (_head, samples, _tail) = unsafe { black_box(&bytes[..]).align_to::<f32>() };
+            let (_head, samples, _tail) = unsafe { black_box(bytes).align_to::<f32>() };
             black_box(samples);
         });
     });

@@ -31,7 +31,7 @@ whether the publish fan-out fires:
    anti-recursion rule, that tag push does **NOT** trigger the three registry
    workflows — so this path is **GitHub-only**: it stops at the git tag + the
    GitHub Release. Registry publishing is a manual follow-up (Step 4). See
-   [§ Automated minor/patch release (release-please style)](#automated-minorpatch-release-release-please-style).
+   [§ Automated release (GitHub-only for now)](#automated-release-github-only-for-now).
 2. **Manual tag push.** A maintainer bumps the manifests + CHANGELOG by
    hand (via `scripts/bump-version.sh`), commits, and pushes an annotated
    `vX.Y.Z` tag directly (local git or a PAT). This tag push is **not** from a

@@ -12,6 +12,7 @@ The input proposed several items multiple times across categories. They are merg
 - **Verdict:** adopt-with-changes
 - **Gap:** `CaptureTarget` (`core/config.rs:53-66`) has typed ctors (`app`/`pid`/`device`, `introspection.rs:81-102`) but no string parser. Every CLI/config/env consumer hand-rolls the match; rsac's own `main.rs build_target` (`:458-464`) duplicates it. VISION.md:128 lists it as roadmap.
 - **api_sketch:**
+
   ```rust
   // core/config.rs
   impl std::str::FromStr for CaptureTarget {
@@ -23,6 +24,7 @@ The input proposed several items multiple times across categories. They are merg
   // api.rs
   impl AudioCaptureBuilder { pub fn target_str(self, s:&str) -> AudioResult<Self>; } // with_target(s.parse()?)
   ```
+
 - **Grounded in:** cpal `DeviceId` `Display`/`FromStr` round-trip (`cpal/src/lib.rs:284`, `device_description.rs`); wiremix `kind:value` mini-grammar (`config/property_key.rs:33`); obs case-insensitive multi-field matching (`pipewire-audio-capture-app.c:285-310`).
 - **Effort:** small.
 - **REQUIRED CHANGES (grammar reconciliation — the one real wrinkle):** rsac's existing convention is `app:<pid>` — `AudioSource.id` is formatted `app:{pid}` (`introspection.rs:179,197,250`) and `to_capture_target()` maps a discovered app to `Application(ApplicationId(pid_string))` (`introspection.rs:66-76`). The naive `app:<name>→ApplicationByName` mapping would break round-tripping of `AudioSource.id`. **Pick `app:<pid> → Application` (matches the codebase) and use a distinct prefix `name:<n> → ApplicationByName`**, so `source.id.parse()` round-trips. Map non-numeric/overflow PID → `InvalidParameter` (never panic). Split `device:` IDs on the FIRST colon only (e.g. `device:hw:0,0`). Write + test the `Display` inverse. Parsing runs only at config time — RT-irrelevant.
@@ -31,6 +33,7 @@ The input proposed several items multiple times across categories. They are merg
 - **Verdict:** adopt-with-changes
 - **Gap:** (1) No `pub mod prelude` (`lib.rs:92-138` re-exports ~15 names flat); VISION.md:129 roadmap. (2) RMS/peak helpers that power `rsac capture`'s meter live only in the binary (`main.rs:480-493`), not the library — every VU/meter consumer re-derives RMS from `buffer.data()`. `AudioBuffer` (`core/buffer.rs:150-278`) exposes `data()/channels()/duration()` but no `rms()/peak()/dbfs()`.
 - **api_sketch:**
+
   ```rust
   // lib.rs
   pub mod prelude {
@@ -43,6 +46,7 @@ The input proposed several items multiple times across categories. They are merg
   pub fn rms_dbfs(&self) -> f32;  pub fn peak_dbfs(&self) -> f32;     // NEG_INFINITY for silence
   pub fn channel_rms(&self, ch:u16) -> Option<f32>;  pub fn channel_peak(&self, ch:u16) -> Option<f32>;
   ```
+
 - **Grounded in:** wiremix `find_peak` SIMD metering + `AtomicF32` update (`wirehose/stream.rs:59-86,209-234`); rsac's own CLI `rms_level` (`main.rs:480-486`).
 - **Effort:** small.
 - **REQUIRED CHANGES:** (a) implement `channel_rms/channel_peak` as a **strided** reduction (`skip(ch).step_by(channels)`) — do NOT reuse `channel_data()` (`buffer.rs:248-262`) which allocates via `collect()`; keep allocation-free. (b) guard `channels()==0` (div-by-zero). (c) `rms_dbfs/peak_dbfs` return `f32::NEG_INFINITY` at level 0.0; clamp/handle NaN/Inf inputs (buffers can legitimately carry them — see `buffer_with_nan_and_infinity` test, `buffer.rs:651`). (d) refactor CLI `rms_level` to call `AudioBuffer::rms()` to kill duplication. RMS/peak are read-only metrics (metadata), NOT DSP — in scope. Run on consumer threads on already-delivered buffers, never the OS callback.
@@ -51,6 +55,7 @@ The input proposed several items multiple times across categories. They are merg
 - **Verdict:** adopt-with-changes
 - **Gap:** `StreamStats {overruns, is_running, format_description}` is defined and publicly re-exported (`lib.rs:115`) and its doc says "Obtained via `AudioCapture::stream_stats()`" (`introspection.rs:326`) — **but that method does not exist** (`api.rs` has only piecemeal `overrun_count()/is_running()/is_under_backpressure()`). A broken-promise API. Separately there is no `AudioCapture::format()` to read the *negotiated* (not requested) format. The bridge already tracks `buffers_pushed`/`buffers_dropped`/`buffers_popped`/`consecutive_drops` as Relaxed atomics (`bridge/ring_buffer.rs:93-101`) but none of the totals/uptime/drop-ratio are reachable.
 - **api_sketch:**
+
   ```rust
   // core/introspection.rs — enrich + make non_exhaustive (keep #[derive(Default)])
   #[non_exhaustive]
@@ -68,6 +73,7 @@ The input proposed several items multiple times across categories. They are merg
       pub fn stream_stats(&self) -> StreamStats;    // snapshot atomics + uptime; defaults when stream None
   }
   ```
+
 - **Grounded in:** camilladsp `ProcessingState`/buffer-fill diagnostics surfaced in status messages (`wasapi_backend/device.rs:1272,1443-1461`); rsac-baseline dangling-API gap; pipewire-rs negotiated-format reporting (`CapturingStream::format()`, `interface.rs:144`).
 - **Effort:** small.
 - **REQUIRED CHANGES:** (a) name fields `buffers_*`, NOT `frames_*` — the bridge counts buffers, not frames. (b) `#[non_exhaustive]` MUST land WITH the field additions (the struct is not currently marked, so adding fields is source-breaking for external literals); keep `Default`. (c) `format()` reports the negotiated format (`interface.rs:140-144` contract). (d) `format_description` allocates a `String` only on the caller thread — never the OS callback. (e) update the `introspection.rs` doc once shipped so the contract is honored end-to-end. (f) `start_instant: Option<Instant>` set in `start()` (`api.rs:469`) drives `uptime`.
@@ -76,6 +82,7 @@ The input proposed several items multiple times across categories. They are merg
 - **Verdict:** adopt-with-changes
 - **Gap:** Linux enumeration + target resolution shell out to `pw-dump` (`introspection.rs:211`), `pw-cli`/`pw-dump`/`pw-metadata` (`audio/linux/mod.rs:65/77/94`), `find_pipewire_node_serial` (`thread.rs:538`). Fragile (regex/JSON parsing of human output), adds a runtime binary dependency (**`list_audio_applications()` silently returns empty if `pw-dump` is missing — common on headless/Flatpak**), and incurs spawn latency. The crate already depends on `pipewire = 0.9.2` and already builds a `MainLoop+Context+Core+Registry` — but the registry is bound `let _registry` (`thread.rs:887`) and never listened on.
 - **api_sketch:**
+
   ```rust
   // audio/linux/thread.rs — additive commands, no public API change
   enum PipeWireCommand { /*…*/
@@ -90,6 +97,7 @@ The input proposed several items multiple times across categories. They are merg
   }
   // LinuxDeviceEnumerator + introspection route through these instead of std::process::Command.
   ```
+
 - **Grounded in:** pipewire-rs `Registry::add_listener_local` (`registry/mod.rs:40,119,128`) + `Metadata::add_listener_local` (`metadata.rs:46,130`); wiremix native registry session (`wirehose/session.rs:312-451`) + `media_class` predicates; obs `on_global_cb` (`:705-810`) + `default_node_cb` (`:659-701`).
 - **Effort:** large.
 - **REQUIRED CHANGES:** (1) Define the discovery-thread lifecycle — enumeration spawns NO PW thread today; choose either per-call spawn (init latency) or a persistent discovery thread with explicit teardown. (2) `global` callbacks are `Fn + 'static` (not `FnMut`) — share the in-memory snapshot via `Rc<RefCell<…>>` captured into the closure (wiremix idiom). (3) A `SnapshotDevices` reply MUST wait for a `core.sync()`/`done` roundtrip so the initial registry dump is complete before replying (else it races an empty registry). (4) Keep the subprocess path behind `cfg`/fallback until native is proven on headless/Flatpak, then remove. RT-safe: callbacks fire on the PW thread during `main_loop.iterate()` (`thread.rs:918`), never the audio callback; only owned `Vec`s cross the mpsc reply.
@@ -102,6 +110,7 @@ The input proposed several items multiple times across categories. They are merg
 - **Verdict:** adopt-with-changes · **api_fit: awkward**
 - **Gap:** `list_audio_sources()`/`AudioSource` expose only id/name/is_default. Callers can't tell input from output/loopback before `build()`. `DeviceKind{Input,Output}` already exists (`interface.rs:17-24`).
 - **api_sketch:**
+
   ```rust
   // core/interface.rs
   trait AudioDevice { fn kind(&self) -> AudioResult<DeviceKind>; fn describe(&self) -> DeviceInfo; }
@@ -109,6 +118,7 @@ The input proposed several items multiple times across categories. They are merg
                           pub is_default:bool, pub default_format:Option<AudioFormat> }
   // introspection.rs additive field: AudioSourceKind::Device { device_id, is_default, kind:Option<DeviceKind> }
   ```
+
 - **Grounded in:** cpal `DeviceDescription`/`DeviceDirection` (`device_description.rs:16-379`); wiremix `media_class` predicates + `PropertyStore`.
 - **Effort:** medium.
 - **REQUIRED CHANGES:** Make `kind()` **fallible** (`-> AudioResult<DeviceKind>`) or rename — WASAPI already has an inherent fallible `kind()` doing COM `GetDataFlow` (`wasapi.rs:744-786`); the infallible sketch clashes. macOS `MacosAudioDevice` holds only `device_id` (`coreaudio.rs:127-129`) — needs real CoreAudio scope probing, `kind()` is NOT free there. `default_format` is frequently `None` (Linux `supported_formats()` returns `vec![]`). Keep `AudioSourceKind::Device{kind:Option<DeviceKind>}` additive.
@@ -117,6 +127,7 @@ The input proposed several items multiple times across categories. They are merg
 - **Verdict:** adopt-with-changes
 - **Gap:** Lifecycle is `build()→start()→…→stop()`; forgetting `start()` yields a confusing `StreamReadError` (`api.rs:620`). `Drop` stops (`api.rs:910`) but no scoped guard makes the started region explicit, and no one-call helper.
 - **api_sketch:**
+
   ```rust
   impl AudioCaptureBuilder { pub fn start(self) -> AudioResult<RunningCapture>; } // build()? + start()?
   pub struct RunningCapture { inner: std::mem::ManuallyDrop<AudioCapture> }
@@ -127,6 +138,7 @@ The input proposed several items multiple times across categories. They are merg
   impl Deref/DerefMut for RunningCapture { type Target = AudioCapture; }
   impl Drop for RunningCapture { /* ManuallyDrop::take once; inner Drop stops */ }
   ```
+
 - **Grounded in:** AudioCap explicit tap lifecycle prepare→run→invalidate (`ProcessTap.swift:38-159`); rsac-baseline RAII-guard gap.
 - **Effort:** small.
 - **REQUIRED CHANGES:** Use `ManuallyDrop<AudioCapture>` so `into_inner`/`stop` can move out without double-stop (use-after-move otherwise). `AudioCapture::stop()` is idempotent and `AudioCapture::Drop` already best-effort stops (`api.rs:567,910`) — the explicit `RunningCapture::Drop` stop is therefore redundant; either drop it or keep only to log errors (don't imply two distinct cleanup layers). Document that `stop()`'s returned handle has `stream=None` and a later `start()` creates a fresh OS stream (`api.rs:469`).
@@ -135,6 +147,7 @@ The input proposed several items multiple times across categories. They are merg
 - **Verdict:** adopt-with-changes
 - **Gap:** Monitoring several targets requires one `AudioCapture` per source and hand-merging `subscribe()` receivers, losing origin. No helper fans multiple captures into ONE receiver with each buffer tagged. **This is fan-in, NOT mixing** — buffers stay separate.
 - **api_sketch:**
+
   ```rust
   pub struct SourceId(pub String);
   pub struct TaggedBuffer { pub source: SourceId, pub buffer: AudioBuffer }
@@ -143,6 +156,7 @@ The input proposed several items multiple times across categories. They are merg
   pub fn combine_sources<I>(sources: I) -> AudioResult<CombinedReceiver>
       where I: IntoIterator<Item=(SourceId, mpsc::Receiver<AudioBuffer>)>;
   ```
+
 - **Grounded in:** VISION.md:24-26,71-78 (simultaneous multi-source is a core goal; mixing 2+→1 is the out-of-scope line, VISION.md:96); cpal/SCK per-stream independent handler model; rsac's proven `subscribe()` pump (`api.rs:790-834`).
 - **Effort:** medium.
 - **REQUIRED CHANGES:** Reconcile prose vs signature — take caller-produced receivers (cleaner; caller owns `subscribe()`). `AudioBuffer` is already `Send` (`subscribe()` sends it over mpsc, `api.rs:815`). The `CombinedReceiver` guard must drop forwarding senders to terminate per-source threads (mirror `subscribe()` teardown). Inherits `subscribe()`'s ~1ms poll latency floor and single-consumer-per-ring caveat (non-issue with one capture per source).
@@ -151,6 +165,7 @@ The input proposed several items multiple times across categories. They are merg
 - **Verdict:** adopt-with-changes · **api_fit: awkward**
 - **Gap:** `build()` couples validation+device-resolution+negotiation (`api.rs:135-291`); callers can't ask "known-good config for this platform" or read the rate whitelist (`SUPPORTED_SAMPLE_RATES` is private at `api.rs:157`). `pick_supported_format` is private + Linux-gated (`api.rs:305-334`).
 - **api_sketch:**
+
   ```rust
   impl PlatformCapabilities {
       pub fn recommended_config(&self) -> StreamConfig;
@@ -158,6 +173,7 @@ The input proposed several items multiple times across categories. They are merg
   }
   pub const COMMON_SAMPLE_RATES: &[u32] = &[22050,32000,44100,48000,88200,96000]; // = existing 6, single source of truth
   ```
+
 - **Grounded in:** cpal `cmp_default_heuristics()` (`lib.rs:771`) + `COMMON_SAMPLE_RATES` (`lib.rs:865`).
 - **Effort:** small.
 - **REQUIRED CHANGES:** Keep the existing **6-rate** whitelist (do NOT widen to 9 — that silently changes the public validation contract + error string at `api.rs:162`); widening is a separate deliberate decision. Do NOT promise cpal reuse — rsac's `AudioFormat` derives only `PartialEq/Eq/Hash` (no `Ord`); reimplement the heuristic natively. Define `recommended_config()` output on the unsupported stub (range `(0,0)`, empty formats, `max_channels 0`, `capabilities.rs:160-171`).
@@ -166,6 +182,7 @@ The input proposed several items multiple times across categories. They are merg
 - **Verdict:** adopt-with-changes
 - **Gap:** `AudioError` has a great developer taxonomy (`kind()/recoverability()/Display`, `error.rs:292-419`) but no user-facing layer turning an error into a short actionable sentence + "what to DO" hint. Every downstream tool re-matches 22 variants.
 - **api_sketch:**
+
   ```rust
   pub struct UserFacingError {
       pub summary: String, pub remedy: Option<String>,
@@ -173,6 +190,7 @@ The input proposed several items multiple times across categories. They are merg
   }
   impl AudioError { pub fn user_message(&self) -> UserFacingError; } // EXHAUSTIVE match, no `_`
   ```
+
 - **Grounded in:** cpal `RealtimeDenied`-with-recovery messages + `ResultExt::context()` (`error.rs:10-86,209-222`); AudioCap OSStatus-in-UI strings (`ProcessTap.swift:99,138,155`).
 - **Effort:** small.
 - **REQUIRED CHANGES:** Use an EXHAUSTIVE match (no catch-all) mirroring `recoverability()` (`error.rs:242`) so a new variant forces a compile error. Only 4 variants carry `BackendContext` (`UnsupportedFormat/DeviceEnumerationError/StreamCreationFailed/BackendError`) → `backend_code` is `None` otherwise (consistent with `Option`). Add a test asserting every variant yields a non-empty summary (mirror `all_variants_display_is_nonempty`, `error.rs:1191`).
@@ -181,6 +199,7 @@ The input proposed several items multiple times across categories. They are merg
 - **Verdict:** adopt-with-changes · **api_fit: awkward**
 - **Gap:** Backpressure is one bool from `consecutive_drops >= threshold` (`ring_buffer.rs:140-142`). A consumer dropping 1-of-3 buffers (33% loss) never trips it because a successful push resets the streak to 0 (`ring_buffer.rs:236`). No severity, no rate.
 - **api_sketch:**
+
   ```rust
   pub struct BackpressureReport {
       pub window: Duration, pub buffers_captured_in_window: u64, pub buffers_dropped_in_window: u64,
@@ -189,6 +208,7 @@ The input proposed several items multiple times across categories. They are merg
   pub enum BackpressureLevel { Healthy, Elevated, Critical }
   impl AudioCapture { pub fn backpressure_report(&self) -> BackpressureReport; } // delta since last call, interior Mutex
   ```
+
 - **Grounded in:** cpal `ErrorKind::Xrun`; camilladsp graded stream health + periodic re-measurement over an interval.
 - **Effort:** small.
 - **REQUIRED CHANGES:** Name fields `buffers_*` (no frame counter exists). Computing `dropped/(pushed+dropped)` REQUIRES an additive trait accessor for the success/push count — `CapturingStream` (`interface.rs:120-201`) exposes only `overrun_count()`/`is_under_backpressure()`; `BridgeStream::buffers_read/buffers_dropped` are inherent, not on the trait, so unreachable from the handle. Route through the existing `StreamStats`/introspection surface (H3) rather than a parallel type.
@@ -197,11 +217,13 @@ The input proposed several items multiple times across categories. They are merg
 - **Verdict:** adopt-with-changes
 - **Gap:** `check_audio_capture_permission()` hardcodes `NotDetermined` on macOS (`introspection.rs:312`); no request fn to drive the `kTCCServiceAudioCapture` prompt before a Process Tap. First `Application`/`ProcessTree` capture either silently yields no audio or fails with an opaque OSStatus deep in `tap.rs`. The code itself names `AudioRecordingPermission.swift` as the future port (`:311`).
 - **api_sketch:**
+
   ```rust
   pub fn request_audio_capture_permission() -> PermissionStatus; // macOS: TCC preflight/request; else NotRequired
   // check_* macOS arm returns real Granted/Denied/NotDetermined via SPI guard
   // api.rs build(): Application/ApplicationByName/ProcessTree on macOS, Denied -> PermissionDenied early
   ```
+
 - **Grounded in:** AudioCap TCC SPI `dlopen`+`dlsym` `TCCAccessPreflight`/`TCCAccessRequest` (`AudioRecordingPermission.swift:77-124`); rsac TCC notes + selector guards (`introspection.rs:296-313`, `tap.rs:407,424`).
 - **Effort:** medium.
 - **REQUIRED CHANGES:** OSStatus goes into `PermissionDenied.details` (the variant has NO `BackendContext` field, `error.rs:181-184`) or use `BackendError`. `TCCAccessRequest` is async with a completion callback — the sync `-> PermissionStatus` must bridge async→sync (block caller on a channel while the dialog is up). `dlopen`/`dlsym` null → `NotDetermined`. Reuse the macOS 14.4+ gate (`capabilities.rs:125-141`). Placement of an `audio/macos` shim called from `core/introspection.rs` matches existing precedent (`introspection.rs:137,176`).
@@ -210,6 +232,7 @@ The input proposed several items multiple times across categories. They are merg
 - **Verdict:** adopt-with-changes
 - **Gap:** Below macOS 14.4 the Process Tap doesn't exist; `supports_application_capture` is correctly `false` (`capabilities.rs:129`) but a macOS-13 caller gets a generic `PlatformNotSupported` with no hint that SCK (13.0+) is the route, nor a "what min OS unlocks this". A full SCK *backend* is disproportionate (display-scoped, app-exclusion not inclusion pre-15.0, screen-recording TCC ≠ audio TCC). The high-value slice is granular self-documenting capabilities.
 - **api_sketch:**
+
   ```rust
   pub struct PlatformCapabilities { /*…*/
       pub min_os_for_application_capture: Option<&'static str>,
@@ -218,6 +241,7 @@ The input proposed several items multiple times across categories. They are merg
   impl PlatformCapabilities { pub fn explain_unsupported(&self, target:&CaptureTarget) -> Option<String>; }
   // build() enriches its PlatformNotSupported error via explain_unsupported()
   ```
+
 - **Grounded in:** screencapturekit-rs version-gated features `macos_13_0..macos_26_0`; cpal `ErrorKind` fallback-UI variants (`error.rs:10-86`); rsac `get_macos_version()` gate (`capabilities.rs:125-141`).
 - **Effort:** medium.
 - **REQUIRED CHANGES:** Update the `supports_format_missing` test literal (`capabilities.rs:383`) with the two new fields. Phrase SCK as an **assessment** ("ScreenCaptureKit (assessed, backend not yet implemented)"), never as a usable route — otherwise it re-introduces the "claim a feature you don't back" violation it's meant to prevent. Keep the SCK backend deferred.
@@ -226,6 +250,7 @@ The input proposed several items multiple times across categories. They are merg
 - **Verdict:** adopt-with-changes
 - **Gap:** No way to ask "will this (target, config) work right now, and if not why + how to fix?" before committing to the slow/permission-prompting device resolution. `PlatformCapabilities` predicates + permission state are scattered.
 - **api_sketch:**
+
   ```rust
   pub struct PreflightReport { pub findings: Vec<PreflightFinding>, pub permission: PermissionStatus }
   impl PreflightReport { pub fn is_ok(&self)->bool; pub fn blockers(&self)->impl Iterator<Item=&PreflightFinding>; }
@@ -234,6 +259,7 @@ The input proposed several items multiple times across categories. They are merg
   pub fn preflight(target:&CaptureTarget, config:&StreamConfig) -> PreflightReport; // caps+permission, NO device open
   impl AudioCaptureBuilder { pub fn preflight(&self) -> PreflightReport; }
   ```
+
 - **Grounded in:** cpal contextual error taxonomy (`HostUnavailable`/`DeviceNotAvailable`/`PermissionDenied`); AudioCap TCC preflight; rsac private `SUPPORTED_SAMPLE_RATES` + `NotDetermined` TODO.
 - **Effort:** medium.
 - **REQUIRED CHANGES:** Validate against the builder's ACTUAL list (the hardcoded 6 rates at `api.rs:157` + channels 1..=32), NOT `sample_rate_range` — promote the const to one `pub` source consumed by both `build()` and `preflight()` (M4) to avoid drift. Surface the macOS `NotDetermined` limitation in the remedy text. Runs entirely before any stream exists — RT-irrelevant.
@@ -242,12 +268,14 @@ The input proposed several items multiple times across categories. They are merg
 - **Verdict:** adopt-with-changes · **api_fit: clean**
 - **Gap:** `DeviceEnumerator` (`interface.rs:221-243`) offers only one-shot snapshots. No notification on device add/remove/state-flip or default-endpoint change; consumers must poll. All three OS backends expose native change notifications.
 - **api_sketch:**
+
   ```rust
   pub enum DeviceEvent { DeviceAdded{id,name,kind}, DeviceRemoved{id}, DefaultChanged{id,kind}, StateChanged{id,available} }
   trait DeviceEnumerator { fn watch(&self, on_event: Box<dyn FnMut(DeviceEvent)+Send+'static>) -> AudioResult<DeviceWatcher> { Err(PlatformNotSupported{..}) } }
   pub struct DeviceWatcher; // RAII; Drop unregisters OS listener + joins notify thread
   impl CrossPlatformDeviceEnumerator { pub fn watch(&self, …) -> AudioResult<DeviceWatcher>; } // inherent = real entry
   ```
+
 - **Grounded in:** cpal `DefaultDeviceMonitor`/`IMMNotificationClient` (`wasapi/stream.rs:44-190`) + CoreAudio `AudioObjectPropertyListener` RAII (`coreaudio/macos/property_listener.rs:1-90`); wiremix `metadata.rs:1-58` default-sink listener + pipewire-rs `Registry::add_listener_local`.
 - **Effort:** large.
 - **REQUIRED CHANGES:** (1) Do NOT claim VISION mandates it — it's a net-new capture-UX feature (the "dynamic device changes" line is `REFERENCE_ANALYSIS.md:868`, a per-backend reference survey, not an rsac scope commitment). (2) Add a `PlatformCapabilities` flag (`supports_device_change_notifications`) so callers gate before calling. (3) The inherent enum `watch()` is the public entry (`CrossPlatformDeviceEnumerator` doesn't impl the trait); the trait default is for external impls. (4) Linux is genuinely large: `LinuxDeviceEnumerator` is a unit struct shelling out subprocesses with NO persistent loop — `watch()` needs a NEW persistent pw main-loop + registry/metadata listener thread (best sequenced after H4). RT-safe: handler runs on the OS notification thread, never the audio callback.
@@ -260,6 +288,7 @@ The input proposed several items multiple times across categories. They are merg
 - **Verdict:** adopt-with-changes
 - **Gap:** `log::` used ad hoc (`api.rs:217/258/583/923`, `introspection.rs:153`), no correlation. Concurrent `AudioCapture` instances interleave log lines with no per-capture id; no spans around build→resolve→negotiate→start→pump→stop; no events for transitions.
 - **api_sketch:**
+
   ```rust
   // Cargo.toml: [features] tracing = ["dep:tracing"]; tracing optional
   macro_rules! rsac_event { /* tracing event! when feature, else log::* */ }
@@ -267,6 +296,7 @@ The input proposed several items multiple times across categories. They are merg
   // pump/subscribe gain an instrumented span; optional:
   pub fn install_default_tracing();  // behind feature = "tracing"
   ```
+
 - **Grounded in:** camilladsp outer-thread health logging (rate drift, silence, disconnect reason) with RT inner thread clean; cpal `RealtimeDenied` setup-path messages.
 - **Effort:** medium.
 - **REQUIRED CHANGES:** Sketch bug — `spawn_callback_pump` is an associated fn with no `self` (`api.rs:525`); pass `capture_id` + a Debug-cloned target as params (or create the span in `start()`). The "final stats from OBS-1" event must degrade to `overrun_count()` alone (no aggregate stats type exists in the library — those counters live only in `main.rs`); couple to H3's `StreamStats` once it lands. Add `tracing = {optional=true}` + the feature; with it off, the macro compiles to today's `log::` calls (behavior-identical). Strict review invariant: NO `tracing`/`log`/alloc/format inside `ring_buffer.rs` producer.

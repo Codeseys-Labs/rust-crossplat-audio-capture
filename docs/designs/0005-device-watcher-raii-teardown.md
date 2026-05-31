@@ -111,8 +111,11 @@ join the notify thread**:
   Unregister + join guarantees the ordering: **stop callbacks → reclaim consumer
   → release apartment**, never the reverse. The `Send` of the holder is asserted
   via `unsafe impl Send for SendWatcherTeardown {}`, scoped to the
-  free-threaded MTA objects (`COINIT_MULTITHREADED`), with the apartment pin
-  held purely for its `Drop` (`#[allow(dead_code)]` on `com_initializer`).
+  free-threaded MTA objects (`COINIT_MULTITHREADED`). The `com_initializer`
+  field is load-bearing for its `Drop`, not its value: it is moved into the
+  teardown closure inside `teardown_state` and released by the closure's final
+  `drop(teardown_state)`, so the apartment outlives Unregister + join even
+  though the field is never read.
 
 - **macOS** (`coreaudio.rs`): (1) `AudioObjectRemovePropertyListener` for all
   three `WATCH_ADDRESSES` (best-effort — stops *new* notifications); (2) **take

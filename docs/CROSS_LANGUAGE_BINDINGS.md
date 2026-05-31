@@ -232,8 +232,9 @@ caps = rsac.platform_capabilities()
 **Key:** GIL release during blocking reads via `py.allow_threads()`. Sample data
 crosses as `to_bytes()` (numpy `frombuffer(..., dtype="<f4")`-compatible LE f32),
 using the provably-sound `f32::to_le_bytes` path — there is no zero-copy
-`rust-numpy` `to_numpy()` method in the shipped binding. See the
-[Python iterator end-of-stream caveat](#known-binding-limitations-tracked).
+`rust-numpy` `to_numpy()` method in the shipped binding. The iterator ends
+cleanly on the fatal terminal (see [Binding behaviours
+(current)](#binding-behaviours-current), BFFI-03 — RESOLVED 0.3.0).
 
 ## 3. Node.js/Bun (napi-rs)
 
@@ -312,10 +313,10 @@ derived in Go via a shared `linToDbfs` helper. Buffer transfer is always a copy
 (~1μs for a 10 ms chunk); cgo per-call overhead (~100 ns) is negligible at audio
 rates.
 
-> **Caveat (tracked, critique BFFI-02):** see the
-> [concurrent-`Close()` use-after-free note](#known-binding-limitations-tracked)
-> — do not call `Close()` concurrently with an in-flight `ReadBuffer`/
-> `TryReadBuffer` until the code fix lands.
+> **Concurrent `Close()` is safe (was BFFI-02 / #28 — RESOLVED 0.3.0):**
+> `Close()` may be called concurrently with an in-flight `ReadBuffer`/
+> `TryReadBuffer` — see [Binding behaviours
+> (current)](#binding-behaviours-current).
 
 ## Not yet implemented
 

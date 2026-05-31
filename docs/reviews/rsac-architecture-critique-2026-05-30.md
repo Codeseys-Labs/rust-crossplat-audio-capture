@@ -65,6 +65,8 @@ CAVEATS (honesty drift, not scope creep): (1) A few vestigial surfaces lean towa
 
 **Recommendation:** Write an ADR recording the device-change-notification delivery model: considered options (direct-invoke vs helper-thread hand-off; bounded vs unbounded; drop-oldest vs drop-newest; channel capacity), the chosen per-platform approach, and WHY Linux differs (PipeWire's !Send Rc loop objects make same-thread invocation natural). Either unify Linux onto the helper-thread+bounded-channel model for true parity, or document the divergence in the watch() trait contract and PlatformCapabilities so consumers can branch honestly.
 
+> **RESOLVED in this PR by [ADR-0004](../designs/0004-device-change-notifications.md)** (device-change-notification delivery model, Status: Accepted). The recommended ADR now exists: it records the per-platform delivery model (Windows/macOS bounded `sync_channel(64)` + helper thread; Linux direct-invoke on the PipeWire loop thread), the drop-newest full-channel policy, and the documented Linux divergence rationale. The finding above reflects the pre-ADR snapshot when this critique was written.
+
 
 ### [HIGH] (test-coverage) rt_alloc.rs (the sole ADR-0001 alloc-free proof) is never executed in any CI job
 
@@ -336,7 +338,7 @@ CAVEATS (honesty drift, not scope creep): (1) A few vestigial surfaces lean towa
 
 - **abi3-decision.md** — _needs-update_: Recommendation already EXECUTED (abi3-py39 enabled in rsac-python/Cargo.toml:20; single cp39-abi3 wheel in release-pypi.yml) but within the 0.2.0 line, not post-v0.2.0 as §5 planned. Promote Status to Accepted/Implemented, correct §5 sequencing/version note, and check the §6.4 verification boxes the CI smoke test now covers.
 
-- **GAP: device-watch threading model (per-OS watch() delivery)** — _gap-missing-adr_: Write a new ADR. Record the device-change-notification delivery model: direct-invoke (Linux, PipeWire loop thread) vs bounded-channel + helper-thread hand-off (Windows/macOS), bounded vs unbounded, drop-oldest vs drop-newest, channel capacity (64), and WHY Linux differs (!Send Rc loop objects). Either unify Linux for true parity or document the divergence in the watch() trait contract + PlatformCapabilities. This is the highest-priority ADR gap.
+- **GAP: device-watch threading model (per-OS watch() delivery)** — _~~gap-missing-adr~~ RESOLVED in this PR by [ADR-0004](../designs/0004-device-change-notifications.md)_: Write a new ADR. Record the device-change-notification delivery model: direct-invoke (Linux, PipeWire loop thread) vs bounded-channel + helper-thread hand-off (Windows/macOS), bounded vs unbounded, drop-oldest vs drop-newest, channel capacity (64), and WHY Linux differs (!Send Rc loop objects). Either unify Linux for true parity or document the divergence in the watch() trait contract + PlatformCapabilities. This is the highest-priority ADR gap. _(ADR-0004, Status: Accepted, now records exactly this model; the gap above is the pre-ADR snapshot.)_
 
 - **GAP: bridge-zerocopy SampleRing alternative data plane** — _gap-missing-adr_: Write an ADR (or design note). Record why a parallel SampleRingProducer/Consumer plane exists, its default-off A/B-only status, the two-ring all-or-nothing commit/metadata-desync invariant, the rtrb 0.3.4 pin for write_chunk_uninit/CopyToUninit, and the criteria for promoting it into backends or removing it — so it does not rot as undocumented near-dead surface.
 

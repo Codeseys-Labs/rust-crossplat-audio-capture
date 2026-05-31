@@ -178,7 +178,15 @@ export declare class AudioCapture {
    * end via the thrown error. Only the push pump (`onData`) drains the terminal
    * state and reports *why* it ended via `onEnd`. To observe the terminal cause,
    * use `onData` + `onEnd`; with the pull API, treat `stop()`/`isRunning` as the
-   * end-of-stream signal and a thrown read error as retryable.
+   * end-of-stream signal.
+   *
+   * This terminal-cause-invisibility is the *only* thing that makes a thrown
+   * read error retryable: while the capture is running, a thrown error may be a
+   * transient hiccup masking a terminal end, so retry it. It does **not** make
+   * *every* thrown read error retryable — `read*()` also throws when the capture
+   * is not running (before `start()` or after `stop()`), which is a normal usage
+   * error, not a transient condition. Don't blind-retry: gate retries on
+   * `isRunning` so a pre-start/stopped capture doesn't spin in a retry loop.
    */
   read(): AudioChunk | null;
 

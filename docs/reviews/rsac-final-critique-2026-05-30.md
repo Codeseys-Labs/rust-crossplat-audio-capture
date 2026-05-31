@@ -77,7 +77,7 @@ Of the first critique's 40 findings, the docs + CI/CD waves produced a clear thr
 
 ### [MEDIUM] (data-flow-cross-platform) [new] FH-1: Async/blocking end-of-stream signal is Windows-only — Linux/macOS never call signal_done(), so audio_data_stream() can hang forever on producer death
 
-**Evidence:** Verified: signal_done() production callers are ONLY in src/audio/windows/thread.rs (7 sites); zero matches in src/audio/linux/* or src/audio/macos/*. Both non-Windows backends only transition Created->Running, never to Stopping/Stopped. is_stream_producing() (stream.rs:317) stays true while Running; async_stream.rs:96-99 returns Poll::Pending whenever empty AND producing, so a dead/stalled Linux/macOS producer leaves state Running forever — poll_next never yields None or Err.
+**Evidence:** Verified: signal_done() production callers are ONLY in src/audio/windows/thread.rs (7 sites); zero matches in src/audio/linux/\* or src/audio/macos/\*. Both non-Windows backends only transition Created->Running, never to Stopping/Stopped. is_stream_producing() (stream.rs:317) stays true while Running; async_stream.rs:96-99 returns Poll::Pending whenever empty AND producing, so a dead/stalled Linux/macOS producer leaves state Running forever — poll_next never yields None or Err.
 
 **Recommendation:** Have the Linux PipeWire loop and macOS CoreAudio IOProc call producer.signal_done() (or transition Running->Stopping/Error) when the capture loop terminates or hits a fatal error, mirroring Windows. Add an ADR documenting the producer-side terminal-signal contract so async/blocking terminal behavior is uniform. At minimum document that async end-of-stream is Windows-only today.
 

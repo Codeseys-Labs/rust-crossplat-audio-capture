@@ -86,6 +86,7 @@ behavioral difference that consumers can observe under handler stalls.
 ## 3. Considered options
 
 ### Option A — Unify all platforms on bounded-channel + helper-thread hand-off
+
 Run a `sync_channel(N)` + dedicated helper thread on Linux too, marshaling
 events off the PipeWire loop thread before invoking the user closure.
 - ➕ Identical observable threading model and identical drop policy on all three
@@ -98,6 +99,7 @@ events off the PipeWire loop thread before invoking the user closure.
   out is each owned `DeviceEvent`. Rejected as machinery without a payoff.
 
 ### Option B — Invoke the user handler inline on the OS notify thread everywhere
+
 Call the user `FnMut` directly from the COM `IMMNotificationClient` method and
 the CoreAudio proc, like Linux does.
 - ➖ A slow/blocking/allocating user closure would run on the COM system
@@ -109,6 +111,7 @@ the CoreAudio proc, like Linux does.
   on Windows/macOS.
 
 ### Option C — Per-platform: helper-thread on Windows/macOS, direct-invoke on Linux (CHOSEN)
+
 Use the bounded-channel + dedicated-helper-thread hand-off where the OS notify
 thread is hostile to user code (Windows COM, macOS CoreAudio proc), and
 direct-invoke on the PipeWire loop thread where same-thread invocation is the

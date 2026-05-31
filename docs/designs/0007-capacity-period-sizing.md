@@ -55,6 +55,7 @@ contract with what the code actually does.
    load-bearing constant on a bugfix-class branch. Rejected.
 
 ### Option B — Add a pure period-derived sizer alongside the static one; adopt per-backend (CHOSEN)
+
 Add `calculate_capacity_for_period(period_frames, channels)` as a pure function that
 backends can adopt independently once they know the negotiated period, keeping
 `calculate_capacity` as the fallback and the still-current default. Sizing model:

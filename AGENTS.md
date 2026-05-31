@@ -368,13 +368,15 @@ all contributors and AI agents working in this repo.
 
 Every review comment (from a human, CodeRabbit, or an agent) must reach one of
 two terminal states **before the PR merges**: *fixed in the PR*, or *captured in
-a tracking GitHub issue*. A review finding must **never silently disappear** when
-its PR merges. Triage each comment into exactly one disposition:
+a tracking GitHub issue*. ("Fixed in the PR" includes the case where the fix
+already exists — see **already-addressed** below.) A review finding must
+**never silently disappear** when its PR merges. Triage each comment into exactly
+one disposition:
 
 | Disposition | Action |
 |---|---|
 | **fix-now** | Fix it in the PR. Reply on the thread noting the fix. |
-| **already-addressed** | Reply pointing at the current code that handles it. |
+| **already-addressed** | A form of *fixed in the PR* — the fix already exists. Reply pointing at the current code that handles it (no new issue needed). |
 | **valid-defer** | **Open a tracking issue** (label `deferred-review` + a domain label like `bug`/`tech-debt`/`ci`), then reply on the thread linking the issue (`📌 Tracked in #N`). |
 | **invalid** / **wont-fix** | **Record the decision in an issue** (one consolidated "review dispositions" issue per PR is fine; label `invalid`/`wontfix`; close it as *not planned* — it is a searchable decision record, not open work) and reply on the thread with the rationale + link. |
 

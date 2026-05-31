@@ -354,7 +354,10 @@ Manual drain pattern:
 ```rust
 let mut wav = WavFileSink::new("out.wav", &capture.format().unwrap_or_default())?;
 capture.start()?;
-while let Some(buffer) = capture.read_buffer()? {
+// `read_buffer_blocking()` waits for data instead of returning early on a
+// momentary empty ring (as the non-blocking `read_buffer()` would). It returns
+// an error once the stream is no longer running, ending the drain cleanly.
+while let Ok(buffer) = capture.read_buffer_blocking() {
     wav.write(&buffer)?;
 }
 wav.flush()?;

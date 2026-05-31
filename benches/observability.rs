@@ -141,10 +141,18 @@ fn read_stream_stats(producer: &BridgeProducer, consumer: &BridgeConsumer) -> St
 }
 
 /// Assemble a [`BackpressureReport`]-equivalent from the windowed
-/// `(pushed, dropped)` snapshot and the consecutive-drop flag — the same read-side
+/// `(pushed, dropped)` snapshot — the same read-side
 /// `dropped / (pushed + dropped)` math `AudioCapture::backpressure_report` does.
 /// `from_counts` is `pub(crate)`, so we reproduce it here via `Default` + public
 /// field assignment (the struct is `#[non_exhaustive]`).
+///
+/// The consecutive-drop `is_under_backpressure` flag the production path also
+/// folds in (`stream.is_under_backpressure()`) is **not** mirrored here: the only
+/// reads of it — `BridgeShared::is_under_backpressure()` and the `shared()`
+/// accessor that reaches it — are `pub(crate)`, so a separate bench crate cannot
+/// observe the flag. This bench drives a warmed zero-drop steady state where
+/// `consecutive_drops == 0`, so the real flag is provably `false` regardless; we
+/// pin `false` below as that known value rather than as a stand-in for a read.
 #[inline]
 #[allow(clippy::field_reassign_with_default)]
 fn read_backpressure_report(producer: &BridgeProducer) -> BackpressureReport {
@@ -161,6 +169,8 @@ fn read_backpressure_report(producer: &BridgeProducer) -> BackpressureReport {
     report.pushed = pushed;
     report.dropped = dropped;
     report.drop_rate = drop_rate;
+    // Known-`false` in this warmed zero-drop steady state (see doc above); the
+    // real `pub(crate)` flag read cannot be mirrored from a bench crate.
     report.is_under_backpressure = false;
     report
 }

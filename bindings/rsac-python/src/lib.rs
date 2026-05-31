@@ -198,7 +198,7 @@ fn audio_error_to_pyerr(err: rsac::AudioError) -> PyErr {
 ///
 ///     CaptureTarget.parse("system")
 ///     CaptureTarget.parse("device:<id>")
-///     CaptureTarget.parse("app:<pid>")
+///     CaptureTarget.parse("app:<id>")
 ///     CaptureTarget.parse("name:<n>")
 ///     CaptureTarget.parse("tree:<pid>")
 #[pyclass(name = "CaptureTarget", module = "rsac._rsac", frozen)]

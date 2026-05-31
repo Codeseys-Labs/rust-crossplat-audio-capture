@@ -60,6 +60,7 @@ explicit, documented contract.
 ## 3. Considered options
 
 ### Option A — Hard-depend on `tracing` everywhere; drop `log`
+
 Make `tracing` a non-optional dependency and route all instrumentation through it.
 - ➕ Single backend, no macro gymnastics, structured spans always available.
 - ➖ Forces a new mandatory dependency (and the question of a subscriber) on every
@@ -67,6 +68,7 @@ Make `tracing` a non-optional dependency and route all instrumentation through i
   zero-extra-dependency default and the existing `log`-based diagnostics. Rejected.
 
 ### Option B — Two parallel call sites guarded by `#[cfg(feature = "tracing")]`
+
 At each instrumentation point, write a `tracing::event!` arm and a `log::` arm.
 - ➕ No macro machinery.
 - ➖ Doubles every call site; the two arms drift; nothing structurally prevents an
@@ -74,6 +76,7 @@ At each instrumentation point, write a `tracing::event!` arm and a `log::` arm.
   Rejected.
 
 ### Option C — Dual-backend macro shim (`rsac_event!` / `rsac_span!`), facade-only `tracing`, RT-path prohibition (CHOSEN)
+
 One pair of `#[macro_export]`ed macros. With `--features tracing` they expand to
 `tracing::event!` / `tracing::span!`; without it they expand to the matching
 `log::<level>!` (a span has no `log` analogue, so it **degrades to an event** and

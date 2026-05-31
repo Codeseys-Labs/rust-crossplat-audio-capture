@@ -527,7 +527,7 @@ jobs:
         run: |
           CGO_ENABLED=1 \
           CGO_LDFLAGS="-L$(pwd)/lib -lrsac_ffi" \
-          go vet ./... || true
+          go vet ./...
 
   # ── Go ARM64 cross-compile check (staticlib only) ────────────────────
   # The pipewire-debian PPA publishes no arm64 binaries, so a full aarch64
