@@ -134,6 +134,46 @@ func TestIsRecoverable(t *testing.T) {
 	}
 }
 
+// TestErrClosed_IdentityMatch pins the fix for the bug where (*Error).Is matched
+// purely by Code: because ErrClosed carries the recoverable ErrStreamRead code,
+// a plain code-equality Is would make EVERY transient ErrStreamRead satisfy
+// errors.Is(err, ErrClosed). The stream loops gate on
+// `IsRecoverable(err) && !errors.Is(err, ErrClosed)`, so that bug would have made
+// them STOP on a recoverable hiccup instead of retrying — violating the
+// terminal-error contract. ErrClosed must match by identity only.
+func TestErrClosed_IdentityMatch(t *testing.T) {
+	// The sentinel matches itself.
+	if !errors.Is(ErrClosed, ErrClosed) {
+		t.Fatal("errors.Is(ErrClosed, ErrClosed) must be true")
+	}
+	// A *distinct* transient read error must NOT be mistaken for "closed",
+	// even though it shares the ErrStreamRead code.
+	transient := &Error{Code: ErrStreamRead, Message: "transient overrun"}
+	if errors.Is(transient, ErrClosed) {
+		t.Error("a transient ErrStreamRead must NOT satisfy errors.Is(err, ErrClosed)")
+	}
+	// Therefore the stream-loop guard retries the transient hiccup...
+	if !(IsRecoverable(transient) && !errors.Is(transient, ErrClosed)) {
+		t.Error("guard must RETRY a transient recoverable read error")
+	}
+	// ...and stops on the close sentinel.
+	if IsRecoverable(ErrClosed) && !errors.Is(ErrClosed, ErrClosed) {
+		t.Error("guard must STOP on ErrClosed (errors.Is short-circuits the retry)")
+	}
+	// A wrapped ErrClosed still matches by identity through the chain.
+	wrapped := fmt.Errorf("close path: %w", ErrClosed)
+	if !errors.Is(wrapped, ErrClosed) {
+		t.Error("a wrapped ErrClosed must still satisfy errors.Is(err, ErrClosed)")
+	}
+	// Two different non-sentinel *Errors with the same code still match by code
+	// (the generic contract is preserved for everything except the sentinel).
+	a := &Error{Code: ErrTimeout, Message: "a"}
+	b := &Error{Code: ErrTimeout, Message: "b"}
+	if !errors.Is(a, b) {
+		t.Error("non-sentinel *Errors of the same code should still match by code")
+	}
+}
+
 func TestError_Error(t *testing.T) {
 	e := &Error{Code: ErrDeviceNotFound, Message: "device foo not found"}
 	got := e.Error()

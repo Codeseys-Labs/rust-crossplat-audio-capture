@@ -128,8 +128,18 @@ scan_layer() {
   # module-level form `crate::audio` (e.g. `use crate::audio;` / `crate::audio::`)
   # with a word boundary so `crate::audiox` is not a false hit. The trailing
   # `(::|\b)` makes the `::` optional so a module-level reverse edge is caught.
-  # Relative `super::`-qualified reverse edges are normalised + scanned below.
-  local pattern="crate::(${alt})(::|\b)"
+  #
+  # CI-7: ALSO catch relative `super::`-qualified reverse edges. A file directly
+  # under `src/<layer>/` reaches the crate root via `super::super::`, so a
+  # reverse edge to a forbidden sibling layer reads `super::super::api::Foo`
+  # (or deeper). We match one-or-more `super::` segments landing directly on a
+  # forbidden layer name: `(super::)+(alt)(::|\b)`. Because `alt` is exactly the
+  # set of layers this one must NOT depend on (its own name and lower layers are
+  # excluded), any `super::…::<alt>` is a genuine reverse edge regardless of the
+  # exact nesting depth — a sibling-internal `super::foo` never names a
+  # forbidden layer, so this does not false-positive. Doc/comment stripping
+  # below applies to both forms.
+  local pattern="(crate::|(super::)+)(${alt})(::|\b)"
 
   local raw
   if [[ "${have_rg}" -eq 1 ]]; then
@@ -166,7 +176,7 @@ scan_layer() {
     # module reference (crate::audio) so a module-level `use crate::audio;` edge
     # is reported, not silently dropped.
     local matched
-    matched="$(printf '%s' "${stripped}" | grep -oE "crate::(${alt})(::[A-Za-z0-9_]+)*" | head -n1 || true)"
+    matched="$(printf '%s' "${stripped}" | grep -oE "(crate::|(super::)+)(${alt})(::[A-Za-z0-9_]+)*" | head -n1 || true)"
     [[ -z "${matched}" ]] && continue
 
     # Normalise the path to repo-relative POSIX form (Windows rg emits "\").

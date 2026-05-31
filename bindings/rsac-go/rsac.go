@@ -206,8 +206,28 @@ func (e *Error) Error() string {
 	return fmt.Sprintf("rsac: %s", e.Code)
 }
 
-// Is supports errors.Is matching by error code.
+// Is supports errors.Is matching by error code, with one exception: the
+// ErrClosed sentinel matches by pointer identity, NOT by code.
+//
+// ErrClosed deliberately carries the recoverable ErrStreamRead code (the C ABI
+// has no distinct "closed" code — see the ErrClosed doc), so plain code-equality
+// would make EVERY transient ErrStreamRead satisfy errors.Is(err, ErrClosed).
+// That would wrongly terminate the stream loops on a recoverable hiccup
+// (violating the terminal-error contract: a recoverable error must never end
+// the stream). ErrClosed is only ever returned as this exact sentinel pointer
+// (never via newError), so identity matching is correct and sufficient. Any
+// other *Error continues to match by code.
 func (e *Error) Is(target error) bool {
+	// Identity match for the ErrClosed sentinel: a transient ErrStreamRead must
+	// NOT be mistaken for "closed".
+	if target == ErrClosed {
+		return e == ErrClosed
+	}
+	if e == ErrClosed {
+		// The receiver is the sentinel but the target is some other *Error of
+		// the same code — that is a transient read error, not "closed".
+		return false
+	}
 	var t *Error
 	if errors.As(target, &t) {
 		return e.Code == t.Code
@@ -217,7 +237,10 @@ func (e *Error) Is(target error) bool {
 
 // Sentinel errors for use with errors.Is.
 var (
-	// ErrClosed is returned by operations on a closed [AudioCapture].
+	// ErrClosed is returned by operations on a closed [AudioCapture]. It carries
+	// the recoverable ErrStreamRead code only because the C ABI has no dedicated
+	// "closed" code; matching is by identity (see [Error.Is]), so a transient
+	// ErrStreamRead never satisfies errors.Is(err, ErrClosed).
 	ErrClosed = &Error{Code: ErrStreamRead, Message: "capture closed"}
 )
 
