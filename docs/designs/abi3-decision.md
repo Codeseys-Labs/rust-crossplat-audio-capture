@@ -1,10 +1,22 @@
 # abi3 vs per-version Python wheels — decision
 
-**Status:** Recommendation
-**Date:** 2026-04-17
+**Status:** Accepted / Implemented
+**Date:** 2026-04-17 (recommendation); implemented within the 0.2.0 line.
 **Issue:** [#18](https://github.com/Codeseys-Labs/rust-crossplat-audio-capture/issues/18)
 **Scope:** `bindings/rsac-python` PyPI release strategy
-**Verdict:** **Adopt `abi3-py39`** after v0.2.0 ships on the current per-version matrix.
+**Verdict:** **Adopt `abi3-py39`.** Shipped: `abi3-py39` is enabled on pyo3 in
+`bindings/rsac-python/Cargo.toml`, and `.github/workflows/release-pypi.yml` builds a
+single `cp39-abi3` wheel per (platform, arch) instead of a per-interpreter matrix.
+
+> **Implementation note (2026-05-30).** This ADR was authored as a forward-looking
+> recommendation that gated adoption to *after* v0.2.0 (see §5). In practice abi3-py39
+> was adopted **during** the 0.2.0 line, not post-v0.2.0 — the §5 sequencing below is
+> retained for the historical record but is superseded by §5.1. The migration matched
+> §6 with two refinements: the wheel matrix is keyed on `(os, arch)` (Linux ships both
+> x86_64 and aarch64 manylinux wheels; macOS ships a `universal2` wheel) rather than os
+> alone, and the build interpreter is pinned via `--interpreter 3.9` (not
+> `setup-python` alone). A forward-compat smoke test (§6.4) is now part of the release
+> workflow.
 
 ## 1. Context
 
@@ -149,6 +161,20 @@ in pure Rust (audio I/O), not in the FFI boundary.
 and we want one more release on the current matrix to validate which platforms
 users actually install from before collapsing the wheel set.
 
+### 5.1 What actually shipped (supersedes the "post-v0.2.0" gating)
+
+The "keep per-version for v0.2.0, adopt abi3 for v0.3.0" sequencing above was **not**
+followed. abi3-py39 was adopted **within the 0.2.0 line**: `bindings/rsac-python/Cargo.toml`
+already carries `features = ["extension-module", "abi3-py39"]`, while the crate version
+(`Cargo.toml`), the workspace root `Cargo.toml`, and `pyproject.toml` are all still
+`0.2.0`. The post-v0.2.0 gate was dropped because the §4 audit found **zero**
+abi3-incompatible APIs (so there was no compatibility risk to defer for), the 80% CI-cost
+reduction was wanted immediately rather than one release later, and the
+"validate-which-platforms-users-install-from" rationale was moot — the sdist plus the
+single abi3 wheel cover every CPython 3.9+ install on all three platforms regardless of
+which one users pull. The original gating reflected caution that the compatibility audit
+retired.
+
 ## 6. Migration steps (for the follow-up PR)
 
 Concrete file-level diffs for when we adopt this.
@@ -225,18 +251,30 @@ Notes:
    the wheel's runtime interpreter set.
 3. The `sdist` and `publish-pypi` jobs are unchanged.
 
-### 6.4 Verification checklist for the migration PR
+### 6.4 Verification checklist
 
-- [ ] `maturin build --release --manifest-path bindings/rsac-python/Cargo.toml`
-  locally produces a wheel named `rsac-0.3.0-cp39-abi3-<platform>.whl` (note
-  `cp39-abi3`, not `cp39-cp39`).
-- [ ] Install the produced wheel on Python 3.9, 3.10, 3.11, 3.12, 3.13 and run
-  `python -c "import rsac; print(rsac.platform_capabilities())"`.
-- [ ] `python -c "import rsac; rsac.RsacError"` — verify the exception hierarchy
-  is intact (this is the riskiest thing in the audit).
-- [ ] Push a pre-release tag (e.g. `v0.3.0rc1`) to `TestPyPI` before promoting.
-- [ ] Confirm `pip install rsac` on a fresh Python 3.14 alpha works (proves
-  forward compat). Optional but high-value.
+Status reflects what the shipped `.github/workflows/release-pypi.yml` `build-wheels`
+job now covers automatically on every release tag (the abi3 forward-compat smoke step,
+which builds one wheel and re-imports it across CPython minors).
+
+- [x] The `build-wheels` job produces a wheel named `rsac-0.2.0-cp39-abi3-<platform>.whl`
+  (note `cp39-abi3`, not `cp39-cp39`) — one per `(os, arch)`: Linux x86_64 + aarch64
+  manylinux, macOS `universal2`, Windows x64. The build interpreter is pinned with
+  `--interpreter 3.9` so the abi3 floor is 3.9.
+- [x] The smoke step installs the single built wheel into **Python 3.9 (floor) and 3.13
+  (a newer minor)** and runs `import rsac; rsac.platform_capabilities().backend_name`
+  plus `rsac.CaptureTarget.parse('system')`, proving one `cp39-abi3` wheel imports and
+  calls device-free APIs across CPython versions. (The full 3.9–3.13 spread from the
+  original draft was reduced to the floor + one newer minor to keep CI fast; the abi3
+  contract guarantees the in-between minors.)
+- [ ] `python -c "import rsac; rsac.RsacError"` — exception-hierarchy import is **not yet
+  in the CI smoke step** (the audit §4.4 flagged this as the riskiest item). Add
+  `rsac.RsacError` to the smoke `-c` line, or run it as a follow-up check.
+- [ ] Push a pre-release tag to `TestPyPI` before promoting — **not automated**; the
+  release workflow triggers only on stable `v*.*.*` tags (pre-release shapes are
+  excluded), so TestPyPI dry-runs remain a manual step.
+- [ ] Confirm `pip install rsac` on a fresh Python 3.14 alpha works — **not automated**
+  (the smoke step uses 3.9 + 3.13). Optional but high-value as 3.14 nears release.
 
 ### 6.5 Rollback
 

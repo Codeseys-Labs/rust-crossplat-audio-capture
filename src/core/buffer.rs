@@ -261,6 +261,150 @@ impl AudioBuffer {
         Some(samples)
     }
 
+    // ── Level metering ───────────────────────────────────────────────
+    //
+    // These are *read-only* signal-level metrics over the existing samples
+    // (observability metadata for VU meters, clip detection, silence gating),
+    // **not** DSP: they neither mutate nor produce new audio. Every method is
+    // `#[inline]`, allocation-free, and lock-free — safe to call on the audio
+    // callback thread. Non-finite samples (`NaN`/`±inf`, which the buffer
+    // tolerates) are skipped so a single poisoned sample cannot corrupt the
+    // meter into `NaN`/`inf`.
+
+    /// Converts a non-negative linear amplitude to decibels relative to full
+    /// scale (dBFS): `20 · log10(level)`.
+    ///
+    /// Returns [`f32::NEG_INFINITY`] for a level of `0.0` (digital silence),
+    /// matching the convention that silence sits infinitely far below 0 dBFS.
+    /// A level of `1.0` (full scale) maps to `0.0` dB. Inputs are assumed
+    /// finite and `>= 0.0` (as produced by [`rms`](Self::rms) /
+    /// [`peak`](Self::peak)).
+    #[inline]
+    fn lin_to_dbfs(level: f32) -> f32 {
+        if level <= 0.0 {
+            f32::NEG_INFINITY
+        } else {
+            20.0 * level.log10()
+        }
+    }
+
+    /// Returns the root-mean-square (RMS) level across **all** samples and
+    /// channels: `sqrt(mean(xᵢ²))`.
+    ///
+    /// Returns `0.0` for an empty buffer (never `NaN`). Non-finite samples
+    /// (`NaN`/`±inf`) are skipped; if every sample is non-finite the result is
+    /// `0.0`. Allocation-free and `#[inline]` — RT-callback safe.
+    #[inline]
+    pub fn rms(&self) -> f32 {
+        let mut sum_sq = 0.0f64;
+        let mut count = 0u64;
+        for &x in &self.data {
+            if x.is_finite() {
+                let v = x as f64;
+                sum_sq += v * v;
+                count += 1;
+            }
+        }
+        if count == 0 {
+            return 0.0;
+        }
+        (sum_sq / count as f64).sqrt() as f32
+    }
+
+    /// Returns the peak (maximum absolute) level across **all** samples and
+    /// channels: `max(|xᵢ|)`.
+    ///
+    /// Returns `0.0` for an empty buffer (never `NaN`). Non-finite samples
+    /// (`NaN`/`±inf`) are skipped; if every sample is non-finite the result is
+    /// `0.0`. Allocation-free and `#[inline]` — RT-callback safe.
+    #[inline]
+    pub fn peak(&self) -> f32 {
+        let mut peak = 0.0f32;
+        for &x in &self.data {
+            if x.is_finite() {
+                let a = x.abs();
+                if a > peak {
+                    peak = a;
+                }
+            }
+        }
+        peak
+    }
+
+    /// Returns the RMS level in dBFS: `20 · log10(rms())`.
+    ///
+    /// Returns [`f32::NEG_INFINITY`] when the RMS level is `0.0` (silence or an
+    /// empty buffer). Allocation-free and `#[inline]`.
+    #[inline]
+    pub fn rms_dbfs(&self) -> f32 {
+        Self::lin_to_dbfs(self.rms())
+    }
+
+    /// Returns the peak level in dBFS: `20 · log10(peak())`.
+    ///
+    /// Returns [`f32::NEG_INFINITY`] when the peak level is `0.0` (silence or an
+    /// empty buffer). A full-scale signal (peak `1.0`) maps to `0.0` dBFS.
+    /// Allocation-free and `#[inline]`.
+    #[inline]
+    pub fn peak_dbfs(&self) -> f32 {
+        Self::lin_to_dbfs(self.peak())
+    }
+
+    /// Returns the RMS level of a single channel (0-indexed), reduced over a
+    /// **strided** view of the interleaved data — no intermediate allocation.
+    ///
+    /// Returns `None` if `channel` is out of range (`>= channels()`) or if the
+    /// buffer reports `0` channels. Non-finite samples are skipped; a channel
+    /// with no finite samples yields `Some(0.0)`. Unlike
+    /// [`channel_data`](Self::channel_data) this does **not** allocate a `Vec`,
+    /// so it is safe to call on the audio callback thread.
+    #[inline]
+    pub fn channel_rms(&self, channel: u16) -> Option<f32> {
+        let ch = self.format.channels as usize;
+        if ch == 0 || channel as usize >= ch {
+            return None;
+        }
+        let mut sum_sq = 0.0f64;
+        let mut count = 0u64;
+        for &x in self.data.iter().skip(channel as usize).step_by(ch) {
+            if x.is_finite() {
+                let v = x as f64;
+                sum_sq += v * v;
+                count += 1;
+            }
+        }
+        if count == 0 {
+            return Some(0.0);
+        }
+        Some((sum_sq / count as f64).sqrt() as f32)
+    }
+
+    /// Returns the peak (maximum absolute) level of a single channel
+    /// (0-indexed), reduced over a **strided** view of the interleaved data —
+    /// no intermediate allocation.
+    ///
+    /// Returns `None` if `channel` is out of range (`>= channels()`) or if the
+    /// buffer reports `0` channels. Non-finite samples are skipped. Unlike
+    /// [`channel_data`](Self::channel_data) this does **not** allocate a `Vec`,
+    /// so it is safe to call on the audio callback thread.
+    #[inline]
+    pub fn channel_peak(&self, channel: u16) -> Option<f32> {
+        let ch = self.format.channels as usize;
+        if ch == 0 || channel as usize >= ch {
+            return None;
+        }
+        let mut peak = 0.0f32;
+        for &x in self.data.iter().skip(channel as usize).step_by(ch) {
+            if x.is_finite() {
+                let a = x.abs();
+                if a > peak {
+                    peak = a;
+                }
+            }
+        }
+        Some(peak)
+    }
+
     // ── Slice compatibility (kept for backward compat) ───────────────
 
     /// Returns a slice view of the audio data.
@@ -277,11 +421,16 @@ impl AudioBuffer {
     }
 }
 
-// AudioBuffer only contains Vec<f32>, AudioFormat, and Option<Duration>,
-// all of which are Send + Sync, so auto-derive is sufficient.
-// Explicit impls below kept for clarity and to match the old code.
-unsafe impl Send for AudioBuffer {}
-unsafe impl Sync for AudioBuffer {}
+// `AudioBuffer` holds only `Vec<f32>`, `AudioFormat`, and `Option<Duration>`,
+// all of which are `Send + Sync`, so the compiler derives both auto-traits.
+// We deliberately do NOT hand-write `unsafe impl Send/Sync`: doing so would
+// suppress the compiler's safety net if a non-`Send`/`Sync` field were ever
+// added (e.g. a raw pointer or `Rc`), silently making the type unsound. The
+// compile-time assertion below keeps the guarantee explicit without `unsafe`.
+const _: () = {
+    const fn _assert_send_sync<T: Send + Sync>() {}
+    _assert_send_sync::<AudioBuffer>();
+};
 
 #[cfg(test)]
 mod tests {
@@ -690,5 +839,211 @@ mod tests {
         let buf = AudioBuffer::with_format(vec![0.5, -0.5], format);
         assert_eq!(buf.format().sample_format, SampleFormat::I16);
         assert_eq!(buf.data(), &[0.5, -0.5]); // data is still f32
+    }
+
+    // ===== Level metering (rsac-9a18) =====
+
+    #[test]
+    fn rms_and_peak_square_wave() {
+        // A ±0.5 square wave has both RMS and peak == 0.5.
+        let buf = AudioBuffer::new(vec![0.5, -0.5, 0.5, -0.5], 2, 48000);
+        assert!((buf.rms() - 0.5).abs() < 1e-6, "rms was {}", buf.rms());
+        assert!((buf.peak() - 0.5).abs() < 1e-6, "peak was {}", buf.peak());
+    }
+
+    #[test]
+    fn rms_and_peak_empty_buffer_are_zero() {
+        let buf = AudioBuffer::empty(2, 48000);
+        assert_eq!(buf.rms(), 0.0);
+        assert_eq!(buf.peak(), 0.0);
+        assert!(!buf.rms().is_nan());
+        assert!(!buf.peak().is_nan());
+    }
+
+    #[test]
+    fn rms_and_peak_silence_are_zero() {
+        let buf = AudioBuffer::new(vec![0.0; 64], 2, 48000);
+        assert_eq!(buf.rms(), 0.0);
+        assert_eq!(buf.peak(), 0.0);
+    }
+
+    #[test]
+    fn peak_uses_absolute_value() {
+        // Largest magnitude is the negative sample.
+        let buf = AudioBuffer::new(vec![0.1, -0.9, 0.3], 1, 48000);
+        assert!((buf.peak() - 0.9).abs() < 1e-6);
+    }
+
+    #[test]
+    fn rms_known_value() {
+        // mean of squares of [1, 0, 0, 0] = 0.25 → rms = 0.5
+        let buf = AudioBuffer::new(vec![1.0, 0.0, 0.0, 0.0], 1, 48000);
+        assert!((buf.rms() - 0.5).abs() < 1e-6, "rms was {}", buf.rms());
+        assert!((buf.peak() - 1.0).abs() < 1e-6);
+    }
+
+    #[test]
+    fn rms_dbfs_silence_is_neg_infinity() {
+        let silent = AudioBuffer::new(vec![0.0; 16], 1, 48000);
+        assert_eq!(silent.rms_dbfs(), f32::NEG_INFINITY);
+
+        let empty = AudioBuffer::empty(1, 48000);
+        assert_eq!(empty.rms_dbfs(), f32::NEG_INFINITY);
+    }
+
+    #[test]
+    fn peak_dbfs_silence_is_neg_infinity() {
+        let silent = AudioBuffer::new(vec![0.0; 16], 1, 48000);
+        assert_eq!(silent.peak_dbfs(), f32::NEG_INFINITY);
+
+        let empty = AudioBuffer::empty(1, 48000);
+        assert_eq!(empty.peak_dbfs(), f32::NEG_INFINITY);
+    }
+
+    #[test]
+    fn peak_dbfs_full_scale_is_zero() {
+        let buf = AudioBuffer::new(vec![1.0, -1.0, 1.0, -1.0], 2, 48000);
+        assert!(
+            buf.peak_dbfs().abs() < 1e-4,
+            "peak_dbfs was {}",
+            buf.peak_dbfs()
+        );
+        // A ±1.0 square wave is also full-scale in RMS terms.
+        assert!(
+            buf.rms_dbfs().abs() < 1e-4,
+            "rms_dbfs was {}",
+            buf.rms_dbfs()
+        );
+    }
+
+    #[test]
+    fn peak_dbfs_half_scale_is_about_minus_six() {
+        // peak 0.5 → 20*log10(0.5) ≈ -6.0206 dBFS
+        let buf = AudioBuffer::new(vec![0.5, -0.5], 1, 48000);
+        assert!(
+            (buf.peak_dbfs() - (-6.020599)).abs() < 1e-3,
+            "peak_dbfs was {}",
+            buf.peak_dbfs()
+        );
+    }
+
+    #[test]
+    fn channel_metering_matches_deinterleaved_stereo() {
+        // Interleaved stereo: L=[1.0,-1.0,1.0], R=[0.25,-0.25,0.25]
+        let buf = AudioBuffer::new(vec![1.0, 0.25, -1.0, -0.25, 1.0, 0.25], 2, 48000);
+
+        // Channel 0 (left): peak 1.0, rms 1.0
+        assert!((buf.channel_peak(0).unwrap() - 1.0).abs() < 1e-6);
+        assert!((buf.channel_rms(0).unwrap() - 1.0).abs() < 1e-6);
+
+        // Channel 1 (right): peak 0.25, rms 0.25
+        assert!((buf.channel_peak(1).unwrap() - 0.25).abs() < 1e-6);
+        assert!((buf.channel_rms(1).unwrap() - 0.25).abs() < 1e-6);
+
+        // Cross-check against the (allocating) deinterleaved reference path.
+        for ch in 0u16..2 {
+            let deint = buf.channel_data(ch).unwrap();
+            let ref_peak = deint.iter().fold(0.0f32, |m, &x| m.max(x.abs()));
+            let ref_rms = {
+                let sum_sq: f64 = deint.iter().map(|&x| (x as f64) * (x as f64)).sum();
+                (sum_sq / deint.len() as f64).sqrt() as f32
+            };
+            assert!((buf.channel_peak(ch).unwrap() - ref_peak).abs() < 1e-6);
+            assert!((buf.channel_rms(ch).unwrap() - ref_rms).abs() < 1e-6);
+        }
+    }
+
+    #[test]
+    fn channel_metering_mono() {
+        let buf = AudioBuffer::new(vec![0.5, -0.5, 0.5, -0.5], 1, 48000);
+        assert!((buf.channel_rms(0).unwrap() - 0.5).abs() < 1e-6);
+        assert!((buf.channel_peak(0).unwrap() - 0.5).abs() < 1e-6);
+        // Mono channel metrics equal the whole-buffer metrics.
+        assert!((buf.channel_rms(0).unwrap() - buf.rms()).abs() < 1e-6);
+        assert!((buf.channel_peak(0).unwrap() - buf.peak()).abs() < 1e-6);
+    }
+
+    #[test]
+    fn channel_metering_out_of_range_returns_none() {
+        let buf = AudioBuffer::new(vec![1.0, 2.0, 3.0, 4.0], 2, 48000);
+        // channel == channels() is out of range (0-indexed).
+        assert_eq!(buf.channel_rms(2), None);
+        assert_eq!(buf.channel_peak(2), None);
+        assert_eq!(buf.channel_rms(100), None);
+        assert_eq!(buf.channel_peak(100), None);
+    }
+
+    #[test]
+    fn channel_metering_zero_channels_returns_none() {
+        let buf = AudioBuffer::new(vec![1.0, 2.0, 3.0], 0, 48000);
+        assert_eq!(buf.channel_rms(0), None);
+        assert_eq!(buf.channel_peak(0), None);
+    }
+
+    #[test]
+    fn channel_metering_empty_buffer_is_zero_not_none() {
+        // Channels exist but carry no samples → Some(0.0), not None.
+        let buf = AudioBuffer::empty(2, 48000);
+        assert_eq!(buf.channel_rms(0), Some(0.0));
+        assert_eq!(buf.channel_peak(0), Some(0.0));
+        assert_eq!(buf.channel_rms(1), Some(0.0));
+        assert_eq!(buf.channel_peak(1), Some(0.0));
+        // Still None when out of range.
+        assert_eq!(buf.channel_rms(2), None);
+        assert_eq!(buf.channel_peak(2), None);
+    }
+
+    #[test]
+    fn metering_skips_nan_and_infinity() {
+        // NaN/±inf must not poison the meter; finite results expected.
+        let data = vec![f32::NAN, 0.5, f32::INFINITY, -0.5, f32::NEG_INFINITY];
+        let buf = AudioBuffer::new(data, 1, 48000);
+
+        let rms = buf.rms();
+        let peak = buf.peak();
+        assert!(rms.is_finite(), "rms was {rms}");
+        assert!(peak.is_finite(), "peak was {peak}");
+        // Only finite samples (±0.5) contribute: rms = sqrt((0.25+0.25)/2)=0.5.
+        assert!((rms - 0.5).abs() < 1e-6, "rms was {rms}");
+        assert!((peak - 0.5).abs() < 1e-6, "peak was {peak}");
+
+        // dBFS derived from finite levels must also be finite here.
+        assert!(buf.rms_dbfs().is_finite());
+        assert!(buf.peak_dbfs().is_finite());
+    }
+
+    #[test]
+    fn channel_metering_all_nonfinite_channel_is_zero() {
+        // Stereo: L = all NaN/inf, R = finite.
+        let data = vec![f32::NAN, 0.5, f32::INFINITY, -0.5, f32::NEG_INFINITY, 0.5];
+        let buf = AudioBuffer::new(data, 2, 48000);
+
+        // Left channel has no finite samples → 0.0 (not NaN).
+        assert_eq!(buf.channel_rms(0), Some(0.0));
+        assert_eq!(buf.channel_peak(0), Some(0.0));
+
+        // Right channel is finite.
+        assert!((buf.channel_rms(1).unwrap() - 0.5).abs() < 1e-6);
+        assert!((buf.channel_peak(1).unwrap() - 0.5).abs() < 1e-6);
+    }
+
+    #[test]
+    fn metering_all_nonfinite_buffer_is_zero() {
+        let buf = AudioBuffer::new(vec![f32::NAN, f32::INFINITY, f32::NEG_INFINITY], 1, 48000);
+        assert_eq!(buf.rms(), 0.0);
+        assert_eq!(buf.peak(), 0.0);
+        assert_eq!(buf.rms_dbfs(), f32::NEG_INFINITY);
+        assert_eq!(buf.peak_dbfs(), f32::NEG_INFINITY);
+    }
+
+    #[test]
+    fn lin_to_dbfs_edge_values() {
+        // Full scale → 0 dB.
+        assert!(AudioBuffer::lin_to_dbfs(1.0).abs() < 1e-6);
+        // Zero / negative → -inf.
+        assert_eq!(AudioBuffer::lin_to_dbfs(0.0), f32::NEG_INFINITY);
+        assert_eq!(AudioBuffer::lin_to_dbfs(-0.5), f32::NEG_INFINITY);
+        // 0.5 → ~ -6.02 dB.
+        assert!((AudioBuffer::lin_to_dbfs(0.5) - (-6.020599)).abs() < 1e-3);
     }
 }

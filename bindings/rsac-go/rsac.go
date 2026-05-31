@@ -38,59 +38,68 @@
 // that respects context cancellation. For lower-level control, use
 // [AudioCapture.ReadBuffer] (blocking) or [AudioCapture.TryReadBuffer]
 // (non-blocking).
+//
+// # ABI
+//
+// The binding tracks the rsac-ffi C ABI declared in rsac.h (kept in lockstep
+// with bindings/rsac-ffi/include/rsac.h). Fallible C functions return an
+// rsac_error_t and deliver any produced handle through an out-pointer; pure
+// accessors return their value directly with -1 (int32) or 0 used as the
+// "null handle" sentinel.
 package rsac
 
 /*
 #cgo CFLAGS: -I${SRCDIR}
 #cgo LDFLAGS: -L${SRCDIR}/lib -lrsac_ffi
 
+// Per-OS system libraries the Rust std staticlib pulls in. The Makefile passes
+// these via CGO_LDFLAGS too, but declaring them here lets a bare `go build` /
+// `go test` (not driven by the Makefile) link as well.
+//   - Windows: WASAPI/COM + the Win32 libs Rust std needs (ws2_32/ntdll/bcrypt/…).
+//     cgo links via MinGW, so the rsac-ffi staticlib must be the *-pc-windows-gnu
+//     build (see Makefile / docs/CROSS_LANGUAGE_BINDINGS.md).
+//   - Linux: PipeWire + the usual pthread/dl/m.
+//   - macOS: the CoreAudio/AudioToolbox/CoreFoundation/Security frameworks.
+#cgo windows LDFLAGS: -lole32 -loleaut32 -lwinmm -lksuser -luuid -lbcrypt -lntdll -luserenv -lws2_32 -ladvapi32 -lkernel32
+#cgo linux LDFLAGS: -lpipewire-0.3 -lpthread -ldl -lm
+#cgo darwin LDFLAGS: -framework CoreAudio -framework AudioToolbox -framework CoreFoundation -framework Security -framework SystemConfiguration
+
 #include "rsac.h"
 #include <stdlib.h>
-
-// Bridge function for the C callback — calls back into Go.
-extern void goAudioCallback(const rsac_audio_buffer_t* buffer, void* user_data);
 */
 import "C"
 import (
 	"context"
 	"errors"
 	"fmt"
+	"math"
 	"runtime"
 	"sync"
+	"sync/atomic"
 	"unsafe"
 )
 
 // ── Error Types ─────────────────────────────────────────────────────────
 
-// ErrorCode represents a categorized error from the rsac library.
+// ErrorCode represents a categorized error from the rsac library. The values
+// match the rsac_error_t discriminants in the rsac-ffi C ABI.
 type ErrorCode int
 
 const (
 	ErrOK                   ErrorCode = C.RSAC_OK
-	ErrInvalidParameter     ErrorCode = C.RSAC_ERROR_INVALID_PARAMETER
-	ErrUnsupportedFormat    ErrorCode = C.RSAC_ERROR_UNSUPPORTED_FORMAT
-	ErrConfiguration        ErrorCode = C.RSAC_ERROR_CONFIGURATION
-	ErrDeviceNotFound       ErrorCode = C.RSAC_ERROR_DEVICE_NOT_FOUND
-	ErrDeviceNotAvailable   ErrorCode = C.RSAC_ERROR_DEVICE_NOT_AVAILABLE
-	ErrDeviceEnumeration    ErrorCode = C.RSAC_ERROR_DEVICE_ENUMERATION
-	ErrStreamCreation       ErrorCode = C.RSAC_ERROR_STREAM_CREATION
-	ErrStreamStart          ErrorCode = C.RSAC_ERROR_STREAM_START
-	ErrStreamStop           ErrorCode = C.RSAC_ERROR_STREAM_STOP
-	ErrStreamRead           ErrorCode = C.RSAC_ERROR_STREAM_READ
-	ErrBufferOverrun        ErrorCode = C.RSAC_ERROR_BUFFER_OVERRUN
-	ErrBufferUnderrun       ErrorCode = C.RSAC_ERROR_BUFFER_UNDERRUN
-	ErrBackend              ErrorCode = C.RSAC_ERROR_BACKEND
-	ErrBackendNotAvailable  ErrorCode = C.RSAC_ERROR_BACKEND_NOT_AVAILABLE
-	ErrBackendInit          ErrorCode = C.RSAC_ERROR_BACKEND_INIT
-	ErrAppNotFound          ErrorCode = C.RSAC_ERROR_APP_NOT_FOUND
-	ErrAppCaptureFailed     ErrorCode = C.RSAC_ERROR_APP_CAPTURE_FAILED
-	ErrPlatformNotSupported ErrorCode = C.RSAC_ERROR_PLATFORM_NOT_SUPPORTED
-	ErrPermissionDenied     ErrorCode = C.RSAC_ERROR_PERMISSION_DENIED
-	ErrInternal             ErrorCode = C.RSAC_ERROR_INTERNAL
-	ErrTimeout              ErrorCode = C.RSAC_ERROR_TIMEOUT
 	ErrNullPointer          ErrorCode = C.RSAC_ERROR_NULL_POINTER
-	ErrNotRunning           ErrorCode = C.RSAC_ERROR_NOT_RUNNING
-	ErrAlreadyRunning       ErrorCode = C.RSAC_ERROR_ALREADY_RUNNING
+	ErrInvalidParameter     ErrorCode = C.RSAC_ERROR_INVALID_PARAMETER
+	ErrDeviceNotFound       ErrorCode = C.RSAC_ERROR_DEVICE_NOT_FOUND
+	ErrPlatformNotSupported ErrorCode = C.RSAC_ERROR_PLATFORM_NOT_SUPPORTED
+	ErrStreamFailed         ErrorCode = C.RSAC_ERROR_STREAM_FAILED
+	ErrStreamRead           ErrorCode = C.RSAC_ERROR_STREAM_READ
+	ErrConfiguration        ErrorCode = C.RSAC_ERROR_CONFIGURATION
+	ErrAppNotFound          ErrorCode = C.RSAC_ERROR_APPLICATION_NOT_FOUND
+	ErrBackend              ErrorCode = C.RSAC_ERROR_BACKEND
+	ErrPermissionDenied     ErrorCode = C.RSAC_ERROR_PERMISSION_DENIED
+	ErrTimeout              ErrorCode = C.RSAC_ERROR_TIMEOUT
+	ErrInternal             ErrorCode = C.RSAC_ERROR_INTERNAL
+	ErrPanic                ErrorCode = C.RSAC_ERROR_PANIC
 )
 
 // String returns the human-readable name of the error code.
@@ -98,57 +107,88 @@ func (e ErrorCode) String() string {
 	switch e {
 	case ErrOK:
 		return "OK"
-	case ErrInvalidParameter:
-		return "InvalidParameter"
-	case ErrUnsupportedFormat:
-		return "UnsupportedFormat"
-	case ErrConfiguration:
-		return "Configuration"
-	case ErrDeviceNotFound:
-		return "DeviceNotFound"
-	case ErrDeviceNotAvailable:
-		return "DeviceNotAvailable"
-	case ErrDeviceEnumeration:
-		return "DeviceEnumeration"
-	case ErrStreamCreation:
-		return "StreamCreation"
-	case ErrStreamStart:
-		return "StreamStart"
-	case ErrStreamStop:
-		return "StreamStop"
-	case ErrStreamRead:
-		return "StreamRead"
-	case ErrBufferOverrun:
-		return "BufferOverrun"
-	case ErrBufferUnderrun:
-		return "BufferUnderrun"
-	case ErrBackend:
-		return "Backend"
-	case ErrBackendNotAvailable:
-		return "BackendNotAvailable"
-	case ErrBackendInit:
-		return "BackendInit"
-	case ErrAppNotFound:
-		return "AppNotFound"
-	case ErrAppCaptureFailed:
-		return "AppCaptureFailed"
-	case ErrPlatformNotSupported:
-		return "PlatformNotSupported"
-	case ErrPermissionDenied:
-		return "PermissionDenied"
-	case ErrInternal:
-		return "Internal"
-	case ErrTimeout:
-		return "Timeout"
 	case ErrNullPointer:
 		return "NullPointer"
-	case ErrNotRunning:
-		return "NotRunning"
-	case ErrAlreadyRunning:
-		return "AlreadyRunning"
+	case ErrInvalidParameter:
+		return "InvalidParameter"
+	case ErrDeviceNotFound:
+		return "DeviceNotFound"
+	case ErrPlatformNotSupported:
+		return "PlatformNotSupported"
+	case ErrStreamFailed:
+		return "StreamFailed"
+	case ErrStreamRead:
+		return "StreamRead"
+	case ErrConfiguration:
+		return "Configuration"
+	case ErrAppNotFound:
+		return "AppNotFound"
+	case ErrBackend:
+		return "Backend"
+	case ErrPermissionDenied:
+		return "PermissionDenied"
+	case ErrTimeout:
+		return "Timeout"
+	case ErrInternal:
+		return "Internal"
+	case ErrPanic:
+		return "Panic"
 	default:
 		return fmt.Sprintf("Unknown(%d)", int(e))
 	}
+}
+
+// IsRecoverable reports whether an error of this code is a transient hiccup the
+// caller should retry, rather than a fatal/terminal condition that ends the
+// stream. It approximates the rsac core's recoverability classification
+// (ADR-0003) as projected onto the FFI error codes by map_rsac_error in
+// bindings/rsac-ffi/src/lib.rs:
+//
+//   - Recoverable: ErrStreamRead (transient read / over- or under-run),
+//     ErrTimeout, ErrBackend.
+//   - Fatal: ErrStreamFailed (covers the terminal StreamEnded), and every
+//     other code (configuration, device, platform, internal, panic, …).
+//
+// Caveat — lossy FFI projection on ErrBackend: the C ABI collapses three
+// distinct core variants onto the single ErrBackend code (map_rsac_error maps
+// BackendError, BackendNotAvailable, and BackendInitializationFailed all to
+// RSAC_ERROR_BACKEND). In the core, only BackendError is recoverable
+// (TransientRetry); BackendNotAvailable and BackendInitializationFailed are
+// Fatal. Because the Go layer only sees the merged code, ErrBackend is reported
+// recoverable — which agrees with the core for BackendError but NOT for the two
+// fatal Backend variants. This is acceptable in practice because of narrow
+// reachability: BackendNotAvailable / BackendInitializationFailed are
+// build/start-time failures surfaced by Build() / Start(), not by the
+// read/stream path where IsRecoverable is consulted; the only ErrBackend a
+// streaming loop is expected to encounter mid-stream is the recoverable
+// BackendError. A caller that needs the exact core classification of a
+// build/start error should inspect that error at Build()/Start() time rather
+// than relying on the merged ErrBackend code here.
+//
+// Consumers (e.g. [AudioCapture.Stream]) continue past a recoverable error and
+// stop only on a fatal one.
+func (e ErrorCode) IsRecoverable() bool {
+	switch e {
+	case ErrStreamRead, ErrTimeout, ErrBackend:
+		return true
+	default:
+		return false
+	}
+}
+
+// IsRecoverable reports whether err is a recoverable rsac error (see
+// [ErrorCode.IsRecoverable]). It unwraps to the underlying *Error via
+// errors.As; a nil error or a non-rsac error is treated as not recoverable
+// (callers should already have handled nil before asking).
+func IsRecoverable(err error) bool {
+	if err == nil {
+		return false
+	}
+	var e *Error
+	if errors.As(err, &e) {
+		return e.Code.IsRecoverable()
+	}
+	return false
 }
 
 // Error represents an error returned by the rsac library.
@@ -166,8 +206,28 @@ func (e *Error) Error() string {
 	return fmt.Sprintf("rsac: %s", e.Code)
 }
 
-// Is supports errors.Is matching by error code.
+// Is supports errors.Is matching by error code, with one exception: the
+// ErrClosed sentinel matches by pointer identity, NOT by code.
+//
+// ErrClosed deliberately carries the recoverable ErrStreamRead code (the C ABI
+// has no distinct "closed" code — see the ErrClosed doc), so plain code-equality
+// would make EVERY transient ErrStreamRead satisfy errors.Is(err, ErrClosed).
+// That would wrongly terminate the stream loops on a recoverable hiccup
+// (violating the terminal-error contract: a recoverable error must never end
+// the stream). ErrClosed is only ever returned as this exact sentinel pointer
+// (never via newError), so identity matching is correct and sufficient. Any
+// other *Error continues to match by code.
 func (e *Error) Is(target error) bool {
+	// Identity match for the ErrClosed sentinel: a transient ErrStreamRead must
+	// NOT be mistaken for "closed".
+	if target == ErrClosed {
+		return e == ErrClosed
+	}
+	if e == ErrClosed {
+		// The receiver is the sentinel but the target is some other *Error of
+		// the same code — that is a transient read error, not "closed".
+		return false
+	}
 	var t *Error
 	if errors.As(target, &t) {
 		return e.Code == t.Code
@@ -177,6 +237,10 @@ func (e *Error) Is(target error) bool {
 
 // Sentinel errors for use with errors.Is.
 var (
+	// ErrClosed is returned by operations on a closed [AudioCapture]. It carries
+	// the recoverable ErrStreamRead code only because the C ABI has no dedicated
+	// "closed" code; matching is by identity (see [Error.Is]), so a transient
+	// ErrStreamRead never satisfies errors.Is(err, ErrClosed).
 	ErrClosed = &Error{Code: ErrStreamRead, Message: "capture closed"}
 )
 
@@ -196,21 +260,19 @@ func newError(code C.rsac_error_t) error {
 	}
 }
 
-// newErrorMsg creates an Error with a Go-side message.
-func newErrorMsg(code ErrorCode, msg string) error {
-	return &Error{Code: code, Message: msg}
-}
-
 // ── Capture Target ──────────────────────────────────────────────────────
 
 // CaptureTarget specifies what audio to capture.
 // Use the constructor functions to create targets.
 type CaptureTarget struct {
-	kind    targetKind
-	name    string
-	pid     uint32
-	devID   string
-	appID   string
+	kind  targetKind
+	name  string
+	pid   uint32
+	devID string
+	appID string
+	// spec is the raw canonical target string for a targetString target,
+	// applied via rsac_builder_set_target_str at Build time.
+	spec string
 }
 
 type targetKind int
@@ -221,6 +283,7 @@ const (
 	targetApplication
 	targetApplicationByName
 	targetProcessTree
+	targetString
 )
 
 // SystemDefault returns a CaptureTarget for the system default audio device/mix.
@@ -250,6 +313,41 @@ func Device(id string) CaptureTarget {
 // identified by its platform-specific application ID.
 func Application(id string) CaptureTarget {
 	return CaptureTarget{kind: targetApplication, appID: id}
+}
+
+// ParseTarget parses a canonical target string into a CaptureTarget using the
+// rsac CaptureTarget grammar (the same parser the Rust core uses, reached
+// through the FFI — no grammar is reimplemented in Go):
+//
+//	"system"            → the system default mix
+//	"device:<id>"       → a specific device by ID
+//	"app:<pid-or-id>"   → an application session
+//	"name:<name>"       → an application matched by name
+//	"tree:<pid>"        → a process tree rooted at <pid>
+//
+// The scheme is case-insensitive. A malformed string returns an *Error with
+// code ErrInvalidParameter; ParseTarget never panics. The returned target can
+// be passed to [CaptureBuilder.WithTarget] or applied directly via
+// [CaptureBuilder.WithTargetString].
+func ParseTarget(spec string) (CaptureTarget, error) {
+	// Validate the spec now (fail fast at parse time) by routing it through a
+	// throwaway builder. The grammar lives entirely in the Rust core, so this
+	// is the single source of truth — Go does not duplicate the parser.
+	var cbuilder *C.RsacBuilder
+	if rc := C.rsac_builder_new(&cbuilder); rc != C.RSAC_OK {
+		return CaptureTarget{}, newError(rc)
+	}
+	if cbuilder == nil {
+		return CaptureTarget{}, newError(C.RSAC_ERROR_INTERNAL)
+	}
+	defer C.rsac_builder_free(cbuilder)
+
+	cspec := C.CString(spec)
+	defer C.free(unsafe.Pointer(cspec))
+	if rc := C.rsac_builder_set_target_str(cbuilder, cspec); rc != C.RSAC_OK {
+		return CaptureTarget{}, newError(rc)
+	}
+	return CaptureTarget{kind: targetString, spec: spec}, nil
 }
 
 // ── Audio Buffer ────────────────────────────────────────────────────────
@@ -291,10 +389,10 @@ func (b AudioBuffer) SampleRate() int {
 
 // NumSamples returns the total number of samples (NumFrames * Channels).
 func (b AudioBuffer) NumSamples() int {
-	return b.numFrames * b.channels
+	return len(b.data)
 }
 
-// Duration returns the duration of the audio data in this buffer.
+// Duration returns the duration of the audio data in this buffer, in seconds.
 func (b AudioBuffer) Duration() float64 {
 	if b.sampleRate == 0 {
 		return 0
@@ -307,9 +405,74 @@ func (b AudioBuffer) IsEmpty() bool {
 	return len(b.data) == 0
 }
 
+// RMS returns the root-mean-square level across all samples and channels:
+// sqrt(mean(x^2)). Non-finite samples (NaN/±Inf) are skipped; an empty or
+// all-non-finite buffer yields 0 (never NaN). This mirrors the rsac core
+// AudioBuffer::rms metering on the Go-owned sample copy (read-only measurement).
+func (b AudioBuffer) RMS() float32 {
+	var sumSq float64
+	var count uint64
+	for _, x := range b.data {
+		v := float64(x)
+		if isFinite(v) {
+			sumSq += v * v
+			count++
+		}
+	}
+	if count == 0 {
+		return 0
+	}
+	return float32(math.Sqrt(sumSq / float64(count)))
+}
+
+// Peak returns the peak (maximum absolute) level across all samples and
+// channels: max(|x|). Non-finite samples are skipped; an empty or
+// all-non-finite buffer yields 0 (never NaN). Mirrors core AudioBuffer::peak.
+func (b AudioBuffer) Peak() float32 {
+	var peak float32
+	for _, x := range b.data {
+		v := float64(x)
+		if isFinite(v) {
+			a := float32(math.Abs(v))
+			if a > peak {
+				peak = a
+			}
+		}
+	}
+	return peak
+}
+
+// RMSDbfs returns the RMS level in dBFS: 20*log10(RMS()). Returns negative
+// infinity for silence or an empty buffer; full scale (RMS 1.0) maps to 0 dBFS.
+// Mirrors core AudioBuffer::rms_dbfs.
+func (b AudioBuffer) RMSDbfs() float32 {
+	return linToDbfs(b.RMS())
+}
+
+// PeakDbfs returns the peak level in dBFS: 20*log10(Peak()). Returns negative
+// infinity for silence or an empty buffer; a full-scale signal (peak 1.0) maps
+// to 0 dBFS. Mirrors core AudioBuffer::peak_dbfs.
+func (b AudioBuffer) PeakDbfs() float32 {
+	return linToDbfs(b.Peak())
+}
+
+// isFinite reports whether v is neither NaN nor ±Inf.
+func isFinite(v float64) bool {
+	return !math.IsNaN(v) && !math.IsInf(v, 0)
+}
+
+// linToDbfs converts a linear amplitude to dBFS, returning negative infinity at
+// or below 0 (silence) to match the core metering's NEG_INFINITY convention.
+func linToDbfs(lin float32) float32 {
+	if lin <= 0 {
+		return float32(math.Inf(-1))
+	}
+	return float32(20 * math.Log10(float64(lin)))
+}
+
 // audioBufferFromC copies data from a C audio buffer into a Go AudioBuffer,
 // then frees the C buffer. The returned AudioBuffer is fully Go-managed.
-func audioBufferFromC(cbuf *C.rsac_audio_buffer_t) AudioBuffer {
+func audioBufferFromC(cbuf *C.RsacAudioBuffer) AudioBuffer {
 	if cbuf == nil {
 		return AudioBuffer{}
 	}
@@ -318,7 +481,7 @@ func audioBufferFromC(cbuf *C.rsac_audio_buffer_t) AudioBuffer {
 	numFrames := int(C.rsac_audio_buffer_num_frames(cbuf))
 	channels := int(C.rsac_audio_buffer_channels(cbuf))
 	sampleRate := int(C.rsac_audio_buffer_sample_rate(cbuf))
-	numSamples := int(C.rsac_audio_buffer_num_samples(cbuf))
+	numSamples := int(C.rsac_audio_buffer_len(cbuf))
 
 	// Copy the sample data into Go memory.
 	cdata := C.rsac_audio_buffer_data(cbuf)
@@ -343,6 +506,77 @@ func audioBufferFromC(cbuf *C.rsac_audio_buffer_t) AudioBuffer {
 	}
 }
 
+// ── Stream Statistics ─────────────────────────────────────────────────────
+
+// StreamStats is a point-in-time snapshot of a capture's diagnostic counters.
+// It mirrors the C-ABI RsacStreamStats out-parameter filled by the FFI; it is a
+// plain value (nothing to free). Obtain one via [AudioCapture.StreamStats].
+type StreamStats struct {
+	// BuffersCaptured is the number of buffers delivered to the consumer
+	// (popped off the ring) since Start.
+	BuffersCaptured uint64
+	// BuffersDropped is the number of buffers dropped to ring overflow since Start.
+	BuffersDropped uint64
+	// BuffersPushed is the number of buffers enqueued by the OS callback since Start.
+	BuffersPushed uint64
+	// Overruns counts ring-buffer overruns; equal to BuffersDropped (retained alias).
+	Overruns uint64
+	// UptimeSecs is how long the stream has been running, in seconds (0 when not started).
+	UptimeSecs float64
+	// DroppedRatio is the fraction of accounted-for buffers lost to overflow, in 0.0..=1.0.
+	DroppedRatio float64
+	// IsRunning is true when the stream is currently capturing.
+	IsRunning bool
+}
+
+// ── Audio Format ──────────────────────────────────────────────────────────
+
+// SampleFormat is the negotiated wire/storage format the backend reports.
+// All audio data is still delivered as interleaved float32 regardless of this
+// value. The discriminants match rsac_sample_format_t in the C ABI.
+type SampleFormat int
+
+const (
+	// SampleFormatI16 is signed 16-bit integer.
+	SampleFormatI16 SampleFormat = C.RSAC_SAMPLE_FORMAT_I16
+	// SampleFormatI24 is signed 24-bit integer (packed in a 32-bit container).
+	SampleFormatI24 SampleFormat = C.RSAC_SAMPLE_FORMAT_I24
+	// SampleFormatI32 is signed 32-bit integer.
+	SampleFormatI32 SampleFormat = C.RSAC_SAMPLE_FORMAT_I32
+	// SampleFormatF32 is 32-bit IEEE 754 floating-point (the library's internal standard).
+	SampleFormatF32 SampleFormat = C.RSAC_SAMPLE_FORMAT_F32
+)
+
+// String returns the human-readable name of the sample format.
+func (f SampleFormat) String() string {
+	switch f {
+	case SampleFormatI16:
+		return "I16"
+	case SampleFormatI24:
+		return "I24"
+	case SampleFormatI32:
+		return "I32"
+	case SampleFormatF32:
+		return "F32"
+	default:
+		return fmt.Sprintf("Unknown(%d)", int(f))
+	}
+}
+
+// AudioFormat describes a capture's negotiated delivery format. It mirrors the
+// C-ABI RsacAudioFormat out-parameter; it is a plain value (nothing to free).
+// Obtain one via [AudioCapture.Format].
+type AudioFormat struct {
+	// SampleRate is samples per second (e.g. 44100, 48000).
+	SampleRate uint32
+	// Channels is the number of audio channels (e.g. 1 mono, 2 stereo).
+	Channels uint16
+	// SampleFormat is the negotiated sample wire format.
+	SampleFormat SampleFormat
+	// BitsPerSample is the bits per sample for SampleFormat (16, 24, or 32).
+	BitsPerSample uint16
+}
+
 // ── Capture Builder ─────────────────────────────────────────────────────
 
 // CaptureBuilder configures and creates an [AudioCapture] instance using a
@@ -359,11 +593,10 @@ type CaptureBuilder struct {
 	target     CaptureTarget
 	sampleRate uint32
 	channels   uint16
-	bufferSize uint32 // 0 = platform default
 }
 
 // NewCaptureBuilder creates a new builder with default settings:
-// system default target, 48000 Hz, 2 channels, platform-default buffer size.
+// system default target, 48000 Hz, 2 channels.
 func NewCaptureBuilder() *CaptureBuilder {
 	return &CaptureBuilder{
 		target:     SystemDefault(),
@@ -408,6 +641,34 @@ func (b *CaptureBuilder) WithApplication(appID string) *CaptureBuilder {
 	return b
 }
 
+// WithTargetString sets the capture target from a canonical target string (see
+// [ParseTarget] for the grammar). The string is validated immediately; an
+// invalid spec is reported by [SetTargetString], whereas this fluent setter
+// stores the (unvalidated) spec and defers any error to [CaptureBuilder.Build].
+//
+// For fail-fast validation in a fluent chain, prefer [SetTargetString] or
+// [ParseTarget] + [CaptureBuilder.WithTarget].
+func (b *CaptureBuilder) WithTargetString(spec string) *CaptureBuilder {
+	b.target = CaptureTarget{kind: targetString, spec: spec}
+	return b
+}
+
+// SetTargetString parses and sets the capture target from a canonical target
+// string (see [ParseTarget] for the grammar), validating it immediately. A
+// malformed string returns an *Error with code ErrInvalidParameter and leaves
+// the builder's current target unchanged; it never panics.
+//
+// Unlike the fluent [CaptureBuilder.WithTargetString], this returns an error so
+// callers can react to a bad spec at configuration time rather than at Build().
+func (b *CaptureBuilder) SetTargetString(spec string) error {
+	target, err := ParseTarget(spec)
+	if err != nil {
+		return err
+	}
+	b.target = target
+	return nil
+}
+
 // SampleRate sets the desired sample rate in Hz.
 // Common values: 22050, 32000, 44100, 48000, 88200, 96000.
 func (b *CaptureBuilder) SampleRate(rate uint32) *CaptureBuilder {
@@ -421,18 +682,14 @@ func (b *CaptureBuilder) Channels(ch uint16) *CaptureBuilder {
 	return b
 }
 
-// BufferSize sets the desired buffer size in frames.
-// Pass 0 to use the platform default.
-func (b *CaptureBuilder) BufferSize(frames uint32) *CaptureBuilder {
-	b.bufferSize = frames
-	return b
-}
-
 // Build validates the configuration and creates an [AudioCapture] instance.
 // Returns an error if the configuration is invalid or the platform does not
 // support the requested capture target.
 func (b *CaptureBuilder) Build() (*AudioCapture, error) {
-	cbuilder := C.rsac_builder_new()
+	var cbuilder *C.RsacBuilder
+	if rc := C.rsac_builder_new(&cbuilder); rc != C.RSAC_OK {
+		return nil, newError(rc)
+	}
 	if cbuilder == nil {
 		return nil, newError(C.RSAC_ERROR_INTERNAL)
 	}
@@ -455,7 +712,11 @@ func (b *CaptureBuilder) Build() (*AudioCapture, error) {
 	case targetApplication:
 		cid := C.CString(b.target.appID)
 		defer C.free(unsafe.Pointer(cid))
-		rc = C.rsac_builder_set_target_app_by_pid(cbuilder, cid)
+		rc = C.rsac_builder_set_target_app_by_id(cbuilder, cid)
+	case targetString:
+		cspec := C.CString(b.target.spec)
+		defer C.free(unsafe.Pointer(cspec))
+		rc = C.rsac_builder_set_target_str(cbuilder, cspec)
 	}
 	if rc != C.RSAC_OK {
 		C.rsac_builder_free(cbuilder)
@@ -471,15 +732,12 @@ func (b *CaptureBuilder) Build() (*AudioCapture, error) {
 		C.rsac_builder_free(cbuilder)
 		return nil, newError(rc)
 	}
-	if b.bufferSize > 0 {
-		if rc = C.rsac_builder_set_buffer_size(cbuilder, C.uint32_t(b.bufferSize)); rc != C.RSAC_OK {
-			C.rsac_builder_free(cbuilder)
-			return nil, newError(rc)
-		}
-	}
 
-	// Build the capture. This consumes the builder.
-	ccapture := C.rsac_builder_build(cbuilder)
+	// Build the capture. This consumes (and frees) the builder regardless of outcome.
+	var ccapture *C.RsacCapture
+	if rc = C.rsac_builder_build(cbuilder, &ccapture); rc != C.RSAC_OK {
+		return nil, newError(rc)
+	}
 	if ccapture == nil {
 		return nil, newError(C.RSAC_ERROR_INTERNAL)
 	}
@@ -503,9 +761,22 @@ func (b *CaptureBuilder) Build() (*AudioCapture, error) {
 // The caller must call [AudioCapture.Close] when done to release resources.
 // A finalizer is registered as a safety net, but explicit Close() is preferred.
 type AudioCapture struct {
-	mu     sync.Mutex
-	handle *C.rsac_capture_t
-	closed bool
+	mu       sync.Mutex
+	handle   *C.RsacCapture
+	closed   bool
+	callback uintptr // backing cgo.Handle for the active callback, 0 if none
+
+	// reads tracks in-flight ReadBuffer/TryReadBuffer C calls so Close() can
+	// drain them before freeing the handle. Add(1) happens under c.mu (ordered
+	// before any Close observes closed=true), and Done() runs via defer after
+	// the C call returns. Close() releases c.mu, then reads.Wait() to drain.
+	reads sync.WaitGroup
+	// closing is set true (under c.mu, before closed) at the start of Close().
+	// A reader that has already taken the WaitGroup barrier re-checks it after
+	// dropping c.mu and bails before entering C if a close has begun. This is
+	// the #28 use-after-free fix: the handle is never freed underneath a parked
+	// read because Close() drains reads.Wait() before rsac_capture_free.
+	closing atomic.Bool
 }
 
 // Start begins audio capture. The underlying OS stream is created and begins
@@ -547,12 +818,60 @@ func (c *AudioCapture) Close() error {
 	return c.closeLocked()
 }
 
-// closeLocked frees the C handle. Must be called with c.mu held.
+// closeLocked frees the C handle. Must be called with c.mu held on entry; it
+// briefly RELEASES c.mu while draining in-flight reads (see below) and
+// re-acquires it before freeing, so on return c.mu is held again (Close's
+// deferred Unlock balances it).
+//
+// Ordering matters for two distinct use-after-free races:
+//
+//  1. Callback (#28, already fixed): the cgo.Handle backing an active callback
+//     must never be Delete()d while a callback could still resolve it on the
+//     FFI delivery thread. We clear the C-layer callback first, then free, then
+//     Delete the cgo.Handle (goAudioCallback also recovers from a resolve of an
+//     already-deleted handle).
+//
+//  2. Blocking-read (#28, this fix): a goroutine parked in C.rsac_capture_read
+//     holds no Go lock during the C call, so a naive free would yank the handle
+//     out from under it. The reads WaitGroup keeps the handle alive for the
+//     duration of every in-flight C read; we set closing+closed FIRST (so new
+//     reads bail), call rsac_capture_request_stop to UNBLOCK a parked reader
+//     (it observes a terminal stream and returns within ~1ms instead of waiting
+//     out the blocking-read timeout), then UNLOCK c.mu and reads.Wait() to
+//     drain, RE-LOCK, and only then free. Releasing c.mu during Wait() is
+//     mandatory: the parked reader's error path re-takes c.mu, so holding it
+//     across Wait() would deadlock.
 func (c *AudioCapture) closeLocked() error {
+	// Set closing BEFORE closed (both under c.mu). A reader either took the
+	// WaitGroup barrier before Close started (and we drain it) or it sees
+	// closed=true under c.mu and bails without Add — so reads.Add never races
+	// reads.Wait (the "Add after Wait" panic the sync docs warn about).
+	c.closing.Store(true)
 	c.closed = true
 	runtime.SetFinalizer(c, nil)
+	// Clear the C-layer callback first so the FFI pump stops dispatching to
+	// goAudioCallback before the handle it resolves is deleted.
+	if c.callback != 0 {
+		C.rsac_capture_set_callback(c.handle, nil, nil)
+	}
+	// Snapshot the handle for the unlocked drain window: request_stop only
+	// reads, so it is safe to call concurrently with the in-flight reads we are
+	// about to drain. It transitions the stream terminal, unblocking any parked
+	// rsac_capture_read so reads.Wait() returns promptly.
+	handle := c.handle
+	C.rsac_capture_request_stop(handle)
+
+	// Drain in-flight reads with c.mu released so parked readers can finish
+	// their C call and run their deferred reads.Done() (and, on error, re-take
+	// c.mu). After Wait() no read can be inside C against this handle.
+	c.mu.Unlock()
+	c.reads.Wait()
+	c.mu.Lock()
+
 	C.rsac_capture_free(c.handle)
 	c.handle = nil
+	// Now that delivery is torn down, it is safe to delete the cgo.Handle.
+	c.clearCallbackHandleLocked()
 	return nil
 }
 
@@ -569,7 +888,8 @@ func (c *AudioCapture) IsRunning() bool {
 	if c.closed {
 		return false
 	}
-	return bool(C.rsac_capture_is_running(c.handle))
+	// rsac_capture_is_running returns 1 (running), 0 (stopped), or -1 (null).
+	return C.rsac_capture_is_running(c.handle) == 1
 }
 
 // OverrunCount returns the number of audio buffers dropped due to ring buffer
@@ -581,6 +901,59 @@ func (c *AudioCapture) OverrunCount() uint64 {
 		return 0
 	}
 	return uint64(C.rsac_capture_overrun_count(c.handle))
+}
+
+// StreamStats returns a point-in-time snapshot of the capture's diagnostic
+// counters bundled with running state, uptime, and the overflow ratio. Reading
+// it never allocates on or blocks the OS audio callback thread.
+//
+// Before Start (or after Stop) every counter is zero, UptimeSecs is 0, and
+// IsRunning is false. Returns ErrClosed if the capture has been closed.
+//
+// OverrunCount() and StreamStats().Overruns report the same ring-overflow count.
+func (c *AudioCapture) StreamStats() (StreamStats, error) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if c.closed {
+		return StreamStats{}, ErrClosed
+	}
+	var cs C.RsacStreamStats
+	if rc := C.rsac_capture_stream_stats(c.handle, &cs); rc != C.RSAC_OK {
+		return StreamStats{}, newError(rc)
+	}
+	return StreamStats{
+		BuffersCaptured: uint64(cs.buffers_captured),
+		BuffersDropped:  uint64(cs.buffers_dropped),
+		BuffersPushed:   uint64(cs.buffers_pushed),
+		Overruns:        uint64(cs.overruns),
+		UptimeSecs:      float64(cs.uptime_secs),
+		DroppedRatio:    float64(cs.dropped_ratio),
+		IsRunning:       cs.is_running != 0,
+	}, nil
+}
+
+// Format returns the negotiated delivery format the backend actually produces,
+// atomically published once a stream is created.
+//
+// Returns an *Error with code ErrStreamFailed when no stream has been created
+// yet (before Start, or after Stop) — call this only on a started capture, or
+// after checking IsRunning(). Returns ErrClosed if the capture has been closed.
+func (c *AudioCapture) Format() (AudioFormat, error) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if c.closed {
+		return AudioFormat{}, ErrClosed
+	}
+	var cf C.RsacAudioFormat
+	if rc := C.rsac_capture_format(c.handle, &cf); rc != C.RSAC_OK {
+		return AudioFormat{}, newError(rc)
+	}
+	return AudioFormat{
+		SampleRate:    uint32(cf.sample_rate),
+		Channels:      uint16(cf.channels),
+		SampleFormat:  SampleFormat(cf.sample_format),
+		BitsPerSample: uint16(cf.bits_per_sample),
+	}, nil
 }
 
 // ReadBuffer reads the next chunk of audio data, blocking until data is
@@ -595,21 +968,40 @@ func (c *AudioCapture) ReadBuffer() (AudioBuffer, error) {
 		return AudioBuffer{}, ErrClosed
 	}
 	handle := c.handle
+	// Join the in-flight-read barrier UNDER c.mu, so the Add(1) is ordered
+	// before any Close() observes closed=true. Close() drains reads.Wait()
+	// before freeing the handle, so the handle cannot be freed while this C
+	// call is in flight (#28 fix). The matching Done() runs via defer below.
+	c.reads.Add(1)
 	c.mu.Unlock()
+	defer c.reads.Done()
 
-	// Note: ReadBuffer releases the lock during the blocking C call so that
-	// other goroutines can call IsRunning(), OverrunCount(), or Stop().
-	// The handle is safe to use without the lock because Close() only frees
-	// the handle, and we check closed before and after.
-	cbuf := C.rsac_capture_read(handle)
-	if cbuf == nil {
+	// A close may have started after we dropped c.mu (it sets closing first).
+	// Bail before entering C so we never park in a blocking read against a
+	// handle Close() is about to drain+free.
+	if c.closing.Load() {
+		return AudioBuffer{}, ErrClosed
+	}
+
+	// The barrier keeps the handle alive for the duration of this C read;
+	// Close() sets closing, signals rsac_capture_request_stop, then drains
+	// in-flight reads (reads.Wait) before rsac_capture_free, so the handle is
+	// never freed underneath a parked read. We re-check closed on the error
+	// path (a concurrent request_stop surfaces as a terminal stream error).
+	var cbuf *C.RsacAudioBuffer
+	rc := C.rsac_capture_read(handle, &cbuf)
+	if rc != C.RSAC_OK {
 		c.mu.Lock()
 		defer c.mu.Unlock()
 		if c.closed {
 			return AudioBuffer{}, ErrClosed
 		}
-		lastErr := C.rsac_capture_last_error(handle)
-		return AudioBuffer{}, newError(lastErr)
+		return AudioBuffer{}, newError(rc)
+	}
+	if cbuf == nil {
+		// RSAC_OK with no buffer should not happen for a blocking read, but
+		// guard against it rather than dereferencing nil.
+		return AudioBuffer{}, nil
 	}
 	return audioBufferFromC(cbuf), nil
 }
@@ -624,21 +1016,30 @@ func (c *AudioCapture) TryReadBuffer() (AudioBuffer, bool, error) {
 		return AudioBuffer{}, false, ErrClosed
 	}
 	handle := c.handle
+	// Same in-flight-read barrier as ReadBuffer. The C call is non-blocking so
+	// the window is tiny, but the Add(1)/Done() span must still bracket it so a
+	// concurrent Close()+free cannot land mid-call (#28 fix).
+	c.reads.Add(1)
 	c.mu.Unlock()
+	defer c.reads.Done()
 
-	cbuf := C.rsac_capture_try_read(handle)
-	if cbuf == nil {
+	if c.closing.Load() {
+		return AudioBuffer{}, false, ErrClosed
+	}
+
+	var cbuf *C.RsacAudioBuffer
+	rc := C.rsac_capture_try_read(handle, &cbuf)
+	if rc != C.RSAC_OK {
 		c.mu.Lock()
 		defer c.mu.Unlock()
 		if c.closed {
 			return AudioBuffer{}, false, ErrClosed
 		}
-		lastErr := C.rsac_capture_last_error(handle)
-		if lastErr == C.RSAC_OK {
-			// No data available (not an error).
-			return AudioBuffer{}, false, nil
-		}
-		return AudioBuffer{}, false, newError(lastErr)
+		return AudioBuffer{}, false, newError(rc)
+	}
+	if cbuf == nil {
+		// RSAC_OK with a null buffer means "no data available" (not an error).
+		return AudioBuffer{}, false, nil
 	}
 	return audioBufferFromC(cbuf), true, nil
 }
@@ -692,7 +1093,17 @@ func (c *AudioCapture) streamLoop(ctx context.Context, ch chan<- AudioBuffer) {
 
 		buf, ok, err := c.TryReadBuffer()
 		if err != nil {
-			return // stream error, stop delivering
+			// A recoverable hiccup must NOT end the stream — yield and retry
+			// (mirrors the in-process subscribe loop and the napi pump). A
+			// fatal/terminal error (ErrStreamFailed for the terminal
+			// StreamEnded, or anything non-recoverable) stops delivery and
+			// closes the channel. ErrClosed (the capture was closed underneath
+			// us) always stops, even though its code is in the recoverable set.
+			if IsRecoverable(err) && !errors.Is(err, ErrClosed) {
+				runtime.Gosched()
+				continue
+			}
+			return // fatal terminal (or closed): stop delivering, close channel
 		}
 		if !ok {
 			// No data available. Yield briefly to avoid busy-spinning.
@@ -707,6 +1118,40 @@ func (c *AudioCapture) streamLoop(ctx context.Context, ch chan<- AudioBuffer) {
 	}
 }
 
+// streamLoopWithErrors is the goroutine body behind [AudioCapture.StreamWithErrors].
+//
+// # Terminal-error & recoverable-error delivery contract
+//
+// This loop honours the rsac terminal-error contract (see
+// docs/CROSS_LANGUAGE_BINDINGS.md § "Terminal-error & recoverable-error
+// delivery"). Two invariants hold across every rsac binding:
+//
+//   - A recoverable hiccup (IsRecoverable, e.g. a transient ErrStreamRead /
+//     ErrTimeout / ErrBackend) NEVER ends the stream — the loop yields and
+//     retries.
+//   - The stream ends cleanly on, and only on, a fatal/terminal error: the
+//     terminal AudioError is delivered as the FINAL StreamResult{Err} before the
+//     channel is closed, so the consumer learns exactly why the stream ended
+//     instead of racing a bare channel-close.
+//
+// Within that shared contract, Go is on the **SWALLOW** side of a deliberate,
+// documented divergence in how recoverable errors are *delivered*:
+//
+//   - Go (this loop) SWALLOWS recoverable errors: it logs nothing and forwards
+//     nothing — it just runtime.Gosched()es and retries. A `for r := range ch`
+//     consumer therefore never observes a transient hiccup as a StreamResult{Err}
+//     it would otherwise mistake for a terminal error and break on. This matches
+//     the value-only Stream() loop and the napi onData pump, and the blueprint's
+//     "logs + sleeps + continues" note.
+//   - Rust subscribe_with_errors() instead FORWARDS each recoverable error to
+//     the consumer as a non-terminal Err item and then continues, so an mpsc
+//     consumer can observe (and meter) transient hiccups it never has to act on.
+//
+// Both are conformant: neither ends on a recoverable error and both end on the
+// fatal terminal. The only observable difference is whether the consumer SEES
+// the transient hiccups. ErrClosed (the capture was closed underneath us) carries
+// a code in the recoverable set but always stops the loop — it is gated via
+// errors.Is below, matching the value-only Stream() loop.
 func (c *AudioCapture) streamLoopWithErrors(ctx context.Context, ch chan<- StreamResult) {
 	defer close(ch)
 	for {
@@ -719,6 +1164,20 @@ func (c *AudioCapture) streamLoopWithErrors(ctx context.Context, ch chan<- Strea
 
 		buf, ok, err := c.TryReadBuffer()
 		if err != nil {
+			// A recoverable hiccup must NOT be reported as a terminal error
+			// (that would mislead a `for r := range ch` consumer into stopping)
+			// — SWALLOW it and keep delivering, matching the value-only
+			// Stream() loop and the napi onData pump. (Rust's
+			// subscribe_with_errors forwards recoverable errors as non-terminal
+			// Err items instead; see the doc-comment above and
+			// docs/CROSS_LANGUAGE_BINDINGS.md for the cross-binding contract.)
+			// A fatal/terminal error (or ErrClosed) is delivered as the FINAL
+			// StreamResult{Err} and then closes the channel, so the consumer
+			// learns why the stream ended.
+			if IsRecoverable(err) && !errors.Is(err, ErrClosed) {
+				runtime.Gosched()
+				continue
+			}
 			select {
 			case ch <- StreamResult{Err: err}:
 			case <-ctx.Done():
@@ -753,37 +1212,33 @@ type Capabilities struct {
 	BackendName string
 	// MaxChannels is the maximum number of audio channels supported.
 	MaxChannels int
-	// MinSampleRate is the minimum supported sample rate in Hz.
-	MinSampleRate int
-	// MaxSampleRate is the maximum supported sample rate in Hz.
-	MaxSampleRate int
 }
 
 // PlatformCapabilities queries and returns the audio capabilities of the
 // current platform. This is a static query that does not require an active
 // capture session.
 func PlatformCapabilities() (Capabilities, error) {
-	ccaps := C.rsac_capabilities_query()
+	var ccaps *C.RsacCapabilities
+	if rc := C.rsac_capabilities_query(&ccaps); rc != C.RSAC_OK {
+		return Capabilities{}, newError(rc)
+	}
 	if ccaps == nil {
 		return Capabilities{}, newError(C.RSAC_ERROR_INTERNAL)
 	}
 	defer C.rsac_capabilities_free(ccaps)
 
-	backendNameC := C.rsac_capabilities_backend_name(ccaps)
 	backendName := ""
-	if backendNameC != nil {
-		backendName = C.GoString(backendNameC)
+	if cname := C.rsac_capabilities_backend_name(ccaps); cname != nil {
+		backendName = C.GoString(cname)
 	}
 
 	return Capabilities{
-		SupportsSystemCapture:   bool(C.rsac_capabilities_supports_system_capture(ccaps)),
-		SupportsAppCapture:      bool(C.rsac_capabilities_supports_app_capture(ccaps)),
-		SupportsProcessTree:     bool(C.rsac_capabilities_supports_process_tree(ccaps)),
-		SupportsDeviceSelection: bool(C.rsac_capabilities_supports_device_selection(ccaps)),
+		SupportsSystemCapture:   C.rsac_capabilities_supports_system_capture(ccaps) == 1,
+		SupportsAppCapture:      C.rsac_capabilities_supports_app_capture(ccaps) == 1,
+		SupportsProcessTree:     C.rsac_capabilities_supports_process_tree(ccaps) == 1,
+		SupportsDeviceSelection: C.rsac_capabilities_supports_device_selection(ccaps) == 1,
 		BackendName:             backendName,
 		MaxChannels:             int(C.rsac_capabilities_max_channels(ccaps)),
-		MinSampleRate:           int(C.rsac_capabilities_min_sample_rate(ccaps)),
-		MaxSampleRate:           int(C.rsac_capabilities_max_sample_rate(ccaps)),
 	}, nil
 }
 
@@ -794,9 +1249,9 @@ type DeviceKind int
 
 const (
 	// DeviceInput is an audio input (recording) device.
-	DeviceInput DeviceKind = 0
+	DeviceInput DeviceKind = C.RSAC_DEVICE_INPUT
 	// DeviceOutput is an audio output (playback) device.
-	DeviceOutput DeviceKind = 1
+	DeviceOutput DeviceKind = C.RSAC_DEVICE_OUTPUT
 )
 
 // AudioDevice describes an audio device discovered by the platform backend.
@@ -809,59 +1264,11 @@ type AudioDevice struct {
 	IsDefault bool
 }
 
-// ListDevices enumerates all audio devices available on the current platform.
-func ListDevices() ([]AudioDevice, error) {
-	cenum := C.rsac_device_enumerator_new()
-	if cenum == nil {
-		return nil, newError(C.RSAC_ERROR_INTERNAL)
-	}
-	defer C.rsac_device_enumerator_free(cenum)
-
-	clist := C.rsac_enumerate_devices(cenum)
-	if clist == nil {
-		return nil, newError(C.RSAC_ERROR_DEVICE_ENUMERATION)
-	}
-	defer C.rsac_device_list_free(clist)
-
-	count := int(C.rsac_device_list_count(clist))
-	devices := make([]AudioDevice, 0, count)
-	for i := 0; i < count; i++ {
-		cdev := C.rsac_device_list_get(clist, C.uint32_t(i))
-		if cdev == nil {
-			continue
-		}
-		dev := AudioDevice{
-			IsDefault: bool(C.rsac_device_is_default(cdev)),
-		}
-		if cid := C.rsac_device_id(cdev); cid != nil {
-			dev.ID = C.GoString(cid)
-		}
-		if cname := C.rsac_device_name(cdev); cname != nil {
-			dev.Name = C.GoString(cname)
-		}
-		devices = append(devices, dev)
-		// Note: devices from rsac_device_list_get are borrowed from the list;
-		// they are freed when the list is freed. Do NOT call rsac_device_free.
-	}
-	return devices, nil
-}
-
-// DefaultDevice returns the default audio device of the given kind.
-func DefaultDevice(kind DeviceKind) (AudioDevice, error) {
-	cenum := C.rsac_device_enumerator_new()
-	if cenum == nil {
-		return AudioDevice{}, newError(C.RSAC_ERROR_INTERNAL)
-	}
-	defer C.rsac_device_enumerator_free(cenum)
-
-	cdev := C.rsac_default_device(cenum, C.uint32_t(kind))
-	if cdev == nil {
-		return AudioDevice{}, newError(C.RSAC_ERROR_DEVICE_NOT_FOUND)
-	}
-	defer C.rsac_device_free(cdev)
-
+// deviceFromC reads the fields of a C device handle into a Go AudioDevice.
+// It does not free the handle.
+func deviceFromC(cdev *C.RsacDevice) AudioDevice {
 	dev := AudioDevice{
-		IsDefault: bool(C.rsac_device_is_default(cdev)),
+		IsDefault: C.rsac_device_is_default(cdev) == 1,
 	}
 	if cid := C.rsac_device_id(cdev); cid != nil {
 		dev.ID = C.GoString(cid)
@@ -869,5 +1276,70 @@ func DefaultDevice(kind DeviceKind) (AudioDevice, error) {
 	if cname := C.rsac_device_name(cdev); cname != nil {
 		dev.Name = C.GoString(cname)
 	}
-	return dev, nil
+	return dev
+}
+
+// ListDevices enumerates all audio devices available on the current platform.
+func ListDevices() ([]AudioDevice, error) {
+	var cenum *C.RsacDeviceEnumerator
+	if rc := C.rsac_device_enumerator_new(&cenum); rc != C.RSAC_OK {
+		return nil, newError(rc)
+	}
+	if cenum == nil {
+		return nil, newError(C.RSAC_ERROR_INTERNAL)
+	}
+	defer C.rsac_device_enumerator_free(cenum)
+
+	var clist *C.RsacDeviceList
+	if rc := C.rsac_device_list_new(cenum, &clist); rc != C.RSAC_OK {
+		return nil, newError(rc)
+	}
+	if clist == nil {
+		return nil, newError(C.RSAC_ERROR_INTERNAL)
+	}
+	defer C.rsac_device_list_free(clist)
+
+	count := int(C.rsac_device_list_count(clist))
+	devices := make([]AudioDevice, 0, count)
+	for i := 0; i < count; i++ {
+		var cdev *C.RsacDevice
+		if rc := C.rsac_device_list_get(clist, C.size_t(i), &cdev); rc != C.RSAC_OK || cdev == nil {
+			continue
+		}
+		devices = append(devices, deviceFromC(cdev))
+		// Devices returned by rsac_device_list_get are owned snapshots and
+		// must be freed individually.
+		C.rsac_device_free(cdev)
+	}
+	return devices, nil
+}
+
+// DefaultDevice returns the default audio device of the given kind.
+//
+// NOTE: rsac is a loopback (output) capture library; only DeviceOutput is
+// supported. Any other kind returns ErrPlatformNotSupported rather than
+// silently returning the default output device.
+func DefaultDevice(kind DeviceKind) (AudioDevice, error) {
+	if kind != DeviceOutput {
+		return AudioDevice{}, newError(C.RSAC_ERROR_PLATFORM_NOT_SUPPORTED)
+	}
+	var cenum *C.RsacDeviceEnumerator
+	if rc := C.rsac_device_enumerator_new(&cenum); rc != C.RSAC_OK {
+		return AudioDevice{}, newError(rc)
+	}
+	if cenum == nil {
+		return AudioDevice{}, newError(C.RSAC_ERROR_INTERNAL)
+	}
+	defer C.rsac_device_enumerator_free(cenum)
+
+	var cdev *C.RsacDevice
+	if rc := C.rsac_default_device(cenum, C.rsac_device_kind_t(kind), &cdev); rc != C.RSAC_OK {
+		return AudioDevice{}, newError(rc)
+	}
+	if cdev == nil {
+		return AudioDevice{}, newError(C.RSAC_ERROR_DEVICE_NOT_FOUND)
+	}
+	defer C.rsac_device_free(cdev)
+
+	return deviceFromC(cdev), nil
 }

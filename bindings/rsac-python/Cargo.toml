@@ -1,6 +1,6 @@
 [package]
 name = "rsac-python"
-version = "0.2.0"
+version = "0.3.0"
 edition = "2021"
 description = "Python bindings for rsac (Rust Cross-Platform Audio Capture)"
 license = "MIT OR Apache-2.0"
@@ -13,10 +13,31 @@ name = "_rsac"
 crate-type = ["cdylib"]
 
 [dependencies]
-pyo3 = { version = "0.24", features = ["extension-module"] }
+# abi3-py39: build against CPython's stable ABI for 3.9+, so ONE wheel per
+# platform is importable on CPython 3.9–3.13 (rsac#18 / rsac-c353) instead of a
+# wheel per interpreter minor version. `extension-module` keeps Python out of the
+# link line (the interpreter provides the symbols at load time).
+pyo3 = { version = "0.24", features = ["extension-module", "abi3-py39"] }
 
-# Path dependency to the rsac library crate
-[dependencies.rsac]
+# Path dependency to the rsac library crate.
+#
+# rsac gates each platform backend behind a `feat_<os>` feature, and enabling a
+# backend on the wrong OS does not compile. We therefore select the backend
+# per-target: each table enables exactly the one backend that matches the host
+# platform, with `default-features = false` so the other two backends (and their
+# OS-only system deps) are never pulled in. This lets `rsac-python` build on all
+# three platforms. (Mirrors the per-target backend selection rsac itself uses.)
+[target.'cfg(windows)'.dependencies.rsac]
+path = "../.."
+default-features = false
+features = ["feat_windows"]
+
+[target.'cfg(target_os = "linux")'.dependencies.rsac]
+path = "../.."
+default-features = false
+features = ["feat_linux"]
+
+[target.'cfg(target_os = "macos")'.dependencies.rsac]
 path = "../.."
 default-features = false
 features = ["feat_macos"]

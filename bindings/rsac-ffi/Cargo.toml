@@ -1,9 +1,23 @@
 [package]
 name = "rsac-ffi"
-version = "0.1.0"
+# In lockstep with the workspace version (rsac + napi + python) — ci.yml's
+# version-lockstep gate and scripts/bump-version.sh treat all six manifests as
+# one version.
+version = "0.3.0"
 edition = "2021"
+# Mirror the parent crate's MSRV floor (1.87): rsac-ffi builds against rsac and
+# must not require a newer toolchain than the library it wraps.
+rust-version = "1.87"
 description = "C FFI bindings for the rsac (Rust Cross-Platform Audio Capture) library"
 license = "MIT OR Apache-2.0"
+repository = "https://github.com/baladita/rust-crossplat-audio-capture"
+readme = "README.md"
+keywords = ["audio", "capture", "ffi", "c-bindings"]
+categories = ["multimedia::audio", "external-ffi-bindings"]
+# NOTE: this crate is publishable to crates.io. It is left unpublished by
+# default only so day-to-day workspace builds never risk an accidental
+# `cargo publish`; flip to `publish = true` (or drop this line) in the release
+# commit. See "Publishing to crates.io" in README.md for the dependency switch.
 publish = false
 
 [lib]
@@ -19,7 +33,11 @@ feat_macos = ["rsac/feat_macos"]
 sink-wav = ["rsac/sink-wav"]
 
 [dependencies]
-rsac = { path = "../../", default-features = false }
+# Path + version: the path is used for local/workspace dev, and the version
+# requirement is what `cargo publish` records (crates.io ignores `path`). Keep
+# the version in lockstep with the parent crate's `[package].version` so a
+# published rsac-ffi resolves the matching rsac release. See README.
+rsac = { path = "../../", version = "0.3.0", default-features = false }
 log = "0.4"
 
 [build-dependencies]

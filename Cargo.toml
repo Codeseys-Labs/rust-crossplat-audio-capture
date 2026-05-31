@@ -1,7 +1,12 @@
 [package]
 name = "rsac"
-version = "0.2.0"
+version = "0.3.0"
 edition = "2021"
+# Explicit MSRV floor. wasapi 0.23 bumps its own MSRV to 1.76; declaring it here
+# makes the minimum supported Rust version visible (under the pinned 1.95
+# toolchain). Floor is 1.87: wasapi 0.23 needs 1.76, and the codebase uses
+# `u64::is_multiple_of` (stable 1.87). Bump if a dependency/feature requires more.
+rust-version = "1.87"
 build = "build.rs"
 autobins = false
 description = "Cross-platform audio capture library with per-application process taps (macOS), WASAPI (Windows), and PipeWire (Linux)"
@@ -56,14 +61,25 @@ test-utils = [] # Feature to enable test utilities
 # Streaming/data-plane features
 async-stream = ["dep:atomic-waker"]  # Async Stream support (adds atomic-waker for async notification)
 sink-wav = []                        # WavFileSink sink adapter (hound is always available)
+# rsac-3616: opt-in sample-domain SPSC ring (interleaved f32 written via rtrb
+# write_chunk_uninit + CopyToUninit) that avoids the per-buffer Vec/AudioBuffer
+# allocation on the producer's RT thread. Default OFF — the AudioBuffer ring
+# remains the default path; this is A/B'd in benches/bridge.rs.
+bridge-zerocopy = []
+# rsac-624c: opt-in structured instrumentation. Default OFF — with the feature
+# off, rsac_event!/rsac_span! fall back to `log::` (behavior-identical, no extra
+# deps). With it on, they emit tracing events/spans and `install_default_tracing`
+# becomes available. Pulls in only the `tracing` facade (no tracing-subscriber).
+tracing = ["dep:tracing"]
 
 [dependencies]
 # Core dependencies
 futures-core = "0.3.32"
-rtrb = "0.3.3"                                               # Lock-free SPSC ring buffer for audio data bridge
+rtrb = "0.3.4"                                               # Lock-free SPSC ring buffer for audio data bridge (0.3.4: write_chunk_uninit + CopyToUninit for bridge-zerocopy)
 atomic-waker = { version = "1.1.2", optional = true }           # Async waker for ring buffer notification (behind async-stream feature)
 thiserror = "2.0.18"                                       # For error handling
 log = "0.4.29"                                                 # For logging
+tracing = { version = "0.1.41", optional = true }              # Optional structured instrumentation (behind the `tracing` feature; rsac_event!/rsac_span! fall back to `log::` when off)
 
 hound = "3.5.1"
 clap = { version = "4.5.60", features = ["derive"] }
@@ -74,11 +90,17 @@ libc = "0.2.183"
 env_logger = "0.11.9"
 
 serde = { version = "1.0.228", features = ["derive"] }
-serde_json = "1.0.149"
+# serde_json: hard library dep on the native Linux PipeWire path — it parses the
+# `default.audio.sink`/`.source` metadata JSON object in `audio/linux/thread.rs`
+# (`parse_default_metadata_name`), which the in-process native registry listener
+# (post-H4) emits, not just the `pw-dump` subprocess fallback. So it stays a
+# library dependency on Linux and is NOT cfg-gated to diagnostics-only (rsac-3ff4).
+# Patch-pinned to the latest compatible 1.0.x; no major/minor bump.
+serde_json = "1.0.150"
 
 # Platform-specific audio capture
 [target.'cfg(target_os = "windows")'.dependencies]
-wasapi = "0.22.0"  # WASAPI bindings for Process Loopback
+wasapi = "0.23.0"  # WASAPI bindings for Process Loopback (0.23: safe parse_from_blob_bytes, get_device)
 windows = { version = "0.62.2", features = [
     "Foundation",                 # For basic Windows types like HRESULT, BOOL, HANDLE
     "Win32_Foundation",           # For basic Windows types like HRESULT, BOOL, HANDLE
@@ -198,6 +220,41 @@ required-features = ["feat_linux"]
 name = "ci_audio"
 path = "tests/ci_audio/main.rs"
 harness = true
+
+# rsac-e40c: allocation-counting integration test for the RT bridge producer.
+# Its own binary because it installs a process-wide #[global_allocator]; run
+# single-threaded (the default for one #[test] per binary). harness = true so the
+# standard libtest harness drives it.
+[[test]]
+name = "rt_alloc"
+path = "tests/rt_alloc.rs"
+harness = true
+
+# rsac-1d02: cross-platform "honest failure" enumeration test matrix (audit L4).
+# Asserts non-empty-or-classified-AudioError (never Ok(empty)/no fabricated
+# default) + DeviceInfo round-trip + default-device kind() + the Linux native
+# (pw-dump-free) path. Passes headless via graceful skip / honest-failure arm.
+# harness = true so the standard libtest harness drives the #[test] fns.
+[[test]]
+name = "enumeration_matrix"
+path = "tests/enumeration_matrix.rs"
+harness = true
+
+# rsac-603b: criterion benchmark harness for the bridge data plane. harness =
+# false hands main() to criterion_main!; does not affect cargo build/cargo test.
+[[bench]]
+name = "bridge"
+path = "benches/bridge.rs"
+harness = false
+
+# rsac-03a5: criterion benchmark for the consumer-side observability read path
+# (stream_stats / backpressure_report assembly + AudioBuffer level meters). Proves
+# these are cheap, non-locking, alloc-free reads and embeds an RT-safety
+# regression guard. harness = false hands main() to criterion_main!.
+[[bench]]
+name = "observability"
+path = "benches/observability.rs"
+harness = false
 
 [workspace]
 members = ["bindings/rsac-python", "bindings/rsac-ffi", "bindings/rsac-napi"]

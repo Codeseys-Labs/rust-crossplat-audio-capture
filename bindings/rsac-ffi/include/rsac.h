@@ -51,6 +51,49 @@ typedef enum {
     RSAC_DEVICE_OUTPUT = 1,
 } rsac_device_kind_t;
 
+/* ── Sample format ──────────────────────────────────────────────────── */
+
+/**
+ * Sample wire/storage format. All audio data is delivered as interleaved
+ * f32 regardless of this value; it describes the negotiated wire format.
+ */
+typedef enum {
+    RSAC_SAMPLE_FORMAT_I16 = 0,
+    RSAC_SAMPLE_FORMAT_I24 = 1,
+    RSAC_SAMPLE_FORMAT_I32 = 2,
+    RSAC_SAMPLE_FORMAT_F32 = 3,
+} rsac_sample_format_t;
+
+/* ── Value (out-parameter) types ────────────────────────────────────── */
+
+/**
+ * Point-in-time snapshot of a capture's stream statistics.
+ *
+ * Filled by rsac_capture_stream_stats(). Plain value type — no heap, no free.
+ * Before start (or after stop) every field is zero and is_running is 0.
+ */
+typedef struct {
+    uint64_t buffers_captured; /**< Buffers delivered to the consumer. */
+    uint64_t buffers_dropped;  /**< Buffers dropped to ring overflow. */
+    uint64_t buffers_pushed;   /**< Buffers enqueued by the OS callback. */
+    uint64_t overruns;         /**< Ring overruns (== buffers_dropped). */
+    double   uptime_secs;      /**< Seconds running; 0.0 when not started. */
+    double   dropped_ratio;    /**< Lost fraction in 0.0..=1.0. */
+    int32_t  is_running;       /**< 1 if capturing, else 0. */
+} RsacStreamStats;
+
+/**
+ * Point-in-time snapshot of a capture's negotiated delivery format.
+ *
+ * Filled by rsac_capture_format(). Plain value type — no heap, no free.
+ */
+typedef struct {
+    uint32_t             sample_rate;     /**< Samples per second. */
+    uint16_t             channels;        /**< Number of channels. */
+    rsac_sample_format_t sample_format;   /**< Negotiated wire format. */
+    uint16_t             bits_per_sample; /**< 16, 24, or 32. */
+} RsacAudioFormat;
+
 /* ── Opaque handle types ────────────────────────────────────────────── */
 
 /** Opaque handle to an AudioCaptureBuilder. */
@@ -126,6 +169,21 @@ rsac_error_t rsac_builder_set_target_app_by_id(RsacBuilder* builder,
 rsac_error_t rsac_builder_set_target_process_tree(RsacBuilder* builder,
                                                    uint32_t pid);
 
+/**
+ * Sets the capture target by parsing a canonical target string.
+ *
+ * `spec` uses the CaptureTarget string grammar (case-insensitive scheme):
+ *   "system" | "device:<id>" | "app:<pid-or-id>" | "name:<name>" | "tree:<pid>"
+ * Convenience over the typed rsac_builder_set_target_* setters (which remain).
+ *
+ * A malformed string returns RSAC_ERROR_INVALID_PARAMETER and leaves the
+ * builder's existing target unchanged (parse-then-commit). Returns
+ * RSAC_ERROR_NULL_POINTER if builder or spec is null, and
+ * RSAC_ERROR_INVALID_PARAMETER if spec is not valid UTF-8 or not a valid spec.
+ */
+rsac_error_t rsac_builder_set_target_str(RsacBuilder* builder,
+                                         const char* spec);
+
 /** Sets the desired sample rate in Hz. */
 rsac_error_t rsac_builder_set_sample_rate(RsacBuilder* builder,
                                            uint32_t sample_rate);
@@ -150,6 +208,17 @@ rsac_error_t rsac_capture_start(RsacCapture* capture);
 rsac_error_t rsac_capture_stop(RsacCapture* capture);
 
 /**
+ * Best-effort unblock of a parked rsac_capture_read by transitioning the
+ * stream to a terminal state. Idempotent; a no-op when no stream exists or it
+ * is already stopped. Safe to call concurrently with an in-flight
+ * rsac_capture_read / rsac_capture_try_read to unblock it. NOT safe to call
+ * concurrently with rsac_capture_free — order request_stop + drain of
+ * in-flight reads BEFORE free. Returns RSAC_ERROR_NULL_POINTER if capture is
+ * null, else RSAC_OK.
+ */
+rsac_error_t rsac_capture_request_stop(const RsacCapture* capture);
+
+/**
  * Returns 1 if the capture is running, 0 if stopped, -1 on error (null).
  */
 int32_t rsac_capture_is_running(const RsacCapture* capture);
@@ -160,6 +229,24 @@ int32_t rsac_capture_is_running(const RsacCapture* capture);
  */
 uint64_t rsac_capture_overrun_count(const RsacCapture* capture);
 
+/**
+ * Fills *out with a point-in-time stream-statistics snapshot.
+ * *out is an out-parameter (not a handle) — nothing to free.
+ * Before start (or after stop) the snapshot is all-zero (is_running == 0).
+ * Returns RSAC_ERROR_NULL_POINTER if capture or out is null, else RSAC_OK.
+ */
+rsac_error_t rsac_capture_stream_stats(const RsacCapture* capture,
+                                       RsacStreamStats* out);
+
+/**
+ * Fills *out with the negotiated delivery format.
+ * *out is an out-parameter (not a handle) — nothing to free.
+ * Returns RSAC_ERROR_STREAM_FAILED (leaving *out untouched) when no stream
+ * has been created yet; RSAC_ERROR_NULL_POINTER if capture or out is null.
+ */
+rsac_error_t rsac_capture_format(const RsacCapture* capture,
+                                 RsacAudioFormat* out);
+
 /** Frees a capture handle. Stops the stream if running. No-op if null. */
 void rsac_capture_free(RsacCapture* capture);
 
@@ -169,15 +256,23 @@ void rsac_capture_free(RsacCapture* capture);
  * Non-blocking read. On success with data, *out receives a buffer handle.
  * On success with no data available, *out is null and RSAC_OK is returned.
  * The buffer must be freed with rsac_audio_buffer_free().
+ *
+ * Takes a const capture: it only reads, so it may run concurrently with
+ * rsac_capture_request_stop. Still NOT safe against a concurrent
+ * rsac_capture_free (free the handle only after draining in-flight reads).
  */
-rsac_error_t rsac_capture_try_read(RsacCapture* capture,
+rsac_error_t rsac_capture_try_read(const RsacCapture* capture,
                                     RsacAudioBuffer** out);
 
 /**
  * Blocking read. Blocks until an audio buffer is available.
  * The buffer must be freed with rsac_audio_buffer_free().
+ *
+ * Takes a const capture: a concurrent rsac_capture_request_stop can unblock a
+ * thread parked here. Still NOT safe against a concurrent rsac_capture_free —
+ * drain in-flight reads before freeing the handle.
  */
-rsac_error_t rsac_capture_read(RsacCapture* capture,
+rsac_error_t rsac_capture_read(const RsacCapture* capture,
                                 RsacAudioBuffer** out);
 
 /* ── Callback-based capture ─────────────────────────────────────────── */
@@ -213,6 +308,32 @@ uint16_t rsac_audio_buffer_channels(const RsacAudioBuffer* buffer);
 
 /** Returns the sample rate in Hz. */
 uint32_t rsac_audio_buffer_sample_rate(const RsacAudioBuffer* buffer);
+
+/**
+ * Returns the RMS level across all samples/channels: sqrt(mean(x^2)).
+ * Non-finite samples are skipped; silence/empty yields 0.0 (never NaN).
+ * Read-only measurement. Returns 0.0 if buffer is null.
+ */
+float rsac_audio_buffer_rms(const RsacAudioBuffer* buffer);
+
+/**
+ * Returns the peak (max absolute) level across all samples/channels: max(|x|).
+ * Non-finite samples are skipped; silence/empty yields 0.0 (never NaN).
+ * Read-only measurement. Returns 0.0 if buffer is null.
+ */
+float rsac_audio_buffer_peak(const RsacAudioBuffer* buffer);
+
+/**
+ * Returns the RMS level in dBFS: 20*log10(rms). Full scale (RMS 1.0) == 0.0 dBFS.
+ * Returns -infinity for silence/empty, and also -infinity if buffer is null.
+ */
+float rsac_audio_buffer_rms_dbfs(const RsacAudioBuffer* buffer);
+
+/**
+ * Returns the peak level in dBFS: 20*log10(peak). Full scale (peak 1.0) == 0.0 dBFS.
+ * Returns -infinity for silence/empty, and also -infinity if buffer is null.
+ */
+float rsac_audio_buffer_peak_dbfs(const RsacAudioBuffer* buffer);
 
 /** Frees an audio buffer handle. No-op if null. */
 void rsac_audio_buffer_free(RsacAudioBuffer* buffer);
@@ -252,6 +373,9 @@ void rsac_device_list_free(RsacDeviceList* list);
 /**
  * Gets the default audio device. The returned device must be freed
  * with rsac_device_free().
+ *
+ * Only RSAC_DEVICE_OUTPUT is supported (rsac is a loopback capture library);
+ * RSAC_DEVICE_INPUT returns RSAC_ERROR_INVALID_PARAMETER.
  */
 rsac_error_t rsac_default_device(const RsacDeviceEnumerator* enumerator,
                                   rsac_device_kind_t kind,

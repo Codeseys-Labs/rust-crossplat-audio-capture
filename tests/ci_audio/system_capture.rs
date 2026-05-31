@@ -29,11 +29,16 @@ fn test_system_capture_receives_audio() {
     {
         Ok(c) => c,
         Err(e) => {
-            eprintln!("[ci_audio] Failed to build capture: {:?}", e);
             if let Some(p) = player {
                 helpers::stop_player(p);
             }
-            // Don't fail hard — this might be an environment issue
+            // On a deterministic source, build() must succeed — a failure here
+            // is a real regression in the pre-streaming path, not an
+            // environment quirk, so hard-fail instead of silently skipping.
+            if helpers::deterministic_audio_env() {
+                panic!("deterministic source: capture build failed: {:?}", e);
+            }
+            eprintln!("[ci_audio] Failed to build capture: {:?}", e);
             eprintln!("[ci_audio] SKIPPING: Capture build failed (not a test logic error)");
             return;
         }
@@ -41,10 +46,14 @@ fn test_system_capture_receives_audio() {
 
     // Start capture
     if let Err(e) = capture.start() {
-        eprintln!("[ci_audio] Failed to start capture: {:?}", e);
         if let Some(p) = player {
             helpers::stop_player(p);
         }
+        // Same rationale as build(): a deterministic source must start cleanly.
+        if helpers::deterministic_audio_env() {
+            panic!("deterministic source: capture start failed: {:?}", e);
+        }
+        eprintln!("[ci_audio] Failed to start capture: {:?}", e);
         eprintln!("[ci_audio] SKIPPING: Capture start failed (not a test logic error)");
         return;
     }
@@ -69,12 +78,28 @@ fn test_system_capture_receives_audio() {
 
                 if !got_non_silence && helpers::verify_non_silence(&buffer, 0.001) {
                     got_non_silence = true;
-                    let (rms, _) = helpers::verify_rms_energy(&buffer, 0.0);
+                    let (rms, rms_ok) = helpers::verify_rms_energy(&buffer, 0.01);
                     eprintln!(
                         "[ci_audio] First non-silent buffer: {} frames, RMS={:.6}",
                         buffer.num_frames(),
                         rms
                     );
+
+                    // Under the deterministic Linux source (PipeWire null sink +
+                    // 440 Hz/0.8 sine tone) silence is impossible if capture works,
+                    // so promote the checks to hard asserts: RMS must clear the
+                    // 0.01 floor and the 440 Hz tone must dominate the spectrum.
+                    if helpers::deterministic_audio_env() {
+                        assert!(
+                            rms_ok,
+                            "deterministic source: RMS energy {:.6} below 0.01 floor",
+                            rms
+                        );
+                        assert!(
+                            helpers::verify_tone_present(&buffer, 440.0),
+                            "deterministic source: 440 Hz test tone not detected in capture"
+                        );
+                    }
                 }
 
                 // If we have enough data, break early
@@ -110,15 +135,43 @@ fn test_system_capture_receives_audio() {
         buffers_read, total_frames
     );
 
+    if buffers_read == 0 {
+        // The dbus-less PipeWire VM in CI may not route SystemDefault capture
+        // at all (0 buffers). Under a deterministic source that's a real
+        // regression; otherwise skip honestly — we do NOT claim to have verified
+        // capture here (content is verified on real hardware and on the
+        // deterministic Windows VB-CABLE runner).
+        if helpers::deterministic_audio_env() {
+            panic!(
+                "deterministic source: 0 buffers captured — the 440 Hz tone never \
+                 reached the SystemDefault capture path (real regression, not flakiness)"
+            );
+        }
+        eprintln!(
+            "[ci_audio] SKIPPED: 0 buffers captured in this environment \
+             (SystemDefault capture not verifiable here)"
+        );
+        return;
+    }
+
     assert!(buffers_read > 0, "Should have read at least one buffer");
     assert!(
         total_frames > 0,
         "Should have captured at least some audio frames"
     );
 
-    // Non-silence check is a soft warning, not a hard failure
-    // CI audio routing can be flaky
-    if !got_non_silence {
+    if helpers::deterministic_audio_env() {
+        // The Linux deterministic source guarantees audible, tonal output.
+        // Anything less than non-silence here is a genuine capture regression.
+        assert!(
+            got_non_silence,
+            "deterministic source: all captured audio was silence — \
+             the 440 Hz tone never reached the capture path (real regression, \
+             not CI flakiness)"
+        );
+    } else if !got_non_silence {
+        // Non-deterministic hosts (Windows VB-CABLE, macOS BlackHole/TCC):
+        // keep the soft warning — routing here is genuinely flaky.
         eprintln!(
             "[ci_audio] ⚠ WARNING: All captured audio was silence. \
              This may indicate audio routing issues in CI."
@@ -155,21 +208,27 @@ fn test_capture_format_correct() {
     {
         Ok(c) => c,
         Err(e) => {
-            eprintln!("[ci_audio] Failed to build capture: {:?}", e);
-            eprintln!("[ci_audio] SKIPPING: Capture build failed");
             if let Some(p) = player {
                 helpers::stop_player(p);
             }
+            if helpers::deterministic_audio_env() {
+                panic!("deterministic source: capture build failed: {:?}", e);
+            }
+            eprintln!("[ci_audio] Failed to build capture: {:?}", e);
+            eprintln!("[ci_audio] SKIPPING: Capture build failed");
             return;
         }
     };
 
     if let Err(e) = capture.start() {
-        eprintln!("[ci_audio] Failed to start capture: {:?}", e);
-        eprintln!("[ci_audio] SKIPPING: Capture start failed");
         if let Some(p) = player {
             helpers::stop_player(p);
         }
+        if helpers::deterministic_audio_env() {
+            panic!("deterministic source: capture start failed: {:?}", e);
+        }
+        eprintln!("[ci_audio] Failed to start capture: {:?}", e);
+        eprintln!("[ci_audio] SKIPPING: Capture start failed");
         return;
     }
 
@@ -194,10 +253,12 @@ fn test_capture_format_correct() {
                     buffer.num_frames()
                 );
 
-                assert!(
-                    helpers::verify_format(&buffer, expected_sample_rate, expected_channels),
-                    "Audio format should match requested configuration"
-                );
+                // rsac does not resample: the delivered format equals the
+                // *request* only under a deterministic source. On an arbitrary
+                // host the device negotiates its own mix format, so we assert
+                // self-consistency and only require exact equality where the
+                // source format is controlled. See `helpers::assert_buffer_format`.
+                helpers::assert_buffer_format(&buffer, expected_sample_rate, expected_channels);
 
                 // Monotonic non-decreasing overrun_count check — property
                 // assertion alongside the no-panic backbone.
@@ -246,12 +307,23 @@ fn test_capture_format_correct() {
         helpers::stop_player(p);
     }
 
-    // If NO buffer arrived, this is almost certainly the "no working
-    // loopback environment" case (VB-CABLE installed but no audio
-    // actually playing through it, or test-tone player unavailable).
-    // Skip with a diagnostic rather than failing loudly, matching the
-    // skip-philosophy of the rest of the ci_audio suite.
+    // If NO buffer arrived: under a deterministic source the tone is
+    // guaranteed to flow (Linux null sink / Windows VB-CABLE), so zero
+    // buffers means the producer stopped pushing — a real regression, not
+    // flakiness. Hard-fail there, mirroring the sibling
+    // `test_system_capture_receives_audio` (above). On non-deterministic
+    // hosts this is the "no functional loopback" case, so skip honestly.
+    // Without this branch the deterministic run was a vacuous PASS: it could
+    // return without ever examining a buffer.
     if !format_verified {
+        if helpers::deterministic_audio_env() {
+            panic!(
+                "deterministic source: no buffer arrived within {:?} — the \
+                 format-path capture producer stopped pushing under the \
+                 null sink / VB-CABLE (real regression, not flakiness)",
+                timeout
+            );
+        }
         eprintln!(
             "[ci_audio] test_capture_format_correct: no buffer arrived \
              within {:?}; environment lacks a functional audio loopback — \

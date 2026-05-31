@@ -234,7 +234,6 @@ func ExamplePlatformCapabilities() {
 	fmt.Printf("App capture: %v\n", caps.SupportsAppCapture)
 	fmt.Printf("Process tree: %v\n", caps.SupportsProcessTree)
 	fmt.Printf("Device selection: %v\n", caps.SupportsDeviceSelection)
-	fmt.Printf("Sample rate range: %d-%d Hz\n", caps.MinSampleRate, caps.MaxSampleRate)
 	fmt.Printf("Max channels: %d\n", caps.MaxChannels)
 }
 

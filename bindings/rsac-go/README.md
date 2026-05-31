@@ -28,6 +28,28 @@ cgo and linked as a static library.
 - Platform build dependencies for the active rsac backend. See
   [`docs/features.md`](../../docs/features.md).
 
+### Per-platform prerequisites
+
+The cgo link pulls in the active backend's system libraries, so each host
+needs that backend's dev packages installed before `make build`:
+
+| Platform | Toolchain / target | System dependencies |
+|----------|--------------------|---------------------|
+| **Linux** (x86_64, aarch64) | host `cc` + `clang`/`libclang` (bindgen) | `libpipewire-0.3-dev`, `libspa-0.2-dev`, `pkg-config` |
+| **macOS** (arm64, x86_64) | Xcode command-line tools | CoreAudio / AudioToolbox / CoreFoundation / Security / SystemConfiguration frameworks (ship with macOS — no install) |
+| **Windows** (x86_64) | MinGW gcc **and** the `x86_64-pc-windows-gnu` Rust target (`rustup target add x86_64-pc-windows-gnu`) | WASAPI/COM system libs (ship with Windows) |
+
+> **Windows / cgo note:** cgo links through MinGW `gcc`, which consumes the
+> GNU-archive `librsac_ffi.a`. An MSVC-built `rsac_ffi.lib` will **not** link,
+> so the FFI crate must be built for the `*-pc-windows-gnu` target (the Makefile
+> copies whichever archive cargo emits, but only the GNU `.a` links under cgo).
+
+These are exercised in CI: the `Go Bindings (<os>)` job builds the staticlib and
+runs `make test-pure` natively on Linux x86_64, Windows, and macOS arm64, and
+`Go Bindings ARM64 Staticlib Check` compile-checks the aarch64 staticlib. The
+per-platform `librsac_ffi.a` is **never committed** — it is built in CI (and by
+`make` locally) from `bindings/rsac-ffi`.
+
 ## Build
 
 The `Makefile` handles both the Rust staticlib build and the cgo link.
@@ -40,17 +62,21 @@ make test-pure   # Go-only tests that don't need real audio
 make clean
 ```
 
-Behind the scenes, `make rust-ffi` runs `cargo build --release -p
-rsac-ffi` at the repo root and copies `librsac_ffi.a` (macOS/Linux) or
-`rsac_ffi.lib` (Windows) into `bindings/rsac-go/lib/`. `make go-build`
-then sets `CGO_LDFLAGS` to include the platform-specific system
-libraries:
+Behind the scenes, `make rust-ffi` runs `cargo build --release` in
+`bindings/rsac-ffi/` and copies the GNU static archive `librsac_ffi.a`
+into `bindings/rsac-go/lib/` (cgo links through the GNU toolchain on
+every platform — on Windows build the `*-pc-windows-gnu` target so cargo
+emits `librsac_ffi.a` rather than an MSVC `rsac_ffi.lib`). `make
+go-build` then sets `CGO_LDFLAGS` to include the platform-specific
+system libraries:
 
 - macOS: `-framework CoreAudio -framework AudioToolbox
   -framework CoreFoundation -framework Security -framework
   SystemConfiguration`
 - Linux: `-lpipewire-0.3 -lspa-0.2 -lpthread -ldl -lm`
 - Windows (MinGW): `-lole32 -loleaut32 -lwinmm -lksuser -luuid`
+  plus the Win32 libs the Rust std runtime needs
+  (`-lbcrypt -lntdll -luserenv -lws2_32 -ladvapi32 -lkernel32`)
 
 ## Quick start
 

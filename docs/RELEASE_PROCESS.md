@@ -11,10 +11,38 @@ target version where appropriate.
 
 ## Automated Release Flow
 
-A single `git tag -a vX.Y.Z && git push --tags` fans out to **three
-registry workflows**. They all key on the same `v*.*.*` tag push and run
-in parallel — each publishes to one registry, and the GitHub Release is
-created once the crates.io flow finishes.
+Three registry workflows (`release.yml`, `release-npm.yml`, `release-pypi.yml`)
+are *wired* to the same `v*.*.*` tag push and would run in parallel — each
+publishing to one registry. **Whether they actually fire depends on HOW the tag
+was pushed** (see the two paths below): a tag pushed with the default
+`GITHUB_TOKEN` does **not** re-trigger them (GitHub's anti-recursion rule), so
+the automated path is **GitHub-only for now** (tag + GitHub Release, no registry
+publish) until a PAT / GitHub App token is wired. A tag pushed manually (local
+git, or a PAT) **does** trigger the full fan-out.
+
+There are **two ways** that `vX.Y.Z` tag gets created, and they differ in
+whether the publish fan-out fires:
+
+1. **Automated, release-please style (recommended for minor/patch).** A
+   maintainer runs the **Release Prepare** workflow from the Actions tab;
+   it opens a `release: vX.Y.Z` PR (version bump + CHANGELOG rotation), a
+   maintainer squash-merges it, and `release-tag.yml` then auto-creates
+   and pushes the tag **using the default `GITHUB_TOKEN`**. Because of GitHub's
+   anti-recursion rule, that tag push does **NOT** trigger the three registry
+   workflows — so this path is **GitHub-only**: it stops at the git tag + the
+   GitHub Release. Registry publishing is a manual follow-up (Step 4). See
+   [§ Automated release (GitHub-only for now)](#automated-release-github-only-for-now).
+2. **Manual tag push.** A maintainer bumps the manifests + CHANGELOG by
+   hand (via `scripts/bump-version.sh`), commits, and pushes an annotated
+   `vX.Y.Z` tag directly (local git or a PAT). This tag push is **not** from a
+   workflow's `GITHUB_TOKEN`, so it **DOES** trigger the full registry fan-out
+   below. It is also the **only** supported path for a **MAJOR** bump (the
+   automated path refuses to change the major) and the fallback whenever the
+   automation is unavailable. See §1–§9 below.
+
+The three publish workflows below run when a tag is pushed by something OTHER
+than a workflow's `GITHUB_TOKEN` (i.e. path 2, or once a PAT/App token is wired
+for path 1) — they never trigger off anything but a `v*.*.*` tag push.
 
 | Workflow | Registry | Matrix | Key jobs | Required secret |
 |---|---|---|---|---|
@@ -157,6 +185,291 @@ of the automated flows fails.
 
 ---
 
+## Automated release (GitHub-only for now)
+
+This is the **recommended** way to cut a `minor` or `patch` release. It
+is a two-workflow, release-please-style flow: a maintainer kicks off a
+*prepare* workflow that opens a reviewable release PR, and merging that
+PR triggers a *tag* workflow that creates the `vX.Y.Z` tag **and the
+GitHub Release**. **No bot ever pushes to `master` directly** — every byte
+that ships is reviewed in a normal PR first.
+
+> ### ⚠️ Scope: GitHub-only — registry publishing is still MANUAL
+> The automated flow currently produces the **git tag + a GitHub Release**
+> and nothing more. It does **not** automatically publish to crates.io /
+> npm / PyPI. The reason is a deliberate GitHub Actions rule: a tag pushed
+> with the default `GITHUB_TOKEN` does **not** re-trigger the
+> `on: push: tags:` publish workflows (`release.yml` / `release-npm.yml` /
+> `release-pypi.yml`), and this repo has no PAT / GitHub App token wired
+> yet. So after the automated GitHub Release lands, **publish to the
+> registries by hand** (see "Step 4" below). When a triggering token is
+> added later, the tag push will fan out automatically and this caveat
+> goes away.
+
+```
+ ┌──────────────────────────┐   human runs from Actions tab, picks bump=minor|patch
+ │  Release Prepare          │   (.github/workflows/release-prepare.yml)
+ │  (workflow_dispatch)      │
+ └────────────┬─────────────┘
+              │  computes next NON-major version, runs
+              │  scripts/bump-version.sh, opens a PR
+              ▼
+ ┌──────────────────────────┐   human reviews + SQUASH-MERGES
+ │  PR: "release: vX.Y.Z"    │   (CI version-lockstep gate must be green;
+ └────────────┬─────────────┘    it now also runs at tag time)
+              │  squash commit subject == "release: vX.Y.Z (#N)" lands on master
+              ▼
+ ┌──────────────────────────┐   detects the release commit, creates the
+ │  Release Tag on Merge     │   annotated tag vX.Y.Z AND a GitHub Release
+ │  (push: master)           │   (.github/workflows/release-tag.yml)
+ └────────────┬─────────────┘
+              │  GitHub Release published.
+              │  (GITHUB_TOKEN tag push does NOT auto-trigger the registry
+              │   publishes — do Step 4 manually.)
+              ▼
+   Step 4 (manual): run release.yml / release-npm.yml / release-pypi.yml
+```
+
+### Step 1 — run the "Release Prepare" workflow
+
+From **Actions → Release Prepare → Run workflow**, choose the `bump`
+input:
+
+- **`minor`** (the **default**) — `X.(Y+1).0`.
+- **`patch`** — `X.Y.(Z+1)`.
+
+There is deliberately **no `major` option**. `release-prepare.yml`
+(`.github/workflows/release-prepare.yml`) then:
+
+1. Reads the current `[package].version` from the root `Cargo.toml`,
+   parses it as a strict `X.Y.Z`, and computes the next version from the
+   `bump` choice. It **asserts the major stays the same** (belt-and-
+   suspenders — `minor`/`patch` arithmetic can't change the major, but it
+   refuses anyway if a future edit ever does) and **refuses if the tag
+   `vX.Y.Z` already exists**.
+2. Runs `bash scripts/bump-version.sh <computed-version>` (under
+   `TZ=UTC`), which rewrites the five lockstep manifests
+   (`Cargo.toml`, `bindings/rsac-napi/{Cargo.toml,package.json}`,
+   `bindings/rsac-python/{Cargo.toml,pyproject.toml}`) and rotates
+   `CHANGELOG.md` (`[Unreleased]` → `[X.Y.Z] - <UTC date>` plus a fresh
+   `Unreleased` scaffold). See §"Versioning & ABI contract" for the
+   `bindings/rsac-ffi/Cargo.toml` and `rsac-go` tag caveats the script
+   does *not* handle.
+3. Opens (via `peter-evans/create-pull-request`) a PR from a
+   `release/vX.Y.Z` branch into `master`, titled **`release: vX.Y.Z`**,
+   labeled `release`, whose body lists the bumped manifests and the merge
+   instructions.
+
+The job is guarded to the `Codeseys-Labs/rust-crossplat-audio-capture`
+repo (a fork can't open a bogus release PR) and serialised via a
+`concurrency` group so two dispatches can't race on the same branch.
+Its `permissions:` are exactly `contents: write` (to push the
+`release/*` branch) + `pull-requests: write` (to open the PR) — it never
+writes to `master`.
+
+### Step 2 — review and SQUASH-MERGE the release PR
+
+Treat the `release: vX.Y.Z` PR like any other PR: review the manifest
+diff and the CHANGELOG rotation. The CI **`version-lockstep` gate must be
+green** on the PR before merging — it cross-checks that all **six** manifests
+(root `Cargo.toml`, the rsac-ffi / rsac-napi / rsac-python `Cargo.toml`s, the
+napi `package.json`, and the python `pyproject.toml`) carry the same version.
+Because this gate runs on the PR/master push that subsequently gets tagged, the
+tagged commit is already lockstep-verified before `release-tag.yml` tags it. (At
+*tag* time, `release.yml` additionally re-checks the tag matches the root
+`Cargo.toml`, and `ci.yml` *also* re-runs on the `v*.*.*` tag push — its `on:`
+block includes a `tags: ['v*.*.*', '!v*-*']` trigger — so the full six-manifest
+lockstep gate runs again at tag time as well as on push/PR.)
+
+> **Merge it as a SQUASH merge, and do NOT edit the commit subject.** The
+> tag automation in step 3 keys on the squash-merge commit *subject* being
+> exactly **`release: vX.Y.Z`** (which GitHub defaults to the PR title for
+> a squash merge). If you reword the subject, or use a merge-commit /
+> rebase strategy that changes the HEAD subject, the tag workflow will see
+> a "normal" commit and **no tag will be created** — the release silently
+> stalls. (Recoverable: fix it by pushing the tag manually per §4.)
+
+### Step 3 — automatic tag creation (`release-tag.yml`)
+
+`release-tag.yml` (`.github/workflows/release-tag.yml`, workflow name
+**"Release Tag on Merge"**) runs on **every push to `master`**. On each
+push it:
+
+1. **Detects a release commit** — reads `git log -1 --format=%s` and
+   proceeds only if the HEAD subject matches exactly
+   `release: vX.Y.Z`. Any other commit is a no-op (the remaining steps are
+   gated on this). Matching the squash-commit subject is the primary
+   signal; it needs no API call and is independent of merge strategy.
+2. **Manifest defense** — re-parses `[package].version` from `Cargo.toml`
+   at that commit and **refuses to tag** if it disagrees with the version
+   in the commit subject.
+3. **Major guard** — refuses if the parsed major differs from the
+   manifest major. The automated prepare path can never produce a major
+   bump, but this defends against a hand-crafted `release:` commit that
+   crosses a major boundary.
+4. **Idempotency** — checks both the local tag set and `git ls-remote
+   --tags origin`; if `vX.Y.Z` already exists it **skips with a notice and
+   never re-tags**.
+5. **Creates + pushes the annotated tag** — `git tag -a vX.Y.Z -m
+   "Release X.Y.Z"` on HEAD (the reviewed, lockstep-passing squash commit)
+   and `git push origin vX.Y.Z`.
+6. **Publishes the GitHub Release** — extracts the `## [X.Y.Z]` section
+   from `CHANGELOG.md` as the release notes and creates the GitHub Release
+   for the tag (via `softprops/action-gh-release`). The default
+   `GITHUB_TOKEN` is allowed to create tags and releases.
+7. **Emits a manual-publish reminder** — a `::warning::` instructing the
+   maintainer to run the registry publishes (Step 4), because the
+   `GITHUB_TOKEN`-pushed tag does **not** auto-trigger them.
+
+This job is repo-guarded to
+`Codeseys-Labs/rust-crossplat-audio-capture` (a fork that merges a
+`release:` commit must never tag + release), serialised via a
+`concurrency` group, and runs with least-privilege `permissions: contents:
+write` (tag + release only). The version is verified at three points: the
+merged PR's `version-lockstep` gate, the same gate re-running at tag time
+(ci.yml now triggers on `v*.*.*` tags), and `release-tag.yml`'s own
+manifest defense.
+
+### Step 4 — publish to the registries (MANUAL, for now)
+
+The automated flow above stops at the **git tag + GitHub Release**. To
+publish the crate and bindings to crates.io / npm / PyPI, trigger the
+publish workflows by hand after the GitHub Release appears:
+
+- **crates.io** — Actions → **Release** (`release.yml`) → *Run workflow*
+  (it has a `workflow_dispatch` with a `dry_run` toggle; set `dry_run:
+  false` to publish for real). Needs the `CARGO_REGISTRY_TOKEN` secret.
+- **npm** (`@rsac/audio`) — `release-npm.yml` triggers only on a tag push.
+  Until a triggering token is added, re-push the tag from a machine/token
+  that re-triggers workflows, or add a temporary `workflow_dispatch`.
+- **PyPI** (`rsac`) — `release-pypi.yml`, same as npm (tag-triggered;
+  publishes via PyPI Trusted Publishing / OIDC).
+
+**Why this is manual:** a tag pushed with the default `GITHUB_TOKEN` does
+not re-trigger `on: push: tags:` workflows (GitHub's anti-recursion rule),
+and this repo has no PAT / GitHub App token configured yet. When one is
+added to `release-tag.yml`'s checkout, Step 4 becomes automatic and this
+section can be deleted. See `release-tag.yml`'s header for the wiring TODO.
+
+### What the automated flow will NOT do (use the manual path instead)
+
+- **MAJOR releases.** The `bump` input offers only `minor`/`patch`, the
+  prepare job asserts the major is unchanged, and the tag job refuses a
+  major-crossing release commit. A `X` → `X+1` (or pre-1.0 `0.x` →
+  `0.(x+1)` per the ABI policy in §"Versioning & ABI contract") bump must
+  be done **manually**: run `scripts/bump-version.sh <new-major.0.0>`,
+  bring `bindings/rsac-ffi/Cargo.toml` to the same version, commit with a
+  normal (non-`release:`) message, then tag and push by hand per §4.
+- **`bindings/rsac-ffi/Cargo.toml` and the `rsac-go` tag.**
+  `bump-version.sh` (and therefore the prepare workflow) does not touch
+  the FFI manifest or push the `bindings/rsac-go/vX.Y.Z` Go module tag —
+  see §"Versioning & ABI contract" (b) and (c). Reconcile the FFI manifest
+  in the release PR before merging, and push the Go tag in lockstep after
+  the crate tag lands.
+- **A skipped or misnamed squash subject.** If step 3 never fires (subject
+  reworded, non-squash merge), the manifests are still correctly bumped on
+  `master`; just create the tag manually (§4) to trigger the publish
+  fan-out.
+
+### Recap: idempotency and safety properties
+
+- **No direct push to `master`** — the bump only reaches `master` through
+  a reviewed, squash-merged PR.
+- **Idempotent tagging** — `release-tag.yml` never re-creates an existing
+  local or remote tag.
+- **`version-lockstep`** gates the release PR and is re-checked on the tag
+  by `release.yml`; the five manifests must agree before anything ships.
+- **Repo-guarded** — both workflows only run on
+  `Codeseys-Labs/rust-crossplat-audio-capture`.
+- **Major-proof** — three independent guards (no `major` input, prepare
+  assertion, tag-job assertion) keep a major bump off this path.
+
+---
+
+## Versioning & ABI contract
+
+This is the **normative** policy for how `rsac` and its four bindings are
+versioned. The release tooling (`scripts/bump-version.sh`, the
+`version-lockstep` CI job in `.github/workflows/ci.yml`, and the
+tag↔manifest guard in `release.yml`) all enforce pieces of it.
+
+### (a) Lockstep version bumps
+
+`rsac` (root `Cargo.toml`) and the publishable bindings bump **in
+lockstep** on every semver tag. A tag `vX.Y.Z` means *all* of these
+carry version `X.Y.Z`:
+
+| Manifest | Field | Notes |
+|---|---|---|
+| `Cargo.toml` | `[package].version` | the crates.io crate, source of truth |
+| `bindings/rsac-ffi/Cargo.toml` | `[package].version` | C FFI crate (`publish = false`; versioned for ABI tracking, see (b)) |
+| `bindings/rsac-napi/Cargo.toml` | `[package].version` | napi crate |
+| `bindings/rsac-napi/package.json` | top-level `"version"` | npm package `@rsac/audio` |
+| `bindings/rsac-python/Cargo.toml` | `[package].version` | pyo3 crate |
+| `bindings/rsac-python/pyproject.toml` | `[project].version` | PyPI package `rsac` |
+
+Run `bash scripts/bump-version.sh X.Y.Z` to rewrite the manifests it knows
+about (root + napi + python, plus the CHANGELOG rotation); bring
+`bindings/rsac-ffi/Cargo.toml` to the same value in the same commit. The
+`version-lockstep` CI job re-checks all six values on every push/PR
+(warning on a mid-cycle skew). Because the release PR's merge commit is a
+push to `master`, this gate runs — and must be green — on the exact commit that
+`release-tag.yml` then tags, so a mismatched manifest never reaches the tag.
+At *tag* time, `release.yml`'s `verify` job independently re-checks the pushed
+tag against the root `Cargo.toml` before publishing (a second, registry-side
+gate), and `ci.yml` re-runs its full six-manifest lockstep on the `v*.*.*` tag
+push too (its `on:` block has a `tags: ['v*.*.*', '!v*-*']` trigger), so the
+lockstep gate covers push/PR *and* tag time. A mismatched manifest must never
+reach a registry.
+
+> Mid-cycle skew is tolerated by CI (warning only) so a binding can lag
+> the root crate between releases, but it must be reconciled before
+> tagging. As of this writing `rsac-ffi` trails at `0.1.0` while the
+> others are at `0.2.0`; the next release must bring all six to the same
+> version.
+
+### (b) C ABI changes are MAJOR for `rsac-ffi`
+
+The `rsac-ffi` crate exposes a C ABI: the exported `extern "C"` symbols
+and the generated `rsac.h` header. **Any** of the following is a
+**MAJOR** version change for the FFI surface and MUST be called out in
+the CHANGELOG under a dedicated `### C ABI changes` subsection (see
+[`CHANGELOG.md`](../CHANGELOG.md)):
+
+- removing or renaming an exported symbol;
+- changing the signature of an exported function (parameter/return types,
+  arity, calling convention);
+- changing the layout, size, or field order of any `#[repr(C)]` struct or
+  enum crossing the boundary;
+- changing the meaning of an existing return/error code.
+
+Additive changes (new symbols, new `#[repr(C)]` types that don't alter
+existing ones) are MINOR. Because `rsac` and the bindings bump in
+lockstep (a), an ABI-MAJOR change forces the whole line to the next MAJOR
+on a `0.x`→`0.(x+1)` (pre-1.0) or `x`→`x+1` (post-1.0) boundary; record
+the rationale in the ABI subsection so consumers pinning the `.so`/`.dll`
+know to recompile.
+
+### (c) `rsac-go` tag convention
+
+`bindings/rsac-go` is a Go module (`module
+github.com/Codeseys-Labs/rsac-go`, see `bindings/rsac-go/go.mod`) and
+carries **no in-manifest version** — Go derives versions from git tags.
+Because the module lives in a subdirectory, its releases are tagged with
+the **module-path-prefixed** form Go's module proxy expects:
+
+```
+bindings/rsac-go/vX.Y.Z
+```
+
+Push this tag in lockstep with the `vX.Y.Z` crate tag (same `X.Y.Z`).
+Consumers then `go get
+github.com/Codeseys-Labs/rsac-go@vX.Y.Z`. The `version-lockstep`
+CI job notes rsac-go's absence of an in-tree version explicitly so the
+gap is intentional, not an oversight.
+
+---
+
 ## Pre-release Tags and Dry Runs
 
 All three release workflows key on the `v*.*.*` tag pattern and also
@@ -235,12 +548,17 @@ Before you start a release, confirm all of the following:
   ```
 
 > **Manual fallback procedure.** The sections below describe how to run
-> the release by hand. When `.github/workflows/release.yml` is wired up
-> (see "Automated Release Flow" above), the tag push does §4–§5 and §7
-> step 4 for you; the manual steps here remain the fallback when the
-> `CARGO_REGISTRY_TOKEN` secret is unset or a maintainer needs to
-> override the automation. `scripts/bump-version.sh` is still absent —
-> §3 is always manual today.
+> the release by hand. For a `minor`/`patch` release you normally do
+> **not** run these by hand — use the automated release-please-style flow
+> (§"Automated minor/patch release (release-please style)"), which runs
+> `scripts/bump-version.sh` for you (§3), opens the bump PR, and pushes the
+> tag (§4) on merge; the tag push then does §5 and §7 step 4. These manual
+> steps remain the path for a **MAJOR** bump (the automation refuses one),
+> when the `CARGO_REGISTRY_TOKEN` secret is unset, or when a maintainer
+> needs to override the automation. `scripts/bump-version.sh` now exists
+> and rewrites five of the six manifests + rotates the CHANGELOG — §3 is
+> still a manual *invocation* of it (plus the `rsac-ffi` reconcile), not a
+> hand-edit.
 
 ---
 
@@ -268,6 +586,46 @@ The workflows live in `.github/workflows/` (`ci.yml`,
 tab — do not rely solely on local results, since Linux PipeWire, Windows
 WASAPI session, and macOS CoreAudio backends each have CI-only coverage.
 
+#### What `ci.yml` now gates (architecture-critique closures)
+
+The per-OS unit jobs in `ci.yml` were tightened to close gaps flagged in
+[`docs/reviews/rsac-architecture-critique-2026-05-30.md`](reviews/rsac-architecture-critique-2026-05-30.md);
+each is a hard regression gate on a `vX.Y.Z` release commit:
+
+- **`rt_alloc` runs per-OS (TC-01).** `cargo test --test rt_alloc … --
+  --test-threads=1` runs on Linux, Windows, **and** macOS. This is the
+  *sole* empirical proof of ADR-0001's alloc-free producer hot path
+  (`tests/rt_alloc.rs` installs a process-wide counting `#[global_allocator]`,
+  hence its own single-threaded binary). It is device-free, so it
+  **hard-fails** on every platform — an allocation regression now blocks
+  the release rather than slipping through the old `--lib`-only matrix.
+- **`enumeration_matrix` runs per-OS (TC-02).** `cargo test --test
+  enumeration_matrix` runs on all three platforms. It encodes the
+  honest-failure enumeration contract (non-empty-or-classified-error) and
+  gracefully skips the hardware assertions on a headless runner, so it is
+  safe to gate everywhere.
+- **Module-DAG reverse-edge guard (DAG-004).**
+  `scripts/check-module-dag.sh` runs in CI and enforces the
+  `core → bridge → audio → api (→ sink)` layering: it fails the build on
+  any **new** upward edge (e.g. a fresh `core → audio` reference). It is
+  allowlist-based — the known, documented `core/introspection.rs → audio`
+  deviation (critique DAG-001/DAG-002, tracked in
+  `docs/ARCHITECTURE.md` §1) is recorded as an explicit per-symbol
+  exception, so the guard passes today but catches regressions.
+- **Windows unit job hard-fails (TC-07).** The Windows `cargo test --lib`
+  step is no longer `continue-on-error` on the whole suite. It now
+  **partitions**: the platform-independent + non-audio tests hard-fail,
+  and only the device-touching `create_audio_client*` subset (which needs
+  a real WASAPI client, absent on Blacksmith Windows runners) is `--skip`ped
+  into a separate tolerated step. `release.yml`'s `verify` job mirrors this
+  exact partition.
+- **macOS process-tap tests stay bounded (TC-03).** The unguarded
+  CoreAudio process-tap tests are not executed (TCC grants are unavailable
+  on Blacksmith macOS); instead CI asserts they are *wired up* via a
+  `--list`/`--list --ignored` existence check, and the integration steps
+  carry `timeout-minutes` caps so a stuck FFI test can't hang the job for
+  10+ minutes.
+
 ### CHANGELOG promotion
 
 Open `CHANGELOG.md` and verify that the release section already exists
@@ -287,47 +645,66 @@ tagging.
 
 ## 3. Version bump
 
-The crate version lives in `Cargo.toml` at the repo root:
-
-```toml
-[package]
-name = "rsac"
-version = "0.2.0"
-```
-
-Bump this to the target version. If the language bindings under
-`rsac-napi/` or `rsac-python/` have their own manifests with independent
-versions, bump those to match in the same commit. (As of this writing
-both binding directories are stubs — no `package.json` / `pyproject.toml`
-yet — so only the root `Cargo.toml` needs to change.)
-
-**Worked example — loop-19 / task A2** bumped `Cargo.toml` from `0.1.0`
-to `0.2.0` and fixed an unused-variable warning in
-`examples/verify_audio.rs` in the same commit. Use that PR as a reference
-for the shape of a version-bump change.
-
-Commit:
+Do **not** hand-edit the version anymore — drive it through
+`scripts/bump-version.sh`, the same script the automated **Release
+Prepare** workflow runs. It takes an **explicit** `X.Y.Z` (it does *not*
+compute minor/patch — that arithmetic lives in `release-prepare.yml`) and
+rewrites all five lockstep manifests plus rotates the CHANGELOG:
 
 ```bash
-git add Cargo.toml Cargo.lock
-git commit -m "rsac 0.2.0"
+# Preview the edits without writing them:
+bash scripts/bump-version.sh 0.3.0 --dry-run
+
+# Apply them:
+bash scripts/bump-version.sh 0.3.0
 ```
 
-Push and ensure CI is green on the bump commit before proceeding.
+This rewrites, in one shot:
+
+- `Cargo.toml` (root `rsac` crate)
+- `bindings/rsac-napi/Cargo.toml` and `bindings/rsac-napi/package.json`
+- `bindings/rsac-python/Cargo.toml` and `bindings/rsac-python/pyproject.toml`
+- `CHANGELOG.md` — `## [Unreleased]` → `## [X.Y.Z] - <UTC date>` with a
+  fresh `Unreleased` scaffold
+
+Then reconcile the **sixth** manifest the script does not touch —
+`bindings/rsac-ffi/Cargo.toml` — to the same `X.Y.Z` by hand (see
+§"Versioning & ABI contract" (b)). The `version-lockstep` CI job checks
+all six agree and hard-fails on a tag if any disagree.
+
+Commit (use a normal subject for a manual/major release; reserve the
+`release: vX.Y.Z` subject for the automated PR, since `release-tag.yml`
+auto-tags any `release:` squash commit):
+
+```bash
+git add -A
+git commit -m "chore: release 0.3.0"
+```
+
+Push and ensure CI — including `version-lockstep` — is green on the bump
+commit before proceeding.
 
 ---
 
 ## 4. Tag the release
 
-Annotated tags only — do not use lightweight tags.
+> For a `minor`/`patch` release prepared via the automated flow you do
+> **not** run this step — `release-tag.yml` creates and pushes the
+> annotated `vX.Y.Z` tag automatically once the `release: vX.Y.Z` PR is
+> squash-merged (it is idempotent and won't double-tag). This manual step
+> is for a **MAJOR** release or any time you bumped by hand in §3.
+
+Annotated tags only — do not use lightweight tags. The tag name is
+`v<semver>`; pushing it is the event all three publish workflows key on.
 
 ```bash
 git tag -a v0.2.0 -m "rsac 0.2.0"
 git push origin v0.2.0
 ```
 
-The tag name is `v<semver>`. If a release automation workflow is added
-later, this is the event it should key on.
+If `release-tag.yml` already pushed the tag for you, this is a no-op (it
+refuses to re-tag an existing `vX.Y.Z`); only run it by hand when the tag
+does not yet exist.
 
 ---
 
@@ -571,17 +948,32 @@ risking a real upload:
 
 Tracked here so follow-up release-automation tasks can pick them up:
 
+- **Minor/patch releases are automated up to the GitHub Release** via the
+  release-please-style two-workflow flow (`release-prepare.yml` +
+  `release-tag.yml`) — see §"Automated minor/patch release (release-please
+  style)". Run **Release Prepare** from the Actions tab, squash-merge the
+  `release: vX.Y.Z` PR (keeping that exact subject), and the tag + GitHub
+  Release are created automatically. **Registry publishing is NOT part of this
+  automation** (the `GITHUB_TOKEN`-pushed tag does not trigger the publish
+  workflows — see Step 4); it remains a manual follow-up until a PAT / GitHub
+  App token is wired. **MAJOR bumps stay manual** (the automation refuses to
+  change the major): use `scripts/bump-version.sh` + a hand-pushed tag per
+  §3–§4. The manual §1–§9 flow remains the fallback whenever the
+  automation is unavailable or a maintainer needs to override it.
 - All three registry workflows exist (`release.yml`, `release-npm.yml`,
   `release-pypi.yml`). Before the first tag push, the corresponding
   secrets (`CARGO_REGISTRY_TOKEN`, `NPM_TOKEN`, `MATURIN_PYPI_TOKEN`)
   must be set under **Settings → Secrets and variables → Actions**.
   Missing secrets fail only the affected `publish-*` job; the other
   flows continue. Fall back to §2–§6 for the affected registry.
-- No `scripts/bump-version.sh` — version strings are edited by hand in
-  `Cargo.toml`, `bindings/rsac-napi/package.json`, and
-  `bindings/rsac-python/pyproject.toml`. `apps/audio-graph/` has its
-  own bump script; a cross-manifest version sync helper is still a
-  nice-to-have.
+- `scripts/bump-version.sh X.Y.Z` rewrites all six manifests — the root
+  `Cargo.toml`, `bindings/rsac-ffi/Cargo.toml` (including its internal `rsac`
+  dependency version pin), `bindings/rsac-napi/{Cargo.toml,package.json}`, and
+  `bindings/rsac-python/{Cargo.toml,pyproject.toml}` — and rotates the
+  CHANGELOG. It cannot tag `rsac-go` (push `bindings/rsac-go/vX.Y.Z`
+  separately — see §"Versioning & ABI contract" (c)). The `version-lockstep` CI job in
+  `ci.yml` catches any manifest that drifts: it warns on push/PR and
+  hard-fails on a release tag.
 - `release-npm.yml` builds five napi-rs triples; other targets
   (`linux-x64-musl`, `linux-arm-gnueabihf`, FreeBSD, Android) are not
   wired. Add them to the matrix if downstream users request them.

@@ -6,12 +6,13 @@
 /**
  * A chunk of captured audio data.
  *
- * Contains interleaved Float64 PCM samples along with format metadata.
+ * Contains interleaved Float32 PCM samples along with format metadata.
  * This is the primary data unit flowing through the JS capture pipeline.
  */
 export interface AudioChunk {
-  /** Interleaved PCM audio samples (f32 from Rust, widened to f64 for JS). */
-  data: number[];
+  /** Interleaved PCM audio samples as a native `Float32Array` (the captured
+   * `f32` samples carried through directly — no `f32` -> `f64` widening). */
+  data: Float32Array;
   /** Number of audio frames (samples per channel). */
   numFrames: number;
   /** Number of audio channels. */
@@ -22,6 +23,27 @@ export interface AudioChunk {
   length: number;
   /** Duration of this chunk in seconds. */
   duration: number;
+  /** RMS (root-mean-square) level across all samples/channels, linear
+   * `0.0..=1.0`. Computed once by rsac core (alloc-free, NaN-safe); `0.0` for
+   * silence or an empty chunk, never `NaN`. */
+  rms: number;
+  /** Peak (max absolute) level across all samples/channels, linear `0.0..=1.0`.
+   * `0.0` for an empty chunk, never `NaN`. */
+  peak: number;
+  /** RMS level in dBFS (`20·log10(rms)`). `-Infinity` at silence; `0.0` dBFS is
+   * full scale. */
+  rmsDbfs: number;
+  /** Peak level in dBFS (`20·log10(peak)`). `-Infinity` at silence; `0.0` dBFS
+   * is full scale. */
+  peakDbfs: number;
+  /** Per-channel RMS levels in channel order, linear `0.0..=1.0`
+   * (`channelRms[ch]` is the RMS of channel `ch`). Length equals `channels`;
+   * empty when the chunk reports `0` channels. Computed once by rsac core. */
+  channelRms: number[];
+  /** Per-channel peak levels in channel order, linear `0.0..=1.0`
+   * (`channelPeak[ch]` is the peak of channel `ch`). Length equals `channels`;
+   * empty when the chunk reports `0` channels. Computed once by rsac core. */
+  channelPeak: number[];
 }
 
 /**
@@ -46,6 +68,28 @@ export declare class CaptureTarget {
   static applicationByName(name: string): CaptureTarget;
   /** Capture audio from a process and all its child processes. */
   static processTree(pid: number): CaptureTarget;
+  /**
+   * Parse a capture target from its canonical string form. The scheme prefix is
+   * matched case-insensitively:
+   *
+   * - `"system"` / `"default"` — system default mix
+   * - `"device:<id>"` — a specific device (the id may itself contain colons,
+   *   e.g. `"device:hw:0,0"`)
+   * - `"app:<id>"` — a specific application session
+   * - `"name:<name>"` — the first application matching `<name>`
+   * - `"tree:<pid>"` / `"pid:<pid>"` — a process and its children
+   *
+   * Throws an `Error` (code `ERR_RSAC_CONFIGURATION`) on an unknown scheme or a
+   * non-numeric / out-of-range pid.
+   *
+   * @example
+   * ```ts
+   * CaptureTarget.parse("system");
+   * CaptureTarget.parse("name:Firefox");
+   * CaptureTarget.parse("pid:1234");
+   * ```
+   */
+  static parse(spec: string): CaptureTarget;
   /** Returns a string description of this capture target. */
   describe(): string;
 }
@@ -125,6 +169,24 @@ export declare class AudioCapture {
    * Read a single audio chunk synchronously (non-blocking).
    * Returns `null` if no data is currently available.
    * Throws if the capture is not running.
+   *
+   * **Not terminal-observable.** The pull readers (`read`, `readBlocking`,
+   * `readAsync`, `readBlockingAsync`) route through rsac's `read_buffer*`, which
+   * short-circuits to a *recoverable* read error the moment the stream leaves
+   * the running state — it never surfaces the terminal "stream ended" cause. So
+   * a pull consumer cannot distinguish a transient hiccup from a real terminal
+   * end via the thrown error. Only the push pump (`onData`) drains the terminal
+   * state and reports *why* it ended via `onEnd`. To observe the terminal cause,
+   * use `onData` + `onEnd`; with the pull API, treat `stop()`/`isRunning` as the
+   * end-of-stream signal.
+   *
+   * This terminal-cause-invisibility is the *only* thing that makes a thrown
+   * read error retryable: while the capture is running, a thrown error may be a
+   * transient hiccup masking a terminal end, so retry it. It does **not** make
+   * *every* thrown read error retryable — `read*()` also throws when the capture
+   * is not running (before `start()` or after `stop()`), which is a normal usage
+   * error, not a transient condition. Don't blind-retry: gate retries on
+   * `isRunning` so a pre-start/stopped capture doesn't spin in a retry loop.
    */
   read(): AudioChunk | null;
 
@@ -132,6 +194,11 @@ export declare class AudioCapture {
    * Read a single audio chunk, blocking until data is available.
    * WARNING: This blocks the Node.js event loop. Use `readBlockingAsync()`
    * or `onData()` in production.
+   *
+   * Like `read()`, this is **not terminal-observable** — it routes through
+   * `read_buffer_blocking` and surfaces only recoverable errors, never the
+   * terminal "stream ended" cause. Use `onData` + `onEnd` to observe the
+   * terminal reason.
    */
   readBlocking(): AudioChunk;
 
@@ -139,12 +206,19 @@ export declare class AudioCapture {
    * Read a single audio chunk asynchronously (non-blocking, off main thread).
    * Returns `null` if no data is currently available.
    * Throws if the capture is not running.
+   *
+   * Like `read()`, this is **not terminal-observable** (it routes through
+   * `read_buffer`). Use `onData` + `onEnd` to observe the terminal reason.
    */
   readAsync(): Promise<AudioChunk | null>;
 
   /**
    * Read a single audio chunk asynchronously, blocking the worker thread
    * until data is available. Does not block the Node.js event loop.
+   *
+   * Like `read()`, this is **not terminal-observable** (it routes through
+   * `read_buffer_blocking`). Use `onData` + `onEnd` to observe the terminal
+   * reason.
    */
   readBlockingAsync(): Promise<AudioChunk>;
 
@@ -160,16 +234,127 @@ export declare class AudioCapture {
   onData(callback: (chunk: AudioChunk) => void): void;
 
   /**
+   * Register a callback that fires exactly once when push-based delivery
+   * (`onData`) ends, carrying *why* it ended.
+   *
+   * The data pump ends in one of two ways a plain `onData` consumer cannot
+   * otherwise distinguish:
+   *
+   * - **Terminal (fatal):** the backend stream reached its terminal state
+   *   (e.g. the capture ended). `error` is the formatted terminal error
+   *   message (a non-null `string`).
+   * - **Clean stop:** the pump was torn down by `stop()` / `offData()`.
+   *   `error` is `null`.
+   *
+   * This is the Node parity for the Rust `subscribe_with_errors` and Go
+   * `StreamWithErrors` APIs — an `onData` consumer registers `onEnd` to learn
+   * the terminal reason instead of the end being silent. Optional and
+   * independent of `onData`.
+   *
+   * The registration **persists across multiple `start()`/`stop()` sessions**,
+   * exactly like `onData`: it fires once per session (when that session's data
+   * pump ends) and stays armed for the next `start()`. It is cleared only by
+   * `offEnd()`, or replaced by calling `onEnd()` again. A recoverable hiccup
+   * never fires it — only the terminal end (fatal) or a clean stop does.
+   *
+   * @example
+   * ```ts
+   * capture.onData((chunk) => process(chunk));
+   * capture.onEnd((err) => {
+   *   if (err) console.error(`capture ended: ${err}`);
+   *   else console.log('capture stopped cleanly');
+   * });
+   * capture.start();
+   * capture.stop();   // fires onEnd(null)
+   * capture.start();  // onEnd still armed — fires again at the next stop
+   * ```
+   */
+  onEnd(callback: (error: string | null) => void): void;
+
+  /**
    * Remove the registered data callback.
-   * Stops the data pump thread if running.
+   * Stops the data pump thread if running. A callback registered via `onEnd`
+   * is left registered for a later session; use `offEnd()` to clear it.
    */
   offData(): void;
+
+  /**
+   * Remove the registered terminal-observability callback (see `onEnd`).
+   * This is the only way to clear an `onEnd` registration — the pump leaves it
+   * armed across sessions. After this, the pump's end is no longer reported to
+   * JS (a fatal terminal still emits a throttled stderr log; a clean stop is
+   * silent). Does not stop the pump.
+   */
+  offEnd(): void;
 
   /**
    * Number of audio buffers dropped due to ring buffer overflow.
    * A non-zero value means the JavaScript consumer is not keeping up.
    */
   readonly overrunCount: number;
+
+  /**
+   * A point-in-time snapshot of the stream's diagnostic counters.
+   *
+   * Reading this never allocates on or blocks the OS audio callback thread.
+   * Before `start()` (or after `stop()`) the snapshot is zeroed with
+   * `isRunning === false` and `uptimeSecs === 0`.
+   *
+   * @example
+   * ```ts
+   * const s = capture.streamStats();
+   * console.log(`pushed=${s.buffersPushed} dropped=${s.buffersDropped} ` +
+   *             `ratio=${s.droppedRatio.toFixed(4)} up=${s.uptimeSecs}s`);
+   * ```
+   */
+  streamStats(): StreamStats;
+
+  /**
+   * The negotiated *delivery* format the backend actually produces, or `null`
+   * before `start()` creates a stream. May differ from the requested settings
+   * when the device forced a negotiation.
+   */
+  readonly format: AudioFormat | null;
+}
+
+/**
+ * A point-in-time snapshot of an {@link AudioCapture}'s diagnostic counters.
+ *
+ * Cumulative counters are `bigint` (Rust `u64`) so they do not silently lose
+ * precision past `Number.MAX_SAFE_INTEGER` on a long-running capture.
+ */
+export interface StreamStats {
+  /** Buffers dropped due to ring-buffer overflow (alias of `buffersDropped`,
+   * kept for parity with `overrunCount`). */
+  overruns: bigint;
+  /** Cumulative buffers delivered to the consumer (popped off the ring). */
+  buffersCaptured: bigint;
+  /** Cumulative buffers dropped due to ring-buffer overflow. */
+  buffersDropped: bigint;
+  /** Cumulative buffers enqueued by the producer (the OS audio callback). */
+  buffersPushed: bigint;
+  /** How long the stream has been running, in seconds. `0` when not started. */
+  uptimeSecs: number;
+  /** Fraction of accounted-for buffers lost to overflow, in `0.0..=1.0`
+   * (`buffersDropped / (buffersCaptured + buffersDropped)`; `0.0` when none). */
+  droppedRatio: number;
+  /** Whether the stream is currently capturing. */
+  isRunning: boolean;
+  /** Compact human-readable format description (e.g. `"2ch 48000Hz F32"`);
+   * empty before the stream starts. */
+  formatDescription: string;
+}
+
+/**
+ * The negotiated audio delivery format.
+ */
+export interface AudioFormat {
+  /** Samples per second (e.g. 48000). */
+  sampleRate: number;
+  /** Number of interleaved channels (e.g. 2 for stereo). */
+  channels: number;
+  /** Sample format name: one of `"I16"`, `"I24"`, `"I32"`, `"F32"`. */
+  sampleFormat: string;
 }
 
 /**

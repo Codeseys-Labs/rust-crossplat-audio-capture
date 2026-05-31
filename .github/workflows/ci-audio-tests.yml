@@ -8,11 +8,16 @@ name: Audio Integration Tests
 #
 # Platform status:
 #   ✅ Linux (PipeWire)  — PRIMARY. Fully validated, expected to pass.
-#   ✅ Windows (WASAPI)  — VB-CABLE virtual driver. 3/3 tests real.
+#   ✅ Windows (WASAPI)  — FIRST-CLASS. VB-CABLE virtual driver, 3/3 tests
+#                           real. Hard-gated: no continue-on-error, and the
+#                           summary fails on a Windows regression.
 #   ⏳ macOS (CoreAudio)  — skip-early on CI (TCC Audio Capture cannot be
 #                           granted non-interactively on managed runners).
 #                           VALIDATED on real hardware (macOS 14.4+).
 #                           See docs/reviews/ci-audio-final-status-*.md.
+#                           macOS jobs keep continue-on-error ONLY because the
+#                           runner cannot grant kTCCServiceAudioCapture — that
+#                           gap is documented per-job and on the summary gate.
 # =============================================================================
 
 on:
@@ -48,6 +53,12 @@ jobs:
     name: "Linux | System Capture"
     runs-on: blacksmith-4vcpu-ubuntu-2404
     timeout-minutes: 15
+    # Use the `bash` keyword shell (`-eo pipefail`) instead of the Actions
+    # default (`bash -e`, no pipefail) so a failing `cargo test` propagates
+    # through the `| tee log` pipe instead of being masked by tee's exit 0.
+    defaults:
+      run:
+        shell: bash
     steps:
       - uses: actions/checkout@v5
       - uses: dtolnay/rust-toolchain@1.95.0
@@ -88,26 +99,90 @@ jobs:
           # Verify
           pw-cli info 0 || echo "WARNING: pw-cli info failed"
 
-      - name: Create virtual audio sink
+      - name: Create and verify virtual audio sink
         run: |
+          # Fail-fast on sink creation (no `|| true`): a missing sink used to
+          # masquerade as "audio available" because RSAC_CI_AUDIO_AVAILABLE was
+          # hardcoded later. Now we create, then VERIFY, then export the env.
+          #
+          # Wait for the pipewire-pulse Pulse socket to actually accept pactl
+          # before loading the sink. The `sleep 2` above is a fixed delay, not a
+          # readiness gate, and can race a slow pipewire-pulse startup.
+          for _ in $(seq 1 20); do
+            pactl info >/dev/null 2>&1 && break
+            sleep 1
+          done
+          pactl info >/dev/null 2>&1 || { echo "ERROR: pipewire-pulse (pactl) not ready"; exit 1; }
           pactl load-module module-null-sink \
             sink_name=ci_test_sink \
             sink_properties=device.description="CI_Test_Sink" \
-            rate=48000 channels=2 format=float32le || true
-          pactl set-default-sink ci_test_sink || true
+            rate=48000 channels=2 format=float32le
+          # Under the manually-bootstrapped PipeWire in CI there is no dbus
+          # session: `pactl set-default-sink` returns "Not supported" and
+          # pw-metadata cannot connect. That's fine — with ci_test_sink as the
+          # ONLY sink, default routing resolves to it, so pw-play→default and
+          # SystemDefault monitor capture both land on ci_test_sink.
+          pactl set-default-sink ci_test_sink 2>/dev/null || true
+          sleep 1
+
+          # Hard gate: the sink MUST exist. The old `|| true` masked a missing
+          # sink and let capture silently see silence (a false green).
+          if ! pactl list short sinks | grep -q "ci_test_sink"; then
+            echo "ERROR: ci_test_sink not present in 'pactl list short sinks'"
+            pactl list short sinks || true
+            exit 1
+          fi
+
+          # Enable HARD non-silence/tone asserts only when ci_test_sink is the
+          # effective default: pactl names it explicitly, OR it is the sole sink
+          # (pipewire-pulse returns the symbolic '@DEFAULT_SINK@' when no explicit
+          # default is set — routing still lands on the only sink). Otherwise keep
+          # capture enabled but fall back to soft warnings (honest: we don't claim
+          # deterministic verification in an environment that can't guarantee it).
+          DEFAULT_SINK="$(pactl get-default-sink 2>/dev/null || echo unknown)"
+          SINK_COUNT="$(pactl list short sinks | grep -c .)"
+          echo "default sink='${DEFAULT_SINK}' sink_count=${SINK_COUNT}"
+          echo "RSAC_CI_AUDIO_AVAILABLE=1" >> "$GITHUB_ENV"
+          # NOTE: RSAC_CI_AUDIO_DETERMINISTIC is intentionally NOT set on Linux.
+          # The dbus-less Firecracker PipeWire here does not actually route
+          # monitor capture (SystemDefault yields 0 buffers), so we cannot make
+          # hard non-silence/tone claims. Capture *content* is verified on real
+          # hardware and on the deterministic Windows VB-CABLE runner; here the
+          # capture tests run but honestly SKIP their content asserts on 0
+          # buffers (see helpers / per-test skip paths) rather than false-pass.
+          echo "Linux CI: capture content asserts are SOFT (see note above)."
 
       - name: Run system capture tests
         env:
-          RSAC_CI_AUDIO_AVAILABLE: "1"
           RSAC_TEST_CAPTURE_TIMEOUT_SECS: "15"
         run: |
           cargo test --test ci_audio system_capture \
             --no-default-features --features feat_linux \
             -- --test-threads=1 --nocapture 2>&1 | tee ci-audio-output.log
 
+      # G8 overrun coverage: stalls the consumer and asserts the ring buffer
+      # overflows under the deterministic source. Previously this module had
+      # no CI invocation at all.
+      - name: Run overrun tests
+        env:
+          RSAC_TEST_CAPTURE_TIMEOUT_SECS: "15"
+        run: |
+          cargo test --test ci_audio overrun \
+            --no-default-features --features feat_linux \
+            -- --test-threads=1 --nocapture 2>&1 | tee -a ci-audio-output.log
+
+      # G7 subscribe coverage: the `subscribe` module was never matched by any
+      # CI filter. The `subscribe` substring matches only this module.
+      - name: Run subscribe tests
+        env:
+          RSAC_TEST_CAPTURE_TIMEOUT_SECS: "15"
+        run: |
+          cargo test --test ci_audio subscribe \
+            --no-default-features --features feat_linux \
+            -- --test-threads=1 --nocapture 2>&1 | tee -a ci-audio-output.log
+
       - name: Run platform capabilities tests
         env:
-          RSAC_CI_AUDIO_AVAILABLE: "1"
           RSAC_TEST_CAPTURE_TIMEOUT_SECS: "15"
         run: |
           cargo test --test ci_audio platform_caps \
@@ -116,7 +191,6 @@ jobs:
 
       - name: Run stream lifecycle tests
         env:
-          RSAC_CI_AUDIO_AVAILABLE: "1"
           RSAC_TEST_CAPTURE_TIMEOUT_SECS: "15"
         run: |
           cargo test --test ci_audio stream_lifecycle \
@@ -128,12 +202,22 @@ jobs:
       # halt the other. See tests/ci_audio/multi_source.rs.
       - name: Run multi-source capture tests
         env:
-          RSAC_CI_AUDIO_AVAILABLE: "1"
           RSAC_TEST_CAPTURE_TIMEOUT_SECS: "15"
         run: |
           cargo test --test ci_audio multi_source \
             --no-default-features --features feat_linux \
             -- --test-threads=1 --nocapture 2>&1 | tee -a ci-audio-output.log
+
+      # CI-4: enumeration_matrix's "no silent empty list" (audit L4) assertion
+      # only has teeth when audio_available() is true. RSAC_CI_AUDIO_AVAILABLE=1
+      # is exported in the setup step above, so running it HERE (on a runner with
+      # a real virtual sink) is the only place that arm actually executes — the
+      # default unit-test matrix runs it headless, where it correctly self-skips.
+      - name: Run enumeration_matrix against real devices (L4 non-empty assertion)
+        run: |
+          cargo test --test enumeration_matrix \
+            --no-default-features --features feat_linux \
+            -- --nocapture 2>&1 | tee -a ci-audio-output.log
 
       - name: Diagnostics on failure
         if: failure()
@@ -156,6 +240,10 @@ jobs:
     name: "Linux | Device Capture"
     runs-on: blacksmith-4vcpu-ubuntu-2404
     timeout-minutes: 15
+    # `bash` keyword shell (`-eo pipefail`) so cargo failures aren't masked by tee.
+    defaults:
+      run:
+        shell: bash
     steps:
       - uses: actions/checkout@v5
       - uses: dtolnay/rust-toolchain@1.95.0
@@ -188,17 +276,45 @@ jobs:
           sleep 2
           pw-cli info 0 || echo "WARNING: pw-cli info failed"
 
-      - name: Create virtual audio sink
+      - name: Create and verify virtual audio sink
         run: |
+          # Wait for the pipewire-pulse Pulse socket before loading the sink
+          # (readiness gate, not a fixed sleep).
+          for _ in $(seq 1 20); do
+            pactl info >/dev/null 2>&1 && break
+            sleep 1
+          done
+          pactl info >/dev/null 2>&1 || { echo "ERROR: pipewire-pulse (pactl) not ready"; exit 1; }
           pactl load-module module-null-sink \
             sink_name=ci_test_sink \
             sink_properties=device.description="CI_Test_Sink" \
-            rate=48000 channels=2 format=float32le || true
-          pactl set-default-sink ci_test_sink || true
+            rate=48000 channels=2 format=float32le
+          # Under the manually-bootstrapped PipeWire in CI there is no dbus
+          # session: set-default-sink is "Not supported" and pw-metadata can't
+          # connect. With ci_test_sink as the ONLY sink, default routing lands
+          # on it anyway.
+          pactl set-default-sink ci_test_sink 2>/dev/null || true
+          sleep 1
+          if ! pactl list short sinks | grep -q "ci_test_sink"; then
+            echo "ERROR: ci_test_sink not present in 'pactl list short sinks'"
+            pactl list short sinks || true
+            exit 1
+          fi
+          DEFAULT_SINK="$(pactl get-default-sink 2>/dev/null || echo unknown)"
+          SINK_COUNT="$(pactl list short sinks | grep -c .)"
+          echo "default sink='${DEFAULT_SINK}' sink_count=${SINK_COUNT}"
+          echo "RSAC_CI_AUDIO_AVAILABLE=1" >> "$GITHUB_ENV"
+          # NOTE: RSAC_CI_AUDIO_DETERMINISTIC is intentionally NOT set on Linux.
+          # The dbus-less Firecracker PipeWire here does not actually route
+          # monitor capture (SystemDefault yields 0 buffers), so we cannot make
+          # hard non-silence/tone claims. Capture *content* is verified on real
+          # hardware and on the deterministic Windows VB-CABLE runner; here the
+          # capture tests run but honestly SKIP their content asserts on 0
+          # buffers (see helpers / per-test skip paths) rather than false-pass.
+          echo "Linux CI: capture content asserts are SOFT (see note above)."
 
       - name: Run device capture tests
         env:
-          RSAC_CI_AUDIO_AVAILABLE: "1"
           RSAC_TEST_CAPTURE_TIMEOUT_SECS: "15"
         run: |
           cargo test --test ci_audio device_capture \
@@ -207,7 +323,6 @@ jobs:
 
       - name: Run device enumeration tests
         env:
-          RSAC_CI_AUDIO_AVAILABLE: "1"
           RSAC_TEST_CAPTURE_TIMEOUT_SECS: "15"
         run: |
           cargo test --test ci_audio device_enumeration \
@@ -233,6 +348,10 @@ jobs:
     name: "Linux | Process Capture"
     runs-on: blacksmith-4vcpu-ubuntu-2404
     timeout-minutes: 15
+    # `bash` keyword shell (`-eo pipefail`) so cargo failures aren't masked by tee.
+    defaults:
+      run:
+        shell: bash
     steps:
       - uses: actions/checkout@v5
       - uses: dtolnay/rust-toolchain@1.95.0
@@ -265,17 +384,45 @@ jobs:
           sleep 2
           pw-cli info 0 || echo "WARNING: pw-cli info failed"
 
-      - name: Create virtual audio sink
+      - name: Create and verify virtual audio sink
         run: |
+          # Wait for the pipewire-pulse Pulse socket before loading the sink
+          # (readiness gate, not a fixed sleep).
+          for _ in $(seq 1 20); do
+            pactl info >/dev/null 2>&1 && break
+            sleep 1
+          done
+          pactl info >/dev/null 2>&1 || { echo "ERROR: pipewire-pulse (pactl) not ready"; exit 1; }
           pactl load-module module-null-sink \
             sink_name=ci_test_sink \
             sink_properties=device.description="CI_Test_Sink" \
-            rate=48000 channels=2 format=float32le || true
-          pactl set-default-sink ci_test_sink || true
+            rate=48000 channels=2 format=float32le
+          # Under the manually-bootstrapped PipeWire in CI there is no dbus
+          # session: set-default-sink is "Not supported" and pw-metadata can't
+          # connect. With ci_test_sink as the ONLY sink, default routing lands
+          # on it anyway.
+          pactl set-default-sink ci_test_sink 2>/dev/null || true
+          sleep 1
+          if ! pactl list short sinks | grep -q "ci_test_sink"; then
+            echo "ERROR: ci_test_sink not present in 'pactl list short sinks'"
+            pactl list short sinks || true
+            exit 1
+          fi
+          DEFAULT_SINK="$(pactl get-default-sink 2>/dev/null || echo unknown)"
+          SINK_COUNT="$(pactl list short sinks | grep -c .)"
+          echo "default sink='${DEFAULT_SINK}' sink_count=${SINK_COUNT}"
+          echo "RSAC_CI_AUDIO_AVAILABLE=1" >> "$GITHUB_ENV"
+          # NOTE: RSAC_CI_AUDIO_DETERMINISTIC is intentionally NOT set on Linux.
+          # The dbus-less Firecracker PipeWire here does not actually route
+          # monitor capture (SystemDefault yields 0 buffers), so we cannot make
+          # hard non-silence/tone claims. Capture *content* is verified on real
+          # hardware and on the deterministic Windows VB-CABLE runner; here the
+          # capture tests run but honestly SKIP their content asserts on 0
+          # buffers (see helpers / per-test skip paths) rather than false-pass.
+          echo "Linux CI: capture content asserts are SOFT (see note above)."
 
       - name: Run application capture tests
         env:
-          RSAC_CI_AUDIO_AVAILABLE: "1"
           RSAC_TEST_CAPTURE_TIMEOUT_SECS: "15"
         run: |
           cargo test --test ci_audio app_capture \
@@ -284,10 +431,28 @@ jobs:
 
       - name: Run process tree capture tests
         env:
-          RSAC_CI_AUDIO_AVAILABLE: "1"
           RSAC_TEST_CAPTURE_TIMEOUT_SECS: "15"
         run: |
           cargo test --test ci_audio process_tree_capture \
+            --no-default-features --features feat_linux \
+            -- --test-threads=1 --nocapture 2>&1 | tee -a ci-audio-output.log
+
+      # The `process_tree` public-API module (introspection round-trips,
+      # capability/builder contract, PID=0) was never matched by any filter.
+      # The `process_tree::` prefix matches ONLY that module's test paths,
+      # not `process_tree_capture::*`, so the two steps don't overlap.
+      #
+      # NOTE on application_by_name / application_by_pid: those modules are
+      # `#![cfg(target_os = "macos")]` and every test is `#[ignore]` (they
+      # need macOS 14.4+ Process Tap + TCC audio permission). They cannot run
+      # on Linux or on a headless macOS runner, so they are intentionally not
+      # invoked here. A Linux ApplicationByName path does not exist in the
+      # backend, so there is nothing low-risk to add for Linux.
+      - name: Run process tree public-API tests
+        env:
+          RSAC_TEST_CAPTURE_TIMEOUT_SECS: "15"
+        run: |
+          cargo test --test ci_audio "process_tree::" \
             --no-default-features --features feat_linux \
             -- --test-threads=1 --nocapture 2>&1 | tee -a ci-audio-output.log
 
@@ -307,17 +472,24 @@ jobs:
           retention-days: 14
 
   # =============================================================================
-  # Windows tiers — VB-CABLE virtual audio driver
+  # Windows tiers — VB-CABLE virtual audio driver — FIRST-CLASS (hard-gated)
   # NOTE: Blacksmith Windows VMs (Firecracker) have no audio subsystem at all
   # (AudioSrv, AudioEndpointBuilder, AudioSes.dll are all absent).
   # We use GitHub-hosted windows-latest for audio integration tests, which
   # has a full Windows audio stack. Blacksmith handles compilation/unit tests.
+  #
+  # rsac M5: Windows is a first-class tier. These jobs deliberately have NO
+  # continue-on-error and set RSAC_CI_AUDIO_DETERMINISTIC=1 so a real WASAPI
+  # "capture returns silence" regression turns the tier RED instead of landing
+  # green. The verify steps above (VB-CABLE is the active default playback)
+  # fail-fast before cargo runs if the audio route is wrong, so a hard gate
+  # here surfaces genuine capture regressions, not flaky-runner setup noise.
+  # The summary job's failure gate includes these jobs.
   # =============================================================================
 
   windows-system:
     name: "Windows | System Capture"
     runs-on: windows-latest
-    continue-on-error: true
     timeout-minutes: 20
     steps:
       - uses: actions/checkout@v5
@@ -395,6 +567,12 @@ jobs:
           if ($devices) {
             $devices | Format-List FriendlyName, Status
             echo "RSAC_CI_AUDIO_AVAILABLE=1" >> $env:GITHUB_ENV
+            # rsac M5: VB-CABLE is installed AND verified as the active default
+            # playback endpoint by the hard gate two steps above. That makes
+            # system-capture loopback deterministic — the test tone provably
+            # routes to the captured endpoint — so enable the hard
+            # non-silence/tone asserts (mirrors the Linux ci_test_sink path).
+            echo "RSAC_CI_AUDIO_DETERMINISTIC=1" >> $env:GITHUB_ENV
           } else {
             Write-Host "No audio devices found"
             echo "RSAC_CI_AUDIO_AVAILABLE=0" >> $env:GITHUB_ENV
@@ -454,7 +632,14 @@ jobs:
   windows-device:
     name: "Windows | Device Capture"
     runs-on: windows-latest
-    continue-on-error: true
+    # rsac M5: first-class, hard-gated (no continue-on-error). NOTE: we do NOT
+    # set RSAC_CI_AUDIO_DETERMINISTIC here. The deterministic hard-asserts in
+    # tests/ci_audio/device_capture.rs are written against the Linux null-sink
+    # *monitor* (which always carries the 440 Hz tone). On windows-latest the
+    # device-capture path opens VB-CABLE's capture endpoint directly with no
+    # tone guaranteed to be routed to it, so a deterministic non-silence assert
+    # would false-RED. The job still hard-fails on build/start/panic regressions
+    # (a genuine WASAPI device-open regression), which is the M5 goal.
     timeout-minutes: 20
     steps:
       - uses: actions/checkout@v5
@@ -531,7 +716,12 @@ jobs:
   windows-process:
     name: "Windows | Process Capture"
     runs-on: windows-latest
-    continue-on-error: true
+    # rsac M5: first-class, hard-gated (no continue-on-error). As with the
+    # device tier, RSAC_CI_AUDIO_DETERMINISTIC is intentionally NOT set: the
+    # per-process loopback tone is generated by a child player whose routing is
+    # not as tightly verified as the system-default endpoint, so a deterministic
+    # non-silence assert risks a false RED. Build/start/panic regressions in the
+    # WASAPI Process Loopback path still hard-fail the job (the M5 goal).
     timeout-minutes: 20
     steps:
       - uses: actions/checkout@v5
@@ -873,7 +1063,9 @@ jobs:
           retention-days: 14
 
   # =============================================================================
-  # Summary — reports overall status, fails only if Linux (primary) fails
+  # Summary — reports overall status; fails if any Linux OR Windows
+  # (first-class) job fails. macOS stays advisory (TCC cannot be granted on
+  # managed runners — see the per-job rsac#26 notes).
   # =============================================================================
 
   summary:
@@ -902,19 +1094,24 @@ jobs:
           echo "  Device Capture:  ${{ needs.linux-device.result }}"
           echo "  Process Capture: ${{ needs.linux-process.result }}"
           echo ""
-          echo "Windows (VB-CABLE, continue-on-error):"
+          echo "Windows (VB-CABLE, first-class — hard-gated):"
           echo "  System Capture:  ${{ needs.windows-system.result }}"
           echo "  Device Capture:  ${{ needs.windows-device.result }}"
           echo "  Process Capture: ${{ needs.windows-process.result }}"
           echo ""
-          echo "macOS (BlackHole):"
+          echo "macOS (BlackHole, advisory — TCC ungrantable on runners):"
           echo "  System Capture:  ${{ needs.macos-system.result }}"
           echo "  Device Capture:  ${{ needs.macos-device.result }}"
           echo "  Process Capture: ${{ needs.macos-process.result }}"
           echo ""
           echo "============================================================"
 
-          # Fail only if any Linux job failed (primary platform)
+          # rsac M5: fail if any Linux (primary) OR Windows (first-class) job
+          # failed. macOS is intentionally excluded from the gate because
+          # kTCCServiceAudioCapture cannot be granted on a managed runner, so
+          # its capture jobs skip-early / run under continue-on-error; gating on
+          # them would wedge CI on an unfixable environment limitation. macOS is
+          # validated on real hardware (see the per-job rsac#26 notes).
           FAILED=0
           for result in \
             "${{ needs.linux-system.result }}" \
@@ -926,10 +1123,23 @@ jobs:
             fi
           done
 
+          # Windows is a first-class tier. A 'skipped' result is allowed only
+          # when the whole workflow path-filter excluded the job; any
+          # 'failure'/'cancelled' is a real regression and fails the gate.
+          for result in \
+            "${{ needs.windows-system.result }}" \
+            "${{ needs.windows-device.result }}" \
+            "${{ needs.windows-process.result }}"; do
+            if [ "$result" != "success" ] && [ "$result" != "skipped" ]; then
+              echo "FAILED: Windows job returned '$result'"
+              FAILED=1
+            fi
+          done
+
           if [ "$FAILED" -eq 1 ]; then
             echo ""
-            echo "Linux is the primary platform — failures must be investigated."
+            echo "Linux + Windows are first-class platforms — failures must be investigated."
             exit 1
           else
-            echo "All Linux (primary) jobs passed."
+            echo "All Linux + Windows (first-class) jobs passed."
           fi

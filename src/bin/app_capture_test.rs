@@ -215,7 +215,11 @@ fn test_capture_lifecycle() -> Result<(), Box<dyn std::error::Error>> {
 fn test_platform_specific() -> Result<(), Box<dyn std::error::Error>> {
     println!("🖥️  Testing platform-specific features...");
 
-    #[cfg(target_os = "windows")]
+    // Gate on the FEATURE too, not just target_os: rsac::audio::windows only
+    // exists when feat_windows is enabled. Under `--no-default-features` on a
+    // Windows host, target_os is true but the module is absent (E0432), so the
+    // block must compile to empty there (matches the library's own gating).
+    #[cfg(all(target_os = "windows", feature = "feat_windows"))]
     {
         println!("  Windows platform detected");
         use rsac::audio::windows::WindowsApplicationCapture;

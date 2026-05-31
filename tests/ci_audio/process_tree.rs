@@ -311,14 +311,30 @@ fn process_tree_pid_zero_fails_cleanly() {
                     e
                 ),
                 Ok(()) => {
-                    // A few backends will silently produce no audio; stop and
-                    // report. The contract is "no panic/hang", which we met.
-                    std::thread::sleep(Duration::from_millis(100));
+                    // A few backends will silently produce no audio for an
+                    // invalid PID. If audio DOES arrive, the tree bound the
+                    // wrong source — assert silence rather than passing blind.
+                    let start = std::time::Instant::now();
+                    let mut produced_audio = false;
+                    while start.elapsed() < Duration::from_millis(300) {
+                        match capture.read_buffer() {
+                            Ok(Some(buf)) => {
+                                if helpers::verify_non_silence(&buf, 0.001) {
+                                    produced_audio = true;
+                                    break;
+                                }
+                            }
+                            Ok(None) => std::thread::sleep(Duration::from_millis(10)),
+                            Err(_) => break,
+                        }
+                    }
                     let _ = capture.stop();
-                    eprintln!(
-                        "[ci_audio] ⚠ ProcessTree(PID=0) started without error \
-                         (backend accepts invalid PIDs silently)"
+                    assert!(
+                        !produced_audio,
+                        "ProcessTree(PID=0) must not produce non-silent audio — \
+                         the builder/start accepted PID 0 and bound a real source"
                     );
+                    eprintln!("[ci_audio] ✅ ProcessTree(PID=0) started but produced only silence");
                 }
             }
         }

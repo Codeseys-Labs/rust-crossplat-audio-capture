@@ -6,6 +6,13 @@ name: CI
 on:
   push:
     branches: [main, master]
+    # Also run on stable semver tags so the version-lockstep job's tag-time
+    # hard-gate (which asserts all six manifests equal the tag) actually fires
+    # at the point of no return — it was previously dead code (ci.yml had no
+    # tags: trigger). Pre-release shapes (v*-rc.1) are excluded.
+    tags:
+      - 'v*.*.*'
+      - '!v*-*'
   pull_request:
     branches: [main, master]
   workflow_dispatch:
@@ -14,39 +21,81 @@ env:
   CARGO_TERM_COLOR: always
   RUST_BACKTRACE: 1
 
+# Least-privilege token: this workflow only builds/tests, never writes.
+permissions:
+  contents: read
+
+# Cancel superseded runs on the same ref (saves runner minutes on PR pushes).
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
 jobs:
-  # ── Lint ────────────────────────────────────────────────────────────
+  # ── Lint (clippy matrix across all 3 OS) ────────────────────────────
   lint:
-    name: Lint & Format
-    runs-on: blacksmith-4vcpu-ubuntu-2404
+    name: Lint & Format (${{ matrix.feature }})
+    timeout-minutes: 20
+    runs-on: ${{ matrix.runner }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - runner: blacksmith-4vcpu-ubuntu-2404
+            feature: feat_linux
+            os: linux
+          - runner: blacksmith-4vcpu-windows-2025
+            feature: feat_windows
+            os: windows
+          - runner: blacksmith-6vcpu-macos-15
+            feature: feat_macos
+            os: macos
     steps:
-      - uses: actions/checkout@v5
-      - uses: dtolnay/rust-toolchain@1.95.0
+      - uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5
+        with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@e081816240890017053eacbb1bdf337761dc5582 # 1.95.0
         with:
           components: rustfmt, clippy
-      - uses: Swatinem/rust-cache@v2
+      - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
 
       - name: Install PipeWire dev libraries
+        if: matrix.os == 'linux'
         run: |
           sudo add-apt-repository ppa:pipewire-debian/pipewire-upstream -y
           sudo apt-get update
           sudo apt-get install -y libpipewire-0.3-dev libspa-0.2-dev pkg-config
 
+      # rustfmt is platform-independent; run the check once on the Linux leg.
       - name: Check formatting
+        if: matrix.os == 'linux'
         run: cargo fmt --all -- --check
 
+      # rsac L14(a): clippy now lints --all-targets (lib + bins + examples +
+      # tests + benches) for the active platform, so example/test/bench code is
+      # held to the same -D warnings bar as the library and demo binaries —
+      # previously they were exempt and could accumulate lint debt silently.
       - name: Run Clippy
-        run: cargo clippy --lib --no-default-features --features feat_linux -- -D warnings
+        run: cargo clippy --all-targets --no-default-features --features ${{ matrix.feature }} -- -D warnings
+
+      # FH-2: the bare `--no-default-features` build (NO platform feature) must
+      # still compile. It broke on Windows (E0432) because a bin gated only on
+      # target_os pulled in a feature-gated module. Run it on all three runners —
+      # the failure only manifests where target_os is true but the feat_* is off.
+      - name: Build with no default features (bare-build smoke)
+        run: cargo build --no-default-features
 
   # ── Linux unit tests ────────────────────────────────────────────────
   test-linux:
     name: Linux Unit Tests
+    timeout-minutes: 25
     needs: lint
     runs-on: blacksmith-4vcpu-ubuntu-2404
     steps:
-      - uses: actions/checkout@v5
-      - uses: dtolnay/rust-toolchain@1.95.0
-      - uses: Swatinem/rust-cache@v2
+      - uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5
+        with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@e081816240890017053eacbb1bdf337761dc5582 # 1.95.0
+      - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
 
       - name: Install PipeWire dev libraries
         run: |
@@ -57,28 +106,101 @@ jobs:
       - name: Cargo check
         run: cargo check --lib --no-default-features --features feat_linux
 
+      # Build every target (bin/ + examples/), not just the lib, so demo
+      # binaries and examples are compiled and kept from bit-rotting.
+      - name: Build all targets
+        run: cargo build --all-targets --no-default-features --features feat_linux
+
       - name: Cargo test (unit tests)
-        run: cargo test --lib --no-default-features --features feat_linux -- --test-threads=1
+        run: cargo test --lib --no-default-features --features feat_linux
+
+      # TC-01: ADR-0001's headline alloc-free producer guarantee is proved ONLY
+      # by tests/rt_alloc.rs, which is an integration test and so was never run
+      # by the `--lib` job above. Allocation behaviour can differ per target, so
+      # it runs on every per-OS unit job. It installs a process-wide
+      # #[global_allocator] (CountingAllocator) and must therefore be its OWN
+      # test binary; we pin --test-threads=1 so the global counter is never
+      # perturbed by a parallel test in the same process.
+      - name: Cargo test (rt_alloc — ADR-0001 alloc-free proof)
+        run: cargo test --test rt_alloc --no-default-features --features feat_linux -- --test-threads=1
+
+      # TC-02: the enumeration honest-failure contract (tests/enumeration_matrix.rs)
+      # is device-free / graceful-skip (it asserts non-empty-or-classified-error
+      # and skips the hardware assertions on a headless runner), but it was dead
+      # in CI because the matrix only ran `--lib`. Wire it in per-OS.
+      - name: Cargo test (enumeration_matrix — honest-failure contract)
+        run: cargo test --test enumeration_matrix --no-default-features --features feat_linux
 
   # ── Windows unit tests ──────────────────────────────────────────────
   test-windows:
     name: Windows Unit Tests
+    timeout-minutes: 25
     needs: lint
     runs-on: blacksmith-4vcpu-windows-2025
     steps:
-      - uses: actions/checkout@v5
-      - uses: dtolnay/rust-toolchain@1.95.0
-      - uses: Swatinem/rust-cache@v2
+      - uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5
+        with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@e081816240890017053eacbb1bdf337761dc5582 # 1.95.0
+      - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
 
       - name: Cargo check
         run: cargo check --lib --no-default-features --features feat_windows
 
-      - name: Cargo test (unit tests)
-        # Blacksmith Windows VMs have no audio subsystem (AudioSrv absent).
-        # WASAPI tests that try to open devices will fail. The compilation
-        # check above is the important gate; test failures here are expected.
+      # Build every target (bin/ + examples/), not just the lib.
+      - name: Build all targets
+        run: cargo build --all-targets --no-default-features --features feat_windows
+
+      # TC-07: the Windows unit step used to be continue-on-error on the WHOLE
+      # `cargo test --lib` run, so the ~40 inline wasapi.rs tests + 21 thread.rs
+      # tests + the device-free DeviceWatcher lifecycle tests could regress
+      # without ever gating CI. We now PARTITION the suite exactly like
+      # release.yml's verify job: the platform-independent + non-audio tests
+      # HARD-FAIL here (a real Windows unit regression blocks CI), while ONLY the
+      # device-touching subset (the create_audio_client_* tests in
+      # src/audio/windows/thread.rs, which open a real WASAPI client) is excluded
+      # via --skip and re-run as a tolerated step below. The filter substring
+      # mirrors release.yml's device_test_filter — keep the two in lockstep and
+      # as narrow as possible if device-dependent test names change.
+      # The device-dependent unit tests open a real WASAPI client / default
+      # endpoint / IMMNotificationClient, which need the Windows Audio service
+      # (Audiosrv) + an audio endpoint — both ABSENT on the Blacksmith Windows
+      # runner (AGENTS.md §6), where they fail with RPC-unavailable (0x800706BA)
+      # / service-not-installed (0x80070424). They are partitioned out of the
+      # hard-fail step (via --skip) and re-run as a tolerated step. Everything
+      # NOT in this list (parse_session_identifier, get_process_name_by_pid,
+      # backend_context, data_flow_to_kind, application_session_info, …) is pure
+      # logic and HARD-FAILS, so a real unit regression still gates CI.
+      # DEVICE_SKIPS must stay in lockstep with release.yml's verify job.
+      - name: Cargo test (unit tests, hard-fail)
+        shell: bash
+        run: |
+          DEVICE_SKIPS="--skip enumerate --skip default_device --skip device_enumeration --skip device_id --skip device_supported_formats --skip audio_device_ --skip create_stream --skip find_device --skip watch_ --skip create_audio_client"
+          cargo test --lib --no-default-features --features feat_windows -- --test-threads=1 $DEVICE_SKIPS
+
+      # Device-dependent subset ONLY (the families --skip'd above). Tolerated
+      # because the Blacksmith Windows runner has no audio subsystem; this step
+      # runs ONLY those families, so it can never mask the hard-fail partition.
+      # Mirrors release.yml's tolerated device step — keep the filters in sync.
+      - name: Cargo test (device-dependent tests, tolerated)
         continue-on-error: true
-        run: cargo test --lib --no-default-features --features feat_windows -- --test-threads=1
+        shell: bash
+        run: |
+          for f in enumerate default_device device_enumeration device_id device_supported_formats audio_device_ create_stream find_device watch_ create_audio_client; do
+            cargo test --lib --no-default-features --features feat_windows -- --test-threads=1 "$f" || true
+          done
+
+      # TC-01: ADR-0001 alloc-free producer proof (process-wide allocator, own
+      # binary, single-threaded). Device-free, so it HARD-FAILS like Linux —
+      # an allocation regression on Windows now blocks CI.
+      - name: Cargo test (rt_alloc — ADR-0001 alloc-free proof)
+        shell: bash
+        run: cargo test --test rt_alloc --no-default-features --features feat_windows -- --test-threads=1
+
+      # TC-02: device-free enumeration honest-failure contract (graceful-skip).
+      - name: Cargo test (enumeration_matrix — honest-failure contract)
+        shell: bash
+        run: cargo test --test enumeration_matrix --no-default-features --features feat_windows
 
       - name: Report audio service status
         if: always()
@@ -92,12 +214,15 @@ jobs:
   # ── macOS unit tests ────────────────────────────────────────────────
   test-macos:
     name: macOS Unit Tests
+    timeout-minutes: 25
     needs: lint
     runs-on: blacksmith-6vcpu-macos-15
     steps:
-      - uses: actions/checkout@v5
-      - uses: dtolnay/rust-toolchain@1.95.0
-      - uses: Swatinem/rust-cache@v2
+      - uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5
+        with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@e081816240890017053eacbb1bdf337761dc5582 # 1.95.0
+      - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
 
       - name: Grant audio permissions for CI
         run: |
@@ -124,8 +249,34 @@ jobs:
       - name: Cargo check
         run: cargo check --lib --no-default-features --features feat_macos
 
+      # Build every target (bin/ + examples/), not just the lib.
+      - name: Build all targets
+        run: cargo build --all-targets --no-default-features --features feat_macos
+
+      # TC-03: src/audio/macos/tap.rs has process-tap tests that are NOT
+      # #[ignore]d (e.g. test_new_system_creates_tap at tap.rs:1352 calls
+      # CoreAudioProcessTap::new_system -> AudioHardwareCreateProcessTap, which
+      # the project's own docs note can BLOCK 10+ minutes without a
+      # kTCCServiceAudioCapture grant — unavailable on Blacksmith macOS). The
+      # job-level timeout-minutes: 25 already bounds the worst case, but a
+      # step-level timeout fails THIS step fast (5 min) so a hang surfaces as a
+      # clear failure here rather than eating the whole job budget. The proper
+      # fix is to #[ignore] those tests in src/ — flagged as a follow-up for the
+      # orchestrator since this job may not edit src/.
       - name: Cargo test (unit tests)
-        run: cargo test --lib --no-default-features --features feat_macos -- --test-threads=1
+        timeout-minutes: 5
+        run: cargo test --lib --no-default-features --features feat_macos
+
+      # TC-01: ADR-0001 alloc-free producer proof (process-wide allocator, own
+      # binary, single-threaded). Device-free, so it HARD-FAILS like Linux.
+      - name: Cargo test (rt_alloc — ADR-0001 alloc-free proof)
+        timeout-minutes: 5
+        run: cargo test --test rt_alloc --no-default-features --features feat_macos -- --test-threads=1
+
+      # TC-02: device-free enumeration honest-failure contract (graceful-skip).
+      - name: Cargo test (enumeration_matrix — honest-failure contract)
+        timeout-minutes: 5
+        run: cargo test --test enumeration_matrix --no-default-features --features feat_macos
 
       # OPTION B (existence check): Blacksmith macOS runners lack TCC grants for
       # Process Tap capture (see macos-process job in ci-audio-tests.yml —
@@ -172,14 +323,17 @@ jobs:
   # ── Linux ARM64 cross-compilation check ─────────────────────────────
   cross-compile-linux-arm64:
     name: Linux ARM64 Cross-Compile Check
+    timeout-minutes: 20
     needs: lint
     runs-on: blacksmith-4vcpu-ubuntu-2404
     steps:
-      - uses: actions/checkout@v5
-      - uses: dtolnay/rust-toolchain@1.95.0
+      - uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5
+        with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@e081816240890017053eacbb1bdf337761dc5582 # 1.95.0
         with:
           targets: aarch64-unknown-linux-gnu
-      - uses: Swatinem/rust-cache@v2
+      - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
 
       - name: Install cross-compilation tools
         run: |
@@ -192,52 +346,36 @@ jobs:
 
       - name: Cross-compile check (lib only)
         run: |
-          # For ARM64, we can only check compilation, not link (no ARM64 PipeWire libs)
+          # ARM64 cross-check. We do NOT install :arm64 PipeWire dev packages:
+          # the pipewire-debian PPA does not publish arm64 binaries, so apt
+          # would fail. Instead we run `cargo check` (compile-only, no link) and
+          # turn it into a *real* gate by failing on genuine rustc errors while
+          # tolerating expected link/pkg-config noise. Errors are detected by
+          # grepping the captured output for `error[` / `error:` — a rustc
+          # error there fails the job (unlike the old `|| echo` mask, which
+          # could never fail).
+          set -o pipefail
           echo "Checking ARM64 compilation (library code only, no linking)..."
-          cargo check --lib --no-default-features --features feat_linux --target aarch64-unknown-linux-gnu 2>&1 || echo "ARM64 cross-check completed with expected linker warnings"
-
-  # ── Audio-graph downstream compile check ─────────────────────────────
-  # The audio-graph Tauri app is the primary in-tree consumer of rsac.
-  # Without this gate, a breaking rsac API change lands clean in this repo
-  # and surfaces only when someone bumps the audio-graph submodule pointer.
-  # Compile-check only (no tests) to keep CI fast — audio-graph's own
-  # workflow runs the full test suite.
-  check-audio-graph:
-    name: Downstream (audio-graph)
-    needs: lint
-    runs-on: blacksmith-4vcpu-ubuntu-2404
-    steps:
-      - uses: actions/checkout@v5
-        with:
-          submodules: recursive
-
-      - uses: dtolnay/rust-toolchain@1.95.0
-      - uses: Swatinem/rust-cache@v2
-        with:
-          workspaces: apps/audio-graph/src-tauri
-
-      - name: Install system dependencies (rsac + Tauri)
-        run: |
-          sudo add-apt-repository ppa:pipewire-debian/pipewire-upstream -y
-          sudo apt-get update
-          sudo apt-get install -y \
-            libpipewire-0.3-dev libspa-0.2-dev \
-            libwebkit2gtk-4.1-dev libgtk-3-dev libayatana-appindicator3-dev \
-            librsvg2-dev cmake clang libclang-dev pkg-config
-
-      - name: Cargo check (audio-graph against this rsac)
-        working-directory: apps/audio-graph/src-tauri
-        run: cargo check
+          cargo check --lib --no-default-features --features feat_linux \
+            --target aarch64-unknown-linux-gnu 2>&1 | tee arm64-check.log || true
+          if grep -E 'error(\[|:)' arm64-check.log; then
+            echo "FAIL: rustc reported compilation errors for aarch64-unknown-linux-gnu"
+            exit 1
+          fi
+          echo "OK: ARM64 cross-check produced no rustc compilation errors"
 
   # ── Binding crates compilation check ─────────────────────────────────
   check-bindings:
     name: Binding Crates
+    timeout-minutes: 20
     needs: lint
     runs-on: blacksmith-4vcpu-ubuntu-2404
     steps:
-      - uses: actions/checkout@v5
-      - uses: dtolnay/rust-toolchain@1.95.0
-      - uses: Swatinem/rust-cache@v2
+      - uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5
+        with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@e081816240890017053eacbb1bdf337761dc5582 # 1.95.0
+      - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
 
       - name: Install PipeWire dev libraries
         run: |
@@ -248,6 +386,82 @@ jobs:
       - name: Check rsac-ffi (C FFI)
         run: cargo check -p rsac-ffi
 
+      # rsac-3e24: clippy the binding crates under -D warnings. The root lint job
+      # only lints the workspace default member (feat_<os>), so binding-crate
+      # clippy errors (e.g. manual_is_multiple_of, type_complexity) previously
+      # reached CI only as a `cargo check` pass. Lint all three to the same bar.
+      - name: Clippy binding crates (-D warnings)
+        env:
+          PYO3_USE_ABI3_FORWARD_COMPATIBILITY: "1"
+        run: |
+          cargo clippy -p rsac-ffi --all-targets -- -D warnings
+          cargo clippy -p rsac-napi --all-targets -- -D warnings
+          cargo clippy -p rsac-python --all-targets -- -D warnings
+
+      # rsac-1413 / BP-5: the curated include/rsac.h (which rsac-go links against)
+      # must never silently drift from the cbindgen-generated twin. build.rs runs
+      # cbindgen on every build and writes include/rsac_generated.h. Here we build
+      # rsac-ffi to (re)generate that twin, then diff its SYMBOL SET — every
+      # typedef/struct/enum type name plus every exported `rsac_*` function name —
+      # against the curated header. We compare the symbol SET, not the byte stream,
+      # so the headers may legitimately differ in layout, doc comments, and the
+      # tagged-vs-anonymous typedef style (`typedef enum X {…} X;` vs
+      # `typedef enum {…} X;`) — only a genuinely added / renamed / removed symbol
+      # fails the job. A failure means: regenerate rsac_generated.h, then update the
+      # curated rsac.h (NEVER point cbindgen --output at rsac.h).
+      - name: Header drift check (curated rsac.h vs generated)
+        shell: bash
+        run: |
+          set -euo pipefail
+          # build.rs runs cbindgen and writes include/rsac_generated.h.
+          cargo build -p rsac-ffi
+          cd bindings/rsac-ffi/include
+
+          CURATED="rsac.h"
+          GENERATED="rsac_generated.h"
+          for h in "$CURATED" "$GENERATED"; do
+            [ -f "$h" ] || { echo "::error::expected header $h not found"; exit 1; }
+          done
+
+          # Extract the canonical symbol set from a C header:
+          #   • value typedefs   ->  trailing "} NAME;"  (enum/struct, either style)
+          #   • opaque typedefs  ->  "typedef struct X NAME;"
+          #   • fn-ptr typedefs  ->  "(*NAME)("
+          #   • exported fns     ->  "rsac_<name>("
+          # This is style-tolerant: a tagged `typedef enum X {…} X;` and an
+          # anonymous `typedef enum {…} X;` both reduce to the name `X`.
+          symbols() {
+            local f="$1"
+            {
+              grep -oE '^\}[[:space:]]*[A-Za-z_][A-Za-z0-9_]*[[:space:]]*;' "$f" \
+                | sed -E 's/^\}[[:space:]]*//; s/[[:space:]]*;//'
+              grep -oE 'typedef[[:space:]]+struct[[:space:]]+[A-Za-z_][A-Za-z0-9_]*[[:space:]]+[A-Za-z_][A-Za-z0-9_]*[[:space:]]*;' "$f" \
+                | sed -E 's/.*[[:space:]]([A-Za-z_][A-Za-z0-9_]*)[[:space:]]*;/\1/'
+              grep -oE '\(\*[A-Za-z_][A-Za-z0-9_]*\)' "$f" | sed -E 's/\(\*//; s/\)//'
+              grep -oE '\brsac_[A-Za-z0-9_]*\(' "$f" | sed -E 's/\($//'
+            } | sort -u
+          }
+
+          symbols "$CURATED" > curated-symbols.txt
+          symbols "$GENERATED" > generated-symbols.txt
+
+          echo "curated  symbols: $(wc -l < curated-symbols.txt)"
+          echo "generated symbols: $(wc -l < generated-symbols.txt)"
+
+          # Guard against an extractor that silently matched nothing.
+          if [ ! -s curated-symbols.txt ] || [ ! -s generated-symbols.txt ]; then
+            echo "::error::symbol extraction yielded an empty set — the header format may have changed; fix the extractor in ci.yml"
+            exit 1
+          fi
+
+          if ! diff -u curated-symbols.txt generated-symbols.txt; then
+            echo "::error::cbindgen-generated header symbol set has DRIFTED from the curated include/rsac.h."
+            echo "::error::'-' lines are only in curated rsac.h; '+' lines are only in generated rsac_generated.h."
+            echo "::error::Reconcile: regenerate rsac_generated.h, then update the curated rsac.h to match (NEVER cbindgen --output rsac.h)."
+            exit 1
+          fi
+          echo "OK: curated rsac.h and generated rsac_generated.h share an identical symbol set ($(wc -l < curated-symbols.txt) symbols)."
+
       - name: Check rsac-napi (Node.js/TypeScript)
         run: cargo check -p rsac-napi
 
@@ -255,3 +469,339 @@ jobs:
         env:
           PYO3_USE_ABI3_FORWARD_COMPATIBILITY: "1"
         run: cargo check -p rsac-python
+
+  # ── Go bindings: build the FFI staticlib + run device-free tests ─────
+  # rsac-go links librsac_ffi.a (built by bindings/rsac-go/Makefile) via cgo.
+  # This matrix builds that staticlib natively on each platform and runs
+  # `make test-pure` (the no-audio-device logic tests), so the cgo link +
+  # the Go wrappers stay green across linux/windows/macos. Windows uses the
+  # *-pc-windows-gnu toolchain because cgo links through MinGW gcc, which
+  # consumes the GNU-archive .a (an MSVC .lib would not link). (rsac-9728)
+  go-bindings:
+    name: Go Bindings (${{ matrix.os }})
+    timeout-minutes: 25
+    needs: lint
+    strategy:
+      fail-fast: false
+      matrix:
+        os:
+          - blacksmith-4vcpu-ubuntu-2404
+          - blacksmith-4vcpu-windows-2025
+          - blacksmith-6vcpu-macos-15
+    runs-on: ${{ matrix.os }}
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5
+        with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@e081816240890017053eacbb1bdf337761dc5582 # 1.95.0
+      - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
+      - uses: actions/setup-go@41dfa10bad2bb2ae585af6ee5bb4d7d973ad74ed # v5
+        with:
+          go-version: '1.22'
+
+      - name: Install PipeWire dev libraries (Linux)
+        if: runner.os == 'Linux'
+        run: |
+          sudo add-apt-repository ppa:pipewire-debian/pipewire-upstream -y
+          sudo apt-get update
+          sudo apt-get install -y libpipewire-0.3-dev libspa-0.2-dev pkg-config libclang-dev
+
+      # cgo links through MinGW gcc on Windows, which needs the GNU .a — so the
+      # FFI crate must be built for the *-pc-windows-gnu target. Add it here.
+      - name: Add windows-gnu Rust target (Windows)
+        if: runner.os == 'Windows'
+        run: rustup target add x86_64-pc-windows-gnu
+
+      # Build the FFI staticlib + run the Go-only (device-free) logic tests.
+      # `make test-pure` builds rsac-ffi (release) and runs the no-device test
+      # subset; the cgo link exercises every new FFI symbol.
+      - name: Build FFI staticlib + run Go device-free tests
+        working-directory: bindings/rsac-go
+        run: make test-pure
+
+      - name: go vet
+        working-directory: bindings/rsac-go
+        run: |
+          CGO_ENABLED=1 \
+          CGO_LDFLAGS="-L$(pwd)/lib -lrsac_ffi" \
+          go vet ./...
+
+  # ── Go ARM64 cross-compile check (staticlib only) ────────────────────
+  # The pipewire-debian PPA publishes no arm64 binaries, so a full aarch64
+  # link+test is not possible here (matching cross-compile-linux-arm64).
+  # We compile-check the FFI staticlib for aarch64 so the Go-linked artifact
+  # does not bit-rot on ARM; full ARM Go tests run on native ARM elsewhere.
+  go-bindings-arm64-check:
+    name: Go Bindings ARM64 Staticlib Check
+    timeout-minutes: 20
+    needs: lint
+    runs-on: blacksmith-4vcpu-ubuntu-2404
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5
+        with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@e081816240890017053eacbb1bdf337761dc5582 # 1.95.0
+        with:
+          targets: aarch64-unknown-linux-gnu
+      - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
+
+      - name: Install cross toolchain + host PipeWire dev libs
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y gcc-aarch64-linux-gnu g++-aarch64-linux-gnu
+          sudo add-apt-repository ppa:pipewire-debian/pipewire-upstream -y
+          sudo apt-get update
+          sudo apt-get install -y libpipewire-0.3-dev libspa-0.2-dev pkg-config libclang-dev
+
+      - name: Cross-compile rsac-ffi staticlib (aarch64, compile-only)
+        run: |
+          # Compile-only check (no arm64 PipeWire link libs in the PPA). A real
+          # rustc error fails the job; expected link/pkg-config noise is ignored.
+          set -o pipefail
+          cargo build -p rsac-ffi --release \
+            --target aarch64-unknown-linux-gnu 2>&1 | tee go-arm64.log || true
+          if grep -E 'error(\[|:)' go-arm64.log; then
+            echo "FAIL: rustc reported errors building rsac-ffi for aarch64"
+            exit 1
+          fi
+          echo "OK: aarch64 rsac-ffi staticlib produced no rustc compilation errors"
+
+  # ── Feature-combo compile + doctests (Linux) ────────────────────────
+  # The async-stream / sink-wav / test-utils features are not exercised by
+  # any other job (they're off in the default --features feat_<platform>
+  # runs), so they can silently bit-rot. This job compiles them together and
+  # runs the doctests, which are otherwise never executed in CI.
+  feature-combo-doctests:
+    name: Feature Combo + Doctests (Linux)
+    timeout-minutes: 20
+    needs: lint
+    runs-on: blacksmith-4vcpu-ubuntu-2404
+    steps:
+      - uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5
+        with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@e081816240890017053eacbb1bdf337761dc5582 # 1.95.0
+      - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
+
+      - name: Install PipeWire dev libraries
+        run: |
+          sudo add-apt-repository ppa:pipewire-debian/pipewire-upstream -y
+          sudo apt-get update
+          sudo apt-get install -y libpipewire-0.3-dev libspa-0.2-dev pkg-config
+
+      - name: Check feature combination (async-stream + sink-wav + test-utils)
+        run: cargo check --no-default-features --features feat_linux,async-stream,sink-wav,test-utils
+
+      # rsac-3e24: clippy the optional features under -D warnings. The root lint
+      # job lints only feat_<os>, so a lint that fires solely under bridge-zerocopy
+      # (e.g. drop_non_drop on the SampleRing path) never gated CI. Lint the full
+      # optional-feature set + bridge-zerocopy here.
+      - name: Clippy optional features (-D warnings)
+        run: |
+          cargo clippy --all-targets --no-default-features --features feat_linux,async-stream,sink-wav,test-utils -- -D warnings
+          cargo clippy --all-targets --no-default-features --features feat_linux,bridge-zerocopy -- -D warnings
+
+      - name: Run doctests
+        # Build doctests with the same feature set so doc examples that touch
+        # async-stream / sink-wav APIs are exercised too.
+        run: cargo test --doc --no-default-features --features feat_linux,async-stream,sink-wav,test-utils
+
+  # ── docs.rs render gate (cargo doc) ─────────────────────────────────
+  # rsac L14(b): Cargo.toml carries a [package.metadata.docs.rs] block
+  # (all-features = true, rustdoc-args = ["--cfg", "docsrs"]) but nothing in
+  # CI exercised it, so a broken intra-doc link or a `#[cfg_attr(docsrs, …)]`
+  # mistake would only surface as a RED docs.rs build *after* publish. This job
+  # reproduces the docs.rs invocation as closely as a single Linux runner can:
+  #   • --all-features matches docs.rs `all-features = true`. The macOS/Windows
+  #     backends are gated `all(target_os = "X", feature = "feat_X")`, so on a
+  #     Linux runner they stay cfg-disabled even with every feature on — only
+  #     the Linux backend + the non-platform features (async-stream, sink-wav,
+  #     test-utils) are documented here. (Per-OS rendering is docs.rs's job.)
+  #   • RUSTDOCFLAGS="--cfg docsrs -D warnings" turns broken-doc-link / bad-doc
+  #     warnings into a hard failure and enables the `docsrs` cfg the metadata
+  #     block sets, so `#[cfg_attr(docsrs, doc(...))]` annotations are exercised.
+  docs:
+    name: Docs (cargo doc, docs.rs config)
+    timeout-minutes: 20
+    needs: lint
+    runs-on: blacksmith-4vcpu-ubuntu-2404
+    steps:
+      - uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5
+        with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@e081816240890017053eacbb1bdf337761dc5582 # 1.95.0
+      - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
+
+      - name: Install PipeWire dev libraries
+        run: |
+          sudo add-apt-repository ppa:pipewire-debian/pipewire-upstream -y
+          sudo apt-get update
+          sudo apt-get install -y libpipewire-0.3-dev libspa-0.2-dev pkg-config
+
+      - name: cargo doc (no-deps, all-features, docs.rs flags)
+        env:
+          RUSTDOCFLAGS: "--cfg docsrs -D warnings"
+        run: cargo doc --no-deps --all-features
+
+  # ── Supply-chain audit (cargo-deny) ─────────────────────────────────
+  # cargo-deny is chosen over cargo-audit because it covers advisories AND
+  # license compliance, banned/duplicate crates, and source registries in a
+  # single declarative config (deny.toml at the repo root). The initial
+  # deny.toml is conservative: hard-fail on security advisories + disallowed
+  # licenses, warn-only on duplicate versions so a benign version skew doesn't
+  # break CI on day one.
+  # ── Module-DAG reverse-edge guard (DAG-004) ─────────────────────────
+  # Enforce the layering invariant core -> bridge -> audio -> api -> lib by
+  # failing on any NEW reverse import edge (e.g. core importing crate::audio).
+  # The one known, tracked exception (core/introspection.rs -> crate::audio for
+  # cross-platform enumeration) is allowlisted inside the script. No toolchain
+  # needed — it is a pure ripgrep/grep source scan.
+  module-dag:
+    name: Module DAG (reverse-edge guard)
+    timeout-minutes: 5
+    needs: lint
+    runs-on: blacksmith-4vcpu-ubuntu-2404
+    steps:
+      - uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5
+        with:
+          persist-credentials: false
+      - name: Check for reverse module-DAG edges
+        run: bash scripts/check-module-dag.sh
+      # CI-5 regression guard: prove the scanner still FLAGS a deliberate
+      # core->audio reverse edge (catches the guard silently degrading to a
+      # false-negative, e.g. a pattern that misses a bare `use crate::audio;`).
+      - name: Self-test the module-DAG guard
+        run: bash scripts/check-module-dag.sh --self-test
+
+  supply-chain:
+    name: Supply Chain (cargo-deny)
+    timeout-minutes: 20
+    needs: lint
+    runs-on: blacksmith-4vcpu-ubuntu-2404
+    steps:
+      - uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5
+        with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@e081816240890017053eacbb1bdf337761dc5582 # 1.95.0
+      - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
+
+      - name: Install cargo-deny
+        uses: taiki-e/install-action@0fd46367812ee04360509b4169d9f659d6892bb2 # v2
+        with:
+          tool: cargo-deny
+
+      - name: Run cargo-deny
+        run: cargo deny check advisories bans licenses sources
+
+  # ── Version lockstep guard (rsac + 4 bindings) ──────────────────────
+  # Enforces the versioning/ABI contract documented in
+  # docs/RELEASE_PROCESS.md §"Versioning & ABI contract":
+  # rsac and every publishable binding manifest bump in lockstep on a
+  # semver tag. This job extracts the [package].version of the root crate
+  # and the four binding manifests (rsac-ffi/rsac-napi/rsac-python +
+  # rsac-napi/package.json + rsac-python/pyproject.toml) and asserts they
+  # all agree.
+  #
+  #   • On a `vX.Y.Z` tag push it ALSO asserts every version equals the
+  #     tag (minus the leading `v`) and HARD-FAILS on any divergence — a
+  #     mismatched manifest must never reach a registry. This is the
+  #     "CI check that fails if versions diverge from the release tag"
+  #     required by the contract.
+  #   • On ordinary pushes / PRs it only WARNS (via ::warning::) so a
+  #     deliberate mid-cycle skew (e.g. a binding lagging behind the root
+  #     crate between releases) does not block day-to-day CI. The hard
+  #     gate runs at tag time, which is the point of no return.
+  version-lockstep:
+    name: Version Lockstep (rsac + bindings)
+    timeout-minutes: 5
+    needs: lint
+    runs-on: blacksmith-4vcpu-ubuntu-2404
+    steps:
+      - uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5
+        with:
+          persist-credentials: false
+
+      - name: Check rsac + binding versions are in lockstep
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          # Extract the first `version = "X.Y.Z"` inside the [package] /
+          # [project] section of a TOML manifest. Mirrors the extractor in
+          # scripts/bump-version.sh so the two stay in agreement.
+          toml_pkg_version() {
+            awk '
+              /^\[package\][[:space:]]*$/ || /^\[project\][[:space:]]*$/ { in_sec = 1; next }
+              /^\[/ { if ($0 !~ /^\[(package|project)\][[:space:]]*$/) in_sec = 0 }
+              in_sec && /^[[:space:]]*version[[:space:]]*=[[:space:]]*"[^"]+"[[:space:]]*$/ {
+                match($0, /"[^"]+"/); print substr($0, RSTART + 1, RLENGTH - 2); exit
+              }
+            ' "$1"
+          }
+          # Top-level (2-space indent) "version" key of a package.json.
+          json_top_version() {
+            awk '
+              /^  "version"[[:space:]]*:[[:space:]]*"[^"]+"[[:space:]]*,?[[:space:]]*$/ {
+                colon = index($0, ":"); rest = substr($0, colon + 1)
+                match(rest, /"[^"]+"/); print substr(rest, RSTART + 1, RLENGTH - 2); exit
+              }
+            ' "$1"
+          }
+
+          declare -A V
+          V[Cargo.toml]=$(toml_pkg_version Cargo.toml)
+          V[bindings/rsac-ffi/Cargo.toml]=$(toml_pkg_version bindings/rsac-ffi/Cargo.toml)
+          V[bindings/rsac-napi/Cargo.toml]=$(toml_pkg_version bindings/rsac-napi/Cargo.toml)
+          V[bindings/rsac-napi/package.json]=$(json_top_version bindings/rsac-napi/package.json)
+          V[bindings/rsac-python/Cargo.toml]=$(toml_pkg_version bindings/rsac-python/Cargo.toml)
+          V[bindings/rsac-python/pyproject.toml]=$(toml_pkg_version bindings/rsac-python/pyproject.toml)
+
+          echo "Discovered versions:"
+          for f in "${!V[@]}"; do
+            printf '  %-42s %s\n' "$f" "${V[$f]:-<none>}"
+            if [ -z "${V[$f]:-}" ]; then
+              echo "::error::could not extract a version from $f"
+              exit 1
+            fi
+          done
+
+          ROOT="${V[Cargo.toml]}"
+          DIVERGED=0
+          for f in "${!V[@]}"; do
+            if [ "${V[$f]}" != "$ROOT" ]; then
+              DIVERGED=1
+              echo "DIVERGENCE: $f is ${V[$f]}, root Cargo.toml is $ROOT"
+            fi
+          done
+
+          # rsac-go has no version field — releases are tagged
+          # bindings/rsac-go/vX.Y.Z (see docs/RELEASE_PROCESS.md). Nothing
+          # to compare in-tree; recorded here so the absence is intentional.
+          echo "note: rsac-go carries no manifest version (tagged out-of-band as bindings/rsac-go/vX.Y.Z)"
+
+          if [[ "${GITHUB_REF:-}" == refs/tags/v* ]]; then
+            TAG_VERSION="${GITHUB_REF#refs/tags/v}"
+            echo "release tag detected: v${TAG_VERSION} — enforcing lockstep + tag match"
+            FAIL=0
+            for f in "${!V[@]}"; do
+              if [ "${V[$f]}" != "$TAG_VERSION" ]; then
+                FAIL=1
+                echo "::error::$f version ${V[$f]} does not match release tag v${TAG_VERSION}"
+              fi
+            done
+            if [ "$FAIL" -ne 0 ]; then
+              echo "::error::version lockstep violated on release tag — refusing to proceed"
+              exit 1
+            fi
+            echo "OK: all manifests match release tag v${TAG_VERSION}"
+          elif [ "$DIVERGED" -ne 0 ]; then
+            echo "::warning::rsac + binding versions are not in lockstep (see above). This only HARD-FAILS on a release tag; bump every manifest to match before tagging (scripts/bump-version.sh)."
+          else
+            echo "OK: rsac + all bindings agree at $ROOT"
+          fi

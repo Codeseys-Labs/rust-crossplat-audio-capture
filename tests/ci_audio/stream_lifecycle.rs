@@ -5,6 +5,8 @@
 
 use rsac::{AudioCaptureBuilder, CaptureTarget};
 
+use crate::helpers;
+
 #[test]
 fn test_stream_start_read_stop() {
     require_system_capture!();
@@ -53,28 +55,12 @@ fn test_stream_start_read_stop() {
 
                 // Property assertions layered on top of the no-panic backbone.
                 // Goal: catch silent-wrong-output regressions (bogus-but-well-
-                // formed buffers) without breaking CI on heterogeneous audio
-                // hardware — we only assert if a buffer actually came back.
-                assert_eq!(
-                    buf.sample_rate(),
-                    expected_sample_rate,
-                    "Buffer sample_rate must match the value configured on the builder"
-                );
-                assert_eq!(
-                    buf.channels(),
-                    expected_channels,
-                    "Buffer channels must match the value configured on the builder"
-                );
-                assert_eq!(
-                    buf.num_frames() * buf.channels() as usize,
-                    buf.data().len(),
-                    "Interleaved data length must equal num_frames * channels \
-                     (rate={}, channels={}, frames={}, data.len={})",
-                    buf.sample_rate(),
-                    buf.channels(),
-                    buf.num_frames(),
-                    buf.data().len()
-                );
+                // formed buffers) without breaking on heterogeneous audio
+                // hardware. rsac does not resample, so the delivered format
+                // equals the *request* only under a deterministic source;
+                // elsewhere we assert self-consistency. See
+                // `helpers::assert_buffer_format`.
+                helpers::assert_buffer_format(&buf, expected_sample_rate, expected_channels);
             }
             Ok(None) => {
                 std::thread::sleep(std::time::Duration::from_millis(10));

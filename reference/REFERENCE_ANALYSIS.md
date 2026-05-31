@@ -925,3 +925,146 @@ This maps directly to rsac's `PlatformCapabilities` struct — each cell becomes
 9. **`Stream: Send` should be enforced at compile time** (like cpal's `assert_stream_send!()` macro). `CapturingStream` must be movable between threads.
 
 10. **Format handling**: Use f32 internally everywhere. Convert in the OS callback thread before pushing to rtrb. The autoconvert flags on Windows and format negotiation on PipeWire/CoreAudio handle OS-side conversion.
+
+
+---
+
+## Reference Delta & Unadopted Techniques (2026-05-29)
+
+This section appends per-repo NEW unadopted techniques and upstream-vs-pinned deltas mined from the vendored submodules. rsac is **capture-only** (no mixing/resampling/encoding/playback/effects/VAD/AEC). Techniques crossing that line are tagged INFORMATIONAL ONLY.
+
+### wasapi-rs (pinned `wasapi = 0.22.0` → submodule now `0.23.0`)
+
+**Upstream delta (0.22.0 → 0.23.0):**
+- Memory safety: `WaveFormat::parse_from_blob_bytes()` reads `WAVEFORMATEXTENSIBLE` from byte-aligned device property blobs via `read_unaligned()`, fixing UB vs. the old aligned-reference cast (`waveformat.rs:92-118`).
+- Pointer safety: `std::ptr::from_mut`/`std::ptr::from_ref` replace manual `as` casts for const-correctness (`api.rs:706-717`).
+- COM cleanup: `AudioEffectsManager::get_audio_effects()` now `CoTaskMemFree`s a non-null buffer even when `num_effects==0` (`api.rs:1865-1877`).
+- New APIs (Win11+): `AudioEffectsManager` + `AcousticEchoCancellationControl` (`api.rs:1849-1913`); `AudioClientProperties` builder + `StreamOption` enum (Raw/MatchFormat/Ambisonics) (`api.rs:1290-1465`); generic `GetService<T>()` interface resolution (`api.rs:1215-1225`).
+- **MSRV bump 1.74 → 1.76** (commit `75d017a`). rsac is `edition = "2021"` with no `rust-version` pin — adopting 0.23 forces an MSRV declaration.
+- Transitive bumps: `log 0.4`, `thiserror 2.0`, `sysinfo 0.38`, `rand 0.10`. No public-API breaks.
+
+**NEW unadopted techniques relevant to rsac (capture-only):**
+- `parse_from_blob_bytes()` (`waveformat.rs:92-118`) — adopt the safe-parse pattern in any rsac path that reads `WAVEFORMATEX` from a device blob; setup-time only, RT-irrelevant. *Relevance:* `WindowsDeviceEnumerator` format discovery.
+- `std::ptr::from_mut`/`from_ref` (`api.rs:706-717`) — audit `WindowsCaptureThread` + device enumeration unsafe casts. *Relevance:* RT-callback pointer hygiene; preferred where any unsafe touches audio buffers.
+- `StreamOption`/`AudioClientProperties` builder (`api.rs:1290-1465`) — rsac hardcodes shared-mode format/flags; `Raw` (AEC-free capture) and `MatchFormat` are legitimately *capture-relevant* config knobs (NOT effects processing). *Relevance:* `create_audio_client()` format negotiation; medium effort.
+- `AudioEffectsManager` / AEC (`api.rs:1849-1913`) — **INFORMATIONAL ONLY**, out of scope (effects/AEC). Could at most inform a future read-only "OS effects present" capability hint; do not wire control.
+- `GetService<T>()` generic pattern (`api.rs:1215-1225`) — INFORMATIONAL; only if rsac ever exposes additional optional WASAPI interfaces.
+
+### camilladsp (`v4.1.3`; rsac references v3)
+
+**Upstream delta:** `wasapi-rs` still 0.22.0 (matches rsac); `windows 0.62.0` (rsac 0.62.2, compatible); uses `ringbuf 0.4.7` (rsac uses `rtrb 0.3.3` — different SPSC lib). v4 adds Bluez/DBus device-change + PipeWire 0.3.44+ features; Windows WASAPI backend stable, no breaking changes.
+
+**NEW unadopted techniques (capture-relevant):**
+- Multi-format fallback chain S32→S24→S16→F32 (`wasapi_backend/device.rs:278-301`) — probe on rejection instead of hard-failing on hardcoded f32. *Relevance:* `src/audio/windows/wasapi.rs create_audio_client()`; small.
+- Exclusive-mode period alignment `calculate_aligned_period_near()` (`device.rs:333-334,408-409`) — rsac's exclusive stub doesn't align to the hardware quantum. *Relevance:* `wasapi.rs`; small.
+- Session notification callbacks for disconnect/format-change (`device.rs:481-492,615-626`) — `DisconnectReason::FormatChange` vs `Error` to trigger clean restart vs. retry; rsac's `wasapi_capture_thread_main()` has none and can hang on disconnect. *Relevance:* `src/audio/windows/thread.rs`; medium. **Callback must only send an enum to a bounded channel — no alloc/lock on the WASAPI thread.**
+- Sample-rate drift detection via `ValueWatcher` (`device.rs:1266,1408-1425`) — surface drift as diagnostics/`StreamStats`, NOT resample (capture-only). *Relevance:* metadata/log; medium.
+- Silence/stall state machine `SilenceCounter` (`device.rs:1272,1443-1461`) — Running/Paused/Stalled/Inactive distinguishes intentional silence from a broken stream. *Relevance:* `StreamStats`; medium.
+- Polling fallback with `poll_delay = device_period_hns/10` (`device.rs:682-708`) — robustness when `set_get_eventhandle()` fails on buggy drivers; rsac is event-driven only. *Relevance:* `src/audio/windows/thread.rs`; medium.
+- Channel-capacity scaling from device period (`device.rs:837-840,1190-1195`) — rsac's `calculate_capacity()` uses a flat multiplier. *Relevance:* `src/bridge/mod.rs`; small.
+- RT-priority boost via `audio_thread_priority` on capture thread with graceful fallback (`device.rs:643-652,1285-1296`) — rsac's Windows thread does no RT promotion. *Relevance:* new dep + `thread.rs`; small.
+- INFORMATIONAL ONLY: PI rate-controller for playback feedback (`device.rs:984-994`) — playback, out of scope.
+
+### wiremix (TUI PipeWire mixer)
+
+**Upstream delta:** `pipewire 0.9.2` + `libspa 0.9.2` (`v0_3_44`) — exact match to rsac. `nix 0.29.0` (eventfd), `pulp 0.22.2` (SIMD). `bytemuck::cast_slice` for zero-copy conversion (rsac already uses). No version pressure; wiremix is a production reference for the APIs rsac depends on but doesn't fully exploit.
+
+**NEW unadopted techniques (capture-relevant):**
+- Native registry listeners + deferred GC via `EventFd` (`session.rs:312-451`, `proxy_registry.rs`, `stream_registry.rs`) — replaces rsac's `pw-dump` subprocess enumeration with in-process live tracking; deferred deletion avoids callback re-entrancy. *Relevance:* `src/audio/linux/mod.rs`, `thread.rs`; large. (See backlog PR-1.)
+- `media.class` predicates `is_sink/is_source/is_sink_input/is_source_output` (`media_class.rs:1-18`, `node.rs:20-35`) — cleaner than substring-parsing pw-dump JSON. *Relevance:* `parse_pw_dump_nodes`; small.
+- `PropertyStore` metadata extraction (`property_store.rs`, `node.rs:89-94`) — populate richer `DeviceInfo`/app metadata without parsing. *Relevance:* `src/core/interface.rs DeviceInfo`; small.
+- `AtomicF32` peak metering in `process()` + `Arc<[AtomicF32]>` share-to-UI (`atomic_f32.rs:1-48`, `stream.rs:209-234`) — RT-safe level metrics; skip first (zero) buffer. *Relevance:* metering; metering is read-only metadata (in scope), but rsac's RMS/peak belongs on `AudioBuffer` consumer-side (UX-1), not necessarily in the callback.
+- `pulp::Arch` SIMD peak (`stream.rs:59-86`) — portable vectorized abs/max, no NEON/SSE branches. *Relevance:* only if metering moves into the callback.
+- `default`-metadata monitoring for default sink/source changes (`metadata.rs:1-58`) — live default-device-change events without `pw-metadata`. *Relevance:* `get_pipewire_default_device`; medium.
+- `pipewire::channel` for loop-integrated commands (`session.rs:53-66`) vs rsac's `std::mpsc` + manual pump. *Relevance:* `thread.rs PipeWireCommand`; small.
+- `EventFd`-based shutdown signaling (`session.rs:50-103`). *Relevance:* `thread.rs` shutdown; small.
+
+### pipewire-rs (`0.9.2`, matches rsac)
+
+**Upstream delta:** rsac pin `0.9.2` is current; upstream exposes feature flags `v0_3_44..v0_3_57` (+ `v1_1` in dev). `v0.3.50` adds `Time::buffered/queued_buffers/avail_buffers`. API stable, no breaking changes across 0.9.x. rsac uses only `v0_3_44`.
+
+**NEW unadopted techniques (capture-relevant):**
+- In-process `Registry::add_listener_local` discovery (`registry/mod.rs:67-72`) — replaces `pw-dump`/`pw-cli` subprocess enumeration. *Relevance:* `LinuxDeviceEnumerator`; large. (PR-1.)
+- `Metadata::add_listener_local` default sink/source proxy (`metadata.rs:46-95`) — in-process default discovery + change notifications vs `pw-metadata`. *Relevance:* `get_pipewire_default_device`; medium.
+- `Node::subscribe_params`/`enum_params` format-capability enumeration (`node.rs:41-90`) — build a real Linux `supported_formats()` list. *Relevance:* `src/audio/linux`; medium (note: PR-5 — proxy machinery is currently unused; `_registry` discarded at `thread.rs:887`).
+- `state_changed` callback (`stream/mod.rs:25-52,410`) — Error/Unconnected/Connecting/Paused/Streaming transitions for disconnect detection. *Relevance:* `thread.rs CaptureStreamData`; small.
+- `format_utils::parse_format()` + `AudioInfoRaw::parse()` (`format_utils.rs:13-34`) — safe POD format parsing vs manual extraction. *Relevance:* `param_changed`; small.
+- `drained` callback (`stream/mod.rs:418`) — graceful EOF for record-to-EOF. *Relevance:* `CapturingStream` flush semantics; small.
+- `MainLoopRc::downgrade()`/`upgrade()` weak refs in callbacks (`pw-mon.rs:62-75`). *Relevance:* `thread.rs` listener user_data; small.
+- `AttachedReceiver::deattach()` (`channel.rs:119-138`) — pause/resume listening without recreation. *Relevance:* start/stop caching; medium.
+- INFORMATIONAL: `io_changed`/`control_info`/`Stream::time()` (`stream/mod.rs:54-140,382-413`) — buffer/latency/position metadata; useful for timestamping but currently no rsac consumer.
+
+### obs-pipewire-audio-capture (C; vendored at HEAD, no canonical upstream)
+
+**Upstream delta:** No version churn — uses stable PipeWire 0.3.x registry/metadata/`spa_io_position` APIs. No breaking changes vs rsac's `pipewire-rs 0.9.2`; techniques adoptable without a version bump.
+
+**NEW unadopted techniques (capture-relevant):**
+- Registry-driven node discovery + virtual null-sink + dynamic link management for multi-app capture (`pipewire-audio-capture-app.c:705-810,504-535`) — unblocks `ApplicationByName`/`ProcessTree` multi-app. *Relevance:* large; foundational for future multi-source.
+- Metadata listener for default-sink changes + virtual-sink recreation (`:659-701`). *Relevance:* device hot-swap for `SystemDefault`; medium.
+- Case-insensitive multi-field app matching (binary, app_name, node_name, client metadata) with invert/"except" mode (`:285-310,161-180`) — reduces "app not found" when binary lives only on the client. *Relevance:* `ApplicationByName`; small.
+- Explicit `PW_KEY_AUDIO_CHANNEL` port→channel mapping (`:326-375`) — correct FL/FR/LFE alignment for multi-app linking. *Relevance:* future multi-app fidelity; small.
+- `spa_io_position.clock.rate_diff` timestamp calc (`pipewire-audio.c:204-215`) + `on_io_changed` to obtain `spa_io_position` (`:249-258`) — rsac currently leaves Linux `AudioBuffer.timestamp = None`. *Relevance:* timestamping foundation; small. **NOTE: rsac's `param_changed` exists but `on_io_changed` is missing — prerequisite for any timestamping.**
+- Deferred per-port registration + auto-link on new port (`:228-276,756-760`) — handles apps that add/remove ports (Zoom call start/end). *Relevance:* multi-app reliability; medium.
+- Pre-disconnect stream-state validation (`pipewire-audio-capture-device.c:67-90`) — idempotent teardown. *Relevance:* `LinuxPlatformStream::stop_capture`; small.
+- Format preference list (F32P, U8, S16, S32, ...) (`pipewire-audio.c:293-310`) — fallback ordering vs rsac's single F32LE request. *Relevance:* small; lower value since rsac converts internally.
+- INFORMATIONAL: proxy-list RAII bookkeeping (`pipewire-audio.h:128-170`) — Rust ownership already covers this.
+
+### AudioCap (Swift; CoreAudio Process Tap reference)
+
+**Upstream delta:** No breaking changes — stable CoreAudio Process Tap APIs (`CATapDescription`, `AudioHardware{Create,Destroy}ProcessTap`, `AudioDeviceCreateIOProcIDWithBlock`) since macOS 14.4. `respondsToSelector` guards (`setPrivateTap:`) align with rsac's macOS 26+ forward-compat approach.
+
+**NEW unadopted techniques (capture-relevant):**
+- Private TCC SPI preflight/request via `dlopen`+`dlsym` (`TCCAccessPreflight`/`TCCAccessRequest`) (`AudioRecordingPermission.swift:77-124`) — proactive permission check/request; rsac hardcodes `NotDetermined` (`introspection.rs:312`). *Relevance:* macOS first-run UX; medium. (PR-4.)
+- `kAudioProcessPropertyIsRunning` audio-activity per process (`AudioProcessController.swift:125`, `CoreAudioUtils.swift:86-88`) — filter to apps actually producing audio. *Relevance:* `enumerate_audio_applications`; small.
+- `libproc` `proc_name`/`proc_pidpath` (`:198-217`) — PID→path for daemon/background processes invisible to `NSWorkspace`/sysinfo. *Relevance:* enumeration reliability; small.
+- `NSWorkspace.publisher(for:\.runningApplications)` reactive process tracking (`:69-76`) — detect target exit/restart. *Relevance:* `ProcessTree` re-enumeration; medium.
+- Explicit tap lifecycle state tracking prepare→run→invalidate with guards (`ProcessTap.swift:38-159`) — rsac's tap `Drop` assumes valid state. *Relevance:* macOS robustness; small.
+- Bundle vs CLI classification via `URL.contentType` + bounded `parentBundleURL` walk (`:226-243`). *Relevance:* enrich `ApplicationInfo` (`kind`/`bundle_url`); small.
+- OSStatus codes preserved in user-facing strings (`ProcessTap.swift:99,138,155`) — rsac maps to `AudioError` but drops the raw code from user messages. *Relevance:* `BackendContext`/error UX; small.
+
+### audio-rec (C++/ObjC; CoreAudio Process Tap recorder)
+
+**Upstream delta:** Vendored at fixed commit, no active upstream; stable macOS 14.4+ CoreAudio APIs (`kAudioSubTapDriftCompensationKey` etc.).
+
+**NEW unadopted techniques (capture-relevant):**
+- `kAudioSubTapDriftCompensationKey: true` in the aggregate-device tap dict (`audiorec.mm:231-236`) — prevents sample-rate drift on long/synchronized recordings; rsac builds the dict but doesn't set drift compensation. *Relevance:* `tap.rs build_aggregate_device_dict`; small. (Drift *compensation at the OS tap layer* is capture-config, not rsac-side resampling — in scope.)
+- Per-stream format enumeration via `kAudioDevicePropertyStreams` + `kAudioStreamPropertyVirtualFormat` by direction (`main.mm:35-79`) — rsac returns `vec![default]`. *Relevance:* `coreaudio.rs supported_formats`; medium.
+- `kAudioHardwarePropertyProcessObjectList` + `proc_pidinfo` + `NSRunningApplication` enumeration, dual `name→pid`/`pid→name` maps (`audiorec.mm:38-147`) — audio-active filtering without subprocesses. *Relevance:* `enumerate_audio_applications`; medium.
+- INFORMATIONAL / no-change-recommended (input concurs): push IOProc callback model (`audiorec.h:8-15`), upfront child-PID aggregation (`:257`), format caching (`main.mm:157-165`) — rsac's pull-based rtrb bridge + sysinfo child discovery is the safer, idiomatic choice.
+
+### screencapturekit-rs (`v0.2` → submodule now `v6.1.0`) — MAJOR jump
+
+**Upstream delta (v0.2 → v6.1.0):** Pure Swift FFI (no ObjC bridge), per-stream heap `StreamContext` callback routing. New: microphone device selection (macOS 15.0+), HDR modes (15.0+), executor-agnostic async API, per-output `DispatchQueue` QoS config, stream naming, `excludes_current_process_audio`, batched `frame_info()` FFI. Dependency bumps `apple-cf 0.6→0.10`, `apple-metal 0.6→0.9` (now macOS 13+). **rsac does NOT depend on this crate** — it's a reference for a potential macOS 13+ fallback backend.
+
+**NEW unadopted techniques (capture-relevant, mostly INFORMATIONAL given rsac's Process-Tap scope):**
+- Version-gated Cargo features `macos_13_0..macos_26_0` (`Cargo.toml`) — pattern for honest sub-14.4 capability gating. *Relevance:* `PlatformCapabilities` macOS reporting; medium. (PR-2.)
+- `catch_unwind` panic-safety at the FFI/C ABI boundary + RwLock poison recovery (`sc_stream.rs:145-150`, `panic_safe.rs`) — prevents one callback panic from breaking the stream. *Relevance:* rsac's ring producer has no panic guard at the OS callback edge; small. **Genuinely applicable RT-safety hardening.**
+- Arc-style FFI refcount with explicit Acquire/Release fences (`sc_stream.rs:51-102`) — for Rust objects exposed to long-lived C/Swift callbacks. *Relevance:* small; only if rsac adds trampolines.
+- Enum-validated `AudioSampleRate`/`AudioChannelCount` constructors (`audio.rs:42-148`) — config-time validation. *Relevance:* `StreamConfig`; small (cf. EF-4).
+- `data()` vs `data_mut()` aliasing documentation (`cm/audio.rs:55-92`) — memory-safety doc pattern. *Relevance:* `AudioBuffer` docs; small.
+- INFORMATIONAL: per-output QoS dispatch (`sc_stream.rs:549-555`), microphone/system separation (`audio.rs:309-450`), async completion handlers (`async_api.rs`), batched `frame_info()` — out of proportion for capture-only Process Tap; **SCK handlers run on arbitrary DispatchQueue threads, NOT RT** — any SCK backend would need a dedicated thread + rtrb bridge and must document no-RT-guarantee.
+
+### rtrb (`v0.3.4` upstream; rsac pins `rtrb = "0.3.3"`)
+
+**Upstream delta (0.3.3 → 0.3.4):** Purely additive/UX, **no breaking changes, no new functions of substance**: added `#[must_use]` to `push_partial_slice`/`pop_partial_slice`/`pop_partial_slice_uninit` (`chunks.rs:280,404,491`); added `ReadChunkIntoIter::iterated()` to track partial consumption (`chunks.rs:1037-1062`); doc improvements. Low-risk bump.
+
+**NEW unadopted techniques (capture-relevant):**
+- Zero-copy `write_chunk_uninit()` + `CopyToUninit` (`lib.rs:788-813`, `chunks.rs:702-721`) — write f32 directly into `MaybeUninit` slots, eliminating the `Vec` intermediate in `BridgeProducer::push_samples_or_drop` (`ring_buffer.rs:288-344`). **Strengthens ADR-0001's RT-allocation guarantee** by removing the Vec entirely. *Relevance:* high-value, small.
+- `push_partial_slice()` returning `(pushed, remainder)` (`chunks.rs:306-338`) — synchronous overflow detection in the callback vs post-hoc `buffers_dropped`. *Relevance:* RT overflow metrics; small.
+- `ReadChunkIntoIter::iterated()` (`chunks.rs:1037-1062`, new in 0.3.4) — batch-consume N buffers, commit only those actually consumed. *Relevance:* future adaptive-batch consumer; medium.
+- `CachePadded<AtomicUsize>` head/tail (`cache_padded.rs`) — rsac's `BridgeShared` atomics (`ring_buffer.rs:90-134`) are NOT cache-padded; false-sharing tail-latency risk on 32+ core systems. *Relevance:* p99 jitter on Xeon/EPYC; medium.
+- INFORMATIONAL: position-collapse arithmetic (`lib.rs:170-215`) — only if rsac ever forks a custom raw-f32 ring.
+
+### cpal (`v0.18.0`; rsac does not depend on cpal — architectural reference)
+
+**Upstream delta:** Unified `Error{kind, message}` model with `ErrorKind::{RealtimeDenied, HostUnavailable, Xrun, DeviceChanged}`; structured `DeviceDescription`/`DeviceType`/`InterfaceType`/`DeviceDirection`; `SupportedStreamConfigRange::cmp_default_heuristics()`; serializable `DeviceId` (`Display`/`FromStr`) + `device_by_id()`; `COMMON_SAMPLE_RATES` (29 rates). rsac should track these for parity in all three backends.
+
+**NEW unadopted techniques (capture-relevant):**
+- `DefaultDeviceMonitor` / `IMMNotificationClient` (`wasapi/stream.rs:44-190`) — fires `DeviceChanged`; callbacks set `Arc<AtomicBool>`, never call user callbacks directly (deadlock-safe). *Relevance:* `DeviceEnumerator::watch()` Windows arm (DL-1); medium.
+- `AudioObjectPropertyListener` RAII wrapper with closure callbacks + auto-deregister on drop (`coreaudio/macos/property_listener.rs:1-90`). *Relevance:* DL-1 macOS arm; medium.
+- `cmp_default_heuristics()` (stereo>mono>channel-count>format-rank) (`lib.rs:700+`) — formal, testable default selection vs rsac's private `pick_supported_format`. *Relevance:* `EF-4 closest_format`; small (note: rsac's `AudioFormat` lacks `Ord` — reimplement, do not "reuse").
+- `COMMON_SAMPLE_RATES` (`lib.rs:~4980`) — rsac hides a private 6-rate const in `build()` (`api.rs:157`). *Relevance:* EF-4 public list; small.
+- `DeviceDescription` structured metadata (`device_description.rs:16-379`) — rsac's `AudioDevice` exposes only `id`/`name`. *Relevance:* EF-2 `kind()`/`DeviceInfo`; medium.
+- Compile-time `assert_stream_send!`/`assert_stream_sync!` (`wasapi/stream.rs:243-244`) — rsac claims `CapturingStream: Send` but doesn't statically assert it. *Relevance:* small, high-confidence safety net.
+- `ResultExt::context()` error-context chaining (`error.rs:209-222`) and `RealtimeDenied`/`PermissionDenied`/`HostUnavailable` taxonomy (`error.rs:10-86`). *Relevance:* OBS-4 user-message mapping; small.
+- `RateListener` async sample-rate confirmation (`coreaudio/macos/device.rs:161-200`). *Relevance:* macOS format-change sync; medium.

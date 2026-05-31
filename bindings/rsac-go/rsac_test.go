@@ -3,6 +3,11 @@ package rsac
 import (
 	"context"
 	"errors"
+	"fmt"
+	"math"
+	"runtime/cgo"
+	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 )
@@ -15,20 +20,157 @@ func TestErrorCode_String(t *testing.T) {
 		want string
 	}{
 		{ErrOK, "OK"},
+		{ErrNullPointer, "NullPointer"},
 		{ErrInvalidParameter, "InvalidParameter"},
 		{ErrDeviceNotFound, "DeviceNotFound"},
+		{ErrStreamFailed, "StreamFailed"},
 		{ErrStreamRead, "StreamRead"},
+		{ErrConfiguration, "Configuration"},
 		{ErrAppNotFound, "AppNotFound"},
+		{ErrBackend, "Backend"},
 		{ErrPlatformNotSupported, "PlatformNotSupported"},
 		{ErrPermissionDenied, "PermissionDenied"},
 		{ErrInternal, "Internal"},
 		{ErrTimeout, "Timeout"},
+		{ErrPanic, "Panic"},
 		{ErrorCode(9999), "Unknown(9999)"},
 	}
 	for _, tt := range tests {
 		if got := tt.code.String(); got != tt.want {
 			t.Errorf("ErrorCode(%d).String() = %q, want %q", int(tt.code), got, tt.want)
 		}
+	}
+}
+
+// TestErrorCode_Discriminants pins the numeric values of every error code to
+// the rsac_error_t discriminants in bindings/rsac-ffi/src/lib.rs. These MUST
+// match the Rust enum exactly — a mismatch silently mislabels every error that
+// crosses the FFI boundary. (Audit finding C1.)
+func TestErrorCode_Discriminants(t *testing.T) {
+	tests := []struct {
+		code ErrorCode
+		want int
+	}{
+		{ErrOK, 0},
+		{ErrNullPointer, 1},
+		{ErrInvalidParameter, 2},
+		{ErrDeviceNotFound, 3},
+		{ErrPlatformNotSupported, 4},
+		{ErrStreamFailed, 5},
+		{ErrStreamRead, 6},
+		{ErrConfiguration, 7},
+		{ErrAppNotFound, 8},
+		{ErrBackend, 9},
+		{ErrPermissionDenied, 10},
+		{ErrTimeout, 11},
+		{ErrInternal, 12},
+		{ErrPanic, 99},
+	}
+	for _, tt := range tests {
+		if int(tt.code) != tt.want {
+			t.Errorf("ErrorCode discriminant = %d, want %d (%s)", int(tt.code), tt.want, tt.code)
+		}
+	}
+}
+
+// TestErrorCode_IsRecoverable pins the recoverability classification used by
+// the stream loops to continue-on-recoverable / stop-on-fatal. It must mirror
+// the rsac core (ADR-0003) as projected onto the FFI codes by map_rsac_error:
+// STREAM_READ / TIMEOUT / BACKEND are recoverable; STREAM_FAILED (the terminal
+// StreamEnded) and everything else are fatal. (BP-6.)
+func TestErrorCode_IsRecoverable(t *testing.T) {
+	recoverable := []ErrorCode{ErrStreamRead, ErrTimeout, ErrBackend}
+	fatal := []ErrorCode{
+		ErrOK, ErrNullPointer, ErrInvalidParameter, ErrDeviceNotFound,
+		ErrPlatformNotSupported, ErrStreamFailed, ErrConfiguration,
+		ErrAppNotFound, ErrPermissionDenied, ErrInternal, ErrPanic,
+		ErrorCode(9999),
+	}
+	for _, c := range recoverable {
+		if !c.IsRecoverable() {
+			t.Errorf("%s should be recoverable", c)
+		}
+	}
+	for _, c := range fatal {
+		if c.IsRecoverable() {
+			t.Errorf("%s should NOT be recoverable (fatal/terminal)", c)
+		}
+	}
+	// The terminal StreamEnded crosses the FFI as ErrStreamFailed; it must be
+	// classified fatal so the stream loops end (not retry) on natural end.
+	if ErrStreamFailed.IsRecoverable() {
+		t.Errorf("ErrStreamFailed (terminal StreamEnded) must be fatal")
+	}
+}
+
+// TestIsRecoverable checks the package-level helper that unwraps an error to
+// its *Error and classifies it. A nil or non-rsac error is not recoverable.
+func TestIsRecoverable(t *testing.T) {
+	if !IsRecoverable(&Error{Code: ErrStreamRead}) {
+		t.Error("a StreamRead *Error should be recoverable")
+	}
+	if !IsRecoverable(&Error{Code: ErrTimeout}) {
+		t.Error("a Timeout *Error should be recoverable")
+	}
+	if IsRecoverable(&Error{Code: ErrStreamFailed}) {
+		t.Error("a StreamFailed *Error should be fatal")
+	}
+	if IsRecoverable(nil) {
+		t.Error("nil error must not be classified recoverable")
+	}
+	if IsRecoverable(errors.New("plain non-rsac error")) {
+		t.Error("a non-rsac error must not be classified recoverable")
+	}
+	// Wrapped rsac error still unwraps via errors.As.
+	wrapped := fmt.Errorf("context: %w", &Error{Code: ErrBackend})
+	if !IsRecoverable(wrapped) {
+		t.Error("a wrapped recoverable *Error should still be recoverable")
+	}
+	// ErrClosed carries ErrStreamRead, so it is *code-recoverable*; the stream
+	// loops special-case it with errors.Is(err, ErrClosed) to stop anyway. This
+	// documents that IsRecoverable alone returns true for ErrClosed.
+	if !IsRecoverable(ErrClosed) {
+		t.Error("ErrClosed's code (ErrStreamRead) is recoverable; loops gate it via errors.Is")
+	}
+}
+
+// TestErrClosed_IdentityMatch pins the fix for the bug where (*Error).Is matched
+// purely by Code: because ErrClosed carries the recoverable ErrStreamRead code,
+// a plain code-equality Is would make EVERY transient ErrStreamRead satisfy
+// errors.Is(err, ErrClosed). The stream loops gate on
+// `IsRecoverable(err) && !errors.Is(err, ErrClosed)`, so that bug would have made
+// them STOP on a recoverable hiccup instead of retrying — violating the
+// terminal-error contract. ErrClosed must match by identity only.
+func TestErrClosed_IdentityMatch(t *testing.T) {
+	// The sentinel matches itself.
+	if !errors.Is(ErrClosed, ErrClosed) {
+		t.Fatal("errors.Is(ErrClosed, ErrClosed) must be true")
+	}
+	// A *distinct* transient read error must NOT be mistaken for "closed",
+	// even though it shares the ErrStreamRead code.
+	transient := &Error{Code: ErrStreamRead, Message: "transient overrun"}
+	if errors.Is(transient, ErrClosed) {
+		t.Error("a transient ErrStreamRead must NOT satisfy errors.Is(err, ErrClosed)")
+	}
+	// Therefore the stream-loop guard retries the transient hiccup...
+	if !(IsRecoverable(transient) && !errors.Is(transient, ErrClosed)) {
+		t.Error("guard must RETRY a transient recoverable read error")
+	}
+	// ...and stops on the close sentinel.
+	if IsRecoverable(ErrClosed) && !errors.Is(ErrClosed, ErrClosed) {
+		t.Error("guard must STOP on ErrClosed (errors.Is short-circuits the retry)")
+	}
+	// A wrapped ErrClosed still matches by identity through the chain.
+	wrapped := fmt.Errorf("close path: %w", ErrClosed)
+	if !errors.Is(wrapped, ErrClosed) {
+		t.Error("a wrapped ErrClosed must still satisfy errors.Is(err, ErrClosed)")
+	}
+	// Two different non-sentinel *Errors with the same code still match by code
+	// (the generic contract is preserved for everything except the sentinel).
+	a := &Error{Code: ErrTimeout, Message: "a"}
+	b := &Error{Code: ErrTimeout, Message: "b"}
+	if !errors.Is(a, b) {
+		t.Error("non-sentinel *Errors of the same code should still match by code")
 	}
 }
 
@@ -196,9 +338,6 @@ func TestCaptureBuilder_Defaults(t *testing.T) {
 	if b.channels != 2 {
 		t.Errorf("default channels = %d, want 2", b.channels)
 	}
-	if b.bufferSize != 0 {
-		t.Errorf("default bufferSize = %d, want 0", b.bufferSize)
-	}
 	if b.target.kind != targetSystemDefault {
 		t.Errorf("default target.kind = %v, want %v", b.target.kind, targetSystemDefault)
 	}
@@ -208,8 +347,7 @@ func TestCaptureBuilder_FluentAPI(t *testing.T) {
 	b := NewCaptureBuilder().
 		WithApplicationByName("Chrome").
 		SampleRate(44100).
-		Channels(1).
-		BufferSize(1024)
+		Channels(1)
 
 	if b.target.kind != targetApplicationByName {
 		t.Error("target kind should be applicationByName")
@@ -222,9 +360,6 @@ func TestCaptureBuilder_FluentAPI(t *testing.T) {
 	}
 	if b.channels != 1 {
 		t.Errorf("channels = %d, want 1", b.channels)
-	}
-	if b.bufferSize != 1024 {
-		t.Errorf("bufferSize = %d, want 1024", b.bufferSize)
 	}
 }
 
@@ -320,20 +455,25 @@ func TestStream_ContextCancellation(t *testing.T) {
 	}
 }
 
-// ── Callback Registry Tests (pure Go) ───────────────────────────────────
+// ── Callback Handle Bridge Tests ─────────────────────────────────────────
 
-func TestCallbackRegistry_RegisterAndLookup(t *testing.T) {
+// The FFI callback closure is bridged across the C boundary via a
+// runtime/cgo.Handle stored as the void* user_data. These tests cover the
+// handle round-trip and the per-handle isolation that the SetCallback /
+// goAudioCallback pair relies on.
+
+func TestCallbackHandle_RoundTrip(t *testing.T) {
 	called := false
 	fn := func(buf AudioBuffer) {
 		called = true
 	}
 
-	id := registerCallback(fn)
-	defer unregisterCallback(id)
+	h := cgo.NewHandle(fn)
+	defer h.Delete()
 
-	got, ok := lookupCallback(id)
+	got, ok := h.Value().(func(AudioBuffer))
 	if !ok {
-		t.Fatal("lookupCallback should find registered callback")
+		t.Fatal("handle value should resolve to func(AudioBuffer)")
 	}
 	got(AudioBuffer{})
 	if !called {
@@ -341,27 +481,20 @@ func TestCallbackRegistry_RegisterAndLookup(t *testing.T) {
 	}
 }
 
-func TestCallbackRegistry_UnregisterRemoves(t *testing.T) {
-	fn := func(buf AudioBuffer) {}
-	id := registerCallback(fn)
-	unregisterCallback(id)
-
-	_, ok := lookupCallback(id)
-	if ok {
-		t.Error("lookupCallback should not find unregistered callback")
-	}
-}
-
-func TestCallbackRegistry_MultipleCallbacks(t *testing.T) {
+func TestCallbackHandle_MultipleHandles(t *testing.T) {
 	count1 := 0
 	count2 := 0
-	id1 := registerCallback(func(buf AudioBuffer) { count1++ })
-	id2 := registerCallback(func(buf AudioBuffer) { count2++ })
-	defer unregisterCallback(id1)
-	defer unregisterCallback(id2)
+	h1 := cgo.NewHandle(func(buf AudioBuffer) { count1++ })
+	h2 := cgo.NewHandle(func(buf AudioBuffer) { count2++ })
+	defer h1.Delete()
+	defer h2.Delete()
 
-	fn1, _ := lookupCallback(id1)
-	fn2, _ := lookupCallback(id2)
+	if h1 == h2 {
+		t.Fatal("distinct callbacks must get distinct handles")
+	}
+
+	fn1 := h1.Value().(func(AudioBuffer))
+	fn2 := h2.Value().(func(AudioBuffer))
 	fn1(AudioBuffer{})
 	fn2(AudioBuffer{})
 	fn1(AudioBuffer{})
@@ -393,6 +526,413 @@ func TestStreamResult_Values(t *testing.T) {
 	}
 	if sr2.Err == nil {
 		t.Error("StreamResult.Err should be set")
+	}
+}
+
+// ── AudioBuffer Metering Tests (pure Go, no C dependency) ────────────────
+
+func TestAudioBuffer_Metering_FullScale(t *testing.T) {
+	// A constant ±1.0 signal: RMS == 1.0, peak == 1.0, both 0.0 dBFS.
+	buf := AudioBuffer{
+		data:       []float32{1, -1, 1, -1},
+		numFrames:  2,
+		channels:   2,
+		sampleRate: 48000,
+	}
+	if got := buf.RMS(); absf32(got-1.0) > 1e-6 {
+		t.Errorf("RMS() = %v, want 1.0", got)
+	}
+	if got := buf.Peak(); absf32(got-1.0) > 1e-6 {
+		t.Errorf("Peak() = %v, want 1.0", got)
+	}
+	if got := buf.RMSDbfs(); absf32(got) > 1e-4 {
+		t.Errorf("RMSDbfs() = %v, want 0.0", got)
+	}
+	if got := buf.PeakDbfs(); absf32(got) > 1e-4 {
+		t.Errorf("PeakDbfs() = %v, want 0.0", got)
+	}
+}
+
+func TestAudioBuffer_Metering_HalfScale(t *testing.T) {
+	// Constant 0.5 magnitude: RMS == 0.5, peak == 0.5, dBFS ≈ -6.0206.
+	buf := AudioBuffer{
+		data:       []float32{0.5, -0.5, 0.5, -0.5},
+		numFrames:  2,
+		channels:   2,
+		sampleRate: 48000,
+	}
+	if got := buf.RMS(); absf32(got-0.5) > 1e-6 {
+		t.Errorf("RMS() = %v, want 0.5", got)
+	}
+	if got := buf.Peak(); absf32(got-0.5) > 1e-6 {
+		t.Errorf("Peak() = %v, want 0.5", got)
+	}
+	if got := buf.PeakDbfs(); absf32(got-(-6.0206)) > 1e-3 {
+		t.Errorf("PeakDbfs() = %v, want ≈ -6.0206", got)
+	}
+}
+
+func TestAudioBuffer_Metering_SilenceIsNegInf(t *testing.T) {
+	buf := AudioBuffer{data: []float32{0, 0, 0, 0}, numFrames: 2, channels: 2, sampleRate: 48000}
+	if got := buf.RMS(); got != 0 {
+		t.Errorf("RMS() = %v, want 0", got)
+	}
+	if got := buf.Peak(); got != 0 {
+		t.Errorf("Peak() = %v, want 0", got)
+	}
+	if got := buf.RMSDbfs(); !math.IsInf(float64(got), -1) {
+		t.Errorf("RMSDbfs() = %v, want -Inf", got)
+	}
+	if got := buf.PeakDbfs(); !math.IsInf(float64(got), -1) {
+		t.Errorf("PeakDbfs() = %v, want -Inf", got)
+	}
+}
+
+func TestAudioBuffer_Metering_Empty(t *testing.T) {
+	buf := AudioBuffer{}
+	if got := buf.RMS(); got != 0 {
+		t.Errorf("empty RMS() = %v, want 0", got)
+	}
+	if got := buf.Peak(); got != 0 {
+		t.Errorf("empty Peak() = %v, want 0", got)
+	}
+	if got := buf.RMSDbfs(); !math.IsInf(float64(got), -1) {
+		t.Errorf("empty RMSDbfs() = %v, want -Inf", got)
+	}
+}
+
+func TestAudioBuffer_Metering_NaNSafe(t *testing.T) {
+	// Non-finite samples are skipped: only the finite ±1.0 contribute.
+	inf := float32(math.Inf(1))
+	nan := float32(math.NaN())
+	buf := AudioBuffer{data: []float32{1, nan, -1, inf}, numFrames: 2, channels: 2, sampleRate: 48000}
+	if got := buf.RMS(); absf32(got-1.0) > 1e-6 {
+		t.Errorf("NaN-safe RMS() = %v, want 1.0", got)
+	}
+	if got := buf.Peak(); absf32(got-1.0) > 1e-6 {
+		t.Errorf("NaN-safe Peak() = %v, want 1.0", got)
+	}
+}
+
+func absf32(v float32) float32 {
+	if v < 0 {
+		return -v
+	}
+	return v
+}
+
+// ── SampleFormat / AudioFormat / StreamStats value tests (pure Go) ───────
+
+func TestSampleFormat_String(t *testing.T) {
+	tests := []struct {
+		f    SampleFormat
+		want string
+	}{
+		{SampleFormatI16, "I16"},
+		{SampleFormatI24, "I24"},
+		{SampleFormatI32, "I32"},
+		{SampleFormatF32, "F32"},
+		{SampleFormat(42), "Unknown(42)"},
+	}
+	for _, tt := range tests {
+		if got := tt.f.String(); got != tt.want {
+			t.Errorf("SampleFormat(%d).String() = %q, want %q", int(tt.f), got, tt.want)
+		}
+	}
+}
+
+func TestSampleFormat_Discriminants(t *testing.T) {
+	// Pin the Go constants to the rsac_sample_format_t discriminants.
+	if SampleFormatI16 != 0 || SampleFormatI24 != 1 || SampleFormatI32 != 2 || SampleFormatF32 != 3 {
+		t.Errorf("SampleFormat discriminants drifted: %d %d %d %d",
+			SampleFormatI16, SampleFormatI24, SampleFormatI32, SampleFormatF32)
+	}
+}
+
+func TestStreamStats_ZeroValue(t *testing.T) {
+	var s StreamStats
+	if s.BuffersCaptured != 0 || s.Overruns != 0 || s.IsRunning || s.UptimeSecs != 0 {
+		t.Errorf("zero StreamStats should be all-zero/false, got %+v", s)
+	}
+}
+
+func TestAudioFormat_ZeroValue(t *testing.T) {
+	var f AudioFormat
+	if f.SampleRate != 0 || f.Channels != 0 || f.BitsPerSample != 0 || f.SampleFormat != SampleFormatI16 {
+		t.Errorf("zero AudioFormat should be all-zero, got %+v", f)
+	}
+}
+
+// ── Target String Tests (require the C library) ──────────────────────────
+
+func TestParseTarget_ValidGrammar(t *testing.T) {
+	valid := []string{
+		"system",
+		"name:Firefox",
+		"app:1234",
+		"device:hw:0,0",
+		"tree:4321",
+	}
+	for _, spec := range valid {
+		ct, err := ParseTarget(spec)
+		if err != nil {
+			t.Errorf("ParseTarget(%q) returned error: %v", spec, err)
+			continue
+		}
+		if ct.kind != targetString {
+			t.Errorf("ParseTarget(%q).kind = %v, want targetString", spec, ct.kind)
+		}
+		if ct.spec != spec {
+			t.Errorf("ParseTarget(%q).spec = %q, want round-trip", spec, ct.spec)
+		}
+	}
+}
+
+func TestParseTarget_InvalidGrammar(t *testing.T) {
+	_, err := ParseTarget("not-a-real-scheme:whatever")
+	if err == nil {
+		t.Fatal("ParseTarget should reject an unknown scheme")
+	}
+	var rsacErr *Error
+	if !errors.As(err, &rsacErr) {
+		t.Fatalf("ParseTarget error should be *Error, got %T", err)
+	}
+	if rsacErr.Code != ErrInvalidParameter {
+		t.Errorf("ParseTarget invalid spec code = %v, want InvalidParameter", rsacErr.Code)
+	}
+}
+
+func TestCaptureBuilder_SetTargetString(t *testing.T) {
+	b := NewCaptureBuilder()
+	if err := b.SetTargetString("name:Spotify"); err != nil {
+		t.Fatalf("SetTargetString(valid) returned error: %v", err)
+	}
+	if b.target.kind != targetString || b.target.spec != "name:Spotify" {
+		t.Errorf("SetTargetString did not store the spec: %+v", b.target)
+	}
+
+	// An invalid spec must not mutate the previously-set target.
+	if err := b.SetTargetString("garbage::bad"); err == nil {
+		t.Error("SetTargetString(invalid) should return an error")
+	}
+	if b.target.spec != "name:Spotify" {
+		t.Errorf("SetTargetString(invalid) mutated target to %+v", b.target)
+	}
+}
+
+func TestCaptureBuilder_WithTargetString(t *testing.T) {
+	b := NewCaptureBuilder().WithTargetString("app:777")
+	if b.target.kind != targetString {
+		t.Errorf("WithTargetString kind = %v, want targetString", b.target.kind)
+	}
+	if b.target.spec != "app:777" {
+		t.Errorf("WithTargetString spec = %q, want %q", b.target.spec, "app:777")
+	}
+}
+
+// ── Concurrent Close-during-Read barrier (issue #28, H2) ─────────────────
+//
+// These tests exercise the read/Close use-after-free barrier WITHOUT a real
+// audio device (CI is device-free), mirroring the device-free style of
+// TestStream_ContextCancellation. The production AudioCapture keeps its handle
+// alive across an in-flight C read via a sync.WaitGroup + a closing atomic.Bool,
+// and Close() signals request_stop then drains reads.Wait() before freeing.
+//
+// closeHarness reproduces that exact ordering against a stub that stands in for
+// the C handle + the rsac_capture_read / rsac_capture_request_stop / free FFI
+// calls, so `go test -race` validates that the handle is never touched after it
+// is "freed" while a read is in flight. It is a faithful copy of the real
+// rsac.go logic (same field names, same lock discipline), not the real cgo path.
+type closeHarness struct {
+	mu      sync.Mutex
+	closed  bool
+	closing atomic.Bool
+	reads   sync.WaitGroup
+
+	// freed models the freed C handle: set true only after reads.Wait() drains.
+	// The race detector flags any read of *handle after free; here we assert
+	// logically that no in-flight read observes freed==true.
+	freed atomic.Bool
+	// terminal models the bridge's terminal flag that request_stop sets so a
+	// parked stubRead returns promptly (StreamEnded-equivalent) rather than
+	// spinning out a long timeout.
+	terminal atomic.Bool
+}
+
+// stubRead stands in for C.rsac_capture_read: it parks (no data) until the
+// stream goes terminal (request_stop) or a bounded fallback elapses, then
+// returns ErrClosed. It asserts the "handle" is never freed while it runs.
+func (h *closeHarness) stubRead() error {
+	deadline := time.Now().Add(2 * time.Second)
+	for {
+		if h.freed.Load() {
+			// The whole point of the barrier: this must never happen.
+			return errors.New("USE-AFTER-FREE: read observed a freed handle")
+		}
+		if h.terminal.Load() {
+			return ErrClosed // request_stop unblocked us → terminal stream
+		}
+		if time.Now().After(deadline) {
+			return ErrClosed // safety net so a broken test can't hang CI
+		}
+		time.Sleep(time.Millisecond)
+	}
+}
+
+// ReadBuffer mirrors AudioCapture.ReadBuffer's barrier exactly.
+func (h *closeHarness) ReadBuffer() error {
+	h.mu.Lock()
+	if h.closed {
+		h.mu.Unlock()
+		return ErrClosed
+	}
+	h.reads.Add(1)
+	h.mu.Unlock()
+	defer h.reads.Done()
+
+	if h.closing.Load() {
+		return ErrClosed
+	}
+	return h.stubRead()
+}
+
+// Close mirrors AudioCapture.Close + closeLocked's drain-before-free ordering.
+func (h *closeHarness) Close() error {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	if h.closed {
+		return nil
+	}
+	h.closing.Store(true)
+	h.closed = true
+	// request_stop: flip terminal so parked stubRead returns promptly.
+	h.terminal.Store(true)
+	// Drain in-flight reads with the lock released (matches closeLocked).
+	h.mu.Unlock()
+	h.reads.Wait()
+	h.mu.Lock()
+	// Only now is it safe to "free" — every in-flight read has returned.
+	h.freed.Store(true)
+	return nil
+}
+
+// T1 + T2: N concurrent readers vs Close. Asserts no race, no UAF, Close
+// returns promptly (well under the 1s blocking-read timeout the real FFI uses),
+// and every in-flight read returns ErrClosed.
+func TestCloseDuringRead_NoUseAfterFree(t *testing.T) {
+	h := &closeHarness{}
+
+	const n = 16
+	var wg sync.WaitGroup
+	errs := make([]error, n)
+	for i := 0; i < n; i++ {
+		wg.Add(1)
+		go func(idx int) {
+			defer wg.Done()
+			errs[idx] = h.ReadBuffer()
+		}(i)
+	}
+
+	// Let the readers park in stubRead.
+	time.Sleep(20 * time.Millisecond)
+
+	start := time.Now()
+	if err := h.Close(); err != nil {
+		t.Fatalf("Close returned error: %v", err)
+	}
+	elapsed := time.Since(start)
+	// T2: request_stop must unblock parked readers, so Close returns fast.
+	if elapsed > 500*time.Millisecond {
+		t.Errorf("Close took %v; request_stop should unblock reads promptly", elapsed)
+	}
+
+	wg.Wait()
+	for i, err := range errs {
+		if err == nil {
+			continue // a read that completed before Close is fine
+		}
+		if !errors.Is(err, ErrClosed) {
+			t.Errorf("reader %d: unexpected error %v (want ErrClosed)", i, err)
+		}
+	}
+	if !h.freed.Load() {
+		t.Error("handle should be freed after Close drains in-flight reads")
+	}
+}
+
+// T2 (focused): Close does not deadlock against a single parked reader and
+// returns promptly because request_stop (terminal flag) unblocks it.
+func TestCloseDuringRead_NoDeadlock(t *testing.T) {
+	h := &closeHarness{}
+	done := make(chan error, 1)
+	go func() { done <- h.ReadBuffer() }()
+
+	time.Sleep(20 * time.Millisecond)
+
+	closed := make(chan struct{})
+	go func() {
+		_ = h.Close()
+		close(closed)
+	}()
+	select {
+	case <-closed:
+	case <-time.After(1 * time.Second):
+		t.Fatal("Close deadlocked against a parked reader")
+	}
+
+	select {
+	case err := <-done:
+		if !errors.Is(err, ErrClosed) {
+			t.Errorf("parked read returned %v, want ErrClosed", err)
+		}
+	case <-time.After(1 * time.Second):
+		t.Fatal("parked reader did not return after Close")
+	}
+}
+
+// T4: idempotent Close (twice → nil both times) and Close-then-Read → ErrClosed.
+func TestClose_IdempotentAndReadAfterClose(t *testing.T) {
+	h := &closeHarness{}
+	if err := h.Close(); err != nil {
+		t.Fatalf("first Close: %v", err)
+	}
+	if err := h.Close(); err != nil {
+		t.Fatalf("second Close should be a no-op nil, got %v", err)
+	}
+	if err := h.ReadBuffer(); !errors.Is(err, ErrClosed) {
+		t.Errorf("ReadBuffer after Close = %v, want ErrClosed", err)
+	}
+}
+
+// T3-ish: many concurrent Close + Read interleavings stress the barrier under
+// the race detector (mirrors the GC-finalizer/explicit-Close coexistence: both
+// route through the same closing/closed-guarded path).
+func TestCloseDuringRead_ConcurrentClosersAndReaders(t *testing.T) {
+	h := &closeHarness{}
+	var wg sync.WaitGroup
+
+	for i := 0; i < 8; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			_ = h.ReadBuffer()
+		}()
+	}
+	for i := 0; i < 4; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			_ = h.Close()
+		}()
+	}
+	wg.Wait()
+
+	if !h.freed.Load() {
+		t.Error("handle should be freed after all Close calls")
+	}
+	// A post-drain read must cleanly report closed, never touch a freed handle.
+	if err := h.ReadBuffer(); !errors.Is(err, ErrClosed) {
+		t.Errorf("post-close ReadBuffer = %v, want ErrClosed", err)
 	}
 }
 

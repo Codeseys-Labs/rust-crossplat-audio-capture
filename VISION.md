@@ -52,18 +52,63 @@ pipeline.
 
 ### The output contract
 
-- `CapturingStream::subscribe() -> mpsc::Receiver<AudioBuffer>` — the
-  canonical pull-model interface. Downstream consumers can:
-  - Record to disk (write `AudioBuffer.data` as WAV/FLAC via `hound`,
-    `symphonia`, etc.)
+- `AudioCapture::read_buffer() -> AudioResult<Option<AudioBuffer>>` — the
+  canonical pull-model interface (consumer asks; producer fills the ring).
+  `Ok(None)` means "no data yet" (not end-of-stream); a terminal stream is
+  signalled by an `Err` carrying a fatal `AudioError` (use
+  `AudioError::is_fatal()` / `recoverability()` to decide retry-vs-stop).
+  `AudioCapture::subscribe() -> mpsc::Receiver<AudioBuffer>` provides the
+  push-based delivery mode on top of the same ring. Downstream consumers can:
+  - Record to disk (write `AudioBuffer::data()` samples as WAV/FLAC via
+    `hound`, `symphonia`, etc.)
   - Stream to a transcription service (Whisper, Deepgram, AssemblyAI,
     Gemini Live)
   - Run DSP in-flight (filtering, VAD, feature extraction)
   - Forward over WebSocket / gRPC
-- `BridgeStream<S>::is_under_backpressure() -> bool` — lets consumers
-  throttle / switch downstreams when the ring buffer is filling.
-- Zero-copy where the backend allows it (ring buffer → consumer
-  without intermediate Vec).
+- **Ergonomic lifecycle** — `AudioCaptureBuilder::start() -> RunningCapture`
+  returns an RAII guard that `Deref`s to the full `AudioCapture` surface and
+  calls `stop()` on `Drop`, so "build, start, use, tear down" is one call. The
+  `capture!` macro (`capture!(system, rate: 48000)`) is a one-line builder, and
+  `rsac::prelude::*` re-exports the everyday surface (the macro,
+  `RunningCapture`, `CaptureTarget`, `AudioBuffer`, errors, …) in a single
+  import. String targets are first-class: `CaptureTarget` round-trips through
+  `FromStr` / `TryFrom<&str>` / `Display`, and the builder exposes
+  `target_str()` (fallible) plus `try_target_str()` (infallible best-effort).
+- **Read-only level metering on `AudioBuffer`** — `rms()`, `peak()`,
+  `rms_dbfs()`, `peak_dbfs()`, and the per-channel `channel_rms()` /
+  `channel_peak()` are allocation-free and `#[inline]`, so they are safe to call
+  on the audio callback thread. These are observability metadata, **not** DSP —
+  they read the buffer and never mutate it.
+- **Diagnostics** — `CapturingStream::is_under_backpressure() -> bool` (also
+  exposed as `AudioCapture::is_under_backpressure()`) lets consumers throttle /
+  switch downstreams when the ring buffer is filling. `AudioCapture::stream_stats()
+  -> StreamStats` is a cheap point-in-time snapshot (buffers pushed / captured /
+  dropped, uptime, running state, negotiated-format description) and
+  `backpressure_report() -> BackpressureReport` adds cumulative drop accounting
+  (lifetime pushed / dropped counts, a lifetime drop-rate ratio, and the carried
+  consecutive-drop backpressure flag) — counters are cumulative, not windowed.
+  Both are `#[non_exhaustive]`.
+- **Device-change watching** — `DeviceEnumerator::watch(on_event) ->
+  DeviceWatcher` (reachable from the `CrossPlatformDeviceEnumerator` facade)
+  delivers `DeviceEvent`s (add / remove / default-changed) on the backend's OS
+  notification thread, never the RT audio thread. The returned `DeviceWatcher` is
+  an RAII guard that unregisters the listener on `Drop`. **Per-platform divergence
+  (intentional, documented):** Windows and macOS hand events off through a
+  bounded channel + helper thread (drop-on-full backpressure), while Linux
+  invokes the handler directly on the PipeWire loop thread — see
+  [`docs/designs/`](docs/designs/) for the device-watch threading ADR.
+- **Buffer timestamps** — `AudioBuffer::timestamp() -> Option<Duration>` exists,
+  but **no backend currently populates it**, so it is always `None` in
+  production; downstreams must derive wall-clock time themselves. This is a
+  reserved capture-side timing surface, tracked as a known limitation (see the
+  architecture critique, DF-01), not a delivered feature.
+- The default hot path is **alloc-free in steady state** (the producer reuses
+  ring slots via a free-list return ring — see
+  [`docs/designs/0001-rt-allocation-guarantee.md`](docs/designs/0001-rt-allocation-guarantee.md)),
+  with one owned `AudioBuffer` materialized per delivered chunk on the non-RT
+  consumer side. A true zero-copy `SampleRing` plane (no intermediate `Vec`)
+  exists behind the off-by-default `bridge-zerocopy` feature and is wired only to
+  the benchmark today; it is not yet on any backend's default path.
 
 ### Multi-source
 
@@ -82,6 +127,14 @@ pipeline.
 - Same feature flags (`feat_windows` / `feat_linux` / `feat_macos`)
   — but platform is also gated by `#[cfg(target_os = ...)]`, so
   cross-compilation behaves predictably.
+- Same device-introspection surface — `AudioDevice::describe() -> DeviceInfo`
+  and `AudioDevice::supported_formats() -> Vec<AudioFormat>` are implemented on
+  all three backends (WASAPI, PipeWire, CoreAudio), so format discovery no
+  longer differs by platform.
+- **Bindings at parity** — the C/Go (`rsac-ffi` + cgo), Python (PyO3), and
+  Node (napi) bindings expose the same surface: `stream_stats()`, format query,
+  metering, string targets, and idiomatic context managers / RAII. Python ships
+  a single `cp39-abi3` wheel (CPython stable ABI, 3.9+).
 
 ## What's Out of Scope (by design)
 
@@ -103,14 +156,34 @@ are explicitly deferred to downstream crates:
 Mixing requires downstream-specific decisions: (a) what sample-rate
 to mix at (resampling cost), (b) per-source gain, (c) clipping /
 limiter strategy, (d) real-time vs. buffered. These belong to the
-application, not the capture layer. rsac exposes `AudioBuffer.data: Vec<f32>` —
-if you want to mix two captures, it's 3 lines:
+application, not the capture layer. rsac exposes the interleaved samples
+through the `AudioBuffer::data() -> &[f32]` accessor — if you want to mix two
+captures, it's 3 lines:
+
 ```rust
-let mixed: Vec<f32> = buf_a.data.iter().zip(&buf_b.data).map(|(a, b)| a + b).collect();
+let mixed: Vec<f32> = buf_a.data().iter().zip(buf_b.data()).map(|(a, b)| a + b).collect();
 ```
 
 If a downstream crate like `rsac-mixer` emerges, we'll link it from
 docs — but it won't be in the core.
+
+## Recently Shipped (was on the roadmap, now in-scope)
+
+The following were "roadmap" items in earlier revisions and have since landed;
+they are documented above as part of the in-scope surface:
+
+- **`CaptureTarget::FromStr` / `TryFrom<&str>` / `Display`** — round-trip
+  string parsing for CLI-friendly and FFI-friendly targets.
+- **`rsac::prelude`** — one-import module re-exporting the everyday surface.
+- **`capture!` macro** and **`RunningCapture` RAII** — the one-line build path.
+- **`AudioBuffer` level metering** (`rms`/`peak`/`*_dbfs`/`channel_*`).
+- **`stream_stats()` / `backpressure_report()`** diagnostics.
+- **`DeviceWatcher` + `watch()`** device-change notifications (all 3 platforms).
+- **Cross-platform `supported_formats()` / `describe()`** — including Linux
+  (PipeWire) native device + app enumeration.
+- **abi3-py39** Python wheels — a single `cp39-abi3` wheel replaces the
+  per-version matrix (adopted within the 0.2.0 line; see
+  [`docs/designs/abi3-decision.md`](docs/designs/abi3-decision.md)).
 
 ## What's On the Roadmap (explicit backlog, not promises)
 
@@ -118,15 +191,23 @@ docs — but it won't be in the core.
   is validated on Alpine containers.
 - **docs.rs rendering verification** (rsac#16) — one-shot post-publish
   check via `scripts/verify-docs-rs.sh`.
-- **abi3-py39** for Python bindings (deferred per rsac#18 decision,
-  adopted post-v0.2.0) — shrinks the PyPI wheel matrix from 15 → 3
-  jobs.
-- **`CaptureTarget::FromStr`** for CLI-friendly string parsing.
-- **`rsac::prelude`** module for one-line imports.
-- **Linux `supported_formats()` query** — PipeWire exposes this,
-  we just haven't wired it through.
+- **Populate `AudioBuffer::timestamp()`** in at least one backend (producer-side
+  monotonic stamp at enqueue), or formally reserve it — currently always `None`.
+- **Honor `buffer_size` / period-aware ring sizing on macOS + Linux** —
+  `calculate_capacity_for_period` is implemented and tested but only Windows
+  threads the requested `buffer_size` through today.
+- **Promote or retire the `bridge-zerocopy` `SampleRing` plane** — wire it into
+  an interleaved-f32 backend (PipeWire / CoreAudio) and measure, or keep it as
+  an opt-in A/B path. (The default path is already alloc-free in steady state.)
+- **`AudioCapture::pipe_to(sink)`** — a built-in driver that pumps the bundled
+  `AudioSink` adapters (`NullSink` / `ChannelSink` / `WavFileSink`) without a
+  hand-rolled read loop. The sink trait + adapters ship today; the driver does
+  not yet exist.
+- **`subscribe()` terminal-error delivery** — surface the fatal `AudioError`
+  that ended a push subscription rather than only a channel disconnect.
 
-Each of these has a GitHub issue on `Codeseys-Labs/rust-crossplat-audio-capture`.
+Each of these is tracked on `Codeseys-Labs/rust-crossplat-audio-capture` and/or
+in [`docs/reviews/`](docs/reviews/).
 
 ## How We Verify the Vision
 
@@ -134,19 +215,21 @@ Each of these has a GitHub issue on `Codeseys-Labs/rust-crossplat-audio-capture`
 
 - **Default matrix** (`.github/workflows/ci.yml`): 3 platforms × (lint
   + unit tests + bindings check + downstream audio-graph build).
-  All 298+ library tests + 22 ci_audio integration tests
-  (subscribe, process_tree, ApplicationByName, ApplicationByPID)
-  gated to `#[ignore]` or `require_audio!()` so CI doesn't need real
-  audio hardware.
+  The library unit suite (300+ tests — exact count varies by platform
+  and feature set) plus the `ci_audio` integration suite (~40+ tests
+  across subscribe, process_tree, application_by_name, application_by_pid,
+  device enumeration, overrun, multi-source, lifecycle) are gated behind
+  `require_audio!()` / `#[ignore]` so CI doesn't need real audio hardware.
 
 ### Integration tests with real audio (gated)
 
-- **`.github/workflows/ci-audio-tests.yml`** (846 lines): 9-job
-  matrix (3 platforms × 3 modes: system / device / process) with
-  virtual audio sources (PipeWire dummy sink on Linux, VB-CABLE on
-  Windows, loopback via BlackHole or platform-native on macOS).
-- Runs on `workflow_dispatch` + tagged releases (not every push —
-  slow, requires audio runtime).
+- **`.github/workflows/ci-audio-tests.yml`**: 9-job matrix
+  (3 platforms × 3 modes: system / device / process) with virtual
+  audio sources (PipeWire dummy sink on Linux, VB-CABLE on Windows,
+  loopback via BlackHole or platform-native on macOS).
+- Triggered on push to `main`/`master`, pull requests, and
+  `workflow_dispatch` (it provisions a virtual audio runtime per job, so
+  it is heavier than the default unit-test matrix).
 
 ### Runner-specific
 
@@ -190,4 +273,4 @@ Each of these has a GitHub issue on `Codeseys-Labs/rust-crossplat-audio-capture`
 
 ---
 
-_Last revised: 2026-04-24_
+_Last revised: 2026-05-30_

@@ -1,0 +1,11 @@
+// FIXTURE (not compiled — .rs.txt). Deliberate module-DAG reverse edges used by
+// scripts/check-module-dag.sh's --self-test: `core` must never reference
+// `crate::audio`. The guard must FLAG all of: the symbol form, the bare
+// module-level form, AND the relative `super::`-qualified form (CI-7). Keep this
+// file OUT of the Rust build (it is .rs.txt, and tests/fixtures is not a source
+// root). When copied to src/core/<tmp>.rs, `super::super::` resolves to the
+// crate root, so `super::super::audio` is the relative spelling of `crate::audio`.
+#[allow(unused_imports)]
+use crate::audio;
+fn _bare_module_edge() { let _ = crate::audio::get_device_enumerator(); }
+fn _relative_super_edge() { let _ = super::super::audio::get_device_enumerator(); }

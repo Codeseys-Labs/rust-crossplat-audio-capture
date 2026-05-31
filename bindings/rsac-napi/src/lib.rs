@@ -34,11 +34,15 @@ fn audio_err_to_napi(e: rsac::AudioError) -> napi::Error {
 ///
 /// Contains interleaved Float32 PCM samples along with format metadata.
 /// This is the primary data unit flowing through the JS capture pipeline.
+///
+/// `data` is a native JS `Float32Array` carrying the captured `f32` samples
+/// directly — there is no `f32` -> `f64` widening on the delivery path, so the
+/// values JS observes are bit-for-bit identical to the source samples.
 #[napi(object)]
-#[derive(Clone)]
 pub struct AudioChunk {
-    /// Interleaved Float32 PCM audio samples.
-    pub data: Vec<f64>,
+    /// Interleaved Float32 PCM audio samples (native `Float32Array`, no
+    /// precision widening).
+    pub data: Float32Array,
     /// Number of audio frames (samples per channel).
     pub num_frames: u32,
     /// Number of audio channels.
@@ -49,27 +53,84 @@ pub struct AudioChunk {
     pub length: u32,
     /// Duration of this chunk in seconds.
     pub duration: f64,
+    /// Root-mean-square (RMS) level across **all** samples/channels, in linear
+    /// `0.0..=1.0`. Computed once (alloc-free) by rsac core; `0.0` for silence
+    /// or an empty chunk, never `NaN`.
+    pub rms: f64,
+    /// Peak (maximum absolute) level across all samples/channels, in linear
+    /// `0.0..=1.0`. `0.0` for an empty chunk, never `NaN`.
+    pub peak: f64,
+    /// RMS level in dBFS (`20·log10(rms)`). `-Infinity` at silence; `0.0` dBFS
+    /// is full scale. Computed by rsac core.
+    pub rms_dbfs: f64,
+    /// Peak level in dBFS (`20·log10(peak)`). `-Infinity` at silence; `0.0` dBFS
+    /// is full scale. Computed by rsac core.
+    pub peak_dbfs: f64,
+    /// Per-channel RMS levels, one entry per channel in channel order, linear
+    /// `0.0..=1.0`. `channelRms[ch]` is the RMS of channel `ch`. Empty when the
+    /// chunk reports `0` channels. Computed once by rsac core's strided,
+    /// alloc-free `channel_rms` (a channel with no finite samples is `0.0`).
+    pub channel_rms: Vec<f64>,
+    /// Per-channel peak levels, one entry per channel in channel order, linear
+    /// `0.0..=1.0`. `channelPeak[ch]` is the peak of channel `ch`. Empty when
+    /// the chunk reports `0` channels. Computed once by rsac core's strided,
+    /// alloc-free `channel_peak`.
+    pub channel_peak: Vec<f64>,
 }
 
 impl AudioChunk {
     fn from_rsac_buffer(buf: &rsac::AudioBuffer) -> Self {
-        let data: Vec<f64> = buf.data().iter().map(|&s| s as f64).collect();
-        let num_frames = buf.num_frames() as u32;
+        // Pre-compute the whole-buffer metering scalars via rsac core's
+        // alloc-free, NaN-safe meters *before* we move the samples out — the
+        // values JS sees are exactly what core measured (no re-derivation in JS,
+        // no precision loss beyond the f32 -> f64 widen of a single scalar).
+        let rms = buf.rms() as f64;
+        let peak = buf.peak() as f64;
+        let rms_dbfs = buf.rms_dbfs() as f64;
+        let peak_dbfs = buf.peak_dbfs() as f64;
+
+        // Per-channel meters. rsac core's `channel_rms(ch)`/`channel_peak(ch)`
+        // are parameterized, and a `#[napi(object)]` is a plain JS object that
+        // cannot carry methods — and the package entry point re-exports a fixed
+        // symbol set, so free functions would be unreachable. So materialize a
+        // small per-channel array (one f64 per channel) here. Core returns
+        // `None` only for an out-of-range index, which cannot happen for
+        // `0..channels`, so `unwrap_or(0.0)` is a defensive no-op.
         let channels = buf.channels() as u32;
+        let mut channel_rms = Vec::with_capacity(channels as usize);
+        let mut channel_peak = Vec::with_capacity(channels as usize);
+        for ch in 0..channels {
+            channel_rms.push(buf.channel_rms(ch as u16).unwrap_or(0.0) as f64);
+            channel_peak.push(buf.channel_peak(ch as u16).unwrap_or(0.0) as f64);
+        }
+
+        // Carry the interleaved f32 samples straight through to a native JS
+        // Float32Array. We take a single owned Vec<f32> (one allocation, same
+        // cost as the previous Vec<f64> collect but half the width) and hand
+        // it to napi's Float32Array, which adopts the buffer without any
+        // per-sample f32 -> f64 conversion.
+        let samples = buf.data().to_vec();
+        let length = samples.len() as u32;
+        let num_frames = buf.num_frames() as u32;
         let sample_rate = buf.sample_rate();
-        let length = data.len() as u32;
         let duration = if sample_rate > 0 {
             num_frames as f64 / sample_rate as f64
         } else {
             0.0
         };
         AudioChunk {
-            data,
+            data: Float32Array::new(samples),
             num_frames,
             channels,
             sample_rate,
             length,
             duration,
+            rms,
+            peak,
+            rms_dbfs,
+            peak_dbfs,
+            channel_rms,
+            channel_peak,
         }
     }
 }
@@ -133,6 +194,32 @@ impl CaptureTarget {
         }
     }
 
+    /// Parse a capture target from its canonical string form.
+    ///
+    /// Accepts the cross-binding grammar (the scheme is case-insensitive):
+    /// - `"system"` / `"default"` → system default mix
+    /// - `"device:<id>"` → a specific device (the id may itself contain colons,
+    ///   e.g. `"device:hw:0,0"`)
+    /// - `"app:<id>"` → a specific application session
+    /// - `"name:<name>"` → the first application matching `<name>`
+    /// - `"tree:<pid>"` / `"pid:<pid>"` → a process and its children
+    ///
+    /// Throws a JS `Error` (code `ERR_RSAC_CONFIGURATION`) on an unknown scheme
+    /// or a non-numeric / out-of-range pid. Never panics.
+    ///
+    /// ```js
+    /// CaptureTarget.parse("system")
+    /// CaptureTarget.parse("name:Firefox")
+    /// CaptureTarget.parse("pid:1234")
+    /// ```
+    #[napi(factory)]
+    pub fn parse(spec: String) -> Result<Self> {
+        // Parses via rsac's CaptureTarget::FromStr; an invalid spec surfaces as
+        // AudioError::InvalidParameter, mapped to a thrown JS Error.
+        let inner: rsac::CaptureTarget = spec.parse().map_err(audio_err_to_napi)?;
+        Ok(CaptureTarget { inner })
+    }
+
     /// Returns a string description of this capture target.
     #[napi]
     pub fn describe(&self) -> String {
@@ -144,6 +231,13 @@ impl CaptureTarget {
                 format!("ApplicationByName({})", name)
             }
             rsac::CaptureTarget::ProcessTree(pid) => format!("ProcessTree({})", pid),
+            // `rsac::CaptureTarget` is `#[non_exhaustive]`: a future variant added
+            // in a minor release lands here rather than breaking the build. Fall
+            // back to the upstream canonical string form (its in-crate `Display`
+            // impl is exhaustive, so it renders any variant) so describe() stays
+            // forward-compatible. Every variant known at this version has a
+            // dedicated arm above; this only fires for additions.
+            other => other.to_string(),
         }
     }
 }
@@ -172,11 +266,24 @@ impl CaptureTarget {
 /// // ... later ...
 /// capture.stop();
 /// ```
+/// The per-buffer data callback held behind an `Arc<Mutex<Option<…>>>` (to
+/// prevent GC + allow re-registration). Aliased to keep the struct field within
+/// clippy's `type_complexity` bar.
+type DataCallback = Arc<Mutex<Option<ThreadsafeFunction<AudioChunk, ErrorStrategy::Fatal>>>>;
+/// The terminal-observability callback, carrying the optional terminal cause
+/// string. Same storage shape as [`DataCallback`].
+type EndCallback = Arc<Mutex<Option<ThreadsafeFunction<Option<String>, ErrorStrategy::Fatal>>>>;
+
 #[napi]
 pub struct AudioCapture {
     inner: Arc<Mutex<rsac::AudioCapture>>,
     /// Active data callback (ThreadsafeFunction). Held here to prevent GC.
-    callback: Arc<Mutex<Option<ThreadsafeFunction<AudioChunk, ErrorStrategy::Fatal>>>>,
+    callback: DataCallback,
+    /// Optional terminal-observability callback (ThreadsafeFunction). Fires once
+    /// when the data pump ends, carrying the terminal cause so a JS `onData`
+    /// consumer can observe *why* delivery stopped — parity with Rust
+    /// `subscribe_with_errors` / Go `StreamWithErrors`. Held here to prevent GC.
+    end_callback: EndCallback,
     /// Whether the push-model data pump thread is running.
     pump_active: Arc<AtomicBool>,
 }
@@ -194,6 +301,7 @@ impl AudioCapture {
         Ok(AudioCapture {
             inner: Arc::new(Mutex::new(capture)),
             callback: Arc::new(Mutex::new(None)),
+            end_callback: Arc::new(Mutex::new(None)),
             pump_active: Arc::new(AtomicBool::new(false)),
         })
     }
@@ -228,6 +336,7 @@ impl AudioCapture {
         Ok(AudioCapture {
             inner: Arc::new(Mutex::new(capture)),
             callback: Arc::new(Mutex::new(None)),
+            end_callback: Arc::new(Mutex::new(None)),
             pump_active: Arc::new(AtomicBool::new(false)),
         })
     }
@@ -303,9 +412,18 @@ impl AudioCapture {
     ///
     /// Returns `null` if no data is currently available.
     /// Throws if the capture is not running.
+    ///
+    /// Not terminal-observable: this (and `read_blocking`/`read_async`/
+    /// `read_blocking_async`) routes through rsac's `read_buffer`, which
+    /// short-circuits to a *recoverable* `StreamReadError` the moment the stream
+    /// leaves `Running` and never surfaces the terminal `StreamEnded`. Only the
+    /// push pump started by `on_data` drains the terminal state and reports it via
+    /// `on_end`. A pull consumer should treat `stop`/`is_running` as the
+    /// end-of-stream signal and a thrown read error as retryable.
     #[napi]
     pub fn read(&self) -> Result<Option<AudioChunk>> {
-        let mut inner = self.inner.lock().map_err(|e| {
+        // `read_buffer` takes `&self` now, so the guard does not need `mut`.
+        let inner = self.inner.lock().map_err(|e| {
             napi::Error::new(
                 napi::Status::GenericFailure,
                 format!("Lock poisoned: {}", e),
@@ -321,9 +439,15 @@ impl AudioCapture {
     /// WARNING: This blocks the calling thread. In Node.js, prefer
     /// `onData()` for push-based streaming or use `read()` in a loop
     /// with appropriate yielding.
+    ///
+    /// Like `read`, this is not terminal-observable: it routes through
+    /// `read_buffer_blocking` and surfaces only recoverable errors, never the
+    /// terminal `StreamEnded`. Use `on_data` + `on_end` to observe the terminal
+    /// reason.
     #[napi]
     pub fn read_blocking(&self) -> Result<AudioChunk> {
-        let mut inner = self.inner.lock().map_err(|e| {
+        // `read_buffer_blocking` takes `&self` now, so the guard does not need `mut`.
+        let inner = self.inner.lock().map_err(|e| {
             napi::Error::new(
                 napi::Status::GenericFailure,
                 format!("Lock poisoned: {}", e),
@@ -344,7 +468,8 @@ impl AudioCapture {
 
         let result =
             tokio::task::spawn_blocking(move || -> napi::Result<Option<rsac::AudioBuffer>> {
-                let mut capture = inner.lock().map_err(|e| {
+                // `read_buffer` takes `&self`, so the guard does not need `mut`.
+                let capture = inner.lock().map_err(|e| {
                     napi::Error::new(
                         napi::Status::GenericFailure,
                         format!("Lock poisoned: {}", e),
@@ -372,7 +497,8 @@ impl AudioCapture {
         let inner = self.inner.clone();
 
         let result = tokio::task::spawn_blocking(move || -> napi::Result<rsac::AudioBuffer> {
-            let mut capture = inner.lock().map_err(|e| {
+            // `read_buffer_blocking` takes `&self`, so the guard does not need `mut`.
+            let capture = inner.lock().map_err(|e| {
                 napi::Error::new(
                     napi::Status::GenericFailure,
                     format!("Lock poisoned: {}", e),
@@ -437,14 +563,73 @@ impl AudioCapture {
         Ok(())
     }
 
+    /// Register a callback that fires exactly once when push-based delivery ends,
+    /// carrying *why* it ended.
+    ///
+    /// The data pump started by `onData` ends in one of two ways, and a plain
+    /// `onData` consumer cannot otherwise distinguish them:
+    ///
+    /// - **Terminal (fatal):** the backend stream reached its terminal state
+    ///   (e.g. `StreamEnded`). The callback's `error` argument is the formatted
+    ///   terminal `AudioError` message (a non-null string).
+    /// - **Clean stop:** the pump was torn down by `stop` / `offData`, or the
+    ///   read mutex was poisoned. The callback's `error` argument is `null`.
+    ///
+    /// This is the Node parity for Rust's `subscribe_with_errors` and Go's
+    /// `StreamWithErrors`: an `onData` consumer registers `onEnd` to learn the
+    /// terminal reason instead of the pump silently logging it. Registering an
+    /// `onEnd` callback is optional and independent of `onData`.
+    ///
+    /// The registration persists across multiple `start`/`stop` sessions on the
+    /// same `AudioCapture`, exactly like `onData`: it fires once per session (at
+    /// each pump run's end) and stays armed for the next session. The pump fires a
+    /// *clone* and leaves the registered callback in place; it is cleared only by
+    /// `offEnd` or replaced by a later `onEnd` call. A recoverable hiccup never
+    /// fires it — only the single terminal end (fatal) or a clean stop does.
+    #[napi(ts_args_type = "callback: (error: string | null) => void")]
+    pub fn on_end(
+        &self,
+        callback: ThreadsafeFunction<Option<String>, ErrorStrategy::Fatal>,
+    ) -> Result<()> {
+        let mut cb_guard = self.end_callback.lock().map_err(|e| {
+            napi::Error::new(
+                napi::Status::GenericFailure,
+                format!("Lock poisoned: {}", e),
+            )
+        })?;
+        *cb_guard = Some(callback);
+        Ok(())
+    }
+
     /// Remove the registered data callback.
     ///
-    /// Stops the data pump thread if running.
+    /// Stops the data pump thread if running. The terminal-observability
+    /// callback registered via `onEnd` is left registered for a later session;
+    /// use `offEnd` to clear it.
     #[napi]
     pub fn off_data(&self) -> Result<()> {
         self.pump_active.store(false, Ordering::SeqCst);
 
         let mut cb_guard = self.callback.lock().map_err(|e| {
+            napi::Error::new(
+                napi::Status::GenericFailure,
+                format!("Lock poisoned: {}", e),
+            )
+        })?;
+        *cb_guard = None;
+        Ok(())
+    }
+
+    /// Remove the registered terminal-observability callback (see `onEnd`).
+    ///
+    /// This is the *only* way to clear an `onEnd` registration — unlike a
+    /// one-shot, the pump leaves it armed across sessions. After this, the pump's
+    /// end is no longer reported to JS; a *fatal* terminal still falls back to a
+    /// (throttled) stderr log line, while a clean stop ends silently. Does not
+    /// stop the pump.
+    #[napi]
+    pub fn off_end(&self) -> Result<()> {
+        let mut cb_guard = self.end_callback.lock().map_err(|e| {
             napi::Error::new(
                 napi::Status::GenericFailure,
                 format!("Lock poisoned: {}", e),
@@ -468,6 +653,145 @@ impl AudioCapture {
         })?;
         Ok(inner.overrun_count() as u32)
     }
+
+    /// Returns a point-in-time snapshot of the stream's diagnostic counters.
+    ///
+    /// Maps rsac's `#[non_exhaustive]` `StreamStats` field-by-field into a plain
+    /// JS object (see `StreamStats` in the type definitions). All counters are
+    /// read with cheap relaxed loads on this non-real-time query path — calling
+    /// this never allocates on or blocks the OS audio callback thread.
+    ///
+    /// Before `start()` (or after `stop()`) this returns a zeroed snapshot with
+    /// `isRunning === false` and `uptimeSecs === 0`.
+    #[napi]
+    pub fn stream_stats(&self) -> Result<JsStreamStats> {
+        let inner = self.inner.lock().map_err(|e| {
+            napi::Error::new(
+                napi::Status::GenericFailure,
+                format!("Lock poisoned: {}", e),
+            )
+        })?;
+        let s = inner.stream_stats();
+        // Map field-by-field; `dropped_ratio()` is a derived accessor on the
+        // Rust side, surfaced here as a precomputed field for JS convenience.
+        Ok(JsStreamStats {
+            overruns: bigint_from_u64(s.overruns),
+            buffers_captured: bigint_from_u64(s.buffers_captured),
+            buffers_dropped: bigint_from_u64(s.buffers_dropped),
+            buffers_pushed: bigint_from_u64(s.buffers_pushed),
+            uptime_secs: s.uptime.as_secs_f64(),
+            dropped_ratio: s.dropped_ratio(),
+            is_running: s.is_running,
+            format_description: s.format_description.clone(),
+        })
+    }
+
+    /// The negotiated *delivery* format the backend actually produces, or `null`
+    /// before `start()` creates a stream.
+    ///
+    /// This is the authoritative format published by the bridge once a backend
+    /// records it; it may differ from the requested settings when the device
+    /// forced a negotiation. Reading it does not allocate or lock the data plane.
+    #[napi(getter)]
+    pub fn format(&self) -> Result<Option<JsAudioFormat>> {
+        let inner = self.inner.lock().map_err(|e| {
+            napi::Error::new(
+                napi::Status::GenericFailure,
+                format!("Lock poisoned: {}", e),
+            )
+        })?;
+        Ok(inner.format().map(|f| JsAudioFormat {
+            sample_rate: f.sample_rate,
+            channels: f.channels as u32,
+            sample_format: sample_format_name(f.sample_format).to_string(),
+        }))
+    }
+}
+
+// ── Stream statistics + format (read-side observability) ─────────────────
+
+/// Widen a Rust `u64` counter to a JS `BigInt`.
+///
+/// rsac's stream counters are `u64`; JS `number` is an IEEE-754 double that
+/// loses integer precision past 2^53. Carrying them as `BigInt` is the honest
+/// typing — a long-running capture can legitimately exceed `Number.MAX_SAFE_INTEGER`.
+#[inline]
+fn bigint_from_u64(v: u64) -> BigInt {
+    BigInt::from(v)
+}
+
+/// Map an rsac `SampleFormat` to its short uppercase name (matches core's
+/// `format_description_string`).
+#[inline]
+fn sample_format_name(fmt: rsac::SampleFormat) -> &'static str {
+    match fmt {
+        rsac::SampleFormat::I16 => "I16",
+        rsac::SampleFormat::I24 => "I24",
+        rsac::SampleFormat::I32 => "I32",
+        rsac::SampleFormat::F32 => "F32",
+    }
+}
+
+/// A point-in-time snapshot of an [`AudioCapture`]'s diagnostic counters.
+///
+/// Field-by-field mirror of rsac's `#[non_exhaustive]` `StreamStats`. Counters
+/// are `BigInt` (u64) to avoid silent precision loss on long-running captures;
+/// `uptimeSecs` and `droppedRatio` are doubles.
+#[napi(object)]
+pub struct JsStreamStats {
+    /// Buffers dropped due to ring-buffer overflow (alias of `buffersDropped`,
+    /// kept for backward compatibility with `overrunCount`).
+    pub overruns: BigInt,
+    /// Cumulative buffers delivered to the consumer (popped off the ring).
+    pub buffers_captured: BigInt,
+    /// Cumulative buffers dropped due to ring-buffer overflow.
+    pub buffers_dropped: BigInt,
+    /// Cumulative buffers enqueued by the producer (the OS audio callback).
+    pub buffers_pushed: BigInt,
+    /// How long the stream has been running, in seconds. `0` when not started.
+    pub uptime_secs: f64,
+    /// Fraction of accounted-for buffers lost to overflow, in `0.0..=1.0`
+    /// (`buffersDropped / (buffersCaptured + buffersDropped)`; `0.0` when none).
+    pub dropped_ratio: f64,
+    /// Whether the stream is currently capturing.
+    pub is_running: bool,
+    /// Compact human-readable description of the negotiated format
+    /// (e.g. `"2ch 48000Hz F32"`); empty before the stream starts.
+    pub format_description: String,
+}
+
+/// The negotiated audio delivery format.
+#[napi(object)]
+pub struct JsAudioFormat {
+    /// Samples per second (e.g. 48000).
+    pub sample_rate: u32,
+    /// Number of interleaved channels (e.g. 2 for stereo).
+    pub channels: u32,
+    /// Sample format name: one of `"I16"`, `"I24"`, `"I32"`, `"F32"`.
+    pub sample_format: String,
+}
+
+// ── Data-pump recoverable-error log throttle ─────────────────────────────
+
+/// How often the data pump logs a *sustained* run of recoverable read errors.
+///
+/// The pump logs the first error in a streak eagerly, then only every
+/// `RECOVERABLE_LOG_EVERY`th after that, so a backend stuck returning a
+/// recoverable error on every ~1 ms poll cannot flood stderr at ~1000 lines/sec.
+const RECOVERABLE_LOG_EVERY: u64 = 1000;
+
+/// Whether the `count`-th (0-based) consecutive recoverable read error should be
+/// logged, given [`RECOVERABLE_LOG_EVERY`].
+///
+/// Returns `true` for the first error in a streak (`count == 0`) and then once
+/// per `RECOVERABLE_LOG_EVERY` errors. Pure arithmetic so the throttle policy is
+/// unit-testable without a node runtime; the pump increments the count on each
+/// recoverable error and resets it to `0` on a successful read.
+#[inline]
+fn should_log_recoverable(count: u64) -> bool {
+    // is_multiple_of (stable 1.87 = pinned MSRV) — clippy::manual_is_multiple_of
+    // rejects the `% N == 0` form under -D warnings.
+    count.is_multiple_of(RECOVERABLE_LOG_EVERY)
 }
 
 // ── AudioCapture private helpers ─────────────────────────────────────────
@@ -478,6 +802,7 @@ impl AudioCapture {
     fn start_data_pump(&self) -> Result<()> {
         let inner = self.inner.clone();
         let callback = self.callback.clone();
+        let end_callback = self.end_callback.clone();
         let pump_active = self.pump_active.clone();
 
         pump_active.store(true, Ordering::SeqCst);
@@ -485,18 +810,45 @@ impl AudioCapture {
         std::thread::Builder::new()
             .name("rsac-napi-pump".into())
             .spawn(move || {
+                // The terminal reason this pump ended with: `Some(msg)` on a fatal
+                // terminal (the formatted `AudioError`), `None` on a clean stop /
+                // poisoned mutex. Fired to the JS `onEnd` callback exactly once
+                // after the loop exits (see the `end_callback` notification below).
+                let mut end_reason: Option<String> = None;
+                // Recoverable-read-error log throttle. A sustained transient (e.g. a
+                // backend that returns a recoverable `StreamReadError` on every poll)
+                // would otherwise spam stderr ~1000 lines/sec (one per 1 ms retry).
+                // We log the FIRST occurrence eagerly, then only every
+                // `RECOVERABLE_LOG_EVERY`th thereafter (see `should_log_recoverable`)
+                // — annotated with how many were suppressed since the last line — so a
+                // stuck stream leaves a bounded, legible trail instead of a flood.
+                // Counting is a plain `u64` on this thread (no alloc, no lock), and the
+                // counter resets whenever a read succeeds so an isolated blip logs.
+                let mut recoverable_errors: u64 = 0;
                 while pump_active.load(Ordering::SeqCst) {
-                    // Try to read a buffer
+                    // Read via `read_chunk_nonblocking` (NOT `read_buffer`):
+                    // `read_buffer` short-circuits to a RECOVERABLE
+                    // `StreamReadError` the moment the stream leaves `Running`,
+                    // so it can NEVER surface the fatal `StreamEnded` — the pump
+                    // would loop on a recoverable error forever after stop.
+                    // `read_chunk_nonblocking` drains the buffered tail during
+                    // `Stopping` and yields the terminal `StreamEnded` (fatal)
+                    // once the ring is empty AND the stream is terminal, so we
+                    // can end cleanly on a real terminal (BP-3).
                     let maybe_buf = {
-                        let mut capture = match inner.lock() {
+                        let capture = match inner.lock() {
                             Ok(c) => c,
-                            Err(_) => break, // Mutex poisoned, bail
+                            Err(_) => break, // Mutex poisoned, bail (clean: None)
                         };
-                        capture.read_buffer()
+                        capture.read_chunk_nonblocking()
                     };
 
                     match maybe_buf {
                         Ok(Some(buf)) => {
+                            // A successful read clears the transient-error streak so a
+                            // later isolated blip is logged eagerly again (the throttle
+                            // only suppresses a *sustained* run of recoverable errors).
+                            recoverable_errors = 0;
                             let chunk = AudioChunk::from_rsac_buffer(&buf);
                             let cb = match callback.lock() {
                                 Ok(c) => c,
@@ -510,13 +862,66 @@ impl AudioCapture {
                             // No data available, yield briefly to avoid busy-spinning
                             std::thread::sleep(std::time::Duration::from_millis(1));
                         }
-                        Err(_) => {
-                            // Stream error — stop pumping
+                        // FATAL terminal (e.g. StreamEnded): the stream is done —
+                        // stop pumping cleanly. Capture the terminal cause so it is
+                        // surfaced to a registered `onEnd` callback (and logged), so
+                        // the end is never fully silent. (A consumer that needs the
+                        // terminal AudioError surfaced to JS registers `onEnd`; the
+                        // data pump itself ends here without erroring.)
+                        Err(ref e) if e.is_fatal() => {
+                            eprintln!("rsac-napi data pump ended (terminal): {}", e);
+                            end_reason = Some(e.to_string());
                             break;
+                        }
+                        // RECOVERABLE hiccup (transient StreamReadError,
+                        // BufferOverrun/Underrun): a transient error must NOT end
+                        // delivery. Log and retry after a brief pause, mirroring
+                        // the in-process callback pump and the subscribe loop. The
+                        // log is throttled (first occurrence, then every
+                        // `RECOVERABLE_LOG_EVERY`th) so a stuck stream cannot flood
+                        // stderr at ~1000 lines/sec.
+                        Err(e) => {
+                            if should_log_recoverable(recoverable_errors) {
+                                if recoverable_errors == 0 {
+                                    eprintln!("rsac-napi data pump read error (retrying): {}", e);
+                                } else {
+                                    eprintln!(
+                                        "rsac-napi data pump read error (retrying; \
+                                         {} more suppressed since last line): {}",
+                                        RECOVERABLE_LOG_EVERY - 1,
+                                        e
+                                    );
+                                }
+                            }
+                            recoverable_errors = recoverable_errors.saturating_add(1);
+                            std::thread::sleep(std::time::Duration::from_millis(1));
                         }
                     }
                 }
                 pump_active.store(false, Ordering::SeqCst);
+
+                // Notify the JS consumer (if it registered `onEnd`) *why* delivery
+                // stopped — the terminal `AudioError` message on a fatal terminal,
+                // or `null` on a clean stop. This is the Node parity for
+                // `subscribe_with_errors` / `StreamWithErrors`.
+                //
+                // The callback is *cloned* (not taken) so it survives across
+                // multiple start/stop sessions on the same `AudioCapture`, exactly
+                // like the `onData` callback. A `ThreadsafeFunction` is internally
+                // ref-counted, so the clone shares the same underlying JS function;
+                // firing this run's clone leaves the canonical copy registered in
+                // `end_callback` for the next pump run to re-arm automatically. The
+                // registration is cleared only by an explicit `offEnd` (or replaced
+                // by a later `onEnd`), so `onEnd` and `onData` are now symmetric:
+                // both fire once per session and both persist until explicitly
+                // cleared. (Fires at most once per pump run.)
+                let end_tsfn = match end_callback.lock() {
+                    Ok(guard) => guard.clone(),
+                    Err(_) => None,
+                };
+                if let Some(tsfn) = end_tsfn {
+                    tsfn.call(end_reason, ThreadsafeFunctionCallMode::NonBlocking);
+                }
             })
             .map_err(|e| {
                 napi::Error::new(
@@ -579,7 +984,7 @@ pub async fn list_devices() -> Result<Vec<JsAudioDevice>> {
 pub async fn get_default_device() -> Result<JsAudioDevice> {
     tokio::task::spawn_blocking(|| -> napi::Result<JsAudioDevice> {
         let enumerator = rsac::get_device_enumerator().map_err(audio_err_to_napi)?;
-        let device = enumerator.get_default_device().map_err(audio_err_to_napi)?;
+        let device = enumerator.default_device().map_err(audio_err_to_napi)?;
 
         Ok(JsAudioDevice {
             id: device.id().to_string(),
@@ -635,5 +1040,268 @@ pub fn platform_capabilities() -> JsPlatformCapabilities {
         min_sample_rate: caps.sample_rate_range.0,
         max_sample_rate: caps.sample_rate_range.1,
         backend_name: caps.backend_name.to_string(),
+    }
+}
+
+// ── Tests ─────────────────────────────────────────────────────────────────
+//
+// These exercise the napi-environment-independent logic only (string-target
+// parsing via rsac, the strided per-channel metering math, and the field-map
+// helpers). The JS-facing `#[napi]` surface (Float32Array I/O, ThreadsafeFn) is
+// validated at the node-build / inspection tier.
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // ── rsac-28ee: CaptureTarget.parse round-trip ────────────────────────
+
+    /// Valid specs round-trip through rsac's FromStr into the right variant —
+    /// the same parse `CaptureTarget::parse(spec)` performs. Covers the bare
+    /// scheme, a colon-bearing device id, name, app, and both pid spellings.
+    #[test]
+    fn parse_valid_specs_round_trip() {
+        let cases: &[(&str, rsac::CaptureTarget)] = &[
+            ("system", rsac::CaptureTarget::SystemDefault),
+            ("DEFAULT", rsac::CaptureTarget::SystemDefault), // case-insensitive
+            (
+                "device:hw:0,0",
+                rsac::CaptureTarget::Device(rsac::DeviceId("hw:0,0".to_string())),
+            ),
+            (
+                "app:session-7",
+                rsac::CaptureTarget::Application(rsac::ApplicationId("session-7".to_string())),
+            ),
+            (
+                "name:Firefox",
+                rsac::CaptureTarget::ApplicationByName("Firefox".to_string()),
+            ),
+            (
+                "pid:1234",
+                rsac::CaptureTarget::ProcessTree(rsac::ProcessId(1234)),
+            ),
+            (
+                "tree:1234",
+                rsac::CaptureTarget::ProcessTree(rsac::ProcessId(1234)),
+            ),
+        ];
+        for (spec, expected) in cases {
+            let parsed: rsac::CaptureTarget = spec
+                .parse()
+                .unwrap_or_else(|e| panic!("'{spec}' should parse: {e}"));
+            assert_eq!(&parsed, expected, "spec '{spec}'");
+        }
+    }
+
+    /// Invalid specs surface an `AudioError` (mapped to a thrown JS Error by
+    /// `CaptureTarget::parse`) without panicking.
+    #[test]
+    fn parse_invalid_specs_error_not_panic() {
+        for bad in ["bogus", "pid:not-a-number", "tree:-1", "device"] {
+            // "device" has no colon → unknown target; the others are bad scheme/pid.
+            let res: std::result::Result<rsac::CaptureTarget, _> = bad.parse();
+            assert!(res.is_err(), "'{bad}' should be rejected");
+        }
+    }
+
+    // ── rsac-fd16: metering exposed via AudioChunk fields ────────────────
+
+    /// The eager scalar + per-channel meters on `AudioChunk` come straight from
+    /// rsac core's `AudioBuffer` meters. Assert the source methods agree with
+    /// hand-computed values for a known interleaved stereo buffer:
+    /// L = [1.0, -1.0] → rms 1.0, peak 1.0; R = [0.5, -0.5] → rms 0.5, peak 0.5.
+    #[test]
+    fn channel_metering_matches_known_values() {
+        // interleaved L,R,L,R
+        let buf = rsac::AudioBuffer::new(vec![1.0f32, 0.5, -1.0, -0.5], 2, 48_000);
+        let rms_l = buf.channel_rms(0).unwrap();
+        let rms_r = buf.channel_rms(1).unwrap();
+        let peak_l = buf.channel_peak(0).unwrap();
+        let peak_r = buf.channel_peak(1).unwrap();
+        assert!((rms_l - 1.0).abs() < 1e-6, "L rms {rms_l}");
+        assert!((rms_r - 0.5).abs() < 1e-6, "R rms {rms_r}");
+        assert!((peak_l - 1.0).abs() < 1e-6, "L peak {peak_l}");
+        assert!((peak_r - 0.5).abs() < 1e-6, "R peak {peak_r}");
+    }
+
+    /// Out-of-range channel → None in core (the napi field path materializes
+    /// exactly `0..channels`, so that index is never produced).
+    #[test]
+    fn channel_metering_edge_cases() {
+        let buf = rsac::AudioBuffer::new(vec![1.0f32, 0.5, -1.0, -0.5], 2, 48_000);
+        assert_eq!(buf.channel_rms(2), None); // out of range
+        assert_eq!(buf.channel_peak(5), None);
+    }
+
+    /// The eager whole-buffer scalars on `AudioChunk` come straight from rsac
+    /// core's `AudioBuffer` meters — assert the source methods agree with the
+    /// expected values for a known buffer (the napi `from_rsac_buffer` copy is
+    /// exercised at the node tier).
+    #[test]
+    fn audio_buffer_scalar_meters_agree_with_core() {
+        let buf = rsac::AudioBuffer::new(vec![1.0f32, -1.0, 1.0, -1.0], 2, 48_000);
+        assert!((buf.rms() - 1.0).abs() < 1e-6);
+        assert!((buf.peak() - 1.0).abs() < 1e-6);
+        assert!((buf.peak_dbfs() - 0.0).abs() < 1e-6); // full scale → 0 dBFS
+                                                       // Silence → NEG_INFINITY dBFS (carried to JS as -Infinity).
+        let silent = rsac::AudioBuffer::new(vec![0.0f32; 4], 2, 48_000);
+        assert_eq!(silent.rms(), 0.0);
+        assert!(silent.rms_dbfs().is_infinite() && silent.rms_dbfs() < 0.0);
+    }
+
+    // ── rsac-fe6e: stats/format field mapping ────────────────────────────
+
+    /// `sample_format_name` maps every rsac SampleFormat variant to the short
+    /// uppercase name used in the JS `AudioFormat.sampleFormat` field.
+    #[test]
+    fn sample_format_name_maps_all_variants() {
+        assert_eq!(sample_format_name(rsac::SampleFormat::I16), "I16");
+        assert_eq!(sample_format_name(rsac::SampleFormat::I24), "I24");
+        assert_eq!(sample_format_name(rsac::SampleFormat::I32), "I32");
+        assert_eq!(sample_format_name(rsac::SampleFormat::F32), "F32");
+    }
+
+    /// A zeroed `StreamStats` (the pre-start snapshot) maps to a JS object with
+    /// `isRunning == false`, zero counters/uptime, and `droppedRatio == 0.0` —
+    /// i.e. every field the JS `StreamStats` interface declares is populated.
+    #[test]
+    fn stream_stats_default_maps_field_by_field() {
+        let s = rsac::StreamStats::default();
+        assert_eq!(s.overruns, 0);
+        assert_eq!(s.buffers_captured, 0);
+        assert_eq!(s.buffers_dropped, 0);
+        assert_eq!(s.buffers_pushed, 0);
+        assert_eq!(s.uptime, std::time::Duration::ZERO);
+        assert!(!s.is_running);
+        assert_eq!(s.dropped_ratio(), 0.0);
+        assert!(s.format_description.is_empty());
+        // The counters widen losslessly to BigInt (u64 -> BigInt) for JS.
+        // get_u64() -> (sign_negative, value, lossless).
+        let (neg, val, lossless) = bigint_from_u64(u64::MAX).get_u64();
+        assert!(!neg && lossless);
+        assert_eq!(val, u64::MAX);
+    }
+
+    /// `overruns` is the documented alias of `buffers_dropped`, so a JS caller's
+    /// `streamStats().overruns` and `overrunCount` agree (Go test parity).
+    ///
+    /// `StreamStats` is `#[non_exhaustive]`, so it can only be obtained via
+    /// `Default` outside its defining crate — which is exactly how the JS path
+    /// reads it (the live snapshot comes from `AudioCapture::stream_stats`).
+    #[test]
+    fn stream_stats_overruns_aliases_buffers_dropped() {
+        let s = rsac::StreamStats::default();
+        assert_eq!(s.overruns, s.buffers_dropped);
+    }
+
+    // ── rsac-cbda: onEnd terminal-observability classification ───────────
+    //
+    // The `onEnd` ThreadsafeFunction path cannot be driven without a node
+    // runtime + a real device, so these pin the *classification contract* the
+    // data pump's `end_reason` computation relies on: only a FATAL terminal
+    // produces a non-null reason (the formatted `AudioError`), and the formatted
+    // message is what gets surfaced to JS; a RECOVERABLE hiccup never ends the
+    // pump and so never fires `onEnd`. This mirrors the Python `__next__` and Go
+    // `StreamWithErrors` terminal-classification tests.
+
+    /// A fatal terminal (`StreamEnded`, ADR-0003) is what the pump surfaces to
+    /// `onEnd` as a non-null reason — and the reason is exactly `e.to_string()`,
+    /// the same formatted message the pump logs.
+    #[test]
+    fn on_end_fatal_terminal_surfaces_formatted_reason() {
+        let e = rsac::AudioError::StreamEnded {
+            reason: "capture ended".into(),
+        };
+        assert!(
+            e.is_fatal(),
+            "StreamEnded must be fatal → pump ends and fires onEnd with Some(reason)"
+        );
+        // The pump stores `Some(e.to_string())` as the end reason; the JS callback
+        // receives exactly this string (non-empty, carries the upstream cause).
+        let surfaced = e.to_string();
+        assert!(!surfaced.is_empty());
+        assert_eq!(surfaced, e.to_string());
+    }
+
+    /// A recoverable hiccup (transient `StreamReadError`, `BufferOverrun`/
+    /// `Underrun`) is NOT fatal, so the pump retries instead of ending — it never
+    /// fires `onEnd`. Pin the classification so a future change can't silently
+    /// turn a transient blip into a terminal `onEnd`.
+    #[test]
+    fn on_end_recoverable_does_not_terminate_pump() {
+        for e in [
+            rsac::AudioError::StreamReadError {
+                reason: "transient".into(),
+            },
+            rsac::AudioError::BufferOverrun { dropped_frames: 1 },
+            rsac::AudioError::BufferUnderrun {
+                requested: 1,
+                available: 0,
+            },
+        ] {
+            assert!(
+                !e.is_fatal(),
+                "{e} is recoverable → pump retries, onEnd not fired"
+            );
+            assert!(e.is_recoverable());
+        }
+    }
+
+    // ── rsac-2587: data-pump recoverable-error log throttle ──────────────
+    //
+    // The pump cannot be driven without a node runtime + a real device, so
+    // these pin the *throttle policy* the pump's logging decision relies on:
+    // the first error in a streak logs, then only every `RECOVERABLE_LOG_EVERY`th
+    // thereafter, so a sustained transient cannot flood stderr at ~1000 lines/sec.
+
+    /// The first error in a streak (`count == 0`) always logs, so an isolated
+    /// blip is never silently swallowed.
+    #[test]
+    fn recoverable_throttle_logs_first_occurrence() {
+        assert!(should_log_recoverable(0));
+    }
+
+    /// Within the first window, errors `1..RECOVERABLE_LOG_EVERY` are suppressed
+    /// (only the boundary multiples log), so a sustained transient at the pump's
+    /// ~1 ms retry cadence produces at most ~1 line per `RECOVERABLE_LOG_EVERY`
+    /// errors instead of one per error.
+    #[test]
+    fn recoverable_throttle_suppresses_within_window() {
+        for count in 1..RECOVERABLE_LOG_EVERY {
+            assert!(
+                !should_log_recoverable(count),
+                "count {count} should be suppressed (not a multiple of {RECOVERABLE_LOG_EVERY})"
+            );
+        }
+    }
+
+    /// Logging recurs exactly on each `RECOVERABLE_LOG_EVERY` boundary, so a
+    /// stuck stream still leaves a bounded, periodic trail (a flat-zero rate
+    /// would hide a genuinely wedged backend).
+    #[test]
+    fn recoverable_throttle_logs_on_each_boundary() {
+        assert!(should_log_recoverable(RECOVERABLE_LOG_EVERY));
+        assert!(should_log_recoverable(RECOVERABLE_LOG_EVERY * 2));
+        assert!(should_log_recoverable(RECOVERABLE_LOG_EVERY * 7));
+        // ...and the off-by-one neighbours of a boundary are still suppressed.
+        assert!(!should_log_recoverable(RECOVERABLE_LOG_EVERY - 1));
+        assert!(!should_log_recoverable(RECOVERABLE_LOG_EVERY + 1));
+    }
+
+    /// Over a long sustained streak, the number of *logged* lines is bounded by
+    /// `streak / RECOVERABLE_LOG_EVERY + 1` — the property that makes the flood
+    /// impossible. Assert it directly for a streak far larger than one window.
+    #[test]
+    fn recoverable_throttle_bounds_logged_lines() {
+        let streak = RECOVERABLE_LOG_EVERY * 5 + 123; // not a clean multiple
+        let logged = (0..streak).filter(|&c| should_log_recoverable(c)).count() as u64;
+        let upper_bound = streak / RECOVERABLE_LOG_EVERY + 1;
+        assert!(
+            logged <= upper_bound,
+            "logged {logged} lines over a {streak}-error streak exceeds the \
+             {upper_bound}-line bound"
+        );
+        // Concretely: 5 full windows + a partial → exactly 6 logged lines
+        // (counts 0, EVERY, 2·EVERY, 3·EVERY, 4·EVERY, 5·EVERY).
+        assert_eq!(logged, 6);
     }
 }

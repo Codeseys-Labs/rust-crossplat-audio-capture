@@ -22,6 +22,13 @@ use std::fmt;
 // ── Supporting Types ─────────────────────────────────────────────────────
 
 /// Categorizes an [`AudioError`] into a high-level domain.
+///
+/// # Stability
+///
+/// This enum is **deliberately not** `#[non_exhaustive]`: its seven domains are a
+/// fixed, intentional classification axis that downstream code is meant to match
+/// exhaustively. Keeping it closed is a stability guarantee — the set will not
+/// grow in a way that silently breaks exhaustive matches.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum ErrorKind {
     Configuration,
@@ -48,6 +55,14 @@ impl fmt::Display for ErrorKind {
 }
 
 /// Three-state recoverability classification for [`AudioError`].
+///
+/// # Stability
+///
+/// This enum is **deliberately not** `#[non_exhaustive]`: the three recoverability
+/// states are a fixed, intentional classification axis callers branch on
+/// exhaustively (retry / abandon / continue). Keeping it closed is a stability
+/// guarantee — the set will not grow in a way that silently breaks exhaustive
+/// matches.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum Recoverability {
     /// The error is recoverable — the caller can continue normally.
@@ -102,9 +117,23 @@ impl fmt::Display for BackendContext {
 
 /// Represents all errors that can occur during audio operations.
 ///
-/// Organized into 7 categories with 21 total variants.
+/// Organized into 7 categories with 22 total variants.
 /// Each variant carries structured context for diagnostics.
+///
+/// # Stability
+///
+/// This enum is `#[non_exhaustive]`: new failure modes may be added in a minor
+/// release without it being a breaking change. **Out-of-crate** code matching on
+/// `AudioError` must therefore include a trailing wildcard (`_ =>`) arm to stay
+/// forward-compatible; treat an unrecognized variant by consulting
+/// [`kind`](Self::kind) / [`recoverability`](Self::recoverability) /
+/// [`user_message`](Self::user_message) rather than the variant identity. The
+/// classification methods on this type ([`kind`](Self::kind),
+/// [`recoverability`](Self::recoverability), [`user_message`](Self::user_message))
+/// remain exhaustive **inside this crate** so every new variant is forced to
+/// declare its category, recoverability, and user-facing text deliberately.
 #[derive(Debug)]
+#[non_exhaustive]
 pub enum AudioError {
     // ── Configuration errors ─────────────────────────────────────────
     /// A parameter value is invalid.
@@ -139,7 +168,17 @@ pub enum AudioError {
     /// Failed to stop an audio stream.
     StreamStopFailed { reason: String },
     /// An error occurred while reading audio data from a stream.
+    ///
+    /// This is a **transient/recoverable** read failure (e.g. a momentary
+    /// internal hiccup) — NOT end-of-stream. When a read fails because the
+    /// stream has reached a terminal state, [`StreamEnded`](AudioError::StreamEnded)
+    /// is returned instead, so callers can distinguish "retry" from "done".
     StreamReadError { reason: String },
+    /// The stream has ended: a read was attempted on a stream that has reached
+    /// a terminal state (Stopped / Closed / Error). This is **fatal** for the
+    /// read loop — the stream will produce no more data and should not be
+    /// retried. Distinct from the recoverable [`StreamReadError`](AudioError::StreamReadError).
+    StreamEnded { reason: String },
     /// The ring buffer overflowed — audio frames were dropped.
     BufferOverrun { dropped_frames: usize },
     /// The ring buffer underran — not enough data was available.
@@ -204,6 +243,7 @@ impl AudioError {
             | AudioError::StreamStartFailed { .. }
             | AudioError::StreamStopFailed { .. }
             | AudioError::StreamReadError { .. }
+            | AudioError::StreamEnded { .. }
             | AudioError::BufferOverrun { .. }
             | AudioError::BufferUnderrun { .. } => ErrorKind::Stream,
 
@@ -226,7 +266,11 @@ impl AudioError {
     ///
     /// - `Recoverable`: `BufferOverrun`, `BufferUnderrun`, `StreamReadError`
     /// - `TransientRetry`: `DeviceNotAvailable`, `Timeout`, `BackendError`
-    /// - `Fatal`: everything else
+    /// - `Fatal`: everything else (including `StreamEnded` — the stream is done)
+    ///
+    /// This match is **exhaustive** (no `_` catch-all) on purpose: adding a new
+    /// `AudioError` variant forces a compile error here so its recoverability is
+    /// classified deliberately rather than silently defaulting to `Fatal`.
     pub fn recoverability(&self) -> Recoverability {
         match self {
             AudioError::BufferOverrun { .. }
@@ -237,7 +281,24 @@ impl AudioError {
             | AudioError::Timeout { .. }
             | AudioError::BackendError { .. } => Recoverability::TransientRetry,
 
-            _ => Recoverability::Fatal,
+            // Fatal: the operation should be abandoned. StreamEnded is fatal for
+            // a read loop — the stream will produce no more data.
+            AudioError::InvalidParameter { .. }
+            | AudioError::UnsupportedFormat { .. }
+            | AudioError::ConfigurationError { .. }
+            | AudioError::DeviceNotFound { .. }
+            | AudioError::DeviceEnumerationError { .. }
+            | AudioError::StreamCreationFailed { .. }
+            | AudioError::StreamStartFailed { .. }
+            | AudioError::StreamStopFailed { .. }
+            | AudioError::StreamEnded { .. }
+            | AudioError::BackendNotAvailable { .. }
+            | AudioError::BackendInitializationFailed { .. }
+            | AudioError::ApplicationNotFound { .. }
+            | AudioError::ApplicationCaptureFailed { .. }
+            | AudioError::PlatformNotSupported { .. }
+            | AudioError::PermissionDenied { .. }
+            | AudioError::InternalError { .. } => Recoverability::Fatal,
         }
     }
 
@@ -252,6 +313,268 @@ impl AudioError {
     /// Returns `true` if the error is `Fatal`.
     pub fn is_fatal(&self) -> bool {
         self.recoverability() == Recoverability::Fatal
+    }
+
+    /// Builds a [`UserFacingError`] — actionable, UI-ready text for this error.
+    ///
+    /// This turns the internal error taxonomy into a plain-language `summary`
+    /// plus an optional `remedy` hint (a concrete next step the user or
+    /// developer can take), without changing the taxonomy itself. The
+    /// [`recoverability`](UserFacingError::recoverability) and
+    /// [`kind`](UserFacingError::kind) fields mirror [`recoverability()`](Self::recoverability)
+    /// and [`kind()`](Self::kind); [`backend_code`](UserFacingError::backend_code)
+    /// surfaces the underlying OS error code ([`BackendContext::os_error_code`])
+    /// when one is attached.
+    ///
+    /// The `match` here is **exhaustive** (no `_` catch-all) on purpose, mirroring
+    /// [`recoverability()`](Self::recoverability): adding a new [`AudioError`]
+    /// variant forces a compile error so its user-facing message is written
+    /// deliberately rather than silently defaulting to a generic string.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use rsac::{AudioError, Recoverability};
+    ///
+    /// let err = AudioError::PermissionDenied {
+    ///     operation: "capture".into(),
+    ///     details: None,
+    /// };
+    /// let ui = err.user_message();
+    /// assert!(!ui.summary.is_empty());
+    /// assert!(ui.remedy.is_some());
+    /// assert_eq!(ui.recoverability, Recoverability::Fatal);
+    /// ```
+    pub fn user_message(&self) -> UserFacingError {
+        // Pull the OS error code out of any attached BackendContext so the UI
+        // can surface it alongside the plain-language summary.
+        let backend_code = self.backend_context().and_then(|ctx| ctx.os_error_code);
+
+        let (summary, remedy): (String, Option<String>) = match self {
+            // ── Configuration ────────────────────────────────────────────
+            AudioError::InvalidParameter { param, reason } => (
+                format!("Invalid value for '{param}': {reason}."),
+                Some(format!(
+                    "Correct the '{param}' value in your AudioCaptureBuilder configuration and rebuild."
+                )),
+            ),
+            AudioError::UnsupportedFormat { format, .. } => (
+                format!("The audio format '{format}' is not supported."),
+                Some(
+                    "Choose a format the backend accepts (query supported formats with \
+                     PlatformCapabilities::query())."
+                        .to_string(),
+                ),
+            ),
+            AudioError::ConfigurationError { message } => (
+                format!("The capture configuration is invalid: {message}."),
+                Some("Review your AudioCaptureBuilder settings and rebuild.".to_string()),
+            ),
+
+            // ── Device ───────────────────────────────────────────────────
+            AudioError::DeviceNotFound { device_id } => (
+                format!("The audio device '{device_id}' could not be found."),
+                Some("List devices with list_audio_sources() and pick an available one.".to_string()),
+            ),
+            AudioError::DeviceNotAvailable { device_id, reason } => (
+                format!("The audio device '{device_id}' is currently unavailable: {reason}."),
+                Some(
+                    "The device may be in use or disconnected — retry shortly, or pick \
+                     another device from list_audio_sources()."
+                        .to_string(),
+                ),
+            ),
+            AudioError::DeviceEnumerationError { reason, .. } => (
+                format!("Could not enumerate audio devices: {reason}."),
+                Some("Check that the audio subsystem is running, then retry.".to_string()),
+            ),
+
+            // ── Stream ───────────────────────────────────────────────────
+            AudioError::StreamCreationFailed { reason, .. } => (
+                format!("The audio stream could not be created: {reason}."),
+                Some(
+                    "Verify the device and format are supported (PlatformCapabilities::query()) \
+                     and try again."
+                        .to_string(),
+                ),
+            ),
+            AudioError::StreamStartFailed { reason } => (
+                format!("The audio stream failed to start: {reason}."),
+                Some("Ensure the capture target is still available, then retry start().".to_string()),
+            ),
+            AudioError::StreamStopFailed { reason } => (
+                format!("The audio stream failed to stop cleanly: {reason}."),
+                None,
+            ),
+            AudioError::StreamReadError { reason } => (
+                format!("A transient error occurred while reading audio: {reason}."),
+                Some("This is usually momentary — retry the read.".to_string()),
+            ),
+            AudioError::StreamEnded { reason } => (
+                format!("The audio stream has ended: {reason}."),
+                Some("The stream will produce no more data — create a new capture to continue.".to_string()),
+            ),
+            AudioError::BufferOverrun { dropped_frames } => (
+                format!("The capture buffer overran and {dropped_frames} frame(s) were dropped."),
+                Some("Consume buffers more frequently or increase the buffer size to avoid drops.".to_string()),
+            ),
+            AudioError::BufferUnderrun {
+                requested,
+                available,
+            } => (
+                format!(
+                    "Not enough audio was available: requested {requested} frame(s) but only \
+                     {available} were ready."
+                ),
+                Some("Wait for more audio to be captured before reading again.".to_string()),
+            ),
+
+            // ── Backend ──────────────────────────────────────────────────
+            AudioError::BackendError {
+                backend,
+                operation,
+                message,
+                ..
+            } => (
+                format!("The {backend} audio backend failed during '{operation}': {message}."),
+                Some("This may be transient — retry the operation.".to_string()),
+            ),
+            AudioError::BackendNotAvailable { backend } => (
+                format!("The {backend} audio backend is not available on this system."),
+                Some(
+                    "Confirm the platform/feature is supported with PlatformCapabilities::query()."
+                        .to_string(),
+                ),
+            ),
+            AudioError::BackendInitializationFailed { backend, reason } => (
+                format!("The {backend} audio backend failed to initialize: {reason}."),
+                Some(
+                    "Ensure the OS audio service is running (e.g. PipeWire on Linux) and retry."
+                        .to_string(),
+                ),
+            ),
+
+            // ── Application ──────────────────────────────────────────────
+            AudioError::ApplicationNotFound { identifier } => (
+                format!("No running application matched '{identifier}' for capture."),
+                Some(
+                    "Confirm the application is running and producing audio; list candidates \
+                     with list_audio_applications()."
+                        .to_string(),
+                ),
+            ),
+            AudioError::ApplicationCaptureFailed { app_id, reason } => (
+                format!("Capturing audio from application '{app_id}' failed: {reason}."),
+                Some(
+                    "Confirm the application is still running and that per-application capture \
+                     is supported (PlatformCapabilities::query())."
+                        .to_string(),
+                ),
+            ),
+
+            // ── Platform ─────────────────────────────────────────────────
+            AudioError::PlatformNotSupported { feature, platform } => (
+                format!("The feature '{feature}' is not supported on {platform}."),
+                Some(format!(
+                    "'{feature}' is unavailable on {platform} — check PlatformCapabilities::query() \
+                     before using it and choose a supported capture target."
+                )),
+            ),
+            AudioError::PermissionDenied { operation, details } => {
+                let mut summary = format!("Permission was denied for '{operation}'.");
+                if let Some(d) = details {
+                    summary.push(' ');
+                    summary.push_str(d);
+                }
+                (
+                    summary,
+                    Some(
+                        "Grant audio capture permission in System Settings > Privacy \
+                         (macOS 14.4+), or your platform's equivalent, then retry."
+                            .to_string(),
+                    ),
+                )
+            }
+
+            // ── Internal ─────────────────────────────────────────────────
+            AudioError::InternalError { message, .. } => (
+                format!("An unexpected internal error occurred: {message}."),
+                Some("This is likely a bug — please report it with the surrounding logs.".to_string()),
+            ),
+            AudioError::Timeout {
+                operation,
+                duration,
+            } => (
+                format!("The operation '{operation}' timed out after {duration:?}."),
+                Some("Retry the operation; if it persists, check the device/backend health.".to_string()),
+            ),
+        };
+
+        UserFacingError {
+            summary,
+            remedy,
+            recoverability: self.recoverability(),
+            kind: self.kind(),
+            backend_code,
+        }
+    }
+
+    /// Borrows the [`BackendContext`] attached to this error, if any.
+    ///
+    /// Only the variants that carry an `Option<BackendContext>` can return
+    /// `Some`; all others return `None`. This is the single source of truth
+    /// for [`user_message`](Self::user_message)'s `backend_code` extraction.
+    fn backend_context(&self) -> Option<&BackendContext> {
+        match self {
+            AudioError::UnsupportedFormat { context, .. }
+            | AudioError::DeviceEnumerationError { context, .. }
+            | AudioError::StreamCreationFailed { context, .. }
+            | AudioError::BackendError { context, .. } => context.as_ref(),
+            _ => None,
+        }
+    }
+}
+
+// ── UserFacingError ────────────────────────────────────────────────────────
+
+/// Actionable, UI-ready presentation of an [`AudioError`].
+///
+/// Produced by [`AudioError::user_message`]. Unlike [`Display`](fmt::Display),
+/// which renders a single diagnostic line, this splits the error into a
+/// plain-language [`summary`](Self::summary) and an optional concrete
+/// [`remedy`](Self::remedy) so a UI can show "what happened" and "what to do
+/// about it" separately. It also carries the machine-readable
+/// [`recoverability`](Self::recoverability) and [`kind`](Self::kind)
+/// classifications (mirroring [`AudioError::recoverability`] and
+/// [`AudioError::kind`]) plus the raw OS [`backend_code`](Self::backend_code)
+/// when one is available.
+///
+/// `#[non_exhaustive]`: additional fields may be added in future minor
+/// releases, so construct it only via [`AudioError::user_message`].
+#[derive(Debug, Clone)]
+#[non_exhaustive]
+pub struct UserFacingError {
+    /// Plain-language description of what went wrong. Always non-empty.
+    pub summary: String,
+    /// A concrete next step the user or developer can take, when one is
+    /// actionable. `None` when no useful remedy applies.
+    pub remedy: Option<String>,
+    /// Recoverability classification, mirroring [`AudioError::recoverability`].
+    pub recoverability: Recoverability,
+    /// High-level error category, mirroring [`AudioError::kind`].
+    pub kind: ErrorKind,
+    /// Raw OS-level error code from the underlying [`BackendContext`], when
+    /// the originating error carried one.
+    pub backend_code: Option<i64>,
+}
+
+impl fmt::Display for UserFacingError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "{}", self.summary)?;
+        if let Some(ref remedy) = self.remedy {
+            write!(f, " {remedy}")?;
+        }
+        Ok(())
     }
 }
 
@@ -306,6 +629,9 @@ impl fmt::Display for AudioError {
             }
             AudioError::StreamReadError { reason } => {
                 write!(f, "Stream read error: {}", reason)
+            }
+            AudioError::StreamEnded { reason } => {
+                write!(f, "Stream ended: {}", reason)
             }
             AudioError::BufferOverrun { dropped_frames } => {
                 write!(f, "Buffer overrun: {} frames dropped", dropped_frames)
@@ -498,6 +824,9 @@ mod tests {
             AudioError::StreamReadError {
                 reason: "timeout".into(),
             },
+            AudioError::StreamEnded {
+                reason: "stream stopped".into(),
+            },
             AudioError::BufferOverrun { dropped_frames: 42 },
             AudioError::BufferUnderrun {
                 requested: 1024,
@@ -545,9 +874,10 @@ mod tests {
     // ── Construction ─────────────────────────────────────────────────
 
     #[test]
-    fn all_21_variants_constructible() {
+    fn all_variants_constructible() {
         let variants = make_all_variants();
-        assert_eq!(variants.len(), 21, "Must have exactly 21 variants");
+        // 22 variants since ADR-0003 added StreamEnded (was 21).
+        assert_eq!(variants.len(), 22, "Must have exactly 22 variants");
     }
 
     // ── ErrorKind: Configuration ─────────────────────────────────────
@@ -644,6 +974,32 @@ mod tests {
             .kind(),
             ErrorKind::Stream
         );
+    }
+
+    // ── StreamEnded semantics (ADR-0003) ─────────────────────────────
+
+    #[test]
+    fn stream_ended_is_fatal_and_stream_kind() {
+        let e = AudioError::StreamEnded {
+            reason: "Stream stopped".into(),
+        };
+        assert_eq!(e.kind(), ErrorKind::Stream);
+        assert!(
+            e.is_fatal(),
+            "StreamEnded must be Fatal so read loops terminate"
+        );
+        assert!(!e.is_recoverable());
+    }
+
+    #[test]
+    fn stream_read_error_stays_recoverable() {
+        // The transient read error must remain Recoverable — only StreamEnded is
+        // the terminal signal (ADR-0003).
+        let e = AudioError::StreamReadError {
+            reason: "hiccup".into(),
+        };
+        assert!(e.is_recoverable());
+        assert!(!e.is_fatal());
     }
 
     // ── ErrorKind: Backend ───────────────────────────────────────────
@@ -1579,6 +1935,159 @@ mod tests {
         assert!(
             display.contains("1024") || display.contains("512"),
             "Should contain requested/available counts: {display}"
+        );
+    }
+
+    // ── UserFacingError (user_message) ────────────────────────────────
+
+    #[test]
+    fn user_message_every_variant_has_nonempty_summary() {
+        // Reuse the canonical "every variant" constructor so adding a variant
+        // forces it (and thus this assertion) to cover the new case.
+        for err in make_all_variants() {
+            let ui = err.user_message();
+            assert!(
+                !ui.summary.trim().is_empty(),
+                "user_message().summary is empty for {err:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn user_message_mirrors_recoverability_and_kind() {
+        // Representative sample across categories/recoverabilities.
+        for err in make_all_variants() {
+            let ui = err.user_message();
+            assert_eq!(
+                ui.recoverability,
+                err.recoverability(),
+                "recoverability mismatch for {err:?}"
+            );
+            assert_eq!(ui.kind, err.kind(), "kind mismatch for {err:?}");
+        }
+    }
+
+    #[test]
+    fn user_message_permission_denied_has_remedy() {
+        let ui = AudioError::PermissionDenied {
+            operation: "capture".into(),
+            details: None,
+        }
+        .user_message();
+        let remedy = ui.remedy.expect("PermissionDenied must have a remedy");
+        assert!(!remedy.trim().is_empty());
+        // Mentions the actionable step.
+        assert!(
+            remedy.contains("permission") || remedy.contains("Privacy"),
+            "remedy should mention granting permission: {remedy}"
+        );
+    }
+
+    #[test]
+    fn user_message_platform_not_supported_remedy_names_platform_and_feature() {
+        let ui = AudioError::PlatformNotSupported {
+            feature: "process-tap".into(),
+            platform: "linux".into(),
+        }
+        .user_message();
+        let remedy = ui.remedy.expect("PlatformNotSupported must have a remedy");
+        assert!(
+            remedy.contains("process-tap"),
+            "remedy names feature: {remedy}"
+        );
+        assert!(remedy.contains("linux"), "remedy names platform: {remedy}");
+        assert!(
+            remedy.contains("PlatformCapabilities"),
+            "remedy points to capability probe: {remedy}"
+        );
+    }
+
+    #[test]
+    fn user_message_extracts_backend_code() {
+        let ctx = BackendContext {
+            backend_name: "WASAPI".into(),
+            os_error_code: Some(-2004287478),
+            os_error_message: Some("device in use".into()),
+        };
+        let ui = AudioError::BackendError {
+            backend: "WASAPI".into(),
+            operation: "init".into(),
+            message: "fail".into(),
+            context: Some(ctx),
+        }
+        .user_message();
+        assert_eq!(ui.backend_code, Some(-2004287478));
+    }
+
+    #[test]
+    fn user_message_backend_code_none_without_context() {
+        // A variant that has no BackendContext field at all.
+        let ui = AudioError::DeviceNotFound {
+            device_id: "hw:0".into(),
+        }
+        .user_message();
+        assert_eq!(ui.backend_code, None);
+        // And a context-carrying variant with context: None.
+        let ui2 = AudioError::StreamCreationFailed {
+            reason: "x".into(),
+            context: None,
+        }
+        .user_message();
+        assert_eq!(ui2.backend_code, None);
+    }
+
+    #[test]
+    fn user_message_display_includes_summary_and_remedy() {
+        let ui = AudioError::DeviceNotFound {
+            device_id: "hw:9".into(),
+        }
+        .user_message();
+        let shown = ui.to_string();
+        assert!(
+            shown.contains("hw:9"),
+            "Display should include the summary: {shown}"
+        );
+        assert!(
+            shown.contains("list_audio_sources"),
+            "Display should append the remedy: {shown}"
+        );
+    }
+
+    // ── #[non_exhaustive] semantics (AEG-1 / rsac-4341) ──────────────────
+
+    /// `AudioError` is `#[non_exhaustive]`. Out-of-crate consumers must include a
+    /// trailing wildcard arm; the canonical forward-compatible path is to classify
+    /// an unrecognized variant via [`kind`]/[`recoverability`] rather than its
+    /// identity. This test models a *binding-style* match (the shape the three
+    /// binding crates use) — every named arm PLUS a `_ =>` fallback — and asserts
+    /// the wildcard is reachable as the classification default.
+    ///
+    /// In-crate this match would still compile without the `_` (the attribute is a
+    /// no-op for matches in the defining crate), but writing it here documents and
+    /// locks in the contract the binding crates depend on.
+    #[test]
+    fn non_exhaustive_match_uses_wildcard_classification() {
+        fn classify(err: &AudioError) -> Recoverability {
+            match err {
+                AudioError::StreamReadError { .. } => Recoverability::Recoverable,
+                // The trailing wildcard is REQUIRED out-of-crate because
+                // AudioError is #[non_exhaustive]; defer to the crate's own
+                // classification so a future variant is handled, not ignored.
+                other => other.recoverability(),
+            }
+        }
+
+        // A known arm.
+        assert_eq!(
+            classify(&AudioError::StreamReadError { reason: "x".into() }),
+            Recoverability::Recoverable
+        );
+        // An arm reached only through the wildcard.
+        assert_eq!(
+            classify(&AudioError::StreamEnded {
+                reason: "done".into()
+            }),
+            Recoverability::Fatal
         );
     }
 }

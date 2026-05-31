@@ -89,7 +89,10 @@ pub(crate) struct BridgeStream<S: PlatformStream> {
     consumer: Mutex<BridgeConsumer>,
     /// Shared state (lifecycle + diagnostics) — cloned from the consumer's Arc.
     shared: Arc<BridgeShared>,
-    /// Audio format of data flowing through this stream.
+    /// Audio format **requested** when the stream was created. Used only as the
+    /// fallback for [`format`](CapturingStream::format) until a backend records
+    /// the authoritative delivery format on the shared state (M1). The shared
+    /// negotiated format is the source of truth; this field is the seed value.
     format: AudioFormat,
     /// Platform-specific stream handle, protected by Mutex for &self access.
     platform_stream: Mutex<S>,
@@ -152,18 +155,48 @@ impl<S: PlatformStream> BridgeStream<S> {
     pub fn buffers_read(&self) -> u64 {
         self.shared.buffers_popped.load(Ordering::Relaxed)
     }
+
+    /// Aggregate `(pushed, dropped)` totals across the bridge's sliding
+    /// drop-rate window (`rsac-cfe4`).
+    ///
+    /// This is the windowed view that does **not** reset on a single successful
+    /// push (unlike [`is_under_backpressure`](CapturingStream::is_under_backpressure)),
+    /// so it surfaces sustained 1-in-N loss the consecutive-drop bool misses.
+    /// The `AudioCapture`/`BackpressureReport` layer (stats area) reads this to
+    /// compute a windowed `drop_rate`; exposed here so it can reach the bridge
+    /// atomics through the stream without touching producer internals.
+    #[allow(dead_code)]
+    pub fn drop_window_snapshot(&self) -> (u64, u64) {
+        self.shared.drop_window_snapshot()
+    }
 }
 
 // ── CapturingStream Implementation ───────────────────────────────────────
+
+/// Maps a non-readable [`StreamState`] to the right error: a terminal state
+/// (`Stopped`/`Closed`/`Error`) is end-of-stream → the Fatal
+/// [`AudioError::StreamEnded`]; a pre-start state (`Created`) is a usage error
+/// the caller can recover from by starting the stream → the recoverable
+/// [`AudioError::StreamReadError`]. See ADR-0003.
+fn non_readable_error(state: StreamState) -> AudioError {
+    match state {
+        StreamState::Stopped | StreamState::Closed | StreamState::Error => {
+            AudioError::StreamEnded {
+                reason: format!("Stream is in {} state, no more data", state),
+            }
+        }
+        _ => AudioError::StreamReadError {
+            reason: format!("Stream is in {} state, cannot read", state),
+        },
+    }
+}
 
 impl<S: PlatformStream + Sync + 'static> CapturingStream for BridgeStream<S> {
     fn read_chunk(&self) -> AudioResult<AudioBuffer> {
         // Check state — must be readable (Running or Stopping).
         if !self.shared.state.is_readable() {
             let state = self.shared.state.get();
-            return Err(AudioError::StreamReadError {
-                reason: format!("Stream is in {} state, cannot read", state),
-            });
+            return Err(non_readable_error(state));
         }
 
         let mut consumer = self
@@ -181,9 +214,7 @@ impl<S: PlatformStream + Sync + 'static> CapturingStream for BridgeStream<S> {
         // Check state — must be readable (Running or Stopping).
         if !self.shared.state.is_readable() {
             let state = self.shared.state.get();
-            return Err(AudioError::StreamReadError {
-                reason: format!("Stream is in {} state, cannot read", state),
-            });
+            return Err(non_readable_error(state));
         }
 
         let mut consumer = self
@@ -235,11 +266,24 @@ impl<S: PlatformStream + Sync + 'static> CapturingStream for BridgeStream<S> {
             .state
             .transition(StreamState::Stopping, StreamState::Stopped);
 
+        // Wake a consumer parked in a blocking read so it observes the terminal
+        // state promptly (PU-5). stop() drives Running→Stopping→Stopped directly
+        // (not via signal_done/signal_error, which wake on their own), so without
+        // this a quiet stream's blocked reader would only wake via the bounded
+        // backstop poll. Called from the non-RT stop path, so the notify is sound
+        // (ADR-0001 forbids notify only from the RT audio callbacks).
+        self.shared.notify_wake();
+
         result
     }
 
     fn format(&self) -> AudioFormat {
-        self.format.clone()
+        // M1: surface the *delivery* format, not just the requested one. If a
+        // backend has called `BridgeProducer::set_negotiated_format`, that
+        // authoritative format is returned; otherwise this falls back to the
+        // requested format the stream was constructed with (which is also the
+        // seed value stored in shared state).
+        self.shared.negotiated_format()
     }
 
     fn is_running(&self) -> bool {
@@ -250,10 +294,36 @@ impl<S: PlatformStream + Sync + 'static> CapturingStream for BridgeStream<S> {
         self.shared.buffers_dropped.load(Ordering::Relaxed)
     }
 
+    fn buffers_captured(&self) -> u64 {
+        // Buffers delivered to the consumer == popped off the ring buffer.
+        self.shared.buffers_popped.load(Ordering::Relaxed)
+    }
+
+    fn buffers_pushed(&self) -> u64 {
+        self.shared.buffers_pushed.load(Ordering::Relaxed)
+    }
+
+    fn buffers_dropped(&self) -> u64 {
+        // Alias of overrun_count(): both report ring-buffer-overflow drops.
+        self.shared.buffers_dropped.load(Ordering::Relaxed)
+    }
+
+    fn is_producing(&self) -> bool {
+        self.shared.state.is_running()
+    }
+
     fn is_under_backpressure(&self) -> bool {
         self.shared.is_under_backpressure()
     }
 
+    // FH-5 waker contract: `BridgeStream` registers the waker into the
+    // lock-free `AtomicWaker` on the shared bridge state and returns `true`,
+    // committing to wake it. That promise is kept by `BridgeProducer`, which
+    // wakes the waker on every push (ring_buffer.rs) and on every state
+    // transition / `signal_done` / `signal_error` (the terminal path), so a
+    // parked `AsyncAudioStream` is always woken when data or a terminal state
+    // arrives. Returning `true` is therefore honest here; see
+    // `CapturingStream::register_waker` for the full contract.
     #[cfg(feature = "async-stream")]
     fn register_waker(&self, waker: &std::task::Waker) -> bool {
         self.shared.waker.register(waker);
@@ -420,7 +490,7 @@ mod tests {
         assert_eq!(stream.shared().state.get(), StreamState::Stopped);
     }
 
-    // 7. Reading after stop returns error
+    // 7. Reading after stop returns the terminal StreamEnded error (ADR-0003).
     #[test]
     fn test_read_after_stop() {
         let (_producer, stream) = create_test_stream();
@@ -429,14 +499,59 @@ mod tests {
         let result = stream.read_chunk();
         assert!(result.is_err());
         match result.unwrap_err() {
-            AudioError::StreamReadError { reason } => {
+            AudioError::StreamEnded { reason } => {
                 assert!(reason.contains("Stopped"));
             }
-            other => panic!("Expected StreamReadError, got: {:?}", other),
+            other => panic!("Expected StreamEnded, got: {:?}", other),
         }
 
         let try_result = stream.try_read_chunk();
         assert!(try_result.is_err());
+        assert!(
+            matches!(try_result.unwrap_err(), AudioError::StreamEnded { .. }),
+            "try_read_chunk after stop must also be StreamEnded"
+        );
+    }
+
+    // M1: format() reflects the negotiated *delivery* format once a backend
+    // records it via the producer, not just the requested format.
+    #[test]
+    fn test_format_reflects_negotiated_delivery_format() {
+        let requested = AudioFormat::default(); // 48k/2ch/F32
+        let (producer, consumer) = create_bridge(8, requested.clone());
+        consumer
+            .shared()
+            .state
+            .transition(StreamState::Created, StreamState::Running)
+            .unwrap();
+        let stream = BridgeStream::new(
+            consumer,
+            MockPlatformStream::new(),
+            requested.clone(),
+            Duration::from_secs(1),
+        );
+
+        // Before negotiation, format() == requested.
+        assert_eq!(stream.format(), requested);
+
+        // Backend negotiates a different delivery rate/channels. It reports the
+        // endpoint's native sample type (I16), but the bridge converts to f32,
+        // so format() must report the delivered rate/channels with F32.
+        let delivered = AudioFormat {
+            sample_rate: 44100,
+            channels: 1,
+            sample_format: crate::core::config::SampleFormat::I16,
+        };
+        producer.set_negotiated_format(&delivered);
+
+        let reported = stream.format();
+        assert_eq!(reported.sample_rate, 44100);
+        assert_eq!(reported.channels, 1);
+        assert_eq!(
+            reported.sample_format,
+            crate::core::config::SampleFormat::F32,
+            "bridge delivers f32; reported sample_format must be normalized"
+        );
     }
 
     // 8. Verify format() returns correct AudioFormat
@@ -606,6 +721,105 @@ mod tests {
         }
         let stream: Box<dyn CapturingStream> = Box::new(MinimalStream);
         assert_eq!(stream.overrun_count(), 0);
+        // New trait counters also default to zero / delegate to is_running().
+        assert_eq!(stream.buffers_captured(), 0);
+        assert_eq!(stream.buffers_pushed(), 0);
+        assert_eq!(stream.buffers_dropped(), 0);
+        assert!(!stream.is_producing()); // MinimalStream::is_running() == false
+    }
+
+    // ===== rsac-713b: bridge counters surfaced through CapturingStream =====
+
+    // buffers_pushed / buffers_dropped / buffers_captured on the
+    // CapturingStream trait must read the BridgeShared atomics after a
+    // scripted push / drop / pop sequence.
+    #[test]
+    fn test_trait_counters_reflect_push_drop_pop() {
+        let format = test_format();
+        let (mut producer, consumer) = create_bridge(4, format.clone());
+        consumer
+            .shared()
+            .state
+            .transition(StreamState::Created, StreamState::Running)
+            .unwrap();
+        // Access through the trait object so we exercise the overrides, not
+        // the inherent BridgeStream methods.
+        let stream: Box<dyn CapturingStream> = Box::new(BridgeStream::new(
+            consumer,
+            MockPlatformStream::new(),
+            format,
+            Duration::from_secs(1),
+        ));
+
+        // Fresh stream: all counters zero and the producer is producing.
+        assert_eq!(stream.buffers_pushed(), 0);
+        assert_eq!(stream.buffers_dropped(), 0);
+        assert_eq!(stream.buffers_captured(), 0);
+        assert!(stream.is_producing());
+
+        // Push 4 buffers — exactly fills the ring (capacity 4); all succeed.
+        for _ in 0..4 {
+            assert!(producer.push_or_drop(test_buffer(1.0)));
+        }
+        assert_eq!(stream.buffers_pushed(), 4, "4 successful pushes");
+        assert_eq!(stream.buffers_dropped(), 0, "nothing dropped yet");
+        assert_eq!(stream.buffers_captured(), 0, "nothing popped yet");
+
+        // Push 2 more while full — both are dropped.
+        assert!(!producer.push_or_drop(test_buffer(2.0)));
+        assert!(!producer.push_or_drop(test_buffer(3.0)));
+        assert_eq!(
+            stream.buffers_pushed(),
+            4,
+            "pushed count unchanged by drops"
+        );
+        assert_eq!(stream.buffers_dropped(), 2, "2 dropped pushes");
+        // buffers_dropped is an alias of overrun_count.
+        assert_eq!(stream.buffers_dropped(), stream.overrun_count());
+
+        // Pop 3 buffers — buffers_captured tracks delivered-to-consumer.
+        for _ in 0..3 {
+            assert!(stream.try_read_chunk().unwrap().is_some());
+        }
+        assert_eq!(stream.buffers_captured(), 3, "3 buffers delivered");
+        assert_eq!(stream.buffers_pushed(), 4, "pushed unaffected by pops");
+        assert_eq!(stream.buffers_dropped(), 2, "dropped unaffected by pops");
+
+        // is_producing tracks the running state; stop() ends production.
+        assert!(stream.is_producing());
+        stream.stop().unwrap();
+        assert!(!stream.is_producing());
+    }
+
+    // rsac-cfe4: the windowed drop snapshot is reachable through BridgeStream and
+    // reflects pushes/drops recorded on the producer's shared state.
+    #[test]
+    fn test_drop_window_snapshot_through_stream() {
+        let format = test_format();
+        let (mut producer, consumer) = create_bridge(2, format.clone());
+        consumer
+            .shared()
+            .state
+            .transition(StreamState::Created, StreamState::Running)
+            .unwrap();
+        let stream = BridgeStream::new(
+            consumer,
+            MockPlatformStream::new(),
+            format,
+            Duration::from_secs(1),
+        );
+
+        // Fresh: all-zero window.
+        assert_eq!(stream.drop_window_snapshot(), (0, 0));
+
+        // Fill the ring (cap 2) with 2 successful pushes, then force 1 drop.
+        assert!(producer.push_or_drop(test_buffer(1.0)));
+        assert!(producer.push_or_drop(test_buffer(1.0)));
+        assert!(!producer.push_or_drop(test_buffer(9.0)));
+
+        let (pushed, dropped) = stream.drop_window_snapshot();
+        assert_eq!(pushed, 2, "two successful pushes recorded in the window");
+        assert_eq!(dropped, 1, "one drop recorded in the window");
     }
 
     // 13. Stop from Created state returns error

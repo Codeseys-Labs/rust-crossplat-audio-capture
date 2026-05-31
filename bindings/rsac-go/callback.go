@@ -2,83 +2,73 @@ package rsac
 
 /*
 #include "rsac.h"
+#include "bridge.h"
 */
 import "C"
 import (
-	"sync"
+	"runtime/cgo"
 	"unsafe"
 )
 
-// callbackRegistry maintains a global mapping from integer IDs to Go callback
-// functions. This is necessary because CGo cannot pass Go function pointers
-// directly to C — we pass an integer ID as the void* user_data instead.
-var callbackRegistry = struct {
-	mu    sync.RWMutex
-	funcs map[uintptr]func(AudioBuffer)
-	next  uintptr
-}{
-	funcs: make(map[uintptr]func(AudioBuffer)),
-	next:  1,
-}
-
-// registerCallback stores a Go callback and returns an ID for it.
-func registerCallback(fn func(AudioBuffer)) uintptr {
-	callbackRegistry.mu.Lock()
-	defer callbackRegistry.mu.Unlock()
-	id := callbackRegistry.next
-	callbackRegistry.next++
-	callbackRegistry.funcs[id] = fn
-	return id
-}
-
-// unregisterCallback removes a callback by ID.
-func unregisterCallback(id uintptr) {
-	callbackRegistry.mu.Lock()
-	defer callbackRegistry.mu.Unlock()
-	delete(callbackRegistry.funcs, id)
-}
-
-// lookupCallback retrieves a callback by ID.
-func lookupCallback(id uintptr) (func(AudioBuffer), bool) {
-	callbackRegistry.mu.RLock()
-	defer callbackRegistry.mu.RUnlock()
-	fn, ok := callbackRegistry.funcs[id]
-	return fn, ok
-}
+// Callback delivery uses runtime/cgo.Handle to bridge a Go closure across the
+// FFI boundary safely. cgo cannot pass a Go function pointer (or any Go pointer
+// that itself contains Go pointers) directly to C, so we wrap the closure in a
+// cgo.Handle — an opaque integer the Go runtime maps back to the value — and
+// pass that as the void* user_data. goAudioCallback resolves the Handle back to
+// the closure. This is GC-safe.
+//
+// AudioCapture.callback stores the live cgo.Handle so Close() (and a replacing
+// SetCallback) can Delete() it deterministically; otherwise a Handle would leak.
 
 //export goAudioCallback
-func goAudioCallback(cbuf *C.rsac_audio_buffer_t, userData unsafe.Pointer) {
-	id := uintptr(userData)
-	fn, ok := lookupCallback(id)
+func goAudioCallback(bufferData *C.float, numSamples C.size_t, channels C.uint16_t, sampleRate C.uint32_t, userData unsafe.Pointer) {
+	// A panic must not escape this C->Go export: an unrecovered panic crossing
+	// the cgo boundary aborts the entire process. This recover covers BOTH a
+	// panicking user callback AND a cgo.Handle.Value() resolve of an
+	// already-Deleted handle. The latter is the residual #28 window: Close()
+	// (or a replacing SetCallback) may Delete the handle while this callback is
+	// in flight on the FFI delivery thread; cgo.Handle.Value() panics on a
+	// deleted handle, and recovering here turns that race into a dropped
+	// delivery instead of a use-after-free crash. The capture mutex orders the
+	// C-layer set_callback(NULL)+free before the Delete (see closeLocked), so
+	// this only ever fires for a delivery already in progress.
+	defer func() { _ = recover() }()
+
+	if userData == nil {
+		return
+	}
+	h := cgo.Handle(uintptr(userData))
+	fn, ok := h.Value().(func(AudioBuffer))
 	if !ok || fn == nil {
 		return
 	}
 
-	// Build a Go AudioBuffer from the C buffer WITHOUT freeing it.
-	// The C callback contract says the buffer is valid only for the callback duration.
-	// We must copy the data.
-	if cbuf == nil {
-		return
+	// The C contract (rsac_audio_callback_t) hands us the raw interleaved f32
+	// data directly — buffer_data/num_samples/channels/sample_rate — and the
+	// pointer is valid only for the duration of this call. Copy into Go-managed
+	// memory before invoking the user's callback so no Go AudioBuffer ever
+	// aliases the C buffer after this function returns.
+	n := int(numSamples)
+	ch := int(channels)
+	rate := int(sampleRate)
+
+	var data []float32
+	if bufferData != nil && n > 0 {
+		data = make([]float32, n)
+		cSlice := unsafe.Slice((*float32)(unsafe.Pointer(bufferData)), n)
+		copy(data, cSlice)
 	}
 
-	numFrames := int(C.rsac_audio_buffer_num_frames(cbuf))
-	channels := int(C.rsac_audio_buffer_channels(cbuf))
-	sampleRate := int(C.rsac_audio_buffer_sample_rate(cbuf))
-	numSamples := int(C.rsac_audio_buffer_num_samples(cbuf))
-
-	cdata := C.rsac_audio_buffer_data(cbuf)
-	var data []float32
-	if cdata != nil && numSamples > 0 {
-		data = make([]float32, numSamples)
-		cSlice := unsafe.Slice((*float32)(unsafe.Pointer(cdata)), numSamples)
-		copy(data, cSlice)
+	numFrames := 0
+	if ch > 0 {
+		numFrames = n / ch
 	}
 
 	buf := AudioBuffer{
 		data:       data,
 		numFrames:  numFrames,
-		channels:   channels,
-		sampleRate: sampleRate,
+		channels:   ch,
+		sampleRate: rate,
 	}
 	fn(buf)
 }
@@ -100,18 +90,30 @@ func (c *AudioCapture) SetCallback(fn func(AudioBuffer)) error {
 
 	if fn == nil {
 		rc := C.rsac_capture_set_callback(c.handle, nil, nil)
-		return newError(rc)
+		if rc != C.RSAC_OK {
+			return newError(rc)
+		}
+		c.clearCallbackHandleLocked()
+		return nil
 	}
 
-	id := registerCallback(fn)
-	rc := C.rsac_capture_set_callback(
-		c.handle,
-		C.rsac_audio_callback_t(C.goAudioCallback),
-		unsafe.Pointer(id),
-	)
+	h := cgo.NewHandle(fn)
+	rc := C.rsac_go_set_callback(c.handle, C.uintptr_t(h))
 	if rc != C.RSAC_OK {
-		unregisterCallback(id)
+		h.Delete()
 		return newError(rc)
 	}
+	// Replace any previously registered callback for this capture.
+	c.clearCallbackHandleLocked()
+	c.callback = uintptr(h)
 	return nil
+}
+
+// clearCallbackHandleLocked deletes the cgo.Handle backing the current callback
+// (if any). Must be called with c.mu held. Safe to call repeatedly.
+func (c *AudioCapture) clearCallbackHandleLocked() {
+	if c.callback != 0 {
+		cgo.Handle(c.callback).Delete()
+		c.callback = 0
+	}
 }

@@ -1,7 +1,8 @@
 #!/usr/bin/env bash
 #
-# Bump the rsac workspace version across the five files that must agree:
+# Bump the rsac workspace version across the six files that must agree:
 #   - Cargo.toml                              (root `rsac` crate)
+#   - bindings/rsac-ffi/Cargo.toml            (C FFI crate)
 #   - bindings/rsac-napi/Cargo.toml           (napi crate)
 #   - bindings/rsac-napi/package.json         (npm package)
 #   - bindings/rsac-python/Cargo.toml         (pyo3 crate)
@@ -76,13 +77,14 @@ REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "$REPO_ROOT"
 
 ROOT_CARGO="Cargo.toml"
+FFI_CARGO="bindings/rsac-ffi/Cargo.toml"
 NAPI_CARGO="bindings/rsac-napi/Cargo.toml"
 NAPI_PKG="bindings/rsac-napi/package.json"
 PY_CARGO="bindings/rsac-python/Cargo.toml"
 PY_PYPROJ="bindings/rsac-python/pyproject.toml"
 CHANGELOG="CHANGELOG.md"
 
-for f in "$ROOT_CARGO" "$NAPI_CARGO" "$NAPI_PKG" "$PY_CARGO" "$PY_PYPROJ" "$CHANGELOG"; do
+for f in "$ROOT_CARGO" "$FFI_CARGO" "$NAPI_CARGO" "$NAPI_PKG" "$PY_CARGO" "$PY_PYPROJ" "$CHANGELOG"; do
     [ -f "$f" ] || { err "missing required file: $f"; exit 1; }
 done
 
@@ -167,6 +169,161 @@ rewrite_json_version() {
     mv "$file.tmp" "$file"
 }
 
+# Read the version pin from an internal rsac dependency in a binding manifest.
+# Two manifest forms are recognised, both restricted to the *internal* rsac dep
+# (the entry must carry a relative `path = "../..` to the workspace root, so an
+# unrelated crate named `rsac-foo` or a registry dep can never be picked up):
+#
+#   1. Single-line inline table:
+#        rsac = { path = "../../", version = "X.Y.Z", ... }     (rsac-ffi today)
+#   2. Multi-line dependency table (rsac-python pins its backend deps this way):
+#        [target.'cfg(windows)'.dependencies.rsac]
+#        path = "../.."
+#        version = "X.Y.Z"           # path-only today; future-proofed here
+#
+# Emits nothing if the manifest has no versioned internal rsac dep (path-only
+# deps — rsac-napi, rsac-python — legitimately omit the version requirement).
+# The `version` key is matched with a left word boundary so a longer key like
+# `min_version =` can never be mistaken for it.
+internal_rsac_dep_version() {
+    awk '
+        # ── form 1: single-line inline table ──────────────────────────
+        /^[[:space:]]*rsac[[:space:]]*=[[:space:]]*\{/ && /path[[:space:]]*=[[:space:]]*"\.\.\// {
+            # Pull the value out of the first `version = "..."` key on the line.
+            # The `(^|[^[:alnum:]_])` left boundary keeps `min_version` etc. out.
+            if (match($0, /(^|[^[:alnum:]_])version[[:space:]]*=[[:space:]]*"[^"]+"/)) {
+                kv = substr($0, RSTART, RLENGTH)
+                match(kv, /"[^"]+"/)
+                print substr(kv, RSTART + 1, RLENGTH - 2)
+            }
+            exit
+        }
+
+        # ── form 2: multi-line [*.dependencies.rsac] table ────────────
+        # A section header ending in `.dependencies.rsac` (e.g.
+        # [dependencies.rsac] or [target.cfg(...).dependencies.rsac])
+        # opens a block we scan for a `path = "../..` + `version = "..."` pair.
+        /^[[:space:]]*\[.*\.?dependencies\.rsac\][[:space:]]*$/ {
+            in_tbl = 1; tbl_path = 0; tbl_ver = ""
+            next
+        }
+        in_tbl && /^[[:space:]]*\[/ {           # next section closes the block
+            in_tbl = 0
+        }
+        in_tbl {
+            if ($0 ~ /^[[:space:]]*path[[:space:]]*=[[:space:]]*"\.\.\//) tbl_path = 1
+            # `^[[:space:]]*version` anchors the key to the start of its own
+            # line, so `min_version = ...` (different start) can never match.
+            if (match($0, /^[[:space:]]*version[[:space:]]*=[[:space:]]*"[^"]+"/)) {
+                kv = substr($0, RSTART, RLENGTH)
+                match(kv, /"[^"]+"/)
+                tbl_ver = substr(kv, RSTART + 1, RLENGTH - 2)
+            }
+            # Emit as soon as a versioned internal table is fully identified.
+            if (tbl_path && tbl_ver != "") {
+                print tbl_ver
+                exit
+            }
+        }
+    ' "$1"
+}
+
+# In-place rewrite of the version pin on an internal rsac dependency so a binding
+# crate that records a version requirement (today only rsac-ffi) stays in lockstep
+# with the workspace `[package].version`. Without this, a bump rewrites rsac-ffi's
+# own `[package].version` but leaves its `rsac = { path = "../../", version =
+# "<old>" }` pin stale, which breaks the workspace build until hand-fixed
+# (seed rsac-0d58).
+#
+# Handles both manifest forms (mirroring internal_rsac_dep_version):
+#   1. Single-line inline table — `rsac = { path = "../..", version = "X" }`
+#   2. Multi-line `[*.dependencies.rsac]` table with a `version = "X"` line
+# In both cases only the value of the existing `version = "..."` key is replaced;
+# every other key, the table form, ordering and spacing are preserved. A
+# path-only internal dep (no `version` key) is left untouched — there is nothing
+# to keep in lockstep. The `version` key is matched with a left word boundary so
+# a longer key (`min_version =`) is never rewritten by mistake.
+rewrite_internal_rsac_dep_version() {
+    local file="$1" new="$2"
+    awk -v new="$new" '
+        # Splice a new value into the FIRST standalone `version = "..."` key on
+        # `line`, preserving everything else. The left boundary ((^|[^[:alnum:]_]))
+        # keeps a longer key such as `min_version =` from matching. awk sub() has
+        # no \1 backreference, so we locate the value with match()+substr() and
+        # rebuild the string by hand. Returns the rewritten line (unchanged if no
+        # standalone version key is present).
+        function splice_version(line,   ks, kl, pre, post, hit, qpre) {
+            if (!match(line, /(^|[^[:alnum:]_])version[[:space:]]*=[[:space:]]*"[^"]+"/))
+                return line
+            # Snapshot the key-match bounds BEFORE the inner match() clobbers
+            # RSTART/RLENGTH.
+            ks = RSTART; kl = RLENGTH
+            pre  = substr(line, 1, ks - 1)        # text before the matched key
+            post = substr(line, ks + kl)          # text after the matched value
+            hit  = substr(line, ks, kl)           # the matched `[b]version = "old"`
+            # Replace only the quoted value inside the matched span.
+            match(hit, /"[^"]+"/)
+            qpre = substr(hit, 1, RSTART - 1)     # `[b]version = ` (key + separator)
+            return pre qpre "\"" new "\"" post
+        }
+
+        # Emit the buffered multi-line table, rewriting its version line only when
+        # the table is the internal rsac dep (carries the `../..` path pin) and we
+        # have not already rewritten a pin elsewhere.
+        function flush_tbl(   i) {
+            if (tbl_path && tbl_ver_idx > 0 && !done) {
+                buf[tbl_ver_idx] = splice_version(buf[tbl_ver_idx])
+                done = 1
+            }
+            for (i = 1; i <= nbuf; i++) print buf[i]
+            nbuf = 0; tbl_path = 0; tbl_ver_idx = 0
+        }
+
+        BEGIN { done = 0; in_tbl = 0; nbuf = 0; tbl_path = 0; tbl_ver_idx = 0 }
+
+        # A section header closes any open multi-line table first.
+        /^[[:space:]]*\[/ {
+            if (in_tbl) { flush_tbl(); in_tbl = 0 }
+        }
+
+        # ── form 2: open a multi-line [*.dependencies.rsac] table ─────
+        /^[[:space:]]*\[.*\.?dependencies\.rsac\][[:space:]]*$/ {
+            in_tbl = 1
+            print
+            next
+        }
+
+        # Buffer lines inside a multi-line table so we can decide (path + version)
+        # before rewriting, regardless of key ordering.
+        in_tbl {
+            buf[++nbuf] = $0
+            if ($0 ~ /^[[:space:]]*path[[:space:]]*=[[:space:]]*"\.\.\//) tbl_path = 1
+            # `^[[:space:]]*version` anchors the key to the line start, so a
+            # `min_version = ...` line (different start) is never targeted.
+            if (tbl_ver_idx == 0 \
+                && $0 ~ /^[[:space:]]*version[[:space:]]*=[[:space:]]*"[^"]+"/) {
+                tbl_ver_idx = nbuf
+            }
+            next
+        }
+
+        # ── form 1: single-line inline table ──────────────────────────
+        !done \
+            && /^[[:space:]]*rsac[[:space:]]*=[[:space:]]*\{/ \
+            && /path[[:space:]]*=[[:space:]]*"\.\.\// {
+            new_line = splice_version($0)
+            if (new_line != $0) { $0 = new_line; done = 1 }
+            print
+            next
+        }
+
+        { print }
+
+        END { if (in_tbl) flush_tbl() }
+    ' "$file" > "$file.tmp"
+    mv "$file.tmp" "$file"
+}
+
 # ── plan ─────────────────────────────────────────────────────────────
 # Wraps an extractor call so an empty result becomes a fatal error rather
 # than silently propagating an empty string into later comparisons (which
@@ -186,27 +343,51 @@ extract_or_die() {
 }
 
 CUR_ROOT=$(extract_or_die       "root crate"   "$ROOT_CARGO" cargo_package_version)
+CUR_FFI_CARGO=$(extract_or_die  "rsac-ffi"     "$FFI_CARGO"  cargo_package_version)
 CUR_NAPI_CARGO=$(extract_or_die "rsac-napi"    "$NAPI_CARGO" cargo_package_version)
 CUR_NAPI_PKG=$(extract_or_die   "rsac-napi pkg" "$NAPI_PKG"   json_version)
 CUR_PY_CARGO=$(extract_or_die   "rsac-python"  "$PY_CARGO"   cargo_package_version)
 CUR_PY_PYPROJ=$(extract_or_die  "rsac-python pyproject" "$PY_PYPROJ" cargo_package_version)
 
+# Internal `rsac = { ..., version = "X.Y.Z" }` dep pins in the binding manifests
+# (seed rsac-0d58). These must track the root crate version so a published
+# binding resolves the matching rsac release and the workspace build stays
+# self-consistent after a bump. We scan every binding Cargo.toml and remember
+# the ones that actually carry a versioned internal rsac dep — path-only deps
+# (no version requirement) are skipped, not an error. Today only rsac-ffi pins a
+# version, but driving this off detection means a new versioned pin in any
+# binding manifest is picked up automatically.
+INTERNAL_DEP_MANIFESTS=("$FFI_CARGO" "$NAPI_CARGO" "$PY_CARGO")
+INTERNAL_DEP_FILES=()    # manifests with a stale internal pin to rewrite
+for m in "${INTERNAL_DEP_MANIFESTS[@]}"; do
+    cur_pin=$(internal_rsac_dep_version "$m")
+    [ -z "$cur_pin" ] && continue          # path-only internal dep — nothing to pin
+    if [ "$cur_pin" != "$NEW_VERSION" ]; then
+        INTERNAL_DEP_FILES+=("$m")
+    fi
+done
+
 info "target version:  $NEW_VERSION"
 info "current versions:"
 printf '  %-42s %s\n' "$ROOT_CARGO"  "$CUR_ROOT"
+printf '  %-42s %s\n' "$FFI_CARGO"   "$CUR_FFI_CARGO"
 printf '  %-42s %s\n' "$NAPI_CARGO"  "$CUR_NAPI_CARGO"
 printf '  %-42s %s\n' "$NAPI_PKG"    "$CUR_NAPI_PKG"
 printf '  %-42s %s\n' "$PY_CARGO"    "$CUR_PY_CARGO"
 printf '  %-42s %s\n' "$PY_PYPROJ"   "$CUR_PY_PYPROJ"
 
-# Idempotency guard: if every target already matches, exit cleanly without
-# touching the changelog either (rotating a changelog that's already been
-# rotated would create a duplicate ## [X.Y.Z] header).
+# Idempotency guard: if every target already matches — including the internal
+# rsac dep pins — exit cleanly without touching the changelog either (rotating a
+# changelog that's already been rotated would create a duplicate ## [X.Y.Z]
+# header). A stale internal pin (a non-empty INTERNAL_DEP_FILES) still counts as
+# work to do, so this stays correct after the rsac-0d58 fix.
 if [ "$CUR_ROOT" = "$NEW_VERSION" ] && \
+   [ "$CUR_FFI_CARGO" = "$NEW_VERSION" ] && \
    [ "$CUR_NAPI_CARGO" = "$NEW_VERSION" ] && \
    [ "$CUR_NAPI_PKG" = "$NEW_VERSION" ] && \
    [ "$CUR_PY_CARGO" = "$NEW_VERSION" ] && \
-   [ "$CUR_PY_PYPROJ" = "$NEW_VERSION" ]; then
+   [ "$CUR_PY_PYPROJ" = "$NEW_VERSION" ] && \
+   [ "${#INTERNAL_DEP_FILES[@]}" -eq 0 ]; then
     ok "already at version $NEW_VERSION — nothing to do"
     exit 0
 fi
@@ -214,10 +395,17 @@ fi
 # Plan per-file changes.
 CHANGES=()
 [ "$CUR_ROOT" != "$NEW_VERSION" ]       && CHANGES+=("$ROOT_CARGO")
+[ "$CUR_FFI_CARGO" != "$NEW_VERSION" ]  && CHANGES+=("$FFI_CARGO")
 [ "$CUR_NAPI_CARGO" != "$NEW_VERSION" ] && CHANGES+=("$NAPI_CARGO")
 [ "$CUR_NAPI_PKG" != "$NEW_VERSION" ]   && CHANGES+=("$NAPI_PKG")
 [ "$CUR_PY_CARGO" != "$NEW_VERSION" ]   && CHANGES+=("$PY_CARGO")
 [ "$CUR_PY_PYPROJ" != "$NEW_VERSION" ]  && CHANGES+=("$PY_PYPROJ")
+
+# Internal rsac dep-pin rewrites (rsac-0d58). Listed distinctly so the plan is
+# honest even when the same manifest also gets a [package].version bump (FFI).
+for m in "${INTERNAL_DEP_FILES[@]}"; do
+    CHANGES+=("$m (internal rsac dep pin → $NEW_VERSION)")
+done
 
 # Changelog rotation is planned if there's an "## [Unreleased]" section
 # *and* no "## [$NEW_VERSION]" header already exists (idempotent).
@@ -247,10 +435,17 @@ fi
 
 # ── apply ────────────────────────────────────────────────────────────
 [ "$CUR_ROOT"       != "$NEW_VERSION" ] && rewrite_cargo_version "$ROOT_CARGO"  "$NEW_VERSION"
+[ "$CUR_FFI_CARGO"  != "$NEW_VERSION" ] && rewrite_cargo_version "$FFI_CARGO"   "$NEW_VERSION"
 [ "$CUR_NAPI_CARGO" != "$NEW_VERSION" ] && rewrite_cargo_version "$NAPI_CARGO"  "$NEW_VERSION"
 [ "$CUR_NAPI_PKG"   != "$NEW_VERSION" ] && rewrite_json_version  "$NAPI_PKG"    "$NEW_VERSION"
 [ "$CUR_PY_CARGO"   != "$NEW_VERSION" ] && rewrite_cargo_version "$PY_CARGO"    "$NEW_VERSION"
 [ "$CUR_PY_PYPROJ"  != "$NEW_VERSION" ] && rewrite_cargo_version "$PY_PYPROJ"   "$NEW_VERSION"
+
+# Internal rsac dep pins (rsac-0d58) — rewrite after the [package].version pass
+# so a manifest that gets both (FFI) ends up fully self-consistent.
+for m in "${INTERNAL_DEP_FILES[@]}"; do
+    rewrite_internal_rsac_dep_version "$m" "$NEW_VERSION"
+done
 
 # ── changelog rotation ───────────────────────────────────────────────
 if [ "$CHANGELOG_ROTATE" -eq 1 ]; then

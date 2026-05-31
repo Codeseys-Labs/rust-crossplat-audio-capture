@@ -1,6 +1,41 @@
 # Architecture Overview — `rsac` (Rust Cross-Platform Audio Capture)
 
-> **Status:** Master Architecture Document — Subtask B4
+> ⚠️ **ASPIRATIONAL / HISTORICAL DESIGN — NOT THE SOURCE OF TRUTH.**
+> This master design document captures the original architecture plan. The
+> shipped code diverged from it in several spots, and **the code is the source of
+> truth.** For a user-facing, accurate overview see
+> [`docs/ARCHITECTURE.md`](../ARCHITECTURE.md); for what changed and why, see the
+> ADRs in [`docs/designs/`](../designs/). Notably:
+>
+> - The platform layer is **`src/audio/`** (`audio/windows`, `audio/linux`,
+>   `audio/macos`), **not** the `src/backend/` this doc draws. The internal trait
+>   is **`PlatformStream`** (two methods, `Send`-only); there is no
+>   `PlatformBackend` trait and no `ResolvedConfig`. See
+>   [BACKEND_CONTRACT.md §0](BACKEND_CONTRACT.md#0-shipped-reality-what-the-code-actually-does).
+> - The streaming consumption methods are `read_buffer()` / `subscribe()` /
+>   `audio_data_stream()` (not `async_stream` / `pipe_to`; `pipe_to` does not
+>   exist). `rsac::prelude` **does** exist (re-exports `capture!`, `RunningCapture`,
+>   `DeviceInfo`); `AudioBufferRef` does not.
+> - `AudioError` has **22** variants (this doc's "21 variants" predates ADR-0003's
+>   `StreamEnded`); the state machine has **six** states (adds `Stopping` and
+>   `Error`).
+> - The **device-change `watch()`** surface, the per-OS `DeviceEnumerator`
+>   implementations, and native device/application enumeration all live in
+>   `audio/`. `watch()` delivery threading diverges per platform (recorded in
+>   ADR-0004; see [`docs/ARCHITECTURE.md` §5](../ARCHITECTURE.md#5-device-change-notifications-watch)).
+> - The module DAG (`core → bridge → audio → api → lib`) is the **intended**
+>   invariant, but the shipped code has a tracked `core → audio` reverse edge in
+>   `core/introspection.rs` (see [§5](#5-module-dependency-graph) and
+>   [`docs/ARCHITECTURE.md` §1](../ARCHITECTURE.md#1-the-layering-split)).
+> - The **"Types/Functions/Files to Remove"** tables below are an *aspirational
+>   migration plan that was only partially executed*. In particular, the
+>   `AudioProcessor` trait (`src/core/processing.rs:19`) and the `AudioFileFormat`
+>   enum (`src/core/config.rs:360`) were **never removed** — they remain in the
+>   tree as dormant/vestigial surface (capture-only scope means `AudioProcessor`
+>   ships no implementors; `AudioFileFormat` is unused). Treat those tables as
+>   "what was once planned", not "what shipped".
+>
+> **Status:** Master Architecture Document — Subtask B4 (historical)
 > **Depends on:**
 > - [API_DESIGN.md](API_DESIGN.md) (B1) — Public API surface
 > - [ERROR_CAPABILITY_DESIGN.md](ERROR_CAPABILITY_DESIGN.md) (B2) — Error taxonomy & capability model
@@ -107,7 +142,7 @@ User configures AudioCaptureBuilder
 | Component | Role | Detailed Design |
 |---|---|---|
 | **`AudioCaptureBuilder`** | Builder pattern entry point. Configures target, format, buffer sizes. `.build()` validates and creates an `AudioCapture`. | [API_DESIGN.md §5](API_DESIGN.md#5-audiocapturebuilder) |
-| **`AudioCapture`** | Lifecycle manager. Owns the platform backend and stream. Provides `start()`, `stop()`, `read_chunk()`, `async_stream()`, `buffers_iter()`, `set_callback()`, `pipe_to()`. All methods take `&self`. | [API_DESIGN.md §6](API_DESIGN.md#6-audiocapture--lifecycle-manager) |
+| **`AudioCapture`** | Lifecycle manager. Owns the platform backend and stream. Shipped surface: `start()`, `stop()`, `read_buffer()`, `read_buffer_blocking()`, `buffers_iter()`, `subscribe()`, `set_callback()`, `audio_data_stream()` (async-stream feature), plus `stream_stats()`/`format()`/`backpressure_report()`. (`read_chunk()`/`try_read_chunk()` are `pub(crate)` `CapturingStream` methods, not public; `pipe_to()`/`async_stream()` do **not** exist — see the header note.) | [API_DESIGN.md §6](API_DESIGN.md#6-audiocapture--lifecycle-manager) |
 | **`CapturingStream`** trait | Core streaming trait. `Send + Sync`. Defines `start()`, `stop()`, `close()`, `read_chunk()`, `try_read_chunk()`, `to_async_stream()`, `format()`, `latency_frames()`. | [API_DESIGN.md §7](API_DESIGN.md#7-capturingstream--the-core-streaming-trait) |
 | **`AudioBuffer`** | Owned chunk of captured audio. `Vec<f32>` samples + `AudioFormat` + `frame_offset` + `sequence` + optional `timestamp`. `Clone`, `Send`, `Sync`. | [API_DESIGN.md §8](API_DESIGN.md#8-audiobuffer--data-container) |
 | **`AudioFormat` / `SampleFormat`** | Format descriptors. `SampleFormat` simplified to 4 variants: `I16`, `I24`, `I32`, `F32`. No endianness. | [API_DESIGN.md §4](API_DESIGN.md#4-audioformat-and-streamconfig) |
@@ -231,7 +266,7 @@ These variants are referenced in macOS backend code but never existed in the err
 
 | File | Type | Kind | Purpose |
 |---|---|---|---|
-| `core/error.rs` | `AudioError` | enum (21 variants) | Canonical error type with categorization |
+| `core/error.rs` | `AudioError` | enum (22 variants in the shipped code; "21" here is pre-ADR-0003) | Canonical error type with categorization |
 | `core/error.rs` | `ErrorKind` | enum | Category-level matching |
 | `core/error.rs` | `Recoverability` | enum | Recoverable / Fatal / UserError classification |
 | `core/error.rs` | `BackendContext` | struct | Structured OS error wrapping (operation + message + code) |
@@ -328,6 +363,26 @@ These variants are referenced in macOS backend code but never existed in the err
 ---
 
 ## 5. Module Dependency Graph
+
+> **Shipped-naming note.** The diagrams in this section label the platform layer
+> `backend/`; in the shipped code it is **`src/audio/`** (`audio/windows`,
+> `audio/linux`, `audio/macos`). Read every `backend/` below as `audio/`. The
+> dependency *ordering* the diagrams assert is otherwise correct:
+> `core → bridge → audio → api → lib`.
+>
+> **Known deviation (tracked).** Dependency Rule 1 below ("`core/` depends on
+> nothing internal") is **violated in the shipped code**:
+> [`core/introspection.rs`](../../src/core/introspection.rs) reaches up into the
+> `audio` layer — `list_audio_sources()` calls
+> `crate::audio::get_device_enumerator()`, and the per-OS
+> `list_audio_applications_into()` arms call
+> `crate::audio::{macos,windows,linux}::enumerate_*`. This is a real
+> `core → audio` reverse edge (2026-05-30 critique). The module's own
+> "Separation of Concerns" doc-comment relabels core/bridge/audio as one lump to
+> make the edge look conformant — do not take that at face value. The accepted
+> fix moves the discovery functions into `audio`/`api` (re-exporting at the same
+> `lib.rs` paths so the public surface is unchanged) and adds a CI guard for
+> reverse edges. Until then, treat introspection as the documented exception.
 
 ### Layered Architecture
 

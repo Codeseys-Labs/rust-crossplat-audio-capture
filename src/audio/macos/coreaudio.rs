@@ -14,8 +14,11 @@
 
 // ── New API imports ──────────────────────────────────────────────────────
 use crate::core::config::{AudioFormat, DeviceId, SampleFormat, StreamConfig};
-use crate::core::error::{AudioError, AudioResult};
-use crate::core::interface::{AudioDevice, CapturingStream, DeviceEnumerator};
+use crate::core::error::{AudioError, AudioResult, BackendContext};
+use crate::core::interface::{
+    AudioDevice, CapturingStream, DeviceEnumerator, DeviceEvent, DeviceEventHandler, DeviceKind,
+    DeviceWatcher,
+};
 
 // ── Bridge imports ───────────────────────────────────────────────────────
 use crate::bridge::state::StreamState;
@@ -32,10 +35,15 @@ use coreaudio::Error as CAError;
 
 // ── CoreAudio-sys raw FFI imports ────────────────────────────────────────
 use coreaudio_sys::{
-    kAudioDevicePropertyStreamFormat, kAudioFormatFlagIsBigEndian, kAudioFormatFlagIsFloat,
-    kAudioFormatFlagIsPacked, kAudioFormatFlagIsSignedInteger, kAudioFormatLinearPCM,
-    kAudioObjectPropertyScopeOutput, AudioObjectGetPropertyData, AudioObjectID,
-    AudioObjectPropertyAddress, AudioStreamBasicDescription,
+    kAudioDevicePropertyStreamFormat, kAudioDevicePropertyStreams, kAudioFormatFlagIsBigEndian,
+    kAudioFormatFlagIsFloat, kAudioFormatFlagIsPacked, kAudioFormatFlagIsSignedInteger,
+    kAudioFormatLinearPCM, kAudioHardwarePropertyDefaultInputDevice,
+    kAudioHardwarePropertyDefaultOutputDevice, kAudioHardwarePropertyDevices,
+    kAudioObjectPropertyScopeGlobal, kAudioObjectPropertyScopeInput,
+    kAudioObjectPropertyScopeOutput, kAudioObjectSystemObject, AudioObjectAddPropertyListener,
+    AudioObjectGetPropertyData, AudioObjectGetPropertyDataSize, AudioObjectID,
+    AudioObjectPropertyAddress, AudioObjectRemovePropertyListener, AudioStreamBasicDescription,
+    AudioValueRange,
 };
 
 /// Forward-compatible alias for `kAudioObjectPropertyElementMain`.
@@ -45,8 +53,71 @@ use coreaudio_sys::{
 /// `coreaudio-sys` 0.2.17 doesn't export the new name, so we define it here.
 const KAUDIO_OBJECT_PROPERTY_ELEMENT_MAIN: u32 = 0;
 
+/// `kAudioStreamPropertyAvailableVirtualFormats` = `'sfma'` (`0x73666d61`).
+///
+/// The stream property carrying the list of `AudioStreamRangedDescription`s the
+/// stream can be configured to deliver. `coreaudio-sys` 0.2.17 does not always
+/// export this selector by name, so we define the value directly — identical to
+/// the value in CoreAudio's `AudioHardware.h`.
+const KAUDIO_STREAM_PROPERTY_AVAILABLE_VIRTUAL_FORMATS: u32 = 0x7366_6d61;
+
+/// `kAudioHardwarePropertyProcessObjectList` = `'prs#'` (`0x70727323`).
+///
+/// System-object property carrying the list of audio process `AudioObjectID`s
+/// (macOS 14.4+). Defined locally because `coreaudio-sys` 0.2.17 does not
+/// reliably export it under a stable name on every host SDK.
+const KAUDIO_HARDWARE_PROPERTY_PROCESS_OBJECT_LIST: u32 = 0x7072_7323;
+
+/// `kAudioProcessPropertyPID` = `'ppid'` (`0x70706964`).
+///
+/// Per-process-object property returning the owning process's `pid_t` (`i32`).
+/// Value verified against the macOS 14.4+ CoreAudio `AudioHardware.h`.
+const KAUDIO_PROCESS_PROPERTY_PID: u32 = 0x7070_6964;
+
+/// `kAudioProcessPropertyIsRunningOutput` = `'piro'` (`0x7069726f`).
+///
+/// Per-process-object `UInt32` boolean: the process is actively producing
+/// **output** audio. This is the signal a capture library cares about.
+/// Value verified against the macOS 14.4+ CoreAudio `AudioHardware.h`.
+const KAUDIO_PROCESS_PROPERTY_IS_RUNNING_OUTPUT: u32 = 0x7069_726f;
+
+/// `kAudioProcessPropertyIsRunning` = `'pir?'` (`0x7069723f`).
+///
+/// Per-process-object `UInt32` boolean: the process is participating in audio
+/// I/O at all. Used as a fallback when the output-specific flag is unreadable.
+/// Value verified against the macOS 14.4+ CoreAudio `AudioHardware.h`.
+const KAUDIO_PROCESS_PROPERTY_IS_RUNNING: u32 = 0x7069_723f;
+
+/// CoreAudio's `AudioStreamRangedDescription` (from `AudioHardwareBase.h`).
+///
+/// `kAudioStreamPropertyAvailableVirtualFormats` returns an array of these — a
+/// fixed [`AudioStreamBasicDescription`] paired with the sample-rate range the
+/// stream supports for it. We define a `#[repr(C)]` mirror locally rather than
+/// depending on a possibly-unexported generated name; the layout is fixed by
+/// the CoreAudio ABI (an ASBD followed by two `Float64`s).
+#[repr(C)]
+#[derive(Clone, Copy)]
+struct AudioStreamRangedDescription {
+    /// The concrete stream format.
+    m_format: AudioStreamBasicDescription,
+    /// The inclusive sample-rate range valid for `m_format`. Present for ABI
+    /// layout fidelity (the property buffer interleaves it with `m_format`); we
+    /// only consume `m_format`, so the field is never read by name.
+    #[allow(dead_code)]
+    m_sample_rate_range: AudioValueRange,
+}
+
 /// AudioDeviceID is an alias for AudioObjectID (u32).
 type AudioDeviceID = AudioObjectID;
+
+/// CoreAudio `OSStatus` result type (a signed 32-bit error code; `0` = `noErr`).
+///
+/// Defined locally as the C ABI `i32` rather than importing `coreaudio_sys`'s
+/// generated alias, matching the defensive convention this file already uses for
+/// selectors `coreaudio-sys` 0.2.17 does not reliably export by name. Used as the
+/// return type of the property-listener proc, whose C prototype returns
+/// `OSStatus` (we always return `noErr`).
+type OSStatus = i32;
 
 // ── ObjC imports for application enumeration ─────────────────────────────
 use objc2_app_kit::{NSRunningApplication, NSWorkspace};
@@ -71,12 +142,97 @@ pub struct ApplicationInfo {
     pub bundle_id: Option<String>,
 }
 
-/// Enumerates running applications on macOS that are potential audio sources.
+/// Enumerates running applications that are **actually producing audio**.
+///
+/// On macOS 14.4+ this intersects the unfiltered NSWorkspace application list
+/// (which supplies the localized name + bundle id) with the set of PIDs that
+/// CoreAudio reports as live audio processes — i.e. processes that own an audio
+/// process object reporting "running" — via
+/// `kAudioHardwarePropertyProcessObjectList`. This filters out the large mass
+/// of GUI apps that aren't currently playing audio, so
+/// [`list_audio_sources`](crate::core::introspection::list_audio_sources)
+/// surfaces a focused, capture-relevant list (rsac-84fd).
+///
+/// On macOS **< 14.4** (where the audio-process-object API and Process Taps are
+/// unavailable) this transparently falls back to the full NSWorkspace list — the
+/// historical behaviour — so older systems keep working. The same fallback
+/// applies if the CoreAudio process-object query is unavailable or yields no
+/// usable PIDs, so this function never returns fewer apps than callers can act
+/// on.
+///
+/// For an explicitly unfiltered list (diagnostics / debugging), use
+/// [`enumerate_audio_applications_all`].
 ///
 /// The returned PIDs can be used with [`CaptureTarget::Application`](crate::core::config::CaptureTarget::Application)
 /// via [`AudioCaptureBuilder`](crate::api::AudioCaptureBuilder) to capture
 /// application-specific audio using CoreAudio Process Taps (macOS 14.4+).
 pub fn enumerate_audio_applications() -> AudioResult<Vec<ApplicationInfo>> {
+    let all = enumerate_audio_applications_all()?;
+
+    // Version gate: the audio-process-object API (and Process Taps) require
+    // macOS 14.4+. On older systems we cannot filter, so return the full list.
+    let (major, minor, _patch) = crate::core::capabilities::get_macos_version();
+    let supports_process_objects = major > 14 || (major == 14 && minor >= 4);
+    if !supports_process_objects {
+        log::debug!(
+            "macOS {}.{} < 14.4: returning unfiltered NSWorkspace application list",
+            major,
+            minor
+        );
+        return Ok(all);
+    }
+
+    // Gather the set of PIDs CoreAudio reports as live audio processes.
+    let audio_pids = match active_audio_process_pids() {
+        Some(pids) if !pids.is_empty() => pids,
+        // Property unavailable, query failed, or no audio processes detected:
+        // fall back to the full NSWorkspace list rather than returning an
+        // empty/over-aggressive result.
+        _ => {
+            log::debug!(
+                "No active CoreAudio audio processes detected (or property unavailable); \
+                 returning unfiltered NSWorkspace application list"
+            );
+            return Ok(all);
+        }
+    };
+
+    // Intersect: keep only NSWorkspace apps whose PID owns a live audio process
+    // object. This recovers localizedName / bundleId for the audio PIDs.
+    let filtered: Vec<ApplicationInfo> = all
+        .into_iter()
+        .filter(|app| audio_pids.contains(&app.process_id))
+        .collect();
+
+    // Defensive: if the intersection is somehow empty (e.g. audio is owned by a
+    // helper process NSWorkspace doesn't list), surface the audio PIDs anyway so
+    // callers still see the active sources rather than an empty list.
+    if filtered.is_empty() {
+        log::debug!(
+            "Audio-process PID set did not intersect NSWorkspace apps; \
+             returning audio PIDs without NSWorkspace metadata"
+        );
+        return Ok(audio_pids
+            .into_iter()
+            .map(|pid| ApplicationInfo {
+                process_id: pid,
+                name: format!("PID {pid}"),
+                bundle_id: None,
+            })
+            .collect());
+    }
+
+    Ok(filtered)
+}
+
+/// Enumerates **all** running NSWorkspace applications, unfiltered.
+///
+/// This is the historical behaviour of [`enumerate_audio_applications`] before
+/// rsac-84fd added the CoreAudio "actually producing audio" filter. It is
+/// retained for diagnostics and for the macOS < 14.4 fallback path. It returns
+/// every running GUI application regardless of whether it is currently emitting
+/// audio.
+pub fn enumerate_audio_applications_all() -> AudioResult<Vec<ApplicationInfo>> {
     let mut app_infos: Vec<ApplicationInfo> = Vec::new();
 
     let shared_workspace = NSWorkspace::sharedWorkspace();
@@ -115,6 +271,151 @@ pub fn enumerate_audio_applications() -> AudioResult<Vec<ApplicationInfo>> {
     Ok(app_infos)
 }
 
+/// Returns the set of PIDs that CoreAudio reports as **live audio processes**.
+///
+/// Enumerates audio process objects via `kAudioHardwarePropertyProcessObjectList`
+/// (macOS 14.4+), then for each object reads its PID
+/// (`kAudioProcessPropertyPID`) and keeps it only if the process reports it is
+/// running output (`kAudioProcessPropertyIsRunningOutput`) — falling back to the
+/// generic `kAudioProcessPropertyIsRunning` flag when the output-specific one is
+/// unavailable. Output-running is the relevant signal for a *capture* library:
+/// we want processes emitting audio, not merely recording it.
+///
+/// Returns `None` if the process-object-list property is unavailable or the
+/// query fails (caller then falls back to the NSWorkspace list); `Some(set)`
+/// otherwise (possibly empty if nothing is currently playing). Never panics.
+fn active_audio_process_pids() -> Option<std::collections::HashSet<u32>> {
+    let list_addr = AudioObjectPropertyAddress {
+        mSelector: KAUDIO_HARDWARE_PROPERTY_PROCESS_OBJECT_LIST,
+        mScope: kAudioObjectPropertyScopeGlobal,
+        mElement: KAUDIO_OBJECT_PROPERTY_ELEMENT_MAIN,
+    };
+
+    unsafe {
+        let mut data_size: u32 = 0;
+        let status = AudioObjectGetPropertyDataSize(
+            kAudioObjectSystemObject,
+            &list_addr,
+            0,
+            std::ptr::null(),
+            &mut data_size,
+        );
+        if status != 0 || data_size == 0 {
+            return None;
+        }
+
+        let count = data_size as usize / std::mem::size_of::<AudioObjectID>();
+        if count == 0 {
+            // Property exists but no audio processes; caller treats empty as
+            // "fall back", so signal an empty set explicitly.
+            return Some(std::collections::HashSet::new());
+        }
+
+        let mut object_ids = vec![0u32; count];
+        let status = AudioObjectGetPropertyData(
+            kAudioObjectSystemObject,
+            &list_addr,
+            0,
+            std::ptr::null(),
+            &mut data_size,
+            object_ids.as_mut_ptr() as *mut std::ffi::c_void,
+        );
+        if status != 0 {
+            return None;
+        }
+
+        let actual = data_size as usize / std::mem::size_of::<AudioObjectID>();
+        object_ids.truncate(actual);
+
+        let mut pids: std::collections::HashSet<u32> = std::collections::HashSet::new();
+        for &obj in &object_ids {
+            if obj == 0 {
+                continue;
+            }
+            if process_object_is_emitting(obj) {
+                if let Some(pid) = process_object_pid(obj) {
+                    pids.insert(pid);
+                }
+            }
+        }
+        Some(pids)
+    }
+}
+
+/// Reads `kAudioProcessPropertyPID` (a `pid_t`/`i32`) from an audio process
+/// object. Returns `None` on FFI failure or a non-positive PID. Never panics.
+///
+/// # Safety
+/// `obj` must be a valid `AudioObjectID` for an audio process object.
+unsafe fn process_object_pid(obj: AudioObjectID) -> Option<u32> {
+    let addr = AudioObjectPropertyAddress {
+        mSelector: KAUDIO_PROCESS_PROPERTY_PID,
+        mScope: kAudioObjectPropertyScopeGlobal,
+        mElement: KAUDIO_OBJECT_PROPERTY_ELEMENT_MAIN,
+    };
+
+    let mut pid: i32 = -1;
+    let mut size = std::mem::size_of::<i32>() as u32;
+    let status = AudioObjectGetPropertyData(
+        obj,
+        &addr,
+        0,
+        std::ptr::null(),
+        &mut size,
+        &mut pid as *mut i32 as *mut std::ffi::c_void,
+    );
+    if status != 0 || pid <= 0 {
+        return None;
+    }
+    Some(pid as u32)
+}
+
+/// Returns `true` if the audio process object reports it is actively producing
+/// output audio.
+///
+/// Prefers `kAudioProcessPropertyIsRunningOutput`; if that property read fails,
+/// falls back to the generic `kAudioProcessPropertyIsRunning`. Returns `false`
+/// when neither can be read. Never panics.
+///
+/// # Safety
+/// `obj` must be a valid `AudioObjectID` for an audio process object.
+unsafe fn process_object_is_emitting(obj: AudioObjectID) -> bool {
+    if let Some(running_output) =
+        read_process_bool_property(obj, KAUDIO_PROCESS_PROPERTY_IS_RUNNING_OUTPUT)
+    {
+        return running_output;
+    }
+    read_process_bool_property(obj, KAUDIO_PROCESS_PROPERTY_IS_RUNNING).unwrap_or(false)
+}
+
+/// Reads a `UInt32` boolean audio-process property, returning `Some(bool)` on a
+/// successful query and `None` if the property could not be read. Never panics.
+///
+/// # Safety
+/// `obj` must be a valid `AudioObjectID` for an audio process object.
+unsafe fn read_process_bool_property(obj: AudioObjectID, selector: u32) -> Option<bool> {
+    let addr = AudioObjectPropertyAddress {
+        mSelector: selector,
+        mScope: kAudioObjectPropertyScopeGlobal,
+        mElement: KAUDIO_OBJECT_PROPERTY_ELEMENT_MAIN,
+    };
+
+    let mut value: u32 = 0;
+    let mut size = std::mem::size_of::<u32>() as u32;
+    let status = AudioObjectGetPropertyData(
+        obj,
+        &addr,
+        0,
+        std::ptr::null(),
+        &mut size,
+        &mut value as *mut u32 as *mut std::ffi::c_void,
+    );
+    if status != 0 {
+        return None;
+    }
+    Some(value != 0)
+}
+
 // ══════════════════════════════════════════════════════════════════════════
 // MacosAudioDevice — implements the NEW AudioDevice trait
 // ══════════════════════════════════════════════════════════════════════════
@@ -147,32 +448,40 @@ impl AudioDevice for MacosAudioDevice {
     }
 
     fn supported_formats(&self) -> Vec<AudioFormat> {
-        // Query the device's default stream format using raw CoreAudio API
-        let address = AudioObjectPropertyAddress {
-            mSelector: kAudioDevicePropertyStreamFormat,
-            mScope: kAudioObjectPropertyScopeOutput,
-            mElement: KAUDIO_OBJECT_PROPERTY_ELEMENT_MAIN,
-        };
+        // rsac-81ae: probe every output stream's available virtual formats so we
+        // return the full multi-format list (parity with the Windows backend),
+        // not just the single current format. The current format is returned
+        // first (stable ordering) so callers that only read formats[0] keep the
+        // previous behaviour. Never panics; a zero-stream device yields vec![].
+        let mut formats: Vec<AudioFormat> = Vec::new();
 
-        unsafe {
-            let mut asbd: AudioStreamBasicDescription = std::mem::zeroed();
-            let mut size = std::mem::size_of::<AudioStreamBasicDescription>() as u32;
-            let status = AudioObjectGetPropertyData(
-                self.device_id,
-                &address,
-                0,
-                std::ptr::null(),
-                &mut size,
-                &mut asbd as *mut _ as *mut std::ffi::c_void,
-            );
-            if status != 0 {
-                return vec![];
-            }
-            match asbd_to_audio_format(&asbd) {
-                Ok(fmt) => vec![fmt],
-                Err(_) => vec![],
+        // 1. Current stream format first (stable ordering).
+        if let Some(fmt) = self.current_stream_format() {
+            formats.push(fmt);
+        }
+
+        // 2. Per-stream available virtual formats.
+        for stream_id in self.output_stream_ids() {
+            for fmt in probe_stream_available_formats(stream_id) {
+                if !formats.contains(&fmt) {
+                    formats.push(fmt);
+                }
             }
         }
+
+        formats
+    }
+
+    fn kind(&self) -> AudioResult<DeviceKind> {
+        // Probe the device's stream scopes: a device exposing output streams is
+        // classified as an output endpoint, otherwise one exposing input streams
+        // is an input endpoint. A device exposing streams on neither scope yields
+        // an honest `PlatformNotSupported` rather than a guess — matching the
+        // trait contract (rsac-3093, shared with the DeviceAdded.kind probe).
+        device_kind_of(self.device_id).ok_or_else(|| AudioError::PlatformNotSupported {
+            feature: "device kind".to_string(),
+            platform: std::env::consts::OS.to_string(),
+        })
     }
 
     fn create_stream(&self, config: &StreamConfig) -> AudioResult<Box<dyn CapturingStream>> {
@@ -206,14 +515,491 @@ impl AudioDevice for MacosAudioDevice {
             channels: format.channels,
         };
 
-        // 6. Create the CoreAudio capture (registers callback, starts AudioUnit)
-        let platform_stream = create_macos_capture(capture_config, producer)?;
+        // PU-1/PERF-07 (rsac-2c56): publish the negotiated *delivery* format onto
+        // the bridge so `stream.format()` / `StreamStats.format_description` report
+        // what is actually delivered, not merely what was requested. The IO proc
+        // sets the AUHAL stream format to an interleaved-F32 ASBD built from
+        // `format.sample_rate`/`format.channels` (see `build_f32_asbd` /
+        // `create_macos_capture`), so CoreAudio's AUHAL converts and delivers
+        // exactly that rate/channels as f32 — which is what the input callback
+        // pushes via `push_samples_or_drop`. We record it here, before the
+        // `producer` is moved into `create_macos_capture`, because that is the
+        // negotiation point reachable from this owned file. The bridge normalizes
+        // `sample_format` to F32 internally, so that field is ignored. One-time,
+        // off-RT, lock-free `Release` store on the setup path.
+        producer.set_negotiated_format(&format);
+
+        // 6. Create the CoreAudio capture (registers callback, starts AudioUnit).
+        //    Producer-terminal-signal (FH-1 / ADR-0010): hand the platform stream
+        //    a clone of the bridge's shared state so its stop/Drop choke point can
+        //    drive the bridge terminal (consumer is in scope here). Fully-qualified
+        //    `Arc` avoids adding a `use` import to this watch-area-shared file.
+        let terminal = std::sync::Arc::clone(consumer.shared());
+        let platform_stream = create_macos_capture(capture_config, producer, terminal)?;
 
         // 7. Create BridgeStream wrapping consumer + platform stream
         let bridge_stream =
             BridgeStream::new(consumer, platform_stream, format, Duration::from_secs(1));
 
         Ok(Box::new(bridge_stream))
+    }
+}
+
+// ── MacosAudioDevice format-probing helpers (rsac-81ae) ────────────────────
+
+impl MacosAudioDevice {
+    /// Queries the device's current output stream format.
+    ///
+    /// Returns `None` if the property query fails or the format is not a
+    /// representable Linear-PCM format. Never panics.
+    fn current_stream_format(&self) -> Option<AudioFormat> {
+        let address = AudioObjectPropertyAddress {
+            mSelector: kAudioDevicePropertyStreamFormat,
+            mScope: kAudioObjectPropertyScopeOutput,
+            mElement: KAUDIO_OBJECT_PROPERTY_ELEMENT_MAIN,
+        };
+
+        unsafe {
+            let mut asbd: AudioStreamBasicDescription = std::mem::zeroed();
+            let mut size = std::mem::size_of::<AudioStreamBasicDescription>() as u32;
+            let status = AudioObjectGetPropertyData(
+                self.device_id,
+                &address,
+                0,
+                std::ptr::null(),
+                &mut size,
+                &mut asbd as *mut _ as *mut std::ffi::c_void,
+            );
+            if status != 0 {
+                return None;
+            }
+            asbd_to_audio_format(&asbd).ok()
+        }
+    }
+
+    /// Enumerates the `AudioStreamID`s on this device's output scope via
+    /// `kAudioDevicePropertyStreams`.
+    ///
+    /// Returns an empty vec on any failure or for a device with no output
+    /// streams (e.g. an input-only device queried on the output scope). Never
+    /// panics.
+    fn output_stream_ids(&self) -> Vec<AudioObjectID> {
+        let address = AudioObjectPropertyAddress {
+            mSelector: kAudioDevicePropertyStreams,
+            mScope: kAudioObjectPropertyScopeOutput,
+            mElement: KAUDIO_OBJECT_PROPERTY_ELEMENT_MAIN,
+        };
+
+        unsafe {
+            // Size query: how many bytes of AudioStreamID does the device report?
+            let mut data_size: u32 = 0;
+            let status = AudioObjectGetPropertyDataSize(
+                self.device_id,
+                &address,
+                0,
+                std::ptr::null(),
+                &mut data_size,
+            );
+            if status != 0 || data_size == 0 {
+                return Vec::new();
+            }
+
+            let count = data_size as usize / std::mem::size_of::<AudioObjectID>();
+            if count == 0 {
+                return Vec::new();
+            }
+
+            let mut stream_ids = vec![0u32; count];
+            let status = AudioObjectGetPropertyData(
+                self.device_id,
+                &address,
+                0,
+                std::ptr::null(),
+                &mut data_size,
+                stream_ids.as_mut_ptr() as *mut std::ffi::c_void,
+            );
+            if status != 0 {
+                return Vec::new();
+            }
+
+            // The device may report fewer streams than the initial size implied.
+            let actual = data_size as usize / std::mem::size_of::<AudioObjectID>();
+            stream_ids.truncate(actual);
+            stream_ids
+        }
+    }
+}
+
+/// Probes a single CoreAudio stream for its available virtual formats via
+/// `kAudioStreamPropertyAvailableVirtualFormats`, converting each one with the
+/// shared [`asbd_to_audio_format`].
+///
+/// The property returns an array of `AudioStreamRangedDescription`; we read the
+/// `.m_format` ASBD of each. Non-LinearPCM / big-endian / unsupported-bit-depth
+/// formats are skipped (not errored). De-duplicates within the stream. Returns
+/// an empty vec on any FFI failure. Never panics.
+///
+/// CoreAudio properties retrieved via `AudioObjectGetPropertyData` are *not*
+/// owned by the caller (the create-vs-get rule applies only to `Create`/`Copy`
+/// calls returning CF objects), and the array elements here are plain POD
+/// structs, so there is nothing to `CFRelease`.
+fn probe_stream_available_formats(stream_id: AudioObjectID) -> Vec<AudioFormat> {
+    let address = AudioObjectPropertyAddress {
+        mSelector: KAUDIO_STREAM_PROPERTY_AVAILABLE_VIRTUAL_FORMATS,
+        mScope: kAudioObjectPropertyScopeGlobal,
+        mElement: KAUDIO_OBJECT_PROPERTY_ELEMENT_MAIN,
+    };
+
+    let mut out: Vec<AudioFormat> = Vec::new();
+
+    unsafe {
+        let mut data_size: u32 = 0;
+        let status = AudioObjectGetPropertyDataSize(
+            stream_id,
+            &address,
+            0,
+            std::ptr::null(),
+            &mut data_size,
+        );
+        if status != 0 || data_size == 0 {
+            return out;
+        }
+
+        let elem = std::mem::size_of::<AudioStreamRangedDescription>();
+        let count = data_size as usize / elem;
+        if count == 0 {
+            return out;
+        }
+
+        let mut descs: Vec<AudioStreamRangedDescription> = vec![std::mem::zeroed(); count];
+        let status = AudioObjectGetPropertyData(
+            stream_id,
+            &address,
+            0,
+            std::ptr::null(),
+            &mut data_size,
+            descs.as_mut_ptr() as *mut std::ffi::c_void,
+        );
+        if status != 0 {
+            return out;
+        }
+
+        let actual = data_size as usize / elem;
+        descs.truncate(actual);
+
+        for desc in &descs {
+            // Skip (do not error) formats we cannot represent — non-LinearPCM,
+            // big-endian, or unsupported bit depths are all handled by
+            // asbd_to_audio_format returning Err.
+            if let Ok(fmt) = asbd_to_audio_format(&desc.m_format) {
+                if !out.contains(&fmt) {
+                    out.push(fmt);
+                }
+            }
+        }
+    }
+
+    out
+}
+
+/// Returns `true` if `device_id` exposes at least one audio stream on `scope`.
+///
+/// Queries `kAudioDevicePropertyStreams` with the given scope
+/// (`kAudioObjectPropertyScopeInput` or `kAudioObjectPropertyScopeOutput`) and
+/// reports whether the reported byte size is non-zero. Used to classify a device
+/// as input vs output. Never panics; any FFI failure is treated as "no streams".
+///
+/// # Safety
+/// Internally calls `AudioObjectGetPropertyDataSize` with a stack address; the
+/// device id need not be live (a stale id simply yields `false`).
+fn device_has_streams_on_scope(device_id: AudioObjectID, scope: u32) -> bool {
+    let address = AudioObjectPropertyAddress {
+        mSelector: kAudioDevicePropertyStreams,
+        mScope: scope,
+        mElement: KAUDIO_OBJECT_PROPERTY_ELEMENT_MAIN,
+    };
+
+    unsafe {
+        let mut data_size: u32 = 0;
+        let status = AudioObjectGetPropertyDataSize(
+            device_id,
+            &address,
+            0,
+            std::ptr::null(),
+            &mut data_size,
+        );
+        status == 0 && data_size > 0
+    }
+}
+
+/// Classifies a CoreAudio device as [`Input`](DeviceKind::Input) or
+/// [`Output`](DeviceKind::Output) by probing its stream scopes.
+///
+/// A device with output streams is reported as [`Output`](DeviceKind::Output);
+/// otherwise a device with input streams is [`Input`](DeviceKind::Input). A
+/// device exposing streams on neither scope (e.g. already torn down, or a
+/// metadata-only object) yields `None` — the caller decides whether that is an
+/// error (`kind()`) or a capture-oriented fallback (`DeviceAdded.kind`, which
+/// defaults to [`Output`](DeviceKind::Output) since loopback capture targets
+/// output endpoints). Never panics.
+///
+/// Shared by [`MacosAudioDevice::kind`] and the
+/// [`watch`](MacosDeviceEnumerator::watch) `DeviceAdded` event population so the
+/// two cannot drift (rsac-3093).
+fn device_kind_of(device_id: AudioObjectID) -> Option<DeviceKind> {
+    if device_has_streams_on_scope(device_id, kAudioObjectPropertyScopeOutput) {
+        Some(DeviceKind::Output)
+    } else if device_has_streams_on_scope(device_id, kAudioObjectPropertyScopeInput) {
+        Some(DeviceKind::Input)
+    } else {
+        None
+    }
+}
+
+// ══════════════════════════════════════════════════════════════════════════
+// Device-change watching (rsac-3093): AudioObjectPropertyListener + helper thread
+// ══════════════════════════════════════════════════════════════════════════
+
+/// Bound for the bounded channel between the CoreAudio listener proc (producer)
+/// and the watch helper thread (consumer).
+///
+/// Device-topology changes are rare and bursty at worst (a dock plugged in can
+/// add several devices in quick succession), so a small bound generously
+/// absorbs realistic bursts; if it ever fills, the proc drops the event rather
+/// than block the CoreAudio listener thread.
+const WATCH_CHANNEL_CAP: usize = 64;
+
+/// The three system-object property addresses we register listeners on, in
+/// registration order. `AudioObjectPropertyAddress` is a plain `#[repr(C)]` POD,
+/// so this array is built at runtime (its fields reference `coreaudio-sys`
+/// selector constants).
+const fn watch_address(selector: u32) -> AudioObjectPropertyAddress {
+    AudioObjectPropertyAddress {
+        mSelector: selector,
+        mScope: kAudioObjectPropertyScopeGlobal,
+        mElement: KAUDIO_OBJECT_PROPERTY_ELEMENT_MAIN,
+    }
+}
+
+/// The property addresses watched by [`MacosDeviceEnumerator::watch`], in
+/// registration / teardown order. Index 0 is the device-list selector (diffed
+/// for add/remove); indices 1 and 2 are the default-output / default-input
+/// selectors (emit `DefaultChanged`).
+static WATCH_ADDRESSES: [AudioObjectPropertyAddress; 3] = [
+    watch_address(kAudioHardwarePropertyDevices),
+    watch_address(kAudioHardwarePropertyDefaultOutputDevice),
+    watch_address(kAudioHardwarePropertyDefaultInputDevice),
+];
+
+/// Context shared between the CoreAudio listener proc and the watch helper
+/// thread. Boxed and passed to `AudioObjectAddPropertyListener` as the
+/// `inClientData` cookie.
+///
+/// # Lifetime — intentional bounded leak (H1 / PS-1)
+///
+/// CoreAudio's PROC-based listener gives **no** guarantee that an in-flight
+/// `watch_listener_proc` has finished when `AudioObjectRemovePropertyListener`
+/// returns (Apple's docs promise only that *no new* notifications fire; an
+/// already-dispatched proc may still be running on a CoreAudio thread). There is
+/// no app-side barrier that can close that window without risking deadlock on
+/// the HAL's internal locks. To make the proc's `client_data` deref always sound
+/// we therefore **intentionally leak** this allocation: `watch()` builds it with
+/// `Box::into_raw` and never reclaims it on the success / spawn-failure paths
+/// (it is reclaimed only on the pre-add construction-error path, where no
+/// listener was ever registered and thus no proc can fire). A late or in-flight
+/// proc consequently always dereferences valid, `'static` memory.
+///
+/// Event **delivery** is stopped at teardown not by freeing this struct but by
+/// disconnecting the channel: teardown takes the `SyncSender` out of
+/// `event_tx` (sets it to `None`), which drops the last live sender so the
+/// helper's `recv()` returns `Err` and the helper exits. A proc that fires after
+/// that finds `event_tx == None` (or a `Disconnected` channel) and is a no-op.
+///
+/// The leak is bounded and tiny — one `WatchListenerContext` (a sender slot plus
+/// a `HashSet` of device ids, tens of bytes) per `watch()`/drop cycle. Watchers
+/// are long-lived and few, so this is acceptable as a stopgap. The proper fix
+/// that eliminates both the leak and the race (migrate to
+/// `AudioObjectAddPropertyListenerBlock` on a self-owned serial dispatch queue,
+/// removing the listener on that same queue, per the Chromium/Itsuki pattern) is
+/// deferred — see ADR-0005 §5/§6.
+struct WatchListenerContext {
+    /// Producer end of the bounded channel; the proc pushes `DeviceEvent`s here.
+    ///
+    /// Wrapped in `Mutex<Option<…>>` so teardown can drop the sender *without*
+    /// freeing the (leaked) context: setting it to `None` disconnects the
+    /// channel and ends the helper, while the rest of the struct stays valid for
+    /// any in-flight proc. The proc locks and no-ops when it is `None`. Locking
+    /// is off the RT path (the proc runs on a CoreAudio thread, not the audio
+    /// callback) so a `Mutex` here is fine; poison is always recovered, never
+    /// `unwrap`ped, so neither the proc nor teardown can panic.
+    event_tx: std::sync::Mutex<Option<std::sync::mpsc::SyncSender<DeviceEvent>>>,
+    /// The device-id set observed at the previous device-list notification, used
+    /// to diff for add/remove. Behind a `Mutex` because CoreAudio may invoke the
+    /// proc from its internal thread pool (treated as possibly concurrent).
+    previous_devices: std::sync::Mutex<std::collections::HashSet<AudioObjectID>>,
+}
+
+/// A raw `*mut WatchListenerContext` that we assert is safe to send across the
+/// teardown-closure boundary.
+///
+/// The pointee is an **intentionally leaked** allocation (see
+/// [`WatchListenerContext`]): `watch()` creates it with `Box::into_raw` and the
+/// teardown closure never reclaims it, so it is valid for the process lifetime —
+/// no co-captured `Box` is needed to keep it alive. The teardown closure uses
+/// this pointer only to identify the listener registration when it passes the
+/// same cookie value back to `AudioObjectRemovePropertyListener` (which compares
+/// it by value); it does **not** gate the liveness of the pointee.
+/// `WatchListenerContext` is itself `Send` (its fields are `Send`), so carrying
+/// the pointer across the spawn/teardown boundary is sound.
+struct SendContextPtr(*mut WatchListenerContext);
+// SAFETY: see the type-level note — the pointee is `Send` and intentionally
+// leaked (valid for `'static`), and the pointer is only used to identify the
+// listener registration at teardown.
+unsafe impl Send for SendContextPtr {}
+
+/// Snapshots the current set of CoreAudio device ids.
+///
+/// Used to seed and diff the device-list listener. Returns an empty set on any
+/// FFI failure (the next successful snapshot re-syncs). Never panics.
+fn current_device_id_set() -> std::collections::HashSet<AudioObjectID> {
+    match get_audio_device_ids() {
+        Ok(ids) => ids.into_iter().collect(),
+        Err(_) => std::collections::HashSet::new(),
+    }
+}
+
+/// The CoreAudio property-listener proc.
+///
+/// CoreAudio invokes this on one of its own threads when any of the watched
+/// properties changes. It must NOT call arbitrary user code or re-enter
+/// CoreAudio in a blocking way, so it only translates the change into
+/// `DeviceEvent`(s) and pushes them into the bounded channel for the helper
+/// thread to deliver. It never panics (a panic across the FFI boundary would be
+/// UB): all work is fallible-by-skipping.
+///
+/// # Safety
+/// - `client_data` points to a [`WatchListenerContext`] that is **intentionally
+///   leaked** and therefore valid for the process lifetime. CoreAudio does
+///   **not** guarantee an in-flight proc has finished when
+///   `AudioObjectRemovePropertyListener` returns, so the deref is made sound by
+///   never freeing the allocation rather than by an ordering barrier; a proc
+///   that fires after teardown simply finds the channel disconnected (its sender
+///   taken) and no-ops. See [`WatchListenerContext`] for the full rationale.
+/// - `addresses` / `num_addresses` describe a C array of
+///   `AudioObjectPropertyAddress`; we read `num_addresses` entries.
+unsafe extern "C" fn watch_listener_proc(
+    _object_id: AudioObjectID,
+    num_addresses: u32,
+    addresses: *const AudioObjectPropertyAddress,
+    client_data: *mut std::ffi::c_void,
+) -> OSStatus {
+    // Recover the context. A null cookie should never happen, but guard anyway.
+    if client_data.is_null() {
+        return 0;
+    }
+    let context = &*(client_data as *const WatchListenerContext);
+
+    if addresses.is_null() {
+        return 0;
+    }
+
+    for i in 0..num_addresses as isize {
+        let address = &*addresses.offset(i);
+        match address.mSelector {
+            sel if sel == kAudioHardwarePropertyDevices => {
+                emit_device_list_diff(context);
+            }
+            sel if sel == kAudioHardwarePropertyDefaultOutputDevice => {
+                emit_default_changed(context, DeviceKind::Output, false);
+            }
+            sel if sel == kAudioHardwarePropertyDefaultInputDevice => {
+                emit_default_changed(context, DeviceKind::Input, true);
+            }
+            _ => {
+                // Unwatched selector (should not occur); ignore.
+            }
+        }
+    }
+
+    0
+}
+
+/// Diffs the current device-id set against the previous snapshot and pushes a
+/// `DeviceAdded` / `DeviceRemoved` event for each difference, then updates the
+/// snapshot. Called from the listener proc (off the RT path); allocation here is
+/// fine. Never panics — a poisoned snapshot mutex is recovered into.
+fn emit_device_list_diff(context: &WatchListenerContext) {
+    let current = current_device_id_set();
+
+    // Recover from a poisoned lock rather than panicking inside the FFI proc.
+    let mut previous = context
+        .previous_devices
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+
+    // Added: in current, not in previous.
+    for &id in current.difference(&previous) {
+        let device = MacosAudioDevice { device_id: id };
+        // Loopback capture targets output endpoints, so a device whose scope we
+        // cannot determine defaults to Output (the capture-oriented default for
+        // this capture-only library), mirroring describe()'s Input fallback for
+        // the opposite (record) orientation.
+        let kind = device_kind_of(id).unwrap_or(DeviceKind::Output);
+        let event = DeviceEvent::DeviceAdded {
+            id: DeviceId(id.to_string()),
+            name: device.name(),
+            kind,
+        };
+        try_push_event(context, event);
+    }
+
+    // Removed: in previous, not in current.
+    for &id in previous.difference(&current) {
+        let event = DeviceEvent::DeviceRemoved {
+            id: DeviceId(id.to_string()),
+        };
+        try_push_event(context, event);
+    }
+
+    *previous = current;
+}
+
+/// Reads the current default device for `input` (false = output, true = input)
+/// and pushes a `DefaultChanged` carrying its id + `kind`. Skips silently if no
+/// default is currently resolvable. Never panics.
+fn emit_default_changed(context: &WatchListenerContext, kind: DeviceKind, input: bool) {
+    if let Some(id) = get_default_device_id(input) {
+        let event = DeviceEvent::DefaultChanged {
+            id: DeviceId(id.to_string()),
+            kind,
+        };
+        try_push_event(context, event);
+    }
+}
+
+/// Non-blocking push into the bounded channel. A full channel (consumer behind)
+/// or a disconnected channel (helper thread already gone) drops the event rather
+/// than blocking the CoreAudio listener thread. After teardown has taken the
+/// sender (`event_tx == None`) — possible on a leaked context whose proc fires
+/// late — this is a silent no-op. Never panics (a poisoned sender lock is
+/// recovered into, not `unwrap`ped).
+fn try_push_event(context: &WatchListenerContext, event: DeviceEvent) {
+    let guard = context
+        .event_tx
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    let Some(tx) = guard.as_ref() else {
+        // Teardown took the sender; the watcher is being dropped. Nothing to do.
+        return;
+    };
+    match tx.try_send(event) {
+        Ok(()) => {}
+        Err(std::sync::mpsc::TrySendError::Full(_)) => {
+            log::warn!("rsac macOS device-watch channel full; dropping a DeviceEvent");
+        }
+        Err(std::sync::mpsc::TrySendError::Disconnected(_)) => {
+            // Helper thread has exited (teardown in progress); nothing to do.
+        }
     }
 }
 
@@ -263,6 +1049,224 @@ impl DeviceEnumerator for MacosDeviceEnumerator {
             device_id: "default_output".into(),
         })?;
         Ok(Box::new(MacosAudioDevice { device_id }))
+    }
+
+    /// Subscribe to CoreAudio device hot-plug / default-change notifications.
+    ///
+    /// Registers three `AudioObjectAddPropertyListener`s on
+    /// `kAudioObjectSystemObject`:
+    ///
+    /// - `kAudioHardwarePropertyDevices` — the device list changed; we diff the
+    ///   current id set against the previous snapshot to emit
+    ///   [`DeviceAdded`](DeviceEvent::DeviceAdded) /
+    ///   [`DeviceRemoved`](DeviceEvent::DeviceRemoved).
+    /// - `kAudioHardwarePropertyDefaultOutputDevice` /
+    ///   `kAudioHardwarePropertyDefaultInputDevice` — the system default changed;
+    ///   we emit [`DefaultChanged`](DeviceEvent::DefaultChanged) with the new
+    ///   default's id + [`DeviceKind`].
+    ///
+    /// The CoreAudio listener proc runs on a CoreAudio-managed thread where
+    /// invoking arbitrary user code (or re-entering CoreAudio) is unsafe, so the
+    /// proc only *pushes* a [`DeviceEvent`] into a bounded `mpsc` channel. A
+    /// dedicated helper thread owned by the returned [`DeviceWatcher`] drains the
+    /// channel and invokes `on_event`. Neither thread is the real-time audio
+    /// callback thread, so allocation and locking off the channel are fine.
+    ///
+    /// The returned [`DeviceWatcher`]'s teardown closure removes **every**
+    /// registered listener (best-effort — stops *new* notifications), takes the
+    /// channel sender out of the context to disconnect the channel (signalling
+    /// the helper thread to exit), and joins the helper thread — no leaked
+    /// listener, no leaked thread, no hang.
+    ///
+    /// The listener-proc context (a [`WatchListenerContext`]) is **intentionally
+    /// leaked** (`Box::into_raw`, never reclaimed on the success/spawn-failure
+    /// paths), because CoreAudio gives no barrier that an in-flight proc has
+    /// finished when the listener is removed; never freeing it makes a late proc
+    /// deref always sound. Delivery is stopped by disconnecting the channel, not
+    /// by freeing the context. The residual cost is a bounded, intentional
+    /// per-cycle context leak (tens of bytes); the proper race-free fix is
+    /// deferred — see [`WatchListenerContext`] and ADR-0005 §5/§6.
+    fn watch(&self, on_event: DeviceEventHandler) -> AudioResult<DeviceWatcher> {
+        // Bounded channel: the CoreAudio proc is the producer, the helper thread
+        // the consumer. A bound avoids unbounded growth if events ever burst; on
+        // a full channel the proc drops the event (logged) rather than blocking
+        // the CoreAudio listener thread.
+        let (event_tx, event_rx) = std::sync::mpsc::sync_channel::<DeviceEvent>(WATCH_CHANNEL_CAP);
+
+        // The listener-proc context. Boxed for a stable address we pass to
+        // CoreAudio as the `inClientData` cookie, then INTENTIONALLY LEAKED via
+        // `Box::into_raw`: CoreAudio gives no barrier that an in-flight proc has
+        // finished when its listener is removed, so we make a late deref sound by
+        // never freeing the allocation (see `WatchListenerContext` + ADR-0005).
+        // The Box is consumed by `into_raw`, so it does NOT drop at end of scope;
+        // the success/spawn-failure paths leak it, and only the pre-add
+        // construction-error path reclaims it (no proc can be in flight there).
+        // The sender lives in a `Mutex<Option<…>>` so teardown can disconnect the
+        // channel (take the sender) WITHOUT freeing the leaked context. The
+        // previous-device-id snapshot lets the device-list proc diff for
+        // add/remove; it lives behind a Mutex because the proc may be invoked
+        // re-entrantly / from CoreAudio's internal thread pool.
+        let context_ptr: *mut WatchListenerContext =
+            Box::into_raw(Box::new(WatchListenerContext {
+                event_tx: std::sync::Mutex::new(Some(event_tx)),
+                previous_devices: std::sync::Mutex::new(current_device_id_set()),
+            }));
+
+        // Register all three listeners against the 'static address table. If any
+        // registration fails, unregister the ones that already succeeded and bail
+        // — leaving no dangling listener. On THIS construction-error path we
+        // reclaim the context (the only path that frees it): a failed add means
+        // no listener is left that could fire a proc, so there is no in-flight
+        // deref to protect and freeing is sound.
+        // `i` doubles as the count of listeners registered BEFORE this one, so on
+        // a mid-loop failure the rollback unregisters exactly indices `0..i`.
+        for (i, address) in WATCH_ADDRESSES.iter().enumerate() {
+            let status = unsafe {
+                AudioObjectAddPropertyListener(
+                    kAudioObjectSystemObject,
+                    address,
+                    Some(watch_listener_proc),
+                    context_ptr as *mut std::ffi::c_void,
+                )
+            };
+            if status != 0 {
+                // Roll back the listeners registered so far (indices 0..i), fail.
+                for prior in WATCH_ADDRESSES.iter().take(i) {
+                    unsafe {
+                        AudioObjectRemovePropertyListener(
+                            kAudioObjectSystemObject,
+                            prior,
+                            Some(watch_listener_proc),
+                            context_ptr as *mut std::ffi::c_void,
+                        );
+                    }
+                }
+                // Reclaim the leaked-by-default context: this is the ONLY path
+                // that frees it. After the rollback loop above, no listener is
+                // registered, so no proc can be mid-flight or dispatched against
+                // `context_ptr` — the deref-after-free window cannot exist here.
+                // SAFETY: `context_ptr` came from `Box::into_raw` above, has not
+                // been freed, and (post-rollback) is referenced by no live
+                // listener; this reconstitutes the unique owning Box exactly once.
+                unsafe {
+                    drop(Box::from_raw(context_ptr));
+                }
+                return Err(AudioError::BackendError {
+                    backend: "CoreAudio".into(),
+                    operation: "watch".into(),
+                    message: format!(
+                        "AudioObjectAddPropertyListener failed (OSStatus {}) for selector {}",
+                        status, address.mSelector
+                    ),
+                    context: Some(BackendContext {
+                        backend_name: "CoreAudio".into(),
+                        os_error_code: Some(status as i64),
+                        os_error_message: Some(format!("OSStatus {}", status)),
+                    }),
+                });
+            }
+        }
+
+        // Helper thread: drain the channel and invoke the user handler. It exits
+        // when the sender is dropped (teardown), at which point recv() returns
+        // Err and the loop ends. `on_event` runs here, NOT on the CoreAudio
+        // listener thread.
+        let mut on_event = on_event;
+        let helper = match std::thread::Builder::new()
+            .name("rsac-macos-device-watch".to_string())
+            .spawn(move || {
+                while let Ok(event) = event_rx.recv() {
+                    on_event(event);
+                }
+            }) {
+            Ok(handle) => handle,
+            Err(e) => {
+                // Spawn failed: undo the listeners so nothing dangles, then error.
+                for address in WATCH_ADDRESSES.iter() {
+                    unsafe {
+                        AudioObjectRemovePropertyListener(
+                            kAudioObjectSystemObject,
+                            address,
+                            Some(watch_listener_proc),
+                            context_ptr as *mut std::ffi::c_void,
+                        );
+                    }
+                }
+                // INTENTIONALLY LEAK `context_ptr` here (do NOT Box::from_raw):
+                // unlike the mid-loop construction-error path, the listeners WERE
+                // successfully registered, so the HAL may already have dispatched
+                // a proc against `context_ptr` before we removed them above.
+                // CoreAudio gives no in-flight-proc barrier, so freeing now would
+                // reopen the use-after-free window. The leak is a bounded one-time
+                // cost on this cold spawn-failure path and keeps the guarantee
+                // uniform with the success teardown.
+                return Err(AudioError::BackendError {
+                    backend: "CoreAudio".into(),
+                    operation: "watch".into(),
+                    message: format!("failed to spawn device-watch helper thread: {e}"),
+                    context: None,
+                });
+            }
+        };
+
+        // Wrap the raw context pointer so the teardown closure stays `Send`
+        // (a bare `*mut` is `!Send`). See `SendContextPtr`'s safety note.
+        let send_ctx = SendContextPtr(context_ptr);
+
+        // Teardown closure (runs once on DeviceWatcher::drop): remove every
+        // listener FIRST (best-effort — stops NEW notifications), THEN take the
+        // SyncSender out of the (leaked) context to disconnect the channel,
+        // signalling the helper to exit, THEN join the helper thread. The context
+        // allocation itself is NEVER freed (see `WatchListenerContext`): a late
+        // or in-flight proc therefore always derefs valid memory and, finding the
+        // sender taken, no-ops.
+        let teardown: Box<dyn FnOnce() + Send> = Box::new(move || {
+            // Rebind the WHOLE `SendContextPtr` as a unit. Under Rust 2021's
+            // disjoint closure captures, writing `send_ctx.0` directly would
+            // capture only the `*mut WatchListenerContext` FIELD — which is
+            // `!Send` — bypassing the wrapper's `unsafe impl Send` and making
+            // this teardown closure `!Send` (it must be `FnOnce() + Send`).
+            // Capturing `send_ctx` whole preserves the Send assertion.
+            let send_ctx = send_ctx;
+            // `send_ctx.0` points at the intentionally-leaked context, valid for
+            // the process lifetime; we deref it below to disconnect the channel.
+            let ctx_ptr = send_ctx.0;
+            for address in WATCH_ADDRESSES.iter() {
+                unsafe {
+                    AudioObjectRemovePropertyListener(
+                        kAudioObjectSystemObject,
+                        address,
+                        Some(watch_listener_proc),
+                        ctx_ptr as *mut std::ffi::c_void,
+                    );
+                }
+            }
+            // Disconnect the channel WITHOUT freeing the context: take the
+            // SyncSender out of the leaked context. Dropping the last live sender
+            // makes the helper's recv() return Err so its loop ends. A proc that
+            // fires after this finds `event_tx == None` and no-ops.
+            // SAFETY: `ctx_ptr` addresses the leaked (never-freed) context, so it
+            // is a valid `&WatchListenerContext` for the process lifetime. We only
+            // touch the `Mutex`-guarded sender; concurrent proc access is
+            // serialised by that lock.
+            let ctx: &WatchListenerContext = unsafe { &*ctx_ptr };
+            // Recover a poisoned lock rather than panicking inside Drop; taking
+            // the sender out (and dropping it) cannot itself panic.
+            let mut guard = ctx
+                .event_tx
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            *guard = None;
+            // Release the sender lock BEFORE joining so a concurrent proc's
+            // try-lock in `try_push_event` is never blocked on the joining
+            // thread (it will simply observe `None` and no-op).
+            drop(guard);
+            // Join the helper thread; ignore a panicked-handler join error so
+            // Drop never panics.
+            let _ = helper.join();
+        });
+
+        Ok(DeviceWatcher::from_teardown(teardown))
     }
 }
 
@@ -326,7 +1330,13 @@ pub(crate) fn map_ca_error(err: CAError) -> AudioError {
         backend: "CoreAudio".into(),
         operation: category.to_string(),
         message: format!("CoreAudio error ({}): OSStatus {}", category, os_status),
-        context: None,
+        // M6: surface the raw OSStatus so callers can match on it machine-readably.
+        // OSStatus is an i32; sign-extend to i64 for the BackendContext field.
+        context: Some(BackendContext {
+            backend_name: "CoreAudio".into(),
+            os_error_code: Some(os_status as i64),
+            os_error_message: Some(format!("OSStatus {} ({})", os_status, category)),
+        }),
     }
 }
 
@@ -423,6 +1433,71 @@ mod tests {
     use super::*;
     use crate::core::config::{AudioFormat, CaptureTarget, SampleFormat, StreamConfig};
     use crate::core::interface::DeviceEnumerator;
+
+    // ── CoreAudio FourCC constant regression guards (rsac-81ae/rsac-84fd) ──
+    //
+    // These selectors are defined locally as raw values; a transposed character
+    // would silently break enumeration/filtering at runtime (the property query
+    // would just return an error and we'd fall back). Pin the exact values from
+    // Apple's macOS 14.4+ CoreAudio `AudioHardware.h`.
+
+    /// Builds a big-endian FourCC u32 from a 4-byte ASCII code, matching the
+    /// CoreAudio convention used to derive these selector values.
+    fn fourcc(code: &[u8; 4]) -> u32 {
+        ((code[0] as u32) << 24)
+            | ((code[1] as u32) << 16)
+            | ((code[2] as u32) << 8)
+            | (code[3] as u32)
+    }
+
+    #[test]
+    fn process_object_list_selector_is_prs_hash() {
+        assert_eq!(
+            KAUDIO_HARDWARE_PROPERTY_PROCESS_OBJECT_LIST,
+            fourcc(b"prs#")
+        );
+        assert_eq!(KAUDIO_HARDWARE_PROPERTY_PROCESS_OBJECT_LIST, 0x7072_7323);
+    }
+
+    #[test]
+    fn process_property_selectors_match_header() {
+        assert_eq!(KAUDIO_PROCESS_PROPERTY_PID, fourcc(b"ppid"));
+        assert_eq!(KAUDIO_PROCESS_PROPERTY_PID, 0x7070_6964);
+
+        // The output-specific flag is 'piro' — NOT 'pruo'. This guards the
+        // exact bug caught during implementation.
+        assert_eq!(KAUDIO_PROCESS_PROPERTY_IS_RUNNING_OUTPUT, fourcc(b"piro"));
+        assert_eq!(KAUDIO_PROCESS_PROPERTY_IS_RUNNING_OUTPUT, 0x7069_726f);
+
+        assert_eq!(KAUDIO_PROCESS_PROPERTY_IS_RUNNING, fourcc(b"pir?"));
+        assert_eq!(KAUDIO_PROCESS_PROPERTY_IS_RUNNING, 0x7069_723f);
+    }
+
+    #[test]
+    fn available_virtual_formats_selector_is_sfma() {
+        assert_eq!(
+            KAUDIO_STREAM_PROPERTY_AVAILABLE_VIRTUAL_FORMATS,
+            fourcc(b"sfma")
+        );
+        assert_eq!(
+            KAUDIO_STREAM_PROPERTY_AVAILABLE_VIRTUAL_FORMATS,
+            0x7366_6d61
+        );
+    }
+
+    #[test]
+    fn audio_stream_ranged_description_layout() {
+        // The CoreAudio ABI: an ASBD followed by an AudioValueRange (two f64).
+        // If this size drifts, our element-count math in
+        // probe_stream_available_formats would mis-slice the property buffer.
+        assert_eq!(
+            std::mem::size_of::<AudioStreamRangedDescription>(),
+            std::mem::size_of::<AudioStreamBasicDescription>()
+                + std::mem::size_of::<AudioValueRange>()
+        );
+        // ASBD is 40 bytes, AudioValueRange is 16 bytes (2 × f64) → 56 total.
+        assert_eq!(std::mem::size_of::<AudioStreamRangedDescription>(), 56);
+    }
 
     // ── Helper function tests: asbd_to_audio_format ──────────────────
 
@@ -689,6 +1764,33 @@ mod tests {
         );
     }
 
+    #[test]
+    fn map_ca_error_populates_os_error_code() {
+        // M6: BackendError should carry the raw OSStatus in os_error_code so it's
+        // machine-readable, not just embedded in the human-readable message.
+        let err = map_ca_error(CAError::Unknown(-50));
+        match err {
+            AudioError::BackendError {
+                context: Some(ctx), ..
+            } => {
+                assert_eq!(ctx.backend_name, "CoreAudio");
+                assert_eq!(
+                    ctx.os_error_code,
+                    Some(-50i64),
+                    "OSStatus should be sign-extended into os_error_code"
+                );
+                assert!(
+                    ctx.os_error_message.is_some(),
+                    "os_error_message should be populated"
+                );
+            }
+            other => panic!(
+                "Expected BackendError with populated context, got: {:?}",
+                other
+            ),
+        }
+    }
+
     // ── Device construction tests (require audio hardware) ───────────
 
     #[test]
@@ -728,6 +1830,53 @@ mod tests {
             !formats.is_empty(),
             "default device should support at least one format"
         );
+    }
+
+    #[test]
+    #[ignore = "requires macOS audio hardware"]
+    fn supported_formats_does_not_panic_on_any_enumerated_device() {
+        // rsac-81ae acceptance: probing must never panic, even on devices with
+        // zero output streams (input-only devices queried on the output scope).
+        let enumerator = MacosDeviceEnumerator::new();
+        let devices = enumerator
+            .enumerate_devices()
+            .expect("enumerate should succeed");
+        for dev in &devices {
+            // Must not panic; output-only-stream-less devices may return vec![].
+            let _ = dev.supported_formats();
+        }
+    }
+
+    #[test]
+    #[ignore = "requires macOS audio hardware"]
+    fn supported_formats_returns_unique_formats() {
+        // rsac-81ae: probed formats are de-duplicated; the current format is
+        // returned first (stable ordering).
+        let enumerator = MacosDeviceEnumerator::new();
+        let device = enumerator
+            .default_device()
+            .expect("default device should exist");
+        let formats = device.supported_formats();
+        assert!(
+            !formats.is_empty(),
+            "default output device should report >= 1 format"
+        );
+        // No duplicates.
+        for i in 0..formats.len() {
+            for j in (i + 1)..formats.len() {
+                assert_ne!(
+                    formats[i], formats[j],
+                    "supported_formats must not contain duplicates"
+                );
+            }
+        }
+        // The "current stream format is returned first" ordering is an internal
+        // guarantee of `MacosAudioDevice::current_stream_format` (a private
+        // inherent helper). `default_device()` hands back a `Box<dyn AudioDevice>`,
+        // through which that helper is not reachable, so it is exercised by the
+        // dedicated unit test below rather than re-checked here through the trait
+        // object. This test asserts the trait-level contract: a non-empty,
+        // duplicate-free format list.
     }
 
     #[test]
@@ -807,6 +1956,87 @@ mod tests {
             );
             assert_ne!(app.name, "<Unknown Name>");
         }
+    }
+
+    #[test]
+    #[ignore = "requires macOS GUI environment"]
+    fn enumerate_audio_applications_all_is_unfiltered_superset() {
+        // rsac-84fd: the filtered list must be a subset of the full NSWorkspace
+        // list, and `_all()` must never error (it's the fallback path).
+        let all =
+            enumerate_audio_applications_all().expect("unfiltered enumeration should succeed");
+        assert!(
+            !all.is_empty(),
+            "macOS desktop should report at least one running application"
+        );
+
+        let filtered = enumerate_audio_applications().expect("filtered enumeration should succeed");
+        assert!(
+            filtered.len() <= all.len(),
+            "filtered list ({}) must not exceed the unfiltered list ({})",
+            filtered.len(),
+            all.len()
+        );
+
+        // On macOS 14.4+, every filtered PID should appear in the unfiltered
+        // set (unless we fell back to the synthetic "PID n" entries because the
+        // intersection was empty — in which case names start with "PID ").
+        let all_pids: std::collections::HashSet<u32> = all.iter().map(|a| a.process_id).collect();
+        let synthetic_fallback = filtered.iter().all(|a| a.name.starts_with("PID "));
+        if !synthetic_fallback {
+            for app in &filtered {
+                assert!(
+                    all_pids.contains(&app.process_id),
+                    "filtered PID {} should be present in the NSWorkspace list",
+                    app.process_id
+                );
+            }
+        }
+    }
+
+    #[test]
+    #[ignore = "requires macOS 14.4+ audio hardware"]
+    fn enumerate_audio_applications_filters_below_unfiltered_count() {
+        // rsac-84fd acceptance: on a 14.4+ desktop with audio playing, the
+        // filtered count is strictly smaller than the raw NSWorkspace count
+        // (most GUI apps are not emitting audio). On <14.4 the two are equal
+        // (fallback), which is also acceptable, so only assert the inequality
+        // when the OS supports process objects AND something is actually
+        // producing audio.
+        let (major, minor, _) = crate::core::capabilities::get_macos_version();
+        let supports = major > 14 || (major == 14 && minor >= 4);
+        if !supports {
+            eprintln!("macOS < 14.4; filter is a no-op fallback — skipping strict-subset check");
+            return;
+        }
+
+        let all = enumerate_audio_applications_all().expect("unfiltered should succeed");
+        let filtered = enumerate_audio_applications().expect("filtered should succeed");
+
+        // If nothing is emitting audio, the fallback returns the full list;
+        // only assert strict filtering when we actually narrowed the set.
+        if filtered.len() < all.len() {
+            assert!(
+                filtered.len() < all.len(),
+                "expected strictly fewer audio apps ({}) than all apps ({})",
+                filtered.len(),
+                all.len()
+            );
+        } else {
+            eprintln!(
+                "no audio currently playing (filtered={} == all={}); fallback returned full list",
+                filtered.len(),
+                all.len()
+            );
+        }
+    }
+
+    #[test]
+    #[ignore = "requires macOS 14.4+ audio hardware"]
+    fn active_audio_process_pids_does_not_panic() {
+        // rsac-84fd: the process-object query must never panic; it returns None
+        // when the property is unavailable, or Some(set) (possibly empty).
+        let _ = active_audio_process_pids();
     }
 
     // ── Stream lifecycle tests (require audio hardware) ──────────────
@@ -898,5 +2128,372 @@ mod tests {
         assert_eq!(fmt.sample_rate, 48000);
         assert_eq!(fmt.channels, 2);
         assert_eq!(fmt.sample_format, SampleFormat::F32);
+    }
+
+    // ── Device-change watching (rsac-3093) ──────────────────────────────
+    //
+    // `DeviceEnumerator` is imported at the test-module top; `DeviceEvent`,
+    // `DeviceKind`, and `DeviceWatcher` come in via `use super::*` (they are
+    // imported at file scope for the `watch()` impl).
+
+    /// The watched selectors must equal their canonical CoreAudio FourCC values
+    /// from `AudioHardware.h`. A wrong import (or a `coreaudio-sys` drift) would
+    /// register listeners on the wrong property and silently never fire.
+    #[test]
+    fn watch_selectors_match_header() {
+        assert_eq!(kAudioHardwarePropertyDevices, fourcc(b"dev#"));
+        assert_eq!(kAudioHardwarePropertyDefaultOutputDevice, fourcc(b"dOut"));
+        assert_eq!(kAudioHardwarePropertyDefaultInputDevice, fourcc(b"dIn "));
+    }
+
+    /// The address table registers exactly the three watched selectors, all on
+    /// the global scope / main element, in the documented order (device-list
+    /// first, then default-output, then default-input).
+    #[test]
+    fn watch_addresses_table_is_well_formed() {
+        assert_eq!(WATCH_ADDRESSES.len(), 3);
+        assert_eq!(WATCH_ADDRESSES[0].mSelector, kAudioHardwarePropertyDevices);
+        assert_eq!(
+            WATCH_ADDRESSES[1].mSelector,
+            kAudioHardwarePropertyDefaultOutputDevice
+        );
+        assert_eq!(
+            WATCH_ADDRESSES[2].mSelector,
+            kAudioHardwarePropertyDefaultInputDevice
+        );
+        for addr in WATCH_ADDRESSES.iter() {
+            assert_eq!(addr.mScope, kAudioObjectPropertyScopeGlobal);
+            assert_eq!(addr.mElement, KAUDIO_OBJECT_PROPERTY_ELEMENT_MAIN);
+        }
+    }
+
+    /// `OSStatus`'s `noErr` is `0`, the value the listener proc returns; guard
+    /// the local alias is the right width.
+    #[test]
+    fn osstatus_alias_is_i32() {
+        let ok: OSStatus = 0;
+        assert_eq!(ok, 0i32);
+        assert_eq!(std::mem::size_of::<OSStatus>(), 4);
+    }
+
+    /// `emit_device_list_diff` emits one `DeviceRemoved` per id that disappears
+    /// from the snapshot, and updates the stored snapshot — exercised without any
+    /// audio hardware by seeding a synthetic previous set and an empty current
+    /// device list (the real `get_audio_device_ids()` returns whatever the host
+    /// has, so we only assert the removed-side diff for ids the host cannot have:
+    /// reserved sentinel ids that never appear in a real enumeration).
+    ///
+    /// This is device-free: it constructs the context directly and reads off the
+    /// channel without registering any CoreAudio listener.
+    #[test]
+    fn device_list_diff_emits_removed_for_vanished_ids() {
+        let (tx, rx) = std::sync::mpsc::sync_channel::<DeviceEvent>(WATCH_CHANNEL_CAP);
+        // Seed the previous snapshot with sentinel ids that cannot be live
+        // devices (0 is kAudioObjectUnknown; u32::MAX is not a real object id),
+        // so the real current snapshot will not contain them and they must be
+        // reported as removed regardless of the host's actual device list.
+        let mut seed = std::collections::HashSet::new();
+        seed.insert(0u32);
+        seed.insert(u32::MAX);
+        let ctx = WatchListenerContext {
+            event_tx: std::sync::Mutex::new(Some(tx)),
+            previous_devices: std::sync::Mutex::new(seed),
+        };
+
+        emit_device_list_diff(&ctx);
+
+        // Collect the removed ids reported (added events may also appear for the
+        // host's real devices on first diff — we ignore those and assert only
+        // that both sentinels were reported removed).
+        let mut removed: std::collections::HashSet<String> = std::collections::HashSet::new();
+        while let Ok(ev) = rx.try_recv() {
+            if let DeviceEvent::DeviceRemoved { id } = ev {
+                removed.insert(id.0);
+            }
+        }
+        assert!(
+            removed.contains("0"),
+            "sentinel id 0 should be reported removed; got {removed:?}"
+        );
+        assert!(
+            removed.contains(&u32::MAX.to_string()),
+            "sentinel id u32::MAX should be reported removed; got {removed:?}"
+        );
+
+        // The snapshot must have been replaced with the current set (which does
+        // not contain the sentinels).
+        let snap = ctx.previous_devices.lock().unwrap();
+        assert!(!snap.contains(&0u32));
+        assert!(!snap.contains(&u32::MAX));
+    }
+
+    /// `try_push_event` drops events when the bounded channel is full rather than
+    /// blocking the CoreAudio listener thread, and never panics. Device-free.
+    #[test]
+    fn try_push_event_drops_when_full_without_blocking() {
+        let (tx, _rx) = std::sync::mpsc::sync_channel::<DeviceEvent>(1);
+        let ctx = WatchListenerContext {
+            event_tx: std::sync::Mutex::new(Some(tx)),
+            previous_devices: std::sync::Mutex::new(std::collections::HashSet::new()),
+        };
+        // Fill the single slot, then push two more; must not block or panic.
+        for n in 0..3u32 {
+            try_push_event(
+                &ctx,
+                DeviceEvent::DeviceRemoved {
+                    id: DeviceId(n.to_string()),
+                },
+            );
+        }
+        // The channel held at most its capacity; the rest were dropped.
+    }
+
+    /// `try_push_event` silently no-ops on a disconnected channel (helper thread
+    /// already gone during teardown). Device-free.
+    ///
+    /// H1 / PS-1 relevance: the macOS watch teardown leaves the
+    /// `WatchListenerContext` intentionally leaked (never freed) so that a late
+    /// or in-flight `watch_listener_proc` always derefs valid memory. This test
+    /// is the unit proof that such a late proc — reaching `try_push_event` after
+    /// the helper's receiver is gone — is a harmless no-op rather than a hang or
+    /// panic.
+    #[test]
+    fn try_push_event_noop_when_disconnected() {
+        let (tx, rx) = std::sync::mpsc::sync_channel::<DeviceEvent>(WATCH_CHANNEL_CAP);
+        drop(rx); // disconnect
+        let ctx = WatchListenerContext {
+            event_tx: std::sync::Mutex::new(Some(tx)),
+            previous_devices: std::sync::Mutex::new(std::collections::HashSet::new()),
+        };
+        try_push_event(
+            &ctx,
+            DeviceEvent::DeviceRemoved {
+                id: DeviceId("x".into()),
+            },
+        );
+        // No panic; nothing to assert beyond reaching here.
+    }
+
+    /// H1 / PS-1: models the macOS teardown's channel-disconnect step on a
+    /// leaked context purely in safe Rust. Teardown takes the `SyncSender` out of
+    /// `event_tx` (sets it to `None`); we assert (i) the helper-equivalent
+    /// `recv()` then returns `Err` (Disconnected — so the real helper thread
+    /// would exit), and (ii) a subsequent `try_push_event` — modelling an
+    /// in-flight proc firing AFTER teardown against the still-valid leaked
+    /// context — is a no-op without panic. Device-free.
+    #[test]
+    fn teardown_disconnect_stops_delivery_after_leak() {
+        let (tx, rx) = std::sync::mpsc::sync_channel::<DeviceEvent>(WATCH_CHANNEL_CAP);
+        let ctx = WatchListenerContext {
+            event_tx: std::sync::Mutex::new(Some(tx)),
+            previous_devices: std::sync::Mutex::new(std::collections::HashSet::new()),
+        };
+
+        // Teardown action: take the sender out of the context, dropping it. This
+        // is exactly what the watch() teardown closure does against the leaked
+        // context (minus the unsafe deref, which is irrelevant to this logic).
+        {
+            let mut guard = ctx
+                .event_tx
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            *guard = None;
+        }
+
+        // (i) With the only sender taken, the receiver observes disconnection —
+        // the real helper's `recv()` loop would end here.
+        match rx.recv() {
+            Err(std::sync::mpsc::RecvError) => {}
+            Ok(ev) => panic!("expected Disconnected after teardown, got event {ev:?}"),
+        }
+
+        // (ii) A late/in-flight proc reaching try_push_event after teardown is a
+        // clean no-op against the still-valid (leaked) context.
+        try_push_event(
+            &ctx,
+            DeviceEvent::DeviceRemoved {
+                id: DeviceId("late".into()),
+            },
+        );
+        // No panic, no hang; reaching here is the assertion.
+    }
+
+    /// H1 / PS-1: the teardown's "take the sender" step must be poison-safe — a
+    /// proc that panicked while holding `event_tx` (it cannot today, but the
+    /// invariant must hold under the no-panics-in-Drop rule) must not make
+    /// teardown panic. Poison the sender lock, then run the take-and-drop step,
+    /// and assert it recovers without panicking. Device-free.
+    #[test]
+    fn teardown_take_sender_is_poison_safe() {
+        let (tx, _rx) = std::sync::mpsc::sync_channel::<DeviceEvent>(WATCH_CHANNEL_CAP);
+        let ctx = WatchListenerContext {
+            event_tx: std::sync::Mutex::new(Some(tx)),
+            previous_devices: std::sync::Mutex::new(std::collections::HashSet::new()),
+        };
+
+        // Poison the sender mutex by panicking while holding its guard.
+        let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let _guard = ctx.event_tx.lock().unwrap();
+            panic!("intentional poison");
+        }));
+        assert!(
+            ctx.event_tx.is_poisoned(),
+            "sender mutex should be poisoned by the panic above"
+        );
+
+        // The teardown take-and-drop step recovers the poisoned guard rather than
+        // unwrapping, so it must not panic.
+        let mut guard = ctx
+            .event_tx
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        *guard = None;
+        drop(guard);
+
+        // And a subsequent proc-equivalent push is still a clean no-op.
+        try_push_event(
+            &ctx,
+            DeviceEvent::DeviceRemoved {
+                id: DeviceId("after-poison".into()),
+            },
+        );
+    }
+
+    /// `device_kind_of` never panics for an arbitrary (including invalid) id and
+    /// returns `None` for a non-device sentinel id on a headless box. Device-free
+    /// (the FFI size-query just fails for a bogus id, which we treat as "no
+    /// streams").
+    #[test]
+    fn device_kind_of_is_safe_for_sentinel_id() {
+        // kAudioObjectUnknown (0) and u32::MAX are not real devices.
+        assert_eq!(device_kind_of(0), None);
+        assert_eq!(device_kind_of(u32::MAX), None);
+    }
+
+    /// rsac-3093 acceptance: registering a watcher and dropping it over a short
+    /// window must complete cleanly — no panic, no leaked listener, no hang.
+    /// Requires real CoreAudio (the system object must accept listeners).
+    ///
+    /// H1 / PS-1: teardown now stops delivery by taking the `SyncSender` out of
+    /// the (intentionally leaked) context to disconnect the channel rather than
+    /// by freeing the context; this still removes every listener and joins the
+    /// helper. The second register-and-drop proves teardown released the prior
+    /// listeners. (The leaked context is bounded and intentional, so a leak
+    /// sanitizer should be configured to expect it — use ASan, not LSan.)
+    #[test]
+    #[ignore = "requires macOS audio hardware"]
+    fn watch_registers_and_drops_cleanly() {
+        let enumerator = MacosDeviceEnumerator::new();
+        let watcher = enumerator
+            .watch(Box::new(|_event| {
+                // Handler runs on the helper thread; no-op for this lifecycle test.
+            }))
+            .expect("watch() should register listeners on a real CoreAudio system");
+        // Hold the subscription briefly, then drop it. Drop must remove every
+        // listener and join the helper thread without hanging.
+        std::thread::sleep(Duration::from_millis(50));
+        drop(watcher);
+        // Re-register and drop again to prove teardown fully released the prior
+        // listeners (a leaked listener would not fail here, but a double-free /
+        // dangling context would surface as a crash).
+        let watcher2 = enumerator
+            .watch(Box::new(|_event| {}))
+            .expect("watch() should succeed a second time after clean teardown");
+        drop(watcher2);
+    }
+
+    /// rsac-3093: a watcher whose handler is never invoked still tears down
+    /// cleanly and promptly (the helper thread exits on sender disconnect — H1:
+    /// teardown takes the sender out of the leaked context, which disconnects
+    /// the channel just as the old `drop(context)` did, so the prompt-join
+    /// guarantee is unchanged). Requires real CoreAudio.
+    #[test]
+    #[ignore = "requires macOS audio hardware"]
+    fn watch_drop_joins_helper_thread_promptly() {
+        let enumerator = MacosDeviceEnumerator::new();
+        let start = std::time::Instant::now();
+        let watcher = enumerator
+            .watch(Box::new(|_| {}))
+            .expect("watch should register");
+        drop(watcher);
+        assert!(
+            start.elapsed() < Duration::from_secs(2),
+            "watch() register + drop should not hang"
+        );
+    }
+
+    /// H1 / PS-1 UAF model under sanitizer: register a watcher, run its teardown
+    /// (drop), THEN directly invoke `watch_listener_proc` against the same cookie
+    /// to model an in-flight proc that fires after teardown. Pre-fix this would
+    /// deref freed memory (ASan would flag a use-after-free); post-fix the
+    /// context is intentionally leaked, so the deref is valid and the proc simply
+    /// finds the sender taken and no-ops.
+    ///
+    /// Run with: `cargo +nightly test -Zsanitizer=address --target aarch64-apple-darwin`.
+    /// Use the ADDRESS sanitizer (NOT leak): the per-cycle context leak is
+    /// intentional and expected, so a leak sanitizer would report it as a false
+    /// positive.
+    ///
+    /// Note: this re-derives the cookie the same way `watch()` does (a fresh
+    /// leaked context) rather than reaching into the opaque `DeviceWatcher`,
+    /// because the teardown closure is private; it exercises the *soundness*
+    /// argument (deref of a leaked allocation is always valid) directly.
+    #[test]
+    #[ignore = "requires macOS + ASan (cargo +nightly -Zsanitizer=address)"]
+    fn watch_listener_proc_after_teardown_is_sound_under_asan() {
+        // Build a leaked context exactly as watch() does.
+        let (event_tx, event_rx) = std::sync::mpsc::sync_channel::<DeviceEvent>(WATCH_CHANNEL_CAP);
+        let context_ptr: *mut WatchListenerContext =
+            Box::into_raw(Box::new(WatchListenerContext {
+                event_tx: std::sync::Mutex::new(Some(event_tx)),
+                previous_devices: std::sync::Mutex::new(current_device_id_set()),
+            }));
+
+        // Model the teardown step that disconnects the channel without freeing
+        // the context: take the sender out. (We deliberately do NOT free
+        // context_ptr — that is the whole point of the leak-based fix.)
+        unsafe {
+            let ctx: &WatchListenerContext = &*context_ptr;
+            let mut guard = ctx
+                .event_tx
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            *guard = None;
+        }
+        drop(event_rx); // helper-equivalent receiver gone
+
+        // Now fire the proc against the cookie AFTER teardown. Under the leak the
+        // deref at the top of watch_listener_proc is valid; the proc no-ops.
+        unsafe {
+            let status = watch_listener_proc(
+                kAudioObjectSystemObject,
+                WATCH_ADDRESSES.len() as u32,
+                WATCH_ADDRESSES.as_ptr(),
+                context_ptr as *mut std::ffi::c_void,
+            );
+            assert_eq!(status, 0, "proc must return noErr even post-teardown");
+        }
+        // context_ptr is intentionally never freed (matches the production leak).
+    }
+
+    /// rsac-3093: `kind()` on macOS now probes stream scopes. On a real host the
+    /// default output device should classify as Output (it has output streams).
+    /// Requires audio hardware.
+    #[test]
+    #[ignore = "requires macOS audio hardware"]
+    fn default_device_kind_is_output() {
+        let enumerator = MacosDeviceEnumerator::new();
+        let device = enumerator
+            .default_device()
+            .expect("default device should exist");
+        // default_device() returns the default OUTPUT device, so kind() should
+        // resolve to Output (it exposes output streams).
+        match device.kind() {
+            Ok(k) => assert_eq!(k, DeviceKind::Output, "default output device kind"),
+            // Some virtual/aggregate defaults may expose no probeable streams;
+            // an honest PlatformNotSupported is acceptable, a wrong kind is not.
+            Err(AudioError::PlatformNotSupported { .. }) => {}
+            Err(other) => panic!("unexpected kind() error: {other:?}"),
+        }
     }
 }

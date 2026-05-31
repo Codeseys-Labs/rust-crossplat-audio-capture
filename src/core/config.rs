@@ -50,7 +50,16 @@ impl std::fmt::Display for ProcessId {
 /// This enum specifies *what* audio should be captured. It replaces the old
 /// combination of `DeviceSelector` + PID/session fields with a single,
 /// explicit discriminated union.
+///
+/// # Stability
+///
+/// This enum is `#[non_exhaustive]`: new capture-target kinds may be added in a
+/// minor release. **Out-of-crate** code matching on `CaptureTarget` must include a
+/// trailing wildcard (`_ =>`) arm. The in-crate [`Display`](std::fmt::Display) and
+/// [`FromStr`](std::str::FromStr) impls stay exhaustive on purpose so a new variant
+/// forces its canonical string form to be defined.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Hash)]
+#[non_exhaustive]
 pub enum CaptureTarget {
     /// Capture from the system default audio device / mix.
     #[default]
@@ -65,6 +74,121 @@ pub enum CaptureTarget {
     ProcessTree(ProcessId),
 }
 
+impl std::fmt::Display for CaptureTarget {
+    /// Formats a [`CaptureTarget`] into its canonical string form.
+    ///
+    /// The output is the exact inverse of the [`FromStr`](std::str::FromStr)
+    /// impl: for any `target`,
+    /// `target.to_string().parse::<CaptureTarget>() == Ok(target)`.
+    ///
+    /// Canonical forms:
+    /// - [`SystemDefault`](CaptureTarget::SystemDefault) → `"system"`
+    /// - [`Device`](CaptureTarget::Device) → `"device:<id>"`
+    /// - [`Application`](CaptureTarget::Application) → `"app:<id>"`
+    /// - [`ApplicationByName`](CaptureTarget::ApplicationByName) → `"name:<name>"`
+    /// - [`ProcessTree`](CaptureTarget::ProcessTree) → `"tree:<pid>"`
+    ///
+    /// The `match` is intentionally exhaustive (no wildcard arm) so that adding
+    /// a new [`CaptureTarget`] variant is a compile error until its canonical
+    /// form is defined here.
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            CaptureTarget::SystemDefault => write!(f, "system"),
+            CaptureTarget::Device(id) => write!(f, "device:{}", id.0),
+            CaptureTarget::Application(id) => write!(f, "app:{}", id.0),
+            CaptureTarget::ApplicationByName(name) => write!(f, "name:{}", name),
+            CaptureTarget::ProcessTree(pid) => write!(f, "tree:{}", pid.0),
+        }
+    }
+}
+
+impl std::str::FromStr for CaptureTarget {
+    type Err = crate::core::error::AudioError;
+
+    /// Parses a [`CaptureTarget`] from its canonical string form.
+    ///
+    /// Grammar (the `scheme` prefix is matched case-insensitively):
+    /// - `system` | `default` → [`SystemDefault`](CaptureTarget::SystemDefault)
+    /// - `device:<id>` → [`Device`](CaptureTarget::Device). The body is taken
+    ///   verbatim after the **first** colon, so device ids that themselves
+    ///   contain colons (e.g. `hw:0,0`) are preserved.
+    /// - `app:<id>` → [`Application`](CaptureTarget::Application)
+    /// - `name:<name>` → [`ApplicationByName`](CaptureTarget::ApplicationByName)
+    /// - `tree:<pid>` | `pid:<pid>` → [`ProcessTree`](CaptureTarget::ProcessTree),
+    ///   where `<pid>` must be a `u32`.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`AudioError::InvalidParameter`] with `param == "capture_target"`
+    /// for an unknown scheme or a non-numeric / out-of-range pid. Never panics.
+    ///
+    /// [`AudioError::InvalidParameter`]: crate::core::error::AudioError::InvalidParameter
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        use crate::core::error::AudioError;
+
+        let invalid = |reason: String| AudioError::InvalidParameter {
+            param: "capture_target".to_string(),
+            reason,
+        };
+
+        // Schemes without a body: bare `system` / `default`.
+        // Compare case-insensitively against the (whole) trimmed input.
+        if s.eq_ignore_ascii_case("system") || s.eq_ignore_ascii_case("default") {
+            return Ok(CaptureTarget::SystemDefault);
+        }
+
+        // Schemes of the form `<scheme>:<body>`. Split on the FIRST colon only,
+        // so a body that contains further colons (device ids) is preserved.
+        let (scheme, body) = match s.split_once(':') {
+            Some((scheme, body)) => (scheme, body),
+            None => {
+                return Err(invalid(format!(
+                    "unknown capture target '{}': expected one of \
+                     'system', 'default', 'device:<id>', 'app:<id>', \
+                     'name:<name>', 'tree:<pid>', or 'pid:<pid>'",
+                    s
+                )));
+            }
+        };
+
+        // Case-insensitive scheme matching: lowercase only the short scheme
+        // token (never the body, which is preserved verbatim).
+        let scheme_lc = scheme.to_ascii_lowercase();
+
+        // Parses a pid body as a u32, mapping failures to InvalidParameter.
+        let parse_pid = |kind: &str| -> Result<u32, AudioError> {
+            body.parse::<u32>()
+                .map_err(|e| invalid(format!("invalid {} pid '{}': {}", kind, body, e)))
+        };
+
+        match scheme_lc.as_str() {
+            "device" => Ok(CaptureTarget::Device(DeviceId(body.to_string()))),
+            "app" => Ok(CaptureTarget::Application(ApplicationId(body.to_string()))),
+            "name" => Ok(CaptureTarget::ApplicationByName(body.to_string())),
+            "tree" => Ok(CaptureTarget::ProcessTree(ProcessId(parse_pid("tree")?))),
+            "pid" => Ok(CaptureTarget::ProcessTree(ProcessId(parse_pid("pid")?))),
+            other => Err(invalid(format!(
+                "unknown capture target scheme '{}': expected one of \
+                 'device', 'app', 'name', 'tree', or 'pid' \
+                 (or bare 'system'/'default')",
+                other
+            ))),
+        }
+    }
+}
+
+impl TryFrom<&str> for CaptureTarget {
+    type Error = crate::core::error::AudioError;
+
+    /// Parses a [`CaptureTarget`] from a string slice.
+    ///
+    /// Delegates to the [`FromStr`](std::str::FromStr) implementation, so it
+    /// follows exactly the same grammar and error rules.
+    fn try_from(s: &str) -> Result<Self, Self::Error> {
+        s.parse()
+    }
+}
+
 // ── SampleFormat (new canonical 4-variant) ───────────────────────────────
 
 /// Specifies the format of audio samples.
@@ -72,6 +196,13 @@ pub enum CaptureTarget {
 /// All audio data is standardized to `f32` internally, but this enum
 /// describes the wire/storage format for configuration and capability
 /// negotiation.
+///
+/// # Stability
+///
+/// This enum is **deliberately not** `#[non_exhaustive]`: the four PCM sample
+/// formats are a fixed, intentional set callers match exhaustively (e.g. to size
+/// per-sample buffers). Keeping it closed is a stability guarantee — the set will
+/// not grow in a way that silently breaks exhaustive matches.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum SampleFormat {
     /// Signed 16-bit integer.
@@ -145,8 +276,28 @@ pub struct StreamConfig {
     pub channels: u16,
     /// The desired sample format.
     pub sample_format: SampleFormat,
-    /// Optional desired buffer size in frames.
-    /// If `None`, the backend will choose a suitable default.
+    /// Optional ring-buffer depth, in **buffers/slots** (not frames).
+    ///
+    /// This is the number of [`AudioBuffer`](super::buffer::AudioBuffer) slots in
+    /// the bridge ring — i.e. how many callback periods of slack the consumer has
+    /// before the producer must drop. Each slot holds one whole interleaved callback
+    /// period, so this is a *slot count*, **not** a per-frame size; the field name is
+    /// historical. The value is passed straight into the bridge's
+    /// `calculate_capacity(requested, 4)` (rounded up to a power of two, min 4).
+    ///
+    /// If `None`, the backend uses the default depth (`calculate_capacity(None, 4)` = 64).
+    ///
+    /// # Platform support (current state)
+    ///
+    /// **Honored only on Windows (WASAPI) today.** The Linux (PipeWire) and macOS
+    /// (CoreAudio) backends hardcode `calculate_capacity(None, 4)` and ignore this
+    /// field, so setting it has no effect there — they always get the 64-slot default.
+    /// Threading the request (or a period-derived size) through every backend is
+    /// tracked in ADR-0007 (`docs/designs/0007-capacity-period-sizing.md`).
+    ///
+    /// The [`buffer_size_frames`](crate::api::AudioCaptureBuilder::buffer_size_frames)
+    /// builder setter is a backward-compat alias that writes this same field; its
+    /// "frames" name is likewise historical and denotes slots, not frames.
     pub buffer_size: Option<usize>,
     /// The capture target for this stream.
     /// Propagated from [`AudioCaptureBuilder`](crate::api::AudioCaptureBuilder) so backends know
@@ -251,6 +402,7 @@ pub enum AudioFileFormat {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::core::error::AudioError;
 
     // ── DeviceId ─────────────────────────────────────────────────────
 
@@ -369,6 +521,324 @@ mod tests {
     fn capture_target_debug() {
         let dbg = format!("{:?}", CaptureTarget::SystemDefault);
         assert!(dbg.contains("SystemDefault"));
+    }
+
+    // ── CaptureTarget: Display ───────────────────────────────────────
+
+    #[test]
+    fn capture_target_display_system_default() {
+        assert_eq!(CaptureTarget::SystemDefault.to_string(), "system");
+    }
+
+    #[test]
+    fn capture_target_display_device() {
+        assert_eq!(
+            CaptureTarget::Device(DeviceId("hw:0,0".to_string())).to_string(),
+            "device:hw:0,0"
+        );
+    }
+
+    #[test]
+    fn capture_target_display_application() {
+        assert_eq!(
+            CaptureTarget::Application(ApplicationId("Spotify".to_string())).to_string(),
+            "app:Spotify"
+        );
+    }
+
+    #[test]
+    fn capture_target_display_application_by_name() {
+        assert_eq!(
+            CaptureTarget::ApplicationByName("Firefox".to_string()).to_string(),
+            "name:Firefox"
+        );
+    }
+
+    #[test]
+    fn capture_target_display_process_tree() {
+        assert_eq!(
+            CaptureTarget::ProcessTree(ProcessId(7)).to_string(),
+            "tree:7"
+        );
+    }
+
+    // ── CaptureTarget: FromStr (happy paths) ─────────────────────────
+
+    #[test]
+    fn capture_target_parse_system() {
+        assert_eq!(
+            "system".parse::<CaptureTarget>().unwrap(),
+            CaptureTarget::SystemDefault
+        );
+    }
+
+    #[test]
+    fn capture_target_parse_default_alias() {
+        assert_eq!(
+            "default".parse::<CaptureTarget>().unwrap(),
+            CaptureTarget::SystemDefault
+        );
+    }
+
+    #[test]
+    fn capture_target_parse_scheme_is_case_insensitive() {
+        assert_eq!(
+            "SYSTEM".parse::<CaptureTarget>().unwrap(),
+            CaptureTarget::SystemDefault
+        );
+        assert_eq!(
+            "Default".parse::<CaptureTarget>().unwrap(),
+            CaptureTarget::SystemDefault
+        );
+        assert_eq!(
+            "DEVICE:hw:0,0".parse::<CaptureTarget>().unwrap(),
+            CaptureTarget::Device(DeviceId("hw:0,0".to_string()))
+        );
+        assert_eq!(
+            "App:Spotify".parse::<CaptureTarget>().unwrap(),
+            CaptureTarget::Application(ApplicationId("Spotify".to_string()))
+        );
+        assert_eq!(
+            "Tree:42".parse::<CaptureTarget>().unwrap(),
+            CaptureTarget::ProcessTree(ProcessId(42))
+        );
+    }
+
+    #[test]
+    fn capture_target_parse_device_preserves_colons_in_id() {
+        // Split on the FIRST colon only — the id may itself contain colons.
+        assert_eq!(
+            "device:hw:0,0".parse::<CaptureTarget>().unwrap(),
+            CaptureTarget::Device(DeviceId("hw:0,0".to_string()))
+        );
+    }
+
+    #[test]
+    fn capture_target_parse_application() {
+        assert_eq!(
+            "app:Spotify".parse::<CaptureTarget>().unwrap(),
+            CaptureTarget::Application(ApplicationId("Spotify".to_string()))
+        );
+    }
+
+    #[test]
+    fn capture_target_parse_application_body_preserves_colons() {
+        // The body after `app:` is taken verbatim, colons and all.
+        assert_eq!(
+            "app:com.example:session:1"
+                .parse::<CaptureTarget>()
+                .unwrap(),
+            CaptureTarget::Application(ApplicationId("com.example:session:1".to_string()))
+        );
+    }
+
+    #[test]
+    fn capture_target_parse_application_by_name() {
+        assert_eq!(
+            "name:VLC".parse::<CaptureTarget>().unwrap(),
+            CaptureTarget::ApplicationByName("VLC".to_string())
+        );
+    }
+
+    #[test]
+    fn capture_target_parse_name_body_is_case_preserving() {
+        // Only the scheme is case-insensitive; the body keeps its case.
+        assert_eq!(
+            "NAME:MixedCaseApp".parse::<CaptureTarget>().unwrap(),
+            CaptureTarget::ApplicationByName("MixedCaseApp".to_string())
+        );
+    }
+
+    #[test]
+    fn capture_target_parse_tree() {
+        assert_eq!(
+            "tree:99".parse::<CaptureTarget>().unwrap(),
+            CaptureTarget::ProcessTree(ProcessId(99))
+        );
+    }
+
+    #[test]
+    fn capture_target_parse_pid_alias_equals_tree() {
+        // Both `pid:<n>` and `tree:<n>` map to ProcessTree.
+        assert_eq!(
+            "pid:99".parse::<CaptureTarget>().unwrap(),
+            CaptureTarget::ProcessTree(ProcessId(99))
+        );
+        assert_eq!(
+            "pid:99".parse::<CaptureTarget>().unwrap(),
+            "tree:99".parse::<CaptureTarget>().unwrap()
+        );
+    }
+
+    #[test]
+    fn capture_target_parse_pid_zero_and_max() {
+        assert_eq!(
+            "tree:0".parse::<CaptureTarget>().unwrap(),
+            CaptureTarget::ProcessTree(ProcessId(0))
+        );
+        let max = u32::MAX;
+        assert_eq!(
+            format!("tree:{}", max).parse::<CaptureTarget>().unwrap(),
+            CaptureTarget::ProcessTree(ProcessId(max))
+        );
+    }
+
+    // ── CaptureTarget: FromStr (error paths, never panic) ────────────
+
+    #[test]
+    fn capture_target_parse_unknown_scheme_errors() {
+        let err = "bogus:x".parse::<CaptureTarget>().unwrap_err();
+        match err {
+            AudioError::InvalidParameter { param, .. } => {
+                assert_eq!(param, "capture_target");
+            }
+            other => panic!("expected InvalidParameter, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn capture_target_parse_no_colon_unknown_errors() {
+        let err = "bogus".parse::<CaptureTarget>().unwrap_err();
+        match err {
+            AudioError::InvalidParameter { param, .. } => {
+                assert_eq!(param, "capture_target");
+            }
+            other => panic!("expected InvalidParameter, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn capture_target_parse_non_numeric_pid_errors() {
+        for input in ["pid:abc", "tree:abc", "pid:", "tree:1.5", "pid:-1"] {
+            let err = input.parse::<CaptureTarget>().unwrap_err();
+            match err {
+                AudioError::InvalidParameter { param, .. } => {
+                    assert_eq!(param, "capture_target", "for input {:?}", input);
+                }
+                other => panic!("expected InvalidParameter for {:?}, got {:?}", input, other),
+            }
+        }
+    }
+
+    #[test]
+    fn capture_target_parse_overflow_pid_errors() {
+        // One past u32::MAX must error, not panic or wrap.
+        let too_big = (u32::MAX as u64 + 1).to_string();
+        let err = format!("tree:{}", too_big)
+            .parse::<CaptureTarget>()
+            .unwrap_err();
+        match err {
+            AudioError::InvalidParameter { param, .. } => {
+                assert_eq!(param, "capture_target");
+            }
+            other => panic!("expected InvalidParameter, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn capture_target_parse_empty_string_errors() {
+        let err = "".parse::<CaptureTarget>().unwrap_err();
+        assert!(matches!(err, AudioError::InvalidParameter { .. }));
+    }
+
+    // ── CaptureTarget: TryFrom<&str> matches FromStr ─────────────────
+
+    #[test]
+    fn capture_target_try_from_matches_from_str() {
+        let inputs = [
+            "system",
+            "default",
+            "device:hw:0,0",
+            "app:Spotify",
+            "name:VLC",
+            "tree:99",
+            "pid:99",
+            "bogus:x",
+            "pid:abc",
+            "",
+        ];
+        for input in inputs {
+            let via_from_str = input.parse::<CaptureTarget>();
+            let via_try_from = CaptureTarget::try_from(input);
+            match (via_from_str, via_try_from) {
+                (Ok(a), Ok(b)) => assert_eq!(a, b, "Ok mismatch for {:?}", input),
+                (Err(a), Err(b)) => {
+                    // Compare on the structured fields (AudioError isn't PartialEq).
+                    match (a, b) {
+                        (
+                            AudioError::InvalidParameter {
+                                param: pa,
+                                reason: ra,
+                            },
+                            AudioError::InvalidParameter {
+                                param: pb,
+                                reason: rb,
+                            },
+                        ) => {
+                            assert_eq!(pa, pb, "param mismatch for {:?}", input);
+                            assert_eq!(ra, rb, "reason mismatch for {:?}", input);
+                        }
+                        (other_a, other_b) => {
+                            panic!(
+                                "non-InvalidParameter errors for {:?}: {:?} / {:?}",
+                                input, other_a, other_b
+                            )
+                        }
+                    }
+                }
+                (a, b) => panic!("Ok/Err disagreement for {:?}: {:?} / {:?}", input, a, b),
+            }
+        }
+    }
+
+    // ── CaptureTarget: round-trip (Display ∘ FromStr == identity) ────
+
+    #[test]
+    fn capture_target_round_trip_all_variants() {
+        let targets = [
+            CaptureTarget::SystemDefault,
+            CaptureTarget::Device(DeviceId("hw:0,0".to_string())),
+            CaptureTarget::Device(DeviceId("simple-id".to_string())),
+            CaptureTarget::Device(DeviceId(String::new())),
+            CaptureTarget::Application(ApplicationId("Spotify".to_string())),
+            CaptureTarget::Application(ApplicationId("com.example:session:1".to_string())),
+            CaptureTarget::ApplicationByName("Firefox".to_string()),
+            CaptureTarget::ApplicationByName("Name With Spaces".to_string()),
+            CaptureTarget::ProcessTree(ProcessId(0)),
+            CaptureTarget::ProcessTree(ProcessId(7)),
+            CaptureTarget::ProcessTree(ProcessId(u32::MAX)),
+        ];
+        for t in targets {
+            let rendered = t.to_string();
+            let parsed = rendered.parse::<CaptureTarget>().unwrap_or_else(|e| {
+                panic!(
+                    "round-trip parse failed for {:?} -> {:?}: {}",
+                    t, rendered, e
+                )
+            });
+            assert_eq!(parsed, t, "round-trip mismatch via {:?}", rendered);
+        }
+    }
+
+    #[test]
+    fn capture_target_round_trip_canonical_forms() {
+        // Exact canonical strings cited in the spec acceptance criteria.
+        assert_eq!(
+            CaptureTarget::ProcessTree(ProcessId(7)).to_string(),
+            "tree:7"
+        );
+        assert_eq!(
+            CaptureTarget::ApplicationByName("Firefox".to_string()).to_string(),
+            "name:Firefox"
+        );
+        assert_eq!(
+            "tree:7".parse::<CaptureTarget>().unwrap(),
+            CaptureTarget::ProcessTree(ProcessId(7))
+        );
+        assert_eq!(
+            "name:Firefox".parse::<CaptureTarget>().unwrap(),
+            CaptureTarget::ApplicationByName("Firefox".to_string())
+        );
     }
 
     // ── SampleFormat ─────────────────────────────────────────────────

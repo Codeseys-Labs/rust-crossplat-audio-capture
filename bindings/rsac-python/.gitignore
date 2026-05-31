@@ -9,6 +9,7 @@ build/
 *.so
 *.pyd
 *.dylib
+*.pdb
 
 # Python caches
 __pycache__/

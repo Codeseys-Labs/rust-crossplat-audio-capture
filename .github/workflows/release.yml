@@ -11,10 +11,16 @@
 # Required GitHub secret:
 #   CARGO_REGISTRY_TOKEN — crates.io API token with publish-update scope for `rsac`
 #
-# TODO(future): wire bindings/ publish once manifests exist — rsac-napi to npm
-# (needs NPM_TOKEN + NAPI-RS per-platform build matrix) and rsac-python to PyPI
-# via maturin (needs MATURIN_PYPI_TOKEN + maturin-action wheel matrix). Docs
-# note these bindings are placeholder dirs without package.json/pyproject.toml.
+# Scope: this workflow publishes ONLY the Rust crate to crates.io. The
+# bindings are released by their own tag-triggered workflows (they now have
+# real manifests, so the old "placeholder dirs without package.json/
+# pyproject.toml" note no longer applies):
+#   • rsac-napi  → npm  via .github/workflows/release-npm.yml
+#                  (bindings/rsac-napi/package.json; needs NPM_TOKEN)
+#   • rsac-python → PyPI via .github/workflows/release-pypi.yml
+#                  (bindings/rsac-python/pyproject.toml; PyPI Trusted
+#                  Publishing / OIDC — no long-lived token)
+# All three fire on the same semver tag; bump every manifest in lockstep.
 
 name: Release
 
@@ -38,6 +44,9 @@ env:
   CARGO_TERM_COLOR: always
   RUST_BACKTRACE: 1
 
+permissions:
+  contents: read
+
 jobs:
   # ── Verify: rerun per-platform unit tests on the tagged commit ──────
   verify:
@@ -49,22 +58,35 @@ jobs:
           - os: blacksmith-4vcpu-ubuntu-2404
             features: feat_linux
             install_deps: true
-            continue_tests_on_error: false
+            # device_test_filter is empty on platforms whose unit tests are
+            # fully runnable in CI — the whole --lib suite hard-fails.
+            device_test_filter: ''
           - os: blacksmith-4vcpu-windows-2025
             features: feat_windows
             install_deps: false
-            # Blacksmith Windows runners lack an audio subsystem; ci.yml
-            # already treats WASAPI test failures as expected there.
-            continue_tests_on_error: true
+            # Blacksmith Windows runners lack an audio subsystem (see
+            # AGENTS.md §6). Only the WASAPI tests that actually open an
+            # audio client/device need a device; those are isolated below
+            # into a SEPARATE tolerated step. Everything else hard-fails.
+            # Space-separated substrings matching the device-dependent unit
+            # tests that open a real WASAPI client / default endpoint /
+            # IMMNotificationClient (need Audiosrv + an endpoint, ABSENT on the
+            # Blacksmith Windows runner — they fail RPC-unavailable 0x800706BA /
+            # service-not-installed 0x80070424). MUST stay in lockstep with
+            # ci.yml's test-windows DEVICE_SKIPS. Everything not listed here is
+            # pure logic and hard-fails.
+            device_test_filter: 'enumerate default_device device_enumeration device_id device_supported_formats audio_device_ create_stream find_device watch_ create_audio_client'
           - os: blacksmith-6vcpu-macos-15
             features: feat_macos
             install_deps: false
-            continue_tests_on_error: false
+            device_test_filter: ''
     runs-on: ${{ matrix.os }}
     steps:
-      - uses: actions/checkout@v5
-      - uses: dtolnay/rust-toolchain@1.95.0
-      - uses: Swatinem/rust-cache@v2
+      - uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5
+        with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@e081816240890017053eacbb1bdf337761dc5582 # 1.95.0
+      - uses: useblacksmith/rust-cache@81d053bdb0871dcd3f10763c8cc60d0adc41762b # v1 branch head (no v1 tag exists upstream)
 
       - name: Install PipeWire dev libraries (Linux)
         if: matrix.install_deps
@@ -73,19 +95,52 @@ jobs:
           sudo apt-get update
           sudo apt-get install -y libpipewire-0.3-dev libspa-0.2-dev pkg-config
 
-      - name: Cargo test (unit tests)
-        continue-on-error: ${{ matrix.continue_tests_on_error }}
-        run: cargo test --lib --no-default-features --features ${{ matrix.features }} -- --test-threads=1
+      # Hard-fail the platform-independent + non-audio --lib tests. When a
+      # device_test_filter is set (Windows), the device-touching subset is
+      # excluded here via --skip and re-run as a tolerated step below, so
+      # the two steps partition the full --lib suite. A genuine unit-test
+      # regression now blocks publish instead of being silently swallowed.
+      - name: Cargo test (unit tests, hard-fail)
+        shell: bash
+        run: |
+          if [ -n "${{ matrix.device_test_filter }}" ]; then
+            # Build a --skip arg per device-test substring so the device-
+            # dependent families are EXCLUDED from this hard-fail partition.
+            SKIPS=""
+            for f in ${{ matrix.device_test_filter }}; do SKIPS="$SKIPS --skip $f"; done
+            cargo test --lib --no-default-features --features ${{ matrix.features }} -- --test-threads=1 $SKIPS
+          else
+            cargo test --lib --no-default-features --features ${{ matrix.features }} -- --test-threads=1
+          fi
+
+      # Device-dependent subset only. Tolerated because the Blacksmith
+      # Windows runner has no audio endpoints (AGENTS.md §6). Runs ONLY the
+      # filtered families (one cargo invocation each, union), so it never
+      # masks the hard-fail partition above.
+      - name: Cargo test (device-dependent tests, tolerated)
+        if: matrix.device_test_filter != ''
+        continue-on-error: true
+        shell: bash
+        run: |
+          for f in ${{ matrix.device_test_filter }}; do
+            cargo test --lib --no-default-features --features ${{ matrix.features }} -- --test-threads=1 "$f" || true
+          done
 
   # ── Publish: cargo publish to crates.io ─────────────────────────────
   publish:
     name: Publish to crates.io
     needs: verify
+    # Guard against forks running the irreversible crates.io publish.
+    if: github.repository == 'Codeseys-Labs/rust-crossplat-audio-capture'
     runs-on: blacksmith-4vcpu-ubuntu-2404
+    permissions:
+      contents: read
     steps:
-      - uses: actions/checkout@v5
-      - uses: dtolnay/rust-toolchain@1.95.0
-      - uses: Swatinem/rust-cache@v2
+      - uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5
+        with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@e081816240890017053eacbb1bdf337761dc5582 # 1.95.0
+      - uses: useblacksmith/rust-cache@81d053bdb0871dcd3f10763c8cc60d0adc41762b # v1 branch head (no v1 tag exists upstream)
 
       - name: Install PipeWire dev libraries
         run: |
@@ -93,9 +148,22 @@ jobs:
           sudo apt-get update
           sudo apt-get install -y libpipewire-0.3-dev libspa-0.2-dev pkg-config
 
+      # Tag↔manifest version guard: the pushed tag must match the version
+      # in Cargo.toml, otherwise we'd publish a mismatched crate. Only runs
+      # on tag events (GITHUB_REF_NAME is the tag for tag pushes).
+      - name: Verify tag matches Cargo.toml version
+        if: startsWith(github.ref, 'refs/tags/')
+        shell: bash
+        run: |
+          VERSION="${GITHUB_REF_NAME#v}"
+          MANIFEST="$(grep -m1 '^version' Cargo.toml | sed -E 's/.*"([^"]+)".*/\1/')"
+          echo "tag version: ${VERSION}  manifest version: ${MANIFEST}"
+          if [ "${VERSION}" != "${MANIFEST}" ]; then
+            echo "::error::Tag version (${VERSION}) does not match Cargo.toml version (${MANIFEST})"
+            exit 1
+          fi
+
       - name: Cargo publish (dry run)
-        env:
-          CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
         run: cargo publish --dry-run
 
       - name: Cargo publish
@@ -110,11 +178,14 @@ jobs:
   github-release:
     name: Create GitHub Release
     needs: publish
+    if: github.repository == 'Codeseys-Labs/rust-crossplat-audio-capture'
     runs-on: blacksmith-4vcpu-ubuntu-2404
     permissions:
       contents: write
     steps:
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5
+        with:
+          persist-credentials: false
 
       - name: Extract version from tag
         id: version
@@ -144,7 +215,7 @@ jobs:
           cat release_body.md
 
       - name: Create GitHub Release
-        uses: softprops/action-gh-release@v2
+        uses: softprops/action-gh-release@3bb12739c298aeb8a4eeaf626c5b8d85266b0e65 # v2
         with:
           tag_name: ${{ steps.version.outputs.tag }}
           name: rsac ${{ steps.version.outputs.version }}

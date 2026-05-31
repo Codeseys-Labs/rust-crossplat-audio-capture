@@ -11,16 +11,62 @@
 //! All implementations must be `Send + Sync`.
 
 use super::config::{AudioFormat, DeviceId, StreamConfig};
-use super::error::AudioResult;
+use super::error::{AudioError, AudioResult};
 use crate::core::buffer::AudioBuffer;
 
 /// Represents the kind of an audio device.
+///
+/// # Stability
+///
+/// This enum is **deliberately not** `#[non_exhaustive]`: an audio endpoint is
+/// either an input or an output, a fixed binary classification callers match
+/// exhaustively. Keeping it closed is a stability guarantee — the set will not grow
+/// in a way that silently breaks exhaustive matches.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum DeviceKind {
     /// An input device, typically used for recording audio.
     Input,
     /// An output device, typically used for playing audio.
     Output,
+}
+
+/// A cheap, owned snapshot of an [`AudioDevice`]'s metadata.
+///
+/// `DeviceInfo` bundles the four metadata accessors of [`AudioDevice`]
+/// (`id`, `name`, `is_default`, `kind`) together with the device's preferred
+/// audio format into a single, plain-data value that is easy to clone, store,
+/// log, or send across a channel without holding a `Box<dyn AudioDevice>`.
+///
+/// Obtain one via [`AudioDevice::describe`].
+///
+/// # `default_format`
+///
+/// `default_format` is the first entry of `supported_formats()`, or `None`
+/// when the backend reports no formats. On **Linux (PipeWire)** the native
+/// backend intentionally returns an empty `supported_formats()` list (format
+/// negotiation happens at stream-open time), so `default_format` is `None`
+/// there by design (L2) — its absence is expected, not an error.
+///
+/// # Stability
+///
+/// This struct is `#[non_exhaustive]`: new metadata fields may be added in a
+/// minor release. Match it with a trailing `..` and do not construct it by
+/// struct literal outside this crate; use [`AudioDevice::describe`] instead.
+#[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
+pub struct DeviceInfo {
+    /// The unique platform-specific identifier for the device.
+    pub id: DeviceId,
+    /// The human-readable device name.
+    pub name: String,
+    /// Whether the device is an input or output endpoint.
+    pub kind: DeviceKind,
+    /// Whether the device is the system default.
+    pub is_default: bool,
+    /// The device's preferred format (the first entry of
+    /// `supported_formats()`), or `None` when none are reported — including on
+    /// Linux/PipeWire by design (see the type-level note).
+    pub default_format: Option<AudioFormat>,
 }
 
 /// A trait representing an audio device.
@@ -51,6 +97,68 @@ pub trait AudioDevice: Send + Sync {
     /// Returns the audio formats supported by this device.
     fn supported_formats(&self) -> Vec<AudioFormat>;
 
+    /// Returns whether this device is an [`Input`](DeviceKind::Input) or
+    /// [`Output`](DeviceKind::Output) endpoint.
+    ///
+    /// # Platform behaviour
+    ///
+    /// - **Windows (WASAPI):** resolved from `IMMEndpoint::GetDataFlow`
+    ///   (`eRender` → [`Output`](DeviceKind::Output),
+    ///   `eCapture` → [`Input`](DeviceKind::Input)).
+    /// - **Linux (PipeWire):** maps the node's source/sink role. A device that
+    ///   is both a source and a sink (e.g. a monitor) reports
+    ///   [`Input`](DeviceKind::Input).
+    /// - **macOS (CoreAudio):** probed from the device's stream scope
+    ///   (`scopeInput` vs `scopeOutput`).
+    ///
+    /// # Errors
+    ///
+    /// Returns [`AudioError::PlatformNotSupported`] from the default
+    /// implementation. Backends that cannot determine a definite kind (for
+    /// example a CoreAudio device exposing no streams on either scope) return
+    /// an error rather than guessing.
+    ///
+    /// This is a **provided** method so external `AudioDevice` implementations
+    /// keep compiling without change; they inherit the
+    /// `PlatformNotSupported` default until they choose to override it.
+    fn kind(&self) -> AudioResult<DeviceKind> {
+        Err(AudioError::PlatformNotSupported {
+            feature: "device kind".to_string(),
+            platform: std::env::consts::OS.to_string(),
+        })
+    }
+
+    /// Returns an owned [`DeviceInfo`] snapshot of this device's metadata.
+    ///
+    /// This is a **provided** method composed entirely from the existing
+    /// accessors — [`id`](Self::id), [`name`](Self::name),
+    /// [`is_default`](Self::is_default), [`kind`](Self::kind), and
+    /// [`supported_formats`](Self::supported_formats) — so every backend and
+    /// external implementation inherits it without change.
+    ///
+    /// Field mapping:
+    ///
+    /// - `default_format` is `supported_formats().into_iter().next()` — the
+    ///   first reported format, or `None` when the list is empty (the Linux
+    ///   PipeWire case by design; see [`DeviceInfo`]).
+    /// - `kind` is taken from [`kind`](Self::kind) when it resolves. When
+    ///   `kind()` returns an error (e.g. the `PlatformNotSupported` default, or
+    ///   a backend that cannot determine the endpoint direction), `describe`
+    ///   falls back to [`DeviceKind::Input`] — the capture-oriented default for
+    ///   this capture-only library — so the snapshot stays infallible. Callers
+    ///   that need to distinguish "known input" from "indeterminate" should call
+    ///   [`kind`](Self::kind) directly and inspect the error.
+    fn describe(&self) -> DeviceInfo {
+        let kind = self.kind().unwrap_or(DeviceKind::Input);
+        DeviceInfo {
+            id: self.id(),
+            name: self.name(),
+            kind,
+            is_default: self.is_default(),
+            default_format: self.supported_formats().into_iter().next(),
+        }
+    }
+
     /// Creates a new capturing stream from this device using the given configuration.
     ///
     /// # Errors
@@ -77,10 +185,14 @@ pub trait AudioDevice: Send + Sync {
 /// # Example
 ///
 /// ```rust,ignore
-/// // Blocking read loop
-/// while stream.is_running() {
-///     let buffer = stream.read_chunk()?;
-///     process_audio(&buffer);
+/// // Blocking read loop. read_chunk() returns AudioError::StreamEnded (Fatal)
+/// // once the stream is terminal, so break on a fatal error.
+/// loop {
+///     match stream.read_chunk() {
+///         Ok(buffer) => process_audio(&buffer),
+///         Err(e) if e.is_fatal() => break, // StreamEnded: producer is done
+///         Err(_) => continue,              // transient read hiccup; retry
+///     }
 /// }
 /// stream.stop()?;
 /// ```
@@ -94,8 +206,25 @@ pub trait CapturingStream: Send + Sync {
     /// # Returns
     ///
     /// * `Ok(buffer)` — Audio data is available.
-    /// * `Err(AudioError::StreamClosed)` — Stream was closed.
-    /// * `Err(AudioError::BufferOverrun { .. })` — Data was lost due to slow consumption.
+    /// * `Err(`[`AudioError::StreamEnded`]`)`
+    ///   — The stream has reached a terminal state (`Stopped` / `Closed` / `Error`)
+    ///   and will produce no more data. This is **fatal** for the read loop
+    ///   (`is_fatal() == true`); break out of it. As of
+    ///   [ADR-0003](https://github.com/Codeseys-Labs/rust-crossplat-audio-capture/blob/master/docs/designs/0003-terminal-stream-error.md)
+    ///   this — not [`AudioError::StreamReadError`]
+    ///   — is the clean end-of-stream signal.
+    /// * `Err(`[`AudioError::StreamReadError`]`)`
+    ///   — A genuinely transient read failure (recoverable; retrying may succeed).
+    ///
+    /// # Dropped buffers
+    ///
+    /// Ring-buffer overflow does **not** surface as an error from this method.
+    /// When the consumer cannot keep up, the producer drops buffers and bumps the
+    /// [`overrun_count()`](Self::overrun_count) counter; poll that counter (or
+    /// [`is_under_backpressure()`](Self::is_under_backpressure)) to detect loss.
+    /// (The [`BufferOverrun`](crate::core::error::AudioError::BufferOverrun) and
+    /// [`BufferUnderrun`](crate::core::error::AudioError::BufferUnderrun) variants
+    /// exist in the taxonomy but are not constructed by the production read path.)
     fn read_chunk(&self) -> AudioResult<AudioBuffer>;
 
     /// Attempts to read audio data without blocking.
@@ -133,6 +262,50 @@ pub trait CapturingStream: Send + Sync {
         0
     }
 
+    /// Returns the cumulative number of audio buffers **delivered to the
+    /// consumer** (i.e. popped off the ring buffer by `read_chunk()` /
+    /// `try_read_chunk()`) since the stream started.
+    ///
+    /// This is the "successfully captured and handed to the caller" tally,
+    /// distinct from [`buffers_pushed()`](Self::buffers_pushed) (what the OS
+    /// callback enqueued) and [`buffers_dropped()`](Self::buffers_dropped)
+    /// (what was lost to overflow). The default implementation returns 0 for
+    /// backends that do not track this counter.
+    fn buffers_captured(&self) -> u64 {
+        0
+    }
+
+    /// Returns the cumulative number of audio buffers **enqueued by the
+    /// producer** (the OS audio callback) since the stream started.
+    ///
+    /// Together with [`buffers_dropped()`](Self::buffers_dropped) this accounts
+    /// for everything the OS produced: `pushed + dropped` is the total the
+    /// callback attempted to deliver. The default implementation returns 0 for
+    /// backends that do not track this counter.
+    fn buffers_pushed(&self) -> u64 {
+        0
+    }
+
+    /// Returns the cumulative number of audio buffers **dropped due to ring
+    /// buffer overflow** since the stream started.
+    ///
+    /// This is an alias of [`overrun_count()`](Self::overrun_count), provided so
+    /// the three bridge counters (`buffers_pushed` / `buffers_dropped` /
+    /// `buffers_captured`) read uniformly. The default implementation returns 0
+    /// for backends that do not track buffer loss.
+    fn buffers_dropped(&self) -> u64 {
+        0
+    }
+
+    /// Returns `true` if the stream's producer is actively producing data.
+    ///
+    /// This is a convenience alias of [`is_running()`](Self::is_running) for
+    /// callers reasoning about producer activity. The default implementation
+    /// delegates to `is_running()`.
+    fn is_producing(&self) -> bool {
+        self.is_running()
+    }
+
     /// Returns true if the stream's producer is experiencing sustained
     /// backpressure (consecutive ring buffer overflows above a threshold).
     ///
@@ -160,9 +333,35 @@ pub trait CapturingStream: Send + Sync {
         Ok(())
     }
 
-    /// Register an async waker to be notified when new audio data is available.
+    /// Register an async waker to be notified when new audio data (or a terminal
+    /// state) becomes available.
     ///
-    /// Returns `true` if the stream supports async notification, `false` otherwise.
+    /// # Contract (FH-5)
+    ///
+    /// The return value is a **promise**, not merely a capability flag:
+    ///
+    /// * `true` — the waker was registered and the producer **will** wake it
+    ///   when new data is pushed or the stream reaches a terminal state. A
+    ///   consumer that registered a waker and got `true` may safely park
+    ///   ([`Poll::Pending`](std::task::Poll::Pending)) and rely on being woken.
+    /// * `false` — the waker was **not** registered and will **never** be woken
+    ///   by this stream. A consumer that gets `false` **must not park** on the
+    ///   waker; doing so would hang forever. It must instead make progress
+    ///   another way (e.g. self-wake to re-poll, poll, or surface an error).
+    ///
+    /// The default implementation returns `false` (no async support), so the
+    /// trait stays additive: external backends keep compiling and are treated
+    /// as non-waking until they opt in by overriding this method and honouring
+    /// the wake promise.
+    ///
+    /// The shipped `BridgeStream` (`pub(crate)`) returns
+    /// `true` and wakes the registered waker from every state transition and on
+    /// every push (the wake itself is alloc-free and lock-free, per ADR-0001).
+    /// [`AsyncAudioStream`](crate::bridge::AsyncAudioStream) is the in-crate
+    /// consumer that depends on this contract; it falls back to a bounded
+    /// self-wake loop when a backend returns `false` so a non-waking backend can
+    /// never cause an async hang.
+    ///
     /// Used internally by `AsyncAudioStream`.
     #[cfg(feature = "async-stream")]
     fn register_waker(&self, waker: &std::task::Waker) -> bool {
@@ -170,15 +369,134 @@ pub trait CapturingStream: Send + Sync {
         false
     }
 
-    /// Returns `true` if the stream's producer is still active and may produce more data.
+    /// Returns `true` if the stream's producer is still active and may produce
+    /// more data.
     ///
-    /// Returns `false` once the producer has signaled completion.
-    /// Used internally by `AsyncAudioStream` to determine when to return `None`.
+    /// Returns `false` once the producer has signaled completion or reached a
+    /// terminal state, so no further data will arrive. Used internally by
+    /// [`AsyncAudioStream`](crate::bridge::AsyncAudioStream) to decide when to
+    /// end the stream (`Poll::Ready(None)`).
+    ///
+    /// # Relationship to the waker contract
+    ///
+    /// This is the companion of [`register_waker`](Self::register_waker): a
+    /// consumer that registered a waker (and got `true`) is woken on the
+    /// transition that flips this from `true` to `false`, so it can re-poll,
+    /// observe the terminal state, and end the stream rather than parking. The
+    /// default implementation returns `true` (always producing) for backends
+    /// that do not track producer liveness.
     #[cfg(feature = "async-stream")]
     fn is_stream_producing(&self) -> bool {
         true
     }
 }
+
+/// A device-topology change reported through
+/// [`DeviceEnumerator::watch`].
+///
+/// Each variant carries the minimum identifying metadata for the change so a
+/// consumer can update a device list without re-enumerating. The event is
+/// delivered on the backend's OS notification thread (the WASAPI
+/// `IMMNotificationClient` callback, the CoreAudio property-listener thread, or
+/// the PipeWire loop thread) — **never** the real-time audio callback thread.
+///
+/// # Stability
+///
+/// `#[non_exhaustive]`: new variants may be added in a minor release. Match with
+/// a trailing `_ =>` arm.
+#[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum DeviceEvent {
+    /// A device became available (hot-plugged, or a virtual device appeared).
+    DeviceAdded {
+        /// Platform-specific identifier of the new device.
+        id: DeviceId,
+        /// Human-readable name at the time of the event.
+        name: String,
+        /// Whether it is an input or output endpoint.
+        kind: DeviceKind,
+    },
+    /// A device was removed (unplugged or destroyed). Only the id is guaranteed
+    /// to still be resolvable; the device may already be gone.
+    DeviceRemoved {
+        /// Identifier of the removed device.
+        id: DeviceId,
+    },
+    /// The system default device for `kind` changed to `id`.
+    DefaultChanged {
+        /// Identifier of the new default device.
+        id: DeviceId,
+        /// Which default role changed (input vs output).
+        kind: DeviceKind,
+    },
+    /// A device's availability/state changed without being added or removed
+    /// (e.g. disabled, unplugged-but-retained, format reset).
+    StateChanged {
+        /// Identifier of the affected device.
+        id: DeviceId,
+        /// Whether the device is currently available for capture.
+        available: bool,
+    },
+}
+
+/// An RAII guard for an active device-change subscription created by
+/// [`DeviceEnumerator::watch`].
+///
+/// While this value is alive the registered handler receives [`DeviceEvent`]s.
+/// Dropping it **unregisters the OS listener and joins the notify thread**, so
+/// the handler is guaranteed not to run after `drop` returns. Hold onto it for
+/// as long as notifications are wanted; let it drop to stop.
+///
+/// The guard owns a backend-specific teardown closure; it is `Send` so it can be
+/// moved across threads, and its `Drop` is best-effort and never panics.
+pub struct DeviceWatcher {
+    /// Backend teardown: unregister the OS listener and join the notify thread.
+    /// `Option` so `Drop` can take it exactly once; boxed so the public type is
+    /// backend-agnostic.
+    teardown: Option<Box<dyn FnOnce() + Send>>,
+}
+
+impl DeviceWatcher {
+    /// Construct a watcher from a backend teardown closure.
+    ///
+    /// Backends call this after registering their OS listener, passing a closure
+    /// that unregisters it and joins the notify thread. Crate-internal: the
+    /// public way to obtain a `DeviceWatcher` is
+    /// [`DeviceEnumerator::watch`].
+    // Unused until the per-OS `watch()` arms land (rsac-e360 / rsac-b92e /
+    // rsac-3093); this is the constructor they call. Allowed dead now so the
+    // public M10 surface can ship ahead of the platform implementations.
+    #[allow(dead_code)]
+    pub(crate) fn from_teardown(teardown: Box<dyn FnOnce() + Send>) -> Self {
+        Self {
+            teardown: Some(teardown),
+        }
+    }
+}
+
+impl std::fmt::Debug for DeviceWatcher {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("DeviceWatcher")
+            .field("active", &self.teardown.is_some())
+            .finish()
+    }
+}
+
+impl Drop for DeviceWatcher {
+    fn drop(&mut self) {
+        if let Some(teardown) = self.teardown.take() {
+            // Best-effort: unregister the OS listener and join the notify thread.
+            // The backend closure must not panic; if it could, it should catch
+            // internally — a panic in Drop while unwinding would abort.
+            teardown();
+        }
+    }
+}
+
+/// The boxed handler type [`DeviceEnumerator::watch`]
+/// invokes for each [`DeviceEvent`]. `Send + 'static` because it runs on the
+/// backend's OS notification thread.
+pub type DeviceEventHandler = Box<dyn FnMut(DeviceEvent) + Send + 'static>;
 
 /// A trait for discovering and enumerating audio devices on the system.
 ///
@@ -219,6 +537,33 @@ pub trait DeviceEnumerator: Send + Sync {
     /// A `Result` containing the default device, or an error if no
     /// default device exists or it cannot be determined.
     fn default_device(&self) -> AudioResult<Box<dyn AudioDevice>>;
+
+    /// Subscribe to device hot-plug / default-change notifications.
+    ///
+    /// On success returns a [`DeviceWatcher`] RAII guard; `on_event` is invoked
+    /// once per [`DeviceEvent`] on the backend's **OS notification thread**
+    /// (never the real-time audio callback thread, so the handler may allocate
+    /// and lock). Dropping the returned guard unregisters the OS listener and
+    /// joins the notify thread, after which the handler will not run again.
+    ///
+    /// # Errors
+    ///
+    /// This is a **provided** method that defaults to
+    /// [`AudioError::PlatformNotSupported`]. Backends whose
+    /// [`supports_device_change_notifications`](crate::core::capabilities::PlatformCapabilities::supports_device_change_notifications)
+    /// is `false` inherit this default; backends that wire up an OS listener
+    /// override it. Returning the default keeps the trait additive for external
+    /// implementations — they need not change to keep compiling.
+    fn watch(&self, on_event: DeviceEventHandler) -> AudioResult<DeviceWatcher> {
+        // `on_event` is intentionally dropped here: with no listener registered
+        // there is nothing to deliver. Named with a leading underscore would lose
+        // the doc-visible parameter name, so bind-and-drop instead.
+        drop(on_event);
+        Err(AudioError::PlatformNotSupported {
+            feature: "device change notifications".to_string(),
+            platform: std::env::consts::OS.to_string(),
+        })
+    }
 }
 
 // AudioError enum has been moved to src/core/error.rs
@@ -226,3 +571,199 @@ pub trait DeviceEnumerator: Send + Sync {
 
 // The AudioBuffer trait has been removed from this file.
 // It is now a concrete struct defined in src/core/buffer.rs.
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::core::config::SampleFormat;
+    use crate::core::error::ErrorKind;
+
+    /// A minimal `AudioDevice` that overrides nothing beyond the required
+    /// methods. It must inherit the provided `kind()` default unchanged,
+    /// proving the addition is additive/non-breaking for external impls.
+    struct MinimalDevice;
+
+    impl AudioDevice for MinimalDevice {
+        fn id(&self) -> DeviceId {
+            DeviceId("minimal".to_string())
+        }
+        fn name(&self) -> String {
+            "Minimal".to_string()
+        }
+        fn is_default(&self) -> bool {
+            false
+        }
+        fn supported_formats(&self) -> Vec<AudioFormat> {
+            Vec::new()
+        }
+        fn create_stream(&self, _config: &StreamConfig) -> AudioResult<Box<dyn CapturingStream>> {
+            Err(AudioError::PlatformNotSupported {
+                feature: "create_stream".to_string(),
+                platform: "test".to_string(),
+            })
+        }
+    }
+
+    /// The default `kind()` reports `PlatformNotSupported` (fatal, Platform
+    /// kind) without requiring the impl to override it.
+    #[test]
+    fn default_kind_is_platform_not_supported() {
+        let device = MinimalDevice;
+        let err = device.kind().expect_err("default kind() must be Err");
+        assert_eq!(err.kind(), ErrorKind::Platform);
+        match err {
+            AudioError::PlatformNotSupported { feature, .. } => {
+                assert_eq!(feature, "device kind");
+            }
+            other => panic!("expected PlatformNotSupported, got {other:?}"),
+        }
+    }
+
+    /// A richer device that overrides `kind()` (as a real backend does) and
+    /// reports a couple of supported formats, exercising the populated arms of
+    /// `describe()`.
+    struct OutputDevice;
+
+    impl AudioDevice for OutputDevice {
+        fn id(&self) -> DeviceId {
+            DeviceId("speakers".to_string())
+        }
+        fn name(&self) -> String {
+            "Speakers".to_string()
+        }
+        fn is_default(&self) -> bool {
+            true
+        }
+        fn supported_formats(&self) -> Vec<AudioFormat> {
+            // First entry must become `default_format`; the second proves we
+            // pick the head, not the tail.
+            vec![
+                AudioFormat {
+                    sample_rate: 48_000,
+                    channels: 2,
+                    sample_format: SampleFormat::F32,
+                },
+                AudioFormat {
+                    sample_rate: 44_100,
+                    channels: 1,
+                    sample_format: SampleFormat::F32,
+                },
+            ]
+        }
+        fn kind(&self) -> AudioResult<DeviceKind> {
+            Ok(DeviceKind::Output)
+        }
+        fn create_stream(&self, _config: &StreamConfig) -> AudioResult<Box<dyn CapturingStream>> {
+            Err(AudioError::PlatformNotSupported {
+                feature: "create_stream".to_string(),
+                platform: "test".to_string(),
+            })
+        }
+    }
+
+    /// `describe()` on a device that does not override `kind()` falls back to
+    /// `Input` (the capture-only default), reports an empty `supported_formats`
+    /// as `default_format == None`, and carries the other accessors verbatim.
+    #[test]
+    fn describe_default_falls_back_to_input_and_no_format() {
+        let info = MinimalDevice.describe();
+        assert_eq!(info.id, DeviceId("minimal".to_string()));
+        assert_eq!(info.name, "Minimal");
+        assert!(!info.is_default);
+        // kind() errored (PlatformNotSupported default) → Input fallback.
+        assert_eq!(info.kind, DeviceKind::Input);
+        // Empty supported_formats() → no preferred format.
+        assert_eq!(info.default_format, None);
+    }
+
+    /// `describe()` honors an overridden `kind()` and takes the FIRST supported
+    /// format as `default_format`.
+    #[test]
+    fn describe_uses_kind_and_first_supported_format() {
+        let info = OutputDevice.describe();
+        assert_eq!(info.id, DeviceId("speakers".to_string()));
+        assert_eq!(info.name, "Speakers");
+        assert!(info.is_default);
+        assert_eq!(info.kind, DeviceKind::Output);
+        assert_eq!(
+            info.default_format,
+            Some(AudioFormat {
+                sample_rate: 48_000,
+                channels: 2,
+                sample_format: SampleFormat::F32,
+            })
+        );
+    }
+
+    /// A minimal `DeviceEnumerator` that overrides nothing beyond the two
+    /// required methods — it must inherit the provided `watch()` default.
+    struct MinimalEnumerator;
+
+    impl DeviceEnumerator for MinimalEnumerator {
+        fn enumerate_devices(&self) -> AudioResult<Vec<Box<dyn AudioDevice>>> {
+            Ok(vec![])
+        }
+        fn default_device(&self) -> AudioResult<Box<dyn AudioDevice>> {
+            Err(AudioError::DeviceNotFound {
+                device_id: "none".to_string(),
+            })
+        }
+    }
+
+    /// The default `watch()` reports `PlatformNotSupported` without the impl
+    /// overriding it — proving the M10 surface is additive for external impls.
+    #[test]
+    fn default_watch_is_platform_not_supported() {
+        let enumerator = MinimalEnumerator;
+        let err = enumerator
+            .watch(Box::new(|_event| {}))
+            .expect_err("default watch() must be Err");
+        assert_eq!(err.kind(), ErrorKind::Platform);
+        match err {
+            AudioError::PlatformNotSupported { feature, .. } => {
+                assert_eq!(feature, "device change notifications");
+            }
+            other => panic!("expected PlatformNotSupported, got {other:?}"),
+        }
+    }
+
+    /// `DeviceWatcher`'s `Drop` runs the backend teardown closure exactly once.
+    #[test]
+    fn device_watcher_drop_runs_teardown_once() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use std::sync::Arc;
+
+        let calls = Arc::new(AtomicUsize::new(0));
+        let calls_in = Arc::clone(&calls);
+        let watcher = DeviceWatcher::from_teardown(Box::new(move || {
+            calls_in.fetch_add(1, Ordering::SeqCst);
+        }));
+        assert_eq!(
+            calls.load(Ordering::SeqCst),
+            0,
+            "teardown must not run early"
+        );
+        drop(watcher);
+        assert_eq!(
+            calls.load(Ordering::SeqCst),
+            1,
+            "teardown must run exactly once on drop"
+        );
+    }
+
+    /// `DeviceEvent` is constructible for each variant and `Clone`/`PartialEq`
+    /// hold (the binding layers rely on cloning events across the FFI boundary).
+    #[test]
+    fn device_event_variants_clone_and_compare() {
+        let added = DeviceEvent::DeviceAdded {
+            id: DeviceId("dev1".to_string()),
+            name: "Dev 1".to_string(),
+            kind: DeviceKind::Output,
+        };
+        assert_eq!(added, added.clone());
+        let removed = DeviceEvent::DeviceRemoved {
+            id: DeviceId("dev1".to_string()),
+        };
+        assert_ne!(added, removed);
+    }
+}

@@ -1,8 +1,158 @@
 # Backend Contract & Internal Architecture Design — `rsac`
 
-> **Status:** Design Document — Subtask B3
+> ⚠️ **HISTORICAL / ASPIRATIONAL DESIGN — NOT THE SOURCE OF TRUTH.**
+> This document captures the *original* internal-architecture plan. The shipped
+> code diverged from it in several load-bearing places, and **the code is the
+> source of truth.** The most important divergences (each grounded against the
+> code below in [§0](#0-shipped-reality-what-the-code-actually-does)):
+>
+> - The platform layer lives at **`src/audio/`** (`audio/windows`, `audio/linux`,
+>   `audio/macos`), **not** `src/backend/`. There is no `backend/` module.
+> - The shipped internal trait is **`PlatformStream`** with exactly two methods —
+>   `stop_capture()` and `is_active()` — and it is **`Send` only**, *not*
+>   `Send + Sync`. There is no `PlatformBackend` associated-type trait, no
+>   `create_stream()`/`capabilities()`/`enumerate_*` on a backend trait, and no
+>   `start`/`close`/`format`/`latency_frames` on `PlatformStream` as drawn below.
+> - `BridgeStream<S>` requires **`S: PlatformStream + Sync + 'static`** at its
+>   `CapturingStream` impl (the `Sync` bound is added there, not on the trait).
+> - The producer hot-path method is **`BridgeProducer::push_samples_or_drop()`**
+>   (and the timestamping `push_samples_or_drop_at()`), *not* a `write()` that
+>   returns a sample count. RT-allocation behaviour is governed by
+>   [ADR-0001](../designs/0001-rt-allocation-guarantee.md).
+> - The state machine has **six** states — `Created → Running → Stopping →
+>   Stopped → Closed`, plus `Error` — not the four (`Created/Running/Stopped/
+>   Closed`) drawn in [§5.2](#52-stream-state-machine).
+> - The "Removal & Deprecation Targets" and "ResolvedConfig"/`backend/` module
+>   tables in this doc and its sibling
+>   [ARCHITECTURE_OVERVIEW.md](ARCHITECTURE_OVERVIEW.md) predate the shipped code;
+>   `ResolvedConfig` does not exist.
+>
+> For an accurate user-facing overview see
+> [`docs/ARCHITECTURE.md`](../ARCHITECTURE.md); for the decisions that supersede
+> parts of this doc see the ADRs in [`docs/designs/`](../designs/) (notably
+> ADR-0001 RT-allocation, ADR-0002 callback delivery, ADR-0003 terminal-stream
+> error, and ADR-0004 device-watch threading model).
+>
+> **Status:** Design Document — Subtask B3 (historical)
 > **Depends on:** [API_DESIGN.md](API_DESIGN.md) (B1), [ERROR_CAPABILITY_DESIGN.md](ERROR_CAPABILITY_DESIGN.md) (B2)
 > **Priority Order:** Correctness → UX → Breadth
+
+---
+
+## 0. Shipped reality (what the code actually does)
+
+This section is the **ground-truth** counterpart to the aspirational design that
+follows. Everything here is verified against the current code; prefer it where it
+disagrees with later sections.
+
+### 0.1 The `PlatformStream` trait
+
+The shipped internal backend contract is intentionally tiny. Each platform
+backend wraps its own OS resources and its `BridgeProducer`, and exposes only
+what `BridgeStream` needs to drive lifecycle:
+
+```rust
+// src/bridge/stream.rs
+pub(crate) trait PlatformStream: Send {
+    /// Stop the OS audio capture callback. Called by BridgeStream::stop()
+    /// after the shared state transitions to Stopping.
+    fn stop_capture(&self) -> AudioResult<()>;
+
+    /// Whether the platform-level capture is still running.
+    fn is_active(&self) -> bool;
+}
+```
+
+Note: `Send` only — *not* `Send + Sync`. `BridgeStream<S>` re-introduces the
+`Sync` requirement at its `CapturingStream` impl bound
+(`impl<S: PlatformStream + Sync + 'static> CapturingStream for BridgeStream<S>`),
+and stores the platform stream behind a `Mutex<S>` so `&self` methods are sound.
+Starting the OS pipeline, format negotiation, and resource release are handled by
+each backend's own `start`/construction and `Drop`, **not** by trait methods.
+
+### 0.2 `BridgeStream<S>` — the universal adapter
+
+`BridgeStream<S>` ([`src/bridge/stream.rs`](../../src/bridge/stream.rs)) is the
+only production `CapturingStream`. It composes:
+
+```rust
+pub(crate) struct BridgeStream<S: PlatformStream> {
+    consumer: Mutex<BridgeConsumer>,   // SPSC ring consumer, Mutex for &self / Sync
+    shared: Arc<BridgeShared>,         // lifecycle state + diagnostic atomics
+    format: AudioFormat,               // requested format; seed/fallback for format()
+    platform_stream: Mutex<S>,         // the backend's OS handle + BridgeProducer
+    default_timeout: Duration,         // default for blocking reads
+}
+```
+
+A compile-time `_assert::<T: Send + Sync>()` in `stream.rs` pins the `Send + Sync`
+guarantee. `format()` returns the negotiated format from `shared` when a backend
+has recorded one, falling back to the requested `format` field otherwise — and in
+the current code that fallback is *always* taken, because no backend calls
+`set_negotiated_format` in production (a known limitation; see [§0.5](#05-known-limitations-tracked)).
+
+### 0.3 Ring-buffer bridge — the real API
+
+`bridge/ring_buffer.rs` exposes:
+
+- `create_bridge(capacity, format) -> (BridgeProducer, BridgeConsumer)` and
+  `create_bridge_with_options(...)`. Capacity is a count of **`AudioBuffer`
+  slots** (one callback period per slot), not a frame count.
+- `BridgeProducer::push_samples_or_drop(&mut self, data: &[f32], channels, sample_rate) -> bool`
+  — the production hot-path push. Returns `true` on enqueue, `false` on drop. It
+  is alloc-free in steady state via a free-list return ring (the whole point of
+  [ADR-0001](../designs/0001-rt-allocation-guarantee.md)); it is *not* the
+  count-returning `write()` shown in [§3.3](#33-producer-side--os-callback).
+- `BridgeProducer::push_samples_or_drop_at(...)` — a timestamping variant that
+  exists but is called by **no** production backend today (so
+  `AudioBuffer::timestamp()` is always `None`; tracked limitation).
+- `calculate_capacity(requested, min) -> usize` (static, power-of-two) and
+  `calculate_capacity_for_period(period_frames, channels) -> usize` (period-derived,
+  12-period headroom, clamped 8..=1024, power-of-two). See [§0.5](#05-known-limitations-tracked)
+  for which backends actually call which.
+
+### 0.4 Native enumeration + `watch()` arms
+
+Each backend hosts, beyond the capture stream:
+
+- **Device enumeration** via a per-OS `DeviceEnumerator` impl
+  (`WindowsDeviceEnumerator` / `LinuxDeviceEnumerator` / `MacosDeviceEnumerator`),
+  reached through the `CrossPlatformDeviceEnumerator` facade and
+  `get_device_enumerator()` ([`src/audio/mod.rs`](../../src/audio/mod.rs)).
+- **Native application enumeration**:
+  `audio::windows::enumerate_application_audio_sessions()`,
+  `audio::macos::enumerate_audio_applications()`,
+  `audio::linux::enumerate_audio_applications()` (the Linux path uses the native
+  in-process PipeWire registry, not a `pw-dump` subprocess).
+- **`DeviceEnumerator::watch()`** — the device-change subscription. `watch()` is a
+  provided trait method defaulting to `PlatformNotSupported`; the three OS
+  backends override it. The user handler always runs on the OS notification
+  thread, never the RT audio thread — but the **delivery threading model differs
+  per platform** (Windows/macOS use a bounded `sync_channel(64)` + helper thread
+  with drop-on-full; Linux invokes the handler directly on the PipeWire loop
+  thread). This divergence and its rationale are recorded in
+  **[ADR-0004](../designs/)** (device-watch threading model) and summarised in
+  [`docs/ARCHITECTURE.md` §5](../ARCHITECTURE.md#5-device-change-notifications-watch).
+
+The `DeviceEnumerator`/`DeviceWatcher`/`DeviceEvent` *types* live in
+`core/interface.rs`; their *implementations* live in `audio/`. Source/application
+discovery in `core/introspection.rs` calls up into `audio/` — the tracked
+`core → audio` DAG deviation noted in
+[`docs/ARCHITECTURE.md` §1](../ARCHITECTURE.md#1-the-layering-split).
+
+### 0.5 Known limitations (tracked)
+
+These are places where the shipped backends under-deliver against the design
+below. They are real findings (2026-05-30 critique), documented here rather than
+papered over:
+
+| Limitation | Reality in code | Tracking |
+|---|---|---|
+| Period-aware ring sizing unwired | `calculate_capacity_for_period` exists + tested but has **no** backend call site; all backends use static `calculate_capacity`. | ADR for the period-sizing model + `buffer_size` semantics (0004-0009 set) |
+| `buffer_size` honored only on Windows | `wasapi.rs` uses `calculate_capacity(config.buffer_size, 4)`; macOS/Linux hardcode `calculate_capacity(None, 4)` (=64). `buffer_size` is a **ring slot count**, not frames. | same ADR |
+| Buffer timestamps always `None` | every backend calls `push_samples_or_drop` (no timestamp); `push_samples_or_drop_at` is unused. | critique DF-01 |
+| Negotiated format not recorded | no backend calls `set_negotiated_format`, so `format()` always returns the *requested* format. | critique PERF-07 |
+| `bridge-zerocopy` `SampleRing` plane | a parallel zero-copy data plane exists behind the `bridge-zerocopy` feature; default build uses the `AudioBuffer` ring (alloc-free in steady state, not zero-copy). | ADR for the zero-copy plane (0004-0009 set) |
 
 ---
 
@@ -83,6 +233,11 @@ The internal backend uses **compile-time `#[cfg]` dispatch** with a `PlatformStr
 ---
 
 ## 2. Internal Backend Trait Contract
+
+> **Superseded by [§0.1](#01-the-platformstream-trait).** The shipped code has no
+> `PlatformBackend` associated-type trait, and the real `PlatformStream` is a
+> two-method `Send`-only trait (`stop_capture` / `is_active`). The trait sketches
+> below are kept for historical context only.
 
 ### 2.1 `PlatformBackend` Trait
 
@@ -974,6 +1129,14 @@ Similar dispatch exists for each platform. Platform-specific details:
 | ProcessTree | Process Loopback with tree flag | Multiple monitors (root + /proc children) | Process Tap with PID list |
 
 ### 5.2 Stream State Machine
+
+> **Superseded by the shipped state machine.** The real
+> [`StreamState`](../../src/bridge/state.rs) has **six** states —
+> `Created → Running → Stopping → Stopped → Closed`, plus a terminal `Error`
+> (and `Stopping` lets the consumer drain buffered data). The four-state diagram
+> below is historical. See [`docs/ARCHITECTURE.md` §2](../ARCHITECTURE.md#2-data-flow)
+> for the accurate diagram and [ADR-0003](../designs/0003-terminal-stream-error.md)
+> for the terminal-error / `StreamEnded` semantics.
 
 ```mermaid
 stateDiagram-v2

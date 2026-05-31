@@ -14,7 +14,11 @@ pub mod async_stream;
 pub mod mock;
 
 // Re-exports for internal use
-pub use ring_buffer::{calculate_capacity, create_bridge, BridgeConsumer, BridgeProducer};
+#[allow(unused_imports)]
+pub use ring_buffer::{
+    calculate_capacity, create_bridge, create_bridge_with_options, BridgeConsumer, BridgeProducer,
+    DEFAULT_BACKPRESSURE_THRESHOLD,
+};
 pub use state::{AtomicStreamState, StreamState};
 // Platform-conditional: used by platform backends when features are enabled,
 // and by integration tests in this module.
@@ -274,6 +278,98 @@ mod integration_tests {
         // (only Running → Stopping → Stopped transitions happen when stop() initiates)
         assert_eq!(stream.shared().state.get(), StreamState::Stopping);
         assert!(!stream.is_running());
+    }
+
+    // ── PU-5 (rsac-efb4): wake-on-push through the BridgeStream surface ──────
+
+    /// A blocking `read_chunk()` (which delegates to `pop_blocking`) must wake
+    /// PROMPTLY when a producer pushes data on another thread and signals the
+    /// unconditional wake — it must NOT sleep out the stream's blocking timeout.
+    /// This exercises PU-5 end-to-end through the public `CapturingStream` read
+    /// surface, not just the raw consumer.
+    #[test]
+    fn read_chunk_wakes_promptly_on_push() {
+        use std::sync::Arc;
+        use std::time::Instant;
+
+        let format = test_format();
+        // A LONG default timeout: a pre-PU-5 1 ms-poll reader would still pass,
+        // but a regression that parks the full timeout (no wake) would hang well
+        // past our prompt-return assertion below.
+        let (mut producer, consumer) = create_bridge(16, format.clone());
+        consumer
+            .shared()
+            .state
+            .transition(StreamState::Created, StreamState::Running)
+            .unwrap();
+        let stream = Arc::new(BridgeStream::new(
+            consumer,
+            MockPlatformStream::new(),
+            format,
+            Duration::from_secs(10),
+        ));
+
+        let reader = Arc::clone(&stream);
+        let handle = std::thread::spawn(move || {
+            let start = Instant::now();
+            let buf = reader.read_chunk().expect("push must wake the reader");
+            (buf, start.elapsed())
+        });
+
+        // Let the reader park, then push + wake (Windows-producer style).
+        std::thread::sleep(Duration::from_millis(50));
+        producer.push(test_buffer(0.6)).expect("push");
+        producer.notify_consumers();
+
+        let (buf, elapsed) = handle.join().expect("reader thread panicked");
+        assert!((buf.data()[0] - 0.6).abs() < 1e-6);
+        assert!(
+            elapsed < Duration::from_secs(2),
+            "read_chunk must wake on the push, not sleep out the 10 s timeout \
+             (returned after {elapsed:?})"
+        );
+    }
+
+    /// `signal_error()` on a parked `read_chunk()` ends it with the Fatal
+    /// `StreamEnded` PROMPTLY (terminal Error). Proves a dead producer unblocks a
+    /// blocking reader through the stream surface, far before the long timeout.
+    #[test]
+    fn read_chunk_wakes_on_signal_error_with_fatal() {
+        use std::sync::Arc;
+        use std::time::Instant;
+
+        let format = test_format();
+        let (producer, consumer) = create_bridge(16, format.clone());
+        consumer
+            .shared()
+            .state
+            .transition(StreamState::Created, StreamState::Running)
+            .unwrap();
+        let stream = Arc::new(BridgeStream::new(
+            consumer,
+            MockPlatformStream::new(),
+            format,
+            Duration::from_secs(10),
+        ));
+
+        let reader = Arc::clone(&stream);
+        let handle = std::thread::spawn(move || {
+            let start = Instant::now();
+            let res = reader.read_chunk();
+            (res, start.elapsed())
+        });
+
+        std::thread::sleep(Duration::from_millis(50));
+        producer.signal_error();
+
+        let (res, elapsed) = handle.join().expect("reader thread panicked");
+        let err = res.expect_err("terminal Error must end the blocking read");
+        assert!(err.is_fatal(), "terminal-Error read must be Fatal");
+        assert!(
+            elapsed < Duration::from_secs(2),
+            "signal_error must wake the parked read_chunk, not sleep out the \
+             timeout (returned after {elapsed:?})"
+        );
     }
 }
 
@@ -576,6 +672,349 @@ mod async_stream_tests {
                 }
                 Poll::Pending => panic!("Expected None (stream end), got Pending"),
             }
+        }
+    }
+
+    /// 6. signal_error (FATAL producer death, FH-1 / ADR-0010) ends the async
+    ///    stream with None. This is the async EOS counterpart of
+    ///    test_async_stream_ends_on_signal_done, but driven by the fatal sibling.
+    ///
+    ///    NOTE the deliberate behavioral difference from signal_done: the terminal
+    ///    `Error` state is NOT readable (only Running/Stopping are), so
+    ///    `try_read_chunk` returns the Fatal StreamEnded rather than draining, and
+    ///    `poll_next` maps that to `Poll::Ready(None)` (because the stream is no
+    ///    longer producing). A dead producer ends the stream promptly; any
+    ///    still-buffered tail is moot once the producer has died. Contrast with
+    ///    test_async_stream_ends_on_signal_done, where graceful Stopping IS
+    ///    readable and drains the buffered tail before ending.
+    #[test]
+    fn test_signal_error_ends_async_stream() {
+        let (mut producer, bridge_stream) = create_test_stream();
+        let (waker, _test_waker) = make_test_waker();
+        let mut cx = Context::from_waker(&waker);
+
+        // Push some data, then the producer DIES (e.g. device unplug).
+        producer.push(test_buffer(3.0)).unwrap();
+        producer.push(test_buffer(4.0)).unwrap();
+        producer.signal_error();
+
+        let mut async_stream = AsyncAudioStream::new(&bridge_stream);
+
+        // Terminal Error → not readable → stream ends with None (no hang, no
+        // spurious error item leaking past the producer's death).
+        {
+            let pinned = Pin::new(&mut async_stream);
+            match pinned.poll_next(&mut cx) {
+                Poll::Ready(None) => {}
+                other => panic!(
+                    "Expected stream end (None) after signal_error, got {:?}",
+                    other
+                ),
+            }
+        }
+    }
+
+    /// 7. A pending async poll is woken by signal_error (the fatal sibling wakes
+    ///    the waker just like signal_done), and the next poll yields None.
+    #[test]
+    fn test_signal_error_wakes_waker() {
+        let (producer, bridge_stream) = create_test_stream();
+        let (waker, test_waker) = make_test_waker();
+        let mut cx = Context::from_waker(&waker);
+
+        let mut async_stream = AsyncAudioStream::new(&bridge_stream);
+
+        // Poll — Pending (no data, producer still alive), registers the waker.
+        {
+            let pinned = Pin::new(&mut async_stream);
+            match pinned.poll_next(&mut cx) {
+                Poll::Pending => {}
+                other => panic!("Expected Pending, got {:?}", other),
+            }
+        }
+        assert!(
+            !test_waker.woken.load(Ordering::SeqCst),
+            "Waker should NOT be triggered before signal_error"
+        );
+
+        // Producer dies → must wake the registered waker.
+        producer.signal_error();
+        assert!(
+            test_waker.woken.load(Ordering::SeqCst),
+            "Waker SHOULD be triggered after signal_error"
+        );
+
+        // Next poll — terminal Error, no data → None.
+        {
+            let pinned = Pin::new(&mut async_stream);
+            match pinned.poll_next(&mut cx) {
+                Poll::Ready(None) => {}
+                other => panic!(
+                    "Expected None (stream end) after signal_error, got {:?}",
+                    other
+                ),
+            }
+        }
+    }
+
+    // ── FH-5: non-waking-backend waker contract ──────────────────────
+    //
+    // These tests exercise the contract that a backend whose
+    // `register_waker()` returns `false` must NEVER cause `AsyncAudioStream`
+    // to park forever on a waker that will never fire. They use a mock that
+    // implements `CapturingStream` DIRECTLY (not via `BridgeStream`, which
+    // always returns `true`) so we can drive the `register_waker == false`
+    // path with no audio device.
+
+    use crate::core::error::AudioError;
+    use crate::core::interface::CapturingStream;
+    use std::sync::atomic::AtomicU32;
+
+    /// A `CapturingStream` that deliberately violates the wake promise:
+    /// `register_waker()` always returns `false` (it never stores or wakes the
+    /// waker). It models an alternate backend that has no async-wake support.
+    /// It can be configured with a finite supply of buffers to hand out and a
+    /// flag controlling whether it claims to still be producing.
+    struct NonWakingStream {
+        /// Buffers remaining to hand out from `try_read_chunk`.
+        remaining: AtomicU32,
+        /// Value carried by each yielded buffer.
+        value: f32,
+        /// Whether `is_stream_producing()` reports the producer as alive.
+        producing: AtomicBool,
+        /// Counts `register_waker` invocations — proves the consumer keeps
+        /// polling (forward progress) rather than parking forever.
+        register_calls: AtomicU32,
+    }
+
+    impl NonWakingStream {
+        fn new(buffers: u32, value: f32, producing: bool) -> Self {
+            Self {
+                remaining: AtomicU32::new(buffers),
+                value,
+                producing: AtomicBool::new(producing),
+                register_calls: AtomicU32::new(0),
+            }
+        }
+    }
+
+    impl CapturingStream for NonWakingStream {
+        fn read_chunk(&self) -> AudioResult<AudioBuffer> {
+            // Not exercised by the async path (which uses try_read_chunk).
+            Err(AudioError::StreamReadError {
+                reason: "blocking read not supported by NonWakingStream".into(),
+            })
+        }
+
+        fn try_read_chunk(&self) -> AudioResult<Option<AudioBuffer>> {
+            // Atomically decrement the supply if any buffers remain.
+            loop {
+                let cur = self.remaining.load(Ordering::SeqCst);
+                if cur == 0 {
+                    return Ok(None);
+                }
+                if self
+                    .remaining
+                    .compare_exchange(cur, cur - 1, Ordering::SeqCst, Ordering::SeqCst)
+                    .is_ok()
+                {
+                    return Ok(Some(test_buffer(self.value)));
+                }
+            }
+        }
+
+        fn stop(&self) -> AudioResult<()> {
+            self.producing.store(false, Ordering::SeqCst);
+            Ok(())
+        }
+
+        fn format(&self) -> AudioFormat {
+            test_format()
+        }
+
+        fn is_running(&self) -> bool {
+            self.producing.load(Ordering::SeqCst)
+        }
+
+        // FH-5: the deliberate contract violation — never registers/wakes.
+        fn register_waker(&self, _waker: &Waker) -> bool {
+            self.register_calls.fetch_add(1, Ordering::SeqCst);
+            false
+        }
+
+        fn is_stream_producing(&self) -> bool {
+            self.producing.load(Ordering::SeqCst)
+        }
+    }
+
+    /// FH-5: a non-waking backend with buffered data must yield that data
+    /// without ever returning a bare `Pending` that would park forever.
+    /// The fast path drains the supply, then the stream ends once the
+    /// producer reports done.
+    #[test]
+    fn test_non_waking_backend_yields_data_without_hanging() {
+        let backend = NonWakingStream::new(2, 0.5, true);
+        let (waker, _test_waker) = make_test_waker();
+        let mut cx = Context::from_waker(&waker);
+
+        let mut async_stream = AsyncAudioStream::new(&backend);
+
+        // Two buffers come out via the fast path (no waker reliance).
+        for expected in [0.5, 0.5] {
+            let pinned = Pin::new(&mut async_stream);
+            match pinned.poll_next(&mut cx) {
+                Poll::Ready(Some(Ok(buf))) => assert_eq!(buf.data()[0], expected),
+                other => panic!("Expected buffered data, got {:?}", other),
+            }
+        }
+
+        // Supply exhausted; producer signals done → stream ends with None
+        // (NOT a hang, NOT a spurious error).
+        backend.stop().unwrap();
+        let pinned = Pin::new(&mut async_stream);
+        match pinned.poll_next(&mut cx) {
+            Poll::Ready(None) => {}
+            other => panic!("Expected stream end (None), got {:?}", other),
+        }
+    }
+
+    /// FH-5: an EMPTY non-waking backend that still claims to be producing must
+    /// NOT park on a waker that will never fire. `poll_next` must self-wake so
+    /// the executor re-polls — proven here by the registered waker actually
+    /// being woken and `register_waker` being re-invoked on the next poll.
+    #[test]
+    fn test_non_waking_empty_backend_self_wakes_not_parks() {
+        let backend = NonWakingStream::new(0, 0.0, true);
+        let (waker, test_waker) = make_test_waker();
+        let mut cx = Context::from_waker(&waker);
+
+        let mut async_stream = AsyncAudioStream::new(&backend);
+
+        // First poll: empty + non-waking + still producing → the stream must
+        // self-wake. The result is Pending (it yields control) BUT it has
+        // arranged its own wakeup, so the task is rescheduled rather than
+        // parked forever.
+        {
+            let pinned = Pin::new(&mut async_stream);
+            assert!(
+                matches!(pinned.poll_next(&mut cx), Poll::Pending),
+                "empty non-waking backend should yield Pending after self-waking"
+            );
+        }
+        assert!(
+            test_waker.woken.load(Ordering::SeqCst),
+            "FH-5: poll_next must self-wake (wake_by_ref) a non-waking backend so \
+             the task is re-polled instead of parking forever"
+        );
+        assert_eq!(
+            backend.register_calls.load(Ordering::SeqCst),
+            1,
+            "register_waker should have been consulted exactly once so far"
+        );
+
+        // The executor would re-poll because of the self-wake. Simulate that:
+        // the second poll consults register_waker again (forward progress),
+        // confirming the consumer did not silently park.
+        test_waker.woken.store(false, Ordering::SeqCst);
+        {
+            let pinned = Pin::new(&mut async_stream);
+            let _ = pinned.poll_next(&mut cx);
+        }
+        assert_eq!(
+            backend.register_calls.load(Ordering::SeqCst),
+            2,
+            "a re-poll must re-consult register_waker, proving progress is made"
+        );
+    }
+
+    /// FH-5: a non-waking backend that never produces and never wakes must
+    /// eventually FAIL FAST rather than self-wake (busy-spin) forever. Polling
+    /// in a bounded loop must terminate with an error within a finite number of
+    /// iterations — this is the test that would HANG (time out) under the
+    /// pre-fix code that returned a bare `Poll::Pending`.
+    #[test]
+    fn test_non_waking_empty_backend_fails_fast_eventually() {
+        let backend = NonWakingStream::new(0, 0.0, true);
+        let (waker, _test_waker) = make_test_waker();
+        let mut cx = Context::from_waker(&waker);
+
+        let mut async_stream = AsyncAudioStream::new(&backend);
+
+        // Drive the stream the way an executor would: re-poll on each self-wake.
+        // The self-wake budget bounds this to a finite number of iterations, so
+        // a generous cap that EXCEEDS the budget must observe the fail-fast
+        // error. If the stream parked forever (pre-fix bug) this loop would
+        // only ever see Pending and the assertion at the end would fire.
+        let mut saw_error = false;
+        // Budget is 1024; poll comfortably more than that.
+        for _ in 0..4096 {
+            let pinned = Pin::new(&mut async_stream);
+            match pinned.poll_next(&mut cx) {
+                Poll::Pending => continue,
+                Poll::Ready(Some(Err(e))) => {
+                    // Fatal so a pump-style consumer stops cleanly rather than
+                    // retrying the unproductive poll forever.
+                    assert!(
+                        e.is_fatal(),
+                        "fail-fast error must be fatal (contract violation), got {e:?}"
+                    );
+                    assert!(
+                        matches!(e, AudioError::InternalError { .. }),
+                        "fail-fast error should be an InternalError, got {e:?}"
+                    );
+                    saw_error = true;
+                    break;
+                }
+                other => panic!("Expected fail-fast error, got {:?}", other),
+            }
+        }
+        assert!(
+            saw_error,
+            "FH-5: a non-waking, never-producing backend must fail fast within \
+             the bounded self-wake budget, never hang on a bare Pending"
+        );
+    }
+
+    /// FH-5: the self-wake budget must RESET when progress is made, so a
+    /// non-waking backend that produces data slowly (interleaved empties) is
+    /// never starved by the fail-fast cap. We hand out one buffer after a burst
+    /// of empties shorter than the budget and confirm the stream keeps serving
+    /// data rather than erroring.
+    #[test]
+    fn test_non_waking_budget_resets_on_progress() {
+        // Backend starts empty but is flipped to "has one buffer" after a few
+        // empty self-wakes — well under the 1024 budget.
+        let backend = NonWakingStream::new(0, 0.9, true);
+        let (waker, _test_waker) = make_test_waker();
+        let mut cx = Context::from_waker(&waker);
+
+        let mut async_stream = AsyncAudioStream::new(&backend);
+
+        // A handful of empty polls (consume part of the budget).
+        for _ in 0..8 {
+            let pinned = Pin::new(&mut async_stream);
+            assert!(matches!(pinned.poll_next(&mut cx), Poll::Pending));
+        }
+
+        // Now make a buffer available; the next poll yields it (fast path) and
+        // resets the budget.
+        backend.remaining.store(1, Ordering::SeqCst);
+        {
+            let pinned = Pin::new(&mut async_stream);
+            match pinned.poll_next(&mut cx) {
+                Poll::Ready(Some(Ok(buf))) => assert_eq!(buf.data()[0], 0.9),
+                other => panic!("Expected the produced buffer, got {:?}", other),
+            }
+        }
+
+        // After the reset, a fresh burst of empties (again under budget) still
+        // does not error — proving the budget was refilled by the yield.
+        for _ in 0..8 {
+            let pinned = Pin::new(&mut async_stream);
+            assert!(
+                matches!(pinned.poll_next(&mut cx), Poll::Pending),
+                "budget should have reset after yielding a buffer; no premature error"
+            );
         }
     }
 }

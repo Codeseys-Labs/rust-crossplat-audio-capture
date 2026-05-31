@@ -37,6 +37,15 @@ pub struct PlatformCapabilities {
     pub supports_process_tree_capture: bool,
     /// Whether device selection is supported.
     pub supports_device_selection: bool,
+    /// Whether the backend can deliver device hot-plug / default-change
+    /// notifications via [`DeviceEnumerator::watch`](crate::core::interface::DeviceEnumerator::watch).
+    ///
+    /// `false` means [`watch`](crate::core::interface::DeviceEnumerator::watch)
+    /// returns [`AudioError::PlatformNotSupported`](crate::core::error::AudioError::PlatformNotSupported);
+    /// honest reporting, never claim a notification source the backend has not
+    /// wired up. Each platform arm flips this to `true` only once its OS listener
+    /// is implemented.
+    pub supports_device_change_notifications: bool,
     /// Supported sample formats.
     pub supported_sample_formats: Vec<SampleFormat>,
     /// Supported sample rate range (min, max) in Hz.
@@ -48,29 +57,61 @@ pub struct PlatformCapabilities {
 }
 
 impl PlatformCapabilities {
+    /// The whitelist of sample rates the [`AudioCaptureBuilder`] accepts at
+    /// configuration time, as a single source of truth.
+    ///
+    /// This is the *config-time contract* — the exact set
+    /// [`AudioCaptureBuilder::build`] / `preflight` validate the requested rate
+    /// against — and is intentionally narrower than the per-platform
+    /// [`sample_rate_range`](Self::sample_rate_range) a device may negotiate to.
+    /// Callers can pre-validate a rate against this list (e.g. populating a UI
+    /// drop-down) without constructing a builder, and the builder references the
+    /// same const so the two cannot drift.
+    ///
+    /// [`AudioCaptureBuilder`]: crate::api::AudioCaptureBuilder
+    /// [`AudioCaptureBuilder::build`]: crate::api::AudioCaptureBuilder::build
+    pub const SUPPORTED_SAMPLE_RATES: [u32; 6] = [22050, 32000, 44100, 48000, 88200, 96000];
+
+    /// Returns the builder's config-time sample-rate whitelist as a slice.
+    ///
+    /// A borrowed view of [`SUPPORTED_SAMPLE_RATES`](Self::SUPPORTED_SAMPLE_RATES)
+    /// for callers that prefer a `&[u32]` (e.g. to `contains` / iterate without
+    /// naming the array length). The contents are identical to the const.
+    pub fn supported_sample_rates() -> &'static [u32] {
+        &Self::SUPPORTED_SAMPLE_RATES
+    }
+
     /// Query the capabilities of the current platform's audio backend.
     ///
-    /// This is determined at compile time based on the target OS.
+    /// Determined at compile time from BOTH the target OS *and* the matching
+    /// platform feature flag (`feat_windows`/`feat_linux`/`feat_macos`). The
+    /// backend modules are gated on `all(target_os = X, feature = feat_X)`
+    /// (see `src/audio/mod.rs`), so when the OS matches but its feature is not
+    /// enabled there is no backend to back the report — we must return
+    /// the all-false `unsupported` capabilities rather than claim support a capture call would
+    /// then refuse with `PlatformNotSupported`. Gating only on `target_os`
+    /// (the previous behavior) made `--no-default-features --features
+    /// feat_windows` on Linux falsely report full support.
     pub fn query() -> Self {
-        #[cfg(target_os = "windows")]
+        #[cfg(all(target_os = "windows", feature = "feat_windows"))]
         {
-            Self::windows()
+            return Self::windows();
         }
 
-        #[cfg(target_os = "macos")]
+        #[cfg(all(target_os = "macos", feature = "feat_macos"))]
         {
-            Self::macos()
+            return Self::macos();
         }
 
-        #[cfg(target_os = "linux")]
+        #[cfg(all(target_os = "linux", feature = "feat_linux"))]
         {
-            Self::linux()
+            return Self::linux();
         }
 
-        #[cfg(not(any(target_os = "windows", target_os = "macos", target_os = "linux")))]
-        {
-            Self::unsupported()
-        }
+        // OS without its backend feature enabled, or an unsupported OS: no
+        // backend is compiled in, so report nothing as supported.
+        #[allow(unreachable_code)]
+        Self::unsupported()
     }
 
     /// Check if a specific sample format is supported.
@@ -79,8 +120,13 @@ impl PlatformCapabilities {
     }
 
     /// Check if a specific sample rate is supported.
+    ///
+    /// A rate of 0 is never valid, and the `unsupported` backend reports a
+    /// degenerate `(0, 0)` range meaning "nothing supported" — guard against
+    /// both so the honest-capability contract holds (a rate of 0 must not slip
+    /// through as "in range" for the empty stub).
     pub fn supports_sample_rate(&self, rate: u32) -> bool {
-        rate >= self.sample_rate_range.0 && rate <= self.sample_rate_range.1
+        rate > 0 && rate >= self.sample_rate_range.0 && rate <= self.sample_rate_range.1
     }
 
     /// Check if a specific channel count is supported.
@@ -90,13 +136,15 @@ impl PlatformCapabilities {
 
     // ── Platform constructors (private) ──────────────────────────────────
 
-    #[cfg(target_os = "windows")]
+    #[cfg(all(target_os = "windows", feature = "feat_windows"))]
     fn windows() -> Self {
         Self {
             supports_system_capture: true,
             supports_application_capture: true, // WASAPI session capture
             supports_process_tree_capture: true, // WASAPI include_tree=true
             supports_device_selection: true,
+            // IMMNotificationClient watch() arm is implemented (rsac-e360).
+            supports_device_change_notifications: true,
             supported_sample_formats: vec![
                 SampleFormat::I16,
                 SampleFormat::I24,
@@ -109,7 +157,7 @@ impl PlatformCapabilities {
         }
     }
 
-    #[cfg(target_os = "macos")]
+    #[cfg(all(target_os = "macos", feature = "feat_macos"))]
     fn macos() -> Self {
         // Process Tap API requires macOS 14.4+. Detect at runtime.
         let (major, minor, _patch) = get_macos_version();
@@ -120,6 +168,9 @@ impl PlatformCapabilities {
             supports_application_capture: has_process_tap, // CoreAudio Process Tap (14.4+)
             supports_process_tree_capture: has_process_tap, // Multi-PID tap via sysinfo child discovery (14.4+)
             supports_device_selection: true,
+            // CoreAudio AudioObjectPropertyListener watch() arm landed (rsac-3093):
+            // device-list + default-output/input change notifications are wired up.
+            supports_device_change_notifications: true,
             supported_sample_formats: vec![SampleFormat::I16, SampleFormat::I32, SampleFormat::F32],
             sample_rate_range: (8000, 192000),
             max_channels: 8,
@@ -127,13 +178,18 @@ impl PlatformCapabilities {
         }
     }
 
-    #[cfg(target_os = "linux")]
+    #[cfg(all(target_os = "linux", feature = "feat_linux"))]
     fn linux() -> Self {
         Self {
             supports_system_capture: true,
             supports_application_capture: true, // PipeWire node targeting
             supports_process_tree_capture: true, // /proc-based child PID discovery + pw-dump node lookup
             supports_device_selection: true,
+            // PipeWire registry-listener watch() arm landed (rsac-b92e):
+            // LinuxDeviceEnumerator::watch spawns a persistent registry +
+            // `default` metadata listener thread that delivers DeviceAdded /
+            // DeviceRemoved / DefaultChanged.
+            supports_device_change_notifications: true,
             supported_sample_formats: vec![SampleFormat::I16, SampleFormat::I32, SampleFormat::F32],
             sample_rate_range: (8000, 384000),
             max_channels: 32, // PipeWire supports many channels
@@ -141,13 +197,16 @@ impl PlatformCapabilities {
         }
     }
 
-    #[cfg(not(any(target_os = "windows", target_os = "macos", target_os = "linux")))]
+    /// Capabilities for a build with no compiled-in backend: an unsupported OS,
+    /// or a supported OS whose platform feature flag is disabled. Always
+    /// available so [`query()`](Self::query) has a fallback in every config.
     fn unsupported() -> Self {
         Self {
             supports_system_capture: false,
             supports_application_capture: false,
             supports_process_tree_capture: false,
             supports_device_selection: false,
+            supports_device_change_notifications: false,
             supported_sample_formats: vec![],
             sample_rate_range: (0, 0),
             max_channels: 0,
@@ -257,6 +316,18 @@ fn parse_version_string(s: &str) -> Option<(u32, u32, u32)> {
 mod tests {
     use super::*;
 
+    /// True when a real backend is compiled in — i.e. the current target_os
+    /// matches an enabled `feat_*` feature. When false (e.g. building with
+    /// `feat_linux` on Windows), `query()` returns the all-false `unsupported`
+    /// stub, so the cross-platform "a real backend supports X" assertions below
+    /// must be skipped. Mirrors the gating in `PlatformCapabilities::query()`
+    /// (audit H4).
+    const HAS_BACKEND: bool = cfg!(any(
+        all(target_os = "windows", feature = "feat_windows"),
+        all(target_os = "macos", feature = "feat_macos"),
+        all(target_os = "linux", feature = "feat_linux"),
+    ));
+
     #[test]
     fn query_returns_valid_capabilities() {
         // `caps` is used in cfg-gated blocks below. On targets where no
@@ -268,35 +339,89 @@ mod tests {
         #[allow(unused_variables)]
         let caps = PlatformCapabilities::query();
 
-        #[cfg(target_os = "linux")]
+        #[cfg(all(target_os = "linux", feature = "feat_linux"))]
         {
             assert_eq!(caps.backend_name, "PipeWire");
             assert!(caps.supports_system_capture);
             assert!(caps.supports_application_capture);
             assert!(caps.supports_process_tree_capture);
             assert!(caps.supports_device_selection);
+            // watch() arm landed for Linux (rsac-b92e).
+            assert!(caps.supports_device_change_notifications);
             assert_eq!(caps.max_channels, 32);
             assert_eq!(caps.sample_rate_range, (8000, 384000));
             assert!(!caps.supported_sample_formats.is_empty());
         }
 
-        #[cfg(target_os = "windows")]
+        #[cfg(all(target_os = "windows", feature = "feat_windows"))]
         {
             assert_eq!(caps.backend_name, "WASAPI");
             assert!(caps.supports_system_capture);
         }
 
-        #[cfg(target_os = "macos")]
+        #[cfg(all(target_os = "macos", feature = "feat_macos"))]
         {
             assert_eq!(caps.backend_name, "CoreAudio");
             assert!(caps.supports_system_capture);
         }
     }
 
+    // Regression (audit H4): query() must be gated on BOTH target_os AND the
+    // matching feature. When the current OS's backend feature is NOT enabled,
+    // query() must report the all-false `unsupported` backend rather than
+    // claiming support that every capture call would then refuse.
+    #[test]
+    fn query_reports_unsupported_without_matching_feature() {
+        // This test only makes a claim in the configuration where no
+        // (target_os, feature) pair is active. In the normal default-feature
+        // build the matching feature IS enabled, so we assert the positive case
+        // there and the negative case otherwise.
+        let caps = PlatformCapabilities::query();
+
+        #[cfg(any(
+            all(target_os = "windows", feature = "feat_windows"),
+            all(target_os = "macos", feature = "feat_macos"),
+            all(target_os = "linux", feature = "feat_linux"),
+        ))]
+        {
+            // A backend is compiled in → must NOT be the unsupported stub.
+            assert_ne!(
+                caps.backend_name, "unsupported",
+                "with the matching feature enabled, query() must report a real backend"
+            );
+        }
+
+        #[cfg(not(any(
+            all(target_os = "windows", feature = "feat_windows"),
+            all(target_os = "macos", feature = "feat_macos"),
+            all(target_os = "linux", feature = "feat_linux"),
+        )))]
+        {
+            // No backend compiled in (e.g. feat_linux on Windows) → honest stub.
+            assert_eq!(caps.backend_name, "unsupported");
+            assert!(!caps.supports_system_capture);
+            assert!(!caps.supports_application_capture);
+            assert!(!caps.supports_process_tree_capture);
+        }
+    }
+
     #[test]
     fn supports_format_f32() {
         let caps = PlatformCapabilities::query();
+        // The unsupported stub advertises no formats; only assert F32 support
+        // when a real backend is compiled in.
+        #[cfg(any(
+            all(target_os = "windows", feature = "feat_windows"),
+            all(target_os = "macos", feature = "feat_macos"),
+            all(target_os = "linux", feature = "feat_linux"),
+        ))]
         assert!(caps.supports_format(SampleFormat::F32));
+        #[cfg(not(any(
+            all(target_os = "windows", feature = "feat_windows"),
+            all(target_os = "macos", feature = "feat_macos"),
+            all(target_os = "linux", feature = "feat_linux"),
+        )))]
+        assert!(!caps.supports_format(SampleFormat::F32));
     }
 
     #[test]
@@ -306,6 +431,7 @@ mod tests {
             supports_application_capture: false,
             supports_process_tree_capture: false,
             supports_device_selection: false,
+            supports_device_change_notifications: false,
             supported_sample_formats: vec![SampleFormat::I16],
             sample_rate_range: (8000, 48000),
             max_channels: 2,
@@ -316,6 +442,9 @@ mod tests {
 
     #[test]
     fn supports_sample_rate_48000() {
+        if !HAS_BACKEND {
+            return; // unsupported stub has rate range (0,0)
+        }
         let caps = PlatformCapabilities::query();
         assert!(caps.supports_sample_rate(48000));
     }
@@ -323,12 +452,17 @@ mod tests {
     #[test]
     fn supports_sample_rate_zero_is_false() {
         let caps = PlatformCapabilities::query();
-        // 0 is below the minimum range for any real platform
+        // Rate 0 is never valid — true on every backend, including the
+        // `unsupported` stub whose (0,0) range is now explicitly rejected by
+        // the `rate > 0` guard in supports_sample_rate (review R2-#3).
         assert!(!caps.supports_sample_rate(0));
     }
 
     #[test]
     fn supports_channels_stereo() {
+        if !HAS_BACKEND {
+            return; // stub max_channels is 0
+        }
         let caps = PlatformCapabilities::query();
         assert!(caps.supports_channels(2));
     }
@@ -344,21 +478,21 @@ mod tests {
     // ── Backend name (platform-specific) ────────────────────────────
 
     #[test]
-    #[cfg(target_os = "linux")]
+    #[cfg(all(target_os = "linux", feature = "feat_linux"))]
     fn backend_name_is_pipewire_on_linux() {
         let caps = PlatformCapabilities::query();
         assert_eq!(caps.backend_name, "PipeWire");
     }
 
     #[test]
-    #[cfg(target_os = "windows")]
+    #[cfg(all(target_os = "windows", feature = "feat_windows"))]
     fn backend_name_is_wasapi_on_windows() {
         let caps = PlatformCapabilities::query();
         assert_eq!(caps.backend_name, "WASAPI");
     }
 
     #[test]
-    #[cfg(target_os = "macos")]
+    #[cfg(all(target_os = "macos", feature = "feat_macos"))]
     fn backend_name_is_coreaudio_on_macos() {
         let caps = PlatformCapabilities::query();
         assert_eq!(caps.backend_name, "CoreAudio");
@@ -368,12 +502,18 @@ mod tests {
 
     #[test]
     fn supports_i16_format() {
+        if !HAS_BACKEND {
+            return;
+        }
         let caps = PlatformCapabilities::query();
         assert!(caps.supports_format(SampleFormat::I16));
     }
 
     #[test]
     fn supports_i32_format() {
+        if !HAS_BACKEND {
+            return;
+        }
         let caps = PlatformCapabilities::query();
         assert!(caps.supports_format(SampleFormat::I32));
     }
@@ -381,21 +521,21 @@ mod tests {
     // ── I24 support (platform-specific) ─────────────────────────────
 
     #[test]
-    #[cfg(target_os = "linux")]
+    #[cfg(all(target_os = "linux", feature = "feat_linux"))]
     fn does_not_support_i24_on_linux() {
         let caps = PlatformCapabilities::query();
         assert!(!caps.supports_format(SampleFormat::I24));
     }
 
     #[test]
-    #[cfg(target_os = "windows")]
+    #[cfg(all(target_os = "windows", feature = "feat_windows"))]
     fn supports_i24_on_windows() {
         let caps = PlatformCapabilities::query();
         assert!(caps.supports_format(SampleFormat::I24));
     }
 
     #[test]
-    #[cfg(target_os = "macos")]
+    #[cfg(all(target_os = "macos", feature = "feat_macos"))]
     fn does_not_support_i24_on_macos() {
         let caps = PlatformCapabilities::query();
         assert!(!caps.supports_format(SampleFormat::I24));
@@ -405,6 +545,9 @@ mod tests {
 
     #[test]
     fn supports_sample_rate_min_boundary() {
+        if !HAS_BACKEND {
+            return;
+        }
         let caps = PlatformCapabilities::query();
         assert!(
             caps.supports_sample_rate(8000),
@@ -413,7 +556,10 @@ mod tests {
     }
 
     #[test]
-    #[cfg(any(target_os = "linux", target_os = "windows"))]
+    #[cfg(any(
+        all(target_os = "linux", feature = "feat_linux"),
+        all(target_os = "windows", feature = "feat_windows")
+    ))]
     fn supports_sample_rate_max_boundary_384000() {
         let caps = PlatformCapabilities::query();
         assert!(
@@ -423,7 +569,7 @@ mod tests {
     }
 
     #[test]
-    #[cfg(target_os = "macos")]
+    #[cfg(all(target_os = "macos", feature = "feat_macos"))]
     fn supports_sample_rate_max_boundary_192000() {
         let caps = PlatformCapabilities::query();
         assert!(
@@ -446,7 +592,7 @@ mod tests {
     // ── Channel count boundaries (platform-specific) ────────────────
 
     #[test]
-    #[cfg(target_os = "linux")]
+    #[cfg(all(target_os = "linux", feature = "feat_linux"))]
     fn supports_channels_max_boundary_linux() {
         let caps = PlatformCapabilities::query();
         assert!(caps.supports_channels(32)); // Linux max is 32
@@ -454,7 +600,7 @@ mod tests {
     }
 
     #[test]
-    #[cfg(target_os = "windows")]
+    #[cfg(all(target_os = "windows", feature = "feat_windows"))]
     fn supports_channels_max_boundary_windows() {
         let caps = PlatformCapabilities::query();
         assert!(caps.supports_channels(8)); // Windows max is 8
@@ -462,7 +608,7 @@ mod tests {
     }
 
     #[test]
-    #[cfg(target_os = "macos")]
+    #[cfg(all(target_os = "macos", feature = "feat_macos"))]
     fn supports_channels_max_boundary_macos() {
         let caps = PlatformCapabilities::query();
         assert!(caps.supports_channels(8)); // macOS max is 8
@@ -480,19 +626,25 @@ mod tests {
 
     #[test]
     fn query_system_capture_supported() {
+        if !HAS_BACKEND {
+            return;
+        }
         let caps = PlatformCapabilities::query();
         assert!(caps.supports_system_capture);
     }
 
     #[test]
-    #[cfg(not(target_os = "macos"))]
+    #[cfg(any(
+        all(target_os = "windows", feature = "feat_windows"),
+        all(target_os = "linux", feature = "feat_linux")
+    ))]
     fn query_application_capture_supported() {
         let caps = PlatformCapabilities::query();
         assert!(caps.supports_application_capture);
     }
 
     #[test]
-    #[cfg(target_os = "macos")]
+    #[cfg(all(target_os = "macos", feature = "feat_macos"))]
     fn query_application_capture_reflects_version() {
         let caps = PlatformCapabilities::query();
         let (major, minor, _) = get_macos_version();
@@ -505,21 +657,34 @@ mod tests {
     }
 
     #[test]
-    #[cfg(target_os = "linux")]
+    #[cfg(all(target_os = "linux", feature = "feat_linux"))]
     fn query_process_tree_supported_on_linux() {
         let caps = PlatformCapabilities::query();
         assert!(caps.supports_process_tree_capture);
     }
 
     #[test]
-    #[cfg(target_os = "windows")]
+    #[cfg(all(target_os = "windows", feature = "feat_windows"))]
     fn query_process_tree_supported_on_windows() {
         let caps = PlatformCapabilities::query();
         assert!(caps.supports_process_tree_capture);
     }
 
     #[test]
-    #[cfg(target_os = "macos")]
+    #[cfg(all(target_os = "macos", feature = "feat_macos"))]
+    fn macos_reports_device_change_notifications_supported() {
+        // rsac-3093: the CoreAudio AudioObjectPropertyListener watch() arm is
+        // implemented, so macOS must now honestly advertise device-change
+        // notification support (no longer the false stub).
+        let caps = PlatformCapabilities::query();
+        assert!(
+            caps.supports_device_change_notifications,
+            "macOS should report device-change notification support once watch() is wired up"
+        );
+    }
+
+    #[test]
+    #[cfg(all(target_os = "macos", feature = "feat_macos"))]
     fn query_process_tree_reflects_version_on_macos() {
         let caps = PlatformCapabilities::query();
         let (major, minor, _) = get_macos_version();
@@ -560,7 +725,7 @@ mod tests {
     // ── macOS version detection tests ────────────────────────────────
 
     #[test]
-    #[cfg(target_os = "macos")]
+    #[cfg(all(target_os = "macos", feature = "feat_macos"))]
     fn get_macos_version_returns_nonzero() {
         let (major, _minor, _patch) = get_macos_version();
         // We should always be able to detect the version on a real macOS system
@@ -572,7 +737,7 @@ mod tests {
     }
 
     #[test]
-    #[cfg(target_os = "macos")]
+    #[cfg(all(target_os = "macos", feature = "feat_macos"))]
     fn parse_version_string_typical() {
         assert_eq!(parse_version_string("14.4.1"), Some((14, 4, 1)));
         assert_eq!(parse_version_string("15.0"), Some((15, 0, 0)));
@@ -580,10 +745,36 @@ mod tests {
     }
 
     #[test]
-    #[cfg(target_os = "macos")]
+    #[cfg(all(target_os = "macos", feature = "feat_macos"))]
     fn parse_version_string_edge_cases() {
         assert_eq!(parse_version_string("14"), Some((14, 0, 0)));
         assert_eq!(parse_version_string(""), None);
         assert_eq!(parse_version_string("abc"), None);
+    }
+
+    // ── SUPPORTED_SAMPLE_RATES const / supported_sample_rates() (rsac-c957) ──
+
+    /// The promoted public const is the canonical config-time whitelist and must
+    /// equal the documented six rates exactly.
+    #[test]
+    fn supported_sample_rates_const_is_canonical() {
+        assert_eq!(
+            PlatformCapabilities::SUPPORTED_SAMPLE_RATES,
+            [22050, 32000, 44100, 48000, 88200, 96000]
+        );
+    }
+
+    /// `supported_sample_rates()` returns a slice over the same const: 48000 is
+    /// present, 11025 (a valid audio rate that is *not* whitelisted) is absent.
+    #[test]
+    fn supported_sample_rates_slice_membership() {
+        let rates = PlatformCapabilities::supported_sample_rates();
+        assert!(rates.contains(&48000), "48000 must be in the whitelist");
+        assert!(
+            !rates.contains(&11025),
+            "11025 is not a whitelisted config-time rate"
+        );
+        // The slice is a borrowed view of the const — identical contents/length.
+        assert_eq!(rates, &PlatformCapabilities::SUPPORTED_SAMPLE_RATES);
     }
 }

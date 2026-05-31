@@ -6,8 +6,11 @@ substrate that the Go binding ([`rsac-go`](../rsac-go/)) builds against
 and can also be linked directly from C, C++, or any language with a C
 FFI story.
 
-This crate is `publish = false` — it is not shipped to crates.io. Use it
-by building it locally against a checkout of the rsac repository.
+This crate carries full crates.io package metadata and is publishable, but
+ships with `publish = false` set in `Cargo.toml` so routine workspace builds
+can never trigger an accidental `cargo publish`. For local use, build it
+against a checkout of the rsac repository. To release it to crates.io, see
+[Publishing to crates.io](#publishing-to-cratesio) below.
 
 ## What you get
 
@@ -151,13 +154,78 @@ The rules are spelled out in the crate-level Rust doc. Summary:
 curated `include/rsac.h` is hand-maintained and should track the
 generated file; use it as the consumer-facing header.
 
-To run cbindgen manually:
+To run cbindgen manually, target **`rsac_generated.h`** — never the curated
+`rsac.h`, which is hand-maintained and linked against by `rsac-go`:
 
 ```bash
 cbindgen --config bindings/rsac-ffi/cbindgen.toml \
          --crate rsac-ffi \
-         --output bindings/rsac-ffi/include/rsac.h
+         --output bindings/rsac-ffi/include/rsac_generated.h
 ```
+
+> **Do not** point `--output` at `include/rsac.h`. Overwriting the curated
+> header with the generated twin would clobber its hand-written documentation
+> and ABI grouping. The two are kept honest by CI: the `check-bindings` job
+> builds `rsac-ffi` (which runs cbindgen via `build.rs`) and diffs the
+> generated header's **symbol set** — every `typedef`/`struct`/`enum` name plus
+> every exported function name — against the curated `rsac.h`, tolerating only
+> the tagged-vs-anonymous typedef style difference. Any genuine drift (a new,
+> renamed, or removed symbol) fails CI, so the curated header can never silently
+> fall behind the generated one. The generated header carries the same C names
+> as the curated header because the Rust types are already named in their final
+> C-ABI form (no cbindgen prefix is applied — see `cbindgen.toml`).
+
+## Stream statistics and negotiated format
+
+Two out-parameter accessors expose diagnostics without any heap allocation —
+the caller passes a stack value and the library fills it in. Neither result
+needs freeing.
+
+```c
+RsacStreamStats stats;
+if (rsac_capture_stream_stats(capture, &stats) == RSAC_OK) {
+    printf("pushed=%llu captured=%llu dropped=%llu (%.1f%% lost), up %.1fs, running=%d\n",
+           (unsigned long long)stats.buffers_pushed,
+           (unsigned long long)stats.buffers_captured,
+           (unsigned long long)stats.buffers_dropped,
+           stats.dropped_ratio * 100.0,
+           stats.uptime_secs,
+           stats.is_running);
+}
+
+RsacAudioFormat fmt;
+if (rsac_capture_format(capture, &fmt) == RSAC_OK) {
+    printf("%u ch @ %u Hz, %u-bit\n",
+           fmt.channels, fmt.sample_rate, fmt.bits_per_sample);
+}
+```
+
+`rsac_capture_stream_stats()` works at any time: before the stream starts (or
+after it stops) it reports an all-zero snapshot with `is_running == 0`.
+`rsac_capture_format()` returns `RSAC_ERROR_STREAM_FAILED` until a stream has
+been created (the negotiated format is only known once the backend opens it),
+so call it after `rsac_capture_start()`.
+
+## Publishing to crates.io
+
+This crate is publish-ready: it declares `description`, `license`,
+`repository`, `readme`, `keywords`, `categories`, and `rust-version`, and its
+`rsac` dependency carries both a `path` (for workspace/local dev) and a
+`version` requirement. crates.io ignores `path` and resolves the published
+`rsac` by its `version`, so the path entry does **not** block publishing.
+
+To cut a release:
+
+1. Ensure the matching `rsac` version is already published to crates.io (the
+   `version = "x.y.z"` in `[dependencies].rsac` must resolve there).
+2. In `Cargo.toml`, set `publish = true` (or delete the `publish = false`
+   line). It is intentionally `false` in-tree to prevent an accidental
+   `cargo publish` during normal development.
+3. `cargo publish -p rsac-ffi --dry-run` to verify, then publish for real.
+
+The `path` entry can stay in place for the published manifest; if you prefer a
+pure-registry dependency, drop `path` and keep only
+`rsac = { version = "x.y.z", default-features = false }`.
 
 ## License
 

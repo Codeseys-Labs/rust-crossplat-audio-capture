@@ -54,7 +54,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 let rms = rms_level(buffer.data());
                 let db = if rms > 0.0 { 20.0 * rms.log10() } else { -60.0 };
 
-                if buffer_count % 10 == 0 {
+                if buffer_count.is_multiple_of(10) {
                     println!(
                         "[{:.1}s] Buffers: {}, Frames: {}, Level: {:.1} dB",
                         start.elapsed().as_secs_f64(),

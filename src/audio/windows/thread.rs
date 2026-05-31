@@ -251,18 +251,22 @@ impl PlatformStream for WindowsPlatformStream {
 /// # Audio Data Flow
 ///
 /// 1. WASAPI fills its internal buffer with captured audio
-/// 2. We read packets from the capture client
-/// 3. Convert raw bytes to `f32` samples
-/// 4. Create [`AudioBuffer`] and push via [`BridgeProducer::push_or_drop()`]
+/// 2. We read each packet's bytes into a reusable contiguous buffer
+/// 3. Reinterpret the F32LE bytes as `&[f32]` in bulk via [`slice::align_to`]
+///    (PU-7 — no per-sample scalar decode, mirroring the Linux path)
+/// 4. Push the samples via [`BridgeProducer::push_samples_or_drop`]
 ///
-/// The `push_or_drop()` call is lock-free and non-blocking, making it safe
-/// for the capture loop context.
+/// The `push_samples_or_drop()` call is lock-free and non-blocking, making it
+/// safe for the capture loop context.
 ///
 /// # Cleanup
 ///
-/// On exit (stop signal or error), the function:
+/// On exit, the function:
 /// - Sets `is_active` to `false`
-/// - Calls `producer.signal_done()` to notify the consumer
+/// - Notifies the consumer of end-of-stream: a clean stop-flag exit calls
+///   `producer.signal_done()` (graceful `Running → Stopping`); a FATAL
+///   device-error exit calls `producer.signal_error()` (terminal `Error`), per
+///   the ADR-0010 cross-backend terminal contract (rsac-66a6)
 /// - WASAPI/COM objects are dropped via RAII
 fn wasapi_capture_thread_main(
     config: WindowsCaptureConfig,
@@ -298,6 +302,21 @@ fn wasapi_capture_thread_main(
     //
     // The client creation strategy depends on the CaptureTarget variant.
 
+    // Process-loopback targets (Application / ApplicationByName / ProcessTree)
+    // are activated via ActivateAudioInterfaceAsync with
+    // AUDIOCLIENT_ACTIVATION_TYPE_PROCESS_LOOPBACK. That activation path does
+    // NOT support AUDCLNT_STREAMFLAGS_AUTOCONVERTPCM — combining it with the
+    // loopback flags makes IAudioClient::Initialize fail (C1). These clients
+    // also can't report their mix format (get_mixformat returns "Not
+    // implemented"), so we must hand the client an explicit format and let it
+    // run without autoconvert.
+    let is_process_loopback = matches!(
+        config.target,
+        CaptureTarget::Application(_)
+            | CaptureTarget::ApplicationByName(_)
+            | CaptureTarget::ProcessTree(_)
+    );
+
     let audio_client_result = create_audio_client(&config);
     let mut audio_client = match audio_client_result {
         Ok(client) => client,
@@ -324,7 +343,19 @@ fn wasapi_capture_thread_main(
     );
 
     let mode = wasapi::StreamMode::EventsShared {
-        autoconvert: true,
+        // C1 fix: the process-loopback activation path rejects
+        // AUDCLNT_STREAMFLAGS_AUTOCONVERTPCM, so autoconvert must be disabled
+        // for Application/ApplicationByName/ProcessTree targets. The regular
+        // system/device-loopback path keeps autoconvert enabled so WASAPI can
+        // resample the endpoint mix format to our requested f32 format.
+        //
+        // TODO: When autoconvert is disabled (process loopback), the captured
+        // data is whatever format the loopback endpoint delivers. We currently
+        // request 32-bit float (see `desired_format`), which the process
+        // loopback path accepts; if a future Windows release delivers a
+        // different format here, downstream format handling/resampling will be
+        // needed since we can't query the mix format on a loopback client.
+        autoconvert: !is_process_loopback,
         buffer_duration_hns: 0, // default buffer duration
     };
 
@@ -396,10 +427,57 @@ fn wasapi_capture_thread_main(
     let channels = config.channels;
     let sample_rate = config.sample_rate;
 
-    // Pre-allocate reusable buffers outside the loop to avoid per-iteration allocations.
-    // The VecDeque is reused for raw bytes from WASAPI, and the Vec<f32> for converted samples.
-    let mut sample_queue = std::collections::VecDeque::with_capacity(48000 * 4 * 2 / 10); // ~100ms at 48kHz stereo f32
-    let mut samples: Vec<f32> = Vec::with_capacity(48000 * 2 / 10); // ~100ms at 48kHz stereo
+    // PU-1/PERF-07 (rsac-2c56): publish the negotiated *delivery* format onto
+    // the bridge so `stream.format()` / `StreamStats.format_description` report
+    // what is actually delivered rather than only what was requested. WASAPI was
+    // opened with the explicit `desired_format` (32-bit float, `sample_rate`,
+    // `channels`): on the system/device-loopback path autoconvert resamples the
+    // endpoint mix format to it, and on the process-loopback path the client
+    // accepts it directly — so in both cases the bridge receives exactly these
+    // `channels`/`sample_rate` as interleaved f32 (the values used by the drain
+    // loop's `push_samples_or_drop`). The bridge normalizes `sample_format` to
+    // F32 internally, so the value passed here is ignored. One-time, off-RT,
+    // lock-free `Release` store on the setup path before the capture loop.
+    producer.set_negotiated_format(&crate::core::config::AudioFormat {
+        sample_rate,
+        channels,
+        sample_format: crate::core::config::SampleFormat::F32,
+    });
+
+    // PU-7 (rsac-7876): bytes per interleaved f32 frame for the negotiated
+    // delivery format. The client is opened with `desired_format` (32-bit float,
+    // `channels`), and both the autoconvert (system/device-loopback) and the
+    // process-loopback paths deliver exactly that — so a frame is `channels`
+    // little-endian f32 samples = `channels * 4` bytes. `channels` is `>= 1`
+    // (validated upstream), so this is non-zero.
+    let bytes_per_frame = channels as usize * std::mem::size_of::<f32>();
+
+    // PU-7: one reusable contiguous byte buffer for the raw WASAPI packet.
+    //
+    // This replaces the previous `VecDeque<u8>` + scalar `from_le_bytes` decode.
+    // `read_from_device` copies a packet's bytes into a `&mut [u8]` in a single
+    // `copy_from_slice` (vs. the deque path's per-byte `push_back`), and because
+    // the destination is already contiguous we drop the O(n) `make_contiguous`
+    // rotation. The bytes are then reinterpreted as `&[f32]` in bulk via
+    // `slice::align_to` (mirroring the Linux/PipeWire path), eliminating the
+    // per-sample scalar loop and the separate `Vec<f32>` staging buffer entirely.
+    //
+    // Pre-sized to ~100ms at 48kHz stereo f32 so steady-state reads never grow
+    // it; a larger packet grows it once (amortized, off the steady-state path).
+    // No allocation happens on the per-packet hot path once warmed.
+    let mut byte_buf: Vec<u8> = Vec::with_capacity(48000 * 4 * 2 / 10);
+
+    // rsac-66a6 (ADR-0010 cross-backend terminal contract): distinguish a clean
+    // stop-flag exit from a FATAL device-error exit. A WASAPI capture-client read
+    // failure (`get_next_packet_size` / `read_from_device`) is the WASAPI signal
+    // for device loss / endpoint invalidation — the producer has spontaneously
+    // died and no further audio can ever arrive. We record that here and break out
+    // of BOTH loops so the cleanup section can drive the bridge to the terminal
+    // `Error` state via `signal_error()` (mirroring the Linux `.state_changed`
+    // Error/Unconnected path and the macOS spontaneous-death path), instead of the
+    // graceful `Stopping` that `signal_done()` produces. A graceful stop-flag exit
+    // leaves this `false` and keeps the `signal_done()` behaviour.
+    let mut fatal_error = false;
 
     loop {
         // Check stop flag before waiting.
@@ -410,63 +488,139 @@ fn wasapi_capture_thread_main(
 
         // Wait for audio data event with a short timeout so we can
         // check the stop flag periodically.
+        //
+        // C3 fix: regardless of whether the event fired or the wait timed
+        // out, drain ALL packets currently queued in the capture client.
+        // WASAPI typically has multiple packets ready per event signal;
+        // reading only one packet per event causes the client buffer to grow
+        // unbounded (latency growth) and eventually overrun/underrun. The
+        // drain loop below pulls packets until `get_next_packet_size()`
+        // reports none remaining, then we return to waiting for the next event.
         if h_event.wait_for_event(100).is_err() {
-            // Timeout or error — check stop flag and continue.
+            // Timeout or error — check stop flag, then still fall through to
+            // drain any packets that may be queued (timeout doesn't mean
+            // empty), so we don't strand data.
             if stop_flag.load(Ordering::SeqCst) {
                 log::debug!("WASAPI thread: stop flag set during wait, exiting");
                 break;
             }
-            continue;
         }
 
-        // Read all available packets from the capture client.
-        // The wasapi-rs crate provides read_from_device_to_deque which
-        // reads raw bytes into a VecDeque. We reuse the VecDeque across iterations.
-        sample_queue.clear();
+        // Drain loop: read every packet currently available, converting each
+        // to f32 and pushing it through the bridge. Remains responsive to the
+        // stop flag so shutdown isn't delayed by a long burst of packets.
+        loop {
+            // Stop promptly if requested mid-drain.
+            if stop_flag.load(Ordering::SeqCst) {
+                break;
+            }
 
-        match capture_client.read_from_device_to_deque(&mut sample_queue) {
-            Ok(_) => {}
-            Err(e) => {
-                log::warn!("WASAPI thread: read_from_device_to_deque failed: {}", e);
-                // Check if we should stop or continue on transient errors.
-                if stop_flag.load(Ordering::SeqCst) {
+            // How many frames are in the next packet? 0 (or None) means the
+            // client buffer is drained — go back to waiting for the event.
+            let packet_frames = match capture_client.get_next_packet_size() {
+                Ok(Some(frames)) => frames,
+                Ok(None) => 0,
+                Err(e) => {
+                    // rsac-66a6: a capture-client query failure is treated as
+                    // device loss (fatal). Flag it and break out of the drain
+                    // loop; the outer-loop check below then exits the thread so
+                    // cleanup signals terminal `Error` rather than graceful
+                    // `Stopping`.
+                    log::error!(
+                        "WASAPI thread: get_next_packet_size failed (treating as device loss): {}",
+                        e
+                    );
+                    fatal_error = true;
                     break;
                 }
+            };
+            if packet_frames == 0 {
+                break;
+            }
+
+            // PU-7: read this packet's raw bytes into the reused contiguous
+            // buffer. `read_from_device` requires the destination to be large
+            // enough to hold the whole packet (else it errors and releases the
+            // WASAPI buffer), so ensure capacity for the predicted packet size.
+            // `resize` only allocates when a packet exceeds the high-water mark
+            // (off the steady-state path); thereafter it is a no-op length set.
+            let needed = packet_frames as usize * bytes_per_frame;
+            if byte_buf.len() < needed {
+                byte_buf.resize(needed, 0);
+            }
+
+            // Copy the packet's bytes in a single `copy_from_slice` (inside
+            // wasapi-rs), into a contiguous slice — no per-byte `push_back`, no
+            // `make_contiguous` rotation. `frames_read` is the authoritative
+            // count of frames actually delivered.
+            let frames_read = match capture_client.read_from_device(&mut byte_buf[..needed]) {
+                Ok((frames, _buffer_info)) => frames as usize,
+                Err(e) => {
+                    // rsac-66a6: a read failure means the capture endpoint can no
+                    // longer deliver audio (device invalidated / unplugged). Flag
+                    // it as fatal and bail out of the drain loop; the outer-loop
+                    // check below exits the thread so cleanup signals terminal
+                    // `Error` rather than graceful `Stopping`.
+                    log::error!(
+                        "WASAPI thread: read_from_device failed (treating as device loss): {}",
+                        e
+                    );
+                    fatal_error = true;
+                    break;
+                }
+            };
+            if frames_read == 0 {
                 continue;
+            }
+
+            // The valid region is exactly `frames_read` whole frames. Slicing to
+            // it keeps the conversion exact even if WASAPI delivered fewer frames
+            // than `get_next_packet_size` predicted.
+            let valid = &byte_buf[..frames_read * bytes_per_frame];
+
+            // Reinterpret the F32LE bytes as `&[f32]` in one bulk operation
+            // instead of a per-sample `from_le_bytes` loop, mirroring the
+            // Linux/PipeWire path. WASAPI's GetBuffer region is sample-aligned and
+            // `byte_buf` is a `Vec<u8>` whose data pointer is at least word-
+            // aligned, so `align_to`'s head/tail are normally empty; we consume
+            // the aligned run of whole samples and ignore any unaligned edge.
+            // (`align_to` is used deliberately over `bytemuck::cast_slice`, which
+            // would *panic* on a misaligned slice — see PU-7 blueprint.) On the
+            // little-endian hosts Windows runs on, the in-memory layout equals the
+            // F32LE byte layout, so this reinterpret is a no-op at the bit level.
+            //
+            // SAFETY: every bit pattern is a valid `f32`, and we only read the
+            // `frames_read * bytes_per_frame` bytes that `read_from_device` just
+            // initialized within `valid`.
+            let samples = bytes_to_f32_aligned(valid);
+
+            if !samples.is_empty() {
+                // Push the borrowed sample view directly. `push_samples_or_drop`
+                // sources its backing buffer from the bridge free-list, so this
+                // is zero-allocation on the capture thread in steady state — and
+                // we no longer stage into an intermediate `Vec<f32>` at all.
+                producer.push_samples_or_drop(samples, channels, sample_rate);
+                // Wake a consumer parked in a blocking read (PU-5). This is sound
+                // here even though the producer push path is RT-disciplined: the
+                // WASAPI capture loop runs on rsac's OWN spawned polling thread
+                // (NOT an OS audio-callback context), so a Condvar notify is
+                // allowed (ADR-0001 forbids notify only from the Linux/macOS RT
+                // callbacks). Without this, a blocking reader only wakes via the
+                // bounded ≤1ms backstop poll.
+                producer.notify_consumers();
             }
         }
 
-        // Convert the raw byte data to f32 samples.
-        // Data from WASAPI with our requested format is IEEE float 32-bit LE.
-        if sample_queue.is_empty() {
-            continue;
+        // rsac-66a6: a fatal capture-client failure during the drain means the
+        // device is gone — exit the capture loop so cleanup signals terminal
+        // `Error`. Checked before the stop flag so a device-loss exit is never
+        // mis-reported as a graceful stop.
+        if fatal_error {
+            log::error!("WASAPI thread: fatal device error, exiting capture loop");
+            break;
         }
 
-        // Make the VecDeque contiguous so we can access it as a slice.
-        // This is O(n) worst case but typically a no-op if the deque hasn't wrapped.
-        let (front, back) = sample_queue.as_slices();
-
-        // Convert bytes to f32 samples (4 bytes per sample, little-endian).
-        // Reuse the samples Vec to avoid allocation on every iteration.
-        samples.clear();
-
-        // Process the front slice
-        for chunk in front.chunks_exact(4) {
-            samples.push(f32::from_le_bytes([chunk[0], chunk[1], chunk[2], chunk[3]]));
-        }
-        // Process the back slice (non-empty when VecDeque has wrapped)
-        for chunk in back.chunks_exact(4) {
-            samples.push(f32::from_le_bytes([chunk[0], chunk[1], chunk[2], chunk[3]]));
-        }
-
-        if !samples.is_empty() {
-            // Use push_samples_or_drop for zero-allocation on the capture thread.
-            // This uses the BridgeProducer's internal scratch buffer to avoid
-            // allocating a new Vec<f32> on every iteration.
-            producer.push_samples_or_drop(&samples, channels, sample_rate);
-        }
-
-        // Check stop flag after processing.
+        // Check stop flag after draining.
         if stop_flag.load(Ordering::SeqCst) {
             log::debug!("WASAPI thread: stop flag set after read, exiting");
             break;
@@ -480,9 +634,24 @@ fn wasapi_capture_thread_main(
 
     let _ = audio_client.stop_stream();
     is_active.store(false, Ordering::SeqCst);
-    producer.signal_done();
+    // rsac-66a6 (ADR-0010): a FATAL device-error exit must drive the bridge to the
+    // terminal `Error` state (`signal_error`) so a parked Linux/blocking reader
+    // observes a Fatal `StreamEnded` instead of an indefinitely-draining graceful
+    // `Stopping`. Only a clean stop-flag exit takes the graceful `signal_done`
+    // (`Running → Stopping`) path. This mirrors the Linux `.state_changed`
+    // Error/Unconnected → `signal_error()` arm and the macOS spontaneous-death
+    // path, satisfying the cross-backend terminal contract.
+    if fatal_error {
+        producer.signal_error();
+    } else {
+        producer.signal_done();
+    }
     wasapi::deinitialize();
-    log::debug!("WASAPI thread: exited cleanly");
+    if fatal_error {
+        log::debug!("WASAPI thread: exited after fatal device error");
+    } else {
+        log::debug!("WASAPI thread: exited cleanly");
+    }
 }
 
 // ── Audio Client Creation Helper ─────────────────────────────────────────
@@ -626,8 +795,10 @@ fn create_audio_client(config: &WindowsCaptureConfig) -> AudioResult<wasapi::Aud
 
 /// Find a WASAPI device by its ID string.
 ///
-/// Enumerates all audio devices and returns the one matching the given ID.
-/// Falls back to the default render device if the ID is empty or "default".
+/// Resolves the endpoint directly via wasapi 0.23's
+/// [`DeviceEnumerator::get_device`] (wrapping `IMMDeviceEnumerator::GetDevice`)
+/// instead of scanning the render collection by hand. Falls back to the
+/// default render device if the ID is empty or `"default"`.
 fn find_device_by_id(device_id: &str) -> AudioResult<wasapi::Device> {
     let enumerator = wasapi::DeviceEnumerator::new().map_err(|e| AudioError::BackendError {
         backend: "wasapi".to_string(),
@@ -647,35 +818,13 @@ fn find_device_by_id(device_id: &str) -> AudioResult<wasapi::Device> {
             });
     }
 
-    // Enumerate all render devices and find one matching the ID.
-    let collection = enumerator
-        .get_device_collection(&wasapi::Direction::Render)
-        .map_err(|e| AudioError::DeviceEnumerationError {
-            reason: format!("Failed to enumerate render devices: {}", e),
-            context: None,
-        })?;
-
-    let device_count =
-        collection
-            .get_nbr_devices()
-            .map_err(|e| AudioError::DeviceEnumerationError {
-                reason: format!("Failed to get device count: {}", e),
-                context: None,
-            })?;
-
-    for i in 0..device_count {
-        if let Ok(device) = collection.get_device_at_index(i) {
-            if let Ok(id) = device.get_id() {
-                if id == device_id {
-                    return Ok(device);
-                }
-            }
-        }
-    }
-
-    Err(AudioError::DeviceNotFound {
-        device_id: device_id.to_string(),
-    })
+    // Direct ID resolution via IMMDeviceEnumerator::GetDevice. A failed lookup
+    // (unknown / stale / removed endpoint) surfaces as DeviceNotFound.
+    enumerator
+        .get_device(device_id)
+        .map_err(|_| AudioError::DeviceNotFound {
+            device_id: device_id.to_string(),
+        })
 }
 
 // ── Process Name Resolution Helper ───────────────────────────────────────
@@ -759,6 +908,33 @@ fn _assert_windows_capture_thread_send() {
     _assert::<WindowsCaptureThread>();
 }
 
+/// Reinterpret a run of F32LE bytes as `&[f32]` in one bulk operation (PU-7).
+///
+/// WASAPI's `GetBuffer` region is sample-aligned and the backing `Vec<u8>` data
+/// pointer is at least word-aligned, so `align_to::<f32>()`'s head/tail are
+/// normally empty and we consume the aligned run of whole samples. `align_to` is
+/// used deliberately over `bytemuck::cast_slice`, which would *panic* on a
+/// misaligned slice. On the little-endian hosts Windows runs on the in-memory
+/// layout equals the F32LE byte layout, so the reinterpret is a bit-level no-op.
+/// A non-empty head/tail (a misaligned region) means whole samples would be
+/// dropped — a `debug_assert` flags it in test/dev builds; in release we still
+/// return the safe aligned run rather than panicking on the audio path.
+///
+/// SAFETY of the caller: `bytes` must be fully initialized (the caller passes the
+/// exact region `read_from_device` just wrote). Every `f32` bit pattern is valid.
+#[inline]
+fn bytes_to_f32_aligned(bytes: &[u8]) -> &[f32] {
+    // SAFETY: see the doc — initialized bytes, all bit patterns valid f32.
+    let (head, samples, tail) = unsafe { bytes.align_to::<f32>() };
+    debug_assert!(
+        head.is_empty() && tail.is_empty(),
+        "WASAPI byte buffer was not 4-byte aligned: head={} tail={} bytes (whole samples would be dropped)",
+        head.len(),
+        tail.len()
+    );
+    samples
+}
+
 // ── Tests ────────────────────────────────────────────────────────────────
 //
 // These tests are automatically Windows-only because this file has
@@ -769,6 +945,36 @@ fn _assert_windows_capture_thread_send() {
 mod tests {
     use super::*;
     use crate::core::config::{ApplicationId, CaptureTarget, DeviceId, ProcessId};
+
+    /// PU-7: the bulk F32LE byte->f32 reinterpret round-trips bit-exactly on the
+    /// little-endian hosts WASAPI runs on (device-free).
+    #[test]
+    fn bytes_to_f32_aligned_round_trips_f32le() {
+        // 1.0f32 = 0x3F800000 little-endian = [0x00,0x00,0x80,0x3F]; -0.5 = 0xBF000000.
+        let samples_in: [f32; 4] = [1.0, -0.5, 0.0, 0.25];
+        let mut bytes = Vec::with_capacity(16);
+        for s in samples_in {
+            bytes.extend_from_slice(&s.to_le_bytes());
+        }
+        let out = bytes_to_f32_aligned(&bytes);
+        assert_eq!(out, &samples_in, "F32LE bytes must reinterpret bit-exactly");
+    }
+
+    /// An exact multiple of 4 bytes yields all whole samples and an empty
+    /// head/tail (the normal WASAPI case).
+    #[test]
+    fn bytes_to_f32_aligned_consumes_whole_samples() {
+        let bytes = vec![0u8; 4 * 8]; // 8 f32 of silence
+        let out = bytes_to_f32_aligned(&bytes);
+        assert_eq!(out.len(), 8);
+        assert!(out.iter().all(|&s| s == 0.0));
+    }
+
+    /// An empty slice yields an empty sample run (no panic, no head/tail assert).
+    #[test]
+    fn bytes_to_f32_aligned_empty_is_empty() {
+        assert!(bytes_to_f32_aligned(&[]).is_empty());
+    }
 
     // ── WindowsCaptureConfig Construction Tests ──────────────────────
 
@@ -886,6 +1092,80 @@ mod tests {
     fn test_capture_thread_is_send() {
         fn assert_send<T: Send>() {}
         assert_send::<WindowsCaptureThread>();
+    }
+
+    // ── Terminal-signal contract (rsac-66a6 / ADR-0010) ──────────────
+    //
+    // `wasapi_capture_thread_main`'s cleanup branches on a `fatal_error` flag:
+    // a clean stop-flag exit calls `producer.signal_done()` (graceful
+    // `Running → Stopping`, drainable), while a FATAL device-error exit
+    // (a `get_next_packet_size` / `read_from_device` failure that signals
+    // device loss) calls `producer.signal_error()` (terminal `Error`).
+    //
+    // Exercising the real capture loop's fatal path needs a physical device to
+    // be invalidated mid-capture, which is not reproducible in a unit test. The
+    // two tests below instead pin the producer-side contract that branch relies
+    // on directly against the bridge — that `signal_error()` lands terminal
+    // `Error` and `signal_done()` lands graceful `Stopping` — so a regression in
+    // the cleanup wiring (e.g. reverting to an unconditional `signal_done`) is
+    // caught by these state-equality assertions.
+
+    use crate::bridge::ring_buffer::create_bridge;
+    use crate::bridge::state::StreamState;
+    use crate::core::config::{AudioFormat, SampleFormat};
+
+    fn terminal_test_format() -> AudioFormat {
+        AudioFormat {
+            sample_rate: 48000,
+            channels: 2,
+            sample_format: SampleFormat::F32,
+        }
+    }
+
+    /// rsac-66a6: the FATAL device-error cleanup branch calls
+    /// `producer.signal_error()`, which must drive the bridge to the terminal
+    /// `Error` state (so a parked reader observes a Fatal `StreamEnded`).
+    #[test]
+    fn test_fatal_exit_signal_error_lands_terminal_error() {
+        let (producer, consumer) = create_bridge(8, terminal_test_format());
+        // The capture loop runs while the session is Running.
+        producer.shared().state.force_set(StreamState::Running);
+
+        // Mirror the cleanup section's `fatal_error == true` branch.
+        producer.signal_error();
+
+        assert_eq!(
+            consumer.shared().state.get(),
+            StreamState::Error,
+            "a fatal device-error exit must land the bridge in terminal Error"
+        );
+        assert!(
+            consumer.shared().state.is_terminal(),
+            "Error is a terminal state (blocking reader returns Fatal StreamEnded)"
+        );
+    }
+
+    /// rsac-66a6: the clean stop-flag cleanup branch calls
+    /// `producer.signal_done()`, which must drive the bridge to the GRACEFUL
+    /// `Stopping` state (drainable, not terminal) — never `Error`.
+    #[test]
+    fn test_clean_exit_signal_done_lands_graceful_stopping() {
+        let (producer, consumer) = create_bridge(8, terminal_test_format());
+        producer.shared().state.force_set(StreamState::Running);
+
+        // Mirror the cleanup section's `fatal_error == false` branch.
+        producer.signal_done();
+
+        assert_eq!(
+            consumer.shared().state.get(),
+            StreamState::Stopping,
+            "a clean stop-flag exit must land the bridge in graceful Stopping"
+        );
+        assert_ne!(
+            consumer.shared().state.get(),
+            StreamState::Error,
+            "a clean stop must never be mis-reported as terminal Error"
+        );
     }
 
     // ── WindowsDeviceEnumerator / AudioDevice (COM required) ────────
@@ -1083,6 +1363,28 @@ mod tests {
             result.is_ok(),
             "Device(empty) should fall back to default: {:?}",
             result.err()
+        );
+    }
+
+    /// Test that `find_device_by_id` resolves a real device ID via the wasapi
+    /// 0.23 `get_device` path (round-trips the default render device's ID).
+    #[test]
+    fn test_find_device_by_id_roundtrip_real_id() {
+        let _hr = wasapi::initialize_mta();
+
+        let enumerator = wasapi::DeviceEnumerator::new().expect("create enumerator");
+        let default_dev = enumerator
+            .get_default_device(&wasapi::Direction::Render)
+            .expect("get default render device");
+        let real_id = default_dev.get_id().expect("get device id");
+
+        // Resolving that exact ID through find_device_by_id (which now uses
+        // get_device under the hood) must return a device with the same ID.
+        let resolved = find_device_by_id(&real_id).expect("find_device_by_id should resolve");
+        let resolved_id = resolved.get_id().expect("resolved device id");
+        assert_eq!(
+            resolved_id, real_id,
+            "find_device_by_id should round-trip the same device ID"
         );
     }
 

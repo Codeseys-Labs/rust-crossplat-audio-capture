@@ -1,7 +1,8 @@
 # Tag-triggered PyPI release workflow for rsac (Python bindings via PyO3 + maturin).
 #
 # Mirrors .github/workflows/release.yml for the crates.io flow:
-#   1. build-wheels — matrix of (os × python) wheels via maturin-action
+#   1. build-wheels — matrix of (os × arch) ABI3 wheels via maturin-action
+#                     (one cp39-abi3 wheel per platform covers CPython 3.9+)
 #   2. build-sdist  — single sdist for source installs / offline mirrors
 #   3. publish-pypi — merges all artifacts, uploads to PyPI with skip-existing
 #
@@ -9,10 +10,13 @@
 # Bump bindings/rsac-python/pyproject.toml version in lockstep with the root
 # Cargo.toml before tagging (see docs/RELEASE_PROCESS.md).
 #
-# Required GitHub secret:
-#   MATURIN_PYPI_TOKEN — PyPI API token scoped to the `rsac` project.
-#                        Create at https://pypi.org/manage/account/token/
-#                        Add via Settings → Secrets and variables → Actions.
+# Authentication: PyPI Trusted Publishing (OIDC) — NO long-lived secret.
+#   The publish-pypi job requests `id-token: write` and uploads via
+#   pypa/gh-action-pypi-publish, which authenticates with a short-lived
+#   OIDC token. A Trusted Publisher must be configured on the PyPI `rsac`
+#   project for this repo + workflow:
+#     https://docs.pypi.org/trusted-publishers/
+#   (The previous MATURIN_PYPI_TOKEN secret is no longer used.)
 #
 # manylinux note: PyO3/maturin-action `manylinux: auto` currently resolves to
 # manylinux2014 (glibc 2.17) on x86_64, which covers py3.9+. aarch64 Linux
@@ -37,44 +41,105 @@ env:
   CARGO_TERM_COLOR: always
   RUST_BACKTRACE: 1
 
+# Least privilege by default. The publish job opts into id-token: write
+# for PyPI Trusted Publishing (OIDC); no other job needs write scope.
+permissions:
+  contents: read
+
 jobs:
-  # build-wheels: os × python matrix.
+  # build-wheels: os × arch matrix. ONE abi3 wheel per (platform, arch).
+  #
+  # The crate builds against the CPython stable ABI (pyo3 `abi3-py39`), so a
+  # single `cp39-abi3` wheel per platform is importable on CPython 3.9–3.13 —
+  # no per-interpreter matrix dimension (rsac-c353 / rsac#18). We build the
+  # wheel with one interpreter, then smoke-test importing it on several minor
+  # versions to prove the forward-compatibility holds.
+  #
+  # `target` selects the arch: Linux ships both x86_64 and aarch64 manylinux
+  # wheels (aarch64 cross-built inside the manylinux container by
+  # maturin-action), macOS ships a universal2 wheel (x86_64 + arm64), Windows
+  # ships x86_64.
   build-wheels:
-    name: Wheel (${{ matrix.os }} py${{ matrix.python }})
+    name: Wheel (${{ matrix.os }} ${{ matrix.target }})
     strategy:
       fail-fast: false
       matrix:
-        os:
-          - blacksmith-4vcpu-ubuntu-2404
-          - blacksmith-6vcpu-macos-15
-          - blacksmith-4vcpu-windows-2025
-        python: ['3.9', '3.10', '3.11', '3.12', '3.13']
+        include:
+          - os: blacksmith-4vcpu-ubuntu-2404
+            target: x86_64
+            smoke: true   # host arch — importable on this runner
+          - os: blacksmith-4vcpu-ubuntu-2404
+            target: aarch64
+            smoke: false  # cross-built; not loadable on the x86_64 runner
+          - os: blacksmith-6vcpu-macos-15
+            target: universal2
+            smoke: true
+          - os: blacksmith-4vcpu-windows-2025
+            target: x64
+            smoke: true
     runs-on: ${{ matrix.os }}
     steps:
-      - uses: actions/checkout@v5
-
-      - uses: actions/setup-python@v5
+      - uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5
         with:
-          python-version: ${{ matrix.python }}
+          persist-credentials: false
 
-      - uses: dtolnay/rust-toolchain@1.95.0
+      # Install the spread of CPython minor versions used by the abi3
+      # forward-compat smoke test below. The first listed (3.9) is the build
+      # interpreter; the rest prove one cp39-abi3 wheel imports across versions.
+      - uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5
+        with:
+          python-version: |
+            3.9
+            3.13
 
-      - uses: Swatinem/rust-cache@v2
+      - uses: dtolnay/rust-toolchain@e081816240890017053eacbb1bdf337761dc5582 # 1.95.0
+
+      - uses: useblacksmith/rust-cache@81d053bdb0871dcd3f10763c8cc60d0adc41762b # v1 branch head (no v1 tag exists upstream)
         with:
           workspaces: bindings/rsac-python -> target
 
-      - name: Build wheel (maturin-action)
-        uses: PyO3/maturin-action@v1
+      # One abi3 wheel for this (platform, arch). `--interpreter 3.9` pins the
+      # abi3 floor; `manylinux: auto` resolves to manylinux2014 (glibc 2.17,
+      # covers 3.9+) and installs PipeWire dev libs via before-script-linux so
+      # the Linux wheel links feat_linux.
+      - name: Build abi3 wheel (maturin-action)
+        uses: PyO3/maturin-action@e83996d129638aa358a18fbd1dfb82f0b0fb5d3b # v1
         with:
           command: build
-          target: auto
+          target: ${{ matrix.target }}
           manylinux: auto
-          args: --release --out dist --interpreter ${{ matrix.python }} --manifest-path bindings/rsac-python/Cargo.toml
+          # manylinux containers are minimal; the Linux backend needs PipeWire +
+          # clang/llvm (bindgen) to compile feat_linux. No-op on macOS/Windows.
+          before-script-linux: |
+            if command -v yum >/dev/null 2>&1; then
+              yum install -y pipewire-devel clang-devel llvm-devel || \
+                yum install -y pipewire clang llvm || true
+            fi
+          args: --release --out dist --interpreter 3.9 --manifest-path bindings/rsac-python/Cargo.toml
+
+      # abi3 forward-compat smoke test: install the ONE built wheel into BOTH
+      # the 3.9 floor and a newer minor (3.13) and import + call device-free
+      # APIs, proving a single cp39-abi3 wheel works across CPython versions.
+      # Skipped for the cross-built aarch64 wheel (not loadable on x86_64).
+      - name: Smoke test wheel across CPython versions (device-free import)
+        if: ${{ matrix.smoke }}
+        shell: bash
+        run: |
+          WHEEL="$(ls dist/*.whl | head -1)"
+          echo "abi3 wheel: ${WHEEL}"
+          for PYBIN in python3.9 python3.13; do
+            if command -v "$PYBIN" >/dev/null 2>&1; then
+              echo "=== import on $("$PYBIN" --version) ==="
+              "$PYBIN" -m pip install --upgrade pip >/dev/null
+              "$PYBIN" -m pip install --force-reinstall "${WHEEL}"
+              "$PYBIN" -c "import rsac; print('rsac', rsac.__version__); print('backend:', rsac.platform_capabilities().backend_name); print('parse:', rsac.CaptureTarget.parse('system'))"
+            fi
+          done
 
       - name: Upload wheel artifact
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
-          name: wheels-${{ matrix.os }}-py${{ matrix.python }}
+          name: wheels-${{ matrix.os }}-${{ matrix.target }}
           path: dist/*.whl
           if-no-files-found: error
 
@@ -83,45 +148,75 @@ jobs:
     name: Source distribution
     runs-on: blacksmith-4vcpu-ubuntu-2404
     steps:
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5
+        with:
+          persist-credentials: false
 
-      - uses: actions/setup-python@v5
+      - uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5
         with:
           python-version: '3.12'
 
-      - uses: dtolnay/rust-toolchain@1.95.0
+      - uses: dtolnay/rust-toolchain@e081816240890017053eacbb1bdf337761dc5582 # 1.95.0
 
       - name: Build sdist (maturin-action)
-        uses: PyO3/maturin-action@v1
+        uses: PyO3/maturin-action@e83996d129638aa358a18fbd1dfb82f0b0fb5d3b # v1
         with:
           command: sdist
           args: --out dist --manifest-path bindings/rsac-python/Cargo.toml
 
       - name: Upload sdist artifact
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
           name: sdist
           path: dist/*.tar.gz
           if-no-files-found: error
 
-  # publish-pypi: upload every artifact with skip-existing.
+  # publish-pypi: upload every artifact via PyPI Trusted Publishing (OIDC).
+  #
+  # NOTE: This requires a Trusted Publisher to be configured on the PyPI
+  # `rsac` project pointing at this repository + workflow file
+  # (https://docs.pypi.org/trusted-publishers/). Once configured, no
+  # long-lived MATURIN_PYPI_TOKEN secret is needed — the upload authenticates
+  # with a short-lived OIDC token minted from `id-token: write` below.
   publish-pypi:
     name: Publish to PyPI
     needs: [build-wheels, build-sdist]
+    # Guard against forks publishing to the PyPI `rsac` project.
+    if: github.repository == 'Codeseys-Labs/rust-crossplat-audio-capture'
     runs-on: blacksmith-4vcpu-ubuntu-2404
+    permissions:
+      contents: read
+      # Required for PyPI Trusted Publishing (OIDC).
+      id-token: write
     steps:
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5
+        with:
+          persist-credentials: false
+
+      # Tag↔manifest version guard: the pushed tag must match the version
+      # in pyproject.toml before publishing to PyPI. Tag events only.
+      - name: Verify tag matches pyproject.toml version
+        if: startsWith(github.ref, 'refs/tags/')
+        shell: bash
+        run: |
+          VERSION="${GITHUB_REF_NAME#v}"
+          MANIFEST="$(grep -m1 '^version' bindings/rsac-python/pyproject.toml | sed -E 's/.*"([^"]+)".*/\1/')"
+          echo "tag version: ${VERSION}  manifest version: ${MANIFEST}"
+          if [ "${VERSION}" != "${MANIFEST}" ]; then
+            echo "::error::Tag version (${VERSION}) does not match pyproject.toml version (${MANIFEST})"
+            exit 1
+          fi
 
       - name: Download all build artifacts
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
         with:
           path: dist-all
           merge-multiple: true
 
-      - name: Publish with maturin upload
-        uses: PyO3/maturin-action@v1
-        env:
-          MATURIN_PYPI_TOKEN: ${{ secrets.MATURIN_PYPI_TOKEN }}
+      # Upload via the official PyPA action using Trusted Publishing.
+      # No password/token input: it uses the OIDC id-token granted above.
+      - name: Publish to PyPI (Trusted Publishing)
+        uses: pypa/gh-action-pypi-publish@cef221092ed1bacb1cc03d23a2d87d1d172e277b # v1.14.0 (head of release/v1)
         with:
-          command: upload
-          args: --skip-existing dist-all/*
+          packages-dir: dist-all
+          skip-existing: true
