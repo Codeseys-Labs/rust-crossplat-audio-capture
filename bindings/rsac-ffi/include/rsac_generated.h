@@ -180,6 +180,42 @@ typedef struct RsacStreamStats {
 } RsacStreamStats;
 
 /**
+ * A point-in-time **windowed** backpressure snapshot.
+ *
+ * Filled by [`rsac_capture_backpressure_report`] from
+ * [`AudioCapture::backpressure_report`]. Plain C-ABI value type (no heap, no
+ * free required). Unlike the lifetime counters in [`RsacStreamStats`], the
+ * `pushed`/`dropped` here cover a bounded recent window, so `drop_rate`
+ * surfaces a sustained 1-in-N loss the consecutive-drop flag resets away.
+ *
+ * When no stream has been created every field is `0`/`0.0`/`false`.
+ * `window_secs` is `0.0` when the span cannot be attributed (unknown buffer
+ * size or sample rate); the `pushed`/`dropped` tallies are still valid.
+ */
+typedef struct RsacBackpressureReport {
+    /**
+     * Wall-clock span the tallies cover, in seconds. `0.0` when unattributed.
+     */
+    double window_secs;
+    /**
+     * Buffers successfully pushed by the producer within the window.
+     */
+    uint64_t pushed;
+    /**
+     * Buffers dropped due to ring-buffer overflow within the window.
+     */
+    uint64_t dropped;
+    /**
+     * Fraction of buffers lost within the window, in `0.0..=1.0`.
+     */
+    double drop_rate;
+    /**
+     * `1` if the legacy consecutive-drop flag is set, `0` otherwise.
+     */
+    int32_t is_under_backpressure;
+} RsacBackpressureReport;
+
+/**
  * A point-in-time snapshot of a capture's negotiated delivery format.
  *
  * Filled by [`rsac_capture_format`] from [`AudioCapture::format`]. Plain C-ABI
@@ -352,6 +388,24 @@ enum rsac_error_t rsac_builder_set_target_app_by_id(struct RsacBuilder *builder,
 
 enum rsac_error_t rsac_capture_stream_stats(const struct RsacCapture *capture,
                                             struct RsacStreamStats *out)
+;
+
+/**
+ * Fills `*out` with a point-in-time **windowed** [`RsacBackpressureReport`].
+ *
+ * Unlike [`rsac_capture_stream_stats`]' lifetime counters, this reports a
+ * bounded recent window, so `drop_rate` reflects a sustained 1-in-N loss that
+ * the consecutive-drop flag resets away. Reading it never allocates on or
+ * blocks the OS audio callback thread.
+ *
+ * When no stream has been created, `*out` is filled with an all-zero report.
+ *
+ * Returns `RSAC_ERROR_NULL_POINTER` if `capture` or `out` is null; otherwise
+ * `RSAC_OK`. `out` is an out-parameter, not a handle: there is nothing to free.
+ */
+
+enum rsac_error_t rsac_capture_backpressure_report(const struct RsacCapture *capture,
+                                                   struct RsacBackpressureReport *out)
 ;
 
 /**
