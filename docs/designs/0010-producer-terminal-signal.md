@@ -142,6 +142,18 @@ Per-backend hooks:
   `stop_audio_unit` in `Drop`. This **closes** the former known limitation; the
   `stop_capture`/`Drop` hook still covers the common explicit-teardown path.
 
+  *Teardown race guard (rsac-ead3-teardown):* because CoreAudio gives no barrier
+  that an in-flight death-watch proc has finished when the listener is removed, a
+  device death that lands *exactly* during an explicit stop/Drop could race the
+  graceful `Running → Stopping` transition. Since terminal `Error` is sticky and
+  outranks `Stopping`, that race would misreport an *intentional* teardown to a
+  reader as a Fatal device-death `StreamEnded`. The `DeviceAliveContext` now
+  carries a `tearing_down: AtomicBool`; `remove_device_alive_listener` sets it
+  (Release) **before** `AudioObjectRemovePropertyListener`, and the proc checks
+  it (Acquire) and no-ops when set. An explicit stop therefore always wins over a
+  racing spontaneous-death notification. The flag lives in the same
+  intentionally-leaked context, so a late proc's read of it stays sound.
+
 `signal_error()`/`signal_done()`/the Linux teardown transition/the macOS transition are
 all **idempotent** (`force_set` is last-writer-wins; the `transition` CAS no-ops if the
 state already advanced past `Running`) and **sticky** (terminal `Error` cannot be

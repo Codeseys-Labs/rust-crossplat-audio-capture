@@ -219,7 +219,11 @@ impl Drop for MacosPlatformStream {
     /// own `Drop` tears down the aggregate device and the tap.
     fn drop(&mut self) {
         // rsac-ead3: remove the device-is-alive listener FIRST, so an app-driven
-        // teardown does not race the death-watch proc. Best-effort + the context
+        // teardown does not race the death-watch proc. `remove_device_alive_listener`
+        // sets the context's `tearing_down` guard (Release) BEFORE removing the
+        // listener, so an in-flight/late proc no-ops instead of poisoning the
+        // stream to Fatal Error (rsac-ead3-teardown) — an intentional stop wins
+        // over a racing spontaneous-death notification. Best-effort + the context
         // is intentionally NOT freed (CoreAudio gives no in-flight-proc barrier);
         // see `remove_device_alive_listener`. A normal stop signals the terminal
         // via `stop_audio_unit` below — the death watch is only for the
@@ -432,7 +436,7 @@ pub(crate) fn create_macos_capture(
 /// | `Device(id)`           | Parse `DeviceId.0` as `u32`; require INPUT streams (M8)     |
 /// | `Application(pid)`     | `CoreAudioProcessTap::new(pid)` → tap's AudioObjectID      |
 /// | `ApplicationByName(n)` | `enumerate_audio_applications()` → find PID → tap           |
-/// | `ProcessTree(pid)`     | `CoreAudioProcessTap::new_tree(pid)` → multi-PID tap       |
+/// | `ProcessTree(pid)`     | `CoreAudioProcessTap::new_tree(pid)` → parent + full descendant closure |
 fn resolve_capture_target(
     config: &MacosCaptureConfig,
 ) -> AudioResult<(AudioDeviceID, Option<CoreAudioProcessTap>)> {
@@ -557,7 +561,9 @@ fn resolve_capture_target(
         }
 
         CaptureTarget::ProcessTree(pid) => {
-            // Multi-PID tap: captures parent process + all direct child processes
+            // Multi-PID tap: captures the parent process + its full descendant
+            // closure (children, grandchildren, …) — see
+            // `CoreAudioProcessTap::new_tree` / `collect_process_tree_pids`.
             let tap = CoreAudioProcessTap::new_tree(pid.0)?;
             let tap_device_id = tap.id();
             log::debug!(

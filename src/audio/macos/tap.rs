@@ -37,6 +37,7 @@ use objc2::runtime::{AnyClass, AnyObject, Sel};
 use objc2::{msg_send, sel};
 use objc2_foundation::{NSArray, NSAutoreleasePool, NSNumber, NSString, NSUUID};
 use std::ffi::c_void;
+use std::panic::AssertUnwindSafe;
 
 // ── Aggregate device dictionary keys (from CoreAudio/AudioHardware.h) ────
 
@@ -146,24 +147,10 @@ impl CoreAudioProcessTap {
                 "process_tap",
             )?;
 
-            // 3. Set name
-            let tap_name_nsstring = NSString::from_str(tap_name_str);
-            let _: () = msg_send![tap_desc_obj, setName: &*tap_name_nsstring];
-
-            // 4. Set UUID on tap description (REQUIRED for aggregate device)
-            let tap_uuid: Retained<NSUUID> = NSUUID::UUID();
-            let _: () = msg_send![tap_desc_obj, setUUID: &*tap_uuid];
-
-            // 5. Set mute behavior to unmuted (CATapUnmuted = 0)
-            let _: () = msg_send![tap_desc_obj, setMuteBehavior: 0i64];
-
-            // 6. Set privateTap if available (guard for macOS 26+ where it may be removed)
-            if msg_send_responds_to(tap_desc_obj, sel!(setPrivateTap:)) {
-                let _: () = msg_send![tap_desc_obj, setPrivateTap: true];
-            }
-
-            // 7. Set mixdown = true (already configured by initStereoMixdown, but safe to set explicitly)
-            let _: () = msg_send![tap_desc_obj, setMixdown: true];
+            // 3–7. Configure shared tap-description properties (name, UUID,
+            // mute behavior, private, mixdown) via the centralized,
+            // exception-guarded helper.
+            let tap_uuid = configure_tap_description(tap_desc_obj, tap_name_str)?;
 
             // 8. Call AudioHardwareCreateProcessTap
             let mut tap_id: sys::AudioObjectID = 0;
@@ -230,12 +217,23 @@ impl CoreAudioProcessTap {
     }
 
     /// Creates and configures a new Core Audio Tap + aggregate device that
-    /// captures audio from a process tree (parent + all direct children).
+    /// captures audio from a process tree (parent + **all transitive
+    /// descendants**, not just direct children).
     ///
-    /// Uses `sysinfo` to enumerate child processes of `parent_pid`, then
-    /// creates a `CATapDescription` targeting all discovered PIDs.
+    /// Uses `sysinfo` to snapshot the process table once, then walks the
+    /// `parent → child` relation breadth-first from `parent_pid` to collect the
+    /// full descendant closure (children, grandchildren, …). This matters for
+    /// real targets: browsers, Electron apps, and shells spawn audio-producing
+    /// work in **grandchild** helper processes (e.g. a browser's GPU/audio
+    /// service under a content process), which a direct-children-only tap would
+    /// miss. Discovery is snapshot-based and best-effort — a process that
+    /// forks after the snapshot is not captured (a documented limitation;
+    /// re-enumeration on process-tree change is future work, see the module doc
+    /// and REFERENCE_ANALYSIS "ProcessTree re-enumeration").
     ///
-    /// If no child processes are found, the tap is created with just the
+    /// Cycles in the reported parent relation (which can occur transiently after
+    /// PID reuse) cannot cause an infinite loop: each PID is visited at most
+    /// once. If no descendants are found, the tap is created with just the
     /// parent PID (graceful degradation to single-process capture).
     ///
     /// Process targeting uses (in order of preference):
@@ -245,28 +243,31 @@ impl CoreAudioProcessTap {
     ///
     /// **Important:** Requires macOS 14.4+ and the `CATapDescription` class.
     pub fn new_tree(parent_pid: u32) -> AudioResult<Self> {
-        // ── Step 1: Discover child processes via sysinfo ──
+        // ── Step 1: Discover the full descendant closure via sysinfo ──
         use sysinfo::{ProcessRefreshKind, RefreshKind, System};
 
         let refresh_kind = RefreshKind::nothing().with_processes(ProcessRefreshKind::everything());
         let sys = System::new_with_specifics(refresh_kind);
 
-        let parent_sysinfo_pid = sysinfo::Pid::from_u32(parent_pid);
-
-        // Collect parent + direct children
-        let mut all_pids: Vec<u32> = vec![parent_pid];
+        // Build a parent → children adjacency map from the single snapshot, then
+        // walk it breadth-first (see `collect_process_tree_pids`). This captures
+        // grandchildren+ (e.g. a browser's audio helper under a content
+        // process), which a direct-children-only scan would miss.
+        let mut children_of: std::collections::HashMap<u32, Vec<u32>> =
+            std::collections::HashMap::new();
         for (pid, process) in sys.processes() {
             if let Some(ppid) = process.parent() {
-                if ppid == parent_sysinfo_pid && *pid != parent_sysinfo_pid {
-                    all_pids.push(pid.as_u32());
-                }
+                children_of
+                    .entry(ppid.as_u32())
+                    .or_default()
+                    .push(pid.as_u32());
             }
         }
-        all_pids.sort();
-        all_pids.dedup();
+
+        let all_pids = collect_process_tree_pids(parent_pid, &children_of);
 
         log::info!(
-            "ProcessTree capture: parent_pid={}, discovered {} total PIDs: {:?}",
+            "ProcessTree capture: parent_pid={}, discovered {} total PIDs (full descendant closure): {:?}",
             parent_pid,
             all_pids.len(),
             all_pids
@@ -295,25 +296,11 @@ impl CoreAudioProcessTap {
                 "process_tap_tree",
             )?;
 
-            // Set name
+            // Configure shared tap-description properties (name, UUID, mute
+            // behavior, private, mixdown) via the centralized, exception-guarded
+            // helper.
             let tap_name_str = format!("rsac-tap-tree-{}", parent_pid);
-            let tap_name_nsstring = NSString::from_str(&tap_name_str);
-            let _: () = msg_send![tap_desc_obj, setName: &*tap_name_nsstring];
-
-            // Set UUID on tap description
-            let tap_uuid: Retained<NSUUID> = NSUUID::UUID();
-            let _: () = msg_send![tap_desc_obj, setUUID: &*tap_uuid];
-
-            // Set mute behavior to unmuted (CATapUnmuted = 0)
-            let _: () = msg_send![tap_desc_obj, setMuteBehavior: 0i64];
-
-            // Set privateTap if available (guard for macOS 26+ where it may be removed)
-            if msg_send_responds_to(tap_desc_obj, sel!(setPrivateTap:)) {
-                let _: () = msg_send![tap_desc_obj, setPrivateTap: true];
-            }
-
-            // Set mixdown = true (already configured by initStereoMixdown, but safe to set explicitly)
-            let _: () = msg_send![tap_desc_obj, setMixdown: true];
+            let tap_uuid = configure_tap_description(tap_desc_obj, &tap_name_str)?;
 
             // Call AudioHardwareCreateProcessTap
             let mut tap_id: sys::AudioObjectID = 0;
@@ -418,6 +405,9 @@ impl CoreAudioProcessTap {
             // Check that the selector is available before calling
             let sel_global_tap = sel!(initStereoGlobalTapButExcludeProcesses:);
             if !msg_send_responds_to(tap_desc_obj, sel_global_tap) {
+                // alloc_obj is uninitialized (init never ran) — release it so we
+                // don't leak the +1 from `alloc`.
+                let _: () = msg_send![tap_desc_obj, release];
                 return Err(AudioError::BackendError {
                     backend: "CoreAudio".into(),
                     operation: "system_tap".into(),
@@ -426,10 +416,19 @@ impl CoreAudioProcessTap {
                 });
             }
 
+            // Exception-guard the init: an undocumented initializer that raises
+            // on this macOS version must degrade to an AudioError, not abort the
+            // process. On a thrown exception `init` has already consumed (and
+            // released) the alloc'd receiver per the ObjC "init consumes self"
+            // rule, so there is nothing to release here.
             let tap_desc_obj: *mut AnyObject =
-                msg_send![tap_desc_obj, initStereoGlobalTapButExcludeProcesses: &*empty_array];
+                guard_objc("initStereoGlobalTapButExcludeProcesses:", || unsafe {
+                    msg_send![tap_desc_obj, initStereoGlobalTapButExcludeProcesses: &*empty_array]
+                })?;
 
             if tap_desc_obj.is_null() {
+                // init returned nil: it already released the receiver (init
+                // consumes self), so we must NOT release again.
                 return Err(AudioError::BackendError {
                     backend: "CoreAudio".into(),
                     operation: "system_tap".into(),
@@ -438,25 +437,10 @@ impl CoreAudioProcessTap {
                 });
             }
 
-            // Set name
-            let tap_name_str = "rsac-tap-system";
-            let tap_name_nsstring = NSString::from_str(tap_name_str);
-            let _: () = msg_send![tap_desc_obj, setName: &*tap_name_nsstring];
-
-            // Set UUID on tap description (REQUIRED for aggregate device)
-            let tap_uuid: Retained<NSUUID> = NSUUID::UUID();
-            let _: () = msg_send![tap_desc_obj, setUUID: &*tap_uuid];
-
-            // Set mute behavior to unmuted (CATapUnmuted = 0)
-            let _: () = msg_send![tap_desc_obj, setMuteBehavior: 0i64];
-
-            // Set privateTap if available (removed in macOS 26+)
-            if msg_send_responds_to(tap_desc_obj, sel!(setPrivateTap:)) {
-                let _: () = msg_send![tap_desc_obj, setPrivateTap: true];
-            }
-
-            // Mixdown already configured by initStereoGlobalTap, but set explicitly for safety
-            let _: () = msg_send![tap_desc_obj, setMixdown: true];
+            // Configure shared tap-description properties (name, UUID, mute
+            // behavior, private, mixdown) via the centralized, exception-guarded
+            // helper.
+            let tap_uuid = configure_tap_description(tap_desc_obj, "rsac-tap-system")?;
 
             // Call AudioHardwareCreateProcessTap
             let mut tap_id: sys::AudioObjectID = 0;
@@ -635,6 +619,48 @@ extern "C" {
 
 // ── Helper functions ─────────────────────────────────────────────────────
 
+/// Collect the full process-tree PID set (the given `root` plus all transitive
+/// descendants) from a `parent → children` adjacency map.
+///
+/// Pure and OS-independent so it can be unit-tested without a live process
+/// table (rsac-ptree). Walks breadth-first, visiting each PID at most once, so
+/// a cyclic `children_of` map (possible transiently after PID reuse) cannot
+/// cause an infinite loop. The returned vec always contains `root` first-ish
+/// but is sorted + de-duplicated for a stable, comparable result.
+///
+/// This is the semantic upgrade over the old direct-children-only scan:
+/// grandchildren and deeper descendants (e.g. a browser's audio-service helper
+/// under a content process) are now included in the tap's target set.
+fn collect_process_tree_pids(
+    root: u32,
+    children_of: &std::collections::HashMap<u32, Vec<u32>>,
+) -> Vec<u32> {
+    use std::collections::{HashSet, VecDeque};
+
+    let mut seen: HashSet<u32> = HashSet::new();
+    let mut queue: VecDeque<u32> = VecDeque::new();
+
+    seen.insert(root);
+    queue.push_back(root);
+
+    while let Some(pid) = queue.pop_front() {
+        if let Some(children) = children_of.get(&pid) {
+            for &child in children {
+                // `insert` returns false if already present → natural cycle /
+                // diamond guard; never enqueue a PID twice.
+                if seen.insert(child) {
+                    queue.push_back(child);
+                }
+            }
+        }
+    }
+
+    let mut pids: Vec<u32> = seen.into_iter().collect();
+    pids.sort_unstable();
+    pids.dedup();
+    pids
+}
+
 /// Translate a process PID to its CoreAudio `AudioObjectID` using
 /// `kAudioHardwarePropertyTranslatePIDToProcessObject`.
 ///
@@ -693,6 +719,26 @@ unsafe fn translate_pid_to_audio_object_id(pid: u32) -> Option<sys::AudioObjectI
 ///    when PID→AudioObjectID translation failed)
 ///
 /// Returns the initialized CATapDescription ObjC object or an error.
+///
+/// # ObjC ownership contract (audited — rsac-catap-safety)
+///
+/// `CATapDescription` is a standard `NSObject` subclass, so its `init…` family
+/// follows normal ObjC retain semantics: the caller receives a **+1-retained**
+/// object it owns (adopted by `AudioHardwareCreateProcessTap`'s caller flow and
+/// released via `Drop`). The two failure modes each have a distinct cleanup
+/// rule, applied consistently below:
+///
+/// * **`init…` returns nil OR throws** — per the ObjC "init consumes self" rule
+///   the initializer has already released the alloc'd receiver, so the caller
+///   must **NOT** release it again. We simply fall through to the next path with
+///   a *fresh* `alloc` (never re-touching the consumed pointer).
+/// * **`init…` was never called** (selector unavailable, or no PIDs to pass) —
+///   the `alloc`'d receiver is still uninitialized and owns a +1 the caller must
+///   `release` before falling through.
+///
+/// Every may-throw private selector goes through [`guard_objc`] so a
+/// version-shape mismatch degrades to an [`AudioError`] rather than aborting the
+/// host process.
 unsafe fn create_process_tap_description(
     ca_tap_class: &AnyClass,
     pids: &[u32],
@@ -728,25 +774,44 @@ unsafe fn create_process_tap_description(
 
             let processes_array = NSArray::from_retained_slice(&nsnumbers);
 
-            let result: *mut AnyObject =
-                msg_send![alloc_obj, initStereoMixdownOfProcesses: &*processes_array];
-            if !result.is_null() {
-                log::info!(
-                    "Using initStereoMixdownOfProcesses: for PIDs {:?} → AudioObjectIDs {:?}",
-                    pids,
-                    audio_obj_ids
-                );
-                return Ok(result);
+            // Exception-guarded init. On a thrown NSException OR a nil return,
+            // `init` has consumed (released) `alloc_obj` — we must NOT release it,
+            // and fall through to Path 2 with a fresh alloc.
+            let init_result = guard_objc("initStereoMixdownOfProcesses:", || unsafe {
+                let result: *mut AnyObject =
+                    msg_send![alloc_obj, initStereoMixdownOfProcesses: &*processes_array];
+                result
+            });
+            match init_result {
+                Ok(result) if !result.is_null() => {
+                    log::info!(
+                        "Using initStereoMixdownOfProcesses: for PIDs {:?} → AudioObjectIDs {:?}",
+                        pids,
+                        audio_obj_ids
+                    );
+                    return Ok(result);
+                }
+                Ok(_) => {
+                    // nil — alloc_obj consumed by init; fall through with a fresh alloc.
+                    log::warn!(
+                        "initStereoMixdownOfProcesses: returned nil for AudioObjectIDs {:?}, trying fallback",
+                        audio_obj_ids
+                    );
+                }
+                Err(e) => {
+                    // Thrown NSException: init consumed the receiver, so no release.
+                    // Fall through to the PID-based paths rather than failing hard —
+                    // a throw here usually means this initializer's shape differs on
+                    // this macOS version, which Path 2/3 may handle.
+                    log::warn!(
+                        "initStereoMixdownOfProcesses: raised ({e:?}) for AudioObjectIDs {:?}, trying fallback",
+                        audio_obj_ids
+                    );
+                }
             }
-            // initStereoMixdownOfProcesses: returned nil — alloc_obj consumed by init.
-            // Fall through to Path 2 with a fresh alloc.
-            log::warn!(
-                "initStereoMixdownOfProcesses: returned nil for AudioObjectIDs {:?}, trying fallback",
-                audio_obj_ids
-            );
         } else {
             // No PIDs could be translated to AudioObjectIDs.
-            // alloc_obj is still uninitialized — release it.
+            // alloc_obj is still uninitialized (init never ran) — release it.
             log::debug!(
                 "No PIDs translated to AudioObjectIDs for {:?}, trying fallback",
                 pids
@@ -755,7 +820,7 @@ unsafe fn create_process_tap_description(
         }
     } else {
         // initStereoMixdownOfProcesses: is not available on this macOS version.
-        // alloc_obj is still uninitialized — release it.
+        // alloc_obj is still uninitialized (init never ran) — release it.
         log::debug!("initStereoMixdownOfProcesses: not available, trying fallback");
         let _: () = msg_send![alloc_obj, release];
     }
@@ -766,6 +831,7 @@ unsafe fn create_process_tap_description(
     let alloc_obj2: *mut AnyObject = msg_send![ca_tap_class, alloc];
     let init_obj: *mut AnyObject = msg_send![alloc_obj2, init];
     if init_obj.is_null() {
+        // init returned nil: it already released the receiver; nothing to release.
         return Err(AudioError::BackendError {
             backend: "CoreAudio".into(),
             operation: operation.into(),
@@ -773,6 +839,15 @@ unsafe fn create_process_tap_description(
             context: None,
         });
     }
+
+    // From here on `init_obj` is a live +1-owned object. Any early return on a
+    // configuration error MUST release it first to avoid leaking it (a thrown
+    // setter would otherwise skip the manual release). `release_on_err` centralizes
+    // that: it releases `init_obj` and returns the error.
+    let release_on_err = |init_obj: *mut AnyObject, e: AudioError| -> AudioError {
+        let _: () = unsafe { msg_send![init_obj, release] };
+        e
+    };
 
     // Create NSArray of PIDs as NSNumber(int:)
     let pid_nsnumbers: Vec<Retained<NSNumber>> = pids
@@ -785,9 +860,16 @@ unsafe fn create_process_tap_description(
     // Path 2: Try combined setProcesses:exclusive: (macOS 14.4–15)
     let sel_set_processes_exclusive = sel!(setProcesses:exclusive:);
     if msg_send_responds_to(init_obj, sel_set_processes_exclusive) {
-        let _: () = msg_send![init_obj, setProcesses: &*pids_nsarray, exclusive: false];
-        log::info!("Using setProcesses:exclusive: for PIDs {:?}", pids);
-        return Ok(init_obj);
+        match guard_objc("setProcesses:exclusive:", || unsafe {
+            let _: () = msg_send![init_obj, setProcesses: &*pids_nsarray, exclusive: false];
+        }) {
+            Ok(()) => {
+                log::info!("Using setProcesses:exclusive: for PIDs {:?}", pids);
+                return Ok(init_obj);
+            }
+            // A thrown setter left `init_obj` live but unconfigured — release it.
+            Err(e) => return Err(release_on_err(init_obj, e)),
+        }
     }
 
     // Path 3: Try separate setProcesses: + setExclusive: (macOS 26 fallback)
@@ -796,27 +878,36 @@ unsafe fn create_process_tap_description(
     if msg_send_responds_to(init_obj, sel_set_processes)
         && msg_send_responds_to(init_obj, sel_set_exclusive)
     {
-        let _: () = msg_send![init_obj, setProcesses: &*pids_nsarray];
-        let _: () = msg_send![init_obj, setExclusive: false];
-        log::info!(
-            "Using separate setProcesses: + setExclusive: for PIDs {:?}",
-            pids
-        );
-        return Ok(init_obj);
+        match guard_objc("setProcesses:/setExclusive:", || unsafe {
+            let _: () = msg_send![init_obj, setProcesses: &*pids_nsarray];
+            let _: () = msg_send![init_obj, setExclusive: false];
+        }) {
+            Ok(()) => {
+                log::info!(
+                    "Using separate setProcesses: + setExclusive: for PIDs {:?}",
+                    pids
+                );
+                return Ok(init_obj);
+            }
+            Err(e) => return Err(release_on_err(init_obj, e)),
+        }
     }
 
-    // No supported method found
-    Err(AudioError::BackendError {
-        backend: "CoreAudio".into(),
-        operation: operation.into(),
-        message: format!(
-            "No supported method found for setting processes on CATapDescription. \
-             Tried initStereoMixdownOfProcesses:, setProcesses:exclusive:, and \
-             separate setProcesses:/setExclusive:. PIDs: {:?}. Ensure macOS 14.4+.",
-            pids
-        ),
-        context: None,
-    })
+    // No supported method found — release the live init_obj before failing.
+    Err(release_on_err(
+        init_obj,
+        AudioError::BackendError {
+            backend: "CoreAudio".into(),
+            operation: operation.into(),
+            message: format!(
+                "No supported method found for setting processes on CATapDescription. \
+                 Tried initStereoMixdownOfProcesses:, setProcesses:exclusive:, and \
+                 separate setProcesses:/setExclusive:. PIDs: {:?}. Ensure macOS 14.4+.",
+                pids
+            ),
+            context: None,
+        },
+    ))
 }
 
 /// Enumerates all audio process AudioObjectIDs from CoreAudio's
@@ -1147,6 +1238,174 @@ unsafe fn msg_send_responds_to(obj: *mut AnyObject, sel: Sel) -> bool {
     msg_send![obj, respondsToSelector: sel]
 }
 
+// ── ObjC exception safety (rsac-catap-safety) ─────────────────────────────
+//
+// `CATapDescription` is a private/undocumented CoreAudio class driven entirely
+// through raw `objc2::msg_send!`. Several of its selectors
+// (`initStereoMixdownOfProcesses:`, `initStereoGlobalTapButExcludeProcesses:`,
+// `setProcesses:exclusive:`, `setMuteBehavior:`, `setPrivateTap:`, …) are
+// undocumented and their argument shapes have shifted across macOS 14.4–26. If
+// one of them raises an `NSException`, the exception unwinds out of the C frame
+// into Rust. With objc2's default `msg_send!` (this crate enables the
+// `"exception"` feature but NOT `"catch-all"`), that unwind is a *foreign*
+// exception that Rust cannot catch with `std::panic::catch_unwind` — it will
+// typically **abort the process**.
+//
+// `objc2::exception::catch` (feature `"exception"`, already enabled in
+// Cargo.toml) is the correct primitive: it wraps the closure in a real ObjC
+// `@try/@catch` and returns `Err(Some(Retained<Exception>))` on a caught
+// `NSException` instead of aborting. We funnel every may-throw `CATapDescription`
+// message send through [`guard_objc`] so a version-shape mismatch degrades to a
+// categorized [`AudioError`] the caller can handle, rather than killing the host
+// process.
+
+/// Runs an ObjC message-send closure, converting any thrown `NSException` into
+/// an [`AudioError::BackendError`] instead of aborting the process.
+///
+/// Backed by [`objc2::exception::catch`] (gated by the `objc2` `"exception"`
+/// cargo feature, enabled for this crate). `operation` is a short label
+/// (usually the selector name) surfaced in the error message and log line.
+///
+/// # Safety / panics
+/// The closure runs inside an ObjC `@try`. A *Rust* panic inside the closure is
+/// NOT converted — it propagates as a normal Rust unwind (matching
+/// `objc2::exception::catch`'s contract). Only ObjC `NSException`s are caught.
+fn guard_objc<R>(operation: &str, f: impl FnOnce() -> R) -> AudioResult<R> {
+    // AssertUnwindSafe: the CATapDescription pointers/refs captured by these
+    // closures are `*mut AnyObject`/borrows used only for the duration of the
+    // single message send; there is no cross-unwind shared-mutable state to be
+    // left in a torn state (a thrown selector either mutated the description or
+    // did not — the caller discards it on error).
+    match objc2::exception::catch(AssertUnwindSafe(f)) {
+        Ok(v) => Ok(v),
+        Err(exc) => {
+            let detail = exc
+                .as_deref()
+                .map(describe_nsexception)
+                .unwrap_or_else(|| "nil ObjC exception (@throw nil)".to_string());
+            log::warn!(
+                "CoreAudio: ObjC exception during {operation}: {detail}. \
+                 The CATapDescription API shape may differ on this macOS version."
+            );
+            Err(AudioError::BackendError {
+                backend: "CoreAudio".into(),
+                operation: operation.into(),
+                message: format!("ObjC exception during {operation}: {detail}"),
+                context: None,
+            })
+        }
+    }
+}
+
+/// Extracts `name: reason` from a caught `NSException` for diagnostics.
+///
+/// `objc2::exception::Exception` derefs to an ObjC object that responds to
+/// `-name` / `-reason` (both `NSString`). Best-effort: a missing field yields an
+/// empty component. Never panics.
+fn describe_nsexception(exc: &objc2::exception::Exception) -> String {
+    unsafe {
+        // `objc2::exception::Exception` is a transparent wrapper over the thrown
+        // ObjC object; reinterpret it as `AnyObject` to read `-name` / `-reason`
+        // (both `NSString`) when the thrown value is an NSException. Best-effort
+        // diagnostics only — a non-NSException or a nil field yields an empty
+        // component and never panics.
+        let obj: *const AnyObject = (exc as *const objc2::exception::Exception).cast();
+        let name: Option<Retained<NSString>> = msg_send![obj, name];
+        let reason: Option<Retained<NSString>> = msg_send![obj, reason];
+        let name = name.map(|s| s.to_string()).unwrap_or_default();
+        let reason = reason.map(|s| s.to_string()).unwrap_or_default();
+        format!("{name}: {reason}")
+    }
+}
+
+/// Centralized, exception-guarded configuration of the shared `CATapDescription`
+/// properties common to all three tap flavours (per-process, process-tree, and
+/// system-wide).
+///
+/// This is the single place that issues the may-throw private selectors
+/// `setName:`, `setUUID:`, `setMuteBehavior:`, `setPrivateTap:`, and
+/// `setMixdown:`, so exception handling, macOS-version guards
+/// (`respondsToSelector:` for the removed-in-26 `setPrivateTap:`), and the
+/// `setMuteBehavior:` `i64` argument-type fix all live in one auditable spot
+/// rather than being copy-pasted across `new`, `new_tree`, and `new_system`.
+///
+/// Returns the tap's freshly-generated UUID (already set on the description) so
+/// the caller can key the aggregate device off it.
+///
+/// # Leak safety on error
+///
+/// `tap_desc_obj` is a live, +1-owned `CATapDescription` the caller no longer
+/// uses if this returns `Err`. To keep every error path leak-free, this helper
+/// **releases `tap_desc_obj` before returning any `Err`** (a thrown setter would
+/// otherwise leave it dangling with no `Drop` to reclaim it, since it is a raw
+/// `*mut AnyObject`, not a `Retained`). Callers therefore must NOT release it on
+/// error, and must NOT use it after an `Err` return.
+///
+/// # Safety
+/// `tap_desc_obj` must be a valid, initialized `CATapDescription` instance
+/// (non-null). The autorelease pool must be active for the current scope.
+unsafe fn configure_tap_description(
+    tap_desc_obj: *mut AnyObject,
+    tap_name: &str,
+) -> AudioResult<Retained<NSUUID>> {
+    // Run the may-throw setters; on the first error release the description so
+    // no path leaks it.
+    match configure_tap_description_inner(tap_desc_obj, tap_name) {
+        Ok(uuid) => Ok(uuid),
+        Err(e) => {
+            let _: () = msg_send![tap_desc_obj, release];
+            Err(e)
+        }
+    }
+}
+
+/// Inner body of [`configure_tap_description`]: issues the guarded setters and
+/// returns the generated UUID, WITHOUT any release-on-error cleanup (the outer
+/// wrapper owns that so there is exactly one release site).
+///
+/// # Safety
+/// Same contract as [`configure_tap_description`].
+unsafe fn configure_tap_description_inner(
+    tap_desc_obj: *mut AnyObject,
+    tap_name: &str,
+) -> AudioResult<Retained<NSUUID>> {
+    // Name.
+    let tap_name_nsstring = NSString::from_str(tap_name);
+    guard_objc("setName:", || unsafe {
+        let _: () = msg_send![tap_desc_obj, setName: &*tap_name_nsstring];
+    })?;
+
+    // UUID (REQUIRED for aggregate device — keyed off this value).
+    let tap_uuid: Retained<NSUUID> = NSUUID::UUID();
+    guard_objc("setUUID:", || unsafe {
+        let _: () = msg_send![tap_desc_obj, setUUID: &*tap_uuid];
+    })?;
+
+    // Mute behavior = CATapUnmuted (0). CATapMuteBehavior is NSInteger-backed
+    // (ObjC type code 'q'), so the argument MUST be i64 — objc2 validates the
+    // argument encoding at runtime and rejects an i32 (a bug the old `objc`
+    // crate silently accepted). See §9.1 of AGENTS.md.
+    guard_objc("setMuteBehavior:", || unsafe {
+        let _: () = msg_send![tap_desc_obj, setMuteBehavior: 0i64];
+    })?;
+
+    // setPrivateTap: — present on macOS 14.4–15, removed on macOS 26+. Guard
+    // with respondsToSelector: so we never send a removed selector.
+    if msg_send_responds_to(tap_desc_obj, sel!(setPrivateTap:)) {
+        guard_objc("setPrivateTap:", || unsafe {
+            let _: () = msg_send![tap_desc_obj, setPrivateTap: true];
+        })?;
+    }
+
+    // Mixdown = true. Already implied by the stereo-mixdown/global initializers,
+    // but set explicitly for safety. Guarded like the rest.
+    guard_objc("setMixdown:", || unsafe {
+        let _: () = msg_send![tap_desc_obj, setMixdown: true];
+    })?;
+
+    Ok(tap_uuid)
+}
+
 /// Build a [`BackendContext`] for a CoreAudio `OSStatus` (M6).
 ///
 /// `OSStatus` is an `i32`; it is sign-extended into the `i64`
@@ -1190,6 +1449,102 @@ mod tests {
         assert_eq!(ctx.backend_name, "CoreAudio");
         assert_eq!(ctx.os_error_code, Some(-50i64));
         assert!(ctx.os_error_message.is_some());
+    }
+
+    /// rsac-catap-safety: `guard_objc` returns `Ok` and forwards the closure's
+    /// value when no ObjC exception is thrown (no CoreAudio hardware needed).
+    #[test]
+    fn guard_objc_returns_ok_for_non_throwing_closure() {
+        let result = guard_objc("noop", || 42u32);
+        assert_eq!(result.expect("non-throwing closure should be Ok"), 42);
+    }
+
+    /// rsac-ptree: `collect_process_tree_pids` gathers the FULL descendant
+    /// closure (grandchildren+), not just direct children. Pure — no live
+    /// process table needed.
+    #[test]
+    fn collect_process_tree_pids_includes_grandchildren() {
+        use std::collections::HashMap;
+        // 1 → {2, 3}; 2 → {4}; 4 → {5}; 3 has no children. Sibling 99 unrelated.
+        let mut m: HashMap<u32, Vec<u32>> = HashMap::new();
+        m.insert(1, vec![2, 3]);
+        m.insert(2, vec![4]);
+        m.insert(4, vec![5]);
+        m.insert(99, vec![100]);
+
+        let pids = collect_process_tree_pids(1, &m);
+        assert_eq!(pids, vec![1, 2, 3, 4, 5], "full closure, sorted, deduped");
+        // Unrelated subtree must NOT be included.
+        assert!(!pids.contains(&99));
+        assert!(!pids.contains(&100));
+    }
+
+    /// rsac-ptree: a leaf root (no children entry) yields just itself.
+    #[test]
+    fn collect_process_tree_pids_leaf_is_just_root() {
+        use std::collections::HashMap;
+        let m: HashMap<u32, Vec<u32>> = HashMap::new();
+        assert_eq!(collect_process_tree_pids(42, &m), vec![42]);
+    }
+
+    /// rsac-ptree: a cyclic parent relation (possible after PID reuse) must not
+    /// hang and must visit each PID once.
+    #[test]
+    fn collect_process_tree_pids_tolerates_cycles() {
+        use std::collections::HashMap;
+        // 1 → 2 → 3 → 1 (cycle), plus 2 → 4.
+        let mut m: HashMap<u32, Vec<u32>> = HashMap::new();
+        m.insert(1, vec![2]);
+        m.insert(2, vec![3, 4]);
+        m.insert(3, vec![1]); // back-edge
+        let pids = collect_process_tree_pids(1, &m);
+        assert_eq!(pids, vec![1, 2, 3, 4]);
+    }
+
+    /// rsac-catap-safety: `guard_objc` converts a thrown `NSException` into an
+    /// `AudioError::BackendError` (labelled with the operation) instead of
+    /// aborting the process. Uses `objc2::exception::throw` to raise a real
+    /// NSException and asserts the caught error carries the operation label.
+    #[test]
+    fn guard_objc_converts_thrown_nsexception_to_backend_error() {
+        // Build a minimal NSException and throw it inside the guarded closure.
+        // We only need *an* ObjC exception object; NSException is the canonical
+        // one. Construct via the runtime so we don't depend on objc2-foundation
+        // exposing a typed NSException builder.
+        let err = guard_objc("throwing_op", || unsafe {
+            // Build an NSException and throw it. Let `msg_send!` perform the
+            // correct autoreleased-return retain directly into a
+            // `Retained<Exception>` (the pointer from
+            // `+exceptionWithName:reason:userInfo:` is +0 autoreleased).
+            let cls = AnyClass::get(c"NSException").expect("NSException class must exist");
+            let name = NSString::from_str("rsacTestException");
+            let reason = NSString::from_str("intentional test throw");
+            let exc: Retained<objc2::exception::Exception> = msg_send![
+                cls,
+                exceptionWithName: &*name,
+                reason: &*reason,
+                userInfo: std::ptr::null::<AnyObject>(),
+            ];
+            objc2::exception::throw(exc);
+        });
+
+        match err {
+            Err(AudioError::BackendError {
+                operation, message, ..
+            }) => {
+                assert_eq!(operation, "throwing_op");
+                assert!(
+                    message.contains("ObjC exception during throwing_op"),
+                    "message should note the ObjC exception, got: {message}"
+                );
+                // The reason should be surfaced for diagnostics.
+                assert!(
+                    message.contains("intentional test throw"),
+                    "message should include the NSException reason, got: {message}"
+                );
+            }
+            other => panic!("Expected BackendError from a thrown NSException, got: {other:?}"),
+        }
     }
 
     /// M6: aggregate-device failures carry the OSStatus machine-readably.
@@ -1346,8 +1701,18 @@ mod tests {
     }
 
     /// Test that new_system() creates a valid system-wide tap.
-    /// Uses std::panic::catch_unwind to catch ObjC exceptions (now that
-    /// the objc crate's "exception" feature is enabled).
+    ///
+    /// ObjC exceptions from the private `CATapDescription` selectors are now
+    /// converted to an `AudioError::BackendError` internally (via `guard_objc`
+    /// → `objc2::exception::catch`), so a version-shape mismatch surfaces as a
+    /// handled `Err`, NOT a Rust panic. We still wrap the call in
+    /// `std::panic::catch_unwind` as a defensive net for a *genuine* Rust panic
+    /// (e.g. a `.unwrap()` regression), which the test then reports.
+    ///
+    /// Note: `std::panic::catch_unwind` does NOT reliably catch foreign ObjC
+    /// exceptions (that would require the objc2 `"catch-all"` feature and would
+    /// otherwise abort); relying on it for that purpose was the bug this change
+    /// fixes. ObjC exceptions are handled inside `new_system` now.
     ///
     /// Ignored by default: `AudioHardwareCreateProcessTap` requires audio
     /// hardware + Screen-Recording (TCC) permission and can BLOCK indefinitely
@@ -1373,16 +1738,19 @@ mod tests {
                 // Drop will clean up the tap and aggregate device
             }
             Ok(Err(audio_err)) => {
-                // AudioError returned — not a panic, just a handled error
+                // AudioError returned — the expected path for a failure. A
+                // caught ObjC exception now arrives here as
+                // AudioError::BackendError (via guard_objc), alongside ordinary
+                // OSStatus/permission failures. All are acceptable on hosts
+                // lacking hardware/TCC or with a differing API shape.
                 eprintln!(
                     "new_system() returned AudioError (not a panic): {:?}",
                     audio_err
                 );
-                // This is acceptable — the test documents what error occurred
-                // On some systems, this may fail due to permissions or API changes
             }
             Err(panic_info) => {
-                // ObjC exception was caught as a Rust panic
+                // A genuine Rust panic (NOT an ObjC exception, which is now
+                // converted to Err above). This indicates a Rust-side bug.
                 let panic_msg = if let Some(s) = panic_info.downcast_ref::<String>() {
                     s.clone()
                 } else if let Some(s) = panic_info.downcast_ref::<&str>() {
@@ -1390,13 +1758,11 @@ mod tests {
                 } else {
                     format!("{:?}", panic_info)
                 };
-                eprintln!(
-                    "new_system() panicked (likely ObjC exception): {}",
-                    panic_msg
-                );
+                eprintln!("new_system() panicked (Rust panic): {}", panic_msg);
                 panic!(
-                    "new_system() threw an ObjC exception: {}. \
-                     This indicates the CATapDescription API needs adjustment for this macOS version.",
+                    "new_system() triggered a Rust panic: {}. \
+                     ObjC exceptions are converted to AudioError now, so this is a \
+                     Rust-side bug, not a CATapDescription API mismatch.",
                     panic_msg
                 );
             }
