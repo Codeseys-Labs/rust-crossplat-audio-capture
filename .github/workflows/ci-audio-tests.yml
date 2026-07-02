@@ -30,6 +30,7 @@ on:
     paths:
       - 'src/**'
       - 'tests/**'
+      - 'examples/**'
       - 'Cargo.toml'
       - 'Cargo.lock'
       - '.github/workflows/ci-audio-tests.yml'
@@ -38,6 +39,7 @@ on:
     paths:
       - 'src/**'
       - 'tests/**'
+      - 'examples/**'
       - 'Cargo.toml'
       - 'Cargo.lock'
       - '.github/workflows/ci-audio-tests.yml'

@@ -48,7 +48,7 @@ for path 1) — they never trigger off anything but a `v*.*.*` tag push.
 |---|---|---|---|---|
 | `.github/workflows/release.yml` | crates.io | linux/win/mac | `verify` → `publish` → `github-release` | `CARGO_REGISTRY_TOKEN` |
 | `.github/workflows/release-npm.yml` | npm (`@rsac/audio`) | 8 napi-rs targets (5 required + 3 best-effort) | `verify-napi-build` (×8) → `publish-npm` | `NPM_TOKEN` |
-| `.github/workflows/release-pypi.yml` | PyPI (`rsac`) | 3 OS × 5 Python (+ sdist) | `build-wheels` (×15) + `build-sdist` → `publish-pypi` | `MATURIN_PYPI_TOKEN` |
+| `.github/workflows/release-pypi.yml` | PyPI (`rsac`) | 3 OS × 5 Python (+ sdist) | `build-wheels` (×15) + `build-sdist` → `publish-pypi` | PyPI Trusted Publishing / OIDC |
 
 ### `release.yml` (crates.io)
 
@@ -339,11 +339,14 @@ publish workflows by hand after the GitHub Release appears:
 - **crates.io** — Actions → **Release** (`release.yml`) → *Run workflow*
   (it has a `workflow_dispatch` with a `dry_run` toggle; set `dry_run:
   false` to publish for real). Needs the `CARGO_REGISTRY_TOKEN` secret.
-- **npm** (`@rsac/audio`) — `release-npm.yml` triggers only on a tag push.
-  Until a triggering token is added, re-push the tag from a machine/token
-  that re-triggers workflows, or add a temporary `workflow_dispatch`.
-- **PyPI** (`rsac`) — `release-pypi.yml`, same as npm (tag-triggered;
-  publishes via PyPI Trusted Publishing / OIDC).
+- **npm** (`@rsac/audio`) — Actions → **Release npm**
+  (`release-npm.yml`) → *Run workflow*, enter `X.Y.Z`, and set `publish:
+  true`. With `publish` left false, the workflow only builds/smokes the
+  artifacts. Needs the `NPM_TOKEN` secret.
+- **PyPI** (`rsac`) — Actions → **Release PyPI** (`release-pypi.yml`) →
+  *Run workflow*, enter `X.Y.Z`, and set `publish: true`. With `publish`
+  left false, the workflow only builds/smokes wheels and sdist. Publishes
+  via PyPI Trusted Publishing / OIDC.
 
 **Why this is manual:** a tag pushed with the default `GITHUB_TOKEN` does
 not re-trigger `on: push: tags:` workflows (GitHub's anti-recursion rule),
@@ -506,11 +509,12 @@ Unchecking `dry_run` on `workflow_dispatch` would execute a real
 `cargo publish` off a non-tagged commit — do not do that. Real
 releases always go through a stable `vX.Y.Z` tag push.
 
-The npm and PyPI workflows do not expose a `workflow_dispatch`: their
-publishes are also irrevocable and there is no analogue to `cargo
-publish --dry-run` that exercises the whole wheel/napi pipeline. For
-those, rely on the tag-exclude guard above plus the existing per-PR CI
-matrix.
+`release-npm.yml` and `release-pypi.yml` also accept manual
+`workflow_dispatch` runs. They are safe-by-default: `publish` defaults to
+false, so the manual run builds/smokes artifacts but skips registry upload.
+To publish manually, set `publish: true` and provide the expected `X.Y.Z`
+version; the publish job verifies that value against the binding manifest
+before uploading.
 
 ### Promoting an RC to a stable release
 
@@ -900,10 +904,10 @@ repository secret**:
 |--------------------------|------------|--------------|
 | `CARGO_REGISTRY_TOKEN`   | crates.io  | <https://crates.io/me> → API Tokens (scope `publish-update`, plus `publish-new` on first publish) |
 | `NPM_TOKEN`              | npmjs      | <https://www.npmjs.com/settings/~/tokens> → new **Automation** token with publish rights on the `@rsac` scope |
-| `MATURIN_PYPI_TOKEN`     | PyPI       | <https://pypi.org/manage/account/token/> → project-scoped token for `rsac` |
+| PyPI Trusted Publisher   | PyPI       | Configure PyPI Trusted Publishing for this repo + `release-pypi.yml`; no long-lived token is used |
 
-Each secret feeds exactly one `publish-*` job. A missing secret fails
-that registry's workflow only — the other two proceed independently.
+Each credential feeds exactly one `publish-*` job. A missing credential
+fails that registry's workflow only — the other two proceed independently.
 
 ### Test-first-before-production flow
 
@@ -922,9 +926,8 @@ risking a real upload:
    workflow**, pick the RC branch or `master`, and leave
    `dry_run` checked (default `true`). `verify` + `publish` run end to
    end but `publish` stops at `cargo publish --dry-run` and never
-   uploads. The npm and PyPI flows do not expose `workflow_dispatch`
-   (no analogue to `--dry-run` exists for wheels/napi artifacts), so
-   for those rely on the tag-exclude guard plus per-PR CI.
+   uploads. For npm/PyPI, run **Release npm** / **Release PyPI** with
+   `publish` left false to build/smoke their artifacts without uploading.
 3. **Promote the RC to a real release.** Once the dry-run is green,
    tag the stable version — this push is the real trigger:
    ```bash

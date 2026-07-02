@@ -98,7 +98,8 @@ Pull requests trigger three workflows:
   [`docs/CI_AUDIO_TESTING.md`](CI_AUDIO_TESTING.md) for which cells are
   exercised end-to-end versus gated by macOS platform-security limits.
 - Release workflows (`release.yml`, `release-npm.yml`,
-  `release-pypi.yml`) only trigger on tags.
+  `release-pypi.yml`) trigger on stable tags and also support guarded
+  manual dispatch for release rehearsals or registry publish recovery.
 
 ## 5. Docs
 

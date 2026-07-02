@@ -261,4 +261,4 @@ jobs:
         env:
           TAG: ${{ steps.detect.outputs.tag }}
         run: |
-          echo "::warning::Tag ${TAG} + GitHub Release created. Registry publishing is NOT automatic (GITHUB_TOKEN-pushed tags do not trigger the on:push:tags publish workflows). To publish: run the 'Release' workflow (release.yml) via workflow_dispatch for crates.io, and trigger release-npm.yml / release-pypi.yml manually (e.g. re-push the tag with a PAT, or add a workflow_dispatch). See docs/RELEASE_PROCESS.md."
+          echo "::warning::Tag ${TAG} + GitHub Release created. Registry publishing is NOT automatic (GITHUB_TOKEN-pushed tags do not trigger the on:push:tags publish workflows). To publish: run 'Release' (release.yml), 'Release npm' (release-npm.yml), and 'Release PyPI' (release-pypi.yml) via workflow_dispatch with the expected version. See docs/RELEASE_PROCESS.md."
