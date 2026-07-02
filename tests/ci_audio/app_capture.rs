@@ -154,6 +154,14 @@ fn test_app_capture_by_pid_string_linux() {
     // Wait for PipeWire to register the player's stream node.
     std::thread::sleep(Duration::from_millis(1000));
 
+    // Only used to decide whether to skip: if PipeWire never registered a node
+    // for this player, app capture cannot possibly route audio here in CI.
+    if helpers::find_pipewire_node_for_pid(pid).is_none() {
+        eprintln!("[ci_audio] No PipeWire node for PID {pid}; skipping (CI routing limitation)");
+        helpers::stop_player(child);
+        return;
+    }
+
     let capture_result = AudioCaptureBuilder::new()
         .with_target(CaptureTarget::Application(ApplicationId(pid.to_string())))
         .sample_rate(48000)

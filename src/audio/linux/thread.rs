@@ -261,6 +261,20 @@ pub(crate) enum PipeWireCommand {
         response_tx: std_mpsc::Sender<AudioResult<Vec<PwAppSnapshot>>>,
     },
 
+    /// Resolve a capture [`TargetQuery`] against the native registry snapshot,
+    /// returning the matched node's `object.serial` (H4 part 3 / `rsac-nat1`).
+    ///
+    /// Like [`SnapshotDevices`](PipeWireCommand::SnapshotDevices), the handler
+    /// waits for a `core.sync()`/`done` roundtrip so the registry's initial dump
+    /// has settled before matching — otherwise it would race an empty registry
+    /// and spuriously report "no match" on a healthy system. `Ok(None)` means
+    /// the registry settled but held no matching node (the caller may then try
+    /// the `pw-dump` fallback); an `Err` is a spawn/roundtrip failure.
+    ResolveTarget {
+        query: TargetQuery,
+        response_tx: std_mpsc::Sender<AudioResult<Option<String>>>,
+    },
+
     /// Enumerate the `SPA_PARAM_EnumFormat` parameters a node advertises and map
     /// each to a [`crate::core::config::AudioFormat`] (PR-5 / `rsac-7469`).
     ///
@@ -723,6 +737,48 @@ impl PipeWireThread {
         }
     }
 
+    /// Resolve a capture [`TargetQuery`] to a node `object.serial` using the
+    /// **native** registry snapshot (H4 part 3 / `rsac-nat1`) — no `pw-dump`.
+    ///
+    /// Sends a [`ResolveTarget`](PipeWireCommand::ResolveTarget) command and
+    /// blocks (bounded by [`SNAPSHOT_TIMEOUT`]) for the reply. The PipeWire
+    /// thread waits for a `core.sync()`/`done` roundtrip so the registry has
+    /// settled before matching. `Ok(None)` means the registry settled but held
+    /// no matching node (the caller may then fall back to the `pw-dump` path).
+    ///
+    /// # Errors
+    ///
+    /// - [`AudioError::BackendError`] if the PipeWire thread is not running or
+    ///   exits without replying.
+    /// - [`AudioError::Timeout`] if resolution does not complete within
+    ///   [`SNAPSHOT_TIMEOUT`].
+    pub fn resolve_target(&self, query: TargetQuery) -> AudioResult<Option<String>> {
+        let (response_tx, response_rx) = std_mpsc::channel();
+
+        self.command_tx
+            .send(PipeWireCommand::ResolveTarget { query, response_tx })
+            .map_err(|_| AudioError::BackendError {
+                backend: "PipeWire".to_string(),
+                operation: "resolve_target".to_string(),
+                message: "PipeWire thread is not running (command channel closed)".to_string(),
+                context: None,
+            })?;
+
+        match response_rx.recv_timeout(SNAPSHOT_TIMEOUT) {
+            Ok(result) => result,
+            Err(std_mpsc::RecvTimeoutError::Timeout) => Err(AudioError::Timeout {
+                operation: "PipeWire ResolveTarget roundtrip".to_string(),
+                duration: SNAPSHOT_TIMEOUT,
+            }),
+            Err(std_mpsc::RecvTimeoutError::Disconnected) => Err(AudioError::BackendError {
+                backend: "PipeWire".to_string(),
+                operation: "resolve_target".to_string(),
+                message: "PipeWire thread exited before responding to ResolveTarget".to_string(),
+                context: None,
+            }),
+        }
+    }
+
     /// Enumerate the audio formats a node advertises via its
     /// `SPA_PARAM_EnumFormat` parameters (PR-5 / `rsac-7469`).
     ///
@@ -961,6 +1017,114 @@ fn parse_ppid_from_stat(stat_contents: &str) -> Option<u32> {
     ppid_str.parse::<u32>().ok()
 }
 
+// ── Native registry target resolution (H4 part 3 / rsac-nat1) ────────────
+//
+// The capture path historically resolved every non-default `CaptureTarget` to a
+// PipeWire node `object.serial` by shelling out to `pw-dump` and parsing its
+// JSON (`find_pipewire_node_serial`). Device/Application discovery already has a
+// *native* in-process path (the registry `global` snapshot — `PwDeviceSnapshot`
+// / `PwAppSnapshot`), so the capture path can reuse that same snapshot instead
+// of a subprocess. These pure helpers do the matching against an already-taken
+// snapshot; `resolve_capture_target` drives the snapshot + these helpers, and
+// falls back to `pw-dump` only when the native path can't resolve (e.g. a
+// permission-restricted registry that hides stream nodes).
+
+/// How to match a capture target against a native registry snapshot.
+///
+/// This mirrors the [`PwNodeLookup`] strategies but operates on the owned
+/// [`PwDeviceSnapshot`] / [`PwAppSnapshot`] lists produced by the registry
+/// `global` callback rather than on `pw-dump` JSON — so no subprocess and no
+/// `PATH` dependency is involved.
+#[derive(Debug, Clone)]
+pub(crate) enum TargetQuery {
+    /// Match a *device/sink/source* node by its [`DeviceId`] string against a
+    /// snapshot node's `object.serial` (or global-id fallback) `id`.
+    ///
+    /// [`DeviceId`]: crate::core::config::DeviceId
+    Device(String),
+    /// Match an application stream node by exact process id.
+    ByPid(u32),
+    /// Match an application stream node by name (see
+    /// [`app_name_matches`] for the exact/relaxed contract).
+    ByAppName(String),
+    /// Match the first application stream node whose PID is in the set (process
+    /// tree capture).
+    ByPidSet(Vec<u32>),
+}
+
+/// The tightened `ApplicationByName` matching contract (native + subprocess).
+///
+/// A candidate application name matches `query` when either:
+/// 1. it is an **exact**, case-insensitive equality, or
+/// 2. after case-folding, the candidate's file-stem (the binary name with any
+///    directory prefix and trailing `.exe`/version suffix stripped) equals the
+///    query.
+///
+/// It intentionally does **not** do arbitrary substring containment: a query of
+/// `"Fire"` must not silently bind to `"Firefox"` (that surprised callers and
+/// could attach to the wrong app). Callers wanting fuzzy discovery should
+/// enumerate via `list_audio_applications()` and pick a PID explicitly.
+///
+/// `candidate` is compared both as-is and as its trailing path component so a
+/// registry `application.process.binary` like `/usr/lib/firefox/firefox` still
+/// matches a query of `firefox`.
+pub(crate) fn app_name_matches(candidate: &str, query: &str) -> bool {
+    let q = query.trim();
+    if q.is_empty() {
+        return false;
+    }
+    if candidate.eq_ignore_ascii_case(q) {
+        return true;
+    }
+    // Compare the candidate's trailing path component (basename) too, so a full
+    // binary path resolves against a bare program name.
+    let base = candidate.rsplit(['/', '\\']).next().unwrap_or(candidate);
+    if base.eq_ignore_ascii_case(q) {
+        return true;
+    }
+    // Strip a trailing ".exe" (cross-platform binary names) from the basename
+    // for the final comparison — never a broad substring match.
+    let stem = base.strip_suffix(".exe").unwrap_or(base);
+    stem.eq_ignore_ascii_case(q)
+}
+
+/// Resolve a [`TargetQuery`] against native registry snapshots, returning the
+/// matched node's `object.serial` (the string the capture path stamps into
+/// `TARGET_OBJECT`).
+///
+/// `devices` and `apps` are the owned snapshots taken on the PipeWire loop
+/// thread (via [`SnapshotDevices`](PipeWireCommand::SnapshotDevices) /
+/// [`SnapshotApplications`](PipeWireCommand::SnapshotApplications)). This is a
+/// **pure** function — no I/O, no subprocess — so it is unit-testable without a
+/// live daemon.
+///
+/// Returns `None` when nothing matches; the caller decides whether that is a
+/// `*NotFound` error or a reason to try the `pw-dump` fallback.
+pub(crate) fn resolve_target_from_snapshot(
+    query: &TargetQuery,
+    devices: &[PwDeviceSnapshot],
+    apps: &[PwAppSnapshot],
+) -> Option<String> {
+    match query {
+        TargetQuery::Device(id) => devices
+            .iter()
+            .find(|d| &d.id == id || d.node_name == *id || d.name == *id)
+            .map(|d| d.id.clone()),
+        TargetQuery::ByPid(pid) => apps
+            .iter()
+            .find(|a| a.pid == *pid)
+            .map(|a| a.node_serial.clone()),
+        TargetQuery::ByAppName(name) => apps
+            .iter()
+            .find(|a| app_name_matches(&a.app_name, name))
+            .map(|a| a.node_serial.clone()),
+        TargetQuery::ByPidSet(pids) => apps
+            .iter()
+            .find(|a| pids.contains(&a.pid))
+            .map(|a| a.node_serial.clone()),
+    }
+}
+
 // ── pw-dump Node Lookup ──────────────────────────────────────────────────
 
 /// Specifies how to look up a PipeWire node via `pw-dump`.
@@ -1108,7 +1272,9 @@ fn find_pipewire_node_serial(lookup: &PwNodeLookup<'_>) -> AudioResult<String> {
                     .get("application.process.binary")
                     .and_then(|v| v.as_str())
                     .unwrap_or("");
-                app_name.eq_ignore_ascii_case(name) || app_binary.eq_ignore_ascii_case(name)
+                // Same tightened contract as the native path (exact / basename /
+                // .exe-stripped, case-insensitive — never arbitrary substring).
+                app_name_matches(app_name, name) || app_name_matches(app_binary, name)
             }
             PwNodeLookup::ByPid(_) => {
                 let proc_id = props
@@ -1187,21 +1353,37 @@ fn find_pipewire_node_serial(lookup: &PwNodeLookup<'_>) -> AudioResult<String> {
 /// Resolve a [`CaptureTarget`] into a ready-to-use [`ResolvedTarget`].
 ///
 /// This is the off-the-event-loop resolution step (audit findings M2/M3): it
-/// runs `pw-dump` and walks `/proc` on the **caller** thread so the PipeWire
-/// event loop never blocks on a subprocess or filesystem traversal while it is
-/// pumping audio. The returned [`ResolvedTarget`] carries only a plain
-/// `object.serial` string (or "no target" for the default sink monitor).
+/// resolves the target **on the caller thread** so the capture PipeWire event
+/// loop never blocks on discovery while pumping audio. The returned
+/// [`ResolvedTarget`] carries only a plain `object.serial` string (or "no
+/// target" for the default sink monitor).
+///
+/// # Native-first resolution (H4 part 3 / `rsac-nat1`)
+///
+/// `Device`/`Application`/`ApplicationByName`/`ProcessTree` are resolved by
+/// taking an **in-process registry snapshot** on a short-lived
+/// [`PipeWireThread`] and matching it via [`resolve_target_from_snapshot`] — no
+/// `pw-dump` subprocess and no `PATH` dependency. `pw-dump` is used only as a
+/// **fallback** when the native path cannot resolve (the snapshot settled but
+/// held no match, or the short-lived thread failed to spawn — e.g. a
+/// permission-restricted registry that hides per-application stream nodes). A
+/// native match always wins; the subprocess is never consulted when the
+/// registry already answered.
 ///
 /// # Target semantics
 ///
-/// - [`SystemDefault`](CaptureTarget::SystemDefault) — no `TARGET_OBJECT`.
+/// - [`SystemDefault`](CaptureTarget::SystemDefault) — no `TARGET_OBJECT`; never
+///   touches the registry or `pw-dump`.
 /// - [`Device`](CaptureTarget::Device) — the [`DeviceId`] is a PipeWire node
-///   `id`/`object.serial`; validated against `pw-dump` and normalised to the
-///   node's `object.serial`. Returns [`AudioError::DeviceNotFound`] if absent.
+///   `object.serial` (or node name); matched against the registry snapshot and
+///   normalised to the node's `object.serial`. Returns
+///   [`AudioError::DeviceNotFound`] if absent in both paths.
 /// - [`Application`](CaptureTarget::Application) — the [`ApplicationId`] is a
-///   **numeric PID string**, matching the Windows/macOS contract. Resolved to
-///   the application's audio-output node serial via `pw-dump`.
-/// - [`ApplicationByName`](CaptureTarget::ApplicationByName) — resolved by name.
+///   **numeric PID string**, matching the Windows/macOS contract. Matched
+///   against each stream node's `application.process.id`.
+/// - [`ApplicationByName`](CaptureTarget::ApplicationByName) — matched by name
+///   using the tightened [`app_name_matches`] contract (exact / basename /
+///   `.exe`-stripped, case-insensitive — never arbitrary substring).
 /// - [`ProcessTree`](CaptureTarget::ProcessTree) — `/proc` is walked for the
 ///   PID's descendants, then any tree member's audio-output node is matched.
 ///
@@ -1211,9 +1393,12 @@ fn resolve_capture_target(target: &CaptureTarget) -> AudioResult<ResolvedTarget>
     match target {
         CaptureTarget::SystemDefault => Ok(ResolvedTarget::SystemDefault),
         CaptureTarget::Device(device_id) => {
-            // Validate the node exists and normalise to its object.serial so we
-            // never silently connect to a non-existent TARGET_OBJECT (M8).
-            let serial = find_pipewire_node_serial(&PwNodeLookup::Device(device_id.0.as_str()))?;
+            // Native-first: match the DeviceId against the registry snapshot;
+            // fall back to pw-dump only if the native path can't resolve.
+            let serial = resolve_serial_native_or_subprocess(
+                TargetQuery::Device(device_id.0.clone()),
+                &PwNodeLookup::Device(device_id.0.as_str()),
+            )?;
             log::debug!(
                 "PipeWire: Device '{}' validated, resolved to node serial={}",
                 device_id.0,
@@ -1223,8 +1408,8 @@ fn resolve_capture_target(target: &CaptureTarget) -> AudioResult<ResolvedTarget>
         }
         CaptureTarget::Application(app_id) => {
             // ApplicationId carries a numeric PID string — same contract as the
-            // Windows/macOS backends (audit finding M7). Resolve PID → node
-            // serial via pw-dump, mirroring ApplicationByName.
+            // Windows/macOS backends (audit finding M7). Parse PID → match the
+            // registry snapshot's `application.process.id`, pw-dump fallback.
             let pid: u32 = app_id
                 .0
                 .parse()
@@ -1234,7 +1419,10 @@ fn resolve_capture_target(target: &CaptureTarget) -> AudioResult<ResolvedTarget>
                         app_id.0
                     ),
                 })?;
-            let serial = find_pipewire_node_serial(&PwNodeLookup::ByPid(pid))?;
+            let serial = resolve_serial_native_or_subprocess(
+                TargetQuery::ByPid(pid),
+                &PwNodeLookup::ByPid(pid),
+            )?;
             log::debug!(
                 "PipeWire: Application PID {} resolved to node serial={}",
                 pid,
@@ -1243,7 +1431,10 @@ fn resolve_capture_target(target: &CaptureTarget) -> AudioResult<ResolvedTarget>
             Ok(ResolvedTarget::Serial(serial))
         }
         CaptureTarget::ApplicationByName(name) => {
-            let serial = find_pipewire_node_serial(&PwNodeLookup::ByAppName(name))?;
+            let serial = resolve_serial_native_or_subprocess(
+                TargetQuery::ByAppName(name.clone()),
+                &PwNodeLookup::ByAppName(name),
+            )?;
             log::debug!(
                 "PipeWire: ApplicationByName '{}' resolved to node serial={}",
                 name,
@@ -1262,7 +1453,10 @@ fn resolve_capture_target(target: &CaptureTarget) -> AudioResult<ResolvedTarget>
                 tree_pids.len(),
                 tree_pids
             );
-            let serial = find_pipewire_node_serial(&PwNodeLookup::ByPidSet(&tree_pids))?;
+            let serial = resolve_serial_native_or_subprocess(
+                TargetQuery::ByPidSet(tree_pids.clone()),
+                &PwNodeLookup::ByPidSet(&tree_pids),
+            )?;
             log::debug!(
                 "PipeWire: ProcessTree PID {} resolved to node serial={} (searched {} PIDs)",
                 pid.0,
@@ -1272,6 +1466,58 @@ fn resolve_capture_target(target: &CaptureTarget) -> AudioResult<ResolvedTarget>
             Ok(ResolvedTarget::Serial(serial))
         }
     }
+}
+
+/// Resolve a target to a node `object.serial`, preferring the **native**
+/// in-process registry snapshot and falling back to the `pw-dump` subprocess
+/// only when the native path cannot answer (H4 part 3 / `rsac-nat1`).
+///
+/// Resolution order:
+/// 1. Spawn a short-lived [`PipeWireThread`] and ask it to
+///    [`resolve_target`](PipeWireThread::resolve_target) `query` against the
+///    settled registry snapshot. A `Some(serial)` wins immediately — no
+///    subprocess is ever run.
+/// 2. If the native path returns `Ok(None)` (registry settled, no match) or an
+///    `Err` (thread spawn/roundtrip failure), fall back to
+///    [`find_pipewire_node_serial`] with `lookup`.
+///
+/// The subprocess fallback preserves the historical error taxonomy
+/// (`DeviceNotFound` / `ApplicationNotFound` / `BackendError`) so callers and
+/// tests that pattern-match on it keep working even when `pw-dump` is absent.
+fn resolve_serial_native_or_subprocess(
+    query: TargetQuery,
+    lookup: &PwNodeLookup<'_>,
+) -> AudioResult<String> {
+    match PipeWireThread::spawn() {
+        Ok(pw_thread) => match pw_thread.resolve_target(query) {
+            Ok(Some(serial)) => {
+                log::debug!(
+                    "PipeWire: native registry resolution matched serial={}",
+                    serial
+                );
+                return Ok(serial);
+            }
+            Ok(None) => {
+                log::debug!(
+                    "PipeWire: native registry settled with no match; trying pw-dump fallback"
+                );
+            }
+            Err(e) => {
+                log::debug!(
+                    "PipeWire: native registry resolution failed ({}); trying pw-dump fallback",
+                    e
+                );
+            }
+        },
+        Err(e) => {
+            log::debug!(
+                "PipeWire: could not spawn thread for native resolution ({}); \
+                 trying pw-dump fallback",
+                e
+            );
+        }
+    }
+    find_pipewire_node_serial(lookup)
 }
 
 // ── PipeWire Thread Main Function ────────────────────────────────────────
@@ -2130,6 +2376,34 @@ fn pw_thread_main(
                 );
                 // Only owned Vecs cross the channel.
                 let _ = response_tx.send(Ok(apps));
+            }
+
+            Ok(PipeWireCommand::ResolveTarget { query, response_tx }) => {
+                log::debug!("PipeWire thread: ResolveTarget received ({:?})", query);
+                // Settle the registry dump before matching (else we race an
+                // empty registry and report "no match" on a healthy system).
+                run_snapshot_roundtrip(&mut default_metadata);
+                // Build owned, PID-deduplicated snapshots exactly as the
+                // SnapshotDevices / SnapshotApplications arms do, then match
+                // natively (pure function, no subprocess).
+                let devices: Vec<PwDeviceSnapshot> =
+                    snapshot.borrow().devices.values().cloned().collect();
+                let mut seen_pids: std::collections::BTreeSet<u32> =
+                    std::collections::BTreeSet::new();
+                let mut apps: Vec<PwAppSnapshot> = Vec::new();
+                for app in snapshot.borrow().applications.values() {
+                    if seen_pids.insert(app.pid) {
+                        apps.push(app.clone());
+                    }
+                }
+                let matched = resolve_target_from_snapshot(&query, &devices, &apps);
+                log::debug!(
+                    "PipeWire thread: ResolveTarget → {:?} (from {} device(s), {} app(s))",
+                    matched,
+                    devices.len(),
+                    apps.len()
+                );
+                let _ = response_tx.send(Ok(matched));
             }
 
             Ok(PipeWireCommand::EnumNodeFormats {
@@ -3093,6 +3367,173 @@ mod tests {
             }
             other => panic!("Expected DeviceNotFound or BackendError, got {:?}", other),
         }
+    }
+
+    // ── Native registry resolution (H4 part 3 / rsac-nat1) ───────────
+    //
+    // These exercise the PURE matching helpers against synthetic snapshots, so
+    // they run without a live PipeWire daemon and without `pw-dump`/`PATH` —
+    // proving the capture path can resolve every non-default target natively.
+
+    fn dev(id: &str, node_name: &str, name: &str, class: &str) -> PwDeviceSnapshot {
+        PwDeviceSnapshot {
+            id: id.to_string(),
+            name: name.to_string(),
+            node_name: node_name.to_string(),
+            media_class: class.to_string(),
+        }
+    }
+
+    fn app_snap(pid: u32, app_name: &str, node_serial: &str) -> PwAppSnapshot {
+        PwAppSnapshot {
+            pid,
+            app_name: app_name.to_string(),
+            node_serial: node_serial.to_string(),
+        }
+    }
+
+    #[test]
+    fn test_app_name_matches_exact_case_insensitive() {
+        assert!(app_name_matches("Firefox", "firefox"));
+        assert!(app_name_matches("firefox", "FIREFOX"));
+        assert!(app_name_matches("VLC media player", "vlc media player"));
+    }
+
+    #[test]
+    fn test_app_name_matches_basename_and_exe_stripped() {
+        // A full binary path resolves against a bare program name.
+        assert!(app_name_matches("/usr/lib/firefox/firefox", "firefox"));
+        assert!(app_name_matches("C:\\Program Files\\VLC\\vlc.exe", "vlc"));
+        assert!(app_name_matches("spotify.exe", "spotify"));
+    }
+
+    #[test]
+    fn test_app_name_matches_rejects_substring() {
+        // The tightened contract: NO arbitrary substring containment. "Fire"
+        // must not bind to "Firefox" (that could attach to the wrong app).
+        assert!(!app_name_matches("Firefox", "Fire"));
+        assert!(!app_name_matches("Firefox", "fox"));
+        assert!(!app_name_matches("Spotify", "Spot"));
+    }
+
+    #[test]
+    fn test_app_name_matches_empty_query_is_no_match() {
+        assert!(!app_name_matches("Firefox", ""));
+        assert!(!app_name_matches("Firefox", "   "));
+    }
+
+    #[test]
+    fn test_resolve_target_from_snapshot_device_by_serial_and_name() {
+        let devices = vec![
+            dev(
+                "55",
+                "alsa_output.pci-0000_00_1f.3",
+                "Built-in Audio",
+                "Audio/Sink",
+            ),
+            dev(
+                "56",
+                "alsa_input.pci-0000_00_1f.3",
+                "Built-in Mic",
+                "Audio/Source",
+            ),
+        ];
+        // Match by object.serial (id).
+        assert_eq!(
+            resolve_target_from_snapshot(&TargetQuery::Device("55".to_string()), &devices, &[]),
+            Some("55".to_string())
+        );
+        // Match by node.name → returns the node's serial (round-trippable).
+        assert_eq!(
+            resolve_target_from_snapshot(
+                &TargetQuery::Device("alsa_input.pci-0000_00_1f.3".to_string()),
+                &devices,
+                &[]
+            ),
+            Some("56".to_string())
+        );
+        // Match by display name.
+        assert_eq!(
+            resolve_target_from_snapshot(
+                &TargetQuery::Device("Built-in Audio".to_string()),
+                &devices,
+                &[]
+            ),
+            Some("55".to_string())
+        );
+        // No match.
+        assert_eq!(
+            resolve_target_from_snapshot(
+                &TargetQuery::Device("no-such".to_string()),
+                &devices,
+                &[]
+            ),
+            None
+        );
+    }
+
+    #[test]
+    fn test_resolve_target_from_snapshot_by_pid() {
+        let apps = vec![
+            app_snap(1234, "Firefox", "9001"),
+            app_snap(5678, "Spotify", "9002"),
+        ];
+        assert_eq!(
+            resolve_target_from_snapshot(&TargetQuery::ByPid(5678), &[], &apps),
+            Some("9002".to_string())
+        );
+        // A PID with no stream node does not match.
+        assert_eq!(
+            resolve_target_from_snapshot(&TargetQuery::ByPid(4242), &[], &apps),
+            None
+        );
+    }
+
+    #[test]
+    fn test_resolve_target_from_snapshot_by_app_name_uses_tight_contract() {
+        let apps = vec![
+            app_snap(1234, "Firefox", "9001"),
+            app_snap(5678, "/usr/bin/spotify", "9002"),
+        ];
+        assert_eq!(
+            resolve_target_from_snapshot(
+                &TargetQuery::ByAppName("firefox".to_string()),
+                &[],
+                &apps
+            ),
+            Some("9001".to_string())
+        );
+        // Basename match against a full path.
+        assert_eq!(
+            resolve_target_from_snapshot(
+                &TargetQuery::ByAppName("spotify".to_string()),
+                &[],
+                &apps
+            ),
+            Some("9002".to_string())
+        );
+        // Substring must NOT match (tightened contract).
+        assert_eq!(
+            resolve_target_from_snapshot(&TargetQuery::ByAppName("Fire".to_string()), &[], &apps),
+            None
+        );
+    }
+
+    #[test]
+    fn test_resolve_target_from_snapshot_by_pid_set() {
+        let apps = vec![
+            app_snap(1000, "parent", "9001"),
+            app_snap(1002, "child", "9002"),
+        ];
+        // Any tree member's node matches; the first found in the app list wins.
+        let matched =
+            resolve_target_from_snapshot(&TargetQuery::ByPidSet(vec![999, 1002, 1003]), &[], &apps);
+        assert_eq!(matched, Some("9002".to_string()));
+        // A tree with no audio-producing member does not match.
+        assert_eq!(
+            resolve_target_from_snapshot(&TargetQuery::ByPidSet(vec![7, 8, 9]), &[], &apps),
+            None
+        );
     }
 
     // ── parse_default_metadata_name (H4 / rsac-bfd8) ─────────────────

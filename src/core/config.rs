@@ -394,11 +394,14 @@ pub struct StreamConfig {
     ///
     /// # Platform support (current state)
     ///
-    /// **Honored only on Windows (WASAPI) today.** The Linux (PipeWire) and macOS
-    /// (CoreAudio) backends hardcode `calculate_capacity(None, 4)` and ignore this
-    /// field, so setting it has no effect there — they always get the 64-slot default.
-    /// Threading the request (or a period-derived size) through every backend is
-    /// tracked in ADR-0007 (`docs/designs/0007-capacity-period-sizing.md`).
+    /// **Honored on Windows (WASAPI) and Linux (PipeWire) today.** Both pass
+    /// this straight into `calculate_capacity(requested, 4)` when sizing the
+    /// bridge ring, so it controls the ring depth (rounded up to a power of two,
+    /// min 4). The macOS (CoreAudio) backend still hardcodes
+    /// `calculate_capacity(None, 4)` and ignores this field, so setting it has
+    /// no effect there — it always gets the 64-slot default. Threading a
+    /// period-derived size through every backend is tracked in ADR-0007
+    /// (`docs/designs/0007-capacity-period-sizing.md`).
     ///
     /// The [`buffer_size_frames`](crate::api::AudioCaptureBuilder::buffer_size_frames)
     /// builder setter is a backward-compat alias that writes this same field; its

@@ -11,21 +11,24 @@
 //! Every non-default target is resolved to a PipeWire node `object.serial`
 //! **on the caller thread** (in `thread::PipeWireThread::start_capture`) before
 //! the work is handed to the PipeWire event loop, so the event loop never
-//! blocks on `pw-dump` or a `/proc` walk while pumping audio.
+//! blocks on discovery while pumping audio. Resolution is **native-first**
+//! (H4 part 3 / `rsac-nat1`): it takes an in-process registry snapshot on a
+//! short-lived `PipeWireThread` and matches it, using the `pw-dump` subprocess
+//! only as a fallback when the native path cannot resolve.
 //!
 //! - `SystemDefault` — attach a monitor stream to the default sink node
 //!   (no `TARGET_OBJECT`; `STREAM_CAPTURE_SINK` + `STREAM_MONITOR` route it).
-//! - `Device(DeviceId)` — the `DeviceId` is a PipeWire node `id`/`object.serial`;
-//!   it is validated against `pw-dump` and normalised to the node's
-//!   `object.serial`. A missing device yields `DeviceNotFound`.
+//! - `Device(DeviceId)` — the `DeviceId` is a PipeWire node `object.serial`
+//!   (or node name); matched against the registry snapshot and normalised to
+//!   the node's `object.serial`. A missing device yields `DeviceNotFound`.
 //! - `Application(ApplicationId)` — like the Windows/macOS backends, the
 //!   `ApplicationId` carries a **numeric PID string**. It is parsed to a PID
-//!   and resolved to the app's audio-output node via `pw-dump` (matching
-//!   `application.process.id`), exactly as `ApplicationByName` does for names.
-//! - `ApplicationByName` — resolve the app's node via `pw-dump`, matching
-//!   `application.name` / `application.process.binary`.
+//!   and matched against each stream node's `application.process.id`.
+//! - `ApplicationByName` — matched by name using the tightened contract
+//!   (exact / basename / `.exe`-stripped, case-insensitive — never arbitrary
+//!   substring; see `thread::app_name_matches`).
 //! - `ProcessTree(ProcessId)` — walk `/proc` for the PID's descendants, then
-//!   match any tree member's audio-output node via `pw-dump`.
+//!   match any tree member's audio-output node.
 //!
 //! ## Format negotiation
 //!
@@ -626,8 +629,14 @@ impl crate::core::interface::AudioDevice for LinuxAudioDevice {
             // 2. Use the capture target from StreamConfig (propagated from builder)
             let target = config.capture_target.clone();
 
-            // 3. Create the ring buffer bridge (64 AudioBuffer slots by default)
-            let capacity = calculate_capacity(None, 4);
+            // 3. Create the ring buffer bridge. Honor the caller's requested
+            //    ring depth (`StreamConfig::buffer_size`, a slot count) exactly
+            //    as the Windows/WASAPI backend does — `calculate_capacity`
+            //    rounds it up to a power of two with a floor of 4, and falls
+            //    back to the 64-slot default when `None`. This closes the
+            //    Linux-ignores-buffer_size gap called out in ADR-0007 / the
+            //    field docs; period-derived sizing remains future work.
+            let capacity = calculate_capacity(config.buffer_size, 4);
             let (producer, consumer) = create_bridge(capacity, format.clone());
 
             // 4. Transition bridge state from Created → Running so reads work
