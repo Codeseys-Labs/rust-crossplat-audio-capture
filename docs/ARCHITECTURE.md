@@ -127,8 +127,8 @@ Created ──▶ Running ──▶ Stopping ──▶ Stopped ──▶ Closed
 |---|---|---|
 | `SystemDefault` | System output (loopback of default sink) | OS default output enumerator |
 | `Device(DeviceId)` | One specific input or loopback device | Device enumerator (per-backend) |
-| `Application(ApplicationId)` | One application session | Backend-native session ID |
-| `ApplicationByName(String)` | First app whose name substring-matches (case-insensitive) | `sysinfo` PID lookup (Win/macOS) or `pw-dump` node serial (Linux) |
+| `Application(ApplicationId)` | One application process | Numeric PID string, resolved by the backend |
+| `ApplicationByName(String)` | First app whose name matches exactly (case-insensitive) | Exact process/app-name lookup, then backend PID resolution |
 | `ProcessTree(ProcessId)` | A parent process and its descendants | Platform-native process loopback / Process Tap with tree bit |
 
 The same enum compiles on every platform. When a variant is not supported
@@ -168,10 +168,10 @@ want to gate features should call
 - `SystemDefault` attaches a monitor stream to the default sink node.
 - `Device(DeviceId)` targets a sink node by its `object.serial`.
 - `Application` / `ApplicationByName` shell out to `pw-dump`, match on
-  `application.process.id` or `application.name`, and attach to that node.
+  `application.process.id` for PID strings or exact case-insensitive
+  `application.name` / `application.process.binary`, and attach to that node.
 - `ProcessTree(pid)` walks the tree with `sysinfo` and maps each PID to a
-  PipeWire node. See the helpers in `tests/ci_audio/helpers.rs` for the
-  exact `pw-dump` parsing logic used in CI.
+  PipeWire node using the same `pw-dump` metadata resolver.
 - Build-time requires `libpipewire-0.3-dev`, `libspa-0.2-dev`,
   `pkg-config`, `clang`/`libclang-dev`, `llvm-dev`. Runtime requires
   PipeWire 0.3.44+ with the user-session daemon running.

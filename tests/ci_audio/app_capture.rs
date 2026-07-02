@@ -7,12 +7,14 @@
 
 use std::time::{Duration, Instant};
 
-use rsac::{ApplicationId, AudioCaptureBuilder, CaptureTarget, ProcessId};
+use rsac::{ApplicationId, AudioCaptureBuilder, CaptureTarget};
 
 use crate::helpers;
 
-/// Test: Spawn audio player, capture by process tree (PID).
-/// Uses `CaptureTarget::ProcessTree(ProcessId(pid))`.
+/// Test: Spawn audio player and capture by application PID.
+///
+/// `ApplicationId` is a cross-platform numeric PID string. Process-tree
+/// behavior is covered separately in `process_tree_capture.rs`.
 #[test]
 fn test_app_capture_by_process_id() {
     require_app_capture!();
@@ -32,9 +34,9 @@ fn test_app_capture_by_process_id() {
     // Wait for player to start producing audio
     std::thread::sleep(Duration::from_millis(500));
 
-    // Build capture targeting the spawned process
+    // Build capture targeting exactly the spawned process.
     let capture_result = AudioCaptureBuilder::new()
-        .with_target(CaptureTarget::ProcessTree(ProcessId(pid)))
+        .with_target(CaptureTarget::Application(ApplicationId(pid.to_string())))
         .sample_rate(48000)
         .channels(2)
         .build();
@@ -128,11 +130,15 @@ fn test_app_capture_by_process_id() {
     }
 }
 
-/// Test: Capture with `Application(ApplicationId)` variant using PipeWire node ID.
-/// Linux-only — discovers the PipeWire node for the spawned player process.
+/// Linux regression: `Application(ApplicationId)` uses a numeric PID string.
+///
+/// Older tests treated the Linux `ApplicationId` as a PipeWire node ID. The
+/// backend contract is now aligned with Windows/macOS: `ApplicationId` is the
+/// application process ID, and the PipeWire backend resolves PID -> node
+/// internally.
 #[test]
 #[cfg(target_os = "linux")]
-fn test_app_capture_by_pipewire_node_id() {
+fn test_app_capture_by_pid_string_linux() {
     require_app_capture!();
 
     let wav_path = helpers::generate_test_wav(5.0, 48000, 2);
@@ -145,22 +151,11 @@ fn test_app_capture_by_pipewire_node_id() {
         }
     };
 
-    // Wait for PipeWire to register the node
+    // Wait for PipeWire to register the player's stream node.
     std::thread::sleep(Duration::from_millis(1000));
 
-    // Discover PipeWire node ID for the player process
-    let node_id = match helpers::find_pipewire_node_for_pid(pid) {
-        Some(id) => id,
-        None => {
-            eprintln!("[ci_audio] Could not find PipeWire node for PID {pid}, skipping");
-            helpers::stop_player(child);
-            return;
-        }
-    };
-    eprintln!("[ci_audio] Found PipeWire node {node_id} for PID {pid}");
-
     let capture_result = AudioCaptureBuilder::new()
-        .with_target(CaptureTarget::Application(ApplicationId(node_id.clone())))
+        .with_target(CaptureTarget::Application(ApplicationId(pid.to_string())))
         .sample_rate(48000)
         .channels(2)
         .build();
@@ -169,7 +164,7 @@ fn test_app_capture_by_pipewire_node_id() {
         Ok(c) => c,
         Err(e) => {
             eprintln!(
-                "[ci_audio] Failed to build app capture for node {node_id}: {:?}",
+                "[ci_audio] Failed to build app capture for PID {pid}: {:?}",
                 e
             );
             helpers::stop_player(child);
@@ -216,28 +211,28 @@ fn test_app_capture_by_pipewire_node_id() {
     helpers::stop_player(child);
 
     eprintln!(
-        "[ci_audio] App capture by node: total_samples={}, got_audio={}",
+        "[ci_audio] Linux app capture by PID string: total_samples={}, got_audio={}",
         total_samples, got_audio
     );
 
     if helpers::deterministic_audio_env() {
         assert!(
             got_audio,
-            "deterministic source: app capture via PW node {node_id} received only silence"
+            "deterministic source: app capture via PID {pid} received only silence"
         );
         assert!(
             rms_ok,
-            "deterministic source: app capture RMS below 0.01 floor for node {node_id}"
+            "deterministic source: app capture RMS below 0.01 floor for PID {pid}"
         );
         assert!(
             tone_present,
-            "deterministic source: 440 Hz tone not detected via PW node {node_id}"
+            "deterministic source: 440 Hz tone not detected via PID {pid}"
         );
-        eprintln!("[ci_audio] ✅ App capture via PW node {node_id} received the 440 Hz tone");
+        eprintln!("[ci_audio] ✅ App capture via PID {pid} received the 440 Hz tone");
     } else if got_audio {
-        eprintln!("[ci_audio] ✅ App capture via PW node {node_id} received non-silent audio");
+        eprintln!("[ci_audio] ✅ App capture via PID {pid} received non-silent audio");
     } else {
-        eprintln!("[ci_audio] ⚠ App capture via PW node did not receive audio (CI routing)");
+        eprintln!("[ci_audio] ⚠ App capture via PID did not receive audio (CI routing)");
     }
 
     // Clean up temp file
@@ -253,7 +248,7 @@ fn test_app_capture_by_pipewire_node_id() {
 fn test_app_capture_nonexistent_target() {
     require_app_capture!();
 
-    // A node ID / PID string that cannot correspond to any real audio source.
+    // A PID string that cannot correspond to any real audio source.
     let bogus_id = "99999999";
     let result = AudioCaptureBuilder::new()
         .with_target(CaptureTarget::Application(ApplicationId(

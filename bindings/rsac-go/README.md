@@ -129,9 +129,9 @@ Matches the Rust `CaptureTarget` enum:
 - `WithSystemDefault()` — the system default output (loopback).
 - `WithDevice(id)` — a specific device by ID (use the device
   enumerator to find one).
-- `WithApplicationByName(name)` — first app whose name
-  substring-matches (case-insensitive).
-- `WithApplication(id)` — a specific application session by ID.
+- `WithApplicationByName(name)` — first app whose name matches exactly
+  (case-insensitive).
+- `WithApplication(id)` — a specific application by numeric PID string.
 - `WithProcessTree(pid)` — a parent process plus all its descendants.
 
 Not every target is supported on every platform. Query capabilities

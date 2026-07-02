@@ -1410,10 +1410,28 @@ impl AudioCapture {
         &self.config
     }
 
-    /// Reads a buffer of audio data synchronously.
+    /// Reads a buffer of audio data synchronously (non-blocking).
     ///
     /// Uses `CapturingStream::try_read_chunk` for non-blocking reads.
     /// Returns `Ok(None)` if no data is currently available.
+    ///
+    /// # Terminal semantics (important)
+    ///
+    /// This is the **simple pull API**: it short-circuits with a **recoverable**
+    /// [`AudioError::StreamReadError`] the moment the stream leaves `Running`, so
+    /// it **never surfaces the fatal [`AudioError::StreamEnded`]** and does **not**
+    /// drain the buffered tail after `stop()`. A loop that branches on
+    /// [`is_fatal()`](AudioError::is_fatal) to detect end-of-stream will therefore
+    /// **never terminate** on this method (the downgraded error is recoverable);
+    /// it is intended for `while let Ok(Some(buf)) = capture.read_buffer()` style
+    /// loops that stop when the caller decides to.
+    ///
+    /// Prefer [`read_chunk_nonblocking`](Self::read_chunk_nonblocking) (its
+    /// terminal-observable sibling) when you need to observe the clean
+    /// end-of-stream signal or drain the tail after `stop()` — that is the path
+    /// the language bindings and the [`AudioBufferIterator`] use. `read_buffer` is
+    /// retained unchanged for backward compatibility; new terminal-aware code
+    /// should migrate to `read_chunk_nonblocking`.
     ///
     /// Takes `&self` (not `&mut self`): this path only reads `self.stream` and
     /// calls the stream's own `&self` methods, mutating no field of the handle.
@@ -1511,13 +1529,28 @@ impl AudioCapture {
     ///
     /// Uses `CapturingStream::read_chunk` which blocks until data arrives.
     ///
+    /// # Terminal semantics (important)
+    ///
+    /// Like [`read_buffer`](Self::read_buffer), this is the **simple pull API**:
+    /// it returns a **recoverable** [`AudioError::StreamReadError`] the instant the
+    /// stream leaves `Running`, so it **never surfaces the fatal
+    /// [`AudioError::StreamEnded`]**. Use
+    /// [`read_chunk_blocking`](Self::read_chunk_blocking) — the terminal-observable
+    /// sibling — when you need the clean end-of-stream signal (it delegates
+    /// straight to `read_chunk` and returns `StreamEnded` promptly on terminal).
+    /// `read_buffer_blocking` is retained unchanged for backward compatibility.
+    ///
     /// Takes `&self` (not `&mut self`) for the same reason as
     /// [`read_buffer`](Self::read_buffer): no field of the handle is mutated, so
     /// a parked `read_buffer_blocking` can be unblocked by a concurrent
     /// [`request_stop`](Self::request_stop) without ever aliasing the handle
     /// mutably. When the stream reaches a terminal state the underlying
     /// `read_chunk` returns [`AudioError::StreamEnded`] promptly instead of
-    /// blocking forever.
+    /// blocking forever — but the `is_running()` guard below means that terminal
+    /// is only observed when the transition happens *during* an already-parked
+    /// read; a call made after the stream is already terminal returns the
+    /// recoverable "not running" error instead (use `read_chunk_blocking` to
+    /// always see `StreamEnded`).
     pub fn read_buffer_blocking(&self) -> AudioResult<AudioBuffer> {
         // Get the stream first — if there's no stream, we're not running.
         let stream = self
@@ -2990,6 +3023,123 @@ mod tests {
             ),
             "terminal reported only after the tail is drained"
         );
+    }
+
+    // ── terminal-read propagation: read_buffer* (simple pull) vs
+    //    read_chunk_* (terminal-observable) — the documented divergence ─────
+
+    /// The load-bearing contract: on a stopped stream, `read_chunk_nonblocking`
+    /// surfaces the FATAL `StreamEnded` while `read_buffer` DOWNGRADES to a
+    /// RECOVERABLE `StreamReadError`. A read loop that ends on `is_fatal()` must
+    /// therefore terminate on `read_chunk_nonblocking` but would spin forever on
+    /// `read_buffer`. This pins the exact behavior their rustdoc promises so it
+    /// cannot silently drift.
+    #[test]
+    fn read_buffer_downgrades_terminal_but_read_chunk_nonblocking_preserves_it() {
+        // read_chunk_nonblocking → fatal StreamEnded on a stopped, empty stream.
+        let mock = Arc::new(MockCapturingStream::new());
+        mock.signal_stop();
+        let capture = make_mock_capture(Arc::clone(&mock));
+        match capture.read_chunk_nonblocking() {
+            Err(e) => {
+                assert!(e.is_fatal(), "read_chunk_nonblocking terminal must be fatal");
+                assert!(matches!(e, AudioError::StreamEnded { .. }));
+            }
+            other => panic!("expected fatal StreamEnded, got: {other:?}"),
+        }
+
+        // read_buffer → recoverable StreamReadError on the same stopped stream
+        // (never StreamEnded), because it short-circuits on !is_running().
+        let mock2 = Arc::new(MockCapturingStream::new());
+        mock2.signal_stop();
+        let capture2 = make_mock_capture(Arc::clone(&mock2));
+        match capture2.read_buffer() {
+            Err(e) => {
+                assert!(
+                    e.is_recoverable(),
+                    "read_buffer downgrades terminal to a recoverable error"
+                );
+                assert!(
+                    matches!(e, AudioError::StreamReadError { .. }),
+                    "read_buffer must report StreamReadError, not StreamEnded"
+                );
+                assert!(
+                    !matches!(e, AudioError::StreamEnded { .. }),
+                    "read_buffer must NEVER surface the fatal terminal"
+                );
+            }
+            other => panic!("expected recoverable StreamReadError, got: {other:?}"),
+        }
+    }
+
+    /// The blocking pair mirrors the non-blocking pair: `read_chunk_blocking`
+    /// surfaces the FATAL `StreamEnded` on a stopped stream, while
+    /// `read_buffer_blocking` short-circuits to a RECOVERABLE `StreamReadError`.
+    #[test]
+    fn read_buffer_blocking_downgrades_terminal_but_read_chunk_blocking_preserves_it() {
+        // read_chunk_blocking → fatal StreamEnded (delegates to read_chunk,
+        // whose MockCapturingStream loop returns StreamEnded once stopped+empty).
+        let mock = Arc::new(MockCapturingStream::new());
+        mock.signal_stop();
+        let capture = make_mock_capture(Arc::clone(&mock));
+        match capture.read_chunk_blocking() {
+            Err(e) => {
+                assert!(e.is_fatal(), "read_chunk_blocking terminal must be fatal");
+                assert!(matches!(e, AudioError::StreamEnded { .. }));
+            }
+            other => panic!("expected fatal StreamEnded, got: {other:?}"),
+        }
+
+        // read_buffer_blocking → recoverable StreamReadError (is_running guard).
+        let mock2 = Arc::new(MockCapturingStream::new());
+        mock2.signal_stop();
+        let capture2 = make_mock_capture(Arc::clone(&mock2));
+        match capture2.read_buffer_blocking() {
+            Err(e) => {
+                assert!(
+                    e.is_recoverable(),
+                    "read_buffer_blocking downgrades terminal to recoverable"
+                );
+                assert!(matches!(e, AudioError::StreamReadError { .. }));
+            }
+            other => panic!("expected recoverable StreamReadError, got: {other:?}"),
+        }
+    }
+
+    /// Both terminal-observable read paths (`read_chunk_nonblocking` and
+    /// `read_chunk_blocking`) must NOT end on a *recoverable* read error: a
+    /// transient `StreamReadError` injected ahead of data is surfaced as-is (and
+    /// is `is_recoverable()`), and the buffer behind it is still delivered on the
+    /// retry — so a correct consumer loop that retries recoverable errors keeps
+    /// going and only stops on `is_fatal()`. This guards the recoverable-vs-fatal
+    /// split end-to-end through the AudioCapture read surface.
+    #[test]
+    fn read_chunk_paths_treat_recoverable_error_as_retryable_not_terminal() {
+        let mock = Arc::new(MockCapturingStream::new());
+        // One transient hiccup, then a real buffer behind it.
+        mock.inject_recoverable_error(AudioError::StreamReadError {
+            reason: "transient hiccup".into(),
+        });
+        mock.push_buffer(AudioBuffer::new(vec![0.9; 4], 2, 48000));
+        let capture = make_mock_capture(Arc::clone(&mock));
+
+        // First read observes the recoverable error (NOT fatal, NOT terminal).
+        match capture.read_chunk_nonblocking() {
+            Err(e) => {
+                assert!(e.is_recoverable(), "injected error must be recoverable");
+                assert!(!e.is_fatal());
+                assert!(!matches!(e, AudioError::StreamEnded { .. }));
+            }
+            other => panic!("expected a recoverable error first, got: {other:?}"),
+        }
+        // Retry delivers the buffer that was queued behind the hiccup.
+        let buf = capture
+            .read_chunk_nonblocking()
+            .expect("read ok on retry")
+            .expect("buffer behind the recoverable error is delivered");
+        assert_eq!(buf.data()[0], 0.9);
+
+        mock.signal_stop();
     }
 
     // ── overrun_count() tests ─────────────────────────────────────────

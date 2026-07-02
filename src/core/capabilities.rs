@@ -17,6 +17,37 @@ use super::config::SampleFormat;
 /// [`PlatformCapabilities::query()`] and check before attempting
 /// operations that may not be available on all platforms.
 ///
+/// # Capability vs. readiness
+///
+/// A `PlatformCapabilities` value answers a **static** question: *can this
+/// build, on this OS, do this kind of thing at all?* It is derived from the
+/// target OS + enabled backend feature (and, on macOS, the runtime OS version
+/// for Process-Tap gating). It is **not** a promise that a *specific* capture
+/// will succeed right now. Three separate axes must all hold for a capture to
+/// start:
+///
+/// 1. **Capability** (this type) — e.g. `supports_application_capture`. If
+///    `false`, [`AudioCaptureBuilder::build`](crate::api::AudioCaptureBuilder::build)
+///    fails its preflight with
+///    [`PlatformNotSupported`](crate::core::error::AudioError::PlatformNotSupported)
+///    before touching any device.
+/// 2. **Permission** — a *runtime* grant, distinct from capability. On macOS
+///    per-application capture needs the Audio-Capture TCC permission even when
+///    `supports_application_capture == true`; query it with
+///    [`check_audio_capture_permission`](crate::core::introspection::check_audio_capture_permission).
+/// 3. **Readiness / resolution** — whether the specific
+///    [`CaptureTarget`](crate::core::config::CaptureTarget) resolves *now* (the
+///    device is present, the PID/app exists and is producing audio). A capable,
+///    permitted platform can still fail here with
+///    [`DeviceNotFound`](crate::core::error::AudioError::DeviceNotFound) /
+///    [`ApplicationNotFound`](crate::core::error::AudioError::ApplicationNotFound)
+///    at build/start time.
+///
+/// So `caps.supports_application_capture == true` means "this platform can
+/// capture *some* application" — not "application `X` is capturable right now".
+/// Treat capability as a gate you check first, then handle permission and
+/// per-target resolution errors when they occur.
+///
 /// # Example
 ///
 /// ```
@@ -24,7 +55,9 @@ use super::config::SampleFormat;
 ///
 /// let caps = PlatformCapabilities::query();
 /// if caps.supports_application_capture {
-///     // Safe to use CaptureTarget::Application(..)
+///     // Capability holds — but a specific CaptureTarget::Application(pid) can
+///     // still fail with ApplicationNotFound (readiness) or need a permission
+///     // grant, handled when build()/start() is called.
 /// }
 /// ```
 #[derive(Debug, Clone)]

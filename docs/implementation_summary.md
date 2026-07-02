@@ -27,7 +27,7 @@ We have successfully implemented a unified cross-platform API for capturing audi
 - ✅ PipeWire node discovery and enumeration
 - ✅ Monitor stream creation with TARGET_OBJECT properties
 - ✅ Audio buffer processing with format negotiation
-- ✅ Application selector (PID, name, node ID, serial)
+- ✅ Application selector (PID string, exact name, node serial)
 - ✅ Non-invasive monitoring with STREAM_MONITOR
 
 **macOS (`src/audio/macos/tap.rs`)**

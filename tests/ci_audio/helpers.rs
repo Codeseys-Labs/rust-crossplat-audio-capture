@@ -30,19 +30,18 @@ pub fn audio_infrastructure_available() -> bool {
     // Runtime detection
     runtime_detect_audio()
 }
-
 /// Whether the test environment provides a *deterministic* audio source.
 ///
-/// Set by CI (`RSAC_CI_AUDIO_DETERMINISTIC=1`) on platforms where the audio
-/// path is fully reproducible: the Linux PipeWire null sink with a known
-/// 440 Hz / 0.8-amplitude sine tone player, and the Windows VB-CABLE tier
-/// (which feeds the same deterministic fixture). When this returns `true`,
-/// capture tests upgrade their soft non-silence checks into HARD ASSERTS — a
-/// deterministic source that yields silence is a real regression, not flakiness.
+/// Set by CI (`RSAC_CI_AUDIO_DETERMINISTIC=1`) only for capture tiers where the
+/// audio path is fully reproducible. Today that is Windows system capture, where
+/// VB-CABLE is verified as the active default playback endpoint before tests
+/// run. When this returns `true`, capture tests upgrade their soft non-silence
+/// checks into HARD ASSERTS — a deterministic source that yields silence is a
+/// real regression, not flakiness.
 ///
-/// When unset (e.g. macOS BlackHole/TCC — permission-gated and less
-/// reproducible), tests keep the soft-warn behavior so they do not flake on
-/// non-reproducible hosts.
+/// When unset (Linux Firecracker PipeWire routing, Windows device/process tiers,
+/// or macOS BlackHole/TCC), tests keep the soft-warn behavior so they do not
+/// flake on non-reproducible hosts.
 pub fn deterministic_audio_env() -> bool {
     matches!(
         std::env::var("RSAC_CI_AUDIO_DETERMINISTIC").as_deref(),
@@ -808,7 +807,7 @@ macro_rules! require_process_capture {
 
 /// Spawn a platform-specific audio player and return the child process + its PID.
 /// Unlike `spawn_test_tone_player`, this always returns the PID for use with
-/// `CaptureTarget::ProcessTree` or PipeWire node discovery.
+/// `CaptureTarget::Application(ApplicationId(pid))` or `CaptureTarget::ProcessTree`.
 pub fn spawn_audio_player_get_pid(wav_path: &std::path::Path) -> Result<(Child, u32), String> {
     #[cfg(target_os = "linux")]
     {
@@ -891,55 +890,4 @@ pub fn spawn_audio_player_get_pid(wav_path: &std::path::Path) -> Result<(Child, 
         let _ = wav_path;
         Err("No audio player available for this platform".to_string())
     }
-}
-
-/// Discover the PipeWire node ID for a given process PID.
-///
-/// Runs `pw-dump` and parses the JSON output to find a node whose
-/// `application.process.id` property matches the given PID.
-/// Returns the node's `id` field as a `String`, or `None` if not found.
-#[cfg(target_os = "linux")]
-pub fn find_pipewire_node_for_pid(pid: u32) -> Option<String> {
-    let output = Command::new("pw-dump").output().ok()?;
-
-    if !output.status.success() {
-        eprintln!(
-            "[ci_audio] pw-dump failed: {}",
-            String::from_utf8_lossy(&output.stderr)
-        );
-        return None;
-    }
-
-    let stdout = String::from_utf8_lossy(&output.stdout);
-
-    // Parse the JSON array from pw-dump
-    let json: serde_json::Value = serde_json::from_str(&stdout).ok()?;
-    let arr = json.as_array()?;
-
-    let pid_str = pid.to_string();
-
-    for obj in arr {
-        // Check that this is a Node type
-        let obj_type = obj.get("type")?.as_str()?;
-        if obj_type != "PipeWire:Interface:Node" {
-            continue;
-        }
-
-        // Look for application.process.id in info.props
-        let props = obj.get("info").and_then(|i| i.get("props"));
-
-        if let Some(props) = props {
-            let app_pid = props.get("application.process.id").and_then(|v| v.as_str());
-
-            if app_pid == Some(&pid_str) {
-                // Return the node's id
-                let node_id = obj.get("id")?.as_u64()?;
-                eprintln!("[ci_audio] Found PipeWire node {} for PID {}", node_id, pid);
-                return Some(node_id.to_string());
-            }
-        }
-    }
-
-    eprintln!("[ci_audio] No PipeWire node found for PID {}", pid);
-    None
 }

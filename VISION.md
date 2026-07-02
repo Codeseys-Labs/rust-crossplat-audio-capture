@@ -46,8 +46,8 @@ pipeline.
 |---|---|---|
 | `SystemDefault` | Whole-system output (loopback of the default sink) | ✅ all 3 platforms |
 | `Device(DeviceId)` | A specific input or loopback device | ✅ all 3 platforms |
-| `Application(ApplicationId)` | One app by PID (Windows: process ID; macOS: PID → CATapDescription; Linux: PipeWire node) | ✅ all 3 platforms |
-| `ApplicationByName(String)` | One app by name substring (case-insensitive) — convenience wrapper | ✅ macOS, partial Windows/Linux |
+| `Application(ApplicationId)` | One app by numeric PID string (resolved to each backend's native capture target) | ✅ all 3 platforms |
+| `ApplicationByName(String)` | One app by exact name (case-insensitive) — convenience wrapper | ✅ all 3 platforms |
 | `ProcessTree(ProcessId)` | A parent process AND all descendants (follows fork/exec) | ✅ all 3 platforms |
 
 ### The output contract

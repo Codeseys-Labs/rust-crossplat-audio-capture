@@ -6,9 +6,11 @@
 //! (the `CaptureTarget::Application` arm) and
 //! `src/audio/macos/tap.rs::CoreAudioProcessTap::new`.
 //!
-//! These tests are `#[ignore]` by default because they exercise
+//! The Process Tap tests are `#[ignore]` by default because they exercise
 //! CoreAudio Process Taps (macOS 14.4+) and need TCC permission for
-//! audio capture. Developers can run them manually with:
+//! audio capture. The non-numeric parse test is safe to run because it fails
+//! before Process Tap creation. Developers can run the ignored tests manually
+//! with:
 //!
 //! ```text
 //! cargo test --test ci_audio application_by_pid \
@@ -39,9 +41,9 @@ fn skip_if_unsupported() -> bool {
     false
 }
 
-/// Asserts the builder accepts a numeric PID of a running process and
-/// exercises the full `CaptureTarget::Application` path: parse PID →
-/// `CoreAudioProcessTap::new` → aggregate device → bind source.
+/// Asserts the backend accepts a numeric PID of a running process and
+/// exercises the full `CaptureTarget::Application` path at `start()`:
+/// parse PID → `CoreAudioProcessTap::new` → aggregate device → bind source.
 ///
 /// Uses `std::process::id()` (the test harness's own PID) because it is
 /// guaranteed to be a real, running process. The current process may
@@ -60,19 +62,21 @@ fn select_by_pid_of_running_app_binds_source() {
     }
 
     let pid = std::process::id();
-    let result = AudioCaptureBuilder::new()
+    let mut capture = AudioCaptureBuilder::new()
         .with_target(CaptureTarget::Application(ApplicationId(pid.to_string())))
         .sample_rate(48000)
         .channels(2)
-        .build();
+        .build()
+        .expect("Application(PID) build should validate config before start-time resolution");
 
-    match result {
-        Ok(capture) => {
+    match capture.start() {
+        Ok(()) => {
             eprintln!(
-                "[ci_audio] ✅ Application(PID={}) bound source: {:?}",
+                "[ci_audio] ✅ Application(PID={}) started source: {:?}",
                 pid,
                 capture.config().target
             );
+            let _ = capture.stop();
         }
         Err(AudioError::BackendError { .. }) | Err(AudioError::InternalError { .. }) => {
             // Acceptable: some macOS versions reject Process-Tapping the
@@ -98,8 +102,8 @@ fn select_by_pid_of_running_app_binds_source() {
 ///
 /// We don't pin the exact variant because CoreAudio's error codes for
 /// "unknown process" are undocumented and have shifted across macOS
-/// versions. What we *do* lock in: the builder must surface an error,
-/// not `Ok(_)` and not a panic.
+/// versions. What we *do* lock in: start-time resolution must surface an
+/// error, not silently produce a stream and not panic.
 #[test]
 #[ignore = "requires macOS 14.4+ with audio capture permission"]
 fn select_by_nonexistent_pid_returns_error() {
@@ -107,20 +111,22 @@ fn select_by_nonexistent_pid_returns_error() {
         return;
     }
 
-    let result = AudioCaptureBuilder::new()
+    let mut capture = match AudioCaptureBuilder::new()
         .with_target(CaptureTarget::Application(ApplicationId(
             NONEXISTENT_PID.to_string(),
         )))
         .sample_rate(48000)
         .channels(2)
-        .build();
-
-    match result {
+        .build()
+    {
+        Ok(c) => c,
         Err(AudioError::BackendError { .. }) | Err(AudioError::InternalError { .. }) => {
+            // Acceptable if build() ever grows an eager Process Tap precheck.
             eprintln!(
-                "[ci_audio] ✅ Nonexistent PID {} rejected with expected error variant",
+                "[ci_audio] ✅ Nonexistent PID {} rejected at build() with expected error variant",
                 NONEXISTENT_PID
             );
+            return;
         }
         Err(AudioError::ApplicationNotFound { identifier }) => {
             // Also acceptable if the backend ever adds an existence
@@ -131,18 +137,43 @@ fn select_by_nonexistent_pid_returns_error() {
                 identifier
             );
             eprintln!(
-                "[ci_audio] ✅ Nonexistent PID {} rejected with ApplicationNotFound",
+                "[ci_audio] ✅ Nonexistent PID {} rejected with ApplicationNotFound at build()",
+                NONEXISTENT_PID
+            );
+            return;
+        }
+        Err(other) => panic!(
+            "Unexpected build error type for nonexistent PID {}: {:?}",
+            NONEXISTENT_PID, other
+        ),
+    };
+
+    match capture.start() {
+        Err(AudioError::BackendError { .. }) | Err(AudioError::InternalError { .. }) => {
+            eprintln!(
+                "[ci_audio] ✅ Nonexistent PID {} rejected at start() with expected error variant",
+                NONEXISTENT_PID
+            );
+        }
+        Err(AudioError::ApplicationNotFound { identifier }) => {
+            assert!(
+                identifier.contains(&NONEXISTENT_PID.to_string()),
+                "ApplicationNotFound identifier should embed the PID, got: {}",
+                identifier
+            );
+            eprintln!(
+                "[ci_audio] ✅ Nonexistent PID {} rejected with ApplicationNotFound at start()",
                 NONEXISTENT_PID
             );
         }
         Err(other) => panic!(
-            "Unexpected error type for nonexistent PID {}: {:?}",
+            "Unexpected start error type for nonexistent PID {}: {:?}",
             NONEXISTENT_PID, other
         ),
-        Ok(_) => panic!(
-            "Expected error for nonexistent PID {}, but build succeeded",
-            NONEXISTENT_PID
-        ),
+        Ok(()) => {
+            let _ = capture.stop();
+            panic!("Expected error for nonexistent PID {NONEXISTENT_PID}, but start() succeeded");
+        }
     }
 }
 
@@ -152,24 +183,44 @@ fn select_by_nonexistent_pid_returns_error() {
 /// `map_err`). This locks in the error *shape* so callers can rely on
 /// `ApplicationNotFound` being the parse-failure signal.
 ///
-/// Does not need audio hardware — the parse failure short-circuits
-/// before any CoreAudio call. Kept `#[ignore]` for consistency with
-/// the rest of the file and to match the `feat_macos` gate convention.
+/// Does not need TCC permission: parsing happens before any Process Tap call.
+/// The current backend resolves the target at `start()`, while `build()` only
+/// validates configuration and creates the backend handle.
 #[test]
-#[ignore = "macOS-only path, grouped with other application_by_pid tests"]
 fn select_by_non_numeric_id_returns_application_not_found() {
     if skip_if_unsupported() {
         return;
     }
 
     let bogus = "not-a-pid";
-    let result = AudioCaptureBuilder::new()
+    let mut capture = match AudioCaptureBuilder::new()
         .with_target(CaptureTarget::Application(ApplicationId(bogus.to_string())))
         .sample_rate(48000)
         .channels(2)
-        .build();
+        .build()
+    {
+        Ok(c) => c,
+        Err(AudioError::ApplicationNotFound { identifier }) => {
+            // Acceptable if build() ever grows a PID precheck — still the
+            // documented variant, embedding the raw ID.
+            assert!(
+                identifier.contains(bogus),
+                "ApplicationNotFound identifier should embed the raw id, got: {}",
+                identifier
+            );
+            eprintln!(
+                "[ci_audio] ✅ Non-numeric id '{}' rejected with ApplicationNotFound at build()",
+                bogus
+            );
+            return;
+        }
+        Err(other) => panic!(
+            "build() for non-numeric id '{}' must succeed or return ApplicationNotFound; got: {:?}",
+            bogus, other
+        ),
+    };
 
-    match result {
+    match capture.start() {
         Err(AudioError::ApplicationNotFound { identifier }) => {
             assert!(
                 identifier.contains(bogus),
@@ -177,7 +228,7 @@ fn select_by_non_numeric_id_returns_application_not_found() {
                 identifier
             );
             eprintln!(
-                "[ci_audio] ✅ Non-numeric id '{}' rejected with ApplicationNotFound",
+                "[ci_audio] ✅ Non-numeric id '{}' rejected with ApplicationNotFound at start()",
                 bogus
             );
         }
@@ -185,10 +236,12 @@ fn select_by_non_numeric_id_returns_application_not_found() {
             "Expected ApplicationNotFound for non-numeric id '{}', got: {:?}",
             bogus, other
         ),
-        Ok(_) => panic!(
-            "Expected ApplicationNotFound for non-numeric id '{}', but build succeeded",
-            bogus
-        ),
+        Ok(()) => {
+            let _ = capture.stop();
+            panic!(
+                "Expected ApplicationNotFound for non-numeric id '{bogus}', but start() succeeded"
+            );
+        }
     }
 }
 
@@ -198,8 +251,8 @@ fn select_by_non_numeric_id_returns_application_not_found() {
 /// (dereferencing nil Objective-C objects, panicking on OSStatus
 /// conversions, etc.) when the target process is the caller.
 ///
-/// The test succeeds as long as `build()` returns — `Ok` or `Err` are
-/// both acceptable. We only fail on a panic from inside the builder.
+/// The test succeeds as long as `build()` and `start()` return — `Ok` or `Err`
+/// are both acceptable. We only fail on a panic from inside the backend.
 #[test]
 #[ignore = "requires macOS 14.4+ with audio capture permission"]
 fn select_by_self_pid_does_not_panic() {
@@ -208,21 +261,34 @@ fn select_by_self_pid_does_not_panic() {
     }
 
     let self_pid = std::process::id();
-    let result = AudioCaptureBuilder::new()
+    let mut capture = match AudioCaptureBuilder::new()
         .with_target(CaptureTarget::Application(ApplicationId(
             self_pid.to_string(),
         )))
         .sample_rate(48000)
         .channels(2)
-        .build();
+        .build()
+    {
+        Ok(c) => c,
+        Err(e) => {
+            eprintln!(
+                "[ci_audio] ✅ Self-PID {} rejected cleanly at build() with: {:?}",
+                self_pid, e
+            );
+            return;
+        }
+    };
 
-    match result {
-        Ok(_) => eprintln!(
-            "[ci_audio] ✅ Self-PID {} accepted (no self-tap rejection on this host)",
-            self_pid
-        ),
+    match capture.start() {
+        Ok(()) => {
+            eprintln!(
+                "[ci_audio] ✅ Self-PID {} accepted (no self-tap rejection on this host)",
+                self_pid
+            );
+            let _ = capture.stop();
+        }
         Err(e) => eprintln!(
-            "[ci_audio] ✅ Self-PID {} rejected cleanly with: {:?}",
+            "[ci_audio] ✅ Self-PID {} rejected cleanly at start() with: {:?}",
             self_pid, e
         ),
     }

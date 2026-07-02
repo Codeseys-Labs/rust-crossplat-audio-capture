@@ -507,6 +507,73 @@ mod tests {
         );
     }
 
+    // 7b. Terminal signal is symmetric: read_chunk and try_read_chunk both
+    // return the SAME fatal StreamEnded once the stream is terminal, and
+    // try_read_chunk does NOT collapse terminal into Ok(None) (ADR-0003 / the
+    // CapturingStream trait contract). This pins the property the AudioCapture
+    // read_chunk_* paths and all binding pumps rely on.
+    #[test]
+    fn terminal_read_is_fatal_and_symmetric_across_both_methods() {
+        let (_producer, stream) = create_test_stream();
+        stream.stop().unwrap();
+
+        // Blocking read: fatal StreamEnded.
+        let blocking = stream.read_chunk();
+        assert!(matches!(
+            blocking,
+            Err(ref e) if e.is_fatal() && matches!(e, AudioError::StreamEnded { .. })
+        ), "read_chunk on a terminal stream must be a fatal StreamEnded, got {blocking:?}");
+
+        // Non-blocking read: the SAME fatal terminal — never Ok(None).
+        let nonblocking = stream.try_read_chunk();
+        assert!(
+            !matches!(nonblocking, Ok(None)),
+            "try_read_chunk must NOT report a terminal stream as Ok(None)"
+        );
+        assert!(matches!(
+            nonblocking,
+            Err(ref e) if e.is_fatal() && matches!(e, AudioError::StreamEnded { .. })
+        ), "try_read_chunk on a terminal stream must be a fatal StreamEnded, got {nonblocking:?}");
+    }
+
+    // 7c. Drain-before-terminal: while Stopping, buffered tail data is returned
+    // by try_read_chunk (Ok(Some)); the fatal StreamEnded is only reported once
+    // the ring is empty AND the state is terminal. Proves reads never discard
+    // the tail on a bare running check.
+    #[test]
+    fn drains_tail_during_stopping_then_reports_fatal_terminal() {
+        let (mut producer, stream) = create_test_stream();
+        producer.push(test_buffer(0.11)).unwrap();
+
+        // Enter Stopping (still readable) with a queued tail buffer.
+        stream
+            .shared()
+            .state
+            .transition(StreamState::Running, StreamState::Stopping)
+            .unwrap();
+
+        // Tail is drained first.
+        let tail = stream.try_read_chunk().unwrap().expect("tail drained");
+        assert_eq!(tail.data()[0], 0.11);
+
+        // Ring empty but still Stopping → Ok(None), not terminal yet.
+        assert!(
+            matches!(stream.try_read_chunk(), Ok(None)),
+            "empty-but-Stopping ring must be Ok(None), not StreamEnded"
+        );
+
+        // Reach a terminal state → now the fatal terminal is reported.
+        stream
+            .shared()
+            .state
+            .transition(StreamState::Stopping, StreamState::Stopped)
+            .unwrap();
+        assert!(matches!(
+            stream.try_read_chunk(),
+            Err(AudioError::StreamEnded { .. })
+        ));
+    }
+
     // M1: format() reflects the negotiated *delivery* format once a backend
     // records it via the producer, not just the requested format.
     #[test]
