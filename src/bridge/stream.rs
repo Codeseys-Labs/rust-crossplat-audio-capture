@@ -519,10 +519,13 @@ mod tests {
 
         // Blocking read: fatal StreamEnded.
         let blocking = stream.read_chunk();
-        assert!(matches!(
-            blocking,
-            Err(ref e) if e.is_fatal() && matches!(e, AudioError::StreamEnded { .. })
-        ), "read_chunk on a terminal stream must be a fatal StreamEnded, got {blocking:?}");
+        assert!(
+            matches!(
+                blocking,
+                Err(ref e) if e.is_fatal() && matches!(e, AudioError::StreamEnded { .. })
+            ),
+            "read_chunk on a terminal stream must be a fatal StreamEnded, got {blocking:?}"
+        );
 
         // Non-blocking read: the SAME fatal terminal — never Ok(None).
         let nonblocking = stream.try_read_chunk();
@@ -530,10 +533,13 @@ mod tests {
             !matches!(nonblocking, Ok(None)),
             "try_read_chunk must NOT report a terminal stream as Ok(None)"
         );
-        assert!(matches!(
-            nonblocking,
-            Err(ref e) if e.is_fatal() && matches!(e, AudioError::StreamEnded { .. })
-        ), "try_read_chunk on a terminal stream must be a fatal StreamEnded, got {nonblocking:?}");
+        assert!(
+            matches!(
+                nonblocking,
+                Err(ref e) if e.is_fatal() && matches!(e, AudioError::StreamEnded { .. })
+            ),
+            "try_read_chunk on a terminal stream must be a fatal StreamEnded, got {nonblocking:?}"
+        );
     }
 
     // 7c. Drain-before-terminal: while Stopping, buffered tail data is returned

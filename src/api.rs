@@ -3042,7 +3042,10 @@ mod tests {
         let capture = make_mock_capture(Arc::clone(&mock));
         match capture.read_chunk_nonblocking() {
             Err(e) => {
-                assert!(e.is_fatal(), "read_chunk_nonblocking terminal must be fatal");
+                assert!(
+                    e.is_fatal(),
+                    "read_chunk_nonblocking terminal must be fatal"
+                );
                 assert!(matches!(e, AudioError::StreamEnded { .. }));
             }
             other => panic!("expected fatal StreamEnded, got: {other:?}"),
