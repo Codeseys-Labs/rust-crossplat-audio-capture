@@ -54,9 +54,9 @@ After install, clear the build cache once: `cargo clean && cargo build`.
 
 ## macOS runtime: `NotDetermined` permission / silent capture
 
-**Symptom:** `PlatformCapabilities::query().check_audio_capture_permission()` returns `NotDetermined`, or capture returns silence on macOS.
+**Symptom:** `rsac::check_audio_capture_permission()` returns `NotDetermined`, or capture returns silence on macOS.
 
-**Fix:** rsac Process Tap needs **Screen Recording** permission (not Microphone). Open *System Settings → Privacy & Security → Screen & System Audio Recording*, enable your binary, and **fully quit and relaunch** the process — granted permissions are picked up only at process start. On first launch macOS prompts only after a capture attempt, not at enumeration time. Also verify you are on macOS 14.4+; Process Tap does not exist on earlier versions.
+**Fix:** rsac Process Tap needs the **Audio Capture** TCC permission (`kTCCServiceAudioCapture`) — this is a *distinct, stricter* service from both Microphone and Screen Recording (`kTCCServiceScreenCapture`). Declare `NSAudioCaptureUsageDescription` in your app's `Info.plist`; the OS then prompts the user on the first Process Tap attempt (not at enumeration time). Approve the prompt (it appears under *System Settings → Privacy & Security → Audio Capture* once granted) and **fully quit and relaunch** the process — granted permissions are picked up only at process start. Also verify you are on macOS 14.4+; Process Tap does not exist on earlier versions. Note: `check_audio_capture_permission()` is a free function in the crate root (`rsac::check_audio_capture_permission()`), not a method on the value returned by `PlatformCapabilities::query()`.
 
 ## macOS: `CATapDescription not found` or Process Tap returns empty data
 

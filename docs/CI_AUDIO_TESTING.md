@@ -100,6 +100,8 @@ tests/ci_audio/
 ├── process_tree_capture.rs    # end-to-end tree capture
 ├── multi_source.rs            # two AudioCapture instances in one process
 ├── stream_lifecycle.rs        # Created → Running → Stopping → Stopped
+├── lifecycle_terminal.rs      # request_stop() + terminal read (StreamEnded)
+├── overrun.rs                 # G8 ring-buffer overflow (overrun_count)
 ├── subscribe.rs               # mpsc subscription contract
 └── platform_caps.rs           # PlatformCapabilities::query sanity
 ```
@@ -137,11 +139,14 @@ centralised in `helpers.rs` so the tests themselves stay portable.
 ### macOS — `macos-system` / `macos-device` / `macos-process`
 
 - `blacksmith-6vcpu-macos-15` runner.
-- BlackHole 2ch is installed via Homebrew for the device-path tests.
-- `SwitchAudioSource` is installed to set BlackHole as default
-  output for a few test paths (not currently sufficient — see the
-  AUHAL hang above).
-- All Process Tap paths skip early via `require_*_capture!()`.
+- BlackHole 2ch is installed via Homebrew as a *future hook* for a
+  non-TCC "BlackHole-as-input" capture path; the current build does not
+  yet wire it to switch the default output, so it does not (by itself)
+  make any capture path deterministic. `coreutils` is installed for
+  `gtimeout`.
+- All Process Tap paths (System / Application / ProcessTree) skip early
+  via `require_*_capture!()` because `kTCCServiceAudioCapture` cannot be
+  granted on a managed runner.
 - Step-level `gtimeout --preserve-status 120` bounds the
   device-path wasted budget.
 

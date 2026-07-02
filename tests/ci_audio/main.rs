@@ -15,6 +15,7 @@ mod application_by_name_windows;
 mod application_by_pid;
 mod device_capture;
 mod device_enumeration;
+mod lifecycle_terminal;
 mod multi_source;
 mod overrun;
 mod platform_caps;

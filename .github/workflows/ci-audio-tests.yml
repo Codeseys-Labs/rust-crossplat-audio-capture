@@ -212,6 +212,19 @@ jobs:
             --no-default-features --features feat_linux \
             -- --test-threads=1 --nocapture 2>&1 | tee -a ci-audio-output.log
 
+      # Terminal read-behavior + request_stop() end-to-end on the real bridge:
+      # request_stop drives the stream terminal (fatal StreamEnded per ADR-0003),
+      # unblocks a parked blocking read promptly, and the stop() vs request_stop()
+      # handle-ownership distinction holds. The `lifecycle_terminal` substring
+      # matches ONLY this module, not `stream_lifecycle`.
+      - name: Run terminal-read / request_stop lifecycle tests
+        env:
+          RSAC_TEST_CAPTURE_TIMEOUT_SECS: "15"
+        run: |
+          cargo test --test ci_audio lifecycle_terminal \
+            --no-default-features --features feat_linux \
+            -- --test-threads=1 --nocapture 2>&1 | tee -a ci-audio-output.log
+
       # Covers the VISION.md "multi-source" pillar: two captures at
       # once must not starve each other, and stopping one must not
       # halt the other. See tests/ci_audio/multi_source.rs.
@@ -651,6 +664,19 @@ jobs:
             -- --test-threads=1 --nocapture `
             2>&1 | Tee-Object -FilePath ci-audio-output-lifecycle.log
 
+      # Terminal read-behavior + request_stop() end-to-end on the real WASAPI
+      # bridge. `lifecycle_terminal` matches ONLY this module (not
+      # `stream_lifecycle`). Hard-gated with the rest of the Windows system tier.
+      - name: Run terminal-read / request_stop lifecycle tests
+        shell: pwsh
+        env:
+          RSAC_TEST_CAPTURE_TIMEOUT_SECS: "15"
+        run: |
+          cargo test --test ci_audio lifecycle_terminal `
+            --no-default-features --features feat_windows `
+            -- --test-threads=1 --nocapture `
+            2>&1 | Tee-Object -FilePath ci-audio-output-terminal.log
+
       - name: Diagnostics on failure
         if: failure()
         shell: pwsh
@@ -960,6 +986,18 @@ jobs:
         run: |
           gtimeout --preserve-status 180 \
             cargo test --test ci_audio stream_lifecycle \
+            --no-default-features --features feat_macos \
+            -- --test-threads=1 --nocapture 2>&1 | tee -a ci-audio-output.log
+
+      # Terminal-read / request_stop tests gate on require_system_capture!(), so
+      # on a runner without RSAC_CI_MACOS_TCC_GRANTED they skip-early BEFORE any
+      # Process Tap call (no CoreAudio hang). gtimeout is the belt-and-braces cap.
+      - name: Run terminal-read / request_stop lifecycle tests (skip-early without TCC)
+        env:
+          RSAC_TEST_CAPTURE_TIMEOUT_SECS: "15"
+        run: |
+          gtimeout --preserve-status 180 \
+            cargo test --test ci_audio lifecycle_terminal \
             --no-default-features --features feat_macos \
             -- --test-threads=1 --nocapture 2>&1 | tee -a ci-audio-output.log
 

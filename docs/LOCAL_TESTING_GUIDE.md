@@ -229,9 +229,14 @@ cargo run -- record --pid <PARENT_PID> --duration 10 tree_audio.wav
 
 ### macOS
 
-- **Permissions:** First run may prompt for microphone/screen recording permission — **grant it**.
-  If you get permission errors, check:
-  **System Settings → Privacy & Security → Microphone** (and Screen Recording)
+- **Permissions:** Per-app / process-tree / system capture on macOS 14.4+ use
+  the **Process Tap** API, gated by the **Audio Capture** TCC service
+  (`kTCCServiceAudioCapture`). This is a *distinct* service from Microphone and
+  from Screen Recording — granting either of those is **not** sufficient. Declare
+  `NSAudioCaptureUsageDescription` in your `Info.plist`; the OS prompts on the
+  first capture attempt. If you get permission errors, approve the prompt under
+  **System Settings → Privacy & Security → Audio Capture** and relaunch the
+  process (grants are read only at process start).
 - **Process Tap:** Requires macOS 14.4+ (Sonoma). On older versions, only system capture works.
 - **Aggregate device:** For app capture, rsac creates a temporary CoreAudio aggregate device automatically.
 - **Xcode requirement:** The build uses CoreAudio system frameworks; Xcode CLI tools must be installed.
@@ -289,11 +294,25 @@ cargo test --test ci_audio --features feat_windows
 
 ### What the Integration Tests Cover
 
-| Test | Description |
+The `ci_audio` suite spans one module per capture surface. A representative
+sample:
+
+| Module | Description |
 |---|---|
-| `test_app_capture_by_process_id` | Spawns an audio player, captures by PID |
-| `test_app_capture_by_pipewire_node_id` | Linux-only: PipeWire node discovery + capture |
-| `test_app_capture_nonexistent_target` | Verifies graceful error handling for missing targets |
+| `system_capture` | `CaptureTarget::SystemDefault` end-to-end (tone → capture → verify) |
+| `device_capture` / `device_enumeration` | Device-targeted capture + enumerator contract |
+| `app_capture` | Per-application capture by PID / PipeWire node + nonexistent-target handling |
+| `application_by_name` / `application_by_pid` | macOS `ApplicationByName` / `Application(PID)` resolution |
+| `process_tree` / `process_tree_capture` | `ProcessTree` public-API + end-to-end tree capture |
+| `subscribe` | `subscribe()` mpsc fan-out, disconnect-after-stop, multi-subscriber |
+| `overrun` | `overrun_count()` increments when the consumer stalls (G8) |
+| `stream_lifecycle` | start → read → stop, idempotent stop, drop-while-running |
+| `lifecycle_terminal` | `request_stop()` + terminal read (`StreamEnded`) semantics |
+| `multi_source` | two `AudioCapture` instances at once |
+| `platform_caps` | `PlatformCapabilities::query()` sanity |
+
+See [`docs/CI_AUDIO_TESTING.md`](CI_AUDIO_TESTING.md) for the full module list,
+the platform × tier truth table, and the gate macros.
 
 ---
 
@@ -335,7 +354,7 @@ RECORD OPTIONS:
 | **"No audio devices found"** | Audio server not running | **Linux:** `systemctl --user start pipewire` · **macOS:** Reboot (CoreAudio is always on) · **Windows:** Check Windows Audio service |
 | **"Application not found"** | App not running or name mismatch | Use `--pid` instead, or check exact process name with `ps`/`tasklist`/`pw-dump` |
 | **Silence captured** | Target app not producing audio | Ensure the app is actively playing audio. On Linux, verify with `pw-top` |
-| **Permission denied (macOS)** | Missing audio capture permission | Grant in **System Settings → Privacy & Security → Microphone** |
+| **Permission denied (macOS)** | Missing Audio Capture (`kTCCServiceAudioCapture`) permission | Grant in **System Settings → Privacy & Security → Audio Capture** (not Microphone / Screen Recording) and relaunch |
 | **COM error (Windows)** | COM initialization conflict | Ensure no STA COM init in the same thread. rsac uses MTA mode. |
 | **"PlatformNotSupported" for app capture** | OS version too old | **macOS:** Need 14.4+ · **Windows:** Need build 20348+ · **Linux:** Need PipeWire 0.3.44+ |
 | **Build fails with missing headers** | Development libraries not installed | **Linux:** `sudo apt install libpipewire-0.3-dev` · **macOS:** `xcode-select --install` · **Windows:** Install VS Build Tools C++ workload |

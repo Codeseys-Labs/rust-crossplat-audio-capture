@@ -1,5 +1,19 @@
 # Windows Audio Debug Workflow
 
+> **⚠️ HISTORICAL — this document is out of date and describes tooling that no
+> longer exists.** The `windows-audio-debug.yml` workflow, the
+> `dynamic_vlc_capture` binary, and the Virtual-Audio-Driver + VLC approach
+> below have all been removed. The current Windows audio CI runs on
+> GitHub-hosted `windows-latest` using the **VB-CABLE** virtual driver
+> (`LABSN/sound-ci-helpers@v1` + `AudioDeviceCmdlets`) and the `ci_audio`
+> integration test suite — **not** VLC or Virtual-Audio-Driver. For the current
+> reality see:
+> - [`docs/CI_AUDIO_TESTING.md`](CI_AUDIO_TESTING.md) — the audio-test truth table (Windows tier)
+> - [`.github/workflows/ci-audio-tests.yml`](../.github/workflows/ci-audio-tests.yml) — the real Windows jobs
+> - [`docs/PLATFORM_TESTING.md`](PLATFORM_TESTING.md) — the platform verification overview
+>
+> The text below is retained only as a record of an earlier CI experiment.
+
 This document describes the Windows Audio Debug workflow designed to test virtual audio driver installation and VLC audio capture in CI environments.
 
 ## Overview

@@ -378,7 +378,7 @@ section can be deleted. See `release-tag.yml`'s header for the wiring TODO.
 - **Idempotent tagging** — `release-tag.yml` never re-creates an existing
   local or remote tag.
 - **`version-lockstep`** gates the release PR and is re-checked on the tag
-  by `release.yml`; the five manifests must agree before anything ships.
+  by `release.yml`; the six manifests must agree before anything ships.
 - **Repo-guarded** — both workflows only run on
   `Codeseys-Labs/rust-crossplat-audio-capture`.
 - **Major-proof** — three independent guards (no `major` input, prepare
