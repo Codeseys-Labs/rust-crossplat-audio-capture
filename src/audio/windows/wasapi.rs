@@ -357,9 +357,18 @@ impl WindowsApplicationCapture {
     }
 }
 
-// Unsafe Send implementations for Windows COM types
-// These are safe because we ensure COM is properly initialized and the types
-// are only used within the same thread context
+// SAFETY: `WindowsApplicationCapture` wraps a `wasapi::AudioClient`, which holds
+// COM interfaces the `windows`/`wasapi` crates conservatively mark `!Send`. rsac
+// only ever constructs and initializes this client after `initialize_mta()`
+// (see `initialize()`), i.e. in a Multi-Threaded Apartment where COM objects are
+// free-threaded and may legally be used from any thread. That MTA guarantee is
+// what makes moving the handle across threads sound — NOT "single-threaded use"
+// (which would contradict `Send`). This mirrors the identical MTA rationale on
+// `WindowsAudioDevice` / `WindowsDeviceEnumerator` below.
+//
+// NOTE: this type is legacy/RT-unsafe (see the type-level `audit L13` docs); the
+// canonical capture path is `WindowsCaptureThread`, whose WASAPI objects never
+// leave their own dedicated thread and so need no such assertion.
 unsafe impl Send for WindowsApplicationCapture {}
 
 // Note: Cannot implement Send for external COM types due to orphan rules

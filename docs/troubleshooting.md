@@ -38,6 +38,14 @@ After install, clear the build cache once: `cargo clean && cargo build`.
 
 **Fix:** Install VB-CABLE as the default output device (the audio-tests workflow in this repo uses the LABSN install path and sets VB-CABLE as default — see `.github/workflows/ci-audio-tests.yml`). For local runs without speakers, same install path works.
 
+## Windows: captured buffer format differs from the requested `sample_rate`/`channels`
+
+**Symptom:** You build with `.sample_rate(48000).channels(2)` but a delivered `AudioBuffer` reports a different rate/channel count (e.g. 96000 Hz / 8 ch on an HDMI or pro interface), or a log line reads `delivered format …Hz/…ch differs from requested …`.
+
+**Cause:** rsac is capture-only and does **not** resample (see `VISION.md`). On the WASAPI **system/device-loopback** path rsac requests 32-bit float at your rate/channels and WASAPI's `AUTOCONVERTPCM` converts the endpoint mix format to it — but some endpoints negotiate their own mix format, and the delivered buffer then carries that negotiated shape. On the **process-loopback** path (`Application` / `ApplicationByName` / `ProcessTree`) autoconvert is unavailable (the activation type rejects it), so the client is opened with an explicit f32 format that the loopback accepts directly.
+
+**Fix / expectation:** Read the delivered format from each `AudioBuffer` (`buffer.sample_rate()`, `buffer.channels()`) rather than assuming your request was honored; resample downstream if you need a fixed rate. The capture thread validates the interleaved-f32 frame invariant per packet and logs a throttled `WASAPI thread: delivered packet violates the interleaved-f32 contract …` error (dropping only a trailing partial frame) if an endpoint ever delivers data that is not a whole multiple of the frame size — that message indicates a genuine format-negotiation anomaly worth reporting, not a routine format difference.
+
 ## macOS: build fails with `xcrun: error: invalid active developer path`
 
 **Symptom:** `cargo build` on macOS errors immediately during `coreaudio-sys` / `objc2` compile with a missing-SDK message.

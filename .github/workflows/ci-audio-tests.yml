@@ -852,6 +852,22 @@ jobs:
             -- --test-threads=1 --nocapture `
             2>&1 | Tee-Object -FilePath ci-audio-output-proctree.log
 
+      # Windows-specific ApplicationByName coverage (WASAPI sysinfo→PID→process
+      # loopback). The cross-platform `application_by_name` module is
+      # `#![cfg(target_os = "macos")]`; the Windows path had no integration
+      # coverage until this module. The `application_by_name_windows` filter
+      # matches ONLY this module (not the macOS `application_by_name` module,
+      # whose name is a strict prefix but whose tests are cfg'd out here).
+      - name: Run ApplicationByName (Windows) tests
+        shell: pwsh
+        env:
+          RSAC_TEST_CAPTURE_TIMEOUT_SECS: "15"
+        run: |
+          cargo test --test ci_audio application_by_name_windows `
+            --no-default-features --features feat_windows `
+            -- --test-threads=1 --nocapture `
+            2>&1 | Tee-Object -FilePath ci-audio-output-appbyname.log
+
       - name: Diagnostics on failure
         if: failure()
         shell: pwsh

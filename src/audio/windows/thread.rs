@@ -215,6 +215,16 @@ impl PlatformStream for WindowsPlatformStream {
     fn stop_capture(&self) -> AudioResult<()> {
         // Just set the stop flag — don't join the thread while holding
         // the mutex lock. Drop handles the actual thread join.
+        //
+        // Lifecycle contract: `stop_capture()` is a *signal*, not a *join*. It
+        // returns as soon as the stop flag is set; the capture loop then exits on
+        // its next iteration (bounded by the 100 ms event wait) and the OS thread
+        // is joined only when the last `Arc<Mutex<WindowsCaptureThread>>` is
+        // dropped (see `WindowsCaptureThread::drop`). This keeps `stop()`
+        // non-blocking and, crucially, avoids joining while holding this mutex —
+        // which `is_active()` also locks — so a stop can never deadlock against a
+        // concurrent liveness check. Calling it more than once is harmless: the
+        // flag store is idempotent.
         let thread = self
             .capture_thread
             .lock()
@@ -349,12 +359,19 @@ fn wasapi_capture_thread_main(
         // system/device-loopback path keeps autoconvert enabled so WASAPI can
         // resample the endpoint mix format to our requested f32 format.
         //
-        // TODO: When autoconvert is disabled (process loopback), the captured
-        // data is whatever format the loopback endpoint delivers. We currently
-        // request 32-bit float (see `desired_format`), which the process
-        // loopback path accepts; if a future Windows release delivers a
-        // different format here, downstream format handling/resampling will be
-        // needed since we can't query the mix format on a loopback client.
+        // Format invariant (WASAPI-hardening): in BOTH modes the client is
+        // initialized with the explicit 32-bit-float `desired_format` above, and
+        // `IAudioClient::Initialize` FAILS if the client cannot deliver it —
+        // autoconvert resamples to it on the system/device path, and the
+        // process-loopback path accepts f32 directly. So a *successful* init is
+        // the contract that every delivered packet is interleaved f32 with
+        // `channels` samples per frame. We cannot re-query the negotiated format
+        // on a loopback client (`get_mixformat` returns "Not implemented"), so
+        // that init success is the only negotiation signal we have — and the
+        // capture loop additionally validates the per-packet frame invariant via
+        // `bytes_to_f32_frames`, failing loud (throttled diagnostics + partial-
+        // frame drop) rather than silently corrupting channel alignment if a
+        // future Windows release ever delivers a packet that violates it.
         autoconvert: !is_process_loopback,
         buffer_duration_hns: 0, // default buffer duration
     };
@@ -451,6 +468,17 @@ fn wasapi_capture_thread_main(
     // little-endian f32 samples = `channels * 4` bytes. `channels` is `>= 1`
     // (validated upstream), so this is non-zero.
     let bytes_per_frame = channels as usize * std::mem::size_of::<f32>();
+
+    // WASAPI-hardening: throttle the invariant-violation diagnostics so a
+    // pathological stream (a loopback endpoint that starts delivering a format
+    // that violates our interleaved-f32 assumption) cannot flood the log at
+    // audio-callback cadence. We log the FIRST occurrence at `error` unconditionally
+    // (it is always a real problem worth surfacing) and thereafter emit a single
+    // rate-limited summary roughly once per second of wall-clock capture, plus a
+    // final count in the cleanup section. Counted per-thread; no atomics needed
+    // because only this capture thread touches them.
+    let mut malformed_packet_count: u64 = 0;
+    let mut last_malformed_log = std::time::Instant::now();
 
     // PU-7: one reusable contiguous byte buffer for the raw WASAPI packet.
     //
@@ -553,24 +581,43 @@ fn wasapi_capture_thread_main(
             // wasapi-rs), into a contiguous slice — no per-byte `push_back`, no
             // `make_contiguous` rotation. `frames_read` is the authoritative
             // count of frames actually delivered.
-            let frames_read = match capture_client.read_from_device(&mut byte_buf[..needed]) {
-                Ok((frames, _buffer_info)) => frames as usize,
-                Err(e) => {
-                    // rsac-66a6: a read failure means the capture endpoint can no
-                    // longer deliver audio (device invalidated / unplugged). Flag
-                    // it as fatal and bail out of the drain loop; the outer-loop
-                    // check below exits the thread so cleanup signals terminal
-                    // `Error` rather than graceful `Stopping`.
-                    log::error!(
-                        "WASAPI thread: read_from_device failed (treating as device loss): {}",
-                        e
-                    );
-                    fatal_error = true;
-                    break;
-                }
-            };
+            //
+            // `buffer_info` carries the WASAPI buffer flags (SILENT /
+            // DATA_DISCONTINUITY) we use for diagnostics below.
+            let (frames_read, buffer_info) =
+                match capture_client.read_from_device(&mut byte_buf[..needed]) {
+                    Ok((frames, info)) => (frames as usize, info),
+                    Err(e) => {
+                        // rsac-66a6: a read failure means the capture endpoint can no
+                        // longer deliver audio (device invalidated / unplugged). Flag
+                        // it as fatal and bail out of the drain loop; the outer-loop
+                        // check below exits the thread so cleanup signals terminal
+                        // `Error` rather than graceful `Stopping`.
+                        log::error!(
+                            "WASAPI thread: read_from_device failed (treating as device loss): {}",
+                            e
+                        );
+                        fatal_error = true;
+                        break;
+                    }
+                };
             if frames_read == 0 {
                 continue;
+            }
+
+            // WASAPI-hardening: log a data-discontinuity flag (a gap in the
+            // captured stream, e.g. the endpoint glitched or a buffer was
+            // dropped by the engine) at `debug`. It is not fatal — audio
+            // continues — but it explains a discontinuity a downstream consumer
+            // might otherwise attribute to rsac. Kept at `debug` so it never
+            // floods a healthy stream's log at `info`+.
+            if buffer_info.flags.data_discontinuity {
+                log::debug!(
+                    "WASAPI thread: capture reported DATA_DISCONTINUITY at frame index {} \
+                     ({} frames) — a gap in the source stream, not a capture bug",
+                    buffer_info.index,
+                    frames_read
+                );
             }
 
             // The valid region is exactly `frames_read` whole frames. Slicing to
@@ -592,7 +639,37 @@ fn wasapi_capture_thread_main(
             // SAFETY: every bit pattern is a valid `f32`, and we only read the
             // `frames_read * bytes_per_frame` bytes that `read_from_device` just
             // initialized within `valid`.
-            let samples = bytes_to_f32_aligned(valid);
+            //
+            // WASAPI-hardening: `bytes_to_f32_frames` additionally enforces the
+            // interleaved-f32 delivery contract — the byte run must be a whole
+            // multiple of `bytes_per_frame` (so the sample count is a whole
+            // multiple of `channels`). If a future/edge loopback endpoint ever
+            // delivers a partial frame (the risk called out by the process-
+            // loopback autoconvert TODO), the trailing partial frame is dropped
+            // and the event surfaced via `malformed`, rather than silently
+            // shifting every subsequent sample into the wrong channel.
+            let (samples, malformed) = bytes_to_f32_frames(valid, bytes_per_frame);
+            if malformed {
+                malformed_packet_count += 1;
+                // First occurrence is always surfaced; subsequent ones are
+                // rate-limited to ~1/s so a persistently-wrong stream can't
+                // flood the log at callback cadence.
+                if malformed_packet_count == 1
+                    || last_malformed_log.elapsed() >= std::time::Duration::from_secs(1)
+                {
+                    log::error!(
+                        "WASAPI thread: delivered packet violates the interleaved-f32 \
+                         contract (byte_len={} not a whole multiple of bytes_per_frame={} \
+                         for {} channels); trailing partial frame dropped. \
+                         total malformed packets so far: {}",
+                        valid.len(),
+                        bytes_per_frame,
+                        channels,
+                        malformed_packet_count
+                    );
+                    last_malformed_log = std::time::Instant::now();
+                }
+            }
 
             if !samples.is_empty() {
                 // Push the borrowed sample view directly. `push_samples_or_drop`
@@ -634,6 +711,16 @@ fn wasapi_capture_thread_main(
 
     let _ = audio_client.stop_stream();
     is_active.store(false, Ordering::SeqCst);
+    // WASAPI-hardening: if any delivered packet violated the interleaved-f32
+    // contract during this session, surface the total once at exit so the
+    // (rate-limited) per-packet errors have an authoritative final count.
+    if malformed_packet_count > 0 {
+        log::error!(
+            "WASAPI thread: {} packet(s) violated the interleaved-f32 delivery contract \
+             during this capture session (trailing partial frames were dropped)",
+            malformed_packet_count
+        );
+    }
     // rsac-66a6 (ADR-0010): a FATAL device-error exit must drive the bridge to the
     // terminal `Error` state (`signal_error`) so a parked Linux/blocking reader
     // observes a Fatal `StreamEnded` instead of an indefinitely-draining graceful
@@ -935,6 +1022,49 @@ fn bytes_to_f32_aligned(bytes: &[u8]) -> &[f32] {
     samples
 }
 
+/// Reinterpret a run of F32LE capture bytes as interleaved `&[f32]` samples,
+/// enforcing the interleaved-f32 delivery contract (WASAPI-hardening).
+///
+/// This wraps [`bytes_to_f32_aligned`] with the *frame*-level invariant the raw
+/// alignment check does not cover: the delivered byte run must be a whole
+/// multiple of `bytes_per_frame` (i.e. the reinterpreted sample count must be a
+/// whole multiple of the channel count). rsac opens every WASAPI client — both
+/// the autoconvert system/device-loopback path and the process-loopback path —
+/// with an explicit 32-bit-float `desired_format`, and wasapi-rs sizes each
+/// packet by that same format, so in the normal case this is always satisfied.
+///
+/// The check exists to *fail loud, not silently corrupt* if that assumption is
+/// ever violated (the process-loopback autoconvert edge called out in the
+/// capture-loop TODO, or a future Windows delivery quirk). A partial trailing
+/// frame — bytes that don't complete a whole `channels`-wide frame — would, if
+/// naively reinterpreted, shift every subsequent sample into the wrong channel
+/// and permanently desync the stereo image. Instead we truncate to the last
+/// whole frame and report `malformed = true` so the caller can surface a
+/// throttled diagnostic.
+///
+/// Returns `(samples, malformed)`:
+/// - `samples`: the aligned, whole-frame run of interleaved f32 (possibly
+///   truncated to drop a partial trailing frame).
+/// - `malformed`: `true` iff the input byte length was not a whole multiple of
+///   `bytes_per_frame` (a contract violation worth logging).
+///
+/// `bytes_per_frame` must be non-zero (guaranteed by the caller: `channels >= 1`
+/// times 4 bytes/sample).
+///
+/// SAFETY of the caller: same as [`bytes_to_f32_aligned`] — `bytes` must be the
+/// initialized region `read_from_device` just wrote.
+#[inline]
+fn bytes_to_f32_frames(bytes: &[u8], bytes_per_frame: usize) -> (&[f32], bool) {
+    debug_assert!(bytes_per_frame != 0, "bytes_per_frame must be non-zero");
+    // Truncate to the last whole frame so a partial trailing frame can never
+    // shift channel alignment. In the normal case `remainder == 0` and this is
+    // a no-op slice.
+    let remainder = bytes.len() % bytes_per_frame;
+    let malformed = remainder != 0;
+    let whole = &bytes[..bytes.len() - remainder];
+    (bytes_to_f32_aligned(whole), malformed)
+}
+
 // ── Tests ────────────────────────────────────────────────────────────────
 //
 // These tests are automatically Windows-only because this file has
@@ -974,6 +1104,88 @@ mod tests {
     #[test]
     fn bytes_to_f32_aligned_empty_is_empty() {
         assert!(bytes_to_f32_aligned(&[]).is_empty());
+    }
+
+    // ── bytes_to_f32_frames: interleaved-f32 invariant (WASAPI-hardening) ──
+
+    /// A byte run that is an exact multiple of `bytes_per_frame` is well-formed:
+    /// all whole frames are returned and `malformed` is false.
+    #[test]
+    fn bytes_to_f32_frames_whole_frames_not_malformed() {
+        // 2ch stereo → 8 bytes/frame. 3 whole frames = 6 f32 samples.
+        let bytes_per_frame = 2 * std::mem::size_of::<f32>();
+        let samples_in: [f32; 6] = [1.0, -1.0, 0.5, -0.5, 0.25, -0.25];
+        let mut bytes = Vec::new();
+        for s in samples_in {
+            bytes.extend_from_slice(&s.to_le_bytes());
+        }
+        let (out, malformed) = bytes_to_f32_frames(&bytes, bytes_per_frame);
+        assert!(!malformed, "a whole-frame byte run must not be malformed");
+        assert_eq!(out, &samples_in);
+        assert_eq!(
+            out.len() % 2,
+            0,
+            "sample count must stay a whole multiple of channels"
+        );
+    }
+
+    /// A byte run with a trailing partial frame is flagged malformed AND the
+    /// partial frame is dropped, so the returned sample count stays a whole
+    /// multiple of the channel count (never shifts channel alignment).
+    #[test]
+    fn bytes_to_f32_frames_partial_frame_is_dropped_and_flagged() {
+        // 2ch stereo → 8 bytes/frame. Provide 2 whole frames (16 bytes) + a
+        // partial third frame (4 bytes = 1 sample, half a stereo frame).
+        let bytes_per_frame = 2 * std::mem::size_of::<f32>();
+        let whole: [f32; 4] = [1.0, 2.0, 3.0, 4.0];
+        let mut bytes = Vec::new();
+        for s in whole {
+            bytes.extend_from_slice(&s.to_le_bytes());
+        }
+        // Append a single dangling sample (partial stereo frame).
+        bytes.extend_from_slice(&9.0f32.to_le_bytes());
+
+        let (out, malformed) = bytes_to_f32_frames(&bytes, bytes_per_frame);
+        assert!(
+            malformed,
+            "a trailing partial frame must be reported as malformed"
+        );
+        assert_eq!(
+            out, &whole,
+            "the partial trailing frame must be dropped, keeping whole frames only"
+        );
+        assert_eq!(
+            out.len() % 2,
+            0,
+            "after dropping the partial frame the sample count is frame-aligned"
+        );
+    }
+
+    /// Mono (1ch → 4 bytes/frame): every 4-byte sample is a whole frame, so a
+    /// clean f32 run is never malformed.
+    #[test]
+    fn bytes_to_f32_frames_mono_is_frame_aligned() {
+        let bytes_per_frame = std::mem::size_of::<f32>(); // 1 channel
+        let samples_in: [f32; 5] = [0.0, 0.1, 0.2, 0.3, 0.4];
+        let mut bytes = Vec::new();
+        for s in samples_in {
+            bytes.extend_from_slice(&s.to_le_bytes());
+        }
+        let (out, malformed) = bytes_to_f32_frames(&bytes, bytes_per_frame);
+        assert!(!malformed);
+        assert_eq!(out, &samples_in);
+    }
+
+    /// An empty input is well-formed (0 is a multiple of any frame size) and
+    /// yields no samples — the silent-packet / drained-buffer case.
+    #[test]
+    fn bytes_to_f32_frames_empty_is_wellformed_empty() {
+        let (out, malformed) = bytes_to_f32_frames(&[], 8);
+        assert!(
+            !malformed,
+            "an empty run is a whole (zero) number of frames"
+        );
+        assert!(out.is_empty());
     }
 
     // ── WindowsCaptureConfig Construction Tests ──────────────────────
