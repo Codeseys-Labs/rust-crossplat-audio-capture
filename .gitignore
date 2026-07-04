@@ -45,3 +45,8 @@ windows-storage/
 
 # Stale tool-cache dirs
 .upstream-refs/
+
+# Kilo agent state (worktrees, manager state, node_modules) — only committed
+# plans (.kilo/plans/) are tracked; everything else is machine-local.
+.kilo/*
+!.kilo/plans/
