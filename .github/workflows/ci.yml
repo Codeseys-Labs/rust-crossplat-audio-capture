@@ -217,6 +217,14 @@ jobs:
         shell: bash
         run: cargo test --test enumeration_matrix --no-default-features --features feat_windows
 
+      # Doctests were Linux-only (feature-combo-doctests job) — doc examples
+      # visible only under cfg(windows) never compiled as doctests. Run the
+      # doc suite on this leg's feature set too (device-free; no_run examples
+      # only compile).
+      - name: Cargo test (doctests)
+        shell: bash
+        run: cargo test --doc --no-default-features --features feat_windows,compose,sink-wav,cli
+
       - name: Report audio service status
         if: always()
         shell: powershell
@@ -296,6 +304,14 @@ jobs:
       - name: Cargo test (enumeration_matrix — honest-failure contract)
         timeout-minutes: 5
         run: cargo test --test enumeration_matrix --no-default-features --features feat_macos
+
+      # Doctests were Linux-only (feature-combo-doctests job) — doc examples
+      # visible only under cfg(macos) never compiled as doctests. Run the doc
+      # suite on this leg's feature set too (device-free; no_run examples only
+      # compile).
+      - name: Cargo test (doctests)
+        timeout-minutes: 10
+        run: cargo test --doc --no-default-features --features feat_macos,compose,sink-wav,cli
 
       # OPTION B (existence check): Blacksmith macOS runners lack TCC grants for
       # Process Tap capture (see macos-process job in ci-audio-tests.yml —

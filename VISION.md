@@ -217,10 +217,11 @@ they are documented above as part of the in-scope surface:
   an opt-in A/B path. (The default path is already alloc-free in steady state.)
 - **`AudioCapture::pipe_to(sink)`** — a built-in driver that pumps the bundled
   `AudioSink` adapters (`NullSink` / `ChannelSink` / `WavFileSink`) without a
-  hand-rolled read loop. The sink trait + adapters ship today; the driver does
-  not yet exist.
-- **`subscribe()` terminal-error delivery** — surface the fatal `AudioError`
-  that ended a push subscription rather than only a channel disconnect.
+  hand-rolled read loop. Partially closed: `RunningCapture::drain_to(sink)` and
+  the `compose` feature's `Composition::drain_to(sink)` are exactly this driver
+  (background thread, recoverable-vs-fatal policy, flush/close finalization);
+  what remains is exposing it on a plain started `AudioCapture` and settling
+  the `pipe_to` naming.
 
 Each of these is tracked on `Codeseys-Labs/rust-crossplat-audio-capture` and/or
 in [`docs/reviews/`](docs/reviews/).

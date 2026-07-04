@@ -600,26 +600,44 @@ jobs:
           # windows-latest VB-CABLE's playback endpoint is named
           # "Speakers (VB-Audio Virtual Cable)", not "CABLE Input ...",
           # so the name filter has to accept either form.
+          #
+          # rsac-eb2f: the endpoint can take a few seconds to register with
+          # AudioSrv after the driver installs, so device discovery AND the
+          # Set-AudioDevice call are retried with a bounded backoff instead of
+          # failing the whole (only) hard e2e tier on a provisioning race.
           Install-Module -Name AudioDeviceCmdlets -Force -Scope CurrentUser 2>$null
           Import-Module AudioDeviceCmdlets -ErrorAction Stop
 
-          Write-Host "=== All Audio Devices ==="
-          $devices = Get-AudioDevice -List
-          $devices | Format-Table Index, Type, Name, Default -AutoSize
+          $cable = $null
+          $maxAttempts = 6
+          for ($attempt = 1; $attempt -le $maxAttempts; $attempt++) {
+            Write-Host "=== Audio device discovery (attempt $attempt/$maxAttempts) ==="
+            $devices = Get-AudioDevice -List
+            $devices | Format-Table Index, Type, Name, Default -AutoSize
 
-          $cable = $devices | Where-Object {
-            $_.Type -eq "Playback" -and (
-              $_.Name -like "*CABLE Input*" -or
-              $_.Name -like "*VB-Audio*" -or
-              $_.Name -like "*VB-CABLE*"
-            )
-          } | Select-Object -First 1
+            $cable = $devices | Where-Object {
+              $_.Type -eq "Playback" -and (
+                $_.Name -like "*CABLE Input*" -or
+                $_.Name -like "*VB-Audio*" -or
+                $_.Name -like "*VB-CABLE*"
+              )
+            } | Select-Object -First 1
 
-          if ($cable) {
-            Write-Host "Setting VB-CABLE as default playback device: $($cable.Name) (Index=$($cable.Index))"
-            Set-AudioDevice -Index $cable.Index -DefaultOnly
-          } else {
-            Write-Error "No VB-CABLE playback device found — LABSN install likely failed"
+            if ($cable) {
+              try {
+                Write-Host "Setting VB-CABLE as default playback device: $($cable.Name) (Index=$($cable.Index))"
+                Set-AudioDevice -Index $cable.Index -DefaultOnly
+                break
+              } catch {
+                Write-Host "Set-AudioDevice failed on attempt ${attempt}: $_"
+                $cable = $null
+              }
+            }
+            if ($attempt -lt $maxAttempts) { Start-Sleep -Seconds 5 }
+          }
+
+          if (-not $cable) {
+            Write-Error "No VB-CABLE playback device found after $maxAttempts attempts — LABSN install likely failed"
             exit 1
           }
 
@@ -668,7 +686,9 @@ jobs:
           }
 
       - name: Compilation check
-        run: cargo check --no-default-features --features feat_windows
+        # compose is included tier-wide so the ci_audio binary compiles once
+        # per job with a single feature fingerprint (mirrors linux-system).
+        run: cargo check --no-default-features --features feat_windows,compose
 
       - name: Run system capture tests
         shell: pwsh
@@ -676,7 +696,7 @@ jobs:
           RSAC_TEST_CAPTURE_TIMEOUT_SECS: "15"
         run: |
           cargo test --test ci_audio system_capture `
-            --no-default-features --features feat_windows `
+            --no-default-features --features feat_windows,compose `
             -- --test-threads=1 --nocapture `
             2>&1 | Tee-Object -FilePath ci-audio-output.log
 
@@ -686,7 +706,7 @@ jobs:
           RSAC_TEST_CAPTURE_TIMEOUT_SECS: "15"
         run: |
           cargo test --test ci_audio platform_caps `
-            --no-default-features --features feat_windows `
+            --no-default-features --features feat_windows,compose `
             -- --test-threads=1 --nocapture `
             2>&1 | Tee-Object -FilePath ci-audio-output-caps.log
 
@@ -696,7 +716,7 @@ jobs:
           RSAC_TEST_CAPTURE_TIMEOUT_SECS: "15"
         run: |
           cargo test --test ci_audio stream_lifecycle `
-            --no-default-features --features feat_windows `
+            --no-default-features --features feat_windows,compose `
             -- --test-threads=1 --nocapture `
             2>&1 | Tee-Object -FilePath ci-audio-output-lifecycle.log
 
@@ -709,9 +729,39 @@ jobs:
           RSAC_TEST_CAPTURE_TIMEOUT_SECS: "15"
         run: |
           cargo test --test ci_audio lifecycle_terminal `
-            --no-default-features --features feat_windows `
+            --no-default-features --features feat_windows,compose `
             -- --test-threads=1 --nocapture `
             2>&1 | Tee-Object -FilePath ci-audio-output-terminal.log
+
+      # Composed multi-source capture (ADR-0011) on the ONLY tier that sets
+      # RSAC_CI_AUDIO_DETERMINISTIC=1: VB-CABLE is the verified default
+      # endpoint, so this is the first HARD tone-content verification of the
+      # compose engine (resample/mixdown/master-clock) over a real backend —
+      # the Linux tier runs the same module with soft content asserts.
+      - name: Run composed capture tests
+        shell: pwsh
+        env:
+          RSAC_TEST_CAPTURE_TIMEOUT_SECS: "15"
+        run: |
+          cargo test --test ci_audio "compose::" `
+            --no-default-features --features feat_windows,compose `
+            -- --test-threads=1 --nocapture `
+            2>&1 | Tee-Object -FilePath ci-audio-output-compose.log
+
+      # Wiring existence check: a renamed/cfg'd-out compose module would make
+      # the filter above match zero tests and pass vacuously. Mirrors the
+      # linux-system guard.
+      - name: Verify compose tests are wired up
+        shell: pwsh
+        run: |
+          $list = cargo test --test ci_audio `
+            --no-default-features --features feat_windows,compose `
+            -- --list 2>&1 | Out-String
+          if ($list -notmatch "compose::") {
+            Write-Error "compose:: tests missing from the ci_audio test list — module rename or feature-gating regression"
+            exit 1
+          }
+          Write-Host "OK: compose:: tests present in the ci_audio binary."
 
       - name: Diagnostics on failure
         if: failure()
@@ -799,6 +849,18 @@ jobs:
             --no-default-features --features feat_windows `
             -- --test-threads=1 --nocapture `
             2>&1 | Tee-Object -FilePath ci-audio-output-enum.log
+
+      # CI-4 (Windows arm): enumeration_matrix's "no silent empty list" (audit
+      # L4) assertion only executes where RSAC_CI_AUDIO_AVAILABLE=1 — this tier
+      # has real WASAPI endpoints (VB-CABLE), so run the armed arm against the
+      # actual Windows enumerator too, not just PipeWire (mirrors linux-system).
+      - name: Run enumeration_matrix against real devices (L4 non-empty assertion)
+        shell: pwsh
+        run: |
+          cargo test --test enumeration_matrix `
+            --no-default-features --features feat_windows `
+            -- --nocapture `
+            2>&1 | Tee-Object -FilePath ci-audio-output-enum-matrix.log
 
       - name: Diagnostics on failure
         if: failure()

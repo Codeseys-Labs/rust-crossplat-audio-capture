@@ -106,14 +106,14 @@ System capture records all audio output from the system's default device.
 # 1. Play some audio on your system (music, video, etc.)
 
 # 2. List available devices — verify your audio stack is working
-cargo run -- list
+cargo run --features cli -- list
 
 # 3. Capture system audio (shows a live ASCII level meter)
 #    Press Ctrl+C to stop
-cargo run -- capture
+cargo run --features cli -- capture
 
 # 4. Record system audio to a WAV file (5 seconds)
-cargo run -- record --duration 5 output.wav
+cargo run --features cli -- record --duration 5 output.wav
 
 # 5. Verify the recorded file
 #    - Check file size is > 44 bytes (WAV header)
@@ -165,13 +165,13 @@ pgrep -x spotify
 pidof spotify
 
 # 3. Capture by PID (uses ProcessTree target)
-cargo run -- capture --pid <PID>
+cargo run --features cli -- capture --pid <PID>
 
 # 4. Capture by application name (uses ApplicationByName target)
-cargo run -- capture --app spotify
+cargo run --features cli -- capture --app spotify
 
 # 5. Record application audio to a WAV file
-cargo run -- record --app spotify --duration 10 app_audio.wav
+cargo run --features cli -- record --app spotify --duration 10 app_audio.wav
 ```
 
 ### How It Works per Platform
@@ -212,16 +212,64 @@ pgrep -x chrome
 pgrep -x firefox
 
 # 3. Capture the entire process tree
-cargo run -- capture --pid <PARENT_PID>
+cargo run --features cli -- capture --pid <PARENT_PID>
 
 # 4. Record process tree audio
-cargo run -- record --pid <PARENT_PID> --duration 10 tree_audio.wav
+cargo run --features cli -- record --pid <PARENT_PID> --duration 10 tree_audio.wav
 ```
 
 > **Note:** When `--pid` is specified, `rsac` uses `CaptureTarget::ProcessTree(ProcessId)`.
 > On platforms that support it, this captures audio from the target PID and all its
 > descendant processes. On platforms where process tree capture is not distinct from
 > single-process capture, the behavior is equivalent to application capture.
+
+---
+
+## Composed Capture Testing (`compose` feature)
+
+Composed capture (ADR-0011) runs several sources simultaneously and delivers
+one interleaved multi-channel stream — e.g. an application mixed to a mono
+channel plus the system default's native channels appended after it.
+
+### Steps
+
+```bash
+# 1. Start an application playing audio (e.g. Spotify, a browser tab).
+
+# 2. Run the shipped example: app group (mono) + system group (native channels).
+#    Falls back to a system-only composition when no app name is given.
+cargo run --example composed_capture --features compose -- spotify
+
+# 3. Verify in the output:
+#    - the printed channel map (e.g. "composed 3 channels": app, sysL, sysR)
+#    - per-group RMS levels move when the app / system audio plays
+#    - the final stats block: per-source buffers_received > 0; padded_frames
+#      stays near zero while both sources play; `resampling=true` appears for
+#      any source whose endpoint rate differs from 48 kHz (expected for
+#      Windows process loopback on 44.1 kHz endpoints)
+```
+
+### What to check per platform
+
+- **Windows** — compose an `ApplicationByName` group with a `SystemDefault`
+  keep-channels group. Process loopback cannot autoconvert, so if the endpoint
+  runs at 44.1 kHz the app source must report `resampling=true` and the
+  composed output must still be 48 kHz.
+- **macOS** — same recipe; the app group exercises Process Tap (14.4+, TCC
+  audio-capture permission required — grant it to your terminal).
+- **Linux** — with the PipeWire null-sink setup from the sections above,
+  route the player to the sink and compose `SystemDefault` twice (mono mix +
+  keep-channels) as a self-test without a second app.
+
+### Deterministic unit-level verification (no devices)
+
+The compose engine (mixdown math, resampling, master-clock pacing, padding /
+trimming / re-election) is fully covered by scripted-source tests that run on
+any machine:
+
+```bash
+cargo test --lib --features compose compose::
+```
 
 ---
 
@@ -369,10 +417,10 @@ RECORD OPTIONS:
 ```bash
 cargo check                     # Compiles?
 cargo test --lib                # Unit tests pass?
-cargo run -- info               # Platform caps look right?
-cargo run -- list               # Devices enumerated?
-cargo run -- capture            # Ctrl+C after seeing level meter
-cargo run -- record --duration 3 test.wav  # Record and play back
+cargo run --features cli -- info               # Platform caps look right?
+cargo run --features cli -- list               # Devices enumerated?
+cargo run --features cli -- capture            # Ctrl+C after seeing level meter
+cargo run --features cli -- record --duration 3 test.wav  # Record and play back
 ```
 
 ### Application Capture End-to-End (macOS)
@@ -383,11 +431,11 @@ SPOTIFY_PID=$(pgrep -x Spotify)
 echo "Spotify PID: $SPOTIFY_PID"
 
 # Capture by name
-cargo run -- capture --app Spotify
+cargo run --features cli -- capture --app Spotify
 # Ctrl+C after confirming audio levels
 
 # Record 10 seconds by PID
-cargo run -- record --pid $SPOTIFY_PID --duration 10 spotify_capture.wav
+cargo run --features cli -- record --pid $SPOTIFY_PID --duration 10 spotify_capture.wav
 
 # Play back
 afplay spotify_capture.wav
@@ -401,11 +449,11 @@ $pid = (Get-Process spotify).Id
 Write-Host "Spotify PID: $pid"
 
 # Capture by name
-cargo run -- capture --app spotify
+cargo run --features cli -- capture --app spotify
 # Ctrl+C after confirming audio levels
 
 # Record 10 seconds
-cargo run -- record --pid $pid --duration 10 spotify_capture.wav
+cargo run --features cli -- record --pid $pid --duration 10 spotify_capture.wav
 
 # Play back
 Start-Process spotify_capture.wav
@@ -422,11 +470,11 @@ echo "Spotify PID: $SPOTIFY_PID"
 pw-top  # Look for the spotify stream
 
 # Capture by name
-cargo run -- capture --app spotify
+cargo run --features cli -- capture --app spotify
 # Ctrl+C after confirming audio levels
 
 # Record 10 seconds by PID
-cargo run -- record --pid $SPOTIFY_PID --duration 10 spotify_capture.wav
+cargo run --features cli -- record --pid $SPOTIFY_PID --duration 10 spotify_capture.wav
 
 # Play back
 pw-play spotify_capture.wav

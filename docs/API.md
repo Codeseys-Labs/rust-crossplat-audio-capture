@@ -7,11 +7,16 @@
 > the authoritative per-item docs run `cargo doc --open` (or browse
 > [docs.rs/rsac](https://docs.rs/rsac)).
 >
-> `rsac` is **capture-only** — it captures system, per-application, and
+> `rsac` is **capture-first** — it captures system, per-application, and
 > process-tree audio on Windows (WASAPI), Linux (PipeWire), and macOS (CoreAudio
-> Process Tap, 14.4+). It does **no** DSP, mixing, resampling, encoding,
-> playback, VAD, or AEC; those are explicit non-goals (see
-> [`VISION.md`](../VISION.md)).
+> Process Tap, 14.4+). It does **no** general-purpose DSP, encoding, playback,
+> VAD, or AEC; those remain non-goals (see [`VISION.md`](../VISION.md)). The
+> one deliberate scope amendment is the opt-in **`compose` feature**
+> ([ADR-0011](designs/0011-compose-feature.md)): multi-source *channel
+> composition* — per-group Mono/Stereo mixdown or native-channel passthrough,
+> with internal `rubato` resampling to align source rates — see
+> [Composing multiple sources](#composing-multiple-sources-compose-feature)
+> below.
 
 ## At a glance
 
@@ -370,12 +375,85 @@ wav.flush()?;
 capture.stop()?;
 ```
 
+## Composing multiple sources (`compose` feature)
+
+Behind the opt-in `compose` feature ([ADR-0011](designs/0011-compose-feature.md)),
+`rsac::compose` composes several capture targets into **one** interleaved
+multi-channel stream. Sources are declared in *groups*: each group either
+mixes down to Mono/Stereo (gain-weighted summation, per-source gain, optional
+`clamp_output`) or passes a single source's native channels through
+(`keep_channels()`). Groups append in declaration order; `channel_map()`
+reports which output channel belongs to which group.
+
+```rust
+use rsac::compose::{CompositionBuilder, Group, GroupLayout};
+use rsac::CaptureTarget;
+
+let mut session = CompositionBuilder::new()
+    .sample_rate(48_000) // session rate; mismatched sources are resampled
+    .group(
+        Group::new("voice")
+            .source(CaptureTarget::ApplicationByName("discord".into()))
+            .source_with_gain(CaptureTarget::ApplicationByName("zoom".into()), 0.8)
+            .mixdown(GroupLayout::Mono), // → 1 composed channel
+    )
+    .group(
+        Group::new("system")
+            .source(CaptureTarget::SystemDefault)
+            .keep_channels(), // → the endpoint's native channels
+    )
+    .build()?;
+
+session.start()?;
+let map = session.channel_map().unwrap();
+loop {
+    match session.read_buffer() {
+        Ok(Some(buffer)) => { /* interleaved f32, map.channels() wide */ }
+        Ok(None) => std::thread::sleep(std::time::Duration::from_millis(1)),
+        Err(e) if e.is_fatal() => break, // composition ended and drained
+        Err(e) => eprintln!("transient: {e}"),
+    }
+}
+session.stop()?;
+```
+
+Key semantics (rustdoc on `rsac::compose` is authoritative):
+
+- **Rate alignment** — sources delivering a different rate than the session
+  rate are resampled with `rubato` on the dedicated non-RT compositor thread
+  (Windows process loopback cannot autoconvert, so this is load-bearing).
+- **Pacing** — a master-clock source (the first system/device source) paces
+  output; behind sources are silence-padded, ahead sources bounded-trimmed;
+  the clock is re-elected if the master ends, and a quantum-cadence wall-clock
+  fallback keeps a stalled session alive. `session.stats()` exposes per-source
+  `padded_frames` / `trimmed_frames` / `resampling` / `ended` counters.
+- **Delivery** — `Composition` implements the same `CapturingStream` contract
+  as a single capture; `session.drain_to(WavFileSink::new(...)?)` records a
+  multi-channel WAV. Explicit `stop()` ends readability immediately (tail
+  discarded); read until the fatal terminal first if you need every buffer.
+- **Ownership** — the composition owns its inner captures; don't read the same
+  sources through other handles while it runs.
+
+Recording a composed stream to a multi-channel WAV:
+
+```rust
+let format = rsac::core::interface::CapturingStream::format(&session);
+let wav = WavFileSink::new("composed.wav", &format)?; // channels = composed width
+let drain = session.drain_to(wav)?;                   // background rsac-drain thread
+std::thread::sleep(std::time::Duration::from_secs(10));
+drain.shutdown();                                     // flush + finalize header
+```
+
 ## Feature flags
 
 - `feat_windows` / `feat_linux` / `feat_macos` — platform backends (default on;
   pair with the matching `target_os`).
 - `async-stream` — enables `AudioCapture::audio_data_stream()`.
 - `sink-wav` — enables `WavFileSink`.
+- `compose` — enables `rsac::compose` multi-source channel composition
+  (adds `rubato` + `audioadapter-buffers`).
+- `cli` — the demo binaries' dependencies (`clap`, `color-eyre`, `ctrlc`,
+  `env_logger`); not in defaults, so library consumers don't pull them.
 - `tracing` — enables `rsac::install_default_tracing` (the `rsac_event!`/
   `rsac_span!` macros are always available, falling back to `log` when off).
 - `test-utils` — shared test helpers for integration tests and binding crates.
