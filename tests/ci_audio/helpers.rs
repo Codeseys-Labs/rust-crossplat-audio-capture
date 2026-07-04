@@ -891,3 +891,51 @@ pub fn spawn_audio_player_get_pid(wav_path: &std::path::Path) -> Result<(Child, 
         Err("No audio player available for this platform".to_string())
     }
 }
+
+/// Best-effort lookup of the PipeWire node id registered for a client PID,
+/// via `pw-dump` (matching `info.props["application.process.id"]`).
+///
+/// Used by the Linux app-capture tests purely as a SKIP gate: if PipeWire
+/// never registered a node for the spawned player, per-application capture
+/// cannot possibly route audio in that environment, so the test skips instead
+/// of failing on a CI routing limitation. Any failure mode (no `pw-dump`
+/// binary, non-zero exit, unparseable output, no matching node) returns
+/// `None` — this helper must never panic a test.
+#[cfg(target_os = "linux")]
+pub fn find_pipewire_node_for_pid(pid: u32) -> Option<u32> {
+    let output = Command::new("pw-dump").output().ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    let parsed: serde_json::Value = serde_json::from_slice(&output.stdout).ok()?;
+    let objects = parsed.as_array()?;
+    for obj in objects {
+        // Only PipeWire node objects can be capture targets.
+        let is_node = obj
+            .get("type")
+            .and_then(|t| t.as_str())
+            .is_some_and(|t| t.ends_with("Node"));
+        if !is_node {
+            continue;
+        }
+        let Some(props) = obj.pointer("/info/props") else {
+            continue;
+        };
+        // pw-dump emits application.process.id as a number on current
+        // versions but has emitted strings historically — accept both.
+        let matches_pid = match props.get("application.process.id") {
+            Some(v) => {
+                v.as_u64() == Some(u64::from(pid))
+                    || v.as_str().is_some_and(|s| s.trim() == pid.to_string())
+            }
+            None => false,
+        };
+        if !matches_pid {
+            continue;
+        }
+        if let Some(id) = obj.get("id").and_then(|i| i.as_u64()) {
+            return Some(id as u32);
+        }
+    }
+    None
+}

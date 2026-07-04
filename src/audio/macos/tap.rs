@@ -420,11 +420,14 @@ impl CoreAudioProcessTap {
             // on this macOS version must degrade to an AudioError, not abort the
             // process. On a thrown exception `init` has already consumed (and
             // released) the alloc'd receiver per the ObjC "init consumes self"
-            // rule, so there is nothing to release here.
-            let tap_desc_obj: *mut AnyObject =
-                guard_objc("initStereoGlobalTapButExcludeProcesses:", || unsafe {
-                    msg_send![tap_desc_obj, initStereoGlobalTapButExcludeProcesses: &*empty_array]
-                })?;
+            // rule, so there is nothing to release here. (No inner `unsafe`:
+            // unsafety contexts are lexical, and this closure is defined inside
+            // the enclosing `unsafe` block above — rustc flags a nested block as
+            // unused_unsafe under -D warnings.)
+            let tap_desc_obj: *mut AnyObject = guard_objc(
+                "initStereoGlobalTapButExcludeProcesses:",
+                || msg_send![tap_desc_obj, initStereoGlobalTapButExcludeProcesses: &*empty_array],
+            )?;
 
             if tap_desc_obj.is_null() {
                 // init returned nil: it already released the receiver (init

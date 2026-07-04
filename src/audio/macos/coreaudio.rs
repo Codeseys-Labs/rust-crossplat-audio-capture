@@ -2492,7 +2492,7 @@ mod tests {
         use crate::bridge::create_bridge;
         use crate::bridge::state::StreamState;
         use crate::core::config::AudioFormat;
-        use std::sync::atomic::{AtomicBool, Ordering};
+        use std::sync::atomic::AtomicBool;
 
         let (_producer, consumer) = create_bridge(16, AudioFormat::default());
         let shared = std::sync::Arc::clone(consumer.shared());
