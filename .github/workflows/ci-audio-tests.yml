@@ -169,12 +169,17 @@ jobs:
           # buffers (see helpers / per-test skip paths) rather than false-pass.
           echo "Linux CI: capture content asserts are SOFT (see note above)."
 
+      # rsac-0a1f: every cargo invocation in this job uses
+      # `feat_linux,compose` so the ci_audio test binary (and the lib rlib) is
+      # compiled ONCE for the whole job. `compose` is additive and
+      # platform-independent; it only unlocks tests/ci_audio/compose.rs
+      # (`#![cfg(feature = "compose")]`) for the compose:: steps below.
       - name: Run system capture tests
         env:
           RSAC_TEST_CAPTURE_TIMEOUT_SECS: "15"
         run: |
           cargo test --test ci_audio system_capture \
-            --no-default-features --features feat_linux \
+            --no-default-features --features feat_linux,compose \
             -- --test-threads=1 --nocapture 2>&1 | tee ci-audio-output.log
 
       # G8 overrun coverage: stalls the consumer and asserts the ring buffer
@@ -185,7 +190,7 @@ jobs:
           RSAC_TEST_CAPTURE_TIMEOUT_SECS: "15"
         run: |
           cargo test --test ci_audio overrun \
-            --no-default-features --features feat_linux \
+            --no-default-features --features feat_linux,compose \
             -- --test-threads=1 --nocapture 2>&1 | tee -a ci-audio-output.log
 
       # G7 subscribe coverage: the `subscribe` module was never matched by any
@@ -195,7 +200,7 @@ jobs:
           RSAC_TEST_CAPTURE_TIMEOUT_SECS: "15"
         run: |
           cargo test --test ci_audio subscribe \
-            --no-default-features --features feat_linux \
+            --no-default-features --features feat_linux,compose \
             -- --test-threads=1 --nocapture 2>&1 | tee -a ci-audio-output.log
 
       - name: Run platform capabilities tests
@@ -203,7 +208,7 @@ jobs:
           RSAC_TEST_CAPTURE_TIMEOUT_SECS: "15"
         run: |
           cargo test --test ci_audio platform_caps \
-            --no-default-features --features feat_linux \
+            --no-default-features --features feat_linux,compose \
             -- --test-threads=1 --nocapture 2>&1 | tee -a ci-audio-output.log
 
       - name: Run stream lifecycle tests
@@ -211,7 +216,7 @@ jobs:
           RSAC_TEST_CAPTURE_TIMEOUT_SECS: "15"
         run: |
           cargo test --test ci_audio stream_lifecycle \
-            --no-default-features --features feat_linux \
+            --no-default-features --features feat_linux,compose \
             -- --test-threads=1 --nocapture 2>&1 | tee -a ci-audio-output.log
 
       # Terminal read-behavior + request_stop() end-to-end on the real bridge:
@@ -224,7 +229,7 @@ jobs:
           RSAC_TEST_CAPTURE_TIMEOUT_SECS: "15"
         run: |
           cargo test --test ci_audio lifecycle_terminal \
-            --no-default-features --features feat_linux \
+            --no-default-features --features feat_linux,compose \
             -- --test-threads=1 --nocapture 2>&1 | tee -a ci-audio-output.log
 
       # Covers the VISION.md "multi-source" pillar: two captures at
@@ -235,8 +240,37 @@ jobs:
           RSAC_TEST_CAPTURE_TIMEOUT_SECS: "15"
         run: |
           cargo test --test ci_audio multi_source \
-            --no-default-features --features feat_linux \
+            --no-default-features --features feat_linux,compose \
             -- --test-threads=1 --nocapture 2>&1 | tee -a ci-audio-output.log
+
+      # rsac-0a1f: composed multi-source capture (`compose` feature) — a
+      # mono-mixdown group + a keep-channels group over system audio through
+      # the composition pipeline. The `compose::` prefix matches ONLY
+      # tests/ci_audio/compose.rs. Content assertions follow the Linux
+      # soft-assert policy (see the sink setup NOTE above): hard on
+      # layout/lifecycle/panics, soft on non-silence until the null-sink
+      # routing is proven deterministic.
+      - name: Run composed capture tests
+        env:
+          RSAC_TEST_CAPTURE_TIMEOUT_SECS: "15"
+        run: |
+          cargo test --test ci_audio "compose::" \
+            --no-default-features --features feat_linux,compose \
+            -- --test-threads=1 --nocapture 2>&1 | tee -a ci-audio-output.log
+
+      # Wiring existence check (mirrors the grep-based guards in ci.yml's
+      # test-macos job): assert the compose:: module is discoverable by the
+      # harness, so a module rename or a cfg/feature change can't silently
+      # reduce the step above to a zero-test filter (a false green).
+      - name: Verify compose tests are wired up
+        run: |
+          cargo test --test ci_audio --no-default-features --features feat_linux,compose \
+            -- --list 2>&1 | tee ci-audio-compose-list.log
+          grep -q "compose::" ci-audio-compose-list.log || {
+            echo "FAIL: compose:: tests not discovered in ci_audio test list"
+            exit 1
+          }
+          echo "OK: compose:: integration tests are wired up"
 
       # CI-4: enumeration_matrix's "no silent empty list" (audit L4) assertion
       # only has teeth when audio_available() is true. RSAC_CI_AUDIO_AVAILABLE=1
@@ -246,7 +280,7 @@ jobs:
       - name: Run enumeration_matrix against real devices (L4 non-empty assertion)
         run: |
           cargo test --test enumeration_matrix \
-            --no-default-features --features feat_linux \
+            --no-default-features --features feat_linux,compose \
             -- --nocapture 2>&1 | tee -a ci-audio-output.log
 
       - name: Diagnostics on failure

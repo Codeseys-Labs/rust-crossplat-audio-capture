@@ -1,7 +1,8 @@
 # Tag-triggered release workflow for rsac.
 # Mirrors the procedure in docs/RELEASE_PROCESS.md:
-#   1. verify       — run the unit test suite on Linux / Windows / macOS
-#   2. publish      — cargo publish --dry-run, then cargo publish to crates.io
+#   1. verify        — run the unit test suite on Linux / Windows / macOS
+#   1b. semver-checks — cargo-semver-checks API gate vs the previous release tag
+#   2. publish       — cargo publish --dry-run, then cargo publish to crates.io
 #   3. github-release — create a GH Release with the matching CHANGELOG section
 #
 # Triggered only by semver-shaped tags (vMAJOR.MINOR.PATCH) to avoid firing
@@ -56,13 +57,15 @@ jobs:
       matrix:
         include:
           - os: blacksmith-4vcpu-ubuntu-2404
-            features: feat_linux
+            # rsac-0a1f: `,compose` mirrors ci.yml's per-OS unit-test legs so
+            # the platform-independent compose unit tests also gate a release.
+            features: feat_linux,compose
             install_deps: true
             # device_test_filter is empty on platforms whose unit tests are
             # fully runnable in CI — the whole --lib suite hard-fails.
             device_test_filter: ''
           - os: blacksmith-4vcpu-windows-2025
-            features: feat_windows
+            features: feat_windows,compose
             install_deps: false
             # Blacksmith Windows runners lack an audio subsystem (see
             # AGENTS.md §6). Only the WASAPI tests that actually open an
@@ -77,7 +80,7 @@ jobs:
             # pure logic and hard-fails.
             device_test_filter: 'enumerate default_device device_enumeration device_id device_supported_formats audio_device_ create_stream find_device watch_ create_audio_client'
           - os: blacksmith-6vcpu-macos-15
-            features: feat_macos
+            features: feat_macos,compose
             install_deps: false
             device_test_filter: ''
     runs-on: ${{ matrix.os }}
@@ -94,6 +97,14 @@ jobs:
           sudo add-apt-repository ppa:pipewire-debian/pipewire-upstream -y
           sudo apt-get update
           sudo apt-get install -y libpipewire-0.3-dev libspa-0.2-dev pkg-config
+
+      # rsac-0a1f: mirror ci.yml's per-OS "Build all targets" coverage. The
+      # `cli` feature gates the rsac/standardized_test bins and several
+      # examples via required-features, so the --lib runs below never compile
+      # them — without this step a release could regress the cli/compose
+      # target surface unnoticed. (matrix.features already carries `compose`.)
+      - name: Build all targets (compose + cli surface)
+        run: cargo build --all-targets --no-default-features --features ${{ matrix.features }},cli
 
       # Hard-fail the platform-independent + non-audio --lib tests. When a
       # device_test_filter is set (Windows), the device-touching subset is
@@ -126,10 +137,70 @@ jobs:
             cargo test --lib --no-default-features --features ${{ matrix.features }} -- --test-threads=1 "$f" || true
           done
 
+  # ── Semver gate: cargo-semver-checks vs the previous release ────────
+  # Pre-publish API-compatibility gate: diffs the public API of the crate
+  # being released against the previous stable release tag and fails when the
+  # version bump does not permit the detected change (e.g. a breaking change
+  # on a minor/patch bump). Runs alongside `verify`; `publish` needs both.
+  # The FIRST release has no baseline — the check skips with a warning rather
+  # than failing. Override procedure (bump the appropriate semver component;
+  # never delete/skip the gate) is documented in docs/RELEASE_PROCESS.md
+  # §"Semver gate (cargo-semver-checks)".
+  semver-checks:
+    name: Semver Gate (cargo-semver-checks)
+    runs-on: blacksmith-4vcpu-ubuntu-2404
+    steps:
+      - uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5
+        with:
+          persist-credentials: false
+          # Full history + tags: the baseline is resolved from the previous
+          # v*.*.* tag, which the default shallow clone cannot see.
+          fetch-depth: 0
+      - uses: dtolnay/rust-toolchain@e081816240890017053eacbb1bdf337761dc5582 # 1.95.0
+      - uses: useblacksmith/rust-cache@81d053bdb0871dcd3f10763c8cc60d0adc41762b # v1 branch head (no v1 tag exists upstream)
+
+      - name: Install PipeWire dev libraries
+        run: |
+          sudo add-apt-repository ppa:pipewire-debian/pipewire-upstream -y
+          sudo apt-get update
+          sudo apt-get install -y libpipewire-0.3-dev libspa-0.2-dev pkg-config
+
+      - name: Install cargo-semver-checks
+        uses: taiki-e/install-action@0fd46367812ee04360509b4169d9f659d6892bb2 # v2
+        with:
+          tool: cargo-semver-checks
+
+      - name: Resolve baseline (previous stable release tag)
+        id: baseline
+        shell: bash
+        run: |
+          # On a tag push HEAD is the tagged commit, so the baseline is the
+          # newest stable v*.*.* tag reachable from HEAD^ (this excludes the
+          # tag being released). Pre-release shapes (v*-*) are excluded to
+          # match the workflow trigger. The first release has no previous
+          # tag: emit a warning and let the check step skip — there is
+          # nothing to diff against, and failing would block the initial
+          # publish.
+          if PREV_TAG="$(git describe --tags --abbrev=0 --match 'v*.*.*' --exclude 'v*-*' HEAD^ 2>/dev/null)"; then
+            echo "baseline release tag: ${PREV_TAG}"
+            echo "prev_tag=${PREV_TAG}" >> "$GITHUB_OUTPUT"
+          else
+            echo "::warning::no previous stable v*.*.* tag found — skipping cargo-semver-checks (first release has no baseline)"
+            echo "prev_tag=" >> "$GITHUB_OUTPUT"
+          fi
+
+      # Scoped to the root crate: this workflow publishes ONLY `rsac` (the
+      # bindings release via their own workflows — see the header).
+      - name: cargo semver-checks (vs previous release)
+        if: steps.baseline.outputs.prev_tag != ''
+        env:
+          PREV_TAG: ${{ steps.baseline.outputs.prev_tag }}
+        run: cargo semver-checks check-release -p rsac --baseline-rev "$PREV_TAG"
+
   # ── Publish: cargo publish to crates.io ─────────────────────────────
   publish:
     name: Publish to crates.io
-    needs: verify
+    needs: [verify, semver-checks]
     # Guard against forks running the irreversible crates.io publish.
     if: github.repository == 'Codeseys-Labs/rust-crossplat-audio-capture'
     runs-on: blacksmith-4vcpu-ubuntu-2404

@@ -57,12 +57,59 @@ for path 1) — they never trigger off anything but a `v*.*.*` tag push.
    running `cargo test --lib` against its platform feature. Mirrors the
    `test-*` jobs in `ci.yml` (including the Windows "no audio subsystem"
    exemption via `continue-on-error`).
-2. **`publish`** — depends on `verify`; single Linux runner executes
+2. **`semver-checks`** — runs alongside `verify` on a single Linux runner;
+   installs `cargo-semver-checks` and diffs the public API of the tagged
+   commit against the previous stable release tag; skips with a warning on
+   the first release (no baseline). See
+   [§ Semver gate](#semver-gate-cargo-semver-checks) for the override
+   procedure.
+3. **`publish`** — depends on `verify` **and** `semver-checks`; single
+   Linux runner executes
    `cargo publish --dry-run` and then `cargo publish`. Uses the
    `CARGO_REGISTRY_TOKEN` repo secret.
-3. **`github-release`** — depends on `publish`; extracts the CHANGELOG
+4. **`github-release`** — depends on `publish`; extracts the CHANGELOG
    section matching the tag version and publishes a GitHub Release via
    `softprops/action-gh-release@v2`.
+
+### Semver gate (`cargo-semver-checks`)
+
+`release.yml`'s `semver-checks` job is a pre-publish API-compatibility
+gate. On a full-history checkout (`fetch-depth: 0`) it resolves the
+previous stable release tag —
+`git describe --tags --abbrev=0 --match 'v*.*.*' --exclude 'v*-*' HEAD^`
+— and runs:
+
+```bash
+cargo semver-checks check-release -p rsac --baseline-rev vPREV
+```
+
+- **What it catches:** any public-API change the version bump does not
+  permit — e.g. removing/renaming a public item or changing a function
+  signature on a minor/patch bump. Pre-1.0 the cargo convention applies:
+  breaking changes require bumping the minor component
+  (`0.x` → `0.(x+1)`).
+- **First release:** with no previous stable `v*.*.*` tag there is no
+  baseline; the job emits a `::warning::` and skips instead of failing.
+- **Scope:** only the root `rsac` crate is checked (`-p rsac`) — this
+  workflow publishes only that crate; the bindings ship via
+  `release-npm.yml` / `release-pypi.yml`.
+
+**Override procedure.** There is no skip input, and deleting or
+commenting out the gate is not an accepted override. If the gate fails a
+release:
+
+1. **Unintentional API change** — delete the tag
+   (`git tag -d vX.Y.Z && git push --delete origin vX.Y.Z`), revert the
+   offending change, and re-tag.
+2. **Intentional API change** — the release is mis-versioned. Delete the
+   tag, re-run the version bump (§3) with the **appropriate semver
+   component** for the reported change category (breaking → next MAJOR,
+   i.e. `0.x` → `0.(x+1)` pre-1.0, matching the ABI policy in
+   §"Versioning & ABI contract"), update the CHANGELOG, and tag the new
+   version.
+3. **Tool false positive** (rare) — report it upstream to
+   cargo-semver-checks, then take path 2 anyway: shipping under a bigger
+   version bump is always semver-safe, while skipping the gate is not.
 
 ### `release-npm.yml` (npm)
 
@@ -172,7 +219,7 @@ git push origin vX.Y.Z
 Watch the Actions tab. If `verify` fails, delete the tag locally and
 remotely (`git tag -d vX.Y.Z && git push --delete origin vX.Y.Z`), fix
 the underlying issue, and re-tag. crates.io publishes are irrevocable,
-so `publish` is gated behind a successful `verify` — but a failure
+so `publish` is gated behind a successful `verify` + `semver-checks` — but a failure
 inside `publish` (e.g. transient network, token rotation) is not safe
 to re-run blindly if `cargo publish` already succeeded. Inspect
 <https://crates.io/crates/rsac> before re-running.
