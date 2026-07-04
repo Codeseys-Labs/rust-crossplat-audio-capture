@@ -307,8 +307,9 @@ impl AudioCaptureBuilder {
             return Err(AudioError::InvalidParameter {
                 param: "sample_rate".into(),
                 reason: format!(
-                    "Unsupported sample rate: {} Hz. Supported: 22050, 32000, 44100, 48000, 88200, 96000",
-                    self.config.sample_rate
+                    "Unsupported sample rate: {} Hz. Supported: {}",
+                    self.config.sample_rate,
+                    PlatformCapabilities::supported_sample_rates_display()
                 ),
             });
         }
@@ -687,7 +688,7 @@ impl RunningCapture {
     /// # #[cfg(not(feature = "sink-wav"))]
     /// # fn main() {}
     /// ```
-    pub fn drain_to<S>(&self, mut sink: S) -> AudioResult<DrainHandle>
+    pub fn drain_to<S>(&self, sink: S) -> AudioResult<DrainHandle>
     where
         S: crate::sink::AudioSink + 'static,
     {
@@ -707,71 +708,7 @@ impl RunningCapture {
                 reason: "Stream is not running".to_string(),
             });
         }
-        let stream = Arc::clone(stream_ref);
-
-        let stop_flag = Arc::new(AtomicBool::new(false));
-        let stop_flag_thread = Arc::clone(&stop_flag);
-        let handle = std::thread::Builder::new()
-            .name("rsac-drain".into())
-            .spawn(move || {
-                loop {
-                    if stop_flag_thread.load(Ordering::SeqCst) {
-                        break;
-                    }
-                    match stream.try_read_chunk() {
-                        // The drain thread OWNS `sink`, so no lock is held while
-                        // user sink code runs (it may block on I/O without
-                        // stalling anything else).
-                        Ok(Some(buffer)) => {
-                            if let Err(e) = sink.write(&buffer) {
-                                if e.is_fatal() {
-                                    log::error!(
-                                        "Drain sink write failed fatally; \
-                                         stopping drain: {:?}",
-                                        e
-                                    );
-                                    break;
-                                }
-                                // Recoverable write error: log and keep draining
-                                // (mirrors the read-side recoverable policy).
-                                log::warn!("Drain sink write error (continuing): {:?}", e);
-                            }
-                        }
-                        Ok(None) => {
-                            // No data right now — avoid busy-spinning. Mirrors
-                            // spawn_callback_pump's idle poll.
-                            std::thread::sleep(std::time::Duration::from_millis(1));
-                        }
-                        // Only a FATAL read error (e.g. StreamEnded — terminal)
-                        // ends the drain. A recoverable read error is logged and
-                        // retried, mirroring the callback pump and subscribe().
-                        Err(e) if e.is_fatal() => break,
-                        Err(e) => {
-                            log::warn!("Drain pump read error (retrying): {:?}", e);
-                            std::thread::sleep(std::time::Duration::from_millis(1));
-                        }
-                    }
-                }
-                // Loop exited (terminal stream, fatal write, or stop signal):
-                // finalize the sink. flush() then close() so a file sink's header
-                // is written even on the error paths. Both are best-effort here
-                // because the thread cannot return a Result; log any failure.
-                if let Err(e) = sink.flush() {
-                    log::error!("Drain sink flush failed: {:?}", e);
-                }
-                if let Err(e) = sink.close() {
-                    log::error!("Drain sink close failed: {:?}", e);
-                }
-            })
-            .map_err(|e| AudioError::InternalError {
-                message: format!("Failed to spawn drain thread: {}", e),
-                source: None,
-            })?;
-
-        Ok(DrainHandle {
-            stop_flag,
-            handle: Some(handle),
-        })
+        spawn_drain_thread(Arc::clone(stream_ref), sink)
     }
 
     /// Consumes the guard and returns the wrapped [`AudioCapture`], **without**
@@ -823,6 +760,92 @@ impl fmt::Debug for RunningCapture {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_tuple("RunningCapture").field(&self.0).finish()
     }
+}
+
+/// Shared drain-thread spawner behind [`RunningCapture::drain_to`] and the
+/// `compose` feature's `Composition::drain_to`: reads the stream's
+/// *terminal-observable* `try_read_chunk` path on a dedicated `rsac-drain`
+/// thread that **owns** the sink, writing each buffer and finalizing
+/// (`flush()` then `close()`) exactly once when the loop exits.
+///
+/// Policy (identical for both callers):
+/// - recoverable read/write errors are logged and retried — they never end
+///   draining;
+/// - a **fatal** read error (e.g. the terminal
+///   [`AudioError::StreamEnded`]) or a fatal write error ends the loop, after
+///   which `flush()`/`close()` still run so a file sink's header is written;
+/// - `Ok(None)` sleeps ~1 ms to avoid busy-spinning (mirrors the callback
+///   pump's idle poll).
+pub(crate) fn spawn_drain_thread<S>(
+    stream: Arc<dyn crate::core::interface::CapturingStream>,
+    mut sink: S,
+) -> AudioResult<DrainHandle>
+where
+    S: crate::sink::AudioSink + 'static,
+{
+    let stop_flag = Arc::new(AtomicBool::new(false));
+    let stop_flag_thread = Arc::clone(&stop_flag);
+    let handle = std::thread::Builder::new()
+        .name("rsac-drain".into())
+        .spawn(move || {
+            loop {
+                if stop_flag_thread.load(Ordering::SeqCst) {
+                    break;
+                }
+                match stream.try_read_chunk() {
+                    // The drain thread OWNS `sink`, so no lock is held while
+                    // user sink code runs (it may block on I/O without
+                    // stalling anything else).
+                    Ok(Some(buffer)) => {
+                        if let Err(e) = sink.write(&buffer) {
+                            if e.is_fatal() {
+                                log::error!(
+                                    "Drain sink write failed fatally; \
+                                     stopping drain: {:?}",
+                                    e
+                                );
+                                break;
+                            }
+                            // Recoverable write error: log and keep draining
+                            // (mirrors the read-side recoverable policy).
+                            log::warn!("Drain sink write error (continuing): {:?}", e);
+                        }
+                    }
+                    Ok(None) => {
+                        // No data right now — avoid busy-spinning. Mirrors
+                        // spawn_callback_pump's idle poll.
+                        std::thread::sleep(std::time::Duration::from_millis(1));
+                    }
+                    // Only a FATAL read error (e.g. StreamEnded — terminal)
+                    // ends the drain. A recoverable read error is logged and
+                    // retried, mirroring the callback pump and subscribe().
+                    Err(e) if e.is_fatal() => break,
+                    Err(e) => {
+                        log::warn!("Drain pump read error (retrying): {:?}", e);
+                        std::thread::sleep(std::time::Duration::from_millis(1));
+                    }
+                }
+            }
+            // Loop exited (terminal stream, fatal write, or stop signal):
+            // finalize the sink. flush() then close() so a file sink's header
+            // is written even on the error paths. Both are best-effort here
+            // because the thread cannot return a Result; log any failure.
+            if let Err(e) = sink.flush() {
+                log::error!("Drain sink flush failed: {:?}", e);
+            }
+            if let Err(e) = sink.close() {
+                log::error!("Drain sink close failed: {:?}", e);
+            }
+        })
+        .map_err(|e| AudioError::InternalError {
+            message: format!("Failed to spawn drain thread: {}", e),
+            source: None,
+        })?;
+
+    Ok(DrainHandle {
+        stop_flag,
+        handle: Some(handle),
+    })
 }
 
 /// Handle to the background thread spawned by
@@ -1168,6 +1191,21 @@ impl CallbackPump {
     }
 }
 
+/// The lifecycle handle for a configured capture session, returned by
+/// [`AudioCaptureBuilder::build`].
+///
+/// `AudioCapture` owns the platform stream and exposes the full capture
+/// lifecycle: [`start()`](AudioCapture::start), [`stop()`](AudioCapture::stop),
+/// pull-based reads ([`read_buffer()`](AudioCapture::read_buffer)), push-based
+/// delivery ([`subscribe()`](AudioCapture::subscribe),
+/// [`set_callback()`](AudioCapture::set_callback)), and runtime introspection
+/// ([`stream_stats()`](AudioCapture::stream_stats),
+/// [`overrun_count()`](AudioCapture::overrun_count),
+/// [`uptime()`](AudioCapture::uptime)).
+///
+/// The handle is `Send + Sync` (asserted at compile time below); see the
+/// [module docs](self) for the threading model and the multiple-captures
+/// guarantee.
 pub struct AudioCapture {
     config: AudioCaptureConfig,
     device: Option<Box<dyn crate::core::interface::AudioDevice>>,

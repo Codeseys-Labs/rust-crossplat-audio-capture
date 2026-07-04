@@ -20,15 +20,74 @@ Releases with no ABI change omit the subsection (or state "No C ABI changes").
 
 ### Added
 
+- **Multi-source channel composition (`compose` feature, ADR-0011).** New
+  `rsac::compose` module — `CompositionBuilder` → `Composition`: declare
+  *groups* of `CaptureTarget`s that either mix down to Mono/Stereo output
+  channels (gain-weighted plain summation, optional `clamp_output`) or pass a
+  single source's native channels through (`keep_channels()`); groups append
+  in declaration order into ONE interleaved-f32 multi-channel stream speaking
+  the standard `CapturingStream` contract (terminal semantics, overrun and
+  backpressure counters, `drain_to()` sinks, async waker all included).
+  Sources delivering a different sample rate are resampled to the session
+  rate (default 48 kHz) with `rubato` on a dedicated non-RT compositor
+  thread. Alignment is master-clock paced (first system/device source) with
+  per-source silence-padding / bounded trimming and a wall-clock fallback on
+  master stall; `Composition::stats()` exposes per-source
+  `padded_frames`/`trimmed_frames`/`resampling` counters and
+  `channel_map()` reports which output channel belongs to which group. Off by
+  default; enabling it pulls `rubato` + `audioadapter-buffers`. See
+  `examples/composed_capture.rs` and docs/designs/0011-compose-feature.md.
+- **CI: MSRV job** — builds with Rust 1.87 (`rust-version` floor) so the
+  declared MSRV can no longer rot silently under the pinned toolchain; also
+  the tripwire for optional-dependency MSRV bumps (rubato et al.).
+- **CI: cargo-hack feature-powerset job** — pairwise (`--depth 2`) checks
+  across `async-stream`/`sink-wav`/`test-utils`/`bridge-zerocopy`/`tracing`/
+  `compose`/`cli`/`feat_linux`, replacing single-combo-only coverage.
+- **Release gate: cargo-semver-checks** — the release verify stage now fails
+  on API breakage not matched by the right semver bump (baseline = previous
+  release tag; auto-skips on the first release).
+- **`#![warn(missing_docs)]`** at the crate root, with the outstanding
+  rustdoc gaps filled (`ErrorKind` variants, `AudioError` variant fields,
+  platform enumerator items).
+
 ### Changed
+
+- **CLI-only dependencies are now feature-gated (`cli` feature).** `clap`,
+  `color-eyre`, `ctrlc`, and `env_logger` were unconditional dependencies
+  serving only the demo binaries; they are now optional behind the new `cli`
+  feature (NOT in defaults). Library consumers' dependency trees shrink
+  accordingly. **Action needed only for binary users:** build/install the
+  demo CLI with `--features cli`; the `rsac`/`standardized_test` bins and the
+  `verify_audio`/`basic_capture`/`record_to_file` examples declare
+  `required-features = ["cli"]`.
+- **VISION scope amendment (ADR-0011):** stream mixing moved from
+  out-of-scope to in-scope *behind the opt-in `compose` feature*;
+  general-purpose DSP/effects/encoding remain out of scope.
+- `Cargo.toml` `repository` now points at the canonical
+  `Codeseys-Labs/rust-crossplat-audio-capture` (was a stale personal fork
+  URL); `/bindings` is excluded from the published crate tarball (rsac-go has
+  no manifest of its own and would otherwise ship in it).
+- CI ARM64 cross-compile gates (`cross-compile-linux-arm64`,
+  `go-bindings-arm64-check`) are now exit-code-authoritative instead of
+  grepping logs behind `|| true` (which `CARGO_TERM_COLOR=always` ANSI codes
+  could false-green); only the known missing-aarch64-PipeWire diagnostic is
+  tolerated.
 
 ### Deprecated
 
 ### Removed
 
+- Stale `blacksmith-audio-probe.yml` one-shot diagnostic workflow (its
+  findings are recorded in AGENTS.md §6).
+
 ### Fixed
 
 ### Security
+
+### C ABI changes
+
+No C ABI changes (the `compose` surface is not yet exposed through
+`rsac-ffi`; tracked as a follow-up).
 
 ## [0.4.0] - 2026-05-31
 

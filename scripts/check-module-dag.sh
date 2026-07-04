@@ -7,18 +7,20 @@
 #   - docs/ARCHITECTURE.md  (§1, "Known deviation (tracked)")
 #   - AGENTS.md             (§ Module layering / §6.6)
 #
-#       core/  →  bridge/  →  audio/  →  api/
+#       core/  →  bridge/  →  audio/  →  api/  →  compose/ (opt-in)
 #                                         ↘ sink/
 #
 # Dependencies may only point DOWN this chain. A layer must never `use` or
 # reference (`crate::<upper-layer>::…`) a layer that sits ABOVE it. Concretely:
 #
-#   core    must not reference  bridge | audio | api | sink
-#   bridge  must not reference  audio  | api   | sink
-#   audio   must not reference  api    | sink
+#   core    must not reference  bridge | audio | api | sink | compose
+#   bridge  must not reference  audio  | api   | sink | compose
+#   audio   must not reference  api    | sink  | compose
+#   api     must not reference  compose
+#   sink    must not reference  compose
 #
-# (api/ and sink/ are the top of the chain, so they have no forbidden edges to
-# guard here.)
+# (compose/ — ADR-0011, behind the `compose` feature — is the top of the chain,
+# so it has no forbidden edges to guard here.)
 #
 # This is the DAG-004 CI guard called for by
 # docs/reviews/rsac-architecture-critique-2026-05-30.md (findings DAG-001 /
@@ -229,18 +231,21 @@ if [[ "${1:-}" == "--self-test" ]]; then
 fi
 
 echo "==> rsac module-DAG reverse-edge guard (DAG-004)"
-echo "    chain: core -> bridge -> audio -> api (-> sink)"
+echo "    chain: core -> bridge -> audio -> api (-> sink) -> compose"
 echo "    tool : $([[ ${have_rg} -eq 1 ]] && echo 'ripgrep' || echo 'grep -rn')"
 echo
 
-# ── The three forbidden-edge scans (one per layer that has things above it) ───
+# ── The forbidden-edge scans (one per layer that has things above it) ─────────
 # Layer source roots are REPO-RELATIVE (see scan_layer for why). NOTE: api/ is
-# the file src/api.rs, every other layer is a directory. sink/ is top-of-chain
-# so it is never a source scanned here.
+# the file src/api.rs, every other layer is a directory. compose/ (ADR-0011) is
+# top-of-chain so it is never a source scanned here; api/ and sink/ gained a
+# forbidden edge (compose) when it landed above them.
 declare -a SCAN_TARGETS=(
-  "core::src/core::bridge|audio|api|sink"
-  "bridge::src/bridge::audio|api|sink"
-  "audio::src/audio::api|sink"
+  "core::src/core::bridge|audio|api|sink|compose"
+  "bridge::src/bridge::audio|api|sink|compose"
+  "audio::src/audio::api|sink|compose"
+  "api::src/api.rs::compose"
+  "sink::src/sink::compose"
 )
 
 new_violations=0

@@ -78,7 +78,7 @@ plus a comprehensive reference analysis:
   - [`WavFileSink`](src/sink/wav.rs) — writes to WAV files (behind `sink-wav` feature)
 - **Module layering** (strict DAG — no reverse dependencies):
   ```
-  core/ → bridge/ → audio/ (backends) → api/ → lib.rs
+  core/ → bridge/ → audio/ (backends) → api/ → compose/ (opt-in) → lib.rs
   ```
 
 ---
@@ -176,6 +176,13 @@ src/
 │   ├── null.rs             # NullSink (discard)
 │   ├── channel.rs          # ChannelSink (mpsc)
 │   └── wav.rs              # WavFileSink (behind sink-wav feature)
+├── compose/                # Multi-source channel composition (compose feature, ADR-0011)
+│   ├── mod.rs              # Module docs + re-exports
+│   ├── builder.rs          # CompositionBuilder, Group, GroupLayout, ChannelMap
+│   ├── engine.rs           # Compositor thread: FIFOs, master-clock pacing, mixdown
+│   ├── resample.rs         # rubato wrapper (per-source rate → session rate)
+│   ├── stream.rs           # Composition handle + ComposedStreamView (CapturingStream)
+│   └── tests.rs            # Engine-loop tests over scripted sources
 ├── audio/                  # Platform backends
 │   ├── mod.rs              # Cross-platform dispatch
 │   ├── capture.rs          # Capture helpers
@@ -243,6 +250,8 @@ docker/                     # Docker-based cross-platform testing
   - `async-stream` — Async `Stream` support (adds `atomic-waker`)
   - `sink-wav` — `WavFileSink` adapter
   - `test-utils` — Test utility exports
+  - `compose` — Multi-source channel composition (`src/compose/`; adds `rubato` + `audioadapter-buffers`) — ADR-0011
+  - `cli` — Demo binaries' deps (`clap`, `color-eyre`, `ctrlc`, `env_logger`); NOT in defaults, so library consumers don't pull them
 
 ### Data & Types
 
@@ -302,9 +311,8 @@ All CI runs on [Blacksmith](https://blacksmith.sh/) runners — a drop-in replac
 
 | Workflow | Purpose |
 |---|---|
-| [`ci.yml`](.github/workflows/ci.yml) | Lint, unit tests (3 platforms), ARM64 cross-compile |
+| [`ci.yml`](.github/workflows/ci.yml) | Lint, unit tests (3 platforms), MSRV, feature powerset, ARM64 cross-compile |
 | [`ci-audio-tests.yml`](.github/workflows/ci-audio-tests.yml) | Audio integration tests (9 platform x tier jobs) |
-| [`blacksmith-audio-probe.yml`](.github/workflows/blacksmith-audio-probe.yml) | One-shot diagnostic: probe audio device availability on Blacksmith runners (workflow_dispatch only) |
 
 **Runner labels:**
 
@@ -476,6 +484,10 @@ Full playbook (when to stack vs parallel PRs, exact commands, pitfalls):
   - Comprehensive docs: [macOS Version Compatibility](docs/MACOS_VERSION_COMPATIBILITY.md), [macOS 26 Process Tap Fix](docs/MACOS26_PROCESS_TAP_FIX.md)
 
 **Recently completed:**
+- ✅ **Multi-source channel composition (`compose` feature, ADR-0011)** — `CompositionBuilder`/`Composition` in `src/compose/`: groups of `CaptureTarget`s mixed to Mono/Stereo (per-source gain) or kept as native channels, appended into one interleaved multi-channel `CapturingStream`; rubato resampling to the session rate; master-clock pacing with silence-pad/trim stats. 30+ unit tests (scripted-source engine harness) + `compose::` ci_audio integration module + `examples/composed_capture.rs`.
+- ✅ **`cli` feature** — clap/color-eyre/ctrlc/env_logger no longer unconditional; demo bins/examples declare `required-features = ["cli"]`; library consumers' dep tree is lean.
+- ✅ **CI hardening** — `msrv` (1.87) job, `feature-powerset` (cargo-hack, depth 2), `cargo-semver-checks` release gate, stale audio-probe workflow deleted, ARM64 grep gates replaced with exit-code-authoritative checks.
+- ✅ **`#![warn(missing_docs)]`** enforced; rustdoc gaps filled (ErrorKind variants, AudioError fields, platform enumerator items).
 - ✅ **`cocoa`/`objc` → `objc2` migration** — Phase 1 (coreaudio.rs, 12 sites) + Phase 2 (tap.rs, ~65 sites) complete. `cocoa` and `objc` crates fully removed from dependencies. See §9.1.
 - ✅ **Cross-language bindings** — C FFI (`bindings/rsac-ffi/`, 45 functions), Python (`bindings/rsac-python/`, PyO3), Node.js/TS (`bindings/rsac-napi/`, napi-rs), Go (`bindings/rsac-go/`, CGo). All compile.
 - ✅ **Cross-platform introspection module** — `src/core/introspection.rs`: `list_audio_sources()`, `list_audio_applications()`, `CaptureTarget::app()`/`pid()`/`device()` convenience constructors, `check_audio_capture_permission()`.
@@ -507,6 +519,8 @@ Full playbook (when to stack vs parallel PRs, exact commands, pitfalls):
 | `log` | Logging facade |
 | `futures-core` | Async `Stream` trait (optional, behind `async-stream` feature) |
 | `atomic-waker` | Async notification from ring buffer (optional, behind `async-stream` feature) |
+| `rubato` | FFT resampling for compose-feature rate alignment (optional, behind `compose`) |
+| `audioadapter-buffers` | Interleaved-slice adapters consumed by rubato v3 (optional, behind `compose`) |
 
 ### Platform-specific
 

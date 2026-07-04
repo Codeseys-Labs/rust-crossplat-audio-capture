@@ -1,5 +1,6 @@
 #![allow(clippy::result_large_err)]
 #![deny(rustdoc::broken_intra_doc_links)]
+#![warn(missing_docs)]
 //! # rsac — cross-platform audio capture
 //!
 //! Streaming-first audio capture for Rust. Captures system audio,
@@ -92,6 +93,11 @@
 pub mod api;
 pub mod audio;
 pub mod bridge;
+// ADR-0011: opt-in multi-source channel composition. Top layer of the module
+// DAG (core → bridge → audio → api → compose); only compiled with the
+// `compose` feature so the default dependency graph is unchanged.
+#[cfg(feature = "compose")]
+pub mod compose;
 pub mod core;
 pub mod prelude;
 pub mod sink;
@@ -314,6 +320,13 @@ pub use crate::sink::WavFileSink;
 // Async stream support
 #[cfg(feature = "async-stream")]
 pub use crate::bridge::AsyncAudioStream;
+
+// Multi-source channel composition (ADR-0011).
+#[cfg(feature = "compose")]
+pub use crate::compose::{
+    ChannelMap, ChannelOrigin, Composition, CompositionBuilder, CompositionStats, Group,
+    GroupLayout, SourceStats,
+};
 
 // Optional `tracing` integration: best-effort default subscriber installer for
 // binaries/examples. The `rsac_event!`/`rsac_span!` macros are always available

@@ -58,14 +58,22 @@ pub enum AudioSourceKind {
     /// fallible (e.g. a backend that cannot determine the direction returns an
     /// error, which is mapped to `None` here via `.ok()`).
     Device {
+        /// Platform device identifier, suitable for [`CaptureTarget::device`].
         device_id: String,
+        /// Whether this is the platform's current default device.
         is_default: bool,
+        /// Endpoint direction (input/output), or `None` when it could not be
+        /// resolved (see the variant docs above).
         kind: Option<DeviceKind>,
     },
     /// An application producing audio.
     Application {
+        /// OS process id of the application.
         pid: u32,
+        /// Human-readable application name.
         app_name: String,
+        /// Platform bundle/application identifier (e.g. a macOS bundle id),
+        /// when the platform exposes one.
         bundle_id: Option<String>,
     },
 }

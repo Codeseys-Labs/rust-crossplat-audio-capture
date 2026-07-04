@@ -11,13 +11,17 @@ build = "build.rs"
 autobins = false
 description = "Cross-platform audio capture library with per-application process taps (macOS), WASAPI (Windows), and PipeWire (Linux)"
 license = "MIT OR Apache-2.0"
-repository = "https://github.com/baladita/rust-crossplat-audio-capture"
+repository = "https://github.com/Codeseys-Labs/rust-crossplat-audio-capture"
 readme = "README.md"
 keywords = ["audio", "capture", "wasapi", "coreaudio", "pipewire"]
 categories = ["multimedia::audio", "os"]
 exclude = [
-    # Application + binding subdirs (published separately or not at all)
+    # Application + binding subdirs (published separately or not at all).
+    # /bindings matters for rsac-go in particular: the Rust binding crates are
+    # auto-excluded by their own Cargo.toml manifests, but rsac-go (Go sources,
+    # Makefile, C bridge — no Cargo.toml) would otherwise ship in the tarball.
     "/apps",
+    "/bindings",
     # Project-internal docs, scripts, infra (not library artifacts)
     "/docs",
     "/docker",
@@ -71,6 +75,18 @@ bridge-zerocopy = []
 # deps). With it on, they emit tracing events/spans and `install_default_tracing`
 # becomes available. Pulls in only the `tracing` facade (no tracing-subscriber).
 tracing = ["dep:tracing"]
+# ADR-0011: opt-in multi-source channel composition (CompositionBuilder /
+# Composition in src/compose/). Default OFF — pulls rubato (resampling to the
+# session rate; FFT path brings realfft + num-complex) and audioadapter-buffers
+# (interleaved-slice adapters rubato v3 consumes). With the feature off the
+# dependency graph and API are unchanged.
+compose = ["dep:rubato", "dep:audioadapter-buffers"]
+# rsac-1ecd: the CLI demo binary's dependencies, feature-gated so library
+# consumers stop paying for them (clap/color-eyre/ctrlc/env_logger were
+# unconditional before 0.5). NOT in default features — build the demo with
+# `cargo build --features cli` / `cargo install rsac --features cli`. Binaries
+# and examples that need these declare `required-features = ["cli"]`.
+cli = ["dep:clap", "dep:color-eyre", "dep:ctrlc", "dep:env_logger"]
 
 [dependencies]
 # Core dependencies
@@ -82,12 +98,21 @@ log = "0.4.29"                                                 # For logging
 tracing = { version = "0.1.41", optional = true }              # Optional structured instrumentation (behind the `tracing` feature; rsac_event!/rsac_span! fall back to `log::` when off)
 
 hound = "3.5.1"
-clap = { version = "4.5.60", features = ["derive"] }
-color-eyre = "0.6.5"
-ctrlc = "3.5.2"
+# CLI-only deps (behind the `cli` feature; see [features] above).
+clap = { version = "4.5.60", features = ["derive"], optional = true }
+color-eyre = { version = "0.6.5", optional = true }
+ctrlc = { version = "3.5.2", optional = true }
 libc = "0.2.183"
 
-env_logger = "0.11.9"
+env_logger = { version = "0.11.11", optional = true }
+
+# compose-only deps (behind the `compose` feature; ADR-0011). rubato v3 MSRV is
+# 1.85 — under our 1.87 floor; the CI `msrv` job is the tripwire if a future
+# bump raises it. audioadapter-buffers is pinned to the same major rubato 3.x
+# itself consumes (its `Adapter`/`AdapterMut` traits must come from the SAME
+# crate version rubato's `process_into_buffer` expects, or the impls mismatch).
+rubato = { version = "3.0.0", optional = true }
+audioadapter-buffers = { version = "3.0.0", optional = true }
 
 serde = { version = "1.0.228", features = ["derive"] }
 # serde_json: hard library dep on the native Linux PipeWire path — it parses the
@@ -162,22 +187,27 @@ futures-util = "0.3"
 [[bin]]
 name = "rsac"
 path = "src/main.rs"
+required-features = ["cli"]
 
 [[bin]]
 name = "standardized_test"
 path = "src/bin/standardized_test.rs"
+required-features = ["cli"]
 
 [[example]]
 name = "verify_audio"
 path = "examples/verify_audio.rs"
+required-features = ["cli"]
 
 [[example]]
 name = "basic_capture"
 path = "examples/basic_capture.rs"
+required-features = ["cli"]
 
 [[example]]
 name = "record_to_file"
 path = "examples/record_to_file.rs"
+required-features = ["cli"]
 
 [[example]]
 name = "list_devices"
@@ -187,6 +217,11 @@ path = "examples/list_devices.rs"
 name = "async_capture"
 path = "examples/async_capture.rs"
 required-features = ["async-stream"]
+
+[[example]]
+name = "composed_capture"
+path = "examples/composed_capture.rs"
+required-features = ["compose"]
 
 [[bin]]
 name = "app_capture_test"

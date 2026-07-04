@@ -12,7 +12,7 @@ dependencies only ever point *down* this chain — no layer reaches back up into
 layer above it:
 
 ```
-core/  →  bridge/  →  audio/ (platform backends)  →  api/
+core/  →  bridge/  →  audio/ (platform backends)  →  api/  →  compose/ (opt-in)
                                                        ↘
                                                         sink/
 ```
@@ -24,6 +24,7 @@ core/  →  bridge/  →  audio/ (platform backends)  →  api/
 | **audio** | [`rsac::audio`](../src/audio/mod.rs) | Per-OS backends: WASAPI on Windows, PipeWire on Linux, CoreAudio Process Tap on macOS. Each implements the internal `PlatformStream` trait and plugs into `BridgeStream<S>`. Also hosts the per-OS `DeviceEnumerator` implementations and native device/application enumeration. |
 | **api** | [`rsac::api`](../src/api.rs) | Public facade: `AudioCaptureBuilder` → `AudioCapture`, whose lifecycle is driven by its `start()`/`stop()` methods (plus the `RunningCapture` RAII guard returned by the builder's own `AudioCaptureBuilder::start()` convenience method, which builds, starts, and stops on `Drop`). This is the primary entry point library consumers need. |
 | **sink** | [`rsac::sink`](../src/sink/mod.rs) | Optional downstream adapters: `NullSink`, `ChannelSink`, `WavFileSink` (behind `sink-wav`). |
+| **compose** | [`rsac::compose`](../src/compose/mod.rs) | Opt-in (`compose` feature, [ADR-0011](designs/0011-compose-feature.md)) multi-source channel composition: `CompositionBuilder` → `Composition`. Owns N inner `AudioCapture`s, aligns them on a dedicated compositor thread (master-clock pacing, silence-pad/trim, `rubato` resampling to the session rate), mixes groups to Mono/Stereo or passes native channels through, and delivers one interleaved multi-channel stream through the same `BridgeStream` ring + `CapturingStream` contract as a single capture. Top of the DAG: it consumes `api`, `bridge`, and `core`; nothing may import it. |
 
 The DAG ordering is also asserted in the crate root docs ([`src/lib.rs`](../src/lib.rs))
 and enforced by convention in [`AGENTS.md`](../AGENTS.md).

@@ -1232,6 +1232,7 @@ fn try_push_event(context: &WatchListenerContext, event: DeviceEvent) {
 pub struct MacosDeviceEnumerator;
 
 impl MacosDeviceEnumerator {
+    /// Creates a new enumerator. The type is stateless; construction never fails.
     pub fn new() -> Self {
         MacosDeviceEnumerator
     }

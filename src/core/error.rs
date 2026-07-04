@@ -31,12 +31,24 @@ use std::fmt;
 /// grow in a way that silently breaks exhaustive matches.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum ErrorKind {
+    /// Invalid or unsupported capture configuration (bad parameter values,
+    /// unsupported formats).
     Configuration,
+    /// Audio device problems: not found, unavailable, or enumeration failure.
     Device,
+    /// Stream lifecycle and data-flow failures: create/start/stop errors,
+    /// read errors, end-of-stream, and ring-buffer over/underruns.
     Stream,
+    /// Platform backend (WASAPI, PipeWire, CoreAudio) operation or
+    /// initialization failures.
     Backend,
+    /// Application-capture failures: target app not found or its audio
+    /// session could not be captured.
     Application,
+    /// Platform-level constraints: unsupported features on the current OS or
+    /// permission denials.
     Platform,
+    /// Internal invariant violations, unexpected errors, and timeouts.
     Internal,
 }
 
@@ -137,90 +149,164 @@ impl fmt::Display for BackendContext {
 pub enum AudioError {
     // ── Configuration errors ─────────────────────────────────────────
     /// A parameter value is invalid.
-    InvalidParameter { param: String, reason: String },
+    InvalidParameter {
+        /// Name of the offending parameter (e.g. `"sample_rate"`).
+        param: String,
+        /// Why the value was rejected.
+        reason: String,
+    },
     /// The requested audio format is not supported.
     UnsupportedFormat {
+        /// Human-readable description of the rejected format.
         format: String,
+        /// OS-level backend context, when the rejection came from a backend.
         context: Option<BackendContext>,
     },
     /// A general configuration error.
-    ConfigurationError { message: String },
+    ConfigurationError {
+        /// Description of the configuration problem.
+        message: String,
+    },
 
     // ── Device errors ────────────────────────────────────────────────
     /// The requested device was not found.
-    DeviceNotFound { device_id: String },
+    DeviceNotFound {
+        /// Identifier of the device that could not be located.
+        device_id: String,
+    },
     /// The device exists but is not currently available.
-    DeviceNotAvailable { device_id: String, reason: String },
+    DeviceNotAvailable {
+        /// Identifier of the unavailable device.
+        device_id: String,
+        /// Why the device is unavailable (e.g. disconnected, in exclusive use).
+        reason: String,
+    },
     /// Failed to enumerate audio devices.
     DeviceEnumerationError {
+        /// Why enumeration failed.
         reason: String,
+        /// OS-level backend context, when one is available.
         context: Option<BackendContext>,
     },
 
     // ── Stream errors ────────────────────────────────────────────────
     /// Failed to create an audio stream.
     StreamCreationFailed {
+        /// Why stream creation failed.
         reason: String,
+        /// OS-level backend context, when one is available.
         context: Option<BackendContext>,
     },
     /// Failed to start an audio stream.
-    StreamStartFailed { reason: String },
+    StreamStartFailed {
+        /// Why the stream could not be started.
+        reason: String,
+    },
     /// Failed to stop an audio stream.
-    StreamStopFailed { reason: String },
+    StreamStopFailed {
+        /// Why the stream could not be stopped.
+        reason: String,
+    },
     /// An error occurred while reading audio data from a stream.
     ///
     /// This is a **transient/recoverable** read failure (e.g. a momentary
     /// internal hiccup) — NOT end-of-stream. When a read fails because the
     /// stream has reached a terminal state, [`StreamEnded`](AudioError::StreamEnded)
     /// is returned instead, so callers can distinguish "retry" from "done".
-    StreamReadError { reason: String },
+    StreamReadError {
+        /// Why the read failed.
+        reason: String,
+    },
     /// The stream has ended: a read was attempted on a stream that has reached
     /// a terminal state (Stopped / Closed / Error). This is **fatal** for the
     /// read loop — the stream will produce no more data and should not be
     /// retried. Distinct from the recoverable [`StreamReadError`](AudioError::StreamReadError).
-    StreamEnded { reason: String },
+    StreamEnded {
+        /// Which terminal state ended the stream and why.
+        reason: String,
+    },
     /// The ring buffer overflowed — audio frames were dropped.
-    BufferOverrun { dropped_frames: usize },
+    BufferOverrun {
+        /// Number of frames dropped because the consumer fell behind.
+        dropped_frames: usize,
+    },
     /// The ring buffer underran — not enough data was available.
-    BufferUnderrun { requested: usize, available: usize },
+    BufferUnderrun {
+        /// Number of frames the caller asked for.
+        requested: usize,
+        /// Number of frames actually available.
+        available: usize,
+    },
 
     // ── Backend errors ───────────────────────────────────────────────
     /// A platform-specific backend operation failed.
     BackendError {
+        /// Backend name (e.g. `"WASAPI"`, `"PipeWire"`, `"CoreAudio"`).
         backend: String,
+        /// The backend operation that failed (e.g. `"IAudioClient::Initialize"`).
         operation: String,
+        /// Human-readable failure description.
         message: String,
+        /// OS-level backend context, when one is available.
         context: Option<BackendContext>,
     },
     /// The requested backend is not available on this system.
-    BackendNotAvailable { backend: String },
+    BackendNotAvailable {
+        /// Name of the missing backend.
+        backend: String,
+    },
     /// The backend failed to initialize.
-    BackendInitializationFailed { backend: String, reason: String },
+    BackendInitializationFailed {
+        /// Name of the backend that failed to initialize.
+        backend: String,
+        /// Why initialization failed.
+        reason: String,
+    },
 
     // ── Application capture errors ───────────────────────────────────
     /// The target application for capture was not found.
-    ApplicationNotFound { identifier: String },
+    ApplicationNotFound {
+        /// The identifier used to look up the application (PID, name, or
+        /// node id, depending on the [`CaptureTarget`](crate::core::config::CaptureTarget) variant).
+        identifier: String,
+    },
     /// Capturing audio from the target application failed.
-    ApplicationCaptureFailed { app_id: String, reason: String },
+    ApplicationCaptureFailed {
+        /// Identifier of the application whose capture failed.
+        app_id: String,
+        /// Why the capture failed.
+        reason: String,
+    },
 
     // ── Platform errors ──────────────────────────────────────────────
     /// The requested feature is not supported on this platform.
-    PlatformNotSupported { feature: String, platform: String },
+    PlatformNotSupported {
+        /// The unsupported feature (e.g. `"process tree capture"`).
+        feature: String,
+        /// The current platform name (e.g. `"linux"`).
+        platform: String,
+    },
     /// The operation was denied due to insufficient permissions.
     PermissionDenied {
+        /// The operation that was denied.
         operation: String,
+        /// Additional platform-specific detail (e.g. which permission to grant).
         details: Option<String>,
     },
 
     // ── Internal errors ──────────────────────────────────────────────
     /// An internal or unexpected error.
     InternalError {
+        /// Description of the internal failure.
         message: String,
+        /// The underlying error that caused this failure, when one exists.
         source: Option<Box<dyn std::error::Error + Send + Sync>>,
     },
     /// An operation timed out.
     Timeout {
+        /// The operation that timed out.
         operation: String,
+        /// How long the operation ran before timing out.
         duration: std::time::Duration,
     },
 }

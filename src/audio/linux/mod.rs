@@ -113,6 +113,15 @@ pub fn enumerate_audio_applications() -> crate::core::error::Result<Vec<LinuxApp
         .collect())
 }
 
+/// PipeWire-backed [`DeviceEnumerator`](crate::core::interface::DeviceEnumerator)
+/// implementation for Linux.
+///
+/// Enumerates audio nodes via the native in-process PipeWire registry, falling
+/// back to the `pw-cli`/`pw-dump` subprocess tools when the native path fails
+/// (see [`DeviceEnumerator::enumerate_devices`](crate::core::interface::DeviceEnumerator::enumerate_devices)
+/// on this type). Obtain one through
+/// [`get_device_enumerator`](crate::audio::get_device_enumerator) rather than
+/// constructing it directly in cross-platform code.
 pub struct LinuxDeviceEnumerator;
 
 impl Default for LinuxDeviceEnumerator {
@@ -122,6 +131,7 @@ impl Default for LinuxDeviceEnumerator {
 }
 
 impl LinuxDeviceEnumerator {
+    /// Creates a new enumerator. The type is stateless; construction never fails.
     pub fn new() -> Self {
         LinuxDeviceEnumerator
     }
@@ -524,12 +534,20 @@ impl LinuxDeviceEnumerator {
     }
 }
 
-// Simple Linux audio device implementation
+/// A PipeWire audio node as seen by [`LinuxDeviceEnumerator`], implementing
+/// the [`AudioDevice`](crate::core::interface::AudioDevice) trait.
 #[derive(Debug, Clone)]
 pub struct LinuxAudioDevice {
+    /// PipeWire node identifier — the node's `object.serial` on the native
+    /// enumeration path (round-trippable through
+    /// [`CaptureTarget::Device`](crate::core::config::CaptureTarget::Device)),
+    /// or a node id/name on the subprocess fallback paths.
     pub id: String,
+    /// Human-readable node name (e.g. `alsa_output.pci-...`).
     pub name: String,
+    /// Whether the node is a capture source (`media.class` contains `Audio/Source`).
     pub is_input: bool,
+    /// Whether the node is a playback sink (`media.class` contains `Audio/Sink`).
     pub is_output: bool,
 }
 

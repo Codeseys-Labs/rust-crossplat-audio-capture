@@ -119,6 +119,11 @@ pipeline.
   cannot interfere.
 - Example use case: one capture for `SystemDefault` (for recording),
   another for `Application(chrome)` (for transcription).
+- With the opt-in `compose` feature, multiple sources can also be
+  **composed into one multi-channel stream** — groups of sources mixed to
+  mono/stereo channels or kept as native channels, appended in declaration
+  order (see "Channel composition" below and
+  [ADR-0011](docs/designs/0011-compose-feature.md)).
 
 ### Cross-platform parity
 
@@ -144,29 +149,39 @@ are explicitly deferred to downstream crates:
 
 | Out-of-scope concern | Use instead |
 |---|---|
-| Stream mixing (combining 2+ captures into 1 output) | `rodio::Source::mix` or a custom `f32 + f32` adder on top of rsac's buffers |
-| Resampling | `samplerate`, `rubato`, `libsoxr-sys` |
+| Resampling (as a general service) | `samplerate`, `rubato`, `libsoxr-sys` — rsac uses `rubato` *internally* only for `compose`-feature rate alignment |
 | Encoding (MP3, AAC, Opus) | `hound` (WAV), `symphonia` (decode), `opus` crate |
 | Playback | `cpal`, `rodio` |
 | Audio effects (compression, EQ, reverb) | `fundsp`, `camilladsp`, `dasp` |
 | Voice-activity detection | `voice_activity_detector`, `webrtc-vad` |
 | Acoustic echo cancellation | `speexdsp-sys`, platform-native libs |
 
-### Why not own mixing?
+### Channel composition (the `compose` feature) — a deliberate scope change
 
-Mixing requires downstream-specific decisions: (a) what sample-rate
-to mix at (resampling cost), (b) per-source gain, (c) clipping /
-limiter strategy, (d) real-time vs. buffered. These belong to the
-application, not the capture layer. rsac exposes the interleaved samples
-through the `AudioBuffer::data() -> &[f32]` accessor — if you want to mix two
-captures, it's 3 lines:
+Earlier revisions of this document declared stream mixing out of scope.
+That stance was **amended** by
+[ADR-0011](docs/designs/0011-compose-feature.md) (2026-07-04): multi-source
+**channel composition** is now in scope, behind the opt-in `compose` cargo
+feature. A `CompositionBuilder` takes *groups* of `CaptureTarget`s; each group
+either mixes down to Mono/Stereo (gain-weighted plain summation) or passes a
+single source's native channels through, and the groups append — in
+declaration order — into one interleaved-f32 multi-channel stream speaking the
+same `CapturingStream` contract as a single capture. Sources at a different
+negotiated rate are resampled (via `rubato`) to the session rate on a
+dedicated non-RT compositor thread.
+
+Why the change: heterogeneous rates (Windows process loopback cannot
+autoconvert) and cross-source alignment (app taps go silent; sources start at
+different times) are problems only the capture layer sees clearly — every
+downstream was going to re-solve them, badly. What did **not** change: rsac
+still ships no effects, no limiter, no encoding, and no general-purpose DSP.
+With the feature off, the dependency graph and API are exactly as before. For
+one-off mixing of two homogeneous buffers, the 3-line downstream adder still
+works:
 
 ```rust
 let mixed: Vec<f32> = buf_a.data().iter().zip(buf_b.data()).map(|(a, b)| a + b).collect();
 ```
-
-If a downstream crate like `rsac-mixer` emerges, we'll link it from
-docs — but it won't be in the core.
 
 ## Recently Shipped (was on the roadmap, now in-scope)
 
@@ -236,8 +251,8 @@ in [`docs/reviews/`](docs/reviews/).
 
 - **Blacksmith 4vcpu/6vcpu runners** (Linux, Windows, macOS) are
   preferred over GitHub-hosted for speed + audio subsystem support.
-- `.github/workflows/blacksmith-audio-probe.yml` — diagnostic that
-  confirms audio devices are visible on Blacksmith hosts.
+  (Audio-device availability per runner was confirmed by a one-shot
+  probe workflow, since deleted; the results live in AGENTS.md §6.)
 
 ### Post-publish verification
 

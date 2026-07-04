@@ -114,6 +114,18 @@ impl PlatformCapabilities {
         &Self::SUPPORTED_SAMPLE_RATES
     }
 
+    /// Human-readable rendering of [`SUPPORTED_SAMPLE_RATES`](Self::SUPPORTED_SAMPLE_RATES)
+    /// (`"22050, 32000, 44100, 48000, 88200, 96000"`), single-sourced from the
+    /// const so validation error messages (the capture builder's and the
+    /// compose builder's) can never drift from the actual whitelist.
+    pub(crate) fn supported_sample_rates_display() -> String {
+        Self::SUPPORTED_SAMPLE_RATES
+            .iter()
+            .map(|r| r.to_string())
+            .collect::<Vec<_>>()
+            .join(", ")
+    }
+
     /// Query the capabilities of the current platform's audio backend.
     ///
     /// Determined at compile time from BOTH the target OS *and* the matching

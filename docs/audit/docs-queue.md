@@ -113,7 +113,7 @@ git push origin master
 - `docs/troubleshooting.md`: exists.
 - `docs/RELEASE_PROCESS.md`: exists.
 - `ci/alpine-musl-validation/`: has a README.
-- `.github/workflows/`: `ci.yml`, `ci-audio-tests.yml`, `release.yml`, `release-npm.yml`, `release-pypi.yml`, `blacksmith-audio-probe.yml` — workflow files themselves are mostly self-explanatory; ensure docs cross-link to them.
+- `.github/workflows/`: `ci.yml`, `ci-audio-tests.yml`, `release.yml`, `release-npm.yml`, `release-pypi.yml` — workflow files themselves are mostly self-explanatory; ensure docs cross-link to them.
 
 ### Seeded TODO items (first pass)
 

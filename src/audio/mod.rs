@@ -49,12 +49,15 @@ use crate::core::interface::DeviceEnumerator;
 
 /// Cross-platform device enumerator that wraps platform-specific implementations.
 pub enum CrossPlatformDeviceEnumerator {
+    /// WASAPI-backed enumerator (Windows).
     #[cfg(all(target_os = "windows", feature = "feat_windows"))]
     Windows(windows::WindowsDeviceEnumerator),
 
+    /// PipeWire-backed enumerator (Linux).
     #[cfg(all(target_os = "linux", feature = "feat_linux"))]
     Linux(linux::LinuxDeviceEnumerator),
 
+    /// CoreAudio-backed enumerator (macOS).
     #[cfg(all(target_os = "macos", feature = "feat_macos"))]
     MacOS(macos::MacosDeviceEnumerator),
 }
