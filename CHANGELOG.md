@@ -49,6 +49,40 @@ Releases with no ABI change omit the subsection (or state "No C ABI changes").
 - **`#![warn(missing_docs)]`** at the crate root, with the outstanding
   rustdoc gaps filled (`ErrorKind` variants, `AudioError` variant fields,
   platform enumerator items).
+- **Buffer timestamps populated on every backend (stream position).** The
+  platform RT push paths (WASAPI thread, PipeWire `.process`, CoreAudio
+  IOProc) now use stamping push variants
+  (`push_samples_or_drop_stamped`/`push_samples_guarded_stamped`): each
+  delivered `AudioBuffer` carries `timestamp() = frames offered ÷ rate` —
+  pure integer math, no clock syscall, ADR-0001 alloc-free proof extended to
+  the stamped path (`tests/rt_alloc.rs`). Producer-side drops surface as
+  *gaps* between consecutive timestamps instead of a contiguous lie. Composed
+  buffers (the `compose` feature) are stamped with the same semantics. The
+  refinement to per-backend device clocks stays tracked (rsac-ec25).
+- **`Composition` consumption parity**: `subscribe()`,
+  `subscribe_with_errors()`, and (with `async-stream`) `audio_data_stream()`
+  now exist on `Composition` with the same delivery contracts as
+  `AudioCapture` (the pumps are shared, not duplicated).
+- **Compose exposed through the C FFI** (`rsac-ffi` `compose` feature, off by
+  default like `sink-wav`): 24 new `rsac_*` functions —
+  `RsacGroup`/`RsacCompositionBuilder`/`RsacComposition` opaque handles,
+  layout enum, `repr(C)` stats structs, channel-map introspection — all
+  null-safe and panic-caught; headers regenerated deterministically behind
+  `RSAC_FEATURE_COMPOSE`. Python/Node/Go wrappers remain tracked
+  (rsac-fba7).
+- **Interop recipes** (`docs/INTEROP.md`): copy-paste bridges from rsac
+  buffers into `dasp`, `cpal`/`rodio` playback, `hound` WAV, and encoder
+  pipelines, plus timestamp-based drop/sync accounting.
+- **CI: advisory coverage job** (cargo-llvm-cov on the Linux lib suite,
+  lcov artifact + optional Codecov upload when `CODECOV_TOKEN` exists;
+  `continue-on-error` — trend data, not a gate).
+- **Release: automatic tag→publish fan-out.** `release-tag.yml` mints a
+  GitHub-App installation token (org secrets `RSAC_RELEASE_APP_ID` /
+  `RSAC_RELEASE_APP_PRIVATE_KEY`) so the version tag triggers the
+  crates.io/npm/PyPI publish workflows automatically, and pushes the
+  `bindings/rsac-go/vX.Y.Z` module tag in the same job. Without the secrets
+  the previous manual-dispatch behavior is preserved and the job summary
+  documents the setup.
 
 ### Changed
 
@@ -86,8 +120,13 @@ Releases with no ABI change omit the subsection (or state "No C ABI changes").
 
 ### C ABI changes
 
-No C ABI changes (the `compose` surface is not yet exposed through
-`rsac-ffi`; tracked as a follow-up).
+**Additive only — no breaking changes.** The `rsac-ffi` `compose` feature
+(off by default) adds 24 new `rsac_*` symbols (`RsacGroup` /
+`RsacCompositionBuilder` / `RsacComposition` handles, `rsac_group_layout_t`,
+`RsacCompositionStats`/`RsacSourceStats` structs), emitted in the generated
+header behind `#if defined(RSAC_FEATURE_COMPOSE)`. Existing symbols,
+signatures, and layouts are unchanged, so consumers pinning the current
+`.so`/`.dll`/`.dylib` need no recompilation.
 
 ## [0.4.0] - 2026-05-31
 

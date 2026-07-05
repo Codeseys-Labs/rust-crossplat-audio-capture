@@ -25,7 +25,9 @@ rsac is a capture library, not a DSP or playback library. For downstream concern
 - **Encoding** → `hound` (WAV) / `symphonia` / `opus`
 - **Playback** → `cpal` / `rodio`
 
-See [VISION.md](VISION.md) for the full in-scope / out-of-scope list.
+See [VISION.md](VISION.md) for the full in-scope / out-of-scope list, and
+[docs/INTEROP.md](docs/INTEROP.md) for copy-paste recipes bridging rsac buffers
+into `dasp`, `cpal`/`rodio`, `hound`, and encoder pipelines.
 
 ## CI Status
 

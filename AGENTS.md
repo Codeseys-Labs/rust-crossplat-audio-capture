@@ -501,7 +501,7 @@ Full playbook (when to stack vs parallel PRs, exact commands, pitfalls):
 - **Linux `ApplicationByName` happy-path integration test** — Windows has `application_by_name_windows`; the Linux happy path (pinned `pw-dump` node name) is still absent and macOS's is `#[ignore]`d behind TCC
 - **Harden non-silence assertions** — Linux capture tests still use soft warnings; flipping `RSAC_CI_AUDIO_DETERMINISTIC=1` needs the deterministic PipeWire routing evidence (seeds rsac-6efb / rsac-b106)
 - **First crates.io publish** — the crate is not yet on crates.io (README's `version = "0.4"` snippet and the docs.rs links are forward-looking until then); release automation exists, needs `CARGO_REGISTRY_TOKEN` + a tag
-- **Compose follow-ups** — bindings exposure (C FFI → Python/Node/Go), `subscribe()`/`audio_data_stream()` parity on `Composition`, live per-source gain/mute
+- **Compose follow-ups** — Python/Node/Go bindings exposure (C FFI shipped; rsac-fba7), live per-source gain/mute (rsac-5a2d), v2 layouts (rsac-7c93)
 - **Blacksmith Windows audio support** — request Blacksmith add audio subsystem to Windows Server images (see §6 runner labels)
 
 ---
