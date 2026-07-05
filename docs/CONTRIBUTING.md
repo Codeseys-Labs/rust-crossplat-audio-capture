@@ -14,9 +14,9 @@ pre-commit clippy gate will drift.
 - Channel: see `rust-toolchain.toml` (currently `1.95.0`).
 - Components: `rustfmt`, `clippy`.
 - Bumping the toolchain is intentional — see the comment at the top of
-  `rust-toolchain.toml` and the `clippy-toolchain-bump-ci-breakage`
-  skill. Run `cargo clippy --all-targets -- -D warnings` locally before
-  pushing the bump so new lints do not land cold in CI.
+  `rust-toolchain.toml` for the rationale. Run
+  `cargo clippy --all-targets -- -D warnings` locally with the new
+  toolchain before pushing the bump so new lints do not land cold in CI.
 
 ### Platform build dependencies
 
@@ -77,6 +77,11 @@ macOS runners without a TCC grant, Process Tap calls block for 10–18
 minutes before erroring — leaving the env var unset lets those tests
 skip early instead of hanging.
 
+On a machine with real, working audio, also export
+`RSAC_CI_AUDIO_DETERMINISTIC=1` — it turns the capture tests' soft
+non-silence warnings into hard assertions (see the workflow-knob list in
+[`docs/CI_AUDIO_TESTING.md`](CI_AUDIO_TESTING.md#5-workflow-knobs)).
+
 To run the integration tests locally (Linux example):
 
 ```bash
@@ -110,9 +115,14 @@ Pull requests trigger three workflows:
 - Prefer updating existing docs over creating new files. See
   [`docs/audit/docs-queue.md`](audit/docs-queue.md) for the current
   documentation audit state.
-- In-tree design docs live under `docs/architecture/` (design intent)
-  and `docs/reviews/` (loop retrospectives). Don't confuse them: reviews
-  snapshot a moment in time; architecture docs stay authoritative.
+- In-tree design docs live under `docs/architecture/` (original design
+  intent — **historical**; each carries a divergence banner) and
+  `docs/reviews/` (loop retrospectives — snapshots of a moment in time).
+  Per [`AGENTS.md` §2](../AGENTS.md): **the code is the source of
+  truth**. When a design doc and the code disagree, fix the doc (or note
+  the divergence in its banner) — never bend the code to match a stale
+  doc. Durable decisions are recorded as ADRs in
+  [`docs/designs/`](designs/).
 
 ## 6. Commit style
 
@@ -147,10 +157,11 @@ Always reply on the originating comment so the thread can be resolved. See
 
 ## 7. Release procedure
 
-Releases are driven by `scripts/bump-version.sh`, which keeps five
+Releases are driven by `scripts/bump-version.sh`, which keeps six
 version-bearing files in sync:
 
 - `Cargo.toml` (root `rsac` crate)
+- `bindings/rsac-ffi/Cargo.toml`
 - `bindings/rsac-napi/Cargo.toml`
 - `bindings/rsac-napi/package.json`
 - `bindings/rsac-python/Cargo.toml`

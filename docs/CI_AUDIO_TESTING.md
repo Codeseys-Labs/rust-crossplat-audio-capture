@@ -155,6 +155,13 @@ centralised in `helpers.rs` so the tests themselves stay portable.
 - `RSAC_CI_AUDIO_AVAILABLE=1` — set by the workflow once the audio
   stack is up; makes `audio_infrastructure_available()` fast-path to
   `true`. Unset on non-audio jobs.
+- `RSAC_CI_AUDIO_DETERMINISTIC=1` — flips the capture tests' soft
+  non-silence warnings into **hard assertions**. Set in CI only where
+  audio routing is deterministic (the Windows system tier); deliberately
+  unset on Linux until the PipeWire virtual-sink routing evidence lands
+  (seeds rsac-6efb / rsac-b106). On a local machine with real, working
+  audio this is exactly what you want: export it to make a silent
+  capture fail loudly instead of warn.
 - `RSAC_CI_MACOS_TCC_GRANTED=1` — set only on self-hosted macOS
   runners where Audio Capture has been granted. Unset on Blacksmith
   and GH-hosted macOS.
