@@ -10,7 +10,7 @@
     "prepublishOnly": "napi prepublish -t npm",
     "artifacts": "napi artifacts",
     "version": "napi version",
-    "test": "echo \"Error: no JS tests yet (binding smoke tests are seeded)\" && exit 1"
+    "test": "node --test"
   },
   "napi": {
     "name": "rsac-audio",

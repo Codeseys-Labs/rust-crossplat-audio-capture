@@ -16,6 +16,10 @@ research/
 *.sln
 *.sw?
 
+# Binding smoke-test scratch (ci.yml check-bindings + local runs, rsac-e1f7)
+.venv-smoke/
+bindings/rsac-napi/package-lock.json
+
 # Logs
 logs/
 *.log
