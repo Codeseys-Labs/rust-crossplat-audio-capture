@@ -1,6 +1,6 @@
 # @rsac/audio
 
-Node.js bindings for [rsac](https://github.com/baladita/rust-crossplat-audio-capture) — a Rust cross-platform audio capture library supporting per-application and system-wide loopback capture on Windows (WASAPI), macOS (CoreAudio Process Taps, 14.4+), and Linux (PipeWire).
+Node.js bindings for [rsac](https://github.com/Codeseys-Labs/rust-crossplat-audio-capture) — a Rust cross-platform audio capture library supporting per-application and system-wide loopback capture on Windows (WASAPI), macOS (CoreAudio Process Taps, 14.4+), and Linux (PipeWire).
 
 Built with [napi-rs](https://napi.rs/).
 

@@ -160,7 +160,7 @@ feature.
 |---|---|---|
 | `rsac-python` | yes | Uses the `[target.'cfg(...)'.dependencies.rsac]` blocks above with `default-features = false`. Reference implementation. |
 | `rsac-ffi` | yes (variant) | Mirrors `rsac`'s `feat_*` through its own `[features]` table and depends on `rsac` with `default-features = false`; consumers pass `--features feat_<os>`. Equivalent end state — only the host backend compiles. |
-| `rsac-napi` | migrating | Historically depended on `rsac` with implicit defaults (all three backends, bloating non-host builds). Should adopt the per-target blocks above so a Linux/Windows/macOS build pulls only its backend. |
+| `rsac-napi` | yes | Migrated (rsac-e8a3) to the per-target blocks with `default-features = false`, matching `rsac-python`. |
 
 > The manifest edits that bring `rsac-napi` (and align `rsac-ffi`) onto
 > this pattern live with the crate-owning change; this document is the
@@ -168,13 +168,19 @@ feature.
 
 ## Binaries / examples gated by features
 
-Some binaries require a specific feature to build (see `Cargo.toml`):
+Several targets require a specific feature to build — cargo names the missing
+feature in a clear error if you forget (see `Cargo.toml` for the full list):
 
-- `pipewire_diagnostics` — `feat_linux`
+- `rsac` (the CLI demo), `standardized_test` — `cli`
+- `pipewire_diagnostics`, `smoke_alpine` — `feat_linux`
 - `wasapi_session_test` — `feat_windows`
+- `examples/verify_audio.rs`, `examples/basic_capture.rs`,
+  `examples/record_to_file.rs` — `cli`
 - `examples/async_capture.rs` — `async-stream`
+- `examples/composed_capture.rs` — `compose`
 
-All other `[[bin]]` and `[[example]]` entries compile under the default feature set.
+Only `examples/list_devices.rs` and the remaining `src/bin/` test binaries
+compile under the default feature set alone.
 
 ## What is *not* behind a feature flag
 
@@ -189,7 +195,7 @@ The following are always compiled and have no opt-out:
 
 ## Version note
 
-This matrix reflects `rsac` at the 0.2.0 release line. Future provider-architecture work may add feature flags for cloud-backed capture providers — those will be listed here as they land.
+This matrix reflects `rsac` at the 0.4.0 line. Future provider-architecture work may add feature flags for cloud-backed capture providers — those will be listed here as they land.
 
 `rsac` and its bindings bump in lockstep on every semver tag, and any
 change to the `rsac-ffi` C ABI is a MAJOR bump for the FFI surface. See

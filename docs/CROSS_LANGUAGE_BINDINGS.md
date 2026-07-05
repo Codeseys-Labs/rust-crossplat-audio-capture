@@ -184,19 +184,17 @@ and its trade-offs are recorded in
 
 ### Backend feature selection
 
-The **rsac-python** binding depends on `rsac` with `default-features = false`
-and selects exactly the one backend matching the build target via
-`[target.'cfg(...)'.dependencies.rsac]` blocks, so a Linux build never compiles
-the Windows/CoreAudio backends. This is the canonical convention documented in
-[`features.md`](features.md#binding-feature-resolution-convention-canonical).
-**rsac-ffi** takes a different (also correct) shape: a single
+The **rsac-python** and **rsac-napi** bindings depend on `rsac` with
+`default-features = false` and select exactly the one backend matching the
+build target via `[target.'cfg(...)'.dependencies.rsac]` blocks, so a Linux
+build never compiles the Windows/CoreAudio backends. This is the canonical
+convention documented in
+[`features.md`](features.md#binding-feature-resolution-convention-canonical)
+(rsac-napi migrated in rsac-e8a3 — it is also a prerequisite for building
+mobile triples). **rsac-ffi** takes a different (also correct) shape: a single
 `default-features = false` dependency plus passthrough features
 (`feat_windows`/`feat_linux`/`feat_macos`, `default = []`), so the consumer —
-the Makefile, CI, or rsac-go — picks the backend at build time. **rsac-napi**
-has not yet migrated — it currently depends on `rsac = { path = "../.." }`
-(all default backends); `features.md` tracks it as still migrating, and the
-migration is a prerequisite for building mobile triples (seeded, label
-`xplat`).
+the Makefile, CI, or rsac-go — picks the backend at build time.
 
 ## 1. C FFI (Foundation)
 
