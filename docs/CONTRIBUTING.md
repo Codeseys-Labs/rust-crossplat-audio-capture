@@ -36,6 +36,11 @@ See [`docs/features.md`](features.md) for the feature matrix.
 
 - **Linux:** `libpipewire-0.3-dev`, `libspa-0.2-dev`, `pkg-config`,
   `clang` / `libclang-dev`, `llvm-dev`.
+  On Windows/macOS, the fastest way to work on the Linux leg is the
+  **devcontainer** ([`.devcontainer/`](../.devcontainer/devcontainer.json)) —
+  it reuses `docker/linux/Dockerfile.test` (full PipeWire stack, session
+  daemons booted at start) and runs
+  `cargo check --features feat_linux` on create.
 - **Windows:** MSVC (WASAPI ships with the OS). Git for Windows provides
   the `bash` used by the gate script and hooks.
 - **macOS:** Xcode Command Line Tools. Process Tap features require
