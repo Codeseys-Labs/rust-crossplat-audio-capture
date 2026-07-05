@@ -22,6 +22,20 @@ This document enumerates every Cargo feature exposed by `rsac`, what it enables,
 
 The three `feat_*` flags are a two-way gate: code inside a platform backend is compiled **only** when both `target_os` matches and the feature is on. See `src/audio/mod.rs` for the `cfg(all(target_os = "…", feature = "feat_…"))` guards.
 
+### PipeWire crate version gate (`v0_3_65`)
+
+`feat_linux` depends on `pipewire = { version = "0.9.2", features = ["v0_3_65"] }`.
+The `v0_3_XX` features are the pipewire-rs crates' API-version gates; `v0_3_65`
+transitively enables the whole chain down to `v0_3_32` (including the
+`v0_3_44` monitor-stream APIs) plus `libspa`/`libspa-sys` `v0_3_65`. This used
+to be force-enabled through a `.cargo/config.toml` rustflags cfg-injection
+hack, which was both global (every crate in the graph got the cfg) and
+**inconsistent** — it never enabled the intermediate `v0_3_45`–`v0_3_64`
+gates, so code behind those cfgs silently compiled out (rsac-9b3c). It is now
+a normal cargo feature. The declared runtime floor (PipeWire 0.3.44+ daemon)
+is unchanged; the compile-time Rust API surface targets 0.3.65 — identical to
+what the hack produced, minus the inconsistency.
+
 Consequences:
 
 - Building on Linux with `--no-default-features --features feat_windows` compiles nothing from `src/audio/windows/` (the `target_os` check fails), so `get_device_enumerator()` will return `AudioError::PlatformNotSupported`.

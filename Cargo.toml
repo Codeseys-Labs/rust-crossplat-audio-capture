@@ -151,7 +151,7 @@ sysinfo = "0.38.4"     # For process discovery by name
 [target.'cfg(target_os = "linux")'.dependencies]
 # PipeWire dependencies for application-specific capture
 # System requirements: libpipewire-0.3-dev, pkg-config, build-essential, clang, libclang-dev, and llvm-dev
-pipewire = { version = "0.9.2", features = ["v0_3_44"] }  # PipeWire bindings with v0.3.44+ features for monitor streams
+pipewire = { version = "0.9.2", features = ["v0_3_65"] }  # v0.3.65 API gate (transitively includes v0_3_44 monitor-stream APIs and enables spa/v0_3_65). Declared here as a real cargo feature — previously force-injected globally via a .cargo/config.toml rustflags cfg hack (rsac-9b3c).
 libspa = "0.9.2"      # SPA (Simple Plugin API) for format negotiation and parameter handling
 libspa-sys = "0.9.2"  # Low-level SPA bindings for direct parameter access
 
