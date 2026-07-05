@@ -848,6 +848,111 @@ where
     })
 }
 
+/// Shared push-subscription pump behind [`AudioCapture::subscribe`] and the
+/// `compose` feature's `Composition::subscribe`: a background `rsac-subscribe`
+/// thread reads the stream's terminal-observable `try_read_chunk` path and
+/// forwards each buffer over an [`mpsc`] channel.
+///
+/// Policy (identical for both callers; mirrors the callback pump and the
+/// iterator):
+/// - only a **fatal** terminal (e.g. [`AudioError::StreamEnded`]) ends the
+///   subscription — the channel then disconnects, which the receiver observes
+///   as a [`RecvError`](std::sync::mpsc::RecvError);
+/// - a **recoverable** read error is logged and retried, never ending delivery
+///   (FH-1/BP-6);
+/// - a momentarily-empty ring sleeps ~1 ms (the documented latency floor);
+/// - a dropped receiver ends the thread.
+pub(crate) fn spawn_subscribe_thread(
+    stream: Arc<dyn crate::core::interface::CapturingStream>,
+) -> AudioResult<mpsc::Receiver<AudioBuffer>> {
+    let (tx, rx) = mpsc::channel();
+
+    std::thread::Builder::new()
+        .name("rsac-subscribe".into())
+        .spawn(move || loop {
+            match stream.try_read_chunk() {
+                Ok(Some(buffer)) => {
+                    if tx.send(buffer).is_err() {
+                        break; // Receiver dropped
+                    }
+                }
+                Ok(None) => {
+                    // No data available, sleep briefly to avoid busy-spinning
+                    std::thread::sleep(std::time::Duration::from_millis(1));
+                }
+                // Only a FATAL terminal (e.g. StreamEnded) ends the
+                // subscription — the channel then disconnects, which the
+                // receiver observes as a RecvError. A recoverable read error
+                // (transient StreamReadError, BufferOverrun/Underrun) must
+                // NOT kill delivery; log and retry after a brief pause,
+                // mirroring the callback pump (spawn_callback_pump) and the
+                // iterator. This closes the prior bug where ANY error broke
+                // the loop and silently ended the subscription (FH-1/BP-6).
+                Err(e) if e.is_fatal() => break,
+                Err(e) => {
+                    log::warn!("Subscribe thread read error (retrying): {:?}", e);
+                    std::thread::sleep(std::time::Duration::from_millis(1));
+                }
+            }
+        })
+        .map_err(|e| AudioError::InternalError {
+            message: format!("Failed to spawn subscribe thread: {}", e),
+            source: None,
+        })?;
+
+    Ok(rx)
+}
+
+/// Error-carrying sibling of [`spawn_subscribe_thread`] behind
+/// [`AudioCapture::subscribe_with_errors`] and the `compose` feature's
+/// `Composition::subscribe_with_errors`: each item is an
+/// [`AudioResult<AudioBuffer>`], and the **fatal terminal** error is delivered
+/// as the final channel item *before* the disconnect, so the consumer never
+/// has to race a bare `RecvError` to learn why the stream ended.
+pub(crate) fn spawn_subscribe_with_errors_thread(
+    stream: Arc<dyn crate::core::interface::CapturingStream>,
+) -> AudioResult<mpsc::Receiver<AudioResult<AudioBuffer>>> {
+    let (tx, rx) = mpsc::channel();
+
+    std::thread::Builder::new()
+        .name("rsac-subscribe-err".into())
+        .spawn(move || loop {
+            match stream.try_read_chunk() {
+                Ok(Some(buffer)) => {
+                    if tx.send(Ok(buffer)).is_err() {
+                        break; // Receiver dropped
+                    }
+                }
+                Ok(None) => {
+                    // No data available, sleep briefly to avoid busy-spinning
+                    std::thread::sleep(std::time::Duration::from_millis(1));
+                }
+                // Fatal terminal: forward the error as the FINAL item, THEN
+                // exit. Send-then-break so the consumer always receives the
+                // terminal AudioError before the channel disconnects (it never
+                // has to race a bare RecvError to learn why the stream ended).
+                Err(e) if e.is_fatal() => {
+                    let _ = tx.send(Err(e));
+                    break;
+                }
+                // Recoverable: surface it (best-effort) AND keep delivering —
+                // a transient hiccup must not end the subscription.
+                Err(e) => {
+                    if tx.send(Err(e)).is_err() {
+                        break; // Receiver dropped
+                    }
+                    std::thread::sleep(std::time::Duration::from_millis(1));
+                }
+            }
+        })
+        .map_err(|e| AudioError::InternalError {
+            message: format!("Failed to spawn subscribe thread: {}", e),
+            source: None,
+        })?;
+
+    Ok(rx)
+}
+
 /// Handle to the background thread spawned by
 /// [`RunningCapture::drain_to`](RunningCapture::drain_to).
 ///
@@ -1797,44 +1902,7 @@ impl AudioCapture {
             });
         }
 
-        let stream = Arc::clone(stream_ref);
-
-        let (tx, rx) = mpsc::channel();
-
-        std::thread::Builder::new()
-            .name("rsac-subscribe".into())
-            .spawn(move || loop {
-                match stream.try_read_chunk() {
-                    Ok(Some(buffer)) => {
-                        if tx.send(buffer).is_err() {
-                            break; // Receiver dropped
-                        }
-                    }
-                    Ok(None) => {
-                        // No data available, sleep briefly to avoid busy-spinning
-                        std::thread::sleep(std::time::Duration::from_millis(1));
-                    }
-                    // Only a FATAL terminal (e.g. StreamEnded) ends the
-                    // subscription — the channel then disconnects, which the
-                    // receiver observes as a RecvError. A recoverable read error
-                    // (transient StreamReadError, BufferOverrun/Underrun) must
-                    // NOT kill delivery; log and retry after a brief pause,
-                    // mirroring the callback pump (spawn_callback_pump) and the
-                    // iterator. This closes the prior bug where ANY error broke
-                    // the loop and silently ended the subscription (FH-1/BP-6).
-                    Err(e) if e.is_fatal() => break,
-                    Err(e) => {
-                        log::warn!("Subscribe thread read error (retrying): {:?}", e);
-                        std::thread::sleep(std::time::Duration::from_millis(1));
-                    }
-                }
-            })
-            .map_err(|e| AudioError::InternalError {
-                message: format!("Failed to spawn subscribe thread: {}", e),
-                source: None,
-            })?;
-
-        Ok(rx)
+        spawn_subscribe_thread(Arc::clone(stream_ref))
     }
 
     /// Like [`subscribe`](Self::subscribe), but delivers each item as an
@@ -1895,47 +1963,7 @@ impl AudioCapture {
             });
         }
 
-        let stream = Arc::clone(stream_ref);
-
-        let (tx, rx) = mpsc::channel();
-
-        std::thread::Builder::new()
-            .name("rsac-subscribe-err".into())
-            .spawn(move || loop {
-                match stream.try_read_chunk() {
-                    Ok(Some(buffer)) => {
-                        if tx.send(Ok(buffer)).is_err() {
-                            break; // Receiver dropped
-                        }
-                    }
-                    Ok(None) => {
-                        // No data available, sleep briefly to avoid busy-spinning
-                        std::thread::sleep(std::time::Duration::from_millis(1));
-                    }
-                    // Fatal terminal: forward the error as the FINAL item, THEN
-                    // exit. Send-then-break so the consumer always receives the
-                    // terminal AudioError before the channel disconnects (it never
-                    // has to race a bare RecvError to learn why the stream ended).
-                    Err(e) if e.is_fatal() => {
-                        let _ = tx.send(Err(e));
-                        break;
-                    }
-                    // Recoverable: surface it (best-effort) AND keep delivering —
-                    // a transient hiccup must not end the subscription.
-                    Err(e) => {
-                        if tx.send(Err(e)).is_err() {
-                            break; // Receiver dropped
-                        }
-                        std::thread::sleep(std::time::Duration::from_millis(1));
-                    }
-                }
-            })
-            .map_err(|e| AudioError::InternalError {
-                message: format!("Failed to spawn subscribe thread: {}", e),
-                source: None,
-            })?;
-
-        Ok(rx)
+        spawn_subscribe_with_errors_thread(Arc::clone(stream_ref))
     }
 
     /// Returns the number of audio buffers dropped due to ring buffer overflow (overruns).

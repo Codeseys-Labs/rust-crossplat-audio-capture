@@ -241,6 +241,19 @@ fn composes_mono_and_keep_groups_end_to_end() {
     let total_frames: usize = buffers.iter().map(|b| b.num_frames()).sum();
     assert_eq!(total_frames, n_buffers * 480, "no frames lost or invented");
 
+    // Composed buffers carry contiguous stream-position timestamps
+    // (frames emitted / session rate), mirroring the backends' stamped pushes.
+    let mut expected_frames = 0u64;
+    for b in &buffers {
+        let expected = Duration::from_nanos(expected_frames * 1_000_000_000 / 48_000);
+        assert_eq!(
+            b.timestamp(),
+            Some(expected),
+            "composed tick timestamp must be its stream position"
+        );
+        expected_frames += b.num_frames() as u64;
+    }
+
     for b in &buffers {
         assert_eq!(b.channels(), 3);
         assert_eq!(b.sample_rate(), 48_000);
@@ -711,6 +724,123 @@ fn ended_master_reelects_live_clock_at_full_rate() {
     harness.shutdown();
 }
 
+// ── Push + async delivery over the composed view ────────────────────────
+
+/// The shared subscribe pump delivers composed buffers and then the fatal
+/// terminal as the FINAL item before the channel disconnects (same contract
+/// as `AudioCapture::subscribe_with_errors`, exercised over the composed
+/// view + drain-complete promotion).
+#[test]
+fn subscribe_with_errors_delivers_buffers_then_terminal() {
+    let n = 5usize;
+    let (src, _) =
+        ScriptedSource::ending((0..n).map(|_| const_buffer(0.5, 1, 48_000, 480)).collect());
+    let harness = Harness::spawn(
+        cfg(
+            1,
+            vec![GroupSpec {
+                layout: GroupLayout::Mono,
+                offset: 0,
+                width: 1,
+            }],
+            vec![SourceSpec {
+                gain: 1.0,
+                group: 0,
+                channels: 0,
+                clock_candidate: false,
+            }],
+            0,
+        ),
+        vec![Box::new(src)],
+    );
+
+    let rx = crate::api::spawn_subscribe_with_errors_thread(harness.stream.clone())
+        .expect("subscribe pump spawns");
+
+    let mut frames = 0usize;
+    let mut saw_terminal = false;
+    let deadline = std::time::Instant::now() + Duration::from_secs(5);
+    while std::time::Instant::now() < deadline {
+        match rx.recv_timeout(Duration::from_millis(100)) {
+            Ok(Ok(buffer)) => frames += buffer.num_frames(),
+            Ok(Err(e)) => {
+                assert!(
+                    e.is_fatal(),
+                    "final delivered error must be fatal, got {e:?}"
+                );
+                saw_terminal = true;
+                break;
+            }
+            Err(std::sync::mpsc::RecvTimeoutError::Timeout) => continue,
+            Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => break,
+        }
+    }
+    assert!(saw_terminal, "terminal error must arrive as the final item");
+    assert_eq!(frames, n * 480, "all composed frames delivered via push");
+    // After the terminal item the channel disconnects.
+    assert!(matches!(
+        rx.recv_timeout(Duration::from_secs(1)),
+        Err(std::sync::mpsc::RecvTimeoutError::Disconnected)
+    ));
+    harness.shutdown();
+}
+
+/// After the composition ends and the ring drains, the async stream yields a
+/// clean `Ready(None)` (end-of-stream), not a hang and not an error.
+#[cfg(feature = "async-stream")]
+#[test]
+fn async_stream_ends_cleanly_after_composition_end() {
+    use futures_core::Stream as _;
+    use std::pin::Pin;
+    use std::task::{Context, Poll, Waker};
+
+    let (src, _) = ScriptedSource::ending(vec![const_buffer(0.25, 1, 48_000, 480)]);
+    let harness = Harness::spawn(
+        cfg(
+            1,
+            vec![GroupSpec {
+                layout: GroupLayout::Mono,
+                offset: 0,
+                width: 1,
+            }],
+            vec![SourceSpec {
+                gain: 1.0,
+                group: 0,
+                channels: 0,
+                clock_candidate: false,
+            }],
+            0,
+        ),
+        vec![Box::new(src)],
+    );
+
+    let mut stream = crate::bridge::AsyncAudioStream::new(&*harness.stream);
+    let waker = Waker::noop();
+    let mut cx = Context::from_waker(waker);
+
+    let mut yielded_frames = 0usize;
+    let deadline = std::time::Instant::now() + Duration::from_secs(5);
+    loop {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "async stream never reached end-of-stream"
+        );
+        match Pin::new(&mut stream).poll_next(&mut cx) {
+            Poll::Ready(Some(Ok(buffer))) => yielded_frames += buffer.num_frames(),
+            Poll::Ready(Some(Err(e))) => panic!("unexpected stream error: {e:?}"),
+            Poll::Ready(None) => break, // clean end-of-stream
+            // Noop waker never fires; the engine is asynchronous to this
+            // poll loop, so just re-poll after a short sleep.
+            Poll::Pending => std::thread::sleep(Duration::from_millis(1)),
+        }
+    }
+    assert_eq!(
+        yielded_frames, 480,
+        "the composed buffer flowed through async"
+    );
+    harness.shutdown();
+}
+
 // ── Not-started Composition handle behavior (device-free) ──────────────
 
 #[test]
@@ -729,6 +859,20 @@ fn unstarted_composition_reads_error_and_reports_honestly() {
     assert!(composition.stats().is_none());
     assert!(matches!(
         composition.read_buffer(),
+        Err(AudioError::StreamReadError { .. })
+    ));
+    // Push + async delivery modes reject a not-started composition uniformly.
+    assert!(matches!(
+        composition.subscribe(),
+        Err(AudioError::StreamReadError { .. })
+    ));
+    assert!(matches!(
+        composition.subscribe_with_errors(),
+        Err(AudioError::StreamReadError { .. })
+    ));
+    #[cfg(feature = "async-stream")]
+    assert!(matches!(
+        composition.audio_data_stream(),
         Err(AudioError::StreamReadError { .. })
     ));
     // Both stop paths tolerate the not-started state identically (no Err).

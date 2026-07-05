@@ -635,6 +635,74 @@ impl Composition {
         crate::api::spawn_drain_thread(stream, sink)
     }
 
+    /// Creates a push subscription delivering composed buffers over an
+    /// [`mpsc`](std::sync::mpsc) channel — the composition analogue of
+    /// [`AudioCapture::subscribe`](crate::api::AudioCapture::subscribe) (same
+    /// background pump, same recoverable-vs-fatal policy, same ~1 ms idle-poll
+    /// latency floor).
+    ///
+    /// The pump exits when the composition reaches its fatal terminal (all
+    /// sources ended and the ring drained, or an explicit stop) — the channel
+    /// then disconnects — or when the receiver is dropped. The background
+    /// reader competes with [`read_buffer`](Self::read_buffer) and
+    /// [`drain_to`](Self::drain_to) for buffers from the same ring; do not mix
+    /// delivery modes on one composition.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`AudioError::StreamReadError`] if the composition is not
+    /// started or no longer running.
+    pub fn subscribe(&self) -> AudioResult<std::sync::mpsc::Receiver<AudioBuffer>> {
+        let stream = self.started_stream()?;
+        if !stream.is_running() {
+            return Err(AudioError::StreamReadError {
+                reason: "Composition is not running".to_string(),
+            });
+        }
+        crate::api::spawn_subscribe_thread(stream.clone())
+    }
+
+    /// Like [`subscribe`](Self::subscribe), but each item is an
+    /// [`AudioResult<AudioBuffer>`] and the **fatal terminal** error is
+    /// delivered as the final channel item before the disconnect — the
+    /// composition analogue of
+    /// [`AudioCapture::subscribe_with_errors`](crate::api::AudioCapture::subscribe_with_errors).
+    ///
+    /// # Errors
+    ///
+    /// Returns [`AudioError::StreamReadError`] if the composition is not
+    /// started or no longer running.
+    pub fn subscribe_with_errors(
+        &self,
+    ) -> AudioResult<std::sync::mpsc::Receiver<AudioResult<AudioBuffer>>> {
+        let stream = self.started_stream()?;
+        if !stream.is_running() {
+            return Err(AudioError::StreamReadError {
+                reason: "Composition is not running".to_string(),
+            });
+        }
+        crate::api::spawn_subscribe_with_errors_thread(stream.clone())
+    }
+
+    /// Returns an asynchronous stream of composed audio buffers — the
+    /// composition analogue of
+    /// [`AudioCapture::audio_data_stream`](crate::api::AudioCapture::audio_data_stream).
+    ///
+    /// The returned [`AsyncAudioStream`](crate::bridge::AsyncAudioStream)
+    /// implements [`futures_core::Stream`], is waker-driven (the compositor
+    /// wakes the task when it pushes a composed buffer), and yields a final
+    /// `None` after the composition ends and the ring drains.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`AudioError::StreamReadError`] if the composition has not been
+    /// started.
+    #[cfg(feature = "async-stream")]
+    pub fn audio_data_stream(&self) -> AudioResult<crate::bridge::AsyncAudioStream<'_>> {
+        let stream = self.started_stream()?;
+        Ok(crate::bridge::AsyncAudioStream::new(&**stream))
+    }
+
     fn started_stream(&self) -> AudioResult<&Arc<ComposedStreamView>> {
         self.stream
             .as_ref()
