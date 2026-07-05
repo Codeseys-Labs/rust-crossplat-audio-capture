@@ -672,11 +672,15 @@ fn wasapi_capture_thread_main(
             }
 
             if !samples.is_empty() {
-                // Push the borrowed sample view directly. `push_samples_or_drop`
+                // Push the borrowed sample view directly. The stamped push
                 // sources its backing buffer from the bridge free-list, so this
                 // is zero-allocation on the capture thread in steady state — and
                 // we no longer stage into an intermediate `Vec<f32>` at all.
-                producer.push_samples_or_drop(samples, channels, sample_rate);
+                // `_stamped` additionally tags each buffer with its stream
+                // position (frames offered / rate; pure integer math), so
+                // `AudioBuffer::timestamp()` is populated and producer-side
+                // drops surface as timestamp gaps (rsac-522b / rsac-ec25).
+                producer.push_samples_or_drop_stamped(samples, channels, sample_rate);
                 // Wake a consumer parked in a blocking read (PU-5). This is sound
                 // here even though the producer push path is RT-disciplined: the
                 // WASAPI capture loop runs on rsac's OWN spawned polling thread

@@ -223,7 +223,7 @@ buf.data() -> &[f32];           buf.into_data() -> Vec<f32>;
 buf.channels() -> u16;          buf.sample_rate() -> u32;     buf.format() -> &AudioFormat;
 buf.len() / is_empty() / num_frames() / samples_per_channel() / duration();
 buf.channel_data(ch) -> Option<Vec<f32>>;          // allocating de-interleave
-buf.timestamp() -> Option<Duration>;               // currently always None in production (tracked)
+buf.timestamp() -> Option<Duration>;               // stream position of the first sample (frames offered / rate); gaps = producer-side drops
 ```
 
 ### Level metering (RT-safe, allocation-free)

@@ -2152,7 +2152,10 @@ fn pw_thread_main(
                                     // overrun counter is incremented; a panic, if
                                     // one ever occurred, is contained rather than
                                     // unwinding into PipeWire's C frames.
-                                    user_data.producer.push_samples_guarded(
+                                    // `_stamped`: stream-position timestamps
+                                    // (frames offered / rate — integer math, same
+                                    // alloc-free path; rsac-522b / rsac-ec25).
+                                    user_data.producer.push_samples_guarded_stamped(
                                         samples,
                                         channels,
                                         sample_rate,
@@ -2192,8 +2195,11 @@ fn pw_thread_main(
                                 if !user_data.realign_scratch.is_empty() {
                                     // Disjoint field borrows: `realign_scratch` is read
                                     // immutably while `producer` is used — allowed.
+                                    // Same stamped push as the aligned fast path so
+                                    // the stream-position timeline stays contiguous
+                                    // across a realigned chunk.
                                     let realigned = user_data.realign_scratch.as_slice();
-                                    user_data.producer.push_samples_guarded(
+                                    user_data.producer.push_samples_guarded_stamped(
                                         realigned,
                                         channels,
                                         sample_rate,

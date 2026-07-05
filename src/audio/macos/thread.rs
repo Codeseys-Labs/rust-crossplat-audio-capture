@@ -385,7 +385,10 @@ pub(crate) fn create_macos_capture(
                 let data: &[f32] = args.data.buffer;
 
                 if !data.is_empty() {
-                    producer.push_samples_guarded(data, channels, sample_rate);
+                    // `_stamped`: stream-position timestamps (frames offered /
+                    // rate — integer math, same guarded alloc-free path;
+                    // rsac-522b / rsac-ec25).
+                    producer.push_samples_guarded_stamped(data, channels, sample_rate);
                 }
 
                 Ok(())

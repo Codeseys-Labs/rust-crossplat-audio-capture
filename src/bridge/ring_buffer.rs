@@ -590,6 +590,14 @@ pub struct BridgeProducer {
     /// momentarily empty (e.g. during warm-up before the consumer has recycled
     /// anything, or under sustained back-pressure when a push is rejected).
     scratch: Vec<f32>,
+    /// Cumulative frames **offered** to the ring (pushed *or* dropped) by the
+    /// stream-position-stamping push variants. Drives
+    /// [`push_samples_or_drop_stamped`](Self::push_samples_or_drop_stamped):
+    /// counting dropped frames too means a producer-side drop shows up as a
+    /// *gap* between consecutive delivered timestamps instead of being papered
+    /// over. Plain `u64` (no atomic) — the producer is single-threaded by
+    /// contract.
+    frames_offered: u64,
 }
 
 // BridgeProducer is Send (can be moved to the callback thread) but not necessarily Sync.
@@ -700,6 +708,74 @@ impl BridgeProducer {
         timestamp: Duration,
     ) -> bool {
         self.push_samples_or_drop_inner(data, channels, sample_rate, Some(timestamp))
+    }
+
+    /// Like [`push_samples_or_drop`](Self::push_samples_or_drop), but stamps the
+    /// buffer with a **stream-position timestamp derived from the frames this
+    /// producer has offered so far** — no clock syscall, pure integer math, so
+    /// it is exactly as RT-safe as the untimed variant (ADR-0001 preserved).
+    ///
+    /// The stamp is the position of this buffer's **first sample** relative to
+    /// stream start, computed as `frames_offered / sample_rate`. The counter
+    /// advances by this call's frames **whether or not the push succeeds**, so
+    /// a producer-side drop appears to the consumer as a *gap* between
+    /// consecutive buffer timestamps (`t₂ − t₁ > frames₁/rate`) instead of a
+    /// silently contiguous timeline — making drop-induced discontinuities
+    /// measurable downstream.
+    ///
+    /// Semantics note: this is *stream position* (frames delivered by the OS),
+    /// not wall-clock time — periods where the OS delivers nothing (e.g. a
+    /// silent process-loopback session) do not advance it. A future upgrade to
+    /// per-backend device clocks (WASAPI `GetPosition`, PipeWire `pw_time`,
+    /// CoreAudio `mSampleTime`) is tracked in `rsac-ec25`; it would refine
+    /// these values, not change the API.
+    ///
+    /// This is the production push for backends that opt into timestamping on
+    /// their own (Rust-owned) capture threads; foreign C-callback boundaries
+    /// use [`push_samples_guarded_stamped`](Self::push_samples_guarded_stamped).
+    #[inline]
+    pub fn push_samples_or_drop_stamped(
+        &mut self,
+        data: &[f32],
+        channels: u16,
+        sample_rate: u32,
+    ) -> bool {
+        let rate = u64::from(sample_rate.max(1));
+        let position = Duration::from_nanos(
+            ((self.frames_offered as u128 * 1_000_000_000) / rate as u128) as u64,
+        );
+        let frames = (data.len() / usize::from(channels.max(1))) as u64;
+        let pushed = self.push_samples_or_drop_inner(data, channels, sample_rate, Some(position));
+        // Count offered frames regardless of outcome (see field docs: drops
+        // must surface as timestamp gaps, not a contiguous lie).
+        self.frames_offered = self.frames_offered.saturating_add(frames);
+        pushed
+    }
+
+    /// Panic-guarded sibling of
+    /// [`push_samples_or_drop_stamped`](Self::push_samples_or_drop_stamped) for
+    /// the **foreign C-callback** boundaries (PipeWire `.process`, CoreAudio
+    /// IOProc) — same unwind containment as
+    /// [`push_samples_guarded`](Self::push_samples_guarded), same
+    /// stream-position stamping, same alloc-free happy path.
+    pub fn push_samples_guarded_stamped(
+        &mut self,
+        data: &[f32],
+        channels: u16,
+        sample_rate: u32,
+    ) -> bool {
+        // See push_samples_guarded for the AssertUnwindSafe rationale: a caught
+        // panic poisons the stream to Error, so a torn `&mut self` is moot.
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            self.push_samples_or_drop_stamped(data, channels, sample_rate)
+        }));
+        match result {
+            Ok(pushed) => pushed,
+            Err(_payload) => {
+                self.on_push_panic();
+                false
+            }
+        }
     }
 
     /// Like [`push_samples_or_drop`](Self::push_samples_or_drop), but reports the
@@ -1579,6 +1655,7 @@ pub fn create_bridge_with_options(
             // Single-slot fallback for when the free-list ring is momentarily
             // empty. Pre-sized for a realistic worst-case callback period.
             scratch: Vec::with_capacity(RT_BUFFER_SAMPLE_CAPACITY),
+            frames_offered: 0,
         },
         BridgeConsumer {
             consumer,
@@ -2203,6 +2280,60 @@ mod tests {
             1,
             "pop should recycle one allocation back to the producer"
         );
+    }
+
+    // rsac-ec25 wiring: the stamped push variants tag each buffer with its
+    // stream position (frames offered / rate), and dropped frames appear as a
+    // GAP between consecutive delivered timestamps rather than a contiguous
+    // timeline.
+    #[test]
+    fn stamped_push_carries_stream_position_and_drops_leave_gaps() {
+        let (mut producer, mut consumer) = create_bridge(4, test_format());
+
+        // Two clean pushes of 480 stereo frames @ 48 kHz → positions 0 and 10 ms.
+        assert!(producer.push_samples_or_drop_stamped(&[0.0; 960], 2, 48_000));
+        assert!(producer.push_samples_or_drop_stamped(&[0.0; 960], 2, 48_000));
+        let b1 = consumer.pop().expect("first buffer");
+        let b2 = consumer.pop().expect("second buffer");
+        assert_eq!(b1.timestamp(), Some(Duration::ZERO));
+        assert_eq!(b2.timestamp(), Some(Duration::from_millis(10)));
+
+        // Fill the ring until a push is dropped; the counter must still
+        // advance for the dropped frames.
+        let mut successful = 2u64;
+        loop {
+            if producer.push_samples_or_drop_stamped(&[0.0; 960], 2, 48_000) {
+                successful += 1;
+                assert!(successful < 64, "ring never filled — capacity change?");
+            } else {
+                break; // exactly one dropped push
+            }
+        }
+
+        // Drain everything delivered so far, then push once more: its stamp
+        // must account for ALL offered frames (successful + the dropped one) —
+        // i.e. the timeline shows a 10 ms hole where the drop happened.
+        while consumer.pop().is_some() {}
+        assert!(producer.push_samples_or_drop_stamped(&[0.0; 960], 2, 48_000));
+        let after = consumer.pop().expect("post-drop buffer");
+        let expected_frames = (successful + 1) * 480; // + the dropped push
+        let expected = Duration::from_nanos(expected_frames * 1_000_000_000 / 48_000);
+        assert_eq!(
+            after.timestamp(),
+            Some(expected),
+            "post-drop stamp must include the dropped frames as a gap"
+        );
+
+        // The guarded sibling shares the same counter/timeline.
+        assert!(producer.push_samples_guarded_stamped(&[0.0; 960], 2, 48_000));
+        let guarded = consumer.pop().expect("guarded buffer");
+        let expected2 = Duration::from_nanos((expected_frames + 480) * 1_000_000_000 / 48_000);
+        assert_eq!(guarded.timestamp(), Some(expected2));
+
+        // The untimed variant still leaves the timestamp empty (rsac-522b's
+        // two-variant contract is unchanged).
+        assert!(producer.push_samples_or_drop(&[0.0; 960], 2, 48_000));
+        assert_eq!(consumer.pop().expect("untimed buffer").timestamp(), None);
     }
 
     // Steady-state push/pop loop preserves data integrity over many cycles

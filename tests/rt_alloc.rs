@@ -204,6 +204,53 @@ fn push_samples_or_drop_is_alloc_free_in_steady_state() {
     );
 }
 
+/// The stream-position-stamping variants (`push_samples_or_drop_stamped` /
+/// `push_samples_guarded_stamped`) are what the platform backends now run on
+/// the RT path (rsac-ec25 wiring), so ADR-0001's zero-allocation guarantee is
+/// proved for them too: the stamp is pure integer math over a plain `u64`
+/// counter — no clock syscall, no allocation.
+#[test]
+fn stamped_push_is_alloc_free_in_steady_state() {
+    let _guard = measure_guard();
+    let slice: Vec<f32> = (0..STEADY_SAMPLES).map(|i| (i as f32) * 1e-4).collect();
+    let (mut producer, mut consumer) = create_bridge(64, AudioFormat::default());
+
+    warm_up(&mut producer, &mut consumer, &slice);
+
+    const CYCLES: usize = 2000;
+    let mut total_push_allocs = 0usize;
+    let mut pushes_ok = 0u64;
+    for i in 0..CYCLES {
+        // Alternate between the plain and panic-guarded stamped variants so
+        // both RT entry points (Windows thread / PipeWire+CoreAudio callbacks)
+        // are covered by the same proof.
+        let mut pushed = false;
+        let allocs = with_alloc_count(|| {
+            pushed = if i % 2 == 0 {
+                producer.push_samples_or_drop_stamped(&slice, CHANNELS, SAMPLE_RATE)
+            } else {
+                producer.push_samples_guarded_stamped(&slice, CHANNELS, SAMPLE_RATE)
+            };
+        });
+        total_push_allocs += allocs;
+        if pushed {
+            pushes_ok += 1;
+        }
+        let _ = consumer.pop();
+    }
+
+    assert_eq!(
+        total_push_allocs, 0,
+        "stamped pushes must be allocation-free across {CYCLES} steady-state \
+         cycles (ADR-0001); observed {total_push_allocs} allocations on the \
+         producer hot path"
+    );
+    assert_eq!(
+        pushes_ok, CYCLES as u64,
+        "every steady-state stamped push should have succeeded"
+    );
+}
+
 /// A callback-period **increase** beyond the seeded buffer capacity triggers at
 /// most a *bounded one-time* allocation on the producer; once the recycled buffers
 /// have grown to the new high-water mark, the larger period is allocation-free

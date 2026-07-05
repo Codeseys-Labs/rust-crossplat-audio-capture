@@ -98,11 +98,16 @@ pipeline.
   bounded channel + helper thread (drop-on-full backpressure), while Linux
   invokes the handler directly on the PipeWire loop thread — see
   [`docs/designs/`](docs/designs/) for the device-watch threading ADR.
-- **Buffer timestamps** — `AudioBuffer::timestamp() -> Option<Duration>` exists,
-  but **no backend currently populates it**, so it is always `None` in
-  production; downstreams must derive wall-clock time themselves. This is a
-  reserved capture-side timing surface, tracked as a known limitation (see the
-  architecture critique, DF-01), not a delivered feature.
+- **Buffer timestamps** — `AudioBuffer::timestamp() -> Option<Duration>` is
+  populated on **all three backends** with a *stream-position* stamp: frames
+  offered so far ÷ delivered rate, computed with pure integer math on the RT
+  push path (no clock syscall; ADR-0001 unchanged), and producer-side drops
+  surface as *gaps* between consecutive timestamps. Composed buffers (the
+  `compose` feature) carry the same stream-position semantics. Note this is
+  stream position, not wall-clock time — periods where the OS delivers
+  nothing do not advance it. An upgrade to per-backend device clocks (WASAPI
+  `GetPosition`, PipeWire `pw_time`, CoreAudio `mSampleTime`) remains tracked
+  (rsac-ec25).
 - The default hot path is **alloc-free in steady state** (the producer reuses
   ring slots via a free-list return ring — see
   [`docs/designs/0001-rt-allocation-guarantee.md`](docs/designs/0001-rt-allocation-guarantee.md)),
@@ -207,8 +212,12 @@ they are documented above as part of the in-scope surface:
   is validated on Alpine containers.
 - **docs.rs rendering verification** (rsac#16) — one-shot post-publish
   check via `scripts/verify-docs-rs.sh`.
-- **Populate `AudioBuffer::timestamp()`** in at least one backend (producer-side
-  monotonic stamp at enqueue), or formally reserve it — currently always `None`.
+- **Populate `AudioBuffer::timestamp()`** — ✅ shipped: all three backends
+  stamp stream-position timestamps on the RT push path (frames offered ÷
+  rate; drops appear as timestamp gaps), and composed buffers are stamped the
+  same way. The refinement to per-backend *device clocks* (WASAPI
+  `GetPosition`, PipeWire `pw_time`, CoreAudio `mSampleTime`) stays tracked
+  in rsac-ec25 (device-gated).
 - **Honor `buffer_size` / period-aware ring sizing on macOS + Linux** —
   `calculate_capacity_for_period` is implemented and tested but only Windows
   threads the requested `buffer_size` through today.

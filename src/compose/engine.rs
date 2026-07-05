@@ -151,6 +151,11 @@ pub(crate) struct Engine {
     active: Arc<AtomicBool>,
     stats: Arc<EngineStatsShared>,
     last_tick: Instant,
+    /// Cumulative frames emitted into the composed ring; stamps each composed
+    /// buffer with its stream position (`frames_emitted / session_rate`) so
+    /// `AudioBuffer::timestamp()` is populated on composed output exactly like
+    /// the platform backends' stamped pushes.
+    frames_emitted: u64,
     /// Reused per-tick output scratch (composed interleaved frame block).
     out_scratch: Vec<f32>,
     /// Reused per-source drain scratch.
@@ -196,6 +201,7 @@ impl Engine {
             active,
             stats,
             last_tick: Instant::now(),
+            frames_emitted: 0,
         }
     }
 
@@ -486,7 +492,15 @@ impl Engine {
             }
         }
 
-        let buffer = AudioBuffer::with_format(out.to_vec(), self.cfg.composed_format.clone());
+        let buffer = AudioBuffer::with_timestamp(
+            out.to_vec(),
+            self.cfg.composed_format.clone(),
+            Duration::from_nanos(
+                ((self.frames_emitted as u128 * 1_000_000_000)
+                    / u64::from(self.cfg.session_rate().max(1)) as u128) as u64,
+            ),
+        );
+        self.frames_emitted = self.frames_emitted.saturating_add(frames as u64);
         // Drop-on-full: the bridge counts drops, surfacing consumer lag via
         // the composed stream's overrun/backpressure counters.
         let _ = self.producer.push_or_drop(buffer);
