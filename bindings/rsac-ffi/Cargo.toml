@@ -31,6 +31,12 @@ feat_windows = ["rsac/feat_windows"]
 feat_linux = ["rsac/feat_linux"]
 feat_macos = ["rsac/feat_macos"]
 sink-wav = ["rsac/sink-wav"]
+# Multi-source channel composition (ADR-0011). Follows the sink-wav precedent:
+# a non-default forwarding feature — enable with `--features compose`. The
+# compose FFI surface (rsac_composition_* / rsac_group_* in src/compose.rs) is
+# compiled only when this is on; both headers guard those declarations behind
+# the RSAC_FEATURE_COMPOSE preprocessor define (see cbindgen.toml [defines]).
+compose = ["rsac/compose"]
 
 [dependencies]
 # Path + version: the path is used for local/workspace dev, and the version

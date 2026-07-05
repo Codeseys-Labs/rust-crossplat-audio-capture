@@ -25,6 +25,14 @@ style = "both"  # Generate both tag and typedef names
 "target_os = windows" = "_WIN32"
 "target_os = macos" = "__APPLE__"
 "target_os = linux" = "__linux__"
+# The compose FFI surface (src/compose.rs) is behind the `compose` cargo
+# feature. cbindgen parses source (it never sees cargo's enabled feature set),
+# so this mapping makes header generation DETERMINISTIC regardless of the
+# features a given build enables: compose items are always emitted, wrapped in
+# `#if defined(RSAC_FEATURE_COMPOSE)`. C consumers define RSAC_FEATURE_COMPOSE
+# when linking a librsac_ffi built with `--features compose`. The curated
+# rsac.h guards its compose section with the same define.
+"feature = compose" = "RSAC_FEATURE_COMPOSE"
 
 [export]
 # Intentionally NO `prefix`: the Rust types already carry their final C names

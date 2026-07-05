@@ -28,6 +28,12 @@ use std::ptr;
 use rsac::prelude::*;
 use rsac::{ApplicationId, DeviceId, ProcessId};
 
+// Multi-source channel composition FFI (rsac_composition_* / rsac_group_*),
+// behind the `compose` feature (forwards to rsac/compose). Header declarations
+// are guarded by RSAC_FEATURE_COMPOSE — see cbindgen.toml [defines].
+#[cfg(feature = "compose")]
+pub mod compose;
+
 // ── Error codes ──────────────────────────────────────────────────────────
 
 /// Error codes returned by all rsac FFI functions.

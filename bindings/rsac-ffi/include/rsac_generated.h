@@ -78,6 +78,36 @@ typedef enum rsac_error_t {
     RSAC_ERROR_PANIC = 99,
 } rsac_error_t;
 
+#if defined(RSAC_FEATURE_COMPOSE)
+/**
+ * How a composition group's sources map onto the composed output channels.
+ * Mirrors [`rsac::compose::GroupLayout`].
+ */
+typedef enum rsac_group_layout_t {
+#if defined(RSAC_FEATURE_COMPOSE)
+    /**
+     * Fold every source in the group to mono and gain-weighted-sum them into
+     * **one** output channel.
+     */
+    RSAC_GROUP_LAYOUT_MONO = 0,
+#endif
+#if defined(RSAC_FEATURE_COMPOSE)
+    /**
+     * Fold every source to stereo and sum into **two** output channels
+     * (the default layout of a new group).
+     */
+    RSAC_GROUP_LAYOUT_STEREO = 1,
+#endif
+#if defined(RSAC_FEATURE_COMPOSE)
+    /**
+     * Pass the group's **single** source through with its native channel
+     * count (a keep-channels group must contain exactly one source).
+     */
+    RSAC_GROUP_LAYOUT_KEEP_CHANNELS = 2,
+#endif
+} rsac_group_layout_t;
+#endif
+
 /**
  * Sample wire/storage format, mirroring [`rsac::SampleFormat`].
  *
@@ -123,6 +153,20 @@ typedef struct RsacCapabilities RsacCapabilities;
  */
 typedef struct RsacCapture RsacCapture;
 
+#if defined(RSAC_FEATURE_COMPOSE)
+/**
+ * Opaque handle to a `Composition` session.
+ */
+typedef struct RsacComposition RsacComposition;
+#endif
+
+#if defined(RSAC_FEATURE_COMPOSE)
+/**
+ * Opaque handle to a `CompositionBuilder`.
+ */
+typedef struct RsacCompositionBuilder RsacCompositionBuilder;
+#endif
+
 /**
  * Opaque handle to a single audio device.
  */
@@ -137,6 +181,13 @@ typedef struct RsacDeviceEnumerator RsacDeviceEnumerator;
  * Opaque handle to a list of audio devices.
  */
 typedef struct RsacDeviceList RsacDeviceList;
+
+#if defined(RSAC_FEATURE_COMPOSE)
+/**
+ * Opaque handle to a composition `Group` under construction.
+ */
+typedef struct RsacGroup RsacGroup;
+#endif
 
 /**
  * A point-in-time snapshot of a capture's stream statistics.
@@ -255,6 +306,65 @@ typedef void (*rsac_audio_callback_t)(const float *buffer_data,
                                       uint16_t channels,
                                       uint32_t sample_rate,
                                       void *user_data);
+
+#if defined(RSAC_FEATURE_COMPOSE)
+/**
+ * A point-in-time snapshot of a running composition's counters.
+ *
+ * Filled by [`rsac_composition_stats`] from `Composition::stats`. Plain C-ABI
+ * value type (no heap, no free required). Before [`rsac_composition_start`]
+ * succeeds every field is `0` (the compositor engine does not exist yet).
+ */
+typedef struct RsacCompositionStats {
+    /**
+     * Composed buffers (ticks) emitted so far.
+     */
+    uint64_t ticks;
+    /**
+     * Ticks emitted by the wall-clock stall fallback (master had no data).
+     */
+    uint64_t fallback_ticks;
+    /**
+     * Number of composed sources, in flat declaration order. `0` before
+     * start. Valid indices for the per-source accessors are
+     * `0..num_sources`.
+     */
+    uintptr_t num_sources;
+} RsacCompositionStats;
+#endif
+
+#if defined(RSAC_FEATURE_COMPOSE)
+/**
+ * A point-in-time snapshot of one composed source's counters.
+ *
+ * Filled by [`rsac_composition_source_stats`]. Plain C-ABI value type (no
+ * heap, no free required). The source's group name and target string are
+ * available via [`rsac_composition_source_group`] and
+ * [`rsac_composition_source_target`].
+ */
+typedef struct RsacSourceStats {
+    /**
+     * Buffers received from the inner capture so far.
+     */
+    uint64_t buffers_received;
+    /**
+     * Frames of silence inserted because the source was behind at tick time.
+     */
+    uint64_t padded_frames;
+    /**
+     * Frames trimmed because the source drifted past the buffering bound.
+     */
+    uint64_t trimmed_frames;
+    /**
+     * `1` if this source is being resampled to the session rate, else `0`.
+     */
+    int32_t resampling;
+    /**
+     * `1` if the source's stream has ended, else `0`.
+     */
+    int32_t ended;
+} RsacSourceStats;
+#endif
 
 /**
  * Returns a pointer to the last error message for the current thread.
@@ -714,5 +824,353 @@ enum rsac_error_t rsac_default_device(const struct RsacDeviceEnumerator *enumera
  * The returned pointer is a static string valid for the lifetime of the library.
  */
  const char *rsac_version(void) ;
+
+#if defined(RSAC_FEATURE_COMPOSE)
+/**
+ * Creates a new composition group with the given name and the default
+ * stereo layout (`RSAC_GROUP_LAYOUT_STEREO`).
+ *
+ * The name must be unique within a composition and non-empty (both enforced
+ * at [`rsac_composition_builder_build`], not here). On success the caller
+ * owns the handle and must either hand it to
+ * [`rsac_composition_builder_add_group`] (which consumes it) or free it with
+ * [`rsac_group_free`].
+ *
+ * Returns `RSAC_ERROR_NULL_POINTER` if `name` or `out` is null, and
+ * `RSAC_ERROR_INVALID_PARAMETER` if `name` is not valid UTF-8.
+ */
+ enum rsac_error_t rsac_group_new(const char *name, struct RsacGroup **out) ;
+#endif
+
+#if defined(RSAC_FEATURE_COMPOSE)
+/**
+ * Frees a group handle. No-op if null.
+ *
+ * Only call this on a group that was **not** consumed by a successful
+ * [`rsac_composition_builder_add_group`].
+ */
+ void rsac_group_free(struct RsacGroup *group) ;
+#endif
+
+#if defined(RSAC_FEATURE_COMPOSE)
+/**
+ * Sets the group's layout (how its sources map onto output channels).
+ *
+ * A `RSAC_GROUP_LAYOUT_KEEP_CHANNELS` group must contain exactly one source;
+ * that arity is enforced at [`rsac_composition_builder_build`].
+ *
+ * Returns `RSAC_ERROR_NULL_POINTER` if `group` is null.
+ */
+ enum rsac_error_t rsac_group_set_layout(struct RsacGroup *group, enum rsac_group_layout_t layout) ;
+#endif
+
+#if defined(RSAC_FEATURE_COMPOSE)
+/**
+ * Adds a capture source to the group with unit gain (1.0).
+ *
+ * `spec` uses the same `CaptureTarget` string grammar as
+ * `rsac_builder_set_target_str()` (case-insensitive scheme): `system`,
+ * `device:<id>`, `app:<pid-or-id>`, `name:<name>`, or `tree:<pid>`.
+ *
+ * Returns `RSAC_ERROR_NULL_POINTER` if `group` or `spec` is null, and
+ * `RSAC_ERROR_INVALID_PARAMETER` if `spec` is not valid UTF-8 or not a valid
+ * target string (the group is unchanged on error — parse-then-commit).
+ */
+ enum rsac_error_t rsac_group_add_source(struct RsacGroup *group, const char *spec) ;
+#endif
+
+#if defined(RSAC_FEATURE_COMPOSE)
+/**
+ * Adds a capture source to the group with an explicit linear gain applied
+ * during mixdown (1.0 = unity).
+ *
+ * `spec` follows the same grammar as `rsac_group_add_source()`. The gain must
+ * be finite and >= 0; an invalid gain is rejected **eagerly** here with
+ * `RSAC_ERROR_INVALID_PARAMETER` (the same values would also be rejected at
+ * [`rsac_composition_builder_build`], but failing at the call site gives a
+ * precise diagnostic).
+ *
+ * Returns `RSAC_ERROR_NULL_POINTER` if `group` or `spec` is null, and
+ * `RSAC_ERROR_INVALID_PARAMETER` for an invalid `spec` or gain (the group is
+ * unchanged on error).
+ */
+
+enum rsac_error_t rsac_group_add_source_with_gain(struct RsacGroup *group,
+                                                  const char *spec,
+                                                  float gain)
+;
+#endif
+
+#if defined(RSAC_FEATURE_COMPOSE)
+/**
+ * Creates a new `CompositionBuilder` with default settings (48 kHz session
+ * rate, no output clamping, no groups).
+ *
+ * Returns a handle that must be freed with
+ * [`rsac_composition_builder_free`] (or consumed by
+ * [`rsac_composition_builder_build`]).
+ */
+ enum rsac_error_t rsac_composition_builder_new(struct RsacCompositionBuilder **out) ;
+#endif
+
+#if defined(RSAC_FEATURE_COMPOSE)
+/**
+ * Frees a composition builder handle. No-op if null.
+ *
+ * Only call this on a builder that was **not** consumed by
+ * [`rsac_composition_builder_build`].
+ */
+ void rsac_composition_builder_free(struct RsacCompositionBuilder *builder) ;
+#endif
+
+#if defined(RSAC_FEATURE_COMPOSE)
+/**
+ * Sets the session sample rate in Hz (default 48000). Sources delivering a
+ * different rate are resampled. An unsupported rate is rejected at
+ * [`rsac_composition_builder_build`].
+ */
+
+enum rsac_error_t rsac_composition_builder_set_sample_rate(struct RsacCompositionBuilder *builder,
+                                                           uint32_t sample_rate)
+;
+#endif
+
+#if defined(RSAC_FEATURE_COMPOSE)
+/**
+ * Enables (`clamp` nonzero) or disables (`clamp` 0) saturating output
+ * clamping to `[-1.0, 1.0]` after summation. Default off: plain summation may
+ * exceed unity, which is legal for f32 pipelines.
+ */
+
+enum rsac_error_t rsac_composition_builder_set_clamp_output(struct RsacCompositionBuilder *builder,
+                                                            int32_t clamp)
+;
+#endif
+
+#if defined(RSAC_FEATURE_COMPOSE)
+/**
+ * Appends a group to the composition. Groups contribute output channels in
+ * the order they are added.
+ *
+ * On success (`RSAC_OK`) **the group handle is consumed**: do not use or
+ * free it afterwards. On any error the group is untouched and the caller
+ * still owns it (and must eventually call [`rsac_group_free`]).
+ *
+ * Returns `RSAC_ERROR_NULL_POINTER` if `builder` or `group` is null.
+ */
+
+enum rsac_error_t rsac_composition_builder_add_group(struct RsacCompositionBuilder *builder,
+                                                     struct RsacGroup *group)
+;
+#endif
+
+#if defined(RSAC_FEATURE_COMPOSE)
+/**
+ * Validates the configuration and builds a (not yet started)
+ * `Composition`.
+ *
+ * **The builder is always consumed** — on failure too (Rust ownership
+ * semantics; create a new builder to retry), matching `rsac_builder_build()`.
+ * No devices are touched here; inner captures are created and started by
+ * [`rsac_composition_start`]. On success `*out` receives the composition
+ * handle, which must be freed with [`rsac_composition_free`]. On failure
+ * `*out` is null.
+ *
+ * Validation failures map to `RSAC_ERROR_CONFIGURATION` (no groups, empty
+ * group, duplicate/empty group name, keep-channels group without exactly one
+ * source, invalid gain, too many sources or channels),
+ * `RSAC_ERROR_INVALID_PARAMETER` (unsupported session sample rate), or
+ * `RSAC_ERROR_PLATFORM_NOT_SUPPORTED` (a target this platform cannot
+ * capture). Call `rsac_error_message()` for details.
+ */
+
+enum rsac_error_t rsac_composition_builder_build(struct RsacCompositionBuilder *builder,
+                                                 struct RsacComposition **out)
+;
+#endif
+
+#if defined(RSAC_FEATURE_COMPOSE)
+/**
+ * Builds and starts one capture per source, resolves the composed channel
+ * layout, and spawns the compositor thread.
+ *
+ * On failure every already-started inner capture is stopped before the error
+ * is returned. Starting an already-started composition returns
+ * `RSAC_ERROR_CONFIGURATION`.
+ */
+ enum rsac_error_t rsac_composition_start(struct RsacComposition *comp) ;
+#endif
+
+#if defined(RSAC_FEATURE_COMPOSE)
+/**
+ * Signals the composition to stop: ends the composed ring and tells the
+ * compositor engine to stop every inner capture. Idempotent; a not-started
+ * composition returns `RSAC_OK`.
+ *
+ * Takes a **const** composition: like `rsac_capture_request_stop()`, this is
+ * safe to call concurrently with an in-flight [`rsac_composition_read`] /
+ * [`rsac_composition_try_read`] to unblock it (no `&mut` alias is formed).
+ * The compositor thread itself is joined later, by
+ * [`rsac_composition_free`]. It is **NOT** safe to call this concurrently
+ * with `rsac_composition_free()` — order stop + a drain of in-flight reads
+ * **before** freeing the handle.
+ *
+ * An explicit stop discards any buffered composed tail: subsequent reads
+ * return the terminal stream error rather than draining. To capture
+ * everything, read until the terminal error *before* stopping.
+ */
+ enum rsac_error_t rsac_composition_stop(const struct RsacComposition *comp) ;
+#endif
+
+#if defined(RSAC_FEATURE_COMPOSE)
+/**
+ * Returns 1 if the composed stream is currently running, 0 otherwise.
+ * Returns -1 if the composition handle is null.
+ */
+ int32_t rsac_composition_is_running(const struct RsacComposition *comp) ;
+#endif
+
+#if defined(RSAC_FEATURE_COMPOSE)
+/**
+ * Frees a composition handle. Stops the composition if running (joining the
+ * compositor thread, which stops every inner capture). No-op if null.
+ *
+ * The composition owns its inner captures; freeing it releases them all.
+ * `RsacAudioBuffer` handles previously returned by reads own their sample
+ * data and remain valid after this call.
+ */
+ void rsac_composition_free(struct RsacComposition *comp) ;
+#endif
+
+#if defined(RSAC_FEATURE_COMPOSE)
+/**
+ * Attempts a non-blocking read of the next composed buffer (mirrors
+ * `rsac_capture_try_read()`).
+ *
+ * On success with data available, `*out` receives a buffer handle that must
+ * be freed with `rsac_audio_buffer_free()`; the data is interleaved f32 at
+ * the session rate with [`rsac_composition_channel_count`] channels. On
+ * success with no data available yet, `*out` is set to null and `RSAC_OK` is
+ * returned. Once the composition has ended and drained, the read returns the
+ * fatal `RSAC_ERROR_STREAM_FAILED` (terminal — do not retry). A composition
+ * that has not been started returns `RSAC_ERROR_STREAM_READ`.
+ */
+
+enum rsac_error_t rsac_composition_try_read(const struct RsacComposition *comp,
+                                            struct RsacAudioBuffer **out)
+;
+#endif
+
+#if defined(RSAC_FEATURE_COMPOSE)
+/**
+ * Reads the next composed buffer, blocking until data is available (mirrors
+ * `rsac_capture_read()`).
+ *
+ * On success, `*out` receives a buffer handle that must be freed with
+ * `rsac_audio_buffer_free()`. Once the composition ends and drains, this
+ * returns the fatal `RSAC_ERROR_STREAM_FAILED`. A concurrent
+ * [`rsac_composition_stop`] unblocks a thread parked here.
+ */
+
+enum rsac_error_t rsac_composition_read(const struct RsacComposition *comp,
+                                        struct RsacAudioBuffer **out)
+;
+#endif
+
+#if defined(RSAC_FEATURE_COMPOSE)
+/**
+ * Returns the number of composed output channels.
+ *
+ * The layout is resolved by [`rsac_composition_start`] (keep-channels widths
+ * depend on the source's negotiated format), so this returns 0 before a
+ * successful start — and also 0 if the handle is null.
+ */
+ uint16_t rsac_composition_channel_count(const struct RsacComposition *comp) ;
+#endif
+
+#if defined(RSAC_FEATURE_COMPOSE)
+/**
+ * Returns the name of the group that produces composed output channel
+ * `channel` (0-based).
+ *
+ * The returned pointer is valid until the next compose string accessor call
+ * ([`rsac_composition_channel_group`], [`rsac_composition_source_group`], or
+ * [`rsac_composition_source_target`]) on the same thread. Returns null if the
+ * handle is null, the composition has not been started, or `channel` is out
+ * of bounds.
+ */
+ const char *rsac_composition_channel_group(const struct RsacComposition *comp, uintptr_t channel) ;
+#endif
+
+#if defined(RSAC_FEATURE_COMPOSE)
+/**
+ * Returns the index of composed output channel `channel` *within* its group
+ * (0-based; e.g. 0 = L, 1 = R for a stereo group).
+ *
+ * Returns -1 if the handle is null, the composition has not been started, or
+ * `channel` is out of bounds.
+ */
+ int32_t rsac_composition_channel_in_group(const struct RsacComposition *comp, uintptr_t channel) ;
+#endif
+
+#if defined(RSAC_FEATURE_COMPOSE)
+/**
+ * Fills `*out` with a point-in-time [`RsacCompositionStats`] snapshot.
+ *
+ * Before [`rsac_composition_start`] succeeds the snapshot is all-zero
+ * (`num_sources == 0`) — the compositor engine does not exist yet. `out` is
+ * an out-parameter, not a handle: there is nothing to free.
+ *
+ * Returns `RSAC_ERROR_NULL_POINTER` if `comp` or `out` is null; otherwise
+ * `RSAC_OK`.
+ */
+
+enum rsac_error_t rsac_composition_stats(const struct RsacComposition *comp,
+                                         struct RsacCompositionStats *out)
+;
+#endif
+
+#if defined(RSAC_FEATURE_COMPOSE)
+/**
+ * Fills `*out` with the [`RsacSourceStats`] counters of the source at
+ * `index` (flat declaration order across all groups; valid indices are
+ * `0..num_sources` from [`rsac_composition_stats`]).
+ *
+ * Returns `RSAC_ERROR_NULL_POINTER` if `comp` or `out` is null,
+ * `RSAC_ERROR_STREAM_READ` if the composition has not been started (per-source
+ * counters exist only while the engine does), and
+ * `RSAC_ERROR_INVALID_PARAMETER` if `index` is out of bounds. `out` is an
+ * out-parameter, not a handle: there is nothing to free.
+ */
+
+enum rsac_error_t rsac_composition_source_stats(const struct RsacComposition *comp,
+                                                uintptr_t index,
+                                                struct RsacSourceStats *out)
+;
+#endif
+
+#if defined(RSAC_FEATURE_COMPOSE)
+/**
+ * Returns the group name of the source at `index` (flat declaration order).
+ *
+ * The returned pointer is valid until the next compose string accessor call
+ * on the same thread. Returns null if the handle is null, the composition has
+ * not been started, or `index` is out of bounds.
+ */
+ const char *rsac_composition_source_group(const struct RsacComposition *comp, uintptr_t index) ;
+#endif
+
+#if defined(RSAC_FEATURE_COMPOSE)
+/**
+ * Returns the capture-target string of the source at `index` (flat
+ * declaration order), rendered in the canonical `CaptureTarget` grammar
+ * (e.g. `"system"`, `"name:discord"`).
+ *
+ * The returned pointer is valid until the next compose string accessor call
+ * on the same thread. Returns null if the handle is null, the composition has
+ * not been started, or `index` is out of bounds.
+ */
+ const char *rsac_composition_source_target(const struct RsacComposition *comp, uintptr_t index) ;
+#endif
 
 #endif  /* RSAC_H */
