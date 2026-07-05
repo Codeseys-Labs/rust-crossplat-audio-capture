@@ -110,7 +110,7 @@ rebuilds.
    specifiers — `import { AudioCapture } from "npm:@rsac/audio"` with
    `--allow-ffi`. This is the preferred path (typed, maintained surface).
 2. **`Deno.dlopen`:** load the `rsac_ffi` cdylib directly against the curated
-   `rsac.h` symbol set (54 functions). More work (hand-written FFI signatures),
+   `rsac.h` symbol set (56 functions). More work (hand-written FFI signatures),
    full control, no npm dependency.
 
 Open verification questions for the wave-2 seed: ThreadsafeFunction callback
@@ -135,7 +135,7 @@ per-Bun-version.
 
 **Desktop: 🟢 expected, unverified.** `dart:ffi` + `package:ffigen` generated
 against the curated `bindings/rsac-ffi/include/rsac.h` gives Dart the full
-54-function surface. The capture read loop runs on a Dart isolate calling the
+56-function surface. The capture read loop runs on a Dart isolate calling the
 blocking read, or uses the callback path via `NativeCallable.listener`. A
 wave-2 spike produces the Dart package skeleton and a desktop capture smoke
 test; publishing a `rsac_dart`/`rsac_flutter` package is a later decision.

@@ -70,7 +70,7 @@ plus a comprehensive reference analysis:
       ProcessTree(ProcessId),
   }
   ```
-- **Error model**: 22 categorized error variants (across 7 `ErrorKind` categories) with three-state recoverability (`Recoverable`, `TransientRetry`, `Fatal`). The `recoverability()` match is exhaustive (no catch-all) so a new variant must be classified or the crate won't compile. See [`src/core/error.rs`](src/core/error.rs).
+- **Error model**: 23 categorized error variants (across 7 `ErrorKind` categories) with three-state recoverability (`Recoverable`, `TransientRetry`, `Fatal`). The `recoverability()` match is exhaustive (no catch-all) so a new variant must be classified or the crate won't compile. See [`src/core/error.rs`](src/core/error.rs).
 - **Platform capabilities**: [`PlatformCapabilities`](src/core/capabilities.rs) struct for honest reporting of what each backend supports — never pretend a platform can do something it cannot. On macOS, capabilities are determined at runtime using [`get_macos_version()`](src/core/capabilities.rs:175) (sysctl-based, no subprocess) to detect Process Tap availability (requires macOS 14.4+).
 - **Sink adapters**: [`AudioSink`](src/sink/traits.rs) trait with three implementations:
   - [`NullSink`](src/sink/null.rs) — discards data (testing/benchmarking)
@@ -158,7 +158,7 @@ src/
 │   ├── capabilities.rs     # PlatformCapabilities
 │   ├── config.rs           # CaptureTarget, StreamConfig, AudioFormat, SampleFormat,
 │   │                       #   DeviceId, ApplicationId, ProcessId newtypes
-│   ├── error.rs            # AudioError (22 variants), ErrorKind, Recoverability,
+│   ├── error.rs            # AudioError (23 variants), ErrorKind, Recoverability,
 │   │                       #   BackendContext
 │   ├── interface.rs        # CapturingStream, AudioDevice, DeviceEnumerator traits
 │   ├── introspection.rs    # Cross-platform source discovery, permission checks,
@@ -216,7 +216,7 @@ src/
 
 ```
 bindings/
-├── rsac-ffi/               # C FFI layer (54 extern "C" functions, cdylib + staticlib)
+├── rsac-ffi/               # C FFI layer (56 extern "C" functions, cdylib + staticlib)
 ├── rsac-python/            # Python bindings (PyO3 + maturin)
 ├── rsac-napi/              # Node.js/TypeScript bindings (napi-rs)
 └── rsac-go/                # Go bindings (CGo over C FFI)
@@ -258,7 +258,7 @@ docker/                     # Docker-based cross-platform testing
 - All audio data standardized to **`f32`** internally
 - [`SampleFormat`](src/core/config.rs) enum: `I16`, `I24`, `I32`, `F32`
 - [`AudioFormat`](src/core/config.rs) struct: `sample_rate`, `channels`, `sample_format`
-- Error type: [`AudioError`](src/core/error.rs) (22 categorized variants)
+- Error type: [`AudioError`](src/core/error.rs) (23 categorized variants)
 - Result type: `AudioResult<T> = Result<T, AudioError>`
 
 ### Patterns
@@ -489,7 +489,7 @@ Full playbook (when to stack vs parallel PRs, exact commands, pitfalls):
 - ✅ **CI hardening** — `msrv` (1.87) job, `feature-powerset` (cargo-hack, depth 2), `cargo-semver-checks` release gate, stale audio-probe workflow deleted, ARM64 grep gates replaced with exit-code-authoritative checks.
 - ✅ **`#![warn(missing_docs)]`** enforced; rustdoc gaps filled (ErrorKind variants, AudioError fields, platform enumerator items).
 - ✅ **`cocoa`/`objc` → `objc2` migration** — Phase 1 (coreaudio.rs, 12 sites) + Phase 2 (tap.rs, ~65 sites) complete. `cocoa` and `objc` crates fully removed from dependencies. See §9.1.
-- ✅ **Cross-language bindings** — C FFI (`bindings/rsac-ffi/`, 54 functions), Python (`bindings/rsac-python/`, PyO3), Node.js/TS (`bindings/rsac-napi/`, napi-rs), Go (`bindings/rsac-go/`, CGo). All compile.
+- ✅ **Cross-language bindings** — C FFI (`bindings/rsac-ffi/`, 56 functions), Python (`bindings/rsac-python/`, PyO3), Node.js/TS (`bindings/rsac-napi/`, napi-rs), Go (`bindings/rsac-go/`, CGo). All compile.
 - ✅ **Cross-platform introspection module** — `src/core/introspection.rs`: `list_audio_sources()`, `list_audio_applications()`, `CaptureTarget::app()`/`pid()`/`device()` convenience constructors, `check_audio_capture_permission()`.
 - ✅ **Mock audio backend** — `src/bridge/mock.rs`: synthetic 440Hz sine wave through real BridgeStream pipeline, 6 unit tests.
 - ✅ **Audio-graph migrated** to use `rsac::list_audio_sources()` — replaced ~120 lines of per-platform `#[cfg]` code.

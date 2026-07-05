@@ -24,6 +24,8 @@
 use crate::audio::get_device_enumerator;
 use crate::core::buffer::AudioBuffer;
 use crate::core::capabilities::PlatformCapabilities;
+#[cfg(target_os = "android")]
+use crate::core::config::AndroidProjectionToken;
 use crate::core::config::{CaptureTarget, SampleFormat, StreamConfig};
 // `AudioFormat` is only referenced by `pick_supported_format` (and its tests),
 // which is itself `cfg(not(target_os = "linux"))`; gate the import to match so
@@ -94,6 +96,11 @@ const MAX_CHANNELS: u16 = 32;
 pub struct AudioCaptureBuilder {
     target: CaptureTarget,
     config: StreamConfig,
+    /// Android `MediaProjection` consent token (rsac-82d4 / ADR-0013).
+    /// Present only on Android builds; playback-capture targets need it once
+    /// an Android backend advertises the capability.
+    #[cfg(target_os = "android")]
+    android_projection: Option<AndroidProjectionToken>,
 }
 
 impl Default for AudioCaptureBuilder {
@@ -101,6 +108,8 @@ impl Default for AudioCaptureBuilder {
         Self {
             target: CaptureTarget::SystemDefault,
             config: StreamConfig::default(),
+            #[cfg(target_os = "android")]
+            android_projection: None,
         }
     }
 }
@@ -119,6 +128,28 @@ impl AudioCaptureBuilder {
     /// Sets the capture target (system default, device, application, …).
     pub fn with_target(mut self, target: CaptureTarget) -> Self {
         self.target = target;
+        self
+    }
+
+    /// Supplies the Android `MediaProjection` consent token
+    /// *(Android targets only)*.
+    ///
+    /// Android gates playback capture (system / application / process-tree
+    /// targets) behind a user-consent dialog whose result the configuration
+    /// must carry — see
+    /// [`AndroidProjectionToken`](crate::core::config::AndroidProjectionToken)
+    /// and `docs/MOBILE_BACKEND_DESIGN.md`. Obtain the token from the rsac
+    /// Android consent helper and pass it here **before**
+    /// [`build`](Self::build); once an Android backend advertises
+    /// `requires_user_consent`, playback-capture targets without a token fail
+    /// the preflight with
+    /// [`UserConsentRequired`](crate::core::error::AudioError::UserConsentRequired).
+    ///
+    /// Microphone ([`CaptureTarget::Device`]) targets never need a token, and
+    /// supplying one is harmless (it is simply unused).
+    #[cfg(target_os = "android")]
+    pub fn with_android_projection(mut self, token: AndroidProjectionToken) -> Self {
+        self.android_projection = Some(token);
         self
     }
 
@@ -300,6 +331,38 @@ impl AudioCaptureBuilder {
                 });
             }
             _ => {}
+        }
+
+        // ── Consent preflight (mobile, ADR-0013 / rsac-82d4) ─────────
+        // Dormant scaffolding until an Android backend exists: it fires only
+        // when the platform *claims* the requested playback-capture tier AND
+        // reports `requires_user_consent` AND no token was supplied. The
+        // capability checks above dominate, so a build with no compiled-in
+        // backend still reports PlatformNotSupported — never a misleading
+        // consent error.
+        #[cfg(target_os = "android")]
+        {
+            let target_needs_consent = match &self.target {
+                CaptureTarget::SystemDefault => caps.supports_system_capture,
+                CaptureTarget::Application(_) | CaptureTarget::ApplicationByName(_) => {
+                    caps.supports_application_capture
+                }
+                CaptureTarget::ProcessTree(_) => caps.supports_process_tree_capture,
+                // Microphone capture never needs a projection token.
+                CaptureTarget::Device(_) => false,
+            };
+            if caps.requires_user_consent
+                && target_needs_consent
+                && self.android_projection.is_none()
+            {
+                return Err(AudioError::UserConsentRequired {
+                    feature: "Android playback capture".to_string(),
+                    missing: "MediaProjection token — obtain one via the rsac Android \
+                              consent helper and pass it to \
+                              AudioCaptureBuilder::with_android_projection()"
+                        .to_string(),
+                });
+            }
         }
 
         // ── Validate sample rate ────────────────────────────────────

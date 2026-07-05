@@ -115,6 +115,10 @@ pub use crate::core::config::{
     ApplicationId, AudioCaptureConfig, AudioFormat, CaptureTarget, DeviceId, ProcessId,
     SampleFormat, StreamConfig,
 };
+// Android `MediaProjection` consent token (rsac-82d4 / ADR-0013) — Android
+// targets only; see `AudioCaptureBuilder::with_android_projection`.
+#[cfg(target_os = "android")]
+pub use crate::core::config::AndroidProjectionToken;
 pub use crate::core::error::{
     AudioError, AudioResult, BackendContext, ErrorKind, Recoverability, UserFacingError,
 };

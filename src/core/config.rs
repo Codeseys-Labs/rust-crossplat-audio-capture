@@ -78,6 +78,49 @@ impl std::fmt::Display for ProcessId {
     }
 }
 
+/// Opaque handle to an Android `MediaProjection` user-consent grant
+/// *(Android targets only)*.
+///
+/// Playback capture on Android (API 29+) is gated behind a user-consent
+/// dialog that yields a `MediaProjection`. The platform glue (the rsac
+/// Android consent helper — see `docs/MOBILE_BACKEND_DESIGN.md`) wraps that
+/// projection in a JNI `GlobalRef` and hands the pointer-sized handle across
+/// as an opaque `i64`. Rust never interprets the value; it is carried to the
+/// (future) Android backend, which resolves it back through JNI.
+///
+/// Supply it to the builder via
+/// [`AudioCaptureBuilder::with_android_projection`](crate::api::AudioCaptureBuilder::with_android_projection);
+/// playback-capture targets without one fail the `build()` preflight with
+/// [`UserConsentRequired`](crate::core::error::AudioError::UserConsentRequired)
+/// once a backend advertises the capability (ADR-0013). Microphone
+/// ([`CaptureTarget::Device`]) targets never need a token.
+///
+/// One token corresponds to one projection session: the backend releases the
+/// underlying `GlobalRef` (and stops the `MediaProjection`) when the owning
+/// capture is dropped. A stale or hand-rolled value is not undefined behavior
+/// at this layer — it surfaces as a backend error when the projection is
+/// first used.
+#[cfg(target_os = "android")]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct AndroidProjectionToken(i64);
+
+#[cfg(target_os = "android")]
+impl AndroidProjectionToken {
+    /// Wraps a raw consent-token handle produced by the rsac Android consent
+    /// helper (`RsacProjection.request(activity)`).
+    ///
+    /// The value is opaque to Rust; correctness is the producer's contract.
+    pub fn from_raw(raw: i64) -> Self {
+        Self(raw)
+    }
+
+    /// Returns the raw opaque handle (for the backend's JNI layer and the C
+    /// FFI, which carry it as `int64_t`).
+    pub fn as_raw(&self) -> i64 {
+        self.0
+    }
+}
+
 // ── CaptureTarget ────────────────────────────────────────────────────────
 
 /// Unified capture target model covering all capture modes.

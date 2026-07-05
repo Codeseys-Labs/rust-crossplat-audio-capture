@@ -201,6 +201,21 @@ rsac_error_t rsac_builder_set_target_process_tree(RsacBuilder* builder,
 rsac_error_t rsac_builder_set_target_str(RsacBuilder* builder,
                                          const char* spec);
 
+/**
+ * Supplies the Android MediaProjection consent token (Android targets only).
+ *
+ * `token` is the opaque int64 handle produced by the rsac Android consent
+ * helper (a JNI GlobalRef to the MediaProjection). On Android builds it is
+ * stored on the builder; playback-capture targets without it fail
+ * rsac_builder_build() with RSAC_ERROR_CONFIGURATION once an Android backend
+ * advertises the capability. Microphone ("device:") targets never need one.
+ *
+ * The symbol exists on every platform so the C ABI is uniform; on non-Android
+ * platforms the call returns RSAC_ERROR_PLATFORM_NOT_SUPPORTED.
+ */
+rsac_error_t rsac_builder_set_android_projection(RsacBuilder* builder,
+                                                 int64_t token);
+
 /** Sets the desired sample rate in Hz. */
 rsac_error_t rsac_builder_set_sample_rate(RsacBuilder* builder,
                                            uint32_t sample_rate);
@@ -449,6 +464,14 @@ int32_t rsac_capabilities_supports_process_tree(const RsacCapabilities* caps);
 
 /** Returns 1 if device selection is supported, 0 if not, -1 if null. */
 int32_t rsac_capabilities_supports_device_selection(const RsacCapabilities* caps);
+
+/**
+ * Returns 1 if starting a capture requires a config-time user-consent
+ * artifact (mobile platforms — e.g. an Android MediaProjection token via
+ * rsac_builder_set_android_projection()), 0 if not, -1 if null.
+ * Always 0 on the desktop backends.
+ */
+int32_t rsac_capabilities_requires_user_consent(const RsacCapabilities* caps);
 
 /** Returns the maximum number of channels supported. Returns 0 if null. */
 uint16_t rsac_capabilities_max_channels(const RsacCapabilities* caps);

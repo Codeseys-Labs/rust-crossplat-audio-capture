@@ -129,7 +129,7 @@ impl fmt::Display for BackendContext {
 
 /// Represents all errors that can occur during audio operations.
 ///
-/// Organized into 7 categories with 22 total variants.
+/// Organized into 7 categories with 23 total variants.
 /// Each variant carries structured context for diagnostics.
 ///
 /// # Stability
@@ -166,6 +166,32 @@ pub enum AudioError {
     ConfigurationError {
         /// Description of the configuration problem.
         message: String,
+    },
+    /// A required user-consent artifact is missing from the capture
+    /// configuration.
+    ///
+    /// Mobile platforms gate capture behind an explicit user-consent flow that
+    /// produces an artifact the builder must receive **before** `build()` —
+    /// e.g. Android's `MediaProjection` token (supplied via
+    /// `AudioCaptureBuilder::with_android_projection`, Android targets only)
+    /// or an embedded iOS broadcast extension + App Group. Returned by the
+    /// `build()`/`preflight()` step, before any OS resource is touched
+    /// (ADR-0013, `docs/MOBILE_BACKEND_DESIGN.md`).
+    ///
+    /// Distinct from [`PermissionDenied`](AudioError::PermissionDenied), which
+    /// is the OS *rejecting* an attempted operation at runtime: this variant
+    /// means the consent artifact was never supplied to the configuration at
+    /// all, so nothing was even attempted. Classified as a configuration
+    /// error ([`ErrorKind::Configuration`], `Fatal`) — fix the builder call,
+    /// don't retry.
+    UserConsentRequired {
+        /// The capture facility that requires consent
+        /// (e.g. `"Android playback capture"`).
+        feature: String,
+        /// The concrete missing artifact and how to supply it (e.g.
+        /// `"MediaProjection token — obtain one via the rsac consent helper
+        /// and pass it to AudioCaptureBuilder::with_android_projection()"`).
+        missing: String,
     },
 
     // ── Device errors ────────────────────────────────────────────────
@@ -319,7 +345,8 @@ impl AudioError {
         match self {
             AudioError::InvalidParameter { .. }
             | AudioError::UnsupportedFormat { .. }
-            | AudioError::ConfigurationError { .. } => ErrorKind::Configuration,
+            | AudioError::ConfigurationError { .. }
+            | AudioError::UserConsentRequired { .. } => ErrorKind::Configuration,
 
             AudioError::DeviceNotFound { .. }
             | AudioError::DeviceNotAvailable { .. }
@@ -372,6 +399,7 @@ impl AudioError {
             AudioError::InvalidParameter { .. }
             | AudioError::UnsupportedFormat { .. }
             | AudioError::ConfigurationError { .. }
+            | AudioError::UserConsentRequired { .. }
             | AudioError::DeviceNotFound { .. }
             | AudioError::DeviceEnumerationError { .. }
             | AudioError::StreamCreationFailed { .. }
@@ -455,6 +483,13 @@ impl AudioError {
             AudioError::ConfigurationError { message } => (
                 format!("The capture configuration is invalid: {message}."),
                 Some("Review your AudioCaptureBuilder settings and rebuild.".to_string()),
+            ),
+            AudioError::UserConsentRequired { feature, missing } => (
+                format!("'{feature}' requires a user-consent grant that was not provided."),
+                Some(format!(
+                    "Missing: {missing}. Run the platform's consent flow first and pass the \
+                     resulting artifact to the builder before calling build()."
+                )),
             ),
 
             // ── Device ───────────────────────────────────────────────────
@@ -683,6 +718,13 @@ impl fmt::Display for AudioError {
             AudioError::ConfigurationError { message } => {
                 write!(f, "Configuration error: {}", message)
             }
+            AudioError::UserConsentRequired { feature, missing } => {
+                write!(
+                    f,
+                    "User consent required for '{}': missing {}",
+                    feature, missing
+                )
+            }
 
             // Device
             AudioError::DeviceNotFound { device_id } => {
@@ -886,6 +928,10 @@ mod tests {
             AudioError::ConfigurationError {
                 message: "bad config".into(),
             },
+            AudioError::UserConsentRequired {
+                feature: "Android playback capture".into(),
+                missing: "MediaProjection token".into(),
+            },
             AudioError::DeviceNotFound {
                 device_id: "hw:0".into(),
             },
@@ -962,8 +1008,9 @@ mod tests {
     #[test]
     fn all_variants_constructible() {
         let variants = make_all_variants();
-        // 22 variants since ADR-0003 added StreamEnded (was 21).
-        assert_eq!(variants.len(), 22, "Must have exactly 22 variants");
+        // 23 variants since UserConsentRequired joined for the mobile consent
+        // preflight (rsac-82d4; was 22 since ADR-0003 added StreamEnded).
+        assert_eq!(variants.len(), 23, "Must have exactly 23 variants");
     }
 
     // ── ErrorKind: Configuration ─────────────────────────────────────
@@ -989,6 +1036,14 @@ mod tests {
         assert_eq!(
             AudioError::ConfigurationError {
                 message: "x".into()
+            }
+            .kind(),
+            ErrorKind::Configuration
+        );
+        assert_eq!(
+            AudioError::UserConsentRequired {
+                feature: "x".into(),
+                missing: "y".into()
             }
             .kind(),
             ErrorKind::Configuration
@@ -1250,6 +1305,10 @@ mod tests {
             },
             AudioError::ConfigurationError {
                 message: "x".into(),
+            },
+            AudioError::UserConsentRequired {
+                feature: "x".into(),
+                missing: "y".into(),
             },
             AudioError::DeviceNotFound {
                 device_id: "x".into(),

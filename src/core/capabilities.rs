@@ -79,6 +79,24 @@ pub struct PlatformCapabilities {
     /// wired up. Each platform arm flips this to `true` only once its OS listener
     /// is implemented.
     pub supports_device_change_notifications: bool,
+    /// Whether starting a capture on this platform requires an explicit
+    /// **user-consent artifact** to be supplied to the builder before
+    /// `build()`.
+    ///
+    /// This is distinct from a runtime OS permission grant (axis 2 in
+    /// "Capability vs. readiness" above): consent here is an artifact the
+    /// *configuration* must carry — e.g. Android's `MediaProjection` token
+    /// (obtained from a user dialog and passed via
+    /// `AudioCaptureBuilder::with_android_projection`) or an iOS
+    /// user-initiated broadcast session. When `true` and the artifact is
+    /// missing for a target that needs it, the builder preflight fails with
+    /// [`UserConsentRequired`](crate::core::error::AudioError::UserConsentRequired)
+    /// before any OS resource is touched.
+    ///
+    /// `false` on all desktop backends (WASAPI / PipeWire / CoreAudio) and on
+    /// the `unsupported` stub; designed to be `true` for the planned mobile
+    /// backends (ADR-0013, `docs/MOBILE_BACKEND_DESIGN.md`).
+    pub requires_user_consent: bool,
     /// Supported sample formats.
     pub supported_sample_formats: Vec<SampleFormat>,
     /// Supported sample rate range (min, max) in Hz.
@@ -190,6 +208,8 @@ impl PlatformCapabilities {
             supports_device_selection: true,
             // IMMNotificationClient watch() arm is implemented (rsac-e360).
             supports_device_change_notifications: true,
+            // Desktop loopback needs no consent artifact (rsac-82d4).
+            requires_user_consent: false,
             supported_sample_formats: vec![
                 SampleFormat::I16,
                 SampleFormat::I24,
@@ -216,6 +236,9 @@ impl PlatformCapabilities {
             // CoreAudio AudioObjectPropertyListener watch() arm landed (rsac-3093):
             // device-list + default-output/input change notifications are wired up.
             supports_device_change_notifications: true,
+            // TCC is a runtime permission, not a config-time consent artifact
+            // (see the field docs) — so this stays false on macOS (rsac-82d4).
+            requires_user_consent: false,
             supported_sample_formats: vec![SampleFormat::I16, SampleFormat::I32, SampleFormat::F32],
             sample_rate_range: (8000, 192000),
             max_channels: 8,
@@ -235,6 +258,8 @@ impl PlatformCapabilities {
             // `default` metadata listener thread that delivers DeviceAdded /
             // DeviceRemoved / DefaultChanged.
             supports_device_change_notifications: true,
+            // Desktop loopback needs no consent artifact (rsac-82d4).
+            requires_user_consent: false,
             supported_sample_formats: vec![SampleFormat::I16, SampleFormat::I32, SampleFormat::F32],
             sample_rate_range: (8000, 384000),
             max_channels: 32, // PipeWire supports many channels
@@ -252,6 +277,7 @@ impl PlatformCapabilities {
             supports_process_tree_capture: false,
             supports_device_selection: false,
             supports_device_change_notifications: false,
+            requires_user_consent: false,
             supported_sample_formats: vec![],
             sample_rate_range: (0, 0),
             max_channels: 0,
@@ -477,6 +503,7 @@ mod tests {
             supports_process_tree_capture: false,
             supports_device_selection: false,
             supports_device_change_notifications: false,
+            requires_user_consent: false,
             supported_sample_formats: vec![SampleFormat::I16],
             sample_rate_range: (8000, 48000),
             max_channels: 2,
@@ -516,6 +543,20 @@ mod tests {
     fn supports_channels_zero_is_false() {
         let caps = PlatformCapabilities::query();
         assert!(!caps.supports_channels(0));
+    }
+
+    // ── Consent requirement (rsac-82d4) ─────────────────────────────
+
+    /// Every desktop backend — and the unsupported stub — must report that no
+    /// config-time consent artifact is required. Mobile backends (ADR-0013)
+    /// will be the first to flip this to `true`.
+    #[test]
+    fn desktop_and_stub_require_no_user_consent() {
+        let caps = PlatformCapabilities::query();
+        assert!(
+            !caps.requires_user_consent,
+            "no desktop backend (or the unsupported stub) requires a consent artifact"
+        );
     }
 
     // ── Additional tests ────────────────────────────────────────────

@@ -442,6 +442,23 @@ enum rsac_error_t rsac_builder_set_target_app_by_id(struct RsacBuilder *builder,
  enum rsac_error_t rsac_builder_set_target_str(struct RsacBuilder *builder, const char *spec) ;
 
 /**
+ * Supplies the Android `MediaProjection` consent token (Android targets only).
+ *
+ * `token` is the opaque `int64_t` handle produced by the rsac Android consent
+ * helper (a JNI `GlobalRef` to the `MediaProjection` — see
+ * `docs/MOBILE_BACKEND_DESIGN.md` and ADR-0013). On Android builds the value
+ * is stored on the builder; playback-capture targets without it fail
+ * `rsac_builder_build()` with `RSAC_ERROR_CONFIGURATION` once an Android
+ * backend advertises the capability. Microphone (`device:`) targets never
+ * need a token.
+ *
+ * The symbol exists on every platform so the C ABI is uniform; on
+ * non-Android platforms the call is rejected with
+ * `RSAC_ERROR_PLATFORM_NOT_SUPPORTED`.
+ */
+ enum rsac_error_t rsac_builder_set_android_projection(struct RsacBuilder *builder, int64_t token) ;
+
+/**
  * Sets the desired sample rate in Hz.
  */
  enum rsac_error_t rsac_builder_set_sample_rate(struct RsacBuilder *builder, uint32_t sample_rate) ;
@@ -803,6 +820,14 @@ enum rsac_error_t rsac_default_device(const struct RsacDeviceEnumerator *enumera
  * Returns -1 if the handle is null.
  */
  int32_t rsac_capabilities_supports_device_selection(const struct RsacCapabilities *caps) ;
+
+/**
+ * Returns 1 if starting a capture requires a config-time user-consent
+ * artifact (mobile platforms — e.g. an Android `MediaProjection` token via
+ * `rsac_builder_set_android_projection()`), 0 otherwise. Always 0 on the
+ * desktop backends. Returns -1 if the handle is null.
+ */
+ int32_t rsac_capabilities_requires_user_consent(const struct RsacCapabilities *caps) ;
 
 /**
  * Returns the maximum number of channels supported.

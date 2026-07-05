@@ -575,6 +575,46 @@ pub unsafe extern "C" fn rsac_builder_set_target_str(
     })
 }
 
+/// Supplies the Android `MediaProjection` consent token (Android targets only).
+///
+/// `token` is the opaque `int64_t` handle produced by the rsac Android consent
+/// helper (a JNI `GlobalRef` to the `MediaProjection` — see
+/// `docs/MOBILE_BACKEND_DESIGN.md` and ADR-0013). On Android builds the value
+/// is stored on the builder; playback-capture targets without it fail
+/// `rsac_builder_build()` with `RSAC_ERROR_CONFIGURATION` once an Android
+/// backend advertises the capability. Microphone (`device:`) targets never
+/// need a token.
+///
+/// The symbol exists on every platform so the C ABI is uniform; on
+/// non-Android platforms the call is rejected with
+/// `RSAC_ERROR_PLATFORM_NOT_SUPPORTED`.
+#[no_mangle]
+pub unsafe extern "C" fn rsac_builder_set_android_projection(
+    builder: *mut RsacBuilder,
+    token: i64,
+) -> rsac_error_t {
+    catch(|| {
+        if builder.is_null() {
+            set_last_error("builder is null");
+            return rsac_error_t::RSAC_ERROR_NULL_POINTER;
+        }
+        #[cfg(target_os = "android")]
+        {
+            let b = unsafe { &mut *builder };
+            b.inner = b.inner.clone().with_android_projection(
+                rsac::core::config::AndroidProjectionToken::from_raw(token),
+            );
+            rsac_error_t::RSAC_OK
+        }
+        #[cfg(not(target_os = "android"))]
+        {
+            let _ = token;
+            set_last_error("rsac_builder_set_android_projection is only meaningful on Android");
+            rsac_error_t::RSAC_ERROR_PLATFORM_NOT_SUPPORTED
+        }
+    })
+}
+
 /// Sets the desired sample rate in Hz.
 #[no_mangle]
 pub unsafe extern "C" fn rsac_builder_set_sample_rate(
@@ -1494,6 +1534,25 @@ pub unsafe extern "C" fn rsac_capabilities_supports_device_selection(
     }
 }
 
+/// Returns 1 if starting a capture requires a config-time user-consent
+/// artifact (mobile platforms — e.g. an Android `MediaProjection` token via
+/// `rsac_builder_set_android_projection()`), 0 otherwise. Always 0 on the
+/// desktop backends. Returns -1 if the handle is null.
+#[no_mangle]
+pub unsafe extern "C" fn rsac_capabilities_requires_user_consent(
+    caps: *const RsacCapabilities,
+) -> i32 {
+    if caps.is_null() {
+        return -1;
+    }
+    let c = unsafe { &*caps };
+    if c.inner.requires_user_consent {
+        1
+    } else {
+        0
+    }
+}
+
 /// Returns the maximum number of channels supported.
 /// Returns 0 if the handle is null.
 #[no_mangle]
@@ -1704,6 +1763,29 @@ mod tests {
         let spec = CString::new("not-a-real-scheme:whatever").unwrap();
         let code = unsafe { rsac_builder_set_target_str(builder, spec.as_ptr()) };
         assert_eq!(code, rsac_error_t::RSAC_ERROR_INVALID_PARAMETER);
+        unsafe { rsac_builder_free(builder) };
+    }
+
+    // ── set_android_projection: null + off-platform contract (rsac-82d4) ──
+
+    #[test]
+    fn set_android_projection_rejects_null_builder() {
+        let code = unsafe { rsac_builder_set_android_projection(ptr::null_mut(), 42) };
+        assert_eq!(code, rsac_error_t::RSAC_ERROR_NULL_POINTER);
+    }
+
+    /// Off Android the symbol must exist (uniform C ABI) but honestly refuse:
+    /// the token is meaningless without the Android consent flow.
+    #[cfg(not(target_os = "android"))]
+    #[test]
+    fn set_android_projection_rejected_off_android() {
+        let mut builder: *mut RsacBuilder = ptr::null_mut();
+        assert_eq!(
+            unsafe { rsac_builder_new(&mut builder) },
+            rsac_error_t::RSAC_OK
+        );
+        let code = unsafe { rsac_builder_set_android_projection(builder, 42) };
+        assert_eq!(code, rsac_error_t::RSAC_ERROR_PLATFORM_NOT_SUPPORTED);
         unsafe { rsac_builder_free(builder) };
     }
 
