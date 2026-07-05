@@ -332,6 +332,7 @@ sudo pacman -S pipewire pkgconf clang
 - [`docs/CONTRIBUTING.md`](docs/CONTRIBUTING.md) — Toolchain pin, local gate (`fmt` + `clippy` + `doc`), test matrix, release procedure, PR checklist.
 - [`docs/features.md`](docs/features.md) — Cargo feature matrix: which features are default, which platforms they enable, and what system packages each one needs.
 - [`docs/troubleshooting.md`](docs/troubleshooting.md) — High-signal fixes for the most common build and runtime errors (PipeWire libs missing, Xcode CLT, TCC permission, WASAPI session contention, etc.).
+- [`docs/CONSUMING_RSAC.md`](docs/CONSUMING_RSAC.md) — How downstream projects consume any rsac surface: Rust crate, C FFI, Python, Node/Bun, Go, CLI — with the working install/link recipe for each.
 - [`docs/FRAMEWORK_COMPATIBILITY.md`](docs/FRAMEWORK_COMPATIBILITY.md) — Using rsac from Tauri v2, Dioxus, Electron, Deno, Bun, Flutter, and more — per-framework status (verified / expected / blocked) and integration recipes.
 - [`docs/MOBILE_BACKEND_DESIGN.md`](docs/MOBILE_BACKEND_DESIGN.md) — Design for the planned Android (`AudioPlaybackCapture` + AAudio) and iOS (AVAudioEngine + ReplayKit) backends ([ADR-0012](docs/designs/0012-mobile-platform-strategy.md), [ADR-0013](docs/designs/0013-mobile-capturetarget-semantics.md)).
 - [`docs/architecture/`](docs/architecture/) — Detailed design documents for the core, bridge, and backend layers.
