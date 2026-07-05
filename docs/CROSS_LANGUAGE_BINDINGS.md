@@ -3,7 +3,9 @@
 > **Status (shipped since the 0.2.0 line; current release 0.4.0):** C FFI,
 > Python, Node.js, and Go bindings are **shipped and at feature parity** for the
 > core capture surface — including the windowed `backpressure_report()` added in
-> 0.4.0. Swift/Kotlin (UniFFI) and WASM remain research-only — see
+> 0.4.0. WASM is not viable; Swift/Kotlin (UniFFI) bindings remain
+> research-only, though the Android/iOS *backends* they'd need are now designed
+> ([`MOBILE_BACKEND_DESIGN.md`](MOBILE_BACKEND_DESIGN.md)) — see
 > [§ Not yet implemented](#not-yet-implemented). rsac is, as far as we know, the
 > first Rust audio-capture crate with cross-language bindings.
 
@@ -15,11 +17,15 @@
 | **Python** | **Shipped** (`bindings/rsac-python`) | PyO3 + maturin, abi3-py39 | Yes (all 5) |
 | **Node.js/Bun** | **Shipped** (`bindings/rsac-napi`) | napi-rs | Yes (all 5) |
 | **Go** | **Shipped** (`bindings/rsac-go`) | CGo over the C FFI | Yes (all 5) |
-| **Swift/Kotlin** | Research only | UniFFI | Partial (needs mobile backends) |
+| **Swift/Kotlin** | Backends designed ([design](MOBILE_BACKEND_DESIGN.md)); UniFFI bindings research-only | UniFFI (later); first-party AAR/SwiftPM glue (planned) | Blocked on mobile backends (seeded, waves 3–4) |
 | **WASM** | Not viable | wasm-bindgen | No (0/5, sandbox) |
 
 The five capture tiers are the `CaptureTarget` variants: system default, device,
 application (by PID), application-by-name, and process tree.
+
+> Framework-level questions (Tauri, Dioxus, Electron, Deno, Bun, Flutter, …)
+> are covered separately in
+> [`FRAMEWORK_COMPATIBILITY.md`](FRAMEWORK_COMPATIBILITY.md).
 
 ## Shipped binding parity (0.2.0)
 
@@ -178,15 +184,19 @@ and its trade-offs are recorded in
 
 ### Backend feature selection
 
-The **rsac-ffi** and **rsac-python** bindings depend on `rsac` with
-`default-features = false` and select exactly the one backend matching the build
-target via `[target.'cfg(...)'.dependencies.rsac]` blocks, so a Linux build never
-compiles the Windows/CoreAudio backends. This is the canonical convention
-documented in
+The **rsac-python** binding depends on `rsac` with `default-features = false`
+and selects exactly the one backend matching the build target via
+`[target.'cfg(...)'.dependencies.rsac]` blocks, so a Linux build never compiles
+the Windows/CoreAudio backends. This is the canonical convention documented in
 [`features.md`](features.md#binding-feature-resolution-convention-canonical).
-**rsac-napi** has not yet migrated — it currently depends on
-`rsac = { path = "../.." }` (all default backends); `features.md` tracks it as
-still migrating.
+**rsac-ffi** takes a different (also correct) shape: a single
+`default-features = false` dependency plus passthrough features
+(`feat_windows`/`feat_linux`/`feat_macos`, `default = []`), so the consumer —
+the Makefile, CI, or rsac-go — picks the backend at build time. **rsac-napi**
+has not yet migrated — it currently depends on `rsac = { path = "../.." }`
+(all default backends); `features.md` tracks it as still migrating, and the
+migration is a prerequisite for building mobile triples (seeded, label
+`xplat`).
 
 ## 1. C FFI (Foundation)
 
@@ -345,16 +355,24 @@ WASM runs in a browser sandbox with zero OS audio API access. All 5
 `CaptureTarget` variants are impossible. Only `AudioBuffer` observation utilities
 (RMS, peak, dBFS) could conceivably run in WASM; capture itself cannot.
 
-### 6. Swift/Kotlin (Mobile) — research only
+### 6. Swift/Kotlin (Mobile) — backends designed, bindings still research
 
-**UniFFI** could generate both Swift and Kotlin from a single Rust source. The
-binding generation is straightforward, but **new audio backends are needed** and
-none exist yet:
+**The blocker was never binding generation — it was backends, and those are
+now designed.** [`MOBILE_BACKEND_DESIGN.md`](MOBILE_BACKEND_DESIGN.md) +
+[ADR-0012](designs/0012-mobile-platform-strategy.md)/[ADR-0013](designs/0013-mobile-capturetarget-semantics.md)
+specify the Android (`AudioPlaybackCapture` + AAudio, JNI ingest, first-party
+Kotlin AAR) and iOS (AVAudioEngine + ReplayKit broadcast extension, first-party
+Swift package) backends; implementation is seeded (label `xplat`, waves 3–4).
 
-| Platform | Current Backend | Mobile Reality |
+| Platform | Current Backend | Designed Backend |
 |---|---|---|
-| iOS | macOS CoreAudio (desktop) | Needs `AVAudioEngine` backend |
-| Android | None | Needs `AAudio` + `MediaProjection` |
+| iOS | None (honest stub) | `AVAudioEngine` mic + ReplayKit `SystemDefault` (per-app capture: impossible, permanent) |
+| Android | None (honest stub) | `AudioPlaybackCapture` (system/app/tree, consent-gated) + `AAudio` mic |
+
+**UniFFI**-generated Swift/Kotlin *bindings* remain research-only: the
+first mobile consumers (Tauri via `tauri-plugin-rsac`, Dioxus, Flutter over
+the C FFI) don't need them — the batteries-included AAR/SwiftPM glue plus the
+Rust/C surfaces cover them. Revisit UniFFI after the backends ship (wave 4+).
 
 ## Repository layout (as shipped)
 
@@ -373,9 +391,9 @@ rsac/                        # workspace root (the `rsac` core crate)
 There is no `rsac-uniffi` crate yet — Swift/Kotlin remain research-only (see
 [Not yet implemented](#not-yet-implemented)).
 
-> **C-header note (tracked, critique BFFI-01):** the curated
-> `bindings/rsac-ffi/include/rsac.h` is the source of truth the Go layer links
-> against. The cbindgen-generated `rsac_generated.h` currently emits
-> double-prefixed names (e.g. `RsacRsacBuilder`); do not regenerate over
-> `rsac.h` until the cbindgen prefix config is fixed, or you will break the C/Go
-> ABI.
+> **C-header note (was BFFI-01 — RESOLVED, rsac-1413):** the curated
+> `bindings/rsac-ffi/include/rsac.h` remains the source of truth the Go layer
+> links against. The old cbindgen double-prefix problem (`RsacRsacBuilder`) was
+> fixed by removing the export prefix in `bindings/rsac-ffi/cbindgen.toml`;
+> `build.rs` regenerates `include/rsac_generated.h` on every build and the CI
+> `check-bindings` job diffs the two headers' symbol sets to catch drift.

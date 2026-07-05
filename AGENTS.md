@@ -216,7 +216,7 @@ src/
 
 ```
 bindings/
-├── rsac-ffi/               # C FFI layer (45 extern "C" functions, cdylib + staticlib)
+├── rsac-ffi/               # C FFI layer (54 extern "C" functions, cdylib + staticlib)
 ├── rsac-python/            # Python bindings (PyO3 + maturin)
 ├── rsac-napi/              # Node.js/TypeScript bindings (napi-rs)
 └── rsac-go/                # Go bindings (CGo over C FFI)
@@ -489,7 +489,7 @@ Full playbook (when to stack vs parallel PRs, exact commands, pitfalls):
 - ✅ **CI hardening** — `msrv` (1.87) job, `feature-powerset` (cargo-hack, depth 2), `cargo-semver-checks` release gate, stale audio-probe workflow deleted, ARM64 grep gates replaced with exit-code-authoritative checks.
 - ✅ **`#![warn(missing_docs)]`** enforced; rustdoc gaps filled (ErrorKind variants, AudioError fields, platform enumerator items).
 - ✅ **`cocoa`/`objc` → `objc2` migration** — Phase 1 (coreaudio.rs, 12 sites) + Phase 2 (tap.rs, ~65 sites) complete. `cocoa` and `objc` crates fully removed from dependencies. See §9.1.
-- ✅ **Cross-language bindings** — C FFI (`bindings/rsac-ffi/`, 45 functions), Python (`bindings/rsac-python/`, PyO3), Node.js/TS (`bindings/rsac-napi/`, napi-rs), Go (`bindings/rsac-go/`, CGo). All compile.
+- ✅ **Cross-language bindings** — C FFI (`bindings/rsac-ffi/`, 54 functions), Python (`bindings/rsac-python/`, PyO3), Node.js/TS (`bindings/rsac-napi/`, napi-rs), Go (`bindings/rsac-go/`, CGo). All compile.
 - ✅ **Cross-platform introspection module** — `src/core/introspection.rs`: `list_audio_sources()`, `list_audio_applications()`, `CaptureTarget::app()`/`pid()`/`device()` convenience constructors, `check_audio_capture_permission()`.
 - ✅ **Mock audio backend** — `src/bridge/mock.rs`: synthetic 440Hz sine wave through real BridgeStream pipeline, 6 unit tests.
 - ✅ **Audio-graph migrated** to use `rsac::list_audio_sources()` — replaced ~120 lines of per-platform `#[cfg]` code.
