@@ -3,7 +3,8 @@
 > **Status legend (honesty contract):**
 > ✅ **verified** — proven by a shipped consumer or an executed test.
 > 🟢 **expected, unverified** — API-level desk research says it works; no hands-on
-> verification has been run yet. A wave-2 seed exists to flip the marker.
+> verification has been run yet. Markers flip to ✅ when a real downstream
+> integration verifies them (see [Verification policy](#verification-policy)).
 > 🟡 **blocked** — the integration path is understood, but it depends on the
 > Android/iOS backends that do not exist yet (see
 > [`MOBILE_BACKEND_DESIGN.md`](MOBILE_BACKEND_DESIGN.md)).
@@ -80,7 +81,8 @@ in [`MOBILE_BACKEND_DESIGN.md`](MOBILE_BACKEND_DESIGN.md); the consent flow
 **Desktop: 🟢 expected, unverified.** Dioxus desktop apps are plain Rust
 processes (wry webview, like Tauri) — rsac needs nothing framework-specific.
 Spawn capture on a background thread/task, feed UI state via Dioxus signals.
-A wave-2 seed adds a worked example to flip this to ✅.
+The marker flips to ✅ when a downstream Dioxus integration verifies it (see
+[Verification policy](#verification-policy)).
 
 **Mobile: 🟡 blocked on backends.** Dioxus has no plugin system like Tauri's, so
 on Android the host app must obtain the MediaProjection consent token itself
@@ -113,9 +115,9 @@ rebuilds.
    `rsac.h` symbol set (56 functions). More work (hand-written FFI signatures),
    full control, no npm dependency.
 
-Open verification questions for the wave-2 seed: ThreadsafeFunction callback
+Open questions for whoever verifies first: ThreadsafeFunction callback
 delivery under Deno's event loop (the `onData` push path), and BigInt counter
-round-trip. Until run, this row stays 🟢.
+round-trip. Until a downstream runs it, this row stays 🟢.
 
 ## Bun and `bun --compile`
 
@@ -125,20 +127,20 @@ is already Bun-first (`bun install`, `bunx @napi-rs/cli` — see
 to work. `bun:ffi` (`dlopen`) over rsac-ffi is the alternative path.
 
 **`bun --compile` caveat:** single-file executables must carry the native
-module. Two recipes to verify in wave 2: (a) embed the `.node` as an asset and
-load it from the extraction dir at runtime; (b) ship the `.node`/cdylib next to
-the compiled binary and `dlopen` by relative path. Bun's native-addon embedding
-support is still maturing — the doc marker stays 🟢 until the recipe is proven
-per-Bun-version.
+module. Two recipes for whoever verifies first: (a) embed the `.node` as an
+asset and load it from the extraction dir at runtime; (b) ship the
+`.node`/cdylib next to the compiled binary and `dlopen` by relative path.
+Bun's native-addon embedding support is still maturing — the doc marker stays
+🟢 until the recipe is proven per-Bun-version.
 
 ## Flutter
 
 **Desktop: 🟢 expected, unverified.** `dart:ffi` + `package:ffigen` generated
 against the curated `bindings/rsac-ffi/include/rsac.h` gives Dart the full
 56-function surface. The capture read loop runs on a Dart isolate calling the
-blocking read, or uses the callback path via `NativeCallable.listener`. A
-wave-2 spike produces the Dart package skeleton and a desktop capture smoke
-test; publishing a `rsac_dart`/`rsac_flutter` package is a later decision.
+blocking read, or uses the callback path via `NativeCallable.listener`. We
+provide guidance when a downstream Flutter project integrates; publishing a
+`rsac_dart`/`rsac_flutter` package is a later decision.
 
 **Mobile: 🟡 blocked on backends.** Once the backends exist, Flutter consumes
 them through the same C FFI (rsac-ffi cross-compiled for
@@ -192,11 +194,17 @@ same rsac-ffi / direct-dep paths as the frameworks above.
   (cdylib/staticlib) against `rsac.h` — this is the C FFI's primary design
   target. Desktop 🟢; mobile 🟡. Uncommitted.
 
-## Verification backlog
+## Verification policy
 
-The 🟢→✅ flips and the mobile work are tracked as seeds in
-`.seeds/issues.jsonl` (labels `xplat`, waves 2–5): Deno smoke test, Bun-compile
-packaging recipe, Flutter desktop ffigen spike, Dioxus desktop example,
-rsac-napi per-target dependency migration (prerequisite for mobile triples),
-then the Android (wave 3) and iOS (wave 4) backends and `tauri-plugin-rsac`
-(wave 5).
+**Runtime/framework verification is guidance-on-demand, not committed rsac
+work** (owner decision, 2026-07-05): when a downstream project integrates via
+Deno, Bun, Flutter, Dioxus, or a long-tail framework, we support them with the
+recipes in this document and flip the 🟢 markers to ✅ from their verified
+results — we don't run speculative verification ourselves. (The original
+wave-2 verification seeds were closed as not-planned with this rationale.)
+
+The committed backlog is the **mobile push**, tracked as `sd` epics:
+umbrella `rsac-0991` → Android backend `rsac-5823` (wave 3), iOS backend
+`rsac-57cb` (wave 4), framework delivery / `tauri-plugin-rsac` `rsac-71d2`
+(wave 5). The core consent surface (rsac-82d4) and the rsac-napi per-target
+dependency migration (rsac-e8a3) are already landed.
