@@ -31,9 +31,61 @@ concurrency:
   cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 jobs:
+  # ── Docs-only fast path (rsac-61ce) ──────────────────────────────────
+  # PRs that touch only documentation/backlog files skip the whole compile
+  # matrix: this job classifies the PR's changed files, `lint` runs only
+  # when code changed, and every other job has `needs: lint`, so a skipped
+  # lint transitively skips the rest. Skipped jobs count as PASSING for
+  # branch-protection required checks (documented GitHub behavior), so the
+  # pattern stays merge-safe if protection is enabled later (master had no
+  # protection/rulesets when this landed — checked 2026-07-05).
+  #
+  # Fail-open by design: anything that is not a pull_request (pushes; tags —
+  # the version-lockstep tag-time hard gate must always fire; dispatch) or
+  # that cannot be classified runs the full matrix.
+  changes:
+    name: Classify changed paths
+    runs-on: blacksmith-4vcpu-ubuntu-2404
+    timeout-minutes: 5
+    permissions:
+      pull-requests: read
+    outputs:
+      code: ${{ steps.filter.outputs.code }}
+    steps:
+      - name: Detect docs-only PR
+        id: filter
+        env:
+          GH_TOKEN: ${{ github.token }}
+          PR_NUMBER: ${{ github.event.pull_request.number }}
+        run: |
+          if [ "${GITHUB_EVENT_NAME}" != "pull_request" ]; then
+            echo "code=true" >> "$GITHUB_OUTPUT"
+            echo "not a pull_request event — running the full matrix"
+            exit 0
+          fi
+          FILES=$(gh api "repos/${GITHUB_REPOSITORY}/pulls/${PR_NUMBER}/files" --paginate -q '.[].filename') || FILES="__api_error__"
+          if [ "$FILES" = "__api_error__" ] || [ -z "$FILES" ]; then
+            echo "code=true" >> "$GITHUB_OUTPUT"
+            echo "could not classify changed files — failing open (full matrix)"
+            exit 0
+          fi
+          printf 'changed files:\n%s\n' "$FILES"
+          NON_DOCS=$(printf '%s\n' "$FILES" \
+            | grep -vE '^(docs/|\.seeds/|\.kilo/|\.mulch/|LICENSE)' \
+            | grep -vE '\.md$' || true)
+          if [ -z "$NON_DOCS" ]; then
+            echo "code=false" >> "$GITHUB_OUTPUT"
+            echo "docs-only PR — skipping the compile matrix"
+          else
+            echo "code=true" >> "$GITHUB_OUTPUT"
+            printf 'code changes detected:\n%s\n' "$NON_DOCS"
+          fi
+
   # ── Lint (clippy matrix across all 3 OS) ────────────────────────────
   lint:
     name: Lint & Format (${{ matrix.feature }})
+    needs: changes
+    if: needs.changes.outputs.code == 'true'
     timeout-minutes: 20
     runs-on: ${{ matrix.runner }}
     strategy:
