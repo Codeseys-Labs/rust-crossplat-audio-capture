@@ -237,4 +237,6 @@ capture) is exercised by the `ci_audio` integration suite; see
 - **macOS**: `blacksmith-6vcpu-macos-15`; Process Tap paths skip early on managed
   runners because `kTCCServiceAudioCapture` cannot be granted non-interactively.
 
-For detailed implementation information, see [Application-Specific Audio Capture Research](app_specific_capture_research.md).
+For detailed implementation information, see the archived
+[Application-Specific Audio Capture Research](history/app_specific_capture_research.md)
+(historical — written against the pre-Phase-0 API).

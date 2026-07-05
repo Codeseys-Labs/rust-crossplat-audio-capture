@@ -327,6 +327,8 @@ sudo pacman -S pipewire pkgconf clang
 
 ## Documentation
 
+Full index (every doc, with status): [`docs/README.md`](docs/README.md).
+
 - [`VISION.md`](VISION.md) — What rsac is, what it isn't, and how we verify the vision on every commit.
 - [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md) — Three-layer architecture overview plus per-backend specifics (WASAPI / PipeWire / CoreAudio Process Tap).
 - [`docs/CONTRIBUTING.md`](docs/CONTRIBUTING.md) — Toolchain pin, local gate (`fmt` + `clippy` + `doc`), test matrix, release procedure, PR checklist.
