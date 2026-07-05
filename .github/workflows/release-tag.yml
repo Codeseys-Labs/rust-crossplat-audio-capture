@@ -12,27 +12,44 @@
 # annotated `vX.Y.Z` tag AND publishes a GitHub Release for it.
 #
 # ─────────────────────────────────────────────────────────────────────────
-#  SCOPE: GitHub-only for now (tag + GitHub Release). Registry publishing
-#  (crates.io / npm / PyPI) is DEFERRED and stays MANUAL — see below.
+#  TOKEN HANDOFF: registry fan-out is AUTOMATIC when the release App
+#  secrets are configured, and gracefully degrades to GitHub-only when not.
 # ─────────────────────────────────────────────────────────────────────────
 #
-# Why registry fan-out is NOT automatic here:
-#   The existing publish workflows (release.yml → crates.io, release-npm.yml →
-#   npm, release-pypi.yml → PyPI) trigger ONLY on `push: tags: v*.*.*`. But a
-#   tag pushed using the default GITHUB_TOKEN does **not** re-trigger other
-#   workflows (GitHub Actions' deliberate anti-recursion rule), and no PAT /
-#   GitHub App token is configured in this repo yet. So if this workflow's tag
-#   push were relied upon to fan out, those publishes would SILENTLY never run.
-#   Rather than broaden token scope prematurely, this workflow is intentionally
-#   GitHub-only: it creates the tag + the GitHub Release (both of which the
-#   default GITHUB_TOKEN CAN do), and tells the maintainer to run the registry
-#   publishes manually (release.yml has workflow_dispatch; npm/pypi currently
-#   need a manual re-tag or a dispatch trigger added).
+# The publish workflows (release.yml → crates.io, release-npm.yml → npm,
+# release-pypi.yml → PyPI) trigger ONLY on `push: tags: v*.*.*`, and a tag
+# pushed with the default GITHUB_TOKEN does **not** re-trigger other
+# workflows (GitHub Actions' deliberate anti-recursion rule). To make the
+# fan-out fire, this workflow mints a GitHub App installation token via
+# actions/create-github-app-token from two org-level secrets:
 #
-#   FUTURE: when the registry paths are wired, add an
-#   actions/create-github-app-token (or fine-grained PAT) to the checkout so the
-#   tag push re-triggers release.yml / release-npm.yml / release-pypi.yml. See
-#   docs/RELEASE_PROCESS.md "Automated release (GitHub-only for now)".
+#   RSAC_RELEASE_APP_ID          — the App's numeric App ID
+#   RSAC_RELEASE_APP_PRIVATE_KEY — the App's PEM private key
+#
+# and pushes the vX.Y.Z tag with THAT token. App-token pushes are not
+# subject to the anti-recursion rule, so release.yml / release-npm.yml /
+# release-pypi.yml fire automatically off the tag. (App setup: an org-owned
+# GitHub App with Repository permissions → Contents: Read and write,
+# installed on this repo. See docs/RELEASE_PROCESS.md
+# §"Release App setup (automatic registry fan-out)".)
+#
+# GRACEFUL FALLBACK: when the secrets are absent, behavior is exactly the
+# pre-App state — the tag + GitHub Release are still created with the
+# default GITHUB_TOKEN (both of which it CAN do; only cross-workflow
+# TRIGGERING is blocked), registry publishing stays manual per-registry
+# workflow_dispatch, and the job summary explains what to configure.
+# Secrets cannot be read in `if:` expressions on every context, so a probe
+# step receives them via env, tests emptiness in the script, and exposes an
+# output flag that `if:`-gates the token-mint step; the push steps then pick
+# the credential with a plain shell conditional on the (possibly empty)
+# minted token.
+#
+# GO MODULE TAG: after the crate tag, this workflow also creates + pushes
+# bindings/rsac-go/vX.Y.Z (same version, same selected credential) so Go
+# consumers can `go get github.com/Codeseys-Labs/rsac-go@vX.Y.Z`. Verified
+# recursion-safe: every `on: push: tags:` filter in this repo is
+# `v*.*.*` (+ `!v*-*`), and a single `*` in a tag glob does not cross `/`,
+# so `bindings/rsac-go/vX.Y.Z` matches nothing.
 #
 # Detection rationale (primary, robust signal):
 #   A squash merge collapses the release PR into a single commit whose subject
@@ -61,7 +78,8 @@ env:
   CARGO_TERM_COLOR: always
   RUST_BACKTRACE: 1
 
-# Least privilege: this workflow only pushes a tag to its own repo.
+# Least privilege: this workflow only pushes tags (vX.Y.Z + the Go module
+# tag) and a Release to its own repo.
 permissions:
   contents: write
 
@@ -181,27 +199,110 @@ jobs:
             echo "Tag ${TAG} does not exist yet — will create."
           fi
 
+      # Credential probe: secrets are NOT readable inside `if:` expressions on
+      # every context, so the robust pattern is to pass them into env and test
+      # emptiness in a script, exporting an output flag for later `if:` guards.
+      # Never prints the values — only whether the pair is present.
+      - name: Detect release App credentials
+        if: steps.detect.outputs.is_release == 'true'
+        id: app-creds
+        shell: bash
+        env:
+          APP_ID: ${{ secrets.RSAC_RELEASE_APP_ID }}
+          APP_PRIVATE_KEY: ${{ secrets.RSAC_RELEASE_APP_PRIVATE_KEY }}
+        run: |
+          set -euo pipefail
+          if [ -n "${APP_ID}" ] && [ -n "${APP_PRIVATE_KEY}" ]; then
+            echo "available=true" >> "$GITHUB_OUTPUT"
+            echo "Release App credentials found — tag will be pushed with an App installation token (publish workflows will fire)."
+          else
+            echo "available=false" >> "$GITHUB_OUTPUT"
+            echo "Release App credentials absent — falling back to GITHUB_TOKEN (tag + Release only; registry publishes stay manual)."
+          fi
+
+      # Mint the App installation token (scoped by default to this repository).
+      # Only runs when both org secrets exist — the fallback path never touches
+      # this step, so a missing App can't fail the release.
+      - name: Mint GitHub App installation token
+        if: steps.detect.outputs.is_release == 'true' && steps.app-creds.outputs.available == 'true'
+        id: app-token
+        uses: actions/create-github-app-token@fee1f7d63c2ff003460e3d139729b119787bc349 # v2.2.2
+        with:
+          app-id: ${{ secrets.RSAC_RELEASE_APP_ID }}
+          private-key: ${{ secrets.RSAC_RELEASE_APP_PRIVATE_KEY }}
+
       # Create + push the annotated tag at HEAD (the squash-merge release
       # commit), so any artifacts come from the exact reviewed +
       # version-lockstep-passing commit on master.
       #
-      # NOTE: pushed with the default GITHUB_TOKEN, this tag does NOT re-trigger
-      # the on:push:tags publish workflows (anti-recursion). That is intentional
-      # for now — see the header. Registry publishing is manual until a PAT/App
-      # token is added.
+      # Credential selection is a shell conditional on the minted token (empty
+      # when the mint step was skipped — GitHub renders a skipped step's
+      # outputs as empty strings):
+      #   • App token present → the push authenticates via an x-access-token
+      #     remote URL, so the tag DOES re-trigger the on:push:tags publish
+      #     workflows (full registry fan-out).
+      #   • App token absent → push over the checkout's persisted
+      #     GITHUB_TOKEN credentials, exactly the pre-App behavior: the tag is
+      #     created but the anti-recursion rule keeps publishes manual (see
+      #     the publish-path report step below).
       - name: Create and push annotated tag
         if: steps.detect.outputs.is_release == 'true' && steps.exists.outputs.exists == 'false'
         shell: bash
         env:
           TAG: ${{ steps.detect.outputs.tag }}
           VERSION: ${{ steps.detect.outputs.version }}
+          APP_TOKEN: ${{ steps.app-token.outputs.token }}
         run: |
           set -euo pipefail
           git config user.name "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
           git tag -a "${TAG}" -m "Release ${VERSION}"
-          git push origin "${TAG}"
-          echo "::notice::Pushed annotated tag ${TAG}."
+          if [ -n "${APP_TOKEN}" ]; then
+            git push "https://x-access-token:${APP_TOKEN}@github.com/${GITHUB_REPOSITORY}.git" "refs/tags/${TAG}"
+            echo "::notice::Pushed annotated tag ${TAG} with the release App token — the registry publish workflows fire automatically."
+          else
+            git push origin "${TAG}"
+            echo "::notice::Pushed annotated tag ${TAG} with GITHUB_TOKEN — registry publishes stay manual (anti-recursion)."
+          fi
+
+      # Go module tag: bindings/rsac-go is a Go module in a subdirectory, so
+      # Go's module proxy expects the module-path-prefixed tag
+      # bindings/rsac-go/vX.Y.Z pushed in lockstep with the crate tag
+      # (docs/RELEASE_PROCESS.md §"Versioning & ABI contract" (c)). Recursion
+      # is not a concern regardless of credential: every `on: push: tags:`
+      # filter in this repo is `v*.*.*` (+ `!v*-*`), and a single `*` in a tag
+      # glob does not cross `/`, so nothing triggers on this tag path. Uses
+      # whichever credential the main push selected. Idempotent on its own
+      # (independent of the crate tag's `exists` check) so a rerun after a
+      # partial failure — crate tag pushed, Go tag missed — backfills the Go
+      # tag instead of skipping it.
+      - name: Create and push Go module tag
+        if: steps.detect.outputs.is_release == 'true'
+        shell: bash
+        env:
+          VERSION: ${{ steps.detect.outputs.version }}
+          APP_TOKEN: ${{ steps.app-token.outputs.token }}
+        run: |
+          set -euo pipefail
+          GO_TAG="bindings/rsac-go/v${VERSION}"
+          if git rev-parse -q --verify "refs/tags/${GO_TAG}" >/dev/null 2>&1; then
+            echo "::notice::Go module tag ${GO_TAG} already exists locally — skipping (idempotent, never re-tag)."
+            exit 0
+          fi
+          if git ls-remote --tags origin "refs/tags/${GO_TAG}" | grep -q "refs/tags/${GO_TAG}"; then
+            echo "::notice::Go module tag ${GO_TAG} already exists on origin — skipping (idempotent, never re-tag)."
+            exit 0
+          fi
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git tag -a "${GO_TAG}" -m "rsac-go ${VERSION}"
+          # Same credential selection as the main tag push.
+          if [ -n "${APP_TOKEN}" ]; then
+            git push "https://x-access-token:${APP_TOKEN}@github.com/${GITHUB_REPOSITORY}.git" "refs/tags/${GO_TAG}"
+          else
+            git push origin "refs/tags/${GO_TAG}"
+          fi
+          echo "::notice::Pushed Go module tag ${GO_TAG} — Go consumers can now 'go get github.com/Codeseys-Labs/rsac-go@v${VERSION}'."
 
       # Extract this version's CHANGELOG section for the GitHub Release body.
       # Pulls the lines between "## [X.Y.Z]" and the next "## [" heading.
@@ -235,7 +336,7 @@ jobs:
 
       # Create (or update) the GitHub Release for the tag. The default
       # GITHUB_TOKEN CAN create releases (only cross-workflow TRIGGERING is
-      # blocked), so this is the GitHub-only deliverable. softprops/action-gh-release
+      # blocked), so this works identically on both credential paths. softprops/action-gh-release
       # is pinned and idempotent: it updates an existing Release rather than
       # erroring, so this step is DECOUPLED from the tag-existence check
       # (gated only on is_release). That makes a rerun after a partial failure —
@@ -253,12 +354,56 @@ jobs:
           draft: false
           prerelease: false
 
-      # Loud reminder that registry publishing is NOT automatic yet. Gated only
-      # on is_release (like the Release step), so a rerun still surfaces it.
-      - name: Registry-publish reminder (manual until a triggering token is added)
+      # Publish-path report. With the App token, the tag push has already
+      # fanned out to the tag-triggered publish workflows — say so. Without
+      # it, keep the loud manual-publish reminder AND write a job-summary
+      # note explaining exactly what to configure, so the fallback is never
+      # mistaken for a broken pipeline. Gated only on is_release (like the
+      # Release step), so a rerun still surfaces it.
+      - name: Report publish path (automatic via App token, or manual)
         if: steps.detect.outputs.is_release == 'true'
         shell: bash
         env:
           TAG: ${{ steps.detect.outputs.tag }}
+          APP_AVAILABLE: ${{ steps.app-creds.outputs.available }}
         run: |
-          echo "::warning::Tag ${TAG} + GitHub Release created. Registry publishing is NOT automatic (GITHUB_TOKEN-pushed tags do not trigger the on:push:tags publish workflows). To publish: run 'Release' (release.yml), 'Release npm' (release-npm.yml), and 'Release PyPI' (release-pypi.yml) via workflow_dispatch with the expected version. See docs/RELEASE_PROCESS.md."
+          set -euo pipefail
+          if [ "${APP_AVAILABLE}" = "true" ]; then
+            echo "::notice::Tag ${TAG} + GitHub Release created. The tag was pushed with the release App token, so 'Release' (release.yml), 'Release npm' (release-npm.yml), and 'Release PyPI' (release-pypi.yml) fire automatically — verify them in the Actions tab."
+            {
+              echo "## Release ${TAG} — registry fan-out is AUTOMATIC"
+              echo ""
+              echo "The \`${TAG}\` tag was pushed with a GitHub App installation token"
+              echo "(org secrets \`RSAC_RELEASE_APP_ID\` + \`RSAC_RELEASE_APP_PRIVATE_KEY\`),"
+              echo "so the tag-triggered publish workflows (\`release.yml\`,"
+              echo "\`release-npm.yml\`, \`release-pypi.yml\`) fire automatically."
+              echo "The Go module tag \`bindings/rsac-go/${TAG}\` was pushed in lockstep."
+              echo "Verify the publish runs in the Actions tab."
+            } >> "$GITHUB_STEP_SUMMARY"
+          else
+            echo "::warning::Tag ${TAG} + GitHub Release created with the default GITHUB_TOKEN. Registry publishing is NOT automatic (GITHUB_TOKEN-pushed tags do not trigger the on:push:tags publish workflows). To publish: run 'Release' (release.yml), 'Release npm' (release-npm.yml), and 'Release PyPI' (release-pypi.yml) via workflow_dispatch with the expected version. See docs/RELEASE_PROCESS.md."
+            {
+              echo "## Release ${TAG} — registry publishing is MANUAL (no release App configured)"
+              echo ""
+              echo "The tag was pushed with the default \`GITHUB_TOKEN\`, which GitHub's"
+              echo "anti-recursion rule prevents from triggering the \`on: push: tags:\`"
+              echo "publish workflows. The tag + GitHub Release exist; nothing has been"
+              echo "published to crates.io / npm / PyPI."
+              echo ""
+              echo "**Publish now (manual):** run \`release.yml\`, \`release-npm.yml\`, and"
+              echo "\`release-pypi.yml\` via *Run workflow* with the expected version"
+              echo "(docs/RELEASE_PROCESS.md §\"Step 4\")."
+              echo ""
+              echo "**Make this automatic:** create an org-owned GitHub App with"
+              echo "Repository permissions → **Contents: Read and write**, install it on"
+              echo "this repository, then add two org secrets visible to this repo:"
+              echo ""
+              echo "| Secret | Value |"
+              echo "|---|---|"
+              echo "| \`RSAC_RELEASE_APP_ID\` | the App's numeric App ID |"
+              echo "| \`RSAC_RELEASE_APP_PRIVATE_KEY\` | the App's PEM private key |"
+              echo ""
+              echo "With both present, this workflow pushes the tag with an App"
+              echo "installation token and the registry fan-out fires automatically."
+            } >> "$GITHUB_STEP_SUMMARY"
+          fi

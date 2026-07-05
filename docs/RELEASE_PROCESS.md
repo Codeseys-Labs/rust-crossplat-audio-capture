@@ -15,10 +15,13 @@ Three registry workflows (`release.yml`, `release-npm.yml`, `release-pypi.yml`)
 are *wired* to the same `v*.*.*` tag push and would run in parallel — each
 publishing to one registry. **Whether they actually fire depends on HOW the tag
 was pushed** (see the two paths below): a tag pushed with the default
-`GITHUB_TOKEN` does **not** re-trigger them (GitHub's anti-recursion rule), so
-the automated path is **GitHub-only for now** (tag + GitHub Release, no registry
-publish) until a PAT / GitHub App token is wired. A tag pushed manually (local
-git, or a PAT) **does** trigger the full fan-out.
+`GITHUB_TOKEN` does **not** re-trigger them (GitHub's anti-recursion rule). The
+automated path therefore pushes the tag with a **GitHub App installation
+token** whenever the org secrets `RSAC_RELEASE_APP_ID` +
+`RSAC_RELEASE_APP_PRIVATE_KEY` are configured — that push **does** trigger the
+full fan-out. When the secrets are absent it gracefully falls back to
+**GitHub-only** (tag + GitHub Release; registry publishes stay manual). A tag
+pushed manually (local git, or a PAT) also triggers the full fan-out.
 
 There are **two ways** that `vX.Y.Z` tag gets created, and they differ in
 whether the publish fan-out fires:
@@ -26,12 +29,16 @@ whether the publish fan-out fires:
 1. **Automated, release-please style (recommended for minor/patch).** A
    maintainer runs the **Release Prepare** workflow from the Actions tab;
    it opens a `release: vX.Y.Z` PR (version bump + CHANGELOG rotation), a
-   maintainer squash-merges it, and `release-tag.yml` then auto-creates
-   and pushes the tag **using the default `GITHUB_TOKEN`**. Because of GitHub's
-   anti-recursion rule, that tag push does **NOT** trigger the three registry
-   workflows — so this path is **GitHub-only**: it stops at the git tag + the
-   GitHub Release. Registry publishing is a manual follow-up (Step 4). See
-   [§ Automated release (GitHub-only for now)](#automated-release-github-only-for-now).
+   maintainer squash-merges it, and `release-tag.yml` then auto-creates and
+   pushes the tag (plus the `bindings/rsac-go/vX.Y.Z` Go module tag). **With
+   the release App secrets configured** the tag is pushed using an App
+   installation token, so it **DOES** trigger the three registry workflows —
+   full fan-out, no manual follow-up. **Without them** the tag is pushed with
+   the default `GITHUB_TOKEN`, which GitHub's anti-recursion rule stops from
+   triggering the registry workflows — the path degrades to **GitHub-only**
+   (git tag + GitHub Release) and registry publishing is a manual follow-up
+   (Step 4). See
+   [§ Automated release (release-please style)](#automated-release-release-please-style).
 2. **Manual tag push.** A maintainer bumps the manifests + CHANGELOG by
    hand (via `scripts/bump-version.sh`), commits, and pushes an annotated
    `vX.Y.Z` tag directly (local git or a PAT). This tag push is **not** from a
@@ -41,8 +48,8 @@ whether the publish fan-out fires:
    automation is unavailable. See §1–§9 below.
 
 The three publish workflows below run when a tag is pushed by something OTHER
-than a workflow's `GITHUB_TOKEN` (i.e. path 2, or once a PAT/App token is wired
-for path 1) — they never trigger off anything but a `v*.*.*` tag push.
+than a workflow's `GITHUB_TOKEN` (i.e. path 2, or path 1 with the release App
+secrets configured) — they never trigger off anything but a `v*.*.*` tag push.
 
 | Workflow | Registry | Matrix | Key jobs | Required secret |
 |---|---|---|---|---|
@@ -232,26 +239,31 @@ of the automated flows fails.
 
 ---
 
-## Automated release (GitHub-only for now)
+## Automated release (release-please style)
 
 This is the **recommended** way to cut a `minor` or `patch` release. It
 is a two-workflow, release-please-style flow: a maintainer kicks off a
 *prepare* workflow that opens a reviewable release PR, and merging that
-PR triggers a *tag* workflow that creates the `vX.Y.Z` tag **and the
-GitHub Release**. **No bot ever pushes to `master` directly** — every byte
-that ships is reviewed in a normal PR first.
+PR triggers a *tag* workflow that creates the `vX.Y.Z` tag, the
+`bindings/rsac-go/vX.Y.Z` Go module tag, **and the GitHub Release**.
+**No bot ever pushes to `master` directly** — every byte that ships is
+reviewed in a normal PR first.
 
-> ### ⚠️ Scope: GitHub-only — registry publishing is still MANUAL
-> The automated flow currently produces the **git tag + a GitHub Release**
-> and nothing more. It does **not** automatically publish to crates.io /
-> npm / PyPI. The reason is a deliberate GitHub Actions rule: a tag pushed
-> with the default `GITHUB_TOKEN` does **not** re-trigger the
-> `on: push: tags:` publish workflows (`release.yml` / `release-npm.yml` /
-> `release-pypi.yml`), and this repo has no PAT / GitHub App token wired
-> yet. So after the automated GitHub Release lands, **publish to the
-> registries by hand** (see "Step 4" below). When a triggering token is
-> added later, the tag push will fan out automatically and this caveat
-> goes away.
+> ### ⚠️ Scope: registry fan-out needs the release App secrets
+> Whether the flow ends at GitHub or fans out to the registries depends on
+> the **release App secrets** (see
+> [§ Release App setup](#release-app-setup-automatic-registry-fan-out)):
+>
+> - **Secrets configured** — `release-tag.yml` pushes the tag with a GitHub
+>   App installation token. That push **does** trigger the
+>   `on: push: tags:` publish workflows (`release.yml` / `release-npm.yml` /
+>   `release-pypi.yml`), so crates.io / npm / PyPI publishing is automatic
+>   and Step 4 becomes a verification step.
+> - **Secrets absent (graceful fallback)** — the tag is pushed with the
+>   default `GITHUB_TOKEN`, which GitHub's anti-recursion rule stops from
+>   re-triggering the publish workflows. The flow produces the **git tag +
+>   GitHub Release** only, the job summary explains what to configure, and
+>   you **publish to the registries by hand** (see "Step 4" below).
 
 ```
  ┌──────────────────────────┐   human runs from Actions tab, picks bump=minor|patch
@@ -267,14 +279,18 @@ that ships is reviewed in a normal PR first.
               │  squash commit subject == "release: vX.Y.Z (#N)" lands on master
               ▼
  ┌──────────────────────────┐   detects the release commit, creates the
- │  Release Tag on Merge     │   annotated tag vX.Y.Z AND a GitHub Release
- │  (push: master)           │   (.github/workflows/release-tag.yml)
- └────────────┬─────────────┘
+ │  Release Tag on Merge     │   annotated tags vX.Y.Z + bindings/rsac-go/vX.Y.Z
+ │  (push: master)           │   AND a GitHub Release
+ └────────────┬─────────────┘   (.github/workflows/release-tag.yml)
               │  GitHub Release published.
-              │  (GITHUB_TOKEN tag push does NOT auto-trigger the registry
-              │   publishes — do Step 4 manually.)
+              │  App secrets set    → tag pushed with an App installation
+              │                       token: release.yml / release-npm.yml /
+              │                       release-pypi.yml fire automatically
+              │                       (Step 4 = verify the runs).
+              │  App secrets absent → GITHUB_TOKEN tag push does NOT trigger
+              │                       them — do Step 4 manually.
               ▼
-   Step 4 (manual): run release.yml / release-npm.yml / release-pypi.yml
+   Step 4: registry publishes (automatic with the App token; manual without)
 ```
 
 ### Step 1 — run the "Release Prepare" workflow
@@ -358,15 +374,29 @@ push it:
    --tags origin`; if `vX.Y.Z` already exists it **skips with a notice and
    never re-tags**.
 5. **Creates + pushes the annotated tag** — `git tag -a vX.Y.Z -m
-   "Release X.Y.Z"` on HEAD (the reviewed, lockstep-passing squash commit)
-   and `git push origin vX.Y.Z`.
-6. **Publishes the GitHub Release** — extracts the `## [X.Y.Z]` section
+   "Release X.Y.Z"` on HEAD (the reviewed, lockstep-passing squash commit).
+   The push credential is selected at runtime: a **GitHub App installation
+   token** (minted via the SHA-pinned `actions/create-github-app-token`)
+   when the `RSAC_RELEASE_APP_ID` + `RSAC_RELEASE_APP_PRIVATE_KEY` org
+   secrets exist — that push re-triggers the registry publish workflows —
+   or the default `GITHUB_TOKEN` otherwise (tag still created; publishes
+   stay manual).
+6. **Creates + pushes the Go module tag** — `bindings/rsac-go/vX.Y.Z`
+   (same version, same selected credential), so Go consumers can
+   `go get github.com/Codeseys-Labs/rsac-go@vX.Y.Z` — see §"Versioning &
+   ABI contract" (c). Idempotent independently of the crate tag, so a
+   rerun backfills a missed Go tag. No workflow triggers on this tag shape
+   (every `tags:` filter in this repo is `v*.*.*`, and a single `*` in a
+   tag glob never crosses `/`), so recursion is not a concern.
+7. **Publishes the GitHub Release** — extracts the `## [X.Y.Z]` section
    from `CHANGELOG.md` as the release notes and creates the GitHub Release
    for the tag (via `softprops/action-gh-release`). The default
    `GITHUB_TOKEN` is allowed to create tags and releases.
-7. **Emits a manual-publish reminder** — a `::warning::` instructing the
-   maintainer to run the registry publishes (Step 4), because the
-   `GITHUB_TOKEN`-pushed tag does **not** auto-trigger them.
+8. **Reports the publish path** — with the App token, a `::notice::` plus
+   a job summary confirming the registry publish workflows fired
+   automatically; without it, a `::warning::` plus a job summary
+   instructing the maintainer to run the registry publishes (Step 4) and
+   documenting the App setup that would make them automatic.
 
 This job is repo-guarded to
 `Codeseys-Labs/rust-crossplat-audio-capture` (a fork that merges a
@@ -377,11 +407,17 @@ merged PR's `version-lockstep` gate, the same gate re-running at tag time
 (ci.yml now triggers on `v*.*.*` tags), and `release-tag.yml`'s own
 manifest defense.
 
-### Step 4 — publish to the registries (MANUAL, for now)
+### Step 4 — registry publishes (automatic with the App token; manual fallback)
 
-The automated flow above stops at the **git tag + GitHub Release**. To
-publish the crate and bindings to crates.io / npm / PyPI, trigger the
-publish workflows by hand after the GitHub Release appears:
+**With the release App secrets configured**, the tag push from Step 3
+already triggered `release.yml`, `release-npm.yml`, and `release-pypi.yml`
+— Step 4 is just verification: watch the three runs in the Actions tab and
+confirm each registry publish succeeds.
+
+**Without the secrets (graceful fallback)**, the automated flow stops at
+the **git tag + GitHub Release**. To publish the crate and bindings to
+crates.io / npm / PyPI, trigger the publish workflows by hand after the
+GitHub Release appears:
 
 - **crates.io** — Actions → **Release** (`release.yml`) → *Run workflow*
   (it has a `workflow_dispatch` with a `dry_run` toggle; set `dry_run:
@@ -395,11 +431,38 @@ publish workflows by hand after the GitHub Release appears:
   left false, the workflow only builds/smokes wheels and sdist. Publishes
   via PyPI Trusted Publishing / OIDC.
 
-**Why this is manual:** a tag pushed with the default `GITHUB_TOKEN` does
-not re-trigger `on: push: tags:` workflows (GitHub's anti-recursion rule),
-and this repo has no PAT / GitHub App token configured yet. When one is
-added to `release-tag.yml`'s checkout, Step 4 becomes automatic and this
-section can be deleted. See `release-tag.yml`'s header for the wiring TODO.
+**Why the fallback is manual:** a tag pushed with the default
+`GITHUB_TOKEN` does not re-trigger `on: push: tags:` workflows (GitHub's
+anti-recursion rule). Configuring the release App (next section) makes
+`release-tag.yml` push the tag with an App installation token instead —
+that token is not subject to the rule, so Step 4 then fires automatically.
+
+### Release App setup (automatic registry fan-out)
+
+One-time org-admin setup that upgrades Step 4 from manual to automatic:
+
+1. **Create an org-owned GitHub App** (Organization Settings → Developer
+   settings → GitHub Apps → New GitHub App). Only one permission is
+   needed: **Repository permissions → Contents: Read and write** (what a
+   tag push requires). No webhook, no user authorization.
+2. **Install the App** on `Codeseys-Labs/rust-crossplat-audio-capture`
+   (or org-wide).
+3. **Generate a private key** for the App (App settings → Private keys)
+   and note the App's numeric **App ID**.
+4. **Add two org secrets** (Organization Settings → Secrets and variables
+   → Actions), visible to this repository:
+
+   | Secret | Value |
+   |---|---|
+   | `RSAC_RELEASE_APP_ID` | the App's numeric App ID |
+   | `RSAC_RELEASE_APP_PRIVATE_KEY` | the App's PEM private key (full contents, including the `BEGIN`/`END` lines) |
+
+`release-tag.yml` probes the pair at runtime (a step receives them via
+`env` and tests emptiness — secrets are not readable in `if:` expressions
+on every context) and mints an installation token with the SHA-pinned
+`actions/create-github-app-token` only when both exist. Missing or partial
+secrets are never an error: the workflow logs the fallback, pushes with
+`GITHUB_TOKEN`, and the job summary spells out this exact setup.
 
 ### What the automated flow will NOT do (use the manual path instead)
 
@@ -410,12 +473,13 @@ section can be deleted. See `release-tag.yml`'s header for the wiring TODO.
   be done **manually**: run `scripts/bump-version.sh <new-major.0.0>`,
   bring `bindings/rsac-ffi/Cargo.toml` to the same version, commit with a
   normal (non-`release:`) message, then tag and push by hand per §4.
-- **`bindings/rsac-ffi/Cargo.toml` and the `rsac-go` tag.**
-  `bump-version.sh` (and therefore the prepare workflow) does not touch
-  the FFI manifest or push the `bindings/rsac-go/vX.Y.Z` Go module tag —
-  see §"Versioning & ABI contract" (b) and (c). Reconcile the FFI manifest
-  in the release PR before merging, and push the Go tag in lockstep after
-  the crate tag lands.
+- **`bindings/rsac-ffi/Cargo.toml`.** `bump-version.sh` (and therefore
+  the prepare workflow) does not touch the FFI manifest — see
+  §"Versioning & ABI contract" (b). Reconcile the FFI manifest in the
+  release PR before merging. (The `bindings/rsac-go/vX.Y.Z` Go module
+  tag, previously a manual lockstep step here, is now created + pushed
+  automatically by `release-tag.yml` right after the crate tag — see
+  §"Versioning & ABI contract" (c).)
 - **A skipped or misnamed squash subject.** If step 3 never fires (subject
   reworded, non-squash merge), the manifests are still correctly bumped on
   `master`; just create the tag manually (§4) to trigger the publish
@@ -512,7 +576,19 @@ the **module-path-prefixed** form Go's module proxy expects:
 bindings/rsac-go/vX.Y.Z
 ```
 
-Push this tag in lockstep with the `vX.Y.Z` crate tag (same `X.Y.Z`).
+This tag ships in lockstep with the `vX.Y.Z` crate tag (same `X.Y.Z`).
+On the automated path, `release-tag.yml` creates + pushes it right after
+the crate tag (same selected credential, independently idempotent, and
+recursion-safe — no workflow in this repo triggers on the
+`bindings/rsac-go/…` tag shape, since every `tags:` filter is `v*.*.*`
+and a single `*` in a tag glob never crosses `/`). On a manual release,
+push it yourself alongside the crate tag:
+
+```bash
+git tag -a bindings/rsac-go/vX.Y.Z -m "rsac-go X.Y.Z"
+git push origin bindings/rsac-go/vX.Y.Z
+```
+
 Consumers then `go get
 github.com/Codeseys-Labs/rsac-go@vX.Y.Z`. The `version-lockstep`
 CI job notes rsac-go's absence of an in-tree version explicitly so the
@@ -601,7 +677,7 @@ Before you start a release, confirm all of the following:
 > **Manual fallback procedure.** The sections below describe how to run
 > the release by hand. For a `minor`/`patch` release you normally do
 > **not** run these by hand — use the automated release-please-style flow
-> (§"Automated minor/patch release (release-please style)"), which runs
+> (§"Automated release (release-please style)"), which runs
 > `scripts/bump-version.sh` for you (§3), opens the bump PR, and pushes the
 > tag (§4) on merge; the tag push then does §5 and §7 step 4. These manual
 > steps remain the path for a **MAJOR** bump (the automation refuses one),
@@ -998,15 +1074,17 @@ risking a real upload:
 
 Tracked here so follow-up release-automation tasks can pick them up:
 
-- **Minor/patch releases are automated up to the GitHub Release** via the
-  release-please-style two-workflow flow (`release-prepare.yml` +
-  `release-tag.yml`) — see §"Automated minor/patch release (release-please
-  style)". Run **Release Prepare** from the Actions tab, squash-merge the
-  `release: vX.Y.Z` PR (keeping that exact subject), and the tag + GitHub
-  Release are created automatically. **Registry publishing is NOT part of this
-  automation** (the `GITHUB_TOKEN`-pushed tag does not trigger the publish
-  workflows — see Step 4); it remains a manual follow-up until a PAT / GitHub
-  App token is wired. **MAJOR bumps stay manual** (the automation refuses to
+- **Minor/patch releases are automated** via the release-please-style
+  two-workflow flow (`release-prepare.yml` + `release-tag.yml`) — see
+  §"Automated release (release-please style)". Run **Release Prepare** from
+  the Actions tab, squash-merge the `release: vX.Y.Z` PR (keeping that exact
+  subject), and the crate tag, the `bindings/rsac-go/vX.Y.Z` Go module tag,
+  and the GitHub Release are created automatically. **Registry publishing is
+  automatic only when the release App secrets (`RSAC_RELEASE_APP_ID` +
+  `RSAC_RELEASE_APP_PRIVATE_KEY`) are configured** — see §"Release App setup
+  (automatic registry fan-out)". Without them, the `GITHUB_TOKEN`-pushed tag
+  does not trigger the publish workflows and Step 4 stays a manual follow-up.
+  **MAJOR bumps stay manual** (the automation refuses to
   change the major): use `scripts/bump-version.sh` + a hand-pushed tag per
   §3–§4. The manual §1–§9 flow remains the fallback whenever the
   automation is unavailable or a maintainer needs to override it.
@@ -1020,8 +1098,9 @@ Tracked here so follow-up release-automation tasks can pick them up:
   `Cargo.toml`, `bindings/rsac-ffi/Cargo.toml` (including its internal `rsac`
   dependency version pin), `bindings/rsac-napi/{Cargo.toml,package.json}`, and
   `bindings/rsac-python/{Cargo.toml,pyproject.toml}` — and rotates the
-  CHANGELOG. It cannot tag `rsac-go` (push `bindings/rsac-go/vX.Y.Z`
-  separately — see §"Versioning & ABI contract" (c)). The `version-lockstep` CI job in
+  CHANGELOG. It cannot tag `rsac-go` — on the automated path
+  `release-tag.yml` pushes `bindings/rsac-go/vX.Y.Z` for you; on a manual
+  release push it separately (see §"Versioning & ABI contract" (c)). The `version-lockstep` CI job in
   `ci.yml` catches any manifest that drifts: it warns on push/PR and
   hard-fails on a release tag.
 - `release-npm.yml` builds five napi-rs triples; other targets

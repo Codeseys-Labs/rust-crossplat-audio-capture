@@ -728,6 +728,82 @@ jobs:
       - name: Check feature powerset
         run: cargo hack check --feature-powerset --depth 2 --no-dev-deps --exclude-features feat_windows,feat_macos --keep-going
 
+  # ── Coverage (cargo-llvm-cov, Linux, ADVISORY) ──────────────────────
+  # continue-on-error at the JOB level: coverage on device-gated audio code
+  # is inherently noisy (backend hot paths only execute against real audio
+  # hardware, which headless runners lack), so the number is TREND DATA for
+  # maintainers, not a merge gate. This job must never block CI and is
+  # deliberately absent from any required-checks logic. Uploads lcov.info as
+  # an artifact always; forwards to Codecov only when a CODECOV_TOKEN secret
+  # is configured (env-emptiness probe — secrets can't be read in `if:`).
+  coverage:
+    name: Coverage (cargo-llvm-cov, advisory)
+    timeout-minutes: 30
+    needs: lint
+    continue-on-error: true
+    runs-on: blacksmith-4vcpu-ubuntu-2404
+    steps:
+      - uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5
+        with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@e081816240890017053eacbb1bdf337761dc5582 # 1.95.0
+        with:
+          components: llvm-tools-preview
+      - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
+        with:
+          # Distinct prefix: llvm-cov instruments with -C instrument-coverage,
+          # so its artifacts must not poison the plain 1.95 caches.
+          prefix-key: v0-rust-llvm-cov
+
+      - name: Install PipeWire dev libraries
+        run: |
+          sudo add-apt-repository ppa:pipewire-debian/pipewire-upstream -y
+          sudo apt-get update
+          sudo apt-get install -y libpipewire-0.3-dev libspa-0.2-dev pkg-config
+
+      - name: Install cargo-llvm-cov
+        uses: taiki-e/install-action@0fd46367812ee04360509b4169d9f659d6892bb2 # v2
+        with:
+          tool: cargo-llvm-cov
+
+      # Same feature set as the Linux lib suite plus the non-platform optional
+      # features, so the sink/test-utils/compose code is measured too.
+      - name: Run cargo-llvm-cov (lib, lcov output)
+        run: cargo llvm-cov --lib --no-default-features --features feat_linux,compose,sink-wav,test-utils --lcov --output-path lcov.info
+
+      - name: Upload lcov.info artifact
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: coverage-lcov
+          path: lcov.info
+          retention-days: 14
+
+      # Codecov upload is opt-in: probe the secret via env emptiness (secrets
+      # are not readable in `if:` expressions on every context) and gate the
+      # upload step on the resulting output flag. No token → artifact-only.
+      - name: Detect Codecov token
+        id: codecov
+        shell: bash
+        env:
+          CODECOV_TOKEN: ${{ secrets.CODECOV_TOKEN }}
+        run: |
+          set -euo pipefail
+          if [ -n "${CODECOV_TOKEN}" ]; then
+            echo "available=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "available=false" >> "$GITHUB_OUTPUT"
+            echo "CODECOV_TOKEN not configured — skipping Codecov upload (lcov.info artifact still uploaded)."
+          fi
+
+      - name: Upload to Codecov
+        if: steps.codecov.outputs.available == 'true'
+        uses: codecov/codecov-action@0fb7174895f61a3b6b78fc075e0cd60383518dac # v5.5.5
+        with:
+          token: ${{ secrets.CODECOV_TOKEN }}
+          files: lcov.info
+          # Advisory job: never fail on an upload hiccup.
+          fail_ci_if_error: false
+
   # ── MSRV check (Rust 1.87, Linux) ───────────────────────────────────
   # Guards rust-version = "1.87" (Cargo.toml:9) from rotting under the pinned
   # 1.95 toolchain: every other job compiles with 1.95.0 (rust-toolchain.toml),
