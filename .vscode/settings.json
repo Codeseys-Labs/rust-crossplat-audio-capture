@@ -1,0 +1,15 @@
+{
+    // Shared project settings (checked in — see .gitignore note, rsac-4f0d).
+    // Off-by-default cargo features would otherwise leave src/compose/,
+    // src/main.rs (cli), and the gated examples as dead-editor zones with no
+    // rust-analyzer diagnostics. bridge-zerocopy and tracing are deliberately
+    // omitted (benchmark-only / opt-in shim). Platform backends need no
+    // entry: the host's feat_<os> is in the default feature set.
+    "rust-analyzer.cargo.features": [
+        "compose",
+        "cli",
+        "sink-wav",
+        "async-stream",
+        "test-utils"
+    ]
+}

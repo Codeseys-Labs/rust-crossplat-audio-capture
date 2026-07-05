@@ -3,8 +3,12 @@
 test-results/
 research/
 
-# Editor / IDE
-.vscode/
+# Editor / IDE — personal files stay ignored, but the shared rust-analyzer
+# feature config is checked in (rsac-4f0d): without it, feature-gated code
+# (src/compose/, src/main.rs, gated examples) gets no diagnostics.
+.vscode/*
+!.vscode/settings.json
+!.vscode/extensions.json
 .idea/
 *.suo
 *.ntvs*

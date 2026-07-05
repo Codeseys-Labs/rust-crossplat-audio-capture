@@ -79,6 +79,23 @@ build error.
 Hooks are opt-in and skippable (`git push --no-verify`); CI is the
 backstop either way.
 
+### Editor setup
+
+Several cargo features are off by default (`compose`, `cli`, `sink-wav`,
+`async-stream`, `test-utils`), so without configuration rust-analyzer
+shows **no diagnostics** inside `src/compose/`, `src/main.rs`, or the
+gated examples. VS Code picks the checked-in
+[`.vscode/settings.json`](../.vscode/settings.json) up automatically.
+For other editors, set the equivalent of:
+
+```json
+{ "rust-analyzer.cargo.features": ["compose", "cli", "sink-wav", "async-stream", "test-utils"] }
+```
+
+(Zed: `languages.Rust.language_servers` → rust-analyzer
+`initialization_options.cargo.features`; Neovim: pass the same table via
+your LSP config's `settings`.)
+
 ## 3. Running the test suite
 
 ### Unit tests (no audio hardware needed)
