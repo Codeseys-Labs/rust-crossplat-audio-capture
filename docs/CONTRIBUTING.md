@@ -6,10 +6,10 @@ architectural context read [`AGENTS.md`](../AGENTS.md) and
 
 ## 1. Toolchain
 
-The Rust toolchain is **pinned** via
-[`rust-toolchain.toml`](../rust-toolchain.toml). `rustup` will pick it up
-automatically; do not install against a different channel or the
-pre-commit clippy gate will drift.
+**Rust** is **pinned** via
+[`rust-toolchain.toml`](../rust-toolchain.toml). `rustup` picks it up
+automatically; do not install against a different channel or your local
+clippy results will drift from CI's.
 
 - Channel: see `rust-toolchain.toml` (currently `1.95.0`).
 - Components: `rustfmt`, `clippy`.
@@ -18,32 +18,66 @@ pre-commit clippy gate will drift.
   `cargo clippy --all-targets -- -D warnings` locally with the new
   toolchain before pushing the bump so new lints do not land cold in CI.
 
+**Everything else** (Bun, Node, Go, Python for the bindings; lefthook for
+git hooks) is pinned via [`mise.toml`](../mise.toml). One-shot setup:
+
+```bash
+# install mise: https://mise.jdx.dev  (winget install jdx.mise / brew install mise)
+mise install        # installs the pinned polyglot toolchain + lefthook
+mise run setup      # installs the git hooks (lefthook install)
+```
+
+mise is a convenience, not a requirement — every task below also shows
+the direct command. mise deliberately does **not** manage Rust.
+
 ### Platform build dependencies
 
 See [`docs/features.md`](features.md) for the feature matrix.
 
 - **Linux:** `libpipewire-0.3-dev`, `libspa-0.2-dev`, `pkg-config`,
   `clang` / `libclang-dev`, `llvm-dev`.
-- **Windows:** MSVC (WASAPI ships with the OS).
+- **Windows:** MSVC (WASAPI ships with the OS). Git for Windows provides
+  the `bash` used by the gate script and hooks.
 - **macOS:** Xcode Command Line Tools. Process Tap features require
   macOS 14.4+.
 
 ## 2. The local gate
 
-Every commit must pass this gate. CI runs it too, so skipping it locally
-just means you find out later:
+The gate is a **faithful replica of ci.yml's `lint` job** for your host
+OS — same commands, same feature flags — so passing locally means the
+lint leg passes in CI. It lives in one place,
+[`scripts/gate.sh`](../scripts/gate.sh) (PowerShell wrapper:
+`scripts/gate.ps1`), and is wired into the pre-push git hook.
 
 ```bash
-cargo fmt --all -- --check
-cargo clippy --all-targets --all-features -- -D warnings
-cargo test --lib --no-default-features --features feat_linux   # on Linux
-# … or feat_windows / feat_macos on the corresponding host
-cargo doc --no-deps --all-features
+mise run gate        # or: bash scripts/gate.sh
+#   1. cargo fmt --all -- --check
+#   2. cargo clippy --all-targets --no-default-features \
+#        --features feat_<host>,compose,cli -- -D warnings
+#   3. cargo build --no-default-features        (bare-build smoke)
+
+mise run gate:full   # or: bash scripts/gate.sh --full
+#   … adds: lib tests, doctests, cargo doc (docsrs, -D warnings),
+#   and the module-DAG guard — the rest of the fast CI legs.
 ```
 
-`cargo doc` is part of the gate because `src/lib.rs` declares
+`cargo doc` is part of `gate:full` because `src/lib.rs` declares
 `#![deny(rustdoc::broken_intra_doc_links)]` — a stale link becomes a
 build error.
+
+### Git hooks (lefthook)
+
+[`lefthook.yml`](../lefthook.yml) defines the hooks; `mise run setup`
+(or `lefthook install`) activates them per-clone:
+
+- **pre-commit** — `cargo fmt --all -- --check` (only when `.rs` files
+  are staged).
+- **commit-msg** — rejects `Co-Authored-By:` trailers and tool bylines
+  (the AGENTS.md §6 commit conventions, enforced mechanically).
+- **pre-push** — runs the gate.
+
+Hooks are opt-in and skippable (`git push --no-verify`); CI is the
+backstop either way.
 
 ## 3. Running the test suite
 
@@ -186,9 +220,10 @@ checks and post-publish verification is in
 
 ## 8. Pull request checklist
 
-- [ ] `cargo fmt --all -- --check` is clean.
-- [ ] `cargo clippy --all-targets --all-features -- -D warnings` is clean.
-- [ ] `cargo doc --no-deps --all-features` is warning-free.
+- [ ] `mise run gate` (or `bash scripts/gate.sh`) is clean — fmt,
+      CI-replica clippy `-D warnings`, bare-build smoke.
+- [ ] `mise run gate:full` extras are clean where relevant — lib tests,
+      doctests, `cargo doc` (warning-free), module-DAG guard.
 - [ ] New public items have rustdoc (purpose + example where non-trivial +
       `# Errors` where applicable).
 - [ ] Relevant CI matrix rows are green (or the PR explains why a row is
