@@ -171,6 +171,16 @@ impl PlatformCapabilities {
             return Self::linux();
         }
 
+        #[cfg(all(target_os = "android", feature = "feat_android"))]
+        {
+            return Self::android();
+        }
+
+        #[cfg(all(target_os = "ios", feature = "feat_ios"))]
+        {
+            return Self::ios();
+        }
+
         // OS without its backend feature enabled, or an unsupported OS: no
         // backend is compiled in, so report nothing as supported.
         #[allow(unreachable_code)]
@@ -264,6 +274,65 @@ impl PlatformCapabilities {
             sample_rate_range: (8000, 384000),
             max_channels: 32, // PipeWire supports many channels
             backend_name: "PipeWire",
+        }
+    }
+
+    /// Android capabilities — **microphone slice only** (rsac-20cd).
+    ///
+    /// Honest current state: the compiled backend captures the default audio
+    /// input via AAudio (`CaptureTarget::Device`). The playback-capture tiers
+    /// (`SystemDefault` / `Application*` / `ProcessTree` via
+    /// `AudioPlaybackCapture` + MediaProjection consent) arrive with
+    /// rsac-77f1/rsac-c4b8 — until then those flags stay `false` and
+    /// `requires_user_consent` stays `false` (the mic needs the RECORD_AUDIO
+    /// *runtime permission*, which is axis-2 readiness, not a config-time
+    /// consent artifact; see the field docs). ADR-0013 fixes the target
+    /// mapping; docs/MOBILE_BACKEND_DESIGN.md has the full design.
+    #[cfg(all(target_os = "android", feature = "feat_android"))]
+    fn android() -> Self {
+        Self {
+            supports_system_capture: false, // rsac-77f1 (AudioPlaybackCapture)
+            supports_application_capture: false, // rsac-77f1 (addMatchingUid)
+            supports_process_tree_capture: false, // rsac-77f1 (PID→UID ≡ app)
+            // Only the default AAudio input is reachable without the Java
+            // AudioManager device list (arrives with the AAR, rsac-c4b8).
+            supports_device_selection: false,
+            supports_device_change_notifications: false,
+            // Flips to true when the playback-capture tiers land (rsac-77f1).
+            requires_user_consent: false,
+            // AAudio delivers PCM_I16 or PCM_FLOAT natively.
+            supported_sample_formats: vec![SampleFormat::I16, SampleFormat::F32],
+            sample_rate_range: (8000, 96000),
+            max_channels: 2,
+            backend_name: "AAudio",
+        }
+    }
+
+    /// iOS capabilities — **microphone slice only** (rsac-9e02).
+    ///
+    /// Honest current state: the compiled backend captures the session's
+    /// audio input via `AVAudioEngine` (`CaptureTarget::Device`).
+    /// `SystemDefault` (ReplayKit broadcast-extension path, rsac-b3aa) is not
+    /// wired yet; `Application*` / `ProcessTree` are **permanently** `false`
+    /// on iOS — Apple provides no API for capturing another app's audio
+    /// (ADR-0013; never soften this). `requires_user_consent` stays `false`
+    /// for the mic slice (`NSMicrophoneUsageDescription` is an axis-2 runtime
+    /// permission) and flips to `true` when the ReplayKit path lands.
+    #[cfg(all(target_os = "ios", feature = "feat_ios"))]
+    fn ios() -> Self {
+        Self {
+            supports_system_capture: false,       // rsac-b3aa (ReplayKit path)
+            supports_application_capture: false,  // permanent: no iOS API
+            supports_process_tree_capture: false, // permanent: no iOS API
+            // Input routing on iOS is session-driven (AVAudioSession routes),
+            // not free device selection.
+            supports_device_selection: false,
+            supports_device_change_notifications: false,
+            requires_user_consent: false, // flips with the ReplayKit path (rsac-b3aa)
+            supported_sample_formats: vec![SampleFormat::F32],
+            sample_rate_range: (8000, 96000),
+            max_channels: 2,
+            backend_name: "AVAudioEngine",
         }
     }
 
@@ -557,6 +626,37 @@ mod tests {
             !caps.requires_user_consent,
             "no desktop backend (or the unsupported stub) requires a consent artifact"
         );
+    }
+
+    /// rsac-20cd: the Android mic slice must report its honest partial state —
+    /// no playback-capture tiers, no device selection, no consent artifact
+    /// (those all arrive with rsac-77f1/rsac-c4b8).
+    #[cfg(all(target_os = "android", feature = "feat_android"))]
+    #[test]
+    fn android_mic_slice_reports_honest_partial_capabilities() {
+        let caps = PlatformCapabilities::query();
+        assert_eq!(caps.backend_name, "AAudio");
+        assert!(!caps.supports_system_capture);
+        assert!(!caps.supports_application_capture);
+        assert!(!caps.supports_process_tree_capture);
+        assert!(!caps.requires_user_consent);
+        assert!(caps.supports_format(SampleFormat::F32));
+        assert!(caps.supports_sample_rate(48000));
+    }
+
+    /// rsac-9e02: the iOS mic slice must report its honest partial state.
+    /// `Application*`/`ProcessTree` are PERMANENTLY false on iOS (ADR-0013).
+    #[cfg(all(target_os = "ios", feature = "feat_ios"))]
+    #[test]
+    fn ios_mic_slice_reports_honest_partial_capabilities() {
+        let caps = PlatformCapabilities::query();
+        assert_eq!(caps.backend_name, "AVAudioEngine");
+        assert!(!caps.supports_system_capture);
+        assert!(!caps.supports_application_capture);
+        assert!(!caps.supports_process_tree_capture);
+        assert!(!caps.requires_user_consent);
+        assert!(caps.supports_format(SampleFormat::F32));
+        assert!(caps.supports_sample_rate(48000));
     }
 
     // ── Additional tests ────────────────────────────────────────────

@@ -22,6 +22,9 @@ exclude = [
     # Makefile, C bridge — no Cargo.toml) would otherwise ship in the tarball.
     "/apps",
     "/bindings",
+    # Mobile platform glue (Kotlin AAR + SwiftPM package; ADR-0012) — built by
+    # Gradle/Xcode, not cargo; never ships in the crates.io tarball.
+    "/mobile",
     # Project-internal docs, scripts, infra (not library artifacts)
     "/docs",
     "/docker",
@@ -56,9 +59,16 @@ exclude = [
 feat_windows = []
 feat_linux = []
 feat_macos = []
+# Mobile backends (ADR-0012/0013; docs/MOBILE_BACKEND_DESIGN.md). Double-gated
+# on target_os like the desktop backends, so enabling them on the wrong OS is
+# inert. Current slice: Device-target microphone capture only (AAudio /
+# AVAudioEngine); playback-capture tiers arrive with rsac-77f1 / rsac-b3aa.
+feat_android = []
+feat_ios = []
 
-# Default features - enables all platform backends
-default = ["feat_windows", "feat_linux", "feat_macos"]
+# Default features - enables all platform backends (the two-way target_os
+# gate makes non-matching entries no-ops, so this is safe cross-platform).
+default = ["feat_windows", "feat_linux", "feat_macos", "feat_android", "feat_ios"]
 
 test-utils = [] # Feature to enable test utilities
 
@@ -173,16 +183,55 @@ core-foundation-sys = "0.8.7"       # Low-level Core Foundation FFI bindings
 sysinfo = "0.38.4"                  # For process tree discovery (ProcessTree capture target)
 # Note: CATapDescription is a private CoreAudio class — raw msg_send! is required (no objc2 bindings)
 
+[target.'cfg(target_os = "ios")'.dependencies]
+# iOS backend (feat_ios, mic slice — rsac-9e02): AVAudioEngine via the objc2
+# family, versions matching the macOS block above. This dependency block is
+# owned by the iOS backend work; extend it there if typed framework crates
+# (e.g. objc2-avf-audio) prove viable for cross-checking without an Apple SDK.
+#
+# NOTE: deliberately WITHOUT the objc2 "exception" feature the macOS block
+# enables — that feature pulls in objc2-exception-helper, whose build script
+# compiles an Objective-C file (needs xcrun + an Apple SDK), which breaks the
+# host-independent `cargo check --target aarch64-apple-ios` CI/dev loop. The
+# iOS backend does not use objc2::exception::catch, so nothing is lost.
+objc2 = "0.6"
+objc2-foundation = { version = "0.3", features = [
+    "NSString", "NSArray", "NSValue",
+    "NSAutoreleasePool", "NSObject", "NSError",
+] }
+block2 = "0.6"   # ObjC blocks for the AVAudioEngine input-node tap callback
+# Typed AVFAudio bindings (same objc2 0.6 generation as the macOS block's
+# objc2-app-kit). Features cover exactly the mic-tap surface used by
+# src/audio/ios/avaudio.rs: engine + input node, bus formats, the PCM tap
+# buffer/time types, and the block2 glue for AVAudioNodeTapBlock.
+objc2-avf-audio = { version = "0.3", features = [
+    "AVAudioEngine", "AVAudioNode", "AVAudioIONode", "AVAudioFormat",
+    "AVAudioBuffer", "AVAudioTime", "AVAudioTypes", "block2",
+] }
+
+# Android backend (feat_android, mic slice — rsac-20cd) needs no crate deps:
+# AAudio is bound via in-tree extern "C" declarations against the stable NDK
+# ABI (see src/audio/android/aaudio.rs); JNI deps arrive with rsac-77f1.
+
 [build-dependencies]
 pkg-config = "0.3.32"
 
 [dev-dependencies]
-criterion = "0.8.2" # Benchmarking
 tempfile = "3.27.0" # Temporary files for tests
 rand = "0.10.0" # For generating test data
 rand_pcg = "0.10.1" # For deterministic random numbers in tests
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "time"] }
 futures-util = "0.3"
+
+# criterion is target-gated OFF the mobile OSes: cargo compiles EVERY
+# dev-dependency for any `--tests` target, and criterion's `alloca` dependency
+# builds C via cc (needs xcrun / an NDK toolchain), which breaks the
+# host-independent mobile cross-target check loops
+# (`cargo check --target aarch64-apple-ios --tests`). Benches never run on
+# mobile anyway; the [[bench]] targets also set `test = false` so `--tests`
+# does not select them where criterion is absent.
+[target.'cfg(not(any(target_os = "ios", target_os = "android")))'.dev-dependencies]
+criterion = "0.8.2" # Benchmarking
 
 [[bin]]
 name = "rsac"
@@ -277,10 +326,16 @@ harness = true
 
 # rsac-603b: criterion benchmark harness for the bridge data plane. harness =
 # false hands main() to criterion_main!; does not affect cargo build/cargo test.
+# test = false keeps `cargo check --tests` from selecting the bench target
+# (bench targets default to test = true): criterion's `alloca` dep compiles C
+# via cc/xcrun, which breaks the host-independent mobile cross-target loops
+# (`cargo check --target aarch64-apple-ios --tests`). No CI job runs benches
+# in test mode, so nothing is lost (AGENTS.md §8: benches are not executed).
 [[bench]]
 name = "bridge"
 path = "benches/bridge.rs"
 harness = false
+test = false
 
 # rsac-03a5: criterion benchmark for the consumer-side observability read path
 # (stream_stats / backpressure_report assembly + AudioBuffer level meters). Proves
@@ -290,6 +345,7 @@ harness = false
 name = "observability"
 path = "benches/observability.rs"
 harness = false
+test = false
 
 [workspace]
 members = ["bindings/rsac-python", "bindings/rsac-ffi", "bindings/rsac-napi"]

@@ -1168,16 +1168,31 @@ dependencies = [
 
 [[package]]
 name = "objc2-audio-toolbox"
-version = "0.3.1"
+version = "0.3.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "10cbe18d879e20a4aea544f8befe38bcf52255eb63d3f23eca2842f3319e4c07"
+checksum = "6948501a91121d6399b79abaa33a8aa4ea7857fe019f341b8c23ad6e81b79b08"
 dependencies = [
  "bitflags 2.11.0",
+ "block2",
  "libc",
  "objc2",
  "objc2-core-audio",
  "objc2-core-audio-types",
  "objc2-core-foundation",
+ "objc2-foundation",
+]
+
+[[package]]
+name = "objc2-avf-audio"
+version = "0.3.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "13a380031deed8e99db00065c45937da434ca987c034e13b87e4441f9e4090be"
+dependencies = [
+ "bitflags 2.11.0",
+ "block2",
+ "objc2",
+ "objc2-audio-toolbox",
+ "objc2-core-audio-types",
  "objc2-foundation",
 ]
 
@@ -1666,6 +1681,7 @@ version = "0.4.0"
 dependencies = [
  "atomic-waker",
  "audioadapter-buffers",
+ "block2",
  "clap",
  "color-eyre",
  "core-foundation",
@@ -1684,6 +1700,7 @@ dependencies = [
  "log",
  "objc2",
  "objc2-app-kit",
+ "objc2-avf-audio",
  "objc2-foundation",
  "pipewire",
  "pkg-config",
