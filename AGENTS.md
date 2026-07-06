@@ -199,14 +199,13 @@ src/
 │       ├── coreaudio.rs    # CoreAudio capture (uses BridgeProducer, no old VecDeque)
 │       ├── tap.rs          # Process Tap FFI
 │       └── thread.rs       # MacosPlatformStream + CoreAudio callback → BridgeProducer
-├── bin/                    # Binary targets (some deprecated)
+├── bin/                    # Binary targets (all require features; see docs/features.md)
 │   ├── standardized_test.rs
-│   ├── run_tests.rs
-│   ├── test_report_generator.rs
 │   ├── app_capture_test.rs
 │   ├── pipewire_test.rs
 │   ├── pipewire_diagnostics.rs
-│   └── (deprecated: firefox_capture_test, real_pipewire_test, etc.)
+│   ├── wasapi_session_test.rs
+│   └── smoke_alpine.rs
 └── utils/                  # Utility modules
     ├── mod.rs
     └── test_utils.rs
@@ -283,20 +282,62 @@ docker/                     # Docker-based cross-platform testing
 
 ## 6. Development Workflow
 
-### Quick validation
+### Local DevEx: mise + lefthook + the gate
+
+The repo's local tooling was overhauled 2026-07-05 (seeds rsac-7e19 …
+rsac-61ce). The pieces and how to use them:
+
+**One-shot onboarding** (full walkthrough: [`docs/CONTRIBUTING.md`](docs/CONTRIBUTING.md) §1–2):
 
 ```bash
-# Fast compilation check (Linux is primary dev environment)
-cargo check
+# Rust comes from rustup + rust-toolchain.toml (pinned 1.95.0) — automatic.
+# Everything else (bun / node / go / python / lefthook) is pinned in mise.toml:
+mise install        # install the pinned polyglot toolchain
+mise run setup      # install the git hooks (lefthook install)
+```
 
-# Run tests
-cargo test
+**The gate** — a faithful replica of ci.yml's `lint` job for the host OS.
+Run it before pushing (the pre-push hook runs it anyway):
 
-# Check a specific platform feature
-cargo check --features feat_linux
+```bash
+mise run gate        # or: bash scripts/gate.sh   (pwsh scripts/gate.ps1 on Windows)
+#   fmt --check → clippy -D warnings (feat_<host>,compose,cli) → bare-build smoke
+mise run gate:full   # + lib tests, doctests, docsrs cargo doc, module-DAG guard
+mise run test        # just the CI test-job replica for the host OS
+```
 
-# Run library tests only
-cargo test --lib
+mise is a convenience, not a requirement — every task is a thin alias over
+`scripts/gate.sh`, which runs directly under bash (Git bash on Windows).
+
+**Git hooks** ([`lefthook.yml`](lefthook.yml), opt-in per clone, CI is the
+backstop): pre-commit = rustfmt check (only when `.rs` staged); commit-msg =
+rejects `Co-Authored-By:` trailers and tool bylines (§6 conventions,
+enforced mechanically); pre-push = the gate. Escape hatch: `--no-verify`.
+
+**Other DevEx surfaces:**
+
+- **Devcontainer** ([`.devcontainer/`](.devcontainer/devcontainer.json)) —
+  full Linux/PipeWire environment for Windows/macOS contributors working
+  the `feat_linux` leg.
+- **Editor**: [`.vscode/settings.json`](.vscode/settings.json) (checked in)
+  enables the off-by-default features for rust-analyzer so `src/compose/`,
+  `src/main.rs`, and gated examples get diagnostics. Non-VS-Code recipe in
+  CONTRIBUTING § Editor setup.
+- **Scripts**: [`scripts/README.md`](scripts/README.md) is the live-list —
+  every script's purpose and caller. Anything not listed was deleted as rot.
+- **Docs**: [`docs/README.md`](docs/README.md) is the index — every doc with
+  a current/historical status.
+- **Local audio testing**: on a machine with real audio, export
+  `RSAC_CI_AUDIO_DETERMINISTIC=1` so capture tests hard-fail on silence
+  instead of warning (all knobs:
+  [`docs/CI_AUDIO_TESTING.md`](docs/CI_AUDIO_TESTING.md) §5).
+
+Plain-cargo equivalents still work if you want no tooling at all:
+
+```bash
+cargo check                          # fast compile check
+cargo test --lib                     # unit tests
+cargo check --features feat_linux    # a specific platform feature
 ```
 
 ### Local testing on physical machines
@@ -311,7 +352,7 @@ All CI runs on [Blacksmith](https://blacksmith.sh/) runners — a drop-in replac
 
 | Workflow | Purpose |
 |---|---|
-| [`ci.yml`](.github/workflows/ci.yml) | Lint, unit tests (3 platforms), MSRV, feature powerset, ARM64 cross-compile |
+| [`ci.yml`](.github/workflows/ci.yml) | Lint, unit tests (3 platforms), MSRV, feature powerset, ARM64 cross-compile, binding runtime smokes (Python import + napi `node --test`). A `changes` gate job skips the whole compile matrix on docs-only PRs (skipped jobs count as passing for required checks); pushes/tags/dispatch always run everything. |
 | [`ci-audio-tests.yml`](.github/workflows/ci-audio-tests.yml) | Audio integration tests (9 platform x tier jobs) |
 
 **Runner labels:**
@@ -361,16 +402,40 @@ recorded as ADRs in [`docs/designs/`](docs/designs/); add a new ADR when you
 make one. If you spot a design doc that contradicts the code, fix the doc (or
 note the divergence in its banner) rather than changing the code to match it.
 
-### Task management
+### Task management — seeds (`sd` CLI)
 
-This project uses [Task Master](https://github.com/task-master-ai/task-master-ai) for task-driven development. See [`.roo/rules/taskmaster.md`](.roo/rules/taskmaster.md) and [`.roo/rules/dev_workflow.md`](.roo/rules/dev_workflow.md) for details.
+The backlog is **git-native**: issues live in [`.seeds/issues.jsonl`](.seeds/)
+and are managed exclusively through the [`sd` CLI](https://github.com/jayminwest/seeds)
+(the full command reference is the tool-managed block in
+[`CLAUDE.md`](CLAUDE.md); run `sd prime` at session start for agent context).
+The working loop:
+
+```bash
+sd ready                          # unblocked work (dependency-aware)
+sd update <id> --status in_progress
+sd close <id> --reason "…"        # close with the evidence (commit SHA, verification)
+sd create --title "…" --type task --priority 2 --labels "…"
+sd dep add <id> <depends-on>      # blockers; epics depend on their child seeds
+sd sync                           # stage+commit .seeds/ before pushing
+```
+
+Conventions this repo layers on top: seed descriptions end with an
+`(effort: … | verify: … | wave: N)` footer plus acceptance criteria; epics
+(e.g. the mobile push: umbrella `rsac-0991` → `rsac-5823`/`rsac-57cb`/`rsac-71d2`)
+carry resume-context in their descriptions and depend on their children, so
+`sd ready` surfaces exactly the unblocked entry points. **Never hand-edit
+`.seeds/issues.jsonl`** — the CLI maintains timestamps/`closedAt`/dependency
+integrity (`sd doctor` catches drift).
 
 ### Git commit conventions
 
 Commit messages **must not** contain a `Co-Authored-By:` trailer or any
 tool-generated byline (e.g. "Generated with Claude Code"). Keep messages plain:
 a concise summary line plus an optional body explaining the *why*. This applies to
-all contributors and AI agents working in this repo.
+all contributors and AI agents working in this repo. With the lefthook hooks
+installed (`mise run setup`), the commit-msg hook
+([`scripts/hooks/commit-msg.sh`](scripts/hooks/commit-msg.sh)) enforces this
+mechanically.
 
 ### Code review dispositions — file an issue for anything not fixed in the PR
 
@@ -431,8 +496,10 @@ Full playbook (when to stack vs parallel PRs, exact commands, pitfalls):
 | Bypass `BridgeStream<S>` for new backends | All backends must use `BridgeStream` + `PlatformStream` trait |
 | Treat `docs/architecture/*_DESIGN.md` as the spec | They are historical design docs; the **code is the source of truth**. Record durable decisions as ADRs in `docs/designs/` |
 | Import from `src/audio/core.rs` | File was deleted in Phase 0 |
-| Add `Co-Authored-By:` trailers or tool bylines to commit messages | This repo requires plain commit messages — no co-author trailers, no "Generated with …" lines (see §6 Git commit conventions) |
+| Add `Co-Authored-By:` trailers or tool bylines to commit messages | This repo requires plain commit messages — no co-author trailers, no "Generated with …" lines (see §6 Git commit conventions; the lefthook commit-msg hook rejects them) |
 | Let a review comment be deferred/rejected with no tracking issue | Every non-fixed review finding must be captured in a GitHub issue before the PR merges, or it silently disappears (see §6 Code review dispositions) |
+| Hand-edit `.seeds/issues.jsonl` | The backlog is CLI-managed — `sd create`/`update`/`close`/`dep` keep timestamps, `closedAt`, and dependency integrity; hand edits trip `sd doctor` (see §6 Task management) |
+| Push without running the gate | `mise run gate` (or `bash scripts/gate.sh`) is the ci.yml lint-job replica — skipping it just moves the failure into CI (see §6 Local DevEx) |
 
 ---
 

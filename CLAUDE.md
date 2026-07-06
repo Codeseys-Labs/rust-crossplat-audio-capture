@@ -25,6 +25,12 @@ in [`AGENTS.md` §6](AGENTS.md) (Code review dispositions).
 
 ## Quick reminders (full detail in AGENTS.md)
 
+- **Local gate:** run `mise run gate` (or `bash scripts/gate.sh`) before pushing —
+  it replicates ci.yml's `lint` job for the host OS. `mise install && mise run setup`
+  once per clone installs the pinned toolchain + lefthook hooks (the commit-msg hook
+  rejects co-author trailers/bylines mechanically).
+- **Backlog:** managed via the `sd` CLI only (see the Seeds section below) —
+  never hand-edit `.seeds/issues.jsonl`.
 - **Module DAG:** `core/ → bridge/ → audio/ → api/ → lib.rs`. No reverse dependencies.
 - **RT-safety:** never allocate, lock, or block on the OS audio callback thread. Use
   `BridgeProducer::push_samples_or_drop()` (alloc-free in steady state via the free-list
@@ -35,3 +41,43 @@ in [`AGENTS.md` §6](AGENTS.md) (Code review dispositions).
 - **Capabilities:** never claim a platform supports a feature it doesn't — gate via
   `PlatformCapabilities`.
 - **Architecture decisions** are recorded as ADRs in [`docs/designs/`](docs/designs/).
+
+<!-- seeds:start -->
+## Issue Tracking (Seeds)
+<!-- seeds-onboard:v0.5.5 -->
+<!-- seeds-onboard-schema:7 -->
+
+This project uses [Seeds](https://github.com/jayminwest/seeds) v0.5.5 for git-native issue tracking.
+
+**At the start of every session**, run:
+```
+sd prime
+```
+
+This injects session context: rules, command reference, and workflows. Pass `--format json|compact|markdown|plain|ids` on any command for agent-friendly output.
+
+**Quick reference:**
+- `sd ready` — Find unblocked work
+- `sd search <query>` — Full-text search across titles + descriptions
+- `sd create --title "..." --type task --priority 2` — Create issue
+- `sd update <id> --status in_progress` — Claim work
+- `sd close <id>` — Complete work
+- `sd dep add <id> <depends-on>` — Add dependency between issues
+- `sd sync` — Sync with git (run before pushing)
+
+### Planning
+Use `sd plan` when work is large or ambiguous enough that an LLM benefits from structured decomposition. Submit spawns one child seed per step; `step.blocks` uses forward semantics (step i with `blocks: [j]` means step i blocks step j, and step j gets step i's id in its `blockedBy`).
+
+- `sd plan templates` — List built-ins (`feature`, `bug`, `refactor`) plus custom templates
+- `sd plan prompt <seed-id>` — Emit a structured prompt the LLM fills in
+- `sd plan submit <seed-id> --plan <file>` — Validate + spawn child seeds
+- `sd plan show <pl-id>` — View sections, children, sub-plans
+- `sd plan edit <id> [--name | --section <name> <text> | --step <i> --title/--priority/--type]` — In-place field edits; bumps revision
+- `sd plan outcome <pl-id> --result success|partial|failure` — Record outcome (storage-only)
+- `sd plan review <pl-id> --by <name>` — Record reviewer (informational)
+
+### Before You Finish
+1. Close completed issues: `sd close <id>`
+2. File issues for remaining work: `sd create --title "..."`
+3. Sync and push: `sd sync && git push`
+<!-- seeds:end -->
