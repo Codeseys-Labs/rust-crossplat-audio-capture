@@ -818,9 +818,9 @@ impl BridgeProducer {
     /// exactly as RT-safe as the untimed variant (ADR-0001 preserved).
     ///
     /// The stamp is the position of this buffer's **first sample** relative to
-    /// stream start, read from [`position_nanos`](Self::position_nanos) before
+    /// stream start, read from `position_nanos` before
     /// the push advances it. The position advances by this call's frames
-    /// (`frames * 1e9 / rate`, saturating — see [`frames_to_nanos`]) **whether
+    /// (`frames * 1e9 / rate`, saturating — see `frames_to_nanos`) **whether
     /// or not the push succeeds**, so a producer-side drop appears to the
     /// consumer as a *gap* between consecutive buffer timestamps
     /// (`t₂ − t₁ > frames₁/rate`) instead of a silently contiguous timeline —

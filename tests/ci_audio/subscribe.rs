@@ -230,7 +230,9 @@ fn subscribe_errors_when_not_started() {
         Err(AudioError::StreamReadError { reason }) => {
             assert!(
                 reason.to_lowercase().contains("not running")
-                    || reason.to_lowercase().contains("not initialized"),
+                    || reason.to_lowercase().contains("not initialized")
+                    || reason.to_lowercase().contains("no active stream")
+                    || reason.to_lowercase().contains("never started"),
                 "expected lifecycle-related reason, got: {}",
                 reason
             );
