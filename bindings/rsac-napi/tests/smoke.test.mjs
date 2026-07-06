@@ -38,9 +38,13 @@ test('CaptureTarget factories + describe round-trip', () => {
   }
 });
 
-test('device enumeration (headless-tolerant)', () => {
+test('device enumeration (headless-tolerant)', async () => {
+  // listDevices() is async (Promise<AudioDevice[]>) — it MUST be awaited here,
+  // otherwise a headless-machine rejection escapes the test as an
+  // unhandledRejection after it ends and fails the whole file (seen on the
+  // first CI run of this suite).
   try {
-    const devices = rsac.listDevices();
+    const devices = await rsac.listDevices();
     assert.ok(Array.isArray(devices));
     console.log(`devices: ${devices.length} enumerated`);
   } catch (err) {
