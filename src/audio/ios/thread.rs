@@ -163,14 +163,20 @@ fn is_default_input_id(id: &str) -> bool {
     id.is_empty() || id.eq_ignore_ascii_case(DEFAULT_INPUT_DEVICE_ID)
 }
 
-/// Validates a [`CaptureTarget`] against the iOS **mic slice** (ADR-0013).
+/// Validates a [`CaptureTarget`] against the iOS **mic path** (ADR-0013).
 ///
 /// | Target | Outcome |
 /// |---|---|
 /// | `Device("default")` (or `""`) | `Ok(())` — the microphone |
 /// | `Device(other)` | [`AudioError::DeviceNotFound`] |
-/// | `SystemDefault` | [`AudioError::PlatformNotSupported`] — **pending** rsac-b3aa (ReplayKit) |
+/// | `SystemDefault` | [`AudioError::PlatformNotSupported`] — served by the **broadcast device** (`super::broadcast`), never by the mic |
 /// | `Application` / `ApplicationByName` / `ProcessTree` | [`AudioError::PlatformNotSupported`] — **permanent** (no iOS API) |
+///
+/// The `SystemDefault` arm exists only for direct `AudioDevice` users: the
+/// builder path never routes `SystemDefault` here (its device resolution
+/// picks [`BroadcastAudioDevice`](super::broadcast::BroadcastAudioDevice)).
+/// Silently serving the microphone instead would be the dishonest fallback
+/// ADR-0013 explicitly rejected.
 ///
 /// The match is intentionally exhaustive (no wildcard): a new
 /// `CaptureTarget` variant must be classified here before the crate
@@ -182,11 +188,13 @@ fn ensure_mic_target(target: &CaptureTarget) -> AudioResult<()> {
             device_id: id.0.clone(),
         }),
         CaptureTarget::SystemDefault => Err(AudioError::PlatformNotSupported {
-            feature: "system-audio capture on iOS: SystemDefault is the ReplayKit \
-                      Broadcast Upload Extension path, which is not wired yet \
-                      (rsac-b3aa). Supported today: the microphone via \
-                      CaptureTarget::Device(DeviceId(\"default\".into())). \
-                      Per-application capture does not exist on iOS, permanently"
+            feature: "system-audio capture through the iOS microphone device: \
+                      SystemDefault is served by the ReplayKit broadcast device \
+                      (build with CaptureTarget::SystemDefault and an App Group \
+                      via AudioCaptureBuilder::with_ios_app_group), not by this \
+                      mic device. Serving the mic instead would deliver \
+                      different audio than requested (ADR-0013). The microphone \
+                      is CaptureTarget::Device(DeviceId(\"default\".into()))"
                 .to_string(),
             platform: "ios".to_string(),
         }),
@@ -197,9 +205,9 @@ fn ensure_mic_target(target: &CaptureTarget) -> AudioResult<()> {
                       provides no API for capturing another app's audio — this \
                       is permanent, not a pending feature (ADR-0013). Supported \
                       today: the microphone via \
-                      CaptureTarget::Device(DeviceId(\"default\".into())); \
-                      system audio arrives with the ReplayKit broadcast path \
-                      (rsac-b3aa)"
+                      CaptureTarget::Device(DeviceId(\"default\".into())) and \
+                      the system mix via CaptureTarget::SystemDefault (ReplayKit \
+                      broadcast)"
                 .to_string(),
             platform: "ios".to_string(),
         }),
@@ -294,14 +302,19 @@ mod tests {
     }
 
     #[test]
-    fn system_default_is_pending_not_permanent() {
+    fn system_default_is_redirected_to_the_broadcast_device() {
+        // The mic device must not silently serve SystemDefault (the dishonest
+        // fallback ADR-0013 rejected) — it points at the broadcast path.
         let err = ensure_mic_target(&CaptureTarget::SystemDefault).unwrap_err();
         assert_eq!(err.kind(), ErrorKind::Platform);
         match err {
             AudioError::PlatformNotSupported { feature, platform } => {
                 assert_eq!(platform, "ios");
-                assert!(feature.contains("rsac-b3aa"), "pending seed: {feature}");
                 assert!(feature.contains("ReplayKit"), "the real path: {feature}");
+                assert!(
+                    feature.contains("with_ios_app_group"),
+                    "consent guidance: {feature}"
+                );
                 assert!(
                     feature.contains("Device(DeviceId(\"default\""),
                     "mic guidance: {feature}"

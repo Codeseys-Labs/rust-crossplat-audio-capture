@@ -1,36 +1,42 @@
-//! iOS audio capture backend — AVAudioEngine **microphone slice** (rsac-9e02).
+//! iOS audio capture backend — AVAudioEngine microphone (rsac-9e02) +
+//! ReplayKit broadcast system capture (rsac-b3aa).
 //!
 //! # Current scope (honest status)
 //!
-//! This backend captures the **session's current audio input** (microphone,
-//! or whatever input route `AVAudioSession` has active — wired headset, BT,
-//! USB) via an `AVAudioEngine` input-node tap. That is the *entire* shipped
-//! surface today:
+//! Two capture paths ship today:
 //!
 //! | `CaptureTarget` | iOS behaviour |
 //! |---|---|
 //! | `Device(DeviceId("default"))` | ✅ mic capture via AVAudioEngine input tap |
-//! | `SystemDefault` | ❌ pending — the ReplayKit Broadcast Upload Extension path (rsac-b3aa) |
+//! | `SystemDefault` | ✅ system mix via the ReplayKit Broadcast Upload Extension transport ([`broadcast`]) — **user-initiated**, requires an App Group + the embedded `RsacBroadcastKit` extension |
 //! | `Application` / `ApplicationByName` / `ProcessTree` | ❌ **permanently unsupported** — Apple provides no API for capturing another app's audio (ADR-0013; never soften this) |
 //!
 //! [`PlatformCapabilities::query`](crate::core::capabilities::PlatformCapabilities::query)
-//! reports exactly this (`backend_name = "AVAudioEngine"`, all per-app flags
-//! `false`).
+//! reports exactly this (`backend_name = "AVAudioEngine"`, per-app flags
+//! `false`, `requires_user_consent = true` — the App Group id is the
+//! config-time consent artifact for `SystemDefault`).
 //!
 //! # Host-app responsibilities (NOT this library's job)
 //!
 //! rsac deliberately does **not** touch the shared `AVAudioSession` — session
 //! configuration is app-global policy that only the host application can own.
-//! Before building a capture, the host app must:
+//! For **mic capture**, before building a capture the host app must:
 //!
 //! 1. declare `NSMicrophoneUsageDescription` in its `Info.plist`,
 //! 2. obtain the microphone permission (the first mic access prompts), and
 //! 3. configure + activate an `AVAudioSession` with a record-capable category
 //!    (`.record` or `.playAndRecord`).
 //!
+//! For **system capture** (`SystemDefault`), the app must embed a Broadcast
+//! Upload Extension built on `RsacBroadcastKit`, share an App Group with it,
+//! pass the App Group id via
+//! [`AudioCaptureBuilder::with_ios_app_group`](crate::api::AudioCaptureBuilder::with_ios_app_group),
+//! and the **user** must start the broadcast (there is no programmatic
+//! start). See the [`broadcast`] module docs and `mobile/ios/README.md`.
+//!
 //! The Swift helpers shipped in `mobile/ios/` (ADR-0012's SwiftPM package)
-//! wrap this consent/session flow. If the session has no active input route,
-//! stream creation fails with an actionable
+//! wrap these consent/session flows. If the session has no active input
+//! route, mic stream creation fails with an actionable
 //! [`AudioError::StreamCreationFailed`](crate::core::error::AudioError::StreamCreationFailed)
 //! rather than delivering silence.
 //!
@@ -44,6 +50,12 @@
 //! AVAudioNodeTapBlock                        BridgeStream<IosPlatformStream>
 //!   → interleave into scratch                  ::read_chunk()
 //!   → BridgeProducer::push_samples_…
+//!
+//! Broadcast drain thread (non-RT)            Consumer thread
+//! ───────────────────────────────            ───────────────
+//! App-Group mmap ring (extension = producer) BridgeStream<BroadcastPlatformStream>
+//!   → copy frames into scratch                 ::read_chunk()
+//!   → BridgeProducer::push_samples_…
 //! ```
 //!
 //! - `avaudio` owns the ObjC interop: engine/tap setup and the tap block
@@ -55,8 +67,12 @@
 //!   impl) whose stop path removes the tap, stops the engine, and drives the
 //!   bridge to its graceful ending state (producer terminal signal,
 //!   ADR-0010).
+//! - [`broadcast`] provides the host-side consumer of the canonical
+//!   cross-process mmap ring (`mobile/ios/…/RingLayout.swift`) plus
+//!   `BroadcastPlatformStream` and [`BroadcastAudioDevice`].
 
 pub(crate) mod avaudio;
+pub(crate) mod broadcast;
 pub(crate) mod thread;
 
 use std::sync::Arc;
@@ -67,6 +83,8 @@ use crate::bridge::{calculate_capacity, create_bridge, BridgeStream};
 use crate::core::config::{AudioFormat, DeviceId, SampleFormat, StreamConfig};
 use crate::core::error::{AudioError, AudioResult};
 use crate::core::interface::{AudioDevice, CapturingStream, DeviceEnumerator, DeviceKind};
+
+pub use broadcast::BroadcastAudioDevice;
 
 /// The [`DeviceId`] string of the single logical iOS input device.
 ///
@@ -82,13 +100,18 @@ pub(crate) const DEFAULT_INPUT_DEVICE_ID: &str = "default";
 
 // ── IosDeviceEnumerator ──────────────────────────────────────────────────
 
-/// [`DeviceEnumerator`] for iOS (AVAudioEngine backend, mic slice).
+/// [`DeviceEnumerator`] for iOS (AVAudioEngine mic + ReplayKit broadcast).
 ///
-/// Enumeration on iOS is intentionally minimal: the OS routes audio input at
-/// the `AVAudioSession` level, so there is exactly **one logical input
-/// device** — `"default"` — representing the session's current input route.
-/// See [`DeviceEnumerator::default_device`] for why the *default device*
-/// (rsac's loopback-oriented notion) is an error on iOS today.
+/// Enumeration on iOS is intentionally minimal — two logical devices:
+///
+/// - `"default"` ([`IosAudioDevice`]): the session's current audio **input**
+///   (mic/headset/BT/USB — the OS routes input at the `AVAudioSession`
+///   level; per-route enumeration is host-app session state and is
+///   deliberately not duplicated here).
+/// - `"replaykit-broadcast"` ([`BroadcastAudioDevice`]): the system-audio
+///   capture endpoint backed by the ReplayKit broadcast transport
+///   (rsac-b3aa). Not a hardware device — listed so device-driven consumers
+///   can discover and select the system-capture path explicitly.
 #[derive(Debug, Clone, Copy)]
 pub struct IosDeviceEnumerator;
 
@@ -110,46 +133,33 @@ impl Default for IosDeviceEnumerator {
 }
 
 impl DeviceEnumerator for IosDeviceEnumerator {
-    /// Lists the single logical iOS audio input device.
+    /// Lists the two logical iOS audio devices: the default input (mic) and
+    /// the ReplayKit broadcast system-capture endpoint.
     ///
-    /// Returns exactly one device — `DeviceId("default")`, the session's
-    /// current audio input. Per-route enumeration
-    /// (`AVAudioSession.availableInputs`) is session state owned by the host
-    /// app and is deliberately not duplicated here.
+    /// Each is the default **of its kind**: the mic is the default
+    /// [`DeviceKind::Input`], the broadcast device the default (and only)
+    /// [`DeviceKind::Output`]-loopback endpoint.
     fn enumerate_devices(&self) -> AudioResult<Vec<Box<dyn AudioDevice>>> {
-        Ok(vec![Box::new(IosAudioDevice::new())])
+        Ok(vec![
+            Box::new(IosAudioDevice::new()),
+            Box::new(BroadcastAudioDevice::new()),
+        ])
     }
 
-    /// The rsac *default device* is not available on iOS yet — errors with
-    /// guidance.
+    /// Returns the ReplayKit broadcast device — rsac's *default device* on
+    /// iOS.
     ///
-    /// On desktop backends `default_device()` returns the default **output**
-    /// endpoint because rsac's headline capability there is system-audio
-    /// loopback. On iOS, system audio (`CaptureTarget::SystemDefault`) is the
-    /// ReplayKit Broadcast Upload Extension path, which is **not wired yet**
-    /// (rsac-b3aa). Pretending the microphone is "the default device" would
-    /// silently deliver different audio than the desktop contract promises
-    /// (the dishonest-fallback option ADR-0013 explicitly rejected), so this
-    /// returns [`AudioError::PlatformNotSupported`] with the honest state:
-    ///
-    /// - **Supported now:** microphone capture via
-    ///   `CaptureTarget::Device(DeviceId("default".into()))`.
-    /// - **Pending:** system audio via the ReplayKit broadcast path
-    ///   (rsac-b3aa).
-    /// - **Permanent:** per-app / process-tree capture does not exist on iOS
-    ///   — Apple provides no API.
+    /// On every desktop backend `default_device()` returns the default
+    /// **output** endpoint because rsac's headline capability is system-audio
+    /// loopback; the iOS equivalent of that endpoint is the broadcast
+    /// transport (rsac-b3aa), so `CaptureTarget::SystemDefault` resolves
+    /// here. Creating a stream from it has real preconditions — an App Group
+    /// id on the builder, an embedded `RsacBroadcastKit` extension, and a
+    /// user-started broadcast — surfaced as actionable errors at
+    /// `create_stream` time (see [`BroadcastAudioDevice`]). For the
+    /// microphone, use `CaptureTarget::Device(DeviceId("default".into()))`.
     fn default_device(&self) -> AudioResult<Box<dyn AudioDevice>> {
-        Err(AudioError::PlatformNotSupported {
-            feature: "default-device (system audio loopback) capture on iOS: \
-                      SystemDefault is the ReplayKit Broadcast Upload Extension \
-                      path, which is not wired yet (rsac-b3aa). Use \
-                      CaptureTarget::Device(DeviceId(\"default\".into())) to \
-                      capture the microphone (the session's current audio \
-                      input). Per-application capture does not exist on iOS, \
-                      permanently — Apple provides no API for it"
-                .to_string(),
-            platform: "ios".to_string(),
-        })
+        Ok(Box::new(BroadcastAudioDevice::new()))
     }
 
     // watch(): inherits the trait default (PlatformNotSupported) — consistent
@@ -240,9 +250,9 @@ impl AudioDevice for IosAudioDevice {
     ///
     /// # Errors
     ///
-    /// - [`AudioError::PlatformNotSupported`] for `SystemDefault`
-    ///   (ReplayKit path pending, rsac-b3aa) and for `Application*` /
-    ///   `ProcessTree` (permanently impossible on iOS).
+    /// - [`AudioError::PlatformNotSupported`] for `SystemDefault` (served by
+    ///   [`BroadcastAudioDevice`], not this mic device) and for
+    ///   `Application*` / `ProcessTree` (permanently impossible on iOS).
     /// - [`AudioError::DeviceNotFound`] for a `Device` id other than
     ///   `"default"`.
     /// - [`AudioError::StreamCreationFailed`] when the engine cannot start
@@ -296,43 +306,45 @@ impl AudioDevice for IosAudioDevice {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::core::error::ErrorKind;
 
     #[test]
-    fn enumerate_devices_returns_single_default_input() {
+    fn enumerate_devices_lists_mic_and_broadcast() {
         let enumerator = IosDeviceEnumerator::new();
         let devices = enumerator
             .enumerate_devices()
             .expect("enumeration is infallible metadata");
-        assert_eq!(devices.len(), 1, "exactly one logical iOS input device");
+        assert_eq!(devices.len(), 2, "mic + broadcast endpoint");
 
-        let device = &devices[0];
-        assert_eq!(device.id(), DeviceId(DEFAULT_INPUT_DEVICE_ID.to_string()));
-        assert_eq!(device.name(), "Default audio input (AVAudioEngine)");
-        assert!(device.is_default());
-        assert_eq!(device.kind().unwrap(), DeviceKind::Input);
+        let mic = &devices[0];
+        assert_eq!(mic.id(), DeviceId(DEFAULT_INPUT_DEVICE_ID.to_string()));
+        assert_eq!(mic.name(), "Default audio input (AVAudioEngine)");
+        assert!(mic.is_default(), "mic stays the default Input device");
+        assert_eq!(mic.kind().unwrap(), DeviceKind::Input);
+
+        let broadcast = &devices[1];
+        assert_eq!(
+            broadcast.id(),
+            DeviceId(broadcast::BROADCAST_DEVICE_ID.to_string())
+        );
+        assert_eq!(broadcast.kind().unwrap(), DeviceKind::Output);
+        assert!(broadcast.is_default(), "default of its (Output) kind");
     }
 
     #[test]
-    fn default_device_is_honest_platform_not_supported() {
+    fn default_device_is_the_broadcast_endpoint() {
+        // rsac-b3aa: SystemDefault resolves to the ReplayKit broadcast device
+        // (the desktop convention — default_device() is the system-loopback
+        // endpoint), no longer an error.
         let enumerator = IosDeviceEnumerator::new();
-        let err = match enumerator.default_device() {
-            Ok(_) => panic!("default_device must error until rsac-b3aa"),
-            Err(err) => err,
-        };
-        assert_eq!(err.kind(), ErrorKind::Platform);
-        match err {
-            AudioError::PlatformNotSupported { feature, platform } => {
-                assert_eq!(platform, "ios");
-                // The three honesty pillars: what works, what's pending, what
-                // is permanent.
-                assert!(feature.contains("default"), "mic guidance: {feature}");
-                assert!(feature.contains("rsac-b3aa"), "pending seed: {feature}");
-                assert!(feature.contains("permanently"), "permanence: {feature}");
-                assert!(feature.contains("ReplayKit"), "system path: {feature}");
-            }
-            other => panic!("expected PlatformNotSupported, got {other:?}"),
-        }
+        let device = enumerator
+            .default_device()
+            .expect("default device is metadata-only until create_stream");
+        assert_eq!(
+            device.id(),
+            DeviceId(broadcast::BROADCAST_DEVICE_ID.to_string())
+        );
+        assert_eq!(device.kind().unwrap(), DeviceKind::Output);
+        assert!(device.name().contains("ReplayKit"), "{}", device.name());
     }
 
     #[test]

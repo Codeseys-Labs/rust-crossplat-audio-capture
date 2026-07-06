@@ -207,6 +207,9 @@ objc2 = "0.6"
 objc2-foundation = { version = "0.3", features = [
     "NSString", "NSArray", "NSValue",
     "NSAutoreleasePool", "NSObject", "NSError",
+    # ReplayKit broadcast ring consumer (rsac-b3aa): App Group container
+    # resolution via -[NSFileManager containerURLForSecurityApplicationGroupIdentifier:].
+    "NSFileManager", "NSURL",
 ] }
 block2 = "0.6"   # ObjC blocks for the AVAudioEngine input-node tap callback
 # Typed AVFAudio bindings (same objc2 0.6 generation as the macOS block's

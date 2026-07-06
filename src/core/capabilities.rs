@@ -94,8 +94,10 @@ pub struct PlatformCapabilities {
     /// before any OS resource is touched.
     ///
     /// `false` on all desktop backends (WASAPI / PipeWire / CoreAudio) and on
-    /// the `unsupported` stub; designed to be `true` for the planned mobile
-    /// backends (ADR-0013, `docs/MOBILE_BACKEND_DESIGN.md`).
+    /// the `unsupported` stub. `true` on iOS, where the App Group identifier
+    /// for the ReplayKit broadcast path is the consent artifact (rsac-b3aa);
+    /// Android flips to `true` when its playback-capture tiers land
+    /// (rsac-77f1). ADR-0013, `docs/MOBILE_BACKEND_DESIGN.md`.
     pub requires_user_consent: bool,
     /// Supported sample formats.
     pub supported_sample_formats: Vec<SampleFormat>,
@@ -308,27 +310,37 @@ impl PlatformCapabilities {
         }
     }
 
-    /// iOS capabilities — **microphone slice only** (rsac-9e02).
+    /// iOS capabilities — microphone (rsac-9e02) + ReplayKit broadcast system
+    /// capture (rsac-b3aa).
     ///
-    /// Honest current state: the compiled backend captures the session's
-    /// audio input via `AVAudioEngine` (`CaptureTarget::Device`).
-    /// `SystemDefault` (ReplayKit broadcast-extension path, rsac-b3aa) is not
-    /// wired yet; `Application*` / `ProcessTree` are **permanently** `false`
+    /// Honest current state: `CaptureTarget::Device` captures the session's
+    /// audio input via `AVAudioEngine`; `CaptureTarget::SystemDefault` is
+    /// served by the ReplayKit Broadcast Upload Extension transport — hence
+    /// `supports_system_capture: true` **with** `requires_user_consent: true`:
+    /// capture is user-initiated (broadcast picker) and the configuration
+    /// must carry the App Group identifier
+    /// (`AudioCaptureBuilder::with_ios_app_group`, the config-time consent
+    /// artifact per ADR-0013; the app must also embed the RsacBroadcastKit
+    /// extension). `Application*` / `ProcessTree` are **permanently** `false`
     /// on iOS — Apple provides no API for capturing another app's audio
-    /// (ADR-0013; never soften this). `requires_user_consent` stays `false`
-    /// for the mic slice (`NSMicrophoneUsageDescription` is an axis-2 runtime
-    /// permission) and flips to `true` when the ReplayKit path lands.
+    /// (ADR-0013; never soften this). The mic path itself needs only the
+    /// `NSMicrophoneUsageDescription` *runtime* permission (axis-2), not the
+    /// consent artifact.
     #[cfg(all(target_os = "ios", feature = "feat_ios"))]
     fn ios() -> Self {
         Self {
-            supports_system_capture: false,       // rsac-b3aa (ReplayKit path)
-            supports_application_capture: false,  // permanent: no iOS API
+            // ReplayKit broadcast transport (rsac-b3aa): user-initiated,
+            // App Group + embedded RsacBroadcastKit extension required.
+            supports_system_capture: true,
+            supports_application_capture: false, // permanent: no iOS API
             supports_process_tree_capture: false, // permanent: no iOS API
             // Input routing on iOS is session-driven (AVAudioSession routes),
             // not free device selection.
             supports_device_selection: false,
             supports_device_change_notifications: false,
-            requires_user_consent: false, // flips with the ReplayKit path (rsac-b3aa)
+            // The App Group id is the config-time consent artifact for
+            // SystemDefault (ADR-0013); Device (mic) targets never need it.
+            requires_user_consent: true,
             supported_sample_formats: vec![SampleFormat::F32],
             sample_rate_range: (8000, 96000),
             max_channels: 2,
@@ -617,8 +629,15 @@ mod tests {
     // ── Consent requirement (rsac-82d4) ─────────────────────────────
 
     /// Every desktop backend — and the unsupported stub — must report that no
-    /// config-time consent artifact is required. Mobile backends (ADR-0013)
-    /// will be the first to flip this to `true`.
+    /// config-time consent artifact is required.
+    ///
+    /// Gated off the mobile OSes: iOS honestly reports
+    /// `requires_user_consent: true` (rsac-b3aa — the App Group id is the
+    /// consent artifact for the ReplayKit broadcast path), and Android will
+    /// when its playback tiers land (rsac-77f1). Mobile consent-reporting is
+    /// covered by the per-OS capability tests below; asserting `false` here
+    /// on those targets would make the test lie.
+    #[cfg(not(any(target_os = "android", target_os = "ios")))]
     #[test]
     fn desktop_and_stub_require_no_user_consent() {
         let caps = PlatformCapabilities::query();
@@ -644,17 +663,24 @@ mod tests {
         assert!(caps.supports_sample_rate(48000));
     }
 
-    /// rsac-9e02: the iOS mic slice must report its honest partial state.
-    /// `Application*`/`ProcessTree` are PERMANENTLY false on iOS (ADR-0013).
+    /// rsac-9e02 / rsac-b3aa: iOS must report its honest state — system
+    /// capture available (ReplayKit broadcast) **with** the consent
+    /// requirement, `Application*`/`ProcessTree` PERMANENTLY false (ADR-0013).
     #[cfg(all(target_os = "ios", feature = "feat_ios"))]
     #[test]
-    fn ios_mic_slice_reports_honest_partial_capabilities() {
+    fn ios_reports_broadcast_system_capture_with_consent() {
         let caps = PlatformCapabilities::query();
         assert_eq!(caps.backend_name, "AVAudioEngine");
-        assert!(!caps.supports_system_capture);
-        assert!(!caps.supports_application_capture);
-        assert!(!caps.supports_process_tree_capture);
-        assert!(!caps.requires_user_consent);
+        assert!(
+            caps.supports_system_capture,
+            "SystemDefault is served by the ReplayKit broadcast path (rsac-b3aa)"
+        );
+        assert!(
+            caps.requires_user_consent,
+            "the App Group id is the config-time consent artifact (ADR-0013)"
+        );
+        assert!(!caps.supports_application_capture, "permanent: no iOS API");
+        assert!(!caps.supports_process_tree_capture, "permanent: no iOS API");
         assert!(caps.supports_format(SampleFormat::F32));
         assert!(caps.supports_sample_rate(48000));
     }

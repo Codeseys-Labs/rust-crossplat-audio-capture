@@ -178,6 +178,30 @@ impl AudioCaptureBuilder {
         self
     }
 
+    /// Supplies the App Group identifier for iOS system-audio capture
+    /// *(iOS targets only)*.
+    ///
+    /// iOS serves [`CaptureTarget::SystemDefault`] through a ReplayKit
+    /// Broadcast Upload Extension writing into a ring in the **shared App
+    /// Group container** (ADR-0013, rsac-b3aa); the App Group id (e.g.
+    /// `"group.com.example.myapp.rsac"`) is the config-time consent artifact
+    /// this backend needs to find that container — see
+    /// [`StreamConfig::ios_app_group`](crate::core::config::StreamConfig::ios_app_group).
+    /// Pass it **before** [`build`](Self::build): `SystemDefault` builds
+    /// without one fail the preflight with
+    /// [`UserConsentRequired`](crate::core::error::AudioError::UserConsentRequired).
+    ///
+    /// Microphone ([`CaptureTarget::Device`]) targets never need an App
+    /// Group, and supplying one is harmless (it is simply unused). The value
+    /// is stored on the builder's [`StreamConfig`], so a later
+    /// [`with_config`](Self::with_config) replaces it along with everything
+    /// else.
+    #[cfg(target_os = "ios")]
+    pub fn with_ios_app_group(mut self, group: impl Into<String>) -> Self {
+        self.config.ios_app_group = Some(group.into());
+        self
+    }
+
     // ── Read-only accessors ──────────────────────────────────────────
 
     /// Returns the capture target configured so far.
@@ -385,6 +409,39 @@ impl AudioCaptureBuilder {
                     missing: "MediaProjection token — obtain one via the rsac Android \
                               consent helper and pass it to \
                               AudioCaptureBuilder::with_android_projection()"
+                        .to_string(),
+                });
+            }
+        }
+
+        // ── Consent preflight (iOS, ADR-0013 / rsac-b3aa) ────────────
+        // Mirror of the Android block above: it fires only when the platform
+        // *claims* the requested capture tier AND reports
+        // `requires_user_consent` AND no App Group was supplied. The
+        // capability checks above dominate (the per-app arms below are
+        // unreachable on iOS today, where those tiers are permanently
+        // unsupported), so a build with no compiled-in backend still reports
+        // PlatformNotSupported — never a misleading consent error.
+        #[cfg(target_os = "ios")]
+        {
+            let target_needs_consent = match &self.target {
+                CaptureTarget::SystemDefault => caps.supports_system_capture,
+                CaptureTarget::Application(_) | CaptureTarget::ApplicationByName(_) => {
+                    caps.supports_application_capture
+                }
+                CaptureTarget::ProcessTree(_) => caps.supports_process_tree_capture,
+                // Microphone capture never needs the App Group artifact.
+                CaptureTarget::Device(_) => false,
+            };
+            if caps.requires_user_consent
+                && target_needs_consent
+                && self.config.ios_app_group.is_none()
+            {
+                return Err(AudioError::UserConsentRequired {
+                    feature: "iOS broadcast capture".to_string(),
+                    missing: "App Group identifier — call \
+                              AudioCaptureBuilder::with_ios_app_group(\"group.…\") and \
+                              embed the RsacBroadcastKit extension"
                         .to_string(),
                 });
             }
@@ -2607,6 +2664,8 @@ mod tests {
             sample_format: SampleFormat::I16,
             buffer_size: Some(1024),
             capture_target: CaptureTarget::SystemDefault,
+            #[cfg(target_os = "ios")]
+            ios_app_group: None,
         };
         let builder = AudioCaptureBuilder::new().with_config(config.clone());
         assert_eq!(builder.config, config);
@@ -2789,6 +2848,8 @@ mod tests {
             sample_format: SampleFormat::I32,
             buffer_size: Some(2048),
             capture_target: CaptureTarget::SystemDefault,
+            #[cfg(target_os = "ios")]
+            ios_app_group: None,
         };
         let builder = AudioCaptureBuilder::new()
             .sample_rate(44100) // This should be overridden

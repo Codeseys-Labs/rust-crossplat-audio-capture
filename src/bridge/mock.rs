@@ -288,6 +288,8 @@ pub fn create_mock_stream(
         sample_format: SampleFormat::F32,
         buffer_size: None,
         capture_target: crate::core::config::CaptureTarget::SystemDefault,
+        #[cfg(target_os = "ios")]
+        ios_app_group: None,
     };
     device.create_stream(&config)
 }
