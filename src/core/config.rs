@@ -14,6 +14,24 @@
 // ── ID Newtypes ──────────────────────────────────────────────────────────
 
 /// Opaque identifier for an audio device.
+///
+/// The string is a **platform-specific device identifier**, interpreted by the
+/// backend when a [`CaptureTarget::Device`] is resolved:
+///
+/// - **Windows (WASAPI):** the endpoint ID string (as returned by
+///   [`AudioDevice::id`](crate::core::interface::AudioDevice::id)); an empty
+///   string or `"default"` (case-insensitive) selects the default render
+///   endpoint for loopback capture.
+/// - **Linux (PipeWire):** the node `id` **or** `object.serial` string of an
+///   `Audio/Sink` or `Audio/Source` node.
+/// - **macOS (CoreAudio):** the numeric `AudioDeviceID` rendered as a decimal
+///   string (**not** a device UID). The device must expose input streams.
+///
+/// Always obtain a `DeviceId` from
+/// [`DeviceEnumerator::enumerate_devices`](crate::core::interface::DeviceEnumerator::enumerate_devices)
+/// / [`AudioDevice::id`](crate::core::interface::AudioDevice::id) rather than
+/// hand-constructing one, since the encoding differs per platform. An
+/// unresolvable id yields [`AudioError::DeviceNotFound`](crate::core::error::AudioError::DeviceNotFound).
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct DeviceId(pub String);
 
@@ -23,7 +41,24 @@ impl std::fmt::Display for DeviceId {
     }
 }
 
-/// Opaque identifier for an application (audio session).
+/// Opaque identifier for an application to capture.
+///
+/// **The string is a numeric OS process id (PID), in decimal, on every
+/// platform** — it is *not* an audio-session GUID, a bundle id, or an
+/// application name. When a [`CaptureTarget::Application`] is resolved the
+/// backend parses `ApplicationId.0` as a `u32` PID:
+///
+/// - **Windows (WASAPI):** process-loopback capture of that single PID
+///   (`include_tree = false`).
+/// - **Linux (PipeWire):** the first `Stream/Output/Audio` node whose
+///   `application.process.id` equals the PID.
+/// - **macOS (CoreAudio):** a Process Tap on that single PID.
+///
+/// A non-numeric string, or a PID with no matching audio, yields
+/// [`AudioError::ApplicationNotFound`](crate::core::error::AudioError::ApplicationNotFound).
+/// To target an application by its human-readable name instead, use
+/// [`CaptureTarget::ApplicationByName`]; to include child processes, use
+/// [`CaptureTarget::ProcessTree`].
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct ApplicationId(pub String);
 
@@ -43,6 +78,49 @@ impl std::fmt::Display for ProcessId {
     }
 }
 
+/// Opaque handle to an Android `MediaProjection` user-consent grant
+/// *(Android targets only)*.
+///
+/// Playback capture on Android (API 29+) is gated behind a user-consent
+/// dialog that yields a `MediaProjection`. The platform glue (the rsac
+/// Android consent helper — see `docs/MOBILE_BACKEND_DESIGN.md`) wraps that
+/// projection in a JNI `GlobalRef` and hands the pointer-sized handle across
+/// as an opaque `i64`. Rust never interprets the value; it is carried to the
+/// (future) Android backend, which resolves it back through JNI.
+///
+/// Supply it to the builder via
+/// [`AudioCaptureBuilder::with_android_projection`](crate::api::AudioCaptureBuilder::with_android_projection);
+/// playback-capture targets without one fail the `build()` preflight with
+/// [`UserConsentRequired`](crate::core::error::AudioError::UserConsentRequired)
+/// once a backend advertises the capability (ADR-0013). Microphone
+/// ([`CaptureTarget::Device`]) targets never need a token.
+///
+/// One token corresponds to one projection session: the backend releases the
+/// underlying `GlobalRef` (and stops the `MediaProjection`) when the owning
+/// capture is dropped. A stale or hand-rolled value is not undefined behavior
+/// at this layer — it surfaces as a backend error when the projection is
+/// first used.
+#[cfg(target_os = "android")]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct AndroidProjectionToken(i64);
+
+#[cfg(target_os = "android")]
+impl AndroidProjectionToken {
+    /// Wraps a raw consent-token handle produced by the rsac Android consent
+    /// helper (`RsacProjection.request(activity)`).
+    ///
+    /// The value is opaque to Rust; correctness is the producer's contract.
+    pub fn from_raw(raw: i64) -> Self {
+        Self(raw)
+    }
+
+    /// Returns the raw opaque handle (for the backend's JNI layer and the C
+    /// FFI, which carry it as `int64_t`).
+    pub fn as_raw(&self) -> i64 {
+        self.0
+    }
+}
+
 // ── CaptureTarget ────────────────────────────────────────────────────────
 
 /// Unified capture target model covering all capture modes.
@@ -50,6 +128,20 @@ impl std::fmt::Display for ProcessId {
 /// This enum specifies *what* audio should be captured. It replaces the old
 /// combination of `DeviceSelector` + PID/session fields with a single,
 /// explicit discriminated union.
+///
+/// # Target semantics (per platform)
+///
+/// The variants below document the *intended contract*; the exact resolution
+/// mechanism differs per backend but the observable behavior is kept aligned.
+/// A target that cannot be resolved fails at
+/// [`build`](crate::api::AudioCaptureBuilder::build) time (or `start`) with a
+/// specific [`AudioError`](crate::core::error::AudioError) rather than silently
+/// capturing nothing — see each variant. Whether a variant is usable at all on
+/// the current platform is reported by
+/// [`PlatformCapabilities`](crate::core::capabilities::PlatformCapabilities);
+/// **capability** (does the platform support this *kind* of target) is distinct
+/// from **readiness** (does *this specific* device/app/pid resolve right now) —
+/// see the `PlatformCapabilities` docs.
 ///
 /// # Stability
 ///
@@ -62,15 +154,71 @@ impl std::fmt::Display for ProcessId {
 #[non_exhaustive]
 pub enum CaptureTarget {
     /// Capture from the system default audio device / mix.
+    ///
+    /// Captures the default output endpoint via loopback (WASAPI loopback,
+    /// PipeWire default sink monitor, CoreAudio system tap). Supported on all
+    /// three platforms; the one target that never requires per-app/PID
+    /// resolution.
     #[default]
     SystemDefault,
     /// Capture from a specific device identified by [`DeviceId`].
+    ///
+    /// The [`DeviceId`] encoding is platform-specific (see [`DeviceId`]).
+    /// Targeting an output-only device for capture may yield no data on some
+    /// platforms unless loopback applies — prefer [`SystemDefault`](Self::SystemDefault)
+    /// for output loopback. Unresolvable id →
+    /// [`AudioError::DeviceNotFound`](crate::core::error::AudioError::DeviceNotFound)
+    /// (macOS additionally rejects an output-only device with
+    /// [`PlatformNotSupported`](crate::core::error::AudioError::PlatformNotSupported)).
     Device(DeviceId),
-    /// Capture audio from a specific application session identified by [`ApplicationId`].
+    /// Capture audio from a **single application**, identified by its PID carried
+    /// in the [`ApplicationId`] string (see [`ApplicationId`] — the string is a
+    /// decimal PID on every platform, not a name or session id).
+    ///
+    /// This captures **only that one process's** audio, **not** its child
+    /// processes — use [`ProcessTree`](Self::ProcessTree) for the subtree. A
+    /// non-numeric id, or a PID producing no audio, →
+    /// [`AudioError::ApplicationNotFound`](crate::core::error::AudioError::ApplicationNotFound)
+    /// (Windows may report
+    /// [`ApplicationCaptureFailed`](crate::core::error::AudioError::ApplicationCaptureFailed)
+    /// if the loopback client cannot be created). Requires
+    /// `supports_application_capture`.
     Application(ApplicationId),
-    /// Capture audio from the first application whose name matches the given string.
+    /// Capture audio from the **first** application whose name matches the given
+    /// string.
+    ///
+    /// Matching is **exact and case-insensitive** (not substring) on every
+    /// platform; when multiple applications match, the **first** one found wins
+    /// (enumeration order is unspecified — do not rely on which of several
+    /// identically-named processes is chosen). The matched field differs per
+    /// platform:
+    ///
+    /// - **Windows (WASAPI):** the OS process name (with flexible `.exe`
+    ///   handling — `"vlc"`, `"vlc.exe"` both match `vlc.exe`).
+    /// - **Linux (PipeWire):** `application.name` **or** `application.process.binary`.
+    /// - **macOS (CoreAudio):** `NSRunningApplication.localizedName`
+    ///   (e.g. `"Safari"`, `"Music"`).
+    ///
+    /// Resolves to a PID and then behaves like [`Application`](Self::Application)
+    /// (single process). No match →
+    /// [`AudioError::ApplicationNotFound`](crate::core::error::AudioError::ApplicationNotFound).
+    /// Requires `supports_application_capture`.
     ApplicationByName(String),
-    /// Capture audio from a process and its child processes, identified by [`ProcessId`].
+    /// Capture audio from a process **and its descendant processes**, identified
+    /// by [`ProcessId`].
+    ///
+    /// Descendant coverage differs per platform (a documented divergence):
+    ///
+    /// - **Windows (WASAPI):** the OS's full-tree loopback flag
+    ///   (`PROCESS_LOOPBACK_MODE_INCLUDE_TARGET_PROCESS_TREE`) — all descendants.
+    /// - **Linux (PipeWire):** a recursive `/proc` walk collects the full
+    ///   descendant set (all levels).
+    /// - **macOS (CoreAudio):** the parent **plus its direct children only**
+    ///   (one level) — deeper descendants are **not** currently included.
+    ///
+    /// No matching audio node/session →
+    /// [`AudioError::ApplicationNotFound`](crate::core::error::AudioError::ApplicationNotFound).
+    /// Requires `supports_process_tree_capture`.
     ProcessTree(ProcessId),
 }
 
@@ -289,11 +437,14 @@ pub struct StreamConfig {
     ///
     /// # Platform support (current state)
     ///
-    /// **Honored only on Windows (WASAPI) today.** The Linux (PipeWire) and macOS
-    /// (CoreAudio) backends hardcode `calculate_capacity(None, 4)` and ignore this
-    /// field, so setting it has no effect there — they always get the 64-slot default.
-    /// Threading the request (or a period-derived size) through every backend is
-    /// tracked in ADR-0007 (`docs/designs/0007-capacity-period-sizing.md`).
+    /// **Honored on Windows (WASAPI) and Linux (PipeWire) today.** Both pass
+    /// this straight into `calculate_capacity(requested, 4)` when sizing the
+    /// bridge ring, so it controls the ring depth (rounded up to a power of two,
+    /// min 4). The macOS (CoreAudio) backend still hardcodes
+    /// `calculate_capacity(None, 4)` and ignores this field, so setting it has
+    /// no effect there — it always gets the 64-slot default. Threading a
+    /// period-derived size through every backend is tracked in ADR-0007
+    /// (`docs/designs/0007-capacity-period-sizing.md`).
     ///
     /// The [`buffer_size_frames`](crate::api::AudioCaptureBuilder::buffer_size_frames)
     /// builder setter is a backward-compat alias that writes this same field; its
@@ -838,6 +989,107 @@ mod tests {
         assert_eq!(
             "name:Firefox".parse::<CaptureTarget>().unwrap(),
             CaptureTarget::ApplicationByName("Firefox".to_string())
+        );
+    }
+
+    // ── CaptureTarget: documented target semantics (contract) ────────
+    //
+    // These pin the semantics documented on the CaptureTarget variants and the
+    // ID newtypes so a refactor cannot quietly change what a target *means*.
+
+    /// `ApplicationId` carries a **numeric PID string** (not a name/session id),
+    /// and it round-trips losslessly through the `app:<pid>` canonical form —
+    /// the encoding every platform backend parses back into a `u32` PID.
+    #[test]
+    fn application_id_is_a_numeric_pid_string_and_round_trips() {
+        let target = CaptureTarget::Application(ApplicationId("1234".to_string()));
+        assert_eq!(target.to_string(), "app:1234");
+        assert_eq!("app:1234".parse::<CaptureTarget>().unwrap(), target);
+
+        // The carried string parses as a u32 PID (the backend contract).
+        if let CaptureTarget::Application(ApplicationId(s)) = &target {
+            assert_eq!(s.parse::<u32>().unwrap(), 1234);
+        } else {
+            panic!("expected Application variant");
+        }
+    }
+
+    /// `Application(pid)` (single app) is a DISTINCT target from
+    /// `ProcessTree(pid)` (the subtree) for the same PID — the documented
+    /// single-process vs process-tree distinction. `to_capture_target()` on a
+    /// discovered app deliberately picks the narrow `Application` form (see
+    /// introspection tests); this asserts the two are not interchangeable.
+    #[test]
+    fn application_and_process_tree_are_distinct_for_same_pid() {
+        let single = CaptureTarget::Application(ApplicationId("42".to_string()));
+        let tree = CaptureTarget::ProcessTree(ProcessId(42));
+        assert_ne!(single, tree, "single-app capture != process-tree capture");
+        // Their canonical forms differ too, so a string round-trip preserves the
+        // distinction across a CLI/config boundary.
+        assert_eq!(single.to_string(), "app:42");
+        assert_eq!(tree.to_string(), "tree:42");
+        assert_ne!(single.to_string(), tree.to_string());
+    }
+
+    /// `ApplicationByName` carries the raw name verbatim (case preserved in the
+    /// body; only the *scheme* is case-insensitive on parse), and is a distinct
+    /// target from an `Application(pid)` — name resolution happens in the backend,
+    /// not in the type. The name is NOT coerced to a PID at the type level.
+    #[test]
+    fn application_by_name_preserves_name_and_is_distinct_from_application() {
+        let by_name = CaptureTarget::ApplicationByName("Mixed Case App".to_string());
+        assert_eq!(by_name.to_string(), "name:Mixed Case App");
+        assert_eq!(
+            "name:Mixed Case App".parse::<CaptureTarget>().unwrap(),
+            by_name
+        );
+        // A numeric name string is still ApplicationByName, NOT Application —
+        // the type never reinterprets a name as a PID.
+        let numeric_name = "name:1234".parse::<CaptureTarget>().unwrap();
+        assert_eq!(
+            numeric_name,
+            CaptureTarget::ApplicationByName("1234".to_string())
+        );
+        assert_ne!(
+            numeric_name,
+            CaptureTarget::Application(ApplicationId("1234".to_string()))
+        );
+    }
+
+    /// `DeviceId` is opaque and preserved verbatim (including embedded colons),
+    /// so a platform-specific id (`hw:0,0`, a numeric CoreAudio id, a PipeWire
+    /// serial) round-trips unchanged through the `device:<id>` form.
+    #[test]
+    fn device_id_is_opaque_and_round_trips_verbatim() {
+        for id in ["hw:0,0", "63", "alsa_output.pci-0000_00", ""] {
+            let target = CaptureTarget::Device(DeviceId(id.to_string()));
+            let rendered = target.to_string();
+            assert_eq!(rendered, format!("device:{id}"));
+            assert_eq!(rendered.parse::<CaptureTarget>().unwrap(), target);
+        }
+    }
+
+    /// The convenience constructors map to exactly the documented variants,
+    /// keeping `app()` = by-name and `pid()` = process-tree (subtree) — the pair
+    /// that mirrors the `ApplicationByName` / `ProcessTree` distinction.
+    #[test]
+    fn convenience_constructors_match_documented_variants() {
+        assert_eq!(
+            CaptureTarget::app("VLC"),
+            CaptureTarget::ApplicationByName("VLC".to_string())
+        );
+        assert_eq!(
+            CaptureTarget::pid(9),
+            CaptureTarget::ProcessTree(ProcessId(9))
+        );
+        assert_eq!(
+            CaptureTarget::device("hw:1,0"),
+            CaptureTarget::Device(DeviceId("hw:1,0".to_string()))
+        );
+        // app() is by-NAME, never by-pid: it is not Application(ApplicationId).
+        assert_ne!(
+            CaptureTarget::app("9"),
+            CaptureTarget::Application(ApplicationId("9".to_string()))
         );
     }
 

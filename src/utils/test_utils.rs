@@ -14,6 +14,7 @@
 //! [`crate::bridge::mock::MockDeviceEnumerator`] instead, which drives the
 //! real ring-buffer bridge with a synthetic 440 Hz sine producer.
 
+/// Placeholder audio-generation helpers (see the module docs above).
 pub mod generation {
     /// Placeholder for audio generation utilities
     pub fn create_sine_wave(_frequency: f32, _duration_ms: u32, _sample_rate: u32) -> Vec<f32> {
@@ -21,6 +22,7 @@ pub mod generation {
     }
 }
 
+/// Placeholder audio-validation helpers (see the module docs above).
 pub mod validation {
     /// Placeholder for audio validation utilities
     pub fn validate_audio_data(_data: &[f32]) -> bool {

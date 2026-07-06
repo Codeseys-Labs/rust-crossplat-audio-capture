@@ -1,13 +1,25 @@
 //! `CaptureTarget::ApplicationByName` integration tests (macOS).
 //!
 //! The macOS backend enumerates running applications via
-//! `NSWorkspace.runningApplications` and performs a case-insensitive
-//! substring match on the app's localized name. See
-//! `src/audio/macos/thread.rs::resolve_capture_target` and
-//! `src/audio/macos/coreaudio.rs::enumerate_audio_applications`.
+//! `NSWorkspace.runningApplications` and performs an **exact,
+//! case-insensitive** match on the app's localized name (via
+//! `app_name_matches` → `str::eq_ignore_ascii_case`). It deliberately does
+//! **not** do substring matching — that historically diverged from the
+//! Windows/Linux backends and could resolve `"Music"` to `"Apple Music"`
+//! (audit L3). See `src/audio/macos/thread.rs::resolve_capture_target` /
+//! `app_name_matches` and `src/audio/macos/coreaudio.rs::enumerate_audio_applications`.
 //!
-//! These tests are `#[ignore]` by default because they exercise
-//! CoreAudio Process Taps (macOS 14.4+) and need TCC permission for
+//! # When resolution happens: `start()`, not `build()`
+//!
+//! Name resolution (NSWorkspace enumeration → PID → Process Tap) runs on the
+//! capture path inside `create_macos_capture` → `resolve_capture_target`,
+//! which is reached at **`start()`** — NOT at `build()`. `build()` only
+//! validates capability and resolves the default output device; it does not
+//! look up the named application. Tests therefore assert name-resolution
+//! outcomes against `start()`, not `build()`.
+//!
+//! These tests are `#[ignore]` by default because the happy-path ones
+//! exercise CoreAudio Process Taps (macOS 14.4+) and need TCC permission for
 //! audio capture. Developers can run them manually with:
 //!
 //! ```text
@@ -44,11 +56,14 @@ fn skip_if_unsupported() -> bool {
     false
 }
 
-/// Asserts the builder successfully resolves an `ApplicationByName`
-/// target when the named app is currently running. A successful `build()`
-/// means the macOS backend found the PID via NSWorkspace, created the
-/// Process Tap, and bound the source — the full happy-path for the
-/// name-based selection code.
+/// Asserts the pipeline resolves an `ApplicationByName` target when the named
+/// app is currently running, using the app's **exact** localized name. A
+/// successful `start()` means the macOS backend found the PID via NSWorkspace
+/// (exact, case-insensitive name match), created the Process Tap, and started
+/// the AudioUnit — the full happy-path for the name-based selection code.
+///
+/// Resolution happens at `start()` (see the module doc), so `build()` is
+/// expected to succeed and the source binding is verified after `start()`.
 ///
 /// Ignored by default: requires macOS 14.4+, TCC audio permission, and
 /// for Finder to be running (always true in a normal user session, but
@@ -60,26 +75,30 @@ fn select_by_exact_name_binds_source() {
         return;
     }
 
-    let result = AudioCaptureBuilder::new()
+    // build() only validates capability + resolves the default output device;
+    // the NSWorkspace name lookup + Process Tap happen at start().
+    let mut capture = AudioCaptureBuilder::new()
         .with_target(CaptureTarget::ApplicationByName(KNOWN_APP_NAME.to_string()))
         .sample_rate(48000)
         .channels(2)
-        .build();
+        .build()
+        .expect("build() should succeed (it does not resolve the app name)");
 
-    match result {
-        Ok(capture) => {
+    match capture.start() {
+        Ok(()) => {
             eprintln!(
-                "[ci_audio] ✅ ApplicationByName('{}') bound source: {:?}",
+                "[ci_audio] ✅ ApplicationByName('{}') resolved + started: {:?}",
                 KNOWN_APP_NAME,
                 capture.config().target
             );
+            let _ = capture.stop();
         }
         Err(e) => {
             // In a sandboxed/headless CI Finder may not be listed, or
             // Process Tap creation may fail due to TCC. Surface the
             // error so developers see why the test skipped locally.
             panic!(
-                "Expected ApplicationByName('{}') to resolve; got: {:?}",
+                "Expected ApplicationByName('{}') to resolve at start(); got: {:?}",
                 KNOWN_APP_NAME, e
             );
         }
@@ -90,11 +109,11 @@ fn select_by_exact_name_binds_source() {
 /// with the unknown name embedded in the error's `identifier` field when
 /// no running app matches. This exercises the error path inside
 /// `resolve_capture_target` — `enumerate_audio_applications()` succeeds
-/// (possibly with zero apps) but the `.find()` returns `None`.
+/// (possibly with zero apps) but the exact-match `.find()` returns `None`.
 ///
 /// # Where the error surfaces
 ///
-/// Name resolution happens on the capture thread inside
+/// Name resolution happens on the capture path inside
 /// `create_macos_capture` → `resolve_capture_target`, which runs at
 /// `start()` — NOT at `build()` (build only validates capability and
 /// resolves the default output device). So the `ApplicationNotFound`
@@ -102,10 +121,10 @@ fn select_by_exact_name_binds_source() {
 ///
 /// # Gating
 ///
-/// Runs on capable runners (was `#[ignore]`). This path short-circuits at
+/// Runs on capable runners (not `#[ignore]`). This path short-circuits at
 /// the `.find()` failure BEFORE any `CoreAudioProcessTap::new` call, so it
 /// does NOT touch the `kTCCServiceAudioCapture` gate and cannot hang on the
-/// 10-minute Process Tap path. It only needs NSWorkspace, which returns an
+/// Process Tap path. It only needs NSWorkspace, which returns an
 /// (possibly empty) list in any session. We still skip on backends without
 /// application-capture capability via `skip_if_unsupported()`.
 #[test]
@@ -157,10 +176,14 @@ fn select_by_missing_name_returns_error() {
     }
 }
 
-/// The macOS backend matches names with `to_lowercase().contains(...)`,
-/// so `"finder"` (lowercase) must resolve to the same app as `"Finder"`.
-/// This test locks in that contract — if a future change switches to
-/// exact-match, this test will fail and force an explicit decision.
+/// The macOS backend matches names **case-insensitively** (via
+/// `app_name_matches` → `str::eq_ignore_ascii_case`), so `"finder"`
+/// (lowercase) must resolve to the same app as `"Finder"`. This test locks
+/// in that contract — if a future change breaks case-insensitivity, it fails
+/// and forces an explicit decision.
+///
+/// Resolution happens at `start()` (see the module doc), so this asserts
+/// against `start()`, not `build()`.
 ///
 /// Ignored by default for the same reasons as
 /// `select_by_exact_name_binds_source`.
@@ -172,49 +195,92 @@ fn case_insensitive_match() {
     }
 
     let lower = KNOWN_APP_NAME.to_lowercase();
-    let result = AudioCaptureBuilder::new()
+    let mut capture = AudioCaptureBuilder::new()
         .with_target(CaptureTarget::ApplicationByName(lower.clone()))
         .sample_rate(48000)
         .channels(2)
-        .build();
+        .build()
+        .expect("build() should succeed (it does not resolve the app name)");
 
-    match result {
-        Ok(_) => {
+    match capture.start() {
+        Ok(()) => {
             eprintln!(
                 "[ci_audio] ✅ Case-insensitive match: '{}' resolved to '{}'",
                 lower, KNOWN_APP_NAME
             );
+            let _ = capture.stop();
         }
         Err(e) => panic!(
-            "Expected case-insensitive match for '{}' to succeed; got: {:?}",
+            "Expected case-insensitive match for '{}' to resolve at start(); got: {:?}",
             lower, e
         ),
     }
 }
 
-/// Substring matching is explicit in the impl
-/// (`a.name.to_lowercase().contains(&name.to_lowercase())`), so a
-/// unique prefix of a known app's name should resolve. "Find" is a
-/// unique prefix of "Finder" that is unlikely to collide with another
-/// running application's localized name.
+/// Matching is **exact** (not substring): the macOS backend uses
+/// `app_name_matches` (`str::eq_ignore_ascii_case`), NOT
+/// `to_lowercase().contains(...)`. A unique *prefix* of a running app's name
+/// must therefore **fail** to resolve, returning `AudioError::ApplicationNotFound`.
+///
+/// `"Find"` is a prefix of `"Finder"`; under the old (removed) substring
+/// algorithm it would have resolved, but exact matching rejects it. This
+/// test guards against a regression back to substring matching, mirroring
+/// the `app_name_matches_rejects_substrings` unit test in
+/// `src/audio/macos/thread.rs`.
+///
+/// # Gating
+///
+/// Not `#[ignore]`: like `select_by_missing_name_returns_error`, this
+/// short-circuits at the exact-match `.find()` failure BEFORE any
+/// `CoreAudioProcessTap::new` call, so it needs only NSWorkspace and does not
+/// touch the TCC Process-Tap gate. (In the astronomically unlikely event a
+/// running app is literally named `"Find"`, resolution would succeed at
+/// start(); we tolerate that below rather than assert a false negative.)
 #[test]
-#[ignore = "requires macOS 14.4+ with audio capture permission and Finder running"]
-fn substring_match_resolves() {
+fn substring_prefix_does_not_resolve() {
     if skip_if_unsupported() {
         return;
     }
 
-    let result = AudioCaptureBuilder::new()
+    // A prefix of "Finder". Exact matching must NOT resolve this to Finder.
+    let mut capture = match AudioCaptureBuilder::new()
         .with_target(CaptureTarget::ApplicationByName("Find".to_string()))
         .sample_rate(48000)
         .channels(2)
-        .build();
+        .build()
+    {
+        Ok(c) => c,
+        Err(AudioError::ApplicationNotFound { identifier }) => {
+            assert!(
+                identifier.contains("Find"),
+                "error identifier should contain the queried name, got: {identifier}"
+            );
+            eprintln!("[ci_audio] ✅ prefix 'Find' rejected at build(): {identifier}");
+            return;
+        }
+        Err(other) => panic!("build() must succeed or return ApplicationNotFound; got: {other:?}"),
+    };
 
-    match result {
-        Ok(_) => eprintln!("[ci_audio] ✅ Substring 'Find' resolved (likely Finder)"),
-        Err(e) => panic!(
-            "Expected substring 'Find' to match a running app; got: {:?}",
-            e
+    match capture.start() {
+        Err(AudioError::ApplicationNotFound { identifier }) => {
+            assert!(
+                identifier.contains("Find"),
+                "error identifier should contain the queried name, got: {identifier}"
+            );
+            eprintln!(
+                "[ci_audio] ✅ exact matching rejected prefix 'Find' (no substring match): {identifier}"
+            );
+        }
+        Err(other) => panic!(
+            "Expected ApplicationNotFound for prefix 'Find' under exact matching, got: {other:?}"
         ),
+        Ok(()) => {
+            // Only reachable if a running app is literally named "Find".
+            let _ = capture.stop();
+            eprintln!(
+                "[ci_audio] ⚠ a running app is exactly named 'Find'; exact match resolved it \
+                 (not a substring match — acceptable)"
+            );
+        }
     }
 }

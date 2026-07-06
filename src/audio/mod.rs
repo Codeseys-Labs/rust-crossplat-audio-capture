@@ -10,6 +10,10 @@
 //! obtaining a `DeviceEnumerator` through the `get_device_enumerator()` function.
 
 // Conditional module declarations
+#[cfg(all(target_os = "android", feature = "feat_android"))]
+pub mod android;
+#[cfg(all(target_os = "ios", feature = "feat_ios"))]
+pub mod ios;
 #[cfg(all(target_os = "linux", feature = "feat_linux"))]
 pub mod linux;
 #[cfg(all(target_os = "macos", feature = "feat_macos"))]
@@ -20,6 +24,10 @@ pub mod windows;
 // --- Trait-Based API Exports ---
 
 // Re-export platform-specific DeviceEnumerators
+#[cfg(all(target_os = "android", feature = "feat_android"))]
+pub use android::AndroidDeviceEnumerator;
+#[cfg(all(target_os = "ios", feature = "feat_ios"))]
+pub use ios::IosDeviceEnumerator;
 #[cfg(all(target_os = "linux", feature = "feat_linux"))]
 pub use linux::LinuxDeviceEnumerator;
 #[cfg(all(target_os = "macos", feature = "feat_macos"))]
@@ -43,20 +51,33 @@ use crate::core::error::AudioError;
 #[cfg(any(
     all(target_os = "windows", feature = "feat_windows"),
     all(target_os = "linux", feature = "feat_linux"),
-    all(target_os = "macos", feature = "feat_macos")
+    all(target_os = "macos", feature = "feat_macos"),
+    all(target_os = "android", feature = "feat_android"),
+    all(target_os = "ios", feature = "feat_ios")
 ))]
 use crate::core::interface::DeviceEnumerator;
 
 /// Cross-platform device enumerator that wraps platform-specific implementations.
 pub enum CrossPlatformDeviceEnumerator {
+    /// WASAPI-backed enumerator (Windows).
     #[cfg(all(target_os = "windows", feature = "feat_windows"))]
     Windows(windows::WindowsDeviceEnumerator),
 
+    /// PipeWire-backed enumerator (Linux).
     #[cfg(all(target_os = "linux", feature = "feat_linux"))]
     Linux(linux::LinuxDeviceEnumerator),
 
+    /// CoreAudio-backed enumerator (macOS).
     #[cfg(all(target_os = "macos", feature = "feat_macos"))]
     MacOS(macos::MacosDeviceEnumerator),
+
+    /// AAudio-backed enumerator (Android; mic slice — rsac-20cd).
+    #[cfg(all(target_os = "android", feature = "feat_android"))]
+    Android(android::AndroidDeviceEnumerator),
+
+    /// AVAudioEngine-backed enumerator (iOS; mic slice — rsac-9e02).
+    #[cfg(all(target_os = "ios", feature = "feat_ios"))]
+    Ios(ios::IosDeviceEnumerator),
 }
 
 impl CrossPlatformDeviceEnumerator {
@@ -77,10 +98,20 @@ impl CrossPlatformDeviceEnumerator {
             CrossPlatformDeviceEnumerator::MacOS(enumerator) => {
                 DeviceEnumerator::enumerate_devices(enumerator)
             }
+            #[cfg(all(target_os = "android", feature = "feat_android"))]
+            CrossPlatformDeviceEnumerator::Android(enumerator) => {
+                DeviceEnumerator::enumerate_devices(enumerator)
+            }
+            #[cfg(all(target_os = "ios", feature = "feat_ios"))]
+            CrossPlatformDeviceEnumerator::Ios(enumerator) => {
+                DeviceEnumerator::enumerate_devices(enumerator)
+            }
             #[cfg(not(any(
                 all(target_os = "windows", feature = "feat_windows"),
                 all(target_os = "linux", feature = "feat_linux"),
-                all(target_os = "macos", feature = "feat_macos")
+                all(target_os = "macos", feature = "feat_macos"),
+                all(target_os = "android", feature = "feat_android"),
+                all(target_os = "ios", feature = "feat_ios")
             )))]
             _ => Err(crate::core::error::AudioError::PlatformNotSupported {
                 feature: "audio device enumeration".to_string(),
@@ -118,10 +149,20 @@ impl CrossPlatformDeviceEnumerator {
             CrossPlatformDeviceEnumerator::MacOS(enumerator) => {
                 DeviceEnumerator::default_device(enumerator)
             }
+            #[cfg(all(target_os = "android", feature = "feat_android"))]
+            CrossPlatformDeviceEnumerator::Android(enumerator) => {
+                DeviceEnumerator::default_device(enumerator)
+            }
+            #[cfg(all(target_os = "ios", feature = "feat_ios"))]
+            CrossPlatformDeviceEnumerator::Ios(enumerator) => {
+                DeviceEnumerator::default_device(enumerator)
+            }
             #[cfg(not(any(
                 all(target_os = "windows", feature = "feat_windows"),
                 all(target_os = "linux", feature = "feat_linux"),
-                all(target_os = "macos", feature = "feat_macos")
+                all(target_os = "macos", feature = "feat_macos"),
+                all(target_os = "android", feature = "feat_android"),
+                all(target_os = "ios", feature = "feat_ios")
             )))]
             _ => Err(crate::core::error::AudioError::PlatformNotSupported {
                 feature: "audio device enumeration".to_string(),
@@ -190,10 +231,20 @@ impl CrossPlatformDeviceEnumerator {
             CrossPlatformDeviceEnumerator::MacOS(enumerator) => {
                 DeviceEnumerator::watch(enumerator, on_event)
             }
+            #[cfg(all(target_os = "android", feature = "feat_android"))]
+            CrossPlatformDeviceEnumerator::Android(enumerator) => {
+                DeviceEnumerator::watch(enumerator, on_event)
+            }
+            #[cfg(all(target_os = "ios", feature = "feat_ios"))]
+            CrossPlatformDeviceEnumerator::Ios(enumerator) => {
+                DeviceEnumerator::watch(enumerator, on_event)
+            }
             #[cfg(not(any(
                 all(target_os = "windows", feature = "feat_windows"),
                 all(target_os = "linux", feature = "feat_linux"),
-                all(target_os = "macos", feature = "feat_macos")
+                all(target_os = "macos", feature = "feat_macos"),
+                all(target_os = "android", feature = "feat_android"),
+                all(target_os = "ios", feature = "feat_ios")
             )))]
             _ => {
                 drop(on_event);
@@ -233,10 +284,24 @@ pub fn get_device_enumerator() -> Result<CrossPlatformDeviceEnumerator, AudioErr
             macos::MacosDeviceEnumerator::new(),
         ))
     }
+    #[cfg(all(target_os = "android", feature = "feat_android"))]
+    {
+        Ok(CrossPlatformDeviceEnumerator::Android(
+            android::AndroidDeviceEnumerator::new(),
+        ))
+    }
+    #[cfg(all(target_os = "ios", feature = "feat_ios"))]
+    {
+        Ok(CrossPlatformDeviceEnumerator::Ios(
+            ios::IosDeviceEnumerator::new(),
+        ))
+    }
     #[cfg(not(any(
         all(target_os = "windows", feature = "feat_windows"),
         all(target_os = "linux", feature = "feat_linux"),
-        all(target_os = "macos", feature = "feat_macos")
+        all(target_os = "macos", feature = "feat_macos"),
+        all(target_os = "android", feature = "feat_android"),
+        all(target_os = "ios", feature = "feat_ios")
     )))]
     {
         Err::<CrossPlatformDeviceEnumerator, AudioError>(AudioError::PlatformNotSupported {

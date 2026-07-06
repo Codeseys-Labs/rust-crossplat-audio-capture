@@ -17,6 +17,37 @@ use super::config::SampleFormat;
 /// [`PlatformCapabilities::query()`] and check before attempting
 /// operations that may not be available on all platforms.
 ///
+/// # Capability vs. readiness
+///
+/// A `PlatformCapabilities` value answers a **static** question: *can this
+/// build, on this OS, do this kind of thing at all?* It is derived from the
+/// target OS + enabled backend feature (and, on macOS, the runtime OS version
+/// for Process-Tap gating). It is **not** a promise that a *specific* capture
+/// will succeed right now. Three separate axes must all hold for a capture to
+/// start:
+///
+/// 1. **Capability** (this type) — e.g. `supports_application_capture`. If
+///    `false`, [`AudioCaptureBuilder::build`](crate::api::AudioCaptureBuilder::build)
+///    fails its preflight with
+///    [`PlatformNotSupported`](crate::core::error::AudioError::PlatformNotSupported)
+///    before touching any device.
+/// 2. **Permission** — a *runtime* grant, distinct from capability. On macOS
+///    per-application capture needs the Audio-Capture TCC permission even when
+///    `supports_application_capture == true`; query it with
+///    [`check_audio_capture_permission`](crate::core::introspection::check_audio_capture_permission).
+/// 3. **Readiness / resolution** — whether the specific
+///    [`CaptureTarget`](crate::core::config::CaptureTarget) resolves *now* (the
+///    device is present, the PID/app exists and is producing audio). A capable,
+///    permitted platform can still fail here with
+///    [`DeviceNotFound`](crate::core::error::AudioError::DeviceNotFound) /
+///    [`ApplicationNotFound`](crate::core::error::AudioError::ApplicationNotFound)
+///    at build/start time.
+///
+/// So `caps.supports_application_capture == true` means "this platform can
+/// capture *some* application" — not "application `X` is capturable right now".
+/// Treat capability as a gate you check first, then handle permission and
+/// per-target resolution errors when they occur.
+///
 /// # Example
 ///
 /// ```
@@ -24,7 +55,9 @@ use super::config::SampleFormat;
 ///
 /// let caps = PlatformCapabilities::query();
 /// if caps.supports_application_capture {
-///     // Safe to use CaptureTarget::Application(..)
+///     // Capability holds — but a specific CaptureTarget::Application(pid) can
+///     // still fail with ApplicationNotFound (readiness) or need a permission
+///     // grant, handled when build()/start() is called.
 /// }
 /// ```
 #[derive(Debug, Clone)]
@@ -46,6 +79,24 @@ pub struct PlatformCapabilities {
     /// wired up. Each platform arm flips this to `true` only once its OS listener
     /// is implemented.
     pub supports_device_change_notifications: bool,
+    /// Whether starting a capture on this platform requires an explicit
+    /// **user-consent artifact** to be supplied to the builder before
+    /// `build()`.
+    ///
+    /// This is distinct from a runtime OS permission grant (axis 2 in
+    /// "Capability vs. readiness" above): consent here is an artifact the
+    /// *configuration* must carry — e.g. Android's `MediaProjection` token
+    /// (obtained from a user dialog and passed via
+    /// `AudioCaptureBuilder::with_android_projection`) or an iOS
+    /// user-initiated broadcast session. When `true` and the artifact is
+    /// missing for a target that needs it, the builder preflight fails with
+    /// [`UserConsentRequired`](crate::core::error::AudioError::UserConsentRequired)
+    /// before any OS resource is touched.
+    ///
+    /// `false` on all desktop backends (WASAPI / PipeWire / CoreAudio) and on
+    /// the `unsupported` stub; designed to be `true` for the planned mobile
+    /// backends (ADR-0013, `docs/MOBILE_BACKEND_DESIGN.md`).
+    pub requires_user_consent: bool,
     /// Supported sample formats.
     pub supported_sample_formats: Vec<SampleFormat>,
     /// Supported sample rate range (min, max) in Hz.
@@ -81,6 +132,18 @@ impl PlatformCapabilities {
         &Self::SUPPORTED_SAMPLE_RATES
     }
 
+    /// Human-readable rendering of [`SUPPORTED_SAMPLE_RATES`](Self::SUPPORTED_SAMPLE_RATES)
+    /// (`"22050, 32000, 44100, 48000, 88200, 96000"`), single-sourced from the
+    /// const so validation error messages (the capture builder's and the
+    /// compose builder's) can never drift from the actual whitelist.
+    pub(crate) fn supported_sample_rates_display() -> String {
+        Self::SUPPORTED_SAMPLE_RATES
+            .iter()
+            .map(|r| r.to_string())
+            .collect::<Vec<_>>()
+            .join(", ")
+    }
+
     /// Query the capabilities of the current platform's audio backend.
     ///
     /// Determined at compile time from BOTH the target OS *and* the matching
@@ -106,6 +169,16 @@ impl PlatformCapabilities {
         #[cfg(all(target_os = "linux", feature = "feat_linux"))]
         {
             return Self::linux();
+        }
+
+        #[cfg(all(target_os = "android", feature = "feat_android"))]
+        {
+            return Self::android();
+        }
+
+        #[cfg(all(target_os = "ios", feature = "feat_ios"))]
+        {
+            return Self::ios();
         }
 
         // OS without its backend feature enabled, or an unsupported OS: no
@@ -145,6 +218,8 @@ impl PlatformCapabilities {
             supports_device_selection: true,
             // IMMNotificationClient watch() arm is implemented (rsac-e360).
             supports_device_change_notifications: true,
+            // Desktop loopback needs no consent artifact (rsac-82d4).
+            requires_user_consent: false,
             supported_sample_formats: vec![
                 SampleFormat::I16,
                 SampleFormat::I24,
@@ -171,6 +246,9 @@ impl PlatformCapabilities {
             // CoreAudio AudioObjectPropertyListener watch() arm landed (rsac-3093):
             // device-list + default-output/input change notifications are wired up.
             supports_device_change_notifications: true,
+            // TCC is a runtime permission, not a config-time consent artifact
+            // (see the field docs) — so this stays false on macOS (rsac-82d4).
+            requires_user_consent: false,
             supported_sample_formats: vec![SampleFormat::I16, SampleFormat::I32, SampleFormat::F32],
             sample_rate_range: (8000, 192000),
             max_channels: 8,
@@ -190,10 +268,71 @@ impl PlatformCapabilities {
             // `default` metadata listener thread that delivers DeviceAdded /
             // DeviceRemoved / DefaultChanged.
             supports_device_change_notifications: true,
+            // Desktop loopback needs no consent artifact (rsac-82d4).
+            requires_user_consent: false,
             supported_sample_formats: vec![SampleFormat::I16, SampleFormat::I32, SampleFormat::F32],
             sample_rate_range: (8000, 384000),
             max_channels: 32, // PipeWire supports many channels
             backend_name: "PipeWire",
+        }
+    }
+
+    /// Android capabilities — **microphone slice only** (rsac-20cd).
+    ///
+    /// Honest current state: the compiled backend captures the default audio
+    /// input via AAudio (`CaptureTarget::Device`). The playback-capture tiers
+    /// (`SystemDefault` / `Application*` / `ProcessTree` via
+    /// `AudioPlaybackCapture` + MediaProjection consent) arrive with
+    /// rsac-77f1/rsac-c4b8 — until then those flags stay `false` and
+    /// `requires_user_consent` stays `false` (the mic needs the RECORD_AUDIO
+    /// *runtime permission*, which is axis-2 readiness, not a config-time
+    /// consent artifact; see the field docs). ADR-0013 fixes the target
+    /// mapping; docs/MOBILE_BACKEND_DESIGN.md has the full design.
+    #[cfg(all(target_os = "android", feature = "feat_android"))]
+    fn android() -> Self {
+        Self {
+            supports_system_capture: false, // rsac-77f1 (AudioPlaybackCapture)
+            supports_application_capture: false, // rsac-77f1 (addMatchingUid)
+            supports_process_tree_capture: false, // rsac-77f1 (PID→UID ≡ app)
+            // Only the default AAudio input is reachable without the Java
+            // AudioManager device list (arrives with the AAR, rsac-c4b8).
+            supports_device_selection: false,
+            supports_device_change_notifications: false,
+            // Flips to true when the playback-capture tiers land (rsac-77f1).
+            requires_user_consent: false,
+            // AAudio delivers PCM_I16 or PCM_FLOAT natively.
+            supported_sample_formats: vec![SampleFormat::I16, SampleFormat::F32],
+            sample_rate_range: (8000, 96000),
+            max_channels: 2,
+            backend_name: "AAudio",
+        }
+    }
+
+    /// iOS capabilities — **microphone slice only** (rsac-9e02).
+    ///
+    /// Honest current state: the compiled backend captures the session's
+    /// audio input via `AVAudioEngine` (`CaptureTarget::Device`).
+    /// `SystemDefault` (ReplayKit broadcast-extension path, rsac-b3aa) is not
+    /// wired yet; `Application*` / `ProcessTree` are **permanently** `false`
+    /// on iOS — Apple provides no API for capturing another app's audio
+    /// (ADR-0013; never soften this). `requires_user_consent` stays `false`
+    /// for the mic slice (`NSMicrophoneUsageDescription` is an axis-2 runtime
+    /// permission) and flips to `true` when the ReplayKit path lands.
+    #[cfg(all(target_os = "ios", feature = "feat_ios"))]
+    fn ios() -> Self {
+        Self {
+            supports_system_capture: false,       // rsac-b3aa (ReplayKit path)
+            supports_application_capture: false,  // permanent: no iOS API
+            supports_process_tree_capture: false, // permanent: no iOS API
+            // Input routing on iOS is session-driven (AVAudioSession routes),
+            // not free device selection.
+            supports_device_selection: false,
+            supports_device_change_notifications: false,
+            requires_user_consent: false, // flips with the ReplayKit path (rsac-b3aa)
+            supported_sample_formats: vec![SampleFormat::F32],
+            sample_rate_range: (8000, 96000),
+            max_channels: 2,
+            backend_name: "AVAudioEngine",
         }
     }
 
@@ -207,6 +346,7 @@ impl PlatformCapabilities {
             supports_process_tree_capture: false,
             supports_device_selection: false,
             supports_device_change_notifications: false,
+            requires_user_consent: false,
             supported_sample_formats: vec![],
             sample_rate_range: (0, 0),
             max_channels: 0,
@@ -432,6 +572,7 @@ mod tests {
             supports_process_tree_capture: false,
             supports_device_selection: false,
             supports_device_change_notifications: false,
+            requires_user_consent: false,
             supported_sample_formats: vec![SampleFormat::I16],
             sample_rate_range: (8000, 48000),
             max_channels: 2,
@@ -471,6 +612,51 @@ mod tests {
     fn supports_channels_zero_is_false() {
         let caps = PlatformCapabilities::query();
         assert!(!caps.supports_channels(0));
+    }
+
+    // ── Consent requirement (rsac-82d4) ─────────────────────────────
+
+    /// Every desktop backend — and the unsupported stub — must report that no
+    /// config-time consent artifact is required. Mobile backends (ADR-0013)
+    /// will be the first to flip this to `true`.
+    #[test]
+    fn desktop_and_stub_require_no_user_consent() {
+        let caps = PlatformCapabilities::query();
+        assert!(
+            !caps.requires_user_consent,
+            "no desktop backend (or the unsupported stub) requires a consent artifact"
+        );
+    }
+
+    /// rsac-20cd: the Android mic slice must report its honest partial state —
+    /// no playback-capture tiers, no device selection, no consent artifact
+    /// (those all arrive with rsac-77f1/rsac-c4b8).
+    #[cfg(all(target_os = "android", feature = "feat_android"))]
+    #[test]
+    fn android_mic_slice_reports_honest_partial_capabilities() {
+        let caps = PlatformCapabilities::query();
+        assert_eq!(caps.backend_name, "AAudio");
+        assert!(!caps.supports_system_capture);
+        assert!(!caps.supports_application_capture);
+        assert!(!caps.supports_process_tree_capture);
+        assert!(!caps.requires_user_consent);
+        assert!(caps.supports_format(SampleFormat::F32));
+        assert!(caps.supports_sample_rate(48000));
+    }
+
+    /// rsac-9e02: the iOS mic slice must report its honest partial state.
+    /// `Application*`/`ProcessTree` are PERMANENTLY false on iOS (ADR-0013).
+    #[cfg(all(target_os = "ios", feature = "feat_ios"))]
+    #[test]
+    fn ios_mic_slice_reports_honest_partial_capabilities() {
+        let caps = PlatformCapabilities::query();
+        assert_eq!(caps.backend_name, "AVAudioEngine");
+        assert!(!caps.supports_system_capture);
+        assert!(!caps.supports_application_capture);
+        assert!(!caps.supports_process_tree_capture);
+        assert!(!caps.requires_user_consent);
+        assert!(caps.supports_format(SampleFormat::F32));
+        assert!(caps.supports_sample_rate(48000));
     }
 
     // ── Additional tests ────────────────────────────────────────────
