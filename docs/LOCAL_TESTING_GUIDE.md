@@ -285,6 +285,25 @@ cargo test --lib --features compose compose::
   first capture attempt. If you get permission errors, approve the prompt under
   **System Settings → Privacy & Security → Audio Capture** and relaunch the
   process (grants are read only at process start).
+- **Your terminal app must ship `NSAudioCaptureUsageDescription`.** TCC
+  attributes the request to the *responsible* app bundle (your terminal), not
+  to the `rsac` process — and `tccd` **categorically refuses** authorization
+  for bundles whose `Info.plist` lacks the key, without ever showing a prompt
+  (log: `Refusing authorization request for service kTCCServiceAudioCapture …
+  without NSAudioCaptureUsageDescription key`). Toggling the permission on in
+  System Settings does **not** override this. Terminal.app and iTerm2 ship the
+  key; some third-party terminals/IDE shells (e.g. cmux, verified 2026-07-06 on
+  macOS 26) do not — under those, every tap delivers correctly-shaped but
+  **all-zero** buffers. Diagnosis one-liner:
+  `plutil -p "<YourTerminal>.app/Contents/Info.plist" | grep -i audiocapture`
+  — if it prints nothing, run capture tests from Terminal.app instead.
+- **Denied-permission behavior (verified on macOS 26, M4):** an unauthorized
+  tap still creates, starts, streams silence, and tears down cleanly — it does
+  **not** hang or error. So "capture runs but peak is 0.000000" means a TCC
+  problem, not an rsac lifecycle bug. This also means
+  `RSAC_CI_AUDIO_DETERMINISTIC=1` (which hard-asserts non-silence) will fail
+  captures under an unauthorized terminal — only set it where the TCC grant is
+  actually effective.
 - **Process Tap:** Requires macOS 14.4+ (Sonoma). On older versions, only system capture works.
 - **Aggregate device:** For app capture, rsac creates a temporary CoreAudio aggregate device automatically.
 - **Xcode requirement:** The build uses CoreAudio system frameworks; Xcode CLI tools must be installed.
