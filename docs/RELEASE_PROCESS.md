@@ -55,15 +55,22 @@ secrets configured) — they never trigger off anything but a `v*.*.*` tag push.
 |---|---|---|---|---|
 | `.github/workflows/release.yml` | crates.io | linux/win/mac | `verify` → `publish` → `github-release` | `CARGO_REGISTRY_TOKEN` |
 | `.github/workflows/release-npm.yml` | npm (`@rsac/audio`) | 8 napi-rs targets (5 required + 3 best-effort) | `verify-napi-build` (×8) → `publish-npm` | `NPM_TOKEN` |
-| `.github/workflows/release-pypi.yml` | PyPI (`rsac`) | 3 OS × 5 Python (+ sdist) | `build-wheels` (×15) + `build-sdist` → `publish-pypi` | PyPI Trusted Publishing / OIDC |
+| `.github/workflows/release-pypi.yml` | PyPI (`rsac`) | 4 abi3 wheels (linux x86_64 + aarch64, macOS universal2, windows x64) + sdist | `build-wheels` (×4) + `build-sdist` → `publish-pypi` | none — PyPI Trusted Publishing / OIDC |
 
 ### `release.yml` (crates.io)
 
 1. **`verify`** — matrix of `blacksmith-4vcpu-ubuntu-2404`,
    `blacksmith-4vcpu-windows-2025`, and `blacksmith-6vcpu-macos-15`, each
-   running `cargo test --lib` against its platform feature. Mirrors the
-   `test-*` jobs in `ci.yml` (including the Windows "no audio subsystem"
-   exemption via `continue-on-error`).
+   building all targets and running `cargo test --lib` against its platform
+   feature **plus `compose`** (`feat_<os>,compose`). Mirrors the `test-*`
+   jobs in `ci.yml`, including the Windows "no audio subsystem" handling:
+   the Windows `--lib` suite is **partitioned**, not blanket-tolerated —
+   the platform-independent + non-audio tests hard-fail, and only the
+   device-touching WASAPI subset (which needs Audiosrv + a real endpoint,
+   absent on Blacksmith Windows runners) is `--skip`ped into a separate
+   `continue-on-error` step. See
+   [§ What `ci.yml` now gates](#what-ciyml-now-gates-architecture-critique-closures)
+   for the same partition on the CI side.
 2. **`semver-checks`** — runs alongside `verify` on a single Linux runner;
    installs `cargo-semver-checks` and diffs the public API of the tagged
    commit against the previous stable release tag; skips with a warning on
@@ -71,7 +78,10 @@ secrets configured) — they never trigger off anything but a `v*.*.*` tag push.
    [§ Semver gate](#semver-gate-cargo-semver-checks) for the override
    procedure.
 3. **`publish`** — depends on `verify` **and** `semver-checks`; single
-   Linux runner executes
+   Linux runner first runs a version guard (on a tag push the tag must
+   match `Cargo.toml`'s `[package].version`; on a `workflow_dispatch`
+   with `dry_run=false` the `version` input is required and must match —
+   dry runs may omit it), then executes
    `cargo publish --dry-run` and then `cargo publish`. Uses the
    `CARGO_REGISTRY_TOKEN` repo secret.
 4. **`github-release`** — depends on `publish`; extracts the CHANGELOG
@@ -155,28 +165,52 @@ release:
    best-effort ones are gated by `continue-on-error`, so their failure
    does not block this job). Downloads every available `.node` into
    `bindings/rsac-napi/artifacts/`, runs `bunx @napi-rs/cli artifacts
-   --dir artifacts` to move them into place and `bunx @napi-rs/cli
-   prepublish -t npm --skip-gh-release` to generate the per-platform
-   sub-packages (`@rsac/audio-darwin-arm64`, etc.), then `bunx npm
-   publish --access public --provenance` for the main package. Uses
-   `NPM_TOKEN` as `NODE_AUTH_TOKEN` / `NPM_CONFIG_TOKEN`.
+   --dir artifacts` to move them into place, then `bunx @napi-rs/cli
+   prepublish -t npm --skip-gh-release` — which itself **publishes** the
+   per-platform sub-packages (`@rsac/audio-darwin-arm64`, etc.) to npm,
+   so that step carries the npm auth env — and finally `bunx npm publish
+   --access public --provenance --ignore-scripts` for the main package
+   (`--ignore-scripts` because package.json's `prepublishOnly` hook would
+   otherwise re-run `napi prepublish` and double-publish the
+   sub-packages). Uses `NPM_TOKEN` as `NODE_AUTH_TOKEN` /
+   `NPM_CONFIG_TOKEN` on both steps.
 
 ### `release-pypi.yml` (PyPI)
 
-1. **`build-wheels`** — matrix of three runners
-   (`blacksmith-4vcpu-ubuntu-2404`, `blacksmith-6vcpu-macos-15`,
-   `blacksmith-4vcpu-windows-2025`) × five Python interpreters (3.9,
-   3.10, 3.11, 3.12, 3.13) = 15 wheel builds. Uses
-   `PyO3/maturin-action@v1` with `command: build`, `target: auto`,
-   `manylinux: auto`, and
-   `--manifest-path bindings/rsac-python/Cargo.toml`. Each wheel is
-   uploaded as an artifact.
+1. **`build-wheels`** — matrix of **four abi3 wheels**, one per
+   (platform, arch):
+
+   | Runner | `target` | Wheel |
+   |---|---|---|
+   | `blacksmith-4vcpu-ubuntu-2404` | `x86_64` | manylinux x86_64 (host-smoked) |
+   | `blacksmith-4vcpu-ubuntu-2404` | `aarch64` | manylinux aarch64 (cross-built in the manylinux container; not host-smoked) |
+   | `blacksmith-6vcpu-macos-15` | `universal2` | macOS x86_64 + arm64 |
+   | `blacksmith-4vcpu-windows-2025` | `x64` | Windows x86_64 |
+
+   The crate builds against the CPython **stable ABI** (pyo3
+   `abi3-py39`), so a single `cp39-abi3` wheel per platform covers
+   CPython 3.9–3.13 — there is **no per-interpreter matrix dimension**.
+   Each job uses `PyO3/maturin-action@v1` (SHA-pinned) with
+   `command: build`, an explicit `target:`, `manylinux: auto`,
+   `--interpreter 3.9` (the abi3 floor), and
+   `--manifest-path bindings/rsac-python/Cargo.toml`; a
+   `before-script-linux` installs PipeWire + clang/llvm inside the
+   manylinux container so the Linux wheels link `feat_linux`. Host-arch
+   wheels are smoke-tested by installing the ONE built wheel into both
+   Python 3.9 and 3.13 and importing it (proving abi3
+   forward-compatibility). Each wheel is uploaded as an artifact.
 2. **`build-sdist`** — single Linux job, `PyO3/maturin-action@v1` with
    `command: sdist`. Uploads the `.tar.gz`.
-3. **`publish-pypi`** — depends on both of the above. Downloads all
-   artifacts into `dist-all/` with `merge-multiple: true`, then
-   `PyO3/maturin-action@v1` with `command: upload` and
-   `--skip-existing dist-all/*`. Uses `MATURIN_PYPI_TOKEN`.
+3. **`publish-pypi`** — depends on both of the above. Verifies the
+   tag/requested version against `bindings/rsac-python/pyproject.toml`,
+   downloads all artifacts into `dist-all/` with `merge-multiple: true`,
+   then uploads via **`pypa/gh-action-pypi-publish`** with
+   `skip-existing: true`. Authentication is **PyPI Trusted Publishing
+   (OIDC)**: the job requests `id-token: write` and the action exchanges
+   the short-lived OIDC token — **no long-lived PyPI secret exists or is
+   used** (the previous `MATURIN_PYPI_TOKEN` flow is gone). A Trusted
+   Publisher must be configured on the PyPI `rsac` project for this
+   repo + `release-pypi.yml` (<https://docs.pypi.org/trusted-publishers/>).
 
    Known limitations:
    - `manylinux: auto` resolves to `manylinux2014` (glibc 2.17+) on
@@ -185,26 +219,30 @@ release:
    - macOS 15 runners produce wheels tagged with the Rust toolchain's
      default deployment target (macOS 11.0+ on `arm64`, 10.12+ on
      `x86_64`). Users on older macOS need to install from sdist.
-   - Python 3.13 wheels require `maturin>=1.7` (already pinned in
-     `bindings/rsac-python/pyproject.toml`).
+   - The aarch64 Linux wheel is cross-built and cannot be import-smoked
+     on the x86_64 runner; its first real load happens on a consumer's
+     machine.
 
 ### One-time setup
 
-Before the **first** tag push, a maintainer must create repo secrets
-for each registry they plan to publish to:
+Before the **first** tag push, a maintainer must configure credentials
+for each registry they plan to publish to — two repo secrets plus one
+PyPI-side Trusted Publisher configuration (PyPI uses OIDC, not a
+secret):
 
-| Secret | Registry | Source |
+| Registry | What to configure | Source |
 |---|---|---|
-| `CARGO_REGISTRY_TOKEN` | crates.io | <https://crates.io/me> → API Tokens, scope `publish-update` (+ `publish-new` if not yet published) |
-| `NPM_TOKEN` | npm | <https://www.npmjs.com/settings/~/tokens> → new **Automation** token with publish rights on the `@rsac` scope |
-| `MATURIN_PYPI_TOKEN` | PyPI | <https://pypi.org/manage/account/token/> → new token scoped to the `rsac` project |
+| crates.io | repo secret `CARGO_REGISTRY_TOKEN` | <https://crates.io/me> → API Tokens, scope `publish-update` (+ `publish-new` if not yet published) |
+| npm | repo secret `NPM_TOKEN` | <https://www.npmjs.com/settings/~/tokens> → new **Automation** token with publish rights on the `@rsac` scope |
+| PyPI | **Trusted Publisher** on the PyPI `rsac` project — no repo secret | <https://docs.pypi.org/trusted-publishers/> → add a GitHub publisher with owner `Codeseys-Labs`, repository `rust-crossplat-audio-capture`, workflow `release-pypi.yml` (no environment). For the very first publish use PyPI's "pending publisher" flow, which reserves the project name against this repo + workflow. |
 
-Add each via **Settings → Secrets and variables → Actions → New
-repository secret**.
+Add the two secrets via **Settings → Secrets and variables → Actions →
+New repository secret**. The PyPI side is configured on pypi.org, not
+in GitHub.
 
-Any secret that is missing causes its workflow's `publish-*` job to
-fail — the other two flows continue independently. In that state, fall
-back to the manual procedure below (§2–§6) for the affected registry.
+A missing credential causes its workflow's `publish-*` job to fail —
+the other two flows continue independently. In that state, fall back
+to the manual procedure below (§2–§6) for the affected registry.
 
 ### Using the automated flow
 
@@ -213,8 +251,9 @@ release (see §2 for the pre-release checklist):
 
 ```bash
 # Bump the version + promote CHANGELOG entries under a dated heading.
-# See §2 "CHANGELOG promotion" and §3 "Version bump" for the details.
-git add Cargo.toml Cargo.lock CHANGELOG.md
+# scripts/bump-version.sh rewrites all six lockstep manifests + rotates
+# the CHANGELOG — see §2 "CHANGELOG promotion" and §3 "Version bump".
+git add -A
 git commit -m "rsac X.Y.Z"
 git push origin master
 
@@ -311,13 +350,15 @@ There is deliberately **no `major` option**. `release-prepare.yml`
    refuses anyway if a future edit ever does) and **refuses if the tag
    `vX.Y.Z` already exists**.
 2. Runs `bash scripts/bump-version.sh <computed-version>` (under
-   `TZ=UTC`), which rewrites the five lockstep manifests
-   (`Cargo.toml`, `bindings/rsac-napi/{Cargo.toml,package.json}`,
+   `TZ=UTC`), which rewrites **all six** lockstep manifests
+   (`Cargo.toml`, `bindings/rsac-ffi/Cargo.toml` — including its internal
+   `rsac = { path = "../../", version = "…" }` dependency pin —
+   `bindings/rsac-napi/{Cargo.toml,package.json}`,
    `bindings/rsac-python/{Cargo.toml,pyproject.toml}`) and rotates
    `CHANGELOG.md` (`[Unreleased]` → `[X.Y.Z] - <UTC date>` plus a fresh
-   `Unreleased` scaffold). See §"Versioning & ABI contract" for the
-   `bindings/rsac-ffi/Cargo.toml` and `rsac-go` tag caveats the script
-   does *not* handle.
+   `Unreleased` scaffold). The one thing the script does *not* handle is
+   the `bindings/rsac-go/vX.Y.Z` tag — see §"Versioning & ABI contract"
+   (c); on this automated path `release-tag.yml` pushes it for you.
 3. Opens (via `peter-evans/create-pull-request`) a PR from a
    `release/vX.Y.Z` branch into `master`, titled **`release: vX.Y.Z`**,
    labeled `release`, whose body lists the bumped manifests and the merge
@@ -383,7 +424,8 @@ push it:
    stay manual).
 6. **Creates + pushes the Go module tag** — `bindings/rsac-go/vX.Y.Z`
    (same version, same selected credential), so Go consumers can
-   `go get github.com/Codeseys-Labs/rsac-go@vX.Y.Z` — see §"Versioning &
+   `go get github.com/Codeseys-Labs/rust-crossplat-audio-capture/bindings/rsac-go@vX.Y.Z`
+   — see §"Versioning &
    ABI contract" (c). Idempotent independently of the crate tag, so a
    rerun backfills a missed Go tag. No workflow triggers on this tag shape
    (every `tags:` filter in this repo is `v*.*.*`, and a single `*` in a
@@ -421,7 +463,10 @@ GitHub Release appears:
 
 - **crates.io** — Actions → **Release** (`release.yml`) → *Run workflow*
   (it has a `workflow_dispatch` with a `dry_run` toggle; set `dry_run:
-  false` to publish for real). Needs the `CARGO_REGISTRY_TOKEN` secret.
+  false` **and enter the expected `X.Y.Z` in the `version` input** to
+  publish for real — the publish job refuses a real dispatch publish
+  without a `version` that matches `Cargo.toml`). Needs the
+  `CARGO_REGISTRY_TOKEN` secret.
 - **npm** (`@rsac/audio`) — Actions → **Release npm**
   (`release-npm.yml`) → *Run workflow*, enter `X.Y.Z`, and set `publish:
   true`. With `publish` left false, the workflow only builds/smokes the
@@ -470,16 +515,14 @@ secrets are never an error: the workflow logs the fallback, pushes with
   prepare job asserts the major is unchanged, and the tag job refuses a
   major-crossing release commit. A `X` → `X+1` (or pre-1.0 `0.x` →
   `0.(x+1)` per the ABI policy in §"Versioning & ABI contract") bump must
-  be done **manually**: run `scripts/bump-version.sh <new-major.0.0>`,
-  bring `bindings/rsac-ffi/Cargo.toml` to the same version, commit with a
-  normal (non-`release:`) message, then tag and push by hand per §4.
-- **`bindings/rsac-ffi/Cargo.toml`.** `bump-version.sh` (and therefore
-  the prepare workflow) does not touch the FFI manifest — see
-  §"Versioning & ABI contract" (b). Reconcile the FFI manifest in the
-  release PR before merging. (The `bindings/rsac-go/vX.Y.Z` Go module
-  tag, previously a manual lockstep step here, is now created + pushed
-  automatically by `release-tag.yml` right after the crate tag — see
-  §"Versioning & ABI contract" (c).)
+  be done **manually**: run `scripts/bump-version.sh <new-major.0.0>`
+  (which rewrites all six manifests, `bindings/rsac-ffi/Cargo.toml`
+  included), commit with a normal (non-`release:`) message, then tag and
+  push by hand per §4.
+- **The `bindings/rsac-go/vX.Y.Z` Go module tag on a manual release.**
+  On the automated path it is created + pushed by `release-tag.yml`
+  right after the crate tag; on a manual release you push it yourself —
+  see §"Versioning & ABI contract" (c).
 - **A skipped or misnamed squash subject.** If step 3 never fires (subject
   reworded, non-squash merge), the manifests are still correctly bumped on
   `master`; just create the tag manually (§4) to trigger the publish
@@ -522,9 +565,10 @@ carry version `X.Y.Z`:
 | `bindings/rsac-python/Cargo.toml` | `[package].version` | pyo3 crate |
 | `bindings/rsac-python/pyproject.toml` | `[project].version` | PyPI package `rsac` |
 
-Run `bash scripts/bump-version.sh X.Y.Z` to rewrite the manifests it knows
-about (root + napi + python, plus the CHANGELOG rotation); bring
-`bindings/rsac-ffi/Cargo.toml` to the same value in the same commit. The
+Run `bash scripts/bump-version.sh X.Y.Z` to rewrite **all six** manifests
+in one shot — including `bindings/rsac-ffi/Cargo.toml` and its internal
+`rsac = { path = "../../", version = "…" }` dependency pin — plus the
+CHANGELOG rotation. The
 `version-lockstep` CI job re-checks all six values on every push/PR
 (warning on a mid-cycle skew). Because the release PR's merge commit is a
 push to `master`, this gate runs — and must be green — on the exact commit that
@@ -538,9 +582,9 @@ reach a registry.
 
 > Mid-cycle skew is tolerated by CI (warning only) so a binding can lag
 > the root crate between releases, but it must be reconciled before
-> tagging. As of this writing `rsac-ffi` trails at `0.1.0` while the
-> others are at `0.2.0`; the next release must bring all six to the same
-> version.
+> tagging. As of this writing all six manifests agree at `0.4.0`
+> (`bump-version.sh` has kept them in lockstep since it grew the
+> rsac-ffi rewrite).
 
 ### (b) C ABI changes are MAJOR for `rsac-ffi`
 
@@ -567,10 +611,16 @@ know to recompile.
 ### (c) `rsac-go` tag convention
 
 `bindings/rsac-go` is a Go module (`module
-github.com/Codeseys-Labs/rsac-go`, see `bindings/rsac-go/go.mod`) and
+github.com/Codeseys-Labs/rust-crossplat-audio-capture/bindings/rsac-go`,
+see `bindings/rsac-go/go.mod`) and
 carries **no in-manifest version** — Go derives versions from git tags.
-Because the module lives in a subdirectory, its releases are tagged with
-the **module-path-prefixed** form Go's module proxy expects:
+Because the module lives in a subdirectory of this repository, two
+things must line up for `go get …@vX.Y.Z` to resolve: the **module path
+is the repository path plus the subdirectory** (as above — a short
+vanity path like `github.com/Codeseys-Labs/rsac-go` would need a
+separate mirror repo and can never resolve from tags on this one), and
+its releases are tagged with the **subdirectory-prefixed** form Go's
+module proxy expects:
 
 ```
 bindings/rsac-go/vX.Y.Z
@@ -590,7 +640,7 @@ git push origin bindings/rsac-go/vX.Y.Z
 ```
 
 Consumers then `go get
-github.com/Codeseys-Labs/rsac-go@vX.Y.Z`. The `version-lockstep`
+github.com/Codeseys-Labs/rust-crossplat-audio-capture/bindings/rsac-go@vX.Y.Z`. The `version-lockstep`
 CI job notes rsac-go's absence of an in-tree version explicitly so the
 gap is intentional, not an oversight.
 
@@ -628,9 +678,14 @@ To use it:
 2. Pick the branch and leave `dry_run` checked (the default).
 3. Start the run and watch `verify` + the dry-run packaging succeed.
 
-Unchecking `dry_run` on `workflow_dispatch` would execute a real
-`cargo publish` off a non-tagged commit — do not do that. Real
-releases always go through a stable `vX.Y.Z` tag push.
+Unchecking `dry_run` on `workflow_dispatch` executes a real
+`cargo publish` off whatever ref you picked — the guard for that path is
+the **`version` input**: a real dispatch publish is refused unless
+`version` is provided and matches `Cargo.toml`'s `[package].version`
+(dry runs stay flexible — `version` is optional and only checked when
+given). Reserve real dispatch publishes for the Step 4 fallback on a
+release commit; routine releases always go through a stable `vX.Y.Z`
+tag push.
 
 `release-npm.yml` and `release-pypi.yml` also accept manual
 `workflow_dispatch` runs. They are safe-by-default: `publish` defaults to
@@ -683,9 +738,8 @@ Before you start a release, confirm all of the following:
 > steps remain the path for a **MAJOR** bump (the automation refuses one),
 > when the `CARGO_REGISTRY_TOKEN` secret is unset, or when a maintainer
 > needs to override the automation. `scripts/bump-version.sh` now exists
-> and rewrites five of the six manifests + rotates the CHANGELOG — §3 is
-> still a manual *invocation* of it (plus the `rsac-ffi` reconcile), not a
-> hand-edit.
+> and rewrites all six manifests + rotates the CHANGELOG — §3 is
+> still a manual *invocation* of it, not a hand-edit.
 
 ---
 
@@ -776,7 +830,7 @@ Do **not** hand-edit the version anymore — drive it through
 `scripts/bump-version.sh`, the same script the automated **Release
 Prepare** workflow runs. It takes an **explicit** `X.Y.Z` (it does *not*
 compute minor/patch — that arithmetic lives in `release-prepare.yml`) and
-rewrites all five lockstep manifests plus rotates the CHANGELOG:
+rewrites all six lockstep manifests plus rotates the CHANGELOG:
 
 ```bash
 # Preview the edits without writing them:
@@ -789,14 +843,15 @@ bash scripts/bump-version.sh 0.3.0
 This rewrites, in one shot:
 
 - `Cargo.toml` (root `rsac` crate)
+- `bindings/rsac-ffi/Cargo.toml` — both its `[package].version` and its
+  internal `rsac = { path = "../../", version = "…" }` dependency pin
 - `bindings/rsac-napi/Cargo.toml` and `bindings/rsac-napi/package.json`
 - `bindings/rsac-python/Cargo.toml` and `bindings/rsac-python/pyproject.toml`
 - `CHANGELOG.md` — `## [Unreleased]` → `## [X.Y.Z] - <UTC date>` with a
   fresh `Unreleased` scaffold
 
-Then reconcile the **sixth** manifest the script does not touch —
-`bindings/rsac-ffi/Cargo.toml` — to the same `X.Y.Z` by hand (see
-§"Versioning & ABI contract" (b)). The `version-lockstep` CI job checks
+That covers all six lockstep manifests — there is no manual reconcile
+step left. The `version-lockstep` CI job checks
 all six agree and hard-fails on a tag if any disagree.
 
 Commit (use a normal subject for a manual/major release; reserve the
@@ -867,12 +922,9 @@ The automated path is `.github/workflows/release-npm.yml` and
 above). Both fire on the same `v*.*.*` tag push as `release.yml`.
 
 Before tagging, bump the binding manifests in lockstep with the root
-`Cargo.toml`:
-
-- `bindings/rsac-napi/package.json` — `"version": "X.Y.Z"`
-- `bindings/rsac-python/pyproject.toml` — `version = "X.Y.Z"` under
-  `[project]`. The Rust side's `bindings/rsac-python/Cargo.toml`
-  typically tracks this too.
+`Cargo.toml` — `bash scripts/bump-version.sh X.Y.Z` does this for you
+(all six manifests, including `bindings/rsac-napi/package.json` and
+`bindings/rsac-python/pyproject.toml`; see §3).
 
 ### Manual fallback — `rsac-napi` → npm
 
@@ -889,7 +941,10 @@ bunx @napi-rs/cli build --platform --release --target x86_64-unknown-linux-gnu
 bunx @napi-rs/cli build --platform --release --target aarch64-unknown-linux-gnu
 bunx @napi-rs/cli build --platform --release --target x86_64-pc-windows-msvc
 bunx @napi-rs/cli prepublish -t npm --skip-gh-release
-NODE_AUTH_TOKEN=<npm-token> bunx npm publish --access public
+# --ignore-scripts: package.json's prepublishOnly hook re-runs
+# `napi prepublish`, which would double-publish the sub-packages the
+# line above already pushed (E403). Same reasoning as release-npm.yml.
+NODE_AUTH_TOKEN=<npm-token> bunx npm publish --access public --ignore-scripts
 ```
 
 Cross-compiling all five targets from one host is impractical; in
@@ -909,9 +964,12 @@ maturin build --release --out dist --manifest-path Cargo.toml
 maturin upload --skip-existing dist/*
 ```
 
-`maturin upload` reads `MATURIN_PYPI_TOKEN` from the environment (or
-`~/.pypirc`). `--skip-existing` is safe to re-run if a partial upload
-landed before the failure.
+`maturin upload` needs a credential: CI uses Trusted Publishing (OIDC),
+which is not available to a local shell, so create a **personal** PyPI
+API token (scoped to the `rsac` project) and export it as
+`MATURIN_PYPI_TOKEN` (or configure `~/.pypirc`) for the manual upload
+only — no such repo secret exists in CI. `--skip-existing` is safe to
+re-run if a partial upload landed before the failure.
 
 ---
 
@@ -1090,9 +1148,11 @@ Tracked here so follow-up release-automation tasks can pick them up:
   automation is unavailable or a maintainer needs to override it.
 - All three registry workflows exist (`release.yml`, `release-npm.yml`,
   `release-pypi.yml`). Before the first tag push, the corresponding
-  secrets (`CARGO_REGISTRY_TOKEN`, `NPM_TOKEN`, `MATURIN_PYPI_TOKEN`)
-  must be set under **Settings → Secrets and variables → Actions**.
-  Missing secrets fail only the affected `publish-*` job; the other
+  credentials must be configured: repo secrets `CARGO_REGISTRY_TOKEN` +
+  `NPM_TOKEN` under **Settings → Secrets and variables → Actions**, and a
+  PyPI **Trusted Publisher** on the `rsac` project (OIDC — no repo
+  secret; see §"One-time setup").
+  A missing credential fails only the affected `publish-*` job; the other
   flows continue. Fall back to §2–§6 for the affected registry.
 - `scripts/bump-version.sh X.Y.Z` rewrites all six manifests — the root
   `Cargo.toml`, `bindings/rsac-ffi/Cargo.toml` (including its internal `rsac`

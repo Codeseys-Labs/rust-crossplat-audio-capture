@@ -5,7 +5,7 @@ import (
 	"fmt"
 	"time"
 
-	rsac "github.com/Codeseys-Labs/rsac-go"
+	rsac "github.com/Codeseys-Labs/rust-crossplat-audio-capture/bindings/rsac-go"
 )
 
 // ExampleNewCaptureBuilder demonstrates the basic capture workflow:

@@ -212,8 +212,11 @@ jobs:
       # Build every target (bin/ + examples/), not just the lib.
       # rsac-0a1f: `cli` + `compose` gate bins/examples via required-features —
       # without them --all-targets silently skips those targets.
+      # rsac-e93b: `async-stream` added — the Linux feature-powerset job
+      # excludes feat_windows/feat_macos, so this leg is the only place
+      # async-stream ever compiles against the WASAPI backend.
       - name: Build all targets
-        run: cargo build --all-targets --no-default-features --features feat_windows,compose,cli
+        run: cargo build --all-targets --no-default-features --features feat_windows,compose,cli,async-stream
 
       # TC-07: the Windows unit step used to be continue-on-error on the WHOLE
       # `cargo test --lib` run, so the ~40 inline wasapi.rs tests + 21 thread.rs
@@ -272,10 +275,11 @@ jobs:
       # Doctests were Linux-only (feature-combo-doctests job) — doc examples
       # visible only under cfg(windows) never compiled as doctests. Run the
       # doc suite on this leg's feature set too (device-free; no_run examples
-      # only compile).
+      # only compile). rsac-e93b: `async-stream` included so its doc examples
+      # compile against feat_windows (the powerset job is Linux-only).
       - name: Cargo test (doctests)
         shell: bash
-        run: cargo test --doc --no-default-features --features feat_windows,compose,sink-wav,cli
+        run: cargo test --doc --no-default-features --features feat_windows,compose,sink-wav,cli,async-stream
 
       - name: Report audio service status
         if: always()
@@ -327,8 +331,11 @@ jobs:
       # Build every target (bin/ + examples/), not just the lib.
       # rsac-0a1f: `cli` + `compose` gate bins/examples via required-features —
       # without them --all-targets silently skips those targets.
+      # rsac-e93b: `async-stream` added — the Linux feature-powerset job
+      # excludes feat_windows/feat_macos, so this leg is the only place
+      # async-stream ever compiles against the CoreAudio backend.
       - name: Build all targets
-        run: cargo build --all-targets --no-default-features --features feat_macos,compose,cli
+        run: cargo build --all-targets --no-default-features --features feat_macos,compose,cli,async-stream
 
       # TC-03: src/audio/macos/tap.rs has process-tap tests that are NOT
       # #[ignore]d (e.g. test_new_system_creates_tap at tap.rs:1352 calls
@@ -360,10 +367,11 @@ jobs:
       # Doctests were Linux-only (feature-combo-doctests job) — doc examples
       # visible only under cfg(macos) never compiled as doctests. Run the doc
       # suite on this leg's feature set too (device-free; no_run examples only
-      # compile).
+      # compile). rsac-e93b: `async-stream` included so its doc examples
+      # compile against feat_macos (the powerset job is Linux-only).
       - name: Cargo test (doctests)
         timeout-minutes: 10
-        run: cargo test --doc --no-default-features --features feat_macos,compose,sink-wav,cli
+        run: cargo test --doc --no-default-features --features feat_macos,compose,sink-wav,cli,async-stream
 
       # OPTION B (existence check): Blacksmith macOS runners lack TCC grants for
       # Process Tap capture (see macos-process job in ci-audio-tests.yml —
@@ -492,15 +500,24 @@ jobs:
       - name: Check rsac-ffi (C FFI)
         run: cargo check -p rsac-ffi
 
+      # rsac-e93b: the 24 compose FFI functions (src/compose.rs, behind the
+      # non-default `compose` feature) are invisible to the bare check above —
+      # without this leg they would never be compiled anywhere in CI.
+      - name: Check rsac-ffi (C FFI, compose feature)
+        run: cargo check -p rsac-ffi --features compose
+
       # rsac-3e24: clippy the binding crates under -D warnings. The root lint job
       # only lints the workspace default member (feat_<os>), so binding-crate
       # clippy errors (e.g. manual_is_multiple_of, type_complexity) previously
       # reached CI only as a `cargo check` pass. Lint all three to the same bar.
+      # rsac-e93b: rsac-ffi is linted twice — bare AND with `compose` — so the
+      # compose FFI surface is held to the same -D warnings bar.
       - name: Clippy binding crates (-D warnings)
         env:
           PYO3_USE_ABI3_FORWARD_COMPATIBILITY: "1"
         run: |
           cargo clippy -p rsac-ffi --all-targets -- -D warnings
+          cargo clippy -p rsac-ffi --all-targets --features compose -- -D warnings
           cargo clippy -p rsac-napi --all-targets -- -D warnings
           cargo clippy -p rsac-python --all-targets -- -D warnings
 
@@ -515,12 +532,33 @@ jobs:
       # `typedef enum {…} X;`) — only a genuinely added / renamed / removed symbol
       # fails the job. A failure means: regenerate rsac_generated.h, then update the
       # curated rsac.h (NEVER point cbindgen --output at rsac.h).
-      - name: Header drift check (curated rsac.h vs generated)
+      #
+      # rsac-e93b: cbindgen.toml's [defines] mapping ("feature = compose" →
+      # RSAC_FEATURE_COMPOSE) promises header generation is DETERMINISTIC
+      # regardless of enabled features — compose items are always emitted,
+      # wrapped in `#if defined(RSAC_FEATURE_COMPOSE)`. We now build rsac-ffi
+      # BOTH bare and with --features compose and byte-diff the two generated
+      # headers, so a build.rs/cbindgen change that breaks that determinism
+      # (e.g. feature-conditional generation) fails here instead of shipping a
+      # header whose content depends on which build produced it.
+      - name: Header drift check (curated rsac.h vs generated, feature-deterministic)
         shell: bash
         run: |
           set -euo pipefail
           # build.rs runs cbindgen and writes include/rsac_generated.h.
+          # Build bare first, snapshot the generated header…
           cargo build -p rsac-ffi
+          cp bindings/rsac-ffi/include/rsac_generated.h rsac_generated.bare.h
+          # …then rebuild with the compose feature (this also re-runs build.rs —
+          # the feature set is part of the build-script fingerprint) and demand
+          # the generated header is byte-identical.
+          cargo build -p rsac-ffi --features compose
+          if ! diff -u rsac_generated.bare.h bindings/rsac-ffi/include/rsac_generated.h; then
+            echo "::error::include/rsac_generated.h differs between the bare and --features compose builds."
+            echo "::error::Header generation must be feature-deterministic (see cbindgen.toml [defines]) — compose items belong behind #if defined(RSAC_FEATURE_COMPOSE), not behind conditional generation."
+            exit 1
+          fi
+          echo "OK: rsac_generated.h is byte-identical with and without --features compose."
           cd bindings/rsac-ffi/include
 
           CURATED="rsac.h"

@@ -46,7 +46,7 @@ workflow, per-OS jobs — Linux/Windows/macOS statuses live in the
 | **Windows** (VB-CABLE) | `windows-system` | `windows-device` | `windows-process` |
 | **macOS** (BlackHole) | `macos-system` | `macos-device` | `macos-process` |
 
-Each cell is a separate CI job visible in the [Actions tab](https://github.com/Codeseys-Labs/rust-crossplat-audio-capture/actions/workflows/ci-audio-tests.yml). Linux is the primary platform; Windows and macOS process capture use `continue-on-error`.
+Each cell is a separate CI job visible in the [Actions tab](https://github.com/Codeseys-Labs/rust-crossplat-audio-capture/actions/workflows/ci-audio-tests.yml). Linux and Windows are first-class, hard-gated tiers (the summary job fails on any Linux or Windows job failure); only the macOS system and process tiers run with `continue-on-error`, because Process Tap capture needs a `kTCCServiceAudioCapture` grant that cannot be issued on managed runners.
 
 ## Features
 

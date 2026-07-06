@@ -46,7 +46,10 @@
 #
 # GO MODULE TAG: after the crate tag, this workflow also creates + pushes
 # bindings/rsac-go/vX.Y.Z (same version, same selected credential) so Go
-# consumers can `go get github.com/Codeseys-Labs/rsac-go@vX.Y.Z`. Verified
+# consumers can `go get
+# github.com/Codeseys-Labs/rust-crossplat-audio-capture/bindings/rsac-go@vX.Y.Z`
+# (the go.mod module path is repo-path-prefixed, which is what makes Go's
+# subdirectory-tag convention resolve from THIS repo). Verified
 # recursion-safe: every `on: push: tags:` filter in this repo is
 # `v*.*.*` (+ `!v*-*`), and a single `*` in a tag glob does not cross `/`,
 # so `bindings/rsac-go/vX.Y.Z` matches nothing.
@@ -302,7 +305,7 @@ jobs:
           else
             git push origin "refs/tags/${GO_TAG}"
           fi
-          echo "::notice::Pushed Go module tag ${GO_TAG} — Go consumers can now 'go get github.com/Codeseys-Labs/rsac-go@v${VERSION}'."
+          echo "::notice::Pushed Go module tag ${GO_TAG} — Go consumers can now 'go get github.com/Codeseys-Labs/rust-crossplat-audio-capture/bindings/rsac-go@v${VERSION}'."
 
       # Extract this version's CHANGELOG section for the GitHub Release body.
       # Pulls the lines between "## [X.Y.Z]" and the next "## [" heading.

@@ -337,13 +337,31 @@ jobs:
       - name: Move artifacts into place
         run: bunx @napi-rs/cli artifacts --dir artifacts
 
-      - name: napi prepublish (generate platform packages)
+      # rsac-e93b: `napi prepublish -t npm` does more than "generate" the
+      # platform packages — it PUBLISHES each @rsac/audio-<platform>
+      # sub-package to npm, so this step needs the npm auth token
+      # (NODE_AUTH_TOKEN feeds the .npmrc written by setup-node's
+      # registry-url; NPM_CONFIG_TOKEN covers direct npm-config reads).
+      # Without it the sub-package publishes fail auth (E401/ENEEDAUTH).
+      # We keep this explicit step (rather than relying on package.json's
+      # `prepublishOnly` lifecycle hook) so we control --skip-gh-release —
+      # GitHub Releases are created by release-tag.yml/release.yml, and this
+      # job's token has no contents:write scope anyway.
+      - name: napi prepublish (publish platform sub-packages)
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
+          NPM_CONFIG_TOKEN: ${{ secrets.NPM_TOKEN }}
         run: bunx @napi-rs/cli prepublish -t npm --skip-gh-release
 
-      - name: Publish main package + platform sub-packages
+      # --ignore-scripts is load-bearing: package.json declares
+      # `"prepublishOnly": "napi prepublish -t npm"`, so a bare `npm publish`
+      # would re-run the prepublish step above and try to publish every
+      # platform sub-package a second time (E403 already-published), failing
+      # the release after a partial publish. The sub-packages were published
+      # by the explicit step above; this step publishes ONLY the main package.
+      - name: Publish main package (sub-packages already published above)
         env:
           NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
           NPM_CONFIG_TOKEN: ${{ secrets.NPM_TOKEN }}
-        run: bunx npm publish --access public --provenance
+        run: bunx npm publish --access public --provenance --ignore-scripts

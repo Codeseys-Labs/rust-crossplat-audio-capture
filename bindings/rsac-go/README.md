@@ -4,8 +4,12 @@ Go bindings for [rsac](../../), a cross-platform Rust audio capture
 library. Built on top of [`rsac-ffi`](../rsac-ffi/) (the C FFI layer) via
 cgo and linked as a static library.
 
-> **Status:** consumer-ready for in-tree integration. Not yet published
-> as a tagged Go module — depend on it by path, not by version.
+> **Status:** consumer-ready for in-tree integration. No
+> `bindings/rsac-go/vX.Y.Z` tag has been pushed yet — depend on it by path
+> until the first release. Once a release tag exists
+> (`release-tag.yml` pushes one in lockstep with the crate tag),
+> `go get github.com/Codeseys-Labs/rust-crossplat-audio-capture/bindings/rsac-go@vX.Y.Z`
+> resolves it directly from this repository.
 
 ## What you get
 
@@ -94,7 +98,7 @@ import (
     "log"
     "time"
 
-    rsac "github.com/Codeseys-Labs/rsac-go"
+    rsac "github.com/Codeseys-Labs/rust-crossplat-audio-capture/bindings/rsac-go"
 )
 
 func main() {

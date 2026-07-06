@@ -101,7 +101,8 @@ encoder's required frame size (e.g. 20 ms = `rate / 50` frames) with a small
 ## Timestamps
 
 `buffer.timestamp()` is the **stream position** of the buffer's first sample
-(frames delivered so far ÷ rate) — not wall-clock time. Two properties useful
+(frames *offered* so far — delivered + dropped — ÷ rate) — not wall-clock
+time. Two properties useful
 for interop pipelines:
 
 - consecutive buffers are contiguous (`t₂ = t₁ + frames₁/rate`) unless the
