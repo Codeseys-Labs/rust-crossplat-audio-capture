@@ -3,7 +3,7 @@
 //! plane a device-backed composition uses, with zero hardware dependency.
 
 use std::collections::VecDeque;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -1078,8 +1078,11 @@ fn subscribe_with_errors_delivers_buffers_then_terminal() {
         vec![Box::new(src)],
     );
 
-    let rx = crate::api::spawn_subscribe_with_errors_thread(harness.stream.clone())
-        .expect("subscribe pump spawns");
+    let rx = crate::api::spawn_subscribe_with_errors_thread(
+        harness.stream.clone(),
+        Arc::new(AtomicU64::new(0)),
+    )
+    .expect("subscribe pump spawns");
 
     let mut frames = 0usize;
     let mut saw_terminal = false;
@@ -1106,6 +1109,101 @@ fn subscribe_with_errors_delivers_buffers_then_terminal() {
         rx.recv_timeout(Duration::from_secs(1)),
         Err(std::sync::mpsc::RecvTimeoutError::Disconnected)
     ));
+    harness.shutdown();
+}
+
+/// rsac-7aa2(1): `Composition::subscribe{,_with_errors}` must accept the
+/// drainable `Stopping` window. A composition whose scripted sources end
+/// immediately leaves the engine exited and the composed ring parked in
+/// `Stopping` with the entire output still buffered; subscribing only AFTER
+/// the engine finished (the old `is_running()` gate rejected exactly this
+/// call, stranding the buffered output) must still deliver every composed
+/// frame followed by the clean terminal.
+#[test]
+fn subscribe_after_engine_finished_drains_buffered_tail() {
+    let n = 5usize;
+    let (src, _) =
+        ScriptedSource::ending((0..n).map(|_| const_buffer(0.5, 1, 48_000, 480)).collect());
+    let harness = Harness::spawn(
+        cfg(
+            1,
+            vec![GroupSpec {
+                layout: GroupLayout::Mono,
+                offset: 0,
+                width: 1,
+            }],
+            vec![SourceSpec {
+                gain: 1.0,
+                group: 0,
+                channels: 0,
+                clock_candidate: false,
+            }],
+            0,
+        ),
+        vec![Box::new(src)],
+    );
+
+    // Wait until the engine has finished: its signal_done parks the ring in
+    // the drainable Stopping state, so is_running() goes false with the whole
+    // composed output still buffered (nobody has read yet).
+    let deadline = std::time::Instant::now() + Duration::from_secs(5);
+    while harness.stream.is_running() {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "engine never finished"
+        );
+        std::thread::sleep(Duration::from_millis(1));
+    }
+
+    // Route through the real public handle so the PUBLIC gate is what's under
+    // test: a device-free composition with the harness view attached.
+    let mut composition = CompositionBuilder::new()
+        .group(
+            Group::new("g")
+                .source(crate::core::config::CaptureTarget::SystemDefault)
+                .mixdown(GroupLayout::Mono),
+        )
+        .build()
+        .expect("device-free build");
+    composition.attach_stream_for_tests(Arc::clone(&harness.stream));
+    assert!(
+        !composition.is_running(),
+        "precondition: the engine already finished (Stopping window)"
+    );
+
+    let rx = composition
+        .subscribe_with_errors()
+        .expect("subscribe in the Stopping window must be accepted");
+
+    let mut frames = 0usize;
+    let mut saw_terminal = false;
+    let deadline = std::time::Instant::now() + Duration::from_secs(5);
+    while std::time::Instant::now() < deadline {
+        match rx.recv_timeout(Duration::from_millis(100)) {
+            Ok(Ok(buffer)) => frames += buffer.num_frames(),
+            Ok(Err(e)) => {
+                assert!(
+                    e.is_fatal(),
+                    "the final error must be the clean terminal, got {e:?}"
+                );
+                saw_terminal = true;
+                break;
+            }
+            Err(std::sync::mpsc::RecvTimeoutError::Timeout) => continue,
+            Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => break,
+        }
+    }
+    assert_eq!(
+        frames,
+        n * 480,
+        "the entire buffered output must be drained by the late subscription"
+    );
+    assert!(saw_terminal, "clean end delivered after the drained tail");
+    assert_eq!(
+        composition.subscriber_dropped_count(),
+        0,
+        "an attentive subscriber loses nothing"
+    );
     harness.shutdown();
 }
 
@@ -1182,7 +1280,7 @@ fn unstarted_composition_reads_error_and_reports_honestly() {
     assert!(composition.channel_map().is_none());
     assert!(composition.stats().is_none());
     assert!(matches!(
-        composition.read_buffer(),
+        composition.read_chunk_nonblocking(),
         Err(AudioError::StreamReadError { .. })
     ));
     // Push + async delivery modes reject a not-started composition uniformly.

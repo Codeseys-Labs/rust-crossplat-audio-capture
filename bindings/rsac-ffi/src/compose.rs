@@ -574,11 +574,12 @@ pub unsafe extern "C" fn rsac_composition_try_read(
         }
         unsafe { *out = ptr::null_mut() };
         let c = unsafe { &*comp };
-        // Composition::read_buffer is the terminal-observable non-blocking
-        // read: the drained end surfaces as the fatal StreamEnded →
-        // RSAC_ERROR_STREAM_FAILED, so C pumps end cleanly (same rationale as
-        // rsac_capture_try_read).
-        match c.inner.read_buffer() {
+        // Composition::read_chunk_nonblocking is the terminal-observable
+        // non-blocking read (renamed from `read_buffer` pre-release to mirror
+        // AudioCapture's terminal-observable sibling): the drained end
+        // surfaces as the fatal StreamEnded → RSAC_ERROR_STREAM_FAILED, so C
+        // pumps end cleanly (same rationale as rsac_capture_try_read).
+        match c.inner.read_chunk_nonblocking() {
             Ok(Some(buf)) => {
                 let handle = Box::new(RsacAudioBuffer { inner: buf });
                 unsafe { *out = Box::into_raw(handle) };
@@ -613,7 +614,10 @@ pub unsafe extern "C" fn rsac_composition_read(
         }
         unsafe { *out = ptr::null_mut() };
         let c = unsafe { &*comp };
-        match c.inner.read_buffer_blocking() {
+        // Composition::read_chunk_blocking is the terminal-observable blocking
+        // read (renamed from `read_buffer_blocking` pre-release — see
+        // rsac_composition_try_read).
+        match c.inner.read_chunk_blocking() {
             Ok(buf) => {
                 let handle = Box::new(RsacAudioBuffer { inner: buf });
                 unsafe { *out = Box::into_raw(handle) };

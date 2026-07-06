@@ -91,7 +91,7 @@
 //! let map = session.channel_map().expect("started");
 //! println!("composed {} channels: {:?}", map.channels(), map);
 //! loop {
-//!     match session.read_buffer() {
+//!     match session.read_chunk_nonblocking() {
 //!         // interleaved f32, `map.channels()` channels @ 48 kHz
 //!         Ok(Some(buffer)) => { let _ = buffer.num_frames(); }
 //!         // No data *yet* — not end-of-stream; poll again shortly.

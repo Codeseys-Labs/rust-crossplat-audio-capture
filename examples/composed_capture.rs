@@ -57,7 +57,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut buffers = 0u64;
     let mut frames = 0u64;
     while Instant::now() < deadline {
-        match session.read_buffer() {
+        match session.read_chunk_nonblocking() {
             Ok(Some(buffer)) => {
                 buffers += 1;
                 frames += buffer.num_frames() as u64;

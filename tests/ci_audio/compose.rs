@@ -111,7 +111,7 @@ fn composed_system_capture_layout_and_delivery() {
     let mut buffers = 0u64;
     let mut nonsilent = false;
     while Instant::now() < deadline {
-        match session.read_buffer() {
+        match session.read_chunk_nonblocking() {
             Ok(Some(buffer)) => {
                 buffers += 1;
                 // HARD: every composed buffer matches the resolved layout.
@@ -196,7 +196,7 @@ fn composed_capture_stop_is_terminal() {
     // (the tail, if any, is discarded by explicit stop — see Composition::stop).
     let deadline = Instant::now() + Duration::from_secs(5);
     loop {
-        match session.read_buffer() {
+        match session.read_chunk_nonblocking() {
             Ok(Some(_)) => continue, // a race-window buffer is tolerated
             Ok(None) => {
                 assert!(

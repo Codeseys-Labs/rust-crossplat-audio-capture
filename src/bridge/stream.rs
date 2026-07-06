@@ -318,6 +318,22 @@ impl<S: PlatformStream + Sync + 'static> CapturingStream for BridgeStream<S> {
     // parked `AsyncAudioStream` is always woken when data or a terminal state
     // arrives. Returning `true` is therefore honest here; see
     // `CapturingStream::register_waker` for the full contract.
+    //
+    // SINGLE-CONSUMER CONSTRAINT (rsac-7aa2): `BridgeShared` holds exactly ONE
+    // AtomicWaker slot, and calling `AtomicWaker::register` from two tasks
+    // concurrently is the crate-documented unsupported case — the losing
+    // task's waker is silently dropped WITHOUT being woken, so a second
+    // concurrent `AsyncAudioStream` over the same stream can park forever on a
+    // promised-but-stolen wake. A defensive "wake the displaced waker" is
+    // deliberately NOT implemented: AtomicWaker offers no atomic
+    // register-and-return-old primitive, so the only sequence available is
+    // take() → wake(old) → register(new), which (a) opens a window where the
+    // slot is empty and a producer wake is lost (only partially mitigated by
+    // the consumer's post-register double-check), and (b) still lets two
+    // concurrent registrants clobber each other between the take and the
+    // register — it narrows the race without closing it while adding a new
+    // one. The constraint is instead documented on `audio_data_stream`
+    // (AudioCapture and Composition): at most one async consumer per capture.
     #[cfg(feature = "async-stream")]
     fn register_waker(&self, waker: &std::task::Waker) -> bool {
         self.shared.waker.register(waker);

@@ -2,7 +2,7 @@
 //! the `PlatformStream` shim that plugs the compositor into the standard
 //! bridge ring.
 
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
@@ -323,9 +323,13 @@ struct EngineHandle {
 /// # Reading
 ///
 /// `Composition` implements [`CapturingStream`], and the inherent
-/// [`read_buffer`](Self::read_buffer) mirrors
-/// [`AudioCapture::read_buffer`](crate::api::AudioCapture::read_buffer).
-/// Composed buffers are interleaved f32 at the session rate with
+/// [`read_chunk_nonblocking`](Self::read_chunk_nonblocking) /
+/// [`read_chunk_blocking`](Self::read_chunk_blocking) pair mirrors
+/// [`AudioCapture::read_chunk_nonblocking`](crate::api::AudioCapture::read_chunk_nonblocking) /
+/// [`AudioCapture::read_chunk_blocking`](crate::api::AudioCapture::read_chunk_blocking)
+/// — the **terminal-observable** read family (the fatal
+/// [`AudioError::StreamEnded`] is surfaced once the composition ends and
+/// drains). Composed buffers are interleaved f32 at the session rate with
 /// [`channel_map().channels()`](ChannelMap::channels) channels.
 ///
 /// # Ownership of inner captures
@@ -340,6 +344,11 @@ pub struct Composition {
     stats: Option<Arc<EngineStatsShared>>,
     /// Flat `(group_name, target_display)` per source, for stats snapshots.
     source_labels: Vec<(String, String)>,
+    /// Composed buffers dropped by this handle's subscribe pumps because a
+    /// subscriber's bounded channel was full (rsac-d6a8). Aggregated across
+    /// every subscription; surfaced via
+    /// [`subscriber_dropped_count`](Composition::subscriber_dropped_count).
+    subscriber_dropped: Arc<AtomicU64>,
 }
 
 impl std::fmt::Debug for Composition {
@@ -371,6 +380,7 @@ impl Composition {
             channel_map: None,
             stats: None,
             source_labels,
+            subscriber_dropped: Arc::new(AtomicU64::new(0)),
         }
     }
 
@@ -601,17 +611,48 @@ impl Composition {
         Ok(())
     }
 
-    /// Non-blocking read of the next composed buffer (mirrors
-    /// [`AudioCapture::read_buffer`](crate::api::AudioCapture::read_buffer)'s
-    /// terminal-observable sibling): `Ok(None)` = nothing yet;
-    /// fatal [`AudioError::StreamEnded`] = composition finished and drained.
-    pub fn read_buffer(&self) -> AudioResult<Option<AudioBuffer>> {
+    /// Non-blocking read of the next composed buffer — the **terminal-observable**
+    /// family, mirroring
+    /// [`AudioCapture::read_chunk_nonblocking`](crate::api::AudioCapture::read_chunk_nonblocking):
+    ///
+    /// - `Ok(Some(buf))` while composed data remains (including the buffered
+    ///   tail after the composition's natural end),
+    /// - `Ok(None)` when the ring is momentarily empty but not yet terminal,
+    /// - the fatal [`AudioError::StreamEnded`] once the composition has ended
+    ///   **and** the ring is drained.
+    ///
+    /// Consumers branch on [`AudioError::is_fatal`]: retry recoverable errors,
+    /// end cleanly on the fatal terminal — exactly like the `AudioCapture`
+    /// sibling and the C FFI pumps.
+    ///
+    /// *(Renamed from `read_buffer` pre-release (rsac-7aa2): the old name
+    /// collided with [`AudioCapture::read_buffer`](crate::api::AudioCapture::read_buffer),
+    /// which is the **downgraded, never-fatal** family — the same name must not
+    /// carry different terminal semantics on the two handles.)*
+    ///
+    /// # Errors
+    ///
+    /// [`AudioError::StreamReadError`] (recoverable) if the composition is not
+    /// started; the fatal [`AudioError::StreamEnded`] at the drained end.
+    pub fn read_chunk_nonblocking(&self) -> AudioResult<Option<AudioBuffer>> {
         self.started_stream()?.try_read_chunk()
     }
 
-    /// Blocking read of the next composed buffer; returns the terminal
-    /// [`AudioError::StreamEnded`] once the composition ends and drains.
-    pub fn read_buffer_blocking(&self) -> AudioResult<AudioBuffer> {
+    /// Blocking read of the next composed buffer — the **terminal-observable**
+    /// blocking sibling, mirroring
+    /// [`AudioCapture::read_chunk_blocking`](crate::api::AudioCapture::read_chunk_blocking):
+    /// blocks until a composed buffer is available (including the drainable
+    /// tail) or the composition reaches its terminal, in which case it returns
+    /// the fatal [`AudioError::StreamEnded`] promptly.
+    ///
+    /// *(Renamed from `read_buffer_blocking` pre-release — see
+    /// [`read_chunk_nonblocking`](Self::read_chunk_nonblocking).)*
+    ///
+    /// # Errors
+    ///
+    /// [`AudioError::StreamReadError`] (recoverable) if the composition is not
+    /// started; the fatal [`AudioError::StreamEnded`] at the drained end.
+    pub fn read_chunk_blocking(&self) -> AudioResult<AudioBuffer> {
         self.started_stream()?.read_chunk()
     }
 
@@ -662,7 +703,24 @@ impl Composition {
     /// a dedicated background thread — the composition analogue of
     /// [`RunningCapture::drain_to`](crate::api::RunningCapture::drain_to)
     /// (same loop, same recoverable-vs-fatal policy, same flush/close
-    /// finalization). Do not mix with manual reads on the same composition.
+    /// finalization, and — rsac-7aa2 — the same acceptance policy). Do not mix
+    /// with manual reads on the same composition.
+    ///
+    /// # Accepted states (drain-the-tail; rsac-7aa2)
+    ///
+    /// Accepted whenever the composed stream exists: `Running`, the drainable
+    /// `Stopping` window (an ended composition's buffered output is drained
+    /// into the sink before finalization), or an already-terminal stream — the
+    /// drain thread then exits on its first read and still finalizes
+    /// (`flush()` then `close()`) the sink, so e.g. a WAV header is always
+    /// written. The gate is stream **presence** only, matching
+    /// `RunningCapture::drain_to` (see its rustdoc for why presence beats a
+    /// state check). Only a not-started composition is rejected.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`AudioError::StreamReadError`] if the composition is not
+    /// started.
     pub fn drain_to<S>(&self, sink: S) -> AudioResult<crate::api::DrainHandle>
     where
         S: crate::sink::AudioSink + 'static,
@@ -671,31 +729,50 @@ impl Composition {
         crate::api::spawn_drain_thread(stream, sink)
     }
 
-    /// Creates a push subscription delivering composed buffers over an
-    /// [`mpsc`](std::sync::mpsc) channel — the composition analogue of
+    /// Creates a push subscription delivering composed buffers over a
+    /// **bounded** [`mpsc`](std::sync::mpsc) channel — the composition
+    /// analogue of
     /// [`AudioCapture::subscribe`](crate::api::AudioCapture::subscribe) (same
-    /// background pump, same recoverable-vs-fatal policy, same ~1 ms idle-poll
-    /// latency floor).
+    /// background pump, same bounded 128-buffer channel, same
+    /// recoverable-vs-fatal policy, same ~1 ms idle-poll latency floor).
+    ///
+    /// # Backpressure: drop, don't block, and count it (rsac-d6a8)
+    ///
+    /// A subscriber slower than real time fills the channel; further composed
+    /// buffers are **dropped** (never queued without bound) and counted in
+    /// [`subscriber_dropped_count`](Self::subscriber_dropped_count). This loss
+    /// is downstream of the composed ring, so it is invisible to
+    /// [`overrun_count`](CapturingStream::overrun_count).
+    ///
+    /// # Accepted states (rsac-7aa2)
+    ///
+    /// Accepted whenever the composed stream exists — `Running` **or** the
+    /// drainable `Stopping` window: a composition whose sources all ended
+    /// still holds its buffered output, and subscribing then delivers that
+    /// tail followed by the clean end (the old `is_running()` gate stranded
+    /// it). An already-terminal stream yields a channel that ends immediately.
+    /// Only a not-started composition is rejected.
     ///
     /// The pump exits when the composition reaches its fatal terminal (all
     /// sources ended and the ring drained, or an explicit stop) — the channel
-    /// then disconnects — or when the receiver is dropped. The background
-    /// reader competes with [`read_buffer`](Self::read_buffer) and
-    /// [`drain_to`](Self::drain_to) for buffers from the same ring; do not mix
-    /// delivery modes on one composition.
+    /// then disconnects — or when the receiver is dropped. **Multiple
+    /// subscriptions are allowed but each subscriber competes for buffers** (a
+    /// single logical consumer per composed buffer, exactly as with
+    /// [`AudioCapture::subscribe`](crate::api::AudioCapture::subscribe)); the
+    /// background reader likewise competes with
+    /// [`read_chunk_nonblocking`](Self::read_chunk_nonblocking) and
+    /// [`drain_to`](Self::drain_to) for buffers from the same ring — do not
+    /// mix delivery modes on one composition.
     ///
     /// # Errors
     ///
     /// Returns [`AudioError::StreamReadError`] if the composition is not
-    /// started or no longer running.
+    /// started.
     pub fn subscribe(&self) -> AudioResult<std::sync::mpsc::Receiver<AudioBuffer>> {
+        // Presence gate only (rsac-7aa2): Running and the drainable Stopping
+        // window are both accepted; see the rustdoc above.
         let stream = self.started_stream()?;
-        if !stream.is_running() {
-            return Err(AudioError::StreamReadError {
-                reason: "Composition is not running".to_string(),
-            });
-        }
-        crate::api::spawn_subscribe_thread(stream.clone())
+        crate::api::spawn_subscribe_thread(stream.clone(), Arc::clone(&self.subscriber_dropped))
     }
 
     /// Like [`subscribe`](Self::subscribe), but each item is an
@@ -704,20 +781,41 @@ impl Composition {
     /// composition analogue of
     /// [`AudioCapture::subscribe_with_errors`](crate::api::AudioCapture::subscribe_with_errors).
     ///
+    /// The bounded-channel/drop-and-count policy, the ~1/s coalescing of
+    /// repeated same-variant recoverable errors, and the blocking send that
+    /// guarantees the final terminal item are all shared with the
+    /// `AudioCapture` sibling — see its rustdoc for the full contract. The
+    /// acceptance policy matches [`subscribe`](Self::subscribe): any existing
+    /// stream (`Running` or the drainable `Stopping` window) is accepted.
+    ///
     /// # Errors
     ///
     /// Returns [`AudioError::StreamReadError`] if the composition is not
-    /// started or no longer running.
+    /// started.
     pub fn subscribe_with_errors(
         &self,
     ) -> AudioResult<std::sync::mpsc::Receiver<AudioResult<AudioBuffer>>> {
+        // Presence gate only (rsac-7aa2) — see subscribe().
         let stream = self.started_stream()?;
-        if !stream.is_running() {
-            return Err(AudioError::StreamReadError {
-                reason: "Composition is not running".to_string(),
-            });
-        }
-        crate::api::spawn_subscribe_with_errors_thread(stream.clone())
+        crate::api::spawn_subscribe_with_errors_thread(
+            stream.clone(),
+            Arc::clone(&self.subscriber_dropped),
+        )
+    }
+
+    /// Total composed buffers dropped by this composition's subscribe pumps
+    /// because a subscriber's bounded channel was full — the composition
+    /// analogue of
+    /// [`AudioCapture::subscriber_dropped_count`](crate::api::AudioCapture::subscriber_dropped_count)
+    /// (rsac-d6a8).
+    ///
+    /// This loss happens *downstream* of the composed ring, so it is invisible
+    /// to [`overrun_count`](CapturingStream::overrun_count) and the per-source
+    /// [`SourceStats`] counters. Aggregated across every subscription created
+    /// from this handle; monotone for the handle's lifetime. `0` means no
+    /// subscriber has ever fallen behind.
+    pub fn subscriber_dropped_count(&self) -> u64 {
+        self.subscriber_dropped.load(Ordering::Relaxed)
     }
 
     /// Returns an asynchronous stream of composed audio buffers — the
@@ -728,6 +826,17 @@ impl Composition {
     /// implements [`futures_core::Stream`], is waker-driven (the compositor
     /// wakes the task when it pushes a composed buffer), and yields a final
     /// `None` after the composition ends and the ring drains.
+    ///
+    /// # Single async consumer (waker contract; rsac-7aa2)
+    ///
+    /// The composed bridge holds exactly **one** waker slot. Two
+    /// `AsyncAudioStream`s over the same composition polled from two tasks
+    /// concurrently are **unsupported** — each registration displaces (and
+    /// silently drops, without waking) the other task's waker, so the
+    /// displaced task can park forever. Use at most one async consumer per
+    /// composition; see
+    /// [`AudioCapture::audio_data_stream`](crate::api::AudioCapture::audio_data_stream)
+    /// for the full rationale.
     ///
     /// # Errors
     ///
@@ -748,6 +857,17 @@ impl Composition {
     }
 }
 
+#[cfg(test)]
+impl Composition {
+    /// Test seam (crate-internal): attach an externally assembled composed
+    /// stream view — the engine-test harness pipeline — so the PUBLIC handle's
+    /// gate policies (subscribe/drain acceptance in the `Stopping` window) can
+    /// be exercised without device-backed inner captures.
+    pub(crate) fn attach_stream_for_tests(&mut self, view: Arc<ComposedStreamView>) {
+        self.stream = Some(view);
+    }
+}
+
 impl Drop for Composition {
     fn drop(&mut self) {
         // Best-effort deterministic teardown; stop() is idempotent.
@@ -757,6 +877,17 @@ impl Drop for Composition {
 
 // ── CapturingStream delegation ──────────────────────────────────────────
 
+/// [`CapturingStream`] delegation so generic consumers (sinks, pumps, the
+/// async adapter) can drive a `Composition` like any single capture.
+///
+/// One asymmetry to know: the **trait** [`stop`](CapturingStream::stop)
+/// (`&self`) only *signals* — it ends the composed ring and flags the engine
+/// to stop, **without joining** the compositor thread — while the **inherent**
+/// [`Composition::stop`] (`&mut self`) signals *and joins*. The `&self` stop
+/// exists so a concurrent reader can be unblocked without forming a `&mut`
+/// alias (the C FFI's `rsac_composition_stop` relies on it); the engine thread
+/// still exits on its own once signalled and is joined by the inherent
+/// `stop`/`Drop`, so nothing leaks either way.
 impl CapturingStream for Composition {
     fn read_chunk(&self) -> AudioResult<AudioBuffer> {
         self.started_stream()?.read_chunk()

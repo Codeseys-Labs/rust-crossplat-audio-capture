@@ -137,7 +137,9 @@ pub use crate::core::introspection::{
 };
 
 // API types
-pub use crate::api::{AudioCapture, AudioCaptureBuilder, RunningCapture};
+pub use crate::api::{
+    AudioBufferIterator, AudioCapture, AudioCaptureBuilder, DrainHandle, RunningCapture,
+};
 
 /// Construct an [`AudioCaptureBuilder`] in one expression with named,
 /// order-independent fields.

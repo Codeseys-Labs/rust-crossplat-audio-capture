@@ -43,7 +43,7 @@ use crate::core::introspection::{BackpressureReport, StreamStats};
 use std::fmt;
 use std::ops::{Deref, DerefMut};
 use std::str::FromStr;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::mpsc;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
@@ -70,6 +70,31 @@ const SUPPORTED_SAMPLE_RATES: [u32; 6] = PlatformCapabilities::SUPPORTED_SAMPLE_
 /// range is `1..=MAX_CHANNELS`). Mirrors the most permissive backend's ceiling;
 /// a narrower per-platform limit is enforced later by `PlatformCapabilities`.
 const MAX_CHANNELS: u16 = 32;
+
+/// Capacity, in buffers, of the **bounded** channel behind
+/// [`AudioCapture::subscribe`], [`AudioCapture::subscribe_with_errors`], and
+/// the `compose` feature's `Composition::subscribe{,_with_errors}`.
+///
+/// 128 buffers is deliberately the same order of magnitude as the bridge ring
+/// itself (the composed ring uses 128 slots; at the typical ~10 ms buffer
+/// cadence this is ~1.3 s of audio). A subscriber that stalls longer than that
+/// starts **losing** buffers — by design: the crate-wide backpressure policy is
+/// *drop, don't block, and count it* (ADR-0007). The previous unbounded
+/// `mpsc::channel()` instead grew without limit while `overrun_count()` /
+/// `backpressure_report()` read healthy, because the pump drained the ring
+/// promptly even when the subscriber never caught up (rsac-d6a8).
+pub(crate) const SUBSCRIBE_CHANNEL_CAPACITY: usize = 128;
+
+/// Minimum interval between two forwarded **same-variant** recoverable errors
+/// on a [`AudioCapture::subscribe_with_errors`] channel.
+///
+/// The pump polls at ~1 ms, so a persistently-recoverable stream would
+/// otherwise emit ~1000 identical advisory `Err` items per second, flooding
+/// the bounded channel and crowding out audio. Repeated recoverable errors of
+/// the same variant are therefore coalesced: forwarded at most once per this
+/// interval, while an error of a *different* variant is always forwarded
+/// immediately (rsac-d6a8).
+pub(crate) const RECOVERABLE_ERROR_FORWARD_INTERVAL: Duration = Duration::from_secs(1);
 
 /// A builder for creating [`AudioCapture`] instances.
 ///
@@ -446,6 +471,7 @@ impl AudioCaptureBuilder {
             callback: Mutex::new(None),
             callback_pump: None,
             start_instant: None,
+            subscriber_dropped: Arc::new(AtomicU64::new(0)),
         })
     }
 
@@ -718,12 +744,27 @@ impl RunningCapture {
     /// from the same ring (a single logical consumer per buffer). **Do not** mix
     /// `drain_to` with manual reads on the same capture.
     ///
+    /// # Accepted stream states (drain-the-tail; rsac-7aa2)
+    ///
+    /// Accepted whenever a stream exists: `Running`, the drainable `Stopping`
+    /// window (a gracefully-ended stream's buffered tail is drained into the
+    /// sink before finalization), or even an already-terminal stream — the
+    /// drain thread then exits on its first read and still finalizes the sink
+    /// (`flush()` then `close()`), so e.g. a WAV header is written for an empty
+    /// capture. The gate is stream **presence** only, chosen over a
+    /// `Running || Stopping` state check because (a) `CapturingStream` cannot
+    /// distinguish `Stopping` from terminal without consuming a buffer, and
+    /// (b) a state check here merely races the stream's own lifecycle — the
+    /// drain loop already handles every state honestly, so rejecting at the
+    /// gate could strand a drainable tail while accepting adds no hazard.
+    /// `Composition::drain_to` (behind the `compose` feature) applies the same
+    /// policy, so the two handles agree.
+    ///
     /// # Errors
     ///
-    /// Returns [`AudioError::StreamReadError`] if the capture has no stream or is
-    /// not running, or [`AudioError::InternalError`] if the drain thread cannot
-    /// be spawned. (`RunningCapture` is normally started, but the underlying
-    /// stream may have reached a terminal state by the time this is called.)
+    /// Returns [`AudioError::StreamReadError`] if the capture has no stream
+    /// (never started, or stopped — `stop()` releases the stream), or
+    /// [`AudioError::InternalError`] if the drain thread cannot be spawned.
     ///
     /// # Example
     ///
@@ -755,22 +796,23 @@ impl RunningCapture {
     where
         S: crate::sink::AudioSink + 'static,
     {
-        // Require a live stream, exactly like subscribe(): a RunningCapture is
-        // normally started, but its stream may already have reached a terminal
-        // state. Read via `&self` (DerefMut not needed) so we never form a `&mut`
-        // alias to the handle — the drain thread only needs a stream Arc clone.
+        // Presence gate only (rsac-7aa2, same policy as subscribe()): Running
+        // AND the drainable Stopping window are accepted — drain-the-tail. On a
+        // stream already at its fatal terminal the drain thread exits on its
+        // first read and finalizes (flush + close) the sink immediately, which
+        // is the honest outcome of racing a natural end. Read via `&self`
+        // (DerefMut not needed) so we never form a `&mut` alias to the handle —
+        // the drain thread only needs a stream Arc clone.
         let stream_ref = self
             .0
             .stream
             .as_ref()
             .ok_or_else(|| AudioError::StreamReadError {
-                reason: "Stream is not initialized. Call start() first.".to_string(),
+                reason: "No active stream: the capture was never started, or has been \
+                         stopped (stop() releases the stream). Call start() to begin \
+                         (or restart) capturing."
+                    .to_string(),
             })?;
-        if !stream_ref.is_running() {
-            return Err(AudioError::StreamReadError {
-                reason: "Stream is not running".to_string(),
-            });
-        }
         spawn_drain_thread(Arc::clone(stream_ref), sink)
     }
 
@@ -914,31 +956,47 @@ where
 /// Shared push-subscription pump behind [`AudioCapture::subscribe`] and the
 /// `compose` feature's `Composition::subscribe`: a background `rsac-subscribe`
 /// thread reads the stream's terminal-observable `try_read_chunk` path and
-/// forwards each buffer over an [`mpsc`] channel.
+/// forwards each buffer over a **bounded** [`mpsc`] channel
+/// ([`SUBSCRIBE_CHANNEL_CAPACITY`] buffers).
 ///
 /// Policy (identical for both callers; mirrors the callback pump and the
 /// iterator):
+/// - buffers are forwarded with a **non-blocking** `try_send`: when the
+///   subscriber has stalled long enough to fill the channel, the buffer is
+///   **dropped and counted** in `dropped` — the crate-wide "drop, don't
+///   block, and count it" backpressure policy. An unbounded channel would
+///   instead grow memory without limit while the ring-side `overrun_count()`
+///   read healthy (rsac-d6a8);
 /// - only a **fatal** terminal (e.g. [`AudioError::StreamEnded`]) ends the
 ///   subscription — the channel then disconnects, which the receiver observes
 ///   as a [`RecvError`](std::sync::mpsc::RecvError);
 /// - a **recoverable** read error is logged and retried, never ending delivery
 ///   (FH-1/BP-6);
 /// - a momentarily-empty ring sleeps ~1 ms (the documented latency floor);
-/// - a dropped receiver ends the thread.
+/// - a dropped receiver ends the thread (observed on every send attempt,
+///   including the `Full` path's `Disconnected` variant).
 pub(crate) fn spawn_subscribe_thread(
     stream: Arc<dyn crate::core::interface::CapturingStream>,
+    dropped: Arc<AtomicU64>,
 ) -> AudioResult<mpsc::Receiver<AudioBuffer>> {
-    let (tx, rx) = mpsc::channel();
+    let (tx, rx) = mpsc::sync_channel(SUBSCRIBE_CHANNEL_CAPACITY);
 
     std::thread::Builder::new()
         .name("rsac-subscribe".into())
         .spawn(move || loop {
             match stream.try_read_chunk() {
-                Ok(Some(buffer)) => {
-                    if tx.send(buffer).is_err() {
-                        break; // Receiver dropped
+                Ok(Some(buffer)) => match tx.try_send(buffer) {
+                    Ok(()) => {}
+                    // Subscriber slower than real time: the bounded channel is
+                    // full. Drop the buffer (never block the pump, never queue
+                    // unbounded memory) and count the loss so it is visible via
+                    // subscriber_dropped_count() — the ring-side counters can't
+                    // see it, because the pump drained the ring successfully.
+                    Err(mpsc::TrySendError::Full(_)) => {
+                        dropped.fetch_add(1, Ordering::Relaxed);
                     }
-                }
+                    Err(mpsc::TrySendError::Disconnected(_)) => break, // Receiver dropped
+                },
                 Ok(None) => {
                     // No data available, sleep briefly to avoid busy-spinning
                     std::thread::sleep(std::time::Duration::from_millis(1));
@@ -972,39 +1030,89 @@ pub(crate) fn spawn_subscribe_thread(
 /// [`AudioResult<AudioBuffer>`], and the **fatal terminal** error is delivered
 /// as the final channel item *before* the disconnect, so the consumer never
 /// has to race a bare `RecvError` to learn why the stream ended.
+///
+/// On top of [`spawn_subscribe_thread`]'s bounded-channel policy (`try_send`
+/// buffers; on `Full` drop-and-count into `dropped`):
+/// - repeated **recoverable** errors are coalesced: a same-variant error is
+///   forwarded at most once per [`RECOVERABLE_ERROR_FORWARD_INTERVAL`] (a
+///   persistently-recoverable stream errors once per ~1 ms poll and would
+///   otherwise flood the channel with identical advisory items); an error of a
+///   *different* variant is always forwarded immediately. A recoverable error
+///   item that meets a full channel is simply not forwarded that round (it is
+///   advisory; it is **not** counted as a dropped buffer);
+/// - the **fatal terminal** is sent with a **blocking** `send` so it can never
+///   be lost to the `Full` path: the pump exits right after, so blocking on
+///   this one final item is acceptable, and delivery is guaranteed unless the
+///   receiver is already gone (in which case nobody is listening anyway).
 pub(crate) fn spawn_subscribe_with_errors_thread(
     stream: Arc<dyn crate::core::interface::CapturingStream>,
+    dropped: Arc<AtomicU64>,
 ) -> AudioResult<mpsc::Receiver<AudioResult<AudioBuffer>>> {
-    let (tx, rx) = mpsc::channel();
+    let (tx, rx) = mpsc::sync_channel(SUBSCRIBE_CHANNEL_CAPACITY);
 
     std::thread::Builder::new()
         .name("rsac-subscribe-err".into())
-        .spawn(move || loop {
-            match stream.try_read_chunk() {
-                Ok(Some(buffer)) => {
-                    if tx.send(Ok(buffer)).is_err() {
-                        break; // Receiver dropped
+        .spawn(move || {
+            // Coalescing state: the variant of the last forwarded recoverable
+            // error and when it was forwarded. Variant identity (discriminant)
+            // rather than full equality keeps the hot path allocation-free.
+            let mut last_recoverable: Option<(std::mem::Discriminant<AudioError>, Instant)> = None;
+            loop {
+                match stream.try_read_chunk() {
+                    Ok(Some(buffer)) => match tx.try_send(Ok(buffer)) {
+                        Ok(()) => {}
+                        // Full channel: drop the buffer, count it (see
+                        // spawn_subscribe_thread — same policy).
+                        Err(mpsc::TrySendError::Full(_)) => {
+                            dropped.fetch_add(1, Ordering::Relaxed);
+                        }
+                        Err(mpsc::TrySendError::Disconnected(_)) => break, // Receiver dropped
+                    },
+                    Ok(None) => {
+                        // No data available, sleep briefly to avoid busy-spinning
+                        std::thread::sleep(std::time::Duration::from_millis(1));
                     }
-                }
-                Ok(None) => {
-                    // No data available, sleep briefly to avoid busy-spinning
-                    std::thread::sleep(std::time::Duration::from_millis(1));
-                }
-                // Fatal terminal: forward the error as the FINAL item, THEN
-                // exit. Send-then-break so the consumer always receives the
-                // terminal AudioError before the channel disconnects (it never
-                // has to race a bare RecvError to learn why the stream ended).
-                Err(e) if e.is_fatal() => {
-                    let _ = tx.send(Err(e));
-                    break;
-                }
-                // Recoverable: surface it (best-effort) AND keep delivering —
-                // a transient hiccup must not end the subscription.
-                Err(e) => {
-                    if tx.send(Err(e)).is_err() {
-                        break; // Receiver dropped
+                    // Fatal terminal: forward the error as the FINAL item, THEN
+                    // exit. This is deliberately the BLOCKING send: the channel
+                    // may be full of unread buffers, and the terminal must never
+                    // be silently lost to the Full path (the consumer would then
+                    // see a bare disconnect and never learn why the stream
+                    // ended). Blocking here is fine — the pump exits right after
+                    // this send, and send() errors out (ignored) if the receiver
+                    // is already gone.
+                    Err(e) if e.is_fatal() => {
+                        let _ = tx.send(Err(e));
+                        break;
                     }
-                    std::thread::sleep(std::time::Duration::from_millis(1));
+                    // Recoverable: surface it (best-effort, coalesced) AND keep
+                    // delivering — a transient hiccup must not end the
+                    // subscription.
+                    Err(e) => {
+                        let variant = std::mem::discriminant(&e);
+                        let now = Instant::now();
+                        let forward = match last_recoverable {
+                            Some((last_variant, last_at)) => {
+                                variant != last_variant
+                                    || now.duration_since(last_at)
+                                        >= RECOVERABLE_ERROR_FORWARD_INTERVAL
+                            }
+                            None => true,
+                        };
+                        if forward {
+                            last_recoverable = Some((variant, now));
+                            // Advisory item: non-blocking. If the channel is
+                            // full the error is not forwarded this round (and
+                            // NOT counted as a dropped buffer); a disconnect
+                            // still ends the pump.
+                            if matches!(
+                                tx.try_send(Err(e)),
+                                Err(mpsc::TrySendError::Disconnected(_))
+                            ) {
+                                break; // Receiver dropped
+                            }
+                        }
+                        std::thread::sleep(std::time::Duration::from_millis(1));
+                    }
                 }
             }
         })
@@ -1390,6 +1498,12 @@ pub struct AudioCapture {
     /// non-RT control path (a single `Instant` store), never on an idempotent
     /// restart of an already-running stream. Drives [`uptime`](AudioCapture::uptime).
     start_instant: Option<Instant>,
+    /// Total buffers dropped by this handle's subscribe pumps because a
+    /// subscriber's bounded channel was full (rsac-d6a8). Shared (aggregated)
+    /// across every subscription created from this handle and monotone for
+    /// the handle's lifetime — it survives `stop()`/restart. Surfaced via
+    /// [`subscriber_dropped_count`](AudioCapture::subscriber_dropped_count).
+    subscriber_dropped: Arc<AtomicU64>,
 }
 
 // ── Send + Sync assertion (AEG-5, rsac-6f1f) ──────────────────────────────
@@ -1428,21 +1542,45 @@ impl AudioCapture {
     /// Creates the underlying OS stream (if not already created) and marks
     /// the capture as running. In the new `CapturingStream` contract, the
     /// stream starts producing data upon creation.
+    ///
+    /// # Restart-by-recreation (rsac-7aa2)
+    ///
+    /// A handle whose stream was released by [`stop`](Self::stop) **can** be
+    /// started again: `start()` creates a *fresh* stream from the same
+    /// resolved device/config, so `stop() → start() → read` works. Notes:
+    ///
+    /// - the uptime anchor re-anchors at the restart —
+    ///   [`uptime`](Self::uptime) reports time since the *current* stream was
+    ///   created, not cumulative capture time;
+    /// - per-stream counters ([`overrun_count`](Self::overrun_count),
+    ///   [`stream_stats`](Self::stream_stats)) reset with the new stream,
+    ///   while [`subscriber_dropped_count`](Self::subscriber_dropped_count)
+    ///   is handle-lifetime and survives.
+    ///
+    /// Calling `start()` while a stream already exists is state-dependent:
+    /// a **running** stream makes it an idempotent no-op (`Ok`); a stream
+    /// that is present but **no longer running** (a naturally-ended stream
+    /// that was never `stop()`ped) returns
+    /// [`AudioError::StreamStartFailed`] — an individual *stream* can never be
+    /// restarted; call `stop()` first to release it, then `start()` to
+    /// restart with a fresh one.
     pub fn start(&mut self) -> AudioResult<()> {
         // If a stream already exists, decide based on its state:
         // - running  → no-op (idempotent restart of an active capture).
-        // - stopped  → error. A stream cannot be restarted (the OS capture
-        //   thread has exited); the docs direct callers to build a new
-        //   AudioCapture. Previously this fell through and spawned a callback
-        //   pump on a dead stream, then read_buffer() would fail confusingly
-        //   (audit L8).
+        // - stopped  → error. An individual stream cannot be restarted (the OS
+        //   capture thread has exited); the caller must first release it via
+        //   stop(), after which start() creates a fresh stream
+        //   (restart-by-recreation — see the rustdoc above). Previously this
+        //   fell through and spawned a callback pump on a dead stream, then
+        //   read_buffer() would fail confusingly (audit L8).
         if let Some(stream) = self.stream.as_ref() {
             if stream.is_running() {
                 return Ok(());
             }
             return Err(AudioError::StreamStartFailed {
-                reason: "Stream already created and is no longer running; a stopped \
-                         stream cannot be restarted — create a new AudioCapture."
+                reason: "Stream already created and is no longer running; an individual \
+                         stream cannot be restarted — call stop() to release it, then \
+                         start() again to restart with a fresh stream."
                     .to_string(),
             });
         }
@@ -1565,8 +1703,13 @@ impl AudioCapture {
 
     /// Stops the audio capture stream.
     ///
-    /// Stops the underlying OS stream and releases resources. After stopping,
-    /// the stream cannot be restarted — create a new `AudioCapture` instead.
+    /// Stops the underlying OS stream and **releases** it: the handle's stream
+    /// slot becomes empty and the uptime anchor is cleared. The handle itself
+    /// remains usable — a subsequent [`start`](Self::start) creates a fresh
+    /// stream from the same resolved device/config (*restart-by-recreation*;
+    /// see [`start`](Self::start) for what carries over). An individual
+    /// *stream* can never be restarted; the handle restarts by creating a new
+    /// one.
     ///
     /// Any active subscriber threads will terminate once they detect the stream
     /// has stopped. The underlying stream is released when all references
@@ -1815,6 +1958,20 @@ impl AudioCapture {
     ///
     /// The capture must be started (via [`start()`](Self::start)) before calling this method.
     ///
+    /// # Single async consumer (waker contract; rsac-7aa2)
+    ///
+    /// The bridge holds exactly **one** waker slot (an
+    /// `atomic_waker::AtomicWaker`). Creating two `AsyncAudioStream`s over the
+    /// same capture and polling them from two tasks concurrently is
+    /// **unsupported**: each poll's waker registration displaces the other
+    /// task's waker (concurrent `AtomicWaker::register` is the documented
+    /// unsupported case — the displaced waker is dropped *without being
+    /// woken*), so the displaced task can park forever on a wake that was
+    /// promised but stolen. Use **at most one** async consumer per capture.
+    /// Two consumers would in any case compete for buffers from the same ring
+    /// (a single logical consumer per buffer), so there is nothing to gain
+    /// from a second stream.
+    ///
     /// # Feature Flag
     ///
     /// This method is only available when the `async-stream` feature is enabled.
@@ -1915,8 +2072,21 @@ impl AudioCapture {
     /// Creates a subscription channel that delivers audio buffers as they are captured.
     ///
     /// Spawns a background thread that reads from the capture stream and sends
-    /// buffers over an [`mpsc`] channel. Returns the receiving
-    /// end of the channel.
+    /// buffers over a **bounded** [`mpsc`] channel (128 buffers — the same
+    /// order as the bridge ring itself; ~1.3 s of audio at the typical ~10 ms
+    /// buffer cadence). Returns the receiving end of the channel.
+    ///
+    /// # Backpressure: drop, don't block, and count it (rsac-d6a8)
+    ///
+    /// If the receiver stalls long enough for the channel to fill, further
+    /// buffers are **dropped** — the pump never blocks and never queues
+    /// unbounded memory — and each drop is counted in
+    /// [`subscriber_dropped_count`](Self::subscriber_dropped_count). This loss
+    /// happens *downstream* of the capture ring, so
+    /// [`overrun_count`](Self::overrun_count) and
+    /// [`backpressure_report`](Self::backpressure_report) do **not** reflect
+    /// it; a slow subscriber must watch `subscriber_dropped_count()` as the
+    /// complement.
     ///
     /// **Important:** The background thread competes with [`read_buffer()`](Self::read_buffer)
     /// and [`read_buffer_blocking()`](Self::read_buffer_blocking) for audio data
@@ -1935,6 +2105,18 @@ impl AudioCapture {
     ///
     /// Multiple subscriptions are allowed but each subscriber competes for buffers.
     ///
+    /// # Accepted stream states (rsac-7aa2)
+    ///
+    /// The subscription is accepted whenever a stream exists — while `Running`
+    /// **or** in the drainable `Stopping` window: a gracefully-ended stream
+    /// still holding a buffered tail can be subscribed to and drained (the old
+    /// `is_running()` gate stranded that tail). Subscribing to a stream that
+    /// already reached its fatal terminal also succeeds and simply yields a
+    /// channel that ends immediately — racing a natural end is inherently
+    /// indistinguishable from subscribing just before it. Only a capture with
+    /// **no** stream (never started, or [`stop`](Self::stop)ped — `stop()`
+    /// releases the stream) is rejected.
+    ///
     /// # Latency floor (audit L5)
     ///
     /// The background thread polls with a 1 ms sleep when the ring buffer is
@@ -1948,24 +2130,23 @@ impl AudioCapture {
     ///
     /// # Errors
     ///
-    /// Returns an error if the capture is not currently running.
+    /// Returns [`AudioError::StreamReadError`] if the capture has no stream
+    /// (never started, or stopped).
     pub fn subscribe(&self) -> AudioResult<mpsc::Receiver<AudioBuffer>> {
-        // Get the stream first — if there's no stream, we're not running.
+        // Presence gate only (rsac-7aa2): Running and the drainable Stopping
+        // window are both accepted; a stream already at its fatal terminal
+        // yields an immediately-ending channel. See the rustdoc above.
         let stream_ref = self
             .stream
             .as_ref()
             .ok_or_else(|| AudioError::StreamReadError {
-                reason: "Stream is not initialized. Call start() first.".to_string(),
+                reason: "No active stream: the capture was never started, or has been \
+                         stopped (stop() releases the stream). Call start() to begin \
+                         (or restart) capturing."
+                    .to_string(),
             })?;
 
-        // Check running state via the stream itself — single source of truth.
-        if !stream_ref.is_running() {
-            return Err(AudioError::StreamReadError {
-                reason: "Stream is not running".to_string(),
-            });
-        }
-
-        spawn_subscribe_thread(Arc::clone(stream_ref))
+        spawn_subscribe_thread(Arc::clone(stream_ref), Arc::clone(&self.subscriber_dropped))
     }
 
     /// Like [`subscribe`](Self::subscribe), but delivers each item as an
@@ -1995,11 +2176,34 @@ impl AudioCapture {
     /// [`read_buffer`](Self::read_buffer) and the callback pump for buffers from
     /// the same ring — do not mix it with manual reads.
     ///
+    /// # Bounded channel, drops, and coalescing (rsac-d6a8)
+    ///
+    /// The channel is **bounded** (128 buffers, like [`subscribe`](Self::subscribe)):
+    /// a stalled receiver causes further buffers to be dropped and counted in
+    /// [`subscriber_dropped_count`](Self::subscriber_dropped_count). Repeated
+    /// **recoverable** errors of the same variant are *coalesced* — forwarded
+    /// at most once per second (a persistently-recoverable stream errors once
+    /// per ~1 ms poll and would otherwise flood the channel with identical
+    /// advisory items); an error of a different variant is always forwarded
+    /// immediately. The **fatal terminal** is exempt from all of this: it is
+    /// sent with a *blocking* send as the guaranteed final item, so it is never
+    /// lost even when the channel is full of unread buffers (the pump exits
+    /// right after; delivery fails only if the receiver is already gone).
+    ///
+    /// # Accepted stream states (rsac-7aa2)
+    ///
+    /// Same policy as [`subscribe`](Self::subscribe): accepted whenever a
+    /// stream exists (`Running` or the drainable `Stopping` window — the
+    /// buffered tail plus the terminal error are then delivered); a stream
+    /// already at its fatal terminal yields a channel whose only item is the
+    /// final `Err`. Only a capture with no stream is rejected.
+    ///
     /// # Errors
     ///
-    /// Returns an error if the capture is not currently running. (Once running,
-    /// the terminal stream error is delivered as the final channel *item*, not as
-    /// the return value of this method.)
+    /// Returns [`AudioError::StreamReadError`] if the capture has no stream
+    /// (never started, or stopped). Once a subscription exists, the terminal
+    /// stream error is delivered as the final channel *item*, not as the
+    /// return value of this method.
     ///
     /// # Backend caveat (FH-1)
     ///
@@ -2011,22 +2215,41 @@ impl AudioCapture {
     /// until the receiver is dropped — the recoverable-vs-fatal branching here is
     /// correct regardless.
     pub fn subscribe_with_errors(&self) -> AudioResult<mpsc::Receiver<AudioResult<AudioBuffer>>> {
-        // Get the stream first — if there's no stream, we're not running.
+        // Presence gate only (rsac-7aa2) — see subscribe() for the rationale.
         let stream_ref = self
             .stream
             .as_ref()
             .ok_or_else(|| AudioError::StreamReadError {
-                reason: "Stream is not initialized. Call start() first.".to_string(),
+                reason: "No active stream: the capture was never started, or has been \
+                         stopped (stop() releases the stream). Call start() to begin \
+                         (or restart) capturing."
+                    .to_string(),
             })?;
 
-        // Check running state via the stream itself — single source of truth.
-        if !stream_ref.is_running() {
-            return Err(AudioError::StreamReadError {
-                reason: "Stream is not running".to_string(),
-            });
-        }
+        spawn_subscribe_with_errors_thread(
+            Arc::clone(stream_ref),
+            Arc::clone(&self.subscriber_dropped),
+        )
+    }
 
-        spawn_subscribe_with_errors_thread(Arc::clone(stream_ref))
+    /// Returns the total number of buffers **dropped by subscribe pumps** on
+    /// this handle because a subscriber's bounded channel was full (rsac-d6a8).
+    ///
+    /// [`subscribe`](Self::subscribe) and
+    /// [`subscribe_with_errors`](Self::subscribe_with_errors) deliver over a
+    /// bounded channel (128 buffers) and, per the crate-wide backpressure
+    /// policy, **drop rather than block** when a subscriber stalls. Those
+    /// drops happen *downstream* of the capture ring, so they are invisible to
+    /// [`overrun_count`](Self::overrun_count) and
+    /// [`backpressure_report`](Self::backpressure_report) — this counter is
+    /// the subscriber-side complement. It aggregates across every subscription
+    /// created from this handle (mirroring how `overrun_count` aggregates the
+    /// ring) and is monotone for the handle's lifetime: unlike the per-stream
+    /// counters it survives [`stop`](Self::stop)/restart.
+    ///
+    /// `0` means no subscriber has ever fallen behind.
+    pub fn subscriber_dropped_count(&self) -> u64 {
+        self.subscriber_dropped.load(Ordering::Relaxed)
     }
 
     /// Returns the number of audio buffers dropped due to ring buffer overflow (overruns).
@@ -2830,6 +3053,24 @@ mod tests {
             callback: Mutex::new(None),
             callback_pump: None,
             start_instant: None,
+            subscriber_dropped: Arc::new(AtomicU64::new(0)),
+        }
+    }
+
+    /// Creates an AudioCapture with NO stream — the pre-start / post-stop
+    /// state — for gate and default-snapshot tests.
+    fn make_capture_without_stream() -> AudioCapture {
+        AudioCapture {
+            config: AudioCaptureConfig {
+                target: CaptureTarget::SystemDefault,
+                stream_config: StreamConfig::default(),
+            },
+            device: None,
+            stream: None,
+            callback: Mutex::new(None),
+            callback_pump: None,
+            start_instant: None,
+            subscriber_dropped: Arc::new(AtomicU64::new(0)),
         }
     }
 
@@ -2882,21 +3123,87 @@ mod tests {
 
     // ── subscribe() tests ─────────────────────────────────────────────
 
+    /// rsac-7aa2(1): subscribe is gated on stream PRESENCE only. A stream that
+    /// already reached its fatal terminal (stopped, nothing buffered) is
+    /// accepted and yields a channel that ends immediately — racing a natural
+    /// end is indistinguishable from subscribing just before it, so an error
+    /// here would be arbitrary. A capture with NO stream at all still rejects,
+    /// with a message that is accurate for both never-started and post-stop.
     #[test]
-    fn subscribe_returns_error_when_not_running() {
+    fn subscribe_on_terminal_stream_yields_immediately_ending_channel() {
         let mock = Arc::new(MockCapturingStream::new());
-        // Signal the mock (stream-side) that it's no longer running — the
-        // stream's state is now the single source of truth.
-        mock.signal_stop();
+        mock.signal_stop(); // terminal, no buffered tail
         let capture = make_mock_capture(mock);
 
-        let result = capture.subscribe();
-        assert!(result.is_err());
-        match result.unwrap_err() {
-            AudioError::StreamReadError { reason } => {
-                assert!(reason.contains("not running"));
+        let rx = capture.subscribe().expect("terminal stream is accepted");
+        assert!(
+            rx.recv_timeout(std::time::Duration::from_secs(2)).is_err(),
+            "channel must end immediately (no data, prompt disconnect)"
+        );
+
+        // No stream at all → rejected via the presence check.
+        let empty = make_capture_without_stream();
+        match empty.subscribe() {
+            Err(AudioError::StreamReadError { reason }) => {
+                assert!(
+                    reason.contains("start()"),
+                    "message must direct to start(): {reason}"
+                );
             }
-            e => panic!("Expected StreamReadError, got: {e:?}"),
+            other => panic!("expected StreamReadError, got: {other:?}"),
+        }
+    }
+
+    /// rsac-7aa2(1): the drainable Stopping window is accepted — a stream that
+    /// gracefully ended with a buffered tail can still be subscribed to, and
+    /// the tail is delivered before the channel ends. (The old `is_running()`
+    /// gate rejected this call and stranded the tail.)
+    #[test]
+    fn subscribe_accepts_stopping_window_and_drains_tail() {
+        let mock = Arc::new(MockCapturingStream::new());
+        for i in 0..3 {
+            mock.push_buffer(AudioBuffer::new(vec![i as f32 + 1.0; 4], 2, 48000));
+        }
+        // Not running, but the tail is still drainable — the mock models the
+        // bridge's Stopping window (drain first, terminal only when empty).
+        mock.signal_stop();
+        let capture = make_mock_capture(Arc::clone(&mock));
+        assert!(!capture.is_running());
+
+        let rx = capture
+            .subscribe()
+            .expect("the drainable Stopping window must be accepted");
+        let mut got = Vec::new();
+        while let Ok(buf) = rx.recv_timeout(std::time::Duration::from_secs(2)) {
+            got.push(buf.data()[0]);
+        }
+        assert_eq!(
+            got,
+            vec![1.0, 2.0, 3.0],
+            "the buffered tail is delivered, then the channel ends"
+        );
+    }
+
+    /// rsac-7aa2(3): the post-stop subscribe error is accurate — stop()
+    /// releases the stream, so subscribe() must not claim the stream "is not
+    /// initialized" (the old message) when it was in fact stopped.
+    #[test]
+    fn post_stop_subscribe_error_is_accurate() {
+        let mock = Arc::new(MockCapturingStream::new());
+        let mut capture = make_mock_capture(mock);
+        capture.stop().unwrap();
+        match capture.subscribe() {
+            Err(AudioError::StreamReadError { reason }) => {
+                assert!(
+                    reason.contains("stopped"),
+                    "post-stop message must mention the stopped state: {reason}"
+                );
+                assert!(
+                    !reason.contains("not initialized"),
+                    "the misleading pre-fix message must be gone: {reason}"
+                );
+            }
+            other => panic!("expected StreamReadError, got: {other:?}"),
         }
     }
 
@@ -3081,6 +3388,160 @@ mod tests {
             saw_terminal,
             "subscribe_with_errors must deliver the terminal Err before disconnect"
         );
+    }
+
+    // ── bounded subscribe channel tests (rsac-d6a8) ───────────────────
+
+    /// rsac-d6a8: a stalled receiver must NOT grow memory without bound. The
+    /// channel depth is capped at SUBSCRIBE_CHANNEL_CAPACITY, the overflow is
+    /// dropped, and every drop is counted in subscriber_dropped_count().
+    #[test]
+    fn subscribe_bounds_channel_and_counts_drops() {
+        const OVERFLOW: usize = 72;
+        let total = SUBSCRIBE_CHANNEL_CAPACITY + OVERFLOW;
+
+        let mock = Arc::new(MockCapturingStream::new());
+        for _ in 0..total {
+            mock.push_buffer(AudioBuffer::new(vec![0.5; 4], 2, 48000));
+        }
+        let capture = make_mock_capture(Arc::clone(&mock));
+        let rx = capture.subscribe().expect("subscribe should succeed");
+        // Stall the receiver: never recv while the pump floods the channel.
+
+        // The pump drains all `total` buffers from the mock; the first
+        // SUBSCRIBE_CHANNEL_CAPACITY fill the channel and the rest are dropped
+        // and counted. Poll (bounded) until the counter reaches the overflow.
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        while capture.subscriber_dropped_count() < OVERFLOW as u64
+            && std::time::Instant::now() < deadline
+        {
+            std::thread::sleep(std::time::Duration::from_millis(2));
+        }
+        assert_eq!(
+            capture.subscriber_dropped_count(),
+            OVERFLOW as u64,
+            "every overflowed buffer is dropped and counted, exactly once"
+        );
+
+        // End the stream so the pump exits, then drain: the channel holds
+        // EXACTLY the cap — bounded depth, not the full flood.
+        mock.signal_stop();
+        let mut received = 0usize;
+        while rx.recv_timeout(std::time::Duration::from_secs(2)).is_ok() {
+            received += 1;
+        }
+        assert_eq!(
+            received, SUBSCRIBE_CHANNEL_CAPACITY,
+            "channel depth is capped at the documented bound"
+        );
+    }
+
+    /// rsac-d6a8: the fatal terminal is NEVER lost to a full channel. After
+    /// drops, subscribe_with_errors still delivers the terminal Err as the
+    /// final item (the pump uses a blocking send for that one item).
+    #[test]
+    fn subscribe_with_errors_terminal_survives_full_channel() {
+        const OVERFLOW: usize = 10;
+        let total = SUBSCRIBE_CHANNEL_CAPACITY + OVERFLOW;
+
+        let mock = Arc::new(MockCapturingStream::new());
+        for _ in 0..total {
+            mock.push_buffer(AudioBuffer::new(vec![0.25; 4], 2, 48000));
+        }
+        let capture = make_mock_capture(Arc::clone(&mock));
+        let rx = capture
+            .subscribe_with_errors()
+            .expect("subscribe_with_errors should succeed");
+
+        // Let the pump flood the (unread) channel and drop the overflow.
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        while capture.subscriber_dropped_count() < OVERFLOW as u64
+            && std::time::Instant::now() < deadline
+        {
+            std::thread::sleep(std::time::Duration::from_millis(2));
+        }
+        assert_eq!(capture.subscriber_dropped_count(), OVERFLOW as u64);
+
+        // Now end the stream: the pump's terminal send blocks on the full
+        // channel until we drain — the terminal must arrive as the FINAL item.
+        mock.signal_stop();
+        let mut oks = 0usize;
+        let terminal = loop {
+            match rx.recv_timeout(std::time::Duration::from_secs(2)) {
+                Ok(Ok(_)) => oks += 1,
+                Ok(Err(e)) => break e,
+                Err(e) => panic!("channel ended before the terminal Err arrived: {e:?}"),
+            }
+        };
+        assert_eq!(
+            oks, SUBSCRIBE_CHANNEL_CAPACITY,
+            "all channel-buffered items are delivered before the terminal"
+        );
+        assert!(
+            terminal.is_fatal() && matches!(terminal, AudioError::StreamEnded { .. }),
+            "the final item is the fatal terminal, got: {terminal:?}"
+        );
+        assert!(
+            rx.recv_timeout(std::time::Duration::from_secs(1)).is_err(),
+            "channel disconnects after the terminal item"
+        );
+    }
+
+    /// rsac-d6a8: repeated recoverable errors of the same variant are
+    /// coalesced (≈1/s), not forwarded once per ~1 ms poll — a persistently-
+    /// recoverable stream must not flood the channel with identical advisory
+    /// items. The audio behind the error burst is still delivered.
+    #[test]
+    fn subscribe_with_errors_coalesces_repeated_recoverable_errors() {
+        const BURST: usize = 50;
+        let mock = Arc::new(MockCapturingStream::new());
+        for _ in 0..BURST {
+            mock.inject_recoverable_error(AudioError::StreamReadError {
+                reason: "persistent transient".into(),
+            });
+        }
+        mock.push_buffer(AudioBuffer::new(vec![0.7; 4], 2, 48000));
+
+        let capture = make_mock_capture(Arc::clone(&mock));
+        let rx = capture
+            .subscribe_with_errors()
+            .expect("subscribe_with_errors should succeed");
+
+        // Collect items until the buffer behind the burst arrives.
+        let mut err_items = 0usize;
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        loop {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "the buffer behind the error burst never arrived"
+            );
+            match rx.recv_timeout(std::time::Duration::from_secs(2)) {
+                Ok(Err(e)) => {
+                    assert!(e.is_recoverable(), "burst items are recoverable");
+                    err_items += 1;
+                }
+                Ok(Ok(buf)) => {
+                    assert_eq!(buf.data()[0], 0.7);
+                    break;
+                }
+                Err(e) => panic!("channel ended prematurely: {e:?}"),
+            }
+        }
+        // 50 identical errors ~1 ms apart span well under the 1 s coalescing
+        // interval, so ~1 forwarded item is expected. Allow a little slack for
+        // pathological CI scheduling (a >1 s stall between two polls legally
+        // forwards again) — the point is "far fewer than the burst".
+        assert!(
+            (1..=3).contains(&err_items),
+            "repeated same-variant recoverable errors must be coalesced \
+             (expected 1..=3 forwarded, got {err_items} of {BURST})"
+        );
+        assert_eq!(
+            capture.subscriber_dropped_count(),
+            0,
+            "advisory error items are never counted as dropped buffers"
+        );
+        mock.signal_stop();
     }
 
     // ── read_chunk_nonblocking() tests (terminal-observable read) ─────
@@ -3278,17 +3739,7 @@ mod tests {
 
     #[test]
     fn overrun_count_returns_zero_when_no_stream() {
-        let capture = AudioCapture {
-            config: AudioCaptureConfig {
-                target: CaptureTarget::SystemDefault,
-                stream_config: StreamConfig::default(),
-            },
-            device: None,
-            stream: None,
-            callback: Mutex::new(None),
-            callback_pump: None,
-            start_instant: None,
-        };
+        let capture = make_capture_without_stream();
         assert_eq!(capture.overrun_count(), 0);
     }
 
@@ -3482,6 +3933,75 @@ mod tests {
         );
     }
 
+    /// rsac-7aa2(3): restart-by-recreation is the blessed lifecycle — stop()
+    /// releases the stream and a later start() creates a FRESH stream from the
+    /// same resolved device; reads work again and the uptime anchor re-anchors.
+    #[test]
+    fn stop_then_start_restarts_by_recreation() {
+        /// A device whose create_stream() hands out a fresh running mock with
+        /// one buffered chunk, so the restarted capture demonstrably serves
+        /// data end-to-end.
+        struct RestartDevice;
+        impl crate::core::interface::AudioDevice for RestartDevice {
+            fn id(&self) -> crate::core::config::DeviceId {
+                crate::core::config::DeviceId("restart-mock".to_string())
+            }
+            fn name(&self) -> String {
+                "RestartMockDevice".to_string()
+            }
+            fn is_default(&self) -> bool {
+                true
+            }
+            fn supported_formats(&self) -> Vec<AudioFormat> {
+                vec![]
+            }
+            fn create_stream(
+                &self,
+                _config: &StreamConfig,
+            ) -> AudioResult<Box<dyn CapturingStream>> {
+                let mock = MockCapturingStream::new();
+                mock.push_buffer(AudioBuffer::new(vec![0.6; 4], 2, 48000));
+                Ok(Box::new(mock))
+            }
+        }
+
+        let first = Arc::new(MockCapturingStream::new());
+        let mut capture = AudioCapture {
+            config: AudioCaptureConfig {
+                target: CaptureTarget::SystemDefault,
+                stream_config: StreamConfig::default(),
+            },
+            device: Some(Box::new(RestartDevice)),
+            stream: Some(first),
+            callback: Mutex::new(None),
+            callback_pump: None,
+            start_instant: Some(Instant::now()),
+            subscriber_dropped: Arc::new(AtomicU64::new(0)),
+        };
+        assert!(capture.is_running());
+
+        capture.stop().expect("stop ok");
+        assert!(!capture.is_running());
+        assert!(capture.uptime().is_none(), "stop clears the uptime anchor");
+
+        // Restart: start() re-creates a stream from the resolved device.
+        capture.start().expect("restart-by-recreation must succeed");
+        assert!(capture.is_running(), "fresh stream is running");
+        assert!(
+            capture.uptime().is_some(),
+            "the uptime anchor re-anchors on restart"
+        );
+
+        // The recreated stream serves data end-to-end.
+        let buf = capture
+            .read_chunk_nonblocking()
+            .expect("read ok")
+            .expect("data from the recreated stream");
+        assert_eq!(buf.data()[0], 0.6);
+
+        capture.stop().expect("second stop ok");
+    }
+
     /// The pump thread exits when the stream stops (try_read_chunk → Err), and
     /// shutdown() is safe to call afterwards (idempotent join).
     #[test]
@@ -3539,17 +4059,7 @@ mod tests {
     /// Before any start(), there is no stream and therefore no uptime.
     #[test]
     fn uptime_is_none_before_start() {
-        let capture = AudioCapture {
-            config: AudioCaptureConfig {
-                target: CaptureTarget::SystemDefault,
-                stream_config: StreamConfig::default(),
-            },
-            device: None,
-            stream: None,
-            callback: Mutex::new(None),
-            callback_pump: None,
-            start_instant: None,
-        };
+        let capture = make_capture_without_stream();
         assert!(capture.uptime().is_none());
     }
 
@@ -3618,17 +4128,7 @@ mod tests {
     /// Before start() there is no stream, so format() reports None.
     #[test]
     fn format_is_none_before_start() {
-        let capture = AudioCapture {
-            config: AudioCaptureConfig {
-                target: CaptureTarget::SystemDefault,
-                stream_config: StreamConfig::default(),
-            },
-            device: None,
-            stream: None,
-            callback: Mutex::new(None),
-            callback_pump: None,
-            start_instant: None,
-        };
+        let capture = make_capture_without_stream();
         assert!(capture.format().is_none());
     }
 
@@ -3716,17 +4216,7 @@ mod tests {
     /// does not panic.
     #[test]
     fn stream_stats_default_when_no_stream() {
-        let capture = AudioCapture {
-            config: AudioCaptureConfig {
-                target: CaptureTarget::SystemDefault,
-                stream_config: StreamConfig::default(),
-            },
-            device: None,
-            stream: None,
-            callback: Mutex::new(None),
-            callback_pump: None,
-            start_instant: None,
-        };
+        let capture = make_capture_without_stream();
         let s = capture.stream_stats();
         assert!(!s.is_running);
         assert_eq!(s.uptime, Duration::ZERO);
@@ -3797,17 +4287,7 @@ mod tests {
     /// backpressure_report() on a capture with no stream is the all-zero default.
     #[test]
     fn backpressure_report_default_when_no_stream() {
-        let capture = AudioCapture {
-            config: AudioCaptureConfig {
-                target: CaptureTarget::SystemDefault,
-                stream_config: StreamConfig::default(),
-            },
-            device: None,
-            stream: None,
-            callback: Mutex::new(None),
-            callback_pump: None,
-            start_instant: None,
-        };
+        let capture = make_capture_without_stream();
         let r = capture.backpressure_report();
         assert_eq!(r.pushed, 0);
         assert_eq!(r.dropped, 0);
@@ -4326,17 +4806,7 @@ mod tests {
     /// request_stop() on a capture with no stream is a no-op (does not panic).
     #[test]
     fn request_stop_no_stream_is_noop() {
-        let capture = AudioCapture {
-            config: AudioCaptureConfig {
-                target: CaptureTarget::SystemDefault,
-                stream_config: StreamConfig::default(),
-            },
-            device: None,
-            stream: None,
-            callback: Mutex::new(None),
-            callback_pump: None,
-            start_instant: None,
-        };
+        let capture = make_capture_without_stream();
         // Must not panic when there is no stream to signal.
         capture.request_stop();
     }
@@ -4505,29 +4975,70 @@ mod tests {
         );
     }
 
-    /// drain_to() returns an error when the underlying stream is not running
-    /// (mirrors subscribe()'s precondition).
+    /// rsac-7aa2(2): drain_to on a stream already at its fatal terminal is
+    /// ACCEPTED (presence-only gate, drain-the-tail policy): the drain thread
+    /// exits on its first read, writes nothing, and still finalizes the sink
+    /// (flush + close) so e.g. a WAV header is written for an empty capture.
     #[test]
-    fn drain_to_errors_when_not_running() {
+    fn drain_to_on_terminal_stream_finalizes_immediately() {
         let mock = Arc::new(MockCapturingStream::new());
-        mock.signal_stop();
+        mock.signal_stop(); // already terminal, no tail
         let capture = RunningCapture(make_mock_capture(mock));
 
         let (writes, frames, flushes, closes) = CountingSink::shared();
         let sink = CountingSink {
-            writes,
+            writes: Arc::clone(&writes),
             frames,
-            flushes,
-            closes,
+            flushes: Arc::clone(&flushes),
+            closes: Arc::clone(&closes),
             fail_first_write_fatal: false,
             first_write_seen: false,
         };
-        let result = capture.drain_to(sink);
-        assert!(result.is_err());
-        match result.unwrap_err() {
-            AudioError::StreamReadError { reason } => assert!(reason.contains("not running")),
-            e => panic!("expected StreamReadError, got: {e:?}"),
+        let drain = capture
+            .drain_to(sink)
+            .expect("a terminal stream is accepted (drain-the-tail policy)");
+        drain.shutdown(); // joins → the finalize has completed
+
+        assert_eq!(writes.load(Ordering::SeqCst), 0, "nothing to drain");
+        assert_eq!(flushes.load(Ordering::SeqCst), 1, "sink still flushed");
+        assert_eq!(closes.load(Ordering::SeqCst), 1, "sink still closed");
+    }
+
+    /// rsac-7aa2(2): drain_to accepts the drainable Stopping window and drains
+    /// the buffered tail into the sink before finalizing — the old is_running()
+    /// gate rejected this call and stranded the tail.
+    #[test]
+    fn drain_to_accepts_stopping_window_and_drains_tail() {
+        let mock = Arc::new(MockCapturingStream::new());
+        mock.push_buffer(AudioBuffer::new(vec![0.1; 4], 2, 48000));
+        mock.push_buffer(AudioBuffer::new(vec![0.2; 4], 2, 48000));
+        mock.signal_stop(); // not running, tail still drainable
+        let capture = RunningCapture(make_mock_capture(Arc::clone(&mock)));
+
+        let (writes, frames, flushes, closes) = CountingSink::shared();
+        let sink = CountingSink {
+            writes: Arc::clone(&writes),
+            frames: Arc::clone(&frames),
+            flushes: Arc::clone(&flushes),
+            closes: Arc::clone(&closes),
+            fail_first_write_fatal: false,
+            first_write_seen: false,
+        };
+        let drain = capture
+            .drain_to(sink)
+            .expect("the Stopping window must be accepted");
+
+        // Poll until the tail is drained (bounded), then join.
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        while writes.load(Ordering::SeqCst) < 2 && std::time::Instant::now() < deadline {
+            std::thread::sleep(std::time::Duration::from_millis(1));
         }
+        drain.shutdown();
+
+        assert_eq!(writes.load(Ordering::SeqCst), 2, "the tail is drained");
+        assert_eq!(frames.load(Ordering::SeqCst), 4, "2 frames per buffer × 2");
+        assert_eq!(flushes.load(Ordering::SeqCst), 1);
+        assert_eq!(closes.load(Ordering::SeqCst), 1);
     }
 
     /// A FATAL write() error ends the drain loop early, but flush() and close()

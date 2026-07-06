@@ -32,7 +32,9 @@
 //! ```
 
 // ── Capture lifecycle: the builder/handle facade ───────────────────────────
-pub use crate::api::{AudioCapture, AudioCaptureBuilder, RunningCapture};
+pub use crate::api::{
+    AudioBufferIterator, AudioCapture, AudioCaptureBuilder, DrainHandle, RunningCapture,
+};
 
 // The `capture!` one-line builder macro. `#[macro_export]` places it at the
 // crate root; re-exporting it here makes `use rsac::prelude::*;` bring it into
