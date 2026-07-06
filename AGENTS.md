@@ -147,8 +147,9 @@ All ten identified gaps have been closed:
 the mic slices are implemented and **compile-checked only** (`aarch64-linux-android` /
 `aarch64-apple-ios` check+clippy green; **no runtime verification on any device yet** —
 do not claim "tested on Android/iOS"). First-party glue (`mobile/android` AAR Kotlin,
-`mobile/ios` SwiftPM incl. the canonical broadcast-ring contract) is source-complete,
-pending its CI build jobs (rsac-1a6e / rsac-48e7).
+`mobile/ios` SwiftPM incl. the canonical broadcast-ring contract) **builds in CI**
+(the `mobile-android` / `mobile-ios` ci.yml jobs: cross-target check+clippy, real
+Gradle AAR + xcodebuild SwiftPM builds — compile-proof only).
 
 | Capture Mode | Android (AAudio) | iOS (AVAudioEngine) |
 |---|---|---|

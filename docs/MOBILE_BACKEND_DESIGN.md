@@ -4,9 +4,11 @@
 > The Android (AAudio) and iOS (AVAudioEngine) `Device("default")` microphone
 > slices exist in `src/audio/{android,ios}/` behind `feat_android`/`feat_ios`
 > (rsac-20cd / rsac-9e02) — cross-target check + clippy green, **no runtime
-> verification on any device yet**. First-party glue sources are in
-> `mobile/{android,ios}/` (rsac-c4b8 / rsac-6d5f, source-complete, CI builds
-> pending — rsac-1a6e / rsac-48e7). Everything else (playback capture, JNI
+> verification on any device yet**. First-party glue lives in
+> `mobile/{android,ios}/` (rsac-c4b8 / rsac-6d5f) and **builds in CI**: the
+> `mobile-android`/`mobile-ios` ci.yml jobs (rsac-1a6e / rsac-48e7) run the
+> cross-target check matrix plus a real Gradle AAR build and xcodebuild of
+> both SwiftPM products. Everything else (playback capture, JNI
 > ingest, ReplayKit consumer) remains design, seeded per the tables below.
 > **Where implementation and this doc diverge, the code (and
 > `mobile/ios/Sources/RsacBroadcastKit/RingLayout.swift` for the ring

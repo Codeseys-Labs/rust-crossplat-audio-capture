@@ -1,14 +1,15 @@
 # rsac — iOS SwiftPM package (`RsacAudio` + `RsacBroadcastKit`)
 
-> ## ⚠️ Status: source-complete; **not yet built in CI**
+> ## Status: **builds in CI** (compile-verified; no device runtime verification)
 >
-> These sources have never been compiled by this repository's CI — there is
-> no Xcode on the machines that authored them. **Seed rsac-48e7 adds the
-> SwiftPM CI job** (`swift build` / `xcodebuild` on a macOS runner) that
-> turns "source-complete" into "builds". Until that job is green, treat
-> every API-shape detail marked `// CI-VERIFY:` in the sources as
-> unconfirmed. Design provenance: ADR-0012 (packaging), ADR-0013 (transport
-> & CaptureTarget semantics), `docs/MOBILE_BACKEND_DESIGN.md` (iOS sections).
+> The `mobile-ios` CI job (rsac-48e7) builds both products with `xcodebuild`
+> against `generic/platform=iOS` on every code PR — green since 2026-07-06.
+> That proves **compilation only**: nothing here has run on a device, so
+> treat runtime-behavior details marked `// CI-VERIFY:` in the sources as
+> compile-confirmed but behavior-unconfirmed (first CI run already caught
+> one: bare `close()` resolving to the instance method). Design provenance:
+> ADR-0012 (packaging), ADR-0013 (transport & CaptureTarget semantics),
+> `docs/MOBILE_BACKEND_DESIGN.md` (iOS sections).
 
 ## What this package is
 

@@ -1,10 +1,11 @@
 # rsac Android glue (`rsac.aar`)
 
-> **⚠️ Source-complete; not yet built in CI.** These sources have never been
-> compiled — no Android SDK/Gradle existed on the authoring machine.
-> **rsac-1a6e** adds the Gradle CI job (and the Gradle wrapper, deliberately
-> absent here) and trues up every version pin marked *"expected; CI trues
-> up"*. The JNI symbols this glue calls ship with **rsac-77f1**
+> **Status: builds in CI** (compile-verified; no device runtime
+> verification). The `mobile-android` CI job (rsac-1a6e) runs
+> `gradle assembleRelease` (Gradle 8.11.1 / JDK 17 / android-35) and asserts
+> the `.aar` artifact on every code PR — green since 2026-07-06. The Gradle
+> wrapper remains deliberately absent (CI provisions Gradle). The JNI
+> symbols this glue calls ship with **rsac-77f1**
 > (`src/audio/android/jni.rs`); until then `librsac.so` is absent and native
 > calls throw `UnsatisfiedLinkError` — guard with
 > `RsacProjection.isNativeAvailable()`.
