@@ -97,6 +97,15 @@ compose = ["dep:rubato", "dep:audioadapter-buffers"]
 # `cargo build --features cli` / `cargo install rsac --features cli`. Binaries
 # and examples that need these declare `required-features = ["cli"]`.
 cli = ["dep:clap", "dep:color-eyre", "dep:ctrlc", "dep:env_logger"]
+# ADR-0015: opt-in macOS system-audio-capture TCC preflight. Default OFF —
+# it dlopen/dlsym's the PRIVATE, undocumented TCC.framework SPI
+# `TCCAccessPreflight("kTCCServiceAudioCapture")` to make
+# `check_audio_capture_permission()` return a real Granted/Denied answer on
+# macOS instead of the honest `NotDetermined` stub. Kept behind a feature
+# because private SPI is App-Store-review-risky and may break on a future
+# macOS. Off by default → no private symbol in the shipped artifact, public
+# API unchanged. Adds no dependency (uses libc dlopen + core-foundation).
+macos-tcc-spi = []
 
 [dependencies]
 # Core dependencies

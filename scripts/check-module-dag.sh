@@ -82,6 +82,12 @@ ALLOWLIST=(
   "src/core/introspection.rs::crate::audio::windows::enumerate_application_audio_sessions"
   "src/core/introspection.rs::crate::audio::linux::enumerate_audio_applications"
 
+  # --- ADR-0015 (seed rsac-84b8): check_audio_capture_permission() reaches the
+  #     macOS TCC preflight shim under the opt-in `macos-tcc-spi` feature. Same
+  #     documented core→audio deviation class as the discovery edges above;
+  #     folds into the same audio/api relocation when DAG-001/002 is resolved.
+  "src/core/introspection.rs::crate::audio::macos::permission"
+
   # --- Test-only edge: the bridge/ integration-test module (#[cfg(test)]) wires
   #     the full stack (sink + bridge) together to exercise the pipeline end to
   #     end. This is test wiring, not a production reverse dependency. Scoped to
