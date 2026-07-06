@@ -456,12 +456,31 @@ export interface PlatformCapabilities {
   supportsProcessTreeCapture: boolean;
   /** Whether device selection is supported. */
   supportsDeviceSelection: boolean;
+  /**
+   * Whether the backend delivers device hot-plug / default-change
+   * notifications.
+   */
+  supportsDeviceChangeNotifications: boolean;
+  /**
+   * True when starting a capture requires a config-time user-consent
+   * artifact (mobile platforms; see docs/MOBILE_BACKEND_DESIGN.md);
+   * false on all desktop backends.
+   */
+  requiresUserConsent: boolean;
   /** Maximum number of channels supported. */
   maxChannels: number;
   /** Minimum supported sample rate in Hz. */
   minSampleRate: number;
   /** Maximum supported sample rate in Hz. */
   maxSampleRate: number;
+  /** Supported sample formats (short names, e.g. "I16", "F32"). */
+  supportedSampleFormats: Array<string>;
+  /**
+   * The config-time sample-rate whitelist the capture constructor accepts —
+   * identical on every platform and intentionally narrower than the
+   * device-negotiable min/max sample-rate range.
+   */
+  supportedSampleRates: Array<number>;
   /** Name of the audio backend (e.g., "WASAPI", "CoreAudio", "PipeWire"). */
   backendName: string;
 }

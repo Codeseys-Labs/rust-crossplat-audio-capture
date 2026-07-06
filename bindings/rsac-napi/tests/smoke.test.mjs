@@ -21,10 +21,25 @@ test('addon loads and exports the expected surface', () => {
 
 test('platformCapabilities has an honest shape', () => {
   const caps = rsac.platformCapabilities();
-  for (const field of ['supportsSystemCapture', 'supportsApplicationCapture', 'supportsProcessTreeCapture', 'backendName']) {
+  for (const field of [
+    'supportsSystemCapture',
+    'supportsApplicationCapture',
+    'supportsProcessTreeCapture',
+    'supportsDeviceChangeNotifications',
+    'requiresUserConsent',
+    'supportedSampleFormats',
+    'supportedSampleRates',
+    'backendName',
+  ]) {
     assert.ok(field in caps, `capabilities missing field: ${field}`);
   }
   assert.equal(typeof caps.backendName, 'string');
+  // Desktop backends never require a config-time consent artifact
+  // (docs/MOBILE_BACKEND_DESIGN.md) — pin it so the projection can't drift.
+  assert.equal(caps.requiresUserConsent, false);
+  assert.ok(Array.isArray(caps.supportedSampleFormats));
+  // The builder whitelist is platform-independent and always contains 48000.
+  assert.ok(Array.isArray(caps.supportedSampleRates) && caps.supportedSampleRates.includes(48000));
 });
 
 test('CaptureTarget factories + describe round-trip', () => {

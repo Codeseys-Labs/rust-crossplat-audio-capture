@@ -1259,6 +1259,10 @@ type Capabilities struct {
 	SupportsProcessTree bool
 	// SupportsDeviceSelection indicates whether specific device selection is available.
 	SupportsDeviceSelection bool
+	// RequiresUserConsent is true when starting a capture requires a
+	// config-time user-consent artifact (mobile platforms; see
+	// docs/MOBILE_BACKEND_DESIGN.md). Always false on desktop backends.
+	RequiresUserConsent bool
 	// BackendName is the name of the audio backend (e.g., "WASAPI", "CoreAudio", "PipeWire").
 	BackendName string
 	// MaxChannels is the maximum number of audio channels supported.
@@ -1288,6 +1292,7 @@ func PlatformCapabilities() (Capabilities, error) {
 		SupportsAppCapture:      C.rsac_capabilities_supports_app_capture(ccaps) == 1,
 		SupportsProcessTree:     C.rsac_capabilities_supports_process_tree(ccaps) == 1,
 		SupportsDeviceSelection: C.rsac_capabilities_supports_device_selection(ccaps) == 1,
+		RequiresUserConsent:     C.rsac_capabilities_requires_user_consent(ccaps) == 1,
 		BackendName:             backendName,
 		MaxChannels:             int(C.rsac_capabilities_max_channels(ccaps)),
 	}, nil

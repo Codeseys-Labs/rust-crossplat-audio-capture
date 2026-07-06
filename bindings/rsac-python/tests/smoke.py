@@ -21,11 +21,22 @@ for field in (
     "supports_system_capture",
     "supports_application_capture",
     "supports_process_tree_capture",
+    "supports_device_change_notifications",
+    "requires_user_consent",
+    "supported_sample_formats",
+    "supported_sample_rates",
     "backend_name",
 ):
     if not hasattr(caps, field):
         failures.append(f"platform_capabilities() missing field: {field}")
 print(f"capabilities: backend={caps.backend_name!r}")
+
+# Desktop backends never require a config-time consent artifact
+# (docs/MOBILE_BACKEND_DESIGN.md) — pin it so the projection can't drift.
+if hasattr(caps, "requires_user_consent") and caps.requires_user_consent is not False:
+    failures.append(
+        f"requires_user_consent should be False on desktop, got {caps.requires_user_consent!r}"
+    )
 
 # ── CaptureTarget grammar round-trip ──────────────────────────────────
 for spec in ("system", "app:1234", "name:Firefox", "tree:42"):
