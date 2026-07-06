@@ -116,17 +116,77 @@ Releases with no ABI change omit the subsection (or state "No C ABI changes").
 
 ### Fixed
 
+Adversarial-review batch (16 tracked seeds, all landed pre-merge):
+
+- **Compose engine panic containment** — a panic on the compositor thread
+  previously left the composed stream permanently non-terminal (blocking
+  reads spun on the 1 ms backstop forever, `is_running()` lied, C callers
+  blocked indefinitely). The tick loop now runs under `catch_unwind` with an
+  infallible teardown that poisons the stream to a fatal terminal.
+- **Resampler tail flush** — resampled compose sources no longer lose the
+  final partial chunk + FFT delay residue (~25–45 ms) at natural end.
+- **Intra-source gap compensation** — the compose engine now consumes the
+  drop-gap timestamp semantics: inner-ring overflows re-insert the hole as
+  silence (`gap_padded_frames` stat) instead of silently time-compressing
+  that source against its peers; inner overruns surface as
+  `SourceStats::inner_dropped`.
+- **Timestamps survive rate renegotiation** — stream-position stamps now
+  accumulate nanoseconds instead of dividing a frame counter by the
+  *current* rate (a mid-stream PipeWire renegotiation retroactively rescaled
+  the whole past timeline); the position advance is centralized so mixing
+  push variants can no longer desync the timeline. The mock backend now
+  stamps like every real backend.
+- **WASAPI capture-thread panic containment** — the capture loop runs under
+  `catch_unwind` routed into the fatal-error tail, upholding ADR-0010's
+  "no exit path leaves the bridge non-terminal" on the panic path.
+- **PipeWire RT callback logging** — the one-shot misalignment `log::warn!`
+  (allocation + lock on the RT thread, outside the panic guard) is now two
+  plain counter adds; the warning emits from the non-RT teardown path.
+- **Bounded subscribe pumps** — `subscribe()`/`subscribe_with_errors()` on
+  both handles switch from unbounded channels to `sync_channel(128)` +
+  drop-and-count (new `subscriber_dropped_count()`), restoring the
+  "drop, don't block, and count it" invariant; the fatal terminal is
+  guaranteed as the final item; repeated recoverable errors coalesce.
+- **Consumption preconditions** — subscribe/drain can now attach during the
+  drainable `Stopping` window (a fast-ending composition no longer strands
+  its buffered tail); `stop()` → `start()` restart-by-recreation is blessed
+  and documented; `Composition`'s read methods renamed to
+  `read_chunk_nonblocking`/`read_chunk_blocking` (the old `read_buffer`
+  names collided with `AudioCapture`'s never-fatal family while carrying
+  terminal-observable semantics).
+- **FFI soundness** — `rsac_group_set_layout`/`rsac_default_device` no longer
+  take Rust enums by value across the ABI (out-of-range ints from C were
+  instant UB; now validated `int32_t`); `rsac_composition_builder_add_group`
+  no longer has a panic window that double-freed the group;
+  `rsac_capture_free`/`rsac_composition_free` teardown is panic-caught.
+- **Go module path** — `bindings/rsac-go` is now repo-path-prefixed so the
+  `bindings/rsac-go/vX.Y.Z` tag automation actually resolves via `go get`
+  (the previous path pointed at a nonexistent repo; the fan-out achieved
+  nothing).
+- **Release-path truth** — RELEASE_PROCESS.md rewritten where it had drifted
+  (PyPI is 4 abi3 wheels + Trusted Publishing, not 15 wheels + a token
+  secret; `bump-version.sh` rewrites all six manifests); README no longer
+  claims Windows audio tiers are soft; `release-npm.yml` prepublish gets its
+  token and the final publish uses `--ignore-scripts` (double-publish);
+  `release.yml` dispatch publishes now require a version guard;
+  `ci-audio-tests.yml` actions SHA-pinned (including the kernel-driver
+  installer); the compose FFI surface is now actually compiled in CI.
+
 ### Security
 
 ### C ABI changes
 
 **Additive only — no breaking changes.** The `rsac-ffi` `compose` feature
-(off by default) adds 24 new `rsac_*` symbols (`RsacGroup` /
-`RsacCompositionBuilder` / `RsacComposition` handles, `rsac_group_layout_t`,
-`RsacCompositionStats`/`RsacSourceStats` structs), emitted in the generated
-header behind `#if defined(RSAC_FEATURE_COMPOSE)`. Existing symbols,
-signatures, and layouts are unchanged, so consumers pinning the current
-`.so`/`.dll`/`.dylib` need no recompilation.
+(off by default) adds 29 new `rsac_*` symbols (`RsacGroup` /
+`RsacCompositionBuilder` / `RsacComposition` handles, layout constants,
+`RsacCompositionStats`/`RsacSourceStats` structs, overrun/knob/preflight
+accessors), emitted in the generated header behind
+`#if defined(RSAC_FEATURE_COMPOSE)`. Two prototypes changed from a C enum
+parameter to `int32_t` (`rsac_group_set_layout`, `rsac_default_device`) —
+ABI-identical on all supported targets (C enums are `int`-sized) and
+C-source-compatible via implicit enum→int conversion; out-of-range values
+now return `RSAC_ERROR_INVALID_PARAMETER` instead of being undefined
+behavior. Existing symbol layouts are otherwise unchanged.
 
 ## [0.4.0] - 2026-05-31
 
