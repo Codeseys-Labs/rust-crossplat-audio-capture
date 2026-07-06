@@ -268,16 +268,25 @@ backend_name:                   "ios-avaudioengine/replaykit"
 
 Staged, honest about what each stage proves:
 
-1. **Wave 3/4 (with the backends):** cross-compile *check* jobs —
-   `cargo ndk -t arm64-v8a check --features feat_android` (Linux runner) and
-   `cargo check --target aarch64-apple-ios --features feat_ios` (macOS
-   runner) — plus Gradle `assembleRelease` for the AAR and `xcodebuild build`
-   for the SwiftPM package. These prove *compilation*, not capture.
-2. **Later (separate seeds, not this plan):** Android emulator instrumentation
-   (API 29+ images support MediaProjection; consent dialog automatable via
-   `uiautomator`) and physical-device iOS runs. Do not claim "tested on
-   Android/iOS" until these exist — same discipline as the desktop
-   verification table in AGENTS.md §6.
+1. **Stage 1 — DONE (2026-07-06):** the `mobile-android` / `mobile-ios` ci.yml
+   jobs run the cross-target check+clippy matrix for both mobile targets, a
+   real Gradle `assembleRelease` of the AAR (artifact-asserted), and
+   `xcodebuild` of both SwiftPM products. These prove *compilation*, not
+   capture. (First run caught two real bugs — the build.rs host-cfg dispatch
+   and a Swift `close()` shadowing — which is exactly the point of the stage.)
+2. **Stage 2 — seeded:** runtime verification. `rsac-0aa9` packages
+   `librsac.so` into the AAR (cargo-ndk + jniLibs — prerequisite for any
+   on-device run and for rsac-77f1's JNI symbols); `rsac-e6d3` brings up an
+   API 29+ Android emulator leg (mic frames delivered, dormant `cfg(android)`
+   tests executed; MediaProjection consent automation via `uiautomator` once
+   rsac-77f1 lands); `rsac-97c8` does the iOS twin (simulator mic first,
+   physical device as stretch, broadcast-extension end-to-end once rsac-b3aa
+   lands). **Do not claim "tested on Android/iOS" until these are green** —
+   same discipline as the desktop verification table in AGENTS.md §6.
+3. **Stage 3 — seeded (delivery):** real Android device enumeration/selection
+   (`rsac-ad8a`), glue distribution — Maven AAR + SwiftPM guidance
+   (`rsac-05b6`), and rsac-ffi mobile-triple cross-checks for Flutter/C
+   consumers (`rsac-7a18`).
 
 ## Risks & open questions (tracked, not hidden)
 
