@@ -116,7 +116,7 @@ public final class RsacRingProducer {
         }
         guard ftruncate(fd, off_t(size)) == 0 else {
             let e = errno
-            close(fd)
+            Darwin.close(fd) // bare close() resolves to RingProducer.close()
             throw ProducerError.fileCreationFailed(path, errno: e)
         }
 
@@ -124,7 +124,7 @@ public final class RsacRingProducer {
               mapped != MAP_FAILED
         else {
             let e = errno
-            close(fd)
+            Darwin.close(fd) // bare close() resolves to RingProducer.close()
             throw ProducerError.mmapFailed(errno: e)
         }
 
