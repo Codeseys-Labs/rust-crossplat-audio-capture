@@ -76,6 +76,26 @@ fn const_buffer(value: f32, channels: u16, rate: u32, frames: usize) -> AudioBuf
     AudioBuffer::new(vec![value; frames * usize::from(channels)], channels, rate)
 }
 
+/// Like [`const_buffer`], but stamped with a stream-position timestamp — the
+/// shape every backend now delivers (rsac-ae4e gap-compensation tests).
+fn stamped_buffer(
+    value: f32,
+    channels: u16,
+    rate: u32,
+    frames: usize,
+    ts: Duration,
+) -> AudioBuffer {
+    AudioBuffer::with_timestamp(
+        vec![value; frames * usize::from(channels)],
+        AudioFormat {
+            sample_rate: rate,
+            channels,
+            sample_format: SampleFormat::F32,
+        },
+        ts,
+    )
+}
+
 struct Harness {
     stream: Arc<ComposedStreamView>,
     stats: Arc<EngineStatsShared>,
@@ -452,12 +472,14 @@ fn heterogeneous_rate_source_is_resampled() {
         "resampling flag must be set"
     );
     let total_frames: usize = buffers.iter().map(|b| b.num_frames()).sum();
-    // 44100 input frames → ~48000 output frames, minus what the FixedInput
-    // resampler retains internally (up to a chunk) — assert the right ballpark
-    // (well above 44100, i.e. actually resampled, not passed through).
+    // rsac-fab0: with the end-of-stream resampler flush, the composed output
+    // carries EXACTLY round(input * to/from) frames — the final partial input
+    // chunk and the FFT delay residue included, trimmed to the exact length
+    // owed. ±1 frame of slack for rounding-convention differences only.
+    let expected = (44_100u64 * 48_000 + 44_100 / 2) / 44_100; // = 48_000
     assert!(
-        total_frames > 44_100 && total_frames <= 48_000,
-        "expected ~48000 resampled frames, got {total_frames}"
+        (total_frames as i64 - expected as i64).abs() <= 1,
+        "expected {expected}±1 resampled frames, got {total_frames}"
     );
     // Constant DC input should come out near-constant after the transient.
     let all: Vec<f32> = buffers
@@ -721,6 +743,308 @@ fn ended_master_reelects_live_clock_at_full_rate() {
         0,
         "the live source must not be trim-discarded after the master ends"
     );
+    harness.shutdown();
+}
+
+// ── Engine panic containment (rsac-1b83) ────────────────────────────────
+
+/// A panic anywhere in the engine loop must surface as a **fatal terminal**
+/// on the composed stream — never a hang — and `is_running()` must go false.
+/// The engine's catch-unwind teardown poisons the ring via `signal_error`;
+/// without it the ring stays `Running` forever: blocking reads loop on
+/// Timeout, pumps spin, and the composition is permanently non-terminal.
+#[test]
+fn engine_panic_poisons_stream_with_fatal_terminal() {
+    /// Delivers a few buffers, then panics inside `try_read` — i.e. inside
+    /// the engine's ingest path on the compositor thread. (The panic prints
+    /// to stderr via the default hook; that noise is expected here.)
+    struct PanickingSource {
+        reads_left: usize,
+    }
+    impl SourceReader for PanickingSource {
+        fn try_read(&mut self) -> AudioResult<Option<AudioBuffer>> {
+            if self.reads_left == 0 {
+                panic!("scripted engine panic (rsac-1b83 test)");
+            }
+            self.reads_left -= 1;
+            Ok(Some(const_buffer(0.5, 1, 48_000, 480)))
+        }
+        fn stop(&mut self) {}
+    }
+
+    let harness = Harness::spawn(
+        cfg(
+            1,
+            vec![GroupSpec {
+                layout: GroupLayout::Mono,
+                offset: 0,
+                width: 1,
+            }],
+            vec![SourceSpec {
+                gain: 1.0,
+                group: 0,
+                channels: 0,
+                clock_candidate: false,
+            }],
+            0,
+        ),
+        vec![Box::new(PanickingSource { reads_left: 3 })],
+    );
+
+    // Timeout-bounded: a regression (permanently non-terminal composition)
+    // fails the deadline assert instead of hanging the suite.
+    let deadline = std::time::Instant::now() + Duration::from_secs(5);
+    let fatal = loop {
+        match harness.stream.try_read_chunk() {
+            // Pre-panic ticks may or may not surface before the poison ends
+            // readability; either way, keep polling until the terminal.
+            Ok(_) => {
+                assert!(
+                    std::time::Instant::now() < deadline,
+                    "engine panic never surfaced a terminal error (composition hung)"
+                );
+                std::thread::sleep(Duration::from_millis(1));
+            }
+            Err(e) => break e,
+        }
+    };
+    assert!(
+        fatal.is_fatal(),
+        "the panic terminal must be fatal, got {fatal:?}"
+    );
+
+    // The blocking read path returns the same fatal terminal immediately —
+    // the state is already terminal, so this cannot park.
+    let blocking = harness.stream.read_chunk();
+    assert!(
+        matches!(blocking, Err(ref e) if e.is_fatal()),
+        "read_chunk after an engine panic must be the fatal terminal, got {blocking:?}"
+    );
+
+    assert!(
+        !harness.stream.is_running(),
+        "is_running() must report the engine's death, not lie"
+    );
+    harness.shutdown();
+}
+
+// ── Intra-source gap compensation (rsac-ae4e) ───────────────────────────
+
+/// A timestamped source whose stamps jump past the expected next position
+/// (how an inner ring overflow manifests) has the hole re-inserted as
+/// silence: output stays time-continuous and `gap_padded_frames` counts it.
+#[test]
+fn timestamp_gap_is_compensated_with_silence() {
+    // Buffer 0 spans 0..10 ms; buffer 1 starts at 20 ms → a 10 ms hole
+    // (480 frames @ 48 kHz) where the inner ring dropped data.
+    let (src, _) = ScriptedSource::ending(vec![
+        stamped_buffer(0.5, 1, 48_000, 480, Duration::ZERO),
+        stamped_buffer(0.5, 1, 48_000, 480, Duration::from_millis(20)),
+    ]);
+    let harness = Harness::spawn(
+        cfg(
+            1,
+            vec![GroupSpec {
+                layout: GroupLayout::Mono,
+                offset: 0,
+                width: 1,
+            }],
+            vec![SourceSpec {
+                gain: 1.0,
+                group: 0,
+                channels: 0,
+                clock_candidate: false,
+            }],
+            0,
+        ),
+        vec![Box::new(src)],
+    );
+
+    let buffers = harness.drain_to_end();
+    let all: Vec<f32> = buffers
+        .iter()
+        .flat_map(|b| b.data().iter().copied())
+        .collect();
+    assert_eq!(
+        all.len(),
+        3 * 480,
+        "output must span the full 30 ms timeline (data + gap + data)"
+    );
+    assert!(
+        all[..480].iter().all(|v| (v - 0.5).abs() < 1e-6),
+        "first 10 ms carries buffer 0"
+    );
+    assert!(
+        all[480..960].iter().all(|v| v.abs() < 1e-9),
+        "the 10 ms hole must be silence, not time-compressed away"
+    );
+    assert!(
+        all[960..].iter().all(|v| (v - 0.5).abs() < 1e-6),
+        "last 10 ms carries buffer 1"
+    );
+    assert_eq!(
+        harness.stats.sources[0]
+            .gap_padded_frames
+            .load(Ordering::Relaxed),
+        480,
+        "gap_padded_frames must count the inserted silence"
+    );
+    harness.shutdown();
+}
+
+/// A source delivering buffers WITHOUT timestamps keeps the exact legacy
+/// behavior: no gap detection, no inserted silence, counter stays zero.
+#[test]
+fn untimestamped_source_gets_no_gap_compensation() {
+    let n = 4usize;
+    let (src, _) =
+        ScriptedSource::ending((0..n).map(|_| const_buffer(0.5, 1, 48_000, 480)).collect());
+    let harness = Harness::spawn(
+        cfg(
+            1,
+            vec![GroupSpec {
+                layout: GroupLayout::Mono,
+                offset: 0,
+                width: 1,
+            }],
+            vec![SourceSpec {
+                gain: 1.0,
+                group: 0,
+                channels: 0,
+                clock_candidate: false,
+            }],
+            0,
+        ),
+        vec![Box::new(src)],
+    );
+    let buffers = harness.drain_to_end();
+    let total_frames: usize = buffers.iter().map(|b| b.num_frames()).sum();
+    assert_eq!(total_frames, n * 480, "delivered frames only, no padding");
+    assert_eq!(
+        harness.stats.sources[0]
+            .gap_padded_frames
+            .load(Ordering::Relaxed),
+        0,
+        "no timestamps → no gap compensation"
+    );
+    harness.shutdown();
+}
+
+/// rsac-ae4e(3): the engine snapshots each source's inner overrun count
+/// (`SourceReader::overruns`) into the shared stats.
+#[test]
+fn inner_overruns_are_snapshotted_into_stats() {
+    struct OverrunningSource {
+        inner: ScriptedSource,
+    }
+    impl SourceReader for OverrunningSource {
+        fn try_read(&mut self) -> AudioResult<Option<AudioBuffer>> {
+            self.inner.try_read()
+        }
+        fn stop(&mut self) {
+            self.inner.stop();
+        }
+        fn overruns(&self) -> u64 {
+            7
+        }
+    }
+
+    let (inner, _) = ScriptedSource::ending(vec![const_buffer(0.5, 1, 48_000, 480)]);
+    let harness = Harness::spawn(
+        cfg(
+            1,
+            vec![GroupSpec {
+                layout: GroupLayout::Mono,
+                offset: 0,
+                width: 1,
+            }],
+            vec![SourceSpec {
+                gain: 1.0,
+                group: 0,
+                channels: 0,
+                clock_candidate: false,
+            }],
+            0,
+        ),
+        vec![Box::new(OverrunningSource { inner })],
+    );
+    let _ = harness.drain_to_end();
+    assert_eq!(
+        harness.stats.sources[0]
+            .inner_dropped
+            .load(Ordering::Relaxed),
+        7,
+        "inner overrun count must be snapshotted into the per-source stats"
+    );
+    harness.shutdown();
+}
+
+// ── Ragged-buffer truncation (rsac-2195) ────────────────────────────────
+
+/// A delivered buffer with a dangling partial frame must be truncated to
+/// whole frames on ingest — otherwise the half-frame rotates the source's
+/// channel interleave (every later L sample lands in R) for the rest of the
+/// session.
+#[test]
+fn ragged_buffer_is_truncated_and_interleave_survives() {
+    // Buffer 0: 480 clean stereo frames of (0.1, 0.2) + ONE dangling sample.
+    let mut ragged_data = Vec::with_capacity(480 * 2 + 1);
+    for _ in 0..480 {
+        ragged_data.extend_from_slice(&[0.1, 0.2]);
+    }
+    ragged_data.push(0.1); // the dangling half frame
+    let ragged = AudioBuffer::new(ragged_data, 2, 48_000);
+    // Buffer 1: 480 clean stereo frames with DIFFERENT per-channel values, so
+    // any interleave rotation is unmistakable.
+    let clean = {
+        let mut data = Vec::with_capacity(480 * 2);
+        for _ in 0..480 {
+            data.extend_from_slice(&[0.3, 0.4]);
+        }
+        AudioBuffer::new(data, 2, 48_000)
+    };
+    let (src, _) = ScriptedSource::ending(vec![ragged, clean]);
+
+    let harness = Harness::spawn(
+        cfg(
+            2,
+            vec![GroupSpec {
+                layout: GroupLayout::KeepChannels,
+                offset: 0,
+                width: 2,
+            }],
+            vec![SourceSpec {
+                gain: 1.0,
+                group: 0,
+                channels: 2,
+                clock_candidate: false,
+            }],
+            0,
+        ),
+        vec![Box::new(src)],
+    );
+
+    let buffers = harness.drain_to_end();
+    let all: Vec<f32> = buffers
+        .iter()
+        .flat_map(|b| b.data().iter().copied())
+        .collect();
+    assert_eq!(
+        all.len(),
+        960 * 2,
+        "dangling half-frame dropped: exactly 960 whole frames flow through"
+    );
+    for f in 0..960 {
+        let (l, r) = (all[f * 2], all[f * 2 + 1]);
+        assert!(
+            (l - 0.1).abs() < 1e-6 || (l - 0.3).abs() < 1e-6,
+            "L slot polluted at frame {f}: {l} (interleave rotated)"
+        );
+        assert!(
+            (r - 0.2).abs() < 1e-6 || (r - 0.4).abs() < 1e-6,
+            "R slot polluted at frame {f}: {r} (interleave rotated)"
+        );
+    }
     harness.shutdown();
 }
 

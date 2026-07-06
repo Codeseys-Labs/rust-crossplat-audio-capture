@@ -36,8 +36,22 @@
 //! [`SourceStats::padded_frames`] / [`SourceStats::trimmed_frames`] counters
 //! expose both. If the master itself stalls past
 //! [`CompositionBuilder::stall_timeout`], a wall-clock fallback tick keeps the
-//! session alive. Timestamp-based drift correction is deliberately out of
-//! scope for v1 (no backend populates `AudioBuffer::timestamp` yet).
+//! session alive.
+//!
+//! # Timestamps and intra-source gap fidelity
+//!
+//! All three backends stamp every delivered buffer with a **stream-position
+//! timestamp** (frames delivered ÷ rate), and a producer-side ring drop
+//! advances the stamp without delivering frames — so lost audio appears as a
+//! *gap* between consecutive stamps. The engine uses those stamps for
+//! **intra-source gap compensation**: a stamp jumping past the expected next
+//! position has the missing span re-inserted as silence (counted in
+//! [`SourceStats::gap_padded_frames`]), so an inner ring overflow shows up as
+//! a hole in that source's channels instead of permanently time-compressing
+//! its lane against the others. Buffers without timestamps are ingested
+//! as-is. **Cross-source** alignment still uses the master-clock pacing
+//! described above; refining it against per-backend device clocks (wall-time
+//! alignment) remains future work (`rsac-ec25`).
 //!
 //! # Delivery contract
 //!

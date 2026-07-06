@@ -27,6 +27,13 @@ const MAX_DRAIN_PER_POLL: usize = 32;
 /// Idle sleep between engine loop passes when no data moved.
 const IDLE_SLEEP: Duration = Duration::from_millis(1);
 
+/// Tolerance before a timestamp jump counts as a real intra-source gap
+/// (rsac-ae4e). Stream-position stamps are exact integer frame math, so a
+/// continuous stream lands within nanoseconds of the expected next position;
+/// 1 ms absorbs Duration rounding without hiding any real hole (the smallest
+/// drop a backend can produce is one OS callback period, ~2.5–10 ms).
+const GAP_EPSILON: Duration = Duration::from_millis(1);
+
 // ── Source abstraction (test seam) ──────────────────────────────────────
 
 /// What the engine needs from a capture source. Implemented by the real
@@ -40,6 +47,16 @@ pub(crate) trait SourceReader: Send {
 
     /// Best-effort stop of the underlying capture (idempotent).
     fn stop(&mut self);
+
+    /// Cumulative ring-overflow drop count *inside* the underlying capture
+    /// (its `overrun_count`) — audio lost upstream of the compositor
+    /// (rsac-ae4e). Defaults to `0` for sources with no inner ring (scripted
+    /// test sources). The engine snapshots this into
+    /// [`SourceStatsShared::inner_dropped`] every ingest pass so composed
+    /// consumers can attribute upstream loss to a specific source.
+    fn overruns(&self) -> u64 {
+        0
+    }
 }
 
 // ── Shared stats (engine writes, handle reads) ──────────────────────────
@@ -51,6 +68,13 @@ pub(crate) struct SourceStatsShared {
     pub buffers_received: AtomicU64,
     pub padded_frames: AtomicU64,
     pub trimmed_frames: AtomicU64,
+    /// Frames of silence inserted to compensate intra-source timestamp gaps
+    /// (rsac-ae4e), counted at the source's *delivered* rate — the rate the
+    /// silence was inserted at (see `Engine::ingest_buffer`).
+    pub gap_padded_frames: AtomicU64,
+    /// Snapshot of the inner capture's own ring-overflow drop count
+    /// (`SourceReader::overruns`), refreshed every ingest pass (rsac-ae4e).
+    pub inner_dropped: AtomicU64,
     pub resampling: AtomicBool,
     pub ended: AtomicBool,
 }
@@ -127,6 +151,16 @@ struct SourceState {
     resampler_in_rate: u32,
     /// Whether a channel-width mismatch was already warned about.
     warned_channel_adapt: bool,
+    /// Whether a ragged (non-whole-frame) delivery was already warned about
+    /// (rsac-2195).
+    warned_ragged: bool,
+    /// Stream position (at the source's *delivered* rate) where the next
+    /// buffer is expected to start, derived from the source's own
+    /// stream-position timestamps (rsac-ae4e). `None` until the first stamped
+    /// buffer arrives; re-anchored to `ts + frames/rate` on every stamped
+    /// buffer thereafter, so there is no cumulative drift. Buffers without
+    /// timestamps neither consult nor advance it.
+    expected_next: Option<Duration>,
     ended: bool,
     stats: Arc<SourceStatsShared>,
 }
@@ -151,11 +185,6 @@ pub(crate) struct Engine {
     active: Arc<AtomicBool>,
     stats: Arc<EngineStatsShared>,
     last_tick: Instant,
-    /// Cumulative frames emitted into the composed ring; stamps each composed
-    /// buffer with its stream position (`frames_emitted / session_rate`) so
-    /// `AudioBuffer::timestamp()` is populated on composed output exactly like
-    /// the platform backends' stamped pushes.
-    frames_emitted: u64,
     /// Reused per-tick output scratch (composed interleaved frame block).
     out_scratch: Vec<f32>,
     /// Reused per-source drain scratch.
@@ -185,6 +214,8 @@ impl Engine {
                 resampler: None,
                 resampler_in_rate: 0,
                 warned_channel_adapt: false,
+                warned_ragged: false,
+                expected_next: None,
                 ended: false,
                 stats,
             })
@@ -201,13 +232,79 @@ impl Engine {
             active,
             stats,
             last_tick: Instant::now(),
-            frames_emitted: 0,
         }
     }
 
-    /// The engine thread body: loop until stopped or every source has ended
-    /// and drained, then tear down (stop readers, signal the ring done).
+    /// The engine thread body: run the tick loop, then tear down (stop the
+    /// inner readers, put the composed ring into a terminal state, flip the
+    /// liveness flag).
+    ///
+    /// The tick loop executes under [`std::panic::catch_unwind`] so the
+    /// teardown is **unconditional** (rsac-1b83). Without the guard, a panic
+    /// anywhere in the loop would leave the ring `Running` and
+    /// `engine_active == true` forever: `ComposedStreamView::read_chunk`
+    /// swallows `Timeout` and loops, subscribe/drain pumps spin,
+    /// `is_running()` lies, and `Composition::stop` joins the dead thread and
+    /// silently discards the panic — a permanently non-terminal composition.
     pub fn run(mut self) {
+        // AssertUnwindSafe: on a caught panic the teardown below immediately
+        // poisons the stream to the terminal `Error` state and stops every
+        // reader, so nothing ever acts on the potentially-torn engine state
+        // (same rationale as the bridge's `push_samples_guarded`).
+        let loop_result =
+            std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| self.run_loop()));
+
+        // ── Infallible teardown — runs on BOTH exit paths ────────────────
+        // Stop the inner captures first (each stop guarded: one reader's
+        // panicking stop() must not strand the others or skip the terminal
+        // signal below).
+        for s in &mut self.sources {
+            let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| s.reader.stop()));
+        }
+        // Then put the composed ring into a terminal state, and only THEN
+        // flip the active flag. Order matters on BOTH arms: the terminal
+        // signal must happen-before `active = false`, because the
+        // consumer-side view promotes Stopping → Stopped when it observes
+        // `!active` on an empty ring — flipping the flag first could promote
+        // from a still-Running state and fail the CAS.
+        match &loop_result {
+            // Clean exit: graceful end. `Stopping` keeps the ring drainable,
+            // preserving ADR-0003 drain-before-terminal semantics for the
+            // flushed tail — exactly the pre-existing path.
+            Ok(()) => self.producer.signal_done(),
+            // Panic: poison to the terminal `Error` state so blocking AND
+            // async readers wake immediately and observe the fatal
+            // `StreamEnded`. (`signal_done`'s graceful `Stopping` would keep
+            // them draining/parking forever instead — the hang this fixes.)
+            Err(payload) => {
+                log::error!(
+                    "rsac-compose engine panicked: {}; poisoning composed stream to Error",
+                    panic_message(payload.as_ref())
+                );
+                self.producer.signal_error();
+            }
+        }
+        self.active.store(false, Ordering::SeqCst);
+        log::debug!(
+            "rsac-compose engine exited (ticks={}, fallback_ticks={}, panicked={})",
+            self.stats.ticks.load(Ordering::Relaxed),
+            self.stats.fallback_ticks.load(Ordering::Relaxed),
+            loop_result.is_err()
+        );
+
+        // Teardown is complete — re-raise so the panic stays observable to
+        // whoever joins the thread (`Composition::stop` logs the join error
+        // instead of discarding it).
+        if let Err(payload) = loop_result {
+            std::panic::resume_unwind(payload);
+        }
+    }
+
+    /// The tick loop proper: loop until stopped or every source has ended and
+    /// drained. Split out of [`run`](Self::run) so the caller can wrap it in
+    /// `catch_unwind` while keeping the teardown *outside* the guarded region
+    /// (rsac-1b83).
+    fn run_loop(&mut self) {
         self.last_tick = Instant::now();
         // Wall-clock cadence for fallback ticks: one quantum's worth of time.
         let quantum_duration = Duration::from_nanos(
@@ -268,23 +365,6 @@ impl Engine {
                 std::thread::sleep(IDLE_SLEEP);
             }
         }
-
-        // Teardown: stop inner captures, end the composed ring, then flip the
-        // active flag. Order matters: `signal_done()` (Running → Stopping)
-        // must happen-before `active = false`, because the consumer-side view
-        // promotes Stopping → Stopped when it observes `!active` on an empty
-        // ring — flipping the flag first could promote from a still-Running
-        // state and fail the CAS.
-        for s in &mut self.sources {
-            s.reader.stop();
-        }
-        self.producer.signal_done();
-        self.active.store(false, Ordering::SeqCst);
-        log::debug!(
-            "rsac-compose engine exited (ticks={}, fallback_ticks={})",
-            self.stats.ticks.load(Ordering::Relaxed),
-            self.stats.fallback_ticks.load(Ordering::Relaxed)
-        );
     }
 
     /// FIFO depth (frames) of the *effective* master: the configured master
@@ -310,6 +390,8 @@ impl Engine {
     /// Returns `true` if any data moved.
     fn ingest_all(&mut self) -> bool {
         let mut moved = false;
+        let session_rate = self.cfg.session_rate();
+        let max_fifo_frames = self.cfg.max_fifo_frames;
         for s in &mut self.sources {
             if s.ended {
                 continue;
@@ -317,12 +399,26 @@ impl Engine {
             for _ in 0..MAX_DRAIN_PER_POLL {
                 match s.reader.try_read() {
                     Ok(Some(buffer)) => {
-                        Self::ingest_buffer(s, buffer, self.cfg.session_rate());
+                        Self::ingest_buffer(s, buffer, session_rate, max_fifo_frames);
                         moved = true;
                     }
                     Ok(None) => break,
                     Err(e) if e.is_fatal() => {
                         log::debug!("compose source ended: {e:?}");
+                        // rsac-fab0: recover the resampler's tail (the final
+                        // partial input chunk + the FFT delay residue) into
+                        // the FIFO *before* marking the source ended, so
+                        // `flush_tail`'s "no captured audio is discarded"
+                        // contract holds for resampled sources too.
+                        if let Some(rs) = s.resampler.as_mut() {
+                            match rs.flush(&mut s.fifo) {
+                                Ok(flushed) => moved |= flushed > 0,
+                                Err(fe) => log::warn!(
+                                    "compose resampler flush failed ({fe}); \
+                                     resampled tail may be truncated"
+                                ),
+                            }
+                        }
                         s.ended = true;
                         s.stats.ended.store(true, Ordering::Relaxed);
                         break;
@@ -334,16 +430,30 @@ impl Engine {
                     }
                 }
             }
+            // rsac-ae4e: refresh the inner capture's own ring-overflow drop
+            // count into the shared stats (a plain load-and-store — the
+            // engine thread is non-RT). Runs on the ending pass too, so the
+            // final value survives the source's end.
+            s.stats
+                .inner_dropped
+                .store(s.reader.overruns(), Ordering::Relaxed);
         }
         moved
     }
 
-    /// Normalize one delivered buffer (channel width, then rate) and append it
-    /// to the source FIFO.
-    fn ingest_buffer(s: &mut SourceState, buffer: AudioBuffer, session_rate: u32) {
+    /// Normalize one delivered buffer (channel width, whole frames, then
+    /// rate) and append it to the source FIFO, compensating intra-source
+    /// timestamp gaps with silence (rsac-ae4e).
+    fn ingest_buffer(
+        s: &mut SourceState,
+        buffer: AudioBuffer,
+        session_rate: u32,
+        max_fifo_frames: usize,
+    ) {
         s.stats.buffers_received.fetch_add(1, Ordering::Relaxed);
         let buf_channels = buffer.channels().max(1);
-        let buf_rate = buffer.sample_rate();
+        let buf_rate = buffer.sample_rate().max(1);
+        let timestamp = buffer.timestamp();
 
         // Lock the source's width on first data (keep-channels sources have it
         // pre-set from the polled negotiated format).
@@ -370,7 +480,64 @@ impl Engine {
             &adapted
         };
 
+        // rsac-2195: truncate to whole frames. A dangling partial frame would
+        // rotate this source's channel interleave for the rest of the session
+        // (every later L sample lands in R, and so on). Only a backend bug
+        // can produce one, so warn once — but keep the engine running with
+        // the truncated (correctly interleaved) remainder. Deliberately NOT a
+        // debug_assert: a panic here would divert into the engine's
+        // panic-teardown (rsac-1b83) and kill the whole composition for a
+        // condition the truncation fully recovers from.
+        let ch = usize::from(s.spec.channels.max(1));
+        let usable = samples.len() - samples.len() % ch;
+        if usable != samples.len() && !s.warned_ragged {
+            log::warn!(
+                "compose source delivered a ragged buffer ({} samples, {} channels); \
+                 truncating the dangling partial frame to preserve interleave",
+                samples.len(),
+                ch
+            );
+            s.warned_ragged = true;
+        }
+        let samples = &samples[..usable];
+        let frames_delivered = usable / ch;
+
+        // ── Intra-source gap compensation (rsac-ae4e) ────────────────────
+        // All backends stamp stream-position timestamps where producer-side
+        // ring drops appear as gaps between consecutive stamps. If this
+        // buffer starts past where the previous one ended, the hole is real
+        // lost audio: re-insert it as silence so the source's lane stays
+        // time-aligned instead of permanently compressing. Bounded to the
+        // FIFO cap (scaled to the delivered rate) so a pathological stamp
+        // jump cannot allocate unboundedly — anything larger would be
+        // trimmed straight back out by `trim_all` anyway.
+        let gap_frames_in: u64 = match (timestamp, s.expected_next) {
+            (Some(ts), Some(expected)) if ts > expected + GAP_EPSILON => {
+                let raw = ((ts - expected).as_secs_f64() * f64::from(buf_rate)).round() as u64;
+                let cap = (max_fifo_frames as u128 * u128::from(buf_rate)
+                    / u128::from(session_rate.max(1))) as u64;
+                raw.min(cap.max(1))
+            }
+            _ => 0,
+        };
+        if let Some(ts) = timestamp {
+            // Re-anchor to the delivered stamp every buffer (never accumulate
+            // locally), so expectation and stamps cannot drift apart.
+            s.expected_next = Some(ts + frames_to_duration(frames_delivered as u64, buf_rate));
+        }
+        if gap_frames_in > 0 {
+            s.stats
+                .gap_padded_frames
+                .fetch_add(gap_frames_in, Ordering::Relaxed);
+        }
+
         if buf_rate == session_rate {
+            // Direct path: the gap silence goes straight into the FIFO ahead
+            // of the buffer's samples (both already at the session rate).
+            if gap_frames_in > 0 {
+                s.fifo
+                    .extend(std::iter::repeat_n(0.0f32, gap_frames_in as usize * ch));
+            }
             s.fifo.extend(samples.iter().copied());
             return;
         }
@@ -398,6 +565,21 @@ impl Engine {
             }
         }
         if let Some(rs) = s.resampler.as_mut() {
+            // Resampled path: the gap silence is fed through the RESAMPLER
+            // INPUT (at the delivered rate) rather than appended to the FIFO
+            // after resampling. This is the simpler *correct* option: the
+            // resampler's cumulative in/out accounting — which makes the
+            // end-of-stream flush trim exact (see `StreamResampler::flush`) —
+            // then counts the gap as ordinary input, and the FIFO receives it
+            // converted at exactly the same ratio as the surrounding audio.
+            // Session-rate silence injected directly into the FIFO would
+            // bypass that accounting and desynchronize the flush-trim math.
+            if gap_frames_in > 0 {
+                let zeros = vec![0.0f32; gap_frames_in as usize * ch];
+                if let Err(e) = rs.push(&zeros, &mut s.fifo) {
+                    log::error!("compose resampler error on gap silence ({e}); gap dropped");
+                }
+            }
             if let Err(e) = rs.push(samples, &mut s.fifo) {
                 log::error!("compose resampler error ({e}); dropping buffer");
             }
@@ -492,18 +674,28 @@ impl Engine {
             }
         }
 
-        let buffer = AudioBuffer::with_timestamp(
-            out.to_vec(),
-            self.cfg.composed_format.clone(),
-            Duration::from_nanos(
-                ((self.frames_emitted as u128 * 1_000_000_000)
-                    / u64::from(self.cfg.session_rate().max(1)) as u128) as u64,
-            ),
+        // rsac-2195: stamped, free-list-backed push. Replaces the previous
+        // `AudioBuffer::with_timestamp(out.to_vec(), ..)` — a heap allocation
+        // per tick — plus the engine's own frames-emitted counter and its
+        // Duration math, all of which the producer subsumes: it stamps each
+        // buffer with its stream position from an internal frames-offered
+        // counter with identical semantics (the position advances whether or
+        // not the push succeeds, so drop-on-full still surfaces as a
+        // timestamp gap to the consumer, and drops are still counted in the
+        // composed stream's overrun/backpressure stats).
+        let pushed = self.producer.push_samples_or_drop_stamped(
+            out,
+            self.cfg.composed_format.channels,
+            self.cfg.session_rate(),
         );
-        self.frames_emitted = self.frames_emitted.saturating_add(frames as u64);
-        // Drop-on-full: the bridge counts drops, surfacing consumer lag via
-        // the composed stream's overrun/backpressure counters.
-        let _ = self.producer.push_or_drop(buffer);
+        if pushed {
+            // rsac-2195: wake a parked blocking reader right now instead of
+            // after the 1 ms WAKE_BACKSTOP_POLL backstop slice. The engine
+            // thread is non-RT — exactly the caller `notify_consumers()` is
+            // documented for (the ADR-0001 prohibition applies only to the
+            // OS audio-callback push paths).
+            self.producer.notify_consumers();
+        }
 
         self.stats.ticks.fetch_add(1, Ordering::Relaxed);
         if fallback {
@@ -511,6 +703,28 @@ impl Engine {
         }
         self.last_tick = Instant::now();
     }
+}
+
+/// Best-effort extraction of a human-readable message from a caught panic
+/// payload (`&str` and `String` payloads cover `panic!`/`assert!`/`expect`;
+/// anything else gets a placeholder). Shared by the engine's catch-unwind
+/// teardown and `Composition::stop`'s join-error logging (rsac-1b83).
+pub(crate) fn panic_message(payload: &(dyn std::any::Any + Send)) -> &str {
+    if let Some(s) = payload.downcast_ref::<&'static str>() {
+        s
+    } else if let Some(s) = payload.downcast_ref::<String>() {
+        s.as_str()
+    } else {
+        "<non-string panic payload>"
+    }
+}
+
+/// Stream-position duration of `frames` frames at `rate` Hz — the same
+/// integer-nanosecond math the backends' stamped pushes use, so the engine's
+/// expected-next positions stay in exact lockstep with delivered timestamps
+/// (rsac-ae4e).
+fn frames_to_duration(frames: u64, rate: u32) -> Duration {
+    Duration::from_nanos(((frames as u128 * 1_000_000_000) / u128::from(rate.max(1))) as u64)
 }
 
 /// Mix `take` frames of one source (interleaved `src`, `src_ch` wide) into the

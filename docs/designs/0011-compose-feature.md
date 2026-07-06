@@ -134,3 +134,20 @@ documented recipe.
   sessions bound drift by the FIFO trim policy rather than correcting it;
   documented as a known limitation.
 - FFI/Python/Node/Go exposure is a follow-up epic, not part of this change.
+
+## 6. Status addendum — 2026-07-05
+
+§4.3 deferred timestamp-based drift correction as "blocked on backends
+populating `AudioBuffer::timestamp`". That blocker no longer exists: all three
+backends now stamp every delivered buffer with a **stream-position** timestamp
+(frames delivered ÷ rate; a producer-side ring drop advances the stamp without
+delivering frames, so lost audio surfaces as a gap between consecutive stamps —
+`rsac-522b`). The compositor consumes those stamps for **intra-source gap
+compensation** (`rsac-ae4e`): a stamp jumping past the expected next position
+has the missing span re-inserted as silence into that source's lane, counted
+per source in `SourceStats::gap_padded_frames`, so an inner-capture ring
+overflow no longer permanently time-compresses one source against the others.
+Cross-source drift correction against real device clocks (WASAPI
+`GetPosition`, PipeWire `pw_time`, CoreAudio `mSampleTime`) remains deferred
+and is still tracked as `rsac-ec25` — stream-position stamps measure delivered
+frames, not wall time, so they cannot arbitrate between two sources' clocks.

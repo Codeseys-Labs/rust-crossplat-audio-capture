@@ -75,6 +75,15 @@ impl SourceReader for CaptureSource {
     fn stop(&mut self) {
         let _ = self.capture.stop();
     }
+
+    fn overruns(&self) -> u64 {
+        // rsac-ae4e: the inner capture's own ring-overflow drop count — audio
+        // lost before the compositor ever saw it. The engine snapshots this
+        // into `SourceStats::inner_dropped` so composed consumers can tell
+        // WHICH source is losing data upstream (the loss itself surfaces in
+        // the output as timestamp-gap silence, see `gap_padded_frames`).
+        self.capture.overrun_count()
+    }
 }
 
 // ── Composed stream view (drain-complete promotion) ─────────────────────
@@ -264,6 +273,21 @@ pub struct SourceStats {
     pub padded_frames: u64,
     /// Frames trimmed because the source drifted past the buffering bound.
     pub trimmed_frames: u64,
+    /// Frames of silence inserted to compensate **intra-source timestamp
+    /// gaps** (rsac-ae4e): when the source's buffer timestamps jump past the
+    /// expected next stream position — how a ring overflow inside the inner
+    /// capture manifests, since drops advance the stamp without delivering
+    /// frames — the missing span is re-inserted as silence so the source's
+    /// channels stay time-aligned instead of permanently compressing.
+    /// Counted in frames at the source's *delivered* rate (the rate the
+    /// silence was inserted at, before any resampling to the session rate).
+    pub gap_padded_frames: u64,
+    /// Ring-overflow drops inside the source's own capture (its
+    /// [`overrun_count`](crate::api::AudioCapture::overrun_count)) — buffers
+    /// lost upstream of the compositor. A nonzero value here alongside a
+    /// growing [`gap_padded_frames`](Self::gap_padded_frames) identifies
+    /// which source is responsible for silence holes in the composed output.
+    pub inner_dropped: u64,
     /// Whether this source is being resampled to the session rate.
     pub resampling: bool,
     /// Whether the source's stream has ended.
@@ -557,7 +581,17 @@ impl Composition {
             if let Ok(mut guard) = engine.join.lock() {
                 if let Some(handle) = guard.take() {
                     if handle.thread().id() != std::thread::current().id() {
-                        let _ = handle.join();
+                        if let Err(payload) = handle.join() {
+                            // rsac-1b83: never discard a panicked engine
+                            // silently. Its own catch-unwind teardown already
+                            // poisoned the composed stream (readers saw the
+                            // fatal terminal); this log is the last-stop
+                            // observability for the panic itself.
+                            log::error!(
+                                "rsac-compose engine thread panicked: {}",
+                                super::engine::panic_message(payload.as_ref())
+                            );
+                        }
                     } else {
                         *guard = Some(handle);
                     }
@@ -611,6 +645,8 @@ impl Composition {
                 buffers_received: s.buffers_received.load(Ordering::Relaxed),
                 padded_frames: s.padded_frames.load(Ordering::Relaxed),
                 trimmed_frames: s.trimmed_frames.load(Ordering::Relaxed),
+                gap_padded_frames: s.gap_padded_frames.load(Ordering::Relaxed),
+                inner_dropped: s.inner_dropped.load(Ordering::Relaxed),
                 resampling: s.resampling.load(Ordering::Relaxed),
                 ended: s.ended.load(Ordering::Relaxed),
             })
