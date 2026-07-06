@@ -423,10 +423,48 @@ struct CaptureStreamData {
     /// existing capacity keeps the RT push allocation-free in steady state
     /// (ADR-0001).
     realign_scratch: Vec<f32>,
-    /// One-shot latch so the rare non-word-aligned chunk is logged **once**
-    /// rather than on every callback, making otherwise-silent data realignment
-    /// (or a truncated trailing sample) visible without flooding the log (#30).
-    misaligned_logged: bool,
+    /// Number of chunks whose valid region was **not** word-aligned and took
+    /// the [`decode_unaligned_f32_le`] realignment fallback (#30 / rsac-9096).
+    ///
+    /// Bumped in the `.process` RT callback with a plain saturating add — the
+    /// callback must NOT log (formatting allocates; typical logger backends
+    /// lock + syscall), so the diagnostic is deferred: the one-shot summary is
+    /// emitted from the non-RT [`Drop`] impl below at session teardown. Plain
+    /// `u64`, no atomic: the listener callbacks hold exclusive `&mut` access,
+    /// and `Drop` runs with ownership after the listener hook is removed, so
+    /// no concurrent reader exists.
+    misaligned_chunks: u64,
+    /// Cumulative count of trailing bytes that formed a truncated partial
+    /// sample (unrecoverable by realignment) across all misaligned chunks
+    /// (rsac-9096). Same write/read discipline as
+    /// [`misaligned_chunks`](Self::misaligned_chunks).
+    misaligned_truncated_bytes: u64,
+}
+
+/// rsac-9096: emit the misaligned-chunk diagnostic from a **non-RT** point.
+///
+/// The `.process` callback (where misalignment is detected) is a C callback
+/// invoked from inside `main_loop.iterate()` on the real-time data path,
+/// outside any panic guard — `log::warn!` there would format (allocate) and
+/// let a typical logger backend lock and syscall, violating the callback's own
+/// "no logging" contract (ADR-0001). The callback therefore only bumps the
+/// plain counters above; this `Drop` — which runs on the loop thread during
+/// session teardown (`capture_listener = None` / the StopCapture, Shutdown,
+/// and channel-disconnect arms), strictly after the listener hook is removed
+/// so no further callback can fire — surfaces the one-shot summary.
+impl Drop for CaptureStreamData {
+    fn drop(&mut self) {
+        if self.misaligned_chunks > 0 {
+            log::warn!(
+                "PipeWire delivered {} non-word-aligned audio chunk(s) during this \
+                 capture session (realigned via copy in the process callback); {} \
+                 trailing byte(s) formed truncated partial samples and were not \
+                 recoverable.",
+                self.misaligned_chunks,
+                self.misaligned_truncated_bytes
+            );
+        }
+    }
 }
 
 // ── PipeWireThread ───────────────────────────────────────────────────────
@@ -1970,7 +2008,8 @@ fn pw_thread_main(
                     // rather than allocating in the `.process` callback. Matches
                     // the bridge's worst-case stereo period seed (ADR-0001).
                     realign_scratch: Vec::with_capacity(2048),
-                    misaligned_logged: false,
+                    misaligned_chunks: 0,
+                    misaligned_truncated_bytes: 0,
                 };
 
                 // ── Register stream listener with callbacks ──
@@ -2172,26 +2211,34 @@ fn pw_thread_main(
                                 // sample is lost regardless of the start offset. Only a
                                 // genuinely truncated trailing partial sample (byte
                                 // length not a multiple of 4) is unrecoverable.
-                                debug_assert!(
-                                    head.len() < std::mem::size_of::<f32>()
-                                        && tail.len() < std::mem::size_of::<f32>(),
-                                    "align_to head/tail must each be a sub-sample edge"
-                                );
+                                //
+                                // NOTE (rsac-9096): a `debug_assert!` on the head/tail
+                                // sizes used to live here, but (a) `align_to`'s
+                                // documented contract does NOT guarantee a maximal
+                                // middle slice (only that the middle is aligned), so
+                                // the assert leaned on an implementation detail, and
+                                // (b) it was a panic site inside this C callback in
+                                // debug builds, OUTSIDE any unwind guard — a firing
+                                // assert would unwind into PipeWire's C frames (UB).
+                                // Correctness never depended on it: the decode below
+                                // reads the raw bytes directly, however align_to
+                                // split them.
                                 let truncated_bytes =
                                     decode_unaligned_f32_le(valid, &mut user_data.realign_scratch);
-                                // Surface the otherwise-invisible realignment ONCE so
-                                // a recurring misalignment (or a truncated tail) is
-                                // diagnosable, without flooding the RT log.
-                                if !user_data.misaligned_logged {
-                                    user_data.misaligned_logged = true;
-                                    log::warn!(
-                                        "PipeWire delivered a non-word-aligned audio chunk \
-                                         (offset {offset}, {} bytes); realigning via copy. \
-                                         {truncated_bytes} trailing byte(s) form a truncated \
-                                         partial sample and were not recoverable.",
-                                        valid.len()
-                                    );
-                                }
+                                // rsac-9096: NO logging here — this closure runs
+                                // inside PipeWire's C `.process` callback (real-time
+                                // path, outside any panic guard), where `log::warn!`
+                                // would format (allocate) and a typical logger backend
+                                // would lock + syscall. Record the occurrence in the
+                                // plain per-session counters instead (exclusive `&mut`
+                                // access; saturating adds — RT-safe) and let the
+                                // non-RT `CaptureStreamData::drop` teardown emit the
+                                // one-shot summary.
+                                user_data.misaligned_chunks =
+                                    user_data.misaligned_chunks.saturating_add(1);
+                                user_data.misaligned_truncated_bytes = user_data
+                                    .misaligned_truncated_bytes
+                                    .saturating_add(truncated_bytes as u64);
                                 if !user_data.realign_scratch.is_empty() {
                                     // Disjoint field borrows: `realign_scratch` is read
                                     // immutably while `producer` is used — allowed.

@@ -87,6 +87,30 @@ fn unpack_window(packed: u64) -> (u32, u32) {
     ((packed >> 32) as u32, (packed & 0xFFFF_FFFF) as u32)
 }
 
+/// Convert a frame count at `sample_rate` to nanoseconds of stream time
+/// (`rsac-1b8c`).
+///
+/// Pure integer math — no float, no clock syscall, no allocation — so it is
+/// safe on the real-time producer path (ADR-0001). The intermediate product is
+/// computed in `u128` so `frames * 1_000_000_000` cannot overflow, and the
+/// result is saturated into `u64`: at nanosecond resolution a `u64` covers
+/// ~584 years of stream time, so saturation is a theoretical guard, never a
+/// practical limit. A `sample_rate` of `0` is clamped to `1` (degenerate input
+/// guard; matches the stamped-push family's historical behavior).
+///
+/// Note the per-call flooring: each call floors `frames * 1e9 / rate`
+/// independently, so an accumulator built from these values can drift below
+/// the exact rational position by at most 1 ns *per push* for rates that do
+/// not divide the frame count evenly (e.g. 44.1 kHz with odd frame counts).
+/// That bounded sub-nanosecond-per-buffer drift is the price of making the
+/// position rate-change-proof (see [`BridgeProducer::position_nanos`]).
+#[inline]
+fn frames_to_nanos(frames: u64, sample_rate: u32) -> u64 {
+    let rate = u128::from(sample_rate.max(1));
+    let nanos = (u128::from(frames) * 1_000_000_000) / rate;
+    u64::try_from(nanos).unwrap_or(u64::MAX)
+}
+
 /// Outcome of a single [`BridgeProducer::push_samples_reporting`] call.
 ///
 /// Surfaces overflow **eagerly**, in the callback, without polling the shared
@@ -590,14 +614,33 @@ pub struct BridgeProducer {
     /// momentarily empty (e.g. during warm-up before the consumer has recycled
     /// anything, or under sustained back-pressure when a push is rejected).
     scratch: Vec<f32>,
-    /// Cumulative frames **offered** to the ring (pushed *or* dropped) by the
-    /// stream-position-stamping push variants. Drives
-    /// [`push_samples_or_drop_stamped`](Self::push_samples_or_drop_stamped):
-    /// counting dropped frames too means a producer-side drop shows up as a
-    /// *gap* between consecutive delivered timestamps instead of being papered
-    /// over. Plain `u64` (no atomic) — the producer is single-threaded by
-    /// contract.
-    frames_offered: u64,
+    /// Cumulative **stream position in nanoseconds** of all audio offered to
+    /// the ring (pushed *or* dropped) by this producer's samples- and
+    /// buffer-push methods (`rsac-1b8c`).
+    ///
+    /// This replaces the former cumulative *frame* counter. Storing the
+    /// position in time units makes it **rate-renegotiation-proof**: a
+    /// mid-stream sample-rate change (e.g. PipeWire `param_changed` updating
+    /// the delivered rate live) only changes how fast *future* pushes advance
+    /// the position — already-issued timestamps never retroactively rescale
+    /// (a frame counter divided by the *new* rate would shift the entire past
+    /// timeline, e.g. a spurious ~884 ms jump for 48 k→44.1 k at 10 s).
+    ///
+    /// Advanced centrally in [`push_samples_or_drop_inner`] by
+    /// `frames * 1e9 / rate` (saturating integer math — see
+    /// [`frames_to_nanos`]; the u64 nanosecond horizon is ~584 years), so
+    /// **every** offered samples-push advances it regardless of variant —
+    /// mixing stamped and unstamped pushes on one producer keeps a single
+    /// contiguous timeline. The `AudioBuffer`-based [`push`]/[`push_or_drop`]
+    /// also advance it (see their docs). Counting dropped frames too means a
+    /// producer-side drop shows up as a *gap* between consecutive delivered
+    /// timestamps instead of being papered over. Plain `u64` (no atomic) —
+    /// the producer is single-threaded by contract.
+    ///
+    /// [`push_samples_or_drop_inner`]: Self::push_samples_or_drop_inner
+    /// [`push`]: Self::push
+    /// [`push_or_drop`]: Self::push_or_drop
+    position_nanos: u64,
 }
 
 // BridgeProducer is Send (can be moved to the callback thread) but not necessarily Sync.
@@ -612,9 +655,32 @@ impl BridgeProducer {
     /// the caller decides what to do with the rejected buffer.
     ///
     /// Increments `buffers_pushed` on success.
+    ///
+    /// # Stream-position interaction (`rsac-1b8c`)
+    ///
+    /// On **success** this advances the producer's internal stream position by
+    /// the buffer's frame count at the buffer's own sample rate, so mixing
+    /// `AudioBuffer` pushes with the `push_samples_*` family on one producer
+    /// yields a single contiguous timeline. It does **not** advance on
+    /// `Err(buffer)` — the buffer is handed back unconsumed, and a later retry
+    /// of the same buffer must not double-count its frames. (If the caller
+    /// drops a rejected buffer themselves, that gap is not recorded; use
+    /// [`push_or_drop`](Self::push_or_drop) for drop-with-gap semantics.) Any
+    /// timestamp already carried by the buffer is preserved as-is; the
+    /// position advance only keeps the internal counter coherent for
+    /// subsequent `_stamped` pushes.
     pub fn push(&mut self, buffer: AudioBuffer) -> Result<(), AudioBuffer> {
+        // Capture the advance inputs before the buffer is moved into the ring.
+        let frames = buffer.num_frames() as u64;
+        let rate = buffer.sample_rate();
         match self.producer.push(buffer) {
             Ok(()) => {
+                // rsac-1b8c: consumed audio advances the stream position (see
+                // the method docs — success only; a rejected buffer may be
+                // retried).
+                self.position_nanos = self
+                    .position_nanos
+                    .saturating_add(frames_to_nanos(frames, rate));
                 self.shared.buffers_pushed.fetch_add(1, Ordering::Relaxed);
                 self.shared.consecutive_drops.store(0, Ordering::Relaxed);
                 // Record a successful attempt in the sliding drop-rate window
@@ -637,10 +703,26 @@ impl BridgeProducer {
     ///
     /// This is the primary method used by audio callbacks — it never blocks
     /// and silently drops data when the consumer can't keep up.
+    ///
+    /// # Stream-position interaction (`rsac-1b8c`)
+    ///
+    /// Advances the producer's internal stream position by the buffer's frame
+    /// count **whether the push succeeds or drops** (the success arm advances
+    /// inside [`push`](Self::push); the drop arm advances here), so a drop
+    /// surfaces as a *gap* in the timeline seen by subsequent `_stamped`
+    /// pushes — same gap semantics as the `push_samples_*` family.
     pub fn push_or_drop(&mut self, buffer: AudioBuffer) -> bool {
         match self.push(buffer) {
             Ok(()) => true,
-            Err(_dropped) => {
+            Err(dropped) => {
+                // rsac-1b8c: the buffer is dropped here for good (gap
+                // semantics) — advance the stream position by its frames so
+                // the loss stays visible as a timestamp gap.
+                let frames = dropped.num_frames() as u64;
+                let rate = dropped.sample_rate();
+                self.position_nanos = self
+                    .position_nanos
+                    .saturating_add(frames_to_nanos(frames, rate));
                 self.shared.buffers_dropped.fetch_add(1, Ordering::Relaxed);
                 self.shared
                     .consecutive_drops
@@ -678,9 +760,19 @@ impl BridgeProducer {
     /// this instead of manually calling `data.to_vec()` + `AudioBuffer::new()` +
     /// `push_or_drop()`.
     ///
-    /// Delegates to [`push_samples_or_drop_at`](Self::push_samples_or_drop_at)
-    /// with no timestamp; see that method for the variant that stamps each
-    /// buffer with a stream-relative position.
+    /// # Stream-position interaction (`rsac-1b8c`)
+    ///
+    /// Although the delivered buffer carries **no timestamp**, this push still
+    /// advances the producer's internal stream position by its frame count
+    /// (the advance is centralized in the shared inner path, so *every*
+    /// offered samples-push counts). Mixing untimed and `_stamped` pushes on
+    /// one producer therefore yields one contiguous, non-overlapping timeline
+    /// — an untimed push consumes stream time even though it does not report
+    /// it.
+    ///
+    /// Delegates to the shared inner path with no timestamp; see
+    /// [`push_samples_or_drop_at`](Self::push_samples_or_drop_at) for the
+    /// variant that stamps each buffer with a caller-supplied position.
     #[inline]
     pub fn push_samples_or_drop(&mut self, data: &[f32], channels: u16, sample_rate: u32) -> bool {
         self.push_samples_or_drop_inner(data, channels, sample_rate, None)
@@ -699,6 +791,16 @@ impl BridgeProducer {
     ///
     /// Shares the exact same alloc-free free-list/scratch path as the untimed
     /// variant: in steady state it performs **no heap allocation**.
+    ///
+    /// # Stream-position interaction (`rsac-1b8c`)
+    ///
+    /// The caller-supplied `timestamp` is delivered as-is, but this push
+    /// **also** advances the producer's internal stream position by its frame
+    /// count (centralized in the shared inner path). So a later switch to the
+    /// counter-driven
+    /// [`push_samples_or_drop_stamped`](Self::push_samples_or_drop_stamped)
+    /// continues from a position that accounts for everything pushed through
+    /// this variant too.
     #[inline]
     pub fn push_samples_or_drop_at(
         &mut self,
@@ -711,17 +813,27 @@ impl BridgeProducer {
     }
 
     /// Like [`push_samples_or_drop`](Self::push_samples_or_drop), but stamps the
-    /// buffer with a **stream-position timestamp derived from the frames this
-    /// producer has offered so far** — no clock syscall, pure integer math, so
-    /// it is exactly as RT-safe as the untimed variant (ADR-0001 preserved).
+    /// buffer with a **stream-position timestamp derived from the nanosecond
+    /// position accumulator** — no clock syscall, pure integer math, so it is
+    /// exactly as RT-safe as the untimed variant (ADR-0001 preserved).
     ///
     /// The stamp is the position of this buffer's **first sample** relative to
-    /// stream start, computed as `frames_offered / sample_rate`. The counter
-    /// advances by this call's frames **whether or not the push succeeds**, so
-    /// a producer-side drop appears to the consumer as a *gap* between
-    /// consecutive buffer timestamps (`t₂ − t₁ > frames₁/rate`) instead of a
-    /// silently contiguous timeline — making drop-induced discontinuities
-    /// measurable downstream.
+    /// stream start, read from [`position_nanos`](Self::position_nanos) before
+    /// the push advances it. The position advances by this call's frames
+    /// (`frames * 1e9 / rate`, saturating — see [`frames_to_nanos`]) **whether
+    /// or not the push succeeds**, so a producer-side drop appears to the
+    /// consumer as a *gap* between consecutive buffer timestamps
+    /// (`t₂ − t₁ > frames₁/rate`) instead of a silently contiguous timeline —
+    /// making drop-induced discontinuities measurable downstream.
+    ///
+    /// # Rate renegotiation (`rsac-1b8c`)
+    ///
+    /// Because the accumulator stores elapsed **time**, not frames, a
+    /// mid-stream `sample_rate` change (e.g. PipeWire `param_changed` updating
+    /// the delivered rate live) is seamless: stamps issued before the change
+    /// are untouched, and deltas after it simply use the new rate. (The former
+    /// frame-counter design divided the *cumulative* frame count by the
+    /// *current* rate, retroactively rescaling the entire past timeline.)
     ///
     /// Semantics note: this is *stream position* (frames delivered by the OS),
     /// not wall-clock time — periods where the OS delivers nothing (e.g. a
@@ -740,16 +852,11 @@ impl BridgeProducer {
         channels: u16,
         sample_rate: u32,
     ) -> bool {
-        let rate = u64::from(sample_rate.max(1));
-        let position = Duration::from_nanos(
-            ((self.frames_offered as u128 * 1_000_000_000) / rate as u128) as u64,
-        );
-        let frames = (data.len() / usize::from(channels.max(1))) as u64;
-        let pushed = self.push_samples_or_drop_inner(data, channels, sample_rate, Some(position));
-        // Count offered frames regardless of outcome (see field docs: drops
-        // must surface as timestamp gaps, not a contiguous lie).
-        self.frames_offered = self.frames_offered.saturating_add(frames);
-        pushed
+        // Stamp = the position of this buffer's FIRST sample: read the
+        // accumulator BEFORE the inner push advances it (the advance itself is
+        // centralized in push_samples_or_drop_inner — rsac-1b8c).
+        let position = Duration::from_nanos(self.position_nanos);
+        self.push_samples_or_drop_inner(data, channels, sample_rate, Some(position))
     }
 
     /// Panic-guarded sibling of
@@ -784,7 +891,9 @@ impl BridgeProducer {
     /// Returns a [`PushOutcome`] giving `pushed` and `dropped_this_call` without
     /// the caller having to poll the shared `buffers_dropped` counter — so a
     /// backend can compute a per-period drop rate cheaply, right in the callback.
-    /// Same alloc-free, lock-free path as [`push_samples_or_drop`](Self::push_samples_or_drop).
+    /// Same alloc-free, lock-free path as [`push_samples_or_drop`](Self::push_samples_or_drop),
+    /// including the stream-position advance (`rsac-1b8c` — the buffer is
+    /// untimed, but its frames still consume stream time).
     #[inline]
     pub fn push_samples_reporting(
         &mut self,
@@ -806,6 +915,18 @@ impl BridgeProducer {
     /// [`AudioBuffer::with_timestamp`]; otherwise with [`AudioBuffer::new`]. Both
     /// paths reuse the identical free-list/scratch logic, so the RT-allocation
     /// guarantee (ADR-0001) is unchanged for the timestamped variant.
+    ///
+    /// # Stream-position advance (`rsac-1b8c`)
+    ///
+    /// This is the **single** place the samples-push family advances
+    /// [`position_nanos`](Self::position_nanos): every offered push — stamped
+    /// or not, pushed or dropped — advances the position by its frame count,
+    /// so mixed stamped/unstamped usage can never silently desync the
+    /// timeline. The advance happens FIRST, before any fallible work, so even
+    /// a panic contained by the guarded wrappers (which account the buffer as
+    /// dropped via `on_push_panic`) leaves the position advanced — the
+    /// panic-drop shows up as a gap, consistent with an ordinary overflow
+    /// drop.
     fn push_samples_or_drop_inner(
         &mut self,
         data: &[f32],
@@ -813,6 +934,13 @@ impl BridgeProducer {
         sample_rate: u32,
         timestamp: Option<Duration>,
     ) -> bool {
+        // rsac-1b8c: advance the stream position for EVERY offered push (see
+        // the doc above). Integer math + saturating add — RT-safe (ADR-0001).
+        let frames = (data.len() / usize::from(channels.max(1))) as u64;
+        self.position_nanos = self
+            .position_nanos
+            .saturating_add(frames_to_nanos(frames, sample_rate));
+
         // Acquire a reusable Vec: prefer a recycled allocation from the
         // free-list ring, otherwise fall back to the single-slot scratch.
         // `used_scratch` records whether we consumed the scratch slot, so the
@@ -1655,7 +1783,7 @@ pub fn create_bridge_with_options(
             // Single-slot fallback for when the free-list ring is momentarily
             // empty. Pre-sized for a realistic worst-case callback period.
             scratch: Vec::with_capacity(RT_BUFFER_SAMPLE_CAPACITY),
-            frames_offered: 0,
+            position_nanos: 0,
         },
         BridgeConsumer {
             consumer,
@@ -2334,6 +2462,151 @@ mod tests {
         // two-variant contract is unchanged).
         assert!(producer.push_samples_or_drop(&[0.0; 960], 2, 48_000));
         assert_eq!(consumer.pop().expect("untimed buffer").timestamp(), None);
+    }
+
+    // rsac-1b8c: the stamp accumulator stores NANOSECONDS, not frames, so a
+    // mid-stream sample-rate renegotiation (e.g. PipeWire `param_changed`
+    // updating the delivered rate live) never retroactively rescales the past
+    // timeline: stamps issued before the change are unchanged, and post-change
+    // deltas use the new rate.
+    #[test]
+    fn stamped_push_survives_rate_renegotiation() {
+        let (mut producer, mut consumer) = create_bridge(8, test_format());
+
+        // Two 480-frame stereo pushes @ 48 kHz → stamps 0 ms and 10 ms.
+        assert!(producer.push_samples_or_drop_stamped(&[0.0; 960], 2, 48_000));
+        assert!(producer.push_samples_or_drop_stamped(&[0.0; 960], 2, 48_000));
+
+        // RATE CHANGE mid-stream: two 441-frame stereo pushes @ 44.1 kHz
+        // (10 ms each at the new rate).
+        assert!(producer.push_samples_or_drop_stamped(&[0.0; 882], 2, 44_100));
+        assert!(producer.push_samples_or_drop_stamped(&[0.0; 882], 2, 44_100));
+
+        let b1 = consumer.pop().expect("buffer 1");
+        let b2 = consumer.pop().expect("buffer 2");
+        let b3 = consumer.pop().expect("buffer 3");
+        let b4 = consumer.pop().expect("buffer 4");
+
+        assert_eq!(b1.timestamp(), Some(Duration::ZERO));
+        assert_eq!(b2.timestamp(), Some(Duration::from_millis(10)));
+        // The PAST timeline is untouched by the rate change: the first
+        // post-change stamp continues exactly where the old rate left off.
+        // (The former frame-counter design would have stamped this
+        // 960 frames / 44100 Hz ≈ 21.77 ms — a spurious retroactive jump.)
+        assert_eq!(
+            b3.timestamp(),
+            Some(Duration::from_millis(20)),
+            "a rate change must not retroactively rescale earlier stream time"
+        );
+        // And the post-change delta uses the NEW rate: 441 frames @ 44.1 kHz
+        // is exactly 10 ms.
+        assert_eq!(
+            b4.timestamp(),
+            Some(Duration::from_millis(30)),
+            "post-change deltas must advance at the new rate"
+        );
+    }
+
+    // rsac-1b8c: the position advance is centralized in the shared inner push,
+    // so mixing stamped and UNSTAMPED pushes on one producer yields a single
+    // contiguous, non-overlapping timeline (an unstamped push consumes stream
+    // time even though it does not report it).
+    #[test]
+    fn mixed_stamped_and_unstamped_pushes_share_one_timeline() {
+        let (mut producer, mut consumer) = create_bridge(8, test_format());
+
+        // stamped (0 ms) → untimed → reporting (both advance, no stamp) →
+        // stamped: the final stamp must cover the untimed pushes' audio.
+        assert!(producer.push_samples_or_drop_stamped(&[0.0; 960], 2, 48_000));
+        assert!(producer.push_samples_or_drop(&[0.0; 960], 2, 48_000));
+        assert!(
+            producer
+                .push_samples_reporting(&[0.0; 960], 2, 48_000)
+                .pushed
+        );
+        assert!(producer.push_samples_or_drop_stamped(&[0.0; 960], 2, 48_000));
+
+        let b1 = consumer.pop().expect("stamped 1");
+        let b2 = consumer.pop().expect("untimed");
+        let b3 = consumer.pop().expect("reporting");
+        let b4 = consumer.pop().expect("stamped 2");
+
+        assert_eq!(b1.timestamp(), Some(Duration::ZERO));
+        assert_eq!(b2.timestamp(), None, "untimed variant stays unstamped");
+        assert_eq!(b3.timestamp(), None, "reporting variant stays unstamped");
+        // The two untimed pushes consumed 2 × 10 ms of stream time, so the
+        // second stamped push starts at 30 ms. (A per-variant counter would
+        // have stamped it 10 ms — overlapping the untimed audio.)
+        assert_eq!(
+            b4.timestamp(),
+            Some(Duration::from_millis(30)),
+            "unstamped pushes must advance the shared timeline (no overlap)"
+        );
+    }
+
+    // rsac-1b8c: multiple consecutive drops accumulate into one cumulative
+    // timestamp gap exactly equal to the dropped duration.
+    #[test]
+    fn consecutive_drops_accumulate_into_one_cumulative_gap() {
+        // Capacity 2: two successful pushes fill the ring, then every further
+        // push drops until the consumer drains.
+        let (mut producer, mut consumer) = create_bridge(2, test_format());
+
+        assert!(producer.push_samples_or_drop_stamped(&[0.0; 960], 2, 48_000)); // 0 ms
+        assert!(producer.push_samples_or_drop_stamped(&[0.0; 960], 2, 48_000)); // 10 ms
+
+        // Three consecutive drops (ring full) — 30 ms of lost audio.
+        for _ in 0..3 {
+            assert!(!producer.push_samples_or_drop_stamped(&[0.0; 960], 2, 48_000));
+        }
+
+        // Drain the two delivered buffers, then the next successful push must
+        // be stamped past the WHOLE cumulative gap:
+        // (2 delivered + 3 dropped) × 10 ms = 50 ms.
+        assert_eq!(
+            consumer.pop().expect("b1").timestamp(),
+            Some(Duration::ZERO)
+        );
+        assert_eq!(
+            consumer.pop().expect("b2").timestamp(),
+            Some(Duration::from_millis(10))
+        );
+        assert!(producer.push_samples_or_drop_stamped(&[0.0; 960], 2, 48_000));
+        let after = consumer.pop().expect("post-drop buffer");
+        assert_eq!(
+            after.timestamp(),
+            Some(Duration::from_millis(50)),
+            "the cumulative gap must equal the dropped duration (3 × 10 ms)"
+        );
+    }
+
+    // rsac-1b8c: the AudioBuffer-based pushes advance the same stream position
+    // as the samples family — `push` on success, `push_or_drop` also on a drop
+    // — so mixing them with `_stamped` pushes keeps one coherent timeline. A
+    // REJECTED `push()` (Err hands the buffer back, retryable) must NOT
+    // advance, or a retry would double-count.
+    #[test]
+    fn audiobuffer_pushes_advance_the_stream_position() {
+        let (mut producer, mut consumer) = create_bridge(2, test_format());
+
+        // 480-frame stereo buffer @ 48 kHz = 10 ms of stream time.
+        let mk = || AudioBuffer::new(vec![0.0; 960], 2, 48_000);
+
+        producer.push(mk()).unwrap(); // success → advances (→ 10 ms)
+        producer.push(mk()).unwrap(); // success → advances (→ 20 ms)
+        assert!(!producer.push_or_drop(mk())); // ring full: drop → advances (→ 30 ms)
+
+        // A rejected push() hands the buffer back WITHOUT advancing.
+        assert!(producer.push(mk()).is_err());
+
+        while consumer.pop().is_some() {}
+        assert!(producer.push_samples_or_drop_stamped(&[0.0; 960], 2, 48_000));
+        assert_eq!(
+            consumer.pop().expect("stamped buffer").timestamp(),
+            Some(Duration::from_millis(30)),
+            "2 pushed + 1 dropped AudioBuffers = 30 ms of consumed stream \
+             time; the rejected push() must not have advanced"
+        );
     }
 
     // Steady-state push/pop loop preserves data integrity over many cycles
