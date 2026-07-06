@@ -478,6 +478,98 @@ jobs:
           fi
           echo "TOLERATED: aarch64 PipeWire system libraries unavailable (pkg-config failure in the pipewire/libspa -sys build scripts); no rustc compilation errors"
 
+  # ── Android mobile leg (rsac-1a6e): backend cross-check + AAR build ──
+  # Stage-1 mobile CI per docs/MOBILE_BACKEND_DESIGN.md: proves COMPILATION,
+  # not capture. `cargo check` needs no NDK (no linking); the Gradle step
+  # builds mobile/android's rsac.aar sources for real. Emulator/device
+  # runtime verification is a separate, later seed — do not claim "tested
+  # on Android" off the back of this job.
+  mobile-android:
+    name: Android Mobile Leg (cross-check + AAR)
+    timeout-minutes: 25
+    needs: lint
+    runs-on: blacksmith-4vcpu-ubuntu-2404
+    steps:
+      - uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5
+        with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@e081816240890017053eacbb1bdf337761dc5582 # 1.95.0
+        with:
+          targets: aarch64-linux-android
+      - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
+
+      - name: Cross-check the Android backend (feat_android)
+        run: |
+          cargo check --target aarch64-linux-android --no-default-features --features feat_android
+          cargo check --target aarch64-linux-android
+          cargo check --target aarch64-linux-android --tests --no-default-features --features feat_android
+          cargo clippy --target aarch64-linux-android --no-default-features --features feat_android -- -D warnings
+
+      - name: Select JDK 17 (AGP 8.x requirement)
+        run: echo "JAVA_HOME=${JAVA_HOME_17_X64}" >> "$GITHUB_ENV"
+
+      - name: Install Android SDK platform for compileSdk 35
+        run: |
+          SDKMANAGER="$ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager"
+          yes | "$SDKMANAGER" --licenses > /dev/null || true
+          "$SDKMANAGER" "platforms;android-35" "build-tools;35.0.0"
+
+      - uses: gradle/actions/setup-gradle@48b5f213c81028ace310571dc5ec0fbbca0b2947 # v4
+        with:
+          gradle-version: "8.11.1"
+
+      - name: Build rsac.aar (mobile/android glue sources)
+        working-directory: mobile/android
+        run: gradle assembleRelease --no-daemon --stacktrace
+
+      - name: Verify the AAR artifact exists
+        run: |
+          AAR="$(find mobile/android/build/outputs/aar -name '*.aar' | head -n1)"
+          if [ -z "$AAR" ]; then
+            echo "FAIL: no .aar produced by assembleRelease"
+            exit 1
+          fi
+          echo "OK: built $AAR ($(stat -c%s "$AAR") bytes)"
+
+  # ── iOS mobile leg (rsac-48e7): backend cross-check + SwiftPM build ──
+  # Same stage-1 honesty: compilation only.
+  mobile-ios:
+    name: iOS Mobile Leg (cross-check + SwiftPM)
+    timeout-minutes: 25
+    needs: lint
+    runs-on: blacksmith-6vcpu-macos-15
+    steps:
+      - uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5
+        with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@e081816240890017053eacbb1bdf337761dc5582 # 1.95.0
+        with:
+          targets: aarch64-apple-ios
+      - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
+
+      - name: Cross-check the iOS backend (feat_ios)
+        run: |
+          cargo check --target aarch64-apple-ios --no-default-features --features feat_ios
+          cargo check --target aarch64-apple-ios
+          cargo check --target aarch64-apple-ios --tests --no-default-features --features feat_ios
+          cargo clippy --target aarch64-apple-ios --no-default-features --features feat_ios -- -D warnings
+
+      - name: Build the SwiftPM package for iOS (both products)
+        working-directory: mobile/ios
+        run: |
+          # xcodebuild drives SwiftPM directly; a generic iOS destination needs
+          # no simulator runtime and no signing for library products.
+          xcodebuild build \
+            -scheme RsacAudio \
+            -destination 'generic/platform=iOS' \
+            -skipPackagePluginValidation \
+            CODE_SIGNING_ALLOWED=NO
+          xcodebuild build \
+            -scheme RsacBroadcastKit \
+            -destination 'generic/platform=iOS' \
+            -skipPackagePluginValidation \
+            CODE_SIGNING_ALLOWED=NO
+
   # ── Binding crates compilation check ─────────────────────────────────
   check-bindings:
     name: Binding Crates
