@@ -505,6 +505,27 @@ jobs:
           cargo check --target aarch64-linux-android --tests --no-default-features --features feat_android
           cargo clippy --target aarch64-linux-android --no-default-features --features feat_android -- -D warnings
 
+      # rsac-7a18: the C FFI is how Flutter/C consumers reach rsac on Android.
+      - name: Cross-check rsac-ffi for Android (feat_android)
+        run: cargo check -p rsac-ffi --target aarch64-linux-android --no-default-features --features feat_android
+
+      # rsac-0aa9: build librsac.so for real with the NDK linker — the first
+      # step that actually LINKS the backend (#[link(name = "aaudio")]);
+      # cargo check never does. Output lands in the AAR's jniLibs so the
+      # Gradle build below packages it (System.loadLibrary("rsac") on the
+      # Kotlin side; JNI exports arrive with rsac-77f1).
+      - name: Install cargo-ndk
+        run: cargo install --locked cargo-ndk
+
+      - name: Build librsac.so into jniLibs (arm64-v8a + x86_64)
+        env:
+          ANDROID_NDK_HOME: ${{ env.ANDROID_NDK_LATEST_HOME }}
+        run: |
+          rustup target add x86_64-linux-android
+          cargo ndk -t arm64-v8a -t x86_64 -o mobile/android/src/main/jniLibs \
+            build --release -p rsac-android-native
+          ls -l mobile/android/src/main/jniLibs/*/librsac.so
+
       - name: Select JDK 17 (AGP 8.x requirement)
         run: echo "JAVA_HOME=${JAVA_HOME_17_X64}" >> "$GITHUB_ENV"
 
@@ -522,7 +543,7 @@ jobs:
         working-directory: mobile/android
         run: gradle assembleRelease --no-daemon --stacktrace
 
-      - name: Verify the AAR artifact exists
+      - name: Verify the AAR artifact contains the native library
         run: |
           AAR="$(find mobile/android/build/outputs/aar -name '*.aar' | head -n1)"
           if [ -z "$AAR" ]; then
@@ -530,6 +551,15 @@ jobs:
             exit 1
           fi
           echo "OK: built $AAR ($(stat -c%s "$AAR") bytes)"
+          # rsac-0aa9: the packaged AAR must carry librsac.so per ABI.
+          for ABI in arm64-v8a x86_64; do
+            unzip -l "$AAR" | grep -q "jni/$ABI/librsac.so" || {
+              echo "FAIL: $AAR is missing jni/$ABI/librsac.so"
+              unzip -l "$AAR"
+              exit 1
+            }
+          done
+          echo "OK: AAR contains librsac.so for arm64-v8a and x86_64"
 
   # ── iOS mobile leg (rsac-48e7): backend cross-check + SwiftPM build ──
   # Same stage-1 honesty: compilation only.
@@ -553,6 +583,11 @@ jobs:
           cargo check --target aarch64-apple-ios
           cargo check --target aarch64-apple-ios --tests --no-default-features --features feat_ios
           cargo clippy --target aarch64-apple-ios --no-default-features --features feat_ios -- -D warnings
+
+      # rsac-7a18: the C FFI is how Flutter/C consumers reach rsac on iOS
+      # (staticlib + dart:ffi).
+      - name: Cross-check rsac-ffi for iOS (feat_ios)
+        run: cargo check -p rsac-ffi --target aarch64-apple-ios --no-default-features --features feat_ios
 
       - name: Build the SwiftPM package for iOS (both products)
         working-directory: mobile/ios

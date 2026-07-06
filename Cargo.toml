@@ -357,7 +357,15 @@ harness = false
 test = false
 
 [workspace]
-members = ["bindings/rsac-python", "bindings/rsac-ffi", "bindings/rsac-napi"]
+members = [
+    "bindings/rsac-python",
+    "bindings/rsac-ffi",
+    "bindings/rsac-napi",
+    # Android cdylib shim (librsac.so for the AAR's jniLibs; rsac-0aa9).
+    # Lives under /mobile, which is excluded from the crates.io package —
+    # workspace membership is orthogonal to packaging.
+    "mobile/android-native",
+]
 exclude = ["apps/audio-graph/src-tauri"]
 
 # rsac#16: docs.rs rendering config. Without this, docs.rs builds with the

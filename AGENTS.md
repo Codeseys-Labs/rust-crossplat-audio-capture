@@ -44,7 +44,7 @@ plus a comprehensive reference analysis:
 | [API Design](docs/architecture/API_DESIGN.md) | Original public API *design* (historical — see banner) |
 | [Error & Capability Design](docs/architecture/ERROR_CAPABILITY_DESIGN.md) | Error taxonomy + platform capabilities *design* (historical) |
 | [Backend Contract](docs/architecture/BACKEND_CONTRACT.md) | Internal backend traits + module architecture (design) |
-| [ADRs](docs/designs/) | Architecture Decision Records (0001–0003) — accepted decisions |
+| [ADRs](docs/designs/) | Architecture Decision Records (0001–0016, indexed in [docs/designs/README.md](docs/designs/README.md)) — accepted decisions |
 | [Reference Analysis](reference/REFERENCE_ANALYSIS.md) | Analysis of 10 reference repos mapped to rsac's architecture |
 | [Local Testing Guide](docs/LOCAL_TESTING_GUIDE.md) | How to test on physical macOS, Windows, and Linux machines |
 | [macOS Version Compatibility](docs/MACOS_VERSION_COMPATIBILITY.md) | macOS API compatibility matrix, version-specific fallbacks, known issues |
@@ -243,7 +243,7 @@ bindings/
 ├── rsac-napi/              # Node.js/TypeScript bindings (napi-rs)
 └── rsac-go/                # Go bindings (CGo over C FFI)
 apps/
-└── audio-graph/            # Tauri v2 desktop app (submodule — Codeseys-Labs/audio-graph)
+└── audio-graph/            # Tauri v2 desktop app (standalone checkout, git-ignored — audio-graph depends on rsac; no longer a submodule)
 docs/
 ├── architecture/           # Original architecture *design* docs (historical; code is source of truth)
 ├── OBJC2_MIGRATION_PLAN.md # objc2 migration plan (completed)
@@ -274,6 +274,7 @@ docker/                     # Docker-based cross-platform testing
   - `test-utils` — Test utility exports
   - `compose` — Multi-source channel composition (`src/compose/`; adds `rubato` + `audioadapter-buffers`) — ADR-0011
   - `cli` — Demo binaries' deps (`clap`, `color-eyre`, `ctrlc`, `env_logger`); NOT in defaults, so library consumers don't pull them
+  - `macos-tcc-spi` — real `check_audio_capture_permission()` preflight via the private `TCCAccessPreflight` SPI, `dlopen`'d at runtime (ADR-0015); off by default so the published artifact carries no private-symbol usage
 
 ### Data & Types
 

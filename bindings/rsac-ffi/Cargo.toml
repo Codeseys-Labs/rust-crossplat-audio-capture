@@ -30,6 +30,13 @@ default = []
 feat_windows = ["rsac/feat_windows"]
 feat_linux = ["rsac/feat_linux"]
 feat_macos = ["rsac/feat_macos"]
+# Mobile passthroughs (rsac-7a18): the C ABI is target-independent (the
+# curated header does not change), but Flutter/C consumers cross-compile this
+# crate for the mobile triples — staticlib + dart:ffi on iOS, cdylib in
+# jniLibs on Android (coordinate with rsac-0aa9's librsac.so, which serves
+# the JNI/AAR path; this crate serves the C-symbol path).
+feat_android = ["rsac/feat_android"]
+feat_ios = ["rsac/feat_ios"]
 sink-wav = ["rsac/sink-wav"]
 # Multi-source channel composition (ADR-0011). Follows the sink-wav precedent:
 # a non-default forwarding feature — enable with `--features compose`. The

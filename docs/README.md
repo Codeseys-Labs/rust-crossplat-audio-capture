@@ -28,7 +28,7 @@ not guidance. Entry points (⭐) are the places to start.
 | [`MACOS_VERSION_COMPATIBILITY.md`](MACOS_VERSION_COMPATIBILITY.md) | macOS 14.4–26 API compatibility matrix |
 | [`MACOS26_PROCESS_TAP_FIX.md`](MACOS26_PROCESS_TAP_FIX.md) | Dated fix record: the 3-path Process Tap fallback |
 | [`OBJC2_MIGRATION_PLAN.md`](OBJC2_MIGRATION_PLAN.md) | Completed cocoa/objc → objc2 migration record |
-| [`designs/`](designs/README.md) | **ADRs 0001–0014** — durable decisions (indexed) |
+| [`designs/`](designs/README.md) | **ADRs 0001–0016** — durable decisions (indexed) |
 | [`architecture/`](architecture/) | Original design docs — **historical**, divergence-banner'd; code wins |
 | [`reviews/`](reviews/) | Review-loop retrospectives (point-in-time snapshots) |
 

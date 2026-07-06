@@ -20,6 +20,20 @@ Releases with no ABI change omit the subsection (or state "No C ABI changes").
 
 ### Added
 
+- **`macos-tcc-spi` feature — real audio-capture permission preflight
+  (ADR-0015).** `check_audio_capture_permission()` on macOS can now return a
+  real answer: there is no public API for the `kTCCServiceAudioCapture`
+  (Process Tap) status, so the opt-in feature `dlopen`s the private
+  `TCCAccessPreflight` SPI at runtime (the AudioCap mechanism). Off by
+  default: the published artifact carries no private-symbol usage and keeps
+  the honest `NotDetermined` stub; any SPI resolution failure also degrades
+  to `NotDetermined`.
+- **macOS silent-zeros diagnostic (ADR-0016).** A denied/unkeyed TCC context
+  makes a Process Tap stream perfectly silent zeros while looking healthy
+  (verified on macOS 26). The RT callback now flips an atomic on the first
+  non-zero sample (alloc-free) and a non-RT watchdog logs one warning at 2 s
+  if a tap capture is still all-silent — warn-only, since silence is
+  legitimate. Would have one-lined a multi-hour diagnosis.
 - **Multi-source channel composition (`compose` feature, ADR-0011).** New
   `rsac::compose` module — `CompositionBuilder` → `Composition`: declare
   *groups* of `CaptureTarget`s that either mix down to Mono/Stereo output
@@ -115,6 +129,18 @@ Releases with no ABI change omit the subsection (or state "No C ABI changes").
   findings are recorded in AGENTS.md §6).
 
 ### Fixed
+
+Real-hardware macOS verification pass (macOS 26 / M4, full report in PR #35):
+
+- `watch()` rustdoc linked a private item from public docs — invisible to
+  CI's Linux-only docs job because `src/audio/macos/` is cfg-stripped there
+  (systemic gap seeded as rsac-0fb1).
+- A stale ci_audio round-trip test still asserted the pre-#27
+  `Application→ProcessTree` mapping; retargeted to the shipped contract.
+- `subscribe_delivers_buffers_from_live_capture` hard-asserted capture
+  content behind `require_audio!()` while targeting the TCC-gated
+  `SystemDefault` tap; now gated on `require_system_capture!()` like its
+  siblings.
 
 Adversarial-review batch (16 tracked seeds, all landed pre-merge):
 

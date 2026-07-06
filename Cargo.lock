@@ -1722,6 +1722,13 @@ dependencies = [
 ]
 
 [[package]]
+name = "rsac-android-native"
+version = "0.4.0"
+dependencies = [
+ "rsac",
+]
+
+[[package]]
 name = "rsac-ffi"
 version = "0.4.0"
 dependencies = [

@@ -22,4 +22,6 @@ its Scope says so.
 | [ADR-0012](0012-mobile-platform-strategy.md) | Batteries-included mobile platform strategy: backends in-crate, Kotlin AAR + Swift package owned by rsac | Accepted | 2026-07-04 |
 | [ADR-0013](0013-mobile-capturetarget-semantics.md) | Mobile `CaptureTarget` semantics: strict Android mapping, ReplayKit-backed iOS `SystemDefault`, explicit consent token | Accepted | 2026-07-04 |
 | [ADR-0014](0014-tauri-integration-model.md) | Tauri integration model: direct library dependency on desktop, `tauri-plugin-rsac` as the mobile vehicle | Proposed | 2026-07-04 |
+| [ADR-0015](0015-macos-tcc-audiocapture-preflight.md) | macOS system-audio-capture permission preflight (private TCC SPI) | Accepted | 2026-07-06 |
+| [ADR-0016](0016-macos-process-tap-silent-zeros-guard.md) | macOS Process-Tap silent-zeros diagnostic (denied-permission guard) | Accepted | 2026-07-06 |
 | [abi3-decision](abi3-decision.md) | abi3 vs per-version Python wheels | Accepted | 2026-04-17 |

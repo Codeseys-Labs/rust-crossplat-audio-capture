@@ -28,6 +28,3 @@
 [submodule "reference/rtrb"]
 	path = reference/rtrb
 	url = https://github.com/mgeier/rtrb
-[submodule "apps/audio-graph"]
-	path = apps/audio-graph
-	url = https://github.com/Codeseys-Labs/audio-graph.git

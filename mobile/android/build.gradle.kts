@@ -42,9 +42,12 @@ android {
         targetCompatibility = JavaVersion.VERSION_17
     }
 
-    // The Rust cdylib (librsac.so, built via cargo-ndk in rsac-1a6e/rsac-77f1)
-    // is packaged into src/main/jniLibs/<abi>/ by the CI job; nothing to
-    // configure here until then. See README.md § Native library.
+    // The Rust cdylib (librsac.so) is built by cargo-ndk from the
+    // mobile/android-native shim crate (rsac-0aa9) and dropped into
+    // src/main/jniLibs/<abi>/ before assembleRelease — the CI mobile-android
+    // job does exactly that and asserts the .so lands inside the AAR.
+    // jniLibs is picked up by AGP's default sourceSet; nothing to configure.
+    // JNI exports arrive with rsac-77f1. See README.md § Native library.
 
     publishing {
         // Maven/GitHub Packages distribution is a follow-up seed; singleVariant
