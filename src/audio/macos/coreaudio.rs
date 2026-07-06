@@ -1300,14 +1300,14 @@ impl DeviceEnumerator for MacosDeviceEnumerator {
     /// the helper thread to exit), and joins the helper thread — no leaked
     /// listener, no leaked thread, no hang.
     ///
-    /// The listener-proc context (a [`WatchListenerContext`]) is **intentionally
+    /// The listener-proc context (a `WatchListenerContext`) is **intentionally
     /// leaked** (`Box::into_raw`, never reclaimed on the success/spawn-failure
     /// paths), because CoreAudio gives no barrier that an in-flight proc has
     /// finished when the listener is removed; never freeing it makes a late proc
     /// deref always sound. Delivery is stopped by disconnecting the channel, not
     /// by freeing the context. The residual cost is a bounded, intentional
     /// per-cycle context leak (tens of bytes); the proper race-free fix is
-    /// deferred — see [`WatchListenerContext`] and ADR-0005 §5/§6.
+    /// deferred — see `WatchListenerContext` and ADR-0005 §5/§6.
     fn watch(&self, on_event: DeviceEventHandler) -> AudioResult<DeviceWatcher> {
         // Bounded channel: the CoreAudio proc is the producer, the helper thread
         // the consumer. A bound avoids unbounded growth if events ever burst; on
