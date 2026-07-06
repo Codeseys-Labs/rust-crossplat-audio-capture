@@ -58,3 +58,7 @@ windows-storage/
 # plans (.kilo/plans/) are tracked; everything else is machine-local.
 .kilo/*
 !.kilo/plans/
+
+# audio-graph now depends on rsac (submodule relationship reversed) —
+# this checkout is a standalone repo, not tracked here.
+/apps/
