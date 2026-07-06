@@ -71,6 +71,13 @@ pub enum rsac_error_t {
 }
 
 /// Device kind for enumeration.
+///
+/// This is a **constants-only** type at the ABI boundary:
+/// [`rsac_default_device`] takes its `kind` parameter as a plain `int32_t`,
+/// never as this enum by value, because materializing an out-of-range integer
+/// as a fieldless Rust enum is immediate undefined behavior — before any
+/// range check could run (rsac-a273). Out-of-range values are rejected with
+/// `RSAC_ERROR_INVALID_PARAMETER` instead.
 #[repr(C)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum rsac_device_kind_t {
@@ -1296,16 +1303,26 @@ pub unsafe extern "C" fn rsac_device_list_free(list: *mut RsacDeviceList) {
 ///
 /// On success, `*out` receives a device handle that must be freed with
 /// `rsac_device_free()`.
+///
+/// `kind` is one of the [`rsac_device_kind_t`] constants, accepted as a plain
+/// `int32_t` (C's implicit enum→int conversion keeps call sites
+/// source-compatible). Taking the raw integer rather than the enum by value
+/// is deliberate: an out-of-range integer materialized as a fieldless Rust
+/// enum at the ABI boundary would be undefined behavior before any check
+/// could run. Anything other than `RSAC_DEVICE_OUTPUT` — including
+/// out-of-range values — is rejected with `RSAC_ERROR_INVALID_PARAMETER`.
 #[no_mangle]
 pub unsafe extern "C" fn rsac_default_device(
     enumerator: *const RsacDeviceEnumerator,
-    kind: rsac_device_kind_t,
+    kind: i32,
     out: *mut *mut RsacDevice,
 ) -> rsac_error_t {
     // rsac is a loopback (output) capture library: only the default OUTPUT
     // device is meaningful. Rather than silently ignoring `kind` and returning
     // the output device for an INPUT request (a lying ABI), reject any non-
-    // output kind explicitly so callers get an honest error.
+    // output kind explicitly so callers get an honest error. The comparison is
+    // against the raw integer, so an out-of-range value from C lands on this
+    // same rejection path instead of instantiating an invalid enum (rsac-a273).
     catch(|| {
         if enumerator.is_null() {
             set_last_error("enumerator is null");
@@ -1315,7 +1332,7 @@ pub unsafe extern "C" fn rsac_default_device(
             set_last_error("out pointer is null");
             return rsac_error_t::RSAC_ERROR_NULL_POINTER;
         }
-        if kind != rsac_device_kind_t::RSAC_DEVICE_OUTPUT {
+        if kind != rsac_device_kind_t::RSAC_DEVICE_OUTPUT as i32 {
             set_last_error(
                 "rsac_default_device: only RSAC_DEVICE_OUTPUT is supported \
                  (rsac is a loopback capture library)",
@@ -1649,6 +1666,41 @@ mod tests {
         // The unblock primitive must null-check like every other capture fn.
         let code = unsafe { rsac_capture_request_stop(ptr::null()) };
         assert_eq!(code, rsac_error_t::RSAC_ERROR_NULL_POINTER);
+    }
+
+    // ── default_device: kind validated as a raw integer (rsac-a273) ───────
+    //
+    // The kind check runs after the null checks but BEFORE the enumerator is
+    // dereferenced, so a dangling-but-non-null enumerator exercises it
+    // device-free (the same dangling-pointer pattern as the tests above).
+
+    #[test]
+    fn default_device_rejects_out_of_range_kind() {
+        let e = ptr::dangling::<RsacDeviceEnumerator>();
+        for bad in [-1, 2, 99, i32::MIN, i32::MAX] {
+            // Pre-poison `out` to prove the rejection path nulls it.
+            let mut out: *mut RsacDevice = ptr::dangling_mut::<RsacDevice>();
+            let code = unsafe { rsac_default_device(e, bad, &mut out) };
+            assert_eq!(
+                code,
+                rsac_error_t::RSAC_ERROR_INVALID_PARAMETER,
+                "kind {bad} must be rejected"
+            );
+            assert!(out.is_null());
+        }
+    }
+
+    #[test]
+    fn default_device_rejects_input_kind() {
+        // rsac is loopback-only: an INPUT request is an honest error, not a
+        // silent fallback to the output device.
+        let e = ptr::dangling::<RsacDeviceEnumerator>();
+        let mut out: *mut RsacDevice = ptr::dangling_mut::<RsacDevice>();
+        let code = unsafe {
+            rsac_default_device(e, rsac_device_kind_t::RSAC_DEVICE_INPUT as i32, &mut out)
+        };
+        assert_eq!(code, rsac_error_t::RSAC_ERROR_INVALID_PARAMETER);
+        assert!(out.is_null());
     }
 
     // ── Sample-format mapping round-trip ───────────────────────────────────

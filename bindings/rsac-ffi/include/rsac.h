@@ -46,6 +46,15 @@ typedef enum {
 
 /* ── Device kind ────────────────────────────────────────────────────── */
 
+/**
+ * Device kind constants for rsac_default_device().
+ *
+ * Constants-only type: rsac_default_device() takes its `kind` parameter as a
+ * plain int32_t (C's implicit enum→int conversion keeps call sites source-
+ * compatible), so an out-of-range integer is rejected with
+ * RSAC_ERROR_INVALID_PARAMETER instead of being undefined behavior on the
+ * Rust side of the ABI.
+ */
 typedef enum {
     RSAC_DEVICE_INPUT  = 0,
     RSAC_DEVICE_OUTPUT = 1,
@@ -416,11 +425,14 @@ void rsac_device_list_free(RsacDeviceList* list);
  * Gets the default audio device. The returned device must be freed
  * with rsac_device_free().
  *
+ * `kind` takes one of the rsac_device_kind_t constants as a plain int32_t
+ * (implicit enum→int conversion — existing call sites compile unchanged).
  * Only RSAC_DEVICE_OUTPUT is supported (rsac is a loopback capture library);
- * RSAC_DEVICE_INPUT returns RSAC_ERROR_INVALID_PARAMETER.
+ * RSAC_DEVICE_INPUT — and any out-of-range value — is rejected with
+ * RSAC_ERROR_INVALID_PARAMETER.
  */
 rsac_error_t rsac_default_device(const RsacDeviceEnumerator* enumerator,
-                                  rsac_device_kind_t kind,
+                                  int32_t kind,
                                   RsacDevice** out);
 
 /* ── Device accessors ───────────────────────────────────────────────── */
@@ -511,7 +523,15 @@ const char* rsac_capabilities_backend_name(const RsacCapabilities* caps);
  */
 #if defined(RSAC_FEATURE_COMPOSE)
 
-/** How a group's sources map onto the composed output channels. */
+/**
+ * How a group's sources map onto the composed output channels.
+ *
+ * Constants-only type: rsac_group_set_layout() takes its `layout` parameter
+ * as a plain int32_t (C's implicit enum→int conversion keeps call sites
+ * source-compatible), so an out-of-range integer is rejected with
+ * RSAC_ERROR_INVALID_PARAMETER instead of being undefined behavior on the
+ * Rust side of the ABI.
+ */
 typedef enum {
     /** Fold every source to mono; gain-weighted-sum into 1 output channel. */
     RSAC_GROUP_LAYOUT_MONO = 0,
@@ -573,11 +593,15 @@ rsac_error_t rsac_group_new(const char* name, RsacGroup** out);
 void rsac_group_free(RsacGroup* group);
 
 /**
- * Sets the group's layout. A keep-channels group must contain exactly one
- * source (arity enforced at rsac_composition_builder_build()).
+ * Sets the group's layout. `layout` takes one of the rsac_group_layout_t
+ * constants as a plain int32_t (implicit enum→int conversion — existing call
+ * sites compile unchanged); any other value is rejected with
+ * RSAC_ERROR_INVALID_PARAMETER and the group is unchanged. A keep-channels
+ * group must contain exactly one source (arity enforced at
+ * rsac_composition_builder_build()).
  */
 rsac_error_t rsac_group_set_layout(RsacGroup* group,
-                                   rsac_group_layout_t layout);
+                                   int32_t layout);
 
 /**
  * Adds a capture source with unit gain (1.0). `spec` uses the same target
@@ -632,7 +656,9 @@ rsac_error_t rsac_composition_builder_set_clamp_output(
 /**
  * Appends a group. Groups contribute output channels in the order added.
  * On RSAC_OK the group handle is CONSUMED — do not use or free it afterwards.
- * On any error the caller still owns the group.
+ * On any error (including a caught panic, RSAC_ERROR_PANIC) the caller still
+ * owns the group: the handle is consumed only after the append has fully
+ * succeeded.
  */
 rsac_error_t rsac_composition_builder_add_group(
     RsacCompositionBuilder* builder,

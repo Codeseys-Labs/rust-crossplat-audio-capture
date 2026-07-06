@@ -13,8 +13,9 @@
 //!   `rsac_composition_builder_build()` transfer ownership of the returned
 //!   handle to the caller, who must free it with the matching `rsac_*_free()`.
 //! - `rsac_composition_builder_add_group()` **consumes the group handle on
-//!   success** (`RSAC_OK`): do not use or free it afterwards. On any error the
-//!   group is untouched and the caller still owns it.
+//!   success** (`RSAC_OK`): do not use or free it afterwards. On any error —
+//!   including a caught panic — the group is untouched and the caller still
+//!   owns it (the handle is consumed only after the append has succeeded).
 //! - `rsac_composition_builder_build()` **always consumes the builder** (even
 //!   on failure — Rust ownership semantics; create a new builder to retry),
 //!   matching `rsac_builder_build()`.
@@ -39,6 +40,13 @@ use crate::{catch, handle_rsac_error, rsac_error_t, set_last_error, RsacAudioBuf
 
 /// How a composition group's sources map onto the composed output channels.
 /// Mirrors [`rsac::compose::GroupLayout`].
+///
+/// This is a **constants-only** type at the ABI boundary:
+/// [`rsac_group_set_layout`] takes its `layout` parameter as a plain
+/// `int32_t`, never as this enum by value, because materializing an
+/// out-of-range integer as a fieldless Rust enum is immediate undefined
+/// behavior — before any range check could run (rsac-a273). Out-of-range
+/// values are rejected with `RSAC_ERROR_INVALID_PARAMETER` instead.
 #[repr(C)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum rsac_group_layout_t {
@@ -192,29 +200,45 @@ pub unsafe extern "C" fn rsac_group_free(group: *mut RsacGroup) {
 
 /// Sets the group's layout (how its sources map onto output channels).
 ///
+/// `layout` is one of the [`rsac_group_layout_t`] constants, accepted as a
+/// plain `int32_t` (C's implicit enum→int conversion keeps call sites
+/// source-compatible). Taking the raw integer rather than the enum by value
+/// is deliberate: an out-of-range integer materialized as a fieldless Rust
+/// enum at the ABI boundary would be undefined behavior before any check
+/// could run. Any value other than the defined constants (0, 1, 2) is
+/// rejected with `RSAC_ERROR_INVALID_PARAMETER` and the group is unchanged.
+///
 /// A `RSAC_GROUP_LAYOUT_KEEP_CHANNELS` group must contain exactly one source;
 /// that arity is enforced at [`rsac_composition_builder_build`].
 ///
 /// Returns `RSAC_ERROR_NULL_POINTER` if `group` is null.
 #[no_mangle]
-pub unsafe extern "C" fn rsac_group_set_layout(
-    group: *mut RsacGroup,
-    layout: rsac_group_layout_t,
-) -> rsac_error_t {
+pub unsafe extern "C" fn rsac_group_set_layout(group: *mut RsacGroup, layout: i32) -> rsac_error_t {
     catch(|| {
         if group.is_null() {
             set_last_error("group is null");
             return rsac_error_t::RSAC_ERROR_NULL_POINTER;
         }
+        // Validate the raw integer BEFORE any enum value exists: rejecting an
+        // out-of-range `layout` here is only possible because the parameter is
+        // an i32 — an invalid fieldless-enum value would already be UB.
         let g = unsafe { &mut *group };
         g.inner = match layout {
-            rsac_group_layout_t::RSAC_GROUP_LAYOUT_MONO => {
+            x if x == rsac_group_layout_t::RSAC_GROUP_LAYOUT_MONO as i32 => {
                 g.inner.clone().mixdown(GroupLayout::Mono)
             }
-            rsac_group_layout_t::RSAC_GROUP_LAYOUT_STEREO => {
+            x if x == rsac_group_layout_t::RSAC_GROUP_LAYOUT_STEREO as i32 => {
                 g.inner.clone().mixdown(GroupLayout::Stereo)
             }
-            rsac_group_layout_t::RSAC_GROUP_LAYOUT_KEEP_CHANNELS => g.inner.clone().keep_channels(),
+            x if x == rsac_group_layout_t::RSAC_GROUP_LAYOUT_KEEP_CHANNELS as i32 => {
+                g.inner.clone().keep_channels()
+            }
+            _ => {
+                set_last_error(&format!(
+                    "layout {layout} is not a valid rsac_group_layout_t (expected 0, 1, or 2)"
+                ));
+                return rsac_error_t::RSAC_ERROR_INVALID_PARAMETER;
+            }
         };
         rsac_error_t::RSAC_OK
     })
@@ -356,8 +380,10 @@ pub unsafe extern "C" fn rsac_composition_builder_set_clamp_output(
 /// the order they are added.
 ///
 /// On success (`RSAC_OK`) **the group handle is consumed**: do not use or
-/// free it afterwards. On any error the group is untouched and the caller
-/// still owns it (and must eventually call [`rsac_group_free`]).
+/// free it afterwards. On any error — including a caught panic
+/// (`RSAC_ERROR_PANIC`) — the group is untouched and the caller still owns
+/// it (and must eventually call [`rsac_group_free`]): the handle is consumed
+/// only after the append has fully succeeded.
 ///
 /// Returns `RSAC_ERROR_NULL_POINTER` if `builder` or `group` is null.
 #[no_mangle]
@@ -374,11 +400,21 @@ pub unsafe extern "C" fn rsac_composition_builder_add_group(
             set_last_error("group is null");
             return rsac_error_t::RSAC_ERROR_NULL_POINTER;
         }
-        // Both handles checked — consume the group (appending never fails;
-        // all validation happens at build).
-        let g = unsafe { Box::from_raw(group) };
+        // Both handles are non-null. ORDER MATTERS from here (rsac-2932): the
+        // documented contract is "on ANY error the caller still owns the
+        // group" — and a caught panic surfaces as RSAC_ERROR_PANIC, which is
+        // an error like any other. So do every fallible step (the clones and
+        // the append, which can panic e.g. on OOM) through borrows FIRST, and
+        // consume the handle only once nothing can fail. Consuming it before
+        // the fallible work would let a panicking clone drop (free) the group
+        // during unwind while the contract tells the caller to free it too —
+        // a double free.
         let b = unsafe { &mut *builder };
-        b.inner = b.inner.clone().group(g.inner);
+        let g_ref = unsafe { &*group };
+        let updated = b.inner.clone().group(g_ref.inner.clone());
+        b.inner = updated;
+        // Success path only: reclaiming and dropping the handle is infallible.
+        drop(unsafe { Box::from_raw(group) });
         rsac_error_t::RSAC_OK
     })
 }
@@ -848,7 +884,10 @@ mod tests {
         );
         assert_eq!(
             unsafe {
-                rsac_group_set_layout(ptr::null_mut(), rsac_group_layout_t::RSAC_GROUP_LAYOUT_MONO)
+                rsac_group_set_layout(
+                    ptr::null_mut(),
+                    rsac_group_layout_t::RSAC_GROUP_LAYOUT_MONO as i32,
+                )
             },
             rsac_error_t::RSAC_ERROR_NULL_POINTER
         );
@@ -998,7 +1037,10 @@ mod tests {
         add_system_source(group);
         assert_eq!(
             unsafe {
-                rsac_group_set_layout(group, rsac_group_layout_t::RSAC_GROUP_LAYOUT_KEEP_CHANNELS)
+                rsac_group_set_layout(
+                    group,
+                    rsac_group_layout_t::RSAC_GROUP_LAYOUT_KEEP_CHANNELS as i32,
+                )
             },
             rsac_error_t::RSAC_OK
         );
@@ -1189,10 +1231,36 @@ mod tests {
             rsac_group_layout_t::RSAC_GROUP_LAYOUT_KEEP_CHANNELS,
         ] {
             assert_eq!(
-                unsafe { rsac_group_set_layout(group, layout) },
+                unsafe { rsac_group_set_layout(group, layout as i32) },
                 rsac_error_t::RSAC_OK
             );
         }
+        unsafe { rsac_group_free(group) };
+    }
+
+    /// An out-of-range layout integer must be rejected with
+    /// `INVALID_PARAMETER` — never materialized as a Rust enum (rsac-a273) —
+    /// and must leave the group unchanged (subsequent valid ops still work).
+    #[test]
+    fn group_set_layout_rejects_out_of_range() {
+        let group = new_group("g");
+        for bad in [-1, 3, 99, i32::MIN, i32::MAX] {
+            assert_eq!(
+                unsafe { rsac_group_set_layout(group, bad) },
+                rsac_error_t::RSAC_ERROR_INVALID_PARAMETER,
+                "layout {bad} must be rejected"
+            );
+            let msg = unsafe { CStr::from_ptr(crate::rsac_error_message()) };
+            assert!(!msg.to_bytes().is_empty());
+        }
+        // The rejections left the group untouched: valid ops still succeed.
+        assert_eq!(
+            unsafe {
+                rsac_group_set_layout(group, rsac_group_layout_t::RSAC_GROUP_LAYOUT_MONO as i32)
+            },
+            rsac_error_t::RSAC_OK
+        );
+        add_system_source(group);
         unsafe { rsac_group_free(group) };
     }
 }

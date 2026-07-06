@@ -10,6 +10,13 @@
 
 /**
  * Device kind for enumeration.
+ *
+ * This is a **constants-only** type at the ABI boundary:
+ * [`rsac_default_device`] takes its `kind` parameter as a plain `int32_t`,
+ * never as this enum by value, because materializing an out-of-range integer
+ * as a fieldless Rust enum is immediate undefined behavior — before any
+ * range check could run (rsac-a273). Out-of-range values are rejected with
+ * `RSAC_ERROR_INVALID_PARAMETER` instead.
  */
 typedef enum rsac_device_kind_t {
     RSAC_DEVICE_INPUT = 0,
@@ -82,6 +89,13 @@ typedef enum rsac_error_t {
 /**
  * How a composition group's sources map onto the composed output channels.
  * Mirrors [`rsac::compose::GroupLayout`].
+ *
+ * This is a **constants-only** type at the ABI boundary:
+ * [`rsac_group_set_layout`] takes its `layout` parameter as a plain
+ * `int32_t`, never as this enum by value, because materializing an
+ * out-of-range integer as a fieldless Rust enum is immediate undefined
+ * behavior — before any range check could run (rsac-a273). Out-of-range
+ * values are rejected with `RSAC_ERROR_INVALID_PARAMETER` instead.
  */
 typedef enum rsac_group_layout_t {
 #if defined(RSAC_FEATURE_COMPOSE)
@@ -750,10 +764,18 @@ enum rsac_error_t rsac_device_list_get(const struct RsacDeviceList *list,
  *
  * On success, `*out` receives a device handle that must be freed with
  * `rsac_device_free()`.
+ *
+ * `kind` is one of the [`rsac_device_kind_t`] constants, accepted as a plain
+ * `int32_t` (C's implicit enum→int conversion keeps call sites
+ * source-compatible). Taking the raw integer rather than the enum by value
+ * is deliberate: an out-of-range integer materialized as a fieldless Rust
+ * enum at the ABI boundary would be undefined behavior before any check
+ * could run. Anything other than `RSAC_DEVICE_OUTPUT` — including
+ * out-of-range values — is rejected with `RSAC_ERROR_INVALID_PARAMETER`.
  */
 
 enum rsac_error_t rsac_default_device(const struct RsacDeviceEnumerator *enumerator,
-                                      enum rsac_device_kind_t kind,
+                                      int32_t kind,
                                       struct RsacDevice **out)
 ;
 
@@ -881,12 +903,20 @@ enum rsac_error_t rsac_default_device(const struct RsacDeviceEnumerator *enumera
 /**
  * Sets the group's layout (how its sources map onto output channels).
  *
+ * `layout` is one of the [`rsac_group_layout_t`] constants, accepted as a
+ * plain `int32_t` (C's implicit enum→int conversion keeps call sites
+ * source-compatible). Taking the raw integer rather than the enum by value
+ * is deliberate: an out-of-range integer materialized as a fieldless Rust
+ * enum at the ABI boundary would be undefined behavior before any check
+ * could run. Any value other than the defined constants (0, 1, 2) is
+ * rejected with `RSAC_ERROR_INVALID_PARAMETER` and the group is unchanged.
+ *
  * A `RSAC_GROUP_LAYOUT_KEEP_CHANNELS` group must contain exactly one source;
  * that arity is enforced at [`rsac_composition_builder_build`].
  *
  * Returns `RSAC_ERROR_NULL_POINTER` if `group` is null.
  */
- enum rsac_error_t rsac_group_set_layout(struct RsacGroup *group, enum rsac_group_layout_t layout) ;
+ enum rsac_error_t rsac_group_set_layout(struct RsacGroup *group, int32_t layout) ;
 #endif
 
 #if defined(RSAC_FEATURE_COMPOSE)
@@ -978,8 +1008,10 @@ enum rsac_error_t rsac_composition_builder_set_clamp_output(struct RsacCompositi
  * the order they are added.
  *
  * On success (`RSAC_OK`) **the group handle is consumed**: do not use or
- * free it afterwards. On any error the group is untouched and the caller
- * still owns it (and must eventually call [`rsac_group_free`]).
+ * free it afterwards. On any error — including a caught panic
+ * (`RSAC_ERROR_PANIC`) — the group is untouched and the caller still owns
+ * it (and must eventually call [`rsac_group_free`]): the handle is consumed
+ * only after the append has fully succeeded.
  *
  * Returns `RSAC_ERROR_NULL_POINTER` if `builder` or `group` is null.
  */
