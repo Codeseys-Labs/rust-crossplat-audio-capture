@@ -47,6 +47,17 @@ use coreaudio_sys::{
 /// Same as CoreAudio's AudioObjectID = u32.
 type AudioDeviceID = u32;
 
+/// Grace window for the silent-zeros diagnostic (ADR-0016): how long a
+/// Process-Tap capture may deliver only zeroed samples before we warn that the
+/// most likely cause is a missing/denied `kTCCServiceAudioCapture` permission.
+/// Generous enough to clear cold-start latency on a busy machine while still
+/// surfacing the diagnostic promptly.
+const SILENCE_GRACE: std::time::Duration = std::time::Duration::from_secs(2);
+
+/// Poll increment for the watchdog's sleep, so it reacts to the teardown stop
+/// flag within one tick instead of blocking the full grace window.
+const SILENCE_POLL: std::time::Duration = std::time::Duration::from_millis(100);
+
 // ── MacosCaptureConfig ───────────────────────────────────────────────────
 
 /// Resolved capture parameters passed to the CoreAudio capture setup.
@@ -135,6 +146,12 @@ pub(crate) struct MacosPlatformStream {
     /// `Arc<BridgeShared>`) are `Send`/`Sync`, so it does not change the existing
     /// thread-safety story.
     device_alive_ctx: Option<*mut super::coreaudio::DeviceAliveContext>,
+    /// Stop flag for the silent-zeros diagnostic watchdog (ADR-0016). Set at
+    /// teardown so the watchdog exits promptly and does not emit a spurious
+    /// "silent capture" warning when the user stops within the grace window.
+    /// `None` for non-Process-Tap captures (the watchdog only runs for tap
+    /// tiers, where the denied-permission silent-zeros trap exists).
+    silence_watchdog_stop: Option<Arc<AtomicBool>>,
 }
 
 // SAFETY: `MacosPlatformStream` carries a raw `*mut DeviceAliveContext` (the
@@ -160,6 +177,14 @@ impl MacosPlatformStream {
     /// Marked private; `stop_capture` is the public (trait) entry point and
     /// `drop` reuses the same logic.
     fn stop_audio_unit(&self) -> AudioResult<()> {
+        // Silence-watchdog stop (ADR-0016): signal first so a stop within the
+        // grace window suppresses a spurious "silent capture" warning. Cheap,
+        // idempotent relaxed store; no-op when the watchdog wasn't spawned
+        // (non-tap tiers) or already exited.
+        if let Some(stop) = &self.silence_watchdog_stop {
+            stop.store(true, Ordering::Relaxed);
+        }
+
         // `stop()` requires `&mut self` on the AudioUnit, so the lock guard must
         // be `mut`. `AudioOutputUnitStop` is synchronous — on return the IO proc
         // has stopped and no further input callbacks will fire.
@@ -355,6 +380,15 @@ pub(crate) fn create_macos_capture(
     let channels = config.channels;
     let sample_rate = config.sample_rate;
 
+    // Silent-zeros diagnostic (ADR-0016): only for Process-Tap tiers, where a
+    // missing/denied kTCCServiceAudioCapture permission makes every setup call
+    // return noErr and then stream all-zero buffers with no error code. The RT
+    // callback flips `non_silence_seen` the first time any non-zero sample
+    // arrives; a non-RT watchdog (spawned after start) warns if it stays unset.
+    let is_tap_tier = process_tap.is_some();
+    let non_silence_seen = Arc::new(AtomicBool::new(false));
+    let rt_non_silence_seen = non_silence_seen.clone();
+
     audio_unit
         .set_input_callback(
             move |args: coreaudio::audio_unit::render_callback::Args<
@@ -385,6 +419,17 @@ pub(crate) fn create_macos_capture(
                 let data: &[f32] = args.data.buffer;
 
                 if !data.is_empty() {
+                    // Silent-zeros diagnostic (ADR-0016): alloc-free, lock-free,
+                    // RT-safe. Once we've seen non-silence, a single relaxed load
+                    // short-circuits the scan; before that, `any(|&s| s != 0.0)`
+                    // stops at the first non-zero sample. No effect on the push.
+                    if is_tap_tier
+                        && !rt_non_silence_seen.load(Ordering::Relaxed)
+                        && data.iter().any(|&s| s != 0.0)
+                    {
+                        rt_non_silence_seen.store(true, Ordering::Relaxed);
+                    }
+
                     // `_stamped`: stream-position timestamps (frames offered /
                     // rate — integer math, same guarded alloc-free path;
                     // rsac-522b / rsac-ec25).
@@ -416,6 +461,55 @@ pub(crate) fn create_macos_capture(
     let device_alive_ctx =
         super::coreaudio::register_device_alive_listener(device_id, terminal.clone());
 
+    // ── Step 6b: Spawn the silent-zeros diagnostic watchdog (ADR-0016) ──
+    // Process-Tap tiers only: a missing/denied kTCCServiceAudioCapture permission
+    // streams all-zero buffers with NO error code. If nothing non-silent arrives
+    // within the grace window while the stream is still healthy, warn once — a
+    // diagnostic, never an error (silence is a legitimate state). Non-RT thread;
+    // exits on the stop flag (set at teardown) or the grace deadline.
+    let silence_watchdog_stop = if is_tap_tier {
+        let stop = Arc::new(AtomicBool::new(false));
+        let stop_for_thread = stop.clone();
+        let wd_terminal = terminal.clone();
+        let target_desc = format!("{:?}", config.target);
+        // Detached: it self-terminates within one SILENCE_POLL of the stop flag
+        // or the grace deadline, so it never blocks the struct's drop-order
+        // contract and needs no JoinHandle stored.
+        std::thread::spawn(move || {
+            let deadline = std::time::Instant::now() + SILENCE_GRACE;
+            loop {
+                if stop_for_thread.load(Ordering::Relaxed) {
+                    return; // stopped within the grace window — no warning
+                }
+                if non_silence_seen.load(Ordering::Relaxed) {
+                    return; // real audio flowed — all good
+                }
+                if wd_terminal.state.is_terminal() {
+                    return; // stream ended/errored on its own — not our concern
+                }
+                if std::time::Instant::now() >= deadline {
+                    break;
+                }
+                std::thread::sleep(SILENCE_POLL);
+            }
+            // Grace elapsed with only zeros on a still-running Process-Tap stream.
+            log::warn!(
+                "CoreAudio: capture target {target_desc} has streamed only silence for \
+                 {}s. If audio is expected, this usually means the system-audio-capture \
+                 permission (TCC kTCCServiceAudioCapture) is missing or denied — the tap \
+                 succeeds but delivers zeroed samples. Ensure the host app bundle declares \
+                 NSAudioCaptureUsageDescription and is granted under System Settings > \
+                 Privacy & Security > Screen & System Audio Recording (a terminal-launched \
+                 or unsigned binary is denied regardless). See ADR-0016. (This is only a \
+                 diagnostic — a genuinely paused/muted source is also silent and fine.)",
+                SILENCE_GRACE.as_secs()
+            );
+        });
+        Some(stop)
+    } else {
+        None
+    };
+
     // ── Step 7: Return the platform stream handle ──
 
     Ok(MacosPlatformStream {
@@ -425,6 +519,7 @@ pub(crate) fn create_macos_capture(
         terminal,
         device_id,
         device_alive_ctx,
+        silence_watchdog_stop,
     })
 }
 
@@ -650,6 +745,54 @@ mod tests {
     use super::*;
     use crate::core::config::{ApplicationId, CaptureTarget, DeviceId};
     use coreaudio_sys::kAudioFormatFlagIsNonInterleaved;
+
+    // ── silent-zeros diagnostic (ADR-0016) ───────────────────────────
+
+    /// The RT-side detection is `any(|&s| s != 0.0)`: an all-zero buffer must
+    /// NOT flip the flag (the denied-permission silent case), and the first
+    /// non-zero sample must flip it (real audio → watchdog stays quiet). This
+    /// mirrors exactly what the input callback does.
+    #[test]
+    fn non_silence_detection_matches_callback_predicate() {
+        let all_zero = [0.0f32; 256];
+        assert!(
+            !all_zero.iter().any(|&s| s != 0.0),
+            "all-zero buffer must read as silent (would warn)"
+        );
+
+        let mut with_signal = [0.0f32; 256];
+        with_signal[200] = -0.0001; // a single tiny non-zero sample is enough
+        assert!(
+            with_signal.iter().any(|&s| s != 0.0),
+            "any non-zero sample must read as non-silent (suppresses the warn)"
+        );
+    }
+
+    /// The watchdog's warn-guard is: warn only if `!non_silence_seen && !stopped
+    /// && !terminal`. Once the flag is set (real audio flowed), it must be
+    /// suppressed regardless of the other conditions — this is the false-positive
+    /// guard for a correctly-permissioned capture.
+    #[test]
+    fn watchdog_suppressed_once_non_silence_seen() {
+        let seen = Arc::new(AtomicBool::new(false));
+        let stop = Arc::new(AtomicBool::new(false));
+        let would_warn = |seen: &AtomicBool, stop: &AtomicBool| {
+            !stop.load(Ordering::Relaxed) && !seen.load(Ordering::Relaxed)
+        };
+
+        assert!(would_warn(&seen, &stop), "silent + running ⇒ would warn");
+        seen.store(true, Ordering::Relaxed);
+        assert!(
+            !would_warn(&seen, &stop),
+            "non-silence observed ⇒ must NOT warn (false-positive guard)"
+        );
+        seen.store(false, Ordering::Relaxed);
+        stop.store(true, Ordering::Relaxed);
+        assert!(
+            !would_warn(&seen, &stop),
+            "stopped within grace window ⇒ must NOT warn"
+        );
+    }
 
     // ── build_f32_asbd tests ─────────────────────────────────────────
 
