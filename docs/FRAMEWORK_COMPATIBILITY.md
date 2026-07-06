@@ -38,14 +38,15 @@ backend design (Android/iOS) see
 | Browser / WASM | ❌ not viable | ❌ | ❌ | Ruled out in [`CROSS_LANGUAGE_BINDINGS.md`](CROSS_LANGUAGE_BINDINGS.md#5-wasm--not-viable-for-capture) |
 
 **The single most important row-shape:** every 🟡 in the Android/iOS columns is
-the *same* blocker — rsac's mobile backends are not usable yet. Status: the
-**microphone slices are implemented and compile-checked** (`feat_android`
-AAudio / `feat_ios` AVAudioEngine, `Device("default")` only — **zero runtime
-verification on any device**), while the playback-capture tiers that
-frameworks actually want for "system audio" remain pending (rsac-77f1 /
-rsac-b3aa; epics `rsac-5823`/`rsac-57cb`). Once those land, every 🟡 above
-resolves through its listed integration path. Conversely, the ❌ cells are
-Apple/Google/browser policy, and **no framework choice changes them**.
+the *same* blocker — rsac's mobile backends are not runtime-verified yet.
+Status: the **microphone slices and the iOS `SystemDefault` broadcast consumer
+are implemented and compile-checked** (`feat_android` AAudio / `feat_ios`
+AVAudioEngine + ReplayKit ring — **zero runtime verification on any device**;
+seeds rsac-e6d3/rsac-97c8), while Android playback capture — what frameworks
+want for "system audio" on Android — remains pending (rsac-77f1). Once
+runtime verification lands, every 🟡 above resolves through its listed
+integration path. Conversely, the ❌ cells are Apple/Google/browser policy,
+and **no framework choice changes them**.
 
 ## Tauri v2
 
@@ -145,11 +146,18 @@ blocking read, or uses the callback path via `NativeCallable.listener`. We
 provide guidance when a downstream Flutter project integrates; publishing a
 `rsac_dart`/`rsac_flutter` package is a later decision.
 
-**Mobile: 🟡 blocked on backends.** Once the backends exist, Flutter consumes
-them through the same C FFI (rsac-ffi cross-compiled for
-`aarch64-linux-android` / `aarch64-apple-ios`), plus a thin Flutter plugin for
-the Android consent flow (backed by the `mobile/android/` AAR) and the iOS
-broadcast-extension template from `mobile/ios/`.
+**Mobile: 🟡 compiled, not runtime-verified.** The consumption path exists
+end-to-end at the compile level (rsac-7a18): rsac-ffi carries
+`feat_android`/`feat_ios` passthrough features and **cross-checks green for
+both mobile triples in CI**; the C header is target-independent. Recipe:
+**Android** — cdylib in the app's `jniLibs` (coordinate with the
+`mobile/android-native` shim that already produces `librsac.so` for the AAR,
+rsac-0aa9); **iOS** — build rsac-ffi as a staticlib for `aarch64-apple-ios`
+and bind via `dart:ffi`, plus a thin Flutter plugin for the Android consent
+flow (backed by the `mobile/android/` AAR) and the iOS broadcast-extension
+template from `mobile/ios/`. Runtime verification tracks
+rsac-e6d3/rsac-97c8 — until those are green, treat mobile Flutter capture as
+unproven.
 
 ## Android and iOS (all frameworks)
 

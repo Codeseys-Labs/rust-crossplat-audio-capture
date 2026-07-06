@@ -154,7 +154,7 @@ Gradle AAR + xcodebuild SwiftPM builds — compile-proof only).
 | Capture Mode | Android (AAudio) | iOS (AVAudioEngine) |
 |---|---|---|
 | **Device — default mic** (`Device("default")`) | 🟡 compiled, unverified (rsac-20cd) | 🟡 compiled, unverified (rsac-9e02) |
-| **System default** (= playback capture, ADR-0013) | ⏳ rsac-77f1 (AudioPlaybackCapture + consent) | ⏳ rsac-b3aa (ReplayKit ring) |
+| **System default** (= playback capture, ADR-0013) | ⏳ rsac-77f1 (AudioPlaybackCapture + consent) | 🟡 compiled, unverified (rsac-b3aa: ReplayKit ring consumer; needs `with_ios_app_group` + embedded extension + user-started broadcast) |
 | **Application / ByName / ProcessTree** | ⏳ rsac-77f1 (UID filters; tree ≡ app) | ❌ permanent — no iOS API (never soften) |
 | **Device selection (real device list)** | ⏳ rsac-ad8a (Java AudioManager via AAR) | ❌ session-routed, not free selection |
 

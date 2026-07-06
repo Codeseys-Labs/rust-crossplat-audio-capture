@@ -207,22 +207,24 @@ for buf := range capture.Stream(ctx) { fmt.Println(buf.RMSDbfs()) }
 
 Full tour: [`bindings/rsac-go/README.md`](../bindings/rsac-go/README.md).
 
-## Mobile (Android / iOS) — mic slices compiled, nothing device-verified
+## Mobile (Android / iOS) — compiled surface growing, nothing device-verified
 
 The first real mobile code exists: `feat_android`/`feat_ios` compile AAudio /
-AVAudioEngine **microphone** backends (`CaptureTarget::Device(DeviceId("default"))`
-only), and first-party glue sources ship in `mobile/{android,ios}/`. Honesty
-status: **compile-checked cross-targets only — no runtime verification on any
-device; do not ship mobile capture claims.** Playback capture (what
-`SystemDefault` means on mobile, per ADR-0013) is still pending
-(`rsac-77f1` Android, `rsac-b3aa` iOS); per-app capture on iOS is permanently
+AVAudioEngine **microphone** backends (`CaptureTarget::Device(DeviceId("default"))`),
+and iOS additionally compiles the **`SystemDefault` broadcast path** (ReplayKit
+ring consumer; configure `AudioCaptureBuilder::with_ios_app_group(…)` and embed
+the `mobile/ios` RsacBroadcastKit extension). First-party glue ships in
+`mobile/{android,ios}/` and builds in CI, including `librsac.so` packaged into
+the AAR. Honesty status: **compile-checked cross-targets only — no runtime
+verification on any device; do not ship mobile capture claims.** Android
+playback capture (what `SystemDefault` means on Android, per ADR-0013) is
+still pending (`rsac-77f1`); per-app capture on iOS is permanently
 unavailable. The consent surface is already in the API: capabilities report
 `requires_user_consent`, Android builds expose
 `AudioCaptureBuilder::with_android_projection(AndroidProjectionToken)` (C FFI:
-`rsac_builder_set_android_projection`), and playback-capture targets without a
-token will fail `build()` with `AudioError::UserConsentRequired` once a
-backend advertises the capability. Full design + status:
-[`MOBILE_BACKEND_DESIGN.md`](MOBILE_BACKEND_DESIGN.md).
+`rsac_builder_set_android_projection`), and consent-gated targets without
+their artifact fail `build()` with `AudioError::UserConsentRequired`. Full
+design + status: [`MOBILE_BACKEND_DESIGN.md`](MOBILE_BACKEND_DESIGN.md).
 
 ## When something goes wrong
 

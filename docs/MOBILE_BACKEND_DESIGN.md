@@ -1,15 +1,17 @@
 # Mobile Backend Design — Android & iOS
 
-> **Status: mic slices implemented (compile-checked only); the rest is design.**
-> The Android (AAudio) and iOS (AVAudioEngine) `Device("default")` microphone
-> slices exist in `src/audio/{android,ios}/` behind `feat_android`/`feat_ios`
-> (rsac-20cd / rsac-9e02) — cross-target check + clippy green, **no runtime
-> verification on any device yet**. First-party glue lives in
-> `mobile/{android,ios}/` (rsac-c4b8 / rsac-6d5f) and **builds in CI**: the
-> `mobile-android`/`mobile-ios` ci.yml jobs (rsac-1a6e / rsac-48e7) run the
-> cross-target check matrix plus a real Gradle AAR build and xcodebuild of
-> both SwiftPM products. Everything else (playback capture, JNI
-> ingest, ReplayKit consumer) remains design, seeded per the tables below.
+> **Status: mic slices + the iOS broadcast consumer implemented
+> (compile-checked only); Android playback capture is the remaining design.**
+> Implemented behind `feat_android`/`feat_ios`: the AAudio / AVAudioEngine
+> `Device("default")` microphone slices (rsac-20cd / rsac-9e02) and the iOS
+> `SystemDefault` ReplayKit ring consumer (rsac-b3aa,
+> `src/audio/ios/broadcast.rs`, App Group id via
+> `AudioCaptureBuilder::with_ios_app_group`) — cross-target check + clippy
+> green, **no runtime verification on any device yet** (seeds rsac-e6d3 /
+> rsac-97c8). First-party glue lives in `mobile/{android,ios}/` and **builds
+> in CI**, including `librsac.so` packaged into the AAR's jniLibs
+> (rsac-0aa9). Still design-only: Android playback capture + JNI ingest
+> (rsac-77f1).
 > **Where implementation and this doc diverge, the code (and
 > `mobile/ios/Sources/RsacBroadcastKit/RingLayout.swift` for the ring
 > contract) wins** — known divergences: `RsacProjection.request` is
