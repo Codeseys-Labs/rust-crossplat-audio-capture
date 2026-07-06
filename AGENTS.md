@@ -143,6 +143,20 @@ All ten identified gaps have been closed:
 | **ProcessTree** | ✅ process loopback | ✅ PID → PipeWire node | ✅ Process Tap |
 | **Device selection** | ✅ | ✅ | ✅ |
 
+**Mobile (in progress — ADR-0012/0013, [`docs/MOBILE_BACKEND_DESIGN.md`](docs/MOBILE_BACKEND_DESIGN.md)):**
+the mic slices are implemented and **compile-checked only** (`aarch64-linux-android` /
+`aarch64-apple-ios` check+clippy green; **no runtime verification on any device yet** —
+do not claim "tested on Android/iOS"). First-party glue (`mobile/android` AAR Kotlin,
+`mobile/ios` SwiftPM incl. the canonical broadcast-ring contract) is source-complete,
+pending its CI build jobs (rsac-1a6e / rsac-48e7).
+
+| Capture Mode | Android (AAudio) | iOS (AVAudioEngine) |
+|---|---|---|
+| **Device — default mic** (`Device("default")`) | 🟡 compiled, unverified (rsac-20cd) | 🟡 compiled, unverified (rsac-9e02) |
+| **System default** (= playback capture, ADR-0013) | ⏳ rsac-77f1 (AudioPlaybackCapture + consent) | ⏳ rsac-b3aa (ReplayKit ring) |
+| **Application / ByName / ProcessTree** | ⏳ rsac-77f1 (UID filters; tree ≡ app) | ❌ permanent — no iOS API (never soften) |
+| **Device selection (real device list)** | ⏳ needs Java AudioManager (AAR) | ❌ session-routed, not free selection |
+
 ---
 
 ## 4. Source Code Layout
@@ -199,6 +213,14 @@ src/
 │       ├── coreaudio.rs    # CoreAudio capture (uses BridgeProducer, no old VecDeque)
 │       ├── tap.rs          # Process Tap FFI
 │       └── thread.rs       # MacosPlatformStream + CoreAudio callback → BridgeProducer
+│   ├── android/            # AAudio backend (mic slice; cfg feat_android — compile-checked, unverified on-device)
+│   │   ├── mod.rs          # AndroidDeviceEnumerator + AndroidAudioDevice
+│   │   ├── aaudio.rs       # In-tree AAudio NDK FFI (no crate deps)
+│   │   └── thread.rs       # AndroidPlatformStream + RT data callback → BridgeProducer
+│   └── ios/                # AVAudioEngine backend (mic slice; cfg feat_ios — compile-checked, unverified on-device)
+│       ├── mod.rs          # IosDeviceEnumerator + IosAudioDevice
+│       ├── avaudio.rs      # objc2-avf-audio input-node tap → BridgeProducer
+│       └── thread.rs       # IosPlatformStream
 ├── bin/                    # Binary targets (all require features; see docs/features.md)
 │   ├── standardized_test.rs
 │   ├── app_capture_test.rs

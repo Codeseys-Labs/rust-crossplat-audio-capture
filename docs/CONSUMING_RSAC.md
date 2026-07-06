@@ -207,19 +207,22 @@ for buf := range capture.Stream(ctx) { fmt.Println(buf.RMSDbfs()) }
 
 Full tour: [`bindings/rsac-go/README.md`](../bindings/rsac-go/README.md).
 
-## Mobile (Android / iOS) — designed, not shipped
+## Mobile (Android / iOS) — mic slices compiled, nothing device-verified
 
-rsac compiles for mobile targets today as an **honest stub**
-(`PlatformCapabilities` reports nothing supported;
-`AudioError::PlatformNotSupported` at runtime). The real backends are designed
-([`MOBILE_BACKEND_DESIGN.md`](MOBILE_BACKEND_DESIGN.md), ADR-0012/0013) and
-the consent surface already exists in the API: capabilities report
+The first real mobile code exists: `feat_android`/`feat_ios` compile AAudio /
+AVAudioEngine **microphone** backends (`CaptureTarget::Device(DeviceId("default"))`
+only), and first-party glue sources ship in `mobile/{android,ios}/`. Honesty
+status: **compile-checked cross-targets only — no runtime verification on any
+device; do not ship mobile capture claims.** Playback capture (what
+`SystemDefault` means on mobile, per ADR-0013) is still pending
+(`rsac-77f1` Android, `rsac-b3aa` iOS); per-app capture on iOS is permanently
+unavailable. The consent surface is already in the API: capabilities report
 `requires_user_consent`, Android builds expose
 `AudioCaptureBuilder::with_android_projection(AndroidProjectionToken)` (C FFI:
 `rsac_builder_set_android_projection`), and playback-capture targets without a
 token will fail `build()` with `AudioError::UserConsentRequired` once a
-backend advertises the capability. Do not ship mobile capture claims until
-those backends land.
+backend advertises the capability. Full design + status:
+[`MOBILE_BACKEND_DESIGN.md`](MOBILE_BACKEND_DESIGN.md).
 
 ## When something goes wrong
 

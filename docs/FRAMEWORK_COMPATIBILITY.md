@@ -38,11 +38,14 @@ backend design (Android/iOS) see
 | Browser / WASM | ❌ not viable | ❌ | ❌ | Ruled out in [`CROSS_LANGUAGE_BINDINGS.md`](CROSS_LANGUAGE_BINDINGS.md#5-wasm--not-viable-for-capture) |
 
 **The single most important row-shape:** every 🟡 in the Android/iOS columns is
-the *same* blocker — rsac has no mobile backends yet. The framework integrations
-themselves are not the hard part; the OS capture backends are. Once
-`src/audio/android/` and `src/audio/ios/` exist (waves 3–4 of the mobile plan),
-every 🟡 above resolves through its listed integration path. Conversely, the ❌
-cells are Apple/Google/browser policy, and **no framework choice changes them**.
+the *same* blocker — rsac's mobile backends are not usable yet. Status: the
+**microphone slices are implemented and compile-checked** (`feat_android`
+AAudio / `feat_ios` AVAudioEngine, `Device("default")` only — **zero runtime
+verification on any device**), while the playback-capture tiers that
+frameworks actually want for "system audio" remain pending (rsac-77f1 /
+rsac-b3aa; epics `rsac-5823`/`rsac-57cb`). Once those land, every 🟡 above
+resolves through its listed integration path. Conversely, the ❌ cells are
+Apple/Google/browser policy, and **no framework choice changes them**.
 
 ## Tauri v2
 

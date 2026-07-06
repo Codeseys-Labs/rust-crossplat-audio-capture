@@ -1,12 +1,22 @@
 # Mobile Backend Design — Android & iOS
 
-> **Status: design document (nothing implemented).** This records the agreed
-> architecture for adding Android and iOS capture backends to rsac. The durable
-> decisions are ADRs:
+> **Status: mic slices implemented (compile-checked only); the rest is design.**
+> The Android (AAudio) and iOS (AVAudioEngine) `Device("default")` microphone
+> slices exist in `src/audio/{android,ios}/` behind `feat_android`/`feat_ios`
+> (rsac-20cd / rsac-9e02) — cross-target check + clippy green, **no runtime
+> verification on any device yet**. First-party glue sources are in
+> `mobile/{android,ios}/` (rsac-c4b8 / rsac-6d5f, source-complete, CI builds
+> pending — rsac-1a6e / rsac-48e7). Everything else (playback capture, JNI
+> ingest, ReplayKit consumer) remains design, seeded per the tables below.
+> **Where implementation and this doc diverge, the code (and
+> `mobile/ios/Sources/RsacBroadcastKit/RingLayout.swift` for the ring
+> contract) wins** — known divergences: `RsacProjection.request` is
+> callback-async (ActivityResult), not the synchronous `request(activity):
+> Long` sketched below; the ring's canonical field layout lives in
+> RingLayout.swift v1. The durable decisions are ADRs:
 > [ADR-0012](designs/0012-mobile-platform-strategy.md) (platform strategy &
 > packaging) and [ADR-0013](designs/0013-mobile-capturetarget-semantics.md)
-> (CaptureTarget semantics). Implementation is seeded in `.seeds/issues.jsonl`
-> (label `xplat`, waves 3–4). Framework-facing guidance lives in
+> (CaptureTarget semantics). Framework-facing guidance lives in
 > [`FRAMEWORK_COMPATIBILITY.md`](FRAMEWORK_COMPATIBILITY.md).
 >
 > Per AGENTS.md: when this doc and future code disagree, **the code wins** —
