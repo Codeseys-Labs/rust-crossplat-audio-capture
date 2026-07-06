@@ -25,11 +25,24 @@
 //!   returned by reads own their sample data and may outlive the composition.
 //! - Free order: `rsac_composition_stop()` (optional) → drain in-flight reads
 //!   → `rsac_composition_free()`. Never free concurrently with a read.
+//!
+//! # Threading
+//!
+//! `rsac_composition_stop()` is the **only** call on this surface that may
+//! overlap another in-flight call on the same handle (it exists to unblock a
+//! parked `rsac_composition_read()` / `rsac_composition_try_read()`, and it is
+//! still never safe against `rsac_composition_free()`). Every other pair of
+//! calls on **one** handle — composition, builder, or group — must not overlap
+//! from multiple threads; the caller provides external synchronization (e.g.
+//! `rsac_composition_start()` racing a parked `rsac_composition_read()` is a
+//! data race). Distinct handles are independent and need no coordination.
 
 use std::cell::RefCell;
 use std::ffi::{CStr, CString};
 use std::os::raw::c_char;
+use std::panic::{self, AssertUnwindSafe};
 use std::ptr;
+use std::time::Duration;
 
 use rsac::compose::{Composition, CompositionBuilder, Group, GroupLayout};
 use rsac::{CaptureTarget, CapturingStream};
@@ -376,6 +389,122 @@ pub unsafe extern "C" fn rsac_composition_builder_set_clamp_output(
     })
 }
 
+/// Sets the composed tick quantum (output buffer duration) in milliseconds.
+/// Default 10 ms. Maps to `CompositionBuilder::quantum`.
+///
+/// The setter is deliberately thin (any `millis` value is accepted here, like
+/// `rsac_composition_builder_set_sample_rate`): validation lives in one place
+/// — a **zero** quantum is rejected at [`rsac_composition_builder_preflight`]
+/// / [`rsac_composition_builder_build`] with `RSAC_ERROR_CONFIGURATION`. At
+/// start the quantum is additionally clamped to at least one frame at the
+/// session rate.
+///
+/// Returns `RSAC_ERROR_NULL_POINTER` if `builder` is null.
+#[no_mangle]
+pub unsafe extern "C" fn rsac_composition_builder_set_quantum_ms(
+    builder: *mut RsacCompositionBuilder,
+    millis: u64,
+) -> rsac_error_t {
+    catch(|| {
+        if builder.is_null() {
+            set_last_error("builder is null");
+            return rsac_error_t::RSAC_ERROR_NULL_POINTER;
+        }
+        let b = unsafe { &mut *builder };
+        b.inner = b.inner.clone().quantum(Duration::from_millis(millis));
+        rsac_error_t::RSAC_OK
+    })
+}
+
+/// Sets how long the compositor waits for the master-clock source before
+/// emitting a wall-clock fallback tick (so a stalled master never freezes the
+/// session), in milliseconds. Default 250 ms. Maps to
+/// `CompositionBuilder::stall_timeout`.
+///
+/// Thin like the other setters: a **zero** timeout is rejected at
+/// [`rsac_composition_builder_preflight`] /
+/// [`rsac_composition_builder_build`] with `RSAC_ERROR_CONFIGURATION`.
+///
+/// Returns `RSAC_ERROR_NULL_POINTER` if `builder` is null.
+#[no_mangle]
+pub unsafe extern "C" fn rsac_composition_builder_set_stall_timeout_ms(
+    builder: *mut RsacCompositionBuilder,
+    millis: u64,
+) -> rsac_error_t {
+    catch(|| {
+        if builder.is_null() {
+            set_last_error("builder is null");
+            return rsac_error_t::RSAC_ERROR_NULL_POINTER;
+        }
+        let b = unsafe { &mut *builder };
+        b.inner = b.inner.clone().stall_timeout(Duration::from_millis(millis));
+        rsac_error_t::RSAC_OK
+    })
+}
+
+/// Sets the per-source buffering bound in milliseconds. A source drifting
+/// ahead of the master beyond this bound has its oldest samples trimmed
+/// (counted in `RsacSourceStats::trimmed_frames`). Default 1000 ms. Maps to
+/// `CompositionBuilder::max_buffer`.
+///
+/// Any value — including 0 — is accepted and passes validation: the Rust
+/// builder clamps the bound to at least one quantum when the composition
+/// starts, so there is no rejectable "invalid" bound.
+///
+/// Returns `RSAC_ERROR_NULL_POINTER` if `builder` is null.
+#[no_mangle]
+pub unsafe extern "C" fn rsac_composition_builder_set_max_buffer_ms(
+    builder: *mut RsacCompositionBuilder,
+    millis: u64,
+) -> rsac_error_t {
+    catch(|| {
+        if builder.is_null() {
+            set_last_error("builder is null");
+            return rsac_error_t::RSAC_ERROR_NULL_POINTER;
+        }
+        let b = unsafe { &mut *builder };
+        b.inner = b.inner.clone().max_buffer(Duration::from_millis(millis));
+        rsac_error_t::RSAC_OK
+    })
+}
+
+/// Runs every device-independent validation
+/// [`rsac_composition_builder_build`] performs, **without consuming the
+/// builder** (maps to `CompositionBuilder::preflight`, which takes `&self`).
+///
+/// Because `build` always consumes its builder — even on failure — this is
+/// how a C caller iterates on a configuration: preflight, fix the reported
+/// error on the *same* builder, preflight again, and only then build.
+///
+/// `RSAC_OK` means build's validation phase would pass. It is **not** a
+/// guarantee the composition will start: no devices are touched here, so
+/// device/capability errors (device resolution, format negotiation, stream
+/// creation) can still surface at [`rsac_composition_start`].
+///
+/// Error codes mirror `build`'s validation phase exactly:
+/// `RSAC_ERROR_CONFIGURATION` (no groups, empty group, duplicate/empty group
+/// name, keep-channels group without exactly one source, invalid gain, too
+/// many sources or channels, zero quantum or stall timeout),
+/// `RSAC_ERROR_INVALID_PARAMETER` (unsupported session sample rate), or
+/// `RSAC_ERROR_PLATFORM_NOT_SUPPORTED` (a target this platform cannot
+/// capture). Returns `RSAC_ERROR_NULL_POINTER` if `builder` is null.
+#[no_mangle]
+pub unsafe extern "C" fn rsac_composition_builder_preflight(
+    builder: *const RsacCompositionBuilder,
+) -> rsac_error_t {
+    catch(|| {
+        if builder.is_null() {
+            set_last_error("builder is null");
+            return rsac_error_t::RSAC_ERROR_NULL_POINTER;
+        }
+        let b = unsafe { &*builder };
+        match b.inner.preflight() {
+            Ok(()) => rsac_error_t::RSAC_OK,
+            Err(e) => handle_rsac_error(e),
+        }
+    })
+}
+
 /// Appends a group to the composition. Groups contribute output channels in
 /// the order they are added.
 ///
@@ -533,6 +662,26 @@ pub unsafe extern "C" fn rsac_composition_is_running(comp: *const RsacCompositio
     }
 }
 
+/// Returns the number of composed-ring overruns: composed buffers dropped
+/// because the C consumer read slower than the compositor produced (the ring
+/// holds ~128 composed buffers ≈ 1.3 s at the default 10 ms quantum). Mirrors
+/// [`rsac_capture_overrun_count`](crate::rsac_capture_overrun_count).
+///
+/// This counts loss at the **composed** ring only. Loss inside an inner
+/// source's own capture is reported per source via
+/// `RsacSourceStats` / [`rsac_composition_source_stats`].
+///
+/// Returns 0 if the composition handle is null or the composition has not
+/// been started.
+#[no_mangle]
+pub unsafe extern "C" fn rsac_composition_overrun_count(comp: *const RsacComposition) -> u64 {
+    if comp.is_null() {
+        return 0;
+    }
+    let c = unsafe { &*comp };
+    c.inner.overrun_count()
+}
+
 /// Frees a composition handle. Stops the composition if running (joining the
 /// compositor thread, which stops every inner capture). No-op if null.
 ///
@@ -542,7 +691,21 @@ pub unsafe extern "C" fn rsac_composition_is_running(comp: *const RsacCompositio
 #[no_mangle]
 pub unsafe extern "C" fn rsac_composition_free(comp: *mut RsacComposition) {
     if !comp.is_null() {
-        let _ = unsafe { Box::from_raw(comp) };
+        // This teardown runs far more logic than the other frees: Composition's
+        // Drop stops the engine and JOINS the compositor thread. A panic
+        // unwinding out of an `extern "C"` fn is an abort, so guard the drop.
+        // The return is void — there is no error code to surface — so swallow
+        // and log (the SendCallback convention), plus set the thread-local
+        // message for callers that poll rsac_error_message(). Box's drop glue
+        // still deallocates the handle's memory when the value's drop panics,
+        // so nothing leaks.
+        let boxed = unsafe { Box::from_raw(comp) };
+        if panic::catch_unwind(AssertUnwindSafe(move || drop(boxed))).is_err() {
+            set_last_error("Rust panic caught in rsac_composition_free teardown");
+            log::error!(
+                "rsac FFI: rsac_composition_free teardown panicked; panic caught at FFI boundary"
+            );
+        }
     }
 }
 
@@ -1266,5 +1429,272 @@ mod tests {
         );
         add_system_source(group);
         unsafe { rsac_group_free(group) };
+    }
+
+    // ── rsac-789f: builder knobs, preflight, overrun count ─────────────
+
+    #[test]
+    fn knob_and_preflight_fns_reject_null() {
+        assert_eq!(
+            unsafe { rsac_composition_builder_set_quantum_ms(ptr::null_mut(), 10) },
+            rsac_error_t::RSAC_ERROR_NULL_POINTER
+        );
+        assert_eq!(
+            unsafe { rsac_composition_builder_set_stall_timeout_ms(ptr::null_mut(), 250) },
+            rsac_error_t::RSAC_ERROR_NULL_POINTER
+        );
+        assert_eq!(
+            unsafe { rsac_composition_builder_set_max_buffer_ms(ptr::null_mut(), 1_000) },
+            rsac_error_t::RSAC_ERROR_NULL_POINTER
+        );
+        assert_eq!(
+            unsafe { rsac_composition_builder_preflight(ptr::null()) },
+            rsac_error_t::RSAC_ERROR_NULL_POINTER
+        );
+    }
+
+    #[test]
+    fn overrun_count_null_and_fresh_composition_are_zero() {
+        // Null handle: 0, mirroring rsac_capture_overrun_count.
+        assert_eq!(unsafe { rsac_composition_overrun_count(ptr::null()) }, 0);
+
+        // A built-but-not-started composition has no composed ring yet: 0.
+        let group = new_group("main");
+        add_system_source(group);
+        let builder = new_builder();
+        assert_eq!(
+            unsafe { rsac_composition_builder_add_group(builder, group) },
+            rsac_error_t::RSAC_OK
+        );
+        let mut comp: *mut RsacComposition = ptr::null_mut();
+        assert_eq!(
+            unsafe { rsac_composition_builder_build(builder, &mut comp) },
+            rsac_error_t::RSAC_OK
+        );
+        assert!(!comp.is_null());
+        assert_eq!(unsafe { rsac_composition_overrun_count(comp) }, 0);
+        unsafe { rsac_composition_free(comp) };
+    }
+
+    /// Preflight must not consume the builder: the C workflow it enables is
+    /// preflight → fix the reported error on the SAME builder → preflight →
+    /// build (build consumes even on failure, so without preflight every
+    /// validation retry means rebuilding the whole configuration).
+    #[test]
+    fn preflight_is_non_consuming_and_repeatable() {
+        let builder = new_builder();
+        // No groups yet → CONFIGURATION, twice (repeatable, non-consuming).
+        for _ in 0..2 {
+            assert_eq!(
+                unsafe { rsac_composition_builder_preflight(builder) },
+                rsac_error_t::RSAC_ERROR_CONFIGURATION
+            );
+            let msg = unsafe { CStr::from_ptr(crate::rsac_error_message()) };
+            assert!(!msg.to_bytes().is_empty());
+        }
+        // Fix the error on the same builder…
+        let group = new_group("main");
+        add_system_source(group);
+        assert_eq!(
+            unsafe { rsac_composition_builder_add_group(builder, group) },
+            rsac_error_t::RSAC_OK
+        );
+        // …and preflight now passes, repeatedly.
+        for _ in 0..2 {
+            assert_eq!(
+                unsafe { rsac_composition_builder_preflight(builder) },
+                rsac_error_t::RSAC_OK
+            );
+        }
+        // The builder is still alive and buildable after every preflight.
+        let mut comp: *mut RsacComposition = ptr::null_mut();
+        assert_eq!(
+            unsafe { rsac_composition_builder_build(builder, &mut comp) },
+            rsac_error_t::RSAC_OK
+        );
+        assert!(!comp.is_null());
+        unsafe { rsac_composition_free(comp) };
+    }
+
+    /// Preflight surfaces the same code build would — pinned on the
+    /// session-rate whitelist check, which precedes every capability gate and
+    /// is deterministic on all platforms (same rationale as
+    /// `unsupported_sample_rate_rejected_at_build`).
+    #[test]
+    fn preflight_reports_unsupported_sample_rate_and_recovers() {
+        let group = new_group("main");
+        add_system_source(group);
+        let builder = new_builder();
+        assert_eq!(
+            unsafe { rsac_composition_builder_add_group(builder, group) },
+            rsac_error_t::RSAC_OK
+        );
+        assert_eq!(
+            unsafe { rsac_composition_builder_set_sample_rate(builder, 12_345) },
+            rsac_error_t::RSAC_OK
+        );
+        assert_eq!(
+            unsafe { rsac_composition_builder_preflight(builder) },
+            rsac_error_t::RSAC_ERROR_INVALID_PARAMETER
+        );
+        // Fix without rebuilding: same builder, corrected rate.
+        assert_eq!(
+            unsafe { rsac_composition_builder_set_sample_rate(builder, 48_000) },
+            rsac_error_t::RSAC_OK
+        );
+        assert_eq!(
+            unsafe { rsac_composition_builder_preflight(builder) },
+            rsac_error_t::RSAC_OK
+        );
+        unsafe { rsac_composition_builder_free(builder) };
+    }
+
+    /// Pins where millis validation lives: the setters are thin (any u64 is
+    /// accepted, RSAC_OK), zero quantum/stall_timeout are rejected by
+    /// preflight/build as CONFIGURATION, and max_buffer has NO rejectable
+    /// value (zero is clamped to one quantum at start).
+    #[test]
+    fn zero_millis_validation_placement() {
+        let group = new_group("main");
+        add_system_source(group);
+        let builder = new_builder();
+        assert_eq!(
+            unsafe { rsac_composition_builder_add_group(builder, group) },
+            rsac_error_t::RSAC_OK
+        );
+
+        // Zero quantum: setter accepts, preflight rejects.
+        assert_eq!(
+            unsafe { rsac_composition_builder_set_quantum_ms(builder, 0) },
+            rsac_error_t::RSAC_OK
+        );
+        assert_eq!(
+            unsafe { rsac_composition_builder_preflight(builder) },
+            rsac_error_t::RSAC_ERROR_CONFIGURATION
+        );
+        assert_eq!(
+            unsafe { rsac_composition_builder_set_quantum_ms(builder, 10) },
+            rsac_error_t::RSAC_OK
+        );
+        assert_eq!(
+            unsafe { rsac_composition_builder_preflight(builder) },
+            rsac_error_t::RSAC_OK
+        );
+
+        // Zero stall timeout: setter accepts, preflight rejects.
+        assert_eq!(
+            unsafe { rsac_composition_builder_set_stall_timeout_ms(builder, 0) },
+            rsac_error_t::RSAC_OK
+        );
+        assert_eq!(
+            unsafe { rsac_composition_builder_preflight(builder) },
+            rsac_error_t::RSAC_ERROR_CONFIGURATION
+        );
+        assert_eq!(
+            unsafe { rsac_composition_builder_set_stall_timeout_ms(builder, 250) },
+            rsac_error_t::RSAC_OK
+        );
+
+        // Zero max_buffer: no validation error anywhere (clamped at start).
+        assert_eq!(
+            unsafe { rsac_composition_builder_set_max_buffer_ms(builder, 0) },
+            rsac_error_t::RSAC_OK
+        );
+        assert_eq!(
+            unsafe { rsac_composition_builder_preflight(builder) },
+            rsac_error_t::RSAC_OK
+        );
+
+        // Extreme values: the Rust builder defines no upper bound, so u64::MAX
+        // passes the setters AND preflight (only zero is validated).
+        assert_eq!(
+            unsafe { rsac_composition_builder_set_quantum_ms(builder, u64::MAX) },
+            rsac_error_t::RSAC_OK
+        );
+        assert_eq!(
+            unsafe { rsac_composition_builder_set_stall_timeout_ms(builder, u64::MAX) },
+            rsac_error_t::RSAC_OK
+        );
+        assert_eq!(
+            unsafe { rsac_composition_builder_set_max_buffer_ms(builder, u64::MAX) },
+            rsac_error_t::RSAC_OK
+        );
+        assert_eq!(
+            unsafe { rsac_composition_builder_preflight(builder) },
+            rsac_error_t::RSAC_OK
+        );
+        unsafe { rsac_composition_builder_free(builder) };
+    }
+
+    /// The zero-quantum rejection also fires at build (preflight and build
+    /// share one validation), and build still consumes the builder on failure.
+    #[test]
+    fn zero_quantum_rejected_at_build_too() {
+        let group = new_group("main");
+        add_system_source(group);
+        let builder = new_builder();
+        assert_eq!(
+            unsafe { rsac_composition_builder_add_group(builder, group) },
+            rsac_error_t::RSAC_OK
+        );
+        assert_eq!(
+            unsafe { rsac_composition_builder_set_quantum_ms(builder, 0) },
+            rsac_error_t::RSAC_OK
+        );
+        let mut out: *mut RsacComposition = ptr::null_mut();
+        assert_eq!(
+            unsafe { rsac_composition_builder_build(builder, &mut out) },
+            rsac_error_t::RSAC_ERROR_CONFIGURATION
+        );
+        assert!(out.is_null());
+        // The builder was consumed by build — do NOT free it here.
+    }
+
+    /// All three knobs set to sane values still build (the happy path).
+    #[test]
+    fn knobs_with_sane_values_build_ok() {
+        let group = new_group("main");
+        add_system_source(group);
+        let builder = new_builder();
+        assert_eq!(
+            unsafe { rsac_composition_builder_set_quantum_ms(builder, 5) },
+            rsac_error_t::RSAC_OK
+        );
+        assert_eq!(
+            unsafe { rsac_composition_builder_set_stall_timeout_ms(builder, 100) },
+            rsac_error_t::RSAC_OK
+        );
+        assert_eq!(
+            unsafe { rsac_composition_builder_set_max_buffer_ms(builder, 500) },
+            rsac_error_t::RSAC_OK
+        );
+        assert_eq!(
+            unsafe { rsac_composition_builder_add_group(builder, group) },
+            rsac_error_t::RSAC_OK
+        );
+        let mut comp: *mut RsacComposition = ptr::null_mut();
+        assert_eq!(
+            unsafe { rsac_composition_builder_build(builder, &mut comp) },
+            rsac_error_t::RSAC_OK
+        );
+        assert!(!comp.is_null());
+        unsafe { rsac_composition_free(comp) };
+    }
+
+    /// The group NAME path through read_c_str must reject non-UTF-8 exactly
+    /// like the *spec* path (`bad_target_spec_rejected` covers that one).
+    #[test]
+    fn group_new_rejects_non_utf8_name() {
+        // 0xFF/0xFE are never valid UTF-8 (and contain no NUL, so CString
+        // construction succeeds — the rejection is rsac_group_new's).
+        let bad_utf8 = CString::new(vec![0xFFu8, 0xFEu8]).unwrap();
+        let mut out: *mut RsacGroup = ptr::null_mut();
+        assert_eq!(
+            unsafe { rsac_group_new(bad_utf8.as_ptr(), &mut out) },
+            rsac_error_t::RSAC_ERROR_INVALID_PARAMETER
+        );
+        assert!(out.is_null());
+        let msg = unsafe { CStr::from_ptr(crate::rsac_error_message()) };
+        assert!(!msg.to_bytes().is_empty());
     }
 }

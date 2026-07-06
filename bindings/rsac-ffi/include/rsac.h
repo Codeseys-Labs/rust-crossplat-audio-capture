@@ -13,6 +13,17 @@
  * Error handling:
  *   - All functions return rsac_error_t. On error, call rsac_error_message()
  *     for a human-readable description.
+ *
+ * Threading:
+ *   - Except for rsac_capture_request_stop (and rsac_composition_stop on the
+ *     compose surface), calls on ONE handle must not overlap from multiple
+ *     threads: the caller must serialize them externally (e.g.
+ *     rsac_capture_start racing a parked rsac_capture_read is a data race).
+ *     Those stop functions are the sole documented exceptions — each may run
+ *     concurrently with an in-flight read on the same handle to unblock it,
+ *     and even they are never safe against the handle's _free (order stop +
+ *     drain of in-flight reads BEFORE free). Distinct handles are independent
+ *     and need no synchronization.
  */
 
 #ifndef RSAC_H
@@ -520,6 +531,13 @@ const char* rsac_capabilities_backend_name(const RsacCapabilities* caps);
  *   - rsac_composition_stop may run concurrently with a parked
  *     rsac_composition_read to unblock it; it is NOT safe concurrently with
  *     rsac_composition_free (stop + drain reads BEFORE freeing).
+ *
+ * Threading: rsac_composition_stop is the ONLY call on this surface that may
+ * overlap another in-flight call on the same handle (see above). Every other
+ * pair of calls on one composition (or group, or builder) handle must not
+ * overlap from multiple threads — the caller must serialize them externally
+ * (e.g. rsac_composition_start racing a parked rsac_composition_read is a
+ * data race). Distinct handles are independent and need no synchronization.
  */
 #if defined(RSAC_FEATURE_COMPOSE)
 
@@ -654,6 +672,41 @@ rsac_error_t rsac_composition_builder_set_clamp_output(
     int32_t clamp);
 
 /**
+ * Sets the composed tick quantum (output buffer duration) in milliseconds
+ * (default 10). The setter is thin — any value is accepted here; a ZERO
+ * quantum is rejected at rsac_composition_builder_preflight() /
+ * rsac_composition_builder_build() with RSAC_ERROR_CONFIGURATION. At start
+ * the quantum is additionally clamped to at least one frame at the session
+ * rate. Returns RSAC_ERROR_NULL_POINTER if builder is null.
+ */
+rsac_error_t rsac_composition_builder_set_quantum_ms(
+    RsacCompositionBuilder* builder,
+    uint64_t millis);
+
+/**
+ * Sets how long the compositor waits for the master-clock source before
+ * emitting a wall-clock fallback tick (so a stalled master never freezes the
+ * session), in milliseconds (default 250). Thin like the other setters: a
+ * ZERO timeout is rejected at rsac_composition_builder_preflight() /
+ * rsac_composition_builder_build() with RSAC_ERROR_CONFIGURATION.
+ * Returns RSAC_ERROR_NULL_POINTER if builder is null.
+ */
+rsac_error_t rsac_composition_builder_set_stall_timeout_ms(
+    RsacCompositionBuilder* builder,
+    uint64_t millis);
+
+/**
+ * Sets the per-source buffering bound in milliseconds (default 1000). A
+ * source drifting ahead of the master beyond this bound has its oldest
+ * samples trimmed (RsacSourceStats.trimmed_frames). Any value — including
+ * 0 — passes validation: the bound is clamped to at least one quantum when
+ * the composition starts. Returns RSAC_ERROR_NULL_POINTER if builder is null.
+ */
+rsac_error_t rsac_composition_builder_set_max_buffer_ms(
+    RsacCompositionBuilder* builder,
+    uint64_t millis);
+
+/**
  * Appends a group. Groups contribute output channels in the order added.
  * On RSAC_OK the group handle is CONSUMED — do not use or free it afterwards.
  * On any error (including a caught panic, RSAC_ERROR_PANIC) the caller still
@@ -663,6 +716,28 @@ rsac_error_t rsac_composition_builder_set_clamp_output(
 rsac_error_t rsac_composition_builder_add_group(
     RsacCompositionBuilder* builder,
     RsacGroup* group);
+
+/**
+ * Runs every device-independent validation rsac_composition_builder_build()
+ * performs, WITHOUT consuming the builder. Because build always consumes its
+ * builder (even on failure), this is how a C caller iterates: preflight, fix
+ * the reported error on the SAME builder, preflight again, then build.
+ *
+ * RSAC_OK means build's validation phase would pass. It is NOT a guarantee
+ * the composition will start: no devices are touched here, so device /
+ * capability errors (device resolution, format negotiation, stream creation)
+ * can still surface at rsac_composition_start().
+ *
+ * Error codes mirror build's validation phase exactly:
+ * RSAC_ERROR_CONFIGURATION (no groups, empty group, duplicate/empty group
+ * name, keep-channels group without exactly one source, invalid gain, too
+ * many sources/channels, zero quantum or stall timeout),
+ * RSAC_ERROR_INVALID_PARAMETER (unsupported session sample rate),
+ * RSAC_ERROR_PLATFORM_NOT_SUPPORTED (a target this platform cannot capture).
+ * Returns RSAC_ERROR_NULL_POINTER if builder is null.
+ */
+rsac_error_t rsac_composition_builder_preflight(
+    const RsacCompositionBuilder* builder);
 
 /**
  * Validates the configuration and builds a (not yet started) composition.
@@ -701,6 +776,17 @@ rsac_error_t rsac_composition_stop(const RsacComposition* comp);
 
 /** Returns 1 if the composed stream is running, 0 if not, -1 if null. */
 int32_t rsac_composition_is_running(const RsacComposition* comp);
+
+/**
+ * Returns the number of composed-ring overruns: composed buffers dropped
+ * because the consumer read slower than the compositor produced (the ring
+ * holds ~128 composed buffers, about 1.3 s at the default 10 ms quantum).
+ * Mirrors rsac_capture_overrun_count(). Counts loss at the COMPOSED ring
+ * only — loss inside an inner source's own capture is reported per source
+ * via rsac_composition_source_stats(). Returns 0 if the handle is null or
+ * the composition has not been started.
+ */
+uint64_t rsac_composition_overrun_count(const RsacComposition* comp);
 
 /**
  * Frees a composition handle. Stops the composition if running (joining the

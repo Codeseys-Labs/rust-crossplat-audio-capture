@@ -1004,6 +1004,92 @@ enum rsac_error_t rsac_composition_builder_set_clamp_output(struct RsacCompositi
 
 #if defined(RSAC_FEATURE_COMPOSE)
 /**
+ * Sets the composed tick quantum (output buffer duration) in milliseconds.
+ * Default 10 ms. Maps to `CompositionBuilder::quantum`.
+ *
+ * The setter is deliberately thin (any `millis` value is accepted here, like
+ * `rsac_composition_builder_set_sample_rate`): validation lives in one place
+ * — a **zero** quantum is rejected at [`rsac_composition_builder_preflight`]
+ * / [`rsac_composition_builder_build`] with `RSAC_ERROR_CONFIGURATION`. At
+ * start the quantum is additionally clamped to at least one frame at the
+ * session rate.
+ *
+ * Returns `RSAC_ERROR_NULL_POINTER` if `builder` is null.
+ */
+
+enum rsac_error_t rsac_composition_builder_set_quantum_ms(struct RsacCompositionBuilder *builder,
+                                                          uint64_t millis)
+;
+#endif
+
+#if defined(RSAC_FEATURE_COMPOSE)
+/**
+ * Sets how long the compositor waits for the master-clock source before
+ * emitting a wall-clock fallback tick (so a stalled master never freezes the
+ * session), in milliseconds. Default 250 ms. Maps to
+ * `CompositionBuilder::stall_timeout`.
+ *
+ * Thin like the other setters: a **zero** timeout is rejected at
+ * [`rsac_composition_builder_preflight`] /
+ * [`rsac_composition_builder_build`] with `RSAC_ERROR_CONFIGURATION`.
+ *
+ * Returns `RSAC_ERROR_NULL_POINTER` if `builder` is null.
+ */
+
+enum rsac_error_t rsac_composition_builder_set_stall_timeout_ms(struct RsacCompositionBuilder *builder,
+                                                                uint64_t millis)
+;
+#endif
+
+#if defined(RSAC_FEATURE_COMPOSE)
+/**
+ * Sets the per-source buffering bound in milliseconds. A source drifting
+ * ahead of the master beyond this bound has its oldest samples trimmed
+ * (counted in `RsacSourceStats::trimmed_frames`). Default 1000 ms. Maps to
+ * `CompositionBuilder::max_buffer`.
+ *
+ * Any value — including 0 — is accepted and passes validation: the Rust
+ * builder clamps the bound to at least one quantum when the composition
+ * starts, so there is no rejectable "invalid" bound.
+ *
+ * Returns `RSAC_ERROR_NULL_POINTER` if `builder` is null.
+ */
+
+enum rsac_error_t rsac_composition_builder_set_max_buffer_ms(struct RsacCompositionBuilder *builder,
+                                                             uint64_t millis)
+;
+#endif
+
+#if defined(RSAC_FEATURE_COMPOSE)
+/**
+ * Runs every device-independent validation
+ * [`rsac_composition_builder_build`] performs, **without consuming the
+ * builder** (maps to `CompositionBuilder::preflight`, which takes `&self`).
+ *
+ * Because `build` always consumes its builder — even on failure — this is
+ * how a C caller iterates on a configuration: preflight, fix the reported
+ * error on the *same* builder, preflight again, and only then build.
+ *
+ * `RSAC_OK` means build's validation phase would pass. It is **not** a
+ * guarantee the composition will start: no devices are touched here, so
+ * device/capability errors (device resolution, format negotiation, stream
+ * creation) can still surface at [`rsac_composition_start`].
+ *
+ * Error codes mirror `build`'s validation phase exactly:
+ * `RSAC_ERROR_CONFIGURATION` (no groups, empty group, duplicate/empty group
+ * name, keep-channels group without exactly one source, invalid gain, too
+ * many sources or channels, zero quantum or stall timeout),
+ * `RSAC_ERROR_INVALID_PARAMETER` (unsupported session sample rate), or
+ * `RSAC_ERROR_PLATFORM_NOT_SUPPORTED` (a target this platform cannot
+ * capture). Returns `RSAC_ERROR_NULL_POINTER` if `builder` is null.
+ */
+
+enum rsac_error_t rsac_composition_builder_preflight(const struct RsacCompositionBuilder *builder)
+;
+#endif
+
+#if defined(RSAC_FEATURE_COMPOSE)
+/**
  * Appends a group to the composition. Groups contribute output channels in
  * the order they are added.
  *
@@ -1085,6 +1171,23 @@ enum rsac_error_t rsac_composition_builder_build(struct RsacCompositionBuilder *
  * Returns -1 if the composition handle is null.
  */
  int32_t rsac_composition_is_running(const struct RsacComposition *comp) ;
+#endif
+
+#if defined(RSAC_FEATURE_COMPOSE)
+/**
+ * Returns the number of composed-ring overruns: composed buffers dropped
+ * because the C consumer read slower than the compositor produced (the ring
+ * holds ~128 composed buffers ≈ 1.3 s at the default 10 ms quantum). Mirrors
+ * [`rsac_capture_overrun_count`](crate::rsac_capture_overrun_count).
+ *
+ * This counts loss at the **composed** ring only. Loss inside an inner
+ * source's own capture is reported per source via
+ * `RsacSourceStats` / [`rsac_composition_source_stats`].
+ *
+ * Returns 0 if the composition handle is null or the composition has not
+ * been started.
+ */
+ uint64_t rsac_composition_overrun_count(const struct RsacComposition *comp) ;
 #endif
 
 #if defined(RSAC_FEATURE_COMPOSE)

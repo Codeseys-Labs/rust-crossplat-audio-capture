@@ -11,6 +11,17 @@
 //! - Functions taking `*const T` or `*mut T` borrow the handle; the caller retains ownership.
 //! - String pointers returned by `rsac_error_message()`, `rsac_device_name()`, etc.
 //!   are owned by this library and valid until the next call on the same thread.
+//!
+//! # Threading
+//!
+//! `rsac_capture_request_stop()` (and, on the compose surface,
+//! `rsac_composition_stop()`) is the **only** call that may overlap another
+//! in-flight call on the same handle — it exists to unblock a parked read, and
+//! it is still never safe against the handle's `_free()`. Every other pair of
+//! calls on **one** handle must not overlap from multiple threads; the caller
+//! provides external synchronization (e.g. `rsac_capture_start()` racing a
+//! parked `rsac_capture_read()` is a data race). Distinct handles are
+//! independent and need no coordination.
 
 #![allow(clippy::missing_safety_doc)]
 #![allow(non_camel_case_types)]
@@ -878,7 +889,21 @@ pub unsafe extern "C" fn rsac_capture_format(
 #[no_mangle]
 pub unsafe extern "C" fn rsac_capture_free(capture: *mut RsacCapture) {
     if !capture.is_null() {
-        let _ = unsafe { Box::from_raw(capture) };
+        // This teardown runs far more logic than the other frees: AudioCapture's
+        // Drop stops the stream and joins its worker threads. A panic unwinding
+        // out of an `extern "C"` fn is an abort, so guard the drop. The return
+        // is void — no error code to surface — so swallow and log (the
+        // SendCallback convention), plus set the thread-local message for
+        // callers that poll rsac_error_message(). Box's drop glue still
+        // deallocates the handle's memory when the value's drop panics, so
+        // nothing leaks.
+        let boxed = unsafe { Box::from_raw(capture) };
+        if panic::catch_unwind(AssertUnwindSafe(move || drop(boxed))).is_err() {
+            set_last_error("Rust panic caught in rsac_capture_free teardown");
+            log::error!(
+                "rsac FFI: rsac_capture_free teardown panicked; panic caught at FFI boundary"
+            );
+        }
     }
 }
 
