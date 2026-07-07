@@ -14,9 +14,10 @@ repository = "https://github.com/Codeseys-Labs/rust-crossplat-audio-capture"
 # - cargo-ndk gets one unambiguous build target whose [lib] name is `rsac`,
 #   producing exactly the `librsac.so` the Kotlin side loads
 #   (System.loadLibrary("rsac") — mobile/android RsacProjection.kt);
-# - the JNI export surface (rsac-77f1, src/audio/android/jni.rs) will be
-#   #[no_mangle] extern "C" symbols in rsac itself; linking rsac into this
-#   cdylib re-exports them, so this shim never needs code of its own beyond
+# - the JNI export surface (rsac-77f1, src/audio/android/jni.rs) is
+#   #[no_mangle] extern symbols in rsac itself (JNI_OnLoad — RegisterNatives
+#   design, no Java_* exports); linking rsac into this cdylib re-exports it,
+#   so this shim never needs code of its own beyond
 #   the keep-alive re-export in src/lib.rs.
 [lib]
 name = "rsac"

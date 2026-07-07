@@ -290,6 +290,8 @@ pub fn create_mock_stream(
         capture_target: crate::core::config::CaptureTarget::SystemDefault,
         #[cfg(target_os = "ios")]
         ios_app_group: None,
+        #[cfg(target_os = "android")]
+        android_projection: None,
     };
     device.create_stream(&config)
 }

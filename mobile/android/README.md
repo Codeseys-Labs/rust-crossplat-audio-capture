@@ -5,9 +5,10 @@
 > `gradle assembleRelease` (Gradle 8.11.1 / JDK 17 / android-35) and asserts
 > the `.aar` artifact on every code PR — green since 2026-07-06. The Gradle
 > wrapper remains deliberately absent (CI provisions Gradle). The JNI
-> symbols this glue calls ship with **rsac-77f1**
-> (`src/audio/android/jni.rs`); until then `librsac.so` is absent and native
-> calls throw `UnsatisfiedLinkError` — guard with
+> natives this glue calls ship inside `librsac.so`
+> (`src/audio/android/jni.rs`, rsac-77f1), which CI builds into the AAR's
+> jniLibs (rsac-0aa9). In a build without the native library, native calls
+> throw `UnsatisfiedLinkError` — guard with
 > `RsacProjection.isNativeAvailable()`.
 
 First-party Kotlin glue for rsac's Android playback-capture backend
@@ -29,15 +30,18 @@ Target resolution, error classification, and stream semantics live in Rust
 
 ## JNI symbol contract
 
-**Lockstep with `src/audio/android/jni.rs` when rsac-77f1 lands** — Rust
-registers these via `RegisterNatives` in `JNI_OnLoad`; renaming a class,
-method, or signature on either side breaks capture. A CI drift guard is part
-of rsac-1a6e.
+**Lockstep with `src/audio/android/jni.rs`** — Rust registers these via
+`RegisterNatives` in `JNI_OnLoad` (there are deliberately **no `Java_*`
+name-resolved exports**; `JNI_OnLoad` is the `.so`'s single JNI entry
+point, asserted by CI's llvm-nm step). Renaming a class, method, or
+signature on either side breaks capture — the host-run `jni_lockstep`
+tests in `src/audio/mod.rs` guard both sides on every `cargo test --lib`.
 
-| Kotlin declaration (class) | JNI symbol | Direction |
+| Kotlin declaration (class) | Registered as | Direction |
 |---|---|---|
-| `@JvmStatic external fun nativeRetainProjection(projection: MediaProjection): Long` (`ai.codeseys.rsac.RsacProjection`) | `Java_ai_codeseys_rsac_RsacProjection_nativeRetainProjection` | Kotlin → Rust: wrap the consented `MediaProjection` in a JNI `GlobalRef`, return the opaque token |
-| `@JvmStatic external fun nativePush(session: Long, buf: FloatArray, frames: Int, channels: Int, sampleRate: Int)` (`ai.codeseys.rsac.CaptureBridge`) | `Java_ai_codeseys_rsac_CaptureBridge_nativePush` | Kotlin → Rust: per-period ingest into `BridgeProducer::push_samples_or_drop()` |
+| `@JvmStatic external fun nativeRetainProjection(projection: MediaProjection): Long` (`ai.codeseys.rsac.RsacProjection`) | `nativeRetainProjection` `(Landroid/media/projection/MediaProjection;)J` | Kotlin → Rust: wrap the consented `MediaProjection` in a JNI `GlobalRef`, return the opaque token |
+| `@JvmStatic external fun nativePush(session: Long, buf: FloatArray, frames: Int, channels: Int, sampleRate: Int)` (`ai.codeseys.rsac.CaptureBridge`) | `nativePush` `(J[FIII)V` | Kotlin → Rust: per-period ingest into the capture's ring buffer (session-lifetime scratch, drop-don't-block) |
+| `@JvmStatic external fun nativeSessionEnded(session: Long)` (`ai.codeseys.rsac.CaptureBridge`) | `nativeSessionEnded` `(J)V` | Kotlin → Rust: terminal handshake — the read thread exited; a still-registered session is treated as spontaneous death (ADR-0010) |
 
 Token lifetime: **one token = one projection session**; release
 (`DeleteGlobalRef` + `MediaProjection.stop()`) is Rust's job, tied to the

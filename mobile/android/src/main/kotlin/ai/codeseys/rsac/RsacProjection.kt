@@ -47,11 +47,12 @@ import java.util.concurrent.atomic.AtomicBoolean
  *
  * ### Native availability
  *
- * The native symbols ship with the Rust JNI layer (seed rsac-77f1). Until
- * `librsac.so` is packaged into the AAR (rsac-1a6e wires the cargo-ndk
- * build), calling [nativeRetainProjection] throws [UnsatisfiedLinkError].
- * Guard with [isNativeAvailable]; [request] fails fast with
- * [IllegalStateException] when the native library is absent.
+ * The native symbols ship with the Rust JNI layer (rsac-77f1), packaged as
+ * `librsac.so` in the AAR's jniLibs (rsac-0aa9). In a build without the
+ * native library (e.g. a stripped-down repackaging), calling
+ * [nativeRetainProjection] throws [UnsatisfiedLinkError]. Guard with
+ * [isNativeAvailable]; [request] fails fast with [IllegalStateException]
+ * when the native library is absent.
  *
  * No capture policy lives here (ADR-0012 §4.2): this object launches the
  * consent dialog and forwards the projection to Rust — nothing more.
@@ -171,14 +172,14 @@ object RsacProjection {
      * consumed by `AudioCaptureBuilder::with_android_projection`.
      *
      * Registered from Rust via `RegisterNatives` (`JNI_OnLoad`,
-     * src/audio/android/jni.rs — seed rsac-77f1). **Lockstep contract**: the
-     * JNI symbol is
-     * `Java_ai_codeseys_rsac_RsacProjection_nativeRetainProjection`; renaming
+     * src/audio/android/jni.rs — rsac-77f1). **Lockstep contract**: renaming
      * this method, its class, or its signature breaks the Rust registration
-     * (a CI drift guard arrives with rsac-1a6e).
+     * — guarded by the host-run `jni_lockstep` tests in src/audio/mod.rs.
      *
-     * Throws [UnsatisfiedLinkError] until the native library ships — guard
-     * with [isNativeAvailable].
+     * Returns `0` when the projection could not be retained (a `0` token
+     * fails stream creation with an actionable error). Throws
+     * [UnsatisfiedLinkError] when the native library is absent — guard with
+     * [isNativeAvailable].
      */
     @JvmStatic
     external fun nativeRetainProjection(projection: MediaProjection): Long

@@ -1,23 +1,28 @@
 # Mobile Backend Design — Android & iOS
 
-> **Status: mic slices + the iOS broadcast consumer implemented
-> (compile-checked only); Android playback capture is the remaining design.**
-> Implemented behind `feat_android`/`feat_ios`: the AAudio / AVAudioEngine
-> `Device("default")` microphone slices (rsac-20cd / rsac-9e02) and the iOS
-> `SystemDefault` ReplayKit ring consumer (rsac-b3aa,
+> **Status: fully implemented (compile-checked only, no on-device runtime
+> proof yet).** Implemented behind `feat_android`/`feat_ios`: the AAudio /
+> AVAudioEngine `Device("default")` microphone slices (rsac-20cd /
+> rsac-9e02), the iOS `SystemDefault` ReplayKit ring consumer (rsac-b3aa,
 > `src/audio/ios/broadcast.rs`, App Group id via
-> `AudioCaptureBuilder::with_ios_app_group`) — cross-target check + clippy
-> green, **no runtime verification on any device yet** (seeds rsac-e6d3 /
-> rsac-97c8). First-party glue lives in `mobile/{android,ios}/` and **builds
-> in CI**, including `librsac.so` packaged into the AAR's jniLibs
-> (rsac-0aa9). Still design-only: Android playback capture + JNI ingest
-> (rsac-77f1).
+> `AudioCaptureBuilder::with_ios_app_group`), and Android playback capture —
+> all four `AudioPlaybackCapture` tiers via the AAR's Kotlin loop + JNI
+> ingest (rsac-77f1, `src/audio/android/{jni,playback}.rs`, consent token
+> via `with_android_projection`) — cross-target check + clippy green, **no
+> runtime verification on any device yet** (seeds rsac-e6d3 / rsac-97c8).
+> First-party glue lives in `mobile/{android,ios}/` and **builds in CI**,
+> including `librsac.so` packaged into the AAR's jniLibs with its
+> `JNI_OnLoad` export asserted (rsac-0aa9/rsac-77f1).
 > **Where implementation and this doc diverge, the code (and
 > `mobile/ios/Sources/RsacBroadcastKit/RingLayout.swift` for the ring
 > contract) wins** — known divergences: `RsacProjection.request` is
 > callback-async (ActivityResult), not the synchronous `request(activity):
 > Long` sketched below; the ring's canonical field layout lives in
-> RingLayout.swift v1. The durable decisions are ADRs:
+> RingLayout.swift v1; the JNI ingest uses a **registry-id session** (not
+> the raw pointer sketched below — `CaptureBridge.stop()`'s bounded join
+> cannot prove push quiescence, see `src/audio/android/jni.rs`) and a
+> `nativeSessionEnded` terminal handshake the sketch below omits. The
+> durable decisions are ADRs:
 > [ADR-0012](designs/0012-mobile-platform-strategy.md) (platform strategy &
 > packaging) and [ADR-0013](designs/0013-mobile-capturetarget-semantics.md)
 > (CaptureTarget semantics). Framework-facing guidance lives in

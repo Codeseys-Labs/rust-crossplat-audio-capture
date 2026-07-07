@@ -7,17 +7,19 @@
 //! decision record.
 //!
 //! The `pub use` below links the rsac rlib into this cdylib. `#[no_mangle]
-//! extern "C"` symbols defined inside rsac — the JNI export surface arriving
-//! with rsac-77f1 (`JNI_OnLoad`, `Java_ai_codeseys_rsac_*`) — are preserved
-//! as exported dynamic symbols of the resulting `.so`, which is exactly what
-//! `System.loadLibrary("rsac")` on the Kotlin side (mobile/android) resolves
-//! against.
+//! extern` symbols defined inside rsac — the JNI export surface (rsac-77f1)
+//! — are preserved as exported dynamic symbols of the resulting `.so`,
+//! which is exactly what `System.loadLibrary("rsac")` on the Kotlin side
+//! (mobile/android) resolves against. The surface is deliberately **one
+//! symbol**: `JNI_OnLoad` (src/audio/android/jni.rs), which registers the
+//! `ai.codeseys.rsac` natives via `RegisterNatives` — there are no `Java_*`
+//! name-resolved exports. The CI android mobile leg asserts the export with
+//! llvm-nm after building the `.so`.
 //!
-//! Until rsac-77f1 lands, the `.so` exports no JNI symbols; the Kotlin glue
-//! guards for that via `RsacProjection.isNativeAvailable()`. Building this
-//! crate in CI still has real verification value: it is the first step that
-//! actually LINKS the Android backend (`#[link(name = "aaudio")]`) against
-//! the NDK, which `cargo check` never does.
+//! Building this crate in CI has real verification value beyond the export:
+//! it is the step that actually LINKS the Android backend
+//! (`#[link(name = "aaudio")]`) against the NDK, which `cargo check` never
+//! does.
 
 // Link the whole rsac library (and thereby its future no_mangle JNI surface)
 // into this cdylib.

@@ -279,29 +279,42 @@ impl PlatformCapabilities {
         }
     }
 
-    /// Android capabilities — **microphone slice only** (rsac-20cd).
+    /// Android capabilities — AAudio microphone slice (rsac-20cd) +
+    /// `AudioPlaybackCapture` playback tiers (rsac-77f1).
     ///
     /// Honest current state: the compiled backend captures the default audio
-    /// input via AAudio (`CaptureTarget::Device`). The playback-capture tiers
-    /// (`SystemDefault` / `Application*` / `ProcessTree` via
-    /// `AudioPlaybackCapture` + MediaProjection consent) arrive with
-    /// rsac-77f1/rsac-c4b8 — until then those flags stay `false` and
-    /// `requires_user_consent` stays `false` (the mic needs the RECORD_AUDIO
-    /// *runtime permission*, which is axis-2 readiness, not a config-time
-    /// consent artifact; see the field docs). ADR-0013 fixes the target
-    /// mapping; docs/MOBILE_BACKEND_DESIGN.md has the full design.
+    /// input via AAudio (`CaptureTarget::Device`) on every supported API
+    /// level, and the playback-capture tiers (`SystemDefault` /
+    /// `Application*` / `ProcessTree` via `AudioPlaybackCapture` +
+    /// MediaProjection consent, ADR-0013) on **API 29+** — reported via a
+    /// runtime SDK check ([`get_android_sdk_version`]), the same
+    /// version-probing pattern as macOS's Process Tap gate. On API < 29 the
+    /// playback flags are honestly `false` (`AudioPlaybackCaptureConfiguration`
+    /// does not exist there).
+    ///
+    /// `requires_user_consent: true` when the playback tiers are available:
+    /// the [`AndroidProjectionToken`](crate::core::config::AndroidProjectionToken)
+    /// is the config-time consent artifact (`with_android_projection`);
+    /// `Device` (mic) targets never need it — the mic's RECORD_AUDIO
+    /// *runtime permission* is axis-2 readiness, not a consent artifact
+    /// (see the field docs).
     #[cfg(all(target_os = "android", feature = "feat_android"))]
     fn android() -> Self {
+        // API 29 (Android 10) introduced AudioPlaybackCaptureConfiguration.
+        let playback_capture = get_android_sdk_version() >= 29;
         Self {
-            supports_system_capture: false, // rsac-77f1 (AudioPlaybackCapture)
-            supports_application_capture: false, // rsac-77f1 (addMatchingUid)
-            supports_process_tree_capture: false, // rsac-77f1 (PID→UID ≡ app)
-            // Only the default AAudio input is reachable without the Java
-            // AudioManager device list (arrives with the AAR, rsac-c4b8).
+            supports_system_capture: playback_capture, // AudioPlaybackCapture (rsac-77f1)
+            supports_application_capture: playback_capture, // addMatchingUid
+            supports_process_tree_capture: playback_capture, // PID→UID (tree ≡ app)
+            // Only the default AAudio input + the logical playback endpoint
+            // are reachable without the Java AudioManager device list
+            // (arrives with rsac-ad8a).
             supports_device_selection: false,
             supports_device_change_notifications: false,
-            // Flips to true when the playback-capture tiers land (rsac-77f1).
-            requires_user_consent: false,
+            // The MediaProjection token is the config-time consent artifact
+            // for the playback tiers (ADR-0013); meaningless below API 29
+            // where those tiers don't exist.
+            requires_user_consent: playback_capture,
             // AAudio delivers PCM_I16 or PCM_FLOAT natively.
             supported_sample_formats: vec![SampleFormat::I16, SampleFormat::F32],
             sample_rate_range: (8000, 96000),
@@ -368,6 +381,59 @@ impl PlatformCapabilities {
 }
 
 // ── macOS version detection ──────────────────────────────────────────────
+
+/// Returns the Android API level (SDK version) of the running device, or
+/// `0` when it cannot be determined.
+///
+/// Reads the `ro.build.version.sdk` system property via
+/// `__system_property_get` (a stable libc export on every Android version)
+/// — no JNI, no subprocess; the same in-process version-probing pattern as
+/// [`get_macos_version`]'s sysctl. A read/parse failure returns `0`, so
+/// version-gated capabilities honestly report `false` rather than claiming
+/// an API that may not exist.
+///
+/// Used by [`PlatformCapabilities`] to gate the playback-capture tiers
+/// (`AudioPlaybackCaptureConfiguration` requires API 29+).
+#[cfg(target_os = "android")]
+pub fn get_android_sdk_version() -> u32 {
+    use std::os::raw::c_char;
+
+    // PROP_VALUE_MAX from <sys/system_properties.h>.
+    const PROP_VALUE_MAX: usize = 92;
+
+    extern "C" {
+        /// Stable Android libc API: copies the property value (NUL-terminated,
+        /// at most PROP_VALUE_MAX bytes including the NUL) into `value` and
+        /// returns its length, or 0 when the property does not exist.
+        fn __system_property_get(name: *const c_char, value: *mut c_char) -> i32;
+    }
+
+    let mut buf = [0u8; PROP_VALUE_MAX];
+    // SAFETY: the name is a NUL-terminated literal and `buf` is at least
+    // PROP_VALUE_MAX bytes, which is the documented maximum the call writes.
+    let len = unsafe {
+        __system_property_get(
+            c"ro.build.version.sdk".as_ptr(),
+            buf.as_mut_ptr().cast::<c_char>(),
+        )
+    };
+    if len <= 0 {
+        log::warn!(
+            "Could not read ro.build.version.sdk; reporting API level 0 \
+             (version-gated capabilities will be false)"
+        );
+        return 0;
+    }
+    let text = std::str::from_utf8(&buf[..len as usize]).unwrap_or("");
+    text.trim().parse().unwrap_or_else(|_| {
+        log::warn!(
+            "Unparseable ro.build.version.sdk value {:?}; reporting API \
+             level 0 (version-gated capabilities will be false)",
+            text
+        );
+        0
+    })
+}
 
 /// Returns the macOS version as `(major, minor, patch)`.
 ///
@@ -633,10 +699,10 @@ mod tests {
     ///
     /// Gated off the mobile OSes: iOS honestly reports
     /// `requires_user_consent: true` (rsac-b3aa — the App Group id is the
-    /// consent artifact for the ReplayKit broadcast path), and Android will
-    /// when its playback tiers land (rsac-77f1). Mobile consent-reporting is
-    /// covered by the per-OS capability tests below; asserting `false` here
-    /// on those targets would make the test lie.
+    /// consent artifact for the ReplayKit broadcast path), and Android does
+    /// on API 29+ (rsac-77f1 — the MediaProjection token). Mobile
+    /// consent-reporting is covered by the per-OS capability tests below;
+    /// asserting `false` here on those targets would make the test lie.
     #[cfg(not(any(target_os = "android", target_os = "ios")))]
     #[test]
     fn desktop_and_stub_require_no_user_consent() {
@@ -647,18 +713,27 @@ mod tests {
         );
     }
 
-    /// rsac-20cd: the Android mic slice must report its honest partial state —
-    /// no playback-capture tiers, no device selection, no consent artifact
-    /// (those all arrive with rsac-77f1/rsac-c4b8).
+    /// rsac-20cd / rsac-77f1: Android must report its honest state — the
+    /// playback-capture tiers are SDK-gated (`AudioPlaybackCapture` needs
+    /// API 29+) and, exactly when available, carry the consent requirement
+    /// (the MediaProjection token, ADR-0013). The three tiers and the
+    /// consent flag always move together: on Android tree ≡ app ≡ system
+    /// transport-wise (one Kotlin pipeline, UID filter optional).
     #[cfg(all(target_os = "android", feature = "feat_android"))]
     #[test]
-    fn android_mic_slice_reports_honest_partial_capabilities() {
+    fn android_reports_sdk_gated_playback_capture_with_consent() {
         let caps = PlatformCapabilities::query();
         assert_eq!(caps.backend_name, "AAudio");
-        assert!(!caps.supports_system_capture);
-        assert!(!caps.supports_application_capture);
-        assert!(!caps.supports_process_tree_capture);
-        assert!(!caps.requires_user_consent);
+        let expect_playback = get_android_sdk_version() >= 29;
+        assert_eq!(caps.supports_system_capture, expect_playback);
+        assert_eq!(caps.supports_application_capture, expect_playback);
+        assert_eq!(caps.supports_process_tree_capture, expect_playback);
+        assert_eq!(
+            caps.requires_user_consent, expect_playback,
+            "the MediaProjection token is required exactly when the playback \
+             tiers exist (ADR-0013)"
+        );
+        assert!(!caps.supports_device_selection, "rsac-ad8a pending");
         assert!(caps.supports_format(SampleFormat::F32));
         assert!(caps.supports_sample_rate(48000));
     }

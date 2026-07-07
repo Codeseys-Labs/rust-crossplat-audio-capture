@@ -104,7 +104,7 @@ const SCRATCH_MIN_FRAMES: usize = 4096;
 /// audio at the delivered rate (with [`SCRATCH_MIN_FRAMES`] as the floor),
 /// times the channel count. One-time cost at 48 kHz stereo: 48 000 × 4 B ≈
 /// 192 KiB — allocated on the setup thread, never in the callback.
-fn scratch_capacity_samples(sample_rate: u32, channels: u16) -> usize {
+pub(super) fn scratch_capacity_samples(sample_rate: u32, channels: u16) -> usize {
     ((sample_rate as usize) / 2).max(SCRATCH_MIN_FRAMES) * usize::from(channels.max(1))
 }
 
@@ -188,8 +188,10 @@ struct ErrorCallbackContext {
 /// counters, so the loss is visible through `overrun_count()` /
 /// `buffers_dropped()` exactly like an ordinary ring-overflow drop.
 /// Lock-free `Relaxed` adds — safe on the RT callback thread (same helper
-/// shape as the iOS backend's `count_external_drop`).
-fn count_external_drop(producer: &BridgeProducer) {
+/// shape as the iOS backend's `count_external_drop`). Shared with the JNI
+/// playback-ingest path (`jni.rs`), which applies the same accounting to
+/// periods that never reach the ring.
+pub(super) fn count_external_drop(producer: &BridgeProducer) {
     let shared = producer.shared();
     shared.buffers_dropped.fetch_add(1, Ordering::Relaxed);
     shared.consecutive_drops.fetch_add(1, Ordering::Relaxed);
@@ -386,9 +388,9 @@ fn is_default_input_id(id: &str) -> bool {
 /// | Target | Outcome |
 /// |---|---|
 /// | `Device("default")` (or `""`) | `Ok(())` — the default AAudio input |
-/// | `Device(other)` | [`AudioError::DeviceNotFound`] — real input-device ids need the Java `AudioManager` list (rsac-c4b8) |
-/// | `SystemDefault` | [`AudioError::PlatformNotSupported`] — **pending** rsac-77f1: on Android this means playback capture (`AudioPlaybackCapture`), **not** the microphone |
-/// | `Application` / `ApplicationByName` / `ProcessTree` | [`AudioError::PlatformNotSupported`] — **pending** rsac-77f1 (UID-filtered playback capture + MediaProjection consent; tree ≡ app on Android) |
+/// | `Device(other)` | [`AudioError::DeviceNotFound`] — real input-device ids need the Java `AudioManager` list (rsac-ad8a) |
+/// | `SystemDefault` | [`AudioError::PlatformNotSupported`] — served by the **playback-capture device** (`super::playback`, rsac-77f1), not the mic |
+/// | `Application` / `ApplicationByName` / `ProcessTree` | [`AudioError::PlatformNotSupported`] — served by the playback-capture device (UID-filtered `AudioPlaybackCapture`; tree ≡ app on Android) |
 ///
 /// The match is intentionally exhaustive (no wildcard): a new
 /// `CaptureTarget` variant must be classified here before the crate
@@ -400,24 +402,25 @@ fn ensure_mic_target(target: &CaptureTarget) -> AudioResult<()> {
             device_id: id.0.clone(),
         }),
         CaptureTarget::SystemDefault => Err(AudioError::PlatformNotSupported {
-            feature: "system-audio capture on Android: SystemDefault maps to \
-                      AudioPlaybackCapture — all capturable playback, NOT the \
-                      microphone (ADR-0013) — and is not wired yet (rsac-77f1, \
-                      MediaProjection consent flow). Supported today: the \
-                      default AAudio input (microphone) via \
-                      CaptureTarget::Device(DeviceId(\"default\".into()))"
+            feature: "system-audio capture through the Android microphone \
+                      device: SystemDefault maps to AudioPlaybackCapture — all \
+                      capturable playback, NOT the microphone (ADR-0013) — and \
+                      is served by the playback-capture device \
+                      (CaptureTarget::SystemDefault resolves there via \
+                      default_device(); this mic device only serves \
+                      CaptureTarget::Device(DeviceId(\"default\".into())))"
                 .to_string(),
             platform: "android".to_string(),
         }),
         CaptureTarget::Application(_)
         | CaptureTarget::ApplicationByName(_)
         | CaptureTarget::ProcessTree(_) => Err(AudioError::PlatformNotSupported {
-            feature: "per-application / process-tree capture on Android: these \
-                      map to AudioPlaybackCapture UID filters (ADR-0013; all of \
-                      an Android app's processes share one UID, so tree ≡ app) \
-                      and arrive with the MediaProjection consent flow \
-                      (rsac-77f1). Supported today: the default AAudio input \
-                      (microphone) via \
+            feature: "per-application / process-tree capture through the \
+                      Android microphone device: these map to \
+                      AudioPlaybackCapture UID filters (ADR-0013; all of an \
+                      Android app's processes share one UID, so tree ≡ app) \
+                      and are served by the playback-capture device, not this \
+                      mic device. This mic device only serves \
                       CaptureTarget::Device(DeviceId(\"default\".into()))"
                 .to_string(),
             platform: "android".to_string(),
@@ -1097,20 +1100,23 @@ mod tests {
     }
 
     #[test]
-    fn system_default_is_pending_playback_capture_not_the_mic() {
+    fn system_default_is_routed_to_playback_capture_not_the_mic() {
         let err = ensure_mic_target(&CaptureTarget::SystemDefault).unwrap_err();
         assert_eq!(err.kind(), ErrorKind::Platform);
         match err {
             AudioError::PlatformNotSupported { feature, platform } => {
                 assert_eq!(platform, "android");
-                // The honesty pillars: what SystemDefault really means, which
-                // seed delivers it, and what works today.
+                // The honesty pillars: what SystemDefault really means, where
+                // it is served, and what this device does serve.
                 assert!(
                     feature.contains("AudioPlaybackCapture"),
                     "real meaning: {feature}"
                 );
                 assert!(feature.contains("NOT the"), "not-the-mic: {feature}");
-                assert!(feature.contains("rsac-77f1"), "pending seed: {feature}");
+                assert!(
+                    feature.contains("playback-capture device"),
+                    "serving device: {feature}"
+                );
                 assert!(
                     feature.contains("Device(DeviceId(\"default\""),
                     "mic guidance: {feature}"
@@ -1121,7 +1127,7 @@ mod tests {
     }
 
     #[test]
-    fn per_app_targets_are_pending_not_permanent() {
+    fn per_app_targets_are_served_by_the_playback_device() {
         let targets = [
             CaptureTarget::Application(ApplicationId("1234".to_string())),
             CaptureTarget::ApplicationByName("com.example.app".to_string()),
@@ -1132,8 +1138,8 @@ mod tests {
                 AudioError::PlatformNotSupported { feature, platform } => {
                     assert_eq!(platform, "android");
                     assert!(
-                        feature.contains("rsac-77f1"),
-                        "must name the delivering seed for {target:?}: {feature}"
+                        feature.contains("playback-capture device"),
+                        "must name the serving device for {target:?}: {feature}"
                     );
                     assert!(
                         feature.contains("tree ≡ app"),
@@ -1141,7 +1147,7 @@ mod tests {
                     );
                     assert!(
                         !feature.contains("permanent"),
-                        "Android playback capture is PENDING, never permanent \
+                        "Android playback capture is SUPPORTED, never permanent \
                          ({target:?}): {feature}"
                     );
                 }

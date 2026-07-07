@@ -47,7 +47,8 @@ android {
     // src/main/jniLibs/<abi>/ before assembleRelease — the CI mobile-android
     // job does exactly that and asserts the .so lands inside the AAR.
     // jniLibs is picked up by AGP's default sourceSet; nothing to configure.
-    // JNI exports arrive with rsac-77f1. See README.md § Native library.
+    // The JNI surface is registered from librsac.so's JNI_OnLoad (rsac-77f1).
+    // See README.md § Native library.
 
     publishing {
         // Maven/GitHub Packages distribution is a follow-up seed; singleVariant

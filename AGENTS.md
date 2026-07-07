@@ -144,18 +144,19 @@ All ten identified gaps have been closed:
 | **Device selection** | ✅ | ✅ | ✅ |
 
 **Mobile (in progress — ADR-0012/0013, [`docs/MOBILE_BACKEND_DESIGN.md`](docs/MOBILE_BACKEND_DESIGN.md)):**
-the mic slices are implemented and **compile-checked only** (`aarch64-linux-android` /
+the mobile backends are implemented and **compile-checked only** (`aarch64-linux-android` /
 `aarch64-apple-ios` check+clippy green; **no runtime verification on any device yet** —
 do not claim "tested on Android/iOS"). First-party glue (`mobile/android` AAR Kotlin,
 `mobile/ios` SwiftPM incl. the canonical broadcast-ring contract) **builds in CI**
 (the `mobile-android` / `mobile-ios` ci.yml jobs: cross-target check+clippy, real
-Gradle AAR + xcodebuild SwiftPM builds — compile-proof only).
+Gradle AAR + xcodebuild SwiftPM builds incl. `librsac.so` in jniLibs with its
+`JNI_OnLoad` export asserted — compile-proof only).
 
-| Capture Mode | Android (AAudio) | iOS (AVAudioEngine) |
+| Capture Mode | Android (AAudio + AudioPlaybackCapture) | iOS (AVAudioEngine) |
 |---|---|---|
 | **Device — default mic** (`Device("default")`) | 🟡 compiled, unverified (rsac-20cd) | 🟡 compiled, unverified (rsac-9e02) |
-| **System default** (= playback capture, ADR-0013) | ⏳ rsac-77f1 (AudioPlaybackCapture + consent) | 🟡 compiled, unverified (rsac-b3aa: ReplayKit ring consumer; needs `with_ios_app_group` + embedded extension + user-started broadcast) |
-| **Application / ByName / ProcessTree** | ⏳ rsac-77f1 (UID filters; tree ≡ app) | ❌ permanent — no iOS API (never soften) |
+| **System default** (= playback capture, ADR-0013) | 🟡 compiled, unverified (rsac-77f1: AAR Kotlin `AudioRecord` loop + JNI ingest; needs `with_android_projection` token + FGS, API 29+) | 🟡 compiled, unverified (rsac-b3aa: ReplayKit ring consumer; needs `with_ios_app_group` + embedded extension + user-started broadcast) |
+| **Application / ByName / ProcessTree** | 🟡 compiled, unverified (rsac-77f1: UID filters; tree ≡ app — same requirements as SystemDefault) | ❌ permanent — no iOS API (never soften) |
 | **Device selection (real device list)** | ⏳ rsac-ad8a (Java AudioManager via AAR) | ❌ session-routed, not free selection |
 
 ---
@@ -214,11 +215,13 @@ src/
 │       ├── coreaudio.rs    # CoreAudio capture (uses BridgeProducer, no old VecDeque)
 │       ├── tap.rs          # Process Tap FFI
 │       └── thread.rs       # MacosPlatformStream + CoreAudio callback → BridgeProducer
-│   ├── android/            # AAudio backend (mic slice; cfg feat_android — compile-checked, unverified on-device)
+│   ├── android/            # AAudio mic + AudioPlaybackCapture backend (cfg feat_android — compile-checked, unverified on-device)
 │   │   ├── mod.rs          # AndroidDeviceEnumerator + AndroidAudioDevice
 │   │   ├── aaudio.rs       # In-tree AAudio NDK FFI (no crate deps)
+│   │   ├── jni.rs          # JNI boundary: JNI_OnLoad/RegisterNatives, session registry, natives (jni-sys)
+│   │   ├── playback.rs     # AndroidPlaybackDevice/Stream — AAR Kotlin loop orchestration, ADR-0013 UID mapping
 │   │   └── thread.rs       # AndroidPlatformStream + RT data callback → BridgeProducer
-│   └── ios/                # AVAudioEngine backend (mic slice; cfg feat_ios — compile-checked, unverified on-device)
+│   └── ios/                # AVAudioEngine backend (mic + ReplayKit consumer; cfg feat_ios — compile-checked, unverified on-device)
 │       ├── mod.rs          # IosDeviceEnumerator + IosAudioDevice
 │       ├── avaudio.rs      # objc2-avf-audio input-node tap → BridgeProducer
 │       └── thread.rs       # IosPlatformStream
@@ -586,7 +589,7 @@ Full playbook (when to stack vs parallel PRs, exact commands, pitfalls):
 - ✅ **Audio-graph migrated** to use `rsac::list_audio_sources()` — replaced ~120 lines of per-platform `#[cfg]` code.
 
 **Remaining:**
-- **Mobile — the playback-capture tiers** (what `SystemDefault` means on mobile, ADR-0013): Android `AudioPlaybackCapture` + JNI ingest (rsac-77f1 — `librsac.so` packaging landed, rsac-0aa9) and iOS `SystemDefault` is compiled (rsac-b3aa: ReplayKit ring consumer mirroring the canonical `mobile/ios` RingLayout v1 contract), pending runtime proof
+- **Mobile — the playback-capture tiers are code-complete** (what `SystemDefault` means on mobile, ADR-0013): Android `AudioPlaybackCapture` + JNI ingest landed (rsac-77f1: all four tiers via the AAR Kotlin loop, `src/audio/android/{jni,playback}.rs`; `librsac.so` packaging rsac-0aa9) and iOS `SystemDefault` is compiled (rsac-b3aa: ReplayKit ring consumer mirroring the canonical `mobile/ios` RingLayout v1 contract) — both pending runtime proof
 - **Mobile — runtime verification** (the honest gap: everything mobile is compile-proof only): Android emulator leg rsac-e6d3, iOS simulator/device leg rsac-97c8 — the AGENTS mobile matrix cells stay "compiled, unverified" until these are green
 - **Mobile — delivery**: real Android device enumeration (rsac-ad8a), AAR Maven + SwiftPM distribution (rsac-05b6), `tauri-plugin-rsac` (rsac-f21c) + the audio-graph decision (rsac-0ac9, ADR-0014) — the rsac-ffi mobile-triple cross-checks landed (rsac-7a18)
 - **Binding capability parity, FFI leg** — additive C ABI accessors (device-change notifications, sample-format list, rate range/whitelist) so Go reaches parity (rsac-a9af, re-scoped)

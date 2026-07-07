@@ -221,9 +221,18 @@ objc2-avf-audio = { version = "0.3", features = [
     "AVAudioBuffer", "AVAudioTime", "AVAudioTypes", "block2",
 ] }
 
-# Android backend (feat_android, mic slice — rsac-20cd) needs no crate deps:
+# Android backend (feat_android — rsac-20cd mic slice, rsac-77f1 playback):
 # AAudio is bound via in-tree extern "C" declarations against the stable NDK
-# ABI (see src/audio/android/aaudio.rs); JNI deps arrive with rsac-77f1.
+# ABI (see src/audio/android/aaudio.rs). The playback-capture path (JNI
+# orchestration of the mobile/android AAR, src/audio/android/jni.rs) uses
+# jni-sys — the canonical, declarations-only transcription of jni.h (no
+# transitive deps, no build.rs). Chosen over (a) the full `jni` crate, which
+# drags cesu8/combine/thiserror for ~15 functions we call, and (b) an
+# in-tree hand transcription of the 233-entry JNIEnv vtable, where a single
+# misplaced field silently calls the wrong JVM function (UB) — the exact
+# failure class the in-tree-FFI convention exists to avoid, inverted.
+[target.'cfg(target_os = "android")'.dependencies]
+jni-sys = "0.3"
 
 [build-dependencies]
 pkg-config = "0.3.32"

@@ -209,17 +209,20 @@ Full tour: [`bindings/rsac-go/README.md`](../bindings/rsac-go/README.md).
 
 ## Mobile (Android / iOS) — compiled surface growing, nothing device-verified
 
-The first real mobile code exists: `feat_android`/`feat_ios` compile AAudio /
-AVAudioEngine **microphone** backends (`CaptureTarget::Device(DeviceId("default"))`),
-and iOS additionally compiles the **`SystemDefault` broadcast path** (ReplayKit
-ring consumer; configure `AudioCaptureBuilder::with_ios_app_group(…)` and embed
-the `mobile/ios` RsacBroadcastKit extension). First-party glue ships in
-`mobile/{android,ios}/` and builds in CI, including `librsac.so` packaged into
-the AAR. Honesty status: **compile-checked cross-targets only — no runtime
-verification on any device; do not ship mobile capture claims.** Android
-playback capture (what `SystemDefault` means on Android, per ADR-0013) is
-still pending (`rsac-77f1`); per-app capture on iOS is permanently
-unavailable. The consent surface is already in the API: capabilities report
+The mobile backends are code-complete: `feat_android`/`feat_ios` compile
+AAudio / AVAudioEngine **microphone** backends
+(`CaptureTarget::Device(DeviceId("default"))`), the iOS **`SystemDefault`
+broadcast path** (ReplayKit ring consumer; configure
+`AudioCaptureBuilder::with_ios_app_group(…)` and embed the `mobile/ios`
+RsacBroadcastKit extension), and Android **playback capture** — all four
+tiers of what `SystemDefault`/`Application*`/`ProcessTree` mean on Android
+per ADR-0013, via the AAR's Kotlin loop + JNI ingest (needs API 29+, a
+`with_android_projection` consent token, and the AAR's foreground service).
+First-party glue ships in `mobile/{android,ios}/` and builds in CI,
+including `librsac.so` packaged into the AAR. Honesty status:
+**compile-checked cross-targets only — no runtime verification on any
+device; do not ship mobile capture claims.** Per-app capture on iOS is
+permanently unavailable. The consent surface: capabilities report
 `requires_user_consent`, Android builds expose
 `AudioCaptureBuilder::with_android_projection(AndroidProjectionToken)` (C FFI:
 `rsac_builder_set_android_projection`), and consent-gated targets without

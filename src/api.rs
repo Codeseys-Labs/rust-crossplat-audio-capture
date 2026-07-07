@@ -383,7 +383,7 @@ impl AudioCaptureBuilder {
         }
 
         // ── Consent preflight (mobile, ADR-0013 / rsac-82d4) ─────────
-        // Dormant scaffolding until an Android backend exists: it fires only
+        // Live as of rsac-77f1 (the Android playback backend): it fires only
         // when the platform *claims* the requested playback-capture tier AND
         // reports `requires_user_consent` AND no token was supplied. The
         // capability checks above dominate, so a build with no compiled-in
@@ -490,6 +490,13 @@ impl AudioCaptureBuilder {
         // ── Build capture config ────────────────────────────────────
         let mut stream_config = self.config;
         stream_config.capture_target = self.target.clone();
+        // Propagate the Android consent token into the stream config so the
+        // backend's create_stream can resolve it back through JNI
+        // (rsac-77f1); mirrors the ios_app_group plumbing.
+        #[cfg(target_os = "android")]
+        {
+            stream_config.android_projection = self.android_projection;
+        }
         #[allow(unused_mut)] // mutated only in the non-Linux negotiation block
         let mut capture_config = AudioCaptureConfig {
             target: self.target,
@@ -2666,6 +2673,8 @@ mod tests {
             capture_target: CaptureTarget::SystemDefault,
             #[cfg(target_os = "ios")]
             ios_app_group: None,
+            #[cfg(target_os = "android")]
+            android_projection: None,
         };
         let builder = AudioCaptureBuilder::new().with_config(config.clone());
         assert_eq!(builder.config, config);
@@ -2850,6 +2859,8 @@ mod tests {
             capture_target: CaptureTarget::SystemDefault,
             #[cfg(target_os = "ios")]
             ios_app_group: None,
+            #[cfg(target_os = "android")]
+            android_projection: None,
         };
         let builder = AudioCaptureBuilder::new()
             .sample_rate(44100) // This should be overridden

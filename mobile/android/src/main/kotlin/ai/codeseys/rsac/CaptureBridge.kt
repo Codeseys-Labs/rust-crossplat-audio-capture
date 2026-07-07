@@ -162,36 +162,45 @@ class CaptureBridge(
 
     /**
      * The dedicated capture loop: blocking reads into the single reused
-     * buffer, one [nativePush] per successful period.
+     * buffer, one [nativePush] per successful period. On exit — error path
+     * or normal stop — exactly one [nativeSessionEnded] fires (the terminal
+     * handshake): Rust treats a still-registered session as a spontaneous
+     * death (projection revoked, service destroyed, record death) and
+     * drives its bridge to the fatal terminal (ADR-0010/ADR-0003); on a
+     * Rust-initiated stop the session is already unregistered and the call
+     * is a no-op.
      */
     private fun readLoop() {
         val buf = readBuffer
-        while (running.get()) {
-            val read = audioRecord.read(buf, 0, buf.size, AudioRecord.READ_BLOCKING)
-            when {
-                read > 0 -> {
-                    // read() returns a float (sample) count; whole frames
-                    // only are forwarded (a partial trailing frame — not
-                    // expected from AudioRecord — is dropped, not split).
-                    val frames = read / channels
-                    if (frames > 0) {
-                        // Rust side: GetFloatArrayRegion into session-lifetime
-                        // scratch → push_samples_or_drop (ring-full ⇒ drop +
-                        // overrun count; never blocks this thread).
-                        nativePush(session, buf, frames, channels, sampleRate)
+        try {
+            while (running.get()) {
+                val read = audioRecord.read(buf, 0, buf.size, AudioRecord.READ_BLOCKING)
+                when {
+                    read > 0 -> {
+                        // read() returns a float (sample) count; whole frames
+                        // only are forwarded (a partial trailing frame — not
+                        // expected from AudioRecord — is dropped, not split).
+                        val frames = read / channels
+                        if (frames > 0) {
+                            // Rust side: GetFloatArrayRegion into session-lifetime
+                            // scratch → push_samples_or_drop (ring-full ⇒ drop +
+                            // overrun count; never blocks this thread).
+                            nativePush(session, buf, frames, channels, sampleRate)
+                        }
+                    }
+                    read == 0 -> {
+                        // Spurious empty read (e.g. racing stop()) — loop.
+                    }
+                    else -> {
+                        // ERROR_INVALID_OPERATION / ERROR_DEAD_OBJECT / ERROR:
+                        // the record can no longer deliver. Exit; the finally
+                        // block signals the terminal handshake — no policy here.
+                        break
                     }
                 }
-                read == 0 -> {
-                    // Spurious empty read (e.g. racing stop()) — loop.
-                }
-                else -> {
-                    // ERROR_INVALID_OPERATION / ERROR_DEAD_OBJECT / ERROR:
-                    // the record can no longer deliver. Exit; the Rust
-                    // orchestration observes the producer going quiet and
-                    // drives terminal semantics (ADR-0010) — no policy here.
-                    break
-                }
             }
+        } finally {
+            nativeSessionEnded(session)
         }
     }
 
@@ -236,14 +245,13 @@ class CaptureBridge(
          * out of [buf] and pushes them into the capture's ring buffer.
          *
          * Registered from Rust via `RegisterNatives` (`JNI_OnLoad`,
-         * src/audio/android/jni.rs — seed rsac-77f1) as
-         * `Java_ai_codeseys_rsac_CaptureBridge_nativePush`. **Lockstep
-         * contract**: renaming this method, its class, or its signature
-         * breaks the Rust registration (CI drift guard arrives with
-         * rsac-1a6e). Throws [UnsatisfiedLinkError] until librsac.so ships —
-         * guard with [RsacProjection.isNativeAvailable].
+         * src/audio/android/jni.rs — rsac-77f1). **Lockstep contract**:
+         * renaming this method, its class, or its signature breaks the Rust
+         * registration — guarded by the host-run `jni_lockstep` tests in
+         * src/audio/mod.rs. Throws [UnsatisfiedLinkError] until librsac.so
+         * is loaded — guard with [RsacProjection.isNativeAvailable].
          *
-         * @param session opaque per-capture ingest state pointer (Rust-owned)
+         * @param session opaque per-capture ingest-session id (Rust-owned)
          * @param buf interleaved f32 samples; only the first
          *   `frames * channels` entries are read
          * @param frames whole frames in this period
@@ -258,5 +266,17 @@ class CaptureBridge(
             channels: Int,
             sampleRate: Int,
         )
+
+        /**
+         * Terminal handshake into Rust: the read thread for [session] has
+         * exited (see [readLoop]). Fired exactly once per bridge, from the
+         * read thread's `finally`.
+         *
+         * Registered alongside [nativePush] (`RegisterNatives`, rsac-77f1)
+         * with signature `(J)V` — same **lockstep contract** and drift
+         * guard. Idempotent and safe for stale sessions on the Rust side.
+         */
+        @JvmStatic
+        external fun nativeSessionEnded(session: Long)
     }
 }

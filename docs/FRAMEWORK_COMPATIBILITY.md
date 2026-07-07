@@ -24,12 +24,12 @@ backend design (Android/iOS) see
 
 | Framework / runtime | Desktop (Win/Linux/macOS) | Android | iOS | Integration path |
 |---|---|---|---|---|
-| **Tauri v2** | ✅ verified (audio-graph) | 🟡 blocked on backend | 🟡 blocked on backend | Direct Rust dependency; mobile via `tauri-plugin-rsac` (planned, [ADR-0014](designs/0014-tauri-integration-model.md)) |
-| **Dioxus** | 🟢 expected | 🟡 blocked on backend | 🟡 blocked on backend | Direct Rust dependency (rsac is UI-framework-agnostic) |
+| **Tauri v2** | ✅ verified (audio-graph) | 🟡 blocked on runtime proof | 🟡 blocked on runtime proof | Direct Rust dependency; mobile via `tauri-plugin-rsac` (planned, [ADR-0014](designs/0014-tauri-integration-model.md)) |
+| **Dioxus** | 🟢 expected | 🟡 blocked on runtime proof | 🟡 blocked on runtime proof | Direct Rust dependency (rsac is UI-framework-agnostic) |
 | **Electron** | ✅ documented (napi, main process) | n/a | n/a | `@rsac/audio` (napi-rs) |
 | **Deno 2** | 🟢 expected | n/a | n/a | `npm:@rsac/audio` (Node-API compat) or `Deno.dlopen` over rsac-ffi |
 | **Bun / `bun --compile`** | 🟢 expected (napi CI is Bun-first); compile has a packaging caveat | n/a | n/a | `@rsac/audio` or `bun:ffi` over rsac-ffi |
-| **Flutter** | 🟢 expected via `dart:ffi` + ffigen | 🟡 blocked on backend | 🟡 blocked on backend | New Dart package over `bindings/rsac-ffi/include/rsac.h` |
+| **Flutter** | 🟢 expected via `dart:ffi` + ffigen | 🟡 blocked on runtime proof | 🟡 blocked on runtime proof | New Dart package over `bindings/rsac-ffi/include/rsac.h` |
 | Rust-native GUIs (egui/Iced/Slint/GPUI) | 🟢 expected (trivially) | 🟡 | 🟡 | Direct Rust dependency |
 | React Native | 🟢 expected on paper (JSI/Nitro or uniffi over rsac-ffi) | 🟡 | 🟡 | Long tail — no commitment |
 | Capacitor / Ionic | — | 🟡 | 🟡 | Long tail — no commitment |
@@ -39,14 +39,15 @@ backend design (Android/iOS) see
 
 **The single most important row-shape:** every 🟡 in the Android/iOS columns is
 the *same* blocker — rsac's mobile backends are not runtime-verified yet.
-Status: the **microphone slices and the iOS `SystemDefault` broadcast consumer
-are implemented and compile-checked** (`feat_android` AAudio / `feat_ios`
-AVAudioEngine + ReplayKit ring — **zero runtime verification on any device**;
-seeds rsac-e6d3/rsac-97c8), while Android playback capture — what frameworks
-want for "system audio" on Android — remains pending (rsac-77f1). Once
-runtime verification lands, every 🟡 above resolves through its listed
-integration path. Conversely, the ❌ cells are Apple/Google/browser policy,
-and **no framework choice changes them**.
+Status: the **mobile backends are code-complete and compile-checked** — the
+microphone slices (`feat_android` AAudio / `feat_ios` AVAudioEngine), the iOS
+`SystemDefault` broadcast consumer (ReplayKit ring), and Android playback
+capture — what frameworks want for "system audio" on Android — all four
+`AudioPlaybackCapture` tiers via the AAR Kotlin loop + JNI ingest (rsac-77f1)
+— with **zero runtime verification on any device** (seeds
+rsac-e6d3/rsac-97c8). Once runtime verification lands, every 🟡 above
+resolves through its listed integration path. Conversely, the ❌ cells are
+Apple/Google/browser policy, and **no framework choice changes them**.
 
 ## Tauri v2
 
@@ -73,7 +74,7 @@ as *proposed* in [ADR-0014](designs/0014-tauri-integration-model.md): audio-grap
 keeps its direct dependency on desktop; the plugin is planned as the mobile
 vehicle (wave 5).
 
-**Mobile: 🟡 blocked on backends.** Tauri v2 builds for Android/iOS today, and
+**Mobile: 🟡 blocked on runtime proofs.** Tauri v2 builds for Android/iOS today, and
 rsac already *compiles* for those targets as an honest stub
 (`PlatformCapabilities::unsupported()`, `AudioError::PlatformNotSupported` —
 src/audio/mod.rs, src/core/capabilities.rs). Real capture requires the backends
@@ -88,7 +89,7 @@ Spawn capture on a background thread/task, feed UI state via Dioxus signals.
 The marker flips to ✅ when a downstream Dioxus integration verifies it (see
 [Verification policy](#verification-policy)).
 
-**Mobile: 🟡 blocked on backends.** Dioxus has no plugin system like Tauri's, so
+**Mobile: 🟡 blocked on runtime proofs.** Dioxus has no plugin system like Tauri's, so
 on Android the host app must obtain the MediaProjection consent token itself
 (via its own Kotlin activity glue) and hand it to
 `AudioCaptureBuilder::with_android_projection(...)` — the documented recipe in
