@@ -3,14 +3,22 @@
 test-results/
 research/
 
-# Editor / IDE
-.vscode/
+# Editor / IDE — personal files stay ignored, but the shared rust-analyzer
+# feature config is checked in (rsac-4f0d): without it, feature-gated code
+# (src/compose/, src/main.rs, gated examples) gets no diagnostics.
+.vscode/*
+!.vscode/settings.json
+!.vscode/extensions.json
 .idea/
 *.suo
 *.ntvs*
 *.njsproj
 *.sln
 *.sw?
+
+# Binding smoke-test scratch (ci.yml check-bindings + local runs, rsac-e1f7)
+.venv-smoke/
+bindings/rsac-napi/package-lock.json
 
 # Logs
 logs/
@@ -45,3 +53,12 @@ windows-storage/
 
 # Stale tool-cache dirs
 .upstream-refs/
+
+# Kilo agent state (worktrees, manager state, node_modules) — only committed
+# plans (.kilo/plans/) are tracked; everything else is machine-local.
+.kilo/*
+!.kilo/plans/
+
+# audio-graph now depends on rsac (submodule relationship reversed) —
+# this checkout is a standalone repo, not tracked here.
+/apps/

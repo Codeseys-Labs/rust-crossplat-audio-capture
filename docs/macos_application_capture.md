@@ -1,153 +1,219 @@
 # macOS Application-Level Audio Capture
 
-This document describes how to use the `rust-crossplat-audio-capture` library to capture audio from specific applications on macOS. This feature leverages Core Audio Taps.
+How to capture audio from a specific application (or process subtree) on macOS
+with the `rsac` library. On macOS this is implemented with a **CoreAudio Process
+Tap** plus an aggregate device; you drive it entirely through the public
+`rsac` API — no platform-specific code in your program.
+
+> All code below uses only the current public API (`use rsac::...`). See
+> [`docs/API.md`](API.md) for the full API tour.
 
 ## Overview
 
-Application-level audio capture on macOS allows you to record or process the audio output of a single, targeted application, rather than the entire system audio mix. This is achieved by creating a "tap" on the audio stream of the target application process.
+Application capture records the audio output of a single targeted process (or a
+process and its descendants) rather than the whole system mix. You select what
+to capture with a [`CaptureTarget`](../src/core/config.rs) and hand it to
+[`AudioCaptureBuilder`](../src/api.rs); the macOS backend resolves the target to
+a Process Tap behind the scenes.
 
 ## Prerequisites
 
-To use application-level audio capture on macOS, the following conditions must be met:
+1. **macOS 14.4 or newer.** CoreAudio Process Tap (the mechanism rsac uses for
+   per-application capture) is only available on macOS 14.4+. The backend uses a
+   3-path `CATapDescription` fallback to remain compatible across macOS 14.4–15
+   (Sonoma/Sequoia) and macOS 26 (Tahoe). See
+   [macOS Version Compatibility](MACOS_VERSION_COMPATIBILITY.md) and the
+   [macOS 26 Process Tap fix](MACOS26_PROCESS_TAP_FIX.md) for details — you do
+   not need to handle any of this yourself.
 
-1.  **Operating System:** macOS 14.4 or newer is required. Earlier versions of macOS do not support the necessary Core Audio features for reliable application-level tapping by third-party applications.
-2.  **Info.plist Configuration:** The application that _uses this library_ (i.e., your application) **must** include the `NSAudioCaptureUsageDescription` key in its `Info.plist` file. This key provides a string that is displayed to the user when the system requests permission for audio capture.
+2. **`Info.plist` — `NSAudioCaptureUsageDescription`.** The application that
+   *uses this library* must declare the `NSAudioCaptureUsageDescription` key.
+   The OS shows this string when it prompts the user for audio-capture
+   permission on the first Process Tap attempt.
 
-    Example `Info.plist` snippet:
+   ```xml
+   <?xml version="1.0" encoding="UTF-8"?>
+   <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+   <plist version="1.0">
+   <dict>
+       <!-- ... other keys ... -->
+       <key>NSAudioCaptureUsageDescription</key>
+       <string>This app captures other applications' audio to [record / visualize / analyze it].</string>
+       <!-- ... other keys ... -->
+   </dict>
+   </plist>
+   ```
 
-    ```xml
-    <?xml version="1.0" encoding="UTF-8"?>
-    <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
-    <plist version="1.0">
-    <dict>
-        <!-- ... other keys ... -->
-        <key>NSAudioCaptureUsageDescription</key>
-        <string>This application needs to capture audio from other applications to [explain your feature, e.g., 'record its sound output', 'visualize its audio', 'provide audio analysis'].</string>
-        <!-- ... other keys ... -->
-    </dict>
-    </plist>
-    ```
+## Permissions: it is "Audio Capture", not "Screen Recording"
 
-    Failure to include this key will result in permission errors or silent failure when attempting to capture audio.
+Process Tap is gated by the **Audio Capture** TCC service
+(`kTCCServiceAudioCapture`). This is a **distinct, stricter** privacy permission
+from:
 
-## Usage Workflow
+- **Screen Recording** (`kTCCServiceScreenCapture`) — used by ScreenCaptureKit /
+  window capture. rsac does **not** use this and you should **not** tell users
+  to enable it.
+- **Microphone** — input-device capture. Process Tap captures application
+  *output*, not the mic, so the Microphone permission is also not what's
+  required.
 
-The typical workflow for capturing audio from a specific application is as follows:
+The dependency is declared via `NSAudioCaptureUsageDescription` in `Info.plist`
+(above); macOS prompts the user on the first Process Tap attempt and records the
+grant/denial under `kTCCServiceAudioCapture`.
 
-1.  **Enumerate Running Applications:**
-    Call [`rust_crossplat_audio_capture::audio::macos::enumerate_audio_applications()`](../src/audio/macos.rs) to get a list of currently running applications. This function returns a `Vec<ApplicationInfo>`, where each [`ApplicationInfo`](../src/audio/macos.rs) struct contains the process ID (PID), name, and bundle ID of an application.
+You can query the current status through the public API:
 
-    ```rust
-    use rust_crossplat_audio_capture::audio::macos::enumerate_audio_applications;
+```rust
+use rsac::check_audio_capture_permission;
+use rsac::core::introspection::PermissionStatus;
 
-    match enumerate_audio_applications() {
-        Ok(apps) => {
-            if apps.is_empty() {
-                println!("No running applications found.");
-            } else {
-                println!("Available applications:");
-                for (i, app_info) in apps.iter().enumerate() {
-                    println!(
-                        "{}: PID: {}, Name: {}, Bundle ID: {:?}",
-                        i, app_info.process_id, app_info.name, app_info.bundle_id
-                    );
-                }
-                // Store 'apps' for selection
+match check_audio_capture_permission() {
+    PermissionStatus::Granted => { /* ready to capture */ }
+    PermissionStatus::NotDetermined => { /* the OS will prompt on first tap */ }
+    PermissionStatus::Denied => { /* guide the user to System Settings */ }
+    PermissionStatus::NotRequired => { /* non-macOS platforms */ }
+    _ => {} // PermissionStatus is #[non_exhaustive]
+}
+```
+
+If permission is denied, guide the user to **System Settings → Privacy &
+Security → Audio Capture** for your app — not Screen Recording, not Microphone.
+
+## Choosing a capture target
+
+macOS supports three application-oriented `CaptureTarget` variants, each
+resolving to a different Process Tap on the backend
+(see [`src/audio/macos/thread.rs`](../src/audio/macos/thread.rs)):
+
+| Target | How it resolves on macOS | Captures |
+|---|---|---|
+| `CaptureTarget::ApplicationByName(name)` | Enumerates running apps, matches `name` **exactly, case-insensitively** against the localized app name (e.g. `"Safari"`, `"Music"`), then taps that PID | One app's audio |
+| `CaptureTarget::Application(ApplicationId(pid))` | Parses the `ApplicationId` string as a numeric PID, then taps it | One process's audio session |
+| `CaptureTarget::ProcessTree(ProcessId(pid))` | Taps the parent PID **and its child processes** (multi-PID tap) | A whole process subtree |
+
+> `ApplicationByName` uses **exact** case-insensitive name matching (not
+> substring), consistent across all three platforms — so `"Music"` will not
+> accidentally resolve to `"Apple Music"`.
+
+Convenience constructors (from [`src/core/introspection.rs`](../src/core/introspection.rs)):
+
+```rust
+use rsac::core::config::CaptureTarget;
+
+let by_name = CaptureTarget::app("Safari");     // → ApplicationByName("Safari")
+let by_tree = CaptureTarget::pid(1234);         // → ProcessTree(ProcessId(1234))
+```
+
+## Discovering targets
+
+Use the cross-platform public discovery helpers — do **not** reach into internal
+`audio::macos::…` paths.
+
+```rust
+use rsac::{list_audio_applications, list_audio_sources};
+use rsac::core::introspection::AudioSourceKind;
+
+// All running applications that may be producing audio.
+for source in list_audio_applications()? {
+    if let AudioSourceKind::Application { pid, app_name, bundle_id } = &source.kind {
+        println!("{app_name} (pid {pid}, bundle {bundle_id:?})");
+    }
+}
+
+// Or the unified list (system default + devices + applications), where each
+// discovered source can be turned straight into a CaptureTarget:
+for source in list_audio_sources()? {
+    let target = source.to_capture_target();
+    let _ = target; // feed into AudioCaptureBuilder::with_target(...)
+}
+```
+
+Note: a discovered application maps to `CaptureTarget::Application` (that single
+app's session), not the whole process tree. To capture the subtree, construct
+`CaptureTarget::pid(...)` / `CaptureTarget::ProcessTree(...)` explicitly.
+
+## Full example
+
+```rust
+use rsac::api::AudioCaptureBuilder;
+use rsac::core::config::{CaptureTarget, SampleFormat};
+
+fn main() -> Result<(), Box<dyn std::error::Error>> {
+    let mut capture = AudioCaptureBuilder::new()
+        .with_target(CaptureTarget::app("Safari")) // capture Safari's audio
+        .sample_rate(48_000)                        // 22050/32000/44100/48000/88200/96000
+        .channels(2)                                // 1..=32
+        .sample_format(SampleFormat::F32)
+        .build()?;
+
+    capture.start()?;
+    println!("Capturing application audio…");
+
+    let start = std::time::Instant::now();
+    while start.elapsed().as_secs() < 5 {
+        match capture.read_buffer()? {          // non-blocking pull
+            Some(buffer) => {
+                let _frames = buffer.num_frames();
+                let _level = buffer.rms_dbfs(); // RT-safe metering
+                // … process buffer.data() (interleaved f32) …
             }
-        }
-        Err(e) => {
-            eprintln!("Error enumerating applications: {:?}", e);
+            None => std::thread::sleep(std::time::Duration::from_millis(1)),
         }
     }
-    ```
 
-2.  **Select Target Application:**
-    Present the list of applications to the user (or use other logic) to select a target application. Obtain the `process_id` (PID) of the chosen application.
+    capture.stop()?;
+    Ok(())
+}
+```
 
-3.  **Build AudioCapture Instance:**
-    Use [`AudioCaptureBuilder`](../src/api.rs) to configure and build an [`AudioCapture`](../src/api.rs) instance. Crucially, call the [`target_application_pid()`](../src/api.rs) method with the PID of the selected application.
+To target a specific PID instead of a name, swap the target:
 
-    ```rust
-    use rust_crossplat_audio_capture::api::AudioCaptureBuilder;
-    use rust_crossplat_audio_capture::audio::{StreamConfig, AudioFormat, SampleFormat, ChannelCount};
+```rust
+use rsac::core::config::{CaptureTarget, ApplicationId, ProcessId};
 
-    let target_pid = /* PID of the selected application */;
-    let stream_config = StreamConfig {
-        format: AudioFormat {
-            sample_format: SampleFormat::F32LE, // CoreAudio taps typically provide F32 non-interleaved
-            sample_rate: 48000, // Or match the tap's native sample rate if known
-            channels: ChannelCount::Stereo, // Or match the tap's native channel count
-        },
-        buffer_size_frames: None, // Use default
-    };
+// One process's session:
+let _ = CaptureTarget::Application(ApplicationId("1234".to_string()));
+// A process and all its children:
+let _ = CaptureTarget::ProcessTree(ProcessId(1234));
+```
 
-    let mut capturer = match AudioCaptureBuilder::new()
-        .target_application_pid(target_pid)
-        .stream_config(stream_config)
-        .build()
-    {
-        Ok(c) => c,
-        Err(e) => {
-            eprintln!("Failed to build application audio capturer: {:?}", e);
-            return; // Or handle error
-        }
-    };
-    ```
-
-4.  **Start and Manage Stream:**
-    Once the `AudioCapture` instance is built, you can start, read/stream data, and stop the stream using its methods (`start_capture()`, `read_chunk()`, `stop_capture()`, etc.) as you would for regular system audio capture.
-
-    ```rust
-    # use rust_crossplat_audio_capture::api::AudioCapture;
-    # use rust_crossplat_audio_capture::core::AudioBuffer;
-    # fn do_capture(mut capturer: AudioCapture<impl rust_crossplat_audio_capture::audio::AudioDevice + 'static>) -> anyhow::Result<()> {
-    capturer.start_capture()?;
-    println!("Capturing audio from target application...");
-
-    // Example: Capture for a few seconds
-    let start_time = std::time::Instant::now();
-    while start_time.elapsed().as_secs() < 5 {
-        match capturer.read_chunk(Some(100)) { // Non-blocking read with timeout
-            Ok(Some(buffer)) => {
-                println!("Read chunk: {} frames", buffer.num_frames());
-                // Process audio data in buffer.as_slice()
-            }
-            Ok(None) => {
-                // No data available, timeout occurred
-                std::thread::sleep(std::time::Duration::from_millis(10));
-            }
-            Err(e) => {
-                eprintln!("Error reading chunk: {:?}", e);
-                break;
-            }
-        }
-    }
-    capturer.stop_capture()?;
-    println!("Capture stopped.");
-    # Ok(())
-    # }
-    ```
+Other consumption styles (blocking reads, the `buffers_iter()` iterator,
+`subscribe()` channel delivery, `set_callback(...)`, and the async stream) work
+identically for application capture — see [`docs/API.md`](API.md).
 
 ## Limitations
 
-- **macOS Version:** This feature is strictly limited to macOS 14.4 and newer.
-- **PID Stability:** Targeting is based on Process IDs (PIDs). If a target application restarts, its PID will change, and the existing capture stream will likely fail or stop producing data. The user may need to re-select the application.
-- **Enumeration vs. Audio Activity:** [`enumerate_audio_applications()`](../src/audio/macos.rs) lists all _running_ applications, not necessarily only those currently playing or producing audio. The tap will attach regardless, but might not yield data if the application is silent.
-- **Permissions:** The user must grant screen and audio recording permission to your application when prompted by macOS. If permission is denied, capture will fail.
+- **macOS version:** strictly macOS 14.4+ (Process Tap requirement).
+- **PID stability:** targeting is ultimately by PID. If the target application
+  restarts, its PID changes and the stream will stop producing data. Re-resolve
+  the target (e.g. re-run `list_audio_applications()` or re-issue
+  `CaptureTarget::app(name)`).
+- **Enumeration vs. audio activity:** `list_audio_applications()` lists running
+  apps, not only those currently producing sound. A tap attaches regardless but
+  yields no data while the app is silent.
+- **Buffer sizing:** the `buffer_size` builder hint is honored only on Windows
+  today; the macOS backend derives its ring capacity internally.
 
 ## Troubleshooting
 
-- **Permission Errors:**
-  - Ensure the `NSAudioCaptureUsageDescription` key is correctly set in your application's `Info.plist`.
-  - Guide the user to grant permission in System Settings > Privacy & Security > Screen Recording (and potentially Microphone, though the tap is for application output). The system prompt for application audio capture usually covers this.
-- **Target Application Quits:** If the targeted application quits or crashes, the audio stream will likely stop producing data. Calls to `read_chunk()` may return errors (e.g., `AudioError::DeviceDisconnected` or a backend-specific error indicating the tap is no longer valid). Your application should handle this gracefully, possibly by notifying the user and allowing them to select a new target.
-- **No Audio Data:**
-  - Verify the target application is actually producing audio.
-  - Check for any errors returned by `build()` or `start_capture()`.
-  - Ensure the correct PID was used.
+- **Permission errors / silent capture:** confirm `NSAudioCaptureUsageDescription`
+  is in your `Info.plist`, and that the user granted **Audio Capture** (System
+  Settings → Privacy & Security → Audio Capture) — *not* Screen Recording and
+  *not* Microphone. Check status with `check_audio_capture_permission()`.
+- **`ApplicationNotFound`:** the name did not match any running app's localized
+  name exactly (case-insensitively), or the PID was not numeric / not running.
+  Enumerate with `list_audio_applications()` to see the exact names/PIDs.
+- **Target quits:** when the app exits, reads stop yielding data and may return a
+  fatal error. Break on `e.is_fatal()` and re-resolve the target.
+- **No audio data:** verify the app is actually producing sound; on a fresh grant
+  the first attempt may trigger the OS permission prompt.
 
-## Best Practices
+## Best practices
 
-- **Re-enumerate on Failure:** If a capture stream for a previously working PID fails (e.g., due to `AudioError::DeviceDisconnected`), consider prompting the user to re-select the application. Call [`enumerate_audio_applications()`](../src/audio/macos.rs) again to get an updated list, as the application might have restarted with a new PID.
-- **User Feedback:** Provide clear feedback to the user about which application is being targeted and the status of the capture.
-- **Error Handling:** Robustly handle potential errors from all library calls, especially those related to device interaction and stream management.
+- **Handle errors by class:** treat `e.is_fatal()` as terminal (re-select a
+  target), retry recoverable errors, and handle `Ok(None)` from `read_buffer()`
+  with a short sleep.
+- **Re-enumerate on failure:** if a previously working target fails, re-run
+  `list_audio_applications()` — the app may have restarted with a new PID.
+- **Report the target:** surface which application is being captured and the
+  capture status to the user.

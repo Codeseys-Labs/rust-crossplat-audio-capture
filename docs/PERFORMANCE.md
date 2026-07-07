@@ -2,14 +2,17 @@
 
 ## Overview
 
-rsac is a **capture-only** library: its performance story is about getting audio
+rsac is a **capture-first** library: its performance story is about getting audio
 off the OS callback thread and to the consumer with the smallest possible
-real-time (RT) risk, *not* about signal processing. There is no DSP, mixing,
-resampling, encoding, or SIMD kernel in rsac — those are explicit non-goals
-(see [`VISION.md`](../VISION.md)) and belong to downstream consumers. This
-document describes the parts of the pipeline that actually affect latency and
-RT-safety, and is honest about which optimisations are wired into the shipping
-path versus implemented-but-not-yet-wired.
+real-time (RT) risk, *not* about signal processing. There is no general-purpose
+DSP, encoding, or SIMD kernel in rsac — those are non-goals
+(see [`VISION.md`](../VISION.md)) and belong to downstream consumers. The one
+scope amendment is the opt-in `compose` feature (ADR-0011), whose mixdown and
+`rubato` resampling run **exclusively on a dedicated non-RT compositor
+thread** — never on an OS audio callback — so it does not change the RT story
+described here. This document describes the parts of the pipeline that
+actually affect latency and RT-safety, and is honest about which optimisations
+are wired into the shipping path versus implemented-but-not-yet-wired.
 
 ## Critical path: the producer/consumer bridge
 
@@ -180,13 +183,16 @@ via `rtrb`'s `write_chunk_uninit` + `CopyToUninit`, eliminating the per-buffer
 These were once aspirational and are explicitly out of scope — rsac is capture,
 not DSP:
 
-- No SIMD signal-processing kernels, buffer-pool DSP, or resampling.
+- No SIMD signal-processing kernels or buffer-pool DSP.
 - No in-place transform pipeline. `AudioProcessor` (`src/core/processing.rs`) is
   an intentionally empty, fenced-off extension point rsac will never populate
   with DSP.
-- Mixing, encoding (MP3/AAC/Opus), playback, VAD, and AEC are downstream
-  concerns. Downstreams own resampling (e.g. `rubato`), mixdown, and encoding
-  (e.g. `hound`/`symphonia`).
+- Encoding (MP3/AAC/Opus), playback, VAD, and AEC are downstream concerns.
+  Downstreams own general-purpose resampling (e.g. `rubato`) and encoding
+  (e.g. `hound`/`symphonia`). The exception is the opt-in `compose` feature
+  (ADR-0011): its per-group mixdown and internal rate-alignment resampling run
+  on a dedicated non-RT compositor thread, off the critical path this document
+  covers.
 
 ## Benchmarks
 

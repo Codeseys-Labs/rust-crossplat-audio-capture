@@ -1,2 +1,0 @@
-[build]
-rustflags = ["--cfg", "feature=\"v0_3_65\""]

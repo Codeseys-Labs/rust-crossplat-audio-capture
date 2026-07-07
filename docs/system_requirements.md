@@ -6,7 +6,7 @@ This document outlines the system requirements and setup steps for building and 
 
 The library supports application-specific audio capture using platform-native APIs:
 
-- **Windows**: WASAPI Process Loopback (Windows 10+)
+- **Windows**: WASAPI Process Loopback (Windows 10 build 20348+)
 - **Linux**: PipeWire monitor streams (PipeWire 0.3.44+)
 - **macOS**: CoreAudio Process Tap (macOS 14.4+)
 
@@ -19,7 +19,7 @@ The library supports application-specific audio capture using platform-native AP
 - **Architecture**: x86_64 (primary), x86 (supported)
 
 #### Build Dependencies
-- **Rust**: 1.74+ (as specified in Cargo.toml)
+- **Rust**: 1.95+ (matches the pinned CI toolchain, `dtolnay/rust-toolchain@1.95.0`)
 - **Windows SDK**: Automatically handled by `windows` crate
 - **Visual Studio Build Tools**: Required for linking
 
@@ -116,7 +116,7 @@ pw-cli list-objects Node
 
 #### Build Dependencies
 - **Xcode Command Line Tools**: Required for framework linking
-- **Rust**: 1.74+ with macOS target support
+- **Rust**: 1.95+ with macOS target support
 
 #### Runtime Dependencies
 - **CoreAudio Framework**: Built into macOS
@@ -209,22 +209,34 @@ cargo check --target aarch64-apple-darwin
 ## Testing Setup
 
 ### Minimal Test Applications
-Each platform includes test applications for verification:
+Each platform ships diagnostic binaries and cross-platform examples for
+verification (see `Cargo.toml` for the full target list):
 
 ```bash
-# Windows - Test WASAPI Process Loopback
-cargo run --example windows_device_test --features feat_windows
+# Windows — WASAPI session diagnostic (feature-gated bin)
+cargo run --bin wasapi_session_test --no-default-features --features feat_windows
 
-# Linux - Test PipeWire monitor streams  
-cargo run --example test_capture --features feat_linux
+# Linux — PipeWire diagnostic (feature-gated bin)
+cargo run --bin pipewire_diagnostics --no-default-features --features feat_linux
 
-# macOS - Test CoreAudio Process Tap
-cargo run --example macos_application_capture --features feat_macos
+# Cross-platform examples (use the public API only; pick your platform feature)
+cargo run --example list_devices  --no-default-features --features feat_linux
+cargo run --example basic_capture --no-default-features --features feat_linux,cli
+cargo run --example record_to_file --no-default-features --features feat_linux,cli -- out.wav
 ```
 
-### CI/CD Considerations
-- **Windows**: Use `windows-latest` with Visual Studio Build Tools
-- **Linux**: Use Ubuntu 22.04+ with PipeWire packages
-- **macOS**: Use `macos-14` or later for Process Tap API support
+The end-to-end capture behaviour (including per-application and process-tree
+capture) is exercised by the `ci_audio` integration suite; see
+[CI Audio Integration Testing](CI_AUDIO_TESTING.md).
 
-For detailed implementation information, see [Application-Specific Audio Capture Research](app_specific_capture_research.md).
+### CI/CD Considerations
+- **Windows**: audio integration tests run on GitHub-hosted `windows-latest`
+  with VB-CABLE (the Blacksmith Windows image has no audio subsystem, so it is
+  compile/unit-only). See [`ci-audio-tests.yml`](../.github/workflows/ci-audio-tests.yml).
+- **Linux**: Ubuntu 24.04 (`blacksmith-4vcpu-ubuntu-2404`) with PipeWire packages.
+- **macOS**: `blacksmith-6vcpu-macos-15`; Process Tap paths skip early on managed
+  runners because `kTCCServiceAudioCapture` cannot be granted non-interactively.
+
+For detailed implementation information, see the archived
+[Application-Specific Audio Capture Research](history/app_specific_capture_research.md)
+(historical — written against the pre-Phase-0 API).

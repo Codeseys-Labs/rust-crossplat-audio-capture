@@ -41,8 +41,8 @@ The compose files live at the repo root per docker-compose convention
 - `docker-compose.testing-no-kvm.yml` — fallback when KVM is unavailable
 - `docker-compose.native-testing.yml` — dockur native VM test stack
 
-See also: [docs/DOCKER_TESTING.md](../docs/DOCKER_TESTING.md) and
-[docs/LOCAL_CI.md](../docs/LOCAL_CI.md) for end-to-end workflows, and
+See also: [docs/DOCKER_TESTING.md](../docs/DOCKER_TESTING.md) for end-to-end
+workflows, and
 [scripts/docker-test-all.sh](../scripts/docker-test-all.sh) for the
 canonical "run every test in a container" entry point.
 

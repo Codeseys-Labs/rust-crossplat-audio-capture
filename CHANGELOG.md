@@ -20,15 +20,199 @@ Releases with no ABI change omit the subsection (or state "No C ABI changes").
 
 ### Added
 
+- **`macos-tcc-spi` feature — real audio-capture permission preflight
+  (ADR-0015).** `check_audio_capture_permission()` on macOS can now return a
+  real answer: there is no public API for the `kTCCServiceAudioCapture`
+  (Process Tap) status, so the opt-in feature `dlopen`s the private
+  `TCCAccessPreflight` SPI at runtime (the AudioCap mechanism). Off by
+  default: the published artifact carries no private-symbol usage and keeps
+  the honest `NotDetermined` stub; any SPI resolution failure also degrades
+  to `NotDetermined`.
+- **macOS silent-zeros diagnostic (ADR-0016).** A denied/unkeyed TCC context
+  makes a Process Tap stream perfectly silent zeros while looking healthy
+  (verified on macOS 26). The RT callback now flips an atomic on the first
+  non-zero sample (alloc-free) and a non-RT watchdog logs one warning at 2 s
+  if a tap capture is still all-silent — warn-only, since silence is
+  legitimate. Would have one-lined a multi-hour diagnosis.
+- **Multi-source channel composition (`compose` feature, ADR-0011).** New
+  `rsac::compose` module — `CompositionBuilder` → `Composition`: declare
+  *groups* of `CaptureTarget`s that either mix down to Mono/Stereo output
+  channels (gain-weighted plain summation, optional `clamp_output`) or pass a
+  single source's native channels through (`keep_channels()`); groups append
+  in declaration order into ONE interleaved-f32 multi-channel stream speaking
+  the standard `CapturingStream` contract (terminal semantics, overrun and
+  backpressure counters, `drain_to()` sinks, async waker all included).
+  Sources delivering a different sample rate are resampled to the session
+  rate (default 48 kHz) with `rubato` on a dedicated non-RT compositor
+  thread. Alignment is master-clock paced (first system/device source) with
+  per-source silence-padding / bounded trimming and a wall-clock fallback on
+  master stall; `Composition::stats()` exposes per-source
+  `padded_frames`/`trimmed_frames`/`resampling` counters and
+  `channel_map()` reports which output channel belongs to which group. Off by
+  default; enabling it pulls `rubato` + `audioadapter-buffers`. See
+  `examples/composed_capture.rs` and docs/designs/0011-compose-feature.md.
+- **CI: MSRV job** — builds with Rust 1.87 (`rust-version` floor) so the
+  declared MSRV can no longer rot silently under the pinned toolchain; also
+  the tripwire for optional-dependency MSRV bumps (rubato et al.).
+- **CI: cargo-hack feature-powerset job** — pairwise (`--depth 2`) checks
+  across `async-stream`/`sink-wav`/`test-utils`/`bridge-zerocopy`/`tracing`/
+  `compose`/`cli`/`feat_linux`, replacing single-combo-only coverage.
+- **Release gate: cargo-semver-checks** — the release verify stage now fails
+  on API breakage not matched by the right semver bump (baseline = previous
+  release tag; auto-skips on the first release).
+- **`#![warn(missing_docs)]`** at the crate root, with the outstanding
+  rustdoc gaps filled (`ErrorKind` variants, `AudioError` variant fields,
+  platform enumerator items).
+- **Buffer timestamps populated on every backend (stream position).** The
+  platform RT push paths (WASAPI thread, PipeWire `.process`, CoreAudio
+  IOProc) now use stamping push variants
+  (`push_samples_or_drop_stamped`/`push_samples_guarded_stamped`): each
+  delivered `AudioBuffer` carries `timestamp() = frames offered ÷ rate` —
+  pure integer math, no clock syscall, ADR-0001 alloc-free proof extended to
+  the stamped path (`tests/rt_alloc.rs`). Producer-side drops surface as
+  *gaps* between consecutive timestamps instead of a contiguous lie. Composed
+  buffers (the `compose` feature) are stamped with the same semantics. The
+  refinement to per-backend device clocks stays tracked (rsac-ec25).
+- **`Composition` consumption parity**: `subscribe()`,
+  `subscribe_with_errors()`, and (with `async-stream`) `audio_data_stream()`
+  now exist on `Composition` with the same delivery contracts as
+  `AudioCapture` (the pumps are shared, not duplicated).
+- **Compose exposed through the C FFI** (`rsac-ffi` `compose` feature, off by
+  default like `sink-wav`): 24 new `rsac_*` functions —
+  `RsacGroup`/`RsacCompositionBuilder`/`RsacComposition` opaque handles,
+  layout enum, `repr(C)` stats structs, channel-map introspection — all
+  null-safe and panic-caught; headers regenerated deterministically behind
+  `RSAC_FEATURE_COMPOSE`. Python/Node/Go wrappers remain tracked
+  (rsac-fba7).
+- **Interop recipes** (`docs/INTEROP.md`): copy-paste bridges from rsac
+  buffers into `dasp`, `cpal`/`rodio` playback, `hound` WAV, and encoder
+  pipelines, plus timestamp-based drop/sync accounting.
+- **CI: advisory coverage job** (cargo-llvm-cov on the Linux lib suite,
+  lcov artifact + optional Codecov upload when `CODECOV_TOKEN` exists;
+  `continue-on-error` — trend data, not a gate).
+- **Release: automatic tag→publish fan-out.** `release-tag.yml` mints a
+  GitHub-App installation token (org secrets `RSAC_RELEASE_APP_ID` /
+  `RSAC_RELEASE_APP_PRIVATE_KEY`) so the version tag triggers the
+  crates.io/npm/PyPI publish workflows automatically, and pushes the
+  `bindings/rsac-go/vX.Y.Z` module tag in the same job. Without the secrets
+  the previous manual-dispatch behavior is preserved and the job summary
+  documents the setup.
+
 ### Changed
+
+- **CLI-only dependencies are now feature-gated (`cli` feature).** `clap`,
+  `color-eyre`, `ctrlc`, and `env_logger` were unconditional dependencies
+  serving only the demo binaries; they are now optional behind the new `cli`
+  feature (NOT in defaults). Library consumers' dependency trees shrink
+  accordingly. **Action needed only for binary users:** build/install the
+  demo CLI with `--features cli`; the `rsac`/`standardized_test` bins and the
+  `verify_audio`/`basic_capture`/`record_to_file` examples declare
+  `required-features = ["cli"]`.
+- **VISION scope amendment (ADR-0011):** stream mixing moved from
+  out-of-scope to in-scope *behind the opt-in `compose` feature*;
+  general-purpose DSP/effects/encoding remain out of scope.
+- `Cargo.toml` `repository` now points at the canonical
+  `Codeseys-Labs/rust-crossplat-audio-capture` (was a stale personal fork
+  URL); `/bindings` is excluded from the published crate tarball (rsac-go has
+  no manifest of its own and would otherwise ship in it).
+- CI ARM64 cross-compile gates (`cross-compile-linux-arm64`,
+  `go-bindings-arm64-check`) are now exit-code-authoritative instead of
+  grepping logs behind `|| true` (which `CARGO_TERM_COLOR=always` ANSI codes
+  could false-green); only the known missing-aarch64-PipeWire diagnostic is
+  tolerated.
 
 ### Deprecated
 
 ### Removed
 
+- Stale `blacksmith-audio-probe.yml` one-shot diagnostic workflow (its
+  findings are recorded in AGENTS.md §6).
+
 ### Fixed
 
+Real-hardware macOS verification pass (macOS 26 / M4, full report in PR #35):
+
+- `watch()` rustdoc linked a private item from public docs — invisible to
+  CI's Linux-only docs job because `src/audio/macos/` is cfg-stripped there
+  (systemic gap seeded as rsac-0fb1).
+- A stale ci_audio round-trip test still asserted the pre-#27
+  `Application→ProcessTree` mapping; retargeted to the shipped contract.
+- `subscribe_delivers_buffers_from_live_capture` hard-asserted capture
+  content behind `require_audio!()` while targeting the TCC-gated
+  `SystemDefault` tap; now gated on `require_system_capture!()` like its
+  siblings.
+
+Adversarial-review batch (16 tracked seeds, all landed pre-merge):
+
+- **Compose engine panic containment** — a panic on the compositor thread
+  previously left the composed stream permanently non-terminal (blocking
+  reads spun on the 1 ms backstop forever, `is_running()` lied, C callers
+  blocked indefinitely). The tick loop now runs under `catch_unwind` with an
+  infallible teardown that poisons the stream to a fatal terminal.
+- **Resampler tail flush** — resampled compose sources no longer lose the
+  final partial chunk + FFT delay residue (~25–45 ms) at natural end.
+- **Intra-source gap compensation** — the compose engine now consumes the
+  drop-gap timestamp semantics: inner-ring overflows re-insert the hole as
+  silence (`gap_padded_frames` stat) instead of silently time-compressing
+  that source against its peers; inner overruns surface as
+  `SourceStats::inner_dropped`.
+- **Timestamps survive rate renegotiation** — stream-position stamps now
+  accumulate nanoseconds instead of dividing a frame counter by the
+  *current* rate (a mid-stream PipeWire renegotiation retroactively rescaled
+  the whole past timeline); the position advance is centralized so mixing
+  push variants can no longer desync the timeline. The mock backend now
+  stamps like every real backend.
+- **WASAPI capture-thread panic containment** — the capture loop runs under
+  `catch_unwind` routed into the fatal-error tail, upholding ADR-0010's
+  "no exit path leaves the bridge non-terminal" on the panic path.
+- **PipeWire RT callback logging** — the one-shot misalignment `log::warn!`
+  (allocation + lock on the RT thread, outside the panic guard) is now two
+  plain counter adds; the warning emits from the non-RT teardown path.
+- **Bounded subscribe pumps** — `subscribe()`/`subscribe_with_errors()` on
+  both handles switch from unbounded channels to `sync_channel(128)` +
+  drop-and-count (new `subscriber_dropped_count()`), restoring the
+  "drop, don't block, and count it" invariant; the fatal terminal is
+  guaranteed as the final item; repeated recoverable errors coalesce.
+- **Consumption preconditions** — subscribe/drain can now attach during the
+  drainable `Stopping` window (a fast-ending composition no longer strands
+  its buffered tail); `stop()` → `start()` restart-by-recreation is blessed
+  and documented; `Composition`'s read methods renamed to
+  `read_chunk_nonblocking`/`read_chunk_blocking` (the old `read_buffer`
+  names collided with `AudioCapture`'s never-fatal family while carrying
+  terminal-observable semantics).
+- **FFI soundness** — `rsac_group_set_layout`/`rsac_default_device` no longer
+  take Rust enums by value across the ABI (out-of-range ints from C were
+  instant UB; now validated `int32_t`); `rsac_composition_builder_add_group`
+  no longer has a panic window that double-freed the group;
+  `rsac_capture_free`/`rsac_composition_free` teardown is panic-caught.
+- **Go module path** — `bindings/rsac-go` is now repo-path-prefixed so the
+  `bindings/rsac-go/vX.Y.Z` tag automation actually resolves via `go get`
+  (the previous path pointed at a nonexistent repo; the fan-out achieved
+  nothing).
+- **Release-path truth** — RELEASE_PROCESS.md rewritten where it had drifted
+  (PyPI is 4 abi3 wheels + Trusted Publishing, not 15 wheels + a token
+  secret; `bump-version.sh` rewrites all six manifests); README no longer
+  claims Windows audio tiers are soft; `release-npm.yml` prepublish gets its
+  token and the final publish uses `--ignore-scripts` (double-publish);
+  `release.yml` dispatch publishes now require a version guard;
+  `ci-audio-tests.yml` actions SHA-pinned (including the kernel-driver
+  installer); the compose FFI surface is now actually compiled in CI.
+
 ### Security
+
+### C ABI changes
+
+**Additive only — no breaking changes.** The `rsac-ffi` `compose` feature
+(off by default) adds 29 new `rsac_*` symbols (`RsacGroup` /
+`RsacCompositionBuilder` / `RsacComposition` handles, layout constants,
+`RsacCompositionStats`/`RsacSourceStats` structs, overrun/knob/preflight
+accessors), emitted in the generated header behind
+`#if defined(RSAC_FEATURE_COMPOSE)`. Two prototypes changed from a C enum
+parameter to `int32_t` (`rsac_group_set_layout`, `rsac_default_device`) —
+ABI-identical on all supported targets (C enums are `int`-sized) and
+C-source-compatible via implicit enum→int conversion; out-of-range values
+now return `RSAC_ERROR_INVALID_PARAMETER` instead of being undefined
+behavior. Existing symbol layouts are otherwise unchanged.
 
 ## [0.4.0] - 2026-05-31
 

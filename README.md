@@ -20,26 +20,25 @@ A streaming-first audio capture library for Rust. Captures system audio, per-app
 
 rsac is a capture library, not a DSP or playback library. For downstream concerns, reach for:
 
-- **Mixing** → `rodio::Source::mix`, or a 3-line `f32 + f32` adder over rsac's `AudioBuffer.data()`
-- **Resampling** → `rubato` / `samplerate`
+- **Mixing (general-purpose)** → `rodio::Source::mix`, or a 3-line `f32 + f32` adder over rsac's `AudioBuffer.data()` — but see the opt-in [`compose` feature](#composing-multiple-sources-the-compose-feature) for capture-side multi-source channel composition ([ADR-0011](docs/designs/0011-compose-feature.md))
+- **Resampling (general-purpose)** → `rubato` / `samplerate` (rsac uses `rubato` internally only to rate-align composed sources)
 - **Encoding** → `hound` (WAV) / `symphonia` / `opus`
 - **Playback** → `cpal` / `rodio`
 
-See [VISION.md](VISION.md) for the full in-scope / out-of-scope list.
+See [VISION.md](VISION.md) for the full in-scope / out-of-scope list, and
+[docs/INTEROP.md](docs/INTEROP.md) for copy-paste recipes bridging rsac buffers
+into `dasp`, `cpal`/`rodio`, `hound`, and encoder pipelines.
 
 ## CI Status
 
-### Unit Tests
+[![CI](https://github.com/Codeseys-Labs/rust-crossplat-audio-capture/actions/workflows/ci.yml/badge.svg?branch=master)](https://github.com/Codeseys-Labs/rust-crossplat-audio-capture/actions/workflows/ci.yml)
+[![Audio Tests](https://github.com/Codeseys-Labs/rust-crossplat-audio-capture/actions/workflows/ci-audio-tests.yml/badge.svg?branch=master)](https://github.com/Codeseys-Labs/rust-crossplat-audio-capture/actions/workflows/ci-audio-tests.yml)
 
-| Platform | Status |
-|----------|--------|
-| Linux | ![Linux](https://github.com/Codeseys-Labs/rust-crossplat-audio-capture/actions/workflows/ci.yml/badge.svg?branch=master) |
-| Windows | ![Windows](https://github.com/Codeseys-Labs/rust-crossplat-audio-capture/actions/workflows/ci.yml/badge.svg?branch=master) |
-| macOS | ![macOS](https://github.com/Codeseys-Labs/rust-crossplat-audio-capture/actions/workflows/ci.yml/badge.svg?branch=master) |
+The `ci.yml` badge covers lint + unit tests on **all three platforms** (one
+workflow, per-OS jobs — Linux/Windows/macOS statuses live in the
+[Actions tab](https://github.com/Codeseys-Labs/rust-crossplat-audio-capture/actions/workflows/ci.yml)).
 
 ### Audio Integration Tests
-
-![Audio Tests](https://github.com/Codeseys-Labs/rust-crossplat-audio-capture/actions/workflows/ci-audio-tests.yml/badge.svg?branch=master)
 
 | | System | Device | Process |
 |---|---|---|---|
@@ -47,7 +46,7 @@ See [VISION.md](VISION.md) for the full in-scope / out-of-scope list.
 | **Windows** (VB-CABLE) | `windows-system` | `windows-device` | `windows-process` |
 | **macOS** (BlackHole) | `macos-system` | `macos-device` | `macos-process` |
 
-Each cell is a separate CI job visible in the [Actions tab](https://github.com/Codeseys-Labs/rust-crossplat-audio-capture/actions/workflows/ci-audio-tests.yml). Linux is the primary platform; Windows and macOS process capture use `continue-on-error`.
+Each cell is a separate CI job visible in the [Actions tab](https://github.com/Codeseys-Labs/rust-crossplat-audio-capture/actions/workflows/ci-audio-tests.yml). Linux and Windows are first-class, hard-gated tiers (the summary job fails on any Linux or Windows job failure); only the macOS system and process tiers run with `continue-on-error`, because Process Tap capture needs a `kTCCServiceAudioCapture` grant that cannot be issued on managed runners.
 
 ## Features
 
@@ -65,7 +64,8 @@ Each cell is a separate CI job visible in the [Actions tab](https://github.com/C
 - **Device introspection** — `AudioDevice::describe()` → `DeviceInfo` and `supported_formats()` on all three backends
 - **Overflow monitoring** (`overrun_count()` tracks dropped buffers)
 - **Backpressure signaling** (`is_under_backpressure()` on the `CapturingStream` trait — returns `true` when sustained consecutive frame drops indicate the consumer cannot keep up; use to throttle, warn, or switch providers)
-- **Sink adapters** — `NullSink`, `ChannelSink`, `WavFileSink` (note: the `pipe_to()` driver is not yet implemented — drive sinks from your own read/subscribe loop)
+- **Sink adapters** — `NullSink`, `ChannelSink`, `WavFileSink` (note: the `pipe_to()` driver is not yet implemented — drive sinks from your own read/subscribe loop, or use `drain_to()`)
+- **Multi-source channel composition** (opt-in `compose` feature) — group captures into one multi-channel stream: per-group Mono/Stereo mixdown with per-source gain, or native-channel passthrough; transparent `rubato` resampling to the session rate; master-clock alignment with silence-padding/trim counters ([ADR-0011](docs/designs/0011-compose-feature.md))
 - **Platform capability reporting** — `PlatformCapabilities::query()` for honest feature detection
 - **Language bindings at parity** — C/Go, Python (PyO3, single `cp39-abi3` wheel), and Node (napi), all exposing metering, `stream_stats`, format query, string targets, and idiomatic context managers / RAII
 
@@ -181,9 +181,76 @@ let _watcher = enumerator.watch(Box::new(|event: DeviceEvent| match event {
 > wired an OS listener return `AudioError::PlatformNotSupported`, matching their
 > `PlatformCapabilities::supports_device_change_notifications` flag.
 
+### Composing Multiple Sources (the `compose` feature)
+
+Capture several sources **simultaneously and composed into one multi-channel
+stream** ([ADR-0011](docs/designs/0011-compose-feature.md)). Sources are
+declared in *groups*: a group either mixes its sources down to one (Mono) or
+two (Stereo) channels — with per-source gain — or passes a single source's
+native channels through (`keep_channels()`). Groups append in declaration
+order; the `ChannelMap` tells you which output channel belongs to which group.
+
+```toml
+rsac = { version = "0.4", features = ["compose"] }
+```
+
+```rust
+use rsac::compose::{CompositionBuilder, Group, GroupLayout};
+use rsac::CaptureTarget;
+
+let mut session = CompositionBuilder::new()
+    .sample_rate(48_000) // session rate; mismatched sources are resampled
+    .group(
+        Group::new("voice") // → 1 composed channel
+            .source(CaptureTarget::ApplicationByName("discord".into()))
+            .source_with_gain(CaptureTarget::ApplicationByName("zoom".into()), 0.8)
+            .mixdown(GroupLayout::Mono),
+    )
+    .group(
+        Group::new("system") // → the endpoint's native channels
+            .source(CaptureTarget::SystemDefault)
+            .keep_channels(),
+    )
+    .build()?;
+
+session.start()?;
+let map = session.channel_map().unwrap(); // e.g. 3 channels: voice, sysL, sysR
+loop {
+    match session.read_buffer() {
+        Ok(Some(buffer)) => { /* interleaved f32, map.channels() wide */ }
+        Ok(None) => std::thread::sleep(std::time::Duration::from_millis(1)), // no data *yet*
+        Err(e) if e.is_fatal() => break, // composition ended and drained
+        Err(e) => eprintln!("transient read error: {e}"), // retryable
+    }
+}
+session.stop()?;
+```
+
+What the compositor handles for you:
+
+- **Heterogeneous sample rates** — e.g. Windows process loopback cannot
+  autoconvert, so an app source may deliver 44.1 kHz while system capture
+  delivers 48 kHz; mismatched sources are resampled (via `rubato`) on the
+  dedicated compositor thread (never an OS callback thread).
+- **Alignment** — a master-clock source (the first system/device source) paces
+  the output; sources that run behind are silence-padded, sources drifting
+  ahead are bounded-trimmed, and a wall-clock fallback keeps the session alive
+  if the master stalls. Per-source `padded_frames` / `trimmed_frames` /
+  `resampling` counters are exposed via `session.stats()`.
+- **Delivery** — the composed stream speaks the same `CapturingStream`
+  contract as a single capture: `drain_to(WavFileSink)` records a
+  multi-channel WAV, and terminal semantics (ADR-0003) apply.
+
+The composition **owns** its inner captures — don't read the same sources
+through other handles while it runs. Mixdown is plain gain-weighted summation
+(no auto-limiter); enable `.clamp_output(true)` if you need hard `[-1, 1]`
+bounds. See `examples/composed_capture.rs` for a runnable demo.
+
 ## CLI Demo
 
-The binary is a thin demo over the library API:
+The binary is a thin demo over the library API (requires the `cli` feature —
+`cargo install rsac --features cli`, or `cargo run --features cli -- <cmd>`
+from a checkout):
 
 ```bash
 # Show platform capabilities
@@ -227,6 +294,19 @@ Add to `Cargo.toml`:
 rsac = { git = "https://github.com/Codeseys-Labs/rust-crossplat-audio-capture" }
 ```
 
+### Cargo Features
+
+| Feature | Default | Adds |
+|---|---|---|
+| `feat_windows` / `feat_linux` / `feat_macos` | ✅ | Platform backends |
+| `compose` | — | Multi-source channel composition (`rubato` + `audioadapter-buffers`) |
+| `cli` | — | The `rsac` demo binary's deps (`clap`, `color-eyre`, `ctrlc`, `env_logger`) — library consumers don't pay for them |
+| `async-stream` | — | `futures_core::Stream` support (`atomic-waker`) |
+| `sink-wav` | — | `WavFileSink` |
+| `tracing` | — | Structured `tracing` events/spans (facade only) |
+
+See [`docs/features.md`](docs/features.md) for the full matrix.
+
 ### Platform Dependencies
 
 **Linux** — PipeWire dev libraries:
@@ -247,11 +327,16 @@ sudo pacman -S pipewire pkgconf clang
 
 ## Documentation
 
+Full index (every doc, with status): [`docs/README.md`](docs/README.md).
+
 - [`VISION.md`](VISION.md) — What rsac is, what it isn't, and how we verify the vision on every commit.
 - [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md) — Three-layer architecture overview plus per-backend specifics (WASAPI / PipeWire / CoreAudio Process Tap).
 - [`docs/CONTRIBUTING.md`](docs/CONTRIBUTING.md) — Toolchain pin, local gate (`fmt` + `clippy` + `doc`), test matrix, release procedure, PR checklist.
 - [`docs/features.md`](docs/features.md) — Cargo feature matrix: which features are default, which platforms they enable, and what system packages each one needs.
 - [`docs/troubleshooting.md`](docs/troubleshooting.md) — High-signal fixes for the most common build and runtime errors (PipeWire libs missing, Xcode CLT, TCC permission, WASAPI session contention, etc.).
+- [`docs/CONSUMING_RSAC.md`](docs/CONSUMING_RSAC.md) — How downstream projects consume any rsac surface: Rust crate, C FFI, Python, Node/Bun, Go, CLI — with the working install/link recipe for each.
+- [`docs/FRAMEWORK_COMPATIBILITY.md`](docs/FRAMEWORK_COMPATIBILITY.md) — Using rsac from Tauri v2, Dioxus, Electron, Deno, Bun, Flutter, and more — per-framework status (verified / expected / blocked) and integration recipes.
+- [`docs/MOBILE_BACKEND_DESIGN.md`](docs/MOBILE_BACKEND_DESIGN.md) — Design for the planned Android (`AudioPlaybackCapture` + AAudio) and iOS (AVAudioEngine + ReplayKit) backends ([ADR-0012](docs/designs/0012-mobile-platform-strategy.md), [ADR-0013](docs/designs/0013-mobile-capturetarget-semantics.md)).
 - [`docs/architecture/`](docs/architecture/) — Detailed design documents for the core, bridge, and backend layers.
 - [`docs/CI_AUDIO_TESTING.md`](docs/CI_AUDIO_TESTING.md) — How audio integration tests run in CI across all three platforms (6 of 9 cells REAL on every run; macOS gaps explained).
 - [`docs/RELEASE_PROCESS.md`](docs/RELEASE_PROCESS.md) — End-to-end procedure for cutting a new `rsac` release: pre-release checks, version bump, tag, `cargo publish`, verification, and rollback.
