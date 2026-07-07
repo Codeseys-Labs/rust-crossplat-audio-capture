@@ -1,13 +1,14 @@
-# Tag-triggered npm release workflow for @rsac/audio (Node.js bindings).
+# Tag/manual npm release workflow for @rsac/audio (Node.js bindings).
 #
 # Mirrors .github/workflows/release.yml for the crates.io flow:
 #   1. verify-napi-build — matrix builds per napi-rs target, uploads .node
 #   2. publish-npm       — merges artifacts, runs `napi prepublish -t npm`,
 #                          publishes main + platform sub-packages to npm
 #
-# Triggered by semver-shaped tags (vMAJOR.MINOR.PATCH) from push --tags.
-# Bump bindings/rsac-napi/package.json version in lockstep with the root
-# Cargo.toml before tagging (see docs/RELEASE_PROCESS.md).
+# Triggered by semver-shaped tags (vMAJOR.MINOR.PATCH) from push --tags,
+# or manually via workflow_dispatch with publish=true + a matching X.Y.Z
+# version input. Bump bindings/rsac-napi/package.json version in lockstep
+# with the root Cargo.toml before publishing (see docs/RELEASE_PROCESS.md).
 #
 # Required GitHub secret:
 #   NPM_TOKEN — npm automation token with publish rights on @rsac scope.
@@ -29,6 +30,18 @@ on:
       # must not trigger real npm publishes. See docs/RELEASE_PROCESS.md.
       - 'v*.*.*'
       - '!v*-*'
+  workflow_dispatch:
+    inputs:
+      version:
+        description: 'Version to verify against bindings/rsac-napi/package.json before publishing (for example: 0.4.0)'
+        type: string
+        required: false
+        default: ''
+      publish:
+        description: 'Publish to npm. Leave false to build/smoke artifacts only.'
+        type: boolean
+        required: false
+        default: false
 
 env:
   CARGO_TERM_COLOR: always
@@ -232,7 +245,7 @@ jobs:
     name: Publish to npm
     needs: verify-napi-build
     # Guard against forks publishing to the @rsac npm scope.
-    if: github.repository == 'Codeseys-Labs/rust-crossplat-audio-capture'
+    if: github.repository == 'Codeseys-Labs/rust-crossplat-audio-capture' && (github.event_name != 'workflow_dispatch' || inputs.publish)
     runs-on: blacksmith-4vcpu-ubuntu-2404
     permissions:
       contents: read
@@ -249,15 +262,26 @@ jobs:
       # Tag↔manifest version guard: the pushed tag must match the version
       # in package.json before we publish to npm. Tag events only.
       - name: Verify tag matches package.json version
-        if: startsWith(github.ref, 'refs/tags/')
         working-directory: bindings/rsac-napi
         shell: bash
         run: |
-          VERSION="${GITHUB_REF_NAME#v}"
+          if [[ "${GITHUB_REF:-}" == refs/tags/v* ]]; then
+            VERSION="${GITHUB_REF_NAME#v}"
+          else
+            VERSION='${{ inputs.version }}'
+          fi
+          if [ -z "${VERSION}" ]; then
+            echo "::error::Manual npm publish requires the workflow_dispatch version input"
+            exit 1
+          fi
+          if ! [[ "${VERSION}" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+            echo "::error::Requested version '${VERSION}' is not a stable X.Y.Z semver version"
+            exit 1
+          fi
           MANIFEST="$(node -p "require('./package.json').version")"
-          echo "tag version: ${VERSION}  manifest version: ${MANIFEST}"
+          echo "requested version: ${VERSION}  manifest version: ${MANIFEST}"
           if [ "${VERSION}" != "${MANIFEST}" ]; then
-            echo "::error::Tag version (${VERSION}) does not match package.json version (${MANIFEST})"
+            echo "::error::Requested version (${VERSION}) does not match package.json version (${MANIFEST})"
             exit 1
           fi
 
@@ -313,13 +337,31 @@ jobs:
       - name: Move artifacts into place
         run: bunx @napi-rs/cli artifacts --dir artifacts
 
-      - name: napi prepublish (generate platform packages)
+      # rsac-e93b: `napi prepublish -t npm` does more than "generate" the
+      # platform packages — it PUBLISHES each @rsac/audio-<platform>
+      # sub-package to npm, so this step needs the npm auth token
+      # (NODE_AUTH_TOKEN feeds the .npmrc written by setup-node's
+      # registry-url; NPM_CONFIG_TOKEN covers direct npm-config reads).
+      # Without it the sub-package publishes fail auth (E401/ENEEDAUTH).
+      # We keep this explicit step (rather than relying on package.json's
+      # `prepublishOnly` lifecycle hook) so we control --skip-gh-release —
+      # GitHub Releases are created by release-tag.yml/release.yml, and this
+      # job's token has no contents:write scope anyway.
+      - name: napi prepublish (publish platform sub-packages)
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
+          NPM_CONFIG_TOKEN: ${{ secrets.NPM_TOKEN }}
         run: bunx @napi-rs/cli prepublish -t npm --skip-gh-release
 
-      - name: Publish main package + platform sub-packages
+      # --ignore-scripts is load-bearing: package.json declares
+      # `"prepublishOnly": "napi prepublish -t npm"`, so a bare `npm publish`
+      # would re-run the prepublish step above and try to publish every
+      # platform sub-package a second time (E403 already-published), failing
+      # the release after a partial publish. The sub-packages were published
+      # by the explicit step above; this step publishes ONLY the main package.
+      - name: Publish main package (sub-packages already published above)
         env:
           NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
           NPM_CONFIG_TOKEN: ${{ secrets.NPM_TOKEN }}
-        run: bunx npm publish --access public --provenance
+        run: bunx npm publish --access public --provenance --ignore-scripts

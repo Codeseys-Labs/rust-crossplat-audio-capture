@@ -37,29 +37,20 @@ help:
 check:
 	cargo check --examples
 
-# Check specific platforms with cross-compilation
+# Check specific platforms with cross-compilation.
+# NOTE (rsac-a3c4): cross-rs has no MSVC or Darwin images, so Windows/macOS
+# cross-checks via `cross` are impossible — use check-windows-docker
+# (cargo-xwin) / check-macos-docker, or CI / real hardware.
 check-linux:
 	@echo "🐧 Checking Linux compilation..."
 	cross check --target x86_64-unknown-linux-gnu --no-default-features --features feat_linux --examples
-
-check-windows:
-	@echo "🪟 Checking Windows compilation..."
-	cross check --target x86_64-pc-windows-msvc --no-default-features --features feat_windows --examples
-
-check-macos:
-	@echo "🍎 Checking macOS compilation..."
-	cross check --target x86_64-apple-darwin --no-default-features --features feat_macos --examples
-
-check-macos-arm:
-	@echo "🍎 Checking macOS ARM compilation..."
-	cross check --target aarch64-apple-darwin --no-default-features --features feat_macos --examples
 
 check-linux-arm:
 	@echo "🐧 Checking Linux ARM compilation..."
 	cross check --target aarch64-unknown-linux-gnu --no-default-features --features feat_linux --examples
 
-# Check all platforms quickly
-check-all: check-linux check-windows check-macos check-macos-arm check-linux-arm
+# Check all cross-able platforms quickly
+check-all: check-linux check-linux-arm
 	@echo "✅ All platform checks completed"
 
 # Docker-based cross-compilation (more robust)
@@ -71,7 +62,7 @@ check-macos-docker:
 	@echo "🍎 Checking macOS compilation with Docker..."
 	docker run --rm -v $(PWD):/workspace -w /workspace \
 		--platform linux/amd64 \
-		rust:1.88 \
+		rust:1.95.0 \
 		sh -c "rustup target add x86_64-apple-darwin && cargo check --target x86_64-apple-darwin --no-default-features --features feat_macos --examples"
 
 # Check all platforms with Docker (most robust)
@@ -186,7 +177,7 @@ docker-test-platform:
 	./scripts/docker-test-all.sh --platform $(PLATFORM)
 
 # =============================================================================
-# Platform-specific testing targets (library + dynamic_vlc example)
+# Platform-specific testing targets (docker-compose.testing.yml)
 # =============================================================================
 
 # Test library and dynamic_vlc example on all platforms

@@ -1,0 +1,34 @@
+{
+    // rsac devcontainer (rsac-c8e2): one-shot Linux/PipeWire dev environment
+    // for the feat_linux dependency wall (libpipewire-0.3-dev etc.), aimed at
+    // Windows/macOS contributors who need to build/test the Linux leg.
+    //
+    // Reuses the existing docker/linux/Dockerfile.test image: Ubuntu 24.04 +
+    // the full PipeWire dev/runtime stack; its entrypoint boots
+    // dbus → pipewire → wireplumber → pipewire-pulse, so `cargo test --lib
+    // --features feat_linux` and even parts of the ci_audio suite can run
+    // (create a virtual sink first: `pactl load-module module-null-sink`,
+    // then export RSAC_CI_AUDIO_AVAILABLE=1 — mirroring ci-audio-tests.yml).
+    //
+    // Deliberately NOT a nix flake: the repo has no nix usage, and the
+    // PPA-pinned PipeWire stack would fight nixpkgs' — judged in the DevEx
+    // audit; recorded here so it isn't re-litigated casually.
+    //
+    // rustup in the image installs `stable`, but rust-toolchain.toml
+    // auto-provisions the pinned 1.95.0 on the first cargo invocation.
+    "name": "rsac (Linux/PipeWire)",
+    "build": {
+        "dockerfile": "../docker/linux/Dockerfile.test",
+        "context": ".."
+    },
+    "remoteUser": "root",
+    "postCreateCommand": "cargo check --no-default-features --features feat_linux",
+    "customizations": {
+        "vscode": {
+            "extensions": [
+                "rust-lang.rust-analyzer",
+                "tamasfe.even-better-toml"
+            ]
+        }
+    }
+}

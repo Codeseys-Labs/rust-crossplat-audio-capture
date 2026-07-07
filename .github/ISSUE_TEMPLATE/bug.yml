@@ -1,0 +1,67 @@
+name: Bug report
+description: Something is broken (build failure, capture failure, wrong audio, crash)
+labels: ["bug"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Before filing: check [`docs/troubleshooting.md`](../../docs/troubleshooting.md)
+        for the known build/runtime fixes.
+  - type: dropdown
+    id: platform
+    attributes:
+      label: Platform
+      options:
+        - Windows (WASAPI)
+        - Linux (PipeWire)
+        - macOS (CoreAudio / Process Tap)
+        - Android / iOS (not yet supported — capture APIs are designed, not shipped)
+        - Other / cross-platform
+    validations:
+      required: true
+  - type: input
+    id: os-version
+    attributes:
+      label: OS version
+      placeholder: "e.g. macOS 14.5 / Ubuntu 24.04 / Windows 11 23H2"
+    validations:
+      required: true
+  - type: input
+    id: rust-version
+    attributes:
+      label: Rust version (`rustc --version`) — or binding + version (Python/Node/Go/C)
+      placeholder: "rustc 1.95.0 / @rsac/audio 0.4.0 / rsac (PyPI) 0.4.0"
+    validations:
+      required: true
+  - type: input
+    id: rsac-version
+    attributes:
+      label: rsac version or commit SHA
+      placeholder: "0.4.0 / aca3f85"
+    validations:
+      required: true
+  - type: input
+    id: capture-target
+    attributes:
+      label: Capture target (if capture-related)
+      placeholder: 'e.g. system / "name:Firefox" / device:… / tree:1234'
+  - type: textarea
+    id: repro
+    attributes:
+      label: Minimal reproduction
+      description: Smallest code/commands that show the problem.
+      render: text
+    validations:
+      required: true
+  - type: textarea
+    id: expected-actual
+    attributes:
+      label: Expected vs actual behaviour
+    validations:
+      required: true
+  - type: textarea
+    id: logs
+    attributes:
+      label: Captured error output
+      description: Run with `RUST_LOG=debug` for more detail.
+      render: text

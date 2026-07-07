@@ -7,17 +7,21 @@ name: Audio Integration Tests
 # Each job is independently identifiable in GitHub Actions.
 #
 # Platform status:
-#   ✅ Linux (PipeWire)  — PRIMARY. Fully validated, expected to pass.
-#   ✅ Windows (WASAPI)  — FIRST-CLASS. VB-CABLE virtual driver, 3/3 tests
-#                           real. Hard-gated: no continue-on-error, and the
-#                           summary fails on a Windows regression.
-#   ⏳ macOS (CoreAudio)  — skip-early on CI (TCC Audio Capture cannot be
-#                           granted non-interactively on managed runners).
-#                           VALIDATED on real hardware (macOS 14.4+).
-#                           See docs/reviews/ci-audio-final-status-*.md.
-#                           macOS jobs keep continue-on-error ONLY because the
-#                           runner cannot grant kTCCServiceAudioCapture — that
-#                           gap is documented per-job and on the summary gate.
+#   ✅ Linux (PipeWire)  — PRIMARY lifecycle/API tier on Blacksmith. The jobs are
+#                           hard-gated for setup/build/start/panic regressions,
+#                           but content assertions remain soft until the null-sink
+#                           routing is proven deterministic in Firecracker.
+#   ✅ Windows (WASAPI)  — FIRST-CLASS for system capture on GitHub-hosted
+#                           windows-latest + LABSN/VB-CABLE. Device/process jobs
+#                           are hard-gated for setup/build/start/panic regressions,
+#                           but their content assertions remain soft because the
+#                           per-device/per-process tone route is not yet proven.
+#   ⏳ macOS (CoreAudio) — advisory on managed CI. Process Tap based system,
+#                           application, and process-tree capture require
+#                           kTCCServiceAudioCapture, which cannot be granted
+#                           non-interactively on Blacksmith/GitHub-hosted runners.
+#                           Full capture validation still requires real hardware
+#                           or a self-hosted, pre-consented macOS runner.
 # =============================================================================
 
 on:
@@ -26,6 +30,7 @@ on:
     paths:
       - 'src/**'
       - 'tests/**'
+      - 'examples/**'
       - 'Cargo.toml'
       - 'Cargo.lock'
       - '.github/workflows/ci-audio-tests.yml'
@@ -34,6 +39,7 @@ on:
     paths:
       - 'src/**'
       - 'tests/**'
+      - 'examples/**'
       - 'Cargo.toml'
       - 'Cargo.lock'
       - '.github/workflows/ci-audio-tests.yml'
@@ -60,9 +66,9 @@ jobs:
       run:
         shell: bash
     steps:
-      - uses: actions/checkout@v5
-      - uses: dtolnay/rust-toolchain@1.95.0
-      - uses: Swatinem/rust-cache@v2
+      - uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5
+      - uses: dtolnay/rust-toolchain@e081816240890017053eacbb1bdf337761dc5582 # 1.95.0
+      - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
         with:
           key: linux-audio
 
@@ -94,10 +100,15 @@ jobs:
           wireplumber &
           sleep 1
           pipewire-pulse &
-          sleep 2
 
-          # Verify
-          pw-cli info 0 || echo "WARNING: pw-cli info failed"
+          # Verify the PipeWire core is accepting commands. A fixed sleep can
+          # race slow startup and later present as false audio-test silence.
+          for _ in $(seq 1 20); do
+            pw-cli info 0 >/dev/null 2>&1 && break
+            sleep 1
+          done
+          pw-cli info 0 >/dev/null 2>&1 || { echo "ERROR: PipeWire core not ready"; exit 1; }
+          pw-cli info 0
 
       - name: Create and verify virtual audio sink
         run: |
@@ -106,8 +117,7 @@ jobs:
           # hardcoded later. Now we create, then VERIFY, then export the env.
           #
           # Wait for the pipewire-pulse Pulse socket to actually accept pactl
-          # before loading the sink. The `sleep 2` above is a fixed delay, not a
-          # readiness gate, and can race a slow pipewire-pulse startup.
+          # before loading the sink.
           for _ in $(seq 1 20); do
             pactl info >/dev/null 2>&1 && break
             sleep 1
@@ -119,9 +129,9 @@ jobs:
             rate=48000 channels=2 format=float32le
           # Under the manually-bootstrapped PipeWire in CI there is no dbus
           # session: `pactl set-default-sink` returns "Not supported" and
-          # pw-metadata cannot connect. That's fine — with ci_test_sink as the
-          # ONLY sink, default routing resolves to it, so pw-play→default and
-          # SystemDefault monitor capture both land on ci_test_sink.
+          # pw-metadata cannot connect. Keep the command as a best effort and
+          # record the actual routing state below; content assertions stay soft
+          # until routing is proven deterministic on the runner.
           pactl set-default-sink ci_test_sink 2>/dev/null || true
           sleep 1
 
@@ -132,13 +142,20 @@ jobs:
             pactl list short sinks || true
             exit 1
           fi
+          for _ in $(seq 1 10); do
+            pactl list short sources | grep -q "ci_test_sink.monitor" && break
+            sleep 1
+          done
+          if ! pactl list short sources | grep -q "ci_test_sink.monitor"; then
+            echo "ERROR: ci_test_sink.monitor not present in 'pactl list short sources'"
+            pactl list short sources || true
+            exit 1
+          fi
 
-          # Enable HARD non-silence/tone asserts only when ci_test_sink is the
-          # effective default: pactl names it explicitly, OR it is the sole sink
-          # (pipewire-pulse returns the symbolic '@DEFAULT_SINK@' when no explicit
-          # default is set — routing still lands on the only sink). Otherwise keep
-          # capture enabled but fall back to soft warnings (honest: we don't claim
-          # deterministic verification in an environment that can't guarantee it).
+          # Probe the default sink for diagnostics. Linux content assertions stay
+          # soft in this Firecracker environment even when ci_test_sink exists:
+          # PipeWire monitor capture has not proven deterministic here, so we do
+          # not export RSAC_CI_AUDIO_DETERMINISTIC.
           DEFAULT_SINK="$(pactl get-default-sink 2>/dev/null || echo unknown)"
           SINK_COUNT="$(pactl list short sinks | grep -c .)"
           echo "default sink='${DEFAULT_SINK}' sink_count=${SINK_COUNT}"
@@ -152,12 +169,17 @@ jobs:
           # buffers (see helpers / per-test skip paths) rather than false-pass.
           echo "Linux CI: capture content asserts are SOFT (see note above)."
 
+      # rsac-0a1f: every cargo invocation in this job uses
+      # `feat_linux,compose` so the ci_audio test binary (and the lib rlib) is
+      # compiled ONCE for the whole job. `compose` is additive and
+      # platform-independent; it only unlocks tests/ci_audio/compose.rs
+      # (`#![cfg(feature = "compose")]`) for the compose:: steps below.
       - name: Run system capture tests
         env:
           RSAC_TEST_CAPTURE_TIMEOUT_SECS: "15"
         run: |
           cargo test --test ci_audio system_capture \
-            --no-default-features --features feat_linux \
+            --no-default-features --features feat_linux,compose \
             -- --test-threads=1 --nocapture 2>&1 | tee ci-audio-output.log
 
       # G8 overrun coverage: stalls the consumer and asserts the ring buffer
@@ -168,7 +190,7 @@ jobs:
           RSAC_TEST_CAPTURE_TIMEOUT_SECS: "15"
         run: |
           cargo test --test ci_audio overrun \
-            --no-default-features --features feat_linux \
+            --no-default-features --features feat_linux,compose \
             -- --test-threads=1 --nocapture 2>&1 | tee -a ci-audio-output.log
 
       # G7 subscribe coverage: the `subscribe` module was never matched by any
@@ -178,7 +200,7 @@ jobs:
           RSAC_TEST_CAPTURE_TIMEOUT_SECS: "15"
         run: |
           cargo test --test ci_audio subscribe \
-            --no-default-features --features feat_linux \
+            --no-default-features --features feat_linux,compose \
             -- --test-threads=1 --nocapture 2>&1 | tee -a ci-audio-output.log
 
       - name: Run platform capabilities tests
@@ -186,7 +208,7 @@ jobs:
           RSAC_TEST_CAPTURE_TIMEOUT_SECS: "15"
         run: |
           cargo test --test ci_audio platform_caps \
-            --no-default-features --features feat_linux \
+            --no-default-features --features feat_linux,compose \
             -- --test-threads=1 --nocapture 2>&1 | tee -a ci-audio-output.log
 
       - name: Run stream lifecycle tests
@@ -194,7 +216,20 @@ jobs:
           RSAC_TEST_CAPTURE_TIMEOUT_SECS: "15"
         run: |
           cargo test --test ci_audio stream_lifecycle \
-            --no-default-features --features feat_linux \
+            --no-default-features --features feat_linux,compose \
+            -- --test-threads=1 --nocapture 2>&1 | tee -a ci-audio-output.log
+
+      # Terminal read-behavior + request_stop() end-to-end on the real bridge:
+      # request_stop drives the stream terminal (fatal StreamEnded per ADR-0003),
+      # unblocks a parked blocking read promptly, and the stop() vs request_stop()
+      # handle-ownership distinction holds. The `lifecycle_terminal` substring
+      # matches ONLY this module, not `stream_lifecycle`.
+      - name: Run terminal-read / request_stop lifecycle tests
+        env:
+          RSAC_TEST_CAPTURE_TIMEOUT_SECS: "15"
+        run: |
+          cargo test --test ci_audio lifecycle_terminal \
+            --no-default-features --features feat_linux,compose \
             -- --test-threads=1 --nocapture 2>&1 | tee -a ci-audio-output.log
 
       # Covers the VISION.md "multi-source" pillar: two captures at
@@ -205,8 +240,37 @@ jobs:
           RSAC_TEST_CAPTURE_TIMEOUT_SECS: "15"
         run: |
           cargo test --test ci_audio multi_source \
-            --no-default-features --features feat_linux \
+            --no-default-features --features feat_linux,compose \
             -- --test-threads=1 --nocapture 2>&1 | tee -a ci-audio-output.log
+
+      # rsac-0a1f: composed multi-source capture (`compose` feature) — a
+      # mono-mixdown group + a keep-channels group over system audio through
+      # the composition pipeline. The `compose::` prefix matches ONLY
+      # tests/ci_audio/compose.rs. Content assertions follow the Linux
+      # soft-assert policy (see the sink setup NOTE above): hard on
+      # layout/lifecycle/panics, soft on non-silence until the null-sink
+      # routing is proven deterministic.
+      - name: Run composed capture tests
+        env:
+          RSAC_TEST_CAPTURE_TIMEOUT_SECS: "15"
+        run: |
+          cargo test --test ci_audio "compose::" \
+            --no-default-features --features feat_linux,compose \
+            -- --test-threads=1 --nocapture 2>&1 | tee -a ci-audio-output.log
+
+      # Wiring existence check (mirrors the grep-based guards in ci.yml's
+      # test-macos job): assert the compose:: module is discoverable by the
+      # harness, so a module rename or a cfg/feature change can't silently
+      # reduce the step above to a zero-test filter (a false green).
+      - name: Verify compose tests are wired up
+        run: |
+          cargo test --test ci_audio --no-default-features --features feat_linux,compose \
+            -- --list 2>&1 | tee ci-audio-compose-list.log
+          grep -q "compose::" ci-audio-compose-list.log || {
+            echo "FAIL: compose:: tests not discovered in ci_audio test list"
+            exit 1
+          }
+          echo "OK: compose:: integration tests are wired up"
 
       # CI-4: enumeration_matrix's "no silent empty list" (audit L4) assertion
       # only has teeth when audio_available() is true. RSAC_CI_AUDIO_AVAILABLE=1
@@ -216,7 +280,7 @@ jobs:
       - name: Run enumeration_matrix against real devices (L4 non-empty assertion)
         run: |
           cargo test --test enumeration_matrix \
-            --no-default-features --features feat_linux \
+            --no-default-features --features feat_linux,compose \
             -- --nocapture 2>&1 | tee -a ci-audio-output.log
 
       - name: Diagnostics on failure
@@ -230,7 +294,7 @@ jobs:
 
       - name: Upload logs
         if: always()
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
           name: linux-system-capture-logs
           path: ci-audio-output.log
@@ -245,9 +309,9 @@ jobs:
       run:
         shell: bash
     steps:
-      - uses: actions/checkout@v5
-      - uses: dtolnay/rust-toolchain@1.95.0
-      - uses: Swatinem/rust-cache@v2
+      - uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5
+      - uses: dtolnay/rust-toolchain@e081816240890017053eacbb1bdf337761dc5582 # 1.95.0
+      - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
         with:
           key: linux-audio
 
@@ -273,8 +337,12 @@ jobs:
           wireplumber &
           sleep 1
           pipewire-pulse &
-          sleep 2
-          pw-cli info 0 || echo "WARNING: pw-cli info failed"
+          for _ in $(seq 1 20); do
+            pw-cli info 0 >/dev/null 2>&1 && break
+            sleep 1
+          done
+          pw-cli info 0 >/dev/null 2>&1 || { echo "ERROR: PipeWire core not ready"; exit 1; }
+          pw-cli info 0
 
       - name: Create and verify virtual audio sink
         run: |
@@ -298,6 +366,15 @@ jobs:
           if ! pactl list short sinks | grep -q "ci_test_sink"; then
             echo "ERROR: ci_test_sink not present in 'pactl list short sinks'"
             pactl list short sinks || true
+            exit 1
+          fi
+          for _ in $(seq 1 10); do
+            pactl list short sources | grep -q "ci_test_sink.monitor" && break
+            sleep 1
+          done
+          if ! pactl list short sources | grep -q "ci_test_sink.monitor"; then
+            echo "ERROR: ci_test_sink.monitor not present in 'pactl list short sources'"
+            pactl list short sources || true
             exit 1
           fi
           DEFAULT_SINK="$(pactl get-default-sink 2>/dev/null || echo unknown)"
@@ -338,7 +415,7 @@ jobs:
 
       - name: Upload logs
         if: always()
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
           name: linux-device-capture-logs
           path: ci-audio-output.log
@@ -353,9 +430,9 @@ jobs:
       run:
         shell: bash
     steps:
-      - uses: actions/checkout@v5
-      - uses: dtolnay/rust-toolchain@1.95.0
-      - uses: Swatinem/rust-cache@v2
+      - uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5
+      - uses: dtolnay/rust-toolchain@e081816240890017053eacbb1bdf337761dc5582 # 1.95.0
+      - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
         with:
           key: linux-audio
 
@@ -381,8 +458,12 @@ jobs:
           wireplumber &
           sleep 1
           pipewire-pulse &
-          sleep 2
-          pw-cli info 0 || echo "WARNING: pw-cli info failed"
+          for _ in $(seq 1 20); do
+            pw-cli info 0 >/dev/null 2>&1 && break
+            sleep 1
+          done
+          pw-cli info 0 >/dev/null 2>&1 || { echo "ERROR: PipeWire core not ready"; exit 1; }
+          pw-cli info 0
 
       - name: Create and verify virtual audio sink
         run: |
@@ -406,6 +487,15 @@ jobs:
           if ! pactl list short sinks | grep -q "ci_test_sink"; then
             echo "ERROR: ci_test_sink not present in 'pactl list short sinks'"
             pactl list short sinks || true
+            exit 1
+          fi
+          for _ in $(seq 1 10); do
+            pactl list short sources | grep -q "ci_test_sink.monitor" && break
+            sleep 1
+          done
+          if ! pactl list short sources | grep -q "ci_test_sink.monitor"; then
+            echo "ERROR: ci_test_sink.monitor not present in 'pactl list short sources'"
+            pactl list short sources || true
             exit 1
           fi
           DEFAULT_SINK="$(pactl get-default-sink 2>/dev/null || echo unknown)"
@@ -442,12 +532,12 @@ jobs:
       # The `process_tree::` prefix matches ONLY that module's test paths,
       # not `process_tree_capture::*`, so the two steps don't overlap.
       #
-      # NOTE on application_by_name / application_by_pid: those modules are
-      # `#![cfg(target_os = "macos")]` and every test is `#[ignore]` (they
-      # need macOS 14.4+ Process Tap + TCC audio permission). They cannot run
-      # on Linux or on a headless macOS runner, so they are intentionally not
-      # invoked here. A Linux ApplicationByName path does not exist in the
-      # backend, so there is nothing low-risk to add for Linux.
+      # NOTE on application_by_name / application_by_pid: the current named-PID
+      # modules are macOS-specific Process Tap tests. Linux does support
+      # Application(ApplicationId(pid)) and ApplicationByName in the backend, but
+      # this job currently exercises the PID path through app_capture only. Add
+      # a Linux-specific ApplicationByName happy path once the null-sink routing
+      # is deterministic enough to make content assertions hard.
       - name: Run process tree public-API tests
         env:
           RSAC_TEST_CAPTURE_TIMEOUT_SECS: "15"
@@ -465,7 +555,7 @@ jobs:
 
       - name: Upload logs
         if: always()
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
           name: linux-process-capture-logs
           path: ci-audio-output.log
@@ -479,12 +569,11 @@ jobs:
   # has a full Windows audio stack. Blacksmith handles compilation/unit tests.
   #
   # rsac M5: Windows is a first-class tier. These jobs deliberately have NO
-  # continue-on-error and set RSAC_CI_AUDIO_DETERMINISTIC=1 so a real WASAPI
-  # "capture returns silence" regression turns the tier RED instead of landing
-  # green. The verify steps above (VB-CABLE is the active default playback)
-  # fail-fast before cargo runs if the audio route is wrong, so a hard gate
-  # here surfaces genuine capture regressions, not flaky-runner setup noise.
-  # The summary job's failure gate includes these jobs.
+  # continue-on-error. Only the system-capture job sets
+  # RSAC_CI_AUDIO_DETERMINISTIC=1 because it verifies VB-CABLE as the active
+  # default playback endpoint before cargo runs; device/process tiers remain
+  # hard-gated for build/start/panic regressions but keep content assertions
+  # soft. The summary job's failure gate includes all Windows jobs.
   # =============================================================================
 
   windows-system:
@@ -492,14 +581,14 @@ jobs:
     runs-on: windows-latest
     timeout-minutes: 20
     steps:
-      - uses: actions/checkout@v5
-      - uses: dtolnay/rust-toolchain@1.95.0
-      - uses: Swatinem/rust-cache@v2
+      - uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5
+      - uses: dtolnay/rust-toolchain@e081816240890017053eacbb1bdf337761dc5582 # 1.95.0
+      - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
         with:
           key: windows-audio
 
       - name: Install virtual audio (VB-CABLE via LABSN)
-        uses: LABSN/sound-ci-helpers@v1
+        uses: LABSN/sound-ci-helpers@d08c889a7bba7d9b1b059f8f76dac4672ea3a9cf # v1 (v1 tag == v1.0.4, resolved via git ls-remote)
 
       - name: Set VB-CABLE as default audio device
         shell: pwsh
@@ -511,26 +600,44 @@ jobs:
           # windows-latest VB-CABLE's playback endpoint is named
           # "Speakers (VB-Audio Virtual Cable)", not "CABLE Input ...",
           # so the name filter has to accept either form.
+          #
+          # rsac-eb2f: the endpoint can take a few seconds to register with
+          # AudioSrv after the driver installs, so device discovery AND the
+          # Set-AudioDevice call are retried with a bounded backoff instead of
+          # failing the whole (only) hard e2e tier on a provisioning race.
           Install-Module -Name AudioDeviceCmdlets -Force -Scope CurrentUser 2>$null
           Import-Module AudioDeviceCmdlets -ErrorAction Stop
 
-          Write-Host "=== All Audio Devices ==="
-          $devices = Get-AudioDevice -List
-          $devices | Format-Table Index, Type, Name, Default -AutoSize
+          $cable = $null
+          $maxAttempts = 6
+          for ($attempt = 1; $attempt -le $maxAttempts; $attempt++) {
+            Write-Host "=== Audio device discovery (attempt $attempt/$maxAttempts) ==="
+            $devices = Get-AudioDevice -List
+            $devices | Format-Table Index, Type, Name, Default -AutoSize
 
-          $cable = $devices | Where-Object {
-            $_.Type -eq "Playback" -and (
-              $_.Name -like "*CABLE Input*" -or
-              $_.Name -like "*VB-Audio*" -or
-              $_.Name -like "*VB-CABLE*"
-            )
-          } | Select-Object -First 1
+            $cable = $devices | Where-Object {
+              $_.Type -eq "Playback" -and (
+                $_.Name -like "*CABLE Input*" -or
+                $_.Name -like "*VB-Audio*" -or
+                $_.Name -like "*VB-CABLE*"
+              )
+            } | Select-Object -First 1
 
-          if ($cable) {
-            Write-Host "Setting VB-CABLE as default playback device: $($cable.Name) (Index=$($cable.Index))"
-            Set-AudioDevice -Index $cable.Index -DefaultOnly
-          } else {
-            Write-Error "No VB-CABLE playback device found — LABSN install likely failed"
+            if ($cable) {
+              try {
+                Write-Host "Setting VB-CABLE as default playback device: $($cable.Name) (Index=$($cable.Index))"
+                Set-AudioDevice -Index $cable.Index -DefaultOnly
+                break
+              } catch {
+                Write-Host "Set-AudioDevice failed on attempt ${attempt}: $_"
+                $cable = $null
+              }
+            }
+            if ($attempt -lt $maxAttempts) { Start-Sleep -Seconds 5 }
+          }
+
+          if (-not $cable) {
+            Write-Error "No VB-CABLE playback device found after $maxAttempts attempts — LABSN install likely failed"
             exit 1
           }
 
@@ -571,7 +678,7 @@ jobs:
             # playback endpoint by the hard gate two steps above. That makes
             # system-capture loopback deterministic — the test tone provably
             # routes to the captured endpoint — so enable the hard
-            # non-silence/tone asserts (mirrors the Linux ci_test_sink path).
+            # non-silence/tone asserts for this system-capture tier.
             echo "RSAC_CI_AUDIO_DETERMINISTIC=1" >> $env:GITHUB_ENV
           } else {
             Write-Host "No audio devices found"
@@ -579,7 +686,9 @@ jobs:
           }
 
       - name: Compilation check
-        run: cargo check --no-default-features --features feat_windows
+        # compose is included tier-wide so the ci_audio binary compiles once
+        # per job with a single feature fingerprint (mirrors linux-system).
+        run: cargo check --no-default-features --features feat_windows,compose
 
       - name: Run system capture tests
         shell: pwsh
@@ -587,7 +696,7 @@ jobs:
           RSAC_TEST_CAPTURE_TIMEOUT_SECS: "15"
         run: |
           cargo test --test ci_audio system_capture `
-            --no-default-features --features feat_windows `
+            --no-default-features --features feat_windows,compose `
             -- --test-threads=1 --nocapture `
             2>&1 | Tee-Object -FilePath ci-audio-output.log
 
@@ -597,7 +706,7 @@ jobs:
           RSAC_TEST_CAPTURE_TIMEOUT_SECS: "15"
         run: |
           cargo test --test ci_audio platform_caps `
-            --no-default-features --features feat_windows `
+            --no-default-features --features feat_windows,compose `
             -- --test-threads=1 --nocapture `
             2>&1 | Tee-Object -FilePath ci-audio-output-caps.log
 
@@ -607,9 +716,52 @@ jobs:
           RSAC_TEST_CAPTURE_TIMEOUT_SECS: "15"
         run: |
           cargo test --test ci_audio stream_lifecycle `
-            --no-default-features --features feat_windows `
+            --no-default-features --features feat_windows,compose `
             -- --test-threads=1 --nocapture `
             2>&1 | Tee-Object -FilePath ci-audio-output-lifecycle.log
+
+      # Terminal read-behavior + request_stop() end-to-end on the real WASAPI
+      # bridge. `lifecycle_terminal` matches ONLY this module (not
+      # `stream_lifecycle`). Hard-gated with the rest of the Windows system tier.
+      - name: Run terminal-read / request_stop lifecycle tests
+        shell: pwsh
+        env:
+          RSAC_TEST_CAPTURE_TIMEOUT_SECS: "15"
+        run: |
+          cargo test --test ci_audio lifecycle_terminal `
+            --no-default-features --features feat_windows,compose `
+            -- --test-threads=1 --nocapture `
+            2>&1 | Tee-Object -FilePath ci-audio-output-terminal.log
+
+      # Composed multi-source capture (ADR-0011) on the ONLY tier that sets
+      # RSAC_CI_AUDIO_DETERMINISTIC=1: VB-CABLE is the verified default
+      # endpoint, so this is the first HARD tone-content verification of the
+      # compose engine (resample/mixdown/master-clock) over a real backend —
+      # the Linux tier runs the same module with soft content asserts.
+      - name: Run composed capture tests
+        shell: pwsh
+        env:
+          RSAC_TEST_CAPTURE_TIMEOUT_SECS: "15"
+        run: |
+          cargo test --test ci_audio "compose::" `
+            --no-default-features --features feat_windows,compose `
+            -- --test-threads=1 --nocapture `
+            2>&1 | Tee-Object -FilePath ci-audio-output-compose.log
+
+      # Wiring existence check: a renamed/cfg'd-out compose module would make
+      # the filter above match zero tests and pass vacuously. Mirrors the
+      # linux-system guard.
+      - name: Verify compose tests are wired up
+        shell: pwsh
+        run: |
+          $list = cargo test --test ci_audio `
+            --no-default-features --features feat_windows,compose `
+            -- --list 2>&1 | Out-String
+          if ($list -notmatch "compose::") {
+            Write-Error "compose:: tests missing from the ci_audio test list — module rename or feature-gating regression"
+            exit 1
+          }
+          Write-Host "OK: compose:: tests present in the ci_audio binary."
 
       - name: Diagnostics on failure
         if: failure()
@@ -623,7 +775,7 @@ jobs:
 
       - name: Upload logs
         if: always()
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
           name: windows-system-capture-logs
           path: ci-audio-output*.log
@@ -642,14 +794,14 @@ jobs:
     # (a genuine WASAPI device-open regression), which is the M5 goal.
     timeout-minutes: 20
     steps:
-      - uses: actions/checkout@v5
-      - uses: dtolnay/rust-toolchain@1.95.0
-      - uses: Swatinem/rust-cache@v2
+      - uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5
+      - uses: dtolnay/rust-toolchain@e081816240890017053eacbb1bdf337761dc5582 # 1.95.0
+      - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
         with:
           key: windows-audio
 
       - name: Install virtual audio (VB-CABLE via LABSN)
-        uses: LABSN/sound-ci-helpers@v1
+        uses: LABSN/sound-ci-helpers@d08c889a7bba7d9b1b059f8f76dac4672ea3a9cf # v1 (v1 tag == v1.0.4, resolved via git ls-remote)
 
       - name: Set VB-CABLE as default audio device
         shell: pwsh
@@ -698,6 +850,18 @@ jobs:
             -- --test-threads=1 --nocapture `
             2>&1 | Tee-Object -FilePath ci-audio-output-enum.log
 
+      # CI-4 (Windows arm): enumeration_matrix's "no silent empty list" (audit
+      # L4) assertion only executes where RSAC_CI_AUDIO_AVAILABLE=1 — this tier
+      # has real WASAPI endpoints (VB-CABLE), so run the armed arm against the
+      # actual Windows enumerator too, not just PipeWire (mirrors linux-system).
+      - name: Run enumeration_matrix against real devices (L4 non-empty assertion)
+        shell: pwsh
+        run: |
+          cargo test --test enumeration_matrix `
+            --no-default-features --features feat_windows `
+            -- --nocapture `
+            2>&1 | Tee-Object -FilePath ci-audio-output-enum-matrix.log
+
       - name: Diagnostics on failure
         if: failure()
         shell: pwsh
@@ -707,7 +871,7 @@ jobs:
 
       - name: Upload logs
         if: always()
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
           name: windows-device-capture-logs
           path: ci-audio-output*.log
@@ -724,9 +888,9 @@ jobs:
     # WASAPI Process Loopback path still hard-fail the job (the M5 goal).
     timeout-minutes: 20
     steps:
-      - uses: actions/checkout@v5
-      - uses: dtolnay/rust-toolchain@1.95.0
-      - uses: Swatinem/rust-cache@v2
+      - uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5
+      - uses: dtolnay/rust-toolchain@e081816240890017053eacbb1bdf337761dc5582 # 1.95.0
+      - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
         with:
           key: windows-audio
 
@@ -737,7 +901,7 @@ jobs:
           Start-Service -Name "AudioSrv" -ErrorAction SilentlyContinue
 
       - name: Install virtual audio (VB-CABLE via LABSN)
-        uses: LABSN/sound-ci-helpers@v1
+        uses: LABSN/sound-ci-helpers@d08c889a7bba7d9b1b059f8f76dac4672ea3a9cf # v1 (v1 tag == v1.0.4, resolved via git ls-remote)
 
       - name: Set VB-CABLE as default audio device
         shell: pwsh
@@ -812,6 +976,22 @@ jobs:
             -- --test-threads=1 --nocapture `
             2>&1 | Tee-Object -FilePath ci-audio-output-proctree.log
 
+      # Windows-specific ApplicationByName coverage (WASAPI sysinfo→PID→process
+      # loopback). The cross-platform `application_by_name` module is
+      # `#![cfg(target_os = "macos")]`; the Windows path had no integration
+      # coverage until this module. The `application_by_name_windows` filter
+      # matches ONLY this module (not the macOS `application_by_name` module,
+      # whose name is a strict prefix but whose tests are cfg'd out here).
+      - name: Run ApplicationByName (Windows) tests
+        shell: pwsh
+        env:
+          RSAC_TEST_CAPTURE_TIMEOUT_SECS: "15"
+        run: |
+          cargo test --test ci_audio application_by_name_windows `
+            --no-default-features --features feat_windows `
+            -- --test-threads=1 --nocapture `
+            2>&1 | Tee-Object -FilePath ci-audio-output-appbyname.log
+
       - name: Diagnostics on failure
         if: failure()
         shell: pwsh
@@ -821,7 +1001,7 @@ jobs:
 
       - name: Upload logs
         if: always()
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
           name: windows-process-capture-logs
           path: ci-audio-output*.log
@@ -853,9 +1033,9 @@ jobs:
     continue-on-error: true
     timeout-minutes: 15
     steps:
-      - uses: actions/checkout@v5
-      - uses: dtolnay/rust-toolchain@1.95.0
-      - uses: Swatinem/rust-cache@v2
+      - uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5
+      - uses: dtolnay/rust-toolchain@e081816240890017053eacbb1bdf337761dc5582 # 1.95.0
+      - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
         with:
           key: macos-audio
 
@@ -907,6 +1087,18 @@ jobs:
             --no-default-features --features feat_macos \
             -- --test-threads=1 --nocapture 2>&1 | tee -a ci-audio-output.log
 
+      # Terminal-read / request_stop tests gate on require_system_capture!(), so
+      # on a runner without RSAC_CI_MACOS_TCC_GRANTED they skip-early BEFORE any
+      # Process Tap call (no CoreAudio hang). gtimeout is the belt-and-braces cap.
+      - name: Run terminal-read / request_stop lifecycle tests (skip-early without TCC)
+        env:
+          RSAC_TEST_CAPTURE_TIMEOUT_SECS: "15"
+        run: |
+          gtimeout --preserve-status 180 \
+            cargo test --test ci_audio lifecycle_terminal \
+            --no-default-features --features feat_macos \
+            -- --test-threads=1 --nocapture 2>&1 | tee -a ci-audio-output.log
+
       - name: Diagnostics on failure
         if: failure()
         run: |
@@ -916,7 +1108,7 @@ jobs:
 
       - name: Upload logs
         if: always()
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
           name: macos-system-capture-logs
           path: ci-audio-output.log
@@ -933,9 +1125,9 @@ jobs:
     # gracefully, but the hang wastes CI budget — `gtimeout 120` caps it.
     timeout-minutes: 10
     steps:
-      - uses: actions/checkout@v5
-      - uses: dtolnay/rust-toolchain@1.95.0
-      - uses: Swatinem/rust-cache@v2
+      - uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5
+      - uses: dtolnay/rust-toolchain@e081816240890017053eacbb1bdf337761dc5582 # 1.95.0
+      - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
         with:
           key: macos-audio
 
@@ -978,7 +1170,7 @@ jobs:
 
       - name: Upload logs
         if: always()
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
           name: macos-device-capture-logs
           path: ci-audio-output.log
@@ -997,9 +1189,9 @@ jobs:
     continue-on-error: true
     timeout-minutes: 20
     steps:
-      - uses: actions/checkout@v5
-      - uses: dtolnay/rust-toolchain@1.95.0
-      - uses: Swatinem/rust-cache@v2
+      - uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5
+      - uses: dtolnay/rust-toolchain@e081816240890017053eacbb1bdf337761dc5582 # 1.95.0
+      - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
         with:
           key: macos-audio
 
@@ -1026,9 +1218,10 @@ jobs:
       - name: Compilation check
         run: cargo check --no-default-features --features feat_macos
 
-      # rsac#25: RSAC_CI_MACOS_TCC_GRANTED is intentionally NOT set — the tests
-      # below must skip early on the TCC gate. `gtimeout 180` is the hard
-      # safety net in case a test slips past the gate.
+      # rsac#25: RSAC_CI_MACOS_TCC_GRANTED is intentionally NOT set. The capture
+      # tests skip early on the TCC gate; the ApplicationId/ApplicationByName
+      # error-path filters below fail before Process Tap creation and are
+      # TCC-free. `gtimeout` remains the hard safety net.
       - name: Run application capture tests
         env:
           RSAC_TEST_CAPTURE_TIMEOUT_SECS: "15"
@@ -1037,6 +1230,28 @@ jobs:
             cargo test --test ci_audio app_capture \
             --no-default-features --features feat_macos \
             -- --test-threads=1 --nocapture 2>&1 | tee ci-audio-output.log
+
+      - name: Run ApplicationId parse test (TCC-free)
+        env:
+          RSAC_TEST_CAPTURE_TIMEOUT_SECS: "15"
+        run: |
+          gtimeout --preserve-status 120 \
+            cargo test --test ci_audio select_by_non_numeric_id_returns_application_not_found \
+            --no-default-features --features feat_macos \
+            -- --test-threads=1 --nocapture 2>&1 | tee -a ci-audio-output.log
+
+      - name: Run ApplicationByName error-path tests (TCC-free)
+        env:
+          RSAC_TEST_CAPTURE_TIMEOUT_SECS: "15"
+        run: |
+          gtimeout --preserve-status 120 \
+            cargo test --test ci_audio select_by_missing_name_returns_error \
+            --no-default-features --features feat_macos \
+            -- --test-threads=1 --nocapture 2>&1 | tee -a ci-audio-output.log
+          gtimeout --preserve-status 120 \
+            cargo test --test ci_audio substring_match_returns_error \
+            --no-default-features --features feat_macos \
+            -- --test-threads=1 --nocapture 2>&1 | tee -a ci-audio-output.log
 
       - name: Run process tree capture tests
         env:
@@ -1056,7 +1271,7 @@ jobs:
 
       - name: Upload logs
         if: always()
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
           name: macos-process-capture-logs
           path: ci-audio-output.log
@@ -1083,6 +1298,38 @@ jobs:
       - macos-device
       - macos-process
     steps:
+      - name: Write CI gap report seed
+        run: |
+          cat > ci-audio-gap-report.md <<'EOF'
+          # Audio CI Coverage Gap Report
+
+          This artifact records first-class coverage claims, current CI gaps, and seeds that need platform evidence before they become hard gates.
+
+          ## Job Results
+
+          | Platform tier | Result |
+          |---|---|
+          | Linux system | ${{ needs.linux-system.result }} |
+          | Linux device | ${{ needs.linux-device.result }} |
+          | Linux process | ${{ needs.linux-process.result }} |
+          | Windows system | ${{ needs.windows-system.result }} |
+          | Windows device | ${{ needs.windows-device.result }} |
+          | Windows process | ${{ needs.windows-process.result }} |
+          | macOS system | ${{ needs.macos-system.result }} |
+          | macOS device | ${{ needs.macos-device.result }} |
+          | macOS process | ${{ needs.macos-process.result }} |
+
+          ## Deferred Seeds
+
+          | Seed | Why it is not a hard gate yet | Evidence needed before implementation |
+          |---|---|---|
+          | Linux hard content assertions | Blacksmith's dbus-less PipeWire startup can expose a sink and monitor while `SystemDefault` still yields 0 buffers. Hard non-silence assertions would risk false REDs. | A green run showing `ci_test_sink.monitor` carries the 440 Hz fixture through rsac capture, then set `RSAC_CI_AUDIO_DETERMINISTIC=1` for the affected Linux tiers. |
+          | Linux `ApplicationByName` happy-path filter | The backend supports it, but a low-risk test needs the exact `application.name`/binary reported by `pw-play` or `paplay` on the runner. Guessing that name would be flaky. | Capture `pw-dump --no-colors` for the spawned player and pin the observed stable field before adding the filter. |
+          | Windows device/process content assertions | The jobs hard-gate build/start/panic coverage, but the per-device and per-process tone route is not proven like the system VB-CABLE default route. | Prove the child player feeds the targeted endpoint/process loopback deterministically, then enable `RSAC_CI_AUDIO_DETERMINISTIC=1` for those jobs. |
+          | macOS first-class managed-runner capture | Process Tap requires `kTCCServiceAudioCapture`, which cannot be granted non-interactively on managed runners. | Use a self-hosted macOS runner with pre-granted Audio Capture permission and set `RSAC_CI_MACOS_TCC_GRANTED=1`. |
+          EOF
+          cat ci-audio-gap-report.md >> "$GITHUB_STEP_SUMMARY"
+
       - name: Report results
         run: |
           echo "============================================================"
@@ -1143,3 +1390,11 @@ jobs:
           else
             echo "All Linux + Windows (first-class) jobs passed."
           fi
+
+      - name: Upload CI gap report seed
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: ci-audio-gap-report-seed
+          path: ci-audio-gap-report.md
+          retention-days: 30
