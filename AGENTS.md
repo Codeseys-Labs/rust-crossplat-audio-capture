@@ -574,6 +574,12 @@ Full playbook (when to stack vs parallel PRs, exact commands, pitfalls):
   `git diff --diff-filter=D --name-only master..<frozen-sha> -- <paths>` and
   `git rm` them explicitly (0.4.1 lesson: 4 deletions from 3 different
   layers had to be swept into L5).
+- **Rename detection hides deletions from `--diff-filter=D`.** A file moved
+  (e.g. into `docs/history/`) is classified `R`, not `D`, so the deletion
+  sweep misses the old path and the release branch ends up with BOTH copies.
+  Use `--no-renames` (or filter `DR` and take each rename's source path) in
+  the sweep (0.4.1 lesson: 10 docs shadow-copies survived to the final
+  identity diff before this was caught).
 - **One invalid pathspec aborts the whole multi-path checkout** — the valid
   paths are silently skipped too. Verify with `git status` file-counts after
   every checkout, and split uncertain paths into their own command.
