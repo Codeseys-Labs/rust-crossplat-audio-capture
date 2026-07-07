@@ -549,6 +549,13 @@ Full playbook (when to stack vs parallel PRs, exact commands, pitfalls):
    adjustments, lockfile resolution noise); run the full local gate; bump the
    version (`scripts/bump-version.sh`); open `release/X.Y.Z → master` — its
    content is already reviewed layer-by-layer.
+7. **Decommission the source branch** once the identity diff is accounted:
+   **never merge it** (squash-merged layers share content but zero SHAs with
+   it — a merge re-replays the whole history into conflicts). Instead tag it
+   (`git tag -a archive/X.Y.Z-source <final-head>` — the `archive/` prefix
+   matches no workflow's `v*.*.*` tag filters) and delete the branch; the
+   closed integration PR's refs also keep every cited SHA resolvable
+   (0.4.1: tag `archive/0.4.1-source`, PR #35).
 
 **Hard-won rules (retro log — append, don't delete):**
 
