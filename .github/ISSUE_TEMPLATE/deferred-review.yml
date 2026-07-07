@@ -1,0 +1,43 @@
+name: Deferred review finding
+description: Track a valid review comment that is not being fixed in its PR (AGENTS.md §6 dispositions)
+labels: ["deferred-review"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Per AGENTS.md §6, every review comment must reach a terminal state
+        **before its PR merges**: fixed in the PR, or captured here. After
+        filing, reply on the review thread with `📌 Tracked in #N`.
+  - type: input
+    id: origin
+    attributes:
+      label: Originating PR + review comment link
+      placeholder: "#42, https://github.com/…/pull/42#discussion_r…"
+    validations:
+      required: true
+  - type: textarea
+    id: finding
+    attributes:
+      label: The finding
+      description: What the reviewer flagged, with file/line context.
+    validations:
+      required: true
+  - type: textarea
+    id: rationale
+    attributes:
+      label: Why it is deferred (not fixed in the PR)
+    validations:
+      required: true
+  - type: dropdown
+    id: domain
+    attributes:
+      label: Domain label to add
+      description: Add the matching label to this issue after filing.
+      options:
+        - bug
+        - tech-debt
+        - ci
+        - docs
+        - security
+    validations:
+      required: true

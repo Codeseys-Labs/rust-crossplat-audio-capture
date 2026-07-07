@@ -170,8 +170,8 @@ if [ "$REQUIREMENTS_MET" = true ]; then
     echo ""
     echo "You can now run:"
     echo "  cargo build --features feat_linux"
-    echo "  cargo run --example test_capture --features feat_linux"
-    echo "  cargo run --bin audio_recorder_tui --features feat_linux"
+    echo "  cargo run --features cli,feat_linux -- capture"
+    echo "  cargo test --test ci_audio --no-default-features --features feat_linux"
 else
     print_status "ERROR" "Some requirements not met - see messages above"
     exit 1

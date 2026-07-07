@@ -31,9 +31,61 @@ concurrency:
   cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 jobs:
+  # ── Docs-only fast path (rsac-61ce) ──────────────────────────────────
+  # PRs that touch only documentation/backlog files skip the whole compile
+  # matrix: this job classifies the PR's changed files, `lint` runs only
+  # when code changed, and every other job has `needs: lint`, so a skipped
+  # lint transitively skips the rest. Skipped jobs count as PASSING for
+  # branch-protection required checks (documented GitHub behavior), so the
+  # pattern stays merge-safe if protection is enabled later (master had no
+  # protection/rulesets when this landed — checked 2026-07-05).
+  #
+  # Fail-open by design: anything that is not a pull_request (pushes; tags —
+  # the version-lockstep tag-time hard gate must always fire; dispatch) or
+  # that cannot be classified runs the full matrix.
+  changes:
+    name: Classify changed paths
+    runs-on: blacksmith-4vcpu-ubuntu-2404
+    timeout-minutes: 5
+    permissions:
+      pull-requests: read
+    outputs:
+      code: ${{ steps.filter.outputs.code }}
+    steps:
+      - name: Detect docs-only PR
+        id: filter
+        env:
+          GH_TOKEN: ${{ github.token }}
+          PR_NUMBER: ${{ github.event.pull_request.number }}
+        run: |
+          if [ "${GITHUB_EVENT_NAME}" != "pull_request" ]; then
+            echo "code=true" >> "$GITHUB_OUTPUT"
+            echo "not a pull_request event — running the full matrix"
+            exit 0
+          fi
+          FILES=$(gh api "repos/${GITHUB_REPOSITORY}/pulls/${PR_NUMBER}/files" --paginate -q '.[].filename') || FILES="__api_error__"
+          if [ "$FILES" = "__api_error__" ] || [ -z "$FILES" ]; then
+            echo "code=true" >> "$GITHUB_OUTPUT"
+            echo "could not classify changed files — failing open (full matrix)"
+            exit 0
+          fi
+          printf 'changed files:\n%s\n' "$FILES"
+          NON_DOCS=$(printf '%s\n' "$FILES" \
+            | grep -vE '^(docs/|\.seeds/|\.kilo/|\.mulch/|LICENSE)' \
+            | grep -vE '\.md$' || true)
+          if [ -z "$NON_DOCS" ]; then
+            echo "code=false" >> "$GITHUB_OUTPUT"
+            echo "docs-only PR — skipping the compile matrix"
+          else
+            echo "code=true" >> "$GITHUB_OUTPUT"
+            printf 'code changes detected:\n%s\n' "$NON_DOCS"
+          fi
+
   # ── Lint (clippy matrix across all 3 OS) ────────────────────────────
   lint:
     name: Lint & Format (${{ matrix.feature }})
+    needs: changes
+    if: needs.changes.outputs.code == 'true'
     timeout-minutes: 20
     runs-on: ${{ matrix.runner }}
     strategy:
@@ -74,8 +126,13 @@ jobs:
       # tests + benches) for the active platform, so example/test/bench code is
       # held to the same -D warnings bar as the library and demo binaries —
       # previously they were exempt and could accumulate lint debt silently.
+      # rsac-0a1f: `cli` gates the rsac/standardized_test bins + the
+      # verify_audio/basic_capture/record_to_file examples via
+      # required-features, so --all-targets WITHOUT it silently skips them
+      # (src/main.rs would lose its -D warnings coverage). `compose` is
+      # platform-independent; lint it on every leg too.
       - name: Run Clippy
-        run: cargo clippy --all-targets --no-default-features --features ${{ matrix.feature }} -- -D warnings
+        run: cargo clippy --all-targets --no-default-features --features ${{ matrix.feature }},compose,cli -- -D warnings
 
       # FH-2: the bare `--no-default-features` build (NO platform feature) must
       # still compile. It broke on Windows (E0432) because a bin gated only on
@@ -108,11 +165,16 @@ jobs:
 
       # Build every target (bin/ + examples/), not just the lib, so demo
       # binaries and examples are compiled and kept from bit-rotting.
+      # rsac-0a1f: `cli` (rsac/standardized_test bins + several examples) and
+      # `compose` (composed_capture example) gate targets via required-features
+      # — without them --all-targets silently skips those targets.
       - name: Build all targets
-        run: cargo build --all-targets --no-default-features --features feat_linux
+        run: cargo build --all-targets --no-default-features --features feat_linux,compose,cli
 
+      # rsac-0a1f: `compose` is platform-independent (mock/scripted sources),
+      # so its unit tests run in the lib suite on every OS leg.
       - name: Cargo test (unit tests)
-        run: cargo test --lib --no-default-features --features feat_linux
+        run: cargo test --lib --no-default-features --features feat_linux,compose
 
       # TC-01: ADR-0001's headline alloc-free producer guarantee is proved ONLY
       # by tests/rt_alloc.rs, which is an integration test and so was never run
@@ -148,8 +210,13 @@ jobs:
         run: cargo check --lib --no-default-features --features feat_windows
 
       # Build every target (bin/ + examples/), not just the lib.
+      # rsac-0a1f: `cli` + `compose` gate bins/examples via required-features —
+      # without them --all-targets silently skips those targets.
+      # rsac-e93b: `async-stream` added — the Linux feature-powerset job
+      # excludes feat_windows/feat_macos, so this leg is the only place
+      # async-stream ever compiles against the WASAPI backend.
       - name: Build all targets
-        run: cargo build --all-targets --no-default-features --features feat_windows
+        run: cargo build --all-targets --no-default-features --features feat_windows,compose,cli,async-stream
 
       # TC-07: the Windows unit step used to be continue-on-error on the WHOLE
       # `cargo test --lib` run, so the ~40 inline wasapi.rs tests + 21 thread.rs
@@ -172,11 +239,14 @@ jobs:
       # backend_context, data_flow_to_kind, application_session_info, …) is pure
       # logic and HARD-FAILS, so a real unit regression still gates CI.
       # DEVICE_SKIPS must stay in lockstep with release.yml's verify job.
+      # rsac-0a1f: `compose` added so the platform-independent compose unit
+      # tests run here too (same feature set in the tolerated step below, so
+      # the lib is compiled once for both partitions).
       - name: Cargo test (unit tests, hard-fail)
         shell: bash
         run: |
           DEVICE_SKIPS="--skip enumerate --skip default_device --skip device_enumeration --skip device_id --skip device_supported_formats --skip audio_device_ --skip create_stream --skip find_device --skip watch_ --skip create_audio_client"
-          cargo test --lib --no-default-features --features feat_windows -- --test-threads=1 $DEVICE_SKIPS
+          cargo test --lib --no-default-features --features feat_windows,compose -- --test-threads=1 $DEVICE_SKIPS
 
       # Device-dependent subset ONLY (the families --skip'd above). Tolerated
       # because the Blacksmith Windows runner has no audio subsystem; this step
@@ -187,7 +257,7 @@ jobs:
         shell: bash
         run: |
           for f in enumerate default_device device_enumeration device_id device_supported_formats audio_device_ create_stream find_device watch_ create_audio_client; do
-            cargo test --lib --no-default-features --features feat_windows -- --test-threads=1 "$f" || true
+            cargo test --lib --no-default-features --features feat_windows,compose -- --test-threads=1 "$f" || true
           done
 
       # TC-01: ADR-0001 alloc-free producer proof (process-wide allocator, own
@@ -201,6 +271,15 @@ jobs:
       - name: Cargo test (enumeration_matrix — honest-failure contract)
         shell: bash
         run: cargo test --test enumeration_matrix --no-default-features --features feat_windows
+
+      # Doctests were Linux-only (feature-combo-doctests job) — doc examples
+      # visible only under cfg(windows) never compiled as doctests. Run the
+      # doc suite on this leg's feature set too (device-free; no_run examples
+      # only compile). rsac-e93b: `async-stream` included so its doc examples
+      # compile against feat_windows (the powerset job is Linux-only).
+      - name: Cargo test (doctests)
+        shell: bash
+        run: cargo test --doc --no-default-features --features feat_windows,compose,sink-wav,cli,async-stream
 
       - name: Report audio service status
         if: always()
@@ -250,8 +329,13 @@ jobs:
         run: cargo check --lib --no-default-features --features feat_macos
 
       # Build every target (bin/ + examples/), not just the lib.
+      # rsac-0a1f: `cli` + `compose` gate bins/examples via required-features —
+      # without them --all-targets silently skips those targets.
+      # rsac-e93b: `async-stream` added — the Linux feature-powerset job
+      # excludes feat_windows/feat_macos, so this leg is the only place
+      # async-stream ever compiles against the CoreAudio backend.
       - name: Build all targets
-        run: cargo build --all-targets --no-default-features --features feat_macos
+        run: cargo build --all-targets --no-default-features --features feat_macos,compose,cli,async-stream
 
       # TC-03: src/audio/macos/tap.rs has process-tap tests that are NOT
       # #[ignore]d (e.g. test_new_system_creates_tap at tap.rs:1352 calls
@@ -263,9 +347,11 @@ jobs:
       # clear failure here rather than eating the whole job budget. The proper
       # fix is to #[ignore] those tests in src/ — flagged as a follow-up for the
       # orchestrator since this job may not edit src/.
+      # rsac-0a1f: `compose` added so the platform-independent compose unit
+      # tests run in this leg too.
       - name: Cargo test (unit tests)
         timeout-minutes: 5
-        run: cargo test --lib --no-default-features --features feat_macos
+        run: cargo test --lib --no-default-features --features feat_macos,compose
 
       # TC-01: ADR-0001 alloc-free producer proof (process-wide allocator, own
       # binary, single-threaded). Device-free, so it HARD-FAILS like Linux.
@@ -277,6 +363,15 @@ jobs:
       - name: Cargo test (enumeration_matrix — honest-failure contract)
         timeout-minutes: 5
         run: cargo test --test enumeration_matrix --no-default-features --features feat_macos
+
+      # Doctests were Linux-only (feature-combo-doctests job) — doc examples
+      # visible only under cfg(macos) never compiled as doctests. Run the doc
+      # suite on this leg's feature set too (device-free; no_run examples only
+      # compile). rsac-e93b: `async-stream` included so its doc examples
+      # compile against feat_macos (the powerset job is Linux-only).
+      - name: Cargo test (doctests)
+        timeout-minutes: 10
+        run: cargo test --doc --no-default-features --features feat_macos,compose,sink-wav,cli,async-stream
 
       # OPTION B (existence check): Blacksmith macOS runners lack TCC grants for
       # Process Tap capture (see macos-process job in ci-audio-tests.yml —
@@ -348,23 +443,41 @@ jobs:
         run: |
           # ARM64 cross-check. We do NOT install :arm64 PipeWire dev packages:
           # the pipewire-debian PPA does not publish arm64 binaries, so apt
-          # would fail. Instead we run `cargo check` (compile-only, no link) and
-          # turn it into a *real* gate by failing on genuine rustc errors while
-          # tolerating expected link/pkg-config noise. Errors are detected by
-          # grepping the captured output for `error[` / `error:` — a rustc
-          # error there fails the job (unlike the old `|| echo` mask, which
-          # could never fail).
+          # would fail. Instead we run `cargo check` (compile-only, no link)
+          # and make its REAL exit code authoritative: exit 0 passes, and a
+          # non-zero exit is tolerated ONLY for the one known-acceptable mode
+          # — the pipewire/libspa -sys build scripts failing pkg-config
+          # discovery of the (missing) aarch64 system libraries. Any other
+          # failure — rustc `error[` / `error:` diagnostics, a non-PipeWire
+          # build-script crash — fails the job. CARGO_TERM_COLOR is forced off
+          # for this invocation so the greps below see plain text (the
+          # workflow-level `always` would embed ANSI codes in the log).
           set -o pipefail
           echo "Checking ARM64 compilation (library code only, no linking)..."
-          cargo check --lib --no-default-features --features feat_linux \
-            --target aarch64-unknown-linux-gnu 2>&1 | tee arm64-check.log || true
-          if grep -E 'error(\[|:)' arm64-check.log; then
-            echo "FAIL: rustc reported compilation errors for aarch64-unknown-linux-gnu"
+          STATUS=0
+          CARGO_TERM_COLOR=never cargo check --lib --no-default-features --features feat_linux \
+            --target aarch64-unknown-linux-gnu 2>&1 | tee arm64-check.log || STATUS=$?
+          if [ "$STATUS" -eq 0 ]; then
+            echo "OK: ARM64 cross-check passed cleanly"
+            exit 0
+          fi
+          # Fail on any error diagnostic that is NOT the tolerated
+          # pipewire/libspa build-script failure.
+          UNEXPECTED="$(grep -E '^error(\[|:)' arm64-check.log \
+            | grep -vE 'failed to run custom build command for `(pipewire|libspa)' || true)"
+          if [ -n "$UNEXPECTED" ]; then
+            echo "FAIL: cargo check exited ${STATUS} with unexpected errors for aarch64-unknown-linux-gnu:"
+            echo "$UNEXPECTED"
             exit 1
           fi
-          echo "OK: ARM64 cross-check produced no rustc compilation errors"
+          # Confirm the root cause really is pkg-config discovery of the
+          # missing aarch64 PipeWire libs, not some other build-script issue.
+          if ! grep -qiE 'pkg-config|library .* was not found|\.pc' arm64-check.log; then
+            echo "FAIL: cargo check exited ${STATUS} without the expected pkg-config/libpipewire diagnostic — not the tolerated missing-arm64-libs mode"
+            exit 1
+          fi
+          echo "TOLERATED: aarch64 PipeWire system libraries unavailable (pkg-config failure in the pipewire/libspa -sys build scripts); no rustc compilation errors"
 
-  # ── Binding crates compilation check ─────────────────────────────────
   check-bindings:
     name: Binding Crates
     timeout-minutes: 20
@@ -386,15 +499,24 @@ jobs:
       - name: Check rsac-ffi (C FFI)
         run: cargo check -p rsac-ffi
 
+      # rsac-e93b: the 24 compose FFI functions (src/compose.rs, behind the
+      # non-default `compose` feature) are invisible to the bare check above —
+      # without this leg they would never be compiled anywhere in CI.
+      - name: Check rsac-ffi (C FFI, compose feature)
+        run: cargo check -p rsac-ffi --features compose
+
       # rsac-3e24: clippy the binding crates under -D warnings. The root lint job
       # only lints the workspace default member (feat_<os>), so binding-crate
       # clippy errors (e.g. manual_is_multiple_of, type_complexity) previously
       # reached CI only as a `cargo check` pass. Lint all three to the same bar.
+      # rsac-e93b: rsac-ffi is linted twice — bare AND with `compose` — so the
+      # compose FFI surface is held to the same -D warnings bar.
       - name: Clippy binding crates (-D warnings)
         env:
           PYO3_USE_ABI3_FORWARD_COMPATIBILITY: "1"
         run: |
           cargo clippy -p rsac-ffi --all-targets -- -D warnings
+          cargo clippy -p rsac-ffi --all-targets --features compose -- -D warnings
           cargo clippy -p rsac-napi --all-targets -- -D warnings
           cargo clippy -p rsac-python --all-targets -- -D warnings
 
@@ -409,12 +531,33 @@ jobs:
       # `typedef enum {…} X;`) — only a genuinely added / renamed / removed symbol
       # fails the job. A failure means: regenerate rsac_generated.h, then update the
       # curated rsac.h (NEVER point cbindgen --output at rsac.h).
-      - name: Header drift check (curated rsac.h vs generated)
+      #
+      # rsac-e93b: cbindgen.toml's [defines] mapping ("feature = compose" →
+      # RSAC_FEATURE_COMPOSE) promises header generation is DETERMINISTIC
+      # regardless of enabled features — compose items are always emitted,
+      # wrapped in `#if defined(RSAC_FEATURE_COMPOSE)`. We now build rsac-ffi
+      # BOTH bare and with --features compose and byte-diff the two generated
+      # headers, so a build.rs/cbindgen change that breaks that determinism
+      # (e.g. feature-conditional generation) fails here instead of shipping a
+      # header whose content depends on which build produced it.
+      - name: Header drift check (curated rsac.h vs generated, feature-deterministic)
         shell: bash
         run: |
           set -euo pipefail
           # build.rs runs cbindgen and writes include/rsac_generated.h.
+          # Build bare first, snapshot the generated header…
           cargo build -p rsac-ffi
+          cp bindings/rsac-ffi/include/rsac_generated.h rsac_generated.bare.h
+          # …then rebuild with the compose feature (this also re-runs build.rs —
+          # the feature set is part of the build-script fingerprint) and demand
+          # the generated header is byte-identical.
+          cargo build -p rsac-ffi --features compose
+          if ! diff -u rsac_generated.bare.h bindings/rsac-ffi/include/rsac_generated.h; then
+            echo "::error::include/rsac_generated.h differs between the bare and --features compose builds."
+            echo "::error::Header generation must be feature-deterministic (see cbindgen.toml [defines]) — compose items belong behind #if defined(RSAC_FEATURE_COMPOSE), not behind conditional generation."
+            exit 1
+          fi
+          echo "OK: rsac_generated.h is byte-identical with and without --features compose."
           cd bindings/rsac-ffi/include
 
           CURATED="rsac.h"
@@ -469,6 +612,33 @@ jobs:
         env:
           PYO3_USE_ABI3_FORWARD_COMPATIBILITY: "1"
         run: cargo check -p rsac-python
+
+      # ── Runtime smoke tests (rsac-e1f7) ────────────────────────────────
+      # cargo check alone lets PyO3/napi signature or panic regressions ship
+      # silently. Build each binding for real, load it in its runtime, and
+      # exercise the device-independent surface (capabilities, target
+      # grammar); device enumeration is headless-tolerant inside the tests.
+      - name: Python binding smoke (maturin develop + import test)
+        env:
+          PYO3_USE_ABI3_FORWARD_COMPATIBILITY: "1"
+        run: |
+          python3 -m venv .venv-smoke
+          . .venv-smoke/bin/activate
+          pip install --quiet maturin
+          maturin develop -m bindings/rsac-python/Cargo.toml
+          python bindings/rsac-python/tests/smoke.py
+
+      - name: Set up Node for the napi smoke test
+        uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
+        with:
+          node-version: 22
+
+      - name: Node binding smoke (napi build + node --test)
+        working-directory: bindings/rsac-napi
+        run: |
+          npm install --no-fund --no-audit
+          npm run build
+          npm test
 
   # ── Go bindings: build the FFI staticlib + run device-free tests ─────
   # rsac-go links librsac_ffi.a (built by bindings/rsac-go/Makefile) via cgo.
@@ -561,16 +731,38 @@ jobs:
 
       - name: Cross-compile rsac-ffi staticlib (aarch64, compile-only)
         run: |
-          # Compile-only check (no arm64 PipeWire link libs in the PPA). A real
-          # rustc error fails the job; expected link/pkg-config noise is ignored.
+          # Compile-only check (no arm64 PipeWire link libs in the PPA). The
+          # build's REAL exit code is authoritative: exit 0 passes, and a
+          # non-zero exit is tolerated ONLY for the one known-acceptable mode
+          # (the pipewire/libspa -sys build scripts failing pkg-config
+          # discovery of the missing aarch64 system libraries). Any other
+          # failure — rustc `error[` / `error:` diagnostics included — fails
+          # the job. CARGO_TERM_COLOR is forced off so the greps see plain
+          # text (the workflow-level `always` would embed ANSI codes).
           set -o pipefail
-          cargo build -p rsac-ffi --release \
-            --target aarch64-unknown-linux-gnu 2>&1 | tee go-arm64.log || true
-          if grep -E 'error(\[|:)' go-arm64.log; then
-            echo "FAIL: rustc reported errors building rsac-ffi for aarch64"
+          STATUS=0
+          CARGO_TERM_COLOR=never cargo build -p rsac-ffi --release \
+            --target aarch64-unknown-linux-gnu 2>&1 | tee go-arm64.log || STATUS=$?
+          if [ "$STATUS" -eq 0 ]; then
+            echo "OK: aarch64 rsac-ffi staticlib built cleanly"
+            exit 0
+          fi
+          # Fail on any error diagnostic that is NOT the tolerated
+          # pipewire/libspa build-script failure.
+          UNEXPECTED="$(grep -E '^error(\[|:)' go-arm64.log \
+            | grep -vE 'failed to run custom build command for `(pipewire|libspa)' || true)"
+          if [ -n "$UNEXPECTED" ]; then
+            echo "FAIL: rsac-ffi aarch64 build exited ${STATUS} with unexpected errors:"
+            echo "$UNEXPECTED"
             exit 1
           fi
-          echo "OK: aarch64 rsac-ffi staticlib produced no rustc compilation errors"
+          # Confirm the root cause really is pkg-config discovery of the
+          # missing aarch64 PipeWire libs, not some other build-script issue.
+          if ! grep -qiE 'pkg-config|library .* was not found|\.pc' go-arm64.log; then
+            echo "FAIL: rsac-ffi aarch64 build exited ${STATUS} without the expected pkg-config/libpipewire diagnostic — not the tolerated missing-arm64-libs mode"
+            exit 1
+          fi
+          echo "TOLERATED: aarch64 PipeWire system libraries unavailable (pkg-config failure in the pipewire/libspa -sys build scripts); no rustc compilation errors"
 
   # ── Feature-combo compile + doctests (Linux) ────────────────────────
   # The async-stream / sink-wav / test-utils features are not exercised by
@@ -595,8 +787,8 @@ jobs:
           sudo apt-get update
           sudo apt-get install -y libpipewire-0.3-dev libspa-0.2-dev pkg-config
 
-      - name: Check feature combination (async-stream + sink-wav + test-utils)
-        run: cargo check --no-default-features --features feat_linux,async-stream,sink-wav,test-utils
+      - name: Check feature combination (async-stream + sink-wav + test-utils + compose)
+        run: cargo check --no-default-features --features feat_linux,async-stream,sink-wav,test-utils,compose
 
       # rsac-3e24: clippy the optional features under -D warnings. The root lint
       # job lints only feat_<os>, so a lint that fires solely under bridge-zerocopy
@@ -604,13 +796,171 @@ jobs:
       # optional-feature set + bridge-zerocopy here.
       - name: Clippy optional features (-D warnings)
         run: |
-          cargo clippy --all-targets --no-default-features --features feat_linux,async-stream,sink-wav,test-utils -- -D warnings
+          cargo clippy --all-targets --no-default-features --features feat_linux,async-stream,sink-wav,test-utils,compose -- -D warnings
           cargo clippy --all-targets --no-default-features --features feat_linux,bridge-zerocopy -- -D warnings
 
       - name: Run doctests
         # Build doctests with the same feature set so doc examples that touch
-        # async-stream / sink-wav APIs are exercised too.
-        run: cargo test --doc --no-default-features --features feat_linux,async-stream,sink-wav,test-utils
+        # async-stream / sink-wav / compose APIs are exercised too — the compose
+        # module docs carry a `no_run` doctest that must COMPILE here.
+        run: cargo test --doc --no-default-features --features feat_linux,async-stream,sink-wav,test-utils,compose
+
+  # ── Feature powerset (cargo-hack, Linux) ───────────────────────────
+  # The hand-picked feature-combo-doctests job above checks ONE combination;
+  # this checks the POWERSET: async-stream / sink-wav / test-utils /
+  # bridge-zerocopy / tracing / compose / cli — and any future features — get
+  # covered combinatorially, so a bad pairwise interaction (a cfg that only
+  # compiles with one feature on and another off) can't slip through.
+  # feat_windows / feat_macos are excluded because their platform deps cannot
+  # compile on a Linux runner; feat_linux stays in the powerset, hence the
+  # PipeWire headers below.
+  feature-powerset:
+    name: Feature Powerset (cargo-hack)
+    timeout-minutes: 30
+    needs: lint
+    runs-on: blacksmith-4vcpu-ubuntu-2404
+    steps:
+      - uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5
+        with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@e081816240890017053eacbb1bdf337761dc5582 # 1.95.0
+      - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
+
+      - name: Install PipeWire dev libraries
+        run: |
+          sudo add-apt-repository ppa:pipewire-debian/pipewire-upstream -y
+          sudo apt-get update
+          sudo apt-get install -y libpipewire-0.3-dev libspa-0.2-dev pkg-config
+
+      - name: Install cargo-hack
+        uses: taiki-e/install-action@0fd46367812ee04360509b4169d9f659d6892bb2 # v2
+        with:
+          tool: cargo-hack
+
+      # rsac-0a1f: compose + cli grew the non-excluded feature set to 8, so a
+      # FULL powerset is 256 combos — past this job's 30-min budget. --depth 2
+      # bounds it to every single feature + every PAIR (37 combos), which is
+      # exactly the pairwise-interaction guarantee this job exists to provide.
+      - name: Check feature powerset
+        run: cargo hack check --feature-powerset --depth 2 --no-dev-deps --exclude-features feat_windows,feat_macos --keep-going
+
+  # ── Coverage (cargo-llvm-cov, Linux, ADVISORY) ──────────────────────
+  # continue-on-error at the JOB level: coverage on device-gated audio code
+  # is inherently noisy (backend hot paths only execute against real audio
+  # hardware, which headless runners lack), so the number is TREND DATA for
+  # maintainers, not a merge gate. This job must never block CI and is
+  # deliberately absent from any required-checks logic. Uploads lcov.info as
+  # an artifact always; forwards to Codecov only when a CODECOV_TOKEN secret
+  # is configured (env-emptiness probe — secrets can't be read in `if:`).
+  coverage:
+    name: Coverage (cargo-llvm-cov, advisory)
+    timeout-minutes: 30
+    needs: lint
+    continue-on-error: true
+    runs-on: blacksmith-4vcpu-ubuntu-2404
+    steps:
+      - uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5
+        with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@e081816240890017053eacbb1bdf337761dc5582 # 1.95.0
+        with:
+          components: llvm-tools-preview
+      - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
+        with:
+          # Distinct prefix: llvm-cov instruments with -C instrument-coverage,
+          # so its artifacts must not poison the plain 1.95 caches.
+          prefix-key: v0-rust-llvm-cov
+
+      - name: Install PipeWire dev libraries
+        run: |
+          sudo add-apt-repository ppa:pipewire-debian/pipewire-upstream -y
+          sudo apt-get update
+          sudo apt-get install -y libpipewire-0.3-dev libspa-0.2-dev pkg-config
+
+      - name: Install cargo-llvm-cov
+        uses: taiki-e/install-action@0fd46367812ee04360509b4169d9f659d6892bb2 # v2
+        with:
+          tool: cargo-llvm-cov
+
+      # Same feature set as the Linux lib suite plus the non-platform optional
+      # features, so the sink/test-utils/compose code is measured too.
+      - name: Run cargo-llvm-cov (lib, lcov output)
+        run: cargo llvm-cov --lib --no-default-features --features feat_linux,compose,sink-wav,test-utils --lcov --output-path lcov.info
+
+      - name: Upload lcov.info artifact
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: coverage-lcov
+          path: lcov.info
+          retention-days: 14
+
+      # Codecov upload is opt-in: probe the secret via env emptiness (secrets
+      # are not readable in `if:` expressions on every context) and gate the
+      # upload step on the resulting output flag. No token → artifact-only.
+      - name: Detect Codecov token
+        id: codecov
+        shell: bash
+        env:
+          CODECOV_TOKEN: ${{ secrets.CODECOV_TOKEN }}
+        run: |
+          set -euo pipefail
+          if [ -n "${CODECOV_TOKEN}" ]; then
+            echo "available=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "available=false" >> "$GITHUB_OUTPUT"
+            echo "CODECOV_TOKEN not configured — skipping Codecov upload (lcov.info artifact still uploaded)."
+          fi
+
+      - name: Upload to Codecov
+        if: steps.codecov.outputs.available == 'true'
+        uses: codecov/codecov-action@0fb7174895f61a3b6b78fc075e0cd60383518dac # v5.5.5
+        with:
+          token: ${{ secrets.CODECOV_TOKEN }}
+          files: lcov.info
+          # Advisory job: never fail on an upload hiccup.
+          fail_ci_if_error: false
+
+  # ── MSRV check (Rust 1.87, Linux) ───────────────────────────────────
+  # Guards rust-version = "1.87" (Cargo.toml:9) from rotting under the pinned
+  # 1.95 toolchain: every other job compiles with 1.95.0 (rust-toolchain.toml),
+  # so a post-1.87 API creeping into src/ would otherwise surface only for
+  # downstream consumers building on the MSRV. This is also the tripwire for
+  # new optional deps exceeding the MSRV: --all-features compiles the `compose`
+  # deps (rubato + audioadapter-buffers) and the `cli` deps (clap, color-eyre,
+  # ctrlc, env_logger), and --all-targets includes the cli-gated bins/examples.
+  # RUSTUP_TOOLCHAIN is set at the job level because the
+  # repo's rust-toolchain.toml (1.95.0) would otherwise override the installed
+  # default for every cargo/rustc invocation, silently un-MSRVing the job.
+  msrv:
+    name: MSRV Check (Rust 1.87)
+    timeout-minutes: 25
+    needs: lint
+    runs-on: blacksmith-4vcpu-ubuntu-2404
+    env:
+      RUSTUP_TOOLCHAIN: "1.87.0"
+    steps:
+      - uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5
+        with:
+          persist-credentials: false
+      # Same SHA-pinned action commit as the 1.95.0 pins above; the
+      # `toolchain` input overrides the ref-derived version with the MSRV.
+      - uses: dtolnay/rust-toolchain@e081816240890017053eacbb1bdf337761dc5582 # action pin as above; toolchain input = 1.87.0
+        with:
+          toolchain: "1.87.0"
+      # Distinct cache prefix so MSRV (1.87) artifacts never poison the 1.95
+      # caches shared by every other job.
+      - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
+        with:
+          prefix-key: v0-rust-msrv-1-87
+
+      - name: Install PipeWire dev libraries
+        run: |
+          sudo add-apt-repository ppa:pipewire-debian/pipewire-upstream -y
+          sudo apt-get update
+          sudo apt-get install -y libpipewire-0.3-dev libspa-0.2-dev pkg-config
+
+      - name: Cargo check (MSRV)
+        run: cargo check --all-features --all-targets
 
   # ── docs.rs render gate (cargo doc) ─────────────────────────────────
   # rsac L14(b): Cargo.toml carries a [package.metadata.docs.rs] block
@@ -622,7 +972,9 @@ jobs:
   #     backends are gated `all(target_os = "X", feature = "feat_X")`, so on a
   #     Linux runner they stay cfg-disabled even with every feature on — only
   #     the Linux backend + the non-platform features (async-stream, sink-wav,
-  #     test-utils) are documented here. (Per-OS rendering is docs.rs's job.)
+  #     test-utils, compose, cli) are documented here — this is also where the
+  #     compose deps (rubato + audioadapter-buffers) must build for rustdoc.
+  #     (Per-OS rendering is docs.rs's job.)
   #   • RUSTDOCFLAGS="--cfg docsrs -D warnings" turns broken-doc-link / bad-doc
   #     warnings into a hard failure and enables the `docsrs` cfg the metadata
   #     block sets, so `#[cfg_attr(docsrs, doc(...))]` annotations are exercised.

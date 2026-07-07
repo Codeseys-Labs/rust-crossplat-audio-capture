@@ -1,12 +1,19 @@
 #!/bin/bash
 
-# Cross-compilation check script for rust-crossplat-audio-capture
-# This script tests compilation for all supported platforms and feature combinations
+# Cross-compilation check script for rsac.
+# Checks the target/feature combinations that are actually possible with
+# cross-rs from a Linux/WSL host.
+#
+# Scope note (2026-07-05 cleanup, rsac-a3c4): earlier versions also tried
+# x86_64-pc-windows-msvc and {x86_64,aarch64}-apple-darwin via `cross` —
+# cross-rs ships no MSVC or Darwin images, so those legs could never
+# succeed. For Windows use `make check-windows-docker` (cargo-xwin); for
+# macOS use `make check-macos-docker` or real hardware/CI.
 
 set -e
 
-echo "🔧 Cross-compilation check for rust-crossplat-audio-capture"
-echo "============================================================"
+echo "🔧 Cross-compilation check for rsac"
+echo "===================================="
 
 # Colors for output
 RED='\033[0;31m'
@@ -19,12 +26,12 @@ check_target() {
     local target=$1
     local features=$2
     local description=$3
-    
+
     echo -e "\n${YELLOW}📦 Checking: $description${NC}"
     echo "Target: $target"
     echo "Features: $features"
     echo "----------------------------------------"
-    
+
     if cross check --target "$target" --no-default-features --features "$features" --examples; then
         echo -e "${GREEN}✅ SUCCESS: $description${NC}"
         return 0
@@ -38,38 +45,22 @@ check_target() {
 declare -a results=()
 
 echo -e "\n🐧 Testing Linux builds..."
-# Linux with PipeWire
 if check_target "x86_64-unknown-linux-gnu" "feat_linux" "Linux x86_64 with PipeWire"; then
     results+=("✅ Linux x86_64 + PipeWire")
 else
     results+=("❌ Linux x86_64 + PipeWire")
 fi
 
-echo -e "\n🪟 Testing Windows builds..."
-# Windows with WASAPI
-if check_target "x86_64-pc-windows-msvc" "feat_windows" "Windows x86_64 with WASAPI"; then
-    results+=("✅ Windows x86_64 + WASAPI")
+if check_target "aarch64-unknown-linux-gnu" "feat_linux" "Linux ARM64 with PipeWire"; then
+    results+=("✅ Linux ARM64 + PipeWire")
 else
-    results+=("❌ Windows x86_64 + WASAPI")
+    results+=("❌ Linux ARM64 + PipeWire")
 fi
 
-echo -e "\n🍎 Testing macOS builds..."
-# macOS Intel with CoreAudio
-if check_target "x86_64-apple-darwin" "feat_macos" "macOS Intel x86_64 with CoreAudio"; then
-    results+=("✅ macOS Intel x86_64 + CoreAudio")
-else
-    results+=("❌ macOS Intel x86_64 + CoreAudio")
-fi
-
-# macOS Apple Silicon with CoreAudio
-if check_target "aarch64-apple-darwin" "feat_macos" "macOS Apple Silicon ARM64 with CoreAudio"; then
-    results+=("✅ macOS Apple Silicon ARM64 + CoreAudio")
-else
-    results+=("❌ macOS Apple Silicon ARM64 + CoreAudio")
-fi
-
-echo -e "\n🔄 Testing multi-platform builds..."
-# Test with all features enabled (should work on any platform but only compile relevant code)
+echo -e "\n🔄 Testing multi-feature build..."
+# All backend features enabled on one target — target_os gating means only
+# the Linux backend actually compiles in; this catches feature-unification
+# breakage.
 if check_target "x86_64-unknown-linux-gnu" "feat_linux,feat_windows,feat_macos" "All features on Linux"; then
     results+=("✅ All features on Linux")
 else
@@ -78,17 +69,14 @@ fi
 
 echo -e "\n📊 SUMMARY"
 echo "=========="
-for result in "${results[@]}"; do
-    echo -e "$result"
+failures=0
+for r in "${results[@]}"; do
+    echo -e "$r"
+    case "$r" in ❌*) failures=$((failures + 1)) ;; esac
 done
 
-# Count failures
-failed_count=$(printf '%s\n' "${results[@]}" | grep -c "❌" || true)
-
-if [ "$failed_count" -eq 0 ]; then
-    echo -e "\n${GREEN}🎉 All cross-compilation checks passed!${NC}"
-    exit 0
-else
-    echo -e "\n${RED}💥 $failed_count cross-compilation check(s) failed!${NC}"
+if [ "$failures" -gt 0 ]; then
+    echo -e "\n${RED}$failures check(s) failed${NC}"
     exit 1
 fi
+echo -e "\n${GREEN}All cross-compilation checks passed${NC}"

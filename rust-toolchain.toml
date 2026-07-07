@@ -11,8 +11,10 @@
 #    toolchain.
 # 3. Fix any new lint errors before pushing.
 #
-# See ~/.claude/skills/clippy-toolchain-bump-ci-breakage for the
-# rationale behind pinning rather than floating on `stable`.
+# Rationale for pinning rather than floating on `stable`: a floating
+# channel means a new stable release can introduce new clippy lints that
+# break `-D warnings` CI on unrelated PRs overnight. Pinning makes the
+# breakage land in the (deliberate) bump PR instead.
 [toolchain]
 channel = "1.95.0"
 components = ["rustfmt", "clippy"]
