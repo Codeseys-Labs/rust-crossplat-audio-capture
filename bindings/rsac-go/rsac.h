@@ -460,6 +460,13 @@ int32_t rsac_capabilities_supports_process_tree(const RsacCapabilities* caps);
 /** Returns 1 if device selection is supported, 0 if not, -1 if null. */
 int32_t rsac_capabilities_supports_device_selection(const RsacCapabilities* caps);
 
+/**
+ * Returns 1 if starting a capture requires a config-time user-consent
+ * artifact (mobile platforms; see docs/MOBILE_BACKEND_DESIGN.md), 0 if not,
+ * -1 if null. Always 0 on the desktop backends.
+ */
+int32_t rsac_capabilities_requires_user_consent(const RsacCapabilities* caps);
+
 /** Returns the maximum number of channels supported. Returns 0 if null. */
 uint16_t rsac_capabilities_max_channels(const RsacCapabilities* caps);
 

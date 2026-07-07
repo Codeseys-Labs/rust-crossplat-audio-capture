@@ -534,8 +534,12 @@ impl PyAudioDevice {
 ///     supports_application_capture: bool
 ///     supports_process_tree_capture: bool
 ///     supports_device_selection: bool
+///     supports_device_change_notifications: bool
+///     requires_user_consent: bool
 ///     max_channels: int
 ///     sample_rate_range: tuple[int, int]
+///     supported_sample_formats: list[str]
+///     supported_sample_rates: list[int]
 ///     backend_name: str
 #[pyclass(name = "PlatformCapabilities", module = "rsac._rsac", frozen)]
 struct PyPlatformCapabilities {
@@ -564,6 +568,21 @@ impl PyPlatformCapabilities {
         self.inner.supports_device_selection
     }
 
+    /// Whether the backend delivers device hot-plug / default-change
+    /// notifications (the Rust ``DeviceEnumerator::watch`` surface).
+    #[getter]
+    fn supports_device_change_notifications(&self) -> bool {
+        self.inner.supports_device_change_notifications
+    }
+
+    /// True when starting a capture requires a config-time user-consent
+    /// artifact (mobile platforms; see docs/MOBILE_BACKEND_DESIGN.md);
+    /// False on all desktop backends.
+    #[getter]
+    fn requires_user_consent(&self) -> bool {
+        self.inner.requires_user_consent
+    }
+
     #[getter]
     fn max_channels(&self) -> u16 {
         self.inner.max_channels
@@ -572,6 +591,25 @@ impl PyPlatformCapabilities {
     #[getter]
     fn sample_rate_range(&self) -> (u32, u32) {
         self.inner.sample_rate_range
+    }
+
+    /// Supported sample formats as lowercase strings (e.g. ``["i16", "f32"]``).
+    #[getter]
+    fn supported_sample_formats(&self) -> Vec<&'static str> {
+        self.inner
+            .supported_sample_formats
+            .iter()
+            .map(|f| sample_format_name(*f))
+            .collect()
+    }
+
+    /// The config-time sample-rate whitelist the capture constructor accepts.
+    ///
+    /// Identical on every platform and intentionally narrower than the
+    /// device-negotiable ``sample_rate_range``.
+    #[getter]
+    fn supported_sample_rates(&self) -> Vec<u32> {
+        rsac::PlatformCapabilities::supported_sample_rates().to_vec()
     }
 
     #[getter]
