@@ -407,7 +407,7 @@ let mut session = CompositionBuilder::new()
 session.start()?;
 let map = session.channel_map().unwrap();
 loop {
-    match session.read_buffer() {
+    match session.read_chunk_nonblocking() {
         Ok(Some(buffer)) => { /* interleaved f32, map.channels() wide */ }
         Ok(None) => std::thread::sleep(std::time::Duration::from_millis(1)),
         Err(e) if e.is_fatal() => break, // composition ended and drained

@@ -221,8 +221,8 @@ cargo run --bin pipewire_diagnostics --no-default-features --features feat_linux
 
 # Cross-platform examples (use the public API only; pick your platform feature)
 cargo run --example list_devices  --no-default-features --features feat_linux
-cargo run --example basic_capture --no-default-features --features feat_linux
-cargo run --example record_to_file -- out.wav --no-default-features --features feat_linux
+cargo run --example basic_capture --no-default-features --features feat_linux,cli
+cargo run --example record_to_file --no-default-features --features feat_linux,cli -- out.wav
 ```
 
 The end-to-end capture behaviour (including per-application and process-tree
