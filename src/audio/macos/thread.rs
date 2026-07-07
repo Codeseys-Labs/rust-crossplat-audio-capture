@@ -47,12 +47,35 @@ use coreaudio_sys::{
 /// Same as CoreAudio's AudioObjectID = u32.
 type AudioDeviceID = u32;
 
-/// Grace window for the silent-zeros diagnostic (ADR-0016): how long a
+/// Default grace window for the silent-zeros diagnostic (ADR-0016): how long a
 /// Process-Tap capture may deliver only zeroed samples before we warn that the
 /// most likely cause is a missing/denied `kTCCServiceAudioCapture` permission.
-/// Generous enough to clear cold-start latency on a busy machine while still
-/// surfacing the diagnostic promptly.
-const SILENCE_GRACE: std::time::Duration = std::time::Duration::from_secs(2);
+///
+/// **10s, not 2s, on purpose.** A *freshly granted* TCC audio-capture
+/// permission is not effective immediately — there is a measured ~6.7s
+/// propagation latency during which the tap delivers all-zero buffers
+/// **exactly like a denied one** (no API error). A window shorter than that
+/// latency false-trips on the first launch after a legitimate grant. 10s
+/// clears the observed latency with margin; the cost on a warm grant is zero
+/// (the window only delays the *warning*, never the audio — real samples flow
+/// to the consumer throughout). Latency is per-machine (hardware / OS / load),
+/// so this is a calibration knob (`RSAC_SILENCE_GRACE_SECS`), not a fixed
+/// constant. See the `macos-tcc-grant-latency-vs-silence-watchdog` runbook.
+const SILENCE_GRACE_DEFAULT: std::time::Duration = std::time::Duration::from_secs(10);
+
+/// Resolve the silence-diagnostic grace window: the `RSAC_SILENCE_GRACE_SECS`
+/// env override (a positive float, seconds) if set and valid, else
+/// [`SILENCE_GRACE_DEFAULT`]. Invalid / non-positive values fall back to the
+/// default rather than disabling the guard.
+fn silence_grace() -> std::time::Duration {
+    match std::env::var("RSAC_SILENCE_GRACE_SECS") {
+        Ok(v) => match v.parse::<f64>() {
+            Ok(s) if s > 0.0 => std::time::Duration::from_secs_f64(s),
+            _ => SILENCE_GRACE_DEFAULT,
+        },
+        Err(_) => SILENCE_GRACE_DEFAULT,
+    }
+}
 
 /// Poll increment for the watchdog's sleep, so it reacts to the teardown stop
 /// flag within one tick instead of blocking the full grace window.
@@ -472,11 +495,12 @@ pub(crate) fn create_macos_capture(
         let stop_for_thread = stop.clone();
         let wd_terminal = terminal.clone();
         let target_desc = format!("{:?}", config.target);
+        let grace = silence_grace();
         // Detached: it self-terminates within one SILENCE_POLL of the stop flag
         // or the grace deadline, so it never blocks the struct's drop-order
         // contract and needs no JoinHandle stored.
         std::thread::spawn(move || {
-            let deadline = std::time::Instant::now() + SILENCE_GRACE;
+            let deadline = std::time::Instant::now() + grace;
             loop {
                 if stop_for_thread.load(Ordering::Relaxed) {
                     return; // stopped within the grace window — no warning
@@ -502,7 +526,7 @@ pub(crate) fn create_macos_capture(
                  Privacy & Security > Screen & System Audio Recording (a terminal-launched \
                  or unsigned binary is denied regardless). See ADR-0016. (This is only a \
                  diagnostic — a genuinely paused/muted source is also silent and fine.)",
-                SILENCE_GRACE.as_secs()
+                grace.as_secs()
             );
         });
         Some(stop)
@@ -747,6 +771,21 @@ mod tests {
     use coreaudio_sys::kAudioFormatFlagIsNonInterleaved;
 
     // ── silent-zeros diagnostic (ADR-0016) ───────────────────────────
+
+    /// The default grace window MUST exceed the ~6.7s fresh-TCC-grant
+    /// propagation latency, or the watchdog false-warns on the first launch
+    /// after a legitimate grant (the tap streams pending-grant zeros for
+    /// several seconds before real audio flows). This is the invariant the
+    /// `macos-tcc-grant-latency-vs-silence-watchdog` runbook exists to protect.
+    #[test]
+    fn default_grace_exceeds_tcc_grant_latency() {
+        assert!(
+            SILENCE_GRACE_DEFAULT >= std::time::Duration::from_secs(7),
+            "default silence grace {}s must exceed the ~6.7s fresh-grant TCC \
+             propagation latency to avoid false-warning on first launch",
+            SILENCE_GRACE_DEFAULT.as_secs()
+        );
+    }
 
     /// The RT-side detection is `any(|&s| s != 0.0)`: an all-zero buffer must
     /// NOT flip the flag (the denied-permission silent case), and the first
