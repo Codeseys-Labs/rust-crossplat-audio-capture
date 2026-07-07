@@ -489,6 +489,12 @@ int32_t rsac_capabilities_supports_process_tree(const RsacCapabilities* caps);
 int32_t rsac_capabilities_supports_device_selection(const RsacCapabilities* caps);
 
 /**
+ * Returns 1 if the backend can deliver device hot-plug / default-change
+ * notifications, 0 if not, -1 if null.
+ */
+int32_t rsac_capabilities_supports_device_change_notifications(const RsacCapabilities* caps);
+
+/**
  * Returns 1 if starting a capture requires a config-time user-consent
  * artifact (mobile platforms — e.g. an Android MediaProjection token via
  * rsac_builder_set_android_projection()), 0 if not, -1 if null.
@@ -498,6 +504,52 @@ int32_t rsac_capabilities_requires_user_consent(const RsacCapabilities* caps);
 
 /** Returns the maximum number of channels supported. Returns 0 if null. */
 uint16_t rsac_capabilities_max_channels(const RsacCapabilities* caps);
+
+/**
+ * Returns the number of sample formats the backend supports.
+ * Returns 0 if null.
+ */
+size_t rsac_capabilities_supported_sample_format_count(const RsacCapabilities* caps);
+
+/**
+ * Returns the supported sample format at `index` as one of the
+ * rsac_sample_format_t constants, carried as a plain int32_t (the same
+ * constants-as-int convention as rsac_default_device()'s `kind`). Valid
+ * indices are 0..rsac_capabilities_supported_sample_format_count().
+ * Returns -1 if the handle is null or `index` is out of bounds.
+ */
+int32_t rsac_capabilities_supported_sample_format_at(const RsacCapabilities* caps,
+                                                     size_t index);
+
+/**
+ * Returns the minimum of the backend's device-negotiable sample-rate range,
+ * in Hz. Returns 0 if null.
+ */
+uint32_t rsac_capabilities_min_sample_rate(const RsacCapabilities* caps);
+
+/**
+ * Returns the maximum of the backend's device-negotiable sample-rate range,
+ * in Hz. Returns 0 if null.
+ */
+uint32_t rsac_capabilities_max_sample_rate(const RsacCapabilities* caps);
+
+/**
+ * Returns the number of entries in the builder's config-time sample-rate
+ * whitelist — the exact set rsac_builder_set_sample_rate() values are
+ * validated against at rsac_builder_build(). Intentionally narrower than
+ * the device-negotiable range reported by rsac_capabilities_min_sample_rate()
+ * / rsac_capabilities_max_sample_rate(). Returns 0 if null.
+ */
+size_t rsac_capabilities_supported_sample_rate_count(const RsacCapabilities* caps);
+
+/**
+ * Returns the config-time whitelisted sample rate at `index`, in Hz. Valid
+ * indices are 0..rsac_capabilities_supported_sample_rate_count(). Returns 0
+ * if the handle is null or `index` is out of bounds (0 is never a valid
+ * sample rate).
+ */
+uint32_t rsac_capabilities_supported_sample_rate_at(const RsacCapabilities* caps,
+                                                    size_t index);
 
 /**
  * Returns the backend name (e.g. "WASAPI", "CoreAudio", "PipeWire").
