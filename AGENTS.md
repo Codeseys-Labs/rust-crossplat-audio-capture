@@ -586,9 +586,9 @@ Full playbook (when to stack vs parallel PRs, exact commands, pitfalls):
 - ✅ **Audio-graph migrated** to use `rsac::list_audio_sources()` — replaced ~120 lines of per-platform `#[cfg]` code.
 
 **Remaining:**
-- **Mobile — the playback-capture tiers** (what `SystemDefault` means on mobile, ADR-0013): Android `AudioPlaybackCapture` + JNI ingest (rsac-77f1, needs the `librsac.so` packaging seed rsac-0aa9 first) and the iOS ReplayKit ring consumer (rsac-b3aa, mirrors the canonical `mobile/ios` RingLayout v1 contract)
+- **Mobile — the playback-capture tiers** (what `SystemDefault` means on mobile, ADR-0013): Android `AudioPlaybackCapture` + JNI ingest (rsac-77f1 — `librsac.so` packaging landed, rsac-0aa9) and iOS `SystemDefault` is compiled (rsac-b3aa: ReplayKit ring consumer mirroring the canonical `mobile/ios` RingLayout v1 contract), pending runtime proof
 - **Mobile — runtime verification** (the honest gap: everything mobile is compile-proof only): Android emulator leg rsac-e6d3, iOS simulator/device leg rsac-97c8 — the AGENTS mobile matrix cells stay "compiled, unverified" until these are green
-- **Mobile — delivery**: real Android device enumeration (rsac-ad8a), AAR Maven + SwiftPM distribution (rsac-05b6), rsac-ffi mobile triples for Flutter/C consumers (rsac-7a18), then `tauri-plugin-rsac` (rsac-f21c) + the audio-graph decision (rsac-0ac9, ADR-0014)
+- **Mobile — delivery**: real Android device enumeration (rsac-ad8a), AAR Maven + SwiftPM distribution (rsac-05b6), `tauri-plugin-rsac` (rsac-f21c) + the audio-graph decision (rsac-0ac9, ADR-0014) — the rsac-ffi mobile-triple cross-checks landed (rsac-7a18)
 - **Binding capability parity, FFI leg** — additive C ABI accessors (device-change notifications, sample-format list, rate range/whitelist) so Go reaches parity (rsac-a9af, re-scoped)
 - Additional sink adapters
 - Performance benchmarking and optimization — benches ship in-tree (`benches/`) but no CI job executes them; ADR-0006's `bridge-zerocopy` promote-or-remove decision is blocked on that A/B data
