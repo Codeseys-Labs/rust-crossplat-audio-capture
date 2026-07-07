@@ -8,10 +8,13 @@ This document enumerates every Cargo feature exposed by `rsac`, what it enables,
 |---|---|---|---|---|
 | `feat_windows` | yes | Windows | WASAPI backend: system + loopback + per-process + process-tree capture, WASAPI device enumeration, session enumeration | Windows 10+ host. No extra system packages (WASAPI ships with the OS). Rust target `x86_64-pc-windows-msvc` or `x86_64-pc-windows-gnu`. |
 | `feat_linux` | yes | Linux | PipeWire backend: system + per-app + process-tree capture via monitor streams, PipeWire device enumeration, `pw-dump` node resolution | `libpipewire-0.3-dev`, `libspa-0.2-dev`, `pkg-config`, `clang`/`libclang-dev`, `llvm-dev`. Runtime: PipeWire 0.3.44+ daemon active. |
-| `feat_macos` | yes | macOS | CoreAudio backend: system capture, per-process + process-tree capture via Process Tap, aggregate device construction, `NSWorkspace` application enumeration | Xcode Command Line Tools. Process Tap requires **macOS 14.4+**. Screen Recording (TCC) permission required at capture time. |
+| `feat_macos` | yes | macOS | CoreAudio backend: system capture, per-process + process-tree capture via Process Tap, aggregate device construction, `NSWorkspace` application enumeration | Xcode Command Line Tools. Process Tap requires **macOS 14.4+**. Audio Capture (`kTCCServiceAudioCapture`) TCC permission required at capture time — distinct from Screen Recording. |
 | `default` | — | all | Meta-feature: `["feat_windows", "feat_linux", "feat_macos"]` | Each enabled backend's requirements above. |
 | `async-stream` | no | all | `AudioCapture::audio_data_stream()` returning a `futures_core::Stream<Item = AudioResult<AudioBuffer>>`; also required by `examples/async_capture.rs` | Pulls in `atomic-waker` dep. Consumer needs an async runtime (Tokio, smol, etc.). |
 | `sink-wav` | no | all | `WavFileSink` adapter (writes captured audio to a WAV file through the `AudioSink` trait) | `hound` is always a hard dependency, so no extra install — the gate is API-surface only. |
+| `compose` | no | all | Multi-source channel composition ([ADR-0011](designs/0011-compose-feature.md)): `CompositionBuilder` / `Composition` in `rsac::compose` — groups of `CaptureTarget`s mixed to Mono/Stereo channels (per-source gain) or kept as native channels, appended into one interleaved multi-channel stream with transparent resampling to the session rate; also required by `examples/composed_capture.rs` and the `compose::` ci_audio integration module | Pulls in `rubato` (FFT resampler → `realfft`, `num-complex`) and `audioadapter-buffers`. No system packages. |
+| `cli` | no | all | The demo binaries' dependency set — required by the `rsac` CLI (`[[bin]]`), `standardized_test`, and the `verify_audio` / `basic_capture` / `record_to_file` examples (all declare `required-features = ["cli"]`). Library consumers who don't enable it no longer compile these deps at all. | Pulls in `clap` (derive), `color-eyre`, `ctrlc`, `env_logger`. |
+| `macos-tcc-spi` | no | macOS | Real `check_audio_capture_permission()` preflight ([ADR-0015](designs/0015-macos-tcc-audiocapture-preflight.md)): queries the `kTCCServiceAudioCapture` authorization via the **private** `TCCAccessPreflight` SPI, `dlopen`'d at runtime (never linked). Feature OFF (the default) keeps the honest `NotDetermined` stub, so published artifacts carry no private-symbol usage. Any SPI resolution failure degrades to `NotDetermined`. | No extra deps (uses `libc` dlopen/dlsym + `core-foundation`, already macOS deps). Private SPI — may break on future macOS releases; see the ADR's risk section. |
 | `tracing` | **no** | all | Routes the internal `rsac_event!` / `rsac_span!` instrumentation macros to the [`tracing`](https://docs.rs/tracing) facade and makes `rsac::install_default_tracing()` available. With the feature **off**, the same macros expand to `log::` calls (behavior-identical), so logging works either way — this flag only changes the *backend*. | Pulls in the `tracing` facade crate only (no `tracing-subscriber`); the consumer installs their own subscriber. |
 | `bridge-zerocopy` | **no** | all | Compiles the opt-in sample-domain SPSC ring (`SampleRing` producer/consumer) that writes interleaved `f32` straight into the ring via `rtrb`'s `write_chunk_uninit` + `CopyToUninit`, avoiding the per-buffer `Vec`/`AudioBuffer` allocation. **Currently A/B-benchmarked only** — see the note below. | None extra (uses the existing `rtrb` dep). |
 | `test-utils` | no | all | Re-exports test helpers used by integration tests and external binding crates | None. Used internally by `tests/` and the `bindings/rsac-*` workspace members. |
@@ -19,6 +22,20 @@ This document enumerates every Cargo feature exposed by `rsac`, what it enables,
 ## Platform-feature semantics
 
 The three `feat_*` flags are a two-way gate: code inside a platform backend is compiled **only** when both `target_os` matches and the feature is on. See `src/audio/mod.rs` for the `cfg(all(target_os = "…", feature = "feat_…"))` guards.
+
+### PipeWire crate version gate (`v0_3_65`)
+
+`feat_linux` depends on `pipewire = { version = "0.9.2", features = ["v0_3_65"] }`.
+The `v0_3_XX` features are the pipewire-rs crates' API-version gates; `v0_3_65`
+transitively enables the whole chain down to `v0_3_32` (including the
+`v0_3_44` monitor-stream APIs) plus `libspa`/`libspa-sys` `v0_3_65`. This used
+to be force-enabled through a `.cargo/config.toml` rustflags cfg-injection
+hack, which was both global (every crate in the graph got the cfg) and
+**inconsistent** — it never enabled the intermediate `v0_3_45`–`v0_3_64`
+gates, so code behind those cfgs silently compiled out (rsac-9b3c). It is now
+a normal cargo feature. The declared runtime floor (PipeWire 0.3.44+ daemon)
+is unchanged; the compile-time Rust API surface targets 0.3.65 — identical to
+what the hack produced, minus the inconsistency.
 
 Consequences:
 
@@ -158,7 +175,7 @@ feature.
 |---|---|---|
 | `rsac-python` | yes | Uses the `[target.'cfg(...)'.dependencies.rsac]` blocks above with `default-features = false`. Reference implementation. |
 | `rsac-ffi` | yes (variant) | Mirrors `rsac`'s `feat_*` through its own `[features]` table and depends on `rsac` with `default-features = false`; consumers pass `--features feat_<os>`. Equivalent end state — only the host backend compiles. |
-| `rsac-napi` | migrating | Historically depended on `rsac` with implicit defaults (all three backends, bloating non-host builds). Should adopt the per-target blocks above so a Linux/Windows/macOS build pulls only its backend. |
+| `rsac-napi` | yes | Migrated (rsac-e8a3) to the per-target blocks with `default-features = false`, matching `rsac-python`. |
 
 > The manifest edits that bring `rsac-napi` (and align `rsac-ffi`) onto
 > this pattern live with the crate-owning change; this document is the
@@ -166,13 +183,19 @@ feature.
 
 ## Binaries / examples gated by features
 
-Some binaries require a specific feature to build (see `Cargo.toml`):
+Several targets require a specific feature to build — cargo names the missing
+feature in a clear error if you forget (see `Cargo.toml` for the full list):
 
-- `pipewire_diagnostics` — `feat_linux`
+- `rsac` (the CLI demo), `standardized_test` — `cli`
+- `pipewire_diagnostics`, `smoke_alpine` — `feat_linux`
 - `wasapi_session_test` — `feat_windows`
+- `examples/verify_audio.rs`, `examples/basic_capture.rs`,
+  `examples/record_to_file.rs` — `cli`
 - `examples/async_capture.rs` — `async-stream`
+- `examples/composed_capture.rs` — `compose`
 
-All other `[[bin]]` and `[[example]]` entries compile under the default feature set.
+Only `examples/list_devices.rs` and the remaining `src/bin/` test binaries
+compile under the default feature set alone.
 
 ## What is *not* behind a feature flag
 
@@ -187,7 +210,7 @@ The following are always compiled and have no opt-out:
 
 ## Version note
 
-This matrix reflects `rsac` at the 0.2.0 release line. Future provider-architecture work may add feature flags for cloud-backed capture providers — those will be listed here as they land.
+This matrix reflects `rsac` at the 0.4.0 line. Future provider-architecture work may add feature flags for cloud-backed capture providers — those will be listed here as they land.
 
 `rsac` and its bindings bump in lockstep on every semver tag, and any
 change to the `rsac-ffi` C ABI is a MAJOR bump for the FFI surface. See

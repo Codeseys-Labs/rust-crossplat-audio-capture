@@ -6,17 +6,29 @@ architectural context read [`AGENTS.md`](../AGENTS.md) and
 
 ## 1. Toolchain
 
-The Rust toolchain is **pinned** via
-[`rust-toolchain.toml`](../rust-toolchain.toml). `rustup` will pick it up
-automatically; do not install against a different channel or the
-pre-commit clippy gate will drift.
+**Rust** is **pinned** via
+[`rust-toolchain.toml`](../rust-toolchain.toml). `rustup` picks it up
+automatically; do not install against a different channel or your local
+clippy results will drift from CI's.
 
 - Channel: see `rust-toolchain.toml` (currently `1.95.0`).
 - Components: `rustfmt`, `clippy`.
 - Bumping the toolchain is intentional — see the comment at the top of
-  `rust-toolchain.toml` and the `clippy-toolchain-bump-ci-breakage`
-  skill. Run `cargo clippy --all-targets -- -D warnings` locally before
-  pushing the bump so new lints do not land cold in CI.
+  `rust-toolchain.toml` for the rationale. Run
+  `cargo clippy --all-targets -- -D warnings` locally with the new
+  toolchain before pushing the bump so new lints do not land cold in CI.
+
+**Everything else** (Bun, Node, Go, Python for the bindings; lefthook for
+git hooks) is pinned via [`mise.toml`](../mise.toml). One-shot setup:
+
+```bash
+# install mise: https://mise.jdx.dev  (winget install jdx.mise / brew install mise)
+mise install        # installs the pinned polyglot toolchain + lefthook
+mise run setup      # installs the git hooks (lefthook install)
+```
+
+mise is a convenience, not a requirement — every task below also shows
+the direct command. mise deliberately does **not** manage Rust.
 
 ### Platform build dependencies
 
@@ -24,26 +36,70 @@ See [`docs/features.md`](features.md) for the feature matrix.
 
 - **Linux:** `libpipewire-0.3-dev`, `libspa-0.2-dev`, `pkg-config`,
   `clang` / `libclang-dev`, `llvm-dev`.
-- **Windows:** MSVC (WASAPI ships with the OS).
+  On Windows/macOS, the fastest way to work on the Linux leg is the
+  **devcontainer** ([`.devcontainer/`](../.devcontainer/devcontainer.json)) —
+  it reuses `docker/linux/Dockerfile.test` (full PipeWire stack, session
+  daemons booted at start) and runs
+  `cargo check --features feat_linux` on create.
+- **Windows:** MSVC (WASAPI ships with the OS). Git for Windows provides
+  the `bash` used by the gate script and hooks.
 - **macOS:** Xcode Command Line Tools. Process Tap features require
   macOS 14.4+.
 
 ## 2. The local gate
 
-Every commit must pass this gate. CI runs it too, so skipping it locally
-just means you find out later:
+The gate is a **faithful replica of ci.yml's `lint` job** for your host
+OS — same commands, same feature flags — so passing locally means the
+lint leg passes in CI. It lives in one place,
+[`scripts/gate.sh`](../scripts/gate.sh) (PowerShell wrapper:
+`scripts/gate.ps1`), and is wired into the pre-push git hook.
 
 ```bash
-cargo fmt --all -- --check
-cargo clippy --all-targets --all-features -- -D warnings
-cargo test --lib --no-default-features --features feat_linux   # on Linux
-# … or feat_windows / feat_macos on the corresponding host
-cargo doc --no-deps --all-features
+mise run gate        # or: bash scripts/gate.sh
+#   1. cargo fmt --all -- --check
+#   2. cargo clippy --all-targets --no-default-features \
+#        --features feat_<host>,compose,cli -- -D warnings
+#   3. cargo build --no-default-features        (bare-build smoke)
+
+mise run gate:full   # or: bash scripts/gate.sh --full
+#   … adds: lib tests, doctests, cargo doc (docsrs, -D warnings),
+#   and the module-DAG guard — the rest of the fast CI legs.
 ```
 
-`cargo doc` is part of the gate because `src/lib.rs` declares
+`cargo doc` is part of `gate:full` because `src/lib.rs` declares
 `#![deny(rustdoc::broken_intra_doc_links)]` — a stale link becomes a
 build error.
+
+### Git hooks (lefthook)
+
+[`lefthook.yml`](../lefthook.yml) defines the hooks; `mise run setup`
+(or `lefthook install`) activates them per-clone:
+
+- **pre-commit** — `cargo fmt --all -- --check` (only when `.rs` files
+  are staged).
+- **commit-msg** — rejects `Co-Authored-By:` trailers and tool bylines
+  (the AGENTS.md §6 commit conventions, enforced mechanically).
+- **pre-push** — runs the gate.
+
+Hooks are opt-in and skippable (`git push --no-verify`); CI is the
+backstop either way.
+
+### Editor setup
+
+Several cargo features are off by default (`compose`, `cli`, `sink-wav`,
+`async-stream`, `test-utils`), so without configuration rust-analyzer
+shows **no diagnostics** inside `src/compose/`, `src/main.rs`, or the
+gated examples. VS Code picks the checked-in
+[`.vscode/settings.json`](../.vscode/settings.json) up automatically.
+For other editors, set the equivalent of:
+
+```json
+{ "rust-analyzer.cargo.features": ["compose", "cli", "sink-wav", "async-stream", "test-utils"] }
+```
+
+(Zed: `languages.Rust.language_servers` → rust-analyzer
+`initialization_options.cargo.features`; Neovim: pass the same table via
+your LSP config's `settings`.)
 
 ## 3. Running the test suite
 
@@ -77,6 +133,11 @@ macOS runners without a TCC grant, Process Tap calls block for 10–18
 minutes before erroring — leaving the env var unset lets those tests
 skip early instead of hanging.
 
+On a machine with real, working audio, also export
+`RSAC_CI_AUDIO_DETERMINISTIC=1` — it turns the capture tests' soft
+non-silence warnings into hard assertions (see the workflow-knob list in
+[`docs/CI_AUDIO_TESTING.md`](CI_AUDIO_TESTING.md#5-workflow-knobs)).
+
 To run the integration tests locally (Linux example):
 
 ```bash
@@ -98,7 +159,8 @@ Pull requests trigger three workflows:
   [`docs/CI_AUDIO_TESTING.md`](CI_AUDIO_TESTING.md) for which cells are
   exercised end-to-end versus gated by macOS platform-security limits.
 - Release workflows (`release.yml`, `release-npm.yml`,
-  `release-pypi.yml`) only trigger on tags.
+  `release-pypi.yml`) trigger on stable tags and also support guarded
+  manual dispatch for release rehearsals or registry publish recovery.
 
 ## 5. Docs
 
@@ -109,9 +171,14 @@ Pull requests trigger three workflows:
 - Prefer updating existing docs over creating new files. See
   [`docs/audit/docs-queue.md`](audit/docs-queue.md) for the current
   documentation audit state.
-- In-tree design docs live under `docs/architecture/` (design intent)
-  and `docs/reviews/` (loop retrospectives). Don't confuse them: reviews
-  snapshot a moment in time; architecture docs stay authoritative.
+- In-tree design docs live under `docs/architecture/` (original design
+  intent — **historical**; each carries a divergence banner) and
+  `docs/reviews/` (loop retrospectives — snapshots of a moment in time).
+  Per [`AGENTS.md` §2](../AGENTS.md): **the code is the source of
+  truth**. When a design doc and the code disagree, fix the doc (or note
+  the divergence in its banner) — never bend the code to match a stale
+  doc. Durable decisions are recorded as ADRs in
+  [`docs/designs/`](designs/).
 
 ## 6. Commit style
 
@@ -146,10 +213,11 @@ Always reply on the originating comment so the thread can be resolved. See
 
 ## 7. Release procedure
 
-Releases are driven by `scripts/bump-version.sh`, which keeps five
+Releases are driven by `scripts/bump-version.sh`, which keeps six
 version-bearing files in sync:
 
 - `Cargo.toml` (root `rsac` crate)
+- `bindings/rsac-ffi/Cargo.toml`
 - `bindings/rsac-napi/Cargo.toml`
 - `bindings/rsac-napi/package.json`
 - `bindings/rsac-python/Cargo.toml`
@@ -174,9 +242,10 @@ checks and post-publish verification is in
 
 ## 8. Pull request checklist
 
-- [ ] `cargo fmt --all -- --check` is clean.
-- [ ] `cargo clippy --all-targets --all-features -- -D warnings` is clean.
-- [ ] `cargo doc --no-deps --all-features` is warning-free.
+- [ ] `mise run gate` (or `bash scripts/gate.sh`) is clean — fmt,
+      CI-replica clippy `-D warnings`, bare-build smoke.
+- [ ] `mise run gate:full` extras are clean where relevant — lib tests,
+      doctests, `cargo doc` (warning-free), module-DAG guard.
 - [ ] New public items have rustdoc (purpose + example where non-trivial +
       `# Errors` where applicable).
 - [ ] Relevant CI matrix rows are green (or the PR explains why a row is

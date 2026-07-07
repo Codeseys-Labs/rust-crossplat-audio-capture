@@ -199,3 +199,89 @@ When a process PID doesn't translate to an AudioObjectID (e.g., ephemeral `afpla
 - Prior fix: `new_system()` in same file already used `initStereoGlobalTapButExcludeProcesses:`
 - Reference: `reference/AudioCap/AudioCap/ProcessTap/ProcessTap.swift` line 92
 - Reference: `reference/AudioCap/AudioCap/ProcessTap/CoreAudioUtils.swift` lines 62–76
+
+---
+
+## Follow-up hardening (rsac-catap-safety / rsac-ptree / rsac-ead3-teardown)
+
+A later pass (from the macOS/CoreAudio deep critique) hardened `tap.rs` and the
+device-alive listener without changing the 3-path fallback behaviour above.
+
+### 1. ObjC exception safety — `guard_objc`
+
+`CATapDescription` is a private/undocumented class whose selectors' argument
+shapes shift across macOS 14.4–26. If one raises an `NSException`, that foreign
+exception unwinds into Rust. With objc2's default `msg_send!` (this crate
+enables `objc2`'s `"exception"` feature but **not** `"catch-all"`), such an
+unwind **is not caught by `std::panic::catch_unwind`** and typically **aborts
+the process**.
+
+Fix: a `guard_objc(operation, closure) -> AudioResult<R>` shim built on
+[`objc2::exception::catch`](https://docs.rs/objc2/latest/objc2/exception/fn.catch.html)
+(the correct primitive; feature `"exception"` already enabled). Every may-throw
+`CATapDescription` message send now goes through it, so a version-shape mismatch
+degrades to a categorized `AudioError::BackendError` (with the thrown
+NSException's `name: reason` surfaced for diagnostics) instead of aborting.
+
+The previous `test_new_system_creates_tap` relied on `std::panic::catch_unwind`
+to "catch ObjC exceptions" — which did not actually work. It now documents that
+ObjC exceptions arrive as `Err(AudioError::BackendError)` and only nets a
+genuine Rust panic defensively.
+
+### 2. Centralized selector configuration — `configure_tap_description`
+
+The shared property setters (`setName:`, `setUUID:`, `setMuteBehavior:`,
+`setPrivateTap:`, `setMixdown:`) were copy-pasted across `new`, `new_tree`, and
+`new_system`. They are now issued from one exception-guarded helper,
+`configure_tap_description`, so exception handling, the `respondsToSelector:`
+guard for the removed-in-26 `setPrivateTap:`, and the `setMuteBehavior:` `i64`
+(`NSInteger`/`'q'`) argument-type fix all live in one auditable place.
+
+### 3. ObjC ownership / nil-init leak-safety audit
+
+`create_process_tap_description`'s ownership contract is now documented and
+consistent: on a `init…` returning **nil OR throwing**, the initializer has
+already consumed (released) the alloc'd receiver per the ObjC "init consumes
+self" rule, so the caller must **not** release it (it falls through with a fresh
+`alloc`); when `init…` was **never called** (selector unavailable / no PIDs) the
+uninitialized alloc is released. The fallback path also releases a live
+`init_obj` before any error return, closing a latent leak where a thrown setter
+would skip the manual `release`.
+
+### 4. ProcessTree = full descendant closure (not just direct children)
+
+`new_tree` previously targeted only the parent + its **direct** children. It now
+walks the `parent → child` relation breadth-first over a single `sysinfo`
+snapshot to target the parent + **all transitive descendants** (children,
+grandchildren, …), via the pure, unit-tested `collect_process_tree_pids` helper
+(cycle-safe: each PID visited once). This matters because browsers/Electron apps
+emit audio from grandchild helper processes a direct-children-only tap would
+miss. Still snapshot-based/best-effort — a process forking after the snapshot is
+not captured (re-enumeration on tree change remains future work).
+
+### 5. Device-alive listener teardown race guard
+
+`DeviceAliveContext` gained a `tearing_down: AtomicBool`.
+`remove_device_alive_listener` sets it (Release) **before**
+`AudioObjectRemovePropertyListener`, and `device_alive_listener_proc` checks it
+(Acquire) and no-ops when set. This prevents a device death that races an
+explicit stop/Drop from `force_set(Error)`-poisoning the bridge (sticky terminal
+`Error` would otherwise outrank the graceful `Stopping`) and misreporting an
+intentional teardown as a Fatal device-death `StreamEnded`. See ADR-0010 §4.
+
+### Verification note (host limitation)
+
+These changes were authored on a **Windows** host with no macOS toolchain, so
+the `feat_macos` backend (which links the CoreAudio/AppKit frameworks) could not
+be compiled or run here. The new logic was structured so the platform-agnostic
+pieces (`collect_process_tree_pids`, `guard_objc` behaviour, the teardown-guard
+flag semantics) are covered by `#[cfg(all(test, target_os = "macos"))]` unit
+tests that run on the macOS CI runner (Blacksmith `blacksmith-6vcpu-macos-15`)
+and locally per the Local Testing Guide. Run:
+
+```bash
+cargo test --features feat_macos --lib audio::macos -- --nocapture
+```
+
+on a macOS 14.4+ host to exercise them (hardware/TCC-gated Process Tap tests
+remain `#[ignore]`).
