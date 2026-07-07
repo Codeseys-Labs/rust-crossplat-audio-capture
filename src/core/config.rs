@@ -454,6 +454,43 @@ pub struct StreamConfig {
     /// Propagated from [`AudioCaptureBuilder`](crate::api::AudioCaptureBuilder) so backends know
     /// whether to do system, application, or process-tree capture.
     pub capture_target: CaptureTarget,
+    /// App Group identifier for iOS system-audio capture *(iOS targets only)*.
+    ///
+    /// [`CaptureTarget::SystemDefault`] on iOS is the ReplayKit Broadcast
+    /// Upload Extension transport (ADR-0013): the extension writes audio into
+    /// a memory-mapped ring in the **shared App Group container**, and the
+    /// host-side consumer needs the group's identifier (e.g.
+    /// `"group.com.example.myapp.rsac"`) to locate that container. The id is
+    /// the config-time **consent artifact** for iOS — the analog of Android's
+    /// [`AndroidProjectionToken`] — set via
+    /// [`AudioCaptureBuilder::with_ios_app_group`](crate::api::AudioCaptureBuilder::with_ios_app_group);
+    /// `SystemDefault` builds without one fail the preflight with
+    /// [`UserConsentRequired`](crate::core::error::AudioError::UserConsentRequired).
+    /// Microphone ([`CaptureTarget::Device`]) targets never need it.
+    ///
+    /// Deliberately a plain `Option<String>` rather than a newtype: an App
+    /// Group id is an opaque, well-known Apple string format with no
+    /// invariants this crate could enforce — the only meaningful validation
+    /// is `containerURLForSecurityApplicationGroupIdentifier:` resolving it
+    /// at stream creation, where failure surfaces as an actionable error.
+    #[cfg(target_os = "ios")]
+    pub ios_app_group: Option<String>,
+    /// MediaProjection consent token for Android playback capture *(Android
+    /// targets only)*.
+    ///
+    /// The playback-capture tiers ([`CaptureTarget::SystemDefault`],
+    /// `Application*`, `ProcessTree`) on Android ride
+    /// `AudioPlaybackCaptureConfiguration`, which requires a user-consented
+    /// `MediaProjection` (ADR-0013). The token is the config-time **consent
+    /// artifact** — the analog of iOS's `ios_app_group` — set via
+    /// [`AudioCaptureBuilder::with_android_projection`](crate::api::AudioCaptureBuilder::with_android_projection)
+    /// and propagated here by `build()` so the backend's `create_stream`
+    /// can resolve it back to the projection object through JNI.
+    /// Playback-target builds without one fail the preflight with
+    /// [`UserConsentRequired`](crate::core::error::AudioError::UserConsentRequired).
+    /// Microphone ([`CaptureTarget::Device`]) targets never need it.
+    #[cfg(target_os = "android")]
+    pub android_projection: Option<AndroidProjectionToken>,
 }
 
 impl Default for StreamConfig {
@@ -465,6 +502,10 @@ impl Default for StreamConfig {
             sample_format: SampleFormat::F32,
             buffer_size: None,
             capture_target: CaptureTarget::default(), // SystemDefault
+            #[cfg(target_os = "ios")]
+            ios_app_group: None,
+            #[cfg(target_os = "android")]
+            android_projection: None,
         }
     }
 }
@@ -1176,6 +1217,10 @@ mod tests {
             sample_format: SampleFormat::I24,
             buffer_size: Some(1024),
             capture_target: CaptureTarget::SystemDefault,
+            #[cfg(target_os = "ios")]
+            ios_app_group: None,
+            #[cfg(target_os = "android")]
+            android_projection: None,
         };
         let fmt = cfg.to_audio_format();
         assert_eq!(fmt.sample_rate, 44100);
@@ -1198,6 +1243,10 @@ mod tests {
             sample_format: SampleFormat::I16,
             buffer_size: Some(512),
             capture_target: CaptureTarget::SystemDefault,
+            #[cfg(target_os = "ios")]
+            ios_app_group: None,
+            #[cfg(target_os = "android")]
+            android_projection: None,
         };
         assert_eq!(cfg.buffer_size, Some(512));
     }
@@ -1221,6 +1270,10 @@ mod tests {
                 sample_format: SampleFormat::F32,
                 buffer_size: Some(2048),
                 capture_target: CaptureTarget::ProcessTree(ProcessId(999)),
+                #[cfg(target_os = "ios")]
+                ios_app_group: None,
+                #[cfg(target_os = "android")]
+                android_projection: None,
             },
         };
         assert_eq!(cfg.target, CaptureTarget::ProcessTree(ProcessId(999)));

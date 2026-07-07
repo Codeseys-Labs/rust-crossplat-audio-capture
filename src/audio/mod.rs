@@ -359,3 +359,136 @@ mod tests {
         }
     }
 }
+
+/// JNI lockstep drift guard (rsac-77f1) — runs on **every** host, not just
+/// Android builds.
+///
+/// The Android playback path registers Rust natives on the Kotlin AAR's
+/// classes via `RegisterNatives` (src/audio/android/jni.rs). The JVM never
+/// checks that contract at build time: a renamed `external fun`, a changed
+/// parameter list, or a moved class fails only at **runtime** on a device.
+/// These tests pin both sides of the contract against the **source text**
+/// (`include_str!` — cfg-independent, so they compile and run on desktop
+/// hosts): each expected name/signature/class must appear verbatim in both
+/// the Kotlin declaration and the Rust registration. Renaming either side
+/// without updating the other (and this table) fails `cargo test --lib`
+/// everywhere.
+///
+/// Packaging note: the Kotlin sources live under `/mobile`, which is
+/// excluded from the crates.io package. That is safe because this module is
+/// `#[cfg(test)]` — the packaged crate never compiles it (`cargo package
+/// --verify` builds, it does not test) — and the guard's job is repo-side
+/// CI, where the files always exist.
+#[cfg(test)]
+mod jni_lockstep {
+    const JNI_RS: &str = include_str!("android/jni.rs");
+    const CAPTURE_BRIDGE_KT: &str =
+        include_str!("../../mobile/android/src/main/kotlin/ai/codeseys/rsac/CaptureBridge.kt");
+    const RSAC_PROJECTION_KT: &str =
+        include_str!("../../mobile/android/src/main/kotlin/ai/codeseys/rsac/RsacProjection.kt");
+
+    /// One registered native: (Kotlin source, `external fun` name, JNI
+    /// signature string registered in jni.rs).
+    const CONTRACT: &[(&str, &str, &str)] = &[
+        (CAPTURE_BRIDGE_KT, "nativePush", "(J[FIII)V"),
+        (CAPTURE_BRIDGE_KT, "nativeSessionEnded", "(J)V"),
+        (
+            RSAC_PROJECTION_KT,
+            "nativeRetainProjection",
+            "(Landroid/media/projection/MediaProjection;)J",
+        ),
+    ];
+
+    #[test]
+    fn every_kotlin_external_fun_is_registered_in_rust() {
+        for (kotlin_src, name, signature) in CONTRACT {
+            assert!(
+                kotlin_src.contains(&format!("external fun {name}(")),
+                "Kotlin side lost `external fun {name}` — update the Rust \
+                 registration (src/audio/android/jni.rs) and this table together"
+            );
+            assert!(
+                JNI_RS.contains(&format!("c\"{name}\"")),
+                "Rust side does not register {name:?} — update \
+                 src/audio/android/jni.rs and this table together"
+            );
+            assert!(
+                JNI_RS.contains(&format!("c\"{signature}\"")),
+                "Rust side does not register the JNI signature {signature:?} \
+                 for {name} — the Kotlin parameter list and the registration \
+                 must move together"
+            );
+        }
+    }
+
+    #[test]
+    fn no_kotlin_external_fun_is_missing_from_the_contract_table() {
+        // Count the `external fun` declarations on the Kotlin side; every
+        // one must be represented in CONTRACT (a new native added in Kotlin
+        // without a Rust registration would otherwise slip through as an
+        // UnsatisfiedLinkError on-device).
+        for (src, file) in [
+            (CAPTURE_BRIDGE_KT, "CaptureBridge.kt"),
+            (RSAC_PROJECTION_KT, "RsacProjection.kt"),
+        ] {
+            let declared = src.matches("external fun ").count();
+            let covered = CONTRACT.iter().filter(|(s, _, _)| *s == src).count();
+            assert_eq!(
+                declared, covered,
+                "{file} declares {declared} `external fun`(s) but the \
+                 lockstep CONTRACT table covers {covered} — extend the table \
+                 and the Rust registration together"
+            );
+        }
+    }
+
+    #[test]
+    fn rust_registers_on_the_kotlin_classes() {
+        // The registration must target the exact binary class names the
+        // Kotlin files define (package ai.codeseys.rsac).
+        for class in [
+            "ai/codeseys/rsac/CaptureBridge",
+            "ai/codeseys/rsac/RsacProjection",
+        ] {
+            assert!(
+                JNI_RS.contains(&format!("c\"{class}\"")),
+                "src/audio/android/jni.rs must resolve {class:?} for \
+                 RegisterNatives"
+            );
+        }
+        for kt in [CAPTURE_BRIDGE_KT, RSAC_PROJECTION_KT] {
+            assert!(
+                kt.contains("package ai.codeseys.rsac"),
+                "the Kotlin sources must stay in the ai.codeseys.rsac package \
+                 the Rust registration resolves"
+            );
+        }
+    }
+
+    #[test]
+    fn frames_per_read_and_uid_sentinel_stay_lockstep() {
+        // Numeric constants that cross the boundary by value: the Kotlin
+        // defaults and the Rust callers must agree.
+        assert!(
+            CAPTURE_BRIDGE_KT.contains("const val DEFAULT_FRAMES_PER_READ: Int = 480"),
+            "Kotlin DEFAULT_FRAMES_PER_READ moved — update playback.rs's \
+             FRAMES_PER_READ and this guard together"
+        );
+        assert!(
+            CAPTURE_BRIDGE_KT.contains("const val NO_UID_FILTER: Int = -1"),
+            "Kotlin NO_UID_FILTER moved — update playback.rs's NO_UID_FILTER \
+             and this guard together"
+        );
+        const PLAYBACK_RS: &str = include_str!("android/playback.rs");
+        assert!(
+            PLAYBACK_RS.contains("const FRAMES_PER_READ: i32 = 480"),
+            "Rust FRAMES_PER_READ moved — keep it lockstep with the Kotlin \
+             default"
+        );
+        assert!(
+            PLAYBACK_RS.contains("const NO_UID_FILTER: i32 = -1"),
+            "Rust NO_UID_FILTER moved — keep it lockstep with the Kotlin \
+             sentinel"
+        );
+    }
+}

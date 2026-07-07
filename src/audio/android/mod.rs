@@ -1,55 +1,66 @@
-//! Android audio capture backend — AAudio **microphone slice** (rsac-20cd).
+//! Android audio capture backend — AAudio microphone slice (rsac-20cd) +
+//! `AudioPlaybackCapture` playback tiers (rsac-77f1).
 //!
 //! # Current scope (honest status)
 //!
-//! This backend captures the **default audio input** (microphone, or
-//! whatever input the OS currently routes — wired headset, BT, USB) via a
-//! pure-NDK AAudio input stream. That is the *entire* shipped surface today:
+//! Two data paths (docs/MOBILE_BACKEND_DESIGN.md § two data paths):
 //!
 //! | `CaptureTarget` | Android behaviour |
 //! |---|---|
-//! | `Device(DeviceId("default"))` | ✅ default-input capture via AAudio |
-//! | `SystemDefault` | ❌ pending — on Android this means **playback capture** (`AudioPlaybackCapture`, ADR-0013), NOT the microphone; arrives with rsac-77f1 |
-//! | `Application` / `ApplicationByName` / `ProcessTree` | ❌ pending — UID-filtered playback capture + MediaProjection consent (rsac-77f1; on Android tree ≡ app, all of an app's processes share one UID) |
-//! | `Device(other id)` | ❌ real input-device ids (mic/USB/BT from `AudioManager.getDevices`) need the Java `AudioManager` — arrives with the rsac AAR (rsac-c4b8) |
+//! | `Device(DeviceId("default"))` | ✅ default-input (microphone) capture via AAudio — pure NDK, no Java |
+//! | `SystemDefault` | 🟡 **playback capture** (`AudioPlaybackCapture`, ADR-0013 — all capturable playback, NOT the microphone) via the rsac AAR's Kotlin loop ([`playback`]); requires API 29+, `RECORD_AUDIO`, and a MediaProjection consent token ([`with_android_projection`]) — compiled, unverified on-device (rsac-e6d3) |
+//! | `Application` / `ApplicationByName` / `ProcessTree` | 🟡 UID-filtered playback capture (tree ≡ app: all of an Android app's processes share one UID) — same requirements/status as `SystemDefault` |
+//! | `Device(other id)` | ❌ real input-device ids (mic/USB/BT from `AudioManager.getDevices`) need the Java `AudioManager` list — rsac-ad8a |
 //!
 //! [`PlatformCapabilities::query`](crate::core::capabilities::PlatformCapabilities::query)
-//! reports exactly this (`backend_name = "AAudio"`, playback-capture flags
-//! `false` until rsac-77f1).
+//! reports exactly this (`backend_name = "AAudio"`; the playback-capture
+//! flags are `true` on API 29+ with `requires_user_consent = true`).
 //!
 //! # Host-app responsibilities (NOT this library's job)
 //!
-//! Microphone capture requires the **`RECORD_AUDIO` runtime permission**:
-//! the host app must declare it in the manifest and obtain the runtime
-//! grant before building a capture (the Kotlin helpers shipped in
-//! `mobile/android/` — ADR-0012's AAR — wrap this flow). Without the grant,
-//! stream creation fails with an actionable
-//! [`AudioError::StreamCreationFailed`](crate::core::error::AudioError::StreamCreationFailed)
-//! rather than delivering silence.
+//! - **`RECORD_AUDIO` runtime permission** — required for the microphone
+//!   *and* for playback capture; the host app must declare it and obtain
+//!   the runtime grant (the Kotlin helpers in `mobile/android/` wrap the
+//!   flow). Without it, stream creation fails actionably.
+//! - **MediaProjection consent** (playback capture only) — obtain a token
+//!   via `RsacProjection.request(activity)` and pass it to
+//!   [`with_android_projection`]; playback builds without one fail the
+//!   preflight with `UserConsentRequired`.
+//! - **Foreground service** (playback capture, API 34+) — a
+//!   `mediaProjection`-typed FGS must be running before capture starts;
+//!   `RsacCaptureService.start(context)` provides one.
+//!
+//! [`with_android_projection`]: crate::api::AudioCaptureBuilder::with_android_projection
 //!
 //! # Architecture
 //!
 //! Same shape as every other rsac backend (no bespoke stream type):
 //!
 //! ```text
-//! AAudio data callback (may be RT)          Consumer thread
-//! ────────────────────────────────          ───────────────
-//! extern "C" data_callback                  BridgeStream<AndroidPlatformStream>
-//!   → f32: push the slice directly            ::read_chunk()
-//!   → i16: convert into pre-alloc scratch
-//!   → BridgeProducer::push_samples_…
+//! Mic (AAudio, may be RT)                Playback (Java loop, non-RT)
+//! ───────────────────────                ────────────────────────────
+//! extern "C" data_callback               Kotlin AudioRecord.read loop
+//!   → BridgeProducer::push_…              → nativePush (JNI, jni.rs)
+//!                                          → BridgeProducer::push_…
+//!            └────────────┬────────────────────────┘
+//!                         ▼
+//!            BridgeStream<…>::read_chunk()   (consumer thread)
 //! ```
 //!
-//! - `aaudio` holds the minimal in-tree `extern "C"` bindings for the
+//! - [`aaudio`] holds the minimal in-tree `extern "C"` bindings for the
 //!   stable AAudio NDK ABI (`libaaudio.so`) — no binding crates.
-//! - `thread` provides `AndroidPlatformStream` (the internal
-//!   [`PlatformStream`](crate::bridge::stream::PlatformStream) impl), the
-//!   panic-free/alloc-free data callback (full ADR-0001 rules — AAudio may
-//!   invoke it on a real-time thread), the error callback that drives the
-//!   bridge terminal on device disconnect (ADR-0010), and the open/start
-//!   factory.
+//! - [`thread`] provides `AndroidPlatformStream` (mic slice) and the
+//!   panic-free/alloc-free AAudio callbacks (full ADR-0001 rules).
+//! - [`jni`] is the JNI boundary for the playback path: `JNI_OnLoad`
+//!   registration, the ingest-session registry, and the natives the AAR's
+//!   `CaptureBridge`/`RsacProjection` call.
+//! - [`playback`] orchestrates the AAR's Kotlin capture pipeline
+//!   (`AndroidPlaybackDevice` + `AndroidPlaybackStream`) and owns the
+//!   ADR-0013 target → UID mapping.
 
 pub(crate) mod aaudio;
+pub(crate) mod jni;
+pub(crate) mod playback;
 pub(crate) mod thread;
 
 use std::sync::Arc;
@@ -60,6 +71,8 @@ use crate::bridge::{calculate_capacity, create_bridge, BridgeStream};
 use crate::core::config::{AudioFormat, DeviceId, SampleFormat, StreamConfig};
 use crate::core::error::{AudioError, AudioResult};
 use crate::core::interface::{AudioDevice, CapturingStream, DeviceEnumerator, DeviceKind};
+
+pub use playback::AndroidPlaybackDevice;
 
 /// The [`DeviceId`] string of the single logical Android input device.
 ///
@@ -75,14 +88,20 @@ pub(crate) const DEFAULT_INPUT_DEVICE_ID: &str = "default";
 
 // ── AndroidDeviceEnumerator ──────────────────────────────────────────────
 
-/// [`DeviceEnumerator`] for Android (AAudio backend, mic slice).
+/// [`DeviceEnumerator`] for Android (AAudio mic + `AudioPlaybackCapture`
+/// playback).
 ///
-/// Enumeration is intentionally minimal: without the Java `AudioManager`
-/// (AAR, rsac-c4b8) the NDK cannot list input devices, so exactly **one
-/// logical input device** — `"default"` — is reported, representing the
-/// default AAudio input route. See
-/// [`DeviceEnumerator::default_device`] for why the *default device*
-/// (rsac's loopback-oriented notion) is an error on Android today.
+/// Enumeration lists exactly **two logical devices** (mirroring the iOS
+/// enumerator's mic + broadcast shape):
+///
+/// - `"default"` ([`AndroidAudioDevice`]): the default AAudio input route
+///   (microphone / headset / BT / USB — whatever the OS routes).
+/// - `"playback-capture"` ([`AndroidPlaybackDevice`]): the playback-capture
+///   endpoint (`AudioPlaybackCapture` behind MediaProjection consent),
+///   serving `SystemDefault` and the per-app tiers.
+///
+/// Real input-device ids (`AudioManager.getDevices`) need the Java side and
+/// arrive with rsac-ad8a; they are deliberately not faked here.
 #[derive(Debug, Clone, Copy)]
 pub struct AndroidDeviceEnumerator;
 
@@ -104,56 +123,37 @@ impl Default for AndroidDeviceEnumerator {
 }
 
 impl DeviceEnumerator for AndroidDeviceEnumerator {
-    /// Lists the single logical Android audio input device.
-    ///
-    /// Returns exactly one device — `DeviceId("default")`, the default
-    /// AAudio input. A real device list (built-in mic / USB / BT ids via
-    /// `AudioManager.getDevices`) needs the Java side and arrives with the
-    /// rsac AAR (rsac-c4b8); it is deliberately not faked here.
+    /// Lists the two logical Android devices: the default AAudio input
+    /// (microphone) and the playback-capture endpoint.
     fn enumerate_devices(&self) -> AudioResult<Vec<Box<dyn AudioDevice>>> {
-        Ok(vec![Box::new(AndroidAudioDevice::new())])
+        Ok(vec![
+            Box::new(AndroidAudioDevice::new()),
+            Box::new(AndroidPlaybackDevice::new()),
+        ])
     }
 
-    /// The rsac *default device* is not available on Android yet — errors
-    /// with guidance.
+    /// Returns the playback-capture device — rsac's *default device* on
+    /// Android.
     ///
-    /// On desktop backends `default_device()` returns the default **output**
-    /// endpoint because rsac's headline capability there is system-audio
-    /// loopback. On Android, system audio (`CaptureTarget::SystemDefault`)
-    /// means `AudioPlaybackCapture` behind the MediaProjection consent flow
-    /// (ADR-0013), which is **not wired yet** (rsac-77f1). Pretending the
-    /// microphone is "the default device" would silently deliver different
-    /// audio than the desktop contract promises (the dishonest-fallback
-    /// option ADR-0013 explicitly rejected) — and `api.rs` routes
-    /// `SystemDefault` / `Application*` / `ProcessTree` through this method,
-    /// so this is the honest refusal point. It returns
-    /// [`AudioError::PlatformNotSupported`] with the honest state:
-    ///
-    /// - **Supported now:** microphone capture via
-    ///   `CaptureTarget::Device(DeviceId("default".into()))`.
-    /// - **Pending:** playback capture (`SystemDefault` and the per-app /
-    ///   process-tree targets) via `AudioPlaybackCapture` + MediaProjection
-    ///   consent (rsac-77f1).
+    /// On every desktop backend `default_device()` returns the default
+    /// **output** endpoint because rsac's headline capability is
+    /// system-audio loopback; the Android equivalent of that endpoint is
+    /// `AudioPlaybackCapture` (ADR-0013, rsac-77f1), so
+    /// `CaptureTarget::SystemDefault` (and the per-app tiers) resolve here.
+    /// The real preconditions — API 29+, `RECORD_AUDIO`, a MediaProjection
+    /// consent token, the mediaProjection foreground service on API 34+ —
+    /// surface as actionable errors at `create_stream` time (see
+    /// [`AndroidPlaybackDevice`]). For the microphone, target
+    /// `CaptureTarget::Device(DeviceId("default".into()))` explicitly.
     fn default_device(&self) -> AudioResult<Box<dyn AudioDevice>> {
-        Err(AudioError::PlatformNotSupported {
-            feature: "default-device (system audio) capture on Android: \
-                      SystemDefault maps to AudioPlaybackCapture — all \
-                      capturable playback, NOT the microphone (ADR-0013) — \
-                      which is not wired yet (rsac-77f1, MediaProjection \
-                      consent flow; per-app and process-tree capture arrive \
-                      with the same seed). Use \
-                      CaptureTarget::Device(DeviceId(\"default\".into())) to \
-                      capture the microphone (the default AAudio input)"
-                .to_string(),
-            platform: "android".to_string(),
-        })
+        Ok(Box::new(AndroidPlaybackDevice::new()))
     }
 
     // watch(): inherits the trait default (PlatformNotSupported) —
     // consistent with `supports_device_change_notifications: false` in
     // PlatformCapabilities::android(). Input-route change notifications are
     // AudioManager/AudioDeviceCallback territory, which belongs to the Java
-    // side (AAR, rsac-c4b8).
+    // side (rsac-ad8a).
 }
 
 // ── AndroidAudioDevice ───────────────────────────────────────────────────
@@ -247,10 +247,10 @@ impl AudioDevice for AndroidAudioDevice {
     /// # Errors
     ///
     /// - [`AudioError::PlatformNotSupported`] for `SystemDefault` and
-    ///   `Application*` / `ProcessTree` (playback-capture tiers, pending
-    ///   rsac-77f1 — see the module docs).
+    ///   `Application*` / `ProcessTree` (playback-capture tiers, served by
+    ///   [`AndroidPlaybackDevice`], not this mic device).
     /// - [`AudioError::DeviceNotFound`] for a `Device` id other than
-    ///   `"default"` (real ids arrive with the AAR, rsac-c4b8).
+    ///   `"default"` (real ids arrive with rsac-ad8a).
     /// - [`AudioError::StreamCreationFailed`] /
     ///   [`AudioError::StreamStartFailed`] from the AAudio open/start path
     ///   (typically: the `RECORD_AUDIO` runtime permission is missing — a
@@ -305,49 +305,45 @@ impl AudioDevice for AndroidAudioDevice {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::core::error::ErrorKind;
 
     #[test]
-    fn enumerate_devices_returns_single_default_input() {
+    fn enumerate_devices_lists_mic_and_playback() {
         let enumerator = AndroidDeviceEnumerator::new();
         let devices = enumerator
             .enumerate_devices()
             .expect("enumeration is infallible metadata");
-        assert_eq!(devices.len(), 1, "exactly one logical Android input device");
+        assert_eq!(devices.len(), 2, "mic + playback-capture endpoint");
 
-        let device = &devices[0];
-        assert_eq!(device.id(), DeviceId(DEFAULT_INPUT_DEVICE_ID.to_string()));
-        assert_eq!(device.name(), "Default audio input (AAudio)");
-        assert!(device.is_default());
-        assert_eq!(device.kind().unwrap(), DeviceKind::Input);
+        let mic = &devices[0];
+        assert_eq!(mic.id(), DeviceId(DEFAULT_INPUT_DEVICE_ID.to_string()));
+        assert_eq!(mic.name(), "Default audio input (AAudio)");
+        assert!(mic.is_default(), "mic stays the default Input device");
+        assert_eq!(mic.kind().unwrap(), DeviceKind::Input);
+
+        let playback = &devices[1];
+        assert_eq!(
+            playback.id(),
+            DeviceId(playback::PLAYBACK_DEVICE_ID.to_string())
+        );
+        assert_eq!(playback.kind().unwrap(), DeviceKind::Output);
+        assert!(playback.is_default(), "default of its (Output) kind");
     }
 
     #[test]
-    fn default_device_is_honest_platform_not_supported() {
+    fn default_device_is_the_playback_capture_endpoint() {
+        // rsac's default device is the system-audio endpoint on every
+        // platform; on Android that is the AudioPlaybackCapture device
+        // (ADR-0013), NOT the microphone — the dishonest-fallback option
+        // ADR-0013 explicitly rejected.
         let enumerator = AndroidDeviceEnumerator::new();
-        let err = match enumerator.default_device() {
-            Ok(_) => panic!("default_device must error until rsac-77f1"),
-            Err(err) => err,
-        };
-        assert_eq!(err.kind(), ErrorKind::Platform);
-        match err {
-            AudioError::PlatformNotSupported { feature, platform } => {
-                assert_eq!(platform, "android");
-                // The honesty pillars: what SystemDefault really means on
-                // Android, which seed delivers it, and what works today.
-                assert!(
-                    feature.contains("AudioPlaybackCapture"),
-                    "real meaning: {feature}"
-                );
-                assert!(feature.contains("NOT the"), "not-the-mic: {feature}");
-                assert!(feature.contains("rsac-77f1"), "pending seed: {feature}");
-                assert!(
-                    feature.contains("Device(DeviceId(\"default\""),
-                    "mic guidance: {feature}"
-                );
-            }
-            other => panic!("expected PlatformNotSupported, got {other:?}"),
-        }
+        let device = enumerator
+            .default_device()
+            .expect("the playback endpoint is metadata-only until create_stream");
+        assert_eq!(
+            device.id(),
+            DeviceId(playback::PLAYBACK_DEVICE_ID.to_string())
+        );
+        assert_eq!(device.kind().unwrap(), DeviceKind::Output);
     }
 
     #[test]
