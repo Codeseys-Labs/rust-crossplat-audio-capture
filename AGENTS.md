@@ -568,6 +568,15 @@ Full playbook (when to stack vs parallel PRs, exact commands, pitfalls):
 - Building a sibling crate locally can **regenerate committed artifacts**
   (cbindgen headers) with toolchain-version noise — restore them before
   committing.
+- **`git checkout <sha> -- <paths>` cannot express deletions.** Files deleted
+  on the frozen source but present on master silently survive the layer.
+  Enumerate them per layer with
+  `git diff --diff-filter=D --name-only master..<frozen-sha> -- <paths>` and
+  `git rm` them explicitly (0.4.1 lesson: 4 deletions from 3 different
+  layers had to be swept into L5).
+- **One invalid pathspec aborts the whole multi-path checkout** — the valid
+  paths are silently skipped too. Verify with `git status` file-counts after
+  every checkout, and split uncertain paths into their own command.
 - Multi-session hygiene: **never `git add -A` in a shared checkout**, always
   stage explicit paths; layer work happens in disposable worktrees;
   `--force-with-lease` only, and only on branches you own.
