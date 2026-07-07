@@ -587,6 +587,11 @@ Full playbook (when to stack vs parallel PRs, exact commands, pitfalls):
   Use `--no-renames` (or filter `DR` and take each rename's source path) in
   the sweep (0.4.1 lesson: 10 docs shadow-copies survived to the final
   identity diff before this was caught).
+- **`gh pr merge --delete-branch` can silently fail to delete the remote
+  branch** (observed whenever the local branch was checked out in a
+  worktree: the local-deletion error aborts before the remote deletion).
+  After the stack completes, audit with `git ls-remote --heads origin` —
+  0.4.1 left 4 of 5 layer branches alive.
 - **One invalid pathspec aborts the whole multi-path checkout** — the valid
   paths are silently skipped too. Verify with `git status` file-counts after
   every checkout, and split uncertain paths into their own command.
