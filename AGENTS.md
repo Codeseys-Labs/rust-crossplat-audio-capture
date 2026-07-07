@@ -544,6 +544,13 @@ Full playbook (when to stack vs parallel PRs, exact commands, pitfalls):
    the layer's seed with evidence, then cut the next layer from the updated
    release branch. Just-in-time cutting avoids the squash-rebase recovery
    hazard of true parent-based stacks entirely.
+   **PR-vs-direct rule:** every *content* commit (anything originating from
+   the frozen source) goes through a layer PR. Direct pushes to the release
+   branch are reserved for (a) the step-2 bootstrap infrastructure (which
+   cannot review itself), (b) post-merge bookkeeping (seeds sync, retro-log
+   docs), and (c) identity-restoring sweeps of already-reviewed content —
+   each small, with the justification in the commit message. Add branch
+   protection on `release/**` if policy alone stops being enough.
 6. **Finish**: diff the release branch against the frozen SHA and account for
    every delta (expected: the trigger/CodeRabbit commits, documented manifest
    adjustments, lockfile resolution noise); run the full local gate; bump the
