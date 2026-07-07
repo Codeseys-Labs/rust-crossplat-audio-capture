@@ -14,11 +14,13 @@ name: Audio Integration Tests
 #                           gate), and then run with
 #                           RSAC_CI_AUDIO_DETERMINISTIC=1 — content assertions
 #                           hard-fail on silence (rsac-b106 / rsac-6efb).
-#   ✅ Windows (WASAPI)  — FIRST-CLASS for system capture on GitHub-hosted
-#                           windows-latest + LABSN/VB-CABLE. Device/process jobs
-#                           are hard-gated for setup/build/start/panic regressions,
-#                           but their content assertions remain soft because the
-#                           per-device/per-process tone route is not yet proven.
+#   ✅ Windows (WASAPI)  — FIRST-CLASS on GitHub-hosted windows-latest +
+#                           LABSN/VB-CABLE. All three tiers run DETERMINISTIC:
+#                           the shared endpoint gate
+#                           (scripts/ci-windows-audio-default.ps1) sets and
+#                           hard-verifies VB-CABLE as the default playback
+#                           endpoint, which every tier's tone route flows
+#                           through (rsac-0f33).
 #   ⏳ macOS (CoreAudio) — advisory on managed CI. Process Tap based system,
 #                           application, and process-tree capture require
 #                           kTCCServiceAudioCapture, which cannot be granted
@@ -652,100 +654,14 @@ jobs:
       - name: Install virtual audio (VB-CABLE via LABSN)
         uses: LABSN/sound-ci-helpers@d08c889a7bba7d9b1b059f8f76dac4672ea3a9cf # v1 (v1 tag == v1.0.4, resolved via git ls-remote)
 
-      - name: Set VB-CABLE as default audio device
+      # rsac-0f33: shared deterministic-endpoint gate (set VB-CABLE as the
+      # default playback endpoint with retries, HARD-verify it, then export
+      # RSAC_CI_AUDIO_AVAILABLE=1 + RSAC_CI_AUDIO_DETERMINISTIC=1). Single-
+      # sourced across all three Windows tiers - see the script header for
+      # why the deterministic flip is sound per tier.
+      - name: Set + verify VB-CABLE default endpoint (hard gate, enables deterministic mode)
         shell: pwsh
-        run: |
-          # rsac#24: LABSN installs the VB-CABLE driver via devcon but
-          # does NOT set it as the default playback endpoint — we have
-          # to do that explicitly with AudioDeviceCmdlets
-          # (https://github.com/frgnca/AudioDeviceCmdlets). On
-          # windows-latest VB-CABLE's playback endpoint is named
-          # "Speakers (VB-Audio Virtual Cable)", not "CABLE Input ...",
-          # so the name filter has to accept either form.
-          #
-          # rsac-eb2f: the endpoint can take a few seconds to register with
-          # AudioSrv after the driver installs, so device discovery AND the
-          # Set-AudioDevice call are retried with a bounded backoff instead of
-          # failing the whole (only) hard e2e tier on a provisioning race.
-          Install-Module -Name AudioDeviceCmdlets -Force -Scope CurrentUser 2>$null
-          Import-Module AudioDeviceCmdlets -ErrorAction Stop
-
-          $cable = $null
-          $maxAttempts = 6
-          for ($attempt = 1; $attempt -le $maxAttempts; $attempt++) {
-            Write-Host "=== Audio device discovery (attempt $attempt/$maxAttempts) ==="
-            $devices = Get-AudioDevice -List
-            $devices | Format-Table Index, Type, Name, Default -AutoSize
-
-            $cable = $devices | Where-Object {
-              $_.Type -eq "Playback" -and (
-                $_.Name -like "*CABLE Input*" -or
-                $_.Name -like "*VB-Audio*" -or
-                $_.Name -like "*VB-CABLE*"
-              )
-            } | Select-Object -First 1
-
-            if ($cable) {
-              try {
-                Write-Host "Setting VB-CABLE as default playback device: $($cable.Name) (Index=$($cable.Index))"
-                Set-AudioDevice -Index $cable.Index -DefaultOnly
-                break
-              } catch {
-                Write-Host "Set-AudioDevice failed on attempt ${attempt}: $_"
-                $cable = $null
-              }
-            }
-            if ($attempt -lt $maxAttempts) { Start-Sleep -Seconds 5 }
-          }
-
-          if (-not $cable) {
-            Write-Error "No VB-CABLE playback device found after $maxAttempts attempts — LABSN install likely failed"
-            exit 1
-          }
-
-      - name: Verify VB-CABLE is the active default playback
-        # rsac#24: if the default playback isn't VB-CABLE, the test
-        # tone goes to the wrong endpoint and system-capture loopback
-        # sees zero buffers. Fail loudly here instead of wasting 15
-        # minutes on cargo compile + tests that cannot possibly pass.
-        shell: pwsh
-        run: |
-          Import-Module AudioDeviceCmdlets -ErrorAction Stop
-          $playback = Get-AudioDevice -Playback
-          Write-Host "Default playback: $($playback.Name) (Default=$($playback.Default), Type=$($playback.Type))"
-          $isCable = ($playback.Name -like "*VB-Audio*") -or
-                     ($playback.Name -like "*CABLE*") -or
-                     ($playback.Name -like "*VB-CABLE*")
-          if (-not $isCable) {
-            Write-Error "Default playback is NOT VB-CABLE (got: '$($playback.Name)'). System capture loopback cannot succeed."
-            exit 1
-          }
-          Write-Host "OK: VB-CABLE is the default playback endpoint."
-
-      - name: Verify audio devices
-        id: verify_audio
-        shell: pwsh
-        run: |
-          Write-Host "=== Audio Devices ==="
-          $devices = Get-PnpDevice -ErrorAction SilentlyContinue | Where-Object {
-            $_.FriendlyName -like "*VB-Audio*" -or
-            $_.FriendlyName -like "*CABLE*" -or
-            $_.Class -eq "AudioEndpoint" -or
-            $_.Class -eq "MEDIA"
-          }
-          if ($devices) {
-            $devices | Format-List FriendlyName, Status
-            echo "RSAC_CI_AUDIO_AVAILABLE=1" >> $env:GITHUB_ENV
-            # rsac M5: VB-CABLE is installed AND verified as the active default
-            # playback endpoint by the hard gate two steps above. That makes
-            # system-capture loopback deterministic — the test tone provably
-            # routes to the captured endpoint — so enable the hard
-            # non-silence/tone asserts for this system-capture tier.
-            echo "RSAC_CI_AUDIO_DETERMINISTIC=1" >> $env:GITHUB_ENV
-          } else {
-            Write-Host "No audio devices found"
-            echo "RSAC_CI_AUDIO_AVAILABLE=0" >> $env:GITHUB_ENV
-          }
+        run: ./scripts/ci-windows-audio-default.ps1
 
       - name: Compilation check
         # compose is included tier-wide so the ci_audio binary compiles once
@@ -846,14 +762,13 @@ jobs:
   windows-device:
     name: "Windows | Device Capture"
     runs-on: windows-latest
-    # rsac M5: first-class, hard-gated (no continue-on-error). NOTE: we do NOT
-    # set RSAC_CI_AUDIO_DETERMINISTIC here. The deterministic hard-asserts in
-    # tests/ci_audio/device_capture.rs are written against the Linux null-sink
-    # *monitor* (which always carries the 440 Hz tone). On windows-latest the
-    # device-capture path opens VB-CABLE's capture endpoint directly with no
-    # tone guaranteed to be routed to it, so a deterministic non-silence assert
-    # would false-RED. The job still hard-fails on build/start/panic regressions
-    # (a genuine WASAPI device-open regression), which is the M5 goal.
+    # rsac M5 + rsac-0f33: first-class, hard-gated (no continue-on-error),
+    # and DETERMINISTIC: the tests target enumerator.default_device() — the
+    # exact endpoint the shared gate hard-verifies to be VB-CABLE — and spawn
+    # their own tone player to that same (default) endpoint, so the loopback
+    # content route is as deterministic as the system tier's. The old
+    # "opens VB-CABLE's capture endpoint directly with no tone routed to it"
+    # concern described a path the tests do not take.
     timeout-minutes: 20
     steps:
       - uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5
@@ -865,29 +780,14 @@ jobs:
       - name: Install virtual audio (VB-CABLE via LABSN)
         uses: LABSN/sound-ci-helpers@d08c889a7bba7d9b1b059f8f76dac4672ea3a9cf # v1 (v1 tag == v1.0.4, resolved via git ls-remote)
 
-      - name: Set VB-CABLE as default audio device
+      # rsac-0f33: shared deterministic-endpoint gate (set VB-CABLE as the
+      # default playback endpoint with retries, HARD-verify it, then export
+      # RSAC_CI_AUDIO_AVAILABLE=1 + RSAC_CI_AUDIO_DETERMINISTIC=1). Single-
+      # sourced across all three Windows tiers - see the script header for
+      # why the deterministic flip is sound per tier.
+      - name: Set + verify VB-CABLE default endpoint (hard gate, enables deterministic mode)
         shell: pwsh
-        run: |
-          Install-Module -Name AudioDeviceCmdlets -Force -Scope CurrentUser 2>$null
-          Import-Module AudioDeviceCmdlets -ErrorAction SilentlyContinue
-          try {
-            $devices = Get-AudioDevice -List
-            $cable = $devices | Where-Object { $_.Name -like "*CABLE Input*" -and $_.Type -eq "Playback" }
-            if (-not $cable) { $cable = $devices | Where-Object { $_.Name -like "*VB-Audio*" -and $_.Type -eq "Playback" } }
-            if ($cable) { Set-AudioDevice -Index $cable[0].Index; Write-Host "Default playback: $($cable[0].Name)" }
-          } catch { Write-Host "Skipping default device setup: $_" }
-
-      - name: Verify audio devices
-        shell: pwsh
-        run: |
-          $devices = Get-PnpDevice -ErrorAction SilentlyContinue | Where-Object {
-            $_.FriendlyName -like "*VB-Audio*" -or $_.FriendlyName -like "*CABLE*"
-          }
-          if ($devices) {
-            echo "RSAC_CI_AUDIO_AVAILABLE=1" >> $env:GITHUB_ENV
-          } else {
-            echo "RSAC_CI_AUDIO_AVAILABLE=0" >> $env:GITHUB_ENV
-          }
+        run: ./scripts/ci-windows-audio-default.ps1
 
       - name: Compilation check
         run: cargo check --no-default-features --features feat_windows
@@ -942,12 +842,12 @@ jobs:
   windows-process:
     name: "Windows | Process Capture"
     runs-on: windows-latest
-    # rsac M5: first-class, hard-gated (no continue-on-error). As with the
-    # device tier, RSAC_CI_AUDIO_DETERMINISTIC is intentionally NOT set: the
-    # per-process loopback tone is generated by a child player whose routing is
-    # not as tightly verified as the system-default endpoint, so a deterministic
-    # non-silence assert risks a false RED. Build/start/panic regressions in the
-    # WASAPI Process Loopback path still hard-fail the job (the M5 goal).
+    # rsac M5 + rsac-0f33: first-class, hard-gated (no continue-on-error),
+    # and DETERMINISTIC: the child player's PlayLooping output routes to the
+    # default playback endpoint, which the shared gate hard-verifies to be
+    # VB-CABLE before any test runs — so WASAPI process loopback of that
+    # child has a proven tone route. (application_by_name_windows keeps its
+    # content asserts soft by its own module-documented design.)
     timeout-minutes: 20
     steps:
       - uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5
@@ -965,29 +865,14 @@ jobs:
       - name: Install virtual audio (VB-CABLE via LABSN)
         uses: LABSN/sound-ci-helpers@d08c889a7bba7d9b1b059f8f76dac4672ea3a9cf # v1 (v1 tag == v1.0.4, resolved via git ls-remote)
 
-      - name: Set VB-CABLE as default audio device
+      # rsac-0f33: shared deterministic-endpoint gate (set VB-CABLE as the
+      # default playback endpoint with retries, HARD-verify it, then export
+      # RSAC_CI_AUDIO_AVAILABLE=1 + RSAC_CI_AUDIO_DETERMINISTIC=1). Single-
+      # sourced across all three Windows tiers - see the script header for
+      # why the deterministic flip is sound per tier.
+      - name: Set + verify VB-CABLE default endpoint (hard gate, enables deterministic mode)
         shell: pwsh
-        run: |
-          Install-Module -Name AudioDeviceCmdlets -Force -Scope CurrentUser 2>$null
-          Import-Module AudioDeviceCmdlets -ErrorAction SilentlyContinue
-          try {
-            $devices = Get-AudioDevice -List
-            $cable = $devices | Where-Object { $_.Name -like "*CABLE Input*" -and $_.Type -eq "Playback" }
-            if (-not $cable) { $cable = $devices | Where-Object { $_.Name -like "*VB-Audio*" -and $_.Type -eq "Playback" } }
-            if ($cable) { Set-AudioDevice -Index $cable[0].Index; Write-Host "Default playback: $($cable[0].Name)" }
-          } catch { Write-Host "Skipping default device setup: $_" }
-
-      - name: Verify audio devices
-        shell: pwsh
-        run: |
-          $devices = Get-PnpDevice -ErrorAction SilentlyContinue | Where-Object {
-            $_.FriendlyName -like "*VB-Audio*" -or $_.FriendlyName -like "*CABLE*"
-          }
-          if ($devices) {
-            echo "RSAC_CI_AUDIO_AVAILABLE=1" >> $env:GITHUB_ENV
-          } else {
-            echo "RSAC_CI_AUDIO_AVAILABLE=0" >> $env:GITHUB_ENV
-          }
+        run: ./scripts/ci-windows-audio-default.ps1
 
       - name: Compilation check
         run: cargo check --no-default-features --features feat_windows
