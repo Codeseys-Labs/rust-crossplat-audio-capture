@@ -22,7 +22,7 @@ name: Audio Integration Tests
 
 on:
   push:
-    branches: [main, master]
+    branches: [main, master, 'release/**']
     paths:
       - 'src/**'
       - 'tests/**'
@@ -30,7 +30,7 @@ on:
       - 'Cargo.lock'
       - '.github/workflows/ci-audio-tests.yml'
   pull_request:
-    branches: [main, master]
+    branches: [main, master, 'release/**']
     paths:
       - 'src/**'
       - 'tests/**'
