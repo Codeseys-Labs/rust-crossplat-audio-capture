@@ -491,6 +491,75 @@ fn heterogeneous_rate_source_is_resampled() {
     harness.shutdown();
 }
 
+/// rsac-7d97: a mid-stream input-rate change must FLUSH the old resampler —
+/// its buffered partial input chunk plus the FFT `output_delay()` residue
+/// (~25–45 ms of real audio) — into the FIFO before the replacement
+/// resampler is built. Without the flush that tail is silently dropped and
+/// the composed output comes up hundreds of frames short.
+#[test]
+fn mid_stream_rate_change_flushes_old_resampler_tail() {
+    // Phase A: 4410 frames @ 44.1 kHz. Deliberately NOT a multiple of the
+    // resampler's 1024-frame input chunk, so a partial chunk is pending at
+    // the switch (on top of the always-present delay residue).
+    let a_buffers = 10usize;
+    let a_frames = 441usize;
+    // Phase B: 3200 frames @ 32 kHz — a different rate, still resampled.
+    let b_buffers = 10usize;
+    let b_frames = 320usize;
+    let mut script: Vec<AudioBuffer> = (0..a_buffers)
+        .map(|_| const_buffer(0.3, 1, 44_100, a_frames))
+        .collect();
+    script.extend((0..b_buffers).map(|_| const_buffer(0.6, 1, 32_000, b_frames)));
+    let (src, _) = ScriptedSource::ending(script);
+
+    let harness = Harness::spawn(
+        cfg(
+            1,
+            vec![GroupSpec {
+                layout: GroupLayout::Mono,
+                offset: 0,
+                width: 1,
+            }],
+            vec![SourceSpec {
+                gain: 1.0,
+                group: 0,
+                channels: 0,
+                clock_candidate: false,
+            }],
+            0,
+        ),
+        vec![Box::new(src)],
+    );
+
+    let buffers = harness.drain_to_end();
+    let total_frames: usize = buffers.iter().map(|b| b.num_frames()).sum();
+
+    // Each phase owes exactly round(in * 48_000/rate) output frames (both
+    // divide exactly here): the rate-change flush recovers phase A's tail
+    // (rsac-7d97) and the natural-end flush recovers phase B's (rsac-fab0).
+    // Without the rate-change flush, phase A alone comes up short by its
+    // pending partial chunk plus the FFT delay residue — several hundred
+    // frames, far beyond this tolerance.
+    let expected_a = (a_buffers * a_frames) as u64 * 48_000 / 44_100; // = 4800
+    let expected_b = (b_buffers * b_frames) as u64 * 48_000 / 32_000; // = 4800
+    let expected = expected_a + expected_b;
+    assert!(
+        (total_frames as i64 - expected as i64).abs() <= 2,
+        "expected {expected}±2 composed frames across the rate change, got {total_frames}"
+    );
+
+    // The signal on both sides of the switch survives (DC levels preserved).
+    let all: Vec<f32> = buffers
+        .iter()
+        .flat_map(|b| b.data().iter().copied())
+        .collect();
+    let a_mid = all[all.len() / 4];
+    let b_mid = all[3 * all.len() / 4];
+    assert!((a_mid - 0.3).abs() < 0.05, "phase A signal, got {a_mid}");
+    assert!((b_mid - 0.6).abs() < 0.05, "phase B signal, got {b_mid}");
+    harness.shutdown();
+}
+
 /// When the master stalls, the wall-clock fallback keeps ticking (with the
 /// master padded) so a live secondary source still flows.
 #[test]
