@@ -23,6 +23,19 @@ tracking issue (`deferred-review` label) and reply `📌 Tracked in #N`;
 and reply with the rationale. Always reply on the originating thread. Full detail
 in [`AGENTS.md` §6](AGENTS.md) (Code review dispositions).
 
+## Release-stacking SDLC (big bodies of work)
+
+Any effort that would exceed ~150 changed files (CodeRabbit's review cap) ships
+via the **release-stacking SDLC**: freeze the source branch, create
+`release/X.Y.Z` from master (with `release/**` CI triggers + `.coderabbit.yaml`
+committed on it FIRST), cut one-domain layer PRs just-in-time from the release
+branch in disposable worktrees (`git checkout <frozen-sha> -- <paths>`),
+review + triage each (identity-preserving: valid findings become seeds worked
+after the stack, not mid-stack patches), squash-merge bottom-up, then diff the
+release branch against the frozen SHA and account for every delta. Full
+procedure + retro log: [`AGENTS.md` §6](AGENTS.md) (Release-stacking SDLC).
+Append lessons there as you learn them — it is a living process.
+
 ## Quick reminders (full detail in AGENTS.md)
 
 - **Local gate:** run `mise run gate` (or `bash scripts/gate.sh`) before pushing —

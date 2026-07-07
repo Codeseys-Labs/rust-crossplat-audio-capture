@@ -507,6 +507,71 @@ that flag is what retargets the child), and `--force-with-lease`, never `--force
 Full playbook (when to stack vs parallel PRs, exact commands, pitfalls):
 [`docs/STACKED_PRS.md`](docs/STACKED_PRS.md).
 
+### Release-stacking SDLC — decomposing a fat branch into a reviewed release
+
+> First executed for 0.4.1 (decision record seed `rsac-79bc`, epic `rsac-4844`,
+> PRs #36+). **This is the house SDLC for any body of work that outgrew one
+> PR** (CodeRabbit caps review at 150 changed files). Improve this section as
+> retros land — it is a living process, not a frozen one.
+
+**The pattern** (integration branch + just-in-time layers):
+
+1. **Freeze** the source ("fat") branch: no new work lands there except
+   explicitly-owned in-flight workstreams; record the frozen SHA.
+2. **Create `release/X.Y.Z` from `master`** — the integration branch every
+   layer PR targets. Before the first layer PR, commit on it:
+   - `release/**` added to `pull_request` **and** `push` triggers in
+     `ci.yml` + `ci-audio-tests.yml` (otherwise layer PRs run **zero CI** and
+     the failure is silent — it happened);
+   - `.coderabbit.yaml` with `reviews.base_branches: ["release/.*"]`
+     (otherwise CodeRabbit refuses the base; the file is read from PR *head*
+     branches, so every layer cut from the release branch inherits it).
+3. **Cut layers just-in-time**, one domain per PR, bottom-up along the module
+   DAG: *library → bindings → CI/DevEx → docs/seeds → platform tails*. Each
+   layer: new `stack/<ver>-<n>-<name>` branch **from the current release
+   branch** in a **separate `git worktree`** (never switch a shared checkout),
+   `git checkout <frozen-sha> -- <layer paths>`, apply the documented
+   hand-adjustments, validate locally (the gate + the layer's own suite),
+   push, open the PR against `release/X.Y.Z`.
+4. **Review every layer**: full CI matrix + CodeRabbit (nudge with
+   `@coderabbitai full review` if it doesn't auto-start) + any other reviewer.
+   Triage per §6 dispositions with one addition — the **identity-preserving
+   policy**: while the stack is in flight, valid findings become seeds worked
+   *after* the stack completes; nothing lands in a layer that the frozen
+   source didn't carry (otherwise "functionally identical to the source"
+   becomes unverifiable). Post the disposition table on the PR.
+5. **Squash-merge bottom-up** (`gh pr merge --squash --delete-branch`), close
+   the layer's seed with evidence, then cut the next layer from the updated
+   release branch. Just-in-time cutting avoids the squash-rebase recovery
+   hazard of true parent-based stacks entirely.
+6. **Finish**: diff the release branch against the frozen SHA and account for
+   every delta (expected: the trigger/CodeRabbit commits, documented manifest
+   adjustments, lockfile resolution noise); run the full local gate; bump the
+   version (`scripts/bump-version.sh`); open `release/X.Y.Z → master` — its
+   content is already reviewed layer-by-layer.
+
+**Hard-won rules (retro log — append, don't delete):**
+
+- *rustfmt resolves `mod` declarations regardless of `cfg`*, so the library
+  crate ships as **one** layer — feature modules (`compose`) and
+  target-gated backends cannot be split out of a layer that contains
+  `lib.rs`/`audio/mod.rs`.
+- *cfg-independent `include_str!` contract tests* (e.g. `jni_lockstep`) drag
+  their pinned foreign sources into the same layer as the tests.
+- Shared files (`Cargo.toml`, `Cargo.lock`, `ci.yml`) need **documented
+  per-layer hand-adjustments** (workspace members, `[[example]]` entries,
+  stripped-then-restored CI jobs); write the adjustment into the layer seed
+  *and* the manifest comment.
+- A **regenerated lockfile silently reverts advisory fixes** — after cutting
+  a layer, re-check `cargo deny`-relevant pins against the source branch
+  (crossbeam-epoch lesson).
+- Building a sibling crate locally can **regenerate committed artifacts**
+  (cbindgen headers) with toolchain-version noise — restore them before
+  committing.
+- Multi-session hygiene: **never `git add -A` in a shared checkout**, always
+  stage explicit paths; layer work happens in disposable worktrees;
+  `--force-with-lease` only, and only on branches you own.
+
 ---
 
 ## 7. What NOT to Do
