@@ -7,10 +7,13 @@ name: Audio Integration Tests
 # Each job is independently identifiable in GitHub Actions.
 #
 # Platform status:
-#   ✅ Linux (PipeWire)  — PRIMARY lifecycle/API tier on Blacksmith. The jobs are
-#                           hard-gated for setup/build/start/panic regressions,
-#                           but content assertions remain soft until the null-sink
-#                           routing is proven deterministic in Firecracker.
+#   ✅ Linux (PipeWire)  — PRIMARY lifecycle/API tier on Blacksmith. The jobs
+#                           pin ci_test_sink as the default, PROVE the
+#                           tone→sink→monitor route end-to-end at the OS level
+#                           (scripts/ci-linux-audio-route.sh, a hard setup
+#                           gate), and then run with
+#                           RSAC_CI_AUDIO_DETERMINISTIC=1 — content assertions
+#                           hard-fail on silence (rsac-b106 / rsac-6efb).
 #   ✅ Windows (WASAPI)  — FIRST-CLASS for system capture on GitHub-hosted
 #                           windows-latest + LABSN/VB-CABLE. Device/process jobs
 #                           are hard-gated for setup/build/start/panic regressions,
@@ -152,22 +155,23 @@ jobs:
             exit 1
           fi
 
-          # Probe the default sink for diagnostics. Linux content assertions stay
-          # soft in this Firecracker environment even when ci_test_sink exists:
-          # PipeWire monitor capture has not proven deterministic here, so we do
-          # not export RSAC_CI_AUDIO_DETERMINISTIC.
+          # Probe the default sink for diagnostics; the routing gate below is
+          # what actually proves (and hardens) the route.
           DEFAULT_SINK="$(pactl get-default-sink 2>/dev/null || echo unknown)"
           SINK_COUNT="$(pactl list short sinks | grep -c .)"
           echo "default sink='${DEFAULT_SINK}' sink_count=${SINK_COUNT}"
           echo "RSAC_CI_AUDIO_AVAILABLE=1" >> "$GITHUB_ENV"
-          # NOTE: RSAC_CI_AUDIO_DETERMINISTIC is intentionally NOT set on Linux.
-          # The dbus-less Firecracker PipeWire here does not actually route
-          # monitor capture (SystemDefault yields 0 buffers), so we cannot make
-          # hard non-silence/tone claims. Capture *content* is verified on real
-          # hardware and on the deterministic Windows VB-CABLE runner; here the
-          # capture tests run but honestly SKIP their content asserts on 0
-          # buffers (see helpers / per-test skip paths) rather than false-pass.
-          echo "Linux CI: capture content asserts are SOFT (see note above)."
+
+      # rsac-b106 / rsac-6efb: prove the tone → ci_test_sink → monitor route
+      # END-TO-END at the OS level (pw-play → parecord + sox RMS/frequency
+      # analysis), pin ci_test_sink as the default sink, and only then export
+      # RSAC_CI_AUDIO_DETERMINISTIC=1 + PULSE_SINK so the capture tests'
+      # content assertions hard-fail on silence instead of soft-warning.
+      # HARD GATE by design: a broken route fails HERE, at setup, with routing
+      # diagnostics — never later as confusing test silence, and never as a
+      # soft-warned false green.
+      - name: Prove deterministic routing (hard gate, enables deterministic mode)
+        run: bash scripts/ci-linux-audio-route.sh
 
       # rsac-0a1f: every cargo invocation in this job uses
       # `feat_linux,compose` so the ci_audio test binary (and the lib rlib) is
@@ -297,7 +301,9 @@ jobs:
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
           name: linux-system-capture-logs
-          path: ci-audio-output.log
+          path: |
+            ci-audio-output.log
+            /tmp/rsac_route_probe_pwdump.json
           retention-days: 14
 
   linux-device:
@@ -381,14 +387,11 @@ jobs:
           SINK_COUNT="$(pactl list short sinks | grep -c .)"
           echo "default sink='${DEFAULT_SINK}' sink_count=${SINK_COUNT}"
           echo "RSAC_CI_AUDIO_AVAILABLE=1" >> "$GITHUB_ENV"
-          # NOTE: RSAC_CI_AUDIO_DETERMINISTIC is intentionally NOT set on Linux.
-          # The dbus-less Firecracker PipeWire here does not actually route
-          # monitor capture (SystemDefault yields 0 buffers), so we cannot make
-          # hard non-silence/tone claims. Capture *content* is verified on real
-          # hardware and on the deterministic Windows VB-CABLE runner; here the
-          # capture tests run but honestly SKIP their content asserts on 0
-          # buffers (see helpers / per-test skip paths) rather than false-pass.
-          echo "Linux CI: capture content asserts are SOFT (see note above)."
+
+      # rsac-b106 / rsac-6efb: OS-level route proof + deterministic-mode flip
+      # (see the linux-system job's copy of this step for the full rationale).
+      - name: Prove deterministic routing (hard gate, enables deterministic mode)
+        run: bash scripts/ci-linux-audio-route.sh
 
       - name: Run device capture tests
         env:
@@ -502,14 +505,11 @@ jobs:
           SINK_COUNT="$(pactl list short sinks | grep -c .)"
           echo "default sink='${DEFAULT_SINK}' sink_count=${SINK_COUNT}"
           echo "RSAC_CI_AUDIO_AVAILABLE=1" >> "$GITHUB_ENV"
-          # NOTE: RSAC_CI_AUDIO_DETERMINISTIC is intentionally NOT set on Linux.
-          # The dbus-less Firecracker PipeWire here does not actually route
-          # monitor capture (SystemDefault yields 0 buffers), so we cannot make
-          # hard non-silence/tone claims. Capture *content* is verified on real
-          # hardware and on the deterministic Windows VB-CABLE runner; here the
-          # capture tests run but honestly SKIP their content asserts on 0
-          # buffers (see helpers / per-test skip paths) rather than false-pass.
-          echo "Linux CI: capture content asserts are SOFT (see note above)."
+
+      # rsac-b106 / rsac-6efb: OS-level route proof + deterministic-mode flip
+      # (see the linux-system job's copy of this step for the full rationale).
+      - name: Prove deterministic routing (hard gate, enables deterministic mode)
+        run: bash scripts/ci-linux-audio-route.sh
 
       - name: Run application capture tests
         env:

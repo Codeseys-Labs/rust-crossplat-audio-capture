@@ -120,7 +120,15 @@ centralised in `helpers.rs` so the tests themselves stay portable.
   because Blacksmith Firecracker microVMs lack a D-Bus user session
   (`systemctl --user` will not start them).
 - `pactl load-module module-null-sink` creates a virtual sink.
-- `pw-play` (or `paplay`) streams a 440 Hz float WAV tone.
+- **Routing gate** (`scripts/ci-linux-audio-route.sh`, rsac-b106/rsac-6efb):
+  pins `ci_test_sink` as the default sink (pactl → pw-metadata → wpctl
+  ladder; single-sink fallback is accepted), then proves the route
+  end-to-end at the OS level — `pw-play` a 440 Hz tone with default
+  routing, `parecord` the sink monitor, assert RMS + rough frequency with
+  sox. A broken route **fails the job at setup**; a proven route exports
+  `RSAC_CI_AUDIO_DETERMINISTIC=1` and `PULSE_SINK=ci_test_sink`.
+- `pw-play` (or `paplay`, pinned via `PULSE_SINK`) streams a 440 Hz float
+  WAV tone during the tests.
 
 ### Windows — `windows-system` / `windows-device` / `windows-process`
 
@@ -156,12 +164,12 @@ centralised in `helpers.rs` so the tests themselves stay portable.
   stack is up; makes `audio_infrastructure_available()` fast-path to
   `true`. Unset on non-audio jobs.
 - `RSAC_CI_AUDIO_DETERMINISTIC=1` — flips the capture tests' soft
-  non-silence warnings into **hard assertions**. Set in CI only where
-  audio routing is deterministic (the Windows system tier); deliberately
-  unset on Linux until the PipeWire virtual-sink routing evidence lands
-  (seeds rsac-6efb / rsac-b106). On a local machine with real, working
-  audio this is exactly what you want: export it to make a silent
-  capture fail loudly instead of warn.
+  non-silence warnings into **hard assertions**. Set in CI where audio
+  routing is deterministic: the Windows system tier, and the Linux tiers
+  after the routing gate (`scripts/ci-linux-audio-route.sh`) proves the
+  virtual-sink route end-to-end (seeds rsac-6efb / rsac-b106). On a local
+  machine with real, working audio this is exactly what you want: export
+  it to make a silent capture fail loudly instead of warn.
 - `RSAC_CI_MACOS_TCC_GRANTED=1` — set only on self-hosted macOS
   runners where Audio Capture has been granted. Unset on Blacksmith
   and GH-hosted macOS.
