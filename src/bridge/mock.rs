@@ -30,7 +30,6 @@ use std::time::Duration;
 use crate::bridge::ring_buffer::create_bridge;
 use crate::bridge::state::StreamState;
 use crate::bridge::stream::{BridgeStream, PlatformStream};
-use crate::core::buffer::AudioBuffer;
 use crate::core::config::{AudioFormat, DeviceId, SampleFormat, StreamConfig};
 use crate::core::error::{AudioError, AudioResult};
 use crate::core::interface::{AudioDevice, CapturingStream, DeviceEnumerator};
@@ -193,8 +192,15 @@ impl AudioDevice for MockAudioDevice {
                         frames_per_buffer,
                         &mut phase,
                     );
-                    let buffer = AudioBuffer::new(data, channels, sample_rate);
-                    producer.push_or_drop(buffer);
+                    // rsac-0940: push STAMPED, exactly like the real backends
+                    // (WASAPI/PipeWire/CoreAudio all use the `_stamped`
+                    // variants), so mock streams deliver
+                    // `AudioBuffer::timestamp() == Some(..)` with the same
+                    // stream-position semantics as production capture. The
+                    // producer's internal nanosecond accumulator tracks the
+                    // cumulative frames across pushes (and leaves gaps for
+                    // drops), so no extra bookkeeping is needed here.
+                    producer.push_samples_or_drop_stamped(&data, channels, sample_rate);
                     std::thread::sleep(buffer_duration);
                 }
 
@@ -282,6 +288,10 @@ pub fn create_mock_stream(
         sample_format: SampleFormat::F32,
         buffer_size: None,
         capture_target: crate::core::config::CaptureTarget::SystemDefault,
+        #[cfg(target_os = "ios")]
+        ios_app_group: None,
+        #[cfg(target_os = "android")]
+        android_projection: None,
     };
     device.create_stream(&config)
 }
@@ -324,6 +334,7 @@ mod tests {
         assert_eq!(stream.format().channels, 2);
 
         // Read a few buffers
+        let mut last_ts: Option<Duration> = None;
         for _ in 0..3 {
             let buffer = stream.read_chunk().unwrap();
             assert_eq!(buffer.channels(), 2);
@@ -334,6 +345,19 @@ mod tests {
                 "Mock stream should deliver non-silent audio (rms={})",
                 rms
             );
+            // rsac-0940: the mock pushes STAMPED like the real backends, so
+            // every delivered buffer carries a non-decreasing stream-position
+            // timestamp (Some, never the unstamped None of the old mock).
+            let ts = buffer
+                .timestamp()
+                .expect("mock stream must deliver stamped buffers like real backends");
+            if let Some(prev) = last_ts {
+                assert!(
+                    ts >= prev,
+                    "mock timestamps must be non-decreasing (prev={prev:?}, got={ts:?})"
+                );
+            }
+            last_ts = Some(ts);
         }
 
         // Stop

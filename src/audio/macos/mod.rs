@@ -23,6 +23,10 @@ pub mod coreaudio;
 pub mod tap;
 #[cfg(target_os = "macos")]
 pub(crate) mod thread;
+// ADR-0015: private-SPI TCC preflight for the system-audio-capture permission.
+// Compiled only under the opt-in `macos-tcc-spi` feature.
+#[cfg(all(target_os = "macos", feature = "macos-tcc-spi"))]
+pub(crate) mod permission;
 
 // Re-export public types for convenience
 #[cfg(target_os = "macos")]

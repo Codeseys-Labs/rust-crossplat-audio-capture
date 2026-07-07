@@ -11,9 +11,14 @@ mod helpers;
 
 mod app_capture;
 mod application_by_name;
+mod application_by_name_windows;
 mod application_by_pid;
+// Composed multi-source capture (ADR-0011). The module is additionally gated
+// on the `compose` feature internally (`#![cfg(feature = "compose")]`).
+mod compose;
 mod device_capture;
 mod device_enumeration;
+mod lifecycle_terminal;
 mod multi_source;
 mod overrun;
 mod platform_caps;

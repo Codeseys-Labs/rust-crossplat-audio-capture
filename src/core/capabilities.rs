@@ -17,6 +17,37 @@ use super::config::SampleFormat;
 /// [`PlatformCapabilities::query()`] and check before attempting
 /// operations that may not be available on all platforms.
 ///
+/// # Capability vs. readiness
+///
+/// A `PlatformCapabilities` value answers a **static** question: *can this
+/// build, on this OS, do this kind of thing at all?* It is derived from the
+/// target OS + enabled backend feature (and, on macOS, the runtime OS version
+/// for Process-Tap gating). It is **not** a promise that a *specific* capture
+/// will succeed right now. Three separate axes must all hold for a capture to
+/// start:
+///
+/// 1. **Capability** (this type) — e.g. `supports_application_capture`. If
+///    `false`, [`AudioCaptureBuilder::build`](crate::api::AudioCaptureBuilder::build)
+///    fails its preflight with
+///    [`PlatformNotSupported`](crate::core::error::AudioError::PlatformNotSupported)
+///    before touching any device.
+/// 2. **Permission** — a *runtime* grant, distinct from capability. On macOS
+///    per-application capture needs the Audio-Capture TCC permission even when
+///    `supports_application_capture == true`; query it with
+///    [`check_audio_capture_permission`](crate::core::introspection::check_audio_capture_permission).
+/// 3. **Readiness / resolution** — whether the specific
+///    [`CaptureTarget`](crate::core::config::CaptureTarget) resolves *now* (the
+///    device is present, the PID/app exists and is producing audio). A capable,
+///    permitted platform can still fail here with
+///    [`DeviceNotFound`](crate::core::error::AudioError::DeviceNotFound) /
+///    [`ApplicationNotFound`](crate::core::error::AudioError::ApplicationNotFound)
+///    at build/start time.
+///
+/// So `caps.supports_application_capture == true` means "this platform can
+/// capture *some* application" — not "application `X` is capturable right now".
+/// Treat capability as a gate you check first, then handle permission and
+/// per-target resolution errors when they occur.
+///
 /// # Example
 ///
 /// ```
@@ -24,7 +55,9 @@ use super::config::SampleFormat;
 ///
 /// let caps = PlatformCapabilities::query();
 /// if caps.supports_application_capture {
-///     // Safe to use CaptureTarget::Application(..)
+///     // Capability holds — but a specific CaptureTarget::Application(pid) can
+///     // still fail with ApplicationNotFound (readiness) or need a permission
+///     // grant, handled when build()/start() is called.
 /// }
 /// ```
 #[derive(Debug, Clone)]
@@ -46,6 +79,26 @@ pub struct PlatformCapabilities {
     /// wired up. Each platform arm flips this to `true` only once its OS listener
     /// is implemented.
     pub supports_device_change_notifications: bool,
+    /// Whether starting a capture on this platform requires an explicit
+    /// **user-consent artifact** to be supplied to the builder before
+    /// `build()`.
+    ///
+    /// This is distinct from a runtime OS permission grant (axis 2 in
+    /// "Capability vs. readiness" above): consent here is an artifact the
+    /// *configuration* must carry — e.g. Android's `MediaProjection` token
+    /// (obtained from a user dialog and passed via
+    /// `AudioCaptureBuilder::with_android_projection`) or an iOS
+    /// user-initiated broadcast session. When `true` and the artifact is
+    /// missing for a target that needs it, the builder preflight fails with
+    /// [`UserConsentRequired`](crate::core::error::AudioError::UserConsentRequired)
+    /// before any OS resource is touched.
+    ///
+    /// `false` on all desktop backends (WASAPI / PipeWire / CoreAudio) and on
+    /// the `unsupported` stub. `true` on iOS, where the App Group identifier
+    /// for the ReplayKit broadcast path is the consent artifact (rsac-b3aa);
+    /// Android flips to `true` when its playback-capture tiers land
+    /// (rsac-77f1). ADR-0013, `docs/MOBILE_BACKEND_DESIGN.md`.
+    pub requires_user_consent: bool,
     /// Supported sample formats.
     pub supported_sample_formats: Vec<SampleFormat>,
     /// Supported sample rate range (min, max) in Hz.
@@ -81,6 +134,18 @@ impl PlatformCapabilities {
         &Self::SUPPORTED_SAMPLE_RATES
     }
 
+    /// Human-readable rendering of [`SUPPORTED_SAMPLE_RATES`](Self::SUPPORTED_SAMPLE_RATES)
+    /// (`"22050, 32000, 44100, 48000, 88200, 96000"`), single-sourced from the
+    /// const so validation error messages (the capture builder's and the
+    /// compose builder's) can never drift from the actual whitelist.
+    pub(crate) fn supported_sample_rates_display() -> String {
+        Self::SUPPORTED_SAMPLE_RATES
+            .iter()
+            .map(|r| r.to_string())
+            .collect::<Vec<_>>()
+            .join(", ")
+    }
+
     /// Query the capabilities of the current platform's audio backend.
     ///
     /// Determined at compile time from BOTH the target OS *and* the matching
@@ -106,6 +171,16 @@ impl PlatformCapabilities {
         #[cfg(all(target_os = "linux", feature = "feat_linux"))]
         {
             return Self::linux();
+        }
+
+        #[cfg(all(target_os = "android", feature = "feat_android"))]
+        {
+            return Self::android();
+        }
+
+        #[cfg(all(target_os = "ios", feature = "feat_ios"))]
+        {
+            return Self::ios();
         }
 
         // OS without its backend feature enabled, or an unsupported OS: no
@@ -145,6 +220,8 @@ impl PlatformCapabilities {
             supports_device_selection: true,
             // IMMNotificationClient watch() arm is implemented (rsac-e360).
             supports_device_change_notifications: true,
+            // Desktop loopback needs no consent artifact (rsac-82d4).
+            requires_user_consent: false,
             supported_sample_formats: vec![
                 SampleFormat::I16,
                 SampleFormat::I24,
@@ -171,6 +248,9 @@ impl PlatformCapabilities {
             // CoreAudio AudioObjectPropertyListener watch() arm landed (rsac-3093):
             // device-list + default-output/input change notifications are wired up.
             supports_device_change_notifications: true,
+            // TCC is a runtime permission, not a config-time consent artifact
+            // (see the field docs) — so this stays false on macOS (rsac-82d4).
+            requires_user_consent: false,
             supported_sample_formats: vec![SampleFormat::I16, SampleFormat::I32, SampleFormat::F32],
             sample_rate_range: (8000, 192000),
             max_channels: 8,
@@ -190,10 +270,94 @@ impl PlatformCapabilities {
             // `default` metadata listener thread that delivers DeviceAdded /
             // DeviceRemoved / DefaultChanged.
             supports_device_change_notifications: true,
+            // Desktop loopback needs no consent artifact (rsac-82d4).
+            requires_user_consent: false,
             supported_sample_formats: vec![SampleFormat::I16, SampleFormat::I32, SampleFormat::F32],
             sample_rate_range: (8000, 384000),
             max_channels: 32, // PipeWire supports many channels
             backend_name: "PipeWire",
+        }
+    }
+
+    /// Android capabilities — AAudio microphone slice (rsac-20cd) +
+    /// `AudioPlaybackCapture` playback tiers (rsac-77f1).
+    ///
+    /// Honest current state: the compiled backend captures the default audio
+    /// input via AAudio (`CaptureTarget::Device`) on every supported API
+    /// level, and the playback-capture tiers (`SystemDefault` /
+    /// `Application*` / `ProcessTree` via `AudioPlaybackCapture` +
+    /// MediaProjection consent, ADR-0013) on **API 29+** — reported via a
+    /// runtime SDK check ([`get_android_sdk_version`]), the same
+    /// version-probing pattern as macOS's Process Tap gate. On API < 29 the
+    /// playback flags are honestly `false` (`AudioPlaybackCaptureConfiguration`
+    /// does not exist there).
+    ///
+    /// `requires_user_consent: true` when the playback tiers are available:
+    /// the [`AndroidProjectionToken`](crate::core::config::AndroidProjectionToken)
+    /// is the config-time consent artifact (`with_android_projection`);
+    /// `Device` (mic) targets never need it — the mic's RECORD_AUDIO
+    /// *runtime permission* is axis-2 readiness, not a consent artifact
+    /// (see the field docs).
+    #[cfg(all(target_os = "android", feature = "feat_android"))]
+    fn android() -> Self {
+        // API 29 (Android 10) introduced AudioPlaybackCaptureConfiguration.
+        let playback_capture = get_android_sdk_version() >= 29;
+        Self {
+            supports_system_capture: playback_capture, // AudioPlaybackCapture (rsac-77f1)
+            supports_application_capture: playback_capture, // addMatchingUid
+            supports_process_tree_capture: playback_capture, // PID→UID (tree ≡ app)
+            // Only the default AAudio input + the logical playback endpoint
+            // are reachable without the Java AudioManager device list
+            // (arrives with rsac-ad8a).
+            supports_device_selection: false,
+            supports_device_change_notifications: false,
+            // The MediaProjection token is the config-time consent artifact
+            // for the playback tiers (ADR-0013); meaningless below API 29
+            // where those tiers don't exist.
+            requires_user_consent: playback_capture,
+            // AAudio delivers PCM_I16 or PCM_FLOAT natively.
+            supported_sample_formats: vec![SampleFormat::I16, SampleFormat::F32],
+            sample_rate_range: (8000, 96000),
+            max_channels: 2,
+            backend_name: "AAudio",
+        }
+    }
+
+    /// iOS capabilities — microphone (rsac-9e02) + ReplayKit broadcast system
+    /// capture (rsac-b3aa).
+    ///
+    /// Honest current state: `CaptureTarget::Device` captures the session's
+    /// audio input via `AVAudioEngine`; `CaptureTarget::SystemDefault` is
+    /// served by the ReplayKit Broadcast Upload Extension transport — hence
+    /// `supports_system_capture: true` **with** `requires_user_consent: true`:
+    /// capture is user-initiated (broadcast picker) and the configuration
+    /// must carry the App Group identifier
+    /// (`AudioCaptureBuilder::with_ios_app_group`, the config-time consent
+    /// artifact per ADR-0013; the app must also embed the RsacBroadcastKit
+    /// extension). `Application*` / `ProcessTree` are **permanently** `false`
+    /// on iOS — Apple provides no API for capturing another app's audio
+    /// (ADR-0013; never soften this). The mic path itself needs only the
+    /// `NSMicrophoneUsageDescription` *runtime* permission (axis-2), not the
+    /// consent artifact.
+    #[cfg(all(target_os = "ios", feature = "feat_ios"))]
+    fn ios() -> Self {
+        Self {
+            // ReplayKit broadcast transport (rsac-b3aa): user-initiated,
+            // App Group + embedded RsacBroadcastKit extension required.
+            supports_system_capture: true,
+            supports_application_capture: false, // permanent: no iOS API
+            supports_process_tree_capture: false, // permanent: no iOS API
+            // Input routing on iOS is session-driven (AVAudioSession routes),
+            // not free device selection.
+            supports_device_selection: false,
+            supports_device_change_notifications: false,
+            // The App Group id is the config-time consent artifact for
+            // SystemDefault (ADR-0013); Device (mic) targets never need it.
+            requires_user_consent: true,
+            supported_sample_formats: vec![SampleFormat::F32],
+            sample_rate_range: (8000, 96000),
+            max_channels: 2,
+            backend_name: "AVAudioEngine",
         }
     }
 
@@ -207,6 +371,7 @@ impl PlatformCapabilities {
             supports_process_tree_capture: false,
             supports_device_selection: false,
             supports_device_change_notifications: false,
+            requires_user_consent: false,
             supported_sample_formats: vec![],
             sample_rate_range: (0, 0),
             max_channels: 0,
@@ -216,6 +381,59 @@ impl PlatformCapabilities {
 }
 
 // ── macOS version detection ──────────────────────────────────────────────
+
+/// Returns the Android API level (SDK version) of the running device, or
+/// `0` when it cannot be determined.
+///
+/// Reads the `ro.build.version.sdk` system property via
+/// `__system_property_get` (a stable libc export on every Android version)
+/// — no JNI, no subprocess; the same in-process version-probing pattern as
+/// [`get_macos_version`]'s sysctl. A read/parse failure returns `0`, so
+/// version-gated capabilities honestly report `false` rather than claiming
+/// an API that may not exist.
+///
+/// Used by [`PlatformCapabilities`] to gate the playback-capture tiers
+/// (`AudioPlaybackCaptureConfiguration` requires API 29+).
+#[cfg(target_os = "android")]
+pub fn get_android_sdk_version() -> u32 {
+    use std::os::raw::c_char;
+
+    // PROP_VALUE_MAX from <sys/system_properties.h>.
+    const PROP_VALUE_MAX: usize = 92;
+
+    extern "C" {
+        /// Stable Android libc API: copies the property value (NUL-terminated,
+        /// at most PROP_VALUE_MAX bytes including the NUL) into `value` and
+        /// returns its length, or 0 when the property does not exist.
+        fn __system_property_get(name: *const c_char, value: *mut c_char) -> i32;
+    }
+
+    let mut buf = [0u8; PROP_VALUE_MAX];
+    // SAFETY: the name is a NUL-terminated literal and `buf` is at least
+    // PROP_VALUE_MAX bytes, which is the documented maximum the call writes.
+    let len = unsafe {
+        __system_property_get(
+            c"ro.build.version.sdk".as_ptr(),
+            buf.as_mut_ptr().cast::<c_char>(),
+        )
+    };
+    if len <= 0 {
+        log::warn!(
+            "Could not read ro.build.version.sdk; reporting API level 0 \
+             (version-gated capabilities will be false)"
+        );
+        return 0;
+    }
+    let text = std::str::from_utf8(&buf[..len as usize]).unwrap_or("");
+    text.trim().parse().unwrap_or_else(|_| {
+        log::warn!(
+            "Unparseable ro.build.version.sdk value {:?}; reporting API \
+             level 0 (version-gated capabilities will be false)",
+            text
+        );
+        0
+    })
+}
 
 /// Returns the macOS version as `(major, minor, patch)`.
 ///
@@ -432,6 +650,7 @@ mod tests {
             supports_process_tree_capture: false,
             supports_device_selection: false,
             supports_device_change_notifications: false,
+            requires_user_consent: false,
             supported_sample_formats: vec![SampleFormat::I16],
             sample_rate_range: (8000, 48000),
             max_channels: 2,
@@ -471,6 +690,74 @@ mod tests {
     fn supports_channels_zero_is_false() {
         let caps = PlatformCapabilities::query();
         assert!(!caps.supports_channels(0));
+    }
+
+    // ── Consent requirement (rsac-82d4) ─────────────────────────────
+
+    /// Every desktop backend — and the unsupported stub — must report that no
+    /// config-time consent artifact is required.
+    ///
+    /// Gated off the mobile OSes: iOS honestly reports
+    /// `requires_user_consent: true` (rsac-b3aa — the App Group id is the
+    /// consent artifact for the ReplayKit broadcast path), and Android does
+    /// on API 29+ (rsac-77f1 — the MediaProjection token). Mobile
+    /// consent-reporting is covered by the per-OS capability tests below;
+    /// asserting `false` here on those targets would make the test lie.
+    #[cfg(not(any(target_os = "android", target_os = "ios")))]
+    #[test]
+    fn desktop_and_stub_require_no_user_consent() {
+        let caps = PlatformCapabilities::query();
+        assert!(
+            !caps.requires_user_consent,
+            "no desktop backend (or the unsupported stub) requires a consent artifact"
+        );
+    }
+
+    /// rsac-20cd / rsac-77f1: Android must report its honest state — the
+    /// playback-capture tiers are SDK-gated (`AudioPlaybackCapture` needs
+    /// API 29+) and, exactly when available, carry the consent requirement
+    /// (the MediaProjection token, ADR-0013). The three tiers and the
+    /// consent flag always move together: on Android tree ≡ app ≡ system
+    /// transport-wise (one Kotlin pipeline, UID filter optional).
+    #[cfg(all(target_os = "android", feature = "feat_android"))]
+    #[test]
+    fn android_reports_sdk_gated_playback_capture_with_consent() {
+        let caps = PlatformCapabilities::query();
+        assert_eq!(caps.backend_name, "AAudio");
+        let expect_playback = get_android_sdk_version() >= 29;
+        assert_eq!(caps.supports_system_capture, expect_playback);
+        assert_eq!(caps.supports_application_capture, expect_playback);
+        assert_eq!(caps.supports_process_tree_capture, expect_playback);
+        assert_eq!(
+            caps.requires_user_consent, expect_playback,
+            "the MediaProjection token is required exactly when the playback \
+             tiers exist (ADR-0013)"
+        );
+        assert!(!caps.supports_device_selection, "rsac-ad8a pending");
+        assert!(caps.supports_format(SampleFormat::F32));
+        assert!(caps.supports_sample_rate(48000));
+    }
+
+    /// rsac-9e02 / rsac-b3aa: iOS must report its honest state — system
+    /// capture available (ReplayKit broadcast) **with** the consent
+    /// requirement, `Application*`/`ProcessTree` PERMANENTLY false (ADR-0013).
+    #[cfg(all(target_os = "ios", feature = "feat_ios"))]
+    #[test]
+    fn ios_reports_broadcast_system_capture_with_consent() {
+        let caps = PlatformCapabilities::query();
+        assert_eq!(caps.backend_name, "AVAudioEngine");
+        assert!(
+            caps.supports_system_capture,
+            "SystemDefault is served by the ReplayKit broadcast path (rsac-b3aa)"
+        );
+        assert!(
+            caps.requires_user_consent,
+            "the App Group id is the config-time consent artifact (ADR-0013)"
+        );
+        assert!(!caps.supports_application_capture, "permanent: no iOS API");
+        assert!(!caps.supports_process_tree_capture, "permanent: no iOS API");
+        assert!(caps.supports_format(SampleFormat::F32));
+        assert!(caps.supports_sample_rate(48000));
     }
 
     // ── Additional tests ────────────────────────────────────────────

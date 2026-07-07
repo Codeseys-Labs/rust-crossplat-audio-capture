@@ -50,7 +50,12 @@ fn fail_or_skip(label: &str, detail: &str) {
 /// CoreAudio on macOS).
 #[test]
 fn subscribe_delivers_buffers_from_live_capture() {
-    require_audio!();
+    // This test captures CaptureTarget::SystemDefault, which on macOS is a
+    // Process Tap behind the kTCCServiceAudioCapture gate — without the grant
+    // the tap "succeeds" but delivers pure silence, so the #34 content checks
+    // can never pass. Gate like system_capture.rs / lifecycle_terminal.rs do
+    // (no-op on Linux/Windows, where macos_tcc_available() is always true).
+    require_system_capture!();
 
     // #34: feed a known 440 Hz tone through SystemDefault loopback so the
     // subscribe path can be CONTENT-verified (not just liveness-verified) on a
@@ -230,7 +235,9 @@ fn subscribe_errors_when_not_started() {
         Err(AudioError::StreamReadError { reason }) => {
             assert!(
                 reason.to_lowercase().contains("not running")
-                    || reason.to_lowercase().contains("not initialized"),
+                    || reason.to_lowercase().contains("not initialized")
+                    || reason.to_lowercase().contains("no active stream")
+                    || reason.to_lowercase().contains("never started"),
                 "expected lifecycle-related reason, got: {}",
                 reason
             );

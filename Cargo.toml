@@ -11,13 +11,20 @@ build = "build.rs"
 autobins = false
 description = "Cross-platform audio capture library with per-application process taps (macOS), WASAPI (Windows), and PipeWire (Linux)"
 license = "MIT OR Apache-2.0"
-repository = "https://github.com/baladita/rust-crossplat-audio-capture"
+repository = "https://github.com/Codeseys-Labs/rust-crossplat-audio-capture"
 readme = "README.md"
 keywords = ["audio", "capture", "wasapi", "coreaudio", "pipewire"]
 categories = ["multimedia::audio", "os"]
 exclude = [
-    # Application + binding subdirs (published separately or not at all)
+    # Application + binding subdirs (published separately or not at all).
+    # /bindings matters for rsac-go in particular: the Rust binding crates are
+    # auto-excluded by their own Cargo.toml manifests, but rsac-go (Go sources,
+    # Makefile, C bridge — no Cargo.toml) would otherwise ship in the tarball.
     "/apps",
+    "/bindings",
+    # Mobile platform glue (Kotlin AAR + SwiftPM package; ADR-0012) — built by
+    # Gradle/Xcode, not cargo; never ships in the crates.io tarball.
+    "/mobile",
     # Project-internal docs, scripts, infra (not library artifacts)
     "/docs",
     "/docker",
@@ -52,9 +59,16 @@ exclude = [
 feat_windows = []
 feat_linux = []
 feat_macos = []
+# Mobile backends (ADR-0012/0013; docs/MOBILE_BACKEND_DESIGN.md). Double-gated
+# on target_os like the desktop backends, so enabling them on the wrong OS is
+# inert. Current slice: Device-target microphone capture only (AAudio /
+# AVAudioEngine); playback-capture tiers arrive with rsac-77f1 / rsac-b3aa.
+feat_android = []
+feat_ios = []
 
-# Default features - enables all platform backends
-default = ["feat_windows", "feat_linux", "feat_macos"]
+# Default features - enables all platform backends (the two-way target_os
+# gate makes non-matching entries no-ops, so this is safe cross-platform).
+default = ["feat_windows", "feat_linux", "feat_macos", "feat_android", "feat_ios"]
 
 test-utils = [] # Feature to enable test utilities
 
@@ -71,6 +85,27 @@ bridge-zerocopy = []
 # deps). With it on, they emit tracing events/spans and `install_default_tracing`
 # becomes available. Pulls in only the `tracing` facade (no tracing-subscriber).
 tracing = ["dep:tracing"]
+# ADR-0011: opt-in multi-source channel composition (CompositionBuilder /
+# Composition in src/compose/). Default OFF — pulls rubato (resampling to the
+# session rate; FFT path brings realfft + num-complex) and audioadapter-buffers
+# (interleaved-slice adapters rubato v3 consumes). With the feature off the
+# dependency graph and API are unchanged.
+compose = ["dep:rubato", "dep:audioadapter-buffers"]
+# rsac-1ecd: the CLI demo binary's dependencies, feature-gated so library
+# consumers stop paying for them (clap/color-eyre/ctrlc/env_logger were
+# unconditional before 0.5). NOT in default features — build the demo with
+# `cargo build --features cli` / `cargo install rsac --features cli`. Binaries
+# and examples that need these declare `required-features = ["cli"]`.
+cli = ["dep:clap", "dep:color-eyre", "dep:ctrlc", "dep:env_logger"]
+# ADR-0015: opt-in macOS system-audio-capture TCC preflight. Default OFF —
+# it dlopen/dlsym's the PRIVATE, undocumented TCC.framework SPI
+# `TCCAccessPreflight("kTCCServiceAudioCapture")` to make
+# `check_audio_capture_permission()` return a real Granted/Denied answer on
+# macOS instead of the honest `NotDetermined` stub. Kept behind a feature
+# because private SPI is App-Store-review-risky and may break on a future
+# macOS. Off by default → no private symbol in the shipped artifact, public
+# API unchanged. Adds no dependency (uses libc dlopen + core-foundation).
+macos-tcc-spi = []
 
 [dependencies]
 # Core dependencies
@@ -82,12 +117,21 @@ log = "0.4.29"                                                 # For logging
 tracing = { version = "0.1.41", optional = true }              # Optional structured instrumentation (behind the `tracing` feature; rsac_event!/rsac_span! fall back to `log::` when off)
 
 hound = "3.5.1"
-clap = { version = "4.5.60", features = ["derive"] }
-color-eyre = "0.6.5"
-ctrlc = "3.5.2"
+# CLI-only deps (behind the `cli` feature; see [features] above).
+clap = { version = "4.5.60", features = ["derive"], optional = true }
+color-eyre = { version = "0.6.5", optional = true }
+ctrlc = { version = "3.5.2", optional = true }
 libc = "0.2.183"
 
-env_logger = "0.11.9"
+env_logger = { version = "0.11.11", optional = true }
+
+# compose-only deps (behind the `compose` feature; ADR-0011). rubato v3 MSRV is
+# 1.85 — under our 1.87 floor; the CI `msrv` job is the tripwire if a future
+# bump raises it. audioadapter-buffers is pinned to the same major rubato 3.x
+# itself consumes (its `Adapter`/`AdapterMut` traits must come from the SAME
+# crate version rubato's `process_into_buffer` expects, or the impls mismatch).
+rubato = { version = "3.0.0", optional = true }
+audioadapter-buffers = { version = "3.0.0", optional = true }
 
 serde = { version = "1.0.228", features = ["derive"] }
 # serde_json: hard library dep on the native Linux PipeWire path — it parses the
@@ -126,7 +170,7 @@ sysinfo = "0.38.4"     # For process discovery by name
 [target.'cfg(target_os = "linux")'.dependencies]
 # PipeWire dependencies for application-specific capture
 # System requirements: libpipewire-0.3-dev, pkg-config, build-essential, clang, libclang-dev, and llvm-dev
-pipewire = { version = "0.9.2", features = ["v0_3_44"] }  # PipeWire bindings with v0.3.44+ features for monitor streams
+pipewire = { version = "0.9.2", features = ["v0_3_65"] }  # v0.3.65 API gate (transitively includes v0_3_44 monitor-stream APIs and enables spa/v0_3_65). Declared here as a real cargo feature — previously force-injected globally via a .cargo/config.toml rustflags cfg hack (rsac-9b3c).
 libspa = "0.9.2"      # SPA (Simple Plugin API) for format negotiation and parameter handling
 libspa-sys = "0.9.2"  # Low-level SPA bindings for direct parameter access
 
@@ -148,36 +192,92 @@ core-foundation-sys = "0.8.7"       # Low-level Core Foundation FFI bindings
 sysinfo = "0.38.4"                  # For process tree discovery (ProcessTree capture target)
 # Note: CATapDescription is a private CoreAudio class — raw msg_send! is required (no objc2 bindings)
 
+[target.'cfg(target_os = "ios")'.dependencies]
+# iOS backend (feat_ios, mic slice — rsac-9e02): AVAudioEngine via the objc2
+# family, versions matching the macOS block above. This dependency block is
+# owned by the iOS backend work; extend it there if typed framework crates
+# (e.g. objc2-avf-audio) prove viable for cross-checking without an Apple SDK.
+#
+# NOTE: deliberately WITHOUT the objc2 "exception" feature the macOS block
+# enables — that feature pulls in objc2-exception-helper, whose build script
+# compiles an Objective-C file (needs xcrun + an Apple SDK), which breaks the
+# host-independent `cargo check --target aarch64-apple-ios` CI/dev loop. The
+# iOS backend does not use objc2::exception::catch, so nothing is lost.
+objc2 = "0.6"
+objc2-foundation = { version = "0.3", features = [
+    "NSString", "NSArray", "NSValue",
+    "NSAutoreleasePool", "NSObject", "NSError",
+    # ReplayKit broadcast ring consumer (rsac-b3aa): App Group container
+    # resolution via -[NSFileManager containerURLForSecurityApplicationGroupIdentifier:].
+    "NSFileManager", "NSURL",
+] }
+block2 = "0.6"   # ObjC blocks for the AVAudioEngine input-node tap callback
+# Typed AVFAudio bindings (same objc2 0.6 generation as the macOS block's
+# objc2-app-kit). Features cover exactly the mic-tap surface used by
+# src/audio/ios/avaudio.rs: engine + input node, bus formats, the PCM tap
+# buffer/time types, and the block2 glue for AVAudioNodeTapBlock.
+objc2-avf-audio = { version = "0.3", features = [
+    "AVAudioEngine", "AVAudioNode", "AVAudioIONode", "AVAudioFormat",
+    "AVAudioBuffer", "AVAudioTime", "AVAudioTypes", "block2",
+] }
+
+# Android backend (feat_android — rsac-20cd mic slice, rsac-77f1 playback):
+# AAudio is bound via in-tree extern "C" declarations against the stable NDK
+# ABI (see src/audio/android/aaudio.rs). The playback-capture path (JNI
+# orchestration of the mobile/android AAR, src/audio/android/jni.rs) uses
+# jni-sys — the canonical, declarations-only transcription of jni.h (no
+# transitive deps, no build.rs). Chosen over (a) the full `jni` crate, which
+# drags cesu8/combine/thiserror for ~15 functions we call, and (b) an
+# in-tree hand transcription of the 233-entry JNIEnv vtable, where a single
+# misplaced field silently calls the wrong JVM function (UB) — the exact
+# failure class the in-tree-FFI convention exists to avoid, inverted.
+[target.'cfg(target_os = "android")'.dependencies]
+jni-sys = "0.3"
+
 [build-dependencies]
 pkg-config = "0.3.32"
 
 [dev-dependencies]
-criterion = "0.8.2" # Benchmarking
 tempfile = "3.27.0" # Temporary files for tests
 rand = "0.10.0" # For generating test data
 rand_pcg = "0.10.1" # For deterministic random numbers in tests
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "time"] }
 futures-util = "0.3"
 
+# criterion is target-gated OFF the mobile OSes: cargo compiles EVERY
+# dev-dependency for any `--tests` target, and criterion's `alloca` dependency
+# builds C via cc (needs xcrun / an NDK toolchain), which breaks the
+# host-independent mobile cross-target check loops
+# (`cargo check --target aarch64-apple-ios --tests`). Benches never run on
+# mobile anyway; the [[bench]] targets also set `test = false` so `--tests`
+# does not select them where criterion is absent.
+[target.'cfg(not(any(target_os = "ios", target_os = "android")))'.dev-dependencies]
+criterion = "0.8.2" # Benchmarking
+
 [[bin]]
 name = "rsac"
 path = "src/main.rs"
+required-features = ["cli"]
 
 [[bin]]
 name = "standardized_test"
 path = "src/bin/standardized_test.rs"
+required-features = ["cli"]
 
 [[example]]
 name = "verify_audio"
 path = "examples/verify_audio.rs"
+required-features = ["cli"]
 
 [[example]]
 name = "basic_capture"
 path = "examples/basic_capture.rs"
+required-features = ["cli"]
 
 [[example]]
 name = "record_to_file"
 path = "examples/record_to_file.rs"
+required-features = ["cli"]
 
 [[example]]
 name = "list_devices"
@@ -187,6 +287,11 @@ path = "examples/list_devices.rs"
 name = "async_capture"
 path = "examples/async_capture.rs"
 required-features = ["async-stream"]
+
+[[example]]
+name = "composed_capture"
+path = "examples/composed_capture.rs"
+required-features = ["compose"]
 
 [[bin]]
 name = "app_capture_test"
@@ -242,10 +347,16 @@ harness = true
 
 # rsac-603b: criterion benchmark harness for the bridge data plane. harness =
 # false hands main() to criterion_main!; does not affect cargo build/cargo test.
+# test = false keeps `cargo check --tests` from selecting the bench target
+# (bench targets default to test = true): criterion's `alloca` dep compiles C
+# via cc/xcrun, which breaks the host-independent mobile cross-target loops
+# (`cargo check --target aarch64-apple-ios --tests`). No CI job runs benches
+# in test mode, so nothing is lost (AGENTS.md §8: benches are not executed).
 [[bench]]
 name = "bridge"
 path = "benches/bridge.rs"
 harness = false
+test = false
 
 # rsac-03a5: criterion benchmark for the consumer-side observability read path
 # (stream_stats / backpressure_report assembly + AudioBuffer level meters). Proves
@@ -255,9 +366,18 @@ harness = false
 name = "observability"
 path = "benches/observability.rs"
 harness = false
+test = false
 
 [workspace]
-members = ["bindings/rsac-python", "bindings/rsac-ffi", "bindings/rsac-napi"]
+members = [
+    "bindings/rsac-python",
+    "bindings/rsac-ffi",
+    "bindings/rsac-napi",
+    # NOTE (stack L1, rsac-f86e): the mobile/android-native member rides in
+    # the mobile tail PR of the 0.4.1 stack (rsac-d303) together with the
+    # rest of mobile/. The two Kotlin contract sources ARE in this layer —
+    # the cfg-independent jni_lockstep tests include_str! them.
+]
 exclude = ["apps/audio-graph/src-tauri"]
 
 # rsac#16: docs.rs rendering config. Without this, docs.rs builds with the
