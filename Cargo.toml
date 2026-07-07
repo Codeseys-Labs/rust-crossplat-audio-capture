@@ -373,10 +373,10 @@ members = [
     "bindings/rsac-python",
     "bindings/rsac-ffi",
     "bindings/rsac-napi",
-    # NOTE (stack L1, rsac-f86e): the mobile/android-native member rides in
-    # the mobile tail PR of the 0.4.1 stack (rsac-d303) together with the
-    # rest of mobile/. The two Kotlin contract sources ARE in this layer —
-    # the cfg-independent jni_lockstep tests include_str! them.
+    # Android cdylib shim (librsac.so for the AAR's jniLibs; rsac-0aa9).
+    # Lives under /mobile, which is excluded from the crates.io package —
+    # workspace membership is orthogonal to packaging.
+    "mobile/android-native",
 ]
 exclude = ["apps/audio-graph/src-tauri"]
 
