@@ -1073,12 +1073,25 @@ pub struct JsPlatformCapabilities {
     pub supports_process_tree_capture: bool,
     /// Whether device selection is supported.
     pub supports_device_selection: bool,
+    /// Whether the backend delivers device hot-plug / default-change
+    /// notifications.
+    pub supports_device_change_notifications: bool,
+    /// True when starting a capture requires a config-time user-consent
+    /// artifact (mobile platforms; see docs/MOBILE_BACKEND_DESIGN.md);
+    /// false on all desktop backends.
+    pub requires_user_consent: bool,
     /// Maximum number of channels supported.
     pub max_channels: u32,
     /// Minimum supported sample rate in Hz.
     pub min_sample_rate: u32,
     /// Maximum supported sample rate in Hz.
     pub max_sample_rate: u32,
+    /// Supported sample formats (short names, e.g. "I16", "F32").
+    pub supported_sample_formats: Vec<String>,
+    /// The config-time sample-rate whitelist the capture constructor accepts —
+    /// identical on every platform and intentionally narrower than the
+    /// device-negotiable min/max sample-rate range.
+    pub supported_sample_rates: Vec<u32>,
     /// Name of the audio backend (e.g., "WASAPI", "CoreAudio", "PipeWire").
     pub backend_name: String,
 }
@@ -1095,9 +1108,17 @@ pub fn platform_capabilities() -> JsPlatformCapabilities {
         supports_application_capture: caps.supports_application_capture,
         supports_process_tree_capture: caps.supports_process_tree_capture,
         supports_device_selection: caps.supports_device_selection,
+        supports_device_change_notifications: caps.supports_device_change_notifications,
+        requires_user_consent: caps.requires_user_consent,
         max_channels: caps.max_channels as u32,
         min_sample_rate: caps.sample_rate_range.0,
         max_sample_rate: caps.sample_rate_range.1,
+        supported_sample_formats: caps
+            .supported_sample_formats
+            .iter()
+            .map(|f| sample_format_name(*f).to_string())
+            .collect(),
+        supported_sample_rates: rsac::PlatformCapabilities::supported_sample_rates().to_vec(),
         backend_name: caps.backend_name.to_string(),
     }
 }

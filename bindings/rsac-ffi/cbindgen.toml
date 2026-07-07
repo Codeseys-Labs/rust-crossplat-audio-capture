@@ -25,12 +25,28 @@ style = "both"  # Generate both tag and typedef names
 "target_os = windows" = "_WIN32"
 "target_os = macos" = "__APPLE__"
 "target_os = linux" = "__linux__"
+# The compose FFI surface (src/compose.rs) is behind the `compose` cargo
+# feature. cbindgen parses source (it never sees cargo's enabled feature set),
+# so this mapping makes header generation DETERMINISTIC regardless of the
+# features a given build enables: compose items are always emitted, wrapped in
+# `#if defined(RSAC_FEATURE_COMPOSE)`. C consumers define RSAC_FEATURE_COMPOSE
+# when linking a librsac_ffi built with `--features compose`. The curated
+# rsac.h guards its compose section with the same define.
+"feature = compose" = "RSAC_FEATURE_COMPOSE"
 
 [export]
 # Intentionally NO `prefix`: the Rust types already carry their final C names
 # (Rsac* opaque structs, rsac_*_t enums/typedefs). A prefix would double it up
 # (RsacRsacBuilder / Rsacrsac_error_t) and drift from the curated rsac.h.
-include = []
+#
+# Force-export the constants-only enums (rsac-a273): rsac_default_device and
+# rsac_group_set_layout take their kind/layout parameter as a plain `int32_t`
+# — an out-of-range integer materialized as a fieldless Rust enum by value at
+# the ABI boundary is UB before any check can run — so no exported prototype
+# references these types anymore and cbindgen would otherwise drop them from
+# the generated header. C callers keep passing the constants (implicit
+# enum→int conversion).
+include = ["rsac_device_kind_t", "rsac_group_layout_t"]
 exclude = []
 # No [export.rename] is needed — names pass through verbatim. (The previous
 # rename keys — "RsacError", "RsacDeviceKind", … — never matched any real type

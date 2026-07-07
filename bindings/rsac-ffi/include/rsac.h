@@ -13,6 +13,17 @@
  * Error handling:
  *   - All functions return rsac_error_t. On error, call rsac_error_message()
  *     for a human-readable description.
+ *
+ * Threading:
+ *   - Except for rsac_capture_request_stop (and rsac_composition_stop on the
+ *     compose surface), calls on ONE handle must not overlap from multiple
+ *     threads: the caller must serialize them externally (e.g.
+ *     rsac_capture_start racing a parked rsac_capture_read is a data race).
+ *     Those stop functions are the sole documented exceptions — each may run
+ *     concurrently with an in-flight read on the same handle to unblock it,
+ *     and even they are never safe against the handle's _free (order stop +
+ *     drain of in-flight reads BEFORE free). Distinct handles are independent
+ *     and need no synchronization.
  */
 
 #ifndef RSAC_H
@@ -46,6 +57,15 @@ typedef enum {
 
 /* ── Device kind ────────────────────────────────────────────────────── */
 
+/**
+ * Device kind constants for rsac_default_device().
+ *
+ * Constants-only type: rsac_default_device() takes its `kind` parameter as a
+ * plain int32_t (C's implicit enum→int conversion keeps call sites source-
+ * compatible), so an out-of-range integer is rejected with
+ * RSAC_ERROR_INVALID_PARAMETER instead of being undefined behavior on the
+ * Rust side of the ABI.
+ */
 typedef enum {
     RSAC_DEVICE_INPUT  = 0,
     RSAC_DEVICE_OUTPUT = 1,
@@ -200,6 +220,21 @@ rsac_error_t rsac_builder_set_target_process_tree(RsacBuilder* builder,
  */
 rsac_error_t rsac_builder_set_target_str(RsacBuilder* builder,
                                          const char* spec);
+
+/**
+ * Supplies the Android MediaProjection consent token (Android targets only).
+ *
+ * `token` is the opaque int64 handle produced by the rsac Android consent
+ * helper (a JNI GlobalRef to the MediaProjection). On Android builds it is
+ * stored on the builder; playback-capture targets without it fail
+ * rsac_builder_build() with RSAC_ERROR_CONFIGURATION once an Android backend
+ * advertises the capability. Microphone ("device:") targets never need one.
+ *
+ * The symbol exists on every platform so the C ABI is uniform; on non-Android
+ * platforms the call returns RSAC_ERROR_PLATFORM_NOT_SUPPORTED.
+ */
+rsac_error_t rsac_builder_set_android_projection(RsacBuilder* builder,
+                                                 int64_t token);
 
 /** Sets the desired sample rate in Hz. */
 rsac_error_t rsac_builder_set_sample_rate(RsacBuilder* builder,
@@ -401,11 +436,14 @@ void rsac_device_list_free(RsacDeviceList* list);
  * Gets the default audio device. The returned device must be freed
  * with rsac_device_free().
  *
+ * `kind` takes one of the rsac_device_kind_t constants as a plain int32_t
+ * (implicit enum→int conversion — existing call sites compile unchanged).
  * Only RSAC_DEVICE_OUTPUT is supported (rsac is a loopback capture library);
- * RSAC_DEVICE_INPUT returns RSAC_ERROR_INVALID_PARAMETER.
+ * RSAC_DEVICE_INPUT — and any out-of-range value — is rejected with
+ * RSAC_ERROR_INVALID_PARAMETER.
  */
 rsac_error_t rsac_default_device(const RsacDeviceEnumerator* enumerator,
-                                  rsac_device_kind_t kind,
+                                  int32_t kind,
                                   RsacDevice** out);
 
 /* ── Device accessors ───────────────────────────────────────────────── */
@@ -450,6 +488,14 @@ int32_t rsac_capabilities_supports_process_tree(const RsacCapabilities* caps);
 /** Returns 1 if device selection is supported, 0 if not, -1 if null. */
 int32_t rsac_capabilities_supports_device_selection(const RsacCapabilities* caps);
 
+/**
+ * Returns 1 if starting a capture requires a config-time user-consent
+ * artifact (mobile platforms — e.g. an Android MediaProjection token via
+ * rsac_builder_set_android_projection()), 0 if not, -1 if null.
+ * Always 0 on the desktop backends.
+ */
+int32_t rsac_capabilities_requires_user_consent(const RsacCapabilities* caps);
+
 /** Returns the maximum number of channels supported. Returns 0 if null. */
 uint16_t rsac_capabilities_max_channels(const RsacCapabilities* caps);
 
@@ -458,6 +504,387 @@ uint16_t rsac_capabilities_max_channels(const RsacCapabilities* caps);
  * Valid until the next call on the same thread. Returns null if null.
  */
 const char* rsac_capabilities_backend_name(const RsacCapabilities* caps);
+
+/* ── Multi-source composition (compose feature) ─────────────────────── */
+
+/*
+ * The declarations below exist only in a librsac_ffi built with the `compose`
+ * cargo feature (cargo build -p rsac-ffi --features compose). Define
+ * RSAC_FEATURE_COMPOSE when compiling C code against such a build; without it
+ * this whole section is preprocessed away, matching a library that does not
+ * export these symbols.
+ *
+ * Model: sources (capture targets) are declared in named GROUPS; each group
+ * contributes output channels according to its layout (mono mixdown = 1,
+ * stereo mixdown = 2, keep-channels = the single source's native width).
+ * Groups append in declaration order into ONE interleaved-f32 stream at the
+ * session rate. The composition owns its inner captures.
+ *
+ * Ownership / free order:
+ *   - A group is consumed by a successful rsac_composition_builder_add_group;
+ *     free it with rsac_group_free only if it was never added (or adding failed).
+ *   - rsac_composition_builder_build ALWAYS consumes the builder (even on
+ *     failure), like rsac_builder_build.
+ *   - rsac_composition_free stops the compositor engine (joining its thread)
+ *     and releases every inner capture. Buffers returned by reads own their
+ *     samples and remain valid after the composition is freed.
+ *   - rsac_composition_stop may run concurrently with a parked
+ *     rsac_composition_read to unblock it; it is NOT safe concurrently with
+ *     rsac_composition_free (stop + drain reads BEFORE freeing).
+ *
+ * Threading: rsac_composition_stop is the ONLY call on this surface that may
+ * overlap another in-flight call on the same handle (see above). Every other
+ * pair of calls on one composition (or group, or builder) handle must not
+ * overlap from multiple threads — the caller must serialize them externally
+ * (e.g. rsac_composition_start racing a parked rsac_composition_read is a
+ * data race). Distinct handles are independent and need no synchronization.
+ */
+#if defined(RSAC_FEATURE_COMPOSE)
+
+/**
+ * How a group's sources map onto the composed output channels.
+ *
+ * Constants-only type: rsac_group_set_layout() takes its `layout` parameter
+ * as a plain int32_t (C's implicit enum→int conversion keeps call sites
+ * source-compatible), so an out-of-range integer is rejected with
+ * RSAC_ERROR_INVALID_PARAMETER instead of being undefined behavior on the
+ * Rust side of the ABI.
+ */
+typedef enum {
+    /** Fold every source to mono; gain-weighted-sum into 1 output channel. */
+    RSAC_GROUP_LAYOUT_MONO = 0,
+    /** Fold every source to stereo; sum into 2 output channels (default). */
+    RSAC_GROUP_LAYOUT_STEREO = 1,
+    /** Pass the group's SINGLE source through with its native channels. */
+    RSAC_GROUP_LAYOUT_KEEP_CHANNELS = 2,
+} rsac_group_layout_t;
+
+/**
+ * Point-in-time snapshot of a running composition's counters.
+ *
+ * Filled by rsac_composition_stats(). Plain value type — no heap, no free.
+ * Before rsac_composition_start() succeeds every field is 0.
+ */
+typedef struct {
+    uint64_t ticks;          /**< Composed buffers (ticks) emitted so far. */
+    uint64_t fallback_ticks; /**< Wall-clock fallback ticks (master stalled). */
+    size_t   num_sources;    /**< Composed sources; valid indices are 0..num_sources. */
+} RsacCompositionStats;
+
+/**
+ * Point-in-time snapshot of one composed source's counters.
+ *
+ * Filled by rsac_composition_source_stats(). Plain value type — no heap, no
+ * free. The source's group name and target string are available via
+ * rsac_composition_source_group() and rsac_composition_source_target().
+ */
+typedef struct {
+    uint64_t buffers_received; /**< Buffers received from the inner capture. */
+    uint64_t padded_frames;    /**< Silence frames inserted (source behind). */
+    uint64_t trimmed_frames;   /**< Frames trimmed (source past buffering bound). */
+    int32_t  resampling;       /**< 1 if resampled to the session rate, else 0. */
+    int32_t  ended;            /**< 1 if the source's stream has ended, else 0. */
+} RsacSourceStats;
+
+/** Opaque handle to a composition builder. */
+typedef struct RsacCompositionBuilder RsacCompositionBuilder;
+/** Opaque handle to a composition group under construction. */
+typedef struct RsacGroup              RsacGroup;
+/** Opaque handle to a composition session. */
+typedef struct RsacComposition        RsacComposition;
+
+/* ── Group construction ── */
+
+/**
+ * Creates a composition group with the given name and the default stereo
+ * layout. The name must be non-empty and unique within a composition (both
+ * enforced at rsac_composition_builder_build(), not here). The caller owns
+ * the handle: hand it to rsac_composition_builder_add_group() (which consumes
+ * it) or free it with rsac_group_free().
+ */
+rsac_error_t rsac_group_new(const char* name, RsacGroup** out);
+
+/**
+ * Frees a group handle. No-op if null. Only for groups NOT consumed by a
+ * successful rsac_composition_builder_add_group().
+ */
+void rsac_group_free(RsacGroup* group);
+
+/**
+ * Sets the group's layout. `layout` takes one of the rsac_group_layout_t
+ * constants as a plain int32_t (implicit enum→int conversion — existing call
+ * sites compile unchanged); any other value is rejected with
+ * RSAC_ERROR_INVALID_PARAMETER and the group is unchanged. A keep-channels
+ * group must contain exactly one source (arity enforced at
+ * rsac_composition_builder_build()).
+ */
+rsac_error_t rsac_group_set_layout(RsacGroup* group,
+                                   int32_t layout);
+
+/**
+ * Adds a capture source with unit gain (1.0). `spec` uses the same target
+ * string grammar as rsac_builder_set_target_str():
+ *   "system" | "device:<id>" | "app:<pid-or-id>" | "name:<name>" | "tree:<pid>"
+ * On a parse error the group is unchanged and RSAC_ERROR_INVALID_PARAMETER
+ * is returned.
+ */
+rsac_error_t rsac_group_add_source(RsacGroup* group, const char* spec);
+
+/**
+ * Adds a capture source with an explicit linear mixdown gain (1.0 = unity).
+ * The gain must be finite and >= 0; invalid gains are rejected eagerly with
+ * RSAC_ERROR_INVALID_PARAMETER (the group is unchanged on error).
+ */
+rsac_error_t rsac_group_add_source_with_gain(RsacGroup* group,
+                                             const char* spec,
+                                             float gain);
+
+/* ── Composition builder ── */
+
+/**
+ * Creates a composition builder with default settings (48 kHz session rate,
+ * no output clamping, no groups). Free with rsac_composition_builder_free()
+ * unless consumed by rsac_composition_builder_build().
+ */
+rsac_error_t rsac_composition_builder_new(RsacCompositionBuilder** out);
+
+/**
+ * Frees a composition builder handle. No-op if null. Only for builders NOT
+ * consumed by rsac_composition_builder_build().
+ */
+void rsac_composition_builder_free(RsacCompositionBuilder* builder);
+
+/**
+ * Sets the session sample rate in Hz (default 48000). Sources delivering a
+ * different rate are resampled. Unsupported rates are rejected at
+ * rsac_composition_builder_build().
+ */
+rsac_error_t rsac_composition_builder_set_sample_rate(
+    RsacCompositionBuilder* builder,
+    uint32_t sample_rate);
+
+/**
+ * Enables (nonzero) or disables (0) saturating output clamping to
+ * [-1.0, 1.0] after summation. Default off.
+ */
+rsac_error_t rsac_composition_builder_set_clamp_output(
+    RsacCompositionBuilder* builder,
+    int32_t clamp);
+
+/**
+ * Sets the composed tick quantum (output buffer duration) in milliseconds
+ * (default 10). The setter is thin — any value is accepted here; a ZERO
+ * quantum is rejected at rsac_composition_builder_preflight() /
+ * rsac_composition_builder_build() with RSAC_ERROR_CONFIGURATION. At start
+ * the quantum is additionally clamped to at least one frame at the session
+ * rate. Returns RSAC_ERROR_NULL_POINTER if builder is null.
+ */
+rsac_error_t rsac_composition_builder_set_quantum_ms(
+    RsacCompositionBuilder* builder,
+    uint64_t millis);
+
+/**
+ * Sets how long the compositor waits for the master-clock source before
+ * emitting a wall-clock fallback tick (so a stalled master never freezes the
+ * session), in milliseconds (default 250). Thin like the other setters: a
+ * ZERO timeout is rejected at rsac_composition_builder_preflight() /
+ * rsac_composition_builder_build() with RSAC_ERROR_CONFIGURATION.
+ * Returns RSAC_ERROR_NULL_POINTER if builder is null.
+ */
+rsac_error_t rsac_composition_builder_set_stall_timeout_ms(
+    RsacCompositionBuilder* builder,
+    uint64_t millis);
+
+/**
+ * Sets the per-source buffering bound in milliseconds (default 1000). A
+ * source drifting ahead of the master beyond this bound has its oldest
+ * samples trimmed (RsacSourceStats.trimmed_frames). Any value — including
+ * 0 — passes validation: the bound is clamped to at least one quantum when
+ * the composition starts. Returns RSAC_ERROR_NULL_POINTER if builder is null.
+ */
+rsac_error_t rsac_composition_builder_set_max_buffer_ms(
+    RsacCompositionBuilder* builder,
+    uint64_t millis);
+
+/**
+ * Appends a group. Groups contribute output channels in the order added.
+ * On RSAC_OK the group handle is CONSUMED — do not use or free it afterwards.
+ * On any error (including a caught panic, RSAC_ERROR_PANIC) the caller still
+ * owns the group: the handle is consumed only after the append has fully
+ * succeeded.
+ */
+rsac_error_t rsac_composition_builder_add_group(
+    RsacCompositionBuilder* builder,
+    RsacGroup* group);
+
+/**
+ * Runs every device-independent validation rsac_composition_builder_build()
+ * performs, WITHOUT consuming the builder. Because build always consumes its
+ * builder (even on failure), this is how a C caller iterates: preflight, fix
+ * the reported error on the SAME builder, preflight again, then build.
+ *
+ * RSAC_OK means build's validation phase would pass. It is NOT a guarantee
+ * the composition will start: no devices are touched here, so device /
+ * capability errors (device resolution, format negotiation, stream creation)
+ * can still surface at rsac_composition_start().
+ *
+ * Error codes mirror build's validation phase exactly:
+ * RSAC_ERROR_CONFIGURATION (no groups, empty group, duplicate/empty group
+ * name, keep-channels group without exactly one source, invalid gain, too
+ * many sources/channels, zero quantum or stall timeout),
+ * RSAC_ERROR_INVALID_PARAMETER (unsupported session sample rate),
+ * RSAC_ERROR_PLATFORM_NOT_SUPPORTED (a target this platform cannot capture).
+ * Returns RSAC_ERROR_NULL_POINTER if builder is null.
+ */
+rsac_error_t rsac_composition_builder_preflight(
+    const RsacCompositionBuilder* builder);
+
+/**
+ * Validates the configuration and builds a (not yet started) composition.
+ * The builder is ALWAYS consumed, even on failure. No devices are touched
+ * here — inner captures are created and started by rsac_composition_start().
+ * On success *out must be freed with rsac_composition_free().
+ *
+ * Validation errors: RSAC_ERROR_CONFIGURATION (no groups, empty group,
+ * duplicate/empty group name, keep-channels group without exactly one source,
+ * invalid gain, too many sources/channels), RSAC_ERROR_INVALID_PARAMETER
+ * (unsupported session sample rate), RSAC_ERROR_PLATFORM_NOT_SUPPORTED
+ * (a target this platform cannot capture).
+ */
+rsac_error_t rsac_composition_builder_build(
+    RsacCompositionBuilder* builder,
+    RsacComposition** out);
+
+/* ── Composition lifecycle ── */
+
+/**
+ * Builds and starts one capture per source, resolves the composed channel
+ * layout, and spawns the compositor thread. On failure every already-started
+ * inner capture is stopped. Starting twice returns RSAC_ERROR_CONFIGURATION.
+ */
+rsac_error_t rsac_composition_start(RsacComposition* comp);
+
+/**
+ * Signals the composition to stop (idempotent; RSAC_OK before start). Takes a
+ * const composition: safe to call concurrently with an in-flight
+ * rsac_composition_read / rsac_composition_try_read to unblock it. The
+ * compositor thread is joined by rsac_composition_free(); do NOT call this
+ * concurrently with free. An explicit stop discards any buffered composed
+ * tail — read until the terminal error first to capture everything.
+ */
+rsac_error_t rsac_composition_stop(const RsacComposition* comp);
+
+/** Returns 1 if the composed stream is running, 0 if not, -1 if null. */
+int32_t rsac_composition_is_running(const RsacComposition* comp);
+
+/**
+ * Returns the number of composed-ring overruns: composed buffers dropped
+ * because the consumer read slower than the compositor produced (the ring
+ * holds ~128 composed buffers, about 1.3 s at the default 10 ms quantum).
+ * Mirrors rsac_capture_overrun_count(). Counts loss at the COMPOSED ring
+ * only — loss inside an inner source's own capture is reported per source
+ * via rsac_composition_source_stats(). Returns 0 if the handle is null or
+ * the composition has not been started.
+ */
+uint64_t rsac_composition_overrun_count(const RsacComposition* comp);
+
+/**
+ * Frees a composition handle. Stops the composition if running (joining the
+ * compositor thread and stopping every inner capture). No-op if null.
+ * Buffers previously returned by reads own their samples and stay valid.
+ */
+void rsac_composition_free(RsacComposition* comp);
+
+/* ── Reading composed audio ── */
+
+/**
+ * Non-blocking read of the next composed buffer (mirrors
+ * rsac_capture_try_read). On success with data, *out receives a buffer handle
+ * (free with rsac_audio_buffer_free); interleaved f32 at the session rate
+ * with rsac_composition_channel_count() channels. On success with no data
+ * yet, *out is null and RSAC_OK is returned. A drained, ended composition
+ * returns the fatal RSAC_ERROR_STREAM_FAILED (do not retry). A not-started
+ * composition returns RSAC_ERROR_STREAM_READ.
+ */
+rsac_error_t rsac_composition_try_read(const RsacComposition* comp,
+                                       RsacAudioBuffer** out);
+
+/**
+ * Blocking read of the next composed buffer (mirrors rsac_capture_read).
+ * Free the buffer with rsac_audio_buffer_free(). A drained, ended composition
+ * returns the fatal RSAC_ERROR_STREAM_FAILED. A concurrent
+ * rsac_composition_stop() unblocks a thread parked here.
+ */
+rsac_error_t rsac_composition_read(const RsacComposition* comp,
+                                   RsacAudioBuffer** out);
+
+/* ── Channel-map introspection ── */
+
+/**
+ * Returns the number of composed output channels. The layout is resolved by
+ * rsac_composition_start(), so this is 0 before a successful start (and 0 if
+ * the handle is null).
+ */
+uint16_t rsac_composition_channel_count(const RsacComposition* comp);
+
+/**
+ * Returns the name of the group producing composed output channel `channel`
+ * (0-based). Valid until the next compose string accessor call on the same
+ * thread. Returns null if the handle is null, the composition has not been
+ * started, or `channel` is out of bounds.
+ */
+const char* rsac_composition_channel_group(const RsacComposition* comp,
+                                           size_t channel);
+
+/**
+ * Returns the index of output channel `channel` WITHIN its group (0-based;
+ * e.g. 0 = L, 1 = R for a stereo group). Returns -1 if the handle is null,
+ * the composition has not been started, or `channel` is out of bounds.
+ */
+int32_t rsac_composition_channel_in_group(const RsacComposition* comp,
+                                          size_t channel);
+
+/* ── Composition stats ── */
+
+/**
+ * Fills *out with a point-in-time composition-counters snapshot. Before
+ * rsac_composition_start() succeeds the snapshot is all-zero (num_sources 0).
+ * *out is an out-parameter, not a handle — nothing to free.
+ * Returns RSAC_ERROR_NULL_POINTER if comp or out is null, else RSAC_OK.
+ */
+rsac_error_t rsac_composition_stats(const RsacComposition* comp,
+                                    RsacCompositionStats* out);
+
+/**
+ * Fills *out with the counters of the source at `index` (flat declaration
+ * order; valid indices are 0..num_sources from rsac_composition_stats()).
+ * Returns RSAC_ERROR_STREAM_READ before start and
+ * RSAC_ERROR_INVALID_PARAMETER if `index` is out of bounds.
+ */
+rsac_error_t rsac_composition_source_stats(const RsacComposition* comp,
+                                           size_t index,
+                                           RsacSourceStats* out);
+
+/**
+ * Returns the group name of the source at `index` (flat declaration order).
+ * Valid until the next compose string accessor call on the same thread.
+ * Returns null if the handle is null, the composition has not been started,
+ * or `index` is out of bounds.
+ */
+const char* rsac_composition_source_group(const RsacComposition* comp,
+                                          size_t index);
+
+/**
+ * Returns the capture-target string of the source at `index`, rendered in
+ * the canonical target grammar (e.g. "system", "name:discord"). Valid until
+ * the next compose string accessor call on the same thread. Returns null if
+ * the handle is null, the composition has not been started, or `index` is
+ * out of bounds.
+ */
+const char* rsac_composition_source_target(const RsacComposition* comp,
+                                           size_t index);
+
+#endif /* RSAC_FEATURE_COMPOSE */
 
 /* ── Version info ───────────────────────────────────────────────────── */
 
