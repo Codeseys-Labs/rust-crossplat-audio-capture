@@ -97,6 +97,17 @@ jobs:
           # Kill any pre-existing PulseAudio
           pulseaudio --kill 2>/dev/null || true
 
+          # wireplumber 0.4 EXITS at startup without a D-Bus session bus
+          # ("Error acquiring bus address: Cannot autolaunch D-Bus without
+          # X11 $DISPLAY" -> on_disconnected; evidence run 28904373406) -
+          # and without the session manager NO STREAM IS EVER LINKED, so
+          # every capture sees silence (streams appeared in wpctl status
+          # but zero samples flowed, even with pw-play --target). Give the
+          # stack a private session bus; no X11/systemd needed.
+          export DBUS_SESSION_BUS_ADDRESS="unix:path=$XDG_RUNTIME_DIR/bus"
+          dbus-daemon --session --address="$DBUS_SESSION_BUS_ADDRESS" --nopidfile --fork
+          echo "DBUS_SESSION_BUS_ADDRESS=$DBUS_SESSION_BUS_ADDRESS" >> "$GITHUB_ENV"
+
           # Launch PipeWire stack manually
           pipewire &
           sleep 1
@@ -112,6 +123,15 @@ jobs:
           done
           pw-cli info 0 >/dev/null 2>&1 || { echo "ERROR: PipeWire core not ready"; exit 1; }
           pw-cli info 0
+
+          # The session manager must SURVIVE startup - a dead wireplumber
+          # means no links ever form and every capture is silence.
+          sleep 2
+          if ! pgrep -x wireplumber >/dev/null; then
+            echo "ERROR: wireplumber (session manager) is not running"
+            exit 1
+          fi
+          echo "OK: wireplumber alive (pid $(pgrep -x wireplumber))"
 
       - name: Create and verify virtual audio sink
         run: |
@@ -338,6 +358,17 @@ jobs:
           sudo chmod 700 "$XDG_RUNTIME_DIR"
           sudo chown "$(id -u):$(id -g)" "$XDG_RUNTIME_DIR"
           pulseaudio --kill 2>/dev/null || true
+
+          # wireplumber 0.4 EXITS at startup without a D-Bus session bus
+          # ("Error acquiring bus address: Cannot autolaunch D-Bus without
+          # X11 $DISPLAY" -> on_disconnected; evidence run 28904373406) -
+          # and without the session manager NO STREAM IS EVER LINKED, so
+          # every capture sees silence (streams appeared in wpctl status
+          # but zero samples flowed, even with pw-play --target). Give the
+          # stack a private session bus; no X11/systemd needed.
+          export DBUS_SESSION_BUS_ADDRESS="unix:path=$XDG_RUNTIME_DIR/bus"
+          dbus-daemon --session --address="$DBUS_SESSION_BUS_ADDRESS" --nopidfile --fork
+          echo "DBUS_SESSION_BUS_ADDRESS=$DBUS_SESSION_BUS_ADDRESS" >> "$GITHUB_ENV"
           pipewire &
           sleep 1
           wireplumber &
@@ -349,6 +380,15 @@ jobs:
           done
           pw-cli info 0 >/dev/null 2>&1 || { echo "ERROR: PipeWire core not ready"; exit 1; }
           pw-cli info 0
+
+          # The session manager must SURVIVE startup - a dead wireplumber
+          # means no links ever form and every capture is silence.
+          sleep 2
+          if ! pgrep -x wireplumber >/dev/null; then
+            echo "ERROR: wireplumber (session manager) is not running"
+            exit 1
+          fi
+          echo "OK: wireplumber alive (pid $(pgrep -x wireplumber))"
 
       - name: Create and verify virtual audio sink
         run: |
@@ -456,6 +496,17 @@ jobs:
           sudo chmod 700 "$XDG_RUNTIME_DIR"
           sudo chown "$(id -u):$(id -g)" "$XDG_RUNTIME_DIR"
           pulseaudio --kill 2>/dev/null || true
+
+          # wireplumber 0.4 EXITS at startup without a D-Bus session bus
+          # ("Error acquiring bus address: Cannot autolaunch D-Bus without
+          # X11 $DISPLAY" -> on_disconnected; evidence run 28904373406) -
+          # and without the session manager NO STREAM IS EVER LINKED, so
+          # every capture sees silence (streams appeared in wpctl status
+          # but zero samples flowed, even with pw-play --target). Give the
+          # stack a private session bus; no X11/systemd needed.
+          export DBUS_SESSION_BUS_ADDRESS="unix:path=$XDG_RUNTIME_DIR/bus"
+          dbus-daemon --session --address="$DBUS_SESSION_BUS_ADDRESS" --nopidfile --fork
+          echo "DBUS_SESSION_BUS_ADDRESS=$DBUS_SESSION_BUS_ADDRESS" >> "$GITHUB_ENV"
           pipewire &
           sleep 1
           wireplumber &
@@ -467,6 +518,15 @@ jobs:
           done
           pw-cli info 0 >/dev/null 2>&1 || { echo "ERROR: PipeWire core not ready"; exit 1; }
           pw-cli info 0
+
+          # The session manager must SURVIVE startup - a dead wireplumber
+          # means no links ever form and every capture is silence.
+          sleep 2
+          if ! pgrep -x wireplumber >/dev/null; then
+            echo "ERROR: wireplumber (session manager) is not running"
+            exit 1
+          fi
+          echo "OK: wireplumber alive (pid $(pgrep -x wireplumber))"
 
       - name: Create and verify virtual audio sink
         run: |
