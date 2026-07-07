@@ -1,20 +1,28 @@
 fn main() {
     println!("cargo:rerun-if-changed=build.rs");
 
-    // Platform-specific build configuration for application capture
-    // Only configure if the corresponding feature is enabled
+    // Platform-specific build configuration for application capture.
+    //
+    // Dispatch on the COMPILE TARGET (CARGO_CFG_TARGET_OS) + the enabled
+    // feature (CARGO_FEATURE_*), not on host `#[cfg]`: build scripts are
+    // compiled FOR THE HOST, so `#[cfg(target_os = "linux")]` here would be
+    // true when cross-compiling from a Linux host to aarch64-linux-android —
+    // which made the android cross-check demand host PipeWire libraries
+    // (rsac-1a6e first-run failure). Android/iOS targets need no build.rs
+    // work: their linking is declared via `#[link]` attributes in-tree.
+    let target_os = std::env::var("CARGO_CFG_TARGET_OS").unwrap_or_default();
+    let feature_on =
+        |name: &str| std::env::var(format!("CARGO_FEATURE_{}", name.to_uppercase())).is_ok();
 
-    #[cfg(all(target_os = "windows", feature = "feat_windows"))]
-    configure_windows_build();
-
-    #[cfg(all(target_os = "linux", feature = "feat_linux"))]
-    configure_linux_build();
-
-    #[cfg(all(target_os = "macos", feature = "feat_macos"))]
-    configure_macos_build();
+    match target_os.as_str() {
+        "windows" if feature_on("feat_windows") => configure_windows_build(),
+        "linux" if feature_on("feat_linux") => configure_linux_build(),
+        "macos" if feature_on("feat_macos") => configure_macos_build(),
+        // android / ios / anything else: nothing to configure here.
+        _ => {}
+    }
 }
 
-#[cfg(all(target_os = "windows", feature = "feat_windows"))]
 fn configure_windows_build() {
     // Windows-specific build configuration for WASAPI Process Loopback
     println!("cargo:rustc-link-lib=ole32"); // For COM operations
@@ -28,7 +36,7 @@ fn configure_windows_build() {
     println!("cargo:rustc-link-lib=winmm"); // For multimedia operations
 }
 
-#[cfg(all(target_os = "linux", feature = "feat_linux"))]
+#[allow(dead_code)] // dispatched at runtime by target_os; unused on non-linux builds
 fn configure_linux_build() {
     use std::{
         env,
@@ -136,7 +144,7 @@ fn configure_linux_build() {
     process::exit(1);
 }
 
-#[cfg(all(target_os = "macos", feature = "feat_macos"))]
+#[allow(dead_code)] // dispatched at runtime by target_os; unused on non-macos builds
 fn configure_macos_build() {
     // macOS-specific build configuration for CoreAudio Process Tap
 
@@ -172,7 +180,7 @@ fn configure_macos_build() {
     }
 }
 
-#[cfg(all(target_os = "macos", feature = "feat_macos"))]
+#[allow(dead_code)] // helper for configure_macos_build
 fn parse_macos_version(version_str: &str) -> Option<(u32, u32)> {
     let parts: Vec<&str> = version_str.split('.').collect();
     if parts.len() >= 2 {
