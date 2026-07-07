@@ -1,0 +1,27 @@
+[package]
+name = "rsac-android-native"
+version = "0.4.0"
+edition = "2021"
+publish = false
+description = "Android cdylib shim: builds librsac.so (via cargo-ndk) for the rsac AAR's jniLibs (rsac-0aa9)"
+license = "MIT OR Apache-2.0"
+repository = "https://github.com/Codeseys-Labs/rust-crossplat-audio-capture"
+
+# Why a wrapper crate instead of adding crate-type = ["cdylib"] to the root
+# rsac manifest (decision recorded per rsac-0aa9):
+# - the root crate stays a pure rlib, so desktop consumers and the existing
+#   bindings don't pay for (or accidentally ship) an extra cdylib artifact;
+# - cargo-ndk gets one unambiguous build target whose [lib] name is `rsac`,
+#   producing exactly the `librsac.so` the Kotlin side loads
+#   (System.loadLibrary("rsac") — mobile/android RsacProjection.kt);
+# - the JNI export surface (rsac-77f1, src/audio/android/jni.rs) is
+#   #[no_mangle] extern symbols in rsac itself (JNI_OnLoad — RegisterNatives
+#   design, no Java_* exports); linking rsac into this cdylib re-exports it,
+#   so this shim never needs code of its own beyond
+#   the keep-alive re-export in src/lib.rs.
+[lib]
+name = "rsac"
+crate-type = ["cdylib"]
+
+[dependencies]
+rsac = { path = "../..", default-features = false, features = ["feat_android"] }
