@@ -147,8 +147,13 @@ probe_with_player() {
     echo "probe '$label': monitor capture produced no data"
     return 1
   fi
+  # Analyze the LAST 2 s, mixed to mono: sox's rough-frequency estimate is a
+  # zero-crossing count over the whole stream, so interleaved stereo and the
+  # record-before-play leading silence both skew it (observed: 311 Hz for a
+  # clean 440 Hz tone on evidence run 28905294002). The mono tail is pure
+  # tone, so the estimate is accurate there.
   local stat rms freq
-  stat="$(sox "$CAPTURE" -n stat 2>&1)" || true
+  stat="$(sox "$CAPTURE" -n remix 1 trim -2 stat 2>&1)" || true
   rms="$(awk '/RMS.*amplitude/ {print $3; exit}' <<<"$stat")"
   freq="$(awk '/Rough.*frequency/ {print $3; exit}' <<<"$stat")"
   echo "probe '$label': RMS=${rms:-unparseable} rough_frequency=${freq:-unparseable}"
