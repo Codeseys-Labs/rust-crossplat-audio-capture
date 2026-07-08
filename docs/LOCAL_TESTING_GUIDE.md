@@ -291,12 +291,20 @@ cargo test --lib --features compose compose::
   for bundles whose `Info.plist` lacks the key, without ever showing a prompt
   (log: `Refusing authorization request for service kTCCServiceAudioCapture …
   without NSAudioCaptureUsageDescription key`). Toggling the permission on in
-  System Settings does **not** override this. Terminal.app and iTerm2 ship the
-  key; some third-party terminals/IDE shells (e.g. cmux, verified 2026-07-06 on
-  macOS 26) do not — under those, every tap delivers correctly-shaped but
-  **all-zero** buffers. Diagnosis one-liner:
+  System Settings does **not** override this. Host-app audit (verified via
+  `plutil`, 2026-07-07, macOS 26): **VS Code ships the key** ✅; Terminal.app,
+  Ghostty, and cmux do **not** ❌ — under those, every tap delivers
+  correctly-shaped but **all-zero** buffers. Diagnosis one-liner:
   `plutil -p "<YourTerminal>.app/Contents/Info.plist" | grep -i audiocapture`
-  — if it prints nothing, run capture tests from Terminal.app instead.
+  — if it prints nothing, run capture tests from VS Code's integrated terminal
+  (first working end-to-end grant verified 2026-07-07: prompt → Allow →
+  real Firefox audio, peak 0.217).
+- **Fresh grants are not instant.** After clicking Allow there is a measured
+  **~6.7 s propagation window** during which the tap still delivers all-zero
+  buffers (indistinguishable from denial). Make the *first* post-grant capture
+  ≥ 10–12 s; subsequent (warm-grant) runs deliver content immediately. rsac's
+  silent-zeros diagnostic (ADR-0016) defaults its warn window to 10 s for
+  exactly this reason (`RSAC_SILENCE_GRACE_SECS` overrides).
 - **Denied-permission behavior (verified on macOS 26, M4):** an unauthorized
   tap still creates, starts, streams silence, and tears down cleanly — it does
   **not** hang or error. So "capture runs but peak is 0.000000" means a TCC

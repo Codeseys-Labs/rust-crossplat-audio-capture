@@ -69,7 +69,8 @@ In `create_macos_capture`, for **Process-Tap captures only** (`process_tap.is_so
 
 2. **Non-RT side** — a detached watchdog thread spawned right after
    `AudioOutputUnitStop`'s sibling `start()`. It sleeps a bounded grace window
-   (`SILENCE_GRACE`, 2 s) in short increments, then, if and only if
+   (`SILENCE_GRACE_DEFAULT`, **10 s**, overridable via `RSAC_SILENCE_GRACE_SECS`)
+   in short increments, then, if and only if
    `non_silence_seen` is still `false` **and** the stream has not reached a
    terminal state (it's genuinely running, not stopped/errored) **and** teardown
    has not begun, emits one `log::warn!` pointing at the likely
@@ -87,6 +88,21 @@ In `create_macos_capture`, for **Process-Tap captures only** (`process_tap.is_so
 The warning fires **at most once** per capture. There is **no `AudioError`**,
 no state change, no behavioral difference for a correctly-permissioned or
 legitimately-silent capture beyond one atomic load per callback.
+
+### Why 10 s, not 2 s (grant-propagation latency)
+
+The window MUST exceed the macOS **fresh-TCC-grant propagation latency**: after
+a user *approves* `kTCCServiceAudioCapture`, the tap keeps delivering all-zero
+buffers for a measured **~6.7 s** before real audio flows — behaving, during
+that window, exactly like a denied tap (zeros, no error). A 2 s window fills
+entirely with pending-grant zeros and **false-warns on the first launch after a
+legitimate grant** (later, warm-grant launches work — making it look
+intermittent). The default is therefore **10 s** (clears ~6.7 s with margin),
+overridable via `RSAC_SILENCE_GRACE_SECS` because the latency is per-machine
+(hardware / OS / load). Cost on a warm grant is zero — the window only delays
+the *warning*; audio flows to the consumer throughout. A unit test pins the
+invariant `SILENCE_GRACE_DEFAULT >= 7 s`. See the
+`macos-tcc-grant-latency-vs-silence-watchdog` runbook.
 
 ## 4. Consequences
 
