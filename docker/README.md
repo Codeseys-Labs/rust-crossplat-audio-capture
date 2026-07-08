@@ -1,50 +1,33 @@
-# docker/ — Containerized Test & Cross-Compile Environments
+# docker/ — Current Container Surfaces
 
-Docker images for testing rsac on platforms you don't have locally, and for
-cross-compiling to targets that need specific sysroots.
+The legacy Docker test matrix has been retired. Docker is now used only for the
+Linux/PipeWire devcontainer and the optional native VM lab under `dockur/`.
 
 ## Layout
 
 | Subdir | Purpose |
 |---|---|
-| `linux/` | Build + test rsac on Debian + PipeWire. Includes `Dockerfile`, `Dockerfile.test`, `Dockerfile.unified`, and PipeWire entrypoint / verify scripts. |
-| `macos/` | Cross-compile rsac from a Linux host to `x86_64-apple-darwin` / `aarch64-apple-darwin`. Includes `Dockerfile.cross` + `test-cross.sh`. |
-| `windows/` | Cross-compile rsac from a Linux host to `x86_64-pc-windows-msvc` via `cargo-xwin`. Includes `Dockerfile.cargo-xwin` + `test-cargo-xwin.sh`. |
-| `testing/` | Per-platform CI-style runners: `Dockerfile.linux-pipewire`, `Dockerfile.macos`, `Dockerfile.windows-cross`. |
-| `unified/` | Single Dockerfile that builds rsac for all three platforms in one image. Useful for one-shot CI or release verification. |
-| `dockur/` | Full Windows + macOS virtual machines running inside Docker via [dockur/windows](https://github.com/dockur/windows) + [dockur/macos](https://github.com/dockur/macos). Provides **native** WASAPI / CoreAudio testing from a Linux host via QEMU/KVM. |
+| `linux/Dockerfile.test` | Ubuntu/PipeWire image used by `.devcontainer/devcontainer.json`. |
+| `dockur/` | Optional full Windows + macOS virtual machines running inside Docker via [dockur/windows](https://github.com/dockur/windows) + [dockur/macos](https://github.com/dockur/macos). Manual lab only, not a release gate. |
 
-## Quick Start
+## Devcontainer
 
 ```bash
-# Linux PipeWire build + test
-docker build -f docker/linux/Dockerfile -t rsac:linux .
-docker run --rm rsac:linux
-
-# Windows cross-compile from Linux
-docker build -f docker/windows/Dockerfile.cargo-xwin -t rsac:win-cross .
-docker run --rm rsac:win-cross
-
-# Unified build for all 3 platforms
-docker build -f docker/unified/Dockerfile -t rsac:unified .
+docker build -f docker/linux/Dockerfile.test -t rsac-linux-devcontainer .
 ```
 
-## `docker-compose.*.yml` — at repo root (not here)
+VS Code uses this image automatically when reopening the repository in the
+devcontainer. Inside it, use the normal project commands (`mise run gate`,
+`mise run test`, or targeted `cargo` commands).
 
-The compose files live at the repo root per docker-compose convention
-(it expects `docker-compose.yml` in the project root, not under
-`docker/`). Multiple variants select different test profiles:
+## Optional Native VM Lab
 
-- `docker-compose.yml` — default unified test env
-- `docker-compose.unified.yml` — all-platform one-shot CI build
-- `docker-compose.testing.yml` — staged per-platform tests
-- `docker-compose.testing-no-kvm.yml` — fallback when KVM is unavailable
-- `docker-compose.native-testing.yml` — dockur native VM test stack
+`docker-compose.native-testing.yml` is the only root compose file that remains.
+It is for manual Windows/macOS VM experiments and requires a host that supports
+the underlying virtualization stack.
 
-See also: [docs/DOCKER_TESTING.md](../docs/DOCKER_TESTING.md) for end-to-end
-workflows, and
-[scripts/docker-test-all.sh](../scripts/docker-test-all.sh) for the
-canonical "run every test in a container" entry point.
+See [docs/DOCKER_TESTING.md](../docs/DOCKER_TESTING.md) for the retirement note
+and maintained verification paths.
 
 ## Why Not `.docker/`?
 

@@ -24,7 +24,7 @@ not guidance. Entry points (⭐) are the places to start.
 |---|---|
 | ⭐ [`ARCHITECTURE.md`](ARCHITECTURE.md) | Accurate 3-layer architecture overview (start here) |
 | [`PERFORMANCE.md`](PERFORMANCE.md) | RT-safety story, ring sizing, backpressure diagnostics |
-| [`MOBILE_BACKEND_DESIGN.md`](MOBILE_BACKEND_DESIGN.md) | Planned Android/iOS backends (design; nothing implemented) |
+| [`MOBILE_BACKEND_DESIGN.md`](MOBILE_BACKEND_DESIGN.md) | Android/iOS backend design and compile-checked status; runtime verification pending |
 | [`MACOS_VERSION_COMPATIBILITY.md`](MACOS_VERSION_COMPATIBILITY.md) | macOS 14.4–26 API compatibility matrix |
 | [`MACOS26_PROCESS_TAP_FIX.md`](MACOS26_PROCESS_TAP_FIX.md) | Dated fix record: the 3-path Process Tap fallback |
 | [`OBJC2_MIGRATION_PLAN.md`](OBJC2_MIGRATION_PLAN.md) | Completed cocoa/objc → objc2 migration record |
@@ -40,7 +40,7 @@ not guidance. Entry points (⭐) are the places to start.
 | [`CI_AUDIO_TESTING.md`](CI_AUDIO_TESTING.md) | The 9-cell audio-test truth table, gate macros, workflow knobs |
 | [`LOCAL_TESTING_GUIDE.md`](LOCAL_TESTING_GUIDE.md) | Manual verification on physical Windows/macOS/Linux machines |
 | [`PLATFORM_TESTING.md`](PLATFORM_TESTING.md) | Map of the verification layers |
-| [`DOCKER_TESTING.md`](DOCKER_TESTING.md) | Docker cross-compile/test harness (aging; parts unmaintained) |
+| [`DOCKER_TESTING.md`](DOCKER_TESTING.md) | Retired Docker test matrix; current devcontainer/native-VM notes |
 | [`RELEASE_PROCESS.md`](RELEASE_PROCESS.md) | End-to-end release procedure |
 | [`STACKED_PRS.md`](STACKED_PRS.md) | gh-native stacked-PR playbook |
 | [`CONTRIBUTING.md` §6](CONTRIBUTING.md#6-commit-style) / [`AGENTS.md` §6](../AGENTS.md) | Commit + review-disposition rules |
