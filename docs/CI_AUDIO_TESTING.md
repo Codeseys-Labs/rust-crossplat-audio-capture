@@ -135,9 +135,12 @@ centralised in `helpers.rs` so the tests themselves stay portable.
 - `windows-latest` runner.
 - [`LABSN/sound-ci-helpers@v1`](https://github.com/LABSN/sound-ci-helpers)
   installs the VB-CABLE virtual-cable driver.
-- `AudioDeviceCmdlets` + `Set-AudioDevice -DefaultOnly` sets VB-CABLE
-  as the default playback endpoint; a gating step verifies this and
-  exits 1 otherwise.
+- **Endpoint gate** (`scripts/ci-windows-audio-default.ps1`, rsac-0f33,
+  shared by all three tiers): sets VB-CABLE as the default playback
+  endpoint via `AudioDeviceCmdlets` (bounded retries), **hard-verifies**
+  the active default, then exports `RSAC_CI_AUDIO_DETERMINISTIC=1` — every
+  tier's tone route flows through that verified endpoint (system loopback,
+  `default_device()` capture, process loopback of the test player).
 - Test tones use a **PCM16 sibling WAV** + `SoundPlayer.PlayLooping()`:
   `System.Media.SoundPlayer` silently drops `WAVE_FORMAT_IEEE_FLOAT`
   frames on the runner's default endpoint (rsac#24), so we convert to
@@ -165,11 +168,13 @@ centralised in `helpers.rs` so the tests themselves stay portable.
   `true`. Unset on non-audio jobs.
 - `RSAC_CI_AUDIO_DETERMINISTIC=1` — flips the capture tests' soft
   non-silence warnings into **hard assertions**. Set in CI where audio
-  routing is deterministic: the Windows system tier, and the Linux tiers
-  after the routing gate (`scripts/ci-linux-audio-route.sh`) proves the
-  virtual-sink route end-to-end (seeds rsac-6efb / rsac-b106). On a local
-  machine with real, working audio this is exactly what you want: export
-  it to make a silent capture fail loudly instead of warn.
+  routing is deterministic: all three Windows tiers (via the verified
+  VB-CABLE endpoint gate, `scripts/ci-windows-audio-default.ps1` —
+  rsac-0f33), and all three Linux tiers after the routing gate
+  (`scripts/ci-linux-audio-route.sh`) proves the virtual-sink route
+  end-to-end (seeds rsac-6efb / rsac-b106). On a local machine with
+  real, working audio this is exactly what you want: export it to make
+  a silent capture fail loudly instead of warn.
 - `RSAC_CI_MACOS_TCC_GRANTED=1` — set only on self-hosted macOS
   runners where Audio Capture has been granted. Unset on Blacksmith
   and GH-hosted macOS.
