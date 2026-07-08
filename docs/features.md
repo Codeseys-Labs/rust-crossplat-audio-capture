@@ -9,7 +9,9 @@ This document enumerates every Cargo feature exposed by `rsac`, what it enables,
 | `feat_windows` | yes | Windows | WASAPI backend: system + loopback + per-process + process-tree capture, WASAPI device enumeration, session enumeration | Windows 10+ host. No extra system packages (WASAPI ships with the OS). Rust target `x86_64-pc-windows-msvc` or `x86_64-pc-windows-gnu`. |
 | `feat_linux` | yes | Linux | PipeWire backend: system + per-app + process-tree capture via monitor streams, PipeWire device enumeration, `pw-dump` node resolution | `libpipewire-0.3-dev`, `libspa-0.2-dev`, `pkg-config`, `clang`/`libclang-dev`, `llvm-dev`. Runtime: PipeWire 0.3.44+ daemon active. |
 | `feat_macos` | yes | macOS | CoreAudio backend: system capture, per-process + process-tree capture via Process Tap, aggregate device construction, `NSWorkspace` application enumeration | Xcode Command Line Tools. Process Tap requires **macOS 14.4+**. Audio Capture (`kTCCServiceAudioCapture`) TCC permission required at capture time — distinct from Screen Recording. |
-| `default` | — | all | Meta-feature: `["feat_windows", "feat_linux", "feat_macos"]` | Each enabled backend's requirements above. |
+| `feat_android` | yes | Android | AAudio mic capture plus AudioPlaybackCapture playback tiers through first-party AAR/JNI glue | Compile-checked only; runtime unverified. Playback capture requires Android API 29+, MediaProjection consent token, and foreground service integration. |
+| `feat_ios` | yes | iOS | AVAudioEngine mic capture plus ReplayKit `SystemDefault` ring consumer through first-party SwiftPM glue | Compile-checked only; runtime unverified. System capture requires App Group + embedded Broadcast Upload Extension + user-started ReplayKit broadcast. |
+| `default` | — | all | Meta-feature: `feat_windows`, `feat_linux`, `feat_macos`, `feat_android`, and `feat_ios` | Each enabled backend's requirements above; two-way `target_os` gates make non-matching entries inert. |
 | `async-stream` | no | all | `AudioCapture::audio_data_stream()` returning a `futures_core::Stream<Item = AudioResult<AudioBuffer>>`; also required by `examples/async_capture.rs` | Pulls in `atomic-waker` dep. Consumer needs an async runtime (Tokio, smol, etc.). |
 | `sink-wav` | no | all | `WavFileSink` adapter (writes captured audio to a WAV file through the `AudioSink` trait) | `hound` is always a hard dependency, so no extra install — the gate is API-surface only. |
 | `compose` | no | all | Multi-source channel composition ([ADR-0011](designs/0011-compose-feature.md)): `CompositionBuilder` / `Composition` in `rsac::compose` — groups of `CaptureTarget`s mixed to Mono/Stereo channels (per-source gain) or kept as native channels, appended into one interleaved multi-channel stream with transparent resampling to the session rate; also required by `examples/composed_capture.rs` and the `compose::` ci_audio integration module | Pulls in `rubato` (FFT resampler → `realfft`, `num-complex`) and `audioadapter-buffers`. No system packages. |
@@ -21,7 +23,7 @@ This document enumerates every Cargo feature exposed by `rsac`, what it enables,
 
 ## Platform-feature semantics
 
-The three `feat_*` flags are a two-way gate: code inside a platform backend is compiled **only** when both `target_os` matches and the feature is on. See `src/audio/mod.rs` for the `cfg(all(target_os = "…", feature = "feat_…"))` guards.
+The platform `feat_*` flags are a two-way gate: code inside a platform backend is compiled **only** when both `target_os` matches and the feature is on. See `src/audio/mod.rs` for the `cfg(all(target_os = "…", feature = "feat_…"))` guards. Mobile features currently prove cross-target compilation and packaging only; keep Android/iOS runtime claims tied to the runtime-verification seeds.
 
 ### PipeWire crate version gate (`v0_3_65`)
 
@@ -157,7 +159,7 @@ sink-wav = ["rsac/sink-wav"]
 ### All-platform / docs.rs builds
 
 There is **no separate `all-backends` feature** and none is needed: the
-crate's existing `default = ["feat_windows", "feat_linux", "feat_macos"]`
+crate's existing default feature set enables all platform feature flags
 meta-feature is the all-backends opt-in. Because `feat_*` is two-way
 gated on `target_os`, turning all three on still compiles only the host
 backend on any single runner — so a docs.rs-style `--all-features`
@@ -166,7 +168,7 @@ backend on any single runner — so a docs.rs-style `--all-features`
 all three backends *on* from a binding (e.g. a deliberate
 `cargo doc --all-features` of the binding crate), depend on `rsac`
 without `default-features = false`, or add a binding-local
-`all-backends = ["rsac/feat_windows", "rsac/feat_linux", "rsac/feat_macos"]`
+`all-backends = ["rsac/feat_windows", "rsac/feat_linux", "rsac/feat_macos", "rsac/feat_android", "rsac/feat_ios"]`
 feature.
 
 ### Per-binding status
@@ -191,6 +193,7 @@ feature in a clear error if you forget (see `Cargo.toml` for the full list):
 - `wasapi_session_test` — `feat_windows`
 - `examples/verify_audio.rs`, `examples/basic_capture.rs`,
   `examples/record_to_file.rs` — `cli`
+- `examples/record_to_file.rs` does useful recording only with `sink-wav` too
 - `examples/async_capture.rs` — `async-stream`
 - `examples/composed_capture.rs` — `compose`
 

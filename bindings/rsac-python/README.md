@@ -5,12 +5,16 @@ per-application audio, or process-tree audio on Windows (WASAPI),
 Linux (PipeWire), and macOS (CoreAudio Process Tap) from Python.
 
 Built with [PyO3](https://pyo3.rs) + [maturin](https://www.maturin.rs) on top
-of the Rust [`rsac`](https://crates.io/crates/rsac) crate.
+of the Rust `rsac` crate in this repository.
 
 ## Install
 
+The PyPI package is not published yet. Build from source for now:
+
 ```bash
-pip install rsac
+cd bindings/rsac-python
+pip install maturin
+maturin develop --release
 ```
 
 ## Quick start

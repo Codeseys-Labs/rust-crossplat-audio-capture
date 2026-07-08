@@ -61,8 +61,8 @@ feat_linux = []
 feat_macos = []
 # Mobile backends (ADR-0012/0013; docs/MOBILE_BACKEND_DESIGN.md). Double-gated
 # on target_os like the desktop backends, so enabling them on the wrong OS is
-# inert. Current slice: Device-target microphone capture only (AAudio /
-# AVAudioEngine); playback-capture tiers arrive with rsac-77f1 / rsac-b3aa.
+# inert. Android mic + playback capture and iOS mic + ReplayKit SystemDefault
+# compile-check today, but no mobile runtime path is device-verified yet.
 feat_android = []
 feat_ios = []
 
@@ -94,7 +94,7 @@ compose = ["dep:rubato", "dep:audioadapter-buffers"]
 # rsac-1ecd: the CLI demo binary's dependencies, feature-gated so library
 # consumers stop paying for them (clap/color-eyre/ctrlc/env_logger were
 # unconditional before 0.5). NOT in default features — build the demo with
-# `cargo build --features cli` / `cargo install rsac --features cli`. Binaries
+# `cargo build --features cli` / `cargo run --features cli -- <cmd>`. Binaries
 # and examples that need these declare `required-features = ["cli"]`.
 cli = ["dep:clap", "dep:color-eyre", "dep:ctrlc", "dep:env_logger"]
 # ADR-0015: opt-in macOS system-audio-capture TCC preflight. Default OFF —

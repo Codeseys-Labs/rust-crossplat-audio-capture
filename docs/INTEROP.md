@@ -6,11 +6,12 @@ nonetheless trivial because the delivery contract is the simplest possible
 one: **interleaved `f32` samples + a format descriptor**:
 
 ```rust
-let buffer: rsac::AudioBuffer = capture.read_buffer()?.unwrap();
-let samples: &[f32] = buffer.data();     // interleaved: L R L R … (channel-major per frame)
-let channels = buffer.channels();        // u16
-let rate     = buffer.sample_rate();     // u32 Hz
-let position = buffer.timestamp();       // Option<Duration>: stream position of first sample
+if let Some(buffer) = capture.read_buffer()? {
+    let samples: &[f32] = buffer.data(); // interleaved: L R L R ...
+    let channels = buffer.channels();    // u16
+    let rate = buffer.sample_rate();     // u32 Hz
+    let position = buffer.timestamp();   // Option<Duration>: first-sample position
+}
 ```
 
 Every recipe below is copy-paste against that surface — no rsac feature flags

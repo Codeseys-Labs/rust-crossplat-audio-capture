@@ -6,11 +6,10 @@ substrate that the Go binding ([`rsac-go`](../rsac-go/)) builds against
 and can also be linked directly from C, C++, or any language with a C
 FFI story.
 
-This crate carries full crates.io package metadata and is publishable, but
-ships with `publish = false` set in `Cargo.toml` so routine workspace builds
+This crate carries full crates.io package metadata but publishing is deferred.
+It ships with `publish = false` set in `Cargo.toml` so routine workspace builds
 can never trigger an accidental `cargo publish`. For local use, build it
-against a checkout of the rsac repository. To release it to crates.io, see
-[Publishing to crates.io](#publishing-to-cratesio) below.
+against a checkout of the rsac repository.
 
 ## What you get
 
@@ -36,7 +35,8 @@ against a checkout of the rsac repository. To release it to crates.io, see
 From the repository root:
 
 ```bash
-cargo build --release -p rsac-ffi
+cargo build --release -p rsac-ffi --no-default-features --features feat_linux
+# use feat_windows / feat_macos on those hosts
 ```
 
 Output lives under `target/release/`. The `build.rs` in this crate runs
@@ -67,7 +67,7 @@ Feature flags: `feat_windows`, `feat_linux`, `feat_macos`, `sink-wav`,
 ### Linux
 
 ```
--lrsac_ffi -lpipewire-0.3 -lspa-0.2 -lpthread -ldl -lm
+-lrsac_ffi -lpipewire-0.3 -lpthread -ldl -lm
 ```
 
 ### Windows (MSVC)
@@ -130,11 +130,11 @@ int main(void) {
 Build (Linux):
 
 ```bash
-cargo build --release -p rsac-ffi
+cargo build --release -p rsac-ffi --no-default-features --features feat_linux
 cc smoke.c \
   -I bindings/rsac-ffi/include \
   -L target/release -lrsac_ffi \
-  -lpipewire-0.3 -lspa-0.2 -lpthread -ldl -lm \
+  -lpipewire-0.3 -lpthread -ldl -lm \
   -o smoke
 LD_LIBRARY_PATH=$PWD/target/release ./smoke
 ```
@@ -328,26 +328,12 @@ after the composition is freed. `rsac_composition_stop()` may run concurrently
 with a parked `rsac_composition_read()` to unblock it, but never concurrently
 with `rsac_composition_free()`.
 
-## Publishing to crates.io
+## Publishing status
 
-This crate is publish-ready: it declares `description`, `license`,
-`repository`, `readme`, `keywords`, `categories`, and `rust-version`, and its
-`rsac` dependency carries both a `path` (for workspace/local dev) and a
-`version` requirement. crates.io ignores `path` and resolves the published
-`rsac` by its `version`, so the path entry does **not** block publishing.
-
-To cut a release:
-
-1. Ensure the matching `rsac` version is already published to crates.io (the
-   `version = "x.y.z"` in `[dependencies].rsac` must resolve there).
-2. In `Cargo.toml`, set `publish = true` (or delete the `publish = false`
-   line). It is intentionally `false` in-tree to prevent an accidental
-   `cargo publish` during normal development.
-3. `cargo publish -p rsac-ffi --dry-run` to verify, then publish for real.
-
-The `path` entry can stay in place for the published manifest; if you prefer a
-pure-registry dependency, drop `path` and keep only
-`rsac = { version = "x.y.z", default-features = false }`.
+Publishing is intentionally deferred. Release owners should use
+[`docs/RELEASE_PROCESS.md`](../../docs/RELEASE_PROCESS.md) once the registry
+publish lane is re-enabled; normal contributors should keep using source builds
+from this workspace.
 
 ## License
 

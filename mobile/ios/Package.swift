@@ -13,8 +13,7 @@
 // shared across processes, so the acquire/release u64 cursor operations are
 // implemented in C. It is a dependency of RsacBroadcastKit only.
 //
-// Status: source-complete; not yet built in CI (rsac-48e7 adds the
-// `xcodebuild`/`swift build` CI job). See README.md.
+// Status: builds in CI; runtime behavior is not device-verified yet. See README.md.
 
 import PackageDescription
 

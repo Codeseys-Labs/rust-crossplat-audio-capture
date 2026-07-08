@@ -13,15 +13,15 @@
 |---|---|---|
 | A Rust application/library (incl. Tauri or Dioxus desktop) | the `rsac` crate | [Rust crate](#rust-crate) |
 | A C / C++ / anything-with-C-interop program | `rsac-ffi` (cdylib/staticlib + `rsac.h`) | [C FFI](#c-ffi) |
-| A Python tool or pipeline | the `rsac` Python package (PyO3) | [Python](#python) |
-| A Node.js / Bun / Electron (main-process) / Deno 2 app | `@rsac/audio` (napi) | [Node.js / Bun](#nodejs--bun) |
+| A Python tool or pipeline | the `rsac` Python bindings (PyO3) | [Python](#python) |
+| A Node.js / Bun / Electron (main-process) / Deno 2 app | the napi bindings (`@rsac/audio` package name reserved for publish) | [Node.js / Bun](#nodejs--bun) |
 | A Go program | `rsac-go` (CGo over the C FFI) | [Go](#go) |
 | A Flutter / .NET / Qt / other-runtime app | `rsac-ffi` via your runtime's C interop | [C FFI](#c-ffi) + [`FRAMEWORK_COMPATIBILITY.md`](FRAMEWORK_COMPATIBILITY.md) |
 | A quick recording/monitoring tool with no code | the `rsac` CLI demo | [CLI demo](#cli-demo--examples) |
 
 All bindings sit on the same core and meet the same capture contract — the
 parity matrix and per-binding error-delivery semantics are specified in
-[`CROSS_LANGUAGE_BINDINGS.md`](CROSS_LANGUAGE_BINDINGS.md#shipped-binding-parity-020).
+[`CROSS_LANGUAGE_BINDINGS.md`](CROSS_LANGUAGE_BINDINGS.md#shipped-binding-parity).
 
 ## Publish status (read this first)
 
@@ -29,13 +29,14 @@ parity matrix and per-binding error-delivery semantics are specified in
 automation exists but the first publish is pending. Until then:
 
 - **Rust**: the git dependency is the working recipe (below).
-- **Python / Node**: build from source (`maturin develop`, `napi build`) per
-  the binding READMEs; `pip install rsac` / `npm install @rsac/audio` are
-  forward-looking.
-- **Go**: consume by path — the module is not tagged yet
+- **Python / Node**: build from source (`maturin develop`, `bun run build`) per
+  the binding READMEs; registry install commands are forward-looking.
+- **Go**: consume by module path from this repository; the tag shape is
+  `bindings/rsac-go/vX.Y.Z`
   ([`bindings/rsac-go/README.md`](../bindings/rsac-go/README.md)).
 
-Current version: **0.4.0**, MSRV **1.87**, license MIT OR Apache-2.0.
+Current version: **0.4.1**, MSRV **1.87**, repo development toolchain
+**1.95.0**, license MIT OR Apache-2.0.
 Supported platforms: Windows 10 2004+ (WASAPI), Linux (PipeWire 0.3.44+),
 macOS (CoreAudio; Process Tap features need 14.4+). Per-platform system
 dependencies: [README § Platform Dependencies](../README.md#platform-dependencies).
@@ -58,8 +59,11 @@ let mut capture = AudioCaptureBuilder::new()
     .channels(2)
     .build()?;
 capture.start()?;
-while let Some(buf) = capture.read_buffer()? {
-    println!("{} frames, {:.1} dBFS", buf.num_frames(), buf.rms_dbfs());
+loop {
+    match capture.read_buffer()? {
+        Some(buf) => println!("{} frames, {:.1} dBFS", buf.num_frames(), buf.rms_dbfs()),
+        None => std::thread::sleep(std::time::Duration::from_millis(5)),
+    }
 }
 ```
 
@@ -107,9 +111,9 @@ Canonical matrix with host-dependency notes: [`features.md`](features.md).
   `default_device()` (canonical spelling; `get_default_device()` is a
   deprecated alias), `watch(handler)` for hot-plug/default-change events.
 - **Capabilities**: `PlatformCapabilities::query()` — honest per-platform
-  support flags (incl. `requires_user_consent` for the planned mobile
-  backends). Check capability first; handle permission and per-target
-  resolution errors at `build()`/`start()`.
+  support flags (incl. `requires_user_consent` for the compile-checked,
+  runtime-unverified mobile backends). Check capability first; handle
+  permission and per-target resolution errors at `build()`/`start()`.
 - **Permission**: `check_audio_capture_permission()` (macOS TCC et al).
 - **Runtime health**: `stream_stats()` (lifetime counters),
   `backpressure_report()` (windowed drop rate), `overrun_count()` — all cheap,
@@ -131,9 +135,10 @@ cargo run --features cli -- capture --app Firefox
 cargo run --features cli -- record out.wav --duration 10
 ```
 
-Examples (`cargo run --example <name> --features <req>`): `basic_capture`,
-`record_to_file`, `verify_audio` (all `cli`), `list_devices` (no features),
-`async_capture` (`async-stream`), `composed_capture` (`compose`).
+Examples (`cargo run --example <name> --features <req>`): `basic_capture` and
+`verify_audio` need `cli`; `record_to_file` needs `cli sink-wav`; `list_devices`
+needs no extra feature; `async_capture` needs `async-stream`; `composed_capture`
+needs `compose`.
 
 ## C FFI
 
@@ -152,7 +157,7 @@ cargo build -p rsac-ffi --release --features feat_linux   # or feat_windows / fe
 Per-OS link lines (full details + smoke test:
 [README § Linking](../bindings/rsac-ffi/README.md#linking)):
 
-- **Linux**: `-lrsac_ffi -lpipewire-0.3 -lspa-0.2 -lpthread -ldl -lm`
+- **Linux**: `-lrsac_ffi -lpipewire-0.3 -lpthread -ldl -lm`
 - **macOS**: `-lrsac_ffi -framework CoreAudio -framework AudioToolbox -framework CoreFoundation -framework Security -framework SystemConfiguration`
 - **Windows (MSVC)**: `rsac_ffi.lib ole32.lib oleaut32.lib winmm.lib ksuser.lib uuid.lib`
 
@@ -193,10 +198,10 @@ capture.start();
 
 ## Go
 
-Module `github.com/Codeseys-Labs/rsac-go` (Go ≥ 1.22), CGo over the C FFI —
-**consume by path until it is tagged**. `make build` compiles the staticlib
-and the Go package; Windows requires the `x86_64-pc-windows-gnu` Rust target
-+ MinGW (MSVC `.lib` won't link under cgo).
+Module `github.com/Codeseys-Labs/rust-crossplat-audio-capture/bindings/rsac-go`
+(Go ≥ 1.22), CGo over the C FFI. `make build` compiles the staticlib and the Go
+package; Windows requires the `x86_64-pc-windows-gnu` Rust target + MinGW (MSVC
+`.lib` won't link under cgo).
 
 ```go
 capture, _ := rsac.NewCaptureBuilder().WithTargetString("name:Firefox").Build()

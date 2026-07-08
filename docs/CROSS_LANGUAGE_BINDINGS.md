@@ -1,13 +1,12 @@
 # rsac Cross-Language Bindings
 
-> **Status (shipped since the 0.2.0 line; current release 0.4.0):** C FFI,
-> Python, Node.js, and Go bindings are **shipped and at feature parity** for the
-> core capture surface — including the windowed `backpressure_report()` added in
-> 0.4.0. WASM is not viable; Swift/Kotlin (UniFFI) bindings remain
-> research-only, though the Android/iOS *backends* they'd need are now designed
-> ([`MOBILE_BACKEND_DESIGN.md`](MOBILE_BACKEND_DESIGN.md)) — see
-> [§ Not yet implemented](#not-yet-implemented). rsac is, as far as we know, the
-> first Rust audio-capture crate with cross-language bindings.
+> **Status (workspace version 0.4.1):** C FFI, Python, Node.js, and Go bindings
+> are in-tree and at feature parity for the core desktop capture surface,
+> including the windowed `backpressure_report()`. Registry publication is
+> deferred: build these bindings from the repository until crates.io/PyPI/npm
+> publishing is enabled. WASM is not viable. Swift/Kotlin UniFFI bindings remain
+> research-only, while first-party Android AAR and iOS SwiftPM glue now build in
+> CI as compile-only mobile support; see [`MOBILE_BACKEND_DESIGN.md`](MOBILE_BACKEND_DESIGN.md).
 
 ## Summary
 
@@ -17,7 +16,7 @@
 | **Python** | **Shipped** (`bindings/rsac-python`) | PyO3 + maturin, abi3-py39 | Yes (all 5) |
 | **Node.js/Bun** | **Shipped** (`bindings/rsac-napi`) | napi-rs | Yes (all 5) |
 | **Go** | **Shipped** (`bindings/rsac-go`) | CGo over the C FFI | Yes (all 5) |
-| **Swift/Kotlin** | Backends designed ([design](MOBILE_BACKEND_DESIGN.md)); UniFFI bindings research-only | UniFFI (later); first-party AAR/SwiftPM glue (planned) | Blocked on mobile backends (seeded, waves 3–4) |
+| **Swift/Kotlin** | First-party mobile glue builds in CI; UniFFI bindings research-only | Android AAR + iOS SwiftPM today; UniFFI later if needed | Compile-checked only; no device runtime proof yet |
 | **WASM** | Not viable | wasm-bindgen | No (0/5, sandbox) |
 
 The five capture tiers are the `CaptureTarget` variants: system default, device,
@@ -27,7 +26,7 @@ application (by PID), application-by-name, and process tree.
 > are covered separately in
 > [`FRAMEWORK_COMPATIBILITY.md`](FRAMEWORK_COMPATIBILITY.md).
 
-## Shipped binding parity (0.2.0)
+## Shipped binding parity
 
 The three high-level bindings (Python, Node, Go) — all sitting on the same
 `rsac` core (Go via the C FFI) — expose the same capture surface. The matrix
@@ -38,7 +37,7 @@ semantics are identical.
 |---|---|---|---|---|
 | Diagnostic counters snapshot | `AudioCapture::stream_stats()` | `capture.stream_stats()` → `StreamStats` | `capture.streamStats()` | `capture.StreamStats()` |
 | Windowed backpressure report | `AudioCapture::backpressure_report()` | `capture.backpressure_report()` → `BackpressureReport` | `capture.backpressureReport()` | `capture.BackpressureReport()` |
-| Negotiated delivery format | `AudioCapture::format()` | `capture.format()` → `AudioFormat \| None` | `capture.format` (getter) → `AudioFormat \| null` | `capture.Format()` |
+| Negotiated delivery format | `AudioCapture::format()` | `capture.format` → `AudioFormat \| None` | `capture.format` (getter) → `AudioFormat \| null` | `capture.Format()` |
 | Buffer RMS / peak (linear) | `AudioBuffer::rms()` / `peak()` | `buffer.rms()` / `buffer.peak()` | fields `chunk.rms` / `chunk.peak` | `buf.RMS()` / `buf.Peak()` |
 | Buffer RMS / peak (dBFS) | `rms_dbfs()` / `peak_dbfs()` | `buffer.rms_dbfs()` / `peak_dbfs()` | `chunk.rmsDbfs` / `peakDbfs` | `buf.RMSDbfs()` / `PeakDbfs()` |
 | Per-channel meters | `channel_rms(ch)` / `channel_peak(ch)` | (via core) | `chunk.channelRms[]` / `channelPeak[]` | (via core) |
@@ -51,7 +50,7 @@ Notes per row:
   consumer-side reads of the bridge's diagnostic counters and the
   backend-published delivery format. `format()` returns `None`/`null` before
   `start()` has created a stream. In Node it is exposed as a property getter
-  (`capture.format`); Python and Go use a method. (Caveat: the delivery format
+  (`capture.format`); Python exposes a property and Go uses a method. (Caveat: the delivery format
   reflects what the backend negotiated where the backend records it — see the
   `set_negotiated_format` note in [`PERFORMANCE.md`](PERFORMANCE.md) for the
   current limitation that backends fall back to the requested format.)
@@ -132,7 +131,7 @@ never tempted to `break` on a transient error it can do nothing about). Go's
 swallow matches its own value-only `Stream()` loop, the napi `onData` pump, and
 the blueprint's "logs + sleeps + continues" note; Rust's forwarding is the more
 informative outlier. A Go consumer that needs to *see* transient hiccups should
-poll [`AudioCapture.StreamStats`](#shipped-binding-parity-020) (`Overruns` /
+poll [`AudioCapture.StreamStats`](#shipped-binding-parity) (`Overruns` /
 `BuffersDropped`) rather than expecting them on the channel.
 
 > **Note (Go `ErrClosed`):** `ErrClosed` carries a recoverable code
@@ -154,7 +153,7 @@ are now **resolved** in 0.3.0; recorded here so the history is clear:
 - **C FFI `rsac_version()` reports the real version (was BFFI-04 — RESOLVED
   0.3.0).** It now returns `concat!(env!("CARGO_PKG_VERSION"), "\0")` and
   `rsac-ffi` is in version lockstep with the workspace (enforced by the
-  `version-lockstep` CI gate across all six manifests).
+  `version-lockstep` CI gate across all seven manifests).
 - **Go `ReadBuffer`/`TryReadBuffer` concurrent-`Close()` is safe (was BFFI-02 /
   #28 — RESOLVED 0.3.0).** `Close()` sets a `closing` flag, calls
   `rsac_capture_request_stop` to unblock a parked read, and drains a
@@ -207,7 +206,7 @@ The C API is the foundation for Go, C#, Ruby, Lua, Dart, Java, and any language 
 - Error codes returned from every function + thread-local `rsac_error_message()`
 - `std::panic::catch_unwind()` on every FFI boundary
 - Rust allocates, Rust frees (`rsac_audio_buffer_free()`)
-- Behind `c-api` Cargo feature
+- Separate `rsac-ffi` crate with target/backend features mirroring `rsac`
 
 **Key API surface:**
 ```c
@@ -246,7 +245,7 @@ with rsac.AudioCapture(target=target) as cap:
 async with rsac.AudioCapture() as cap:
     cap.start()
     stats = cap.stream_stats()
-    fmt = cap.format()              # None until start() opens a stream
+    fmt = cap.format                # None until start() opens a stream
 
 # Device / capability introspection
 devices = rsac.list_devices()
@@ -353,24 +352,26 @@ WASM runs in a browser sandbox with zero OS audio API access. All 5
 `CaptureTarget` variants are impossible. Only `AudioBuffer` observation utilities
 (RMS, peak, dBFS) could conceivably run in WASM; capture itself cannot.
 
-### 6. Swift/Kotlin (Mobile) — backends designed, bindings still research
+### 6. Swift/Kotlin (Mobile) — first-party glue exists; UniFFI still research
 
-**The blocker was never binding generation — it was backends, and those are
-now designed.** [`MOBILE_BACKEND_DESIGN.md`](MOBILE_BACKEND_DESIGN.md) +
+**The blocker was never binding generation — it was mobile backend semantics and
+consent glue.** [`MOBILE_BACKEND_DESIGN.md`](MOBILE_BACKEND_DESIGN.md) +
 [ADR-0012](designs/0012-mobile-platform-strategy.md)/[ADR-0013](designs/0013-mobile-capturetarget-semantics.md)
 specify the Android (`AudioPlaybackCapture` + AAudio, JNI ingest, first-party
 Kotlin AAR) and iOS (AVAudioEngine + ReplayKit broadcast extension, first-party
-Swift package) backends; implementation is seeded (label `xplat`, waves 3–4).
+Swift package) backends. The code and glue build in CI, but no mobile runtime
+capture path has been verified on a device or emulator yet.
 
 | Platform | Current Backend | Designed Backend |
 |---|---|---|
-| iOS | None (honest stub) | `AVAudioEngine` mic + ReplayKit `SystemDefault` (per-app capture: impossible, permanent) |
-| Android | None (honest stub) | `AudioPlaybackCapture` (system/app/tree, consent-gated) + `AAudio` mic |
+| iOS | Compile-checked `AVAudioEngine` mic + ReplayKit `SystemDefault`; runtime unverified | Same; per-app capture is impossible permanently |
+| Android | Compile-checked `AAudio` mic + `AudioPlaybackCapture` tiers; runtime unverified | Same; consent-gated API 29+ playback capture |
 
 **UniFFI**-generated Swift/Kotlin *bindings* remain research-only: the
 first mobile consumers (Tauri via `tauri-plugin-rsac`, Dioxus, Flutter over
 the C FFI) don't need them — the batteries-included AAR/SwiftPM glue plus the
-Rust/C surfaces cover them. Revisit UniFFI after the backends ship (wave 4+).
+Rust/C surfaces cover them. Revisit UniFFI after runtime proof and distribution
+decisions land.
 
 ## Repository layout (as shipped)
 
@@ -386,7 +387,7 @@ rsac/                        # workspace root (the `rsac` core crate)
     └── rsac-go/             # Go wrapper over the C FFI (cgo; not a Cargo member)
 ```
 
-There is no `rsac-uniffi` crate yet — Swift/Kotlin remain research-only (see
+There is no `rsac-uniffi` crate yet — generated Swift/Kotlin bindings remain research-only (see
 [Not yet implemented](#not-yet-implemented)).
 
 > **C-header note (was BFFI-01 — RESOLVED, rsac-1413):** the curated

@@ -4,12 +4,9 @@ Go bindings for [rsac](../../), a cross-platform Rust audio capture
 library. Built on top of [`rsac-ffi`](../rsac-ffi/) (the C FFI layer) via
 cgo and linked as a static library.
 
-> **Status:** consumer-ready for in-tree integration. No
-> `bindings/rsac-go/vX.Y.Z` tag has been pushed yet — depend on it by path
-> until the first release. Once a release tag exists
-> (`release-tag.yml` pushes one in lockstep with the crate tag),
-> `go get github.com/Codeseys-Labs/rust-crossplat-audio-capture/bindings/rsac-go@vX.Y.Z`
-> resolves it directly from this repository.
+> **Status:** consumer-ready for in-tree integration. The Go module path is
+> `github.com/Codeseys-Labs/rust-crossplat-audio-capture/bindings/rsac-go`;
+> release tags use the subdirectory form `bindings/rsac-go/vX.Y.Z`.
 
 ## What you get
 
@@ -82,7 +79,7 @@ system libraries:
 - macOS: `-framework CoreAudio -framework AudioToolbox
   -framework CoreFoundation -framework Security -framework
   SystemConfiguration`
-- Linux: `-lpipewire-0.3 -lspa-0.2 -lpthread -ldl -lm`
+- Linux: `-lpipewire-0.3 -lpthread -ldl -lm`
 - Windows (MinGW): `-lole32 -loleaut32 -lwinmm -lksuser -luuid`
   plus the Win32 libs the Rust std runtime needs
   (`-lbcrypt -lntdll -luserenv -lws2_32 -ladvapi32 -lkernel32`)

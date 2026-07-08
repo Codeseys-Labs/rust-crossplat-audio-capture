@@ -19,7 +19,7 @@ The library supports application-specific audio capture using platform-native AP
 - **Architecture**: x86_64 (primary), x86 (supported)
 
 #### Build Dependencies
-- **Rust**: 1.95+ (matches the pinned CI toolchain, `dtolnay/rust-toolchain@1.95.0`)
+- **Rust**: MSRV 1.87; repository development toolchain pinned to 1.95.0
 - **Windows SDK**: Automatically handled by `windows` crate
 - **Visual Studio Build Tools**: Required for linking
 
@@ -86,12 +86,9 @@ sudo pacman -S \
 - **PipeWire**: Must be running as the audio server
 - **Session Manager**: WirePlumber (recommended) or pipewire-media-session
 
-#### Automatic Installation
-Set `RSAC_AUTO_INSTALL=1` environment variable to attempt automatic dependency installation:
-```bash
-export RSAC_AUTO_INSTALL=1
-cargo build
-```
+#### Dependency installation
+Install the PipeWire development packages explicitly using your distro's package
+manager, or run `scripts/install-pipewire-deps.sh` on supported Linux hosts.
 
 #### Verification
 ```bash
@@ -116,7 +113,7 @@ pw-cli list-objects Node
 
 #### Build Dependencies
 - **Xcode Command Line Tools**: Required for framework linking
-- **Rust**: 1.95+ with macOS target support
+- **Rust**: MSRV 1.87; repository development toolchain pinned to 1.95.0
 
 #### Runtime Dependencies
 - **CoreAudio Framework**: Built into macOS
@@ -169,7 +166,7 @@ fi
 
 ### Feature Flags
 The library uses platform-specific feature flags:
-```toml
+```bash
 # Build for specific platforms only
 cargo build --no-default-features --features feat_windows
 cargo build --no-default-features --features feat_linux  
@@ -180,14 +177,9 @@ cargo build
 ```
 
 ### Cross-Platform Development
-For development across multiple platforms:
-```bash
-# Check all platforms compile
-cargo check --target x86_64-pc-windows-msvc
-cargo check --target x86_64-unknown-linux-gnu
-cargo check --target x86_64-apple-darwin
-cargo check --target aarch64-apple-darwin
-```
+Desktop backends link native OS APIs, so build each desktop backend on its own
+host OS. Mobile triples are compile-checked by CI; desktop cross-compilation is
+not the maintained verification path.
 
 ## Troubleshooting
 
@@ -222,7 +214,7 @@ cargo run --bin pipewire_diagnostics --no-default-features --features feat_linux
 # Cross-platform examples (use the public API only; pick your platform feature)
 cargo run --example list_devices  --no-default-features --features feat_linux
 cargo run --example basic_capture --no-default-features --features feat_linux,cli
-cargo run --example record_to_file --no-default-features --features feat_linux,cli -- out.wav
+cargo run --example record_to_file --no-default-features --features feat_linux,cli,sink-wav -- --output out.wav --duration 5
 ```
 
 The end-to-end capture behaviour (including per-application and process-tree

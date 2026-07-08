@@ -64,9 +64,10 @@ The mic path needs none of this. System capture needs all of it:
    entitlement, `containerURL(forSecurityApplicationGroupIdentifier:)`
    returns nil and setup fails with an actionable error.
 4. **Host side (Rust):** build with `CaptureTarget::SystemDefault` and pass
-   the same App Group identifier to the rsac iOS backend (consumption
-   surface lands with rsac-b3aa). The host drains the ring into a normal
-   `BridgeProducer` — overrun/terminal semantics identical to desktop.
+   the same App Group identifier with
+   `AudioCaptureBuilder::with_ios_app_group("group.com.example.myapp.rsac")`.
+   The host drains the ring into a normal `BridgeProducer` — overrun/terminal
+   semantics identical to desktop.
 5. **Starting capture:** offer the user `RPSystemBroadcastPickerView` (you
    can pre-select your extension via `preferredExtension`), or let them use
    the Control Center screen-recording long-press. There is no third
