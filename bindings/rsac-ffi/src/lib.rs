@@ -1576,6 +1576,24 @@ pub unsafe extern "C" fn rsac_capabilities_supports_device_selection(
     }
 }
 
+/// Returns 1 if the backend can deliver device hot-plug / default-change
+/// notifications (the `DeviceEnumerator::watch` surface), 0 otherwise.
+/// Returns -1 if the handle is null.
+#[no_mangle]
+pub unsafe extern "C" fn rsac_capabilities_supports_device_change_notifications(
+    caps: *const RsacCapabilities,
+) -> i32 {
+    if caps.is_null() {
+        return -1;
+    }
+    let c = unsafe { &*caps };
+    if c.inner.supports_device_change_notifications {
+        1
+    } else {
+        0
+    }
+}
+
 /// Returns 1 if starting a capture requires a config-time user-consent
 /// artifact (mobile platforms — e.g. an Android `MediaProjection` token via
 /// `rsac_builder_set_android_projection()`), 0 otherwise. Always 0 on the
@@ -1604,6 +1622,96 @@ pub unsafe extern "C" fn rsac_capabilities_max_channels(caps: *const RsacCapabil
     }
     let c = unsafe { &*caps };
     c.inner.max_channels
+}
+
+/// Returns the number of sample formats the backend supports.
+/// Returns 0 if the handle is null.
+#[no_mangle]
+pub unsafe extern "C" fn rsac_capabilities_supported_sample_format_count(
+    caps: *const RsacCapabilities,
+) -> usize {
+    if caps.is_null() {
+        return 0;
+    }
+    let c = unsafe { &*caps };
+    c.inner.supported_sample_formats.len()
+}
+
+/// Returns the supported sample format at `index` as one of the
+/// [`rsac_sample_format_t`] constants, carried as a plain `int32_t`
+/// (the same constants-as-int convention as [`rsac_default_device`]'s
+/// `kind` parameter). Valid indices are
+/// `0..rsac_capabilities_supported_sample_format_count()`.
+/// Returns -1 if the handle is null or `index` is out of bounds.
+#[no_mangle]
+pub unsafe extern "C" fn rsac_capabilities_supported_sample_format_at(
+    caps: *const RsacCapabilities,
+    index: usize,
+) -> i32 {
+    if caps.is_null() {
+        return -1;
+    }
+    let c = unsafe { &*caps };
+    match c.inner.supported_sample_formats.get(index) {
+        Some(&fmt) => rsac_sample_format_t::from(fmt) as i32,
+        None => -1,
+    }
+}
+
+/// Returns the minimum of the backend's device-negotiable sample-rate
+/// range, in Hz. Returns 0 if the handle is null.
+#[no_mangle]
+pub unsafe extern "C" fn rsac_capabilities_min_sample_rate(caps: *const RsacCapabilities) -> u32 {
+    if caps.is_null() {
+        return 0;
+    }
+    let c = unsafe { &*caps };
+    c.inner.sample_rate_range.0
+}
+
+/// Returns the maximum of the backend's device-negotiable sample-rate
+/// range, in Hz. Returns 0 if the handle is null.
+#[no_mangle]
+pub unsafe extern "C" fn rsac_capabilities_max_sample_rate(caps: *const RsacCapabilities) -> u32 {
+    if caps.is_null() {
+        return 0;
+    }
+    let c = unsafe { &*caps };
+    c.inner.sample_rate_range.1
+}
+
+/// Returns the number of entries in the builder's **config-time sample-rate
+/// whitelist** — the exact set `rsac_builder_set_sample_rate()` values are
+/// validated against at `rsac_builder_build()`. This is intentionally
+/// narrower than the device-negotiable range reported by
+/// `rsac_capabilities_min_sample_rate()` / `rsac_capabilities_max_sample_rate()`.
+/// Returns 0 if the handle is null.
+#[no_mangle]
+pub unsafe extern "C" fn rsac_capabilities_supported_sample_rate_count(
+    caps: *const RsacCapabilities,
+) -> usize {
+    if caps.is_null() {
+        return 0;
+    }
+    PlatformCapabilities::supported_sample_rates().len()
+}
+
+/// Returns the config-time whitelisted sample rate at `index`, in Hz. Valid
+/// indices are `0..rsac_capabilities_supported_sample_rate_count()`.
+/// Returns 0 if the handle is null or `index` is out of bounds (0 is never
+/// a valid sample rate).
+#[no_mangle]
+pub unsafe extern "C" fn rsac_capabilities_supported_sample_rate_at(
+    caps: *const RsacCapabilities,
+    index: usize,
+) -> u32 {
+    if caps.is_null() {
+        return 0;
+    }
+    PlatformCapabilities::supported_sample_rates()
+        .get(index)
+        .copied()
+        .unwrap_or(0)
 }
 
 thread_local! {
@@ -1926,5 +2034,124 @@ mod tests {
         assert_eq!(c_stats.uptime_secs, 0.0);
         assert_eq!(c_stats.dropped_ratio, 0.0);
         assert_eq!(c_stats.is_running, 0);
+    }
+
+    // ── Capability parity accessors (rsac-a9af) ───────────────────────────
+    //
+    // Capabilities are a static, device-free query (PlatformCapabilities is
+    // derived from the target OS + enabled feature, no audio hardware is
+    // touched), so unlike captures these CAN be exercised end-to-end in CI.
+
+    #[test]
+    fn capabilities_new_accessors_reject_null() {
+        assert_eq!(
+            unsafe { rsac_capabilities_supports_device_change_notifications(ptr::null()) },
+            -1
+        );
+        assert_eq!(
+            unsafe { rsac_capabilities_supported_sample_format_count(ptr::null()) },
+            0
+        );
+        assert_eq!(
+            unsafe { rsac_capabilities_supported_sample_format_at(ptr::null(), 0) },
+            -1
+        );
+        assert_eq!(unsafe { rsac_capabilities_min_sample_rate(ptr::null()) }, 0);
+        assert_eq!(unsafe { rsac_capabilities_max_sample_rate(ptr::null()) }, 0);
+        assert_eq!(
+            unsafe { rsac_capabilities_supported_sample_rate_count(ptr::null()) },
+            0
+        );
+        assert_eq!(
+            unsafe { rsac_capabilities_supported_sample_rate_at(ptr::null(), 0) },
+            0
+        );
+    }
+
+    #[test]
+    fn capabilities_new_accessors_round_trip_query() {
+        let rust_caps = PlatformCapabilities::query();
+
+        let mut caps: *mut RsacCapabilities = ptr::null_mut();
+        assert_eq!(
+            unsafe { rsac_capabilities_query(&mut caps) },
+            rsac_error_t::RSAC_OK
+        );
+        assert!(!caps.is_null());
+
+        assert_eq!(
+            unsafe { rsac_capabilities_supports_device_change_notifications(caps) },
+            i32::from(rust_caps.supports_device_change_notifications)
+        );
+        assert_eq!(
+            unsafe { rsac_capabilities_min_sample_rate(caps) },
+            rust_caps.sample_rate_range.0
+        );
+        assert_eq!(
+            unsafe { rsac_capabilities_max_sample_rate(caps) },
+            rust_caps.sample_rate_range.1
+        );
+
+        unsafe { rsac_capabilities_free(caps) };
+    }
+
+    #[test]
+    fn capabilities_sample_format_list_round_trips() {
+        let rust_caps = PlatformCapabilities::query();
+
+        let mut caps: *mut RsacCapabilities = ptr::null_mut();
+        assert_eq!(
+            unsafe { rsac_capabilities_query(&mut caps) },
+            rsac_error_t::RSAC_OK
+        );
+        assert!(!caps.is_null());
+
+        let count = unsafe { rsac_capabilities_supported_sample_format_count(caps) };
+        assert_eq!(count, rust_caps.supported_sample_formats.len());
+        for (i, &fmt) in rust_caps.supported_sample_formats.iter().enumerate() {
+            assert_eq!(
+                unsafe { rsac_capabilities_supported_sample_format_at(caps, i) },
+                rsac_sample_format_t::from(fmt) as i32,
+                "format index {i} must round-trip through the C constant"
+            );
+        }
+        // One past the end is out of bounds → the -1 sentinel, not UB.
+        assert_eq!(
+            unsafe { rsac_capabilities_supported_sample_format_at(caps, count) },
+            -1
+        );
+
+        unsafe { rsac_capabilities_free(caps) };
+    }
+
+    #[test]
+    fn capabilities_sample_rate_whitelist_matches_const() {
+        let mut caps: *mut RsacCapabilities = ptr::null_mut();
+        assert_eq!(
+            unsafe { rsac_capabilities_query(&mut caps) },
+            rsac_error_t::RSAC_OK
+        );
+        assert!(!caps.is_null());
+
+        // The whitelist is single-sourced from the builder's config-time
+        // contract (PlatformCapabilities::SUPPORTED_SAMPLE_RATES) — the C view
+        // must be the same list, in the same order.
+        let whitelist = PlatformCapabilities::supported_sample_rates();
+        let count = unsafe { rsac_capabilities_supported_sample_rate_count(caps) };
+        assert_eq!(count, whitelist.len());
+        for (i, &rate) in whitelist.iter().enumerate() {
+            assert_eq!(
+                unsafe { rsac_capabilities_supported_sample_rate_at(caps, i) },
+                rate,
+                "whitelist index {i} must match the builder's const"
+            );
+        }
+        // Out of bounds → 0 (never a valid sample rate).
+        assert_eq!(
+            unsafe { rsac_capabilities_supported_sample_rate_at(caps, count) },
+            0
+        );
+
+        unsafe { rsac_capabilities_free(caps) };
     }
 }
