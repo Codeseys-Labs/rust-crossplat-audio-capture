@@ -64,8 +64,7 @@ fn discover_audio_producing_app() -> Option<String> {
             // and never contains Finder (which cannot produce audio);
             // the fallback list is the whole GUI session. Use both signals
             // to detect the fallback and skip honestly instead.
-            let looks_like_fallback = apps.len() > 10
-                || apps.iter().any(|a| a.name == "Finder");
+            let looks_like_fallback = apps.len() > 10 || apps.iter().any(|a| a.name == "Finder");
             if looks_like_fallback {
                 eprintln!(
                     "[ci_audio] SKIP: enumeration returned the unfiltered NSWorkspace \
