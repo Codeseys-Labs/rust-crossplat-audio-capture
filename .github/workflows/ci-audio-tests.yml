@@ -36,6 +36,7 @@ on:
       - 'examples/**'
       - 'Cargo.toml'
       - 'Cargo.lock'
+      - 'scripts/ci-linux-audio-route.sh'
       - '.github/workflows/ci-audio-tests.yml'
   pull_request:
     branches: [main, master, 'release/**']
@@ -45,6 +46,7 @@ on:
       - 'examples/**'
       - 'Cargo.toml'
       - 'Cargo.lock'
+      - 'scripts/ci-linux-audio-route.sh'
       - '.github/workflows/ci-audio-tests.yml'
   workflow_dispatch:
 
