@@ -837,10 +837,10 @@ rewrites all six lockstep manifests plus rotates the CHANGELOG:
 
 ```bash
 # Preview the edits without writing them:
-bash scripts/bump-version.sh 0.3.0 --dry-run
+bash scripts/bump-version.sh 0.3.0 --dry-run    # or: mise run release:bump -- 0.3.0 --dry-run
 
 # Apply them:
-bash scripts/bump-version.sh 0.3.0
+bash scripts/bump-version.sh 0.3.0              # or: mise run release:bump -- 0.3.0
 ```
 
 This rewrites, in one shot:
@@ -1042,6 +1042,7 @@ propagate, run the one-command spot-check:
 ```bash
 bash scripts/verify-docs-rs.sh              # uses version from Cargo.toml
 bash scripts/verify-docs-rs.sh 0.2.0        # pin a specific version
+# (or: mise run release:verify-docs [-- X.Y.Z])
 ```
 
 The script is a focused probe — not a smoketest — and hits a handful of

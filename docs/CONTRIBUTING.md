@@ -66,6 +66,12 @@ mise run gate:full   # or: bash scripts/gate.sh --full
 #   and the module-DAG guard — the rest of the fast CI legs.
 ```
 
+Other everyday tasks (`mise tasks` is the live list): `mise run test`
+(CI test-job replica), `mise run test:audio` (the `ci_audio` integration
+suite on this machine, dispatching to the host-OS script), and the
+release pair `mise run release:bump -- X.Y.Z [--dry-run]` /
+`mise run release:verify-docs` (§7).
+
 `cargo doc` is part of `gate:full` because `src/lib.rs` declares
 `#![deny(rustdoc::broken_intra_doc_links)]` — a stale link becomes a
 build error.
@@ -228,6 +234,7 @@ heading and re-seeds an empty `[Unreleased]`).
 
 ```bash
 # Substitute the target version for X.Y.Z (e.g. the current release is 0.4.0).
+# `mise run release:bump -- X.Y.Z` is the same command via the task runner.
 bash scripts/bump-version.sh X.Y.Z --dry-run   # preview
 bash scripts/bump-version.sh X.Y.Z             # apply
 git diff                                        # review

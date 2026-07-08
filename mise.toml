@@ -46,3 +46,18 @@ run_windows = "pwsh -NoProfile -ExecutionPolicy Bypass -File scripts/gate.ps1 --
 [tasks.fmt]
 description = "Format the workspace"
 run = "cargo fmt --all"
+
+[tasks."test:audio"]
+description = "ci_audio integration suite on this machine, all 3 capture tiers (extra args pass through, e.g. `mise run test:audio -- --tier system`)"
+run = """bash -c 'case "$(uname -s)" in Darwin) exec bash scripts/test-audio-macos.sh "$@" ;; *) exec bash scripts/test-audio-linux.sh "$@" ;; esac' --"""
+run_windows = "pwsh -NoProfile -ExecutionPolicy Bypass -File scripts/test-audio-windows.ps1"
+
+[tasks."release:bump"]
+description = "Bump the six lockstep manifests + rotate CHANGELOG: mise run release:bump -- X.Y.Z [--dry-run]"
+run = "bash scripts/bump-version.sh"
+run_windows = "pwsh -NoProfile -ExecutionPolicy Bypass -File scripts/run-bash.ps1 scripts/bump-version.sh"
+
+[tasks."release:verify-docs"]
+description = "Post-publish docs.rs rendering spot-check: mise run release:verify-docs [-- X.Y.Z]"
+run = "bash scripts/verify-docs-rs.sh"
+run_windows = "pwsh -NoProfile -ExecutionPolicy Bypass -File scripts/run-bash.ps1 scripts/verify-docs-rs.sh"
