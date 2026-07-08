@@ -7,7 +7,7 @@ on:
   push:
     branches: [main, master, 'release/**']
     # Also run on stable semver tags so the version-lockstep job's tag-time
-    # hard-gate (which asserts all six manifests equal the tag) actually fires
+    # hard-gate (which asserts all seven manifests equal the tag) actually fires
     # at the point of no return — it was previously dead code (ci.yml had no
     # tags: trigger). Pre-release shapes (v*-rc.1) are excluded.
     tags:
@@ -1269,6 +1269,7 @@ jobs:
           V[bindings/rsac-napi/package.json]=$(json_top_version bindings/rsac-napi/package.json)
           V[bindings/rsac-python/Cargo.toml]=$(toml_pkg_version bindings/rsac-python/Cargo.toml)
           V[bindings/rsac-python/pyproject.toml]=$(toml_pkg_version bindings/rsac-python/pyproject.toml)
+          V[mobile/android-native/Cargo.toml]=$(toml_pkg_version mobile/android-native/Cargo.toml)
 
           echo "Discovered versions:"
           for f in "${!V[@]}"; do

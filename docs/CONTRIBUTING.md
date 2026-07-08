@@ -219,7 +219,7 @@ Always reply on the originating comment so the thread can be resolved. See
 
 ## 7. Release procedure
 
-Releases are driven by `scripts/bump-version.sh`, which keeps six
+Releases are driven by `scripts/bump-version.sh`, which keeps seven
 version-bearing files in sync:
 
 - `Cargo.toml` (root `rsac` crate)
@@ -228,12 +228,13 @@ version-bearing files in sync:
 - `bindings/rsac-napi/package.json`
 - `bindings/rsac-python/Cargo.toml`
 - `bindings/rsac-python/pyproject.toml`
+- `mobile/android-native/Cargo.toml`
 
 Plus `CHANGELOG.md` (it rotates the `[Unreleased]` section into a dated
 heading and re-seeds an empty `[Unreleased]`).
 
 ```bash
-# Substitute the target version for X.Y.Z (e.g. the current release is 0.4.0).
+# Substitute the target version for X.Y.Z (e.g. the current release is 0.4.1).
 # `mise run release:bump -- X.Y.Z` is the same command via the task runner.
 bash scripts/bump-version.sh X.Y.Z --dry-run   # preview
 bash scripts/bump-version.sh X.Y.Z             # apply

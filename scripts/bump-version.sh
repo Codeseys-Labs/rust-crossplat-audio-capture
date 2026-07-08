@@ -1,12 +1,13 @@
 #!/usr/bin/env bash
 #
-# Bump the rsac workspace version across the six files that must agree:
+# Bump the rsac workspace version across the seven files that must agree:
 #   - Cargo.toml                              (root `rsac` crate)
 #   - bindings/rsac-ffi/Cargo.toml            (C FFI crate)
 #   - bindings/rsac-napi/Cargo.toml           (napi crate)
 #   - bindings/rsac-napi/package.json         (npm package)
 #   - bindings/rsac-python/Cargo.toml         (pyo3 crate)
 #   - bindings/rsac-python/pyproject.toml     (python package)
+#   - mobile/android-native/Cargo.toml        (Android cdylib shim)
 #
 # Also rotates CHANGELOG.md: the current "## [Unreleased]" section becomes
 # "## [X.Y.Z] - YYYY-MM-DD" and a fresh Unreleased scaffold is inserted.
@@ -82,9 +83,10 @@ NAPI_CARGO="bindings/rsac-napi/Cargo.toml"
 NAPI_PKG="bindings/rsac-napi/package.json"
 PY_CARGO="bindings/rsac-python/Cargo.toml"
 PY_PYPROJ="bindings/rsac-python/pyproject.toml"
+ANDROID_NATIVE_CARGO="mobile/android-native/Cargo.toml"
 CHANGELOG="CHANGELOG.md"
 
-for f in "$ROOT_CARGO" "$FFI_CARGO" "$NAPI_CARGO" "$NAPI_PKG" "$PY_CARGO" "$PY_PYPROJ" "$CHANGELOG"; do
+for f in "$ROOT_CARGO" "$FFI_CARGO" "$NAPI_CARGO" "$NAPI_PKG" "$PY_CARGO" "$PY_PYPROJ" "$ANDROID_NATIVE_CARGO" "$CHANGELOG"; do
     [ -f "$f" ] || { err "missing required file: $f"; exit 1; }
 done
 
@@ -348,6 +350,7 @@ CUR_NAPI_CARGO=$(extract_or_die "rsac-napi"    "$NAPI_CARGO" cargo_package_versi
 CUR_NAPI_PKG=$(extract_or_die   "rsac-napi pkg" "$NAPI_PKG"   json_version)
 CUR_PY_CARGO=$(extract_or_die   "rsac-python"  "$PY_CARGO"   cargo_package_version)
 CUR_PY_PYPROJ=$(extract_or_die  "rsac-python pyproject" "$PY_PYPROJ" cargo_package_version)
+CUR_ANDROID_NATIVE=$(extract_or_die "rsac-android-native" "$ANDROID_NATIVE_CARGO" cargo_package_version)
 
 # Internal `rsac = { ..., version = "X.Y.Z" }` dep pins in the binding manifests
 # (seed rsac-0d58). These must track the root crate version so a published
@@ -375,6 +378,7 @@ printf '  %-42s %s\n' "$NAPI_CARGO"  "$CUR_NAPI_CARGO"
 printf '  %-42s %s\n' "$NAPI_PKG"    "$CUR_NAPI_PKG"
 printf '  %-42s %s\n' "$PY_CARGO"    "$CUR_PY_CARGO"
 printf '  %-42s %s\n' "$PY_PYPROJ"   "$CUR_PY_PYPROJ"
+printf '  %-42s %s\n' "$ANDROID_NATIVE_CARGO" "$CUR_ANDROID_NATIVE"
 
 # Idempotency guard: if every target already matches — including the internal
 # rsac dep pins — exit cleanly without touching the changelog either (rotating a
@@ -387,6 +391,7 @@ if [ "$CUR_ROOT" = "$NEW_VERSION" ] && \
    [ "$CUR_NAPI_PKG" = "$NEW_VERSION" ] && \
    [ "$CUR_PY_CARGO" = "$NEW_VERSION" ] && \
    [ "$CUR_PY_PYPROJ" = "$NEW_VERSION" ] && \
+   [ "$CUR_ANDROID_NATIVE" = "$NEW_VERSION" ] && \
    [ "${#INTERNAL_DEP_FILES[@]}" -eq 0 ]; then
     ok "already at version $NEW_VERSION — nothing to do"
     exit 0
@@ -400,6 +405,7 @@ CHANGES=()
 [ "$CUR_NAPI_PKG" != "$NEW_VERSION" ]   && CHANGES+=("$NAPI_PKG")
 [ "$CUR_PY_CARGO" != "$NEW_VERSION" ]   && CHANGES+=("$PY_CARGO")
 [ "$CUR_PY_PYPROJ" != "$NEW_VERSION" ]  && CHANGES+=("$PY_PYPROJ")
+[ "$CUR_ANDROID_NATIVE" != "$NEW_VERSION" ] && CHANGES+=("$ANDROID_NATIVE_CARGO")
 
 # Internal rsac dep-pin rewrites (rsac-0d58). Listed distinctly so the plan is
 # honest even when the same manifest also gets a [package].version bump (FFI).
@@ -440,6 +446,7 @@ fi
 [ "$CUR_NAPI_PKG"   != "$NEW_VERSION" ] && rewrite_json_version  "$NAPI_PKG"    "$NEW_VERSION"
 [ "$CUR_PY_CARGO"   != "$NEW_VERSION" ] && rewrite_cargo_version "$PY_CARGO"    "$NEW_VERSION"
 [ "$CUR_PY_PYPROJ"  != "$NEW_VERSION" ] && rewrite_cargo_version "$PY_PYPROJ"   "$NEW_VERSION"
+[ "$CUR_ANDROID_NATIVE" != "$NEW_VERSION" ] && rewrite_cargo_version "$ANDROID_NATIVE_CARGO" "$NEW_VERSION"
 
 # Internal rsac dep pins (rsac-0d58) — rewrite after the [package].version pass
 # so a manifest that gets both (FFI) ends up fully self-consistent.
