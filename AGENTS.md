@@ -395,7 +395,7 @@ All CI runs on [Blacksmith](https://blacksmith.sh/) runners — a drop-in replac
 
 | Platform | Virtual Audio Available? | Details |
 |---|---|---|
-| **Linux** | ✅ Working | PipeWire launched manually (not via systemd — Firecracker VMs lack D-Bus user session). Virtual null sink via `pactl load-module module-null-sink`. Requires `pulseaudio-utils` for `pactl`, and `XDG_RUNTIME_DIR` setup. |
+| **Linux** | ✅ Working | PipeWire launched manually (not via systemd) with a **private session `dbus-daemon`** — wireplumber 0.4 exits without a bus, and without the session manager no stream ever links (root cause of the historical "SystemDefault yields 0 buffers"; fixed in PR #43). Virtual null sink via `pactl load-module module-null-sink`; the routing gate (`scripts/ci-linux-audio-route.sh`) proves the route end-to-end and flips `RSAC_CI_AUDIO_DETERMINISTIC=1`. Requires `pulseaudio-utils` for `pactl`, and `XDG_RUNTIME_DIR` setup. |
 | **Windows** | ❌ No audio stack | VB-CABLE setup exe installs without error, but Windows Audio services (`AudioSrv`, `AudioEndpointBuilder`) don't exist in the Firecracker microVM. No audio endpoints are created. **Option D probe confirmed**: `AudioSes.dll`, `AudioEndpointBuilder.dll`, `Audiodg.exe` are all absent from System32; audio registry keys don't exist; `Install-WindowsFeature Server-Media-Foundation` unavailable. The audio subsystem is not part of the Blacksmith Windows image at all. Windows audio integration tests run on GitHub-hosted `windows-latest` instead. |
 | **macOS** | ✅ Working | BlackHole 2ch installs via `brew`, CoreAudio daemon running, virtual 48kHz stereo device as default I/O. Apple Silicon M4 hardware (not a VM). |
 
@@ -691,12 +691,10 @@ Full playbook (when to stack vs parallel PRs, exact commands, pitfalls):
 - **Mobile — the playback-capture tiers are code-complete** (what `SystemDefault` means on mobile, ADR-0013): Android `AudioPlaybackCapture` + JNI ingest landed (rsac-77f1: all four tiers via the AAR Kotlin loop, `src/audio/android/{jni,playback}.rs`; `librsac.so` packaging rsac-0aa9) and iOS `SystemDefault` is compiled (rsac-b3aa: ReplayKit ring consumer mirroring the canonical `mobile/ios` RingLayout v1 contract) — both pending runtime proof
 - **Mobile — runtime verification** (the honest gap: everything mobile is compile-proof only): Android emulator leg rsac-e6d3, iOS simulator/device leg rsac-97c8 — the AGENTS mobile matrix cells stay "compiled, unverified" until these are green
 - **Mobile — delivery**: real Android device enumeration (rsac-ad8a), AAR Maven + SwiftPM distribution (rsac-05b6), `tauri-plugin-rsac` (rsac-f21c) + the audio-graph decision (rsac-0ac9, ADR-0014) — the rsac-ffi mobile-triple cross-checks landed (rsac-7a18)
-- **Binding capability parity, FFI leg** — additive C ABI accessors (device-change notifications, sample-format list, rate range/whitelist) so Go reaches parity (rsac-a9af, re-scoped)
 - Additional sink adapters
 - Performance benchmarking and optimization — benches ship in-tree (`benches/`) but no CI job executes them; ADR-0006's `bridge-zerocopy` promote-or-remove decision is blocked on that A/B data
 - macOS 15 (Sequoia) testing on real hardware (expected to work via Path 2, untested)
 - **Linux `ApplicationByName` happy-path integration test** — Windows has `application_by_name_windows`; the Linux happy path (pinned `pw-dump` node name) is still absent and macOS's is `#[ignore]`d behind TCC
-- **Harden non-silence assertions** — Linux capture tests still use soft warnings; flipping `RSAC_CI_AUDIO_DETERMINISTIC=1` needs the deterministic PipeWire routing evidence (seeds rsac-6efb / rsac-b106)
 - **First crates.io publish** — the crate is not yet on crates.io (README's `version = "0.4"` snippet and the docs.rs links are forward-looking until then); release automation exists, needs `CARGO_REGISTRY_TOKEN` + a tag
 - **Compose follow-ups** — Python/Node/Go bindings exposure (C FFI shipped; rsac-fba7), live per-source gain/mute (rsac-5a2d), v2 layouts (rsac-7c93)
 - **Blacksmith Windows audio support** — request Blacksmith add audio subsystem to Windows Server images (see §6 runner labels)
