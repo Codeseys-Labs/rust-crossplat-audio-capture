@@ -1,25 +1,47 @@
 [package]
 name = "rsac-napi"
-version = "0.4.0"
+version = "0.4.1"
 edition = "2021"
 description = "Node.js/TypeScript bindings for rsac (Rust Cross-Platform Audio Capture)"
 license = "MIT OR Apache-2.0"
-repository = "https://github.com/baladita/rust-crossplat-audio-capture"
+repository = "https://github.com/Codeseys-Labs/rust-crossplat-audio-capture"
 
 [lib]
 crate-type = ["cdylib"]
 
 [dependencies]
-rsac = { path = "../.." }
 napi = { version = "2", features = ["napi9", "async", "tokio_rt", "serde-json"] }
 napi-derive = "2"
 tokio = { version = "1", features = ["rt", "rt-multi-thread"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 
+# Path dependency to the rsac library crate.
+#
+# Canonical binding feature-resolution convention (docs/features.md): select the
+# backend per-target with `default-features = false`, so each build compiles
+# exactly the one backend matching the host platform and never pulls the other
+# two backends' OS-only system deps. Mirrors bindings/rsac-python. (rsac-e8a3 —
+# previously this crate depended on rsac with all default backends.)
+[target.'cfg(windows)'.dependencies.rsac]
+path = "../.."
+default-features = false
+features = ["feat_windows"]
+
+[target.'cfg(target_os = "linux")'.dependencies.rsac]
+path = "../.."
+default-features = false
+features = ["feat_linux"]
+
+[target.'cfg(target_os = "macos")'.dependencies.rsac]
+path = "../.."
+default-features = false
+features = ["feat_macos"]
+
 [build-dependencies]
 napi-build = "2"
 
-[profile.release]
-lto = true
-strip = "symbols"
+# NOTE: no [profile.release] here — rsac-napi is a workspace member, so a member
+# profile section is ignored by cargo (and used to emit a warning on every
+# cargo invocation repo-wide). Release binary settings, if wanted, belong in the
+# workspace root manifest.

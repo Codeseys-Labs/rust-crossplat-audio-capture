@@ -69,12 +69,29 @@ fn test_system_capture_receives_audio() {
     let mut total_frames: usize = 0;
     let mut got_non_silence = false;
     let mut buffers_read: usize = 0;
+    let mut last_timestamp: Option<std::time::Duration> = None;
 
     while start.elapsed() < timeout {
         match capture.read_buffer() {
             Ok(Some(buffer)) => {
                 buffers_read += 1;
                 total_frames += buffer.num_frames();
+
+                // rsac-ec25 wiring: every backend's RT push now stamps buffers
+                // with a stream-position timestamp, so these are HARD asserts —
+                // they are pure data-plane properties, independent of audio
+                // routing: timestamps must be present and non-decreasing.
+                let ts = buffer.timestamp().expect(
+                    "AudioBuffer::timestamp must be populated by the stamped \
+                     producer push (stream-position wiring, rsac-ec25)",
+                );
+                if let Some(prev) = last_timestamp {
+                    assert!(
+                        ts >= prev,
+                        "buffer timestamps must be non-decreasing: {prev:?} then {ts:?}"
+                    );
+                }
+                last_timestamp = Some(ts);
 
                 if !got_non_silence && helpers::verify_non_silence(&buffer, 0.001) {
                     got_non_silence = true;

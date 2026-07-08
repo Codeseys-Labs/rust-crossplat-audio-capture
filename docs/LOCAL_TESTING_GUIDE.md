@@ -106,14 +106,14 @@ System capture records all audio output from the system's default device.
 # 1. Play some audio on your system (music, video, etc.)
 
 # 2. List available devices — verify your audio stack is working
-cargo run -- list
+cargo run --features cli -- list
 
 # 3. Capture system audio (shows a live ASCII level meter)
 #    Press Ctrl+C to stop
-cargo run -- capture
+cargo run --features cli -- capture
 
 # 4. Record system audio to a WAV file (5 seconds)
-cargo run -- record --duration 5 output.wav
+cargo run --features cli -- record --duration 5 output.wav
 
 # 5. Verify the recorded file
 #    - Check file size is > 44 bytes (WAV header)
@@ -165,13 +165,13 @@ pgrep -x spotify
 pidof spotify
 
 # 3. Capture by PID (uses ProcessTree target)
-cargo run -- capture --pid <PID>
+cargo run --features cli -- capture --pid <PID>
 
 # 4. Capture by application name (uses ApplicationByName target)
-cargo run -- capture --app spotify
+cargo run --features cli -- capture --app spotify
 
 # 5. Record application audio to a WAV file
-cargo run -- record --app spotify --duration 10 app_audio.wav
+cargo run --features cli -- record --app spotify --duration 10 app_audio.wav
 ```
 
 ### How It Works per Platform
@@ -212,10 +212,10 @@ pgrep -x chrome
 pgrep -x firefox
 
 # 3. Capture the entire process tree
-cargo run -- capture --pid <PARENT_PID>
+cargo run --features cli -- capture --pid <PARENT_PID>
 
 # 4. Record process tree audio
-cargo run -- record --pid <PARENT_PID> --duration 10 tree_audio.wav
+cargo run --features cli -- record --pid <PARENT_PID> --duration 10 tree_audio.wav
 ```
 
 > **Note:** When `--pid` is specified, `rsac` uses `CaptureTarget::ProcessTree(ProcessId)`.
@@ -225,13 +225,93 @@ cargo run -- record --pid <PARENT_PID> --duration 10 tree_audio.wav
 
 ---
 
+## Composed Capture Testing (`compose` feature)
+
+Composed capture (ADR-0011) runs several sources simultaneously and delivers
+one interleaved multi-channel stream — e.g. an application mixed to a mono
+channel plus the system default's native channels appended after it.
+
+### Steps
+
+```bash
+# 1. Start an application playing audio (e.g. Spotify, a browser tab).
+
+# 2. Run the shipped example: app group (mono) + system group (native channels).
+#    Falls back to a system-only composition when no app name is given.
+cargo run --example composed_capture --features compose -- spotify
+
+# 3. Verify in the output:
+#    - the printed channel map (e.g. "composed 3 channels": app, sysL, sysR)
+#    - per-group RMS levels move when the app / system audio plays
+#    - the final stats block: per-source buffers_received > 0; padded_frames
+#      stays near zero while both sources play; `resampling=true` appears for
+#      any source whose endpoint rate differs from 48 kHz (expected for
+#      Windows process loopback on 44.1 kHz endpoints)
+```
+
+### What to check per platform
+
+- **Windows** — compose an `ApplicationByName` group with a `SystemDefault`
+  keep-channels group. Process loopback cannot autoconvert, so if the endpoint
+  runs at 44.1 kHz the app source must report `resampling=true` and the
+  composed output must still be 48 kHz.
+- **macOS** — same recipe; the app group exercises Process Tap (14.4+, TCC
+  audio-capture permission required — grant it to your terminal).
+- **Linux** — with the PipeWire null-sink setup from the sections above,
+  route the player to the sink and compose `SystemDefault` twice (mono mix +
+  keep-channels) as a self-test without a second app.
+
+### Deterministic unit-level verification (no devices)
+
+The compose engine (mixdown math, resampling, master-clock pacing, padding /
+trimming / re-election) is fully covered by scripted-source tests that run on
+any machine:
+
+```bash
+cargo test --lib --features compose compose::
+```
+
+---
+
 ## Platform-Specific Notes
 
 ### macOS
 
-- **Permissions:** First run may prompt for microphone/screen recording permission — **grant it**.
-  If you get permission errors, check:
-  **System Settings → Privacy & Security → Microphone** (and Screen Recording)
+- **Permissions:** Per-app / process-tree / system capture on macOS 14.4+ use
+  the **Process Tap** API, gated by the **Audio Capture** TCC service
+  (`kTCCServiceAudioCapture`). This is a *distinct* service from Microphone and
+  from Screen Recording — granting either of those is **not** sufficient. Declare
+  `NSAudioCaptureUsageDescription` in your `Info.plist`; the OS prompts on the
+  first capture attempt. If you get permission errors, approve the prompt under
+  **System Settings → Privacy & Security → Audio Capture** and relaunch the
+  process (grants are read only at process start).
+- **Your terminal app must ship `NSAudioCaptureUsageDescription`.** TCC
+  attributes the request to the *responsible* app bundle (your terminal), not
+  to the `rsac` process — and `tccd` **categorically refuses** authorization
+  for bundles whose `Info.plist` lacks the key, without ever showing a prompt
+  (log: `Refusing authorization request for service kTCCServiceAudioCapture …
+  without NSAudioCaptureUsageDescription key`). Toggling the permission on in
+  System Settings does **not** override this. Host-app audit (verified via
+  `plutil`, 2026-07-07, macOS 26): **VS Code ships the key** ✅; Terminal.app,
+  Ghostty, and cmux do **not** ❌ — under those, every tap delivers
+  correctly-shaped but **all-zero** buffers. Diagnosis one-liner:
+  `plutil -p "<YourTerminal>.app/Contents/Info.plist" | grep -i audiocapture`
+  — if it prints nothing, run capture tests from VS Code's integrated terminal
+  (first working end-to-end grant verified 2026-07-07: prompt → Allow →
+  real Firefox audio, peak 0.217).
+- **Fresh grants are not instant.** After clicking Allow there is a measured
+  **~6.7 s propagation window** during which the tap still delivers all-zero
+  buffers (indistinguishable from denial). Make the *first* post-grant capture
+  ≥ 10–12 s; subsequent (warm-grant) runs deliver content immediately. rsac's
+  silent-zeros diagnostic (ADR-0016) defaults its warn window to 10 s for
+  exactly this reason (`RSAC_SILENCE_GRACE_SECS` overrides).
+- **Denied-permission behavior (verified on macOS 26, M4):** an unauthorized
+  tap still creates, starts, streams silence, and tears down cleanly — it does
+  **not** hang or error. So "capture runs but peak is 0.000000" means a TCC
+  problem, not an rsac lifecycle bug. This also means
+  `RSAC_CI_AUDIO_DETERMINISTIC=1` (which hard-asserts non-silence) will fail
+  captures under an unauthorized terminal — only set it where the TCC grant is
+  actually effective.
 - **Process Tap:** Requires macOS 14.4+ (Sonoma). On older versions, only system capture works.
 - **Aggregate device:** For app capture, rsac creates a temporary CoreAudio aggregate device automatically.
 - **Xcode requirement:** The build uses CoreAudio system frameworks; Xcode CLI tools must be installed.
@@ -289,11 +369,25 @@ cargo test --test ci_audio --features feat_windows
 
 ### What the Integration Tests Cover
 
-| Test | Description |
+The `ci_audio` suite spans one module per capture surface. A representative
+sample:
+
+| Module | Description |
 |---|---|
-| `test_app_capture_by_process_id` | Spawns an audio player, captures by PID |
-| `test_app_capture_by_pipewire_node_id` | Linux-only: PipeWire node discovery + capture |
-| `test_app_capture_nonexistent_target` | Verifies graceful error handling for missing targets |
+| `system_capture` | `CaptureTarget::SystemDefault` end-to-end (tone → capture → verify) |
+| `device_capture` / `device_enumeration` | Device-targeted capture + enumerator contract |
+| `app_capture` | Per-application capture by PID / PipeWire node + nonexistent-target handling |
+| `application_by_name` / `application_by_pid` | macOS `ApplicationByName` / `Application(PID)` resolution |
+| `process_tree` / `process_tree_capture` | `ProcessTree` public-API + end-to-end tree capture |
+| `subscribe` | `subscribe()` mpsc fan-out, disconnect-after-stop, multi-subscriber |
+| `overrun` | `overrun_count()` increments when the consumer stalls (G8) |
+| `stream_lifecycle` | start → read → stop, idempotent stop, drop-while-running |
+| `lifecycle_terminal` | `request_stop()` + terminal read (`StreamEnded`) semantics |
+| `multi_source` | two `AudioCapture` instances at once |
+| `platform_caps` | `PlatformCapabilities::query()` sanity |
+
+See [`docs/CI_AUDIO_TESTING.md`](CI_AUDIO_TESTING.md) for the full module list,
+the platform × tier truth table, and the gate macros.
 
 ---
 
@@ -335,7 +429,7 @@ RECORD OPTIONS:
 | **"No audio devices found"** | Audio server not running | **Linux:** `systemctl --user start pipewire` · **macOS:** Reboot (CoreAudio is always on) · **Windows:** Check Windows Audio service |
 | **"Application not found"** | App not running or name mismatch | Use `--pid` instead, or check exact process name with `ps`/`tasklist`/`pw-dump` |
 | **Silence captured** | Target app not producing audio | Ensure the app is actively playing audio. On Linux, verify with `pw-top` |
-| **Permission denied (macOS)** | Missing audio capture permission | Grant in **System Settings → Privacy & Security → Microphone** |
+| **Permission denied (macOS)** | Missing Audio Capture (`kTCCServiceAudioCapture`) permission | Grant in **System Settings → Privacy & Security → Audio Capture** (not Microphone / Screen Recording) and relaunch |
 | **COM error (Windows)** | COM initialization conflict | Ensure no STA COM init in the same thread. rsac uses MTA mode. |
 | **"PlatformNotSupported" for app capture** | OS version too old | **macOS:** Need 14.4+ · **Windows:** Need build 20348+ · **Linux:** Need PipeWire 0.3.44+ |
 | **Build fails with missing headers** | Development libraries not installed | **Linux:** `sudo apt install libpipewire-0.3-dev` · **macOS:** `xcode-select --install` · **Windows:** Install VS Build Tools C++ workload |
@@ -350,10 +444,10 @@ RECORD OPTIONS:
 ```bash
 cargo check                     # Compiles?
 cargo test --lib                # Unit tests pass?
-cargo run -- info               # Platform caps look right?
-cargo run -- list               # Devices enumerated?
-cargo run -- capture            # Ctrl+C after seeing level meter
-cargo run -- record --duration 3 test.wav  # Record and play back
+cargo run --features cli -- info               # Platform caps look right?
+cargo run --features cli -- list               # Devices enumerated?
+cargo run --features cli -- capture            # Ctrl+C after seeing level meter
+cargo run --features cli -- record --duration 3 test.wav  # Record and play back
 ```
 
 ### Application Capture End-to-End (macOS)
@@ -364,11 +458,11 @@ SPOTIFY_PID=$(pgrep -x Spotify)
 echo "Spotify PID: $SPOTIFY_PID"
 
 # Capture by name
-cargo run -- capture --app Spotify
+cargo run --features cli -- capture --app Spotify
 # Ctrl+C after confirming audio levels
 
 # Record 10 seconds by PID
-cargo run -- record --pid $SPOTIFY_PID --duration 10 spotify_capture.wav
+cargo run --features cli -- record --pid $SPOTIFY_PID --duration 10 spotify_capture.wav
 
 # Play back
 afplay spotify_capture.wav
@@ -382,11 +476,11 @@ $pid = (Get-Process spotify).Id
 Write-Host "Spotify PID: $pid"
 
 # Capture by name
-cargo run -- capture --app spotify
+cargo run --features cli -- capture --app spotify
 # Ctrl+C after confirming audio levels
 
 # Record 10 seconds
-cargo run -- record --pid $pid --duration 10 spotify_capture.wav
+cargo run --features cli -- record --pid $pid --duration 10 spotify_capture.wav
 
 # Play back
 Start-Process spotify_capture.wav
@@ -403,11 +497,11 @@ echo "Spotify PID: $SPOTIFY_PID"
 pw-top  # Look for the spotify stream
 
 # Capture by name
-cargo run -- capture --app spotify
+cargo run --features cli -- capture --app spotify
 # Ctrl+C after confirming audio levels
 
 # Record 10 seconds by PID
-cargo run -- record --pid $SPOTIFY_PID --duration 10 spotify_capture.wav
+cargo run --features cli -- record --pid $SPOTIFY_PID --duration 10 spotify_capture.wav
 
 # Play back
 pw-play spotify_capture.wav

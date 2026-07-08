@@ -1,4 +1,4 @@
-# Tag-triggered PyPI release workflow for rsac (Python bindings via PyO3 + maturin).
+# Tag/manual PyPI release workflow for rsac (Python bindings via PyO3 + maturin).
 #
 # Mirrors .github/workflows/release.yml for the crates.io flow:
 #   1. build-wheels — matrix of (os × arch) ABI3 wheels via maturin-action
@@ -6,9 +6,11 @@
 #   2. build-sdist  — single sdist for source installs / offline mirrors
 #   3. publish-pypi — merges all artifacts, uploads to PyPI with skip-existing
 #
-# Triggered by semver-shaped tags (vMAJOR.MINOR.PATCH) from push --tags.
-# Bump bindings/rsac-python/pyproject.toml version in lockstep with the root
-# Cargo.toml before tagging (see docs/RELEASE_PROCESS.md).
+# Triggered by semver-shaped tags (vMAJOR.MINOR.PATCH) from push --tags,
+# or manually via workflow_dispatch with publish=true + a matching X.Y.Z
+# version input. Bump bindings/rsac-python/pyproject.toml version in
+# lockstep with the root Cargo.toml before publishing (see
+# docs/RELEASE_PROCESS.md).
 #
 # Authentication: PyPI Trusted Publishing (OIDC) — NO long-lived secret.
 #   The publish-pypi job requests `id-token: write` and uploads via
@@ -36,6 +38,18 @@ on:
       # must not trigger real PyPI publishes. See docs/RELEASE_PROCESS.md.
       - 'v*.*.*'
       - '!v*-*'
+  workflow_dispatch:
+    inputs:
+      version:
+        description: 'Version to verify against bindings/rsac-python/pyproject.toml before publishing (for example: 0.4.0)'
+        type: string
+        required: false
+        default: ''
+      publish:
+        description: 'Publish to PyPI. Leave false to build/smoke wheels only.'
+        type: boolean
+        required: false
+        default: false
 
 env:
   CARGO_TERM_COLOR: always
@@ -182,7 +196,7 @@ jobs:
     name: Publish to PyPI
     needs: [build-wheels, build-sdist]
     # Guard against forks publishing to the PyPI `rsac` project.
-    if: github.repository == 'Codeseys-Labs/rust-crossplat-audio-capture'
+    if: github.repository == 'Codeseys-Labs/rust-crossplat-audio-capture' && (github.event_name != 'workflow_dispatch' || inputs.publish)
     runs-on: blacksmith-4vcpu-ubuntu-2404
     permissions:
       contents: read
@@ -195,15 +209,26 @@ jobs:
 
       # Tag↔manifest version guard: the pushed tag must match the version
       # in pyproject.toml before publishing to PyPI. Tag events only.
-      - name: Verify tag matches pyproject.toml version
-        if: startsWith(github.ref, 'refs/tags/')
+      - name: Verify requested version matches pyproject.toml version
         shell: bash
         run: |
-          VERSION="${GITHUB_REF_NAME#v}"
+          if [[ "${GITHUB_REF:-}" == refs/tags/v* ]]; then
+            VERSION="${GITHUB_REF_NAME#v}"
+          else
+            VERSION='${{ inputs.version }}'
+          fi
+          if [ -z "${VERSION}" ]; then
+            echo "::error::Manual PyPI publish requires the workflow_dispatch version input"
+            exit 1
+          fi
+          if ! [[ "${VERSION}" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+            echo "::error::Requested version '${VERSION}' is not a stable X.Y.Z semver version"
+            exit 1
+          fi
           MANIFEST="$(grep -m1 '^version' bindings/rsac-python/pyproject.toml | sed -E 's/.*"([^"]+)".*/\1/')"
-          echo "tag version: ${VERSION}  manifest version: ${MANIFEST}"
+          echo "requested version: ${VERSION}  manifest version: ${MANIFEST}"
           if [ "${VERSION}" != "${MANIFEST}" ]; then
-            echo "::error::Tag version (${VERSION}) does not match pyproject.toml version (${MANIFEST})"
+            echo "::error::Requested version (${VERSION}) does not match pyproject.toml version (${MANIFEST})"
             exit 1
           fi
 

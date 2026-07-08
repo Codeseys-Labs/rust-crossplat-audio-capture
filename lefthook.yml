@@ -1,0 +1,26 @@
+# lefthook.yml — git hooks for rsac (rsac-7e19). Opt-in: run
+# `lefthook install` (or `mise run setup`) once per clone; CI remains the
+# backstop for anyone who skips hooks.
+#
+# Speed discipline:
+#   pre-commit  — fast only: rustfmt check (runs only when .rs files are staged)
+#   commit-msg  — trailer/byline lint (AGENTS.md §6), milliseconds
+#   pre-push    — the CI-replica gate (clippy -D warnings + bare build)
+#
+# Skip escape hatches: `git push --no-verify`, or `LEFTHOOK=0 git …`.
+
+pre-commit:
+  commands:
+    rustfmt:
+      glob: "*.rs"
+      run: cargo fmt --all -- --check
+
+commit-msg:
+  commands:
+    no-tool-bylines:
+      run: bash scripts/hooks/commit-msg.sh {1}
+
+pre-push:
+  commands:
+    gate:
+      run: bash scripts/gate.sh

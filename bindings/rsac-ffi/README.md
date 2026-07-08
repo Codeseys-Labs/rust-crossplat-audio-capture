@@ -50,7 +50,9 @@ cargo build --release -p rsac-ffi \
   --no-default-features --features feat_linux
 ```
 
-Feature flags: `feat_windows`, `feat_linux`, `feat_macos`, `sink-wav`.
+Feature flags: `feat_windows`, `feat_linux`, `feat_macos`, `sink-wav`,
+`compose` (multi-source channel composition — see
+[Composing multiple sources](#composing-multiple-sources-compose-feature)).
 
 ## Linking
 
@@ -225,6 +227,106 @@ if (rsac_capture_backpressure_report(capture, &bp) == RSAC_OK) {
            bp.is_under_backpressure);
 }
 ```
+
+## Composing multiple sources (compose feature)
+
+Build with the `compose` feature to expose rsac's multi-source channel
+composition (ADR-0011) through C:
+
+```bash
+cargo build --release -p rsac-ffi --features compose
+```
+
+The compose declarations in `rsac.h` are guarded by the
+`RSAC_FEATURE_COMPOSE` preprocessor define — add `-DRSAC_FEATURE_COMPOSE` to
+your compiler flags when linking a compose-enabled `librsac_ffi` (without the
+define the section preprocesses away, matching a library that does not export
+those symbols).
+
+Sources are declared in named groups; each group contributes output channels
+according to its layout (mono mixdown → 1, stereo mixdown → 2, keep-channels →
+the single source's native width). Groups append in declaration order into one
+interleaved-f32 stream at the session rate:
+
+```c
+/* Build: discord+zoom mixed to 1 mono channel, system audio as stereo. */
+RsacGroup *voice = NULL, *sys = NULL;
+rsac_group_new("voice", &voice);
+rsac_group_add_source(voice, "name:discord");
+rsac_group_add_source_with_gain(voice, "name:zoom", 0.8f);
+rsac_group_set_layout(voice, RSAC_GROUP_LAYOUT_MONO);
+
+rsac_group_new("system", &sys);
+rsac_group_add_source(sys, "system");
+/* default layout is RSAC_GROUP_LAYOUT_STEREO */
+
+RsacCompositionBuilder *builder = NULL;
+rsac_composition_builder_new(&builder);
+rsac_composition_builder_set_sample_rate(builder, 48000);
+rsac_composition_builder_add_group(builder, voice); /* consumes voice */
+rsac_composition_builder_add_group(builder, sys);   /* consumes sys   */
+
+RsacComposition *comp = NULL;
+if (rsac_composition_builder_build(builder, &comp) != RSAC_OK) { /* builder consumed */
+    fprintf(stderr, "build failed: %s\n", rsac_error_message());
+    return 1;
+}
+
+if (rsac_composition_start(comp) != RSAC_OK) {
+    fprintf(stderr, "start failed: %s\n", rsac_error_message());
+    rsac_composition_free(comp);
+    return 1;
+}
+
+/* Channel map: which output channel belongs to which group. */
+uint16_t n = rsac_composition_channel_count(comp); /* 3 here: voice + L + R */
+for (uint16_t ch = 0; ch < n; ch++) {
+    printf("channel %u <- group '%s' (channel %d in group)\n",
+           ch,
+           rsac_composition_channel_group(comp, ch),
+           rsac_composition_channel_in_group(comp, ch));
+}
+
+/* Read composed interleaved f32 exactly like a single capture. */
+RsacAudioBuffer *buf = NULL;
+rsac_error_t rc = rsac_composition_try_read(comp, &buf);
+if (rc == RSAC_OK && buf != NULL) {
+    /* rsac_audio_buffer_data / _num_frames / _channels as usual */
+    rsac_audio_buffer_free(buf);
+} else if (rc == RSAC_ERROR_STREAM_FAILED) {
+    /* terminal: composition ended and drained — do not retry */
+}
+
+/* Runtime counters, all-zero before start; no freeing needed. */
+RsacCompositionStats stats;
+if (rsac_composition_stats(comp, &stats) == RSAC_OK) {
+    for (size_t i = 0; i < stats.num_sources; i++) {
+        RsacSourceStats s;
+        if (rsac_composition_source_stats(comp, i, &s) == RSAC_OK) {
+            printf("%s (%s): recv=%llu padded=%llu trimmed=%llu%s%s\n",
+                   rsac_composition_source_group(comp, i),
+                   rsac_composition_source_target(comp, i),
+                   (unsigned long long)s.buffers_received,
+                   (unsigned long long)s.padded_frames,
+                   (unsigned long long)s.trimmed_frames,
+                   s.resampling ? " [resampling]" : "",
+                   s.ended ? " [ended]" : "");
+        }
+    }
+}
+
+rsac_composition_stop(comp);
+rsac_composition_free(comp); /* joins the compositor; stops inner captures */
+```
+
+Ownership rules (also in the header): a group is **consumed** by a successful
+`rsac_composition_builder_add_group()`; the builder is **always consumed** by
+`rsac_composition_builder_build()`; the composition **owns its inner
+captures** — `rsac_composition_free()` stops the engine (joining its thread)
+and releases them. Buffers returned by reads own their samples and stay valid
+after the composition is freed. `rsac_composition_stop()` may run concurrently
+with a parked `rsac_composition_read()` to unblock it, but never concurrently
+with `rsac_composition_free()`.
 
 ## Publishing to crates.io
 

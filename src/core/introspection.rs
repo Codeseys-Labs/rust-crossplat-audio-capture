@@ -58,14 +58,22 @@ pub enum AudioSourceKind {
     /// fallible (e.g. a backend that cannot determine the direction returns an
     /// error, which is mapped to `None` here via `.ok()`).
     Device {
+        /// Platform device identifier, suitable for [`CaptureTarget::device`].
         device_id: String,
+        /// Whether this is the platform's current default device.
         is_default: bool,
+        /// Endpoint direction (input/output), or `None` when it could not be
+        /// resolved (see the variant docs above).
         kind: Option<DeviceKind>,
     },
     /// An application producing audio.
     Application {
+        /// OS process id of the application.
         pid: u32,
+        /// Human-readable application name.
         app_name: String,
+        /// Platform bundle/application identifier (e.g. a macOS bundle id),
+        /// when the platform exposes one.
         bundle_id: Option<String>,
     },
 }
@@ -301,17 +309,36 @@ pub enum PermissionStatus {
 ///
 /// On other platforms, audio capture typically doesn't require special
 /// permissions, so this returns `PermissionStatus::NotRequired`.
+///
+/// ## macOS: real answer requires the `macos-tcc-spi` feature
+///
+/// There is **no public API** to query the `kTCCServiceAudioCapture` status
+/// (`AVCaptureDevice.authorizationStatus(for: .audio)` reports the *microphone*
+/// service, not the Process Tap). With the opt-in `macos-tcc-spi` feature
+/// (ADR-0015), this preflights the private `TCCAccessPreflight` SPI and returns
+/// a real `Granted`/`Denied`/`NotDetermined`. With the feature **off** (the
+/// default), it honestly returns `NotDetermined` — matching `insidegui/AudioCap`'s
+/// no-SPI build. Note the preflight is *advisory*: a `Granted` result does not
+/// guarantee non-silent capture (a terminal-launched or unbundled process is
+/// denied at runtime regardless of the TCC DB); the runtime silent-zeros guard
+/// (ADR-0016) is the authoritative backstop.
 pub fn check_audio_capture_permission() -> PermissionStatus {
-    #[cfg(target_os = "macos")]
+    #[cfg(all(target_os = "macos", feature = "macos-tcc-spi"))]
     {
-        // On macOS, Process Tap / per-application capture requires the Audio
-        // Capture TCC service (kTCCServiceAudioCapture). This is distinct from
-        // the Screen Recording service (kTCCServiceScreenCapture) that
-        // ScreenCaptureKit / CGWindowList use. Reporting NotDetermined until
-        // the OS prompt has been answered matches the behavior documented in
-        // `insidegui/AudioCap`. A future improvement can port AudioCap's
-        // `AudioRecordingPermission.swift` via the private AudioHardware
-        // preflight SPI.
+        // DAG note: this is the same documented core→audio deviation as the
+        // discovery calls elsewhere in this file (see the allowlist in
+        // scripts/check-module-dag.sh). ADR-0015.
+        crate::audio::macos::permission::audio_capture_permission()
+    }
+
+    #[cfg(all(target_os = "macos", not(feature = "macos-tcc-spi")))]
+    {
+        // Process Tap / per-application capture requires the Audio Capture TCC
+        // service (kTCCServiceAudioCapture), distinct from Screen Recording
+        // (kTCCServiceScreenCapture). Without the `macos-tcc-spi` feature we
+        // have no public way to query it, so we honestly report NotDetermined
+        // (matching `insidegui/AudioCap`'s no-SPI build). Enable `macos-tcc-spi`
+        // for a real preflight (ADR-0015).
         PermissionStatus::NotDetermined
     }
 

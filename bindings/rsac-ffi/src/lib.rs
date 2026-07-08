@@ -11,6 +11,17 @@
 //! - Functions taking `*const T` or `*mut T` borrow the handle; the caller retains ownership.
 //! - String pointers returned by `rsac_error_message()`, `rsac_device_name()`, etc.
 //!   are owned by this library and valid until the next call on the same thread.
+//!
+//! # Threading
+//!
+//! `rsac_capture_request_stop()` (and, on the compose surface,
+//! `rsac_composition_stop()`) is the **only** call that may overlap another
+//! in-flight call on the same handle — it exists to unblock a parked read, and
+//! it is still never safe against the handle's `_free()`. Every other pair of
+//! calls on **one** handle must not overlap from multiple threads; the caller
+//! provides external synchronization (e.g. `rsac_capture_start()` racing a
+//! parked `rsac_capture_read()` is a data race). Distinct handles are
+//! independent and need no coordination.
 
 #![allow(clippy::missing_safety_doc)]
 #![allow(non_camel_case_types)]
@@ -27,6 +38,12 @@ use std::ptr;
 // (they are constructed only at the FFI boundary), so import them explicitly.
 use rsac::prelude::*;
 use rsac::{ApplicationId, DeviceId, ProcessId};
+
+// Multi-source channel composition FFI (rsac_composition_* / rsac_group_*),
+// behind the `compose` feature (forwards to rsac/compose). Header declarations
+// are guarded by RSAC_FEATURE_COMPOSE — see cbindgen.toml [defines].
+#[cfg(feature = "compose")]
+pub mod compose;
 
 // ── Error codes ──────────────────────────────────────────────────────────
 
@@ -65,6 +82,13 @@ pub enum rsac_error_t {
 }
 
 /// Device kind for enumeration.
+///
+/// This is a **constants-only** type at the ABI boundary:
+/// [`rsac_default_device`] takes its `kind` parameter as a plain `int32_t`,
+/// never as this enum by value, because materializing an out-of-range integer
+/// as a fieldless Rust enum is immediate undefined behavior — before any
+/// range check could run (rsac-a273). Out-of-range values are rejected with
+/// `RSAC_ERROR_INVALID_PARAMETER` instead.
 #[repr(C)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum rsac_device_kind_t {
@@ -186,9 +210,12 @@ fn map_rsac_error(err: &rsac::AudioError) -> rsac_error_t {
     use rsac::AudioError;
     match err {
         AudioError::InvalidParameter { .. } => rsac_error_t::RSAC_ERROR_INVALID_PARAMETER,
-        AudioError::UnsupportedFormat { .. } | AudioError::ConfigurationError { .. } => {
-            rsac_error_t::RSAC_ERROR_CONFIGURATION
-        }
+        // UserConsentRequired is ErrorKind::Configuration in core and the
+        // header documents the missing-Android-projection-token preflight
+        // failure as RSAC_ERROR_CONFIGURATION — keep the C contract honest.
+        AudioError::UnsupportedFormat { .. }
+        | AudioError::ConfigurationError { .. }
+        | AudioError::UserConsentRequired { .. } => rsac_error_t::RSAC_ERROR_CONFIGURATION,
         AudioError::DeviceNotFound { .. }
         | AudioError::DeviceNotAvailable { .. }
         | AudioError::DeviceEnumerationError { .. } => rsac_error_t::RSAC_ERROR_DEVICE_NOT_FOUND,
@@ -569,6 +596,46 @@ pub unsafe extern "C" fn rsac_builder_set_target_str(
     })
 }
 
+/// Supplies the Android `MediaProjection` consent token (Android targets only).
+///
+/// `token` is the opaque `int64_t` handle produced by the rsac Android consent
+/// helper (a JNI `GlobalRef` to the `MediaProjection` — see
+/// `docs/MOBILE_BACKEND_DESIGN.md` and ADR-0013). On Android builds the value
+/// is stored on the builder; playback-capture targets without it fail
+/// `rsac_builder_build()` with `RSAC_ERROR_CONFIGURATION` once an Android
+/// backend advertises the capability. Microphone (`device:`) targets never
+/// need a token.
+///
+/// The symbol exists on every platform so the C ABI is uniform; on
+/// non-Android platforms the call is rejected with
+/// `RSAC_ERROR_PLATFORM_NOT_SUPPORTED`.
+#[no_mangle]
+pub unsafe extern "C" fn rsac_builder_set_android_projection(
+    builder: *mut RsacBuilder,
+    token: i64,
+) -> rsac_error_t {
+    catch(|| {
+        if builder.is_null() {
+            set_last_error("builder is null");
+            return rsac_error_t::RSAC_ERROR_NULL_POINTER;
+        }
+        #[cfg(target_os = "android")]
+        {
+            let b = unsafe { &mut *builder };
+            b.inner = b.inner.clone().with_android_projection(
+                rsac::core::config::AndroidProjectionToken::from_raw(token),
+            );
+            rsac_error_t::RSAC_OK
+        }
+        #[cfg(not(target_os = "android"))]
+        {
+            let _ = token;
+            set_last_error("rsac_builder_set_android_projection is only meaningful on Android");
+            rsac_error_t::RSAC_ERROR_PLATFORM_NOT_SUPPORTED
+        }
+    })
+}
+
 /// Sets the desired sample rate in Hz.
 #[no_mangle]
 pub unsafe extern "C" fn rsac_builder_set_sample_rate(
@@ -825,7 +892,21 @@ pub unsafe extern "C" fn rsac_capture_format(
 #[no_mangle]
 pub unsafe extern "C" fn rsac_capture_free(capture: *mut RsacCapture) {
     if !capture.is_null() {
-        let _ = unsafe { Box::from_raw(capture) };
+        // This teardown runs far more logic than the other frees: AudioCapture's
+        // Drop stops the stream and joins its worker threads. A panic unwinding
+        // out of an `extern "C"` fn is an abort, so guard the drop. The return
+        // is void — no error code to surface — so swallow and log (the
+        // SendCallback convention), plus set the thread-local message for
+        // callers that poll rsac_error_message(). Box's drop glue still
+        // deallocates the handle's memory when the value's drop panics, so
+        // nothing leaks.
+        let boxed = unsafe { Box::from_raw(capture) };
+        if panic::catch_unwind(AssertUnwindSafe(move || drop(boxed))).is_err() {
+            set_last_error("Rust panic caught in rsac_capture_free teardown");
+            log::error!(
+                "rsac FFI: rsac_capture_free teardown panicked; panic caught at FFI boundary"
+            );
+        }
     }
 }
 
@@ -1250,16 +1331,26 @@ pub unsafe extern "C" fn rsac_device_list_free(list: *mut RsacDeviceList) {
 ///
 /// On success, `*out` receives a device handle that must be freed with
 /// `rsac_device_free()`.
+///
+/// `kind` is one of the [`rsac_device_kind_t`] constants, accepted as a plain
+/// `int32_t` (C's implicit enum→int conversion keeps call sites
+/// source-compatible). Taking the raw integer rather than the enum by value
+/// is deliberate: an out-of-range integer materialized as a fieldless Rust
+/// enum at the ABI boundary would be undefined behavior before any check
+/// could run. Anything other than `RSAC_DEVICE_OUTPUT` — including
+/// out-of-range values — is rejected with `RSAC_ERROR_INVALID_PARAMETER`.
 #[no_mangle]
 pub unsafe extern "C" fn rsac_default_device(
     enumerator: *const RsacDeviceEnumerator,
-    kind: rsac_device_kind_t,
+    kind: i32,
     out: *mut *mut RsacDevice,
 ) -> rsac_error_t {
     // rsac is a loopback (output) capture library: only the default OUTPUT
     // device is meaningful. Rather than silently ignoring `kind` and returning
     // the output device for an INPUT request (a lying ABI), reject any non-
-    // output kind explicitly so callers get an honest error.
+    // output kind explicitly so callers get an honest error. The comparison is
+    // against the raw integer, so an out-of-range value from C lands on this
+    // same rejection path instead of instantiating an invalid enum (rsac-a273).
     catch(|| {
         if enumerator.is_null() {
             set_last_error("enumerator is null");
@@ -1269,7 +1360,7 @@ pub unsafe extern "C" fn rsac_default_device(
             set_last_error("out pointer is null");
             return rsac_error_t::RSAC_ERROR_NULL_POINTER;
         }
-        if kind != rsac_device_kind_t::RSAC_DEVICE_OUTPUT {
+        if kind != rsac_device_kind_t::RSAC_DEVICE_OUTPUT as i32 {
             set_last_error(
                 "rsac_default_device: only RSAC_DEVICE_OUTPUT is supported \
                  (rsac is a loopback capture library)",
@@ -1488,6 +1579,43 @@ pub unsafe extern "C" fn rsac_capabilities_supports_device_selection(
     }
 }
 
+/// Returns 1 if the backend can deliver device hot-plug / default-change
+/// notifications (the `DeviceEnumerator::watch` surface), 0 otherwise.
+/// Returns -1 if the handle is null.
+#[no_mangle]
+pub unsafe extern "C" fn rsac_capabilities_supports_device_change_notifications(
+    caps: *const RsacCapabilities,
+) -> i32 {
+    if caps.is_null() {
+        return -1;
+    }
+    let c = unsafe { &*caps };
+    if c.inner.supports_device_change_notifications {
+        1
+    } else {
+        0
+    }
+}
+
+/// Returns 1 if starting a capture requires a config-time user-consent
+/// artifact (mobile platforms — e.g. an Android `MediaProjection` token via
+/// `rsac_builder_set_android_projection()`), 0 otherwise. Always 0 on the
+/// desktop backends. Returns -1 if the handle is null.
+#[no_mangle]
+pub unsafe extern "C" fn rsac_capabilities_requires_user_consent(
+    caps: *const RsacCapabilities,
+) -> i32 {
+    if caps.is_null() {
+        return -1;
+    }
+    let c = unsafe { &*caps };
+    if c.inner.requires_user_consent {
+        1
+    } else {
+        0
+    }
+}
+
 /// Returns the maximum number of channels supported.
 /// Returns 0 if the handle is null.
 #[no_mangle]
@@ -1497,6 +1625,96 @@ pub unsafe extern "C" fn rsac_capabilities_max_channels(caps: *const RsacCapabil
     }
     let c = unsafe { &*caps };
     c.inner.max_channels
+}
+
+/// Returns the number of sample formats the backend supports.
+/// Returns 0 if the handle is null.
+#[no_mangle]
+pub unsafe extern "C" fn rsac_capabilities_supported_sample_format_count(
+    caps: *const RsacCapabilities,
+) -> usize {
+    if caps.is_null() {
+        return 0;
+    }
+    let c = unsafe { &*caps };
+    c.inner.supported_sample_formats.len()
+}
+
+/// Returns the supported sample format at `index` as one of the
+/// [`rsac_sample_format_t`] constants, carried as a plain `int32_t`
+/// (the same constants-as-int convention as [`rsac_default_device`]'s
+/// `kind` parameter). Valid indices are
+/// `0..rsac_capabilities_supported_sample_format_count()`.
+/// Returns -1 if the handle is null or `index` is out of bounds.
+#[no_mangle]
+pub unsafe extern "C" fn rsac_capabilities_supported_sample_format_at(
+    caps: *const RsacCapabilities,
+    index: usize,
+) -> i32 {
+    if caps.is_null() {
+        return -1;
+    }
+    let c = unsafe { &*caps };
+    match c.inner.supported_sample_formats.get(index) {
+        Some(&fmt) => rsac_sample_format_t::from(fmt) as i32,
+        None => -1,
+    }
+}
+
+/// Returns the minimum of the backend's device-negotiable sample-rate
+/// range, in Hz. Returns 0 if the handle is null.
+#[no_mangle]
+pub unsafe extern "C" fn rsac_capabilities_min_sample_rate(caps: *const RsacCapabilities) -> u32 {
+    if caps.is_null() {
+        return 0;
+    }
+    let c = unsafe { &*caps };
+    c.inner.sample_rate_range.0
+}
+
+/// Returns the maximum of the backend's device-negotiable sample-rate
+/// range, in Hz. Returns 0 if the handle is null.
+#[no_mangle]
+pub unsafe extern "C" fn rsac_capabilities_max_sample_rate(caps: *const RsacCapabilities) -> u32 {
+    if caps.is_null() {
+        return 0;
+    }
+    let c = unsafe { &*caps };
+    c.inner.sample_rate_range.1
+}
+
+/// Returns the number of entries in the builder's **config-time sample-rate
+/// whitelist** — the exact set `rsac_builder_set_sample_rate()` values are
+/// validated against at `rsac_builder_build()`. This is intentionally
+/// narrower than the device-negotiable range reported by
+/// `rsac_capabilities_min_sample_rate()` / `rsac_capabilities_max_sample_rate()`.
+/// Returns 0 if the handle is null.
+#[no_mangle]
+pub unsafe extern "C" fn rsac_capabilities_supported_sample_rate_count(
+    caps: *const RsacCapabilities,
+) -> usize {
+    if caps.is_null() {
+        return 0;
+    }
+    PlatformCapabilities::supported_sample_rates().len()
+}
+
+/// Returns the config-time whitelisted sample rate at `index`, in Hz. Valid
+/// indices are `0..rsac_capabilities_supported_sample_rate_count()`.
+/// Returns 0 if the handle is null or `index` is out of bounds (0 is never
+/// a valid sample rate).
+#[no_mangle]
+pub unsafe extern "C" fn rsac_capabilities_supported_sample_rate_at(
+    caps: *const RsacCapabilities,
+    index: usize,
+) -> u32 {
+    if caps.is_null() {
+        return 0;
+    }
+    PlatformCapabilities::supported_sample_rates()
+        .get(index)
+        .copied()
+        .unwrap_or(0)
 }
 
 thread_local! {
@@ -1584,6 +1802,41 @@ mod tests {
         // The unblock primitive must null-check like every other capture fn.
         let code = unsafe { rsac_capture_request_stop(ptr::null()) };
         assert_eq!(code, rsac_error_t::RSAC_ERROR_NULL_POINTER);
+    }
+
+    // ── default_device: kind validated as a raw integer (rsac-a273) ───────
+    //
+    // The kind check runs after the null checks but BEFORE the enumerator is
+    // dereferenced, so a dangling-but-non-null enumerator exercises it
+    // device-free (the same dangling-pointer pattern as the tests above).
+
+    #[test]
+    fn default_device_rejects_out_of_range_kind() {
+        let e = ptr::dangling::<RsacDeviceEnumerator>();
+        for bad in [-1, 2, 99, i32::MIN, i32::MAX] {
+            // Pre-poison `out` to prove the rejection path nulls it.
+            let mut out: *mut RsacDevice = ptr::dangling_mut::<RsacDevice>();
+            let code = unsafe { rsac_default_device(e, bad, &mut out) };
+            assert_eq!(
+                code,
+                rsac_error_t::RSAC_ERROR_INVALID_PARAMETER,
+                "kind {bad} must be rejected"
+            );
+            assert!(out.is_null());
+        }
+    }
+
+    #[test]
+    fn default_device_rejects_input_kind() {
+        // rsac is loopback-only: an INPUT request is an honest error, not a
+        // silent fallback to the output device.
+        let e = ptr::dangling::<RsacDeviceEnumerator>();
+        let mut out: *mut RsacDevice = ptr::dangling_mut::<RsacDevice>();
+        let code = unsafe {
+            rsac_default_device(e, rsac_device_kind_t::RSAC_DEVICE_INPUT as i32, &mut out)
+        };
+        assert_eq!(code, rsac_error_t::RSAC_ERROR_INVALID_PARAMETER);
+        assert!(out.is_null());
     }
 
     // ── Sample-format mapping round-trip ───────────────────────────────────
@@ -1701,6 +1954,29 @@ mod tests {
         unsafe { rsac_builder_free(builder) };
     }
 
+    // ── set_android_projection: null + off-platform contract (rsac-82d4) ──
+
+    #[test]
+    fn set_android_projection_rejects_null_builder() {
+        let code = unsafe { rsac_builder_set_android_projection(ptr::null_mut(), 42) };
+        assert_eq!(code, rsac_error_t::RSAC_ERROR_NULL_POINTER);
+    }
+
+    /// Off Android the symbol must exist (uniform C ABI) but honestly refuse:
+    /// the token is meaningless without the Android consent flow.
+    #[cfg(not(target_os = "android"))]
+    #[test]
+    fn set_android_projection_rejected_off_android() {
+        let mut builder: *mut RsacBuilder = ptr::null_mut();
+        assert_eq!(
+            unsafe { rsac_builder_new(&mut builder) },
+            rsac_error_t::RSAC_OK
+        );
+        let code = unsafe { rsac_builder_set_android_projection(builder, 42) };
+        assert_eq!(code, rsac_error_t::RSAC_ERROR_PLATFORM_NOT_SUPPORTED);
+        unsafe { rsac_builder_free(builder) };
+    }
+
     // ── AudioBuffer metering accessors: null + synthetic-signal values ─────
 
     #[test]
@@ -1761,5 +2037,124 @@ mod tests {
         assert_eq!(c_stats.uptime_secs, 0.0);
         assert_eq!(c_stats.dropped_ratio, 0.0);
         assert_eq!(c_stats.is_running, 0);
+    }
+
+    // ── Capability parity accessors (rsac-a9af) ───────────────────────────
+    //
+    // Capabilities are a static, device-free query (PlatformCapabilities is
+    // derived from the target OS + enabled feature, no audio hardware is
+    // touched), so unlike captures these CAN be exercised end-to-end in CI.
+
+    #[test]
+    fn capabilities_new_accessors_reject_null() {
+        assert_eq!(
+            unsafe { rsac_capabilities_supports_device_change_notifications(ptr::null()) },
+            -1
+        );
+        assert_eq!(
+            unsafe { rsac_capabilities_supported_sample_format_count(ptr::null()) },
+            0
+        );
+        assert_eq!(
+            unsafe { rsac_capabilities_supported_sample_format_at(ptr::null(), 0) },
+            -1
+        );
+        assert_eq!(unsafe { rsac_capabilities_min_sample_rate(ptr::null()) }, 0);
+        assert_eq!(unsafe { rsac_capabilities_max_sample_rate(ptr::null()) }, 0);
+        assert_eq!(
+            unsafe { rsac_capabilities_supported_sample_rate_count(ptr::null()) },
+            0
+        );
+        assert_eq!(
+            unsafe { rsac_capabilities_supported_sample_rate_at(ptr::null(), 0) },
+            0
+        );
+    }
+
+    #[test]
+    fn capabilities_new_accessors_round_trip_query() {
+        let rust_caps = PlatformCapabilities::query();
+
+        let mut caps: *mut RsacCapabilities = ptr::null_mut();
+        assert_eq!(
+            unsafe { rsac_capabilities_query(&mut caps) },
+            rsac_error_t::RSAC_OK
+        );
+        assert!(!caps.is_null());
+
+        assert_eq!(
+            unsafe { rsac_capabilities_supports_device_change_notifications(caps) },
+            i32::from(rust_caps.supports_device_change_notifications)
+        );
+        assert_eq!(
+            unsafe { rsac_capabilities_min_sample_rate(caps) },
+            rust_caps.sample_rate_range.0
+        );
+        assert_eq!(
+            unsafe { rsac_capabilities_max_sample_rate(caps) },
+            rust_caps.sample_rate_range.1
+        );
+
+        unsafe { rsac_capabilities_free(caps) };
+    }
+
+    #[test]
+    fn capabilities_sample_format_list_round_trips() {
+        let rust_caps = PlatformCapabilities::query();
+
+        let mut caps: *mut RsacCapabilities = ptr::null_mut();
+        assert_eq!(
+            unsafe { rsac_capabilities_query(&mut caps) },
+            rsac_error_t::RSAC_OK
+        );
+        assert!(!caps.is_null());
+
+        let count = unsafe { rsac_capabilities_supported_sample_format_count(caps) };
+        assert_eq!(count, rust_caps.supported_sample_formats.len());
+        for (i, &fmt) in rust_caps.supported_sample_formats.iter().enumerate() {
+            assert_eq!(
+                unsafe { rsac_capabilities_supported_sample_format_at(caps, i) },
+                rsac_sample_format_t::from(fmt) as i32,
+                "format index {i} must round-trip through the C constant"
+            );
+        }
+        // One past the end is out of bounds → the -1 sentinel, not UB.
+        assert_eq!(
+            unsafe { rsac_capabilities_supported_sample_format_at(caps, count) },
+            -1
+        );
+
+        unsafe { rsac_capabilities_free(caps) };
+    }
+
+    #[test]
+    fn capabilities_sample_rate_whitelist_matches_const() {
+        let mut caps: *mut RsacCapabilities = ptr::null_mut();
+        assert_eq!(
+            unsafe { rsac_capabilities_query(&mut caps) },
+            rsac_error_t::RSAC_OK
+        );
+        assert!(!caps.is_null());
+
+        // The whitelist is single-sourced from the builder's config-time
+        // contract (PlatformCapabilities::SUPPORTED_SAMPLE_RATES) — the C view
+        // must be the same list, in the same order.
+        let whitelist = PlatformCapabilities::supported_sample_rates();
+        let count = unsafe { rsac_capabilities_supported_sample_rate_count(caps) };
+        assert_eq!(count, whitelist.len());
+        for (i, &rate) in whitelist.iter().enumerate() {
+            assert_eq!(
+                unsafe { rsac_capabilities_supported_sample_rate_at(caps, i) },
+                rate,
+                "whitelist index {i} must match the builder's const"
+            );
+        }
+        // Out of bounds → 0 (never a valid sample rate).
+        assert_eq!(
+            unsafe { rsac_capabilities_supported_sample_rate_at(caps, count) },
+            0
+        );
+
+        unsafe { rsac_capabilities_free(caps) };
     }
 }

@@ -32,7 +32,9 @@
 //! ```
 
 // ── Capture lifecycle: the builder/handle facade ───────────────────────────
-pub use crate::api::{AudioCapture, AudioCaptureBuilder, RunningCapture};
+pub use crate::api::{
+    AudioBufferIterator, AudioCapture, AudioCaptureBuilder, DrainHandle, RunningCapture,
+};
 
 // The `capture!` one-line builder macro. `#[macro_export]` places it at the
 // crate root; re-exporting it here makes `use rsac::prelude::*;` bring it into
@@ -65,3 +67,7 @@ pub use crate::sink::WavFileSink;
 // ── Async stream support (feature-gated, mirrors the crate root) ───────────
 #[cfg(feature = "async-stream")]
 pub use crate::bridge::AsyncAudioStream;
+
+// ── Multi-source channel composition (feature-gated; ADR-0011) ─────────────
+#[cfg(feature = "compose")]
+pub use crate::compose::{ChannelMap, Composition, CompositionBuilder, Group, GroupLayout};

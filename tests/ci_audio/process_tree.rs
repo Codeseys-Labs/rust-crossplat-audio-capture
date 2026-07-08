@@ -25,8 +25,8 @@
 use std::time::Duration;
 
 use rsac::{
-    list_audio_applications, list_audio_sources, AudioCaptureBuilder, AudioSourceKind,
-    CaptureTarget, PlatformCapabilities, ProcessId,
+    list_audio_applications, list_audio_sources, ApplicationId, AudioCaptureBuilder,
+    AudioSourceKind, CaptureTarget, PlatformCapabilities, ProcessId,
 };
 
 use crate::helpers;
@@ -107,11 +107,16 @@ fn capabilities_match_builder_acceptance() {
 
 /// `list_audio_sources()` always includes at least the system default,
 /// and every `AudioSourceKind::Application` entry must round-trip
-/// cleanly through `to_capture_target()` to a `ProcessTree` variant
-/// with the same PID. This is the contract the Tauri app relies on
-/// when building its "application capture" dropdown.
+/// cleanly through `to_capture_target()` to an `Application` variant
+/// carrying the same PID (as the `ApplicationId` string). Single-app
+/// capture — NOT the over-broad `ProcessTree` — is the deliberate
+/// mapping since #27 (see the L17 note on `AudioSource::to_capture_target`
+/// and its unit test in `src/core/introspection.rs`). This is the
+/// contract the Tauri app relies on for its "application capture"
+/// dropdown; callers that want the whole subtree use
+/// `CaptureTarget::pid()` explicitly.
 #[test]
-fn list_audio_sources_applications_roundtrip_to_process_tree() {
+fn list_audio_sources_applications_roundtrip_to_application() {
     require_audio!();
 
     let sources = match list_audio_sources() {
@@ -145,10 +150,11 @@ fn list_audio_sources_applications_roundtrip_to_process_tree() {
         match (&src.kind, src.to_capture_target()) {
             (
                 AudioSourceKind::Application { pid, .. },
-                CaptureTarget::ProcessTree(ProcessId(tp)),
+                CaptureTarget::Application(ApplicationId(id)),
             ) => {
                 assert_eq!(
-                    *pid, tp,
+                    pid.to_string(),
+                    id,
                     "to_capture_target() must preserve PID from Application kind"
                 );
             }
@@ -161,7 +167,7 @@ fn list_audio_sources_applications_roundtrip_to_process_tree() {
     }
 
     eprintln!(
-        "[ci_audio] ✅ all {} application entries round-trip to ProcessTree",
+        "[ci_audio] ✅ all {} application entries round-trip to Application",
         app_sources.len()
     );
 }

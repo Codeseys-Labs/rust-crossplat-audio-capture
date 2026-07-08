@@ -12,7 +12,7 @@ dependencies only ever point *down* this chain — no layer reaches back up into
 layer above it:
 
 ```
-core/  →  bridge/  →  audio/ (platform backends)  →  api/
+core/  →  bridge/  →  audio/ (platform backends)  →  api/  →  compose/ (opt-in)
                                                        ↘
                                                         sink/
 ```
@@ -24,6 +24,7 @@ core/  →  bridge/  →  audio/ (platform backends)  →  api/
 | **audio** | [`rsac::audio`](../src/audio/mod.rs) | Per-OS backends: WASAPI on Windows, PipeWire on Linux, CoreAudio Process Tap on macOS. Each implements the internal `PlatformStream` trait and plugs into `BridgeStream<S>`. Also hosts the per-OS `DeviceEnumerator` implementations and native device/application enumeration. |
 | **api** | [`rsac::api`](../src/api.rs) | Public facade: `AudioCaptureBuilder` → `AudioCapture`, whose lifecycle is driven by its `start()`/`stop()` methods (plus the `RunningCapture` RAII guard returned by the builder's own `AudioCaptureBuilder::start()` convenience method, which builds, starts, and stops on `Drop`). This is the primary entry point library consumers need. |
 | **sink** | [`rsac::sink`](../src/sink/mod.rs) | Optional downstream adapters: `NullSink`, `ChannelSink`, `WavFileSink` (behind `sink-wav`). |
+| **compose** | [`rsac::compose`](../src/compose/mod.rs) | Opt-in (`compose` feature, [ADR-0011](designs/0011-compose-feature.md)) multi-source channel composition: `CompositionBuilder` → `Composition`. Owns N inner `AudioCapture`s, aligns them on a dedicated compositor thread (master-clock pacing, silence-pad/trim, `rubato` resampling to the session rate), mixes groups to Mono/Stereo or passes native channels through, and delivers one interleaved multi-channel stream through the same `BridgeStream` ring + `CapturingStream` contract as a single capture. Top of the DAG: it consumes `api`, `bridge`, and `core`; nothing may import it. |
 
 The DAG ordering is also asserted in the crate root docs ([`src/lib.rs`](../src/lib.rs))
 and enforced by convention in [`AGENTS.md`](../AGENTS.md).
@@ -127,8 +128,8 @@ Created ──▶ Running ──▶ Stopping ──▶ Stopped ──▶ Closed
 |---|---|---|
 | `SystemDefault` | System output (loopback of default sink) | OS default output enumerator |
 | `Device(DeviceId)` | One specific input or loopback device | Device enumerator (per-backend) |
-| `Application(ApplicationId)` | One application session | Backend-native session ID |
-| `ApplicationByName(String)` | First app whose name substring-matches (case-insensitive) | `sysinfo` PID lookup (Win/macOS) or `pw-dump` node serial (Linux) |
+| `Application(ApplicationId)` | One application process | Numeric PID string, resolved by the backend |
+| `ApplicationByName(String)` | First app whose name matches exactly (case-insensitive) | Exact process/app-name lookup, then backend PID resolution |
 | `ProcessTree(ProcessId)` | A parent process and its descendants | Platform-native process loopback / Process Tap with tree bit |
 
 The same enum compiles on every platform. When a variant is not supported
@@ -168,10 +169,10 @@ want to gate features should call
 - `SystemDefault` attaches a monitor stream to the default sink node.
 - `Device(DeviceId)` targets a sink node by its `object.serial`.
 - `Application` / `ApplicationByName` shell out to `pw-dump`, match on
-  `application.process.id` or `application.name`, and attach to that node.
+  `application.process.id` for PID strings or exact case-insensitive
+  `application.name` / `application.process.binary`, and attach to that node.
 - `ProcessTree(pid)` walks the tree with `sysinfo` and maps each PID to a
-  PipeWire node. See the helpers in `tests/ci_audio/helpers.rs` for the
-  exact `pw-dump` parsing logic used in CI.
+  PipeWire node using the same `pw-dump` metadata resolver.
 - Build-time requires `libpipewire-0.3-dev`, `libspa-0.2-dev`,
   `pkg-config`, `clang`/`libclang-dev`, `llvm-dev`. Runtime requires
   PipeWire 0.3.44+ with the user-session daemon running.

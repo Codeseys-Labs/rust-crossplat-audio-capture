@@ -100,6 +100,8 @@ tests/ci_audio/
 ├── process_tree_capture.rs    # end-to-end tree capture
 ├── multi_source.rs            # two AudioCapture instances in one process
 ├── stream_lifecycle.rs        # Created → Running → Stopping → Stopped
+├── lifecycle_terminal.rs      # request_stop() + terminal read (StreamEnded)
+├── overrun.rs                 # G8 ring-buffer overflow (overrun_count)
 ├── subscribe.rs               # mpsc subscription contract
 └── platform_caps.rs           # PlatformCapabilities::query sanity
 ```
@@ -118,16 +120,27 @@ centralised in `helpers.rs` so the tests themselves stay portable.
   because Blacksmith Firecracker microVMs lack a D-Bus user session
   (`systemctl --user` will not start them).
 - `pactl load-module module-null-sink` creates a virtual sink.
-- `pw-play` (or `paplay`) streams a 440 Hz float WAV tone.
+- **Routing gate** (`scripts/ci-linux-audio-route.sh`, rsac-b106/rsac-6efb):
+  pins `ci_test_sink` as the default sink (pactl → pw-metadata → wpctl
+  ladder; single-sink fallback is accepted), then proves the route
+  end-to-end at the OS level — `pw-play` a 440 Hz tone with default
+  routing, `parecord` the sink monitor, assert RMS + rough frequency with
+  sox. A broken route **fails the job at setup**; a proven route exports
+  `RSAC_CI_AUDIO_DETERMINISTIC=1` and `PULSE_SINK=ci_test_sink`.
+- `pw-play` (or `paplay`, pinned via `PULSE_SINK`) streams a 440 Hz float
+  WAV tone during the tests.
 
 ### Windows — `windows-system` / `windows-device` / `windows-process`
 
 - `windows-latest` runner.
 - [`LABSN/sound-ci-helpers@v1`](https://github.com/LABSN/sound-ci-helpers)
   installs the VB-CABLE virtual-cable driver.
-- `AudioDeviceCmdlets` + `Set-AudioDevice -DefaultOnly` sets VB-CABLE
-  as the default playback endpoint; a gating step verifies this and
-  exits 1 otherwise.
+- **Endpoint gate** (`scripts/ci-windows-audio-default.ps1`, rsac-0f33,
+  shared by all three tiers): sets VB-CABLE as the default playback
+  endpoint via `AudioDeviceCmdlets` (bounded retries), **hard-verifies**
+  the active default, then exports `RSAC_CI_AUDIO_DETERMINISTIC=1` — every
+  tier's tone route flows through that verified endpoint (system loopback,
+  `default_device()` capture, process loopback of the test player).
 - Test tones use a **PCM16 sibling WAV** + `SoundPlayer.PlayLooping()`:
   `System.Media.SoundPlayer` silently drops `WAVE_FORMAT_IEEE_FLOAT`
   frames on the runner's default endpoint (rsac#24), so we convert to
@@ -137,11 +150,14 @@ centralised in `helpers.rs` so the tests themselves stay portable.
 ### macOS — `macos-system` / `macos-device` / `macos-process`
 
 - `blacksmith-6vcpu-macos-15` runner.
-- BlackHole 2ch is installed via Homebrew for the device-path tests.
-- `SwitchAudioSource` is installed to set BlackHole as default
-  output for a few test paths (not currently sufficient — see the
-  AUHAL hang above).
-- All Process Tap paths skip early via `require_*_capture!()`.
+- BlackHole 2ch is installed via Homebrew as a *future hook* for a
+  non-TCC "BlackHole-as-input" capture path; the current build does not
+  yet wire it to switch the default output, so it does not (by itself)
+  make any capture path deterministic. `coreutils` is installed for
+  `gtimeout`.
+- All Process Tap paths (System / Application / ProcessTree) skip early
+  via `require_*_capture!()` because `kTCCServiceAudioCapture` cannot be
+  granted on a managed runner.
 - Step-level `gtimeout --preserve-status 120` bounds the
   device-path wasted budget.
 
@@ -150,6 +166,15 @@ centralised in `helpers.rs` so the tests themselves stay portable.
 - `RSAC_CI_AUDIO_AVAILABLE=1` — set by the workflow once the audio
   stack is up; makes `audio_infrastructure_available()` fast-path to
   `true`. Unset on non-audio jobs.
+- `RSAC_CI_AUDIO_DETERMINISTIC=1` — flips the capture tests' soft
+  non-silence warnings into **hard assertions**. Set in CI where audio
+  routing is deterministic: all three Windows tiers (via the verified
+  VB-CABLE endpoint gate, `scripts/ci-windows-audio-default.ps1` —
+  rsac-0f33), and all three Linux tiers after the routing gate
+  (`scripts/ci-linux-audio-route.sh`) proves the virtual-sink route
+  end-to-end (seeds rsac-6efb / rsac-b106). On a local machine with
+  real, working audio this is exactly what you want: export it to make
+  a silent capture fail loudly instead of warn.
 - `RSAC_CI_MACOS_TCC_GRANTED=1` — set only on self-hosted macOS
   runners where Audio Capture has been granted. Unset on Blacksmith
   and GH-hosted macOS.

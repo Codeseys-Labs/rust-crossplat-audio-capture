@@ -31,12 +31,24 @@ use std::fmt;
 /// grow in a way that silently breaks exhaustive matches.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum ErrorKind {
+    /// Invalid or unsupported capture configuration (bad parameter values,
+    /// unsupported formats).
     Configuration,
+    /// Audio device problems: not found, unavailable, or enumeration failure.
     Device,
+    /// Stream lifecycle and data-flow failures: create/start/stop errors,
+    /// read errors, end-of-stream, and ring-buffer over/underruns.
     Stream,
+    /// Platform backend (WASAPI, PipeWire, CoreAudio) operation or
+    /// initialization failures.
     Backend,
+    /// Application-capture failures: target app not found or its audio
+    /// session could not be captured.
     Application,
+    /// Platform-level constraints: unsupported features on the current OS or
+    /// permission denials.
     Platform,
+    /// Internal invariant violations, unexpected errors, and timeouts.
     Internal,
 }
 
@@ -117,7 +129,7 @@ impl fmt::Display for BackendContext {
 
 /// Represents all errors that can occur during audio operations.
 ///
-/// Organized into 7 categories with 22 total variants.
+/// Organized into 7 categories with 23 total variants.
 /// Each variant carries structured context for diagnostics.
 ///
 /// # Stability
@@ -137,90 +149,190 @@ impl fmt::Display for BackendContext {
 pub enum AudioError {
     // ── Configuration errors ─────────────────────────────────────────
     /// A parameter value is invalid.
-    InvalidParameter { param: String, reason: String },
+    InvalidParameter {
+        /// Name of the offending parameter (e.g. `"sample_rate"`).
+        param: String,
+        /// Why the value was rejected.
+        reason: String,
+    },
     /// The requested audio format is not supported.
     UnsupportedFormat {
+        /// Human-readable description of the rejected format.
         format: String,
+        /// OS-level backend context, when the rejection came from a backend.
         context: Option<BackendContext>,
     },
     /// A general configuration error.
-    ConfigurationError { message: String },
+    ConfigurationError {
+        /// Description of the configuration problem.
+        message: String,
+    },
+    /// A required user-consent artifact is missing from the capture
+    /// configuration.
+    ///
+    /// Mobile platforms gate capture behind an explicit user-consent flow that
+    /// produces an artifact the builder must receive **before** `build()` —
+    /// e.g. Android's `MediaProjection` token (supplied via
+    /// `AudioCaptureBuilder::with_android_projection`, Android targets only)
+    /// or an embedded iOS broadcast extension + App Group. Returned by the
+    /// `build()`/`preflight()` step, before any OS resource is touched
+    /// (ADR-0013, `docs/MOBILE_BACKEND_DESIGN.md`).
+    ///
+    /// Distinct from [`PermissionDenied`](AudioError::PermissionDenied), which
+    /// is the OS *rejecting* an attempted operation at runtime: this variant
+    /// means the consent artifact was never supplied to the configuration at
+    /// all, so nothing was even attempted. Classified as a configuration
+    /// error ([`ErrorKind::Configuration`], `Fatal`) — fix the builder call,
+    /// don't retry.
+    UserConsentRequired {
+        /// The capture facility that requires consent
+        /// (e.g. `"Android playback capture"`).
+        feature: String,
+        /// The concrete missing artifact and how to supply it (e.g.
+        /// `"MediaProjection token — obtain one via the rsac consent helper
+        /// and pass it to AudioCaptureBuilder::with_android_projection()"`).
+        missing: String,
+    },
 
     // ── Device errors ────────────────────────────────────────────────
     /// The requested device was not found.
-    DeviceNotFound { device_id: String },
+    DeviceNotFound {
+        /// Identifier of the device that could not be located.
+        device_id: String,
+    },
     /// The device exists but is not currently available.
-    DeviceNotAvailable { device_id: String, reason: String },
+    DeviceNotAvailable {
+        /// Identifier of the unavailable device.
+        device_id: String,
+        /// Why the device is unavailable (e.g. disconnected, in exclusive use).
+        reason: String,
+    },
     /// Failed to enumerate audio devices.
     DeviceEnumerationError {
+        /// Why enumeration failed.
         reason: String,
+        /// OS-level backend context, when one is available.
         context: Option<BackendContext>,
     },
 
     // ── Stream errors ────────────────────────────────────────────────
     /// Failed to create an audio stream.
     StreamCreationFailed {
+        /// Why stream creation failed.
         reason: String,
+        /// OS-level backend context, when one is available.
         context: Option<BackendContext>,
     },
     /// Failed to start an audio stream.
-    StreamStartFailed { reason: String },
+    StreamStartFailed {
+        /// Why the stream could not be started.
+        reason: String,
+    },
     /// Failed to stop an audio stream.
-    StreamStopFailed { reason: String },
+    StreamStopFailed {
+        /// Why the stream could not be stopped.
+        reason: String,
+    },
     /// An error occurred while reading audio data from a stream.
     ///
     /// This is a **transient/recoverable** read failure (e.g. a momentary
     /// internal hiccup) — NOT end-of-stream. When a read fails because the
     /// stream has reached a terminal state, [`StreamEnded`](AudioError::StreamEnded)
     /// is returned instead, so callers can distinguish "retry" from "done".
-    StreamReadError { reason: String },
+    StreamReadError {
+        /// Why the read failed.
+        reason: String,
+    },
     /// The stream has ended: a read was attempted on a stream that has reached
     /// a terminal state (Stopped / Closed / Error). This is **fatal** for the
     /// read loop — the stream will produce no more data and should not be
     /// retried. Distinct from the recoverable [`StreamReadError`](AudioError::StreamReadError).
-    StreamEnded { reason: String },
+    StreamEnded {
+        /// Which terminal state ended the stream and why.
+        reason: String,
+    },
     /// The ring buffer overflowed — audio frames were dropped.
-    BufferOverrun { dropped_frames: usize },
+    BufferOverrun {
+        /// Number of frames dropped because the consumer fell behind.
+        dropped_frames: usize,
+    },
     /// The ring buffer underran — not enough data was available.
-    BufferUnderrun { requested: usize, available: usize },
+    BufferUnderrun {
+        /// Number of frames the caller asked for.
+        requested: usize,
+        /// Number of frames actually available.
+        available: usize,
+    },
 
     // ── Backend errors ───────────────────────────────────────────────
     /// A platform-specific backend operation failed.
     BackendError {
+        /// Backend name (e.g. `"WASAPI"`, `"PipeWire"`, `"CoreAudio"`).
         backend: String,
+        /// The backend operation that failed (e.g. `"IAudioClient::Initialize"`).
         operation: String,
+        /// Human-readable failure description.
         message: String,
+        /// OS-level backend context, when one is available.
         context: Option<BackendContext>,
     },
     /// The requested backend is not available on this system.
-    BackendNotAvailable { backend: String },
+    BackendNotAvailable {
+        /// Name of the missing backend.
+        backend: String,
+    },
     /// The backend failed to initialize.
-    BackendInitializationFailed { backend: String, reason: String },
+    BackendInitializationFailed {
+        /// Name of the backend that failed to initialize.
+        backend: String,
+        /// Why initialization failed.
+        reason: String,
+    },
 
     // ── Application capture errors ───────────────────────────────────
     /// The target application for capture was not found.
-    ApplicationNotFound { identifier: String },
+    ApplicationNotFound {
+        /// The identifier used to look up the application (PID, name, or
+        /// node id, depending on the [`CaptureTarget`](crate::core::config::CaptureTarget) variant).
+        identifier: String,
+    },
     /// Capturing audio from the target application failed.
-    ApplicationCaptureFailed { app_id: String, reason: String },
+    ApplicationCaptureFailed {
+        /// Identifier of the application whose capture failed.
+        app_id: String,
+        /// Why the capture failed.
+        reason: String,
+    },
 
     // ── Platform errors ──────────────────────────────────────────────
     /// The requested feature is not supported on this platform.
-    PlatformNotSupported { feature: String, platform: String },
+    PlatformNotSupported {
+        /// The unsupported feature (e.g. `"process tree capture"`).
+        feature: String,
+        /// The current platform name (e.g. `"linux"`).
+        platform: String,
+    },
     /// The operation was denied due to insufficient permissions.
     PermissionDenied {
+        /// The operation that was denied.
         operation: String,
+        /// Additional platform-specific detail (e.g. which permission to grant).
         details: Option<String>,
     },
 
     // ── Internal errors ──────────────────────────────────────────────
     /// An internal or unexpected error.
     InternalError {
+        /// Description of the internal failure.
         message: String,
+        /// The underlying error that caused this failure, when one exists.
         source: Option<Box<dyn std::error::Error + Send + Sync>>,
     },
     /// An operation timed out.
     Timeout {
+        /// The operation that timed out.
         operation: String,
+        /// How long the operation ran before timing out.
         duration: std::time::Duration,
     },
 }
@@ -233,7 +345,8 @@ impl AudioError {
         match self {
             AudioError::InvalidParameter { .. }
             | AudioError::UnsupportedFormat { .. }
-            | AudioError::ConfigurationError { .. } => ErrorKind::Configuration,
+            | AudioError::ConfigurationError { .. }
+            | AudioError::UserConsentRequired { .. } => ErrorKind::Configuration,
 
             AudioError::DeviceNotFound { .. }
             | AudioError::DeviceNotAvailable { .. }
@@ -286,6 +399,7 @@ impl AudioError {
             AudioError::InvalidParameter { .. }
             | AudioError::UnsupportedFormat { .. }
             | AudioError::ConfigurationError { .. }
+            | AudioError::UserConsentRequired { .. }
             | AudioError::DeviceNotFound { .. }
             | AudioError::DeviceEnumerationError { .. }
             | AudioError::StreamCreationFailed { .. }
@@ -369,6 +483,13 @@ impl AudioError {
             AudioError::ConfigurationError { message } => (
                 format!("The capture configuration is invalid: {message}."),
                 Some("Review your AudioCaptureBuilder settings and rebuild.".to_string()),
+            ),
+            AudioError::UserConsentRequired { feature, missing } => (
+                format!("'{feature}' requires a user-consent grant that was not provided."),
+                Some(format!(
+                    "Missing: {missing}. Run the platform's consent flow first and pass the \
+                     resulting artifact to the builder before calling build()."
+                )),
             ),
 
             // ── Device ───────────────────────────────────────────────────
@@ -597,6 +718,13 @@ impl fmt::Display for AudioError {
             AudioError::ConfigurationError { message } => {
                 write!(f, "Configuration error: {}", message)
             }
+            AudioError::UserConsentRequired { feature, missing } => {
+                write!(
+                    f,
+                    "User consent required for '{}': missing {}",
+                    feature, missing
+                )
+            }
 
             // Device
             AudioError::DeviceNotFound { device_id } => {
@@ -800,6 +928,10 @@ mod tests {
             AudioError::ConfigurationError {
                 message: "bad config".into(),
             },
+            AudioError::UserConsentRequired {
+                feature: "Android playback capture".into(),
+                missing: "MediaProjection token".into(),
+            },
             AudioError::DeviceNotFound {
                 device_id: "hw:0".into(),
             },
@@ -876,8 +1008,9 @@ mod tests {
     #[test]
     fn all_variants_constructible() {
         let variants = make_all_variants();
-        // 22 variants since ADR-0003 added StreamEnded (was 21).
-        assert_eq!(variants.len(), 22, "Must have exactly 22 variants");
+        // 23 variants since UserConsentRequired joined for the mobile consent
+        // preflight (rsac-82d4; was 22 since ADR-0003 added StreamEnded).
+        assert_eq!(variants.len(), 23, "Must have exactly 23 variants");
     }
 
     // ── ErrorKind: Configuration ─────────────────────────────────────
@@ -903,6 +1036,14 @@ mod tests {
         assert_eq!(
             AudioError::ConfigurationError {
                 message: "x".into()
+            }
+            .kind(),
+            ErrorKind::Configuration
+        );
+        assert_eq!(
+            AudioError::UserConsentRequired {
+                feature: "x".into(),
+                missing: "y".into()
             }
             .kind(),
             ErrorKind::Configuration
@@ -1164,6 +1305,10 @@ mod tests {
             },
             AudioError::ConfigurationError {
                 message: "x".into(),
+            },
+            AudioError::UserConsentRequired {
+                feature: "x".into(),
+                missing: "y".into(),
             },
             AudioError::DeviceNotFound {
                 device_id: "x".into(),

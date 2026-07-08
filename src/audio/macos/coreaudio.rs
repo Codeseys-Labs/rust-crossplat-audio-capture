@@ -837,12 +837,28 @@ const fn device_alive_address() -> AudioObjectPropertyAddress {
 /// [`WatchListenerContext`], it is **intentionally leaked** (`Box::into_raw`,
 /// never reclaimed on the success path) because CoreAudio gives no barrier that
 /// an in-flight proc has finished when its listener is removed — so a late deref
-/// must stay sound. The leak is one tiny struct (an `AudioObjectID` + an
-/// `Arc<BridgeShared>` clone) per capture stream, reclaimed only on the
-/// registration-failure path where no proc can be in flight.
+/// must stay sound. The leak is one tiny struct (an `AudioObjectID`, an
+/// `Arc<BridgeShared>` clone, and an `AtomicBool`) per capture stream, reclaimed
+/// only on the registration-failure path where no proc can be in flight.
+///
+/// # Teardown race guard (rsac-ead3-teardown)
+///
+/// The `tearing_down` flag closes a race between an app-driven teardown and the
+/// death-watch proc. Without it, if the captured device dies *exactly* as the
+/// stream is being stopped/dropped, an in-flight or late proc could
+/// `force_set(Error)` on the shared bridge state — and because terminal `Error`
+/// is sticky and outranks the graceful `Stopping` that `stop_audio_unit` sets,
+/// an *intentional* teardown would be misreported to a reader as a Fatal
+/// `StreamEnded` (device death) rather than a clean stop. Teardown sets
+/// `tearing_down = true` (Release) **before** removing the listener; the proc
+/// checks it (Acquire) and no-ops when set, so a spontaneous death that races an
+/// explicit stop resolves in favor of the explicit stop.
 pub(crate) struct DeviceAliveContext {
     device_id: AudioObjectID,
     terminal: std::sync::Arc<crate::bridge::ring_buffer::BridgeShared>,
+    /// Set true by teardown before listener removal; the proc no-ops when set so
+    /// an intentional stop/Drop is not misreported as a spontaneous device death.
+    tearing_down: std::sync::atomic::AtomicBool,
 }
 
 /// CoreAudio listener proc for `kAudioDevicePropertyDeviceIsAlive`. Runs on a
@@ -863,6 +879,18 @@ unsafe extern "C" fn device_alive_listener_proc(
         return 0;
     }
     let context = unsafe { &*(client_data as *const DeviceAliveContext) };
+
+    // Teardown race guard (rsac-ead3-teardown): if an explicit stop/Drop is in
+    // progress, do NOT poison the stream to the Fatal Error state — the
+    // graceful `stop_audio_unit` transition owns the teardown. A device death
+    // that races an intentional stop should resolve as a clean stop, not a
+    // spontaneous-death StreamEnded.
+    if context
+        .tearing_down
+        .load(std::sync::atomic::Ordering::Acquire)
+    {
+        return 0;
+    }
 
     // Read the current IsAlive value. If the device is gone the read may fail;
     // a failed read on a death notification is itself treated as "dead".
@@ -912,6 +940,7 @@ pub(crate) fn register_device_alive_listener(
     let context_ptr: *mut DeviceAliveContext = Box::into_raw(Box::new(DeviceAliveContext {
         device_id,
         terminal,
+        tearing_down: std::sync::atomic::AtomicBool::new(false),
     }));
     let address = device_alive_address();
     let status = unsafe {
@@ -944,13 +973,33 @@ pub(crate) fn register_device_alive_listener(
 /// NOT freed** (it was leaked at registration for exactly this reason). Called
 /// at stream teardown.
 ///
+/// Teardown race guard (rsac-ead3-teardown): this sets the context's
+/// `tearing_down` flag (Release) **before** calling
+/// `AudioObjectRemovePropertyListener`, so an in-flight or late proc observes
+/// the flag (Acquire) and no-ops instead of poisoning the stream to Fatal
+/// `Error`. This ensures an app-driven stop/Drop that races a spontaneous
+/// device death is reported to a reader as a clean stop, not a device-death
+/// `StreamEnded`.
+///
 /// # Safety
 /// `context_ptr` must be a value returned by [`register_device_alive_listener`]
-/// (i.e. from `Box::into_raw`) for the same `device_id`.
+/// (i.e. from `Box::into_raw`) for the same `device_id`, and must still point at
+/// the intentionally-leaked (never-freed) context.
 pub(crate) unsafe fn remove_device_alive_listener(
     device_id: AudioObjectID,
     context_ptr: *mut DeviceAliveContext,
 ) {
+    // Signal the death-watch proc to stand down BEFORE removing the listener, so
+    // a proc that fires during/after removal (CoreAudio offers no in-flight
+    // barrier) sees the flag and no-ops rather than racing the graceful stop.
+    // SAFETY: `context_ptr` addresses the leaked (never-freed) context, valid
+    // for the process lifetime.
+    if !context_ptr.is_null() {
+        unsafe { &*context_ptr }
+            .tearing_down
+            .store(true, std::sync::atomic::Ordering::Release);
+    }
+
     let address = device_alive_address();
     unsafe {
         AudioObjectRemovePropertyListener(
@@ -1183,6 +1232,7 @@ fn try_push_event(context: &WatchListenerContext, event: DeviceEvent) {
 pub struct MacosDeviceEnumerator;
 
 impl MacosDeviceEnumerator {
+    /// Creates a new enumerator. The type is stateless; construction never fails.
     pub fn new() -> Self {
         MacosDeviceEnumerator
     }
@@ -1250,14 +1300,14 @@ impl DeviceEnumerator for MacosDeviceEnumerator {
     /// the helper thread to exit), and joins the helper thread — no leaked
     /// listener, no leaked thread, no hang.
     ///
-    /// The listener-proc context (a [`WatchListenerContext`]) is **intentionally
+    /// The listener-proc context (a `WatchListenerContext`) is **intentionally
     /// leaked** (`Box::into_raw`, never reclaimed on the success/spawn-failure
     /// paths), because CoreAudio gives no barrier that an in-flight proc has
     /// finished when the listener is removed; never freeing it makes a late proc
     /// deref always sound. Delivery is stopped by disconnecting the channel, not
     /// by freeing the context. The residual cost is a bounded, intentional
     /// per-cycle context leak (tens of bytes); the proper race-free fix is
-    /// deferred — see [`WatchListenerContext`] and ADR-0005 §5/§6.
+    /// deferred — see `WatchListenerContext` and ADR-0005 §5/§6.
     fn watch(&self, on_event: DeviceEventHandler) -> AudioResult<DeviceWatcher> {
         // Bounded channel: the CoreAudio proc is the producer, the helper thread
         // the consumer. A bound avoids unbounded growth if events ever burst; on
@@ -2429,6 +2479,87 @@ mod tests {
         let ok: OSStatus = 0;
         assert_eq!(ok, 0i32);
         assert_eq!(std::mem::size_of::<OSStatus>(), 4);
+    }
+
+    /// rsac-ead3-teardown: when the context's `tearing_down` flag is set, the
+    /// device-is-alive listener proc must NOT poison the bridge to the terminal
+    /// `Error` state — an app-driven stop/Drop owns the teardown and a racing
+    /// device-death notification should resolve as a clean stop. Device-free:
+    /// with the guard set, the proc returns before touching any device, so we
+    /// can drive it with a sentinel id and assert the shared state is untouched.
+    #[test]
+    fn device_alive_proc_noops_during_teardown() {
+        use crate::bridge::create_bridge;
+        use crate::bridge::state::StreamState;
+        use crate::core::config::AudioFormat;
+        use std::sync::atomic::AtomicBool;
+
+        let (_producer, consumer) = create_bridge(16, AudioFormat::default());
+        let shared = std::sync::Arc::clone(consumer.shared());
+        shared.state.force_set(StreamState::Running);
+
+        // Context with teardown IN PROGRESS. u32::MAX is not a real device id,
+        // but the guard makes the proc return before any device read.
+        let ctx = DeviceAliveContext {
+            device_id: u32::MAX,
+            terminal: std::sync::Arc::clone(&shared),
+            tearing_down: AtomicBool::new(true),
+        };
+
+        // Invoke the proc exactly as CoreAudio would (cookie = &ctx).
+        let status = unsafe {
+            device_alive_listener_proc(
+                u32::MAX,
+                0,
+                std::ptr::null(),
+                &ctx as *const DeviceAliveContext as *mut std::ffi::c_void,
+            )
+        };
+        assert_eq!(status, 0, "proc must return noErr");
+
+        // The stream MUST still be Running — the death watch stood down, so the
+        // graceful teardown transition (elsewhere) is not overridden by Error.
+        assert_eq!(
+            shared.state.get(),
+            StreamState::Running,
+            "tearing_down guard must prevent the proc from poisoning the stream to Error"
+        );
+    }
+
+    /// rsac-ead3-teardown: `remove_device_alive_listener` sets the `tearing_down`
+    /// flag before removing the listener. We can't unregister a real listener
+    /// device-free, but we can assert the flag-setting contract by constructing a
+    /// context, leaking it, and confirming the flag flips (the subsequent
+    /// `AudioObjectRemovePropertyListener` on a sentinel id is a harmless no-op).
+    #[test]
+    fn remove_device_alive_listener_sets_teardown_flag() {
+        use crate::bridge::create_bridge;
+        use crate::core::config::AudioFormat;
+        use std::sync::atomic::Ordering;
+
+        let (_producer, consumer) = create_bridge(16, AudioFormat::default());
+        let shared = std::sync::Arc::clone(consumer.shared());
+
+        // Leak a context exactly like registration does, so the pointer stays
+        // valid for the (best-effort) removal call.
+        let ctx_ptr: *mut DeviceAliveContext = Box::into_raw(Box::new(DeviceAliveContext {
+            device_id: u32::MAX,
+            terminal: shared,
+            tearing_down: std::sync::atomic::AtomicBool::new(false),
+        }));
+
+        // SAFETY: ctx_ptr came from Box::into_raw for a sentinel device id; the
+        // removal call is a no-op for a never-registered listener.
+        unsafe {
+            remove_device_alive_listener(u32::MAX, ctx_ptr);
+            assert!(
+                (*ctx_ptr).tearing_down.load(Ordering::Acquire),
+                "remove must set tearing_down before removing the listener"
+            );
+            // Reclaim the leaked context in the test (no listener was ever
+            // registered against it, so no proc can be in flight).
+            drop(Box::from_raw(ctx_ptr));
+        }
     }
 
     /// `emit_device_list_diff` emits one `DeviceRemoved` per id that disappears

@@ -182,6 +182,30 @@ pub trait AudioDevice: Send + Sync {
 /// or [`try_read_chunk()`](Self::try_read_chunk) to retrieve audio data. Internally, the OS
 /// pushes audio into a lock-free SPSC ring buffer; these methods read from the consumer side.
 ///
+/// # Terminal semantics (ADR-0003)
+///
+/// Both read methods share one end-of-stream contract, so a blocking loop and a
+/// non-blocking poll loop can be written the same way:
+///
+/// - Buffered data is always **drained first**. While the stream is `Stopping`,
+///   reads keep yielding the queued tail.
+/// - Once the ring is empty **and** the stream has reached a terminal state
+///   (`Stopped`/`Closed`/`Error`), both methods return the **fatal**
+///   [`AudioError::StreamEnded`] (`is_fatal() == true`) — the single, clean
+///   end-of-stream signal. [`try_read_chunk`](Self::try_read_chunk) does **not**
+///   collapse this into `Ok(None)`; `Ok(None)` means only "no data right now,
+///   still live".
+/// - A genuinely transient failure surfaces as the **recoverable**
+///   [`AudioError::StreamReadError`] and must be retried, never treated as the
+///   end.
+///
+/// This is the authoritative contract; the public
+/// [`AudioCapture`](crate::api::AudioCapture) read methods that preserve it
+/// (`read_chunk_nonblocking` / `read_chunk_blocking`) delegate straight to these
+/// two, while the legacy `read_buffer` / `read_buffer_blocking` pair intentionally
+/// downgrade the terminal signal to a recoverable one for the simple pull API —
+/// see their rustdoc.
+///
 /// # Example
 ///
 /// ```rust,ignore
@@ -235,8 +259,26 @@ pub trait CapturingStream: Send + Sync {
     /// # Returns
     ///
     /// * `Ok(Some(buffer))` — Data was available.
-    /// * `Ok(None)` — No data currently available (try again later).
-    /// * `Err(...)` — Stream error.
+    /// * `Ok(None)` — No data currently available *and the stream is still
+    ///   live* (Running, or Stopping with a not-yet-drained ring) — try again
+    ///   later.
+    /// * `Err(`[`AudioError::StreamEnded`]`)` — **fatal/terminal**. The ring is
+    ///   empty *and* the stream has reached a terminal state
+    ///   (`Stopped`/`Closed`/`Error`); no more data will ever arrive. This
+    ///   mirrors [`read_chunk`](Self::read_chunk)'s terminal signal so a poll
+    ///   loop can end on `is_fatal()` exactly like a blocking loop (ADR-0003).
+    /// * `Err(`[`AudioError::StreamReadError`]`)` — a genuinely transient
+    ///   (recoverable) read failure; retrying may succeed.
+    ///
+    /// # Terminal-vs-drain ordering
+    ///
+    /// Buffered data is drained **before** the terminal signal: while the
+    /// stream is `Stopping`, this keeps returning `Ok(Some(..))` for the tail
+    /// already in the ring, and only returns `StreamEnded` once the ring is
+    /// empty *and* the state is terminal. Consumers must therefore treat
+    /// `Ok(None)` as "not yet" and only [`is_fatal()`](AudioError::is_fatal)
+    /// as "done" — never discard buffered tail data on a bare `is_running()`
+    /// check.
     fn try_read_chunk(&self) -> AudioResult<Option<AudioBuffer>>;
 
     /// Stops the audio stream. OS audio callbacks are halted.

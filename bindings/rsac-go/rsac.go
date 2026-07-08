@@ -1259,10 +1259,30 @@ type Capabilities struct {
 	SupportsProcessTree bool
 	// SupportsDeviceSelection indicates whether specific device selection is available.
 	SupportsDeviceSelection bool
+	// SupportsDeviceChangeNotifications indicates whether the backend can
+	// deliver device hot-plug / default-change notifications.
+	SupportsDeviceChangeNotifications bool
+	// RequiresUserConsent is true when starting a capture requires a
+	// config-time user-consent artifact (mobile platforms; see
+	// docs/MOBILE_BACKEND_DESIGN.md). Always false on desktop backends.
+	RequiresUserConsent bool
 	// BackendName is the name of the audio backend (e.g., "WASAPI", "CoreAudio", "PipeWire").
 	BackendName string
 	// MaxChannels is the maximum number of audio channels supported.
 	MaxChannels int
+	// SupportedSampleFormats lists the sample wire formats the backend supports.
+	SupportedSampleFormats []SampleFormat
+	// MinSampleRate is the minimum of the backend's device-negotiable
+	// sample-rate range, in Hz.
+	MinSampleRate uint32
+	// MaxSampleRate is the maximum of the backend's device-negotiable
+	// sample-rate range, in Hz.
+	MaxSampleRate uint32
+	// SupportedSampleRates is the config-time sample-rate whitelist — the
+	// exact set CaptureBuilder.SampleRate values are validated against at
+	// Build(). Intentionally narrower than the device-negotiable
+	// MinSampleRate..MaxSampleRate range.
+	SupportedSampleRates []uint32
 }
 
 // PlatformCapabilities queries and returns the audio capabilities of the
@@ -1283,13 +1303,38 @@ func PlatformCapabilities() (Capabilities, error) {
 		backendName = C.GoString(cname)
 	}
 
+	// The indexed getters return -1 (formats) / 0 (rates) for a null handle
+	// or an out-of-bounds index; inside 0..count neither sentinel can occur,
+	// so the loops below take every entry verbatim.
+	formatCount := int(C.rsac_capabilities_supported_sample_format_count(ccaps))
+	formats := make([]SampleFormat, 0, formatCount)
+	for i := 0; i < formatCount; i++ {
+		if f := C.rsac_capabilities_supported_sample_format_at(ccaps, C.size_t(i)); f >= 0 {
+			formats = append(formats, SampleFormat(f))
+		}
+	}
+
+	rateCount := int(C.rsac_capabilities_supported_sample_rate_count(ccaps))
+	rates := make([]uint32, 0, rateCount)
+	for i := 0; i < rateCount; i++ {
+		if r := C.rsac_capabilities_supported_sample_rate_at(ccaps, C.size_t(i)); r != 0 {
+			rates = append(rates, uint32(r))
+		}
+	}
+
 	return Capabilities{
-		SupportsSystemCapture:   C.rsac_capabilities_supports_system_capture(ccaps) == 1,
-		SupportsAppCapture:      C.rsac_capabilities_supports_app_capture(ccaps) == 1,
-		SupportsProcessTree:     C.rsac_capabilities_supports_process_tree(ccaps) == 1,
-		SupportsDeviceSelection: C.rsac_capabilities_supports_device_selection(ccaps) == 1,
-		BackendName:             backendName,
-		MaxChannels:             int(C.rsac_capabilities_max_channels(ccaps)),
+		SupportsSystemCapture:             C.rsac_capabilities_supports_system_capture(ccaps) == 1,
+		SupportsAppCapture:                C.rsac_capabilities_supports_app_capture(ccaps) == 1,
+		SupportsProcessTree:               C.rsac_capabilities_supports_process_tree(ccaps) == 1,
+		SupportsDeviceSelection:           C.rsac_capabilities_supports_device_selection(ccaps) == 1,
+		SupportsDeviceChangeNotifications: C.rsac_capabilities_supports_device_change_notifications(ccaps) == 1,
+		RequiresUserConsent:               C.rsac_capabilities_requires_user_consent(ccaps) == 1,
+		BackendName:                       backendName,
+		MaxChannels:                       int(C.rsac_capabilities_max_channels(ccaps)),
+		SupportedSampleFormats:            formats,
+		MinSampleRate:                     uint32(C.rsac_capabilities_min_sample_rate(ccaps)),
+		MaxSampleRate:                     uint32(C.rsac_capabilities_max_sample_rate(ccaps)),
+		SupportedSampleRates:              rates,
 	}, nil
 }
 

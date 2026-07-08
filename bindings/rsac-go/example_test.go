@@ -5,7 +5,7 @@ import (
 	"fmt"
 	"time"
 
-	rsac "github.com/Codeseys-Labs/rsac-go"
+	rsac "github.com/Codeseys-Labs/rust-crossplat-audio-capture/bindings/rsac-go"
 )
 
 // ExampleNewCaptureBuilder demonstrates the basic capture workflow:
@@ -234,7 +234,12 @@ func ExamplePlatformCapabilities() {
 	fmt.Printf("App capture: %v\n", caps.SupportsAppCapture)
 	fmt.Printf("Process tree: %v\n", caps.SupportsProcessTree)
 	fmt.Printf("Device selection: %v\n", caps.SupportsDeviceSelection)
+	fmt.Printf("Device change notifications: %v\n", caps.SupportsDeviceChangeNotifications)
+	fmt.Printf("Requires user consent: %v\n", caps.RequiresUserConsent)
 	fmt.Printf("Max channels: %d\n", caps.MaxChannels)
+	fmt.Printf("Sample formats: %v\n", caps.SupportedSampleFormats)
+	fmt.Printf("Sample rate range: %d-%d Hz\n", caps.MinSampleRate, caps.MaxSampleRate)
+	fmt.Printf("Config-time rate whitelist: %v\n", caps.SupportedSampleRates)
 }
 
 // ExampleListDevices demonstrates audio device enumeration.

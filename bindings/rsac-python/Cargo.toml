@@ -1,11 +1,11 @@
 [package]
 name = "rsac-python"
-version = "0.4.0"
+version = "0.4.1"
 edition = "2021"
 description = "Python bindings for rsac (Rust Cross-Platform Audio Capture)"
 license = "MIT OR Apache-2.0"
 readme = "README.md"
-repository = "https://github.com/baladita/rust-crossplat-audio-capture"
+repository = "https://github.com/Codeseys-Labs/rust-crossplat-audio-capture"
 publish = false
 
 [lib]

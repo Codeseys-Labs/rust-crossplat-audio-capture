@@ -1,0 +1,38 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!--
+  rsac Android glue — library manifest (merged into the host app's manifest).
+
+  Requirements per docs/MOBILE_BACKEND_DESIGN.md § "Manifest & service
+  requirements": RECORD_AUDIO (required even for playback capture),
+  FOREGROUND_SERVICE + FOREGROUND_SERVICE_MEDIA_PROJECTION, and a foreground
+  service declared with android:foregroundServiceType="mediaProjection".
+
+  Hosts that do not want a merged permission can strip it with
+  tools:node="remove" in their own manifest.
+
+  Play Store: declaring the mediaProjection foreground-service type triggers
+  a policy declaration at submission — a HOST-APP obligation (documented in
+  README.md, not solvable here).
+-->
+<manifest xmlns:android="http://schemas.android.com/apk/res/android">
+
+    <!-- Required even for playback (non-mic) capture — API 29+ contract. -->
+    <uses-permission android:name="android.permission.RECORD_AUDIO" />
+    <uses-permission android:name="android.permission.FOREGROUND_SERVICE" />
+    <!-- Enforced from API 34 (targetSdk 34+); harmless to declare earlier. -->
+    <uses-permission android:name="android.permission.FOREGROUND_SERVICE_MEDIA_PROJECTION" />
+
+    <application>
+        <!--
+          Capture host service (skeleton — no capture policy). Must be running
+          in the foreground BEFORE MediaProjection capture starts; on API 34+
+          the OS enforces this ordering. Fully-qualified class name so manifest
+          merging never mis-resolves it against the host namespace.
+        -->
+        <service
+            android:name="ai.codeseys.rsac.RsacCaptureService"
+            android:exported="false"
+            android:foregroundServiceType="mediaProjection" />
+    </application>
+
+</manifest>

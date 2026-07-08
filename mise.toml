@@ -1,0 +1,63 @@
+# mise.toml — per-project toolchain + task runner for rsac (rsac-7e19).
+#
+# Scope (deliberate): mise manages the POLYGLOT toolchain the bindings need
+# (Bun, Node, Go, Python) plus dev tools (lefthook), and provides
+# cross-platform tasks. It does NOT manage Rust — rust-toolchain.toml +
+# rustup stay the single source of truth for the Rust toolchain (CI pins
+# via dtolnay/rust-toolchain; the MSRV job depends on rustup override
+# semantics).
+#
+# Onboarding:   mise install && mise run setup
+# Daily driver: mise run gate   (before pushing; lefthook also runs it on pre-push)
+#
+# CI does not use mise (yet) — versions below mirror what CI installs
+# (setup-go 1.22, napi engines node >=18, Bun-first npm pipeline). If you
+# bump one, check the workflows.
+
+[tools]
+bun = "1"
+node = "22"
+go = "1.22"
+python = "3.12"
+lefthook = "1"
+
+[env]
+RUST_BACKTRACE = "1"
+
+[tasks.setup]
+description = "One-shot onboarding after `mise install`: install the git hooks"
+run = "lefthook install"
+
+[tasks.gate]
+description = "CI lint-job replica: fmt + clippy -D warnings + bare-build smoke"
+run = "bash scripts/gate.sh"
+run_windows = "pwsh -NoProfile -ExecutionPolicy Bypass -File scripts/gate.ps1"
+
+[tasks."gate:full"]
+description = "gate + lib tests + doctests + cargo doc + module-DAG guard"
+run = "bash scripts/gate.sh --full"
+run_windows = "pwsh -NoProfile -ExecutionPolicy Bypass -File scripts/gate.ps1 --full"
+
+[tasks.test]
+description = "CI test-job replica for the host OS (lib tests + doctests)"
+run = "bash scripts/gate.sh --tests-only"
+run_windows = "pwsh -NoProfile -ExecutionPolicy Bypass -File scripts/gate.ps1 --tests-only"
+
+[tasks.fmt]
+description = "Format the workspace"
+run = "cargo fmt --all"
+
+[tasks."test:audio"]
+description = "ci_audio integration suite on this machine, all 3 capture tiers (extra args pass through, e.g. `mise run test:audio -- --tier system`)"
+run = """bash -c 'case "$(uname -s)" in Darwin) exec bash scripts/test-audio-macos.sh "$@" ;; *) exec bash scripts/test-audio-linux.sh "$@" ;; esac' --"""
+run_windows = "pwsh -NoProfile -ExecutionPolicy Bypass -File scripts/test-audio-windows.ps1"
+
+[tasks."release:bump"]
+description = "Bump the six lockstep manifests + rotate CHANGELOG: mise run release:bump -- X.Y.Z [--dry-run]"
+run = "bash scripts/bump-version.sh"
+run_windows = "pwsh -NoProfile -ExecutionPolicy Bypass -File scripts/run-bash.ps1 scripts/bump-version.sh"
+
+[tasks."release:verify-docs"]
+description = "Post-publish docs.rs rendering spot-check: mise run release:verify-docs [-- X.Y.Z]"
+run = "bash scripts/verify-docs-rs.sh"
+run_windows = "pwsh -NoProfile -ExecutionPolicy Bypass -File scripts/run-bash.ps1 scripts/verify-docs-rs.sh"
