@@ -111,6 +111,52 @@ Releases with no ABI change omit the subsection (or state "No C ABI changes").
   `bindings/rsac-go/vX.Y.Z` module tag in the same job. Without the secrets
   the previous manual-dispatch behavior is preserved and the job summary
   documents the setup.
+- **Mobile backends — Android + iOS (compile-verified; ADR-0012/0013).**
+  New target-gated backends riding the same `BridgeStream` data plane:
+  - **Android (`feat_android`)**: AAudio microphone capture
+    (`CaptureTarget::Device`), plus all playback-capture tiers
+    (`SystemDefault`, `Application`/`ApplicationByName`, `ProcessTree` —
+    tree ≡ app on Android) via `AudioPlaybackCaptureConfiguration`:
+    the Java capture loop lives in the first-party AAR
+    (`mobile/android`, Kotlin `CaptureBridge` + `RsacCaptureService` +
+    `RsacProjection` consent helper) and feeds Rust through a JNI ingest
+    layer (`jni-sys`, registry-id sessions, alloc-free scratch pushes).
+    Playback capture requires API 29+, a foreground service, and the new
+    user-consent token: `AudioCaptureBuilder::with_android_projection`
+    (`AndroidProjectionToken`); building a playback target without one
+    fails preflight with the new `AudioError::UserConsentRequired`.
+    `librsac.so` packaging (cargo-ndk) ships in the AAR with its
+    `JNI_OnLoad` export CI-asserted.
+  - **iOS (`feat_ios`)**: AVAudioEngine microphone capture, plus
+    `SystemDefault` as a ReplayKit broadcast-upload consumer
+    (`with_ios_app_group`; the canonical broadcast-ring contract,
+    RingLayout v1, ships in the `mobile/ios` SwiftPM package).
+    `Application`/`ProcessTree` are **permanently unsupported** (no iOS
+    API) and report so via `PlatformCapabilities`.
+  - **Honest status**: both backends are compile- and CI-build-verified
+    (cross-target check + clippy, real Gradle AAR + xcodebuild SwiftPM
+    builds) but **not yet runtime-verified on any device** — capability
+    reporting and docs say so explicitly.
+- **C FFI capability parity accessors.** `rsac_capabilities_*` grew the
+  fields the Rust struct already exposed: device-change-notification
+  support, user-consent requirement (pairs with the new
+  `rsac_builder_set_android_projection`), the supported sample-format
+  list, and the sample-rate range + discrete-rate whitelist. The Go
+  binding projects all of them (capability parity across C/Python/Node/Go).
+- **CI: deterministic desktop audio integration tiers.** The Linux jobs
+  gain a hard routing gate (`scripts/ci-linux-audio-route.sh`: pins the
+  null-sink default, proves the tone→monitor route end-to-end with sox,
+  then flips `RSAC_CI_AUDIO_DETERMINISTIC=1`) on a PipeWire stack brought
+  up with a private session D-Bus — the missing session bus silently
+  killed wireplumber and was the root cause of the historical
+  "SystemDefault yields 0 buffers" softness. Windows device/process tiers
+  gain the equivalent VB-CABLE endpoint gate
+  (`scripts/ci-windows-audio-default.ps1`). All six desktop platform×tier
+  jobs now hard-fail on silence instead of warning.
+- **DevEx: mise task coverage for the operator scripts.** `mise run
+  release:bump -- X.Y.Z [--dry-run]`, `mise run release:verify-docs`, and
+  `mise run test:audio` (host-OS dispatch); new generic
+  `scripts/run-bash.ps1` Git-bash wrapper backs the Windows legs.
 
 ### Changed
 
@@ -212,6 +258,33 @@ Adversarial-review batch (16 tracked seeds, all landed pre-merge):
   `ci-audio-tests.yml` actions SHA-pinned (including the kernel-driver
   installer); the compose FFI surface is now actually compiled in CI.
 
+Post-integration wave (PRs #41–#48, reviewed on the release branch):
+
+- **PipeWire `stop()` no longer wedges for ~8 s.** Destroying a live,
+  linked PipeWire stream from the dedicated loop thread blocked inside
+  `pw_stream_destroy` (observed 7.8 s); teardown now disconnects, pumps
+  the loop, and only then drops the stream.
+- **Compose resampler flush on mid-stream rate renegotiation.** The
+  natural-end tail flush shipped in the review batch above, but a
+  *mid-stream* source rate change rebuilt the resampler without flushing
+  the old one — losing the same ~25–45 ms (partial chunk + FFT delay
+  residue) at every renegotiation. The old resampler is now flushed into
+  the FIFO before the rebuild.
+- **FFI: missing-consent errors are configuration errors.**
+  `AudioError::UserConsentRequired` (Android playback capture built
+  without a projection token) fell through `map_rsac_error`'s
+  forward-compat arm to `RSAC_ERROR_INTERNAL`; it now maps to
+  `RSAC_ERROR_CONFIGURATION` as `rsac.h` documents.
+- **Android JNI: bridge start no longer leaks on GlobalRef failure.** If
+  `NewGlobalRef` failed after `CaptureBridge.start()` succeeded, the Java
+  read thread + `AudioRecord` kept running service-anchored; the failure
+  path now clears the pending exception (JNI calls are illegal with one
+  pending) and rolls back — stop, service unregister, local-ref delete.
+- **macOS: silence-watchdog window widened past TCC grant-propagation
+  latency.** A freshly granted permission streams all-zero buffers for a
+  short window exactly like a denied one; the ADR-0016 watchdog no longer
+  false-warns during it (verified on real hardware).
+
 ### Security
 
 ### C ABI changes
@@ -227,6 +300,22 @@ ABI-identical on all supported targets (C enums are `int`-sized) and
 C-source-compatible via implicit enum→int conversion; out-of-range values
 now return `RSAC_ERROR_INVALID_PARAMETER` instead of being undefined
 behavior. Existing symbol layouts are otherwise unchanged.
+
+Further additive symbols (always compiled, no feature gate):
+`rsac_builder_set_android_projection` (the Android consent-token carry,
+an opaque `int64_t`; present on every platform for ABI uniformity,
+returning `RSAC_ERROR_PLATFORM_NOT_SUPPORTED` off-Android), and the
+capability-parity accessors —
+`rsac_capabilities_supports_device_change_notifications`,
+`rsac_capabilities_requires_user_consent`,
+`rsac_capabilities_supported_sample_format_count`/`_at`,
+`rsac_capabilities_min_sample_rate`/`max_sample_rate`, and
+`rsac_capabilities_supported_sample_rate_count`/`_at`.
+
+One error-code mapping fix (behavioral, not an ABI shape change): a
+playback-capture build missing its consent token now returns the
+documented `RSAC_ERROR_CONFIGURATION` instead of falling through to
+`RSAC_ERROR_INTERNAL`.
 
 ## [0.4.0] - 2026-05-31
 
