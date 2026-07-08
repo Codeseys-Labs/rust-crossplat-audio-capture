@@ -1,13 +1,21 @@
 # CodeRabbit configuration for rsac.
 #
-# base_branches: PRs whose BASE branch matches these regexes get reviewed in
-# addition to PRs targeting the default branch. Without this, CodeRabbit
-# reports "reviews are disabled for this base branch" on the 0.4.1 release
-# stack, whose layer PRs target release/0.4.1 instead of master
+# reviews.auto_review.base_branches: PRs whose BASE branch matches these
+# regexes get reviewed in addition to PRs targeting the default branch.
+# Without this, CodeRabbit reports "Auto reviews are disabled on base/target
+# branches other than the default branch" on the 0.4.1 release stack, whose
+# layer PRs target release/0.4.1 instead of master
 # (decision record: seed rsac-79bc; stack epic: rsac-4844).
+#
+# NOTE the nesting: the key lives under reviews.auto_review, NOT directly
+# under reviews — the first version of this file used `reviews.base_branches`,
+# which CodeRabbit silently ignores (unknown key), so PR #45 was still
+# skipped despite the file being present. Verified against
+# docs.coderabbit.ai/reference/configuration.
 #
 # CodeRabbit reads this file from the HEAD branch of a PR, so every layer
 # branch cut from release/0.4.1 inherits it automatically.
 reviews:
-  base_branches:
-    - "release/.*"
+  auto_review:
+    base_branches:
+      - "release/.*"
