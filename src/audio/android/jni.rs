@@ -1042,6 +1042,12 @@ pub(super) fn create_and_start_bridge(
     // SAFETY: bridge is a live local ref.
     let global = unsafe { jni_call!(env, NewGlobalRef, bridge) };
     if global.is_null() {
+        // NewGlobalRef can fail by *throwing* (e.g. OutOfMemoryError), and
+        // JNI method calls are illegal while an exception is pending — the
+        // rollback below would be skipped (or abort under CheckJNI). Clear
+        // it first and fold its message into the returned error.
+        // SAFETY: env valid; queries/clears the pending exception only.
+        let thrown = unsafe { take_exception_message(env) };
         // Roll back: the bridge is already started and service-anchored.
         // Without this, the Java read thread + AudioRecord keep running
         // (service-pinned) while the Rust caller only unregisters the
@@ -1064,7 +1070,10 @@ pub(super) fn create_and_start_bridge(
             jni_call!(env, DeleteLocalRef, bridge);
         }
         return Err(AudioError::InternalError {
-            message: "NewGlobalRef failed for the CaptureBridge handle".to_string(),
+            message: match thrown {
+                Some(msg) => format!("NewGlobalRef failed for the CaptureBridge handle: {}", msg),
+                None => "NewGlobalRef failed for the CaptureBridge handle".to_string(),
+            },
             source: None,
         });
     }
