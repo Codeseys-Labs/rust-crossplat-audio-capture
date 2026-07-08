@@ -32,13 +32,44 @@
 
 use rsac::{AudioCaptureBuilder, AudioError, CaptureTarget, PlatformCapabilities};
 
-/// Finder is part of every macOS user session and appears in
-/// `NSWorkspace.runningApplications`. It's the most stable target for
-/// a "known-running" application check.
-const KNOWN_APP_NAME: &str = "Finder";
-
 /// A string that cannot plausibly match any real running app.
 const MISSING_APP_NAME: &str = "ThisApplicationDefinitelyDoesNotExist_12345";
+
+/// Discover a currently-audio-producing application to target (rsac-99ee).
+///
+/// The happy-path tests historically hardcoded `"Finder"`, assuming any
+/// running GUI app resolves via `ApplicationByName`. That broke when
+/// `enumerate_audio_applications()` gained the "actively producing audio"
+/// filter (rsac-84fd): Finder runs but emits no audio, so it is *correctly*
+/// absent and the tests failed on every real macOS host.
+///
+/// Instead, ask the same introspection surface the resolver consults —
+/// `list_audio_applications()` — and target whatever it returns. This is
+/// self-consistent by construction (we feed the resolver a name the
+/// enumeration itself produced, covering both the NSWorkspace-intersected
+/// path and the "PID n" fallback), gives real coverage whenever *anything*
+/// is playing audio (a media app, or a tone spawned by the harness), and
+/// skips honestly when nothing is.
+fn discover_audio_producing_app() -> Option<String> {
+    match rsac::list_audio_applications() {
+        Ok(apps) => {
+            let name = apps.first().map(|a| a.name.clone());
+            match &name {
+                Some(n) => eprintln!("[ci_audio] discovered audio-producing app: '{n}'"),
+                None => eprintln!(
+                    "[ci_audio] SKIP: no application is currently producing audio \
+                     (play something, or let the harness spawn a tone, to exercise \
+                     the ApplicationByName happy path)"
+                ),
+            }
+            name
+        }
+        Err(e) => {
+            eprintln!("[ci_audio] SKIP: list_audio_applications failed: {e:?}");
+            None
+        }
+    }
+}
 
 /// Skip helper — mirrors the pattern used by other ci_audio modules
 /// but inlined because `ApplicationByName` only exists on macOS and
@@ -57,28 +88,35 @@ fn skip_if_unsupported() -> bool {
 }
 
 /// Asserts the pipeline resolves an `ApplicationByName` target when the named
-/// app is currently running, using the app's **exact** localized name. A
-/// successful `start()` means the macOS backend found the PID via NSWorkspace
-/// (exact, case-insensitive name match), created the Process Tap, and started
-/// the AudioUnit — the full happy-path for the name-based selection code.
+/// app is currently **producing audio**, using the app's **exact** localized
+/// name. A successful `start()` means the macOS backend found the PID via the
+/// audio-filtered enumeration (exact, case-insensitive name match), created
+/// the Process Tap, and started the AudioUnit — the full happy-path for the
+/// name-based selection code.
+///
+/// The target is discovered dynamically via `list_audio_applications()`
+/// (rsac-99ee — hardcoding `"Finder"` broke when enumeration gained the
+/// actively-producing-audio filter). Skips honestly when nothing is playing.
 ///
 /// Resolution happens at `start()` (see the module doc), so `build()` is
 /// expected to succeed and the source binding is verified after `start()`.
 ///
-/// Ignored by default: requires macOS 14.4+, TCC audio permission, and
-/// for Finder to be running (always true in a normal user session, but
-/// not guaranteed in a headless CI sandbox).
+/// Ignored by default: requires macOS 14.4+, TCC audio permission, and an
+/// audio-producing application.
 #[test]
-#[ignore = "requires macOS 14.4+ with audio capture permission and Finder running"]
+#[ignore = "requires macOS 14.4+ with audio capture permission and an audio-producing app"]
 fn select_by_exact_name_binds_source() {
     if skip_if_unsupported() {
         return;
     }
+    let Some(app_name) = discover_audio_producing_app() else {
+        return; // honest skip — no audio-producing app to target
+    };
 
     // build() only validates capability + resolves the default output device;
-    // the NSWorkspace name lookup + Process Tap happen at start().
+    // the name lookup + Process Tap happen at start().
     let mut capture = AudioCaptureBuilder::new()
-        .with_target(CaptureTarget::ApplicationByName(KNOWN_APP_NAME.to_string()))
+        .with_target(CaptureTarget::ApplicationByName(app_name.clone()))
         .sample_rate(48000)
         .channels(2)
         .build()
@@ -88,18 +126,20 @@ fn select_by_exact_name_binds_source() {
         Ok(()) => {
             eprintln!(
                 "[ci_audio] ✅ ApplicationByName('{}') resolved + started: {:?}",
-                KNOWN_APP_NAME,
+                app_name,
                 capture.config().target
             );
             let _ = capture.stop();
         }
         Err(e) => {
-            // In a sandboxed/headless CI Finder may not be listed, or
-            // Process Tap creation may fail due to TCC. Surface the
-            // error so developers see why the test skipped locally.
+            // The name came from list_audio_applications() moments ago, so a
+            // resolution failure here is a REAL contract break between the
+            // enumeration and the resolver (or the app stopped producing audio
+            // in the window between the two calls — rerun if racy).
             panic!(
-                "Expected ApplicationByName('{}') to resolve at start(); got: {:?}",
-                KNOWN_APP_NAME, e
+                "ApplicationByName('{}') was discovered via list_audio_applications() \
+                 but failed to resolve at start(): {:?}",
+                app_name, e
             );
         }
     }
@@ -177,10 +217,11 @@ fn select_by_missing_name_returns_error() {
 }
 
 /// The macOS backend matches names **case-insensitively** (via
-/// `app_name_matches` → `str::eq_ignore_ascii_case`), so `"finder"`
-/// (lowercase) must resolve to the same app as `"Finder"`. This test locks
-/// in that contract — if a future change breaks case-insensitivity, it fails
-/// and forces an explicit decision.
+/// `app_name_matches` → `str::eq_ignore_ascii_case`), so a case-flipped
+/// variant of a discovered audio-producing app's name (e.g. `"firefox"` for
+/// `"Firefox"`) must resolve to the same app. This test locks in that
+/// contract — if a future change breaks case-insensitivity, it fails and
+/// forces an explicit decision.
 ///
 /// Resolution happens at `start()` (see the module doc), so this asserts
 /// against `start()`, not `build()`.
@@ -188,15 +229,31 @@ fn select_by_missing_name_returns_error() {
 /// Ignored by default for the same reasons as
 /// `select_by_exact_name_binds_source`.
 #[test]
-#[ignore = "requires macOS 14.4+ with audio capture permission and Finder running"]
+#[ignore = "requires macOS 14.4+ with audio capture permission and an audio-producing app"]
 fn case_insensitive_match() {
     if skip_if_unsupported() {
         return;
     }
+    let Some(app_name) = discover_audio_producing_app() else {
+        return; // honest skip — no audio-producing app to target
+    };
 
-    let lower = KNOWN_APP_NAME.to_lowercase();
+    // Flip the discovered name's case (lower, or upper if it was already all
+    // lowercase) so we genuinely exercise the case-insensitive comparison.
+    let flipped = if app_name.chars().any(|c| c.is_uppercase()) {
+        app_name.to_lowercase()
+    } else {
+        app_name.to_uppercase()
+    };
+    if flipped == app_name {
+        // Caseless name (digits/symbols only, e.g. a "PID 1234" fallback
+        // entry) — the flip is a no-op, so this proves nothing. Skip honestly.
+        eprintln!("[ci_audio] SKIP: discovered app name '{app_name}' has no case to flip");
+        return;
+    }
+
     let mut capture = AudioCaptureBuilder::new()
-        .with_target(CaptureTarget::ApplicationByName(lower.clone()))
+        .with_target(CaptureTarget::ApplicationByName(flipped.clone()))
         .sample_rate(48000)
         .channels(2)
         .build()
@@ -206,13 +263,14 @@ fn case_insensitive_match() {
         Ok(()) => {
             eprintln!(
                 "[ci_audio] ✅ Case-insensitive match: '{}' resolved to '{}'",
-                lower, KNOWN_APP_NAME
+                flipped, app_name
             );
             let _ = capture.stop();
         }
         Err(e) => panic!(
-            "Expected case-insensitive match for '{}' to resolve at start(); got: {:?}",
-            lower, e
+            "Expected case-insensitive match for '{}' (from discovered '{}') to \
+             resolve at start(); got: {:?}",
+            flipped, app_name, e
         ),
     }
 }
