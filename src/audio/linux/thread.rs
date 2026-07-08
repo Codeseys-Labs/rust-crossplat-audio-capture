@@ -2366,7 +2366,36 @@ fn pw_thread_main(
                 // Teardown order within this block is unchanged: listener before
                 // stream (the listener's C callbacks reference the stream pointer).
                 capture_listener = None;
-                capture_stream = None;
+                log::debug!("PipeWire thread: StopCapture — listener dropped");
+                // rsac-1d8f (StopCapture wedge, evidence run 28907740898):
+                // dropping a LIVE, just-linked stream (`StreamBox` drop →
+                // pw_stream_destroy) can block inside libpipewire for many
+                // seconds on a server round trip that nobody pumps — with a
+                // WORKING session manager the stream is actually linked, and
+                // destroy-while-linked needs the daemon to unlink first. The
+                // instrumented timeline showed "StopCapture received" then
+                // 7.8 s of silence inside this arm (no ack), which held the
+                // whole stop() path (and a parked reader's StreamEnded)
+                // hostage. Disconnect FIRST (pw_stream_disconnect) and pump
+                // the loop a few short iterations so the unlink round trip
+                // completes, THEN drop the now-idle stream.
+                if let Some(stream) = capture_stream.take() {
+                    if let Err(e) = stream.disconnect() {
+                        log::debug!(
+                            "PipeWire thread: StopCapture — stream disconnect \
+                             reported {e:?}; continuing teardown"
+                        );
+                    }
+                    log::debug!("PipeWire thread: StopCapture — stream disconnected");
+                    // Bounded pump: enough for the unlink round trip on a
+                    // healthy daemon, harmless (just idle iterations) on a
+                    // dead one.
+                    for _ in 0..4 {
+                        let _ = main_loop.loop_().iterate(Duration::from_millis(10));
+                    }
+                    drop(stream);
+                    log::debug!("PipeWire thread: StopCapture — stream dropped");
+                }
 
                 // Producer-terminal-signal (FH-1 / ADR-0010): now that no callback
                 // can race us, drive the bridge to a graceful ending state so a
@@ -2377,6 +2406,7 @@ fn pw_thread_main(
                 // spontaneous-death already poisoned the stream to `Error` during
                 // the drop above — a genuine error correctly wins over the stop.
                 signal_session_graceful_end(active_shared.take());
+                log::debug!("PipeWire thread: StopCapture — graceful end signalled, acking");
 
                 let _ = response_tx.send(Ok(()));
             }

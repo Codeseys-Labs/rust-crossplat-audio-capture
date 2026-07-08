@@ -155,11 +155,22 @@ fn request_stop_drives_real_stream_terminal() {
     eprintln!("[ci_audio] ✅ request_stop() drove the real stream terminal (StreamEnded, fatal)");
 }
 
-/// `request_stop()` must unblock a reader parked in `read_buffer_blocking()`
+/// `request_stop()` must unblock a reader parked in `read_chunk_blocking()`
 /// on a real backend PROMPTLY (well under the blocking-read timeout), returning
 /// the fatal `StreamEnded`. This is the real-backend version of the mock
 /// `request_stop_unblocks_parked_blocking_read` unit test and guards the #28
 /// unblock-primitive contract the C/Go bindings rely on.
+///
+/// Uses `read_chunk_blocking` — the terminal-PRESERVING blocking read — not
+/// `read_buffer_blocking`, whose `is_running()` compatibility guard only
+/// surfaces `StreamEnded` when the terminal transition lands *during* an
+/// already-parked read (documented on the method). On a data-flowing stream
+/// (e.g. the Linux null-sink monitor, which emits continuous silence frames
+/// once the graph actually links — rsac-b106) the reader is usually mid-drain
+/// when the terminal lands, so the race fires deterministically: this test
+/// originally used `read_buffer_blocking` and only ever passed on backends
+/// whose idle loopback kept the reader parked in-flight (evidence: runs
+/// 28906084214 / 28907189823 / 28907740898).
 #[test]
 fn request_stop_unblocks_parked_blocking_read_real() {
     require_system_capture!();
@@ -172,19 +183,21 @@ fn request_stop_unblocks_parked_blocking_read_real() {
     let reader = {
         let capture = Arc::clone(&capture);
         std::thread::spawn(move || {
-            // Loop through the drainable tail: recoverable/no-data reads retry,
-            // only the fatal terminal ends the loop. Bounded so a genuine hang
-            // fails the join-timeout below rather than spinning forever.
+            // Loop through the drainable tail: data reads and transient
+            // errors retry, only the fatal terminal ends the loop. Bounded so
+            // a genuine hang fails the join-timeout below rather than
+            // spinning forever.
             let deadline = Instant::now() + Duration::from_secs(8);
             loop {
-                match capture.read_buffer_blocking() {
+                match capture.read_chunk_blocking() {
                     Ok(_buf) => {
                         // Real audio arrived before we stopped — keep reading.
                     }
                     Err(AudioError::StreamEnded { .. }) => return Ok(()),
-                    Err(AudioError::StreamReadError { .. }) => {
-                        // "not running" recoverable — the blocking read short-
-                        // circuits once state leaves Running; retry briefly.
+                    Err(AudioError::StreamReadError { .. }) | Err(AudioError::Timeout { .. }) => {
+                        // Transient: a recoverable read hiccup, or the bounded
+                        // blocking-read window elapsing before the terminal
+                        // lands. Retry until the deadline.
                         if Instant::now() > deadline {
                             return Err("timed out without StreamEnded".to_string());
                         }

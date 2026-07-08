@@ -243,6 +243,12 @@ rand = "0.10.0" # For generating test data
 rand_pcg = "0.10.1" # For deterministic random numbers in tests
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "time"] }
 futures-util = "0.3"
+# Test-side logger backend so RUST_LOG=rsac=debug actually yields the
+# library's debug lines in `--nocapture` CI runs (the ci_audio harness calls
+# env_logger's try_init; without a backend the CI env var was a no-op and
+# backend-timing questions were undebuggable — rsac-b106 evidence loop).
+# Same version as the optional `cli` dependency above.
+env_logger = "0.11.11"
 
 # criterion is target-gated OFF the mobile OSes: cargo compiles EVERY
 # dev-dependency for any `--tests` target, and criterion's `alloca` dependency

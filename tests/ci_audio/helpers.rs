@@ -22,6 +22,15 @@ use rsac::AudioBuffer;
 ///    - Linux: check PipeWire socket exists AND `pw-cli` responds
 ///    - Other platforms: check device enumeration succeeds
 pub fn audio_infrastructure_available() -> bool {
+    // Every test funnels through here (the require_* macros), so it doubles
+    // as the logging chokepoint: install the env_logger backend once so
+    // RUST_LOG=rsac=debug (set job-wide in CI) actually emits the library's
+    // debug lines into the --nocapture output. Without a backend the CI env
+    // var was a silent no-op, which made backend-timing regressions (e.g.
+    // the rsac-b106 evidence loop's StopCapture-latency question)
+    // undebuggable from CI logs.
+    init_test_logging();
+
     // Check env var first
     if let Ok(val) = std::env::var("RSAC_CI_AUDIO_AVAILABLE") {
         return val == "1";
@@ -29,6 +38,19 @@ pub fn audio_infrastructure_available() -> bool {
 
     // Runtime detection
     runtime_detect_audio()
+}
+
+/// Installs the test-side `env_logger` backend exactly once (idempotent and
+/// race-free across the harness's test threads). Timestamped with
+/// microseconds so CI log timelines can be correlated with the workflow's
+/// own timestamps.
+pub fn init_test_logging() {
+    static INIT: std::sync::Once = std::sync::Once::new();
+    INIT.call_once(|| {
+        let _ = env_logger::Builder::from_default_env()
+            .format_timestamp_micros()
+            .try_init();
+    });
 }
 /// Whether the test environment provides a *deterministic* audio source.
 ///
@@ -273,41 +295,41 @@ fn warmup_and_guard_player(child: &mut Child, label: &str) {
 pub fn spawn_test_tone_player(wav_path: &std::path::Path) -> Option<Child> {
     #[cfg(target_os = "linux")]
     {
-        // Try pw-play first (PipeWire native), fall back to paplay
-        let child = Command::new("pw-play")
-            .arg(wav_path)
-            .stdin(std::process::Stdio::null())
-            .stdout(std::process::Stdio::null())
-            .stderr(std::process::Stdio::piped())
-            .spawn();
-
-        match child {
-            Ok(mut c) => {
-                eprintln!("[ci_audio] Started pw-play for {:?}", wav_path);
-                warmup_and_guard_player(&mut c, "pw-play");
-                Some(c)
-            }
-            Err(_) => {
-                // Fall back to paplay
-                match Command::new("paplay")
-                    .arg(wav_path)
-                    .stdin(std::process::Stdio::null())
-                    .stdout(std::process::Stdio::null())
-                    .stderr(std::process::Stdio::piped())
-                    .spawn()
-                {
-                    Ok(mut c) => {
-                        eprintln!("[ci_audio] Started paplay for {:?}", wav_path);
-                        warmup_and_guard_player(&mut c, "paplay");
-                        Some(c)
-                    }
-                    Err(e) => {
-                        eprintln!("[ci_audio] Failed to start audio player: {}", e);
-                        None
-                    }
+        // Player preference (rsac-b106): when the CI routing gate has pinned
+        // an explicit sink via PULSE_SINK, prefer paplay — the Pulse layer
+        // honors PULSE_SINK, giving a deterministic route regardless of the
+        // PipeWire default-metadata state (which is not settable on the
+        // dbus-less Firecracker runners). Without PULSE_SINK, prefer pw-play
+        // (PipeWire-native default routing) and fall back to paplay.
+        let pulse_sink_pinned = std::env::var_os("PULSE_SINK").is_some();
+        let order: [&str; 2] = if pulse_sink_pinned {
+            ["paplay", "pw-play"]
+        } else {
+            ["pw-play", "paplay"]
+        };
+        for player in order {
+            match Command::new(player)
+                .arg(wav_path)
+                .stdin(std::process::Stdio::null())
+                .stdout(std::process::Stdio::null())
+                .stderr(std::process::Stdio::piped())
+                .spawn()
+            {
+                Ok(mut c) => {
+                    eprintln!(
+                        "[ci_audio] Started {player} for {:?} (PULSE_SINK pinned: {pulse_sink_pinned})",
+                        wav_path
+                    );
+                    warmup_and_guard_player(&mut c, player);
+                    return Some(c);
+                }
+                Err(e) => {
+                    eprintln!("[ci_audio] Failed to start {player}: {e}; trying next player");
                 }
             }
         }
+        eprintln!("[ci_audio] Failed to start any audio player");
+        None
     }
 
     #[cfg(target_os = "windows")]
@@ -811,15 +833,23 @@ macro_rules! require_process_capture {
 pub fn spawn_audio_player_get_pid(wav_path: &std::path::Path) -> Result<(Child, u32), String> {
     #[cfg(target_os = "linux")]
     {
-        let child = Command::new("pw-play")
+        // Same PULSE_SINK-aware player preference as spawn_test_tone_player
+        // (rsac-b106): a pinned Pulse sink makes paplay the deterministic
+        // route on runners where PipeWire default metadata is not settable.
+        let pulse_sink_pinned = std::env::var_os("PULSE_SINK").is_some();
+        let order: [&str; 2] = if pulse_sink_pinned {
+            ["paplay", "pw-play"]
+        } else {
+            ["pw-play", "paplay"]
+        };
+        let child = Command::new(order[0])
             .arg(wav_path)
             .stdin(std::process::Stdio::null())
             .stdout(std::process::Stdio::null())
             .stderr(std::process::Stdio::piped())
             .spawn()
             .or_else(|_| {
-                // Fall back to paplay
-                Command::new("paplay")
+                Command::new(order[1])
                     .arg(wav_path)
                     .stdin(std::process::Stdio::null())
                     .stdout(std::process::Stdio::null())
@@ -831,7 +861,7 @@ pub fn spawn_audio_player_get_pid(wav_path: &std::path::Path) -> Result<(Child, 
         let mut child = child;
         let pid = child.id();
         eprintln!(
-            "[ci_audio] Started audio player PID={pid} for {:?}",
+            "[ci_audio] Started audio player PID={pid} for {:?} (PULSE_SINK pinned: {pulse_sink_pinned})",
             wav_path
         );
         warmup_and_guard_player(&mut child, "pw-play/paplay");

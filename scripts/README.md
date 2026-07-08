@@ -22,6 +22,7 @@ deleted in the 2026-07-05 rot cleanup (rsac-a3c4) — recover via
 | Script | Purpose | Called by |
 |---|---|---|
 | `check-module-dag.sh` | Module-DAG reverse-edge guard (`core→bridge→audio→api`) | ci.yml `module-dag` job, `gate.sh --full` |
+| `ci-linux-audio-route.sh` | Deterministic PipeWire routing gate: pins `ci_test_sink` as default, proves the tone→monitor route end-to-end (sox RMS + frequency), then exports `RSAC_CI_AUDIO_DETERMINISTIC=1` (rsac-b106/rsac-6efb) | ci-audio-tests.yml `linux-system`/`linux-device`/`linux-process`, humans on a Linux box |
 | `bump-version.sh` | Bumps the six version-bearing manifests + rotates CHANGELOG | release-prepare.yml, humans (see CONTRIBUTING §7) |
 | `verify-docs-rs.sh` | Post-publish docs.rs rendering spot-check | humans (see RELEASE_PROCESS.md) |
 
