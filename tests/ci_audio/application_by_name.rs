@@ -53,6 +53,28 @@ const MISSING_APP_NAME: &str = "ThisApplicationDefinitelyDoesNotExist_12345";
 fn discover_audio_producing_app() -> Option<String> {
     match rsac::list_audio_applications() {
         Ok(apps) => {
+            // Fallback detection (review finding, PR #45): when the CoreAudio
+            // audio-process query is unavailable or reports NO active PIDs,
+            // enumerate_audio_applications() deliberately returns the FULL
+            // unfiltered NSWorkspace list rather than an empty one — in that
+            // mode apps.first() could be Finder/Terminal/any silent GUI app,
+            // and targeting it would "pass" without exercising the
+            // audio-producing path this test exists to cover. The filtered
+            // list is characteristically small (active audio producers only)
+            // and never contains Finder (which cannot produce audio);
+            // the fallback list is the whole GUI session. Use both signals
+            // to detect the fallback and skip honestly instead.
+            let looks_like_fallback = apps.len() > 10
+                || apps.iter().any(|a| a.name == "Finder");
+            if looks_like_fallback {
+                eprintln!(
+                    "[ci_audio] SKIP: enumeration returned the unfiltered NSWorkspace \
+                     fallback ({} apps) — the audio-process query found no active \
+                     producers, so there is no audio-producing app to target",
+                    apps.len()
+                );
+                return None;
+            }
             let name = apps.first().map(|a| a.name.clone());
             match &name {
                 Some(n) => eprintln!("[ci_audio] discovered audio-producing app: '{n}'"),

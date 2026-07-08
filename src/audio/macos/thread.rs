@@ -63,14 +63,25 @@ type AudioDeviceID = u32;
 /// constant. See the `macos-tcc-grant-latency-vs-silence-watchdog` runbook.
 const SILENCE_GRACE_DEFAULT: std::time::Duration = std::time::Duration::from_secs(10);
 
+/// Ceiling for the `RSAC_SILENCE_GRACE_SECS` override (1 hour). Values above
+/// this are treated as invalid: the diagnostic exists to fire within a
+/// human-noticeable window, and an unbounded float would reach
+/// `Duration::from_secs_f64`'s panic range (`inf`, `1e400`, …).
+const SILENCE_GRACE_MAX_SECS: f64 = 3600.0;
+
 /// Resolve the silence-diagnostic grace window: the `RSAC_SILENCE_GRACE_SECS`
-/// env override (a positive float, seconds) if set and valid, else
-/// [`SILENCE_GRACE_DEFAULT`]. Invalid / non-positive values fall back to the
-/// default rather than disabling the guard.
+/// env override (a **finite** float in `(0, 3600]` seconds) if set and valid,
+/// else [`SILENCE_GRACE_DEFAULT`]. Invalid values — non-numeric, non-positive,
+/// non-finite (`inf`/`NaN`), or above the ceiling — fall back to the default
+/// rather than disabling the guard or panicking (`Duration::from_secs_f64`
+/// panics on non-finite/overflowing input; a bad env var must never crash
+/// capture startup).
 fn silence_grace() -> std::time::Duration {
     match std::env::var("RSAC_SILENCE_GRACE_SECS") {
         Ok(v) => match v.parse::<f64>() {
-            Ok(s) if s > 0.0 => std::time::Duration::from_secs_f64(s),
+            Ok(s) if s.is_finite() && s > 0.0 && s <= SILENCE_GRACE_MAX_SECS => {
+                std::time::Duration::from_secs_f64(s)
+            }
             _ => SILENCE_GRACE_DEFAULT,
         },
         Err(_) => SILENCE_GRACE_DEFAULT,
