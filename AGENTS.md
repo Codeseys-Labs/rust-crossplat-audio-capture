@@ -331,6 +331,9 @@ mise run gate        # or: bash scripts/gate.sh   (pwsh scripts/gate.ps1 on Wind
 #   fmt --check → clippy -D warnings (feat_<host>,compose,cli) → bare-build smoke
 mise run gate:full   # + lib tests, doctests, docsrs cargo doc, module-DAG guard
 mise run test        # just the CI test-job replica for the host OS
+mise run test:audio  # ci_audio integration suite on this machine (all 3 tiers)
+mise run release:bump -- X.Y.Z [--dry-run]  # six-manifest lockstep bump + CHANGELOG rotation
+mise run release:verify-docs                # post-publish docs.rs spot-check
 ```
 
 mise is a convenience, not a requirement — every task is a thin alias over
