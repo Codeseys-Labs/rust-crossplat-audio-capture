@@ -545,12 +545,26 @@ impl Engine {
         // Rate conversion path. (Re)create the resampler if the delivered rate
         // changed or none exists yet.
         if s.resampler.is_none() || s.resampler_in_rate != buf_rate {
-            if s.resampler.is_some() {
+            // rsac-7d97: on a mid-stream rate CHANGE the old resampler still
+            // holds real audio — up to CHUNK_FRAMES−1 input frames buffered
+            // in `pending` plus the FFT `output_delay()` residue (~25–45 ms
+            // per resampled source) — which replacing it would silently drop.
+            // Flush that tail into the FIFO first, exactly like the
+            // natural-end path in `ingest_all` (rsac-fab0), so no frames are
+            // lost across the rate change.
+            if let Some(rs) = s.resampler.as_mut() {
                 log::warn!(
-                    "compose source input rate changed {} -> {} Hz; rebuilding resampler",
+                    "compose source input rate changed {} -> {} Hz; \
+                     flushing old resampler tail and rebuilding",
                     s.resampler_in_rate,
                     buf_rate
                 );
+                if let Err(fe) = rs.flush(&mut s.fifo) {
+                    log::warn!(
+                        "compose resampler flush on rate change failed ({fe}); \
+                         resampled tail may be truncated"
+                    );
+                }
             }
             match StreamResampler::new(buf_rate, session_rate, s.spec.channels) {
                 Ok(rs) => {
