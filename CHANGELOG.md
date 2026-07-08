@@ -20,6 +20,20 @@ Releases with no ABI change omit the subsection (or state "No C ABI changes").
 
 ### Added
 
+### Changed
+
+### Deprecated
+
+### Removed
+
+### Fixed
+
+### Security
+
+## [0.4.1] - 2026-07-08
+
+### Added
+
 - **`macos-tcc-spi` feature — real audio-capture permission preflight
   (ADR-0015).** `check_audio_capture_permission()` on macOS can now return a
   real answer: there is no public API for the `kTCCServiceAudioCapture`
