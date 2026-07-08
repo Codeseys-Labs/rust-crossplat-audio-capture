@@ -39,6 +39,7 @@ on:
       - 'Cargo.toml'
       - 'Cargo.lock'
       - 'scripts/ci-linux-audio-route.sh'
+      - 'scripts/ci-windows-audio-default.ps1'
       - '.github/workflows/ci-audio-tests.yml'
   pull_request:
     branches: [main, master, 'release/**']
@@ -49,6 +50,7 @@ on:
       - 'Cargo.toml'
       - 'Cargo.lock'
       - 'scripts/ci-linux-audio-route.sh'
+      - 'scripts/ci-windows-audio-default.ps1'
       - '.github/workflows/ci-audio-tests.yml'
   workflow_dispatch:
 
