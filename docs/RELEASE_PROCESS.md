@@ -589,7 +589,10 @@ reach a registry.
 ### (b) C ABI changes are MAJOR for `rsac-ffi`
 
 The `rsac-ffi` crate exposes a C ABI: the exported `extern "C"` symbols
-and the generated `rsac.h` header. **Any** of the following is a
+and the C headers under `bindings/rsac-ffi/include/` — `rsac.h` is the
+**curated** header consumers include; `rsac_generated.h` is the raw
+cbindgen output that CI's header-drift check compares it against. **Any**
+of the following is a
 **MAJOR** version change for the FFI surface and MUST be called out in
 the CHANGELOG under a dedicated `### C ABI changes` subsection (see
 [`CHANGELOG.md`](../CHANGELOG.md)):

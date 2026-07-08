@@ -210,7 +210,7 @@ The following are always compiled and have no opt-out:
 
 ## Version note
 
-This matrix reflects `rsac` at the 0.4.0 line. Future provider-architecture work may add feature flags for cloud-backed capture providers — those will be listed here as they land.
+This matrix reflects `rsac` at the 0.4 line. Future provider-architecture work may add feature flags for cloud-backed capture providers — those will be listed here as they land.
 
 `rsac` and its bindings bump in lockstep on every semver tag, and any
 change to the `rsac-ffi` C ABI is a MAJOR bump for the FFI surface. See
