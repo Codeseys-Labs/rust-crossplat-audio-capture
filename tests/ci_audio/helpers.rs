@@ -22,6 +22,15 @@ use rsac::AudioBuffer;
 ///    - Linux: check PipeWire socket exists AND `pw-cli` responds
 ///    - Other platforms: check device enumeration succeeds
 pub fn audio_infrastructure_available() -> bool {
+    // Every test funnels through here (the require_* macros), so it doubles
+    // as the logging chokepoint: install the env_logger backend once so
+    // RUST_LOG=rsac=debug (set job-wide in CI) actually emits the library's
+    // debug lines into the --nocapture output. Without a backend the CI env
+    // var was a silent no-op, which made backend-timing regressions (e.g.
+    // the rsac-b106 evidence loop's StopCapture-latency question)
+    // undebuggable from CI logs.
+    init_test_logging();
+
     // Check env var first
     if let Ok(val) = std::env::var("RSAC_CI_AUDIO_AVAILABLE") {
         return val == "1";
@@ -29,6 +38,19 @@ pub fn audio_infrastructure_available() -> bool {
 
     // Runtime detection
     runtime_detect_audio()
+}
+
+/// Installs the test-side `env_logger` backend exactly once (idempotent and
+/// race-free across the harness's test threads). Timestamped with
+/// microseconds so CI log timelines can be correlated with the workflow's
+/// own timestamps.
+pub fn init_test_logging() {
+    static INIT: std::sync::Once = std::sync::Once::new();
+    INIT.call_once(|| {
+        let _ = env_logger::Builder::from_default_env()
+            .format_timestamp_micros()
+            .try_init();
+    });
 }
 /// Whether the test environment provides a *deterministic* audio source.
 ///
