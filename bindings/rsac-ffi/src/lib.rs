@@ -210,9 +210,12 @@ fn map_rsac_error(err: &rsac::AudioError) -> rsac_error_t {
     use rsac::AudioError;
     match err {
         AudioError::InvalidParameter { .. } => rsac_error_t::RSAC_ERROR_INVALID_PARAMETER,
-        AudioError::UnsupportedFormat { .. } | AudioError::ConfigurationError { .. } => {
-            rsac_error_t::RSAC_ERROR_CONFIGURATION
-        }
+        // UserConsentRequired is ErrorKind::Configuration in core and the
+        // header documents the missing-Android-projection-token preflight
+        // failure as RSAC_ERROR_CONFIGURATION — keep the C contract honest.
+        AudioError::UnsupportedFormat { .. }
+        | AudioError::ConfigurationError { .. }
+        | AudioError::UserConsentRequired { .. } => rsac_error_t::RSAC_ERROR_CONFIGURATION,
         AudioError::DeviceNotFound { .. }
         | AudioError::DeviceNotAvailable { .. }
         | AudioError::DeviceEnumerationError { .. } => rsac_error_t::RSAC_ERROR_DEVICE_NOT_FOUND,

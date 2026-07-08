@@ -1041,13 +1041,35 @@ pub(super) fn create_and_start_bridge(
     // ── Promote to a GlobalRef the stream can hold across threads ────
     // SAFETY: bridge is a live local ref.
     let global = unsafe { jni_call!(env, NewGlobalRef, bridge) };
-    unsafe { jni_call!(env, DeleteLocalRef, bridge) };
     if global.is_null() {
+        // Roll back: the bridge is already started and service-anchored.
+        // Without this, the Java read thread + AudioRecord keep running
+        // (service-pinned) while the Rust caller only unregisters the
+        // ingest session — a capture-resource leak until the service dies.
+        // Mirror the start-failure branch; ignore secondary failures so
+        // teardown runs to completion.
+        // SAFETY: bridge is a live local ref; method/class ids come from
+        // the cache and match its class.
+        unsafe {
+            jni_call!(env, CallVoidMethodA, bridge, aar.bridge_stop, ptr::null());
+            let _ = take_exception_message(env);
+            jni_call!(
+                env,
+                CallStaticVoidMethodA,
+                aar.service_class,
+                aar.service_unregister_bridge,
+                reg_args.as_ptr()
+            );
+            let _ = take_exception_message(env);
+            jni_call!(env, DeleteLocalRef, bridge);
+        }
         return Err(AudioError::InternalError {
             message: "NewGlobalRef failed for the CaptureBridge handle".to_string(),
             source: None,
         });
     }
+    // SAFETY: bridge is a live local ref; the GlobalRef now owns the object.
+    unsafe { jni_call!(env, DeleteLocalRef, bridge) };
     Ok(global)
 }
 
