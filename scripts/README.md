@@ -25,27 +25,20 @@ deleted in the 2026-07-05 rot cleanup (rsac-a3c4) — recover via
 | `check-module-dag.sh` | Module-DAG reverse-edge guard (`core→bridge→audio→api`) | ci.yml `module-dag` job, `gate.sh --full` |
 | `ci-linux-audio-route.sh` | Deterministic PipeWire routing gate: pins `ci_test_sink` as default, proves the tone→monitor route end-to-end (sox RMS + frequency), then exports `RSAC_CI_AUDIO_DETERMINISTIC=1` (rsac-b106/rsac-6efb) | ci-audio-tests.yml `linux-system`/`linux-device`/`linux-process`, humans on a Linux box |
 | `ci-windows-audio-default.ps1` | Deterministic VB-CABLE endpoint gate: sets + hard-verifies the default playback endpoint, then exports `RSAC_CI_AUDIO_DETERMINISTIC=1` (rsac-0f33) | ci-audio-tests.yml `windows-system`/`windows-device`/`windows-process` |
-| `bump-version.sh` | Bumps the six version-bearing manifests + rotates CHANGELOG | release-prepare.yml, `mise run release:bump -- X.Y.Z`, humans (see CONTRIBUTING §7) |
+| `bump-version.sh` | Bumps the seven version-bearing manifests + rotates CHANGELOG | release-prepare.yml, `mise run release:bump -- X.Y.Z`, humans (see CONTRIBUTING §7) |
 | `verify-docs-rs.sh` | Post-publish docs.rs rendering spot-check | `mise run release:verify-docs`, humans (see RELEASE_PROCESS.md) |
 
-## Docker testing stack
+## Cross-compilation helpers
 
 | Script | Purpose | Called by |
 |---|---|---|
-| `docker-test-all.sh` | Unified docker test orchestrator (`docker-compose.unified.yml`) | `make docker-test-all` etc. |
-| `aggregate-test-results.sh` | Aggregates `test-results/` from platform containers | `make docker-aggregate-results` etc. |
-| `verify-platform-testing.sh` | Validates the docker testing stack's file inventory | humans |
-| `cross-compile-check.sh` | `cross`-based check for the Linux targets (Darwin/MSVC legs removed — impossible with cross-rs) | `make cross-compile` |
-| `download_test_audio.sh` | Fetches the `test_audio.mp3` fixture some docker builds COPY | humans, before docker matrix builds |
+| `cross-compile-check.sh` | `cross`-based check for Linux targets (Darwin/MSVC legs are impossible with cross-rs) | `make cross-compile`, humans |
 
-## ⚠️ Disabled (fail-fast stubs, kept only because live callers reference them)
+## Retired Docker matrix
 
-| Script | Why |
-|---|---|
-| `run_audio_tests.sh` | Depended on the `run_tests` / `test-report-generator` bins removed in Phase 0. Referenced by `docker-compose.yml`, `docker-compose.unified.yml`, `docker/linux/Dockerfile.unified` — those matrix legs are non-functional anyway (missing `pulse-*.conf` COPY sources). Rebuild on `cargo test --test ci_audio` if the functionality is ever wanted again. |
-| `run_linux_matrix_tests.sh` | Orchestrated the matrix above; disabled for the same reason. |
-
-Known remaining docker-stack debt (not scripts): `docker/linux/Dockerfile.unified`
-COPYs nonexistent `pulse-client.conf`/`pulse-daemon.conf`; several Dockerfiles
-pin `rust:1.88.0` vs the repo toolchain 1.95.0; `docker-compose.yml` defines
-`rsac-linux-pipewire` twice.
+The old Docker test matrix (`docker-compose*.yml`, `scripts/docker-test-all.sh`,
+`scripts/run_audio_tests.sh`, and related report/fixture scripts) was removed in
+the 0.4.1 docs cleanup. It depended on removed examples and helper binaries.
+Use `mise run gate`, `mise run test`, `mise run test:audio`, and the CI audio
+workflows instead. The only maintained Docker image is the devcontainer image at
+`docker/linux/Dockerfile.test`; the `dockur` VM lab remains manual/experimental.

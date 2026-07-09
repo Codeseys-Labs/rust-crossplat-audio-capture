@@ -257,7 +257,7 @@ examples/                   # Example programs (basic_capture, record_to_file, l
 tests/                      # Integration tests
 reference/                  # Reference repos + analysis (REFERENCE_ANALYSIS.md)
 scripts/                    # Build/test/CI helper scripts
-docker/                     # Docker-based cross-platform testing
+docker/                     # Linux devcontainer + optional native VM lab; legacy Docker matrix retired
 .github/workflows/          # CI workflows
 ```
 
@@ -272,9 +272,13 @@ docker/                     # Docker-based cross-platform testing
   - `feat_windows` — Windows/WASAPI backend
   - `feat_linux` — Linux/PipeWire backend
   - `feat_macos` — macOS/CoreAudio backend
+  - `feat_android` — Android AAudio + AudioPlaybackCapture backend (compile-checked, runtime-unverified)
+  - `feat_ios` — iOS AVAudioEngine + ReplayKit backend (compile-checked, runtime-unverified)
   - `async-stream` — Async `Stream` support (adds `atomic-waker`)
   - `sink-wav` — `WavFileSink` adapter
   - `test-utils` — Test utility exports
+  - `tracing` — Optional `tracing` facade integration for internal instrumentation
+  - `bridge-zerocopy` — Default-off sample-domain ring used for benchmarking / future data-plane decisions
   - `compose` — Multi-source channel composition (`src/compose/`; adds `rubato` + `audioadapter-buffers`) — ADR-0011
   - `cli` — Demo binaries' deps (`clap`, `color-eyre`, `ctrlc`, `env_logger`); NOT in defaults, so library consumers don't pull them
   - `macos-tcc-spi` — real `check_audio_capture_permission()` preflight via the private `TCCAccessPreflight` SPI, `dlopen`'d at runtime (ADR-0015); off by default so the published artifact carries no private-symbol usage
@@ -332,7 +336,7 @@ mise run gate        # or: bash scripts/gate.sh   (pwsh scripts/gate.ps1 on Wind
 mise run gate:full   # + lib tests, doctests, docsrs cargo doc, module-DAG guard
 mise run test        # just the CI test-job replica for the host OS
 mise run test:audio  # ci_audio integration suite on this machine (all 3 tiers)
-mise run release:bump -- X.Y.Z [--dry-run]  # six-manifest lockstep bump + CHANGELOG rotation
+mise run release:bump -- X.Y.Z [--dry-run]  # seven-manifest lockstep bump + CHANGELOG rotation
 mise run release:verify-docs                # post-publish docs.rs spot-check
 ```
 
@@ -420,7 +424,7 @@ platform-independent Linux subset, so don't pin a brittle exact number) plus the
 `ci_audio` integration suite (~40+ tests), all passing with 0 failures on the
 verified platforms.
 
-- Docker-based testing available for cross-platform validation (see `docker/`)
+- Docker-based Linux devcontainer remains available; the old Docker test matrix is retired in favor of CI and local hardware testing
 - macOS backend includes compatibility with macOS 14.4–15 (Sonoma/Sequoia) and macOS 26 (Tahoe) via 3-path API fallback. See [macOS Version Compatibility](docs/MACOS_VERSION_COMPATIBILITY.md).
 
 ### Architecture alignment
@@ -698,7 +702,7 @@ Full playbook (when to stack vs parallel PRs, exact commands, pitfalls):
 - Performance benchmarking and optimization — benches ship in-tree (`benches/`) but no CI job executes them; ADR-0006's `bridge-zerocopy` promote-or-remove decision is blocked on that A/B data
 - macOS 15 (Sequoia) testing on real hardware (expected to work via Path 2, untested)
 - **Linux `ApplicationByName` happy-path integration test** — Windows has `application_by_name_windows`; the Linux happy path (pinned `pw-dump` node name) is still absent and macOS's is `#[ignore]`d behind TCC
-- **First crates.io publish** — the crate is not yet on crates.io (README's `version = "0.4"` snippet and the docs.rs links are forward-looking until then); release automation exists, needs `CARGO_REGISTRY_TOKEN` + a tag
+- **First crates.io publish** — the crate is not yet on crates.io; source/git dependency snippets are canonical until the registry publish lane is re-enabled
 - **Compose follow-ups** — Python/Node/Go bindings exposure (C FFI shipped; rsac-fba7), live per-source gain/mute (rsac-5a2d), v2 layouts (rsac-7c93)
 - **Blacksmith Windows audio support** — request Blacksmith add audio subsystem to Windows Server images (see §6 runner labels)
 
@@ -752,9 +756,10 @@ let mut capture = AudioCaptureBuilder::new()
 capture.start()?;
 
 // Reading audio (streaming-first)
-let buffer: AudioBuffer = capture.read_buffer()?.unwrap();
-let data: &[f32] = buffer.data();
-let frames: usize = buffer.num_frames();
+if let Some(buffer) = capture.read_buffer()? {
+    let data: &[f32] = buffer.data();
+    let frames: usize = buffer.num_frames();
+}
 
 // Stop capture
 capture.stop()?;
@@ -790,7 +795,7 @@ if dropped > 0 {
 // Device enumeration
 let enumerator = rsac::get_device_enumerator()?;
 let devices = enumerator.enumerate_devices()?;
-let default = enumerator.get_default_device()?;
+let default = enumerator.default_device()?;
 
 // Sink adapters
 use rsac::{NullSink, ChannelSink};

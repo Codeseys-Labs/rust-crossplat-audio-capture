@@ -53,7 +53,7 @@ run = """bash -c 'case "$(uname -s)" in Darwin) exec bash scripts/test-audio-mac
 run_windows = "pwsh -NoProfile -ExecutionPolicy Bypass -File scripts/test-audio-windows.ps1"
 
 [tasks."release:bump"]
-description = "Bump the six lockstep manifests + rotate CHANGELOG: mise run release:bump -- X.Y.Z [--dry-run]"
+description = "Bump the seven lockstep manifests + rotate CHANGELOG: mise run release:bump -- X.Y.Z [--dry-run]"
 run = "bash scripts/bump-version.sh"
 run_windows = "pwsh -NoProfile -ExecutionPolicy Bypass -File scripts/run-bash.ps1 scripts/bump-version.sh"
 

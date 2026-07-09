@@ -6,12 +6,12 @@
 //! lifecycle-correct path that pumps captured buffers into a sink on a
 //! dedicated thread (never the OS audio callback thread).
 //!
-//! Run with: `cargo run --example record_to_file --features sink-wav`
+//! Run with: `cargo run --example record_to_file --features "cli sink-wav"`
 //! Or with arguments:
-//!   `cargo run --example record_to_file --features sink-wav -- --output recording.wav --duration 5`
+//!   `cargo run --example record_to_file --features "cli sink-wav" -- --output recording.wav --duration 5`
 //!
-//! This example requires the `sink-wav` feature (for `WavFileSink`). When built
-//! without it, `main` prints a hint and exits.
+//! This example requires `cli` (target gating in `Cargo.toml`) and `sink-wav`
+//! (for `WavFileSink`). When built without `sink-wav`, `main` prints a hint and exits.
 
 #[cfg(feature = "sink-wav")]
 fn main() -> Result<(), Box<dyn std::error::Error>> {
@@ -106,6 +106,6 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 fn main() {
     eprintln!(
         "This example requires the `sink-wav` feature.\n\
-         Re-run with: cargo run --example record_to_file --features sink-wav"
+         Re-run with: cargo run --example record_to_file --features \"cli sink-wav\""
     );
 }

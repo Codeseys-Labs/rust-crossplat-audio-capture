@@ -22,11 +22,23 @@ Releases with no ABI change omit the subsection (or state "No C ABI changes").
 
 ### Changed
 
+- Release version lockstep now includes `mobile/android-native/Cargo.toml`, so
+  the Android `librsac.so` shim version stays aligned with the root crate and
+  binding manifests.
+
 ### Deprecated
 
 ### Removed
 
+- Retired the stale root Docker test matrix and its dead compose/scripts/images;
+  the maintained container surface is now the Linux/PipeWire devcontainer plus
+  the optional manual `dockur` native VM lab.
+
 ### Fixed
+
+- Refreshed 0.4.1 docs, binding READMEs, and example commands to reflect source
+  builds before registry publishing, mobile compile-only status, Go module tags,
+  and the current example feature flags.
 
 ### Security
 

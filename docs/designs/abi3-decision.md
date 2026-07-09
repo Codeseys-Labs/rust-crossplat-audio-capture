@@ -273,8 +273,10 @@ which builds one wheel and re-imports it across CPython minors).
 - [ ] Push a pre-release tag to `TestPyPI` before promoting — **not automated**; the
   release workflow triggers only on stable `v*.*.*` tags (pre-release shapes are
   excluded), so TestPyPI dry-runs remain a manual step.
-- [ ] Confirm `pip install rsac` on a fresh Python 3.14 alpha works — **not automated**
-  (the smoke step uses 3.9 + 3.13). Optional but high-value as 3.14 nears release.
+- [ ] Confirm a locally built abi3 wheel installs on a fresh Python 3.14 alpha —
+  **not automated** (the smoke step uses 3.9 + 3.13). Optional but high-value as
+  3.14 nears release; switch this to a registry install only after PyPI
+  publishing is enabled.
 
 ### 6.5 Rollback
 

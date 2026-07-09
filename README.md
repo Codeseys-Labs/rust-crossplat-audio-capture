@@ -154,7 +154,7 @@ use rsac::{get_device_enumerator, DeviceKind};
 
 let enumerator = get_device_enumerator()?;
 let devices = enumerator.enumerate_devices()?;
-let default = enumerator.get_default_device()?;
+let default = enumerator.default_device()?;
 ```
 
 ### Device-Change Notifications
@@ -191,7 +191,7 @@ native channels through (`keep_channels()`). Groups append in declaration
 order; the `ChannelMap` tells you which output channel belongs to which group.
 
 ```toml
-rsac = { version = "0.4", features = ["compose"] }
+rsac = { git = "https://github.com/Codeseys-Labs/rust-crossplat-audio-capture", features = ["compose"] }
 ```
 
 ```rust
@@ -248,25 +248,24 @@ bounds. See `examples/composed_capture.rs` for a runnable demo.
 
 ## CLI Demo
 
-The binary is a thin demo over the library API (requires the `cli` feature —
-`cargo install rsac --features cli`, or `cargo run --features cli -- <cmd>`
-from a checkout):
+The binary is a thin demo over the library API. Until the first crates.io
+publish, run it from a checkout with the `cli` feature:
 
 ```bash
 # Show platform capabilities
-rsac info
+cargo run --features cli -- info
 
 # List audio devices
-rsac list
+cargo run --features cli -- list
 
 # Capture system audio (live level meter)
-rsac capture
+cargo run --features cli -- capture
 
 # Capture a specific app by name
-rsac capture --app firefox
+cargo run --features cli -- capture --app firefox
 
 # Record to WAV file (output path is a positional argument)
-rsac record recording.wav --duration 30
+cargo run --features cli -- record recording.wav --duration 30
 ```
 
 ## Capture Mode Support
@@ -298,7 +297,8 @@ rsac = { git = "https://github.com/Codeseys-Labs/rust-crossplat-audio-capture" }
 
 | Feature | Default | Adds |
 |---|---|---|
-| `feat_windows` / `feat_linux` / `feat_macos` | ✅ | Platform backends |
+| `feat_windows` / `feat_linux` / `feat_macos` | ✅ | Desktop platform backends |
+| `feat_android` / `feat_ios` | ✅ | Mobile backend code paths; compile-checked only, not runtime-verified |
 | `compose` | — | Multi-source channel composition (`rubato` + `audioadapter-buffers`) |
 | `cli` | — | The `rsac` demo binary's deps (`clap`, `color-eyre`, `ctrlc`, `env_logger`) — library consumers don't pay for them |
 | `async-stream` | — | `futures_core::Stream` support (`atomic-waker`) |
@@ -336,7 +336,7 @@ Full index (every doc, with status): [`docs/README.md`](docs/README.md).
 - [`docs/troubleshooting.md`](docs/troubleshooting.md) — High-signal fixes for the most common build and runtime errors (PipeWire libs missing, Xcode CLT, TCC permission, WASAPI session contention, etc.).
 - [`docs/CONSUMING_RSAC.md`](docs/CONSUMING_RSAC.md) — How downstream projects consume any rsac surface: Rust crate, C FFI, Python, Node/Bun, Go, CLI — with the working install/link recipe for each.
 - [`docs/FRAMEWORK_COMPATIBILITY.md`](docs/FRAMEWORK_COMPATIBILITY.md) — Using rsac from Tauri v2, Dioxus, Electron, Deno, Bun, Flutter, and more — per-framework status (verified / expected / blocked) and integration recipes.
-- [`docs/MOBILE_BACKEND_DESIGN.md`](docs/MOBILE_BACKEND_DESIGN.md) — Design for the planned Android (`AudioPlaybackCapture` + AAudio) and iOS (AVAudioEngine + ReplayKit) backends ([ADR-0012](docs/designs/0012-mobile-platform-strategy.md), [ADR-0013](docs/designs/0013-mobile-capturetarget-semantics.md)).
+- [`docs/MOBILE_BACKEND_DESIGN.md`](docs/MOBILE_BACKEND_DESIGN.md) — Android (`AudioPlaybackCapture` + AAudio) and iOS (AVAudioEngine + ReplayKit) backend design and compile-checked implementation status; mobile runtime verification remains pending ([ADR-0012](docs/designs/0012-mobile-platform-strategy.md), [ADR-0013](docs/designs/0013-mobile-capturetarget-semantics.md)).
 - [`docs/architecture/`](docs/architecture/) — Detailed design documents for the core, bridge, and backend layers.
 - [`docs/CI_AUDIO_TESTING.md`](docs/CI_AUDIO_TESTING.md) — How audio integration tests run in CI across all three platforms (6 of 9 cells REAL on every run; macOS gaps explained).
 - [`docs/RELEASE_PROCESS.md`](docs/RELEASE_PROCESS.md) — End-to-end procedure for cutting a new `rsac` release: pre-release checks, version bump, tag, `cargo publish`, verification, and rollback.
@@ -357,7 +357,7 @@ core/ → bridge/ → audio/ (backends) → api/ → lib.rs
 
 ### AudioGraph
 
-[AudioGraph](https://github.com/Codeseys-Labs/audio-graph) is a desktop app (Tauri v2) that captures live system audio, performs real-time speech recognition, speaker diarization, entity extraction, and builds a temporal knowledge graph. Included as a [git submodule](apps/audio-graph/).
+[AudioGraph](https://github.com/Codeseys-Labs/audio-graph) is a desktop app (Tauri v2) that captures live system audio, performs real-time speech recognition, speaker diarization, entity extraction, and builds a temporal knowledge graph. It is consumed as a standalone checkout, not a tracked submodule in this repository.
 
 ## Running Tests
 
@@ -368,8 +368,7 @@ cargo test --lib --no-default-features --features feat_linux
 # CI audio integration tests (requires PipeWire + virtual sink)
 cargo test --test ci_audio --no-default-features --features feat_linux -- --test-threads=1
 
-# Docker-based testing
-cd docker/linux && docker-compose run pipewire-test
+# Legacy Docker matrix is retired; use CI/audio docs for maintained paths.
 ```
 
 ## Contributing

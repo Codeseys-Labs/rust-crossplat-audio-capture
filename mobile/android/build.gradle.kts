@@ -6,8 +6,8 @@
 // helpers (PackageResolver). Target resolution, error classification, and
 // stream semantics live in Rust (src/audio/android/).
 //
-// Source-complete per seed rsac-c4b8; first CI build lands with rsac-1a6e.
-// All version pins are "expected; CI trues up".
+// Source-complete per seed rsac-c4b8 and built by the mobile-android CI job.
+// Runtime capture remains unverified until the Android device/emulator seed lands.
 
 import org.jetbrains.kotlin.gradle.dsl.JvmTarget
 

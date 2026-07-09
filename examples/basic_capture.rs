@@ -3,7 +3,7 @@
 //! Minimal example demonstrating the rsac streaming capture pipeline:
 //! `AudioCaptureBuilder → AudioCapture → read_buffer() loop`
 //!
-//! Run with: `cargo run --example basic_capture`
+//! Run with: `cargo run --example basic_capture --features cli`
 
 use rsac::{AudioCaptureBuilder, CaptureTarget, PlatformCapabilities};
 use std::sync::atomic::{AtomicBool, Ordering};

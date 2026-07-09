@@ -8,7 +8,7 @@
 //! Run with:
 //!
 //! ```sh
-//! cargo run --example verify_audio -- --input recording.wav --frequency 440
+//! cargo run --example verify_audio --features cli -- --input recording.wav --frequency 440
 //! ```
 //!
 //! Exit code is `0` when the amplitude exceeds `--amplitude-threshold` and a

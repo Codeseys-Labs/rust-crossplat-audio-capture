@@ -85,10 +85,10 @@ The step-by-step setup and validation procedure is in
 the real examples:
 
 ```bash
-cargo run --example verify_audio       # end-to-end capture sanity check
 cargo run --example list_devices       # enumerate devices via the public API
-cargo run --example basic_capture      # minimal capture loop
-cargo run --example record_to_file --features sink-wav
+cargo run --example basic_capture --features cli
+cargo run --example record_to_file --features "cli sink-wav" -- --output recording.wav --duration 5
+cargo run --example verify_audio --features cli -- --input recording.wav --frequency 440
 cargo run --example async_capture --features async-stream
 ```
 
@@ -96,14 +96,13 @@ Feature-gated platform diagnostics are also available as bins:
 `cargo run --bin pipewire_diagnostics --features feat_linux` (Linux) and
 `cargo run --bin wasapi_session_test --features feat_windows` (Windows).
 
-### 3. `docker/` — legacy containerized harness (stale)
+### 3. `docker/` — legacy containerized harness (retired)
 
-The `docker/` directory and the root `docker-compose*.yml` files contain an
-older containerized test/cross-compile harness. **It is stale and not part of
-the maintained verification path.** It is built around a `dynamic_vlc` example
-that no longer exists in `examples/`, and it predates the Blacksmith CI above.
-Prefer the two CI workflows and the local hardware guide; treat anything under
-`docker/` as unmaintained until it is either updated or removed.
+The old root `docker-compose*.yml` matrix has been retired. It depended on
+removed examples and removed helper binaries, and CI now covers the maintained
+host-native paths. The only maintained Docker image is the Linux/PipeWire
+devcontainer at `docker/linux/Dockerfile.test`; the `dockur` VM lab remains
+manual/experimental. Prefer the two CI workflows and the local hardware guide.
 
 ---
 

@@ -251,7 +251,7 @@ release (see §2 for the pre-release checklist):
 
 ```bash
 # Bump the version + promote CHANGELOG entries under a dated heading.
-# scripts/bump-version.sh rewrites all six lockstep manifests + rotates
+# scripts/bump-version.sh rewrites all seven lockstep manifests + rotates
 # the CHANGELOG — see §2 "CHANGELOG promotion" and §3 "Version bump".
 git add -A
 git commit -m "rsac X.Y.Z"
@@ -350,11 +350,12 @@ There is deliberately **no `major` option**. `release-prepare.yml`
    refuses anyway if a future edit ever does) and **refuses if the tag
    `vX.Y.Z` already exists**.
 2. Runs `bash scripts/bump-version.sh <computed-version>` (under
-   `TZ=UTC`), which rewrites **all six** lockstep manifests
+   `TZ=UTC`), which rewrites **all seven** lockstep manifests
    (`Cargo.toml`, `bindings/rsac-ffi/Cargo.toml` — including its internal
    `rsac = { path = "../../", version = "…" }` dependency pin —
    `bindings/rsac-napi/{Cargo.toml,package.json}`,
-   `bindings/rsac-python/{Cargo.toml,pyproject.toml}`) and rotates
+   `bindings/rsac-python/{Cargo.toml,pyproject.toml}`, and
+   `mobile/android-native/Cargo.toml`) and rotates
    `CHANGELOG.md` (`[Unreleased]` → `[X.Y.Z] - <UTC date>` plus a fresh
    `Unreleased` scaffold). The one thing the script does *not* handle is
    the `bindings/rsac-go/vX.Y.Z` tag — see §"Versioning & ABI contract"
@@ -375,14 +376,15 @@ writes to `master`.
 
 Treat the `release: vX.Y.Z` PR like any other PR: review the manifest
 diff and the CHANGELOG rotation. The CI **`version-lockstep` gate must be
-green** on the PR before merging — it cross-checks that all **six** manifests
+green** on the PR before merging — it cross-checks that all **seven** manifests
 (root `Cargo.toml`, the rsac-ffi / rsac-napi / rsac-python `Cargo.toml`s, the
-napi `package.json`, and the python `pyproject.toml`) carry the same version.
+napi `package.json`, the python `pyproject.toml`, and the Android native shim)
+carry the same version.
 Because this gate runs on the PR/master push that subsequently gets tagged, the
 tagged commit is already lockstep-verified before `release-tag.yml` tags it. (At
 *tag* time, `release.yml` additionally re-checks the tag matches the root
 `Cargo.toml`, and `ci.yml` *also* re-runs on the `v*.*.*` tag push — its `on:`
-block includes a `tags: ['v*.*.*', '!v*-*']` trigger — so the full six-manifest
+block includes a `tags: ['v*.*.*', '!v*-*']` trigger — so the full seven-manifest
 lockstep gate runs again at tag time as well as on push/PR.)
 
 > **Merge it as a SQUASH merge, and do NOT edit the commit subject.** The
@@ -516,7 +518,7 @@ secrets are never an error: the workflow logs the fallback, pushes with
   major-crossing release commit. A `X` → `X+1` (or pre-1.0 `0.x` →
   `0.(x+1)` per the ABI policy in §"Versioning & ABI contract") bump must
   be done **manually**: run `scripts/bump-version.sh <new-major.0.0>`
-  (which rewrites all six manifests, `bindings/rsac-ffi/Cargo.toml`
+  (which rewrites all seven manifests, `bindings/rsac-ffi/Cargo.toml`
   included), commit with a normal (non-`release:`) message, then tag and
   push by hand per §4.
 - **The `bindings/rsac-go/vX.Y.Z` Go module tag on a manual release.**
@@ -535,7 +537,7 @@ secrets are never an error: the workflow logs the fallback, pushes with
 - **Idempotent tagging** — `release-tag.yml` never re-creates an existing
   local or remote tag.
 - **`version-lockstep`** gates the release PR and is re-checked on the tag
-  by `release.yml`; the six manifests must agree before anything ships.
+  by `release.yml`; the seven manifests must agree before anything ships.
 - **Repo-guarded** — both workflows only run on
   `Codeseys-Labs/rust-crossplat-audio-capture`.
 - **Major-proof** — three independent guards (no `major` input, prepare
@@ -564,25 +566,26 @@ carry version `X.Y.Z`:
 | `bindings/rsac-napi/package.json` | top-level `"version"` | npm package `@rsac/audio` |
 | `bindings/rsac-python/Cargo.toml` | `[package].version` | pyo3 crate |
 | `bindings/rsac-python/pyproject.toml` | `[project].version` | PyPI package `rsac` |
+| `mobile/android-native/Cargo.toml` | `[package].version` | Android `librsac.so` shim packaged into the AAR |
 
-Run `bash scripts/bump-version.sh X.Y.Z` to rewrite **all six** manifests
+Run `bash scripts/bump-version.sh X.Y.Z` to rewrite **all seven** manifests
 in one shot — including `bindings/rsac-ffi/Cargo.toml` and its internal
 `rsac = { path = "../../", version = "…" }` dependency pin — plus the
 CHANGELOG rotation. The
-`version-lockstep` CI job re-checks all six values on every push/PR
+`version-lockstep` CI job re-checks all seven values on every push/PR
 (warning on a mid-cycle skew). Because the release PR's merge commit is a
 push to `master`, this gate runs — and must be green — on the exact commit that
 `release-tag.yml` then tags, so a mismatched manifest never reaches the tag.
 At *tag* time, `release.yml`'s `verify` job independently re-checks the pushed
 tag against the root `Cargo.toml` before publishing (a second, registry-side
-gate), and `ci.yml` re-runs its full six-manifest lockstep on the `v*.*.*` tag
+gate), and `ci.yml` re-runs its full seven-manifest lockstep on the `v*.*.*` tag
 push too (its `on:` block has a `tags: ['v*.*.*', '!v*-*']` trigger), so the
 lockstep gate covers push/PR *and* tag time. A mismatched manifest must never
 reach a registry.
 
 > Mid-cycle skew is tolerated by CI (warning only) so a binding can lag
 > the root crate between releases, but it must be reconciled before
-> tagging. As of this writing all six manifests agree at `0.4.0`
+> tagging. As of this writing all seven lockstep manifests agree at `0.4.1`
 > (`bump-version.sh` has kept them in lockstep since it grew the
 > rsac-ffi rewrite).
 
@@ -741,7 +744,7 @@ Before you start a release, confirm all of the following:
 > steps remain the path for a **MAJOR** bump (the automation refuses one),
 > when the `CARGO_REGISTRY_TOKEN` secret is unset, or when a maintainer
 > needs to override the automation. `scripts/bump-version.sh` now exists
-> and rewrites all six manifests + rotates the CHANGELOG — §3 is
+> and rewrites all seven manifests + rotates the CHANGELOG — §3 is
 > still a manual *invocation* of it, not a hand-edit.
 
 ---
@@ -833,7 +836,7 @@ Do **not** hand-edit the version anymore — drive it through
 `scripts/bump-version.sh`, the same script the automated **Release
 Prepare** workflow runs. It takes an **explicit** `X.Y.Z` (it does *not*
 compute minor/patch — that arithmetic lives in `release-prepare.yml`) and
-rewrites all six lockstep manifests plus rotates the CHANGELOG:
+rewrites all seven lockstep manifests plus rotates the CHANGELOG:
 
 ```bash
 # Preview the edits without writing them:
@@ -850,12 +853,13 @@ This rewrites, in one shot:
   internal `rsac = { path = "../../", version = "…" }` dependency pin
 - `bindings/rsac-napi/Cargo.toml` and `bindings/rsac-napi/package.json`
 - `bindings/rsac-python/Cargo.toml` and `bindings/rsac-python/pyproject.toml`
+- `mobile/android-native/Cargo.toml`
 - `CHANGELOG.md` — `## [Unreleased]` → `## [X.Y.Z] - <UTC date>` with a
   fresh `Unreleased` scaffold
 
-That covers all six lockstep manifests — there is no manual reconcile
+That covers all seven lockstep manifests — there is no manual reconcile
 step left. The `version-lockstep` CI job checks
-all six agree and hard-fails on a tag if any disagree.
+all seven agree and hard-fails on a tag if any disagree.
 
 Commit (use a normal subject for a manual/major release; reserve the
 `release: vX.Y.Z` subject for the automated PR, since `release-tag.yml`
@@ -926,8 +930,9 @@ above). Both fire on the same `v*.*.*` tag push as `release.yml`.
 
 Before tagging, bump the binding manifests in lockstep with the root
 `Cargo.toml` — `bash scripts/bump-version.sh X.Y.Z` does this for you
-(all six manifests, including `bindings/rsac-napi/package.json` and
-`bindings/rsac-python/pyproject.toml`; see §3).
+(all seven manifests, including `bindings/rsac-napi/package.json`,
+`bindings/rsac-python/pyproject.toml`, and `mobile/android-native/Cargo.toml`;
+see §3).
 
 ### Manual fallback — `rsac-napi` → npm
 
@@ -1158,11 +1163,12 @@ Tracked here so follow-up release-automation tasks can pick them up:
   secret; see §"One-time setup").
   A missing credential fails only the affected `publish-*` job; the other
   flows continue. Fall back to §2–§6 for the affected registry.
-- `scripts/bump-version.sh X.Y.Z` rewrites all six manifests — the root
+- `scripts/bump-version.sh X.Y.Z` rewrites all seven manifests — the root
   `Cargo.toml`, `bindings/rsac-ffi/Cargo.toml` (including its internal `rsac`
   dependency version pin), `bindings/rsac-napi/{Cargo.toml,package.json}`, and
-  `bindings/rsac-python/{Cargo.toml,pyproject.toml}` — and rotates the
-  CHANGELOG. It cannot tag `rsac-go` — on the automated path
+  `bindings/rsac-python/{Cargo.toml,pyproject.toml}`, and
+  `mobile/android-native/Cargo.toml` — and rotates the CHANGELOG. It cannot tag
+  `rsac-go` — on the automated path
   `release-tag.yml` pushes `bindings/rsac-go/vX.Y.Z` for you; on a manual
   release push it separately (see §"Versioning & ABI contract" (c)). The `version-lockstep` CI job in
   `ci.yml` catches any manifest that drifts: it warns on push/PR and

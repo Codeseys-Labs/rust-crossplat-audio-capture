@@ -7,16 +7,12 @@ Built with [napi-rs](https://napi.rs/).
 ## Install
 
 ```bash
-bun add @rsac/audio
-# or
-npm install @rsac/audio
+bun install
+bun run build
 ```
 
-Prebuilt binaries are published for:
-
-- `darwin-x64`, `darwin-arm64`
-- `linux-x64-gnu`, `linux-arm64-gnu`
-- `win32-x64-msvc`
+The npm package and prebuilt binaries are not published yet. Run the commands
+above from `bindings/rsac-napi` in this repository.
 
 ## Usage
 

@@ -24,7 +24,7 @@ After install, clear the build cache once: `cargo clean && cargo build`.
 
 **Symptom:** `enumerate_devices()` succeeds but `read_buffer()` always returns `Ok(None)`, or the stream errors with `BackendError("Failed to connect to audio server")`.
 
-**Fix:** Confirm PipeWire is the active audio server: `systemctl --user status pipewire pipewire-pulse wireplumber`. All three should be active. If PulseAudio is still running, rsac will not work — PipeWire-compat replaces it. On headless CI, start `pipewire` + a null-sink via the `docker/linux/` setup.
+**Fix:** Confirm PipeWire is the active audio server: `systemctl --user status pipewire pipewire-pulse wireplumber`. All three should be active. If PulseAudio is still running, rsac will not work — PipeWire-compat replaces it. On headless CI, mirror `.github/workflows/ci-audio-tests.yml` and `scripts/ci-linux-audio-route.sh` to start PipeWire, WirePlumber, and a deterministic null sink.
 
 ## Windows: `cargo build` links but `AUDCLNT_E_DEVICE_IN_USE` at runtime
 
@@ -86,4 +86,4 @@ Collect the following before filing an issue:
 - Output of `rsac info` and `rsac list`
 - Whether the repro uses system capture, per-app capture, or process-tree capture
 
-File at the repo's issue tracker. Linux repros run headlessly in `docker/linux/` — attach a minimal reproducer there if possible.
+File at the repo's issue tracker. For Linux audio repros, attach the exact `ci_audio` command, `scripts/test-pipewire-setup.sh` output, and whether `RSAC_CI_AUDIO_DETERMINISTIC=1` was set.

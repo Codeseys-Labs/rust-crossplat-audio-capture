@@ -1,7 +1,7 @@
 [package]
 name = "rsac-ffi"
 # In lockstep with the workspace version (rsac + napi + python) — ci.yml's
-# version-lockstep gate and scripts/bump-version.sh treat all six manifests as
+# version-lockstep gate and scripts/bump-version.sh treat all seven manifests as
 # one version.
 version = "0.4.1"
 edition = "2021"
@@ -14,10 +14,9 @@ repository = "https://github.com/Codeseys-Labs/rust-crossplat-audio-capture"
 readme = "README.md"
 keywords = ["audio", "capture", "ffi", "c-bindings"]
 categories = ["multimedia::audio", "external-ffi-bindings"]
-# NOTE: this crate is publishable to crates.io. It is left unpublished by
-# default only so day-to-day workspace builds never risk an accidental
-# `cargo publish`; flip to `publish = true` (or drop this line) in the release
-# commit. See "Publishing to crates.io" in README.md for the dependency switch.
+# NOTE: publishing is deferred. Keep this false so day-to-day workspace builds
+# never risk an accidental cargo publish; release owners should follow
+# docs/RELEASE_PROCESS.md once the registry lane is re-enabled.
 publish = false
 
 [lib]
@@ -47,9 +46,9 @@ compose = ["rsac/compose"]
 
 [dependencies]
 # Path + version: the path is used for local/workspace dev, and the version
-# requirement is what `cargo publish` records (crates.io ignores `path`). Keep
-# the version in lockstep with the parent crate's `[package].version` so a
-# published rsac-ffi resolves the matching rsac release. See README.
+# requirement is what a future cargo publish records (crates.io ignores `path`).
+# Keep the version in lockstep with the parent crate's `[package].version` so a
+# future published rsac-ffi resolves the matching rsac release.
 rsac = { path = "../../", version = "0.4.1", default-features = false }
 log = "0.4"
 
