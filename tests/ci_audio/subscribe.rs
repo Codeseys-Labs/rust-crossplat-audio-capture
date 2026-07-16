@@ -216,7 +216,10 @@ fn subscribe_delivers_buffers_from_live_capture() {
 /// and that the reason mentions the lifecycle problem.
 #[test]
 fn subscribe_errors_when_not_started() {
-    require_audio!();
+    // rsac-76cd: these tests start a SystemDefault capture, which on macOS
+    // is a Process Tap behind the kTCCServiceAudioCapture gate — gate on
+    // system-capture availability like subscribe_delivers_buffers_from_live_capture.
+    require_system_capture!();
 
     let capture = match AudioCaptureBuilder::new()
         .with_target(CaptureTarget::SystemDefault)
@@ -262,7 +265,10 @@ fn subscribe_errors_when_not_started() {
 /// `Receiver` past `stop()` — they must see `Disconnected`, not hang.
 #[test]
 fn subscribe_receiver_disconnects_after_stop() {
-    require_audio!();
+    // rsac-76cd: these tests start a SystemDefault capture, which on macOS
+    // is a Process Tap behind the kTCCServiceAudioCapture gate — gate on
+    // system-capture availability like subscribe_delivers_buffers_from_live_capture.
+    require_system_capture!();
 
     let mut capture = match AudioCaptureBuilder::new()
         .with_target(CaptureTarget::SystemDefault)
@@ -331,7 +337,10 @@ fn subscribe_receiver_disconnects_after_stop() {
 /// *compete*, so uneven delivery is expected behavior, not a bug.
 #[test]
 fn subscribe_allows_multiple_subscribers() {
-    require_audio!();
+    // rsac-76cd: these tests start a SystemDefault capture, which on macOS
+    // is a Process Tap behind the kTCCServiceAudioCapture gate — gate on
+    // system-capture availability like subscribe_delivers_buffers_from_live_capture.
+    require_system_capture!();
 
     let mut capture = match AudioCaptureBuilder::new()
         .with_target(CaptureTarget::SystemDefault)
@@ -406,7 +415,10 @@ fn subscribe_allows_multiple_subscribers() {
 /// and the first thread's exit didn't poison shared state.
 #[test]
 fn subscribe_thread_exits_on_receiver_drop() {
-    require_audio!();
+    // rsac-76cd: these tests start a SystemDefault capture, which on macOS
+    // is a Process Tap behind the kTCCServiceAudioCapture gate — gate on
+    // system-capture availability like subscribe_delivers_buffers_from_live_capture.
+    require_system_capture!();
 
     let mut capture = match AudioCaptureBuilder::new()
         .with_target(CaptureTarget::SystemDefault)

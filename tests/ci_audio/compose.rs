@@ -106,10 +106,32 @@ fn composed_system_capture_layout_and_delivery() {
         "mono group owns channel 0 (declaration order)"
     );
 
-    // ── Read composed audio for ~2 s ─────────────────────────────────
-    let deadline = Instant::now() + Duration::from_secs(2);
+    // ── Warm-up: wait for the player's audio to actually flow ────────
+    // rsac-2115: the Windows PlayLooping player starts asynchronously and
+    // can take longer than the fixed pre-start sleep to route audio into
+    // the loopback. Don't start the strict measurement window until the
+    // composed stream has delivered its first NON-SILENT buffer (bounded),
+    // mirroring the warm-up pattern in system_capture.rs. Buffers seen
+    // during warm-up still count toward delivery/layout checks.
+    let warmup_deadline = Instant::now() + Duration::from_secs(8);
     let mut buffers = 0u64;
     let mut nonsilent = false;
+    while Instant::now() < warmup_deadline && !nonsilent {
+        match session.read_chunk_nonblocking() {
+            Ok(Some(buffer)) => {
+                buffers += 1;
+                if buffer.data().iter().any(|s| s.abs() > 1e-4) {
+                    nonsilent = true;
+                }
+            }
+            Ok(None) => std::thread::sleep(Duration::from_millis(5)),
+            Err(e) if e.is_fatal() => break,
+            Err(_) => std::thread::sleep(Duration::from_millis(5)),
+        }
+    }
+
+    // ── Read composed audio for ~2 s ─────────────────────────────────
+    let deadline = Instant::now() + Duration::from_secs(2);
     while Instant::now() < deadline {
         match session.read_chunk_nonblocking() {
             Ok(Some(buffer)) => {
