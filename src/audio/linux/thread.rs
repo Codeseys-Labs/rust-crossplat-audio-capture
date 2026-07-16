@@ -3808,6 +3808,7 @@ mod tests {
         let app = |pid: u32, name: &str, serial: &str| PwAppSnapshot {
             pid,
             app_name: name.to_string(),
+            binary: None,
             node_serial: serial.to_string(),
         };
         // PID 100 appears on two different global ids; PID 200 on one.
@@ -3836,6 +3837,7 @@ mod tests {
             PwAppSnapshot {
                 pid: 100,
                 app_name: "App".to_string(),
+                binary: None,
                 node_serial: "1000".to_string(),
             },
         );
