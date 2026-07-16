@@ -560,6 +560,80 @@ fn mid_stream_rate_change_flushes_old_resampler_tail() {
     harness.shutdown();
 }
 
+/// rsac-b7d4: renegotiating a resampled source to EXACTLY the session rate
+/// takes the direct/bypass path, which used to strand the old resampler's
+/// tail (pending partial chunk + FFT delay residue) without flushing it —
+/// silently dropping ~25–45 ms of real audio. The bypass must flush the
+/// stranded resampler just like the rate-change path (rsac-7d97) does.
+#[test]
+fn renegotiation_to_session_rate_flushes_stranded_resampler_tail() {
+    // Phase A: 4410 frames @ 44.1 kHz — resampled, and NOT a multiple of the
+    // 1024-frame input chunk, so a partial chunk is pending at the switch.
+    let a_buffers = 10usize;
+    let a_frames = 441usize;
+    // Phase B: 4800 frames @ 48 kHz — exactly the session rate, direct path.
+    let b_buffers = 10usize;
+    let b_frames = 480usize;
+    let mut script: Vec<AudioBuffer> = (0..a_buffers)
+        .map(|_| const_buffer(0.3, 1, 44_100, a_frames))
+        .collect();
+    script.extend((0..b_buffers).map(|_| const_buffer(0.6, 1, 48_000, b_frames)));
+    let (src, _) = ScriptedSource::ending(script);
+
+    let harness = Harness::spawn(
+        cfg(
+            1,
+            vec![GroupSpec {
+                layout: GroupLayout::Mono,
+                offset: 0,
+                width: 1,
+            }],
+            vec![SourceSpec {
+                gain: 1.0,
+                group: 0,
+                channels: 0,
+                clock_candidate: false,
+            }],
+            0,
+        ),
+        vec![Box::new(src)],
+    );
+
+    let buffers = harness.drain_to_end();
+    let total_frames: usize = buffers.iter().map(|b| b.num_frames()).sum();
+
+    // Phase A owes round(4410 * 48_000/44_100) = 4800 resampled frames —
+    // recoverable in full only if the bypass flushes the stranded resampler.
+    // Phase B passes through 1:1 (4800 frames). Without the fix, phase A
+    // comes up short by its pending partial chunk plus the FFT delay
+    // residue — several hundred frames, far beyond this tolerance.
+    let expected_a = (a_buffers * a_frames) as u64 * 48_000 / 44_100; // = 4800
+    let expected_b = (b_buffers * b_frames) as u64; // = 4800, direct
+    let expected = expected_a + expected_b;
+    assert!(
+        (total_frames as i64 - expected as i64).abs() <= 2,
+        "expected {expected}±2 composed frames across the renegotiation to \
+         the session rate, got {total_frames}"
+    );
+
+    // The resampling flag must drop back to false once the source is direct.
+    assert!(
+        !harness.stats.sources[0].resampling.load(Ordering::Relaxed),
+        "resampling flag must clear after renegotiating to the session rate"
+    );
+
+    // The signal on both sides of the switch survives (DC levels preserved).
+    let all: Vec<f32> = buffers
+        .iter()
+        .flat_map(|b| b.data().iter().copied())
+        .collect();
+    let a_mid = all[all.len() / 4];
+    let b_mid = all[3 * all.len() / 4];
+    assert!((a_mid - 0.3).abs() < 0.05, "phase A signal, got {a_mid}");
+    assert!((b_mid - 0.6).abs() < 0.05, "phase B signal, got {b_mid}");
+    harness.shutdown();
+}
+
 /// When the master stalls, the wall-clock fallback keeps ticking (with the
 /// master padded) so a live secondary source still flows.
 #[test]
