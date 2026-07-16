@@ -457,18 +457,6 @@ fn wasapi_capture_thread_main(
     let channels = config.channels;
     let sample_rate = config.sample_rate;
 
-    // WASAPI-hardening: throttle the invariant-violation diagnostics so a
-    // pathological stream (a loopback endpoint that starts delivering a format
-    // that violates our interleaved-f32 assumption) cannot flood the log at
-    // audio-callback cadence. We log the FIRST occurrence at `error` unconditionally
-    // (it is always a real problem worth surfacing) and thereafter emit a single
-    // rate-limited summary roughly once per second of wall-clock capture, plus a
-    // final count in the cleanup section. Counted per-thread; no atomics needed
-    // because only this capture thread touches them. Declared OUTSIDE the
-    // panic-guarded closure below so the cleanup tail can report the final
-    // count even if the loop panicked.
-    let mut malformed_packet_count: u64 = 0;
-
     // rsac-66a6 (ADR-0010 cross-backend terminal contract): distinguish a clean
     // stop-flag exit from a FATAL device-error exit. A WASAPI capture-client read
     // failure (`get_next_packet_size` / `read_from_device`) is the WASAPI signal
@@ -518,8 +506,6 @@ fn wasapi_capture_thread_main(
         // little-endian f32 samples = `channels * 4` bytes. `channels` is `>= 1`
         // (validated upstream), so this is non-zero.
         let bytes_per_frame = channels as usize * std::mem::size_of::<f32>();
-
-        let mut last_malformed_log = std::time::Instant::now();
 
         // PU-7: one reusable contiguous byte buffer for the raw WASAPI packet.
         //
@@ -672,33 +658,19 @@ fn wasapi_capture_thread_main(
                 // WASAPI-hardening: `bytes_to_f32_frames` additionally enforces the
                 // interleaved-f32 delivery contract — the byte run must be a whole
                 // multiple of `bytes_per_frame` (so the sample count is a whole
-                // multiple of `channels`). If a future/edge loopback endpoint ever
-                // delivers a partial frame (the risk called out by the process-
-                // loopback autoconvert TODO), the trailing partial frame is dropped
-                // and the event surfaced via `malformed`, rather than silently
-                // shifting every subsequent sample into the wrong channel.
+                // multiple of `channels`), dropping a trailing partial frame
+                // rather than silently shifting every subsequent sample into the
+                // wrong channel. Here `valid` is `frames_read * bytes_per_frame`
+                // by construction — an exact multiple — so `malformed` is
+                // structurally unreachable on this path (rsac-0055; the runtime
+                // counter/log machinery it used to feed was dead code). The
+                // debug assert keeps the invariant visible in test builds; the
+                // function's own unit tests cover the partial-frame handling.
                 let (samples, malformed) = bytes_to_f32_frames(valid, bytes_per_frame);
-                if malformed {
-                    malformed_packet_count += 1;
-                    // First occurrence is always surfaced; subsequent ones are
-                    // rate-limited to ~1/s so a persistently-wrong stream can't
-                    // flood the log at callback cadence.
-                    if malformed_packet_count == 1
-                        || last_malformed_log.elapsed() >= std::time::Duration::from_secs(1)
-                    {
-                        log::error!(
-                            "WASAPI thread: delivered packet violates the interleaved-f32 \
-                         contract (byte_len={} not a whole multiple of bytes_per_frame={} \
-                         for {} channels); trailing partial frame dropped. \
-                         total malformed packets so far: {}",
-                            valid.len(),
-                            bytes_per_frame,
-                            channels,
-                            malformed_packet_count
-                        );
-                        last_malformed_log = std::time::Instant::now();
-                    }
-                }
+                debug_assert!(
+                    !malformed,
+                    "valid slice is an exact frame multiple by construction"
+                );
 
                 if !samples.is_empty() {
                     // Push the borrowed sample view directly. The stamped push
@@ -764,16 +736,6 @@ fn wasapi_capture_thread_main(
 
     let _ = audio_client.stop_stream();
     is_active.store(false, Ordering::SeqCst);
-    // WASAPI-hardening: if any delivered packet violated the interleaved-f32
-    // contract during this session, surface the total once at exit so the
-    // (rate-limited) per-packet errors have an authoritative final count.
-    if malformed_packet_count > 0 {
-        log::error!(
-            "WASAPI thread: {} packet(s) violated the interleaved-f32 delivery contract \
-             during this capture session (trailing partial frames were dropped)",
-            malformed_packet_count
-        );
-    }
     // rsac-66a6 (ADR-0010): a FATAL device-error exit must drive the bridge to the
     // terminal `Error` state (`signal_error`) so a parked Linux/blocking reader
     // observes a Fatal `StreamEnded` instead of an indefinitely-draining graceful

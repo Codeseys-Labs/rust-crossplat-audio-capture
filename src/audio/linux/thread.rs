@@ -151,6 +151,11 @@ pub(crate) struct PwAppSnapshot {
     /// Human-readable application name: `application.name`, then
     /// `application.process.binary`, then a generic placeholder.
     pub app_name: String,
+    /// The raw `application.process.binary`, when present. Kept separately so
+    /// `ByAppName` resolution can match name AND binary independently, the
+    /// same fields the `pw-dump` fallback matches (rsac-0055): `app_name`
+    /// prefers `application.name`, which would otherwise shadow the binary.
+    pub binary: Option<String>,
     /// Node `object.serial` (or registry global `id` if no serial) as a string.
     pub node_serial: String,
 }
@@ -1120,9 +1125,13 @@ pub(crate) fn app_name_matches(candidate: &str, query: &str) -> bool {
     if base.eq_ignore_ascii_case(q) {
         return true;
     }
-    // Strip a trailing ".exe" (cross-platform binary names) from the basename
-    // for the final comparison — never a broad substring match.
-    let stem = base.strip_suffix(".exe").unwrap_or(base);
+    // Strip a trailing ".exe" (cross-platform binary names, any case — Wine
+    // apps report names like "VLC.EXE") from the basename for the final
+    // comparison — never a broad substring match.
+    let stem = match base.len().checked_sub(4) {
+        Some(cut) if base[cut..].eq_ignore_ascii_case(".exe") => &base[..cut],
+        _ => base,
+    };
     stem.eq_ignore_ascii_case(q)
 }
 
@@ -1154,7 +1163,15 @@ pub(crate) fn resolve_target_from_snapshot(
             .map(|a| a.node_serial.clone()),
         TargetQuery::ByAppName(name) => apps
             .iter()
-            .find(|a| app_name_matches(&a.app_name, name))
+            // Match name and binary independently — the same two fields the
+            // pw-dump fallback checks — so `application.name` present but
+            // not matching doesn't shadow a matching process binary.
+            .find(|a| {
+                app_name_matches(&a.app_name, name)
+                    || a.binary
+                        .as_deref()
+                        .is_some_and(|b| app_name_matches(b, name))
+            })
             .map(|a| a.node_serial.clone()),
         TargetQuery::ByPidSet(pids) => apps
             .iter()
@@ -1748,11 +1765,12 @@ fn pw_thread_main(
                         else {
                             return;
                         };
+                        let binary = props.get("application.process.binary").map(str::to_owned);
                         let app_name = props
                             .get("application.name")
-                            .or_else(|| props.get("application.process.binary"))
-                            .unwrap_or("Unknown")
-                            .to_owned();
+                            .map(str::to_owned)
+                            .or_else(|| binary.clone())
+                            .unwrap_or_else(|| "Unknown".to_owned());
                         // node_serial mirrors the device-identity contract:
                         // object.serial, falling back to the registry global id.
                         let node_serial = props
@@ -1764,6 +1782,7 @@ fn pw_thread_main(
                             PwAppSnapshot {
                                 pid,
                                 app_name,
+                                binary,
                                 node_serial,
                             },
                         );
@@ -3471,6 +3490,7 @@ mod tests {
         PwAppSnapshot {
             pid,
             app_name: app_name.to_string(),
+            binary: None,
             node_serial: node_serial.to_string(),
         }
     }
@@ -3488,6 +3508,13 @@ mod tests {
         assert!(app_name_matches("/usr/lib/firefox/firefox", "firefox"));
         assert!(app_name_matches("C:\\Program Files\\VLC\\vlc.exe", "vlc"));
         assert!(app_name_matches("spotify.exe", "spotify"));
+        // rsac-0055: the ".exe" strip is case-insensitive too — Wine apps
+        // report mixed/upper-case binary names.
+        assert!(app_name_matches("VLC.EXE", "vlc"));
+        assert!(app_name_matches("C:\\Games\\Player.Exe", "player"));
+        // But ".exe" must be a real suffix, not a fuzzy match.
+        assert!(!app_name_matches("exe", "")); // guard: short candidates
+        assert!(app_name_matches("exe", "exe")); // 3-char name, no strip
     }
 
     #[test]
@@ -3598,6 +3625,35 @@ mod tests {
         // Substring must NOT match (tightened contract).
         assert_eq!(
             resolve_target_from_snapshot(&TargetQuery::ByAppName("Fire".to_string()), &[], &apps),
+            None
+        );
+    }
+
+    /// rsac-0055: the native resolver must match `application.process.binary`
+    /// independently of `application.name`, exactly like the pw-dump
+    /// fallback. An `application.name` that exists but doesn't match must not
+    /// shadow a matching binary.
+    #[test]
+    fn test_resolve_target_from_snapshot_by_app_name_matches_binary() {
+        let apps = vec![PwAppSnapshot {
+            pid: 4321,
+            // Display name doesn't match the query...
+            app_name: "Mozilla Firefox Web Browser".to_string(),
+            // ...but the process binary does (same field pw-dump matches).
+            binary: Some("/usr/lib/firefox/firefox".to_string()),
+            node_serial: "9003".to_string(),
+        }];
+        assert_eq!(
+            resolve_target_from_snapshot(
+                &TargetQuery::ByAppName("firefox".to_string()),
+                &[],
+                &apps
+            ),
+            Some("9003".to_string())
+        );
+        // Still no substring leakage through the binary path either.
+        assert_eq!(
+            resolve_target_from_snapshot(&TargetQuery::ByAppName("fire".to_string()), &[], &apps),
             None
         );
     }
@@ -3719,11 +3775,13 @@ mod tests {
         let app = PwAppSnapshot {
             pid: 4242,
             app_name: "Firefox".to_string(),
+            binary: Some("/usr/lib/firefox/firefox".to_string()),
             node_serial: "1234".to_string(),
         };
         let cloned = app.clone();
         assert_eq!(cloned.pid, 4242);
         assert_eq!(cloned.app_name, "Firefox");
+        assert_eq!(cloned.binary.as_deref(), Some("/usr/lib/firefox/firefox"));
         assert_eq!(cloned.node_serial, "1234");
     }
 

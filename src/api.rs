@@ -1163,16 +1163,21 @@ pub(crate) fn spawn_subscribe_with_errors_thread(
                             None => true,
                         };
                         if forward {
-                            last_recoverable = Some((variant, now));
                             // Advisory item: non-blocking. If the channel is
                             // full the error is not forwarded this round (and
                             // NOT counted as a dropped buffer); a disconnect
                             // still ends the pump.
-                            if matches!(
-                                tx.try_send(Err(e)),
-                                Err(mpsc::TrySendError::Disconnected(_))
-                            ) {
-                                break; // Receiver dropped
+                            match tx.try_send(Err(e)) {
+                                Ok(()) => {
+                                    // rsac-0055: arm the coalescing cooldown
+                                    // only on a DELIVERED error — a Full drop
+                                    // must not suppress the next report.
+                                    last_recoverable = Some((variant, now));
+                                }
+                                Err(mpsc::TrySendError::Full(_)) => {}
+                                Err(mpsc::TrySendError::Disconnected(_)) => {
+                                    break; // Receiver dropped
+                                }
                             }
                         }
                         std::thread::sleep(std::time::Duration::from_millis(1));
