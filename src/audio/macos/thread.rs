@@ -346,61 +346,62 @@ pub(crate) fn create_macos_capture(
     let mut audio_unit = AudioUnit::new(IOType::HalOutput).map_err(map_ca_error)?;
 
     // ── Step 3: Configure the AudioUnit ──
+    //
+    // The steps run in AUHAL_SETUP_ORDER. Per Apple TN2091, EnableIO
+    // (input on, output off) MUST come before CurrentDevice: a fresh
+    // HalOutput unit has its output element enabled by default, so binding
+    // CurrentDevice first asks that still-enabled output element to bind to
+    // the device — an input-only device (every real microphone) has no
+    // output streams and rejects the bind with
+    // kAudioUnitErr_InvalidPropertyValue (-10851). Combo input+output
+    // devices (USB headsets) mask the bug. See GH #53 and the
+    // `auhal_setup_binds_device_only_after_enable_io` test.
 
-    // Set current device
-    audio_unit
-        .set_property(
-            kAudioOutputUnitProperty_CurrentDevice,
-            Scope::Global,
-            Element::Output,
-            Some(&device_id),
-        )
-        .map_err(map_ca_error)?;
-
-    // Enable IO for input (capture) on input bus
     let enable_io: u32 = 1;
-    audio_unit
-        .set_property(
-            kAudioOutputUnitProperty_EnableIO,
-            Scope::Input,
-            Element::Input,
-            Some(&enable_io),
-        )
-        .map_err(map_ca_error)?;
-
-    // Disable IO for output on output bus
     let disable_io: u32 = 0;
-    audio_unit
-        .set_property(
-            kAudioOutputUnitProperty_EnableIO,
-            Scope::Output,
-            Element::Output,
-            Some(&disable_io),
-        )
-        .map_err(map_ca_error)?;
-
-    // Build ASBD for interleaved F32
+    // Interleaved F32 ASBD, set on both bus scopes below.
     let asbd = build_f32_asbd(config.sample_rate, config.channels);
 
-    // Set stream format on OUTPUT scope of INPUT bus (what CoreAudio delivers to us)
-    audio_unit
-        .set_property(
-            kAudioUnitProperty_StreamFormat,
-            Scope::Output,
-            Element::Input,
-            Some(&asbd),
-        )
+    for step in AUHAL_SETUP_ORDER {
+        match step {
+            // Enable IO for input (capture) on input bus
+            AuhalSetupStep::EnableInput => audio_unit.set_property(
+                kAudioOutputUnitProperty_EnableIO,
+                Scope::Input,
+                Element::Input,
+                Some(&enable_io),
+            ),
+            // Disable IO for output on output bus
+            AuhalSetupStep::DisableOutput => audio_unit.set_property(
+                kAudioOutputUnitProperty_EnableIO,
+                Scope::Output,
+                Element::Output,
+                Some(&disable_io),
+            ),
+            // Bind the capture device — only after the output element is off
+            AuhalSetupStep::BindDevice => audio_unit.set_property(
+                kAudioOutputUnitProperty_CurrentDevice,
+                Scope::Global,
+                Element::Output,
+                Some(&device_id),
+            ),
+            // Stream format on OUTPUT scope of INPUT bus (what CoreAudio delivers to us)
+            AuhalSetupStep::InputBusFormat => audio_unit.set_property(
+                kAudioUnitProperty_StreamFormat,
+                Scope::Output,
+                Element::Input,
+                Some(&asbd),
+            ),
+            // Stream format on INPUT scope of OUTPUT bus (matching format)
+            AuhalSetupStep::OutputBusFormat => audio_unit.set_property(
+                kAudioUnitProperty_StreamFormat,
+                Scope::Input,
+                Element::Output,
+                Some(&asbd),
+            ),
+        }
         .map_err(map_ca_error)?;
-
-    // Set stream format on INPUT scope of OUTPUT bus (matching format)
-    audio_unit
-        .set_property(
-            kAudioUnitProperty_StreamFormat,
-            Scope::Input,
-            Element::Output,
-            Some(&asbd),
-        )
-        .map_err(map_ca_error)?;
+    }
 
     // Initialize the AudioUnit
     audio_unit.initialize().map_err(map_ca_error)?;
@@ -743,6 +744,32 @@ fn device_has_input_streams(device_id: AudioDeviceID) -> AudioResult<bool> {
     get_audio_device_supports_scope(device_id, Scope::Input).map_err(map_ca_error)
 }
 
+// ── Helper: AUHAL setup sequence (TN2091 ordering) ──────────────────────
+
+/// One property-configuration step of the AUHAL capture-unit setup.
+///
+/// The order of these steps is load-bearing (Apple TN2091): the device bind
+/// must come after IO enablement, or input-only devices fail with -10851
+/// (GH #53). Keeping the sequence as data lets a unit test assert the
+/// invariant instead of relying on code-review vigilance.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum AuhalSetupStep {
+    EnableInput,
+    DisableOutput,
+    BindDevice,
+    InputBusFormat,
+    OutputBusFormat,
+}
+
+/// The canonical AUHAL setup order executed by `create_macos_capture`.
+const AUHAL_SETUP_ORDER: [AuhalSetupStep; 5] = [
+    AuhalSetupStep::EnableInput,
+    AuhalSetupStep::DisableOutput,
+    AuhalSetupStep::BindDevice,
+    AuhalSetupStep::InputBusFormat,
+    AuhalSetupStep::OutputBusFormat,
+];
+
 // ── Helper: Build F32 ASBD ───────────────────────────────────────────────
 
 /// Builds an `AudioStreamBasicDescription` for interleaved F32 PCM.
@@ -841,6 +868,41 @@ mod tests {
         assert!(
             !would_warn(&seen, &stop),
             "stopped within grace window ⇒ must NOT warn"
+        );
+    }
+
+    // ── AUHAL setup ordering (TN2091 / GH #53) ───────────────────────
+
+    /// The device bind MUST come after both EnableIO steps. Setting
+    /// CurrentDevice on a fresh HalOutput unit (output element still
+    /// enabled) fails with -10851 for input-only devices — every real
+    /// microphone. This test pins the TN2091 ordering so a future refactor
+    /// can't silently reintroduce the bug.
+    #[test]
+    fn auhal_setup_binds_device_only_after_enable_io() {
+        let pos = |step| {
+            AUHAL_SETUP_ORDER
+                .iter()
+                .position(|&s| s == step)
+                .expect("step missing from AUHAL_SETUP_ORDER")
+        };
+
+        let enable_input = pos(AuhalSetupStep::EnableInput);
+        let disable_output = pos(AuhalSetupStep::DisableOutput);
+        let bind_device = pos(AuhalSetupStep::BindDevice);
+        let input_fmt = pos(AuhalSetupStep::InputBusFormat);
+        let output_fmt = pos(AuhalSetupStep::OutputBusFormat);
+
+        assert!(
+            enable_input < bind_device && disable_output < bind_device,
+            "TN2091: EnableIO(input on / output off) must precede the \
+             CurrentDevice bind, or input-only devices fail with -10851 \
+             (GH #53); order = {AUHAL_SETUP_ORDER:?}"
+        );
+        assert!(
+            bind_device < input_fmt && bind_device < output_fmt,
+            "stream formats must be set after the device bind so format \
+             negotiation sees the real device; order = {AUHAL_SETUP_ORDER:?}"
         );
     }
 
