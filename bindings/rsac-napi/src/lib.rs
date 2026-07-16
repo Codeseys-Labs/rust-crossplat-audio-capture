@@ -413,13 +413,15 @@ impl AudioCapture {
     /// Returns `null` if no data is currently available.
     /// Throws if the capture is not running.
     ///
-    /// Not terminal-observable: this (and `read_blocking`/`read_async`/
-    /// `read_blocking_async`) routes through rsac's `read_buffer`, which
-    /// short-circuits to a *recoverable* `StreamReadError` the moment the stream
-    /// leaves `Running` and never surfaces the terminal `StreamEnded`. Only the
-    /// push pump started by `on_data` drains the terminal state and reports it via
-    /// `on_end`. A pull consumer should treat `stop`/`is_running` as the
-    /// end-of-stream signal and a thrown read error as retryable.
+    /// Not terminal-observable: this and `read_async` route through rsac's
+    /// `read_buffer`, which short-circuits to a *recoverable*
+    /// `StreamReadError` the moment the stream leaves `Running` and never
+    /// surfaces the terminal `StreamEnded`. The BLOCKING readers
+    /// (`read_blocking`/`read_blocking_async`) ARE terminal-observable as of
+    /// rsac-477d, as is the push pump started by `on_data` (terminal reason
+    /// via `on_end`). A non-blocking pull consumer should treat
+    /// `stop`/`is_running` as the end-of-stream signal and a thrown read
+    /// error as retryable.
     #[napi]
     pub fn read(&self) -> Result<Option<AudioChunk>> {
         // `read_buffer` takes `&self` now, so the guard does not need `mut`.
@@ -440,13 +442,13 @@ impl AudioCapture {
     /// `onData()` for push-based streaming or use `read()` in a loop
     /// with appropriate yielding.
     ///
-    /// Like `read`, this is not terminal-observable: it routes through
-    /// `read_buffer_blocking` and surfaces only recoverable errors, never the
-    /// terminal `StreamEnded`. Use `on_data` + `on_end` to observe the terminal
-    /// reason.
+    /// Terminal-observable (rsac-477d): once the stream has ended — after
+    /// `stop()` or a fatal backend error — this throws the stream's true
+    /// terminal error (`StreamEnded`) promptly instead of downgrading it to
+    /// a recoverable "not running" error, matching the C FFI and Go.
     #[napi]
     pub fn read_blocking(&self) -> Result<AudioChunk> {
-        // `read_buffer_blocking` takes `&self` now, so the guard does not need `mut`.
+        // `read_chunk_blocking` takes `&self`, so the guard does not need `mut`.
         let inner = self.inner.lock().map_err(|e| {
             napi::Error::new(
                 napi::Status::GenericFailure,
@@ -454,7 +456,7 @@ impl AudioCapture {
             )
         })?;
 
-        let result = inner.read_buffer_blocking().map_err(audio_err_to_napi)?;
+        let result = inner.read_chunk_blocking().map_err(audio_err_to_napi)?;
         Ok(AudioChunk::from_rsac_buffer(&result))
     }
 
@@ -492,19 +494,23 @@ impl AudioCapture {
     /// until data is available.
     ///
     /// This is useful for consuming audio in an async loop without busy-spinning.
+    ///
+    /// Terminal-observable (rsac-477d): once the stream has ended this
+    /// rejects with the stream's true terminal error (`StreamEnded`) promptly
+    /// instead of a recoverable "not running" error — see `readBlocking`.
     #[napi]
     pub async fn read_blocking_async(&self) -> Result<AudioChunk> {
         let inner = self.inner.clone();
 
         let result = tokio::task::spawn_blocking(move || -> napi::Result<rsac::AudioBuffer> {
-            // `read_buffer_blocking` takes `&self`, so the guard does not need `mut`.
+            // `read_chunk_blocking` takes `&self`, so the guard does not need `mut`.
             let capture = inner.lock().map_err(|e| {
                 napi::Error::new(
                     napi::Status::GenericFailure,
                     format!("Lock poisoned: {}", e),
                 )
             })?;
-            capture.read_buffer_blocking().map_err(audio_err_to_napi)
+            capture.read_chunk_blocking().map_err(audio_err_to_napi)
         })
         .await
         .map_err(|e| {

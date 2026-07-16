@@ -399,6 +399,11 @@ class AudioCapture:
 
         Blocks until audio data is available. The GIL is released
         during the wait.
+
+        Terminal-observable: once the stream has ended (after ``stop()``
+        or a fatal backend error) this raises the stream's true terminal
+        error promptly, matching iteration, instead of a recoverable
+        "not running" error.
         """
         ...
 
