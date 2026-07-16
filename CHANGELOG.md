@@ -25,6 +25,12 @@ Releases with no ABI change omit the subsection (or state "No C ABI changes").
 - Release version lockstep now includes `mobile/android-native/Cargo.toml`, so
   the Android `librsac.so` shim version stays aligned with the root crate and
   binding manifests.
+- Python `AudioCapture.read()` and the Node `readBlocking()` /
+  `readBlockingAsync()` readers now use the terminal-accurate
+  `read_chunk_blocking`: after `stop()` or a fatal backend error they surface
+  the stream's true terminal state promptly instead of downgrading it to a
+  recoverable "not running" error — matching the C FFI, Go, and the Python
+  iterator, which had already migrated.
 
 ### Deprecated
 
@@ -33,14 +39,44 @@ Releases with no ABI change omit the subsection (or state "No C ABI changes").
 - Retired the stale root Docker test matrix and its dead compose/scripts/images;
   the maintained container surface is now the Linux/PipeWire devcontainer plus
   the optional manual `dockur` native VM lab.
+- Windows: removed a structurally unreachable malformed-packet branch and its
+  dead counters from the WASAPI capture loop (no behavior change; the
+  interleaved-f32 contract enforcement and its unit tests remain).
 
 ### Fixed
 
 - Refreshed 0.4.1 docs, binding READMEs, and example commands to reflect source
   builds before registry publishing, mobile compile-only status, Go module tags,
   and the current example feature flags.
+- **macOS: capturing from an input-only device (every real microphone) no
+  longer fails instantly with OSStatus -10851.** The AUHAL setup now follows
+  TN2091's ordering — enable input IO and disable output IO *before* binding
+  `kAudioOutputUnitProperty_CurrentDevice` — so the bind no longer asks the
+  still-enabled output element to attach to a device with no output streams.
+  Combo input+output devices (USB headsets) masked the bug. (#53)
+- compose: renegotiating a resampled source to exactly the session rate no
+  longer strands the old resampler's tail (up to ~25–45 ms of captured audio
+  was silently dropped); the exact-rate path now flushes it like the
+  rate-change and end-of-stream paths already did.
+- macOS: the `CATapDescription` used to create a Process Tap is now released
+  after `AudioHardwareCreateProcessTap`, fixing a per-tap-creation object leak
+  in all three constructors (single-process, process-tree, system-wide).
+- Recoverable capture errors forwarded to `subscribe()` receivers now arm
+  their coalescing cooldown only when actually delivered; previously a full
+  channel dropped the error *and* suppressed the next report for the full
+  coalescing interval.
+- Linux: `ApplicationByName` matching strips a trailing `.exe`
+  case-insensitively (Wine apps report names like `VLC.EXE`), and the native
+  resolver now matches `application.name` and `application.process.binary`
+  independently — the same fields the `pw-dump` fallback checks — so a
+  non-matching display name no longer shadows a matching binary.
 
 ### Security
+
+- `build.rs` no longer executes package managers: the opt-in
+  `RSAC_AUTO_INSTALL=1` path that ran `sudo apt-get` from inside the cargo
+  build script is removed. The build now prints the exact install commands;
+  dependency installation stays in the human-invoked setup scripts.
 
 ## [0.4.1] - 2026-07-08
 
