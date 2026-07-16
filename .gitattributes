@@ -2,3 +2,9 @@
 .seeds/templates.jsonl merge=union
 .seeds/plans.jsonl merge=union
 .mulch/expertise/*.jsonl merge=union
+
+# rsac-801c: generated C headers are produced with LF (cbindgen on any host,
+# plus the checked-in copies) — pin them so Windows checkouts with
+# core.autocrlf don't show phantom whole-file diffs / local EOL churn.
+bindings/rsac-ffi/include/*.h text eol=lf
+bindings/rsac-go/rsac.h text eol=lf
