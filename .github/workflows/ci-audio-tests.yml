@@ -63,9 +63,11 @@ on:
       - 'src/**'
       - 'tests/**'
       - 'examples/**'
+      - 'bindings/**'
       - 'Cargo.toml'
       - 'Cargo.lock'
       - 'scripts/ci-linux-audio-route.sh'
+      - 'scripts/ci-linux-tone-loop.sh'
       - 'scripts/ci-windows-audio-default.ps1'
       - '.github/workflows/ci-audio-tests.yml'
       - '.github/actions/**'
@@ -75,9 +77,11 @@ on:
       - 'src/**'
       - 'tests/**'
       - 'examples/**'
+      - 'bindings/**'
       - 'Cargo.toml'
       - 'Cargo.lock'
       - 'scripts/ci-linux-audio-route.sh'
+      - 'scripts/ci-linux-tone-loop.sh'
       - 'scripts/ci-windows-audio-default.ps1'
       - '.github/workflows/ci-audio-tests.yml'
       - '.github/actions/**'
@@ -721,6 +725,137 @@ jobs:
           retention-days: 14
           if-no-files-found: ignore
 
+  # ===========================================================================
+  # Linux binding-level SystemDefault capture smokes (rsac-3635).
+  # Parallel to linux-audio: own PipeWire bootstrap + deterministic-route HARD
+  # GATE (shares the composite actions), then Python/Node/Go smokes on the same
+  # RSAC_CI_AUDIO_DETERMINISTIC=1 + PULSE_SINK the Rust tiers use. Each smoke
+  # spawns a looping tone player (scripts/ci-linux-tone-loop.sh) and kills it.
+  #
+  # A separate job (not steps in linux-audio) so the three heavy binding builds
+  # (maturin develop / napi build / rsac-ffi + cgo) run CONCURRENTLY with the
+  # Rust tiers instead of serializing onto that job's critical path; it reuses
+  # the two composite actions and gets its own Swatinem cache key. The summary
+  # job below fans this in via a fourth `needs:` entry + one gate block.
+  # ===========================================================================
+  linux-audio-bindings:
+    name: "Linux Audio Bindings (python+node+go)"
+    runs-on: blacksmith-4vcpu-ubuntu-2404
+    timeout-minutes: 45
+    # `bash` keyword shell (`-eo pipefail`) so a failing binding smoke propagates
+    # through the `| tee log` pipe instead of being masked by tee's exit 0.
+    defaults:
+      run:
+        shell: bash
+    outputs:
+      binding_python: ${{ steps.record.outputs.binding_python }}
+      binding_node:   ${{ steps.record.outputs.binding_node }}
+      binding_go:     ${{ steps.record.outputs.binding_go }}
+    steps:
+      - uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5
+        with:
+          persist-credentials: false
+      - uses: ./.github/actions/rust-setup
+        with:
+          cache-key: linux-audio-bindings
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
+        with:
+          node-version: 22
+      - uses: actions/setup-go@41dfa10bad2bb2ae585af6ee5bb4d7d973ad74ed # v5
+        with:
+          go-version: '1.22'
+
+      # daemon:true installs the full audio stack + dev headers (libpipewire/
+      # libspa/libclang), bootstraps PipeWire, creates ci_test_sink, and runs
+      # the route HARD GATE that exports RSAC_CI_AUDIO_DETERMINISTIC=1 +
+      # PULSE_SINK (and XDG_RUNTIME_DIR/DBUS_SESSION_BUS_ADDRESS) to $GITHUB_ENV,
+      # which propagate to the binding smoke child processes below.
+      - name: Set up PipeWire + prove deterministic routing (hard gate)
+        uses: ./.github/actions/pipewire-setup
+        with:
+          daemon: "true"
+
+      # ── Build each binding once ──────────────────────────────────────────
+      - name: Build Python binding (maturin develop)
+        env:
+          PYO3_USE_ABI3_FORWARD_COMPATIBILITY: "1"
+        run: |
+          python3 -m venv .venv-cap
+          . .venv-cap/bin/activate
+          pip install --quiet maturin
+          maturin develop -m bindings/rsac-python/Cargo.toml
+
+      - name: Build Node binding (napi build --release)
+        working-directory: bindings/rsac-napi
+        run: |
+          npm install --no-fund --no-audit
+          npm run build
+
+      # (The Go staticlib is built by the `make test-e2e` target in the Go smoke.)
+
+      # ── Smokes (continue-on-error → per-language outputs, summary-gated) ──
+      - name: Python capture smoke
+        id: smoke_python
+        continue-on-error: true
+        timeout-minutes: 8
+        env:
+          RSAC_TEST_CAPTURE_TIMEOUT_SECS: "15"
+        run: |
+          PLAYER_PID="$(bash scripts/ci-linux-tone-loop.sh)"
+          trap 'kill -- "-$PLAYER_PID" 2>/dev/null || true' EXIT  # negative PID = whole setsid group (reaps the looping player)
+          . .venv-cap/bin/activate
+          python bindings/rsac-python/tests/capture_smoke.py 2>&1 | tee ci-bindings-python.log
+
+      - name: Node capture smoke
+        id: smoke_node
+        continue-on-error: true
+        timeout-minutes: 8
+        working-directory: bindings/rsac-napi
+        env:
+          RSAC_TEST_CAPTURE_TIMEOUT_SECS: "15"
+        run: |
+          PLAYER_PID="$(bash ../../scripts/ci-linux-tone-loop.sh)"
+          trap 'kill -- "-$PLAYER_PID" 2>/dev/null || true' EXIT  # negative PID = whole setsid group (reaps the looping player)
+          node --test tests/capture_smoke.mjs 2>&1 | tee ../../ci-bindings-node.log
+
+      - name: Go capture smoke
+        id: smoke_go
+        continue-on-error: true
+        timeout-minutes: 12
+        working-directory: bindings/rsac-go
+        env:
+          RSAC_TEST_CAPTURE_TIMEOUT_SECS: "15"
+        run: |
+          PLAYER_PID="$(bash ../../scripts/ci-linux-tone-loop.sh)"
+          trap 'kill -- "-$PLAYER_PID" 2>/dev/null || true' EXIT  # negative PID = whole setsid group (reaps the looping player)
+          make test-e2e 2>&1 | tee ../../ci-bindings-go.log
+
+      - name: Record binding outcomes
+        id: record
+        if: always()
+        run: |
+          {
+            echo "binding_python=${{ steps.smoke_python.outcome }}"
+            echo "binding_node=${{ steps.smoke_node.outcome }}"
+            echo "binding_go=${{ steps.smoke_go.outcome }}"
+          } >> "$GITHUB_OUTPUT"
+
+      - name: Diagnostics on failure
+        if: ${{ failure() || steps.smoke_python.outcome == 'failure' || steps.smoke_node.outcome == 'failure' || steps.smoke_go.outcome == 'failure' }}
+        run: |
+          pactl list short sinks || true
+          pactl list short sources || true
+          wpctl status || true
+
+      - name: Upload logs
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: linux-audio-bindings-logs
+          path: ci-bindings-*.log
+          retention-days: 14
+          if-no-files-found: ignore
+
   # =============================================================================
   # Summary — the single gate. Fails if any Linux, Windows, or macOS
   # (first-class-lite) tier failed, or if a job's setup failed. rsac-fba6:
@@ -738,6 +873,7 @@ jobs:
       - linux-audio
       - windows-audio
       - macos-audio
+      - linux-audio-bindings
     steps:
       - name: Write CI gap report seed
         env:
@@ -750,6 +886,9 @@ jobs:
           MACOS_SYSTEM: ${{ needs.macos-audio.outputs.tier_system }}
           MACOS_DEVICE: ${{ needs.macos-audio.outputs.tier_device }}
           MACOS_PROCESS: ${{ needs.macos-audio.outputs.tier_process }}
+          BIND_PYTHON: ${{ needs.linux-audio-bindings.outputs.binding_python }}
+          BIND_NODE: ${{ needs.linux-audio-bindings.outputs.binding_node }}
+          BIND_GO: ${{ needs.linux-audio-bindings.outputs.binding_go }}
         run: |
           cat > ci-audio-gap-report.md <<EOF
           # Audio CI Coverage Gap Report
@@ -769,13 +908,16 @@ jobs:
           | macOS system | ${MACOS_SYSTEM:-n/a} |
           | macOS device | ${MACOS_DEVICE:-n/a} |
           | macOS process | ${MACOS_PROCESS:-n/a} |
+          | Linux binding python | ${BIND_PYTHON:-n/a} |
+          | Linux binding node | ${BIND_NODE:-n/a} |
+          | Linux binding go | ${BIND_GO:-n/a} |
 
           ## Deferred Seeds
 
           | Seed | Why it is not a hard gate yet | Evidence needed before implementation |
           |---|---|---|
-          | Linux hard content assertions | Blacksmith's dbus-less PipeWire startup can expose a sink and monitor while \`SystemDefault\` still yields 0 buffers. Hard non-silence assertions would risk false REDs. | A green run showing \`ci_test_sink.monitor\` carries the 440 Hz fixture through rsac capture, then set \`RSAC_CI_AUDIO_DETERMINISTIC=1\` for the affected Linux tiers. |
-          | Linux \`ApplicationByName\` happy-path filter | The backend supports it, but a low-risk test needs the exact \`application.name\`/binary reported by \`pw-play\` or \`paplay\` on the runner. Guessing that name would be flaky. | Capture \`pw-dump --no-colors\` for the spawned player and pin the observed stable field before adding the filter. |
+          | ~~Linux hard content assertions~~ SHIPPED | The deterministic route (\`RSAC_CI_AUDIO_DETERMINISTIC=1\`) hard-gates non-silence in the Rust system tier (\`system_capture.rs\`) and, since rsac-3635, in all three binding smokes (\`linux-audio-bindings\` job). | — (done; row kept for history) |
+          | ~~Linux \`ApplicationByName\` happy-path filter~~ SHIPPED | \`application_by_name_linux.rs\` resolves the player's pinned \`application.name\` via pw-dump and hard-asserts tone content (PR #58). | — (done; row kept for history) |
           | Windows device/process content assertions | The jobs hard-gate build/start/panic coverage, but the per-device and per-process tone route is not proven like the system VB-CABLE default route. | Prove the child player feeds the targeted endpoint/process loopback deterministically, then enable \`RSAC_CI_AUDIO_DETERMINISTIC=1\` for those jobs. |
           | macOS first-class managed-runner capture | Process Tap requires \`kTCCServiceAudioCapture\`, which cannot be granted non-interactively on managed runners. | Use a self-hosted macOS runner with pre-granted Audio Capture permission and set \`RSAC_CI_MACOS_TCC_GRANTED=1\`. |
           EOF
@@ -795,6 +937,10 @@ jobs:
           MACOS_SYSTEM: ${{ needs.macos-audio.outputs.tier_system }}
           MACOS_DEVICE: ${{ needs.macos-audio.outputs.tier_device }}
           MACOS_PROCESS: ${{ needs.macos-audio.outputs.tier_process }}
+          BIND_RESULT: ${{ needs.linux-audio-bindings.result }}
+          BIND_PYTHON: ${{ needs.linux-audio-bindings.outputs.binding_python }}
+          BIND_NODE: ${{ needs.linux-audio-bindings.outputs.binding_node }}
+          BIND_GO: ${{ needs.linux-audio-bindings.outputs.binding_go }}
         run: |
           set -u
           echo "============================================================"
@@ -815,6 +961,11 @@ jobs:
           echo "  System Capture:  ${MACOS_SYSTEM:-n/a}"
           echo "  Device Capture:  ${MACOS_DEVICE:-n/a}"
           echo "  Process Capture: ${MACOS_PROCESS:-n/a}"
+          echo ""
+          echo "Linux bindings (deterministic route — job=${BIND_RESULT}):"
+          echo "  Python: ${BIND_PYTHON:-n/a}"
+          echo "  Node:   ${BIND_NODE:-n/a}"
+          echo "  Go:     ${BIND_GO:-n/a}"
           echo ""
           echo "============================================================"
 
@@ -871,12 +1022,32 @@ jobs:
             done
           fi
 
+          # Linux bindings are hard-gated (Linux is PRIMARY): the deterministic
+          # PipeWire route gate runs at this job's setup, so a job result !=
+          # success is a setup/route failure, and any binding smoke != success
+          # is a real regression. 'skipped' (path filter excluded the workflow
+          # leg) is tolerated per the per-language loop.
+          if [ "${BIND_RESULT}" = "skipped" ]; then
+            echo "Linux audio bindings job skipped (path filter) — allowed."
+          elif [ "${BIND_RESULT}" != "success" ]; then
+            echo "FAILED: linux-audio-bindings job result '${BIND_RESULT}' (setup/route gate failure)"
+            FAILED=1
+          else
+            for pair in "python:${BIND_PYTHON}" "node:${BIND_NODE}" "go:${BIND_GO}"; do
+              name="${pair%%:*}"; res="${pair#*:}"
+              if [ "$res" != "success" ] && [ "$res" != "skipped" ]; then
+                echo "FAILED: binding $name smoke returned '${res:-<empty>}'"
+                FAILED=1
+              fi
+            done
+          fi
+
           if [ "$FAILED" -eq 1 ]; then
             echo ""
-            echo "Linux + Windows + macOS are gated platforms — failures must be investigated."
+            echo "Linux + Windows + macOS + Linux bindings are gated platforms — failures must be investigated."
             exit 1
           else
-            echo "All Linux + Windows + macOS tiers passed."
+            echo "All Linux + Windows + macOS tiers + Linux binding smokes passed."
           fi
 
       - name: Upload CI gap report seed
