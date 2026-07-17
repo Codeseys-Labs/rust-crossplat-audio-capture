@@ -22,6 +22,20 @@ Releases with no ABI change omit the subsection (or state "No C ABI changes").
 
 ### Changed
 
+### Deprecated
+
+### Removed
+
+### Fixed
+
+### Security
+
+## [0.4.2] - 2026-07-17
+
+### Added
+
+### Changed
+
 - Release version lockstep now includes `mobile/android-native/Cargo.toml`, so
   the Android `librsac.so` shim version stays aligned with the root crate and
   binding manifests.
