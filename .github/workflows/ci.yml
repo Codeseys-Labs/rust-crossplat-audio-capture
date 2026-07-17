@@ -356,16 +356,16 @@ jobs:
       - name: Build all targets
         run: cargo build --all-targets --no-default-features --features feat_macos,compose,cli,async-stream
 
-      # TC-03: src/audio/macos/tap.rs has process-tap tests that are NOT
-      # #[ignore]d (e.g. test_new_system_creates_tap at tap.rs:1352 calls
-      # CoreAudioProcessTap::new_system -> AudioHardwareCreateProcessTap, which
-      # the project's own docs note can BLOCK 10+ minutes without a
-      # kTCCServiceAudioCapture grant — unavailable on Blacksmith macOS). The
-      # job-level timeout-minutes: 25 already bounds the worst case, but a
-      # step-level timeout fails THIS step fast (5 min) so a hang surfaces as a
-      # clear failure here rather than eating the whole job budget. The proper
-      # fix is to #[ignore] those tests in src/ — flagged as a follow-up for the
-      # orchestrator since this job may not edit src/.
+      # TC-03: src/audio/macos/tap.rs's only process-tap-creating test —
+      # test_new_system_creates_tap (calls CoreAudioProcessTap::new_system ->
+      # AudioHardwareCreateProcessTap, which can BLOCK 10+ min without a
+      # kTCCServiceAudioCapture grant — unavailable on Blacksmith macOS) — is
+      # already #[ignore]d, so the default unit run does not execute it. The
+      # remaining tap.rs tests are pure or CoreAudio read-only (enumerate /
+      # translate / class-probe) and do not create a process tap. The step-level
+      # timeout-minutes: 5 is retained as a defensive backstop: it fails THIS step
+      # fast if a future non-ignored test regresses into the TCC-block path,
+      # rather than eating the job-level timeout-minutes: 25 budget.
       # rsac-0a1f: `compose` added so the platform-independent compose unit
       # tests run in this leg too.
       - name: Cargo test (unit tests)
