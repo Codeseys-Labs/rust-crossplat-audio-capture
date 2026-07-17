@@ -140,7 +140,8 @@ jobs:
           } >> "$GITHUB_OUTPUT"
 
       # Toolchain needed for the `cargo update` step below. Same SHA pin as
-      # ci.yml (channel 1.95.0 baked into the action's default at this commit).
+      # ci.yml. The SHA pins the ACTION's script version only — the Rust
+      # channel itself is resolved from rust-toolchain.toml at runtime.
       # This workflow otherwise runs no cargo command, so it had no toolchain.
       - uses: dtolnay/rust-toolchain@e081816240890017053eacbb1bdf337761dc5582 # 1.95.0
 
