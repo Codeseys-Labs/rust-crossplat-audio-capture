@@ -899,7 +899,7 @@ impl CompletedAwaitable {
 ///     sample_rate: Sample rate in Hz (default: 48000).
 ///     channels: Number of channels (default: 2).
 ///     buffer_size: Optional buffer size in frames.
-/// Outcome of the GIL-released teardown dance shared by `stop()`/`close()`.
+/// Outcome of the GIL-released lock dances shared by `start()`/`stop()`/`close()`.
 ///
 /// The teardown runs entirely inside `Python::allow_threads` (see the
 /// `stop`/`close` deadlock-fix comments), so it cannot build a `PyErr` in place
@@ -909,8 +909,9 @@ enum TeardownError {
     /// The wrapper `RwLock` was poisoned; carries the formatted poison detail so
     /// the surfaced message matches the pre-fix `format!("Lock poisoned: {e}")`.
     Poisoned(String),
-    /// The capture was already closed (`None` slot). Only `stop()` surfaces this;
-    /// `close()` treats an already-closed capture as an idempotent success.
+    /// The capture was already closed (`None` slot). `stop()` and `start()`
+    /// surface this; `close()` treats an already-closed capture as an
+    /// idempotent success.
     Closed,
     /// The core `stop()` returned an error.
     Stop(rsac::AudioError),
@@ -1008,18 +1009,36 @@ impl PyAudioCapture {
     /// Must be called before reading audio data. Called automatically when
     /// using AudioCapture as a context manager.
     fn start(&self, py: Python<'_>) -> PyResult<()> {
-        // `start()` takes `&mut self` on the core handle → the exclusive write
-        // guard. It never parks, so briefly holding the write guard is fine.
-        let mut guard = self
-            .inner
-            .write()
-            .map_err(|e| PyRuntimeError::new_err(format!("Lock poisoned: {}", e)))?;
-        let capture = guard
-            .as_mut()
-            .ok_or_else(|| PyRuntimeError::new_err("AudioCapture has been closed"))?;
-
-        py.allow_threads(|| capture.start())
-            .map_err(audio_error_to_pyerr)
+        // Entirely GIL-released, like the teardown (rsac-8082 follow-up): readers
+        // can only park in `read()`/`__next__` while the stream is RUNNING, and
+        // core `start()` on a running stream is a documented idempotent no-op —
+        // so a redundant `start()` first checks under a SHARED guard and skips
+        // the exclusive write guard, which would otherwise queue forever behind
+        // a parked reader's shared guard (and, GIL-held, recreate the circular
+        // wait the teardown fix removed).
+        py.allow_threads(|| {
+            {
+                let guard = self
+                    .inner
+                    .read()
+                    .map_err(|e| TeardownError::Poisoned(e.to_string()))?;
+                let capture = guard.as_ref().ok_or(TeardownError::Closed)?;
+                if capture.is_running() {
+                    return Ok(());
+                }
+            }
+            // Not running → no reader can be parked (a blocking read on a
+            // non-running stream returns immediately), so the write guard is only
+            // briefly contended. A racing start() between the guards is absorbed
+            // by core start()'s own running-check (idempotent no-op).
+            let mut guard = self
+                .inner
+                .write()
+                .map_err(|e| TeardownError::Poisoned(e.to_string()))?;
+            let capture = guard.as_mut().ok_or(TeardownError::Closed)?;
+            capture.start().map_err(TeardownError::Stop)
+        })
+        .map_err(TeardownError::into_pyerr)
     }
 
     /// Stop audio capture.

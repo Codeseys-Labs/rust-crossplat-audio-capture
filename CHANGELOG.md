@@ -68,8 +68,11 @@ Releases with no ABI change omit the subsection (or state "No C ABI changes").
   reader releases the GIL across its blocking read but re-acquires it before
   dropping its read guard, so a teardown that held the GIL across the write-lock
   acquire would still deadlock (reader blocked on the GIL, teardown blocked on
-  the write lock). Public API and terminal (`StreamEnded`) semantics are
-  unchanged (rsac-8082).
+  the write lock). `start()` likewise no longer requests exclusive access while
+  a reader may be parked: a redundant `start()` on a running capture is resolved
+  under a shared guard (core `start()` is idempotent on a running stream), so it
+  cannot block behind — or deadlock with — a parked blocking read. Public API
+  and terminal (`StreamEnded`) semantics are unchanged (rsac-8082).
 
 ### Security
 

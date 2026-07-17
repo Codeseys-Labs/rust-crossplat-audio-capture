@@ -361,10 +361,27 @@ impl AudioCapture {
     /// ThreadsafeFunction.
     #[napi]
     pub fn start(&self) -> Result<()> {
-        {
-            // `start()` takes `&mut self` on the core handle → the exclusive
-            // write guard. It never parks, so holding the write guard briefly is
-            // fine (a concurrent read would queue behind it and vice-versa).
+        // Fast path under a SHARED guard (rsac-8082 follow-up): readers can only
+        // park in `readBlocking` while the stream is RUNNING, and core `start()`
+        // on a running stream is a documented idempotent no-op — so a redundant
+        // `start()` must not request the exclusive write guard, which would queue
+        // forever behind a parked reader's shared guard.
+        let already_running = {
+            let inner = self.inner.read().map_err(|e| {
+                napi::Error::new(
+                    napi::Status::GenericFailure,
+                    format!("Lock poisoned: {}", e),
+                )
+            })?;
+            inner.is_running()
+        };
+
+        if !already_running {
+            // Not running → no reader can be parked (a blocking read on a
+            // non-running stream returns immediately), so the write guard is
+            // only ever briefly contended. If another thread starts the capture
+            // between the guards, core `start()`'s own running-check makes this
+            // a no-op — the recheck is delegated to core.
             let mut inner = self.inner.write().map_err(|e| {
                 napi::Error::new(
                     napi::Status::GenericFailure,
