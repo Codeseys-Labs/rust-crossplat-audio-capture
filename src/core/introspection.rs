@@ -762,17 +762,21 @@ mod tests {
             }
         }
 
-        // Windows and Linux always report the exact audio-producer set (Windows
-        // filters to AudioSessionStateActive; Linux returns the native PipeWire
-        // audio-node snapshot). Only macOS can currently report a fallback.
+        // Windows and Linux report the exact audio-producer set on success
+        // (Windows filters to AudioSessionStateActive; Linux returns the native
+        // PipeWire audio-node snapshot) — or EnumerationFailed when the backend
+        // query itself fails (headless CI: no PipeWire daemon in the unit-test
+        // job, no WASAPI session access). They can never report the macOS-only
+        // AllRunningFallback superset.
         #[cfg(any(
             all(target_os = "windows", feature = "feat_windows"),
             all(target_os = "linux", feature = "feat_linux"),
         ))]
-        assert_eq!(
+        assert_ne!(
             enumeration.scope,
-            ApplicationScope::ExactAudioProducers,
-            "Windows/Linux enumeration is always exact"
+            ApplicationScope::AllRunningFallback,
+            "Windows/Linux enumeration is exact-on-success or EnumerationFailed — \
+             never the unfiltered fallback superset"
         );
     }
 
