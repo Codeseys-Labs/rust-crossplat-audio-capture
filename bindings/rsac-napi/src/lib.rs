@@ -9,7 +9,7 @@ extern crate napi_derive;
 use napi::bindgen_prelude::*;
 use napi::threadsafe_function::{ErrorStrategy, ThreadsafeFunction, ThreadsafeFunctionCallMode};
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, RwLock};
 
 // ── Error conversion ─────────────────────────────────────────────────────
 
@@ -276,7 +276,20 @@ type EndCallback = Arc<Mutex<Option<ThreadsafeFunction<Option<String>, ErrorStra
 
 #[napi]
 pub struct AudioCapture {
-    inner: Arc<Mutex<rsac::AudioCapture>>,
+    /// The wrapped rsac capture, behind an `RwLock` (not a `Mutex`) so a blocking
+    /// reader can park while holding only a **shared read guard**.
+    ///
+    /// rsac's read paths (`read_buffer`, `read_chunk_blocking`, …) and
+    /// `request_stop` all take `&self`, while the lifecycle mutators
+    /// (`start`/`stop`) take `&mut self`. Mapping reads to a shared read guard and
+    /// `start`/`stop` to the exclusive write guard is what breaks the
+    /// stop()-vs-parked-blocking-read deadlock (rsac-8082): `stop()` first takes a
+    /// *read* guard to call `request_stop()` — compatible with the guard a reader
+    /// parked in `readBlocking` holds, so it never blocks — which transitions the
+    /// stream terminal and wakes the reader; only then does `stop()` take the write
+    /// guard for the actual `stop()`. With the old `Mutex`, the reader parked while
+    /// holding the sole lock and `stop()` blocked on it forever.
+    inner: Arc<RwLock<rsac::AudioCapture>>,
     /// Active data callback (ThreadsafeFunction). Held here to prevent GC.
     callback: DataCallback,
     /// Optional terminal-observability callback (ThreadsafeFunction). Fires once
@@ -299,7 +312,7 @@ impl AudioCapture {
             .map_err(audio_err_to_napi)?;
 
         Ok(AudioCapture {
-            inner: Arc::new(Mutex::new(capture)),
+            inner: Arc::new(RwLock::new(capture)),
             callback: Arc::new(Mutex::new(None)),
             end_callback: Arc::new(Mutex::new(None)),
             pump_active: Arc::new(AtomicBool::new(false)),
@@ -334,7 +347,7 @@ impl AudioCapture {
         let capture = builder.build().map_err(audio_err_to_napi)?;
 
         Ok(AudioCapture {
-            inner: Arc::new(Mutex::new(capture)),
+            inner: Arc::new(RwLock::new(capture)),
             callback: Arc::new(Mutex::new(None)),
             end_callback: Arc::new(Mutex::new(None)),
             pump_active: Arc::new(AtomicBool::new(false)),
@@ -349,7 +362,10 @@ impl AudioCapture {
     #[napi]
     pub fn start(&self) -> Result<()> {
         {
-            let mut inner = self.inner.lock().map_err(|e| {
+            // `start()` takes `&mut self` on the core handle → the exclusive
+            // write guard. It never parks, so holding the write guard briefly is
+            // fine (a concurrent read would queue behind it and vice-versa).
+            let mut inner = self.inner.write().map_err(|e| {
                 napi::Error::new(
                     napi::Status::GenericFailure,
                     format!("Lock poisoned: {}", e),
@@ -385,7 +401,31 @@ impl AudioCapture {
         // Signal the data pump to stop
         self.pump_active.store(false, Ordering::SeqCst);
 
-        let mut inner = self.inner.lock().map_err(|e| {
+        // Deadlock fix (rsac-8082): a thread parked in `readBlocking` /
+        // `readBlockingAsync` holds a *shared read guard* while blocked inside
+        // `read_chunk_blocking`. If we went straight for the exclusive write
+        // guard here, `stop()` would block forever waiting for that reader to
+        // release — but the reader only releases once the stream goes terminal,
+        // which is exactly what `stop()` is trying to do. Break the cycle the
+        // same way the C FFI / Go binding do: FIRST take a *read* guard (shared
+        // with the parked reader, so it never blocks) and call `request_stop()`,
+        // which flips the stream terminal and wakes the reader within ~1 ms.
+        // `request_stop()` takes `&self`, needs no `&mut`, and does not touch the
+        // bridge consumer mutex the parked read holds, so it is safe to run
+        // concurrently with the in-flight read. Drop the read guard, then take the
+        // write guard for the real `stop()`; by now the woken reader has returned
+        // its terminal error and released its guard, so this proceeds promptly.
+        {
+            let inner = self.inner.read().map_err(|e| {
+                napi::Error::new(
+                    napi::Status::GenericFailure,
+                    format!("Lock poisoned: {}", e),
+                )
+            })?;
+            inner.request_stop();
+        }
+
+        let mut inner = self.inner.write().map_err(|e| {
             napi::Error::new(
                 napi::Status::GenericFailure,
                 format!("Lock poisoned: {}", e),
@@ -399,7 +439,7 @@ impl AudioCapture {
     /// Returns whether the capture is currently running.
     #[napi(getter)]
     pub fn is_running(&self) -> Result<bool> {
-        let inner = self.inner.lock().map_err(|e| {
+        let inner = self.inner.read().map_err(|e| {
             napi::Error::new(
                 napi::Status::GenericFailure,
                 format!("Lock poisoned: {}", e),
@@ -425,7 +465,7 @@ impl AudioCapture {
     #[napi]
     pub fn read(&self) -> Result<Option<AudioChunk>> {
         // `read_buffer` takes `&self` now, so the guard does not need `mut`.
-        let inner = self.inner.lock().map_err(|e| {
+        let inner = self.inner.read().map_err(|e| {
             napi::Error::new(
                 napi::Status::GenericFailure,
                 format!("Lock poisoned: {}", e),
@@ -449,7 +489,7 @@ impl AudioCapture {
     #[napi]
     pub fn read_blocking(&self) -> Result<AudioChunk> {
         // `read_chunk_blocking` takes `&self`, so the guard does not need `mut`.
-        let inner = self.inner.lock().map_err(|e| {
+        let inner = self.inner.read().map_err(|e| {
             napi::Error::new(
                 napi::Status::GenericFailure,
                 format!("Lock poisoned: {}", e),
@@ -471,7 +511,7 @@ impl AudioCapture {
         let result =
             tokio::task::spawn_blocking(move || -> napi::Result<Option<rsac::AudioBuffer>> {
                 // `read_buffer` takes `&self`, so the guard does not need `mut`.
-                let capture = inner.lock().map_err(|e| {
+                let capture = inner.read().map_err(|e| {
                     napi::Error::new(
                         napi::Status::GenericFailure,
                         format!("Lock poisoned: {}", e),
@@ -504,7 +544,7 @@ impl AudioCapture {
 
         let result = tokio::task::spawn_blocking(move || -> napi::Result<rsac::AudioBuffer> {
             // `read_chunk_blocking` takes `&self`, so the guard does not need `mut`.
-            let capture = inner.lock().map_err(|e| {
+            let capture = inner.read().map_err(|e| {
                 napi::Error::new(
                     napi::Status::GenericFailure,
                     format!("Lock poisoned: {}", e),
@@ -553,7 +593,7 @@ impl AudioCapture {
 
         // If already running, start the data pump now
         let is_running = {
-            let inner = self.inner.lock().map_err(|e| {
+            let inner = self.inner.read().map_err(|e| {
                 napi::Error::new(
                     napi::Status::GenericFailure,
                     format!("Lock poisoned: {}", e),
@@ -651,7 +691,7 @@ impl AudioCapture {
     /// the audio producer.
     #[napi(getter)]
     pub fn overrun_count(&self) -> Result<u32> {
-        let inner = self.inner.lock().map_err(|e| {
+        let inner = self.inner.read().map_err(|e| {
             napi::Error::new(
                 napi::Status::GenericFailure,
                 format!("Lock poisoned: {}", e),
@@ -671,7 +711,7 @@ impl AudioCapture {
     /// `isRunning === false` and `uptimeSecs === 0`.
     #[napi]
     pub fn stream_stats(&self) -> Result<JsStreamStats> {
-        let inner = self.inner.lock().map_err(|e| {
+        let inner = self.inner.read().map_err(|e| {
             napi::Error::new(
                 napi::Status::GenericFailure,
                 format!("Lock poisoned: {}", e),
@@ -707,7 +747,7 @@ impl AudioCapture {
     /// `windowSecs === 0`, `dropRate === 0.0`, and `isUnderBackpressure === false`.
     #[napi]
     pub fn backpressure_report(&self) -> Result<JsBackpressureReport> {
-        let inner = self.inner.lock().map_err(|e| {
+        let inner = self.inner.read().map_err(|e| {
             napi::Error::new(
                 napi::Status::GenericFailure,
                 format!("Lock poisoned: {}", e),
@@ -735,7 +775,7 @@ impl AudioCapture {
     /// forced a negotiation. Reading it does not allocate or lock the data plane.
     #[napi(getter)]
     pub fn format(&self) -> Result<Option<JsAudioFormat>> {
-        let inner = self.inner.lock().map_err(|e| {
+        let inner = self.inner.read().map_err(|e| {
             napi::Error::new(
                 napi::Status::GenericFailure,
                 format!("Lock poisoned: {}", e),
@@ -901,7 +941,7 @@ impl AudioCapture {
                     // once the ring is empty AND the stream is terminal, so we
                     // can end cleanly on a real terminal (BP-3).
                     let maybe_buf = {
-                        let capture = match inner.lock() {
+                        let capture = match inner.read() {
                             Ok(c) => c,
                             Err(_) => break, // Mutex poisoned, bail (clean: None)
                         };
@@ -1389,5 +1429,208 @@ mod tests {
         // Concretely: 5 full windows + a partial → exactly 6 logged lines
         // (counts 0, EVERY, 2·EVERY, 3·EVERY, 4·EVERY, 5·EVERY).
         assert_eq!(logged, 6);
+    }
+
+    // ── rsac-8082: stop() must not deadlock a parked blocking read ───────
+    //
+    // The real `AudioCapture` wrapper stores `Arc<RwLock<rsac::AudioCapture>>`,
+    // and `rsac::AudioCapture` can only be built via the device-backed builder —
+    // so we cannot construct a *silent-stream* real capture from a unit test
+    // without hardware. Instead we reproduce the exact WRAPPER LOCK TOPOLOGY the
+    // fix depends on with a faithful stand-in whose method split mirrors core:
+    //
+    //   - `read_chunk_blocking(&self)` parks until a terminal flag flips (the
+    //     silent-stream case: a running stream that never delivers data);
+    //   - `request_stop(&self)` flips that flag (core's unblock primitive — it
+    //     needs only `&self` and does not touch the lock the parked read holds);
+    //   - `stop(&mut self)` is the lifecycle mutator that needs exclusive access.
+    //
+    // This is the binding-side analogue of core's
+    // `request_stop_unblocks_parked_blocking_read` (src/api.rs). It deadlocks on
+    // the OLD shape (a single `Mutex` held across the park, `stop()` taking that
+    // same lock) and passes on the NEW shape (`RwLock`: reader parks under a
+    // shared read guard; `stop()` takes a read guard to `request_stop()` first,
+    // then the write guard), which is exactly what the napi `stop()` now does.
+
+    use std::sync::atomic::AtomicBool;
+    use std::time::{Duration, Instant};
+
+    /// A stand-in for `rsac::AudioCapture` that models a *silent* running stream:
+    /// `read_chunk_blocking` never returns data until the stream is signalled
+    /// terminal via `request_stop`. Mirrors the core method receivers exactly
+    /// (`read`/`request_stop` = `&self`, `stop` = `&mut self`).
+    struct SilentCapture {
+        terminal: AtomicBool,
+        /// Set once a blocking read has actually parked, so the test signals stop
+        /// only when the read is genuinely in flight (deterministic, no fixed
+        /// sleep) — same barrier idea as core's parked-read test.
+        parked: AtomicBool,
+    }
+
+    impl SilentCapture {
+        fn new() -> Self {
+            Self {
+                terminal: AtomicBool::new(false),
+                parked: AtomicBool::new(false),
+            }
+        }
+
+        /// Blocks until `request_stop` flips the terminal flag, then returns the
+        /// terminal signal (`Err`). A real silent stream behaves the same: the
+        /// blocking read parks until the stream goes terminal.
+        fn read_chunk_blocking(&self) -> Result<()> {
+            self.parked.store(true, Ordering::SeqCst);
+            let deadline = Instant::now() + Duration::from_secs(10);
+            while !self.terminal.load(Ordering::SeqCst) {
+                if Instant::now() > deadline {
+                    // Safety net so a genuine hang fails the test rather than
+                    // wedging the whole suite forever.
+                    return Err(napi::Error::from_reason("read timed out (deadlock)"));
+                }
+                std::thread::sleep(Duration::from_millis(1));
+            }
+            Err(napi::Error::from_reason("StreamEnded"))
+        }
+
+        /// Core's `request_stop(&self)`: flips the stream terminal to unblock a
+        /// parked reader. Needs only `&self`, so it is compatible with the shared
+        /// read guard the parked reader holds.
+        fn request_stop(&self) {
+            self.terminal.store(true, Ordering::SeqCst);
+        }
+
+        /// Core's `stop(&mut self)`: the lifecycle mutator needing exclusive
+        /// access. (Body is irrelevant to the topology under test.)
+        fn stop(&mut self) {
+            self.terminal.store(true, Ordering::SeqCst);
+        }
+    }
+
+    /// The FIXED `stop()` topology (what napi `stop()` now does): take a *read*
+    /// guard to `request_stop()` (shared with the parked reader → never blocks),
+    /// drop it, then take the *write* guard for `stop()`. With a reader parked
+    /// under a read guard, this must complete promptly.
+    #[test]
+    fn stop_does_not_deadlock_parked_blocking_read() {
+        let inner = Arc::new(RwLock::new(SilentCapture::new()));
+
+        // Reader thread: parks in a blocking read while holding a SHARED READ
+        // guard, exactly like napi `read_blocking`.
+        let reader = {
+            let inner = Arc::clone(&inner);
+            std::thread::spawn(move || {
+                let guard = inner.read().expect("read guard");
+                guard.read_chunk_blocking()
+            })
+        };
+
+        // Wait (bounded) until the read has genuinely parked, so we exercise the
+        // stop-vs-in-flight-read race rather than a pre-park stop.
+        let deadline = Instant::now() + Duration::from_secs(5);
+        loop {
+            if inner.read().unwrap().parked.load(Ordering::SeqCst) {
+                break;
+            }
+            assert!(Instant::now() < deadline, "reader never parked");
+            std::thread::yield_now();
+        }
+
+        // The FIXED stop(): read-guard → request_stop() → drop → write-guard.
+        // Run it on another thread bounded by a generous timeout so a regression
+        // (e.g. reverting to a write-first stop) surfaces as a test failure
+        // instead of hanging the suite.
+        let stopper = {
+            let inner = Arc::clone(&inner);
+            std::thread::spawn(move || {
+                {
+                    let guard = inner.read().expect("read guard for request_stop");
+                    guard.request_stop();
+                }
+                let mut guard = inner.write().expect("write guard for stop");
+                guard.stop();
+            })
+        };
+
+        // stop() must finish well within the reader's 10 s park safety net.
+        let stop_deadline = Instant::now() + Duration::from_secs(5);
+        while !stopper.is_finished() {
+            assert!(
+                Instant::now() < stop_deadline,
+                "stop() deadlocked against a parked blocking read (rsac-8082 regression)"
+            );
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        stopper.join().expect("stopper thread joins");
+
+        // The parked reader was woken by request_stop() and observed the terminal
+        // signal (an Err — the analogue of StreamEnded), not a timeout.
+        let read_result = reader.join().expect("reader thread joins");
+        let err = read_result.expect_err("silent read ends with a terminal error");
+        assert!(
+            err.reason.contains("StreamEnded"),
+            "reader must wake on the terminal signal, not the deadlock safety net; got: {}",
+            err.reason
+        );
+    }
+
+    /// Documents WHY the old single-lock shape deadlocked: if `stop()` took the
+    /// exclusive guard *first* (as the old `Mutex`-based binding effectively did
+    /// by locking before signalling), it could never acquire it while a reader is
+    /// parked holding a (shared) guard — because the parked reader only releases
+    /// once signalled, and the signal is unreachable behind the exclusive
+    /// acquire. We assert the deadlock shape times out, proving the ordering in
+    /// `stop_does_not_deadlock_parked_blocking_read` is load-bearing.
+    #[test]
+    fn write_first_stop_would_deadlock_against_parked_reader() {
+        let inner = Arc::new(RwLock::new(SilentCapture::new()));
+
+        let reader = {
+            let inner = Arc::clone(&inner);
+            std::thread::spawn(move || {
+                let guard = inner.read().expect("read guard");
+                guard.read_chunk_blocking()
+            })
+        };
+
+        let deadline = Instant::now() + Duration::from_secs(5);
+        loop {
+            if inner.read().unwrap().parked.load(Ordering::SeqCst) {
+                break;
+            }
+            assert!(Instant::now() < deadline, "reader never parked");
+            std::thread::yield_now();
+        }
+
+        // The BROKEN ordering: try to take the write guard BEFORE signalling. A
+        // reader is parked under a read guard, so this write acquire cannot
+        // succeed until the reader releases — which it never will without a
+        // signal. Bounded try so the test itself cannot hang.
+        let acquired_write = {
+            let inner = Arc::clone(&inner);
+            std::thread::spawn(move || {
+                let start = Instant::now();
+                // Poll try_write to emulate a bounded wait for the exclusive lock.
+                while start.elapsed() < Duration::from_millis(500) {
+                    if inner.try_write().is_ok() {
+                        return true; // got the exclusive lock → would NOT deadlock
+                    }
+                    std::thread::sleep(Duration::from_millis(5));
+                }
+                false // never acquired within the window → the deadlock shape
+            })
+            .join()
+            .expect("write-attempt thread joins")
+        };
+
+        assert!(
+            !acquired_write,
+            "write-first stop unexpectedly acquired the exclusive lock while a \
+             reader was parked — the topology no longer reproduces the deadlock, \
+             so the regression test would be vacuous"
+        );
+
+        // Clean up: signal so the parked reader (and its read guard) is released.
+        inner.read().unwrap().request_stop();
+        let _ = reader.join().expect("reader thread joins");
     }
 }

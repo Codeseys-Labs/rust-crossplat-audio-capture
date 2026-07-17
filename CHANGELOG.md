@@ -53,6 +53,24 @@ Releases with no ABI change omit the subsection (or state "No C ABI changes").
 
 ### Fixed
 
+- **Bindings (Node/napi + Python):** fixed a deadlock where `stop()` (and, in
+  Python, `close()`/`__del__`) could hang forever against a thread parked in a
+  blocking read of a silent stream. Both bindings previously held their single
+  wrapper mutex across the parked `read_chunk_blocking`, so the teardown — which
+  needed the same lock to reach the stream — blocked on a lock the reader would
+  only release once the stream went terminal. The wrapper now guards the capture
+  with an `RwLock`: blocking readers park under a shared read guard, and the
+  teardown first takes a read guard to call the core's `request_stop()` (which
+  signals the stream terminal and wakes the parked reader without contending for
+  the lock) before taking the write guard for the lifecycle teardown. In the
+  Python binding the teardown additionally runs the whole read-guard →
+  write-guard dance inside `Python::allow_threads` (GIL released): the parked
+  reader releases the GIL across its blocking read but re-acquires it before
+  dropping its read guard, so a teardown that held the GIL across the write-lock
+  acquire would still deadlock (reader blocked on the GIL, teardown blocked on
+  the write lock). Public API and terminal (`StreamEnded`) semantics are
+  unchanged (rsac-8082).
+
 ### Security
 
 ## [0.4.2] - 2026-07-17
