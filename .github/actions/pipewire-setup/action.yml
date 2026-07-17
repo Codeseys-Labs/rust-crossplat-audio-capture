@@ -1,0 +1,180 @@
+# Composite: PipeWire setup for the Linux CI jobs.
+#
+# Two modes, selected by the `daemon` input:
+#
+#   daemon: 'false' (default) — DEV-LIBRARIES ONLY. Adds the pipewire-debian
+#     upstream PPA and installs the dev headers build.rs needs
+#     (libpipewire-0.3-dev, libspa-0.2-dev, pkg-config) plus any `extra-packages`.
+#     This is the block that was copy-pasted into ~9 compile/lint jobs in ci.yml.
+#
+#   daemon: 'true' — FULL AUDIO STACK. Installs the daemon package set,
+#     bootstraps PipeWire manually (Blacksmith Firecracker microVMs have no
+#     D-Bus user session), creates + verifies the ci_test_sink null sink, and
+#     runs the deterministic-routing HARD GATE (scripts/ci-linux-audio-route.sh)
+#     which flips RSAC_CI_AUDIO_DETERMINISTIC=1. Used by the linux-audio job.
+#
+# All env vars the daemon path writes to $GITHUB_ENV (XDG_RUNTIME_DIR,
+# DBUS_SESSION_BUS_ADDRESS, RSAC_CI_AUDIO_AVAILABLE, and — via the route script —
+# RSAC_CI_AUDIO_DETERMINISTIC + PULSE_SINK) propagate to the caller job's later
+# steps, exactly as they did when these were inline job steps.
+#
+# Linux-only (Ubuntu/apt). No action refs to SHA-pin here — this composite calls
+# apt + a repo script, not other actions.
+name: pipewire-setup
+description: >-
+  Install PipeWire dev libraries (and optionally bootstrap the full PipeWire
+  daemon + ci_test_sink null sink + deterministic-routing hard gate) on an
+  Ubuntu runner.
+
+inputs:
+  daemon:
+    description: >-
+      'true' to install the full daemon stack, bootstrap PipeWire, create the
+      ci_test_sink null sink, and run the routing hard gate. 'false' (default)
+      installs only the dev headers.
+    required: false
+    default: "false"
+  extra-packages:
+    description: >-
+      Additional apt packages to install in dev-libraries mode (e.g.
+      "libclang-dev"). Ignored when daemon == 'true' (the daemon set already
+      includes libclang-dev).
+    required: false
+    default: ""
+
+runs:
+  using: composite
+  steps:
+    # ── Dev-libraries-only install (the 9x-duplicated block from ci.yml) ──
+    - name: Install PipeWire dev libraries
+      if: inputs.daemon != 'true'
+      shell: bash
+      run: |
+        sudo add-apt-repository ppa:pipewire-debian/pipewire-upstream -y
+        sudo apt-get update
+        sudo apt-get install -y libpipewire-0.3-dev libspa-0.2-dev pkg-config ${{ inputs.extra-packages }}
+
+    # ── Full audio stack (daemon path) ───────────────────────────────────
+    - name: Install PipeWire and audio dependencies
+      if: inputs.daemon == 'true'
+      shell: bash
+      run: |
+        sudo add-apt-repository -y ppa:pipewire-debian/pipewire-upstream
+        sudo apt-get update
+        sudo apt-get install -y \
+          pipewire pipewire-bin pipewire-audio-client-libraries \
+          pipewire-pulse libpipewire-0.3-dev libspa-0.2-dev \
+          wireplumber pulseaudio-utils sox libclang-dev
+
+    - name: Start PipeWire
+      if: inputs.daemon == 'true'
+      shell: bash
+      run: |
+        # Blacksmith Firecracker microVMs lack a D-Bus user session, so
+        # systemctl --user services won't start. Launch daemons manually.
+        export XDG_RUNTIME_DIR="${XDG_RUNTIME_DIR:-/run/user/$(id -u)}"
+        echo "XDG_RUNTIME_DIR=$XDG_RUNTIME_DIR" >> "$GITHUB_ENV"
+        sudo mkdir -p "$XDG_RUNTIME_DIR"
+        sudo chmod 700 "$XDG_RUNTIME_DIR"
+        sudo chown "$(id -u):$(id -g)" "$XDG_RUNTIME_DIR"
+
+        # Kill any pre-existing PulseAudio
+        pulseaudio --kill 2>/dev/null || true
+
+        # wireplumber 0.4 EXITS at startup without a D-Bus session bus
+        # ("Error acquiring bus address: Cannot autolaunch D-Bus without
+        # X11 $DISPLAY" -> on_disconnected; evidence run 28904373406) -
+        # and without the session manager NO STREAM IS EVER LINKED, so
+        # every capture sees silence (streams appeared in wpctl status
+        # but zero samples flowed, even with pw-play --target). Give the
+        # stack a private session bus; no X11/systemd needed.
+        export DBUS_SESSION_BUS_ADDRESS="unix:path=$XDG_RUNTIME_DIR/bus"
+        dbus-daemon --session --address="$DBUS_SESSION_BUS_ADDRESS" --nopidfile --fork
+        echo "DBUS_SESSION_BUS_ADDRESS=$DBUS_SESSION_BUS_ADDRESS" >> "$GITHUB_ENV"
+
+        # Launch PipeWire stack manually
+        pipewire &
+        sleep 1
+        wireplumber &
+        sleep 1
+        pipewire-pulse &
+
+        # Verify the PipeWire core is accepting commands. A fixed sleep can
+        # race slow startup and later present as false audio-test silence.
+        for _ in $(seq 1 20); do
+          pw-cli info 0 >/dev/null 2>&1 && break
+          sleep 1
+        done
+        pw-cli info 0 >/dev/null 2>&1 || { echo "ERROR: PipeWire core not ready"; exit 1; }
+        pw-cli info 0
+
+        # The session manager must SURVIVE startup - a dead wireplumber
+        # means no links ever form and every capture is silence.
+        sleep 2
+        if ! pgrep -x wireplumber >/dev/null; then
+          echo "ERROR: wireplumber (session manager) is not running"
+          exit 1
+        fi
+        echo "OK: wireplumber alive (pid $(pgrep -x wireplumber))"
+
+    - name: Create and verify virtual audio sink
+      if: inputs.daemon == 'true'
+      shell: bash
+      run: |
+        # Fail-fast on sink creation (no `|| true`): a missing sink used to
+        # masquerade as "audio available" because RSAC_CI_AUDIO_AVAILABLE was
+        # hardcoded later. Now we create, then VERIFY, then export the env.
+        #
+        # Wait for the pipewire-pulse Pulse socket to actually accept pactl
+        # before loading the sink.
+        for _ in $(seq 1 20); do
+          pactl info >/dev/null 2>&1 && break
+          sleep 1
+        done
+        pactl info >/dev/null 2>&1 || { echo "ERROR: pipewire-pulse (pactl) not ready"; exit 1; }
+        pactl load-module module-null-sink \
+          sink_name=ci_test_sink \
+          sink_properties=device.description="CI_Test_Sink" \
+          rate=48000 channels=2 format=float32le
+        # Under the manually-bootstrapped PipeWire in CI there is no dbus
+        # session: `pactl set-default-sink` returns "Not supported" and
+        # pw-metadata cannot connect. Keep the command as a best effort and
+        # record the actual routing state below; content assertions stay soft
+        # until routing is proven deterministic on the runner.
+        pactl set-default-sink ci_test_sink 2>/dev/null || true
+        sleep 1
+
+        # Hard gate: the sink MUST exist. The old `|| true` masked a missing
+        # sink and let capture silently see silence (a false green).
+        if ! pactl list short sinks | grep -q "ci_test_sink"; then
+          echo "ERROR: ci_test_sink not present in 'pactl list short sinks'"
+          pactl list short sinks || true
+          exit 1
+        fi
+        for _ in $(seq 1 10); do
+          pactl list short sources | grep -q "ci_test_sink.monitor" && break
+          sleep 1
+        done
+        if ! pactl list short sources | grep -q "ci_test_sink.monitor"; then
+          echo "ERROR: ci_test_sink.monitor not present in 'pactl list short sources'"
+          pactl list short sources || true
+          exit 1
+        fi
+
+        # Probe the default sink for diagnostics; the routing gate below is
+        # what actually proves (and hardens) the route.
+        DEFAULT_SINK="$(pactl get-default-sink 2>/dev/null || echo unknown)"
+        SINK_COUNT="$(pactl list short sinks | grep -c .)"
+        echo "default sink='${DEFAULT_SINK}' sink_count=${SINK_COUNT}"
+        echo "RSAC_CI_AUDIO_AVAILABLE=1" >> "$GITHUB_ENV"
+
+    # rsac-b106 / rsac-6efb: prove the tone → ci_test_sink → monitor route
+    # END-TO-END at the OS level, pin ci_test_sink as the default sink, and only
+    # then export RSAC_CI_AUDIO_DETERMINISTIC=1 + PULSE_SINK so the capture
+    # tests' content assertions hard-fail on silence instead of soft-warning.
+    # HARD GATE by design: a broken route fails HERE, at setup, with routing
+    # diagnostics — never later as confusing test silence.
+    - name: Prove deterministic routing (hard gate, enables deterministic mode)
+      if: inputs.daemon == 'true'
+      shell: bash
+      run: bash scripts/ci-linux-audio-route.sh

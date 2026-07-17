@@ -5,7 +5,28 @@ name: CI
 
 on:
   push:
-    branches: [main, master, 'release/**']
+    # release/** intentionally dropped from the push filter (KEPT in
+    # pull_request below): every release-branch commit lands via a PR per
+    # AGENTS.md's PR-vs-direct rule, so push+pull_request both matched and
+    # double-fired the full matrix (66 duplicate checks observed on PR #55).
+    # The pull_request trigger alone gives release/** branches full coverage.
+    branches: [main, master]
+    # Skip branch pushes that only touch docs / backlog / bookkeeping files —
+    # the docs-only fast path (the `changes` job below) only covers
+    # pull_request events, so a direct push of e.g. `.seeds/issues.jsonl` used
+    # to run the whole 23-job matrix (~15.4 job-min) for a 1-line diff.
+    #
+    # NOTE: per GitHub semantics, paths/paths-ignore filters are NOT evaluated
+    # for tag pushes ("Path filters are not evaluated for pushes of tags"), so
+    # the `tags:` trigger below (and the version-lockstep tag-time hard-gate it
+    # feeds) still fires on every `v*.*.*` tag regardless of the changed paths.
+    paths-ignore:
+      - 'docs/**'
+      - '.seeds/**'
+      - '.kilo/**'
+      - '.mulch/**'
+      - '**/*.md'
+      - 'LICENSE'
     # Also run on stable semver tags so the version-lockstep job's tag-time
     # hard-gate (which asserts all seven manifests equal the tag) actually fires
     # at the point of no return — it was previously dead code (ci.yml had no
@@ -105,17 +126,13 @@ jobs:
       - uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5
         with:
           persist-credentials: false
-      - uses: dtolnay/rust-toolchain@e081816240890017053eacbb1bdf337761dc5582 # 1.95.0
+      - uses: ./.github/actions/rust-setup
         with:
           components: rustfmt, clippy
-      - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
 
       - name: Install PipeWire dev libraries
         if: matrix.os == 'linux'
-        run: |
-          sudo add-apt-repository ppa:pipewire-debian/pipewire-upstream -y
-          sudo apt-get update
-          sudo apt-get install -y libpipewire-0.3-dev libspa-0.2-dev pkg-config
+        uses: ./.github/actions/pipewire-setup
 
       # rustfmt is platform-independent; run the check once on the Linux leg.
       - name: Check formatting
@@ -151,14 +168,10 @@ jobs:
       - uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5
         with:
           persist-credentials: false
-      - uses: dtolnay/rust-toolchain@e081816240890017053eacbb1bdf337761dc5582 # 1.95.0
-      - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
+      - uses: ./.github/actions/rust-setup
 
       - name: Install PipeWire dev libraries
-        run: |
-          sudo add-apt-repository ppa:pipewire-debian/pipewire-upstream -y
-          sudo apt-get update
-          sudo apt-get install -y libpipewire-0.3-dev libspa-0.2-dev pkg-config
+        uses: ./.github/actions/pipewire-setup
 
       - name: Cargo check
         run: cargo check --lib --no-default-features --features feat_linux
@@ -203,8 +216,7 @@ jobs:
       - uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5
         with:
           persist-credentials: false
-      - uses: dtolnay/rust-toolchain@e081816240890017053eacbb1bdf337761dc5582 # 1.95.0
-      - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
+      - uses: ./.github/actions/rust-setup
 
       - name: Cargo check
         run: cargo check --lib --no-default-features --features feat_windows
@@ -300,8 +312,7 @@ jobs:
       - uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5
         with:
           persist-credentials: false
-      - uses: dtolnay/rust-toolchain@e081816240890017053eacbb1bdf337761dc5582 # 1.95.0
-      - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
+      - uses: ./.github/actions/rust-setup
 
       - name: Grant audio permissions for CI
         run: |
@@ -425,11 +436,14 @@ jobs:
       - uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5
         with:
           persist-credentials: false
-      - uses: dtolnay/rust-toolchain@e081816240890017053eacbb1bdf337761dc5582 # 1.95.0
+      - uses: ./.github/actions/rust-setup
         with:
           targets: aarch64-unknown-linux-gnu
-      - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
 
+      # Combined cross-gcc + host PipeWire install: kept inline (not the
+      # pipewire-setup composite) because it also installs the aarch64 cross
+      # toolchain the composite does not cover, and shares a single apt-get
+      # update across both package sets.
       - name: Install cross-compilation tools
         run: |
           sudo apt-get update
@@ -493,10 +507,9 @@ jobs:
       - uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5
         with:
           persist-credentials: false
-      - uses: dtolnay/rust-toolchain@e081816240890017053eacbb1bdf337761dc5582 # 1.95.0
+      - uses: ./.github/actions/rust-setup
         with:
           targets: aarch64-linux-android
-      - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
 
       - name: Cross-check the Android backend (feat_android)
         run: |
@@ -600,10 +613,9 @@ jobs:
       - uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5
         with:
           persist-credentials: false
-      - uses: dtolnay/rust-toolchain@e081816240890017053eacbb1bdf337761dc5582 # 1.95.0
+      - uses: ./.github/actions/rust-setup
         with:
           targets: aarch64-apple-ios
-      - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
 
       - name: Cross-check the iOS backend (feat_ios)
         run: |
@@ -643,14 +655,12 @@ jobs:
       - uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5
         with:
           persist-credentials: false
-      - uses: dtolnay/rust-toolchain@e081816240890017053eacbb1bdf337761dc5582 # 1.95.0
-      - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
+      - uses: ./.github/actions/rust-setup
 
       - name: Install PipeWire dev libraries
-        run: |
-          sudo add-apt-repository ppa:pipewire-debian/pipewire-upstream -y
-          sudo apt-get update
-          sudo apt-get install -y libpipewire-0.3-dev libspa-0.2-dev pkg-config libclang-dev
+        uses: ./.github/actions/pipewire-setup
+        with:
+          extra-packages: libclang-dev
 
       - name: Check rsac-ffi (C FFI)
         run: cargo check -p rsac-ffi
@@ -822,18 +832,16 @@ jobs:
       - uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5
         with:
           persist-credentials: false
-      - uses: dtolnay/rust-toolchain@e081816240890017053eacbb1bdf337761dc5582 # 1.95.0
-      - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
+      - uses: ./.github/actions/rust-setup
       - uses: actions/setup-go@41dfa10bad2bb2ae585af6ee5bb4d7d973ad74ed # v5
         with:
           go-version: '1.22'
 
       - name: Install PipeWire dev libraries (Linux)
         if: runner.os == 'Linux'
-        run: |
-          sudo add-apt-repository ppa:pipewire-debian/pipewire-upstream -y
-          sudo apt-get update
-          sudo apt-get install -y libpipewire-0.3-dev libspa-0.2-dev pkg-config libclang-dev
+        uses: ./.github/actions/pipewire-setup
+        with:
+          extra-packages: libclang-dev
 
       # cgo links through MinGW gcc on Windows, which needs the GNU .a — so the
       # FFI crate must be built for the *-pc-windows-gnu target. Add it here.
@@ -872,11 +880,14 @@ jobs:
       - uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5
         with:
           persist-credentials: false
-      - uses: dtolnay/rust-toolchain@e081816240890017053eacbb1bdf337761dc5582 # 1.95.0
+      - uses: ./.github/actions/rust-setup
         with:
           targets: aarch64-unknown-linux-gnu
-      - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
 
+      # Combined cross-gcc + host PipeWire install: kept inline (not the
+      # pipewire-setup composite) because it also installs the aarch64 cross
+      # toolchain the composite does not cover, and shares a single apt-get
+      # update across both package sets.
       - name: Install cross toolchain + host PipeWire dev libs
         run: |
           sudo apt-get update
@@ -934,14 +945,10 @@ jobs:
       - uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5
         with:
           persist-credentials: false
-      - uses: dtolnay/rust-toolchain@e081816240890017053eacbb1bdf337761dc5582 # 1.95.0
-      - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
+      - uses: ./.github/actions/rust-setup
 
       - name: Install PipeWire dev libraries
-        run: |
-          sudo add-apt-repository ppa:pipewire-debian/pipewire-upstream -y
-          sudo apt-get update
-          sudo apt-get install -y libpipewire-0.3-dev libspa-0.2-dev pkg-config
+        uses: ./.github/actions/pipewire-setup
 
       - name: Check feature combination (async-stream + sink-wav + test-utils + compose)
         run: cargo check --no-default-features --features feat_linux,async-stream,sink-wav,test-utils,compose
@@ -979,14 +986,10 @@ jobs:
       - uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5
         with:
           persist-credentials: false
-      - uses: dtolnay/rust-toolchain@e081816240890017053eacbb1bdf337761dc5582 # 1.95.0
-      - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
+      - uses: ./.github/actions/rust-setup
 
       - name: Install PipeWire dev libraries
-        run: |
-          sudo add-apt-repository ppa:pipewire-debian/pipewire-upstream -y
-          sudo apt-get update
-          sudo apt-get install -y libpipewire-0.3-dev libspa-0.2-dev pkg-config
+        uses: ./.github/actions/pipewire-setup
 
       - name: Install cargo-hack
         uses: taiki-e/install-action@0fd46367812ee04360509b4169d9f659d6892bb2 # v2
@@ -1018,20 +1021,15 @@ jobs:
       - uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5
         with:
           persist-credentials: false
-      - uses: dtolnay/rust-toolchain@e081816240890017053eacbb1bdf337761dc5582 # 1.95.0
+      - uses: ./.github/actions/rust-setup
         with:
           components: llvm-tools-preview
-      - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
-        with:
           # Distinct prefix: llvm-cov instruments with -C instrument-coverage,
           # so its artifacts must not poison the plain 1.95 caches.
-          prefix-key: v0-rust-llvm-cov
+          cache-prefix-key: v0-rust-llvm-cov
 
       - name: Install PipeWire dev libraries
-        run: |
-          sudo add-apt-repository ppa:pipewire-debian/pipewire-upstream -y
-          sudo apt-get update
-          sudo apt-get install -y libpipewire-0.3-dev libspa-0.2-dev pkg-config
+        uses: ./.github/actions/pipewire-setup
 
       - name: Install cargo-llvm-cov
         uses: taiki-e/install-action@0fd46367812ee04360509b4169d9f659d6892bb2 # v2
@@ -1143,14 +1141,10 @@ jobs:
       - uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5
         with:
           persist-credentials: false
-      - uses: dtolnay/rust-toolchain@e081816240890017053eacbb1bdf337761dc5582 # 1.95.0
-      - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
+      - uses: ./.github/actions/rust-setup
 
       - name: Install PipeWire dev libraries
-        run: |
-          sudo add-apt-repository ppa:pipewire-debian/pipewire-upstream -y
-          sudo apt-get update
-          sudo apt-get install -y libpipewire-0.3-dev libspa-0.2-dev pkg-config
+        uses: ./.github/actions/pipewire-setup
 
       - name: cargo doc (no-deps, all-features, docs.rs flags)
         env:
@@ -1196,8 +1190,7 @@ jobs:
       - uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5
         with:
           persist-credentials: false
-      - uses: dtolnay/rust-toolchain@e081816240890017053eacbb1bdf337761dc5582 # 1.95.0
-      - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
+      - uses: ./.github/actions/rust-setup
 
       - name: Install cargo-deny
         uses: taiki-e/install-action@0fd46367812ee04360509b4169d9f659d6892bb2 # v2
@@ -1314,3 +1307,75 @@ jobs:
           else
             echo "OK: rsac + all bindings agree at $ROOT"
           fi
+
+  # ── Semver gate for release PRs (interim home) ──────────────────────
+  # cargo-semver-checks (the public-API compatibility gate) normally lives in
+  # release.yml's tag-triggered publish pipeline — but release.yml is currently
+  # disabled_manually (seed rsac-aaea: missing crates.io/npm/PyPI publish
+  # credentials). While it's disabled there is NO path, automatic OR manual, that
+  # runs the semver gate at all, so any breaking API change could ship into a
+  # release undetected. This job is the interim home: it runs the SAME check at
+  # PR-review time, but ONLY on the "release: vX.Y.Z" PR that release-prepare.yml
+  # opens against master (matched by title, NOT by target branch). That scoping
+  # is deliberate — it must NOT fire on ordinary feature PRs, nor on the
+  # release-stacking layer PRs that merge into a frozen release/** branch and
+  # intentionally bundle breaking changes before the single version bump
+  # (docs/reviews/rsac-backlog-blueprints-2026-05-30.md warned a naively-scoped
+  # gate would false-positive-block exactly those). PR-time feedback is strictly
+  # earlier than tag-time, so KEEP this job even after release.yml is re-enabled.
+  #
+  # Baseline resolution mirrors release.yml's `git describe ... HEAD^`: on the
+  # release PR, HEAD^ is master's tip before the merge, and the previous stable
+  # v*.*.* tag is reachable from there.
+  semver-checks-release-pr:
+    name: Semver Gate (release PR)
+    # Keyed on the STRUCTURAL release signal (release-prepare's bump branch is
+    # always release/vX.Y.Z targeting master) OR the release title, so renaming
+    # the PR title alone cannot skip the gate (review PR #56). Layer PRs in the
+    # release-stacking SDLC have base release/X.Y.Z, not master — excluded by
+    # the base check.
+    if: "github.event_name == 'pull_request' && github.base_ref == 'master' && (startsWith(github.head_ref, 'release/') || startsWith(github.event.pull_request.title, 'release: v'))"
+    timeout-minutes: 20
+    runs-on: blacksmith-4vcpu-ubuntu-2404
+    steps:
+      - uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5
+        with:
+          persist-credentials: false
+          # Full history + tags: the baseline is resolved from the previous
+          # v*.*.* tag, which the default shallow clone cannot see.
+          fetch-depth: 0
+      - uses: ./.github/actions/rust-setup
+
+      # cargo-semver-checks builds the crate, so build.rs needs libpipewire —
+      # same dev-headers install release.yml's semver-checks job uses.
+      - name: Install PipeWire dev libraries
+        uses: ./.github/actions/pipewire-setup
+
+      - name: Install cargo-semver-checks
+        uses: taiki-e/install-action@0fd46367812ee04360509b4169d9f659d6892bb2 # v2
+        with:
+          tool: cargo-semver-checks
+
+      - name: Resolve baseline (previous stable release tag)
+        id: baseline
+        shell: bash
+        run: |
+          # Mirrors release.yml's baseline resolution: newest stable v*.*.* tag
+          # reachable from HEAD^ (pre-release shapes v*-* excluded). No previous
+          # tag (first release) => warn + skip rather than fail, since there is
+          # nothing to diff against.
+          if PREV_TAG="$(git describe --tags --abbrev=0 --match 'v*.*.*' --exclude 'v*-*' HEAD^ 2>/dev/null)"; then
+            echo "baseline release tag: ${PREV_TAG}"
+            echo "prev_tag=${PREV_TAG}" >> "$GITHUB_OUTPUT"
+          else
+            echo "::warning::no previous stable v*.*.* tag found — skipping cargo-semver-checks (first release has no baseline)"
+            echo "prev_tag=" >> "$GITHUB_OUTPUT"
+          fi
+
+      # Scoped to the root crate: this mirrors release.yml, which publishes
+      # ONLY `rsac` (the bindings release via their own workflows).
+      - name: cargo semver-checks (vs previous release)
+        if: steps.baseline.outputs.prev_tag != ''
+        env:
+          PREV_TAG: ${{ steps.baseline.outputs.prev_tag }}
+        run: cargo semver-checks check-release -p rsac --baseline-rev "$PREV_TAG"

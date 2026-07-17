@@ -1,0 +1,58 @@
+# Composite: pin the Rust toolchain + restore the Swatinem cache.
+#
+# This wraps the two byte-identical steps that were copy-pasted into ~22 jobs
+# across ci.yml and ci-audio-tests.yml:
+#   - uses: dtolnay/rust-toolchain@<pin>   (channel 1.95.0)
+#   - uses: Swatinem/rust-cache@<pin>
+#
+# NOTE: `actions/checkout` is deliberately NOT included. A composite action
+# cannot check out the repository it lives in before that repository has been
+# checked out (the action file itself is fetched from the checked-out tree), so
+# every caller keeps its own `- uses: actions/checkout@... ` step BEFORE this
+# one. This composite only pins the toolchain + cache.
+#
+# All action refs are SHA-pinned (repo convention). The pins below MUST stay in
+# lockstep with the direct pins elsewhere in the repo; grep for the SHAs before
+# bumping.
+name: rust-setup
+description: >-
+  Install the pinned Rust toolchain (dtolnay/rust-toolchain) and restore the
+  Swatinem/rust-cache, with pass-through inputs. Does NOT run actions/checkout —
+  callers must check out the repo first.
+
+inputs:
+  components:
+    description: Comma-separated rustup components (e.g. "rustfmt, clippy"). Empty = none.
+    required: false
+    default: ""
+  targets:
+    description: Comma-separated target triples to install. Empty = host only.
+    required: false
+    default: ""
+  cache-key:
+    description: >-
+      Optional additional cache key passed through to Swatinem/rust-cache's
+      `key` input (distinguishes otherwise-identical jobs).
+    required: false
+    default: ""
+  cache-prefix-key:
+    description: >-
+      Overrides Swatinem/rust-cache's `prefix-key`. Defaults to the action's own
+      default ("v0-rust"); set a distinct value for toolchains/instrumentation
+      that must NOT share the 1.95 caches (e.g. MSRV, llvm-cov).
+    required: false
+    default: "v0-rust"
+
+runs:
+  using: composite
+  steps:
+    # dtolnay/rust-toolchain @ e0818162… bakes channel 1.95.0 as its default
+    # (matches rust-toolchain.toml). Empty components/targets are safe no-ops.
+    - uses: dtolnay/rust-toolchain@e081816240890017053eacbb1bdf337761dc5582 # 1.95.0
+      with:
+        components: ${{ inputs.components }}
+        targets: ${{ inputs.targets }}
+    - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
+      with:
+        key: ${{ inputs.cache-key }}
+        prefix-key: ${{ inputs.cache-prefix-key }}
