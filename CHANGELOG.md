@@ -50,8 +50,11 @@ Releases with no ABI change omit the subsection (or state "No C ABI changes").
   process-object query is unavailable / reports no active PIDs), in which case
   the list is the full running-app set (`ApplicationScope::AllRunningFallback`);
   Windows (`AudioSessionStateActive`) and Linux (native PipeWire audio nodes)
-  are always `ApplicationScope::ExactAudioProducers`. `rsac list-apps` surfaces
-  the fallback mode with a banner line. The existing
+  report `ApplicationScope::ExactAudioProducers` on success. A failed backend
+  query (PipeWire unreachable, a WASAPI/CoreAudio error) reports
+  `ApplicationScope::EnumerationFailed` — the empty list is *incomplete*, not
+  evidence that nothing is playing. `rsac list-apps` surfaces
+  the fallback and failure modes with banner lines. The existing
   `list_audio_applications()` is unchanged (it delegates to the scoped variant
   and discards the scope). Additive-only; `cargo-semver-checks` reports `minor`.
   No C ABI change. (rsac-f547)

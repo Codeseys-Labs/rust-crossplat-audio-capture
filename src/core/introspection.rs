@@ -124,6 +124,12 @@ pub enum ApplicationScope {
     /// only on macOS < 14.4, or when the macOS CoreAudio process-object query is
     /// unavailable or reports no active PIDs (see the macOS backend fallback).
     AllRunningFallback,
+    /// The backend enumeration itself failed (e.g. PipeWire unreachable, a
+    /// WASAPI/CoreAudio query error), so the (empty) list is *incomplete* —
+    /// not evidence that no applications are producing audio. Discovery stays
+    /// best-effort (the error is swallowed), but scoped callers can distinguish
+    /// "no producers found" from "could not look".
+    EnumerationFailed,
 }
 
 /// Result of a scope-aware application enumeration: the sources plus whether the
@@ -288,31 +294,34 @@ fn list_audio_applications_scoped_into(sources: &mut Vec<AudioSource>) -> Applic
                 ApplicationScope::ExactAudioProducers
             }
         }
-        // Enumeration failed: push nothing and report an exact (empty) list —
-        // this is an honest "we found no audio producers", not an unfiltered
-        // superset. Errors are swallowed to keep discovery best-effort.
-        Err(_) => ApplicationScope::ExactAudioProducers,
+        // Enumeration failed: push nothing and say so — an empty list from a
+        // failed query is INCOMPLETE, not an exact "no producers" answer
+        // (PR #59 review). Errors are swallowed to keep discovery best-effort.
+        Err(_) => ApplicationScope::EnumerationFailed,
     }
 }
 
 #[cfg(all(target_os = "windows", feature = "feat_windows"))]
 fn list_audio_applications_scoped_into(sources: &mut Vec<AudioSource>) -> ApplicationScope {
-    // Windows filters to `AudioSessionStateActive`, so the list is always the
-    // exact audio-producer set.
-    if let Ok(sessions) = crate::audio::windows::enumerate_application_audio_sessions() {
-        for session in sessions {
-            sources.push(AudioSource {
-                id: format!("app:{}", session.process_id),
-                name: session.display_name.clone(),
-                kind: AudioSourceKind::Application {
-                    pid: session.process_id,
-                    app_name: session.display_name,
-                    bundle_id: None,
-                },
-            });
+    // Windows filters to `AudioSessionStateActive`, so a successful query is
+    // always the exact audio-producer set; a failed query is incomplete.
+    match crate::audio::windows::enumerate_application_audio_sessions() {
+        Ok(sessions) => {
+            for session in sessions {
+                sources.push(AudioSource {
+                    id: format!("app:{}", session.process_id),
+                    name: session.display_name.clone(),
+                    kind: AudioSourceKind::Application {
+                        pid: session.process_id,
+                        app_name: session.display_name,
+                        bundle_id: None,
+                    },
+                });
+            }
+            ApplicationScope::ExactAudioProducers
         }
+        Err(_) => ApplicationScope::EnumerationFailed,
     }
-    ApplicationScope::ExactAudioProducers
 }
 
 #[cfg(all(target_os = "linux", feature = "feat_linux"))]
@@ -328,25 +337,30 @@ fn list_audio_applications_scoped_into(sources: &mut Vec<AudioSource>) -> Applic
     // best-effort and must never fail `list_audio_sources`. PID dedup is handled
     // natively (`PwAppSnapshot` is keyed by PID), but we still guard against an
     // id already present in `sources` for parity with the other backends.
-    if let Ok(apps) = crate::audio::linux::enumerate_audio_applications() {
-        for app in apps {
-            let id = format!("app:{}", app.process_id);
-            if sources.iter().any(|s| s.id == id) {
-                continue;
+    match crate::audio::linux::enumerate_audio_applications() {
+        Ok(apps) => {
+            for app in apps {
+                let id = format!("app:{}", app.process_id);
+                if sources.iter().any(|s| s.id == id) {
+                    continue;
+                }
+                sources.push(AudioSource {
+                    id,
+                    name: app.name.clone(),
+                    kind: AudioSourceKind::Application {
+                        pid: app.process_id,
+                        app_name: app.name,
+                        bundle_id: None,
+                    },
+                });
             }
-            sources.push(AudioSource {
-                id,
-                name: app.name.clone(),
-                kind: AudioSourceKind::Application {
-                    pid: app.process_id,
-                    app_name: app.name,
-                    bundle_id: None,
-                },
-            });
+            // A successful native PipeWire audio-node snapshot is always exact.
+            ApplicationScope::ExactAudioProducers
         }
+        // PipeWire unreachable (no daemon/socket): the empty list is
+        // incomplete, not a "no producers" answer (PR #59 review).
+        Err(_) => ApplicationScope::EnumerationFailed,
     }
-    // Linux returns the native PipeWire audio-node snapshot, always exact.
-    ApplicationScope::ExactAudioProducers
 }
 
 #[cfg(not(any(

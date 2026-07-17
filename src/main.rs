@@ -286,6 +286,10 @@ fn scope_banner(scope: ApplicationScope) -> Option<&'static str> {
             "  NOTE: audio-process filtering unavailable — showing ALL running apps \
              (may include silent ones).",
         ),
+        ApplicationScope::EnumerationFailed => Some(
+            "  NOTE: application enumeration FAILED — the (empty) list is \
+             incomplete, not proof that nothing is playing.",
+        ),
         ApplicationScope::ExactAudioProducers => None,
         // ApplicationScope is #[non_exhaustive]: default to no banner for any
         // future exact-ish variant.
@@ -636,6 +640,12 @@ mod tests {
         assert!(
             banner.contains("ALL running apps"),
             "fallback banner must warn the list is unfiltered, got: {banner:?}"
+        );
+        let failed = scope_banner(ApplicationScope::EnumerationFailed)
+            .expect("failed enumeration must print a banner");
+        assert!(
+            failed.contains("incomplete"),
+            "failed-enumeration banner must warn the list is incomplete, got: {failed:?}"
         );
     }
 }

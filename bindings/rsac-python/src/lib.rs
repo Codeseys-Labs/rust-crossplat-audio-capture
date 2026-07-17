@@ -2137,6 +2137,11 @@ impl PyComposition {
                 .lock()
                 .map_err(|e| PyRuntimeError::new_err(format!("Lock poisoned: {}", e)))?;
             *iter_guard = true;
+            // Drop the iterating guard BEFORE start(): start() releases the GIL
+            // inside allow_threads, so holding `iterating` across it recreates
+            // the GIL-vs-lock circular wait (rsac-8082 class) — same fix as
+            // PyAudioCapture::__iter__.
+            drop(iter_guard);
 
             let guard = self_ref
                 .inner
