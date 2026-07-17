@@ -8,8 +8,9 @@ deleted in the 2026-07-05 rot cleanup (rsac-a3c4) — recover via
 
 | Script | Purpose | Called by |
 |---|---|---|
-| `gate.sh` | The local gate — replica of ci.yml's `lint` job for the host OS (`--full` adds tests/doc/DAG) | `mise run gate`, lefthook pre-push, humans |
+| `gate.sh` | The local gate — replica of ci.yml's `lint` job for the host OS, including the docsrs `cargo doc` step (`--full` adds lib tests/doctests/module-DAG guard) | `mise run gate`, lefthook pre-push, humans |
 | `gate.ps1` | PowerShell wrapper for `gate.sh` (delegates via `run-bash.ps1`) | `mise run gate` on Windows, lefthook pre-push |
+| `gate-bindings.sh` | Local replica of ci.yml's `check-bindings` job — rsac-ffi/napi/python check+clippy+test, header drift, napi + python runtime smokes. Each leg skips gracefully if its toolchain is missing (`--strict` hard-fails instead) | `mise run gate:bindings`, humans |
 | `run-bash.ps1` | Generic Windows wrapper: finds Git bash (avoids WSL bash) and runs any repo bash script with args | `gate.ps1`, the Windows legs of `mise run release:bump` / `release:verify-docs` |
 | `hooks/commit-msg.sh` | Rejects `Co-Authored-By:` trailers / tool bylines (AGENTS.md §6) | lefthook commit-msg hook |
 | `test-audio-linux.sh` / `test-audio-macos.sh` / `test-audio-windows.ps1` | Run the `ci_audio` integration suite (all 3 capture tiers) on a physical machine | `mise run test:audio` (host-OS dispatch), humans (see `docs/LOCAL_TESTING_GUIDE.md`) |

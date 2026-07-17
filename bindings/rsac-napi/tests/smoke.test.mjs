@@ -66,3 +66,21 @@ test('device enumeration (headless-tolerant)', async () => {
     console.log(`device enumeration skipped (headless?): ${err.message}`);
   }
 });
+
+test('default device lookup (headless-tolerant)', async () => {
+  // getDefaultDevice() is async (Promise<AudioDevice>, src/lib.rs:1106) —
+  // just like listDevices() above, it MUST be awaited here so a
+  // headless-machine rejection is caught instead of escaping as an
+  // unhandledRejection after the test ends (rsac-f9c1: this export was
+  // exercised nowhere until now, the same dormant landmine class that
+  // caused the listDevices() unhandled-rejection CI failure).
+  try {
+    const device = await rsac.getDefaultDevice();
+    assert.equal(typeof device.id, 'string');
+    assert.equal(typeof device.name, 'string');
+    assert.equal(typeof device.isDefault, 'boolean');
+    console.log(`default device: ${device.name} (${device.id})`);
+  } catch (err) {
+    console.log(`default device lookup skipped (headless?): ${err.message}`);
+  }
+});

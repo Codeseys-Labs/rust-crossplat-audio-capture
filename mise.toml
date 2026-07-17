@@ -29,12 +29,12 @@ description = "One-shot onboarding after `mise install`: install the git hooks"
 run = "lefthook install"
 
 [tasks.gate]
-description = "CI lint-job replica: fmt + clippy -D warnings + bare-build smoke"
+description = "CI lint-job replica: fmt + clippy -D warnings + bare-build smoke + cargo doc (docsrs)"
 run = "bash scripts/gate.sh"
 run_windows = "pwsh -NoProfile -ExecutionPolicy Bypass -File scripts/gate.ps1"
 
 [tasks."gate:full"]
-description = "gate + lib tests + doctests + cargo doc + module-DAG guard"
+description = "gate + lib tests + doctests + module-DAG guard"
 run = "bash scripts/gate.sh --full"
 run_windows = "pwsh -NoProfile -ExecutionPolicy Bypass -File scripts/gate.ps1 --full"
 
@@ -42,6 +42,10 @@ run_windows = "pwsh -NoProfile -ExecutionPolicy Bypass -File scripts/gate.ps1 --
 description = "CI test-job replica for the host OS (lib tests + doctests)"
 run = "bash scripts/gate.sh --tests-only"
 run_windows = "pwsh -NoProfile -ExecutionPolicy Bypass -File scripts/gate.ps1 --tests-only"
+
+[tasks."gate:bindings"]
+description = "check-bindings CI job replica: rsac-ffi/napi/python check+clippy+test, header drift, napi + python runtime smokes (each leg skips gracefully if its toolchain is missing; pass -- --strict to hard-fail on a missing toolchain instead)"
+run = "bash scripts/gate-bindings.sh"
 
 [tasks.fmt]
 description = "Format the workspace"

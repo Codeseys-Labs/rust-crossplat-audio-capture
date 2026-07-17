@@ -3,8 +3,8 @@
 # The gate logic lives once, in scripts/gate.sh (bash), so it cannot drift
 # between platforms; the Git-bash discovery likewise lives once, in
 # scripts/run-bash.ps1. Usage mirrors gate.sh:
-#   pwsh scripts/gate.ps1              # lint-job replica
-#   pwsh scripts/gate.ps1 --full       # + tests, doctests, docs, module-DAG
+#   pwsh scripts/gate.ps1              # lint-job replica (incl. cargo doc, rsac-af3d)
+#   pwsh scripts/gate.ps1 --full       # + tests, doctests, module-DAG
 #   pwsh scripts/gate.ps1 --tests-only # test-job replica only
 $ErrorActionPreference = 'Stop'
 

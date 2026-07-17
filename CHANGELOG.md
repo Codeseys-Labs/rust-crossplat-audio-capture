@@ -31,6 +31,13 @@ Releases with no ABI change omit the subsection (or state "No C ABI changes").
   Additive — `cargo-semver-checks` reports `minor`. The earlier `pipe_to` name
   for this driver is retired: `drain_to` is the single shipped name across all
   three surfaces (rsac-2135).
+- **Bindings (Node/napi):** the runtime smoke suite (`bindings/rsac-napi/tests/smoke.test.mjs`)
+  now also exercises `getDefaultDevice()`, awaited with the same
+  headless-tolerant catch discipline already used for `listDevices()`. It was
+  an async, exported function that had never been smoke-tested — the same
+  class of dormant unhandled-rejection landmine that caused a prior CI
+  failure on the `listDevices()` leg (rsac-f9c1). Test-only; no library
+  behavior change.
 - `AudioError::lifecycle_stage()` — a structured accessor that classifies a
   lifecycle-cause `StreamReadError` into a new `#[non_exhaustive]`
   `LifecycleStage` enum (`NotInitialized`, `NotRunning`, `Unknown`), so
