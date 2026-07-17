@@ -413,14 +413,14 @@ impl AudioCapture {
     /// Returns `null` if no data is currently available.
     /// Throws if the capture is not running.
     ///
-    /// Not terminal-observable: this and `read_async` route through rsac's
+    /// Not terminal-observable: this and `readAsync` route through rsac's
     /// `read_buffer`, which short-circuits to a *recoverable*
     /// `StreamReadError` the moment the stream leaves `Running` and never
     /// surfaces the terminal `StreamEnded`. The BLOCKING readers
-    /// (`read_blocking`/`read_blocking_async`) ARE terminal-observable as of
-    /// rsac-477d, as is the push pump started by `on_data` (terminal reason
-    /// via `on_end`). A non-blocking pull consumer should treat
-    /// `stop`/`is_running` as the end-of-stream signal and a thrown read
+    /// (`readBlocking`/`readBlockingAsync`) ARE terminal-observable as of
+    /// rsac-477d, as is the push pump started by `onData` (terminal reason
+    /// via `onEnd`). A non-blocking pull consumer should treat
+    /// `stop`/`isRunning` as the end-of-stream signal and a thrown read
     /// error as retryable.
     #[napi]
     pub fn read(&self) -> Result<Option<AudioChunk>> {

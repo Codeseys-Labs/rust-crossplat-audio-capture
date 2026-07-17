@@ -120,6 +120,15 @@ fn composed_system_capture_layout_and_delivery() {
         match session.read_chunk_nonblocking() {
             Ok(Some(buffer)) => {
                 buffers += 1;
+                // Warm-up buffers are still delivered composed audio — hold
+                // them to the same layout contract as the measurement loop.
+                assert_eq!(buffer.channels(), map.channels(), "buffer channel count");
+                assert_eq!(buffer.sample_rate(), 48000, "buffer session rate");
+                assert_eq!(
+                    buffer.data().len() % usize::from(map.channels()),
+                    0,
+                    "whole interleaved frames only"
+                );
                 if buffer.data().iter().any(|s| s.abs() > 1e-4) {
                     nonsilent = true;
                 }
