@@ -49,6 +49,13 @@ test('SystemDefault capture delivers non-silence and stops cleanly', { skip: !DE
 
   cap.stop();
   assert.equal(cap.isRunning, false, 'isRunning false after stop()');
-  // readBlocking() is terminal-observable — throws the terminal error after stop.
-  assert.throws(() => cap.readBlocking(), 'readBlocking() after stop() must throw terminal');
+  // readBlocking() is terminal-observable — it must throw the FATAL terminal
+  // (StreamEnded, kind Stream → [ERR_RSAC_STREAM] "Stream ended: …"), not a
+  // recoverable "not running" downgrade (the rsac-477d regression class).
+  assert.throws(
+    () => cap.readBlocking(),
+    (err) =>
+      /\[ERR_RSAC_STREAM\]/.test(err.message) && /Stream ended/i.test(err.message),
+    'readBlocking() after stop() must throw the fatal StreamEnded terminal'
+  );
 });

@@ -365,7 +365,9 @@ non-Linux contributor's local gate — confirmed live (rsac-ef88): an injected
 `--features feat_linux,compose,cli` inside the devcontainer image.
 `gate:linux` runs the same `clippy --all-targets --features
 feat_linux,compose,cli -D warnings` + `fmt --check` ci.yml's `lint
-(feat_linux)` leg runs, via `docker run` against
+(feat_linux)` leg runs — plus the Feature Combo job's two optional-feature
+clippy sweeps (`feat_linux,async-stream,sink-wav,test-utils,compose` and
+`feat_linux,bridge-zerocopy`) — via `docker run` against
 `docker/linux/Dockerfile.test` (the same image `.devcontainer/` builds), with
 named-volume caches for the cargo registry and target dir so warm re-runs are
 fast. It needs Docker (OrbStack/Docker Desktop/native); without it, the task

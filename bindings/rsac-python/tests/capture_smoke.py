@@ -58,12 +58,23 @@ if cap.is_running:
     failures.append("is_running must be False after stop()")
 
 # 5. terminal-observable: blocking read() after stop() raises the stream's true
-#    terminal error (per __init__.pyi AudioCapture.read), not a buffer.
+#    FATAL terminal (StreamEnded → StreamError with "Stream ended: ..."), not a
+#    recoverable "not running" downgrade (the rsac-477d regression class).
 try:
     cap.read()
     failures.append("read() after stop() should raise the terminal error")
-except rsac.RsacError:
-    print("post-stop read raised terminal error: ok")
+except rsac.StreamError as e:
+    if "stream ended" in str(e).lower():
+        print("post-stop read raised the fatal StreamEnded terminal: ok")
+    else:
+        failures.append(
+            f"read() after stop() raised StreamError but not the StreamEnded "
+            f"terminal (got: {e}) — recoverable downgrade regression?"
+        )
+except rsac.RsacError as e:
+    failures.append(
+        f"read() after stop() raised a non-Stream RsacError: {type(e).__name__}: {e}"
+    )
 
 # 6. close/drop cleanly — close() is idempotent.
 cap.close()

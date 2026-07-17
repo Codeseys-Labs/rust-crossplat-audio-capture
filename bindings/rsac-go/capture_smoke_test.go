@@ -77,8 +77,13 @@ func TestSystemCaptureSmoke(t *testing.T) {
 	if cap.IsRunning() {
 		t.Fatal("IsRunning must be false after Stop()")
 	}
-	// terminal-observable: a blocking read after Stop returns an error, not a buffer.
+	// terminal-observable: a blocking read after Stop returns the FATAL
+	// terminal (ErrStreamFailed covers StreamEnded), not a recoverable
+	// downgrade (the rsac-477d regression class) and not a nil error.
 	if _, rerr := cap.ReadBuffer(); rerr == nil {
 		t.Fatal("ReadBuffer() after Stop() must return a terminal error")
+	} else if rsac.IsRecoverable(rerr) {
+		t.Fatalf("ReadBuffer() after Stop() returned a RECOVERABLE error (%v) — "+
+			"the terminal must be fatal (StreamEnded/ErrStreamFailed)", rerr)
 	}
 }

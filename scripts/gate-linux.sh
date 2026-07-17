@@ -84,7 +84,13 @@ docker run --rm \
     source "$HOME/.cargo/env"
     rustup component add clippy rustfmt >/dev/null 2>&1 || true
     cargo fmt --all -- --check
+    # Leg 1: ci.yml `lint` job (linux row of the 3-OS matrix) — byte-identical.
     cargo clippy --all-targets --no-default-features --features feat_linux,compose,cli -- -D warnings
+    # Legs 2+3: ci.yml `Feature Combo` job clippy sweeps — the optional-feature
+    # combos (async-stream/sink-wav/test-utils and bridge-zerocopy) that the
+    # lint job does not cover (PR #61 review).
+    cargo clippy --all-targets --no-default-features --features feat_linux,async-stream,sink-wav,test-utils,compose -- -D warnings
+    cargo clippy --all-targets --no-default-features --features feat_linux,bridge-zerocopy -- -D warnings
   '
 
 printf '\n\033[1;32mgate-linux: OK (feat_linux)\033[0m\n'

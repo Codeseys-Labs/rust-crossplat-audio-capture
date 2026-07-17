@@ -948,8 +948,17 @@ impl AudioCapture {
         // This pump owns the generation value current at spawn time; any
         // cancellation (stop/offData) bumps it, ending ownership even if
         // pump_active is set true again by a rapid re-onData.
-        let my_generation = pump_generation.fetch_add(1, Ordering::SeqCst) + 1;
+        //
+        // ORDER MATTERS (PR #61 review): the flag is set BEFORE the generation
+        // is captured. With gen-first, a stop() between the two lines would
+        // set the flag false, our store(true) would overwrite it, and the
+        // spawned thread — seeing a generation mismatch — would exit WITHOUT
+        // clearing the flag (owner-only clear), wedging pump spawning forever.
+        // Flag-first closes that: a stop() before the capture leaves us owning
+        // the newest generation (owner-exit clears the flag); a stop() after
+        // it leaves the flag false already.
         pump_active.store(true, Ordering::SeqCst);
+        let my_generation = pump_generation.fetch_add(1, Ordering::SeqCst) + 1;
 
         let spawn_result = std::thread::Builder::new()
             .name("rsac-napi-pump".into())
@@ -1078,8 +1087,13 @@ impl AudioCapture {
             Ok(_) => Ok(()),
             Err(e) => {
                 // Roll the flag back so a later onData()/start() can retry —
-                // leaving it true would permanently wedge pump spawning.
-                self.pump_active.store(false, Ordering::SeqCst);
+                // but ONLY if this attempt still owns the generation: a
+                // concurrent stop() + successful re-spawn may already own a
+                // live pump whose flag a blind rollback would kill
+                // (PR #61 review).
+                if self.pump_generation.load(Ordering::SeqCst) == my_generation {
+                    self.pump_active.store(false, Ordering::SeqCst);
+                }
                 Err(napi::Error::new(
                     napi::Status::GenericFailure,
                     format!("Failed to spawn data pump thread: {}", e),
@@ -1562,8 +1576,17 @@ impl Composition {
         // This pump owns the generation value current at spawn time; any
         // cancellation (stop/offData) bumps it, ending ownership even if
         // pump_active is set true again by a rapid re-onData (PR #59 review).
-        let my_generation = pump_generation.fetch_add(1, Ordering::SeqCst) + 1;
+        //
+        // ORDER MATTERS (PR #61 review): the flag is set BEFORE the generation
+        // is captured. With gen-first, a stop() between the two lines would
+        // set the flag false, our store(true) would overwrite it, and the
+        // spawned thread — seeing a generation mismatch — would exit WITHOUT
+        // clearing the flag (owner-only clear), wedging pump spawning forever.
+        // Flag-first closes that: a stop() before the capture leaves us owning
+        // the newest generation (owner-exit clears the flag); a stop() after
+        // it leaves the flag false already.
         pump_active.store(true, Ordering::SeqCst);
+        let my_generation = pump_generation.fetch_add(1, Ordering::SeqCst) + 1;
 
         let spawn_result = std::thread::Builder::new()
             .name("rsac-napi-compose-pump".into())
@@ -1639,10 +1662,14 @@ impl Composition {
         match spawn_result {
             Ok(_) => Ok(()),
             Err(e) => {
-                // Roll the flag back so a later onData()/start() can retry —
-                // leaving it true would permanently wedge pump spawning
-                // (PR #59 review).
-                self.pump_active.store(false, Ordering::SeqCst);
+                // Roll the flag back so a later onData()/start() can retry
+                // (PR #59 review) — but ONLY if this attempt still owns the
+                // generation; a concurrent stop() + successful re-spawn may
+                // already own a live pump whose flag a blind rollback would
+                // kill (PR #61 review).
+                if self.pump_generation.load(Ordering::SeqCst) == my_generation {
+                    self.pump_active.store(false, Ordering::SeqCst);
+                }
                 Err(napi::Error::new(
                     napi::Status::GenericFailure,
                     format!("Failed to spawn compose data pump thread: {}", e),
