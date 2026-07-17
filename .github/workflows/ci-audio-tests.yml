@@ -31,7 +31,11 @@ name: Audio Integration Tests
 
 on:
   push:
-    branches: [main, master, 'release/**']
+    # release/** intentionally dropped from the push filter (KEPT in
+    # pull_request below): every release-branch commit lands via a PR, so
+    # push+pull_request double-fired this audio matrix (mirrors the same fix
+    # in ci.yml). The existing path filter is unchanged.
+    branches: [main, master]
     paths:
       - 'src/**'
       - 'tests/**'
@@ -58,6 +62,15 @@ env:
   CARGO_TERM_COLOR: always
   RUST_BACKTRACE: 1
   RUST_LOG: rsac=debug
+
+# Cancel superseded runs on the same ref (mirrors ci.yml). Without this a rapid
+# sequence of pushes to the same PR branch ran every prior in-flight audio
+# matrix to completion (nothing cancelled it), wasting ~14 job-min per
+# superseded run. cancel-in-progress only on pull_request so a real push to
+# main/master is never cancelled mid-flight.
+concurrency:
+  group: audio-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 # =============================================================================
 # Linux tiers

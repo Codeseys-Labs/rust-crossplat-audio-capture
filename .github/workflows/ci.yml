@@ -5,7 +5,28 @@ name: CI
 
 on:
   push:
-    branches: [main, master, 'release/**']
+    # release/** intentionally dropped from the push filter (KEPT in
+    # pull_request below): every release-branch commit lands via a PR per
+    # AGENTS.md's PR-vs-direct rule, so push+pull_request both matched and
+    # double-fired the full matrix (66 duplicate checks observed on PR #55).
+    # The pull_request trigger alone gives release/** branches full coverage.
+    branches: [main, master]
+    # Skip branch pushes that only touch docs / backlog / bookkeeping files —
+    # the docs-only fast path (the `changes` job below) only covers
+    # pull_request events, so a direct push of e.g. `.seeds/issues.jsonl` used
+    # to run the whole 23-job matrix (~15.4 job-min) for a 1-line diff.
+    #
+    # NOTE: per GitHub semantics, paths/paths-ignore filters are NOT evaluated
+    # for tag pushes ("Path filters are not evaluated for pushes of tags"), so
+    # the `tags:` trigger below (and the version-lockstep tag-time hard-gate it
+    # feeds) still fires on every `v*.*.*` tag regardless of the changed paths.
+    paths-ignore:
+      - 'docs/**'
+      - '.seeds/**'
+      - '.kilo/**'
+      - '.mulch/**'
+      - '**/*.md'
+      - 'LICENSE'
     # Also run on stable semver tags so the version-lockstep job's tag-time
     # hard-gate (which asserts all seven manifests equal the tag) actually fires
     # at the point of no return — it was previously dead code (ci.yml had no
