@@ -38,10 +38,7 @@ fn configure_windows_build() {
 
 #[allow(dead_code)] // dispatched at runtime by target_os; unused on non-linux builds
 fn configure_linux_build() {
-    use std::{
-        env,
-        process::{self, Command},
-    };
+    use std::process;
 
     // Enhanced Linux build configuration for PipeWire application capture
 
@@ -82,65 +79,23 @@ fn configure_linux_build() {
     );
     eprintln!("Application capture requires PipeWire 0.3.44+ for monitor stream functionality");
 
-    if env::var("RSAC_AUTO_INSTALL").as_deref() == Ok("1") {
-        if Command::new("which")
-            .arg("apt-get")
-            .output()
-            .is_ok_and(|o| o.status.success())
-        {
-            let packages: Vec<&str> = missing
-                .iter()
-                .map(|lib| match *lib {
-                    "libpipewire-0.3" => "libpipewire-0.3-dev",
-                    _ => *lib,
-                })
-                .collect();
-
-            eprintln!("Attempting to install: {}", packages.join(" "));
-            let _ = Command::new("sudo").arg("apt-get").arg("update").status();
-            let status = Command::new("sudo")
-                .arg("apt-get")
-                .arg("install")
-                .arg("-y")
-                .args(&packages)
-                .status();
-
-            if status.is_ok_and(|s| s.success()) {
-                let still_missing: Vec<&str> = required_libs
-                    .iter()
-                    .copied()
-                    .filter(|lib| {
-                        if *lib == "libpipewire-0.3" {
-                            pkg_config::Config::new()
-                                .atleast_version("0.3.44")
-                                .probe(lib)
-                                .is_err()
-                        } else {
-                            pkg_config::Config::new().probe(lib).is_err()
-                        }
-                    })
-                    .collect();
-                if still_missing.is_empty() {
-                    return;
-                }
-                eprintln!(
-                    "Automatic install failed or incomplete. Missing: {}",
-                    still_missing.join(", ")
-                );
-            } else {
-                eprintln!("Automatic install failed. Proceeding with error message.");
-            }
-        } else {
-            eprintln!("apt-get not found. Cannot auto-install dependencies.");
-        }
-    } else {
-        eprintln!("Set RSAC_AUTO_INSTALL=1 to attempt automatic installation via apt-get.");
-    }
-
+    // rsac-5c4a: build scripts must never execute package managers (the old
+    // RSAC_AUTO_INSTALL=1 path ran `sudo apt-get` from inside cargo). Print
+    // the exact commands instead; dependency installation belongs to the
+    // developer / setup scripts (scripts/setup_env.sh), not the build.
+    let packages: Vec<&str> = missing
+        .iter()
+        .map(|lib| match *lib {
+            "libpipewire-0.3" => "libpipewire-0.3-dev",
+            _ => *lib,
+        })
+        .collect();
     eprintln!("Install missing libraries with your package manager or set PKG_CONFIG_PATH.");
     eprintln!(
-        "For Ubuntu/Debian: sudo apt-get install libpipewire-0.3-dev pkg-config build-essential"
+        "For Ubuntu/Debian: sudo apt-get install {} pkg-config build-essential",
+        packages.join(" ")
     );
+    eprintln!("Or run: bash scripts/setup_env.sh");
     process::exit(1);
 }
 

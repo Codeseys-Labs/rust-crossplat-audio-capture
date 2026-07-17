@@ -1023,7 +1023,13 @@ impl PyAudioCapture {
     /// Blocks until audio data is available. The GIL is released during
     /// the wait, allowing other Python threads to run.
     ///
-    /// Raises StreamError if the stream is not running or encounters an error.
+    /// Terminal-observable (rsac-477d): once the stream has ended — after
+    /// `stop()` or a fatal backend error — this raises the stream's true
+    /// terminal error (`StreamEndedError`) promptly, matching the iterator
+    /// protocol, the C FFI, and Go. It no longer downgrades a terminal
+    /// stream to a recoverable "not running" error.
+    ///
+    /// Raises StreamError if the stream encounters a recoverable error.
     fn read(&self, py: Python<'_>) -> PyResult<PyAudioBuffer> {
         let mut guard = self
             .inner
@@ -1033,7 +1039,7 @@ impl PyAudioCapture {
             .as_mut()
             .ok_or_else(|| PyRuntimeError::new_err("AudioCapture has been closed"))?;
 
-        let result = py.allow_threads(|| capture.read_buffer_blocking());
+        let result = py.allow_threads(|| capture.read_chunk_blocking());
 
         match result {
             Ok(buf) => Ok(PyAudioBuffer { inner: buf }),

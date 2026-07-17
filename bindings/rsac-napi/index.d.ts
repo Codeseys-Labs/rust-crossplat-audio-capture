@@ -170,14 +170,15 @@ export declare class AudioCapture {
    * Returns `null` if no data is currently available.
    * Throws if the capture is not running.
    *
-   * **Not terminal-observable.** The pull readers (`read`, `readBlocking`,
-   * `readAsync`, `readBlockingAsync`) route through rsac's `read_buffer*`, which
-   * short-circuits to a *recoverable* read error the moment the stream leaves
-   * the running state — it never surfaces the terminal "stream ended" cause. So
-   * a pull consumer cannot distinguish a transient hiccup from a real terminal
-   * end via the thrown error. Only the push pump (`onData`) drains the terminal
-   * state and reports *why* it ended via `onEnd`. To observe the terminal cause,
-   * use `onData` + `onEnd`; with the pull API, treat `stop()`/`isRunning` as the
+   * **Not terminal-observable.** The non-blocking pull readers (`read`,
+   * `readAsync`) route through rsac's `read_buffer`, which short-circuits to
+   * a *recoverable* read error the moment the stream leaves the running
+   * state — it never surfaces the terminal "stream ended" cause. So a
+   * non-blocking pull consumer cannot distinguish a transient hiccup from a
+   * real terminal end via the thrown error. The BLOCKING readers
+   * (`readBlocking`, `readBlockingAsync`) ARE terminal-observable, as is the
+   * push pump (`onData`), which reports *why* the stream ended via `onEnd`.
+   * With the non-blocking pull API, treat `stop()`/`isRunning` as the
    * end-of-stream signal.
    *
    * This terminal-cause-invisibility is the *only* thing that makes a thrown
@@ -195,10 +196,10 @@ export declare class AudioCapture {
    * WARNING: This blocks the Node.js event loop. Use `readBlockingAsync()`
    * or `onData()` in production.
    *
-   * Like `read()`, this is **not terminal-observable** — it routes through
-   * `read_buffer_blocking` and surfaces only recoverable errors, never the
-   * terminal "stream ended" cause. Use `onData` + `onEnd` to observe the
-   * terminal reason.
+   * **Terminal-observable**: once the stream has ended — after `stop()` or a
+   * fatal backend error — this throws the stream's true terminal error
+   * promptly (it routes through `read_chunk_blocking`), instead of
+   * downgrading it to a recoverable "not running" error.
    */
   readBlocking(): AudioChunk;
 
@@ -216,9 +217,9 @@ export declare class AudioCapture {
    * Read a single audio chunk asynchronously, blocking the worker thread
    * until data is available. Does not block the Node.js event loop.
    *
-   * Like `read()`, this is **not terminal-observable** (it routes through
-   * `read_buffer_blocking`). Use `onData` + `onEnd` to observe the terminal
-   * reason.
+   * **Terminal-observable**: like `readBlocking()`, once the stream has
+   * ended this rejects with the stream's true terminal error promptly (it
+   * routes through `read_chunk_blocking`).
    */
   readBlockingAsync(): Promise<AudioChunk>;
 

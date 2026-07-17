@@ -532,6 +532,29 @@ impl Engine {
         }
 
         if buf_rate == session_rate {
+            // rsac-b7d4: if this source was previously resampled and has now
+            // renegotiated to exactly the session rate, the old resampler
+            // still holds real audio (up to CHUNK_FRAMES−1 pending input
+            // frames plus the FFT output_delay() residue, ~25–45 ms). The
+            // rate-change path below flushes that tail (rsac-7d97), but this
+            // bypass used to strand it silently. Flush and drop the
+            // resampler so no captured audio is discarded.
+            if let Some(mut rs) = s.resampler.take() {
+                log::warn!(
+                    "compose source input rate changed {} -> {} Hz (session rate); \
+                     flushing old resampler tail and switching to the direct path",
+                    s.resampler_in_rate,
+                    buf_rate
+                );
+                if let Err(fe) = rs.flush(&mut s.fifo) {
+                    log::warn!(
+                        "compose resampler flush on renegotiation to session rate \
+                         failed ({fe}); resampled tail may be truncated"
+                    );
+                }
+                s.resampler_in_rate = 0;
+                s.stats.resampling.store(false, Ordering::Relaxed);
+            }
             // Direct path: the gap silence goes straight into the FIFO ahead
             // of the buffer's samples (both already at the session rate).
             if gap_frames_in > 0 {

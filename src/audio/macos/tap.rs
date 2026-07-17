@@ -156,6 +156,13 @@ impl CoreAudioProcessTap {
             let mut tap_id: sys::AudioObjectID = 0;
             let status: OSStatus = AudioHardwareCreateProcessTap(tap_desc_obj, &mut tap_id);
 
+            // rsac-0055: the created tap does not borrow the description —
+            // CoreAudio copies what it needs — and ownership (+1 from
+            // alloc/init) stayed with us. Release it right after the call so
+            // neither the success path nor the create-failure path leaks one
+            // CATapDescription per tap creation.
+            let _: () = msg_send![tap_desc_obj, release];
+
             if status != sys::noErr as OSStatus {
                 return Err(map_ca_error(CAError::Unknown(status)));
             }
@@ -306,6 +313,10 @@ impl CoreAudioProcessTap {
             let mut tap_id: sys::AudioObjectID = 0;
             let status: OSStatus = AudioHardwareCreateProcessTap(tap_desc_obj, &mut tap_id);
 
+            // rsac-0055: release the +1-owned description right after the
+            // create call (CoreAudio does not borrow it) — see `new`.
+            let _: () = msg_send![tap_desc_obj, release];
+
             if status != sys::noErr as OSStatus {
                 return Err(map_ca_error(CAError::Unknown(status)));
             }
@@ -448,6 +459,10 @@ impl CoreAudioProcessTap {
             // Call AudioHardwareCreateProcessTap
             let mut tap_id: sys::AudioObjectID = 0;
             let status: OSStatus = AudioHardwareCreateProcessTap(tap_desc_obj, &mut tap_id);
+
+            // rsac-0055: release the +1-owned description right after the
+            // create call (CoreAudio does not borrow it) — see `new`.
+            let _: () = msg_send![tap_desc_obj, release];
 
             if status != sys::noErr as OSStatus {
                 return Err(map_ca_error(CAError::Unknown(status)));
@@ -727,9 +742,10 @@ unsafe fn translate_pid_to_audio_object_id(pid: u32) -> Option<sys::AudioObjectI
 ///
 /// `CATapDescription` is a standard `NSObject` subclass, so its `init…` family
 /// follows normal ObjC retain semantics: the caller receives a **+1-retained**
-/// object it owns (adopted by `AudioHardwareCreateProcessTap`'s caller flow and
-/// released via `Drop`). The two failure modes each have a distinct cleanup
-/// rule, applied consistently below:
+/// object it owns. The constructors release it immediately after
+/// `AudioHardwareCreateProcessTap` returns (rsac-0055 — CoreAudio does not
+/// borrow the description; `CoreAudioProcessTap` never stores it). The two
+/// failure modes each have a distinct cleanup rule, applied consistently below:
 ///
 /// * **`init…` returns nil OR throws** — per the ObjC "init consumes self" rule
 ///   the initializer has already released the alloc'd receiver, so the caller
