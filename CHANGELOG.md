@@ -43,6 +43,18 @@ Releases with no ABI change omit the subsection (or state "No C ABI changes").
   stats. `librsac_ffi.a` for the Go bindings is now built with
   `--features compose` (`FFI_FEATURES += compose`) so the compose symbols are
   exported (rsac-fba7).
+- `list_audio_applications_scoped()` + `ApplicationScope` / `ApplicationEnumeration`:
+  application enumeration now reports whether the list is the *exact*
+  audio-producer set or an *unfiltered fallback superset*. On macOS the
+  audio-process filter can be unavailable (macOS < 14.4, or the CoreAudio
+  process-object query is unavailable / reports no active PIDs), in which case
+  the list is the full running-app set (`ApplicationScope::AllRunningFallback`);
+  Windows (`AudioSessionStateActive`) and Linux (native PipeWire audio nodes)
+  are always `ApplicationScope::ExactAudioProducers`. `rsac list-apps` surfaces
+  the fallback mode with a banner line. The existing
+  `list_audio_applications()` is unchanged (it delegates to the scoped variant
+  and discards the scope). Additive-only; `cargo-semver-checks` reports `minor`.
+  No C ABI change. (rsac-f547)
 - `rsac list-apps` CLI subcommand — prints PID / name / bundle-id for
   applications currently producing audio via `list_audio_applications()`
   (`cli` feature; demo binary only, no library API change; rsac-86ee).
@@ -105,6 +117,20 @@ Releases with no ABI change omit the subsection (or state "No C ABI changes").
 
 ### Fixed
 
+- **macOS device-watch teardown no longer leaks the `WatchListenerContext` or
+  races an in-flight callback (GH #32 / ADR-0005 §5).**
+  `DeviceEnumerator::watch` now registers block-based CoreAudio listeners
+  (`AudioObjectAddPropertyListenerBlock`) on a **self-owned serial dispatch
+  queue** instead of the C-function-pointer PROC API. At teardown it removes each
+  block on that same queue, then dispatches a synchronous no-op **barrier** which
+  — by serial-queue FIFO ordering — cannot return until every in-flight
+  notification block has finished; only then is the `Arc<WatchListenerContext>`
+  dropped, so the context is **freed, not leaked**, with no use-after-free window.
+  This eliminates the previously-*intentional* per-`watch()` context leak (the
+  stopgap that made a late PROC deref sound) and the underlying in-flight-callback
+  race. Adds direct `dispatch2` / `block2` macOS dependencies. No public-API
+  change (the `DeviceWatcher` contract is unchanged) and no C ABI change.
+  (rsac-e8aa)
 - **Bindings (Node/napi + Python):** fixed a deadlock where `stop()` (and, in
   Python, `close()`/`__del__`) could hang forever against a thread parked in a
   blocking read of a silent stream. Both bindings previously held their single

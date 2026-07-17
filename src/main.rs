@@ -11,8 +11,8 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use rsac::{
-    get_device_enumerator, list_audio_applications, AudioCaptureBuilder, AudioSource,
-    AudioSourceKind, CaptureTarget, PlatformCapabilities, ProcessId,
+    get_device_enumerator, list_audio_applications_scoped, ApplicationScope, AudioCaptureBuilder,
+    AudioSource, AudioSourceKind, CaptureTarget, PlatformCapabilities, ProcessId,
 };
 
 // ── CLI definition ───────────────────────────────────────────────────────
@@ -252,10 +252,17 @@ fn cmd_list() -> Result<()> {
 
 /// `rsac list-apps` — list applications currently producing audio.
 fn cmd_list_apps() -> Result<()> {
-    let sources = list_audio_applications().wrap_err("Failed to list audio applications")?;
+    let enumeration =
+        list_audio_applications_scoped().wrap_err("Failed to list audio applications")?;
     println!("rsac — Audio-Producing Applications");
     println!("════════════════════════════════════════");
-    let apps = app_rows(&sources);
+    // Surface the enumeration mode: on macOS the audio-process filter can be
+    // unavailable (< 14.4, or the CoreAudio process-object query found no active
+    // PIDs), in which case the list is the full running-app superset.
+    if let Some(banner) = scope_banner(enumeration.scope) {
+        println!("{banner}");
+    }
+    let apps = app_rows(&enumeration.applications);
     if apps.is_empty() {
         println!("  No audio-producing applications found");
         println!("  (or per-application enumeration is unsupported on this platform).");
@@ -266,6 +273,24 @@ fn cmd_list_apps() -> Result<()> {
         println!("  {:>8}  {:<28}  {}", pid, name, bundle.unwrap_or("—"));
     }
     Ok(())
+}
+
+/// The banner line to print for a given [`ApplicationScope`], or `None` when the
+/// list is the exact audio-producer set (no banner needed).
+///
+/// Factored out as a pure function so both arms are unit-testable on Linux CI,
+/// where the live enumeration is always `ExactAudioProducers` and empty.
+fn scope_banner(scope: ApplicationScope) -> Option<&'static str> {
+    match scope {
+        ApplicationScope::AllRunningFallback => Some(
+            "  NOTE: audio-process filtering unavailable — showing ALL running apps \
+             (may include silent ones).",
+        ),
+        ApplicationScope::ExactAudioProducers => None,
+        // ApplicationScope is #[non_exhaustive]: default to no banner for any
+        // future exact-ish variant.
+        _ => None,
+    }
 }
 
 /// Extract the printable rows (PID / name / bundle id) from a source list,
@@ -594,5 +619,23 @@ mod tests {
             kind: AudioSourceKind::SystemDefault,
         }];
         assert!(app_rows(&sources).is_empty());
+    }
+
+    /// `scope_banner` prints the fallback warning only for
+    /// `AllRunningFallback`, and nothing for the exact audio-producer set
+    /// (rsac-f547). Unit-testable on Linux CI where the live enumeration is
+    /// always exact.
+    #[test]
+    fn scope_banner_only_warns_on_fallback() {
+        assert!(
+            scope_banner(ApplicationScope::ExactAudioProducers).is_none(),
+            "exact audio-producer set needs no banner"
+        );
+        let banner = scope_banner(ApplicationScope::AllRunningFallback)
+            .expect("fallback mode must print a banner");
+        assert!(
+            banner.contains("ALL running apps"),
+            "fallback banner must warn the list is unfiltered, got: {banner:?}"
+        );
     }
 }

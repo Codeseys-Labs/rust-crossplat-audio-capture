@@ -192,7 +192,15 @@ want to gate features should call
   requires `kTCCServiceAudioCapture`.
 - Application resolution uses `NSWorkspace.runningApplications`. Unlike
   Windows/Linux, this returns a superset of what is actually producing
-  audio (README § "macOS Enumeration Scope" has the full caveat).
+  audio (README § "macOS Enumeration Scope" has the full caveat). On
+  macOS 14.4+ rsac intersects that superset with the CoreAudio
+  audio-process set (`kAudioHardwarePropertyProcessObjectList`) to make
+  the enumeration *exact*; when that filter is unavailable (macOS < 14.4,
+  or the process-object query is unavailable / reports no active PIDs) it
+  falls back to the raw superset. This fallback is now **observable** via
+  `ApplicationScope::AllRunningFallback` returned from
+  `list_audio_applications_scoped()` — Windows and Linux always report
+  `ApplicationScope::ExactAudioProducers`.
 - macOS version detection uses `sysctl` (no subprocess, no user-shell
   dependency); see `get_macos_version` in
   [`src/core/capabilities.rs`](../src/core/capabilities.rs).

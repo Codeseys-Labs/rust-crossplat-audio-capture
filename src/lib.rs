@@ -133,8 +133,9 @@ pub use crate::audio::get_device_enumerator;
 
 // Introspection helpers (cross-platform source discovery)
 pub use crate::core::introspection::{
-    check_audio_capture_permission, list_audio_applications, list_audio_sources, AudioSource,
-    AudioSourceKind, BackpressureReport, PermissionStatus, StreamStats,
+    check_audio_capture_permission, list_audio_applications, list_audio_applications_scoped,
+    list_audio_sources, ApplicationEnumeration, ApplicationScope, AudioSource, AudioSourceKind,
+    BackpressureReport, PermissionStatus, StreamStats,
 };
 
 // API types
