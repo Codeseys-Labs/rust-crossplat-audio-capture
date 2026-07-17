@@ -62,3 +62,6 @@ windows-storage/
 # audio-graph now depends on rsac (submodule relationship reversed) —
 # this checkout is a standalone repo, not tracked here.
 /apps/
+
+# Agent/parallel-work worktrees — always in-project, never committed
+/.worktrees/
