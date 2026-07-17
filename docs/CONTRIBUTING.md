@@ -41,6 +41,11 @@ See [`docs/features.md`](features.md) for the feature matrix.
   it reuses `docker/linux/Dockerfile.test` (full PipeWire stack, session
   daemons booted at start) and runs
   `cargo check --features feat_linux` on create.
+  Run `mise run gate:linux` (or `bash scripts/gate-linux.sh`) for the
+  fmt+clippy replica of ci.yml's `feat_linux` lint leg inside the same image —
+  do this before pushing any change that touches `src/audio/linux/`,
+  `cfg(target_os = "linux")` code, or `feat_linux`-gated tests, since
+  `mise run gate` alone only lints your host's own platform feature.
 - **Windows:** MSVC (WASAPI ships with the OS). Git for Windows provides
   the `bash` used by the gate script and hooks.
 - **macOS:** Xcode Command Line Tools. Process Tap features require

@@ -111,9 +111,12 @@ The verdict table, normatively:
 | `Device(id)` | AAudio input device | AVAudioEngine input |
 
 Plus: (1) consent enters via option (a) — explicit builder token + `build()`
-preflight; (2) iOS transport is option (a) — mmap SPSC ring, Darwin
-notifications for start/stop/liveness, heartbeat-miss ⇒ producer terminal
-signal (ADR-0010) ⇒ fatal terminal (ADR-0003); (3) capabilities gain
+preflight; (2) iOS transport is option (a) — mmap SPSC ring; the Rust host's
+start/stop/liveness contract is **heartbeat-poll-only** (bounded publish-word
+polling + heartbeat-miss ⇒ producer terminal signal, ADR-0010 ⇒ fatal
+terminal, ADR-0003) — the extension additionally posts Darwin notifications,
+but they are an optional Swift-side signal the Rust consumer does not observe
+(rsac-7e0a); (3) capabilities gain
 `requires_user_consent: bool` (`true` on both mobile OSes, `false` on
 desktop); (4) apps that are uncapturable by OS policy (pre-Android-10
 targets, `allowAudioPlaybackCapture=false`, `USAGE_VOICE_COMMUNICATION`) are

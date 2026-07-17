@@ -59,6 +59,18 @@
 //! `stop()` is the graceful path: `signal_done()` (`Running → Stopping`, tail
 //! stays drainable).
 //!
+//! # Contract note: no Darwin-notification dependency (rsac-7e0a)
+//!
+//! This consumer is **heartbeat-poll-only** by design: it never registers a
+//! Darwin notification observer (the Core Foundation notify-center APIs).
+//! The extension (`SampleHandlerTemplate.swift`) posts `RsacDarwinNotification`
+//! strings as an optional signal for a future Swift-side host-app UI observer
+//! — this module does not consume them. If a future change adds a Darwin
+//! listener here, update this comment, `RingLayout.swift`'s banner, and
+//! `docs/MOBILE_BACKEND_DESIGN.md`'s "Signaling" bullet in lockstep. (A
+//! `tests/ios_darwin_notification_contract.rs` grep guard enforces this by
+//! failing if the notify-center symbol names appear in this file.)
+//!
 //! # Unit tests
 //!
 //! The pure ring math below (publish-word classification, header/geometry

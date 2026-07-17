@@ -227,9 +227,15 @@ The only third-party route to system-wide audio on iOS. Shape:
   frames stored as interleaved f32 — deliberately mirroring the rtrb bridge
   semantics so the host side is a thin `PlatformStream` that drains the mmap
   ring into a normal `BridgeProducer`.
-- **Signaling:** Darwin notifications (`CFNotificationCenterGetDarwinNotifyCenter`)
-  for started/stopped/liveness; a heartbeat field in the ring header guards
-  against a killed extension (missed heartbeats ⇒ terminal).
+- **Signaling:** the Rust host consumer's contract is **heartbeat-poll-only**
+  — a heartbeat field in the ring header guards against a killed extension
+  (missed heartbeats ⇒ terminal), and `create_stream` bounded-polls the ring
+  header's publish word for start. The Swift extension additionally posts
+  Darwin notifications (`CFNotificationCenterGetDarwinNotifyCenter`,
+  `RsacDarwinNotification` in `RingLayout.swift`) for started/paused/resumed/
+  finished, but these are an **optional Swift-side signal** for a future
+  host-app UI observer — the Rust backend (`src/audio/ios/broadcast.rs`) does
+  not listen for them (rsac-7e0a).
 - **Memory budget:** the extension is hard-capped (~50 MB). The ring is sized
   in the low single-digit MB (seconds of 48 kHz stereo f32); ring-full ⇒ drop
   + overrun count, never block the sample handler.
@@ -301,7 +307,7 @@ Staged, honest about what each stage proves:
 |---|---|
 | JNI ingest adds a copy (Java array → Rust scratch) | Accepted: `AudioRecord.read` is already a buffered non-RT path; overrun counters expose any sustained cost. `GetPrimitiveArrayCritical` is a measured-later optimization |
 | GC pauses on the Java capture thread | Manifest as drops, visible via `overrun_count`/`backpressure_report` — same observability story as desktop |
-| ReplayKit extension killed / broadcast stopped mid-stream | Heartbeat + Darwin notifications ⇒ producer terminal signal (ADR-0010); stream ends with fatal terminal (ADR-0003) |
+| ReplayKit extension killed / broadcast stopped mid-stream | Heartbeat staleness ⇒ producer terminal signal (ADR-0010); stream ends with fatal terminal (ADR-0003). Darwin notifications are posted by the extension but not consumed by the Rust host — heartbeat-poll is the sole mechanism the host relies on |
 | 50 MB extension cap | Ring sized ≪ cap; drop-not-block policy |
 | Store review (Play media-projection declaration; App Store broadcast scrutiny) | Documented consumer obligation; templates keep the surface minimal |
 | `bun --compile`-class packaging issues don't apply here, but Flutter/RN mobile consumers need rsac-ffi built per mobile triple | rsac-napi per-target migration + FFI mobile-triple builds are seeded prerequisites |

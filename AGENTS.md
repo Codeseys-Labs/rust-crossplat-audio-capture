@@ -338,6 +338,9 @@ mise run gate:bindings # check-bindings CI job replica: rsac-ffi/napi/python che
                        #   header drift, napi + python runtime smokes (each leg skips gracefully
                        #   if its toolchain is missing; `bash scripts/gate-bindings.sh --strict`
                        #   hard-fails instead)
+mise run gate:linux    # feat_linux lint-leg replica (clippy -D warnings + fmt) inside the
+                       #   devcontainer image via `docker run`; skips gracefully if Docker
+                       #   is absent; macOS has no equivalent local leg (CI-only blind spot)
 mise run test        # just the CI test-job replica for the host OS
 mise run test:audio  # ci_audio integration suite on this machine (all 3 tiers)
 mise run release:bump -- X.Y.Z [--dry-run]  # seven-manifest lockstep bump + CHANGELOG rotation
@@ -352,6 +355,24 @@ local catch, because nothing local ran the binding crates at all). Run
 toolchain (`mise install` provisions Bun/Node/Go/Python; maturin and the
 napi-rs CLI are project-local, installed into a throwaway `.venv-smoke/` and
 `bindings/rsac-napi/node_modules/` respectively, not mise tools).
+
+`mise run gate:linux` closes a different gap: `scripts/gate.sh` only ever
+lints the **host's** platform feature (macOS→`feat_macos`, Windows→
+`feat_windows`), so a feat_linux-only clippy/fmt break is invisible to a
+non-Linux contributor's local gate — confirmed live (rsac-ef88): an injected
+`feat_linux`-only unused-import break passed
+`cargo clippy --features feat_macos,compose,cli` clean and failed
+`--features feat_linux,compose,cli` inside the devcontainer image.
+`gate:linux` runs the same `clippy --all-targets --features
+feat_linux,compose,cli -D warnings` + `fmt --check` ci.yml's `lint
+(feat_linux)` leg runs, via `docker run` against
+`docker/linux/Dockerfile.test` (the same image `.devcontainer/` builds), with
+named-volume caches for the cargo registry and target dir so warm re-runs are
+fast. It needs Docker (OrbStack/Docker Desktop/native); without it, the task
+prints an actionable skip message and exits 0 rather than failing the caller.
+**macOS remains a CI-only blind spot on any host** — there is no equivalent
+local container for `feat_macos` (CoreAudio is not containerizable), so a
+macOS-only break can only be caught by CI's `lint (feat_macos)` leg.
 
 The docsrs `cargo doc` step (ci.yml's `docs` job replica) moved from
 `gate:full` into the default `gate` in the pre-push path (rsac-af3d): CI run

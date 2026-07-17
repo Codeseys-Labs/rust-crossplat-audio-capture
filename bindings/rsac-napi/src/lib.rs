@@ -299,6 +299,14 @@ pub struct AudioCapture {
     end_callback: EndCallback,
     /// Whether the push-model data pump thread is running.
     pump_active: Arc<AtomicBool>,
+    /// Monotonic pump generation (rsac-1a34, mirrors `Composition`'s PR #59
+    /// fix): each spawned pump owns the generation current at spawn time and
+    /// loops only while it still owns it. Cancellation (`stop`/`offData`)
+    /// bumps the generation, so a stale pump can NEVER be resurrected by a
+    /// rapid `offData()`→`onData()` flip of the bool alone (the old pump
+    /// observes the generation change and exits; only the new generation's
+    /// pump delivers).
+    pump_generation: Arc<AtomicU64>,
 }
 
 #[napi]
@@ -316,6 +324,7 @@ impl AudioCapture {
             callback: Arc::new(Mutex::new(None)),
             end_callback: Arc::new(Mutex::new(None)),
             pump_active: Arc::new(AtomicBool::new(false)),
+            pump_generation: Arc::new(AtomicU64::new(0)),
         })
     }
 
@@ -351,6 +360,7 @@ impl AudioCapture {
             callback: Arc::new(Mutex::new(None)),
             end_callback: Arc::new(Mutex::new(None)),
             pump_active: Arc::new(AtomicBool::new(false)),
+            pump_generation: Arc::new(AtomicU64::new(0)),
         })
     }
 
@@ -415,7 +425,10 @@ impl AudioCapture {
     /// and can be reused if a new capture session is started.
     #[napi]
     pub fn stop(&self) -> Result<()> {
-        // Signal the data pump to stop
+        // Bump the generation FIRST: any live pump loses ownership immediately
+        // and can never be resurrected by a later flag flip (rsac-1a34, PR #59
+        // pattern).
+        self.pump_generation.fetch_add(1, Ordering::SeqCst);
         self.pump_active.store(false, Ordering::SeqCst);
 
         // Deadlock fix (rsac-8082): a thread parked in `readBlocking` /
@@ -671,6 +684,10 @@ impl AudioCapture {
     /// use `offEnd` to clear it.
     #[napi]
     pub fn off_data(&self) -> Result<()> {
+        // Generation bump makes cancellation immune to a rapid re-onData()
+        // setting pump_active back to true before the old pump observes
+        // false: the old pump checks its OWN generation and exits.
+        self.pump_generation.fetch_add(1, Ordering::SeqCst);
         self.pump_active.store(false, Ordering::SeqCst);
 
         let mut cb_guard = self.callback.lock().map_err(|e| {
@@ -926,10 +943,15 @@ impl AudioCapture {
         let callback = self.callback.clone();
         let end_callback = self.end_callback.clone();
         let pump_active = self.pump_active.clone();
+        let pump_generation = self.pump_generation.clone();
 
+        // This pump owns the generation value current at spawn time; any
+        // cancellation (stop/offData) bumps it, ending ownership even if
+        // pump_active is set true again by a rapid re-onData.
+        let my_generation = pump_generation.fetch_add(1, Ordering::SeqCst) + 1;
         pump_active.store(true, Ordering::SeqCst);
 
-        std::thread::Builder::new()
+        let spawn_result = std::thread::Builder::new()
             .name("rsac-napi-pump".into())
             .spawn(move || {
                 // The terminal reason this pump ended with: `Some(msg)` on a fatal
@@ -947,7 +969,9 @@ impl AudioCapture {
                 // Counting is a plain `u64` on this thread (no alloc, no lock), and the
                 // counter resets whenever a read succeeds so an isolated blip logs.
                 let mut recoverable_errors: u64 = 0;
-                while pump_active.load(Ordering::SeqCst) {
+                while pump_active.load(Ordering::SeqCst)
+                    && pump_generation.load(Ordering::SeqCst) == my_generation
+                {
                     // Read via `read_chunk_nonblocking` (NOT `read_buffer`):
                     // `read_buffer` short-circuits to a RECOVERABLE
                     // `StreamReadError` the moment the stream leaves `Running`,
@@ -1020,7 +1044,12 @@ impl AudioCapture {
                         }
                     }
                 }
-                pump_active.store(false, Ordering::SeqCst);
+                // Clear the running flag only if this pump still OWNS the
+                // generation — a stale pump exiting after a rapid re-onData must
+                // not kill the successor pump's flag.
+                if pump_generation.load(Ordering::SeqCst) == my_generation {
+                    pump_active.store(false, Ordering::SeqCst);
+                }
 
                 // Notify the JS consumer (if it registered `onEnd`) *why* delivery
                 // stopped — the terminal `AudioError` message on a fatal terminal,
@@ -1044,15 +1073,19 @@ impl AudioCapture {
                 if let Some(tsfn) = end_tsfn {
                     tsfn.call(end_reason, ThreadsafeFunctionCallMode::NonBlocking);
                 }
-            })
-            .map_err(|e| {
-                napi::Error::new(
+            });
+        match spawn_result {
+            Ok(_) => Ok(()),
+            Err(e) => {
+                // Roll the flag back so a later onData()/start() can retry —
+                // leaving it true would permanently wedge pump spawning.
+                self.pump_active.store(false, Ordering::SeqCst);
+                Err(napi::Error::new(
                     napi::Status::GenericFailure,
                     format!("Failed to spawn data pump thread: {}", e),
-                )
-            })?;
-
-        Ok(())
+                ))
+            }
+        }
     }
 }
 

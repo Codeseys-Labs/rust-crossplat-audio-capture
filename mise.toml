@@ -47,6 +47,10 @@ run_windows = "pwsh -NoProfile -ExecutionPolicy Bypass -File scripts/gate.ps1 --
 description = "check-bindings CI job replica: rsac-ffi/napi/python check+clippy+test, header drift, napi + python runtime smokes (each leg skips gracefully if its toolchain is missing; pass -- --strict to hard-fail on a missing toolchain instead)"
 run = "bash scripts/gate-bindings.sh"
 
+[tasks."gate:linux"]
+description = "feat_linux lint-leg replica via the devcontainer image (docker run); skips gracefully without Docker (pass --rebuild to force a fresh image build)"
+run = "bash scripts/gate-linux.sh"
+
 [tasks.fmt]
 description = "Format the workspace"
 run = "cargo fmt --all"

@@ -247,10 +247,12 @@ public final class RsacRingProducer {
     // ── Teardown ──────────────────────────────────────────────────────────
 
     /// Stamps a final heartbeat and unmaps/closes the ring. The FILE is
-    /// deliberately left in place: the consumer may still drain remaining
-    /// frames after the `finished` Darwin notification; the *absence of
-    /// heartbeats* plus the notification are the terminal signal, not file
-    /// deletion.
+    /// deliberately left in place so the consumer can drain any remaining
+    /// frames after teardown. Per the reconciled liveness contract (rsac-7e0a),
+    /// the *absence of heartbeats* (staleness past `heartbeatTimeoutMillis`) is
+    /// the sole terminal signal the Rust consumer observes — it never watches
+    /// the `finished` Darwin notification (that stays a Swift-side advisory).
+    /// Neither file deletion nor a notification is part of the terminal signal.
     public func close() {
         stampHeartbeat()
         munmap(base, fileSize)

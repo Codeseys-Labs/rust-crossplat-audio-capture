@@ -154,6 +154,19 @@ Releases with no ABI change omit the subsection (or state "No C ABI changes").
   under a shared guard (core `start()` is idempotent on a running stream), so it
   cannot block behind — or deadlock with — a parked blocking read. Public API
   and terminal (`StreamEnded`) semantics are unchanged (rsac-8082).
+- **Bindings (Node/napi):** `AudioCapture`'s push-model data pump (`onData`/
+  `offData`/`stop`) now uses the same monotonic `pump_generation` cancellation
+  guard `Composition` got in PR #59 — a rapid `offData()` → `onData()` flip
+  could previously resurrect a pump thread that had already observed
+  cancellation (or leave a *second* pump alive delivering concurrently with
+  it), and a data-pump-thread spawn failure left `pump_active` permanently
+  `true`, wedging all future `start()`/`onData()` pump attempts. Each spawned
+  pump now owns the generation value current at spawn time and exits the
+  moment cancellation bumps it, regardless of any later flag flip; a spawn
+  failure now rolls `pump_active` back so a later `start()`/`onData()` can
+  retry. `Composition` was fixed for this in PR #59 (CodeRabbit
+  3605948884); `AudioCapture` had the identical pre-existing pattern but sat
+  outside that PR's diff (rsac-1a34). No public API change.
 
 ### Security
 

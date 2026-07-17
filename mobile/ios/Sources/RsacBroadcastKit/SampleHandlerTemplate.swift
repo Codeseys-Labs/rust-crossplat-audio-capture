@@ -296,12 +296,17 @@ open class RsacBroadcastSampleHandler: RPBroadcastSampleHandler {
         heartbeatTimer = timer
     }
 
-    // ── Darwin notifications ──────────────────────────────────────────────
+    // ── Darwin notifications (optional Swift-side signal) ───────────────────
 
     /// Posts on the Darwin notify center (names: `RsacDarwinNotification`,
-    /// defined once in RingLayout.swift — the Rust consumer listens for the
-    /// same strings). Darwin notifications cross the extension/app process
-    /// boundary and carry no payload; all state lives in the ring header.
+    /// defined once in RingLayout.swift). Darwin notifications cross the
+    /// extension/app process boundary and carry no payload; all state lives
+    /// in the ring header. NOT consumed by the Rust host backend — the Rust
+    /// consumer's start/stop/liveness contract is heartbeat-poll-only (see
+    /// RingLayout.swift's "Heartbeat" section). A host app MAY observe these
+    /// for its own UI (e.g. an immediate "broadcast started" toast instead of
+    /// waiting for the first polled ring header), but rsac's Rust backend
+    /// never registers a Darwin notification observer.
     private func postDarwinNotification(_ name: String) {
         CFNotificationCenterPostNotification(
             CFNotificationCenterGetDarwinNotifyCenter(),
