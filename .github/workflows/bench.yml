@@ -1,0 +1,74 @@
+name: Bench (advisory)
+
+# Executes the criterion benches that compile but are never run by any other
+# workflow (rsac-1da3) — cargo build --all-targets / --tests only COMPILE
+# benches/bridge.rs and benches/observability.rs, they never RUN them, so
+# there is no throughput/latency signal and the ADR-0006 bridge-zerocopy
+# promote-or-remove data can never accumulate. This workflow is purely
+# advisory: it never gates a PR or a release, it only archives baselines on a
+# schedule (and on manual dispatch) so future runs have something to diff
+# against by eye. See docs/designs/0006-bridge-zerocopy-samplering.md.
+
+on:
+  schedule:
+    # Weekly, Monday 06:00 UTC. Advisory only — no PR/push trigger; this must
+    # never affect PR turnaround time or release gating.
+    - cron: '0 6 * * 1'
+  workflow_dispatch:
+
+env:
+  CARGO_TERM_COLOR: always
+  RUST_BACKTRACE: 1
+
+permissions:
+  contents: read
+
+concurrency:
+  group: bench-${{ github.workflow }}
+  cancel-in-progress: false
+
+jobs:
+  bench:
+    name: "Criterion benches (Linux, quick mode)"
+    # Guard against forks: the weekly cron would otherwise fire against a
+    # Blacksmith runner forks cannot provision, producing recurring failed
+    # scheduled runs + notifications (mirrors release*.yml).
+    if: github.repository == 'Codeseys-Labs/rust-crossplat-audio-capture'
+    runs-on: blacksmith-4vcpu-ubuntu-2404
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5
+        with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@e081816240890017053eacbb1bdf337761dc5582 # 1.95.0
+      - uses: useblacksmith/rust-cache@81d053bdb0871dcd3f10763c8cc60d0adc41762b # v1 branch head (no v1 tag exists upstream)
+
+      - name: Install PipeWire dev libraries
+        run: |
+          sudo add-apt-repository ppa:pipewire-debian/pipewire-upstream -y
+          sudo apt-get update
+          sudo apt-get install -y libpipewire-0.3-dev libspa-0.2-dev pkg-config
+
+      # Default feature set — the data plane every shipped build uses.
+      - name: cargo bench (default features, --quick)
+        run: |
+          cargo bench --bench bridge -- --quick --save-baseline default
+          cargo bench --bench observability -- --quick --save-baseline default
+
+      # bridge-zerocopy A/B — advisory input to ADR-0006's promote-or-remove
+      # gate (docs/designs/0006-bridge-zerocopy-samplering.md §6). Does not
+      # currently exercise SampleRing directly (no bench wires it in yet —
+      # tracked separately); this establishes the artifact pipeline so that
+      # work has somewhere to land its numbers.
+      - name: cargo bench (bridge-zerocopy feature, --quick)
+        run: |
+          cargo bench --bench bridge --features bridge-zerocopy -- --quick --save-baseline zerocopy
+          cargo bench --bench observability --features bridge-zerocopy -- --quick --save-baseline zerocopy
+
+      - name: Upload criterion baselines
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: criterion-baselines-${{ github.run_id }}
+          path: target/criterion/**
+          retention-days: 90

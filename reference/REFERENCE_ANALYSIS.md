@@ -1032,9 +1032,11 @@ This section appends per-repo NEW unadopted techniques and upstream-vs-pinned de
 - `kAudioHardwarePropertyProcessObjectList` + `proc_pidinfo` + `NSRunningApplication` enumeration, dual `name→pid`/`pid→name` maps (`audiorec.mm:38-147`) — audio-active filtering without subprocesses. *Relevance:* `enumerate_audio_applications`; medium.
 - INFORMATIONAL / no-change-recommended (input concurs): push IOProc callback model (`audiorec.h:8-15`), upfront child-PID aggregation (`:257`), format caching (`main.mm:157-165`) — rsac's pull-based rtrb bridge + sysinfo child discovery is the safer, idiomatic choice.
 
-### screencapturekit-rs (`v0.2` → submodule now `v6.1.0`) — MAJOR jump
+### screencapturekit-rs (`v0.2` → submodule now `v8.0.0`) — MAJOR jump
 
 **Upstream delta (v0.2 → v6.1.0):** Pure Swift FFI (no ObjC bridge), per-stream heap `StreamContext` callback routing. New: microphone device selection (macOS 15.0+), HDR modes (15.0+), executor-agnostic async API, per-output `DispatchQueue` QoS config, stream naming, `excludes_current_process_audio`, batched `frame_info()` FFI. Dependency bumps `apple-cf 0.6→0.10`, `apple-metal 0.6→0.9` (now macOS 13+). **rsac does NOT depend on this crate** — it's a reference for a potential macOS 13+ fallback backend.
+
+**Pin bump addendum (rsac-62bb, 2026-07-17):** the reference pin was bumped `185e39c` (`v6.1.0`-ish) → `744cf43` (`v8.0.0`-ish) because `docs/reviews/rsac-ux-enhancement-backlog.md` still actively cites this crate's version-gated feature pattern. The 16 intervening commits include a `v7.0.0`→`v8.0.0` async-API rework (`AsyncSCStream`, multi-output support) that changes the exact API surface that backlog doc cites. A full re-analysis of the v6.1.0→v8.0.0 delta against the bullets below is **out of scope for this triage** — flagged as a follow-up doc-drift item; the bullets below still describe the v0.2→v6.1.0-era API and may not reflect v8.0.0 exactly. Reference pins are read-only research checkouts, not vendored dependencies — they should be re-fetched and the delta re-analyzed whenever the citing doc (`rsac-ux-enhancement-backlog.md`) is next revised, rather than left to silently drift; this repo has no automated staleness check for `reference/` submodules today.
 
 **NEW unadopted techniques (capture-relevant, mostly INFORMATIONAL given rsac's Process-Tap scope):**
 - Version-gated Cargo features `macos_13_0..macos_26_0` (`Cargo.toml`) — pattern for honest sub-14.4 capability gating. *Relevance:* `PlatformCapabilities` macOS reporting; medium. (PR-2.)
@@ -1044,9 +1046,11 @@ This section appends per-repo NEW unadopted techniques and upstream-vs-pinned de
 - `data()` vs `data_mut()` aliasing documentation (`cm/audio.rs:55-92`) — memory-safety doc pattern. *Relevance:* `AudioBuffer` docs; small.
 - INFORMATIONAL: per-output QoS dispatch (`sc_stream.rs:549-555`), microphone/system separation (`audio.rs:309-450`), async completion handlers (`async_api.rs`), batched `frame_info()` — out of proportion for capture-only Process Tap; **SCK handlers run on arbitrary DispatchQueue threads, NOT RT** — any SCK backend would need a dedicated thread + rtrb bridge and must document no-RT-guarantee.
 
-### rtrb (`v0.3.4` upstream; rsac pins `rtrb = "0.3.3"`)
+### rtrb (`v0.3.4` upstream; rsac pins `rtrb = "0.3.4"`)
 
-**Upstream delta (0.3.3 → 0.3.4):** Purely additive/UX, **no breaking changes, no new functions of substance**: added `#[must_use]` to `push_partial_slice`/`pop_partial_slice`/`pop_partial_slice_uninit` (`chunks.rs:280,404,491`); added `ReadChunkIntoIter::iterated()` to track partial consumption (`chunks.rs:1037-1062`); doc improvements. Low-risk bump.
+**Upstream delta (0.3.3 → 0.3.4):** Purely additive/UX, **no breaking changes, no new functions of substance**: added `#[must_use]` to `push_partial_slice`/`pop_partial_slice`/`pop_partial_slice_uninit` (`chunks.rs:280,404,491`); added `ReadChunkIntoIter::iterated()` to track partial consumption (`chunks.rs:1037-1062`); doc improvements. Low-risk bump. rsac's `Cargo.toml` dependency has since moved to `0.3.4` (matching this delta), so this section header is updated to reflect that — no action item remains here.
+
+**Pin triage (rsac-62bb, 2026-07-17):** the `reference/rtrb` submodule pin (`f5d14ec`) is **exactly** the `0.3.4` tag commit (`git describe --tags` confirms zero drift) — it already matches the shipped `rtrb = "0.3.4"` dependency precisely. No bump needed. If `rtrb`'s Cargo.toml version is ever bumped past 0.3.4, bump this reference pin in lockstep at that time, same commit, per the existing `Cargo.toml` comment discipline.
 
 **NEW unadopted techniques (capture-relevant):**
 - Zero-copy `write_chunk_uninit()` + `CopyToUninit` (`lib.rs:788-813`, `chunks.rs:702-721`) — write f32 directly into `MaybeUninit` slots, eliminating the `Vec` intermediate in `BridgeProducer::push_samples_or_drop` (`ring_buffer.rs:288-344`). **Strengthens ADR-0001's RT-allocation guarantee** by removing the Vec entirely. *Relevance:* high-value, small.
@@ -1058,6 +1062,8 @@ This section appends per-repo NEW unadopted techniques and upstream-vs-pinned de
 ### cpal (`v0.18.0`; rsac does not depend on cpal — architectural reference)
 
 **Upstream delta:** Unified `Error{kind, message}` model with `ErrorKind::{RealtimeDenied, HostUnavailable, Xrun, DeviceChanged}`; structured `DeviceDescription`/`DeviceType`/`InterfaceType`/`DeviceDirection`; `SupportedStreamConfigRange::cmp_default_heuristics()`; serializable `DeviceId` (`Display`/`FromStr`) + `device_by_id()`; `COMMON_SAMPLE_RATES` (29 rates). rsac should track these for parity in all three backends.
+
+**Pin bump addendum (rsac-62bb, 2026-07-17):** the reference pin was bumped `5418f0b` (2026-05-29) → `0ecb418` (2026-07-13), 42 commits, because `docs/MOBILE_BACKEND_DESIGN.md` still actively cites this crate's Android AAudio host as a working example. The intervening range includes real backend-parity fixes directly relevant to rsac's own hardening: xrun reporting added on AAudio/macOS/PipeWire/WASAPI (`f944636`), a WASAPI panic-on-lost-device fix (`bc101ac`), a PipeWire default-device re-routing fix (`abf8a72`, `2a1a033`), and monotonic-timestamp fixes across WASAPI/PipeWire (`e219aaa`, `6ea4fcd`). Reference pins are read-only research checkouts, not vendored dependencies — they should be re-fetched and the delta re-analyzed whenever the citing doc (`MOBILE_BACKEND_DESIGN.md`) is next revised, rather than left to silently drift; this repo has no automated staleness check for `reference/` submodules today.
 
 **NEW unadopted techniques (capture-relevant):**
 - `DefaultDeviceMonitor` / `IMMNotificationClient` (`wasapi/stream.rs:44-190`) — fires `DeviceChanged`; callbacks set `Arc<AtomicBool>`, never call user callbacks directly (deadlock-safe). *Relevance:* `DeviceEnumerator::watch()` Windows arm (DL-1); medium.

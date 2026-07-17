@@ -39,6 +39,8 @@ name: Audio Integration Tests
 #                           and Windows. Full capture validation still requires
 #                           real hardware or a self-hosted, pre-consented macOS
 #                           runner.
+#
+#   Runs on stable tags (advisory, not a release.yml gate — see rsac-75bf).
 # =============================================================================
 
 on:
@@ -48,6 +50,15 @@ on:
     # push+pull_request double-fired this audio matrix (mirrors the same fix
     # in ci.yml). The existing path filter is unchanged.
     branches: [main, master]
+    # Also run on stable semver tags so a release actually re-proves the audio
+    # matrix at the tag (not just whatever the last master-push run happened
+    # to cover) — mirrors ci.yml's tags: trigger. Per GitHub semantics,
+    # paths/paths-ignore are NOT evaluated for tag pushes, so this fires
+    # unconditionally on v*.*.* regardless of the paths: filter below.
+    # Pre-release shapes (v*-rc.1) are excluded, same as ci.yml.
+    tags:
+      - 'v*.*.*'
+      - '!v*-*'
     paths:
       - 'src/**'
       - 'tests/**'

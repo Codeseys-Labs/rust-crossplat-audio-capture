@@ -52,7 +52,7 @@ Apple/Google/browser policy, and **no framework choice changes them**.
 ## Tauri v2
 
 **Desktop: ✅ verified.** [AudioGraph](https://github.com/Codeseys-Labs/audio-graph)
-(the `apps/audio-graph` submodule) is a shipping Tauri v2 app that consumes rsac
+(the `apps/audio-graph` standalone checkout, not a tracked submodule) is a shipping Tauri v2 app that consumes rsac
 as a plain path dependency in its Rust backend — `rsac::list_audio_sources()`,
 the builder API, and capture streaming all work with zero Tauri-specific glue.
 Audio data never crosses the webview IPC boundary; the Rust side consumes
