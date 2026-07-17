@@ -1307,3 +1307,70 @@ jobs:
           else
             echo "OK: rsac + all bindings agree at $ROOT"
           fi
+
+  # ── Semver gate for release PRs (interim home) ──────────────────────
+  # cargo-semver-checks (the public-API compatibility gate) normally lives in
+  # release.yml's tag-triggered publish pipeline — but release.yml is currently
+  # disabled_manually (seed rsac-aaea: missing crates.io/npm/PyPI publish
+  # credentials). While it's disabled there is NO path, automatic OR manual, that
+  # runs the semver gate at all, so any breaking API change could ship into a
+  # release undetected. This job is the interim home: it runs the SAME check at
+  # PR-review time, but ONLY on the "release: vX.Y.Z" PR that release-prepare.yml
+  # opens against master (matched by title, NOT by target branch). That scoping
+  # is deliberate — it must NOT fire on ordinary feature PRs, nor on the
+  # release-stacking layer PRs that merge into a frozen release/** branch and
+  # intentionally bundle breaking changes before the single version bump
+  # (docs/reviews/rsac-backlog-blueprints-2026-05-30.md warned a naively-scoped
+  # gate would false-positive-block exactly those). PR-time feedback is strictly
+  # earlier than tag-time, so KEEP this job even after release.yml is re-enabled.
+  #
+  # Baseline resolution mirrors release.yml's `git describe ... HEAD^`: on the
+  # release PR, HEAD^ is master's tip before the merge, and the previous stable
+  # v*.*.* tag is reachable from there.
+  semver-checks-release-pr:
+    name: Semver Gate (release PR)
+    if: "github.event_name == 'pull_request' && startsWith(github.event.pull_request.title, 'release: v')"
+    timeout-minutes: 20
+    runs-on: blacksmith-4vcpu-ubuntu-2404
+    steps:
+      - uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5
+        with:
+          persist-credentials: false
+          # Full history + tags: the baseline is resolved from the previous
+          # v*.*.* tag, which the default shallow clone cannot see.
+          fetch-depth: 0
+      - uses: ./.github/actions/rust-setup
+
+      # cargo-semver-checks builds the crate, so build.rs needs libpipewire —
+      # same dev-headers install release.yml's semver-checks job uses.
+      - name: Install PipeWire dev libraries
+        uses: ./.github/actions/pipewire-setup
+
+      - name: Install cargo-semver-checks
+        uses: taiki-e/install-action@0fd46367812ee04360509b4169d9f659d6892bb2 # v2
+        with:
+          tool: cargo-semver-checks
+
+      - name: Resolve baseline (previous stable release tag)
+        id: baseline
+        shell: bash
+        run: |
+          # Mirrors release.yml's baseline resolution: newest stable v*.*.* tag
+          # reachable from HEAD^ (pre-release shapes v*-* excluded). No previous
+          # tag (first release) => warn + skip rather than fail, since there is
+          # nothing to diff against.
+          if PREV_TAG="$(git describe --tags --abbrev=0 --match 'v*.*.*' --exclude 'v*-*' HEAD^ 2>/dev/null)"; then
+            echo "baseline release tag: ${PREV_TAG}"
+            echo "prev_tag=${PREV_TAG}" >> "$GITHUB_OUTPUT"
+          else
+            echo "::warning::no previous stable v*.*.* tag found — skipping cargo-semver-checks (first release has no baseline)"
+            echo "prev_tag=" >> "$GITHUB_OUTPUT"
+          fi
+
+      # Scoped to the root crate: this mirrors release.yml, which publishes
+      # ONLY `rsac` (the bindings release via their own workflows).
+      - name: cargo semver-checks (vs previous release)
+        if: steps.baseline.outputs.prev_tag != ''
+        env:
+          PREV_TAG: ${{ steps.baseline.outputs.prev_tag }}
+        run: cargo semver-checks check-release -p rsac --baseline-rev "$PREV_TAG"
