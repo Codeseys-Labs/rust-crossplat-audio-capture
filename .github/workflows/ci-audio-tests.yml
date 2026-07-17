@@ -349,29 +349,37 @@ jobs:
         env:
           RSAC_TEST_CAPTURE_TIMEOUT_SECS: "15"
         run: |
+          # $LASTEXITCODE after EVERY cargo pipe (PR #56 outside-diff review):
+          # a later successful cargo call overwrites the exit code, so without
+          # per-invocation checks an early tier failure is silently masked.
           cargo test --test ci_audio system_capture `
             --no-default-features --features feat_windows,compose `
             -- --test-threads=1 --nocapture `
             2>&1 | Tee-Object -FilePath ci-audio-system.log
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
           cargo test --test ci_audio platform_caps `
             --no-default-features --features feat_windows,compose `
             -- --test-threads=1 --nocapture `
             2>&1 | Tee-Object -FilePath ci-audio-system-caps.log
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
           cargo test --test ci_audio stream_lifecycle `
             --no-default-features --features feat_windows,compose `
             -- --test-threads=1 --nocapture `
             2>&1 | Tee-Object -FilePath ci-audio-system-lifecycle.log
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
           # `lifecycle_terminal` matches ONLY this module (not `stream_lifecycle`).
           cargo test --test ci_audio lifecycle_terminal `
             --no-default-features --features feat_windows,compose `
             -- --test-threads=1 --nocapture `
             2>&1 | Tee-Object -FilePath ci-audio-system-terminal.log
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
           # Composed multi-source capture on the deterministic VB-CABLE default
           # endpoint — first HARD tone-content verification of the compose engine.
           cargo test --test ci_audio "compose::" `
             --no-default-features --features feat_windows,compose `
             -- --test-threads=1 --nocapture `
             2>&1 | Tee-Object -FilePath ci-audio-system-compose.log
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
           # Wiring existence check: a renamed/cfg'd-out compose module would make
           # the filter above match zero tests and pass vacuously.
           $list = cargo test --test ci_audio `
@@ -392,14 +400,17 @@ jobs:
         env:
           RSAC_TEST_CAPTURE_TIMEOUT_SECS: "15"
         run: |
+          # $LASTEXITCODE after every cargo pipe (PR #56 outside-diff review).
           cargo test --test ci_audio device_capture `
             --no-default-features --features feat_windows,compose `
             -- --test-threads=1 --nocapture `
             2>&1 | Tee-Object -FilePath ci-audio-device.log
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
           cargo test --test ci_audio device_enumeration `
             --no-default-features --features feat_windows,compose `
             -- --test-threads=1 --nocapture `
             2>&1 | Tee-Object -FilePath ci-audio-device-enum.log
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
           # CI-4 (Windows arm): enumeration_matrix's "no silent empty list"
           # assertion only executes where RSAC_CI_AUDIO_AVAILABLE=1 — this tier
           # has real WASAPI endpoints (VB-CABLE).
@@ -407,6 +418,7 @@ jobs:
             --no-default-features --features feat_windows,compose `
             -- --nocapture `
             2>&1 | Tee-Object -FilePath ci-audio-device-enum-matrix.log
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
 
       # Formerly only in the windows-process job; needed before the process tier.
       - name: Generate test WAV file (process tier)
@@ -451,15 +463,18 @@ jobs:
           # job-wide deterministic mode; the process-tree step below stays hard.
           # Build/start/panic regressions here still fail the tier.
           $env:RSAC_CI_AUDIO_DETERMINISTIC = "0"
+          # $LASTEXITCODE after every cargo pipe (PR #56 outside-diff review).
           cargo test --test ci_audio app_capture `
             --no-default-features --features feat_windows,compose `
             -- --test-threads=1 --nocapture `
             2>&1 | Tee-Object -FilePath ci-audio-process.log
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
           $env:RSAC_CI_AUDIO_DETERMINISTIC = "1"
           cargo test --test ci_audio process_tree_capture `
             --no-default-features --features feat_windows,compose `
             -- --test-threads=1 --nocapture `
             2>&1 | Tee-Object -FilePath ci-audio-process-proctree.log
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
           # Windows-specific ApplicationByName coverage (WASAPI sysinfo→PID→
           # process loopback). The `application_by_name_windows` filter matches
           # ONLY this module (the macOS `application_by_name` module is cfg'd out).
@@ -467,6 +482,7 @@ jobs:
             --no-default-features --features feat_windows,compose `
             -- --test-threads=1 --nocapture `
             2>&1 | Tee-Object -FilePath ci-audio-process-appbyname.log
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
 
       - name: Record tier outcomes
         id: record

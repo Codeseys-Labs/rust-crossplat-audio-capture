@@ -264,30 +264,52 @@ func ExampleListDevices() {
 // appends the groups' channels into one interleaved stream.
 func ExampleComposition() {
 	// A "voice" group folding two app sources to mono, plus a "system" group
-	// keeping the system mix's native channels.
+	// keeping the system mix's native channels. Free() is deferred right after
+	// construction: it is a no-op once AddGroup consumes the handle, and it
+	// releases the handle on every early-error path before that.
 	voice, err := rsac.NewGroup("voice")
 	if err != nil {
 		fmt.Printf("group error: %v\n", err)
 		return
 	}
-	_ = voice.SetLayout(rsac.LayoutMono)
-	_ = voice.AddSource("name:Discord")
-	_ = voice.AddSourceWithGain("name:Zoom", 0.8)
+	defer voice.Free()
+	if err := voice.SetLayout(rsac.LayoutMono); err != nil {
+		fmt.Printf("voice layout: %v\n", err)
+		return
+	}
+	if err := voice.AddSource("name:Discord"); err != nil {
+		fmt.Printf("voice source: %v\n", err)
+		return
+	}
+	if err := voice.AddSourceWithGain("name:Zoom", 0.8); err != nil {
+		fmt.Printf("voice source: %v\n", err)
+		return
+	}
 
 	system, err := rsac.NewGroup("system")
 	if err != nil {
 		fmt.Printf("group error: %v\n", err)
 		return
 	}
-	_ = system.SetLayout(rsac.LayoutStereo)
-	_ = system.AddSource("system")
+	defer system.Free()
+	if err := system.SetLayout(rsac.LayoutStereo); err != nil {
+		fmt.Printf("system layout: %v\n", err)
+		return
+	}
+	if err := system.AddSource("system"); err != nil {
+		fmt.Printf("system source: %v\n", err)
+		return
+	}
 
 	builder, err := rsac.NewCompositionBuilder()
 	if err != nil {
 		fmt.Printf("builder error: %v\n", err)
 		return
 	}
-	_ = builder.SetSampleRate(48000)
+	if err := builder.SetSampleRate(48000); err != nil {
+		fmt.Printf("sample rate: %v\n", err)
+		return
+	}
 	if err := builder.AddGroup(voice); err != nil {
 		fmt.Printf("add voice: %v\n", err)
 		return
