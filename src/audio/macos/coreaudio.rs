@@ -1512,7 +1512,27 @@ const KAUDIO_UNIT_ERR_FORMAT_NOT_SUPPORTED: i32 = -10868;
 /// In coreaudio-rs 0.14, the `Error` enum wraps typed sub-enums (not raw i32).
 /// We use `as_os_status()` to extract the underlying OSStatus code and then
 /// map well-known codes to specific `AudioError` variants.
+///
+/// Delegates to [`map_ca_error_with_operation`] with `operation: None`, which
+/// derives the `operation`/category label from the `CAError` variant — the
+/// existing behavior, unchanged, for every call site that passes a *typed*
+/// `coreaudio-rs` error (`thread.rs`'s 7 sites via `.map_err(map_ca_error)`).
 pub(crate) fn map_ca_error(err: CAError) -> AudioError {
+    map_ca_error_with_operation(err, None)
+}
+
+/// Like [`map_ca_error`], but threads a caller-supplied `operation` label
+/// through instead of deriving it from the `CAError` variant (rsac-931e).
+///
+/// The 4 tap-creation/introspection call sites in `tap.rs` construct a
+/// synthesized `CAError::Unknown(status)` wrapping a raw `OSStatus` (the
+/// `coreaudio-rs` error type has no room for a real category on a raw
+/// `AudioHardwareCreateProcessTap`/`AudioObjectGetPropertyData` failure), so
+/// `map_ca_error`'s variant-derived category is always `"Unknown"` there —
+/// reproducing the `rsac record --pid 999999` symptom (`Backend CoreAudio
+/// error in Unknown: ...`). Passing `Some(label)` here surfaces the real
+/// operation instead.
+pub(crate) fn map_ca_error_with_operation(err: CAError, operation: Option<&str>) -> AudioError {
     // Extract the real OSStatus value.
     // Note: coreaudio-rs 0.14 has a bug where CAError::Unknown(status)
     // returns kAudioServicesSystemSoundUnspecifiedError (-1500) from
@@ -1523,20 +1543,24 @@ pub(crate) fn map_ca_error(err: CAError) -> AudioError {
         _ => err.as_os_status(),
     };
 
-    // Determine category from the variant
-    let category = match &err {
-        CAError::AudioUnit(_) => "AudioUnit",
-        CAError::AudioCodec(_) => "AudioCodec",
-        CAError::AudioFormat(_) => "AudioFormat",
-        CAError::Audio(_) => "Audio",
-        CAError::Unknown(_) => "Unknown",
-        _ => "Other",
-    };
+    // Determine category: prefer the caller-supplied operation label; fall
+    // back to deriving it from the `CAError` variant (existing behavior).
+    let category = operation.map(str::to_string).unwrap_or_else(|| {
+        match &err {
+            CAError::AudioUnit(_) => "AudioUnit",
+            CAError::AudioCodec(_) => "AudioCodec",
+            CAError::AudioFormat(_) => "AudioFormat",
+            CAError::Audio(_) => "Audio",
+            CAError::Unknown(_) => "Unknown",
+            _ => "Other",
+        }
+        .to_string()
+    });
 
     // Check for well-known CoreAudio OSStatus codes
     if os_status == KAUDIO_HARDWARE_PERMISSIONS_ERROR {
         return AudioError::PermissionDenied {
-            operation: "audio_capture".into(),
+            operation: category,
             details: Some(format!(
                 "CoreAudio permission denied (OSStatus: {})",
                 os_status
@@ -1552,7 +1576,7 @@ pub(crate) fn map_ca_error(err: CAError) -> AudioError {
 
     AudioError::BackendError {
         backend: "CoreAudio".into(),
-        operation: category.to_string(),
+        operation: category.clone(),
         message: format!("CoreAudio error ({}): OSStatus {}", category, os_status),
         // M6: surface the raw OSStatus so callers can match on it machine-readably.
         // OSStatus is an i32; sign-extend to i64 for the BackendContext field.
@@ -2012,6 +2036,53 @@ mod tests {
                 "Expected BackendError with populated context, got: {:?}",
                 other
             ),
+        }
+    }
+
+    // ── map_ca_error_with_operation tests (rsac-931e) ─────────────────
+
+    #[test]
+    fn map_ca_error_with_operation_labels_unknown_status() {
+        // rsac-931e: a raw OSStatus from a tap-creation call
+        // (kAudioHardwareBadObjectError, the code CoreAudio actually returns
+        // for a bogus PID) must surface the real operation label, not the
+        // generic CAError-variant-derived "Unknown".
+        const KAUDIO_HARDWARE_BAD_OBJECT_ERROR: i32 = 560_947_818; // 'obj?'
+        let err = map_ca_error_with_operation(
+            CAError::Unknown(KAUDIO_HARDWARE_BAD_OBJECT_ERROR),
+            Some("process_tap"),
+        );
+        match err {
+            AudioError::BackendError {
+                operation,
+                context: Some(ctx),
+                ..
+            } => {
+                assert_eq!(
+                    operation, "process_tap",
+                    "operation must be the real tap label, not 'Unknown'"
+                );
+                assert_eq!(
+                    ctx.os_error_code,
+                    Some(KAUDIO_HARDWARE_BAD_OBJECT_ERROR as i64)
+                );
+            }
+            other => panic!(
+                "Expected BackendError with operation label, got: {:?}",
+                other
+            ),
+        }
+    }
+
+    #[test]
+    fn map_ca_error_without_operation_keeps_variant_derived_label() {
+        // Backward-compat: the 1-arg map_ca_error() (used by thread.rs's typed
+        // CAError call sites) is unaffected — still derives "Unknown" from the
+        // variant when no explicit operation is threaded through.
+        let err = map_ca_error(CAError::Unknown(-50));
+        match err {
+            AudioError::BackendError { operation, .. } => assert_eq!(operation, "Unknown"),
+            other => panic!("Expected BackendError, got: {:?}", other),
         }
     }
 

@@ -239,6 +239,11 @@ pub enum AudioError {
     /// internal hiccup) — NOT end-of-stream. When a read fails because the
     /// stream has reached a terminal state, [`StreamEnded`](AudioError::StreamEnded)
     /// is returned instead, so callers can distinguish "retry" from "done".
+    ///
+    /// A lifecycle-cause `StreamReadError` (never-started / stopped / not-yet-
+    /// running) can be classified structurally via
+    /// [`AudioError::lifecycle_stage`] (rsac-feb4) instead of matching on the
+    /// `reason` text.
     StreamReadError {
         /// Why the read failed.
         reason: String,
@@ -654,6 +659,74 @@ impl AudioError {
             _ => None,
         }
     }
+
+    /// Structured lifecycle classification for a lifecycle-cause
+    /// [`StreamReadError`](AudioError::StreamReadError) (rsac-feb4). Returns
+    /// `None` for every other variant.
+    ///
+    /// Returns `Some(LifecycleStage::Unknown)` for a `StreamReadError` whose
+    /// `reason` doesn't match a recognized lifecycle phrasing (e.g. a
+    /// future/third-party construction) rather than `None` — callers that
+    /// only care about `StreamReadError` always get a stage, and should treat
+    /// `Unknown` like a `#[non_exhaustive]` wildcard arm.
+    ///
+    /// This intentionally does not parse arbitrary prose: it matches against
+    /// the same canonical `REASON_*` constants that construct the error in
+    /// the first place, so construction and classification can never drift
+    /// independently (the failure mode this method replaces — free-form
+    /// `reason.contains(..)` greps in tests).
+    pub fn lifecycle_stage(&self) -> Option<LifecycleStage> {
+        let AudioError::StreamReadError { reason } = self else {
+            return None;
+        };
+        Some(match reason.as_str() {
+            REASON_NOT_INITIALIZED | REASON_NO_ACTIVE_STREAM | REASON_CAPTURE_NOT_STARTED => {
+                LifecycleStage::NotInitialized
+            }
+            REASON_NOT_RUNNING => LifecycleStage::NotRunning,
+            _ => LifecycleStage::Unknown,
+        })
+    }
+}
+
+/// Canonical reason strings for a lifecycle-cause
+/// [`StreamReadError`](AudioError::StreamReadError) (rsac-feb4). Constructed
+/// here and matched here — the single source of truth
+/// [`AudioError::lifecycle_stage`] classifies against, so construction and
+/// classification can never drift independently the way free-form
+/// `reason.contains(..)` test greps did.
+pub(crate) const REASON_NOT_INITIALIZED: &str = "Stream is not initialized. Call start() first.";
+
+/// See [`REASON_NOT_INITIALIZED`].
+pub(crate) const REASON_NOT_RUNNING: &str = "Stream is not running";
+
+/// See [`REASON_NOT_INITIALIZED`].
+pub(crate) const REASON_NO_ACTIVE_STREAM: &str =
+    "No active stream: the capture was never started, or has been \
+     stopped (stop() releases the stream). Call start() to begin \
+     (or restart) capturing.";
+
+/// See [`REASON_NOT_INITIALIZED`].
+pub(crate) const REASON_CAPTURE_NOT_STARTED: &str =
+    "Capture not started. Call start() before audio_data_stream().";
+
+/// Structured cause of a lifecycle [`AudioError::StreamReadError`]
+/// (rsac-feb4) — see [`AudioError::lifecycle_stage`].
+///
+/// # Stability
+///
+/// `#[non_exhaustive]`: new lifecycle causes may be added in a minor
+/// release. Out-of-crate matches need a trailing wildcard.
+#[non_exhaustive]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LifecycleStage {
+    /// No stream exists yet (never `start()`ed) or it was released by `stop()`.
+    NotInitialized,
+    /// A stream exists but is not in the `Running` state (pre-start `Created`,
+    /// or the simple-pull-API `is_running()` short-circuit).
+    NotRunning,
+    /// Reason text didn't match a recognized lifecycle phrasing.
+    Unknown,
 }
 
 // ── UserFacingError ────────────────────────────────────────────────────────
@@ -1141,6 +1214,67 @@ mod tests {
         };
         assert!(e.is_recoverable());
         assert!(!e.is_fatal());
+    }
+
+    // ── AudioError::lifecycle_stage (rsac-feb4) ───────────────────────
+
+    #[test]
+    fn lifecycle_stage_classifies_known_reasons() {
+        assert_eq!(
+            AudioError::StreamReadError {
+                reason: REASON_NOT_INITIALIZED.into()
+            }
+            .lifecycle_stage(),
+            Some(LifecycleStage::NotInitialized)
+        );
+        assert_eq!(
+            AudioError::StreamReadError {
+                reason: REASON_NOT_RUNNING.into()
+            }
+            .lifecycle_stage(),
+            Some(LifecycleStage::NotRunning)
+        );
+        assert_eq!(
+            AudioError::StreamReadError {
+                reason: REASON_NO_ACTIVE_STREAM.into()
+            }
+            .lifecycle_stage(),
+            Some(LifecycleStage::NotInitialized)
+        );
+        assert_eq!(
+            AudioError::StreamReadError {
+                reason: REASON_CAPTURE_NOT_STARTED.into()
+            }
+            .lifecycle_stage(),
+            Some(LifecycleStage::NotInitialized)
+        );
+    }
+
+    #[test]
+    fn lifecycle_stage_is_none_for_non_stream_read_variants() {
+        assert_eq!(
+            AudioError::StreamEnded { reason: "x".into() }.lifecycle_stage(),
+            None
+        );
+        assert_eq!(
+            AudioError::Timeout {
+                operation: "x".into(),
+                duration: std::time::Duration::ZERO,
+            }
+            .lifecycle_stage(),
+            None
+        );
+    }
+
+    #[test]
+    fn lifecycle_stage_unknown_for_unrecognized_reason() {
+        assert_eq!(
+            AudioError::StreamReadError {
+                reason: "some future phrasing".into()
+            }
+            .lifecycle_stage(),
+            Some(LifecycleStage::Unknown)
+        );
     }
 
     // ── ErrorKind: Backend ───────────────────────────────────────────

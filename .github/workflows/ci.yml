@@ -35,6 +35,14 @@ on:
       - 'v*.*.*'
       - '!v*-*'
   pull_request:
+    # `labeled`/`unlabeled` are added on top of the defaults (opened,
+    # synchronize, reopened) so the changelog-guard job's `changelog-not-needed`
+    # escape hatch takes effect the moment the label is applied. Without them,
+    # adding the label after the PR opens does not re-trigger CI, and even a
+    # manual "Re-run" replays the original event payload (labels captured at
+    # trigger time) — so a maintainer would otherwise have to push a fresh
+    # commit just to make the label visible to the guard.
+    types: [opened, synchronize, reopened, labeled, unlabeled]
     branches: [main, master, 'release/**']
   workflow_dispatch:
 
@@ -363,6 +371,17 @@ jobs:
       - name: Cargo test (unit tests)
         timeout-minutes: 5
         run: cargo test --lib --no-default-features --features feat_macos,compose
+
+      # rsac-86c7: macos-tcc-spi's 1 test (preflight_returns_a_status_without_panicking,
+      # src/audio/macos/permission.rs) is target_os-gated like feat_macos itself, so it
+      # can only ever run on this leg. It never panics regardless of TCC state
+      # (see the test's own doc comment) — safe to hard-fail here. Filtered to
+      # just that test: the step above already executes the rest of the macOS
+      # lib suite, so rerunning all ~600 tests here would only add time and a
+      # second exposure to the TCC-adjacent tap tests.
+      - name: Cargo test (macos-tcc-spi unit test)
+        timeout-minutes: 5
+        run: cargo test --lib --no-default-features --features feat_macos,compose,macos-tcc-spi preflight_returns_a_status_without_panicking
 
       # TC-01: ADR-0001 alloc-free producer proof (process-wide allocator, own
       # binary, single-threaded). Device-free, so it HARD-FAILS like Linux.
@@ -962,6 +981,14 @@ jobs:
           cargo clippy --all-targets --no-default-features --features feat_linux,async-stream,sink-wav,test-utils,compose -- -D warnings
           cargo clippy --all-targets --no-default-features --features feat_linux,bridge-zerocopy -- -D warnings
 
+      # rsac-86c7: async-stream + bridge-zerocopy unit tests (11 + 6 tests) are
+      # clippy'd above but were never EXECUTED by any `--lib` leg. Run them here
+      # — this job already isolates the optional-feature build.
+      - name: Run unit tests (async-stream + bridge-zerocopy)
+        run: |
+          cargo test --lib --no-default-features --features feat_linux,async-stream,sink-wav,test-utils,compose
+          cargo test --lib --no-default-features --features feat_linux,bridge-zerocopy
+
       - name: Run doctests
         # Build doctests with the same feature set so doc examples that touch
         # async-stream / sink-wav / compose APIs are exercised too — the compose
@@ -1122,21 +1149,34 @@ jobs:
   # CI exercised it, so a broken intra-doc link or a `#[cfg_attr(docsrs, …)]`
   # mistake would only surface as a RED docs.rs build *after* publish. This job
   # reproduces the docs.rs invocation as closely as a single Linux runner can:
-  #   • --all-features matches docs.rs `all-features = true`. The macOS/Windows
-  #     backends are gated `all(target_os = "X", feature = "feat_X")`, so on a
-  #     Linux runner they stay cfg-disabled even with every feature on — only
-  #     the Linux backend + the non-platform features (async-stream, sink-wav,
-  #     test-utils, compose, cli) are documented here — this is also where the
-  #     compose deps (rubato + audioadapter-buffers) must build for rustdoc.
-  #     (Per-OS rendering is docs.rs's job.)
+  #   • --all-features matches docs.rs `all-features = true`.
   #   • RUSTDOCFLAGS="--cfg docsrs -D warnings" turns broken-doc-link / bad-doc
   #     warnings into a hard failure and enables the `docsrs` cfg the metadata
   #     block sets, so `#[cfg_attr(docsrs, doc(...))]` annotations are exercised.
+  # rsac-0fb1: the macOS/Windows backends are gated `all(target_os = "X",
+  # feature = "feat_X")`, so a single Linux-only leg left them cfg-disabled
+  # even with every feature on — the `#[cfg_attr(docsrs, ...)]` blocks on
+  # audio::macos::* / audio::windows::* were never rendered or lint-checked
+  # anywhere. Mirror the `lint` job's 3-OS matrix (above) so each OS's
+  # cfg-gated docs get exercised on the runner where they're actually enabled.
   docs:
-    name: Docs (cargo doc, docs.rs config)
+    name: Docs (cargo doc, docs.rs config, ${{ matrix.os }})
     timeout-minutes: 20
     needs: lint
-    runs-on: blacksmith-4vcpu-ubuntu-2404
+    runs-on: ${{ matrix.runner }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - runner: blacksmith-4vcpu-ubuntu-2404
+            feature: feat_linux
+            os: linux
+          - runner: blacksmith-4vcpu-windows-2025
+            feature: feat_windows
+            os: windows
+          - runner: blacksmith-6vcpu-macos-15
+            feature: feat_macos
+            os: macos
     steps:
       - uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5
         with:
@@ -1144,6 +1184,7 @@ jobs:
       - uses: ./.github/actions/rust-setup
 
       - name: Install PipeWire dev libraries
+        if: matrix.os == 'linux'
         uses: ./.github/actions/pipewire-setup
 
       - name: cargo doc (no-deps, all-features, docs.rs flags)
@@ -1180,6 +1221,82 @@ jobs:
       # false-negative, e.g. a pattern that misses a bare `use crate::audio;`).
       - name: Self-test the module-DAG guard
         run: bash scripts/check-module-dag.sh --self-test
+
+  # ── CHANGELOG process guard (rsac-7437) ─────────────────────────────
+  # Every PR touching src/ or bindings/ must record its change in
+  # CHANGELOG.md's [Unreleased] section, or carry the changelog-not-needed
+  # label for genuinely internal changes (test-only, CI-only, docs-only diffs
+  # that also happen to touch src/ comments, etc.). Root cause: 0.4.1's
+  # release notes shipped incomplete because PRs #41-#49 fixed code but never
+  # touched CHANGELOG.md (caught only by a manual post-release audit).
+  # Independent of `changes`/`lint` (must not skip silently). Applies to ALL
+  # PR base branches including release/** — release-stacking layer PRs use
+  # the changelog-not-needed label per-layer (see AGENTS.md §6) rather than
+  # a blanket base-branch exemption the guard can't audit.
+  changelog-guard:
+    name: CHANGELOG Guard
+    if: github.event_name == 'pull_request'
+    timeout-minutes: 5
+    runs-on: blacksmith-4vcpu-ubuntu-2404
+    permissions:
+      contents: read
+      pull-requests: read
+    steps:
+      - uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5
+        with:
+          persist-credentials: false
+          fetch-depth: 0
+
+      - name: Check CHANGELOG.md [Unreleased] touched (or label escape hatch)
+        env:
+          BASE_SHA: ${{ github.event.pull_request.base.sha }}
+          HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+          PR_LABELS_JSON: ${{ toJson(github.event.pull_request.labels.*.name) }}
+        run: |
+          set -euo pipefail
+          if echo "$PR_LABELS_JSON" | grep -q '"changelog-not-needed"'; then
+            echo "OK: PR carries the changelog-not-needed label — skipping."
+            exit 0
+          fi
+
+          MERGE_BASE="$(git merge-base "$BASE_SHA" "$HEAD_SHA")"
+          CHANGED="$(git diff --name-only "$MERGE_BASE" "$HEAD_SHA")"
+          printf 'changed files:\n%s\n' "$CHANGED"
+
+          TOUCHES_SRC="$(printf '%s\n' "$CHANGED" | grep -E '^(src/|bindings/)' || true)"
+          if [ -z "$TOUCHES_SRC" ]; then
+            echo "OK: no src/ or bindings/ changes — CHANGELOG not required."
+            exit 0
+          fi
+
+          if printf '%s\n' "$CHANGED" | grep -q '^CHANGELOG\.md$'; then
+            # Confirm the [Unreleased] section itself changed, not just some
+            # other part of the file (e.g. a stray whitespace fix in an older
+            # release block). Extract the section body — everything between the
+            # `## [Unreleased]` header and the next `## [` header — at both the
+            # merge-base and the head, and compare. Anchoring on the extracted
+            # section (not on `git diff` output, whose lines carry +/-/space
+            # prefixes) is the only reliable approach: an entry added under a
+            # subsection like `### Fixed` puts the diff hunk several lines below
+            # the `## [Unreleased]` header, so the header never appears in the
+            # diff context and a diff-line-anchored awk misses it entirely.
+            # `|| true` keeps `set -euo pipefail` from aborting the step when
+            # CHANGELOG.md does not exist at the merge-base (e.g. a PR that adds
+            # the file for the first time): `git show` exits non-zero there, and
+            # under pipefail that would otherwise hard-fail the whole job.
+            base_unreleased="$( { git show "$MERGE_BASE:CHANGELOG.md" 2>/dev/null || true; } \
+              | awk '/^## \[Unreleased\]/{f=1;next} /^## \[/{f=0} f')"
+            head_unreleased="$( { git show "$HEAD_SHA:CHANGELOG.md" 2>/dev/null || true; } \
+              | awk '/^## \[Unreleased\]/{f=1;next} /^## \[/{f=0} f')"
+            if [ "$base_unreleased" != "$head_unreleased" ]; then
+              echo "OK: CHANGELOG.md [Unreleased] section was modified."
+              exit 0
+            fi
+          fi
+
+          echo "::error::This PR touches src/ or bindings/ but does not update CHANGELOG.md's [Unreleased] section."
+          echo "::error::Add an entry under [Unreleased], or apply the 'changelog-not-needed' label if this change has no user-facing effect (test-only, internal refactor, CI-only)."
+          exit 1
 
   supply-chain:
     name: Supply Chain (cargo-deny)

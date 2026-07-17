@@ -19,7 +19,7 @@
 use std::sync::mpsc;
 use std::time::{Duration, Instant};
 
-use rsac::{AudioCaptureBuilder, AudioError, CaptureTarget};
+use rsac::{AudioCaptureBuilder, AudioError, CaptureTarget, LifecycleStage};
 
 use crate::helpers;
 
@@ -235,18 +235,16 @@ fn subscribe_errors_when_not_started() {
     };
 
     match capture.subscribe() {
-        Err(AudioError::StreamReadError { reason }) => {
-            assert!(
-                reason.to_lowercase().contains("not running")
-                    || reason.to_lowercase().contains("not initialized")
-                    || reason.to_lowercase().contains("no active stream")
-                    || reason.to_lowercase().contains("never started"),
-                "expected lifecycle-related reason, got: {}",
-                reason
+        Err(e @ AudioError::StreamReadError { .. }) => {
+            assert_eq!(
+                e.lifecycle_stage(),
+                Some(LifecycleStage::NotInitialized),
+                "expected NotInitialized lifecycle stage, got: {:?}",
+                e
             );
             eprintln!(
-                "[ci_audio] ✅ subscribe-not-started: got expected StreamReadError: {}",
-                reason
+                "[ci_audio] ✅ subscribe-not-started: got expected StreamReadError: {:?}",
+                e
             );
         }
         Err(other) => panic!(

@@ -24,7 +24,7 @@ use std::time::Duration;
 
 use crate::core::buffer::AudioBuffer;
 use crate::core::config::AudioFormat;
-use crate::core::error::{AudioError, AudioResult};
+use crate::core::error::{AudioError, AudioResult, REASON_NOT_RUNNING};
 use crate::core::interface::CapturingStream;
 
 use super::ring_buffer::{BridgeConsumer, BridgeShared};
@@ -164,6 +164,13 @@ impl<S: PlatformStream> BridgeStream<S> {
 /// [`AudioError::StreamEnded`]; a pre-start state (`Created`) is a usage error
 /// the caller can recover from by starting the stream → the recoverable
 /// [`AudioError::StreamReadError`]. See ADR-0003.
+///
+/// The `Created`-state reason reuses the shared [`REASON_NOT_RUNNING`]
+/// constant (rsac-feb4) rather than formatting the live `StreamState` into
+/// the message — this makes [`AudioError::lifecycle_stage`] a pure
+/// string-equality match with no heuristics, at the cost of the (unused, per
+/// grep sweep of the test suite) `Created` detail in the diagnostic text. See
+/// `docs/designs/0003-terminal-stream-error.md` Amendment 2026-07-17.
 fn non_readable_error(state: StreamState) -> AudioError {
     match state {
         StreamState::Stopped | StreamState::Closed | StreamState::Error => {
@@ -172,7 +179,7 @@ fn non_readable_error(state: StreamState) -> AudioError {
             }
         }
         _ => AudioError::StreamReadError {
-            reason: format!("Stream is in {} state, cannot read", state),
+            reason: REASON_NOT_RUNNING.to_string(),
         },
     }
 }
@@ -365,6 +372,7 @@ mod tests {
     use super::*;
     use crate::bridge::ring_buffer::create_bridge;
     use crate::core::config::AudioFormat;
+    use crate::core::error::LifecycleStage;
     use std::sync::atomic::AtomicBool;
 
     // ── Mock PlatformStream ──────────────────────────────────────────
@@ -941,7 +949,11 @@ mod tests {
             format.clone(),
             Duration::from_secs(1),
         );
-        assert!(stream.read_chunk().is_err());
+        let err = stream.read_chunk().unwrap_err();
+        assert!(matches!(
+            err.lifecycle_stage(),
+            Some(LifecycleStage::NotRunning)
+        ));
         assert!(stream.try_read_chunk().is_err());
     }
 

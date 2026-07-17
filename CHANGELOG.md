@@ -20,13 +20,59 @@ Releases with no ABI change omit the subsection (or state "No C ABI changes").
 
 ### Added
 
+- `AudioError::lifecycle_stage()` — a structured accessor that classifies a
+  lifecycle-cause `StreamReadError` into a new `#[non_exhaustive]`
+  `LifecycleStage` enum (`NotInitialized`, `NotRunning`, `Unknown`), so
+  callers no longer need to grep `reason` prose to distinguish "never
+  started"/"stopped" from "not yet running" (rsac-feb4). Additive-only;
+  `StreamReadError`'s shape is unchanged and `cargo-semver-checks 0.48.0`
+  confirms "no semver update required" against v0.4.2.
+
 ### Changed
+
+- CoreAudio tap-creation/introspection errors (`CoreAudioProcessTap::new`,
+  `new_tree`, `new_system`, `get_stream_format`) now report their real
+  `operation` label (`"process_tap"`, `"process_tap_tree"`, `"system_tap"`,
+  `"get_stream_format"`) instead of the generic `"Unknown"` category that
+  `map_ca_error` previously derived from a synthesized `CAError::Unknown`
+  status — e.g. `rsac record --pid 999999` now reports `operation:
+  "process_tap"` instead of `operation: "Unknown"` (rsac-931e). `pub(crate)`
+  change only; no public API impact. Side effect: a permission-denied
+  OSStatus arriving through `map_ca_error` without a caller-supplied label
+  now derives its `operation` from the `CAError` variant (e.g. `"AudioUnit"`)
+  instead of the former generic `"audio_capture"` — diagnostic text only.
+- `BridgeStream`'s pre-start (`Created`-state) read error now reuses the
+  shared `REASON_NOT_RUNNING` message instead of formatting the live
+  `StreamState` into the text — a diagnostic-text change only, made to keep
+  `AudioError::lifecycle_stage()` a pure string-equality match with no
+  heuristics (rsac-feb4).
 
 ### Deprecated
 
 ### Removed
 
 ### Fixed
+
+- **Bindings (Node/napi + Python):** fixed a deadlock where `stop()` (and, in
+  Python, `close()`/`__del__`) could hang forever against a thread parked in a
+  blocking read of a silent stream. Both bindings previously held their single
+  wrapper mutex across the parked `read_chunk_blocking`, so the teardown — which
+  needed the same lock to reach the stream — blocked on a lock the reader would
+  only release once the stream went terminal. The wrapper now guards the capture
+  with an `RwLock`: blocking readers park under a shared read guard, and the
+  teardown first takes a read guard to call the core's `request_stop()` (which
+  signals the stream terminal and wakes the parked reader without contending for
+  the lock) before taking the write guard for the lifecycle teardown. In the
+  Python binding the teardown additionally runs the whole read-guard →
+  write-guard dance inside `Python::allow_threads` (GIL released): the parked
+  reader releases the GIL across its blocking read but re-acquires it before
+  dropping its read guard, so a teardown that held the GIL across the write-lock
+  acquire would still deadlock (reader blocked on the GIL, teardown blocked on
+  the write lock). `start()` likewise no longer requests exclusive access while
+  a reader may be parked: a redundant `start()` on a running capture is resolved
+  under a shared guard (core `start()` is idempotent on a running stream), so it
+  cannot block behind — or deadlock with — a parked blocking read. Public API
+  and terminal (`StreamEnded`) semantics are unchanged (rsac-8082).
 
 ### Security
 

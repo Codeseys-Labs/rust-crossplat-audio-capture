@@ -95,3 +95,20 @@ helpers to treat `StreamEnded` as clean termination.
    (`src/bridge/ring_buffer.rs`) and `BridgeStream::read_chunk`/`try_read_chunk`
    (`src/bridge/stream.rs`); the FFI mapping in `rsac::map_rsac_error`
    (`bindings/rsac-ffi/src/lib.rs`).
+
+## Amendment 2026-07-17 (rsac-feb4)
+
+`BridgeStream::non_readable_error`'s `Created`-state (recoverable,
+`StreamReadError`) arm previously formatted the live `StreamState` into the
+message (`"Stream is in Created state, cannot read"`). It now reuses the
+shared `REASON_NOT_RUNNING` constant (`src/core/error.rs`) verbatim, dropping
+the `Created` detail from the diagnostic text. This is what makes
+`AudioError::lifecycle_stage()` — a new structured accessor returning
+`LifecycleStage::{NotInitialized, NotRunning, Unknown}` — a pure
+string-equality match against the canonical `REASON_*` constants used at
+every `StreamReadError` construction site, with no heuristics and no risk of
+construction/classification drift. No test asserted on the `Created` wording
+(confirmed by grep); this is a diagnostic-text change only, not a behavior or
+API-shape change to `StreamReadError` (which remains `{ reason: String }` —
+adding a field or `#[non_exhaustive]`-ing the variant would each be a
+semver-major delta per `cargo-semver-checks 0.48.0`, empirically verified).

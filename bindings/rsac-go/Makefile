@@ -29,10 +29,23 @@ UNAME_S := $(shell uname -s)
 # fallback for an MSVC-built staticlib, but cgo can only link the GNU .a.
 ifeq ($(UNAME_S),Darwin)
     STATIC_LIB := librsac_ffi.a
-    # macOS needs frameworks for CoreAudio, Security, etc.
+    # macOS needs frameworks for CoreAudio, Security, etc. IOKit + AppKit are
+    # pulled in transitively by `sysinfo` (process-tree discovery) + objc2-app-kit
+    # once feat_macos actually compiles the CoreAudio backend (rsac-b624) — a
+    # staticlib consumer must link every system framework explicitly; cargo's
+    # automatic framework linking only applies to a binary/cdylib built directly
+    # by cargo, not to a downstream cgo link against the .a.
     EXTRA_LDFLAGS := -framework CoreAudio -framework AudioToolbox \
                      -framework CoreFoundation -framework Security \
-                     -framework SystemConfiguration
+                     -framework SystemConfiguration -framework IOKit \
+                     -framework AppKit
+    # rsac-b624: rsac-ffi's `default = []` means a bare `cargo build` compiles
+    # NO backend, so PlatformCapabilities() always returned the honest-empty
+    # "unsupported" stub regardless of host OS. Select the matching platform
+    # feature (mirrors bindings/rsac-napi + bindings/rsac-python's per-target
+    # `features = ["feat_<os>"]` convention) so the real CoreAudio backend
+    # actually compiles in.
+    FFI_FEATURES := feat_macos
 else ifeq ($(UNAME_S),Linux)
     STATIC_LIB := librsac_ffi.a
     # NOTE: no `-lspa-0.2` — SPA (libspa-0.2) is a header/plugin API with NO
@@ -40,6 +53,7 @@ else ifeq ($(UNAME_S),Linux)
     # so `-lspa-0.2` makes ld fail with "cannot find -lspa-0.2". PipeWire itself
     # is the only system .so the staticlib needs at link time.
     EXTRA_LDFLAGS := -lpipewire-0.3 -lpthread -ldl -lm
+    FFI_FEATURES := feat_linux
 else
     # Windows (MSYS2/MinGW). Build rsac-ffi for the *-pc-windows-gnu target so
     # cargo emits librsac_ffi.a (GNU archive) that cgo's gcc can link.
@@ -53,6 +67,7 @@ else
     # cannot resolve. So we MUST build the GNU target explicitly.
     # `rustup target add x86_64-pc-windows-gnu` is a prerequisite.
     RUST_TARGET := x86_64-pc-windows-gnu
+    FFI_FEATURES := feat_windows
 endif
 
 # When RUST_TARGET is set (Windows), build + read from target/<triple>/release;
@@ -78,7 +93,7 @@ build: rust-ffi go-build
 ## rust-ffi: Compile the Rust FFI crate as a static library.
 rust-ffi:
 	@echo "==> Building rsac-ffi static library..."
-	cd $(FFI_DIR) && cargo build --release $(CARGO_TARGET_FLAG)
+	cd $(FFI_DIR) && cargo build --release $(CARGO_TARGET_FLAG) --no-default-features --features $(FFI_FEATURES)
 	@mkdir -p $(LIB_DIR)
 	@if [ -f "$(CARGO_TARGET)/librsac_ffi.a" ]; then \
 		cp "$(CARGO_TARGET)/librsac_ffi.a" "$(LIB_DIR)/librsac_ffi.a"; \
@@ -117,7 +132,7 @@ test-pure: rust-ffi
 	@echo "==> Running Go-only logic tests..."
 	CGO_ENABLED=1 \
 	CGO_LDFLAGS="-L$(LIB_DIR) -lrsac_ffi $(EXTRA_LDFLAGS)" \
-	go test -v -count=1 -run 'TestErrorCode|TestError_|TestErr|TestCaptureTarget|TestAudioBuffer|TestCaptureBuilder|TestDeviceKind|TestStream_Context|TestCallbackHandle|TestStreamResult' ./...
+	go test -v -count=1 -run 'TestErrorCode|TestError_|TestErr|TestCaptureTarget|TestAudioBuffer|TestCaptureBuilder|TestDeviceKind|TestStream_Context|TestCallbackHandle|TestStreamResult|TestCapabilities' ./...
 
 ## lint: Run golangci-lint on the Go package.
 lint:

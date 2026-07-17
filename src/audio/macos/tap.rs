@@ -21,7 +21,7 @@
 
 #![cfg(target_os = "macos")]
 
-use super::coreaudio::map_ca_error;
+use super::coreaudio::map_ca_error_with_operation;
 use crate::core::error::{AudioError, AudioResult, BackendContext};
 use core_foundation::base::TCFType;
 use core_foundation::boolean::CFBoolean;
@@ -164,7 +164,10 @@ impl CoreAudioProcessTap {
             let _: () = msg_send![tap_desc_obj, release];
 
             if status != sys::noErr as OSStatus {
-                return Err(map_ca_error(CAError::Unknown(status)));
+                return Err(map_ca_error_with_operation(
+                    CAError::Unknown(status),
+                    Some("process_tap"),
+                ));
             }
 
             if tap_id == 0 {
@@ -318,7 +321,10 @@ impl CoreAudioProcessTap {
             let _: () = msg_send![tap_desc_obj, release];
 
             if status != sys::noErr as OSStatus {
-                return Err(map_ca_error(CAError::Unknown(status)));
+                return Err(map_ca_error_with_operation(
+                    CAError::Unknown(status),
+                    Some("process_tap_tree"),
+                ));
             }
 
             if tap_id == 0 {
@@ -465,7 +471,10 @@ impl CoreAudioProcessTap {
             let _: () = msg_send![tap_desc_obj, release];
 
             if status != sys::noErr as OSStatus {
-                return Err(map_ca_error(CAError::Unknown(status)));
+                return Err(map_ca_error_with_operation(
+                    CAError::Unknown(status),
+                    Some("system_tap"),
+                ));
             }
 
             if tap_id == 0 {
@@ -569,7 +578,10 @@ impl CoreAudioProcessTap {
         };
 
         if status != sys::noErr as OSStatus {
-            return Err(map_ca_error(CAError::Unknown(status)));
+            return Err(map_ca_error_with_operation(
+                CAError::Unknown(status),
+                Some("get_stream_format"),
+            ));
         }
         Ok(asbd)
     }
