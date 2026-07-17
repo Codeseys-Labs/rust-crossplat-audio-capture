@@ -29,7 +29,7 @@
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use rsac::{AudioCaptureBuilder, AudioError, CaptureTarget};
+use rsac::{AudioCaptureBuilder, AudioError, CaptureTarget, LifecycleStage};
 
 use crate::helpers;
 
@@ -261,13 +261,15 @@ fn stop_takes_stream_reads_report_not_initialized() {
     // the recoverable not-initialized/not-running StreamReadError, not the
     // fatal StreamEnded.
     match capture.read_chunk_nonblocking() {
-        Err(AudioError::StreamReadError { reason }) => {
-            let low = reason.to_lowercase();
+        Err(e @ AudioError::StreamReadError { .. }) => {
             assert!(
-                low.contains("not initialized") || low.contains("not running"),
-                "expected a lifecycle StreamReadError after stop(), got reason: {reason}"
+                matches!(
+                    e.lifecycle_stage(),
+                    Some(LifecycleStage::NotInitialized | LifecycleStage::NotRunning)
+                ),
+                "expected a lifecycle StreamReadError after stop(), got: {e:?}"
             );
-            eprintln!("[ci_audio] ✅ read after stop() → recoverable StreamReadError: {reason}");
+            eprintln!("[ci_audio] ✅ read after stop() → recoverable StreamReadError: {e:?}");
         }
         other => panic!(
             "read after owning stop() must be a recoverable StreamReadError \

@@ -120,7 +120,8 @@ pub use crate::core::config::{
 #[cfg(target_os = "android")]
 pub use crate::core::config::AndroidProjectionToken;
 pub use crate::core::error::{
-    AudioError, AudioResult, BackendContext, ErrorKind, Recoverability, UserFacingError,
+    AudioError, AudioResult, BackendContext, ErrorKind, LifecycleStage, Recoverability,
+    UserFacingError,
 };
 pub use crate::core::interface::{
     AudioDevice, CapturingStream, DeviceEnumerator, DeviceEvent, DeviceEventHandler, DeviceInfo,

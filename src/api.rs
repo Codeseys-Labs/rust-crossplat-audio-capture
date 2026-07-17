@@ -38,7 +38,13 @@ use crate::core::config::AudioFormat;
 // qualified path through this always-available alias so the public read path
 // is not accidentally tied to the gated import.
 use crate::core::config::AudioFormat as AudioFormatType;
-use crate::core::error::{AudioError, AudioResult};
+#[cfg(test)]
+use crate::core::error::LifecycleStage;
+#[cfg(feature = "async-stream")]
+use crate::core::error::REASON_CAPTURE_NOT_STARTED;
+use crate::core::error::{
+    AudioError, AudioResult, REASON_NOT_INITIALIZED, REASON_NOT_RUNNING, REASON_NO_ACTIVE_STREAM,
+};
 use crate::core::introspection::{BackpressureReport, StreamStats};
 use std::fmt;
 use std::ops::{Deref, DerefMut};
@@ -872,10 +878,7 @@ impl RunningCapture {
             .stream
             .as_ref()
             .ok_or_else(|| AudioError::StreamReadError {
-                reason: "No active stream: the capture was never started, or has been \
-                         stopped (stop() releases the stream). Call start() to begin \
-                         (or restart) capturing."
-                    .to_string(),
+                reason: REASON_NO_ACTIVE_STREAM.to_string(),
             })?;
         spawn_drain_thread(Arc::clone(stream_ref), sink)
     }
@@ -1862,7 +1865,7 @@ impl AudioCapture {
             .stream
             .as_ref()
             .ok_or_else(|| AudioError::StreamReadError {
-                reason: "Stream is not initialized. Call start() first.".to_string(),
+                reason: REASON_NOT_INITIALIZED.to_string(),
             })?;
 
         // Check running state via the stream itself — single source of truth.
@@ -1870,7 +1873,7 @@ impl AudioCapture {
         // AtomicBool was consulted before touching the stream.
         if !stream.is_running() {
             return Err(AudioError::StreamReadError {
-                reason: "Stream is not running".to_string(),
+                reason: REASON_NOT_RUNNING.to_string(),
             });
         }
 
@@ -1911,7 +1914,7 @@ impl AudioCapture {
             .stream
             .as_ref()
             .ok_or_else(|| AudioError::StreamReadError {
-                reason: "Stream is not initialized. Call start() first.".to_string(),
+                reason: REASON_NOT_INITIALIZED.to_string(),
             })?;
         stream.try_read_chunk()
     }
@@ -1938,7 +1941,7 @@ impl AudioCapture {
             .stream
             .as_ref()
             .ok_or_else(|| AudioError::StreamReadError {
-                reason: "Stream is not initialized. Call start() first.".to_string(),
+                reason: REASON_NOT_INITIALIZED.to_string(),
             })?;
         stream.read_chunk()
     }
@@ -1975,13 +1978,13 @@ impl AudioCapture {
             .stream
             .as_ref()
             .ok_or_else(|| AudioError::StreamReadError {
-                reason: "Stream is not initialized. Call start() first.".to_string(),
+                reason: REASON_NOT_INITIALIZED.to_string(),
             })?;
 
         // Check running state via the stream itself — single source of truth.
         if !stream.is_running() {
             return Err(AudioError::StreamReadError {
-                reason: "Stream is not running".to_string(),
+                reason: REASON_NOT_RUNNING.to_string(),
             });
         }
 
@@ -2054,7 +2057,7 @@ impl AudioCapture {
             .stream
             .as_ref()
             .ok_or_else(|| AudioError::StreamReadError {
-                reason: "Capture not started. Call start() before audio_data_stream().".to_string(),
+                reason: REASON_CAPTURE_NOT_STARTED.to_string(),
             })?;
 
         Ok(crate::bridge::AsyncAudioStream::new(stream.as_ref()))
@@ -2209,10 +2212,7 @@ impl AudioCapture {
             .stream
             .as_ref()
             .ok_or_else(|| AudioError::StreamReadError {
-                reason: "No active stream: the capture was never started, or has been \
-                         stopped (stop() releases the stream). Call start() to begin \
-                         (or restart) capturing."
-                    .to_string(),
+                reason: REASON_NO_ACTIVE_STREAM.to_string(),
             })?;
 
         spawn_subscribe_thread(Arc::clone(stream_ref), Arc::clone(&self.subscriber_dropped))
@@ -2289,10 +2289,7 @@ impl AudioCapture {
             .stream
             .as_ref()
             .ok_or_else(|| AudioError::StreamReadError {
-                reason: "No active stream: the capture was never started, or has been \
-                         stopped (stop() releases the stream). Call start() to begin \
-                         (or restart) capturing."
-                    .to_string(),
+                reason: REASON_NO_ACTIVE_STREAM.to_string(),
             })?;
 
         spawn_subscribe_with_errors_thread(
@@ -3221,10 +3218,11 @@ mod tests {
         // No stream at all → rejected via the presence check.
         let empty = make_capture_without_stream();
         match empty.subscribe() {
-            Err(AudioError::StreamReadError { reason }) => {
-                assert!(
-                    reason.contains("start()"),
-                    "message must direct to start(): {reason}"
+            Err(e @ AudioError::StreamReadError { .. }) => {
+                assert_eq!(
+                    e.lifecycle_stage(),
+                    Some(LifecycleStage::NotInitialized),
+                    "expected a NotInitialized lifecycle stage, got: {e:?}"
                 );
             }
             other => panic!("expected StreamReadError, got: {other:?}"),
@@ -3271,13 +3269,16 @@ mod tests {
         capture.stop().unwrap();
         match capture.subscribe() {
             Err(AudioError::StreamReadError { reason }) => {
-                assert!(
-                    reason.contains("stopped"),
-                    "post-stop message must mention the stopped state: {reason}"
-                );
-                assert!(
-                    !reason.contains("not initialized"),
-                    "the misleading pre-fix message must be gone: {reason}"
+                // Intentionally a prose assertion, not a lifecycle_stage() check
+                // (rsac-feb4): this test's whole point is locking in *which
+                // words* appear — the historical regression (rsac-7aa2(3)) was
+                // the message misleadingly saying "not initialized" after a
+                // stop(). Both never-started and post-stop map to the same
+                // `LifecycleStage::NotInitialized`, so a stage-only assert would
+                // silently lose this coverage.
+                assert_eq!(
+                    reason, REASON_NO_ACTIVE_STREAM,
+                    "post-stop message must be the canonical no-active-stream reason: {reason}"
                 );
             }
             other => panic!("expected StreamReadError, got: {other:?}"),

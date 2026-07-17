@@ -20,7 +20,32 @@ Releases with no ABI change omit the subsection (or state "No C ABI changes").
 
 ### Added
 
+- `AudioError::lifecycle_stage()` — a structured accessor that classifies a
+  lifecycle-cause `StreamReadError` into a new `#[non_exhaustive]`
+  `LifecycleStage` enum (`NotInitialized`, `NotRunning`, `Unknown`), so
+  callers no longer need to grep `reason` prose to distinguish "never
+  started"/"stopped" from "not yet running" (rsac-feb4). Additive-only;
+  `StreamReadError`'s shape is unchanged and `cargo-semver-checks 0.48.0`
+  confirms "no semver update required" against v0.4.2.
+
 ### Changed
+
+- CoreAudio tap-creation/introspection errors (`CoreAudioProcessTap::new`,
+  `new_tree`, `new_system`, `get_stream_format`) now report their real
+  `operation` label (`"process_tap"`, `"process_tap_tree"`, `"system_tap"`,
+  `"get_stream_format"`) instead of the generic `"Unknown"` category that
+  `map_ca_error` previously derived from a synthesized `CAError::Unknown`
+  status — e.g. `rsac record --pid 999999` now reports `operation:
+  "process_tap"` instead of `operation: "Unknown"` (rsac-931e). `pub(crate)`
+  change only; no public API impact. Side effect: a permission-denied
+  OSStatus arriving through `map_ca_error` without a caller-supplied label
+  now derives its `operation` from the `CAError` variant (e.g. `"AudioUnit"`)
+  instead of the former generic `"audio_capture"` — diagnostic text only.
+- `BridgeStream`'s pre-start (`Created`-state) read error now reuses the
+  shared `REASON_NOT_RUNNING` message instead of formatting the live
+  `StreamState` into the text — a diagnostic-text change only, made to keep
+  `AudioError::lifecycle_stage()` a pure string-equality match with no
+  heuristics (rsac-feb4).
 
 ### Deprecated
 
