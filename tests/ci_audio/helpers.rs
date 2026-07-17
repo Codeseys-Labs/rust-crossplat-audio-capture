@@ -1018,6 +1018,9 @@ pub fn find_pipewire_app_name_for_pid(pid: u32) -> Option<String> {
         }
         // Prefer the registered application.name; fall back to the basename of
         // the process binary path (what the resolver's basename rule matches).
+        // Keep scanning on a nameless node: a PID can own several nodes (e.g.
+        // a bare stream node registered before the named client node), so the
+        // first match having no usable name must not end the search.
         if let Some(name) = props.get("application.name").and_then(|v| v.as_str()) {
             if !name.is_empty() {
                 return Some(name.to_string());
@@ -1032,7 +1035,6 @@ pub fn find_pipewire_app_name_for_pid(pid: u32) -> Option<String> {
                 return Some(basename.to_string());
             }
         }
-        return None;
     }
     None
 }

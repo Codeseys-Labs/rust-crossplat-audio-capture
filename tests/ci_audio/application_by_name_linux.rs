@@ -50,18 +50,34 @@ fn select_by_name_of_running_player_binds_and_reads() {
         }
     };
 
-    // Let PipeWire register the player's stream node before we look it up.
-    std::thread::sleep(Duration::from_millis(1000));
-
-    // Resolve the exact app-name of our PID's node. If PipeWire never registered
-    // a node (dbus-less Firecracker runner), skip honestly — same CI routing
-    // limitation the PID-string test handles via find_pipewire_node_for_pid.
-    let Some(app_name) = helpers::find_pipewire_app_name_for_pid(pid) else {
+    // Resolve the exact app-name of our PID's node, polling with a bounded
+    // deadline: node registration is asynchronous, and a single early pw-dump
+    // (or one nameless node — see the helper's multi-node note) must not
+    // masquerade as an environment gap.
+    let lookup_deadline = Instant::now() + Duration::from_secs(5);
+    let app_name = loop {
+        if let Some(name) = helpers::find_pipewire_app_name_for_pid(pid) {
+            break Some(name);
+        }
+        if Instant::now() >= lookup_deadline {
+            break None;
+        }
+        std::thread::sleep(Duration::from_millis(250));
+    };
+    let Some(app_name) = app_name else {
+        helpers::stop_player(child);
+        let _ = std::fs::remove_file(&wav_path);
+        if helpers::deterministic_audio_env() {
+            // Deterministic leg: the routed player MUST register a node — a
+            // missing name after 5s is a real regression, not a routing gap.
+            panic!(
+                "deterministic source: no PipeWire node/app-name for PID {pid} within 5s — \
+                 the player's node never registered or carries no usable name"
+            );
+        }
         eprintln!(
             "[ci_audio] no PipeWire node/app-name for PID {pid}; skipping (CI routing limitation)"
         );
-        helpers::stop_player(child);
-        let _ = std::fs::remove_file(&wav_path);
         return;
     };
     eprintln!("[ci_audio] Resolved PID {pid} to application.name='{app_name}'");
@@ -236,9 +252,22 @@ fn select_by_missing_name_returns_error() {
     match capture.start() {
         Err(e) => assert_expected_rejection(&e),
         Ok(()) => {
-            // PipeWire can start with an unresolved target and simply route no
-            // audio. If start() succeeds, the missing name must yield only
-            // silence — non-silent audio would mean we bound the wrong source.
+            // On the deterministic leg the resolver is reachable, so a missing
+            // name MUST be rejected at start() (resolution runs there) — a
+            // silent successful start would mean the documented
+            // ApplicationNotFound contract is broken.
+            if helpers::deterministic_audio_env() {
+                let _ = capture.stop();
+                panic!(
+                    "deterministic source: start() succeeded for missing app name \
+                     '{MISSING_APP_NAME}' — resolution must reject it with \
+                     ApplicationNotFound"
+                );
+            }
+            // Non-deterministic hosts only: PipeWire may start with an
+            // unresolved target and simply route no audio. The missing name
+            // must then yield only silence — non-silent audio would mean we
+            // bound the wrong source.
             let start = Instant::now();
             let mut produced_audio = false;
             while start.elapsed() < Duration::from_millis(500) {

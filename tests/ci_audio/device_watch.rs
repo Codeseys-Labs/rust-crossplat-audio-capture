@@ -205,13 +205,14 @@ fn watch_delivers_device_event_on_change() {
     let deadline = Instant::now() + Duration::from_secs(30);
     loop {
         let remaining = deadline.saturating_duration_since(Instant::now());
-        if remaining.is_zero() {
-            eprintln!(
-                "[ci_audio] ⚠ no DeviceEvent received within 30s — cannot force a hardware \
-                 change in an automated run; returning without failing"
-            );
-            return;
-        }
+        // This test is #[ignore]d and only runs when a human deliberately
+        // invokes it to perform the hardware change — so silence is a FAILURE
+        // (the watcher missed the event), not an environment limitation.
+        assert!(
+            !remaining.is_zero(),
+            "no DeviceEvent received within 30s of a deliberate manual run — plug/unplug \
+             or default-switch should have produced an event; the watch listener missed it"
+        );
         match rx.recv_timeout(remaining.min(Duration::from_millis(500))) {
             Ok(event) => {
                 // Assert the event is a well-formed variant with non-empty
@@ -249,8 +250,13 @@ fn watch_delivers_device_event_on_change() {
             }
             Err(mpsc::RecvTimeoutError::Timeout) => continue,
             Err(mpsc::RecvTimeoutError::Disconnected) => {
-                eprintln!("[ci_audio] device_watch: event channel disconnected; returning");
-                return;
+                // The forwarding thread only exits (dropping its sender) when
+                // the watcher handle is gone — in a manual run that means the
+                // listener died underneath us. Fail loudly.
+                panic!(
+                    "device_watch: event channel disconnected mid-run — the watch \
+                     listener/forwarder died before delivering an event"
+                );
             }
         }
     }

@@ -157,11 +157,19 @@ fn backpressure_report_reflects_stalled_consumer() {
     // Explicit buffer size so `estimate_window_span` can attribute a non-zero
     // window span (0ns without it — see rsac-cfe4 evidence). Public setter
     // confirmed: `AudioCaptureBuilder::buffer_size(Option<usize>)`.
+    //
+    // KEEP THIS SMALL: on Linux and Windows `buffer_size` is honored as the
+    // bridge RING SLOT COUNT (`calculate_capacity`, ADR-0007) — the first CI
+    // run used 1024 and built a 1024-slot ring the ~23-buffers/sec producer
+    // could not overflow within the 5s deadline (117 pushed, 0 dropped). An
+    // 8-slot ring fills in well under a second with the consumer stalled,
+    // while still giving `estimate_window_span` a frames-per-buffer value to
+    // attribute a non-zero window.
     let mut capture = match AudioCaptureBuilder::new()
         .with_target(CaptureTarget::SystemDefault)
         .sample_rate(48000)
         .channels(2)
-        .buffer_size(Some(1024))
+        .buffer_size(Some(8))
         .build()
     {
         Ok(c) => c,
@@ -211,21 +219,15 @@ fn backpressure_report_reflects_stalled_consumer() {
 
     // Stall the consumer: NEVER call read_buffer(). Poll the windowed report
     // until drops appear or a 5s deadline (mirrors the overrun poll loop).
+    // NOTE: no monotonicity assertion on pushed/dropped — the report is a
+    // sliding, slot-resetting window (8×128-attempt ring), so tallies may
+    // legitimately DECREASE as old slots roll out. Asserting non-decreasing
+    // values would treat windowed counters like lifetime totals.
     let deadline = Instant::now() + Duration::from_secs(5);
     let mut report = capture.backpressure_report();
-    let mut prev_pushed = report.pushed;
-    let mut prev_dropped = report.dropped;
-    let mut monotonic = true;
     while Instant::now() < deadline {
         std::thread::sleep(Duration::from_millis(250));
         report = capture.backpressure_report();
-        // pushed/dropped should not go backwards across successive reads within
-        // a run (strengthens the windowed-vs-lifetime claim).
-        if report.pushed < prev_pushed || report.dropped < prev_dropped {
-            monotonic = false;
-        }
-        prev_pushed = report.pushed;
-        prev_dropped = report.dropped;
         if report.dropped > 0 {
             break;
         }
@@ -269,11 +271,6 @@ fn backpressure_report_reflects_stalled_consumer() {
             report.window,
             Duration::ZERO,
             "windowed span must be attributed when buffer_size is configured"
-        );
-        assert!(
-            monotonic,
-            "deterministic source: pushed/dropped tallies must be non-decreasing across \
-             successive reads within a run"
         );
         eprintln!("[ci_audio] ✅ backpressure_report reflected the stalled consumer");
     } else if report.dropped == 0 {

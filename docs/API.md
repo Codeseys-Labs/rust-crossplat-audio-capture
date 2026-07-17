@@ -368,9 +368,9 @@ let mut wav = WavFileSink::new("out.wav", &format)?; // feature `sink-wav`; need
 Built-in driver (`drain_to`) — the recommended path:
 
 ```rust
-let format = capture.format().unwrap_or_default();
+capture.start()?;                                  // negotiate the format first
+let format = capture.format().unwrap_or_default(); // Some(_) once started
 let wav = WavFileSink::new("out.wav", &format)?;   // feature `sink-wav`
-capture.start()?;
 let drain = capture.drain_to(wav)?;                // background rsac-drain thread
 std::thread::sleep(std::time::Duration::from_secs(10));
 drain.shutdown();                                  // flush + close + join the thread
@@ -380,8 +380,8 @@ capture.stop()?;
 Manual drain pattern (lower-level, when you own the read cadence):
 
 ```rust
+capture.start()?; // format() is Some(_) only after start negotiates it
 let mut wav = WavFileSink::new("out.wav", &capture.format().unwrap_or_default())?;
-capture.start()?;
 // `read_buffer_blocking()` waits for data instead of returning early on a
 // momentary empty ring (as the non-blocking `read_buffer()` would). It returns
 // an error once the stream is no longer running, ending the drain cleanly.

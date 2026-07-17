@@ -107,18 +107,23 @@ step "header symbol-set diff (curated rsac.h vs generated rsac_generated.h)"
       grep -oE '\brsac_[A-Za-z0-9_]*\(' "$f" | sed -E 's/\($//'
     } | sort -u
   }
-  symbols "$CURATED" > /tmp/rsac-curated-symbols.txt
-  symbols "$GENERATED" > /tmp/rsac-generated-symbols.txt
+  # mktemp (not fixed /tmp names): predictable paths under a shared /tmp are
+  # symlink/TOCTOU-attackable on multi-user machines. Same portable XXXXXX
+  # template rationale as BARE_HEADER above.
+  CURATED_SYMS="$(mktemp "${TMPDIR:-/tmp}/rsac-curated-symbols.XXXXXX")"
+  GENERATED_SYMS="$(mktemp "${TMPDIR:-/tmp}/rsac-generated-symbols.XXXXXX")"
+  trap 'rm -f "$CURATED_SYMS" "$GENERATED_SYMS"' EXIT
+  symbols "$CURATED" > "$CURATED_SYMS"
+  symbols "$GENERATED" > "$GENERATED_SYMS"
   # Guard against an extractor that silently matched nothing (mirrors ci.yml):
   # `diff -u` of two empty files exits 0, so without this a header-format
   # change that breaks the regexes would pass this leg locally while CI fails.
-  if [ ! -s /tmp/rsac-curated-symbols.txt ] || [ ! -s /tmp/rsac-generated-symbols.txt ]; then
+  if [ ! -s "$CURATED_SYMS" ] || [ ! -s "$GENERATED_SYMS" ]; then
     echo "gate-bindings: symbol extraction yielded an empty set — the header format may have changed; fix the extractor here and in ci.yml." >&2
     exit 1
   fi
-  diff -u /tmp/rsac-curated-symbols.txt /tmp/rsac-generated-symbols.txt
+  diff -u "$CURATED_SYMS" "$GENERATED_SYMS"
 ) || { echo "gate-bindings: curated rsac.h has drifted from the generated header's symbol set." >&2; FAILED=1; }
-rm -f /tmp/rsac-curated-symbols.txt /tmp/rsac-generated-symbols.txt
 
 # ── napi leg: build + node --test (needs Bun or npm, from mise) ────────
 step "napi build + node --test"
