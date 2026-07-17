@@ -332,13 +332,41 @@ Run it before pushing (the pre-push hook runs it anyway):
 
 ```bash
 mise run gate        # or: bash scripts/gate.sh   (pwsh scripts/gate.ps1 on Windows)
-#   fmt --check → clippy -D warnings (feat_<host>,compose,cli) → bare-build smoke
-mise run gate:full   # + lib tests, doctests, docsrs cargo doc, module-DAG guard
+#   fmt --check → clippy -D warnings (feat_<host>,compose,cli) → bare-build smoke → docsrs cargo doc
+mise run gate:full     # + lib tests, doctests, module-DAG guard
+mise run gate:bindings # check-bindings CI job replica: rsac-ffi/napi/python check+clippy+test,
+                       #   header drift, napi + python runtime smokes (each leg skips gracefully
+                       #   if its toolchain is missing; `bash scripts/gate-bindings.sh --strict`
+                       #   hard-fails instead)
 mise run test        # just the CI test-job replica for the host OS
 mise run test:audio  # ci_audio integration suite on this machine (all 3 tiers)
 mise run release:bump -- X.Y.Z [--dry-run]  # seven-manifest lockstep bump + CHANGELOG rotation
 mise run release:verify-docs                # post-publish docs.rs spot-check
 ```
+
+`scripts/gate.sh` never touches `bindings/` — it only replicates the root
+`rsac` crate's `lint`/test jobs (rsac-f9c1: the CI failure post-mortem for run
+28762700151 found a napi smoke unhandled-rejection break with no possible
+local catch, because nothing local ran the binding crates at all). Run
+`mise run gate:bindings` before touching `bindings/` — it needs the polyglot
+toolchain (`mise install` provisions Bun/Node/Go/Python; maturin and the
+napi-rs CLI are project-local, installed into a throwaway `.venv-smoke/` and
+`bindings/rsac-napi/node_modules/` respectively, not mise tools).
+
+The docsrs `cargo doc` step (ci.yml's `docs` job replica) moved from
+`gate:full` into the default `gate` in the pre-push path (rsac-af3d): CI run
+28766312002 showed a broken intra-doc link reach `master` because the quick
+pre-push gate never ran `cargo doc`, only `gate:full` did, and lefthook's
+pre-push hook runs the quick gate. Measured on macOS (2026-07-17):
+`RUSTDOCFLAGS="--cfg docsrs -D warnings" cargo doc --no-deps --all-features`
+costs ~35s cold and ~0.6s warm — cheap enough to run on every push once the
+target dir is warm (which it already is, right after the clippy/build steps
+in the same gate run). `--all-features` is required over a
+`--no-default-features --features <host>,compose` alternative: docs.rs itself
+renders with `all-features = true`, and a single-platform feature subset
+would cfg-filter away the other two backends' modules, silently exempting
+their `#[cfg_attr(docsrs, ...)]`-annotated items and intra-doc links from the
+local check entirely (the exact class of bug rsac-af3d closes).
 
 mise is a convenience, not a requirement — every task is a thin alias over
 `scripts/gate.sh`, which runs directly under bash (Git bash on Windows).

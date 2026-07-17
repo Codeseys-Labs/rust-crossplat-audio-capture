@@ -63,8 +63,8 @@ feat_macos = []
 # on target_os like the desktop backends, so enabling them on the wrong OS is
 # inert. Android mic + playback capture and iOS mic + ReplayKit SystemDefault
 # compile-check today, but no mobile runtime path is device-verified yet.
-feat_android = []
-feat_ios = []
+feat_android = ["dep:jni-sys"]
+feat_ios = ["dep:objc2", "dep:objc2-foundation", "dep:block2", "dep:objc2-avf-audio"]
 
 # Default features - enables all platform backends (the two-way target_os
 # gate makes non-matching entries no-ops, so this is safe cross-platform).
@@ -203,20 +203,24 @@ sysinfo = "0.38.4"                  # For process tree discovery (ProcessTree ca
 # compiles an Objective-C file (needs xcrun + an Apple SDK), which breaks the
 # host-independent `cargo check --target aarch64-apple-ios` CI/dev loop. The
 # iOS backend does not use objc2::exception::catch, so nothing is lost.
-objc2 = "0.6"
-objc2-foundation = { version = "0.3", features = [
+# rsac-a96b: these iOS-owned deps are `optional` and tied to `feat_ios` so the
+# `cfg(all(target_os = "ios", feature = "feat_ios"))` double-gate the src/ cfgs
+# already use is complete at the dep-graph level too — a `--no-default-features`
+# iOS build no longer pulls the objc2/AVFAudio stack unless `feat_ios` is on.
+objc2 = { version = "0.6", optional = true }
+objc2-foundation = { version = "0.3", optional = true, features = [
     "NSString", "NSArray", "NSValue",
     "NSAutoreleasePool", "NSObject", "NSError",
     # ReplayKit broadcast ring consumer (rsac-b3aa): App Group container
     # resolution via -[NSFileManager containerURLForSecurityApplicationGroupIdentifier:].
     "NSFileManager", "NSURL",
 ] }
-block2 = "0.6"   # ObjC blocks for the AVAudioEngine input-node tap callback
+block2 = { version = "0.6", optional = true }   # ObjC blocks for the AVAudioEngine input-node tap callback
 # Typed AVFAudio bindings (same objc2 0.6 generation as the macOS block's
 # objc2-app-kit). Features cover exactly the mic-tap surface used by
 # src/audio/ios/avaudio.rs: engine + input node, bus formats, the PCM tap
 # buffer/time types, and the block2 glue for AVAudioNodeTapBlock.
-objc2-avf-audio = { version = "0.3", features = [
+objc2-avf-audio = { version = "0.3", optional = true, features = [
     "AVAudioEngine", "AVAudioNode", "AVAudioIONode", "AVAudioFormat",
     "AVAudioBuffer", "AVAudioTime", "AVAudioTypes", "block2",
 ] }
@@ -232,7 +236,10 @@ objc2-avf-audio = { version = "0.3", features = [
 # misplaced field silently calls the wrong JVM function (UB) — the exact
 # failure class the in-tree-FFI convention exists to avoid, inverted.
 [target.'cfg(target_os = "android")'.dependencies]
-jni-sys = "0.3"
+# rsac-a96b: `optional` + tied to `feat_android` (see the iOS block note) so a
+# `--no-default-features` android build no longer pulls jni-sys unless the
+# feature is enabled — completing the target_os+feature double-gate.
+jni-sys = { version = "0.3", optional = true }
 
 [build-dependencies]
 pkg-config = "0.3.32"

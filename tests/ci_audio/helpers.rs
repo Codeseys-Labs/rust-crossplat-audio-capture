@@ -969,3 +969,72 @@ pub fn find_pipewire_node_for_pid(pid: u32) -> Option<u32> {
     }
     None
 }
+
+/// Best-effort lookup of the PipeWire `application.name` registered for a client
+/// PID, via `pw-dump` (matching `info.props["application.process.id"]`).
+///
+/// Used by the Linux `ApplicationByName` happy-path test: the CI audio player is
+/// either `pw-play` or `paplay` depending on `PULSE_SINK`, so the registered
+/// `application.name` is NOT a fixed literal. Resolving the *actual* node name of
+/// our spawned PID and feeding that to `CaptureTarget::ApplicationByName` both
+/// removes the ambiguity and directly exercises the Linux node-name contract
+/// (`app_name_matches`: exact / basename / `.exe`-stripped, case-insensitive).
+///
+/// For the matched node, returns `props["application.name"]`, falling back to the
+/// basename of `props["application.process.binary"]`. Any failure mode (no
+/// `pw-dump`, non-zero exit, unparseable output, no matching node, no name)
+/// returns `None` — this helper must never panic a test.
+#[cfg(target_os = "linux")]
+pub fn find_pipewire_app_name_for_pid(pid: u32) -> Option<String> {
+    let output = Command::new("pw-dump").output().ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    let parsed: serde_json::Value = serde_json::from_slice(&output.stdout).ok()?;
+    let objects = parsed.as_array()?;
+    for obj in objects {
+        // Only PipeWire node objects can be capture targets.
+        let is_node = obj
+            .get("type")
+            .and_then(|t| t.as_str())
+            .is_some_and(|t| t.ends_with("Node"));
+        if !is_node {
+            continue;
+        }
+        let Some(props) = obj.pointer("/info/props") else {
+            continue;
+        };
+        // pw-dump emits application.process.id as a number on current
+        // versions but has emitted strings historically — accept both.
+        let matches_pid = match props.get("application.process.id") {
+            Some(v) => {
+                v.as_u64() == Some(u64::from(pid))
+                    || v.as_str().is_some_and(|s| s.trim() == pid.to_string())
+            }
+            None => false,
+        };
+        if !matches_pid {
+            continue;
+        }
+        // Prefer the registered application.name; fall back to the basename of
+        // the process binary path (what the resolver's basename rule matches).
+        // Keep scanning on a nameless node: a PID can own several nodes (e.g.
+        // a bare stream node registered before the named client node), so the
+        // first match having no usable name must not end the search.
+        if let Some(name) = props.get("application.name").and_then(|v| v.as_str()) {
+            if !name.is_empty() {
+                return Some(name.to_string());
+            }
+        }
+        if let Some(binary) = props
+            .get("application.process.binary")
+            .and_then(|v| v.as_str())
+        {
+            let basename = binary.rsplit('/').next().unwrap_or(binary);
+            if !basename.is_empty() {
+                return Some(basename.to_string());
+            }
+        }
+    }
+    None
+}

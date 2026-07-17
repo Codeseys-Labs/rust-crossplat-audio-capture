@@ -18,6 +18,12 @@
 //! (a genuinely idle backend may never push enough buffers to overflow) we
 //! soft-skip with a diagnostic.
 
+//! Backpressure coverage (`backpressure_report()`) lives here too: it is the
+//! windowed sibling of `overrun_count()` — same stalled-consumer setup, but it
+//! exposes the bridge's per-window drop ring (pushed/dropped/drop_rate over an
+//! estimated wall-clock span) rather than a lifetime overrun tally. No unit test
+//! feeds those windowed counters from a real OS callback; this module does.
+
 use std::time::{Duration, Instant};
 
 use rsac::{AudioCaptureBuilder, CaptureTarget};
@@ -128,6 +134,155 @@ fn overrun_count_increments_when_consumer_stalls() {
         );
     } else {
         eprintln!("[ci_audio] ✅ overrun_count incremented ({overruns})");
+    }
+}
+
+/// Windowed backpressure: a stalled consumer must drive `backpressure_report()`
+/// to observe drops, a positive `drop_rate`, and (when a `buffer_size` is
+/// configured so the span is attributable) a non-zero `window`.
+///
+/// This is the integration-level novelty over the `api.rs` unit tests: it proves
+/// the bridge's windowed drop ring is fed by a *real* OS callback (unit tests
+/// only inject counts). `estimate_window_span()` returns `Duration::ZERO` unless
+/// a `buffer_size` is set AND a usable sample rate exists, so we set an explicit
+/// buffer size to exercise the non-zero-window path.
+#[test]
+fn backpressure_report_reflects_stalled_consumer() {
+    require_system_capture!();
+
+    // A test tone keeps the producer busy so drops accrue reliably.
+    let wav_path = helpers::generate_test_wav(10.0, 48000, 2);
+    let player = helpers::spawn_test_tone_player(&wav_path);
+
+    // Explicit buffer size so `estimate_window_span` can attribute a non-zero
+    // window span (0ns without it — see rsac-cfe4 evidence). Public setter
+    // confirmed: `AudioCaptureBuilder::buffer_size(Option<usize>)`.
+    //
+    // KEEP THIS SMALL: on Linux and Windows `buffer_size` is honored as the
+    // bridge RING SLOT COUNT (`calculate_capacity`, ADR-0007) — the first CI
+    // run used 1024 and built a 1024-slot ring the ~23-buffers/sec producer
+    // could not overflow within the 5s deadline (117 pushed, 0 dropped). An
+    // 8-slot ring fills in well under a second with the consumer stalled,
+    // while still giving `estimate_window_span` a frames-per-buffer value to
+    // attribute a non-zero window.
+    let mut capture = match AudioCaptureBuilder::new()
+        .with_target(CaptureTarget::SystemDefault)
+        .sample_rate(48000)
+        .channels(2)
+        .buffer_size(Some(8))
+        .build()
+    {
+        Ok(c) => c,
+        Err(e) => {
+            if let Some(p) = player {
+                helpers::stop_player(p);
+            }
+            cleanup(&wav_path);
+            if helpers::deterministic_audio_env() {
+                panic!(
+                    "deterministic source: SystemDefault build failed — the backend must be \
+                     available under RSAC_CI_AUDIO_DETERMINISTIC=1: {:?}",
+                    e
+                );
+            }
+            eprintln!(
+                "[ci_audio] backpressure: build failed (non-deterministic host): {:?}",
+                e
+            );
+            return;
+        }
+    };
+
+    if let Err(e) = capture.start() {
+        if let Some(p) = player {
+            helpers::stop_player(p);
+        }
+        cleanup(&wav_path);
+        if helpers::deterministic_audio_env() {
+            panic!(
+                "deterministic source: SystemDefault start failed — capture must start under \
+                 RSAC_CI_AUDIO_DETERMINISTIC=1: {:?}",
+                e
+            );
+        }
+        eprintln!(
+            "[ci_audio] backpressure: start failed (non-deterministic host): {:?}",
+            e
+        );
+        return;
+    }
+
+    assert!(
+        capture.is_running(),
+        "capture should be running after start"
+    );
+
+    // Stall the consumer: NEVER call read_buffer(). Poll the windowed report
+    // until drops appear or a 5s deadline (mirrors the overrun poll loop).
+    // NOTE: no monotonicity assertion on pushed/dropped — the report is a
+    // sliding, slot-resetting window (8×128-attempt ring), so tallies may
+    // legitimately DECREASE as old slots roll out. Asserting non-decreasing
+    // values would treat windowed counters like lifetime totals.
+    let deadline = Instant::now() + Duration::from_secs(5);
+    let mut report = capture.backpressure_report();
+    while Instant::now() < deadline {
+        std::thread::sleep(Duration::from_millis(250));
+        report = capture.backpressure_report();
+        if report.dropped > 0 {
+            break;
+        }
+    }
+
+    eprintln!(
+        "[ci_audio] backpressure: pushed={}, dropped={}, drop_rate={:.4}, window={:?}, \
+         is_under_backpressure={} (legacy bool, timing-dependent)",
+        report.pushed,
+        report.dropped,
+        report.drop_rate,
+        report.window,
+        report.is_under_backpressure
+    );
+
+    let _ = capture.stop();
+    if let Some(p) = player {
+        helpers::stop_player(p);
+    }
+    cleanup(&wav_path);
+
+    if helpers::deterministic_audio_env() {
+        // Deterministic source: the producer is definitely pushing and we never
+        // drained, so the windowed drop ring MUST show loss.
+        assert!(
+            report.dropped > 0,
+            "deterministic source: backpressure_report().dropped stayed 0 after stalling the \
+             consumer for 5s — the windowed drop ring is not being fed"
+        );
+        assert!(
+            report.drop_rate > 0.0,
+            "deterministic source: drop_rate must be > 0 once buffers are dropped, got {}",
+            report.drop_rate
+        );
+        assert!(
+            report.pushed + report.dropped > 0,
+            "deterministic source: pushed + dropped must be > 0 under an active producer"
+        );
+        // Non-zero window is only assertable because we configured buffer_size.
+        assert_ne!(
+            report.window,
+            Duration::ZERO,
+            "windowed span must be attributed when buffer_size is configured"
+        );
+        eprintln!("[ci_audio] ✅ backpressure_report reflected the stalled consumer");
+    } else if report.dropped == 0 {
+        eprintln!(
+            "[ci_audio] ⚠ backpressure: dropped stayed 0 (non-deterministic host — backend \
+             may be idle / not producing fast enough to overflow)"
+        );
+    } else {
+        eprintln!(
+            "[ci_audio] ✅ backpressure_report observed drops (dropped={}, drop_rate={:.4})",
+            report.dropped, report.drop_rate
+        );
     }
 }
 

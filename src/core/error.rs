@@ -680,9 +680,10 @@ impl AudioError {
             return None;
         };
         Some(match reason.as_str() {
-            REASON_NOT_INITIALIZED | REASON_NO_ACTIVE_STREAM | REASON_CAPTURE_NOT_STARTED => {
-                LifecycleStage::NotInitialized
-            }
+            REASON_NOT_INITIALIZED
+            | REASON_NO_ACTIVE_STREAM
+            | REASON_CAPTURE_NOT_STARTED
+            | REASON_COMPOSITION_NOT_STARTED => LifecycleStage::NotInitialized,
             REASON_NOT_RUNNING => LifecycleStage::NotRunning,
             _ => LifecycleStage::Unknown,
         })
@@ -709,6 +710,12 @@ pub(crate) const REASON_NO_ACTIVE_STREAM: &str =
 /// See [`REASON_NOT_INITIALIZED`].
 pub(crate) const REASON_CAPTURE_NOT_STARTED: &str =
     "Capture not started. Call start() before audio_data_stream().";
+
+/// See [`REASON_NOT_INITIALIZED`]. Compose analogue: a `Composition` handle
+/// whose stream has not been created yet (rsac-90b1). Classifies as
+/// `NotInitialized` — semantically "no stream exists yet".
+pub(crate) const REASON_COMPOSITION_NOT_STARTED: &str =
+    "Composition is not started. Call start() first.";
 
 /// Structured cause of a lifecycle [`AudioError::StreamReadError`]
 /// (rsac-feb4) — see [`AudioError::lifecycle_stage`].
@@ -1244,6 +1251,15 @@ mod tests {
         assert_eq!(
             AudioError::StreamReadError {
                 reason: REASON_CAPTURE_NOT_STARTED.into()
+            }
+            .lifecycle_stage(),
+            Some(LifecycleStage::NotInitialized)
+        );
+        // rsac-90b1: the compose "not started" reason classifies as
+        // NotInitialized (no stream exists yet), not Unknown.
+        assert_eq!(
+            AudioError::StreamReadError {
+                reason: REASON_COMPOSITION_NOT_STARTED.into()
             }
             .lifecycle_stage(),
             Some(LifecycleStage::NotInitialized)

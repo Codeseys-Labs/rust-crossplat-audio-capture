@@ -11,7 +11,8 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use rsac::{
-    get_device_enumerator, AudioCaptureBuilder, CaptureTarget, PlatformCapabilities, ProcessId,
+    get_device_enumerator, list_audio_applications, AudioCaptureBuilder, AudioSource,
+    AudioSourceKind, CaptureTarget, PlatformCapabilities, ProcessId,
 };
 
 // ── CLI definition ───────────────────────────────────────────────────────
@@ -37,6 +38,8 @@ enum Commands {
     Info,
     /// List available audio devices
     List,
+    /// List applications currently producing audio (PID / name / bundle id)
+    ListApps,
     /// Capture audio and show a live level meter
     Capture {
         /// Capture a specific application by name
@@ -85,6 +88,7 @@ fn main() -> Result<()> {
     match cli.command {
         Commands::Info => cmd_info(),
         Commands::List => cmd_list(),
+        Commands::ListApps => cmd_list_apps(),
         Commands::Capture {
             app,
             pid,
@@ -244,6 +248,44 @@ fn cmd_list() -> Result<()> {
     }
 
     Ok(())
+}
+
+/// `rsac list-apps` — list applications currently producing audio.
+fn cmd_list_apps() -> Result<()> {
+    let sources = list_audio_applications().wrap_err("Failed to list audio applications")?;
+    println!("rsac — Audio-Producing Applications");
+    println!("════════════════════════════════════════");
+    let apps = app_rows(&sources);
+    if apps.is_empty() {
+        println!("  No audio-producing applications found");
+        println!("  (or per-application enumeration is unsupported on this platform).");
+        return Ok(());
+    }
+    println!("  {:>8}  {:<28}  BUNDLE ID", "PID", "NAME");
+    for (pid, name, bundle) in apps {
+        println!("  {:>8}  {:<28}  {}", pid, name, bundle.unwrap_or("—"));
+    }
+    Ok(())
+}
+
+/// Extract the printable rows (PID / name / bundle id) from a source list,
+/// keeping only [`AudioSourceKind::Application`] entries.
+///
+/// Factored out as a pure function so it can be unit-tested where the live
+/// enumeration path returns empty (Linux CI). The `_ =>` arm is mandatory:
+/// `AudioSourceKind` is `#[non_exhaustive]`.
+fn app_rows(sources: &[AudioSource]) -> Vec<(u32, &str, Option<&str>)> {
+    sources
+        .iter()
+        .filter_map(|s| match &s.kind {
+            AudioSourceKind::Application {
+                pid,
+                app_name,
+                bundle_id,
+            } => Some((*pid, app_name.as_str(), bundle_id.as_deref())),
+            _ => None,
+        })
+        .collect()
 }
 
 /// `rsac capture` — capture audio and display a live ASCII level meter.
@@ -498,5 +540,59 @@ fn yes_no(b: bool) -> &'static str {
         "yes"
     } else {
         "no"
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn app_rows_keeps_only_applications_and_projects_fields() {
+        let sources = vec![
+            AudioSource {
+                id: "system-default".into(),
+                name: "System Default".into(),
+                kind: AudioSourceKind::SystemDefault,
+            },
+            AudioSource {
+                id: "app:1234".into(),
+                name: "Discord".into(),
+                kind: AudioSourceKind::Application {
+                    pid: 1234,
+                    app_name: "Discord".into(),
+                    bundle_id: Some("com.hnc.Discord".into()),
+                },
+            },
+            AudioSource {
+                id: "app:5678".into(),
+                name: "Terminal".into(),
+                kind: AudioSourceKind::Application {
+                    pid: 5678,
+                    app_name: "Terminal".into(),
+                    bundle_id: None,
+                },
+            },
+        ];
+
+        let rows = app_rows(&sources);
+        assert_eq!(
+            rows,
+            vec![
+                (1234u32, "Discord", Some("com.hnc.Discord")),
+                (5678u32, "Terminal", None),
+            ],
+            "only Application entries survive, projected to (pid, name, bundle)"
+        );
+    }
+
+    #[test]
+    fn app_rows_empty_when_no_applications() {
+        let sources = vec![AudioSource {
+            id: "system-default".into(),
+            name: "System Default".into(),
+            kind: AudioSourceKind::SystemDefault,
+        }];
+        assert!(app_rows(&sources).is_empty());
     }
 }

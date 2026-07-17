@@ -12,7 +12,7 @@ use crate::bridge::state::StreamState;
 use crate::bridge::stream::{BridgeStream, PlatformStream};
 use crate::core::buffer::AudioBuffer;
 use crate::core::config::{AudioFormat, SampleFormat};
-use crate::core::error::{AudioError, AudioResult};
+use crate::core::error::{AudioError, AudioResult, REASON_COMPOSITION_NOT_STARTED};
 use crate::core::interface::CapturingStream;
 
 use super::builder::{
@@ -852,7 +852,7 @@ impl Composition {
         self.stream
             .as_ref()
             .ok_or_else(|| AudioError::StreamReadError {
-                reason: "Composition is not started. Call start() first.".to_string(),
+                reason: REASON_COMPOSITION_NOT_STARTED.to_string(),
             })
     }
 }

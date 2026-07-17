@@ -825,9 +825,14 @@ let mut running = capture!(system, rate: 44100).start()?;
 ## 13. AudioSink — Downstream Consumers
 
 [`AudioSink`](../../src/sink/traits.rs) is the trait for consuming captured
-buffers. It and the bundled sinks **exist** and are exported, but the user wires
-them manually — see the [§16](#16-not-yet-implemented--tracked) note on
-`pipe_to()`.
+buffers. It and the bundled sinks are exported and driven by the built-in
+`drain_to(sink)` background-thread driver. Wire a sink with `drain_to(sink)`
+(`AudioCapture` / `RunningCapture` / `Composition`); the manual read-loop
+pattern remains available as a lower-level alternative.
+
+> **`pipe_to` retired (rsac-2135).** `pipe_to` was the earlier working name for
+> this driver; it shipped as `drain_to` and the `pipe_to` name is retired — a
+> single public name, no alias, no 1.0 deprecation liability.
 
 ```rust
 pub trait AudioSink: Send {                       // Send (not Send + 'static)
@@ -932,13 +937,6 @@ These surfaces were described in earlier drafts of this design but are **not**
 present in the shipped code. They are listed here so the doc neither hides the
 gap nor presents them as available.
 
-- **`AudioCapture::pipe_to()` / library-driven sink wiring — NOT IMPLEMENTED.**
-  There is no `pipe_to` (or `RunningCapture::drain_to`) method on `AudioCapture`.
-  The `AudioSink` trait and `NullSink`/`ChannelSink`/`WavFileSink` exist and are
-  exported, but the consumer must drive them by hand (read in a loop and call
-  `sink.write()`), as shown in [§13](#13-audiosink--downstream-consumers). The
-  crate's own `examples/record_to_file.rs` writes WAV directly rather than
-  through `WavFileSink`. (Critique API-ERG-03.)
 - **`LatencyMode` as a config field — NOT WIRED.** The `LatencyMode` enum exists
   in `core/config.rs` (and is re-exported), but it is never set, read, or
   threaded into `StreamConfig` or the builder. The `core/config.rs` module doc

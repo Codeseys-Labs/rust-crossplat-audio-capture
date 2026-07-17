@@ -213,6 +213,9 @@ jobs:
           cargo test --test ci_audio device_enumeration \
             --no-default-features --features feat_linux,compose \
             -- --test-threads=1 --nocapture 2>&1 | tee -a ci-audio-device.log
+          cargo test --test ci_audio device_watch \
+            --no-default-features --features feat_linux,compose \
+            -- --test-threads=1 --nocapture 2>&1 | tee -a ci-audio-device.log
 
       # ── Process tier ────────────────────────────────────────────────────
       - name: Process capture tier
@@ -225,6 +228,9 @@ jobs:
           cargo test --test ci_audio app_capture \
             --no-default-features --features feat_linux,compose \
             -- --test-threads=1 --nocapture 2>&1 | tee ci-audio-process.log
+          cargo test --test ci_audio application_by_name_linux \
+            --no-default-features --features feat_linux,compose \
+            -- --test-threads=1 --nocapture 2>&1 | tee -a ci-audio-process.log
           cargo test --test ci_audio process_tree_capture \
             --no-default-features --features feat_linux,compose \
             -- --test-threads=1 --nocapture 2>&1 | tee -a ci-audio-process.log

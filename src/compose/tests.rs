@@ -9,7 +9,7 @@ use std::time::Duration;
 
 use crate::core::buffer::AudioBuffer;
 use crate::core::config::{AudioFormat, SampleFormat};
-use crate::core::error::{AudioError, AudioResult};
+use crate::core::error::{AudioError, AudioResult, LifecycleStage};
 use crate::core::interface::CapturingStream;
 
 use super::builder::{CompositionBuilder, Group, GroupLayout};
@@ -1422,10 +1422,16 @@ fn unstarted_composition_reads_error_and_reports_honestly() {
     assert!(!composition.is_running());
     assert!(composition.channel_map().is_none());
     assert!(composition.stats().is_none());
-    assert!(matches!(
-        composition.read_chunk_nonblocking(),
-        Err(AudioError::StreamReadError { .. })
-    ));
+    // rsac-90b1: the read error classifies structurally as NotInitialized —
+    // "no stream exists yet" — via lifecycle_stage(), not just by variant.
+    let read_err = composition
+        .read_chunk_nonblocking()
+        .expect_err("an unstarted composition read must error");
+    assert!(matches!(read_err, AudioError::StreamReadError { .. }));
+    assert_eq!(
+        read_err.lifecycle_stage(),
+        Some(LifecycleStage::NotInitialized)
+    );
     // Push + async delivery modes reject a not-started composition uniformly.
     assert!(matches!(
         composition.subscribe(),

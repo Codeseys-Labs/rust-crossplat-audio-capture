@@ -866,21 +866,11 @@ impl RunningCapture {
     where
         S: crate::sink::AudioSink + 'static,
     {
-        // Presence gate only (rsac-7aa2, same policy as subscribe()): Running
-        // AND the drainable Stopping window are accepted — drain-the-tail. On a
-        // stream already at its fatal terminal the drain thread exits on its
-        // first read and finalizes (flush + close) the sink immediately, which
-        // is the honest outcome of racing a natural end. Read via `&self`
-        // (DerefMut not needed) so we never form a `&mut` alias to the handle —
-        // the drain thread only needs a stream Arc clone.
-        let stream_ref = self
-            .0
-            .stream
-            .as_ref()
-            .ok_or_else(|| AudioError::StreamReadError {
-                reason: REASON_NO_ACTIVE_STREAM.to_string(),
-            })?;
-        spawn_drain_thread(Arc::clone(stream_ref), sink)
+        // Delegate to the inherent AudioCapture::drain_to so the driver (and its
+        // presence-gate + finalization policy) lives in exactly one place and the
+        // two surfaces can never drift. Read via `&self` (DerefMut not needed) so
+        // we never form a `&mut` alias to the handle.
+        self.0.drain_to(sink)
     }
 
     /// Consumes the guard and returns the wrapped [`AudioCapture`], **without**
@@ -1609,6 +1599,42 @@ const _: () = {
 };
 
 impl AudioCapture {
+    /// Drains captured audio into an [`AudioSink`](crate::sink::AudioSink) on a
+    /// dedicated `rsac-drain` background thread, returning a [`DrainHandle`].
+    ///
+    /// This is **the** built-in sink driver for a plain started `AudioCapture`:
+    /// you do not hand-roll a `read_buffer()` loop to feed a `WavFileSink`/
+    /// `ChannelSink`/`NullSink`. It is the same driver exposed on
+    /// [`RunningCapture::drain_to`] and (behind `compose`) `Composition::drain_to`
+    /// — the sink runs on this thread, never the OS RT callback thread (ADR-0001),
+    /// with the shared recoverable-vs-fatal read/write policy and `flush()`+
+    /// `close()` finalization documented on [`RunningCapture::drain_to`].
+    ///
+    /// # Competes with other readers
+    ///
+    /// The drain thread competes with [`read_buffer`](Self::read_buffer),
+    /// [`subscribe`](Self::subscribe), and the callback pump for buffers from the
+    /// same ring (one logical consumer per buffer). **Do not** mix `drain_to` with
+    /// manual reads on the same capture.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`AudioError::StreamReadError`] if the capture has no stream (never
+    /// started, or stopped), or [`AudioError::InternalError`] if the drain thread
+    /// cannot be spawned.
+    pub fn drain_to<S>(&self, sink: S) -> AudioResult<DrainHandle>
+    where
+        S: crate::sink::AudioSink + 'static,
+    {
+        let stream_ref = self
+            .stream
+            .as_ref()
+            .ok_or_else(|| AudioError::StreamReadError {
+                reason: REASON_NO_ACTIVE_STREAM.to_string(),
+            })?;
+        spawn_drain_thread(Arc::clone(stream_ref), sink)
+    }
+
     /// Starts the audio capture stream.
     ///
     /// Creates the underlying OS stream (if not already created) and marks
@@ -5242,5 +5268,68 @@ mod tests {
         assert_eq!(samples.len(), 8, "two 4-sample buffers");
         assert!((samples[0] - 0.25).abs() < 1e-6);
         assert!((samples[7] - (-0.2)).abs() < 1e-6);
+    }
+
+    /// rsac-2135: the new inherent `AudioCapture::drain_to` surface (not via
+    /// `RunningCapture`) round-trips a WAV. Drives the driver from a plain
+    /// started `AudioCapture` — the `&mut start()` path, modelled here by a mock
+    /// stream already present on the handle (as `start()` leaves it).
+    #[cfg(feature = "sink-wav")]
+    #[test]
+    fn audio_capture_drain_to_wav_round_trip_writes_valid_file() {
+        use crate::core::config::AudioFormat;
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("audio_capture_drain_round_trip.wav");
+
+        let mock = Arc::new(MockCapturingStream::new());
+        mock.push_buffer(AudioBuffer::new(vec![0.25, -0.25, 0.5, -0.5], 2, 48000));
+        mock.push_buffer(AudioBuffer::new(vec![0.1, -0.1, 0.2, -0.2], 2, 48000));
+
+        let format = AudioFormat {
+            sample_rate: 48000,
+            channels: 2,
+            sample_format: SampleFormat::F32,
+        };
+        let sink = crate::sink::WavFileSink::new(&path, &format).expect("sink");
+
+        // A plain AudioCapture (NOT wrapped in RunningCapture) — the surface
+        // rsac-2135 adds.
+        let capture: AudioCapture = make_mock_capture(Arc::clone(&mock));
+        let drain = capture.drain_to(sink).expect("drain_to should succeed");
+
+        std::thread::sleep(std::time::Duration::from_millis(20));
+        mock.signal_stop();
+        drain.shutdown(); // joins the thread → file flushed + finalized
+
+        let reader = hound::WavReader::open(&path).expect("valid WAV");
+        let spec = reader.spec();
+        assert_eq!(spec.channels, 2);
+        assert_eq!(spec.sample_rate, 48000);
+        let samples: Vec<f32> = reader.into_samples::<f32>().map(|s| s.unwrap()).collect();
+        assert_eq!(samples.len(), 8, "two 4-sample buffers");
+        assert!((samples[0] - 0.25).abs() < 1e-6);
+        assert!((samples[7] - (-0.2)).abs() < 1e-6);
+    }
+
+    /// rsac-2135: an `AudioCapture` that was never started has no stream, so
+    /// `drain_to` fails the presence gate with a `StreamReadError` that
+    /// classifies as `NotInitialized` via `lifecycle_stage()`.
+    #[test]
+    fn audio_capture_drain_to_without_stream_reports_not_initialized() {
+        let capture = make_capture_without_stream();
+        let sink = crate::sink::NullSink::new();
+        let err = capture
+            .drain_to(sink)
+            .expect_err("drain_to on an unstarted capture must fail the presence gate");
+        assert!(
+            matches!(err, AudioError::StreamReadError { .. }),
+            "expected StreamReadError, got {err:?}"
+        );
+        assert_eq!(
+            err.lifecycle_stage(),
+            Some(LifecycleStage::NotInitialized),
+            "an unstarted capture classifies as NotInitialized"
+        );
     }
 }
