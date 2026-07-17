@@ -198,6 +198,11 @@ they are documented above as part of the in-scope surface:
 - **`rsac::prelude`** — one-import module re-exporting the everyday surface.
 - **`capture!` macro** and **`RunningCapture` RAII** — the one-line build path.
 - **`AudioBuffer` level metering** (`rms`/`peak`/`*_dbfs`/`channel_*`).
+- **Built-in sink driver — shipped.** `drain_to(sink)` pumps the bundled
+  `AudioSink` adapters (`NullSink` / `ChannelSink` / `WavFileSink`) on a
+  background thread from `AudioCapture`, `RunningCapture`, and `Composition`
+  (`compose`) — no hand-rolled read loop. The earlier `pipe_to` name is retired
+  (rsac-2135).
 - **`stream_stats()` / `backpressure_report()`** diagnostics.
 - **`DeviceWatcher` + `watch()`** device-change notifications (all 3 platforms).
 - **Cross-platform `supported_formats()` / `describe()`** — including Linux
@@ -224,13 +229,6 @@ they are documented above as part of the in-scope surface:
 - **Promote or retire the `bridge-zerocopy` `SampleRing` plane** — wire it into
   an interleaved-f32 backend (PipeWire / CoreAudio) and measure, or keep it as
   an opt-in A/B path. (The default path is already alloc-free in steady state.)
-- **`AudioCapture::pipe_to(sink)`** — a built-in driver that pumps the bundled
-  `AudioSink` adapters (`NullSink` / `ChannelSink` / `WavFileSink`) without a
-  hand-rolled read loop. Partially closed: `RunningCapture::drain_to(sink)` and
-  the `compose` feature's `Composition::drain_to(sink)` are exactly this driver
-  (background thread, recoverable-vs-fatal policy, flush/close finalization);
-  what remains is exposing it on a plain started `AudioCapture` and settling
-  the `pipe_to` naming.
 
 Each of these is tracked on `Codeseys-Labs/rust-crossplat-audio-capture` and/or
 in [`docs/reviews/`](docs/reviews/).

@@ -20,6 +20,17 @@ Releases with no ABI change omit the subsection (or state "No C ABI changes").
 
 ### Added
 
+- `rsac list-apps` CLI subcommand — prints PID / name / bundle-id for
+  applications currently producing audio via `list_audio_applications()`
+  (`cli` feature; demo binary only, no library API change; rsac-86ee).
+- `AudioCapture::drain_to(sink)` — the built-in background-thread sink driver,
+  previously only on `RunningCapture`/`Composition`, is now available on a
+  plain started `AudioCapture` too. Same `rsac-drain` thread, presence gate,
+  recoverable-vs-fatal policy, and `flush()`+`close()` finalization; the
+  `RunningCapture` method now delegates to it so the driver lives in one place.
+  Additive — `cargo-semver-checks` reports `minor`. The earlier `pipe_to` name
+  for this driver is retired: `drain_to` is the single shipped name across all
+  three surfaces (rsac-2135).
 - `AudioError::lifecycle_stage()` — a structured accessor that classifies a
   lifecycle-cause `StreamReadError` into a new `#[non_exhaustive]`
   `LifecycleStage` enum (`NotInitialized`, `NotRunning`, `Unknown`), so
@@ -30,6 +41,17 @@ Releases with no ABI change omit the subsection (or state "No C ABI changes").
 
 ### Changed
 
+- Mobile backend deps (`jni-sys`; `objc2-avf-audio`/`block2`/`objc2`/
+  `objc2-foundation` on iOS) are now `optional` and tied to `feat_android`/
+  `feat_ios`, completing the `cfg(all(target_os, feature))` double-gate the
+  `src/` cfgs already use — a `--no-default-features` build for the mobile
+  triples no longer pulls backend deps unless the matching feature is enabled
+  (rsac-a96b, CodeRabbit PR #36). Default build is unchanged (both features are
+  in `default`).
+- The compose "Composition is not started" `StreamReadError` now routes through
+  a canonical `REASON_*` constant (`REASON_COMPOSITION_NOT_STARTED`), so
+  `AudioError::lifecycle_stage()` classifies it as `NotInitialized` instead of
+  `Unknown` (rsac-90b1). Message text is byte-identical; no error-shape change.
 - CoreAudio tap-creation/introspection errors (`CoreAudioProcessTap::new`,
   `new_tree`, `new_system`, `get_stream_format`) now report their real
   `operation` label (`"process_tap"`, `"process_tap_tree"`, `"system_tap"`,

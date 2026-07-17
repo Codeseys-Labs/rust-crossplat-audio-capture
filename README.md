@@ -64,7 +64,7 @@ Each cell is a separate CI job visible in the [Actions tab](https://github.com/C
 - **Device introspection** — `AudioDevice::describe()` → `DeviceInfo` and `supported_formats()` on all three backends
 - **Overflow monitoring** (`overrun_count()` tracks dropped buffers)
 - **Backpressure signaling** (`is_under_backpressure()` on the `CapturingStream` trait — returns `true` when sustained consecutive frame drops indicate the consumer cannot keep up; use to throttle, warn, or switch providers)
-- **Sink adapters** — `NullSink`, `ChannelSink`, `WavFileSink` (note: the `pipe_to()` driver is not yet implemented — drive sinks from your own read/subscribe loop, or use `drain_to()`)
+- **Sink adapters** — `NullSink`, `ChannelSink`, `WavFileSink` — drive them with `drain_to(sink)`, the built-in background-thread driver on `AudioCapture`, `RunningCapture`, and (with `compose`) `Composition`; or feed them from your own read/subscribe loop.
 - **Multi-source channel composition** (opt-in `compose` feature) — group captures into one multi-channel stream: per-group Mono/Stereo mixdown with per-source gain, or native-channel passthrough; transparent `rubato` resampling to the session rate; master-clock alignment with silence-padding/trim counters ([ADR-0011](docs/designs/0011-compose-feature.md))
 - **Platform capability reporting** — `PlatformCapabilities::query()` for honest feature detection
 - **Language bindings at parity** — C/Go, Python (PyO3, single `cp39-abi3` wheel), and Node (napi), all exposing metering, `stream_stats`, format query, string targets, and idiomatic context managers / RAII

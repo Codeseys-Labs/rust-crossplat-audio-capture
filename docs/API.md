@@ -344,9 +344,14 @@ end-of-stream signal (see [ADR-0003](designs/0003-terminal-stream-error.md)).
 
 ## Sinks
 
-The `AudioSink` trait and the bundled sinks exist and are exported, but the
-consumer wires them manually — there is **no** `AudioCapture::pipe_to()` (see the
-[`API_DESIGN.md` tracked-items list](architecture/API_DESIGN.md#16-not-yet-implemented--tracked)).
+The `AudioSink` trait and the bundled sinks are exported and driven by
+`drain_to(sink)` — the built-in background-thread driver available on
+`AudioCapture`, `RunningCapture`, and (behind `compose`) `Composition`. It
+spawns an `rsac-drain` thread that owns the sink and pumps buffers off the same
+ring the manual reads use, applying the recoverable-vs-fatal read/write policy
+and finalizing with `flush()` + `close()` (the sink never runs on the OS RT
+callback thread — ADR-0001). The lower-level manual-drain loop below remains
+available when you want to own the read cadence yourself.
 
 ```rust
 pub trait AudioSink: Send {
@@ -360,7 +365,19 @@ let (sink, rx) = ChannelSink::new();               // returns BOTH sink and rece
 let mut wav = WavFileSink::new("out.wav", &format)?; // feature `sink-wav`; needs the format
 ```
 
-Manual drain pattern:
+Built-in driver (`drain_to`) — the recommended path:
+
+```rust
+let format = capture.format().unwrap_or_default();
+let wav = WavFileSink::new("out.wav", &format)?;   // feature `sink-wav`
+capture.start()?;
+let drain = capture.drain_to(wav)?;                // background rsac-drain thread
+std::thread::sleep(std::time::Duration::from_secs(10));
+drain.shutdown();                                  // flush + close + join the thread
+capture.stop()?;
+```
+
+Manual drain pattern (lower-level, when you own the read cadence):
 
 ```rust
 let mut wav = WavFileSink::new("out.wav", &capture.format().unwrap_or_default())?;
