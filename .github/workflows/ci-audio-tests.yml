@@ -8,9 +8,10 @@ name: Audio Integration Tests
 # checkout + toolchain + cache + audio bootstrap + compile. This replaced the
 # former 3-OS x 3-tier (9-job) matrix, which recompiled the ci_audio binary and
 # re-ran the ~90-line PipeWire bootstrap once per tier. Per-tier pass/fail is
-# preserved: each tier is a `continue-on-error` step whose outcome is exported
-# as a job output, so a failing tier never stops the others and the `summary`
-# job below is the single gate.
+# exported as a job output (`tier_system`/`tier_device`/`tier_process`) so the
+# `summary` job below can report per-tier results even though (rsac-fba6) the
+# tiers now hard-fail the job on the first failing tier, same as every other
+# platform.
 #
 # Platform status:
 #   ✅ Linux (PipeWire)  — PRIMARY lifecycle/API tier on Blacksmith. The job
@@ -27,12 +28,17 @@ name: Audio Integration Tests
 #                           hard-verifies VB-CABLE as the default playback
 #                           endpoint, which every tier's tone route flows
 #                           through (rsac-0f33).
-#   ⏳ macOS (CoreAudio) — advisory on managed CI. Process Tap based system,
-#                           application, and process-tree capture require
-#                           kTCCServiceAudioCapture, which cannot be granted
-#                           non-interactively on Blacksmith/GitHub-hosted runners.
-#                           Full capture validation still requires real hardware
-#                           or a self-hosted, pre-consented macOS runner.
+#   ⏳ macOS (CoreAudio) — gated on managed CI (rsac-fba6). Process Tap based
+#                           system, application, and process-tree capture
+#                           require kTCCServiceAudioCapture, which cannot be
+#                           granted non-interactively on Blacksmith/GitHub-hosted
+#                           runners, so those code paths skip-early via
+#                           require_*!() gates rather than exercising real
+#                           capture — but a panic/build break in any tier now
+#                           fails the job AND the summary gate, same as Linux
+#                           and Windows. Full capture validation still requires
+#                           real hardware or a self-hosted, pre-consented macOS
+#                           runner.
 # =============================================================================
 
 on:
@@ -480,13 +486,13 @@ jobs:
   #
   # Process Tap capture (system/application/process-tree) needs
   # kTCCServiceAudioCapture, which cannot be granted non-interactively on
-  # managed runners, so tests skip-early via the require_*!() gates. All three
-  # tier steps are continue-on-error (mirroring the former macos-system /
-  # macos-process job-level continue-on-error), so the whole tier suite runs and
-  # the summary job never gates on macOS. The former macos-device job had NO
-  # continue-on-error — its hardness is preserved by the "macOS device gate"
-  # step below, which re-fails THIS job (still advisory / non-gating in the
-  # summary) if the device tier failed, keeping the same red/green signal.
+  # managed runners, so tests skip-early via the require_*!() gates — a
+  # graceful skip returns Ok/ignored, not a hard test failure. rsac-fba6: all
+  # three tiers used to be continue-on-error (so the whole tier suite ran
+  # regardless of outcome, and macOS was excluded from the summary gate below).
+  # That masked real panics/build breaks behind the TCC-skip rationale. Tiers
+  # now hard-fail like every other platform's tiers; the summary job gates on
+  # macOS too (2 green runs observed pre-change: 29564636523, 29564289847).
   # ===========================================================================
   macos-audio:
     name: "macOS Audio (system+device+process)"
@@ -495,6 +501,17 @@ jobs:
     # (system 15 / device 10 / process 20 — matching the former per-tier jobs),
     # and every cargo invocation is additionally bounded by gtimeout.
     timeout-minutes: 55
+    # `bash` keyword shell (`-eo pipefail`), mirroring linux-audio: without it
+    # the steps run under GitHub's default `bash -e` (NO pipefail), so a
+    # `cargo test … | tee log` pipe reports tee's exit 0 and MASKS a real test
+    # panic/build break — which would silently defeat this job's summary gate
+    # (rsac-fba6 makes macOS gating). pipefail makes genuine failures propagate;
+    # the device tier below explicitly tolerates the one KNOWN environmental
+    # hang (AUHAL `.start()` on BlackHole, killed by gtimeout) so pipefail does
+    # not turn that documented timeout into a spurious RED.
+    defaults:
+      run:
+        shell: bash
     outputs:
       tier_system: ${{ steps.record.outputs.tier_system }}
       tier_device: ${{ steps.record.outputs.tier_device }}
@@ -533,7 +550,6 @@ jobs:
       # stream_lifecycle are TCC-free and run normally.
       - name: System capture tier (skip-early without TCC)
         id: tier_system
-        continue-on-error: true
         timeout-minutes: 15
         env:
           RSAC_TEST_CAPTURE_TIMEOUT_SECS: "15"
@@ -563,19 +579,46 @@ jobs:
       # and `gtimeout 120` caps the hang.
       - name: Device capture tier
         id: tier_device
-        continue-on-error: true
         timeout-minutes: 10
         env:
           RSAC_TEST_CAPTURE_TIMEOUT_SECS: "15"
         run: |
+          # device_capture drives a real `.start()` on the BlackHole input
+          # device (supports_device_selection=true on macOS, so the
+          # require_device_selection!() gate does NOT skip). On a headless
+          # managed runner that AUHAL start hangs until `gtimeout` kills it at
+          # the 120s boundary (observed: runs 29564636523 / 29564289847). Under
+          # the job's `-eo pipefail` shell that gtimeout kill (124/137/143)
+          # would otherwise abort the step and — now that macOS is a summary
+          # gate — flip every PR red. So tolerate ONLY the gtimeout kill codes
+          # here via PIPESTATUS; a genuine test failure/panic (any other
+          # non-zero) still propagates and fails the tier.
+          set +e
           gtimeout --preserve-status 120 \
             cargo test --test ci_audio device_capture \
             --no-default-features --features feat_macos \
             -- --test-threads=1 --nocapture 2>&1 | tee ci-audio-device.log
+          rc=${PIPESTATUS[0]}
+          set -e
+          case "$rc" in
+            0) ;;
+            124|137|143)
+              echo "::notice::device_capture hit the documented gtimeout kill (rc=$rc) — tolerated (AUHAL .start() hang on headless BlackHole).";;
+            *)
+              echo "::error::device_capture failed with exit $rc (not a gtimeout kill) — real regression."
+              exit "$rc";;
+          esac
           gtimeout --preserve-status 60 \
             cargo test --test ci_audio device_enumeration \
             --no-default-features --features feat_macos \
             -- --test-threads=1 --nocapture 2>&1 | tee -a ci-audio-device.log
+          # rsac-fba6 rider: mirrors windows-audio's device tier (~L383-386) —
+          # RSAC_CI_AUDIO_AVAILABLE=1 (exported above when BlackHole provides an
+          # output device) gives this real teeth here too.
+          gtimeout --preserve-status 60 \
+            cargo test --test enumeration_matrix \
+            --no-default-features --features feat_macos \
+            -- --nocapture 2>&1 | tee -a ci-audio-device.log
 
       - name: Generate test WAV file (process tier)
         run: |
@@ -593,7 +636,6 @@ jobs:
       # `gtimeout` remains the hard safety net.
       - name: Process capture tier
         id: tier_process
-        continue-on-error: true
         timeout-minutes: 20
         env:
           RSAC_TEST_CAPTURE_TIMEOUT_SECS: "15"
@@ -629,17 +671,6 @@ jobs:
             echo "tier_process=${{ steps.tier_process.outcome }}"
           } >> "$GITHUB_OUTPUT"
 
-      # Preserve the former macos-device job's hardness (it had NO
-      # continue-on-error) WITHOUT letting a device failure abort the other
-      # tiers: run all three tiers tolerantly above, then re-fail the job here
-      # iff the device tier failed. macOS stays excluded from the summary gate,
-      # so this only affects THIS job's red/green visibility (same as before).
-      - name: macOS device gate (device tier was hard-gated pre-consolidation)
-        if: ${{ steps.tier_device.outcome == 'failure' }}
-        run: |
-          echo "macOS device tier failed — failing the macOS audio job (advisory; not part of the summary gate)."
-          exit 1
-
       - name: Diagnostics on failure
         if: ${{ failure() || steps.tier_system.outcome == 'failure' || steps.tier_device.outcome == 'failure' || steps.tier_process.outcome == 'failure' }}
         run: |
@@ -657,10 +688,12 @@ jobs:
           if-no-files-found: ignore
 
   # =============================================================================
-  # Summary — the single gate. Fails if any Linux OR Windows (first-class) tier
-  # failed, or if a first-class job's setup failed. macOS stays advisory (TCC
-  # cannot be granted on managed runners — see the per-job rsac#26 notes) and is
-  # reported for information only.
+  # Summary — the single gate. Fails if any Linux, Windows, or macOS
+  # (first-class-lite) tier failed, or if a job's setup failed. rsac-fba6:
+  # macOS used to be excluded here because kTCCServiceAudioCapture cannot be
+  # granted on a managed runner — but its require_*!() skip-early gates mean a
+  # tier failure here is a real panic/build break, not a TCC limitation, so it
+  # now folds into the same gate the Windows block uses.
   # =============================================================================
 
   summary:
@@ -744,7 +777,7 @@ jobs:
           echo "  Device Capture:  ${WINDOWS_DEVICE:-n/a}"
           echo "  Process Capture: ${WINDOWS_PROCESS:-n/a}"
           echo ""
-          echo "macOS (BlackHole, advisory — job=${MACOS_RESULT}):"
+          echo "macOS (BlackHole, gated — job=${MACOS_RESULT}):"
           echo "  System Capture:  ${MACOS_SYSTEM:-n/a}"
           echo "  Device Capture:  ${MACOS_DEVICE:-n/a}"
           echo "  Process Capture: ${MACOS_PROCESS:-n/a}"
@@ -786,16 +819,30 @@ jobs:
             done
           fi
 
-          # macOS is intentionally excluded from the gate: kTCCServiceAudioCapture
-          # cannot be granted on a managed runner, so its capture tiers skip-early
-          # / run tolerantly. macOS is validated on real hardware (rsac#26).
+          # macOS is now first-class-lite: job setup failures / tier failures
+          # gate, but 'skipped' (e.g. path-filter exclusion) is tolerated —
+          # mirrors the Windows block above.
+          if [ "${MACOS_RESULT}" = "skipped" ]; then
+            echo "macOS audio job skipped (path filter) — allowed."
+          elif [ "${MACOS_RESULT}" != "success" ]; then
+            echo "FAILED: macOS audio job result '${MACOS_RESULT}' (setup/infra failure or a gated tier failed)"
+            FAILED=1
+          else
+            for pair in "system:${MACOS_SYSTEM}" "device:${MACOS_DEVICE}" "process:${MACOS_PROCESS}"; do
+              name="${pair%%:*}"; res="${pair#*:}"
+              if [ "$res" != "success" ] && [ "$res" != "skipped" ]; then
+                echo "FAILED: macOS $name tier returned '${res:-<empty>}'"
+                FAILED=1
+              fi
+            done
+          fi
 
           if [ "$FAILED" -eq 1 ]; then
             echo ""
-            echo "Linux + Windows are first-class platforms — failures must be investigated."
+            echo "Linux + Windows + macOS are gated platforms — failures must be investigated."
             exit 1
           else
-            echo "All Linux + Windows (first-class) tiers passed."
+            echo "All Linux + Windows + macOS tiers passed."
           fi
 
       - name: Upload CI gap report seed

@@ -495,6 +495,19 @@ durable, searchable backlog; PR threads are ephemeral.
 Reply to the originating comment in every case so the reviewer (and the bot) can
 see the outcome and resolve the thread.
 
+### CHANGELOG discipline — every src/ or bindings/ PR must touch [Unreleased]
+
+The 0.4.1 release shipped incomplete notes because PRs #41-#49 fixed real code
+but never touched `CHANGELOG.md`'s `[Unreleased]` section — caught only by a
+manual post-release audit (rsac-7437). A CI job (`changelog-guard` in
+[`ci.yml`](.github/workflows/ci.yml)) now fails any PR that touches `src/` or
+`bindings/` without a corresponding `[Unreleased]` edit. If the change has no
+user-facing effect (test-only, CI-only, an internal refactor), apply the
+`changelog-not-needed` label instead of adding a hollow entry. Release-stacking
+layer PRs (see below) should default to this label per-layer, with the actual
+`[Unreleased]` entry written once at release-prepare time — labeling every
+layer avoids ~N false failures for a single real release note.
+
 ### Stacked pull requests — split big changes along the DAG
 
 A change that layers along the module DAG (`core → bridge → audio → api → lib`)
