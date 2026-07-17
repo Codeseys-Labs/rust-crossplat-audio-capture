@@ -258,6 +258,65 @@ func ExampleListDevices() {
 	}
 }
 
+// ExampleComposition demonstrates multi-source channel composition: build a
+// composition from named groups of capture sources, start it, and read composed
+// buffers. The composition mixes each group down according to its layout and
+// appends the groups' channels into one interleaved stream.
+func ExampleComposition() {
+	// A "voice" group folding two app sources to mono, plus a "system" group
+	// keeping the system mix's native channels.
+	voice, err := rsac.NewGroup("voice")
+	if err != nil {
+		fmt.Printf("group error: %v\n", err)
+		return
+	}
+	_ = voice.SetLayout(rsac.LayoutMono)
+	_ = voice.AddSource("name:Discord")
+	_ = voice.AddSourceWithGain("name:Zoom", 0.8)
+
+	system, err := rsac.NewGroup("system")
+	if err != nil {
+		fmt.Printf("group error: %v\n", err)
+		return
+	}
+	_ = system.SetLayout(rsac.LayoutStereo)
+	_ = system.AddSource("system")
+
+	builder, err := rsac.NewCompositionBuilder()
+	if err != nil {
+		fmt.Printf("builder error: %v\n", err)
+		return
+	}
+	_ = builder.SetSampleRate(48000)
+	if err := builder.AddGroup(voice); err != nil {
+		fmt.Printf("add voice: %v\n", err)
+		return
+	}
+	if err := builder.AddGroup(system); err != nil {
+		fmt.Printf("add system: %v\n", err)
+		return
+	}
+
+	comp, err := builder.Build()
+	if err != nil {
+		fmt.Printf("build error: %v\n", err)
+		return
+	}
+	defer comp.Close()
+
+	if err := comp.Start(); err != nil {
+		fmt.Printf("start error: %v\n", err)
+		return
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+
+	for buf := range comp.Stream(ctx) {
+		fmt.Printf("%d frames, %d composed channels\n", buf.NumFrames(), buf.Channels())
+	}
+}
+
 // ExampleDefaultDevice shows how to get the default device.
 func ExampleDefaultDevice() {
 	dev, err := rsac.DefaultDevice(rsac.DeviceOutput)

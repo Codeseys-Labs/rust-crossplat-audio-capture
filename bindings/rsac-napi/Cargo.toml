@@ -23,20 +23,28 @@ serde_json = "1"
 # exactly the one backend matching the host platform and never pulls the other
 # two backends' OS-only system deps. Mirrors bindings/rsac-python. (rsac-e8a3 —
 # previously this crate depended on rsac with all default backends.)
+# `compose` (multi-source channel composition, ADR-0011) is enabled
+# unconditionally per-target so the compiled addon always carries the
+# Composition/CompositionBuilder/Group classes (parity with Python and with how
+# backends are always-on per platform). CI's bare `cargo check -p rsac-napi` +
+# `npm run build` + `node --test` then always exercise the compose surface. The
+# per-target `default-features = false` tables are the right place for this
+# (rsac-2938: node feature selection uses root defaults per-target), so adding
+# `compose` here does not collide with root default resolution (rsac-fba7).
 [target.'cfg(windows)'.dependencies.rsac]
 path = "../.."
 default-features = false
-features = ["feat_windows"]
+features = ["feat_windows", "compose"]
 
 [target.'cfg(target_os = "linux")'.dependencies.rsac]
 path = "../.."
 default-features = false
-features = ["feat_linux"]
+features = ["feat_linux", "compose"]
 
 [target.'cfg(target_os = "macos")'.dependencies.rsac]
 path = "../.."
 default-features = false
-features = ["feat_macos"]
+features = ["feat_macos", "compose"]
 
 [build-dependencies]
 napi-build = "2"

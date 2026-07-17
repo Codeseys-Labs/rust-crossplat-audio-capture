@@ -446,6 +446,203 @@ class AudioCapture:
     def __del__(self) -> None: ...
     def __repr__(self) -> str: ...
 
+# ── Composition (multi-source channel composition, ADR-0011) ───────────────
+
+class Group:
+    """A composition group: a named set of capture sources sharing a mixdown layout.
+
+    Built up with :meth:`source` / :meth:`source_with_gain` and a layout, then
+    handed to :meth:`CompositionBuilder.add_group`.
+    """
+
+    def __init__(self, name: str) -> None: ...
+
+    def source(self, spec: str) -> None:
+        """Add a capture source with unit gain (1.0).
+
+        ``spec`` uses the canonical target grammar (``"system"``,
+        ``"device:<id>"``, ``"app:<id>"``, ``"name:<n>"``, ``"tree:<pid>"``).
+
+        Raises:
+            ConfigurationError: If ``spec`` is not a valid target string.
+        """
+        ...
+
+    def source_with_gain(self, spec: str, gain: float) -> None:
+        """Add a capture source with an explicit linear mixdown gain (1.0 = unity).
+
+        Raises:
+            ConfigurationError: If ``spec`` is invalid or ``gain`` is not finite
+                and >= 0.
+        """
+        ...
+
+    def mixdown_mono(self) -> None:
+        """Fold every source to mono and sum into one output channel."""
+        ...
+
+    def mixdown_stereo(self) -> None:
+        """Fold every source to stereo and sum into two output channels."""
+        ...
+
+    def keep_channels(self) -> None:
+        """Pass the group's single source through with its native channel count."""
+        ...
+
+    def __repr__(self) -> str: ...
+
+class CompositionBuilder:
+    """Builder for a multi-source :class:`Composition` (ADR-0011)."""
+
+    def __init__(
+        self,
+        sample_rate: int = 48000,
+        clamp_output: bool = False,
+        quantum_ms: int = 10,
+        stall_timeout_ms: int = 250,
+        max_buffer_ms: int = 1000,
+    ) -> None: ...
+
+    def add_group(self, group: Group) -> None:
+        """Append a group (cloned into the builder)."""
+        ...
+
+    def preflight(self) -> None:
+        """Run every device-independent validation :meth:`build` performs.
+
+        Raises:
+            ConfigurationError / RsacError: On an invalid configuration.
+        """
+        ...
+
+    def build(self) -> Composition:
+        """Validate and build a (not-yet-started) :class:`Composition`.
+
+        Raises:
+            ConfigurationError / RsacError: See :meth:`preflight`.
+        """
+        ...
+
+class CompositionStats:
+    """A point-in-time snapshot of a running composition's counters."""
+
+    @property
+    def ticks(self) -> int: ...
+
+    @property
+    def fallback_ticks(self) -> int: ...
+
+    @property
+    def num_sources(self) -> int: ...
+
+    def __repr__(self) -> str: ...
+
+class SourceStats:
+    """A point-in-time snapshot of one composed source's counters."""
+
+    @property
+    def group(self) -> str: ...
+
+    @property
+    def target(self) -> str: ...
+
+    @property
+    def buffers_received(self) -> int: ...
+
+    @property
+    def padded_frames(self) -> int: ...
+
+    @property
+    def trimmed_frames(self) -> int: ...
+
+    @property
+    def gap_padded_frames(self) -> int: ...
+
+    @property
+    def inner_dropped(self) -> int: ...
+
+    @property
+    def resampling(self) -> bool: ...
+
+    @property
+    def ended(self) -> bool: ...
+
+    def __repr__(self) -> str: ...
+
+class Composition:
+    """A multi-source composed capture session (ADR-0011).
+
+    Created by :meth:`CompositionBuilder.build`; inert until :meth:`start`.
+    Supports the synchronous and asynchronous context-manager protocols plus the
+    iterator protocol, with terminal-observable reads.
+
+    An explicit :meth:`stop` / :meth:`close` discards the buffered composed tail;
+    read until the terminal error before stopping to capture everything (the
+    natural end drains the tail first).
+    """
+
+    def start(self) -> None:
+        """Start the composition (build + start one capture per source)."""
+        ...
+
+    def stop(self) -> None:
+        """Signal + join the compositor thread. Discards the buffered tail."""
+        ...
+
+    @property
+    def is_running(self) -> bool: ...
+
+    def try_read(self) -> Optional[AudioBuffer]:
+        """Read the next composed buffer (non-blocking), or None if none ready."""
+        ...
+
+    def read(self) -> AudioBuffer:
+        """Read the next composed buffer (blocking; terminal-observable)."""
+        ...
+
+    @property
+    def overrun_count(self) -> int:
+        """Composed-ring overruns (0 before start)."""
+        ...
+
+    @property
+    def channel_count(self) -> int:
+        """Number of composed output channels (0 before a successful start)."""
+        ...
+
+    def channel_group(self, channel: int) -> Optional[str]:
+        """Group name producing composed output channel ``channel``, or None."""
+        ...
+
+    def channel_in_group(self, channel: int) -> Optional[int]:
+        """Index of ``channel`` within its group, or None."""
+        ...
+
+    def stats(self) -> Optional[CompositionStats]:
+        """Point-in-time composition counters, or None if not started."""
+        ...
+
+    def source_stats(self, index: int) -> Optional[SourceStats]:
+        """Per-source counters for the source at ``index``, or None."""
+        ...
+
+    def subscriber_dropped_count(self) -> int:
+        """Composed buffers dropped by subscribe pumps (0 before start)."""
+        ...
+
+    def close(self) -> None:
+        """Close the composition and release all resources."""
+        ...
+
+    def __enter__(self) -> Composition: ...
+    def __exit__(self, exc_type: type | None, exc_val: BaseException | None, exc_tb: object | None) -> bool: ...
+    def __aenter__(self) -> Awaitable[Composition]: ...
+    def __aexit__(self, exc_type: type | None, exc_val: BaseException | None, exc_tb: object | None) -> Awaitable[None]: ...
+    def __iter__(self) -> Iterator[AudioBuffer]: ...
+    def __next__(self) -> AudioBuffer: ...
+    def __del__(self) -> None: ...
+    def __repr__(self) -> str: ...
+
 # ── Module-level functions ────────────────────────────────────────────────
 
 def list_devices() -> list[AudioDevice]:

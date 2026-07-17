@@ -32,6 +32,12 @@ from rsac._rsac import (
     CaptureTarget,
     PlatformCapabilities,
     StreamStats,
+    # Composition (multi-source channel composition, ADR-0011)
+    Group,
+    CompositionBuilder,
+    Composition,
+    CompositionStats,
+    SourceStats,
     # Module-level functions
     list_devices,
     platform_capabilities,
@@ -59,6 +65,12 @@ __all__ = [
     "CaptureTarget",
     "PlatformCapabilities",
     "StreamStats",
+    # Composition (multi-source channel composition, ADR-0011)
+    "Group",
+    "CompositionBuilder",
+    "Composition",
+    "CompositionStats",
+    "SourceStats",
     # Module-level functions
     "list_devices",
     "platform_capabilities",

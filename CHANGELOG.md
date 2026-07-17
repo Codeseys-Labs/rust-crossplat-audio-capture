@@ -20,6 +20,29 @@ Releases with no ABI change omit the subsection (or state "No C ABI changes").
 
 ### Added
 
+- **Bindings (Node/napi):** `Composition`, `CompositionBuilder`, `Group` classes
+  exposing multi-source channel composition (ADR-0011) — the same
+  `Arc<RwLock<>>` + pump topology and stop-vs-parked-read fix as `AudioCapture`
+  (rsac-8082), `onData`/`onEnd` push delivery, sync + async terminal-observable
+  reads, hand-maintained `index.d.ts` types (`CompositionStats` / `SourceStats`,
+  the full Rust set including `gapPaddedFrames` / `innerDropped`). The `compose`
+  cargo feature is now enabled unconditionally in the compiled addon (rsac-fba7).
+- **Bindings (Python):** `Composition`, `CompositionBuilder`, `Group` classes
+  exposing multi-source channel composition (ADR-0011) — synchronous and
+  asynchronous context-manager + iterator protocols, terminal-observable reads,
+  and per-source stats (`CompositionStats` / `SourceStats`, the full Rust set
+  including `gap_padded_frames` / `inner_dropped`). Teardown reuses
+  `AudioCapture`'s GIL-released two-phase lock discipline (rsac-8082). The
+  `compose` cargo feature is now enabled unconditionally in the Python wheel
+  (rsac-fba7).
+- **Bindings (Go):** `Composition` / `CompositionBuilder` / `Group` cgo wrappers
+  over the `rsac_composition_*` / `rsac_group_*` C FFI, exposing multi-source
+  channel composition (ADR-0011) — mutex-guarded lifecycle with the same
+  in-flight-read drain barrier and `request_stop`-unblock teardown as
+  `AudioCapture`, channel-based `Stream`/`StreamWithErrors`, and per-source
+  stats. `librsac_ffi.a` for the Go bindings is now built with
+  `--features compose` (`FFI_FEATURES += compose`) so the compose symbols are
+  exported (rsac-fba7).
 - `rsac list-apps` CLI subcommand — prints PID / name / bundle-id for
   applications currently producing audio via `list_audio_applications()`
   (`cli` feature; demo binary only, no library API change; rsac-86ee).

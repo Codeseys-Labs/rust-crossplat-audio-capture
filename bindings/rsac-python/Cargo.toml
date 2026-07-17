@@ -27,17 +27,23 @@ pyo3 = { version = "0.24", features = ["extension-module", "abi3-py39"] }
 # platform, with `default-features = false` so the other two backends (and their
 # OS-only system deps) are never pulled in. This lets `rsac-python` build on all
 # three platforms. (Mirrors the per-target backend selection rsac itself uses.)
+# `compose` (multi-source channel composition, ADR-0011) is enabled
+# unconditionally per-target so the Python wheel always carries the composition
+# classes (parity with how backends are always-on per platform). Python has no
+# feature-negotiation layer and the smoke path builds bare, so a single
+# importable wheel must always expose Composition/CompositionBuilder/Group. This
+# pulls rubato + audioadapter-buffers into the wheel (accepted per rsac-fba7).
 [target.'cfg(windows)'.dependencies.rsac]
 path = "../.."
 default-features = false
-features = ["feat_windows"]
+features = ["feat_windows", "compose"]
 
 [target.'cfg(target_os = "linux")'.dependencies.rsac]
 path = "../.."
 default-features = false
-features = ["feat_linux"]
+features = ["feat_linux", "compose"]
 
 [target.'cfg(target_os = "macos")'.dependencies.rsac]
 path = "../.."
 default-features = false
-features = ["feat_macos"]
+features = ["feat_macos", "compose"]

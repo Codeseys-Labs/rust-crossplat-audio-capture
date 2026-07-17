@@ -15,6 +15,7 @@
 use pyo3::exceptions::{PyOSError, PyRuntimeError, PyStopIteration, PyValueError};
 use pyo3::prelude::*;
 use pyo3::types::PyBytes;
+use rsac::CapturingStream;
 use std::str::FromStr;
 use std::sync::{Mutex, RwLock};
 
@@ -1501,6 +1502,771 @@ impl PyAudioCapture {
     }
 }
 
+// ── Composition (multi-source channel composition, ADR-0011) ───────────────
+//
+// These classes wrap `rsac::compose::{Group, CompositionBuilder, Composition}`
+// directly (like `PyAudioCapture` wraps `rsac::AudioCapture`), NOT the C FFI.
+// The `compose` cargo feature is enabled unconditionally in the wheel
+// (Cargo.toml), so they are always importable — there is no runtime feature
+// gate. `Composition` reuses `PyAudioCapture`'s exact lock topology and GIL
+// discipline (rsac-8082): reads/`&self`-stop-signal under a shared read guard,
+// the joining teardown under the write guard, with the whole dance inside
+// `py.allow_threads` (see the `inner` field note on `PyComposition`).
+
+/// A composition group: a named set of capture sources sharing a mixdown
+/// layout. Built up with :meth:`source` / :meth:`source_with_gain` and a layout
+/// (:meth:`mixdown_mono`, :meth:`mixdown_stereo`, or :meth:`keep_channels`),
+/// then handed to :meth:`CompositionBuilder.add_group`.
+///
+/// A group is a value type held behind a mutex so its fluent builders (which
+/// consume ``self`` in Rust) can mutate it in place from Python. The mutex is
+/// never held across a GIL-releasing call, so it cannot participate in the
+/// stop-vs-parked-read GIL cycle the way `Composition`'s lock does.
+#[pyclass(name = "Group", module = "rsac._rsac", frozen)]
+struct PyGroup {
+    inner: Mutex<rsac::compose::Group>,
+}
+
+#[pymethods]
+impl PyGroup {
+    /// Create a group with the given name and the default stereo layout.
+    ///
+    /// The name must be non-empty and unique within a composition (both
+    /// enforced at :meth:`CompositionBuilder.build`, not here).
+    #[new]
+    fn new(name: String) -> Self {
+        PyGroup {
+            inner: Mutex::new(rsac::compose::Group::new(name)),
+        }
+    }
+
+    /// Add a capture source with unit gain (1.0).
+    ///
+    /// ``spec`` uses the canonical target grammar (case-insensitive scheme):
+    /// ``"system"``, ``"device:<id>"``, ``"app:<id>"``, ``"name:<n>"``,
+    /// ``"tree:<pid>"``.
+    ///
+    /// Raises:
+    ///     ConfigurationError: If ``spec`` is not a valid target string.
+    fn source(&self, spec: &str) -> PyResult<()> {
+        self.source_with_gain(spec, 1.0)
+    }
+
+    /// Add a capture source with an explicit linear mixdown gain (1.0 = unity).
+    ///
+    /// The gain must be finite and >= 0; an invalid gain is rejected eagerly.
+    ///
+    /// Raises:
+    ///     ConfigurationError: If ``spec`` is not a valid target string or the
+    ///         gain is not finite and >= 0.
+    fn source_with_gain(&self, spec: &str, gain: f64) -> PyResult<()> {
+        if !gain.is_finite() || gain < 0.0 {
+            return Err(ConfigurationError::new_err(format!(
+                "gain {gain} is invalid (must be finite and >= 0)"
+            )));
+        }
+        let target = rsac::CaptureTarget::from_str(spec).map_err(audio_error_to_pyerr)?;
+        let mut g = self
+            .inner
+            .lock()
+            .map_err(|e| PyRuntimeError::new_err(format!("Lock poisoned: {}", e)))?;
+        *g = g.clone().source_with_gain(target, gain as f32);
+        Ok(())
+    }
+
+    /// Set the group to fold every source to mono and gain-weighted-sum them
+    /// into **one** output channel.
+    fn mixdown_mono(&self) -> PyResult<()> {
+        self.set_layout(rsac::compose::GroupLayout::Mono)
+    }
+
+    /// Set the group to fold every source to stereo and sum into **two** output
+    /// channels (the default layout of a new group).
+    fn mixdown_stereo(&self) -> PyResult<()> {
+        self.set_layout(rsac::compose::GroupLayout::Stereo)
+    }
+
+    /// Set the group to pass its **single** source through with its native
+    /// channel count. A keep-channels group must contain exactly one source
+    /// (enforced at :meth:`CompositionBuilder.build`).
+    fn keep_channels(&self) -> PyResult<()> {
+        let mut g = self
+            .inner
+            .lock()
+            .map_err(|e| PyRuntimeError::new_err(format!("Lock poisoned: {}", e)))?;
+        *g = g.clone().keep_channels();
+        Ok(())
+    }
+
+    fn __repr__(&self) -> String {
+        match self.inner.lock() {
+            Ok(g) => format!(
+                "Group(name={:?}, sources={}, layout={:?})",
+                g.name(),
+                g.sources().len(),
+                g.layout()
+            ),
+            Err(_) => "Group(<poisoned>)".to_string(),
+        }
+    }
+}
+
+impl PyGroup {
+    /// Apply a mixdown layout in place (shared helper for the named methods).
+    fn set_layout(&self, layout: rsac::compose::GroupLayout) -> PyResult<()> {
+        let mut g = self
+            .inner
+            .lock()
+            .map_err(|e| PyRuntimeError::new_err(format!("Lock poisoned: {}", e)))?;
+        *g = g.clone().mixdown(layout);
+        Ok(())
+    }
+
+    /// Clone the inner `Group` (for handing to a builder).
+    fn snapshot(&self) -> PyResult<rsac::compose::Group> {
+        self.inner
+            .lock()
+            .map(|g| g.clone())
+            .map_err(|e| PyRuntimeError::new_err(format!("Lock poisoned: {}", e)))
+    }
+}
+
+/// Builder for a multi-source :class:`Composition` (ADR-0011).
+///
+/// Configure the session knobs in the constructor, add groups with
+/// :meth:`add_group`, optionally :meth:`preflight`, then :meth:`build`.
+#[pyclass(name = "CompositionBuilder", module = "rsac._rsac", frozen)]
+struct PyCompositionBuilder {
+    inner: Mutex<rsac::compose::CompositionBuilder>,
+}
+
+#[pymethods]
+impl PyCompositionBuilder {
+    /// Create a composition builder.
+    ///
+    /// Args:
+    ///     sample_rate: Session sample rate in Hz (default 48000). Sources at a
+    ///         different rate are resampled.
+    ///     clamp_output: Saturating clamp of the summed output to [-1.0, 1.0]
+    ///         (default False).
+    ///     quantum_ms: Composed tick (output buffer) duration in ms (default 10).
+    ///     stall_timeout_ms: How long to wait for the master source before a
+    ///         wall-clock fallback tick, in ms (default 250).
+    ///     max_buffer_ms: Per-source buffering bound in ms (default 1000).
+    #[new]
+    #[pyo3(signature = (sample_rate=48000, clamp_output=false, quantum_ms=10,
+                        stall_timeout_ms=250, max_buffer_ms=1000))]
+    fn new(
+        sample_rate: u32,
+        clamp_output: bool,
+        quantum_ms: u64,
+        stall_timeout_ms: u64,
+        max_buffer_ms: u64,
+    ) -> Self {
+        let builder = rsac::compose::CompositionBuilder::new()
+            .sample_rate(sample_rate)
+            .clamp_output(clamp_output)
+            .quantum(std::time::Duration::from_millis(quantum_ms))
+            .stall_timeout(std::time::Duration::from_millis(stall_timeout_ms))
+            .max_buffer(std::time::Duration::from_millis(max_buffer_ms));
+        PyCompositionBuilder {
+            inner: Mutex::new(builder),
+        }
+    }
+
+    /// Append a group. Groups contribute output channels in the order added.
+    /// The group is cloned into the builder, so the same `Group` object can be
+    /// reused or modified afterwards without affecting the builder.
+    fn add_group(&self, group: &PyGroup) -> PyResult<()> {
+        let g = group.snapshot()?;
+        let mut b = self
+            .inner
+            .lock()
+            .map_err(|e| PyRuntimeError::new_err(format!("Lock poisoned: {}", e)))?;
+        *b = b.clone().group(g);
+        Ok(())
+    }
+
+    /// Run every device-independent validation :meth:`build` performs, without
+    /// building. Lets a caller fix a reported error and retry on the same
+    /// builder.
+    ///
+    /// Raises:
+    ///     ConfigurationError / RsacError: On an invalid configuration (no
+    ///         groups, empty/duplicate group name, keep-channels arity, invalid
+    ///         gain, too many sources/channels, zero quantum/stall timeout,
+    ///         unsupported sample rate, or an unsupported target).
+    fn preflight(&self) -> PyResult<()> {
+        let b = self
+            .inner
+            .lock()
+            .map_err(|e| PyRuntimeError::new_err(format!("Lock poisoned: {}", e)))?;
+        b.preflight().map_err(audio_error_to_pyerr)
+    }
+
+    /// Validate the configuration and build a (not-yet-started)
+    /// :class:`Composition`. No devices are touched here — the inner captures
+    /// are created and started by :meth:`Composition.start`.
+    ///
+    /// Raises:
+    ///     ConfigurationError / RsacError: See :meth:`preflight`.
+    fn build(&self) -> PyResult<PyComposition> {
+        // build() consumes the builder; clone the inner so this Python builder
+        // stays reusable (matching the C FFI, where build consumes, but here a
+        // Python object outlives one build call).
+        let b = self
+            .inner
+            .lock()
+            .map_err(|e| PyRuntimeError::new_err(format!("Lock poisoned: {}", e)))?;
+        let composition = b.clone().build().map_err(audio_error_to_pyerr)?;
+        Ok(PyComposition {
+            inner: RwLock::new(Some(composition)),
+            iterating: Mutex::new(false),
+        })
+    }
+}
+
+/// A point-in-time snapshot of a running composition's counters.
+///
+/// Returned by :meth:`Composition.stats`. Frozen / read-only.
+#[pyclass(name = "CompositionStats", module = "rsac._rsac", frozen)]
+struct PyCompositionStats {
+    ticks: u64,
+    fallback_ticks: u64,
+    num_sources: usize,
+}
+
+#[pymethods]
+impl PyCompositionStats {
+    /// Composed buffers (ticks) emitted so far.
+    #[getter]
+    fn ticks(&self) -> u64 {
+        self.ticks
+    }
+
+    /// Ticks emitted by the wall-clock stall fallback (master had no data).
+    #[getter]
+    fn fallback_ticks(&self) -> u64 {
+        self.fallback_ticks
+    }
+
+    /// Number of composed sources, in flat declaration order.
+    #[getter]
+    fn num_sources(&self) -> usize {
+        self.num_sources
+    }
+
+    fn __repr__(&self) -> String {
+        format!(
+            "CompositionStats(ticks={}, fallback_ticks={}, num_sources={})",
+            self.ticks, self.fallback_ticks, self.num_sources
+        )
+    }
+}
+
+/// A point-in-time snapshot of one composed source's counters.
+///
+/// Returned by :meth:`Composition.source_stats`. Frozen / read-only. Exposes
+/// the full Rust :class:`SourceStats` set — including ``gap_padded_frames`` and
+/// ``inner_dropped``, which the C FFI struct omits.
+#[pyclass(name = "SourceStats", module = "rsac._rsac", frozen)]
+struct PySourceStats {
+    inner: rsac::compose::SourceStats,
+}
+
+#[pymethods]
+impl PySourceStats {
+    /// Name of the group the source belongs to.
+    #[getter]
+    fn group(&self) -> &str {
+        &self.inner.group
+    }
+
+    /// The source's capture target, in canonical grammar (e.g. ``"system"``).
+    #[getter]
+    fn target(&self) -> &str {
+        &self.inner.target
+    }
+
+    /// Buffers received from the inner capture so far.
+    #[getter]
+    fn buffers_received(&self) -> u64 {
+        self.inner.buffers_received
+    }
+
+    /// Frames of silence inserted because the source was behind at tick time.
+    #[getter]
+    fn padded_frames(&self) -> u64 {
+        self.inner.padded_frames
+    }
+
+    /// Frames trimmed because the source drifted past the buffering bound.
+    #[getter]
+    fn trimmed_frames(&self) -> u64 {
+        self.inner.trimmed_frames
+    }
+
+    /// Frames of silence inserted to compensate intra-source timestamp gaps
+    /// (how an inner-capture ring overflow manifests in the composed output).
+    #[getter]
+    fn gap_padded_frames(&self) -> u64 {
+        self.inner.gap_padded_frames
+    }
+
+    /// Ring-overflow drops inside the source's own capture — buffers lost
+    /// upstream of the compositor.
+    #[getter]
+    fn inner_dropped(&self) -> u64 {
+        self.inner.inner_dropped
+    }
+
+    /// Whether this source is being resampled to the session rate.
+    #[getter]
+    fn resampling(&self) -> bool {
+        self.inner.resampling
+    }
+
+    /// Whether the source's stream has ended.
+    #[getter]
+    fn ended(&self) -> bool {
+        self.inner.ended
+    }
+
+    fn __repr__(&self) -> String {
+        format!(
+            "SourceStats(group={:?}, target={:?}, buffers_received={}, padded_frames={}, \
+             trimmed_frames={}, gap_padded_frames={}, inner_dropped={}, resampling={}, ended={})",
+            self.inner.group,
+            self.inner.target,
+            self.inner.buffers_received,
+            self.inner.padded_frames,
+            self.inner.trimmed_frames,
+            self.inner.gap_padded_frames,
+            self.inner.inner_dropped,
+            self.inner.resampling,
+            self.inner.ended,
+        )
+    }
+}
+
+/// A multi-source composed capture session (ADR-0011).
+///
+/// Created by :meth:`CompositionBuilder.build`; inert until :meth:`start`.
+/// Supports the same synchronous / asynchronous context-manager and iterator
+/// protocols as :class:`AudioCapture`, with terminal-observable reads.
+///
+/// Note on stop: an explicit :meth:`stop` / :meth:`close` discards any buffered
+/// composed tail. To capture everything, read until the terminal error (a
+/// fatal ``StreamError`` / ``StopIteration``) *before* stopping; the
+/// composition's natural end (all sources ended) drains the tail first.
+#[pyclass(name = "Composition", module = "rsac._rsac")]
+struct PyComposition {
+    /// The wrapped `rsac::Composition` behind an `RwLock` so a thread parked in
+    /// a blocking `read()` / `__next__` holds only a **shared read guard** while
+    /// the GIL is released — the exact topology `PyAudioCapture` uses.
+    ///
+    /// `Composition`'s read paths (`read_chunk_nonblocking` /
+    /// `read_chunk_blocking`) and the `CapturingStream::stop(&self)` *signal*
+    /// take `&self`, while the joining lifecycle mutators
+    /// (`start`/`stop`/`close`) take `&mut self`. Mapping reads (and the
+    /// signal) to the shared read guard and the mutators to the write guard is
+    /// what breaks the stop-vs-parked-blocking-read deadlock (rsac-8082):
+    /// `stop()`/`close()` FIRST take a read guard to call
+    /// `CapturingStream::stop` (shared with a parked reader, so it never
+    /// blocks), which ends the ring + flags the engine and wakes the reader;
+    /// only then do they take the write guard for the joining inherent `stop`.
+    ///
+    /// GIL INTERACTION (rsac-8082): the parked reader releases the GIL across
+    /// its blocking read (`py.allow_threads`) but holds its read guard the whole
+    /// time — and `allow_threads` re-acquires the GIL *before* the guard drops.
+    /// A teardown that took `.write()` while holding the GIL would deadlock, so
+    /// `stop()`/`close()`/`__del__` run the ENTIRE lock dance inside
+    /// `py.allow_threads`.
+    inner: RwLock<Option<rsac::Composition>>,
+    /// Track iterator state (started via `__iter__`), mirroring `PyAudioCapture`.
+    iterating: Mutex<bool>,
+}
+
+#[pymethods]
+impl PyComposition {
+    /// Start the composition: build + start one capture per source, resolve the
+    /// composed layout, and spawn the compositor thread.
+    ///
+    /// The GIL is released while starting (device work). Starting an
+    /// already-running composition is a no-op.
+    fn start(&self, py: Python<'_>) -> PyResult<()> {
+        py.allow_threads(|| {
+            {
+                let guard = self
+                    .inner
+                    .read()
+                    .map_err(|e| TeardownError::Poisoned(e.to_string()))?;
+                let comp = guard.as_ref().ok_or(TeardownError::Closed)?;
+                if comp.is_running() {
+                    return Ok(());
+                }
+            }
+            let mut guard = self
+                .inner
+                .write()
+                .map_err(|e| TeardownError::Poisoned(e.to_string()))?;
+            let comp = guard.as_mut().ok_or(TeardownError::Closed)?;
+            comp.start().map_err(TeardownError::Stop)
+        })
+        .map_err(TeardownError::into_pyerr)
+    }
+
+    /// Stop the composition: signal the ring + engine (waking any parked
+    /// reader) and join the compositor thread. Discards the buffered tail.
+    fn stop(&self, py: Python<'_>) -> PyResult<()> {
+        // rsac-8082: the two-phase dance runs entirely inside allow_threads (GIL
+        // released across `.write()`), calling `CapturingStream::stop(&comp)` as
+        // the `&self` signal instead of `AudioCapture::request_stop`.
+        py.allow_threads(|| self.teardown_stop())
+            .map_err(TeardownError::into_pyerr)
+    }
+
+    /// Whether the composed stream is currently running.
+    #[getter]
+    fn is_running(&self) -> PyResult<bool> {
+        let guard = self
+            .inner
+            .read()
+            .map_err(|e| PyRuntimeError::new_err(format!("Lock poisoned: {}", e)))?;
+        Ok(guard.as_ref().map(|c| c.is_running()).unwrap_or(false))
+    }
+
+    /// Read the next composed buffer (non-blocking).
+    ///
+    /// Returns an :class:`AudioBuffer` if data is available, or None if no data
+    /// is ready yet. The GIL is released during the read.
+    fn try_read(&self, py: Python<'_>) -> PyResult<Option<PyAudioBuffer>> {
+        let guard = self
+            .inner
+            .read()
+            .map_err(|e| PyRuntimeError::new_err(format!("Lock poisoned: {}", e)))?;
+        let comp = guard
+            .as_ref()
+            .ok_or_else(|| PyRuntimeError::new_err("Composition has been closed"))?;
+        let result = py.allow_threads(|| comp.read_chunk_nonblocking());
+        match result {
+            Ok(Some(buf)) => Ok(Some(PyAudioBuffer { inner: buf })),
+            Ok(None) => Ok(None),
+            Err(e) => Err(audio_error_to_pyerr(e)),
+        }
+    }
+
+    /// Read the next composed buffer (blocking).
+    ///
+    /// Blocks until data is available; the GIL is released during the wait.
+    /// Terminal-observable: once the composition ends and drains this raises
+    /// the fatal terminal ``StreamError``.
+    fn read(&self, py: Python<'_>) -> PyResult<PyAudioBuffer> {
+        let guard = self
+            .inner
+            .read()
+            .map_err(|e| PyRuntimeError::new_err(format!("Lock poisoned: {}", e)))?;
+        let comp = guard
+            .as_ref()
+            .ok_or_else(|| PyRuntimeError::new_err("Composition has been closed"))?;
+        let result = py.allow_threads(|| comp.read_chunk_blocking());
+        match result {
+            Ok(buf) => Ok(PyAudioBuffer { inner: buf }),
+            Err(e) => Err(audio_error_to_pyerr(e)),
+        }
+    }
+
+    /// Number of composed-ring overruns (composed buffers dropped because the
+    /// consumer read slower than the compositor produced). 0 before start.
+    #[getter]
+    fn overrun_count(&self) -> PyResult<u64> {
+        let guard = self
+            .inner
+            .read()
+            .map_err(|e| PyRuntimeError::new_err(format!("Lock poisoned: {}", e)))?;
+        Ok(guard
+            .as_ref()
+            .map(CapturingStream::overrun_count)
+            .unwrap_or(0))
+    }
+
+    /// Number of composed output channels (0 before a successful start).
+    #[getter]
+    fn channel_count(&self) -> PyResult<u16> {
+        let guard = self
+            .inner
+            .read()
+            .map_err(|e| PyRuntimeError::new_err(format!("Lock poisoned: {}", e)))?;
+        Ok(guard
+            .as_ref()
+            .and_then(|c| c.channel_map().map(|m| m.channels()))
+            .unwrap_or(0))
+    }
+
+    /// Name of the group producing composed output channel ``channel``
+    /// (0-based), or None if not started or out of bounds.
+    fn channel_group(&self, channel: usize) -> PyResult<Option<String>> {
+        let guard = self
+            .inner
+            .read()
+            .map_err(|e| PyRuntimeError::new_err(format!("Lock poisoned: {}", e)))?;
+        Ok(guard.as_ref().and_then(|c| {
+            c.channel_map()
+                .and_then(|m| m.entries().get(channel).map(|e| e.group.clone()))
+        }))
+    }
+
+    /// Index of composed output channel ``channel`` within its group (0-based;
+    /// e.g. 0 = L, 1 = R for a stereo group), or None if not started or out of
+    /// bounds.
+    fn channel_in_group(&self, channel: usize) -> PyResult<Option<u16>> {
+        let guard = self
+            .inner
+            .read()
+            .map_err(|e| PyRuntimeError::new_err(format!("Lock poisoned: {}", e)))?;
+        Ok(guard.as_ref().and_then(|c| {
+            c.channel_map()
+                .and_then(|m| m.entries().get(channel).map(|e| e.channel_in_group))
+        }))
+    }
+
+    /// Point-in-time composition counters, or None if not started.
+    fn stats(&self) -> PyResult<Option<PyCompositionStats>> {
+        let guard = self
+            .inner
+            .read()
+            .map_err(|e| PyRuntimeError::new_err(format!("Lock poisoned: {}", e)))?;
+        Ok(guard
+            .as_ref()
+            .and_then(|c| c.stats())
+            .map(|s| PyCompositionStats {
+                ticks: s.ticks,
+                fallback_ticks: s.fallback_ticks,
+                num_sources: s.sources.len(),
+            }))
+    }
+
+    /// Per-source counters for the source at ``index`` (flat declaration order),
+    /// or None if not started or ``index`` is out of bounds.
+    fn source_stats(&self, index: usize) -> PyResult<Option<PySourceStats>> {
+        let guard = self
+            .inner
+            .read()
+            .map_err(|e| PyRuntimeError::new_err(format!("Lock poisoned: {}", e)))?;
+        Ok(guard
+            .as_ref()
+            .and_then(|c| c.stats())
+            .and_then(|s| s.sources.into_iter().nth(index))
+            .map(|inner| PySourceStats { inner }))
+    }
+
+    /// Total composed buffers dropped by this composition's subscribe pumps
+    /// because a subscriber's bounded channel was full. 0 before start / when
+    /// no subscriber has fallen behind.
+    fn subscriber_dropped_count(&self) -> PyResult<u64> {
+        let guard = self
+            .inner
+            .read()
+            .map_err(|e| PyRuntimeError::new_err(format!("Lock poisoned: {}", e)))?;
+        Ok(guard
+            .as_ref()
+            .map(|c| c.subscriber_dropped_count())
+            .unwrap_or(0))
+    }
+
+    /// Close the composition and release all resources.
+    fn close(&self, py: Python<'_>) -> PyResult<()> {
+        py.allow_threads(|| self.teardown_close())
+            .map_err(TeardownError::into_pyerr)
+    }
+
+    // ── Context Manager Protocol ─────────────────────────────────────
+
+    fn __enter__(slf: Py<Self>, py: Python<'_>) -> PyResult<Py<Self>> {
+        slf.borrow(py).start(py)?;
+        Ok(slf)
+    }
+
+    #[pyo3(signature = (_exc_type=None, _exc_val=None, _exc_tb=None))]
+    fn __exit__(
+        &self,
+        py: Python<'_>,
+        _exc_type: Option<Bound<'_, PyAny>>,
+        _exc_val: Option<Bound<'_, PyAny>>,
+        _exc_tb: Option<Bound<'_, PyAny>>,
+    ) -> PyResult<bool> {
+        self.close(py)?;
+        Ok(false)
+    }
+
+    // ── Async Context Manager Protocol ───────────────────────────────
+
+    fn __aenter__(slf: Py<Self>, py: Python<'_>) -> PyResult<Py<CompletedAwaitable>> {
+        slf.borrow(py).start(py)?;
+        CompletedAwaitable::new(py, slf.into_any())
+    }
+
+    #[pyo3(signature = (exc_type=None, _exc_val=None, _exc_tb=None))]
+    fn __aexit__(
+        &self,
+        py: Python<'_>,
+        exc_type: Option<Bound<'_, PyAny>>,
+        _exc_val: Option<Bound<'_, PyAny>>,
+        _exc_tb: Option<Bound<'_, PyAny>>,
+    ) -> PyResult<Py<CompletedAwaitable>> {
+        match self.close(py) {
+            Ok(()) => CompletedAwaitable::new(py, py.None()),
+            Err(_) if exc_type.is_some() => CompletedAwaitable::new(py, py.None()),
+            Err(e) => Err(e),
+        }
+    }
+
+    // ── Finalizer safety net ─────────────────────────────────────────
+
+    fn __del__(&self, py: Python<'_>) {
+        let _ = py.allow_threads(|| self.teardown_close());
+    }
+
+    // ── Iterator Protocol ────────────────────────────────────────────
+
+    fn __iter__(slf: Py<Self>, py: Python<'_>) -> PyResult<Py<Self>> {
+        {
+            let self_ref = slf.borrow(py);
+            let mut iter_guard = self_ref
+                .iterating
+                .lock()
+                .map_err(|e| PyRuntimeError::new_err(format!("Lock poisoned: {}", e)))?;
+            *iter_guard = true;
+
+            let guard = self_ref
+                .inner
+                .read()
+                .map_err(|e| PyRuntimeError::new_err(format!("Lock poisoned: {}", e)))?;
+            if let Some(ref comp) = *guard {
+                if !comp.is_running() {
+                    drop(guard);
+                    self_ref.start(py)?;
+                }
+            }
+        }
+        Ok(slf)
+    }
+
+    fn __next__(&self, py: Python<'_>) -> PyResult<Option<PyAudioBuffer>> {
+        // Terminal-error delivery identical to PyAudioCapture.__next__: a FATAL
+        // terminal (StreamEnded) ends iteration via StopIteration; a RECOVERABLE
+        // hiccup retries; any other error propagates. Reads via
+        // `read_chunk_blocking` (the terminal-observable path) under a per-iteration
+        // SHARED read guard, dropped before the retry backoff so a concurrent
+        // stop()/close() can signal + join (rsac-8082).
+        loop {
+            let outcome = {
+                let guard = self
+                    .inner
+                    .read()
+                    .map_err(|e| PyRuntimeError::new_err(format!("Lock poisoned: {}", e)))?;
+                let comp = match guard.as_ref() {
+                    Some(c) => c,
+                    None => return Err(PyStopIteration::new_err("Composition closed")),
+                };
+                if !comp.is_running() {
+                    return Err(PyStopIteration::new_err("Composition stopped"));
+                }
+                py.allow_threads(|| comp.read_chunk_blocking())
+            };
+
+            match outcome {
+                Ok(buf) => return Ok(Some(PyAudioBuffer { inner: buf })),
+                Err(e) if e.is_fatal() => {
+                    return Err(PyStopIteration::new_err(e.to_string()));
+                }
+                Err(e) if e.is_recoverable() => {
+                    py.allow_threads(|| {
+                        std::thread::sleep(std::time::Duration::from_millis(1));
+                    });
+                    continue;
+                }
+                Err(e) => return Err(audio_error_to_pyerr(e)),
+            }
+        }
+    }
+
+    fn __repr__(&self) -> String {
+        let guard = self.inner.read();
+        match guard {
+            Ok(ref g) => match g.as_ref() {
+                Some(c) => format!("Composition(running={})", c.is_running()),
+                None => "Composition(closed)".to_string(),
+            },
+            Err(_) => "Composition(error)".to_string(),
+        }
+    }
+}
+
+// ── Composition teardown helpers (GIL-released, rsac-8082) ──────────────────
+//
+// Same discipline as `PyAudioCapture`'s helpers: pure Rust, no `Python` token,
+// so `stop()`/`close()`/`__del__` can call them from inside `py.allow_threads`.
+// The `&self` stop SIGNAL uses `CapturingStream::stop` (ends the ring + flags
+// the engine, waking a parked reader) — the composition analogue of
+// `AudioCapture::request_stop`; the write-guard join uses the inherent
+// `Composition::stop(&mut self)`.
+impl PyComposition {
+    /// Take a read guard to signal the stream stop (waking a parked reader via
+    /// `CapturingStream::stop`), drop it, then take the write guard. MUST run
+    /// with the GIL released (inside `allow_threads`).
+    fn request_stop_then_write(
+        &self,
+    ) -> std::result::Result<
+        std::sync::RwLockWriteGuard<'_, Option<rsac::Composition>>,
+        TeardownError,
+    > {
+        {
+            let guard = self
+                .inner
+                .read()
+                .map_err(|e| TeardownError::Poisoned(e.to_string()))?;
+            if let Some(comp) = guard.as_ref() {
+                // &self signal: ends the ring + flags the engine without joining,
+                // so a parked reader is unblocked without lock contention.
+                let _ = CapturingStream::stop(comp);
+            }
+        }
+        self.inner
+            .write()
+            .map_err(|e| TeardownError::Poisoned(e.to_string()))
+    }
+
+    /// `stop()` teardown: signal + inherent (joining) stop in place, leaving the
+    /// composition in the slot. `None` slot → `Closed`.
+    ///
+    /// The inherent `Composition::stop(&mut self)` is called with fully-qualified
+    /// syntax on purpose: `Composition` also implements the trait
+    /// `CapturingStream::stop(&self)` (signal-only, no join), and bare
+    /// `comp.stop()` would resolve to *that* by autoref preference — leaving the
+    /// engine thread unjoined. We want the joining lifecycle stop here.
+    fn teardown_stop(&self) -> std::result::Result<(), TeardownError> {
+        let mut guard = self.request_stop_then_write()?;
+        let comp = guard.as_mut().ok_or(TeardownError::Closed)?;
+        rsac::Composition::stop(comp).map_err(TeardownError::Stop)
+    }
+
+    /// `close()`/`__del__` teardown: signal, TAKE the composition out and run the
+    /// joining stop, dropping it afterward (Drop also joins, so teardown is
+    /// deterministic even on a stop error). An already-closed composition
+    /// (`None` slot) is an idempotent success. Same fully-qualified inherent
+    /// `stop` as `teardown_stop` (see its note).
+    fn teardown_close(&self) -> std::result::Result<(), TeardownError> {
+        let mut guard = self.request_stop_then_write()?;
+        if let Some(mut comp) = guard.take() {
+            let r = rsac::Composition::stop(&mut comp);
+            drop(comp);
+            r.map_err(TeardownError::Stop)?;
+        }
+        Ok(())
+    }
+}
+
 // ── Module-level functions ───────────────────────────────────────────────
 
 /// List all available audio devices on the system.
@@ -1567,6 +2333,12 @@ fn _rsac(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<PyBackpressureReport>()?;
     m.add_class::<PyAudioFormat>()?;
     m.add_class::<PyAudioCapture>()?;
+    // Multi-source channel composition (ADR-0011).
+    m.add_class::<PyGroup>()?;
+    m.add_class::<PyCompositionBuilder>()?;
+    m.add_class::<PyComposition>()?;
+    m.add_class::<PyCompositionStats>()?;
+    m.add_class::<PySourceStats>()?;
     // Internal awaitable returned by AudioCapture.__aenter__/__aexit__.
     m.add_class::<CompletedAwaitable>()?;
 
@@ -1956,6 +2728,242 @@ mod tests {
         // unwound; it still observed the terminal signal from request_stop().
         let read_result = reader.join().expect("reader thread joins");
         let err = read_result.expect_err("silent read ends with a terminal error");
+        assert!(
+            err.contains("StreamEnded"),
+            "reader eventually woke on the terminal signal; got: {err}"
+        );
+    }
+
+    // ── rsac-fba7: compose classification + gain validation + lock topology ──
+    //
+    // A real `rsac::Composition` needs devices to start, and this crate has no
+    // PyO3 interpreter under `cargo test` — so, exactly like the capture tests
+    // above, these pin (1) the terminal-error classification `Composition.read`/
+    // `__next__` rely on, (2) the eager gain rejection `Group.source_with_gain`
+    // performs, and (3) the stop-vs-parked-read GIL lock topology `Composition`
+    // shares with `PyAudioCapture` — with a compose-flavoured `SilentComposition`
+    // stand-in whose receivers mirror `Composition` (`read_chunk_blocking(&self)`,
+    // the `CapturingStream::stop(&self)` signal analogue, `stop(&mut self)` join).
+
+    /// The composition read family surfaces the SAME terminal (`StreamEnded`,
+    /// fatal) and recoverable (`StreamReadError` — e.g. not started) classes as
+    /// the capture family, so `Composition.read`/`__next__` reuse the exact
+    /// `is_fatal` → StopIteration / `is_recoverable` → retry loop.
+    #[test]
+    fn composition_read_terminal_classification() {
+        let ended = rsac::AudioError::StreamEnded {
+            reason: "Composition ended (all sources terminal, ring drained)".into(),
+        };
+        assert!(ended.is_fatal(), "drained composition end must be fatal");
+        assert!(!ended.is_recoverable());
+
+        let not_started = rsac::AudioError::StreamReadError {
+            reason: "not started".into(),
+        };
+        assert!(
+            not_started.is_recoverable(),
+            "a not-started composition read is a recoverable StreamReadError"
+        );
+        assert!(!not_started.is_fatal());
+    }
+
+    /// The canonical not-started reason constant is non-empty — it is what a
+    /// not-started `Composition` read surfaces (recoverable), proving the
+    /// terminal-vs-recoverable split for `__next__`/`read`.
+    #[test]
+    fn composition_not_started_reason_is_non_empty() {
+        let e = rsac::AudioError::StreamReadError {
+            reason: "Composition is not started".into(),
+        };
+        assert!(e.is_recoverable());
+        assert!(!e.to_string().is_empty());
+    }
+
+    /// `Group.source_with_gain` rejects a non-finite or negative gain eagerly
+    /// (matches the C FFI `invalid_gain_rejected_eagerly`). The check is the
+    /// binding's own (before the core builder would also reject it), so pin the
+    /// exact predicate the Python method uses: `!finite || < 0`.
+    #[test]
+    fn compose_gain_validation_predicate() {
+        let reject = |g: f64| !g.is_finite() || g < 0.0;
+        for bad in [-0.5f64, f64::NAN, f64::INFINITY, f64::NEG_INFINITY] {
+            assert!(reject(bad), "gain {bad} must be rejected");
+        }
+        for ok in [0.0f64, 1.0, 0.8, 4.0] {
+            assert!(!reject(ok), "gain {ok} must be accepted");
+        }
+    }
+
+    /// Stand-in for a *silent* running `rsac::Composition`, mirroring the core
+    /// receivers: `read_chunk_blocking(&self)` parks until the
+    /// `CapturingStream::stop`-analogue `&self` signal flips terminal, and
+    /// `stop(&mut self)` is the joining lifecycle mutator.
+    struct SilentComposition {
+        terminal: AtomicBool,
+        parked: AtomicBool,
+    }
+
+    impl SilentComposition {
+        fn new() -> Self {
+            Self {
+                terminal: AtomicBool::new(false),
+                parked: AtomicBool::new(false),
+            }
+        }
+
+        fn read_chunk_blocking(&self) -> std::result::Result<(), String> {
+            self.parked.store(true, Ordering::SeqCst);
+            let deadline = Instant::now() + Duration::from_secs(10);
+            while !self.terminal.load(Ordering::SeqCst) {
+                if Instant::now() > deadline {
+                    return Err("read timed out (deadlock)".to_string());
+                }
+                std::thread::sleep(Duration::from_millis(1));
+            }
+            Err("StreamEnded".to_string())
+        }
+
+        /// `CapturingStream::stop(&self)` analogue: the `&self` signal that ends
+        /// the ring + flags the engine, unblocking a parked reader.
+        fn request_stop(&self) {
+            self.terminal.store(true, Ordering::SeqCst);
+        }
+
+        /// Inherent `stop(&mut self)`: the joining lifecycle mutator.
+        fn stop(&mut self) {
+            self.terminal.store(true, Ordering::SeqCst);
+        }
+    }
+
+    type CompSlot = Arc<RwLock<Option<SilentComposition>>>;
+
+    fn spawn_parked_comp_reader(
+        gil: &Gil,
+        inner: &CompSlot,
+    ) -> std::thread::JoinHandle<std::result::Result<(), String>> {
+        let handle = {
+            let gil = Arc::clone(gil);
+            let inner = Arc::clone(inner);
+            std::thread::spawn(move || {
+                let gil_guard = gil.lock().expect("GIL");
+                let guard = inner.read().expect("read guard");
+                let comp = guard.as_ref().expect("composition present");
+                drop(gil_guard);
+                let read_result = comp.read_chunk_blocking();
+                let regil = gil.lock().expect("GIL re-acquire");
+                drop(guard);
+                drop(regil);
+                read_result
+            })
+        };
+        let deadline = Instant::now() + Duration::from_secs(5);
+        loop {
+            if inner
+                .read()
+                .unwrap()
+                .as_ref()
+                .map(|c| c.parked.load(Ordering::SeqCst))
+                .unwrap_or(false)
+            {
+                break;
+            }
+            assert!(Instant::now() < deadline, "reader never parked");
+            std::thread::yield_now();
+        }
+        handle
+    }
+
+    fn comp_write_take_bounded(inner: &CompSlot, deadline: Duration) -> bool {
+        let start = Instant::now();
+        while start.elapsed() < deadline {
+            if let Ok(mut guard) = inner.try_write() {
+                if let Some(mut comp) = guard.take() {
+                    comp.stop();
+                }
+                return true;
+            }
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        false
+    }
+
+    /// FIXED `Composition.stop()`/`close()`: run the read-guard `request_stop`
+    /// (the `CapturingStream::stop` signal) → `write()` dance INSIDE
+    /// `allow_threads` (GIL released across `write()`), so the woken reader can
+    /// re-acquire the GIL and drop its guard. Copy of the capture test, renamed
+    /// for compose.
+    #[test]
+    fn composition_stop_does_not_deadlock_parked_blocking_read() {
+        let gil: Gil = Arc::new(Mutex::new(()));
+        let inner: CompSlot = Arc::new(RwLock::new(Some(SilentComposition::new())));
+        let reader = spawn_parked_comp_reader(&gil, &inner);
+
+        let stopper = {
+            let (gil, inner) = (Arc::clone(&gil), Arc::clone(&inner));
+            std::thread::spawn(move || {
+                let gil_guard = gil.lock().expect("GIL");
+                drop(gil_guard); // allow_threads: GIL released for the whole dance
+                {
+                    let g = inner.read().expect("read guard for request_stop");
+                    if let Some(comp) = g.as_ref() {
+                        comp.request_stop();
+                    }
+                }
+                let got = comp_write_take_bounded(&inner, Duration::from_secs(5));
+                let _regil = gil.lock().expect("GIL re-acquire");
+                got
+            })
+        };
+
+        let got_write = stopper.join().expect("stopper thread joins");
+        assert!(
+            got_write,
+            "FIXED Composition.stop() failed to acquire the write lock within the \
+             deadline — it deadlocked against the parked reader (rsac-8082 \
+             regression: the GIL must be released across write())"
+        );
+
+        let read_result = reader.join().expect("reader thread joins");
+        let err = read_result.expect_err("silent composition read ends terminal");
+        assert!(
+            err.contains("StreamEnded"),
+            "reader must wake on the terminal signal, not the deadlock safety net; got: {err}"
+        );
+    }
+
+    /// BROKEN teardown for `Composition`: hold the GIL ACROSS `write()`. The
+    /// woken reader cannot re-acquire the GIL to drop its read guard, so
+    /// `write()` never acquires within the deadline — proving the
+    /// `allow_threads` wrap is load-bearing for compose too.
+    #[test]
+    fn composition_gil_held_across_write_deadlocks_parked_reader() {
+        let gil: Gil = Arc::new(Mutex::new(()));
+        let inner: CompSlot = Arc::new(RwLock::new(Some(SilentComposition::new())));
+        let reader = spawn_parked_comp_reader(&gil, &inner);
+
+        let stopper = {
+            let (gil, inner) = (Arc::clone(&gil), Arc::clone(&inner));
+            std::thread::spawn(move || {
+                let _gil_guard = gil.lock().expect("GIL"); // never released — the defect
+                {
+                    let g = inner.read().expect("read guard for request_stop");
+                    if let Some(comp) = g.as_ref() {
+                        comp.request_stop();
+                    }
+                }
+                comp_write_take_bounded(&inner, Duration::from_secs(2))
+            })
+        };
+
+        let got_write = stopper.join().expect("stopper thread joins");
+        assert!(
+            !got_write,
+            "GIL-held-across-write teardown unexpectedly acquired the write lock \
+             while a reader was parked — the compose regression test would be vacuous"
+        );
+
+        let read_result = reader.join().expect("reader thread joins");
+        let err = read_result.expect_err("silent composition read ends terminal");
         assert!(
             err.contains("StreamEnded"),
             "reader eventually woke on the terminal signal; got: {err}"
