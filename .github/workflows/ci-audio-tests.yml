@@ -51,6 +51,7 @@ on:
       - 'scripts/ci-linux-audio-route.sh'
       - 'scripts/ci-windows-audio-default.ps1'
       - '.github/workflows/ci-audio-tests.yml'
+      - '.github/actions/**'
   pull_request:
     branches: [main, master, 'release/**']
     paths:
@@ -62,6 +63,7 @@ on:
       - 'scripts/ci-linux-audio-route.sh'
       - 'scripts/ci-windows-audio-default.ps1'
       - '.github/workflows/ci-audio-tests.yml'
+      - '.github/actions/**'
   workflow_dispatch:
 
 env:
@@ -78,6 +80,11 @@ concurrency:
   group: audio-${{ github.workflow }}-${{ github.ref }}
   cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
+# PR-controlled code (tests, local composite actions) runs after checkout —
+# keep the token read-only and out of the persisted git credentials.
+permissions:
+  contents: read
+
 jobs:
   # ===========================================================================
   # Linux (PipeWire) — system + device + process tiers in one job.
@@ -90,9 +97,10 @@ jobs:
   linux-audio:
     name: "Linux Audio (system+device+process)"
     runs-on: blacksmith-4vcpu-ubuntu-2404
-    # Backstop only: each tier carries its own step-level timeout-minutes (15,
+    # Budget: setup/compile + the three tier step caps (15+15+15) + margin —
+    # a hung early tier must never eat later tiers' budget (review PR #56).
     # matching the former per-tier job timeouts). Real runs finish in minutes.
-    timeout-minutes: 30
+    timeout-minutes: 55
     # `bash` keyword shell (`-eo pipefail`) so a failing `cargo test` propagates
     # through the `| tee log` pipe instead of being masked by tee's exit 0.
     defaults:
@@ -104,6 +112,8 @@ jobs:
       tier_process: ${{ steps.record.outputs.tier_process }}
     steps:
       - uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5
+        with:
+          persist-credentials: false
       - uses: ./.github/actions/rust-setup
         with:
           cache-key: linux-audio
@@ -269,13 +279,15 @@ jobs:
     runs-on: windows-latest
     # Backstop only: each tier carries its own step-level timeout-minutes (20,
     # matching the former per-tier job timeouts).
-    timeout-minutes: 40
+    timeout-minutes: 70
     outputs:
       tier_system: ${{ steps.record.outputs.tier_system }}
       tier_device: ${{ steps.record.outputs.tier_device }}
       tier_process: ${{ steps.record.outputs.tier_process }}
     steps:
       - uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5
+        with:
+          persist-credentials: false
       - uses: ./.github/actions/rust-setup
         with:
           cache-key: windows-audio
@@ -482,13 +494,15 @@ jobs:
     # Backstop only: each tier carries its own step-level timeout-minutes
     # (system 15 / device 10 / process 20 — matching the former per-tier jobs),
     # and every cargo invocation is additionally bounded by gtimeout.
-    timeout-minutes: 30
+    timeout-minutes: 55
     outputs:
       tier_system: ${{ steps.record.outputs.tier_system }}
       tier_device: ${{ steps.record.outputs.tier_device }}
       tier_process: ${{ steps.record.outputs.tier_process }}
     steps:
       - uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5
+        with:
+          persist-credentials: false
       - uses: ./.github/actions/rust-setup
         with:
           cache-key: macos-audio

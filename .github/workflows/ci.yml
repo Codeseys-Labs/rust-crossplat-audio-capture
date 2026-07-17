@@ -1329,7 +1329,12 @@ jobs:
   # v*.*.* tag is reachable from there.
   semver-checks-release-pr:
     name: Semver Gate (release PR)
-    if: "github.event_name == 'pull_request' && startsWith(github.event.pull_request.title, 'release: v')"
+    # Keyed on the STRUCTURAL release signal (release-prepare's bump branch is
+    # always release/vX.Y.Z targeting master) OR the release title, so renaming
+    # the PR title alone cannot skip the gate (review PR #56). Layer PRs in the
+    # release-stacking SDLC have base release/X.Y.Z, not master — excluded by
+    # the base check.
+    if: "github.event_name == 'pull_request' && github.base_ref == 'master' && (startsWith(github.head_ref, 'release/') || startsWith(github.event.pull_request.title, 'release: v'))"
     timeout-minutes: 20
     runs-on: blacksmith-4vcpu-ubuntu-2404
     steps:
