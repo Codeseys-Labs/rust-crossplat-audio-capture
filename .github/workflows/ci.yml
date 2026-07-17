@@ -375,10 +375,13 @@ jobs:
       # rsac-86c7: macos-tcc-spi's 1 test (preflight_returns_a_status_without_panicking,
       # src/audio/macos/permission.rs) is target_os-gated like feat_macos itself, so it
       # can only ever run on this leg. It never panics regardless of TCC state
-      # (see the test's own doc comment) — safe to hard-fail here.
+      # (see the test's own doc comment) — safe to hard-fail here. Filtered to
+      # just that test: the step above already executes the rest of the macOS
+      # lib suite, so rerunning all ~600 tests here would only add time and a
+      # second exposure to the TCC-adjacent tap tests.
       - name: Cargo test (macos-tcc-spi unit test)
         timeout-minutes: 5
-        run: cargo test --lib --no-default-features --features feat_macos,compose,macos-tcc-spi
+        run: cargo test --lib --no-default-features --features feat_macos,compose,macos-tcc-spi preflight_returns_a_status_without_panicking
 
       # TC-01: ADR-0001 alloc-free producer proof (process-wide allocator, own
       # binary, single-threaded). Device-free, so it HARD-FAILS like Linux.
@@ -1226,12 +1229,13 @@ jobs:
   # that also happen to touch src/ comments, etc.). Root cause: 0.4.1's
   # release notes shipped incomplete because PRs #41-#49 fixed code but never
   # touched CHANGELOG.md (caught only by a manual post-release audit).
-  # Independent of `changes`/`lint` (must not skip silently) and of any
-  # release-stacking layer PR targeting release/**, which should use the
-  # label instead per-layer (see AGENTS.md §6).
+  # Independent of `changes`/`lint` (must not skip silently). Applies to ALL
+  # PR base branches including release/** — release-stacking layer PRs use
+  # the changelog-not-needed label per-layer (see AGENTS.md §6) rather than
+  # a blanket base-branch exemption the guard can't audit.
   changelog-guard:
     name: CHANGELOG Guard
-    if: github.event_name == 'pull_request' && !startsWith(github.base_ref, 'release/')
+    if: github.event_name == 'pull_request'
     timeout-minutes: 5
     runs-on: blacksmith-4vcpu-ubuntu-2404
     permissions:

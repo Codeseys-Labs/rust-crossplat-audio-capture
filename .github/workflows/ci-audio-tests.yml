@@ -588,13 +588,14 @@ jobs:
           # require_device_selection!() gate does NOT skip). On a headless
           # managed runner that AUHAL start hangs until `gtimeout` kills it at
           # the 120s boundary (observed: runs 29564636523 / 29564289847). Under
-          # the job's `-eo pipefail` shell that gtimeout kill (124/137/143)
-          # would otherwise abort the step and — now that macOS is a summary
-          # gate — flip every PR red. So tolerate ONLY the gtimeout kill codes
-          # here via PIPESTATUS; a genuine test failure/panic (any other
-          # non-zero) still propagates and fails the tier.
+          # the job's `-eo pipefail` shell that gtimeout kill would otherwise
+          # abort the step and — now that macOS is a summary gate — flip every
+          # PR red. So tolerate ONLY exit 124 via PIPESTATUS: WITHOUT
+          # --preserve-status gtimeout reports its own timeout as exactly 124,
+          # so a real signal death (unrelated SIGTERM/SIGKILL → 143/137) or a
+          # test failure/panic still propagates and fails the tier.
           set +e
-          gtimeout --preserve-status 120 \
+          gtimeout 120 \
             cargo test --test ci_audio device_capture \
             --no-default-features --features feat_macos \
             -- --test-threads=1 --nocapture 2>&1 | tee ci-audio-device.log
@@ -602,7 +603,7 @@ jobs:
           set -e
           case "$rc" in
             0) ;;
-            124|137|143)
+            124)
               echo "::notice::device_capture hit the documented gtimeout kill (rc=$rc) — tolerated (AUHAL .start() hang on headless BlackHole).";;
             *)
               echo "::error::device_capture failed with exit $rc (not a gtimeout kill) — real regression."
