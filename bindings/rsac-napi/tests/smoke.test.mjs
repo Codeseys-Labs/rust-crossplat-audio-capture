@@ -53,6 +53,42 @@ test('CaptureTarget factories + describe round-trip', () => {
   }
 });
 
+test('compose classes are exported', () => {
+  for (const name of ['Composition', 'CompositionBuilder', 'Group']) {
+    assert.equal(typeof rsac[name], 'function', `missing compose export: ${name}`);
+  }
+});
+
+test('compose device-free build + not-started contract', () => {
+  // A "system"-source composition BUILDS without touching a device (build only
+  // validates); we do NOT start() it — that needs a real device.
+  const g = new rsac.Group('main');
+  g.source('system');
+  const builder = rsac.CompositionBuilder.create({ sampleRate: 48000 });
+  builder.addGroup(g);
+  const comp = builder.build();
+
+  assert.equal(comp.channelCount, 0, 'not-started channelCount should be 0');
+  assert.equal(comp.stats(), null, 'not-started stats() should be null');
+  assert.equal(comp.sourceStats(0), null, 'not-started sourceStats(0) should be null');
+  assert.equal(comp.isRunning, false, 'not-started isRunning should be false');
+  // stop() before start() is an idempotent no-op (must not throw).
+  assert.doesNotThrow(() => comp.stop());
+});
+
+test('compose builder validation rejects a zero quantum', () => {
+  const g = new rsac.Group('main');
+  g.source('system');
+  const builder = rsac.CompositionBuilder.create({ quantumMs: 0 });
+  builder.addGroup(g);
+  assert.throws(() => builder.preflight(), /CONFIGURATION|quantum/i);
+});
+
+test('compose group rejects an invalid gain eagerly', () => {
+  const g = new rsac.Group('g');
+  assert.throws(() => g.sourceWithGain('system', -1.0), /CONFIGURATION|gain/i);
+});
+
 test('device enumeration (headless-tolerant)', async () => {
   // listDevices() is async (Promise<AudioDevice[]>) — it MUST be awaited here,
   // otherwise a headless-machine rejection escapes the test as an

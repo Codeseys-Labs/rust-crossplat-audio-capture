@@ -189,6 +189,15 @@ objc2-app-kit = { version = "0.3", features = [
 core-foundation = "0.10.1"          # For CFDictionary creation (aggregate device description)
 core-foundation-sys = "0.8.7"       # Low-level Core Foundation FFI bindings
 
+# Block-based CoreAudio property listeners on a self-owned serial dispatch queue
+# (rsac-e8aa / GH #32): device-watch teardown removes the listener block on the
+# same queue and drains in-flight callbacks with a sync barrier, eliminating the
+# previously-intentional WatchListenerContext leak + in-flight-callback race.
+# Both already resolve at 0.3.0 / 0.6.1 transitively via the objc2-core-audio
+# stack, so this only makes the dependency direct (no version churn).
+dispatch2 = "0.3"                   # Serial dispatch queue + sync barrier for listener teardown
+block2 = "0.6"                      # ObjC block glue for AudioObjectAddPropertyListenerBlock
+
 sysinfo = "0.38.4"                  # For process tree discovery (ProcessTree capture target)
 # Note: CATapDescription is a private CoreAudio class — raw msg_send! is required (no objc2 bindings)
 

@@ -167,10 +167,26 @@ pub struct ApplicationInfo {
 /// via [`AudioCaptureBuilder`](crate::api::AudioCaptureBuilder) to capture
 /// application-specific audio using CoreAudio Process Taps (macOS 14.4+).
 pub fn enumerate_audio_applications() -> AudioResult<Vec<ApplicationInfo>> {
+    enumerate_audio_applications_scoped().map(|(apps, _is_fallback)| apps)
+}
+
+/// Like [`enumerate_audio_applications`], but also reports whether the returned
+/// list is the exact CoreAudio audio-process set or the unfiltered NSWorkspace
+/// fallback superset. `true` = fallback (macOS < 14.4, or the process-object
+/// query was unavailable / found no active PIDs).
+///
+/// This is the scope-carrying primitive behind
+/// [`list_audio_applications_scoped`](crate::core::introspection::list_audio_applications_scoped):
+/// only the fallback exits (version gate, unavailable/empty process-object
+/// query) are a *superset* of possibly-silent apps; the normal filtered
+/// intersection and the synthetic empty-intersection "PID n" path are both
+/// *exact* audio-PID sets and report `false`.
+pub fn enumerate_audio_applications_scoped() -> AudioResult<(Vec<ApplicationInfo>, bool)> {
     let all = enumerate_audio_applications_all()?;
 
     // Version gate: the audio-process-object API (and Process Taps) require
-    // macOS 14.4+. On older systems we cannot filter, so return the full list.
+    // macOS 14.4+. On older systems we cannot filter, so return the full list —
+    // a fallback superset that may include silent apps.
     let (major, minor, _patch) = crate::core::capabilities::get_macos_version();
     let supports_process_objects = major > 14 || (major == 14 && minor >= 4);
     if !supports_process_objects {
@@ -179,7 +195,7 @@ pub fn enumerate_audio_applications() -> AudioResult<Vec<ApplicationInfo>> {
             major,
             minor
         );
-        return Ok(all);
+        return Ok((all, true));
     }
 
     // Gather the set of PIDs CoreAudio reports as live audio processes.
@@ -187,13 +203,13 @@ pub fn enumerate_audio_applications() -> AudioResult<Vec<ApplicationInfo>> {
         Some(pids) if !pids.is_empty() => pids,
         // Property unavailable, query failed, or no audio processes detected:
         // fall back to the full NSWorkspace list rather than returning an
-        // empty/over-aggressive result.
+        // empty/over-aggressive result. This is a fallback superset.
         _ => {
             log::debug!(
                 "No active CoreAudio audio processes detected (or property unavailable); \
                  returning unfiltered NSWorkspace application list"
             );
-            return Ok(all);
+            return Ok((all, true));
         }
     };
 
@@ -206,23 +222,29 @@ pub fn enumerate_audio_applications() -> AudioResult<Vec<ApplicationInfo>> {
 
     // Defensive: if the intersection is somehow empty (e.g. audio is owned by a
     // helper process NSWorkspace doesn't list), surface the audio PIDs anyway so
-    // callers still see the active sources rather than an empty list.
+    // callers still see the active sources rather than an empty list. These are
+    // exact audio PIDs (from the process-object query), NOT a superset of silent
+    // apps — so this path is `false` (exact), not a fallback.
     if filtered.is_empty() {
         log::debug!(
             "Audio-process PID set did not intersect NSWorkspace apps; \
              returning audio PIDs without NSWorkspace metadata"
         );
-        return Ok(audio_pids
-            .into_iter()
-            .map(|pid| ApplicationInfo {
-                process_id: pid,
-                name: format!("PID {pid}"),
-                bundle_id: None,
-            })
-            .collect());
+        return Ok((
+            audio_pids
+                .into_iter()
+                .map(|pid| ApplicationInfo {
+                    process_id: pid,
+                    name: format!("PID {pid}"),
+                    bundle_id: None,
+                })
+                .collect(),
+            false,
+        ));
     }
 
-    Ok(filtered)
+    // Normal filtered intersection: exactly the audio producers.
+    Ok((filtered, false))
 }
 
 /// Enumerates **all** running NSWorkspace applications, unfiltered.
@@ -1012,71 +1034,208 @@ pub(crate) unsafe fn remove_device_alive_listener(
     // Do NOT free context_ptr (intentional leak — see the doc note).
 }
 
-/// Context shared between the CoreAudio listener proc and the watch helper
-/// thread. Boxed and passed to `AudioObjectAddPropertyListener` as the
-/// `inClientData` cookie.
+// ── Block-based device-watch FFI (rsac-e8aa / GH #32) ────────────────────────
+//
+// CoreAudio's *block* listener API takes a `dispatch_queue_t` and an ObjC block
+// instead of a C function pointer + `void*` cookie. Registering all listeners on
+// a single **serial** queue makes every notification block run serialized, and —
+// crucially — removing the block on that same queue then dispatching a synchronous
+// no-op barrier drains any in-flight callback before teardown frees the context.
+// This is the race-free replacement for the old PROC design's intentional leak.
+//
+// `coreaudio-sys` 0.2.17 *does* emit these two symbols, but types them with its
+// own opaque `dispatch_queue_t` / `AudioObjectPropertyListenerBlock` aliases.
+// Following this file's existing convention for selectors/prototypes coreaudio-sys
+// does not reliably surface with usable types (see the `KAUDIO_*` consts above),
+// we hand-declare them locally taking the queue and block as raw `*mut c_void`
+// pointers — decoupling us from coreaudio-sys's dispatch alias and matching the
+// raw pointers we obtain from `dispatch2` / `block2`.
+unsafe extern "C" {
+    /// Registers `inListener` (an ObjC block) to run on `inDispatchQueue` when
+    /// the property at `inAddress` changes. The block's C signature is
+    /// `void (^)(UInt32 inNumberAddresses, const AudioObjectPropertyAddress *inAddresses)`
+    /// — note it carries **no** object id and **no** client-data cookie; context
+    /// is captured by the Rust closure inside the block.
+    fn AudioObjectAddPropertyListenerBlock(
+        inObjectID: AudioObjectID,
+        inAddress: *const AudioObjectPropertyAddress,
+        inDispatchQueue: *mut std::ffi::c_void, // dispatch_queue_t
+        inListener: *mut std::ffi::c_void,      // AudioObjectPropertyListenerBlock
+    ) -> OSStatus;
+
+    /// Removes a block listener previously added with
+    /// [`AudioObjectAddPropertyListenerBlock`]. Per Apple's contract, once this
+    /// returns no *new* block is scheduled for the property; a block already
+    /// dispatched onto the queue may still run (which the serial-queue barrier at
+    /// teardown drains — see [`MacosDeviceEnumerator::watch`]).
+    fn AudioObjectRemovePropertyListenerBlock(
+        inObjectID: AudioObjectID,
+        inAddress: *const AudioObjectPropertyAddress,
+        inDispatchQueue: *mut std::ffi::c_void,
+        inListener: *mut std::ffi::c_void,
+    ) -> OSStatus;
+}
+
+/// Context shared between the CoreAudio notification **block** and the watch
+/// helper thread, held behind an [`Arc`](std::sync::Arc).
 ///
-/// # Lifetime — intentional bounded leak (H1 / PS-1)
+/// # Lifetime — no leak, no race (rsac-e8aa / GH #32)
 ///
-/// CoreAudio's PROC-based listener gives **no** guarantee that an in-flight
-/// `watch_listener_proc` has finished when `AudioObjectRemovePropertyListener`
-/// returns (Apple's docs promise only that *no new* notifications fire; an
-/// already-dispatched proc may still be running on a CoreAudio thread). There is
-/// no app-side barrier that can close that window without risking deadlock on
-/// the HAL's internal locks. To make the proc's `client_data` deref always sound
-/// we therefore **intentionally leak** this allocation: `watch()` builds it with
-/// `Box::into_raw` and never reclaims it on the success / spawn-failure paths
-/// (it is reclaimed only on the pre-add construction-error path, where no
-/// listener was ever registered and thus no proc can fire). A late or in-flight
-/// proc consequently always dereferences valid, `'static` memory.
+/// The old PROC design **intentionally leaked** this struct because CoreAudio's
+/// C-function listener gave no barrier that an in-flight callback had finished
+/// when the listener was removed. The block-based design removes that need:
+/// every notification block runs on a single **serial** dispatch queue owned by
+/// the watcher, so at teardown we (1) remove the block on that queue — no *new*
+/// block is scheduled after `AudioObjectRemovePropertyListenerBlock` returns —
+/// then (2) dispatch a synchronous no-op onto the serial queue, which by FIFO
+/// ordering cannot start until every previously-enqueued block has finished.
+/// When that `exec_sync` returns, no block is in flight or pending, so dropping
+/// the last `Arc<WatchListenerContext>` frees the context with no use-after-free
+/// window. The block holds one `Arc` clone (keeping the context alive for
+/// exactly as long as a block can run); teardown holds another and drops it only
+/// after the barrier.
 ///
-/// Event **delivery** is stopped at teardown not by freeing this struct but by
-/// disconnecting the channel: teardown takes the `SyncSender` out of
-/// `event_tx` (sets it to `None`), which drops the last live sender so the
-/// helper's `recv()` returns `Err` and the helper exits. A proc that fires after
-/// that finds `event_tx == None` (or a `Disconnected` channel) and is a no-op.
-///
-/// The leak is bounded and tiny — one `WatchListenerContext` (a sender slot plus
-/// a `HashSet` of device ids, tens of bytes) per `watch()`/drop cycle. Watchers
-/// are long-lived and few, so this is acceptable as a stopgap. The proper fix
-/// that eliminates both the leak and the race (migrate to
-/// `AudioObjectAddPropertyListenerBlock` on a self-owned serial dispatch queue,
-/// removing the listener on that same queue, per the Chromium/Itsuki pattern) is
-/// deferred — see ADR-0005 §5/§6.
+/// The `Arc` is `Send + Sync` (both fields are), which is required because the
+/// notification block is a shared `Fn` closure.
 struct WatchListenerContext {
-    /// Producer end of the bounded channel; the proc pushes `DeviceEvent`s here.
-    ///
-    /// Wrapped in `Mutex<Option<…>>` so teardown can drop the sender *without*
-    /// freeing the (leaked) context: setting it to `None` disconnects the
-    /// channel and ends the helper, while the rest of the struct stays valid for
-    /// any in-flight proc. The proc locks and no-ops when it is `None`. Locking
-    /// is off the RT path (the proc runs on a CoreAudio thread, not the audio
-    /// callback) so a `Mutex` here is fine; poison is always recovered, never
-    /// `unwrap`ped, so neither the proc nor teardown can panic.
-    event_tx: std::sync::Mutex<Option<std::sync::mpsc::SyncSender<DeviceEvent>>>,
+    /// Producer end of the bounded channel; the notification block pushes
+    /// `DeviceEvent`s here. In a `Mutex` because a `SyncSender` is `Send` but not
+    /// `Sync`, and the block is a shared `Fn` closure that requires its captures
+    /// be `Sync`. The lock is off the RT path (the block runs on our serial
+    /// dispatch queue, never the audio callback) and, because that queue is
+    /// serial, is uncontended in practice; poison is always recovered, never
+    /// `unwrap`ped, so neither the block nor teardown can panic. This is a
+    /// correctness requirement for the `Fn` capture, **not** the old leak dance.
+    event_tx: std::sync::Mutex<std::sync::mpsc::SyncSender<DeviceEvent>>,
     /// The device-id set observed at the previous device-list notification, used
-    /// to diff for add/remove. Behind a `Mutex` because CoreAudio may invoke the
-    /// proc from its internal thread pool (treated as possibly concurrent).
+    /// to diff for add/remove. Behind a `Mutex` for the same `Fn`/`Sync` reason;
+    /// serial-queue execution means it too is uncontended.
     previous_devices: std::sync::Mutex<std::collections::HashSet<AudioObjectID>>,
 }
 
-/// A raw `*mut WatchListenerContext` that we assert is safe to send across the
-/// teardown-closure boundary.
+/// The notification block signature as an erased `Fn`. CoreAudio calls it with
+/// `(UInt32 inNumberAddresses, const AudioObjectPropertyAddress *inAddresses)`;
+/// we type the addresses arg as `*mut c_void` (identical thin-pointer ABI) so the
+/// closure args satisfy `block2`'s `Encode` bounds without a `RefEncode` impl for
+/// the coreaudio-sys `AudioObjectPropertyAddress` type, casting back inside.
+type WatchBlock = block2::RcBlock<dyn Fn(u32, *mut std::ffi::c_void)>;
+
+/// Everything the watcher's teardown closure owns, bundled so it can be captured
+/// by a single `FnOnce() + Send` closure.
 ///
-/// The pointee is an **intentionally leaked** allocation (see
-/// [`WatchListenerContext`]): `watch()` creates it with `Box::into_raw` and the
-/// teardown closure never reclaims it, so it is valid for the process lifetime —
-/// no co-captured `Box` is needed to keep it alive. The teardown closure uses
-/// this pointer only to identify the listener registration when it passes the
-/// same cookie value back to `AudioObjectRemovePropertyListener` (which compares
-/// it by value); it does **not** gate the liveness of the pointee.
-/// `WatchListenerContext` is itself `Send` (its fields are `Send`), so carrying
-/// the pointer across the spawn/teardown boundary is sound.
-struct SendContextPtr(*mut WatchListenerContext);
-// SAFETY: see the type-level note — the pointee is `Send` and intentionally
-// leaked (valid for `'static`), and the pointer is only used to identify the
-// listener registration at teardown.
-unsafe impl Send for SendContextPtr {}
+/// [`block2::RcBlock`] is **not** `Send` by default (it is a ref-counted pointer
+/// to a heap block), so this newtype carries an `unsafe impl Send`. That is sound
+/// because the block only ever *executes* on our owned serial dispatch queue
+/// (never on the teardown thread), and the teardown thread touches it only to (a)
+/// pass its raw pointer to `AudioObjectRemovePropertyListenerBlock` and (b) drop
+/// it — dropping decrements the block's atomic refcount and, at zero, drops the
+/// captured `Arc<WatchListenerContext>` (which is `Send + Sync`), all of which is
+/// safe from any thread. `DispatchRetained<DispatchQueue>` and `JoinHandle` are
+/// already `Send`; the `Arc` is `Send + Sync`.
+struct WatchTeardown {
+    /// The self-owned serial queue all notification blocks run on. Dropped last,
+    /// after the barrier guarantees nothing else runs on it.
+    queue: dispatch2::DispatchRetained<dispatch2::DispatchQueue>,
+    /// The notification block; kept alive for the `Remove` calls, then dropped to
+    /// release its `Arc<WatchListenerContext>` clone.
+    block: WatchBlock,
+    /// The teardown's own `Arc` clone of the context; dropping it after the
+    /// barrier is what frees the context (and drops the sender → ends the helper).
+    context: std::sync::Arc<WatchListenerContext>,
+    /// The helper thread draining the channel into `on_event`.
+    helper: std::thread::JoinHandle<()>,
+}
+// SAFETY: see the type-level note — the block executes only on the owned serial
+// queue; every field is otherwise `Send`, and dropping the `RcBlock` from the
+// teardown thread only touches thread-safe refcounts + a `Send + Sync` `Arc`.
+unsafe impl Send for WatchTeardown {}
+
+impl WatchTeardown {
+    /// The race-free teardown sequence: remove → barrier → free → join. Runs once
+    /// on `DeviceWatcher::drop`, on the drop thread (never on the watch queue, so
+    /// the `exec_sync` barrier cannot self-deadlock). See
+    /// [`MacosDeviceEnumerator::watch`] for the full ordering proof.
+    ///
+    /// Consumes `self` (a single `Send` unit), which is why the teardown closure
+    /// captures the whole struct rather than its individual `!Send` fields.
+    fn run(self) {
+        let WatchTeardown {
+            queue,
+            block,
+            context,
+            helper,
+        } = self;
+
+        // Raw pointers into the owned `queue`/`block`, valid until dropped below.
+        let queue_raw =
+            dispatch2::DispatchRetained::as_ptr(&queue).as_ptr() as *mut std::ffi::c_void;
+        let block_raw = block2::RcBlock::as_ptr(&block) as *mut std::ffi::c_void;
+
+        // 1. Remove every block on the same queue — stops NEW dispatch. Track
+        //    failures: a non-zero OSStatus means CoreAudio may STILL retain the
+        //    copied block for that selector, so the freed-not-leaked fast path
+        //    below would no longer be sound (PR #59 review).
+        let mut removal_failed = false;
+        for address in WATCH_ADDRESSES.iter() {
+            // SAFETY: same object/queue/block as the registrations in `watch()`;
+            // `block_raw`/`queue_raw` address the still-owned `block`/`queue`.
+            let status = unsafe {
+                AudioObjectRemovePropertyListenerBlock(
+                    kAudioObjectSystemObject,
+                    address,
+                    queue_raw,
+                    block_raw,
+                )
+            };
+            if status != 0 {
+                log::warn!(
+                    "rsac macOS device-watch: AudioObjectRemovePropertyListenerBlock \
+                     failed (OSStatus {status}) for selector {} — falling back to the \
+                     leak-on-teardown path for this watcher",
+                    address.mSelector
+                );
+                removal_failed = true;
+            }
+        }
+
+        // 2. Barrier: a synchronous no-op on the SERIAL queue cannot start until
+        //    every previously-enqueued notification block has finished (FIFO), so
+        //    when it returns no block is in flight or pending. This is the
+        //    in-flight barrier the old PROC API lacked.
+        queue.exec_sync(|| {});
+
+        if removal_failed {
+            // A listener may still be registered: a future notification could
+            // dispatch the (CoreAudio-copied) block onto `queue`, and the block's
+            // captured `Arc` keeps `context` alive — so the helper's sender never
+            // drops and `helper.join()` would hang. Fall back to the pre-fix
+            // documented behavior for exactly this watcher: leak the block, the
+            // context, and the queue (all still valid for any late dispatch) and
+            // detach the helper thread. This is the same bounded leak ADR-0005 §5
+            // shipped unconditionally; it is now confined to the (never observed)
+            // removal-failure path.
+            std::mem::forget(block);
+            std::mem::forget(context);
+            std::mem::forget(queue);
+            drop(helper); // JoinHandle drop = detach
+            return;
+        }
+
+        // 3. Drop the block (releasing its captured `Arc` clone), then the
+        //    teardown's `Arc` clone → strong count hits 0 → context freed and its
+        //    `SyncSender` dropped, so the helper's recv() returns Err.
+        drop(block);
+        drop(context);
+
+        // 4. Join the helper thread; ignore a panicked-handler join error so Drop
+        //    never panics.
+        let _ = helper.join();
+
+        // 5. Drop the queue LAST — after the barrier guarantees nothing runs on
+        //    it. (Explicit for the ordering; it would drop here anyway.)
+        drop(queue);
+    }
+}
 
 /// Snapshots the current set of CoreAudio device ids.
 ///
@@ -1089,39 +1248,29 @@ fn current_device_id_set() -> std::collections::HashSet<AudioObjectID> {
     }
 }
 
-/// The CoreAudio property-listener proc.
+/// Body of the CoreAudio notification block.
 ///
-/// CoreAudio invokes this on one of its own threads when any of the watched
-/// properties changes. It must NOT call arbitrary user code or re-enter
-/// CoreAudio in a blocking way, so it only translates the change into
-/// `DeviceEvent`(s) and pushes them into the bounded channel for the helper
-/// thread to deliver. It never panics (a panic across the FFI boundary would be
-/// UB): all work is fallible-by-skipping.
+/// The notification block (registered via [`AudioObjectAddPropertyListenerBlock`])
+/// calls this on our owned serial dispatch queue when any watched property
+/// changes. It must NOT call arbitrary user code or re-enter CoreAudio in a
+/// blocking way, so it only translates the change into `DeviceEvent`(s) and
+/// pushes them into the bounded channel for the helper thread to deliver. It
+/// never panics: all work is fallible-by-skipping.
 ///
 /// # Safety
-/// - `client_data` points to a [`WatchListenerContext`] that is **intentionally
-///   leaked** and therefore valid for the process lifetime. CoreAudio does
-///   **not** guarantee an in-flight proc has finished when
-///   `AudioObjectRemovePropertyListener` returns, so the deref is made sound by
-///   never freeing the allocation rather than by an ordering barrier; a proc
-///   that fires after teardown simply finds the channel disconnected (its sender
-///   taken) and no-ops. See [`WatchListenerContext`] for the full rationale.
-/// - `addresses` / `num_addresses` describe a C array of
-///   `AudioObjectPropertyAddress`; we read `num_addresses` entries.
-unsafe extern "C" fn watch_listener_proc(
-    _object_id: AudioObjectID,
+/// `num_addresses` / `addresses` describe a C array of
+/// `AudioObjectPropertyAddress`; the caller (the block glue) guarantees they
+/// come straight from CoreAudio, so `addresses` is a valid pointer to
+/// `num_addresses` entries (or null, which we guard). `context` is a live
+/// reference held alive by the block's `Arc` clone for as long as the block can
+/// run (see [`WatchListenerContext`]).
+unsafe fn dispatch_watch_notification(
+    context: &WatchListenerContext,
     num_addresses: u32,
     addresses: *const AudioObjectPropertyAddress,
-    client_data: *mut std::ffi::c_void,
-) -> OSStatus {
-    // Recover the context. A null cookie should never happen, but guard anyway.
-    if client_data.is_null() {
-        return 0;
-    }
-    let context = &*(client_data as *const WatchListenerContext);
-
+) {
     if addresses.is_null() {
-        return 0;
+        return;
     }
 
     for i in 0..num_addresses as isize {
@@ -1141,8 +1290,6 @@ unsafe extern "C" fn watch_listener_proc(
             }
         }
     }
-
-    0
 }
 
 /// Diffs the current device-id set against the previous snapshot and pushes a
@@ -1200,19 +1347,18 @@ fn emit_default_changed(context: &WatchListenerContext, kind: DeviceKind, input:
 
 /// Non-blocking push into the bounded channel. A full channel (consumer behind)
 /// or a disconnected channel (helper thread already gone) drops the event rather
-/// than blocking the CoreAudio listener thread. After teardown has taken the
-/// sender (`event_tx == None`) — possible on a leaked context whose proc fires
-/// late — this is a silent no-op. Never panics (a poisoned sender lock is
-/// recovered into, not `unwrap`ped).
+/// than blocking the serial dispatch queue the notification block runs on. Never
+/// panics (a poisoned sender lock is recovered into, not `unwrap`ped).
+///
+/// With the block-based design, teardown no longer needs to take the sender out
+/// of the context (the barrier + `Arc` drop handle liveness); the sender is held
+/// directly. A block that somehow ran after the helper exited would simply see a
+/// `Disconnected` channel and no-op.
 fn try_push_event(context: &WatchListenerContext, event: DeviceEvent) {
-    let guard = context
+    let tx = context
         .event_tx
         .lock()
         .unwrap_or_else(|poisoned| poisoned.into_inner());
-    let Some(tx) = guard.as_ref() else {
-        // Teardown took the sender; the watcher is being dropped. Nothing to do.
-        return;
-    };
     match tx.try_send(event) {
         Ok(()) => {}
         Err(std::sync::mpsc::TrySendError::Full(_)) => {
@@ -1275,8 +1421,9 @@ impl DeviceEnumerator for MacosDeviceEnumerator {
 
     /// Subscribe to CoreAudio device hot-plug / default-change notifications.
     ///
-    /// Registers three `AudioObjectAddPropertyListener`s on
-    /// `kAudioObjectSystemObject`:
+    /// Registers three block listeners (via
+    /// `AudioObjectAddPropertyListenerBlock`) on `kAudioObjectSystemObject`,
+    /// all on **one self-owned serial dispatch queue**:
     ///
     /// - `kAudioHardwarePropertyDevices` — the device list changed; we diff the
     ///   current id set against the previous snapshot to emit
@@ -1287,99 +1434,154 @@ impl DeviceEnumerator for MacosDeviceEnumerator {
     ///   we emit [`DefaultChanged`](DeviceEvent::DefaultChanged) with the new
     ///   default's id + [`DeviceKind`].
     ///
-    /// The CoreAudio listener proc runs on a CoreAudio-managed thread where
-    /// invoking arbitrary user code (or re-entering CoreAudio) is unsafe, so the
-    /// proc only *pushes* a [`DeviceEvent`] into a bounded `mpsc` channel. A
-    /// dedicated helper thread owned by the returned [`DeviceWatcher`] drains the
-    /// channel and invokes `on_event`. Neither thread is the real-time audio
-    /// callback thread, so allocation and locking off the channel are fine.
+    /// The notification block runs on our serial dispatch queue (a CoreAudio /
+    /// libdispatch thread, never the real-time audio callback thread), so it must
+    /// not call arbitrary user code; it only *pushes* a [`DeviceEvent`] into a
+    /// bounded `mpsc` channel. A dedicated helper thread owned by the returned
+    /// [`DeviceWatcher`] drains the channel and invokes `on_event`, so
+    /// `on_event` runs off both the CoreAudio thread *and* our queue
+    /// (preserving the ADR-0004 delivery model).
     ///
-    /// The returned [`DeviceWatcher`]'s teardown closure removes **every**
-    /// registered listener (best-effort — stops *new* notifications), takes the
-    /// channel sender out of the context to disconnect the channel (signalling
-    /// the helper thread to exit), and joins the helper thread — no leaked
-    /// listener, no leaked thread, no hang.
+    /// # Race-free teardown (rsac-e8aa / GH #32)
     ///
-    /// The listener-proc context (a `WatchListenerContext`) is **intentionally
-    /// leaked** (`Box::into_raw`, never reclaimed on the success/spawn-failure
-    /// paths), because CoreAudio gives no barrier that an in-flight proc has
-    /// finished when the listener is removed; never freeing it makes a late proc
-    /// deref always sound. Delivery is stopped by disconnecting the channel, not
-    /// by freeing the context. The residual cost is a bounded, intentional
-    /// per-cycle context leak (tens of bytes); the proper race-free fix is
-    /// deferred — see `WatchListenerContext` and ADR-0005 §5/§6.
+    /// The returned [`DeviceWatcher`]'s teardown closure runs the remove →
+    /// barrier → free sequence:
+    ///
+    /// 1. For each address, `AudioObjectRemovePropertyListenerBlock` on the
+    ///    same queue — per Apple's contract, no *new* block is scheduled after it
+    ///    returns.
+    /// 2. A synchronous no-op barrier (`queue.exec_sync(|| {})`). Because the
+    ///    queue is **serial** and FIFO, this cannot start until every previously
+    ///    enqueued notification block has finished, so when it returns **no block
+    ///    is in flight or pending**. This is exactly the in-flight barrier the
+    ///    old PROC API lacked.
+    /// 3. Drop the block (releasing its `Arc<WatchListenerContext>` clone) and the
+    ///    teardown's own `Arc` clone → the context is **freed, not leaked**, and
+    ///    the contained `SyncSender` drops so the helper's `recv()` returns `Err`.
+    /// 4. Join the helper thread, then drop the queue last.
+    ///
+    /// The synchronization primitive is the serial queue's FIFO ordering, not
+    /// atomics: block N completes-before block N+1 begins, and the `exec_sync`
+    /// enqueued after the removals completes-before returning only once all prior
+    /// blocks complete. The block's `Arc` clone keeps the context alive for
+    /// exactly as long as a block can run, so there is no use-after-free window —
+    /// eliminating both the old intentional `WatchListenerContext` leak *and* the
+    /// in-flight-callback race. The barrier is a `dispatch_sync` on **our own**
+    /// queue (never an app lock held across the HAL), and teardown runs on the
+    /// `DeviceWatcher::drop` thread — never on the watch queue — so it cannot
+    /// self-deadlock or deadlock against the HAL's recursive mutex (the reason
+    /// app-side locking was rejected in ADR-0005 §5/§6).
+    ///
+    /// The device-*alive* listener (`DeviceAliveContext`) is a separate concern
+    /// still on the PROC API + `tearing_down` guard; migrating it is a follow-up.
     fn watch(&self, on_event: DeviceEventHandler) -> AudioResult<DeviceWatcher> {
-        // Bounded channel: the CoreAudio proc is the producer, the helper thread
-        // the consumer. A bound avoids unbounded growth if events ever burst; on
-        // a full channel the proc drops the event (logged) rather than blocking
-        // the CoreAudio listener thread.
+        // Bounded channel: the notification block is the producer, the helper
+        // thread the consumer. A bound avoids unbounded growth if events ever
+        // burst; on a full channel the block drops the event (logged) rather than
+        // blocking the serial dispatch queue.
         let (event_tx, event_rx) = std::sync::mpsc::sync_channel::<DeviceEvent>(WATCH_CHANNEL_CAP);
 
-        // The listener-proc context. Boxed for a stable address we pass to
-        // CoreAudio as the `inClientData` cookie, then INTENTIONALLY LEAKED via
-        // `Box::into_raw`: CoreAudio gives no barrier that an in-flight proc has
-        // finished when its listener is removed, so we make a late deref sound by
-        // never freeing the allocation (see `WatchListenerContext` + ADR-0005).
-        // The Box is consumed by `into_raw`, so it does NOT drop at end of scope;
-        // the success/spawn-failure paths leak it, and only the pre-add
-        // construction-error path reclaims it (no proc can be in flight there).
-        // The sender lives in a `Mutex<Option<…>>` so teardown can disconnect the
-        // channel (take the sender) WITHOUT freeing the leaked context. The
-        // previous-device-id snapshot lets the device-list proc diff for
-        // add/remove; it lives behind a Mutex because the proc may be invoked
-        // re-entrantly / from CoreAudio's internal thread pool.
-        let context_ptr: *mut WatchListenerContext =
-            Box::into_raw(Box::new(WatchListenerContext {
-                event_tx: std::sync::Mutex::new(Some(event_tx)),
-                previous_devices: std::sync::Mutex::new(current_device_id_set()),
-            }));
+        // The listener context, owned by an Arc: one clone is captured by the
+        // notification block (keeping it alive for exactly as long as a block can
+        // run), one clone is held by the teardown closure (dropped only after the
+        // barrier drains in-flight blocks). No leak — see `WatchListenerContext`.
+        let context = std::sync::Arc::new(WatchListenerContext {
+            event_tx: std::sync::Mutex::new(event_tx),
+            previous_devices: std::sync::Mutex::new(current_device_id_set()),
+        });
 
-        // Register all three listeners against the 'static address table. If any
-        // registration fails, unregister the ones that already succeeded and bail
-        // — leaving no dangling listener. On THIS construction-error path we
-        // reclaim the context (the only path that frees it): a failed add means
-        // no listener is left that could fire a proc, so there is no in-flight
-        // deref to protect and freeing is sound.
-        // `i` doubles as the count of listeners registered BEFORE this one, so on
-        // a mid-loop failure the rollback unregisters exactly indices `0..i`.
+        // Self-owned SERIAL dispatch queue: registering all listeners here makes
+        // every notification block run serialized on it, which is what lets the
+        // teardown barrier (a sync no-op) drain any in-flight block.
+        let queue = dispatch2::DispatchQueue::new(
+            "com.rsac.macos.device-watch",
+            dispatch2::DispatchQueueAttr::SERIAL,
+        );
+        let queue_raw =
+            dispatch2::DispatchRetained::as_ptr(&queue).as_ptr() as *mut std::ffi::c_void;
+
+        // One block shared by all three addresses: it re-reads the addresses arg
+        // and dispatches per-selector exactly as the old proc did. The block
+        // captures an `Arc<WatchListenerContext>` clone (a `Fn` closure, hence the
+        // context's fields sit behind `Mutex` for `Sync`).
+        let block_ctx = std::sync::Arc::clone(&context);
+        let block: WatchBlock = block2::RcBlock::new(
+            move |num_addresses: u32, addresses: *mut std::ffi::c_void| {
+                // SAFETY: `addresses` is the `const AudioObjectPropertyAddress *`
+                // CoreAudio passes to the block (typed as `*mut c_void` for the
+                // block2 `Encode` bound); we cast it back and read `num_addresses`
+                // entries. `block_ctx` is alive: the block holds this `Arc` clone
+                // for its whole callable lifetime, and teardown's barrier
+                // guarantees no block runs after the last clone is dropped.
+                unsafe {
+                    dispatch_watch_notification(
+                        &block_ctx,
+                        num_addresses,
+                        addresses as *const AudioObjectPropertyAddress,
+                    );
+                }
+            },
+        );
+        let block_raw = block2::RcBlock::as_ptr(&block) as *mut std::ffi::c_void;
+
+        // Register all three block listeners against the 'static address table on
+        // our serial queue. If any registration fails, remove the ones already
+        // registered (reusing `rollback_range`) and bail — no dangling listener,
+        // and the `Arc` + `RcBlock` + queue drop normally (no leak).
         for (i, address) in WATCH_ADDRESSES.iter().enumerate() {
+            // SAFETY: `kAudioObjectSystemObject` is a valid object; `address`
+            // points at a live entry of the 'static table; `queue_raw` and
+            // `block_raw` are non-null raw pointers into `queue`/`block`, both
+            // owned locally (and moved into the teardown closure on success), so
+            // they outlive every block invocation.
             let status = unsafe {
-                AudioObjectAddPropertyListener(
+                AudioObjectAddPropertyListenerBlock(
                     kAudioObjectSystemObject,
                     address,
-                    Some(watch_listener_proc),
-                    context_ptr as *mut std::ffi::c_void,
+                    queue_raw,
+                    block_raw,
                 )
             };
             if status != 0 {
-                // Roll back the listeners registered so far (indices `0..i` —
-                // see `rollback_range`, which encodes this for the unit test),
-                // then fail.
+                // Roll back the listeners registered so far (indices `0..i`).
+                let mut rollback_failed = false;
                 for prior in WATCH_ADDRESSES.iter().take(rollback_range(i).end) {
-                    unsafe {
-                        AudioObjectRemovePropertyListener(
+                    // SAFETY: same arguments as the matching successful add above;
+                    // removing an already-registered block on the same queue.
+                    let rb = unsafe {
+                        AudioObjectRemovePropertyListenerBlock(
                             kAudioObjectSystemObject,
                             prior,
-                            Some(watch_listener_proc),
-                            context_ptr as *mut std::ffi::c_void,
-                        );
+                            queue_raw,
+                            block_raw,
+                        )
+                    };
+                    if rb != 0 {
+                        rollback_failed = true;
                     }
                 }
-                // Reclaim the leaked-by-default context: this is the ONLY path
-                // that frees it. After the rollback loop above, no listener is
-                // registered, so no proc can be mid-flight or dispatched against
-                // `context_ptr` — the deref-after-free window cannot exist here.
-                // SAFETY: `context_ptr` came from `Box::into_raw` above, has not
-                // been freed, and (post-rollback) is referenced by no live
-                // listener; this reconstitutes the unique owning Box exactly once.
-                unsafe {
-                    drop(Box::from_raw(context_ptr));
+                // Drain any block already dispatched before the removals landed.
+                queue.exec_sync(|| {});
+                if rollback_failed {
+                    // A prior listener may survive: leak block/context/queue so a
+                    // late dispatch never touches freed memory (same bounded
+                    // fallback as WatchTeardown::run — PR #59 review).
+                    log::warn!(
+                        "rsac macOS device-watch: listener rollback failed — leaking \
+                         watch context to stay dispatch-safe"
+                    );
+                    std::mem::forget(block);
+                    std::mem::forget(context);
+                    std::mem::forget(queue);
                 }
+                // Otherwise no leak: dropping `block`, `context`, and `queue` at
+                // end of scope releases everything (no listener remains that
+                // could run a block, so no in-flight deref to protect).
                 return Err(AudioError::BackendError {
                     backend: "CoreAudio".into(),
                     operation: "watch".into(),
                     message: format!(
-                        "AudioObjectAddPropertyListener failed (OSStatus {}) for selector {}",
+                        "AudioObjectAddPropertyListenerBlock failed (OSStatus {}) for selector {}",
                         status, address.mSelector
                     ),
                     context: Some(BackendContext {
@@ -1392,9 +1594,8 @@ impl DeviceEnumerator for MacosDeviceEnumerator {
         }
 
         // Helper thread: drain the channel and invoke the user handler. It exits
-        // when the sender is dropped (teardown), at which point recv() returns
-        // Err and the loop ends. `on_event` runs here, NOT on the CoreAudio
-        // listener thread.
+        // when the sender is dropped (teardown drops the last `Arc`, dropping the
+        // contained sender), at which point recv() returns Err and the loop ends.
         let mut on_event = on_event;
         let helper = match std::thread::Builder::new()
             .name("rsac-macos-device-watch".to_string())
@@ -1405,25 +1606,39 @@ impl DeviceEnumerator for MacosDeviceEnumerator {
             }) {
             Ok(handle) => handle,
             Err(e) => {
-                // Spawn failed: undo the listeners so nothing dangles, then error.
+                // Spawn failed: remove every block on the queue, then run the same
+                // barrier before dropping so no in-flight block outlives the
+                // context. Unlike the PROC path this frees everything (no leak) —
+                // unless a removal itself fails, in which case leak to stay
+                // dispatch-safe (same fallback as WatchTeardown::run).
+                let mut removal_failed = false;
                 for address in WATCH_ADDRESSES.iter() {
-                    unsafe {
-                        AudioObjectRemovePropertyListener(
+                    // SAFETY: mirrors the successful registrations above.
+                    let rb = unsafe {
+                        AudioObjectRemovePropertyListenerBlock(
                             kAudioObjectSystemObject,
                             address,
-                            Some(watch_listener_proc),
-                            context_ptr as *mut std::ffi::c_void,
-                        );
+                            queue_raw,
+                            block_raw,
+                        )
+                    };
+                    if rb != 0 {
+                        removal_failed = true;
                     }
                 }
-                // INTENTIONALLY LEAK `context_ptr` here (do NOT Box::from_raw):
-                // unlike the mid-loop construction-error path, the listeners WERE
-                // successfully registered, so the HAL may already have dispatched
-                // a proc against `context_ptr` before we removed them above.
-                // CoreAudio gives no in-flight-proc barrier, so freeing now would
-                // reopen the use-after-free window. The leak is a bounded one-time
-                // cost on this cold spawn-failure path and keeps the guarantee
-                // uniform with the success teardown.
+                // Barrier: drain any block already dispatched before the removals.
+                queue.exec_sync(|| {});
+                if removal_failed {
+                    log::warn!(
+                        "rsac macOS device-watch: listener removal failed during \
+                         spawn-failure rollback — leaking watch context to stay \
+                         dispatch-safe"
+                    );
+                    std::mem::forget(block);
+                    std::mem::forget(context);
+                    std::mem::forget(queue);
+                }
+                // Otherwise `block`, `context`, `queue` drop here — freed, not leaked.
                 return Err(AudioError::BackendError {
                     backend: "CoreAudio".into(),
                     operation: "watch".into(),
@@ -1433,62 +1648,22 @@ impl DeviceEnumerator for MacosDeviceEnumerator {
             }
         };
 
-        // Wrap the raw context pointer so the teardown closure stays `Send`
-        // (a bare `*mut` is `!Send`). See `SendContextPtr`'s safety note.
-        let send_ctx = SendContextPtr(context_ptr);
+        // Bundle everything the teardown owns into a single `Send` unit. `block`
+        // and `queue` are moved in; `context` is the teardown's `Arc` clone.
+        let teardown_state = WatchTeardown {
+            queue,
+            block,
+            context,
+            helper,
+        };
 
-        // Teardown closure (runs once on DeviceWatcher::drop): remove every
-        // listener FIRST (best-effort — stops NEW notifications), THEN take the
-        // SyncSender out of the (leaked) context to disconnect the channel,
-        // signalling the helper to exit, THEN join the helper thread. The context
-        // allocation itself is NEVER freed (see `WatchListenerContext`): a late
-        // or in-flight proc therefore always derefs valid memory and, finding the
-        // sender taken, no-ops.
-        let teardown: Box<dyn FnOnce() + Send> = Box::new(move || {
-            // Rebind the WHOLE `SendContextPtr` as a unit. Under Rust 2021's
-            // disjoint closure captures, writing `send_ctx.0` directly would
-            // capture only the `*mut WatchListenerContext` FIELD — which is
-            // `!Send` — bypassing the wrapper's `unsafe impl Send` and making
-            // this teardown closure `!Send` (it must be `FnOnce() + Send`).
-            // Capturing `send_ctx` whole preserves the Send assertion.
-            let send_ctx = send_ctx;
-            // `send_ctx.0` points at the intentionally-leaked context, valid for
-            // the process lifetime; we deref it below to disconnect the channel.
-            let ctx_ptr = send_ctx.0;
-            for address in WATCH_ADDRESSES.iter() {
-                unsafe {
-                    AudioObjectRemovePropertyListener(
-                        kAudioObjectSystemObject,
-                        address,
-                        Some(watch_listener_proc),
-                        ctx_ptr as *mut std::ffi::c_void,
-                    );
-                }
-            }
-            // Disconnect the channel WITHOUT freeing the context: take the
-            // SyncSender out of the leaked context. Dropping the last live sender
-            // makes the helper's recv() return Err so its loop ends. A proc that
-            // fires after this finds `event_tx == None` and no-ops.
-            // SAFETY: `ctx_ptr` addresses the leaked (never-freed) context, so it
-            // is a valid `&WatchListenerContext` for the process lifetime. We only
-            // touch the `Mutex`-guarded sender; concurrent proc access is
-            // serialised by that lock.
-            let ctx: &WatchListenerContext = unsafe { &*ctx_ptr };
-            // Recover a poisoned lock rather than panicking inside Drop; taking
-            // the sender out (and dropping it) cannot itself panic.
-            let mut guard = ctx
-                .event_tx
-                .lock()
-                .unwrap_or_else(|poisoned| poisoned.into_inner());
-            *guard = None;
-            // Release the sender lock BEFORE joining so a concurrent proc's
-            // try-lock in `try_push_event` is never blocked on the joining
-            // thread (it will simply observe `None` and no-op).
-            drop(guard);
-            // Join the helper thread; ignore a panicked-handler join error so
-            // Drop never panics.
-            let _ = helper.join();
-        });
+        // Teardown closure (runs once on DeviceWatcher::drop): captures ONLY the
+        // whole `WatchTeardown` (a `Send` unit via its `unsafe impl Send`) and
+        // delegates to `WatchTeardown::run`, which performs the
+        // remove → barrier → free → join sequence. Capturing the struct whole —
+        // rather than its individual `!Send` fields — is what keeps this closure
+        // `Send` under Rust 2021's disjoint captures.
+        let teardown: Box<dyn FnOnce() + Send> = Box::new(move || teardown_state.run());
 
         Ok(DeviceWatcher::from_teardown(teardown))
     }
@@ -2289,6 +2464,26 @@ mod tests {
         }
     }
 
+    /// rsac-f547: the scope-carrying enumeration returns a well-formed list.
+    /// The plain fn is defined as the scoped fn with the bool discarded (see
+    /// `enumerate_audio_applications` at the top of this file), so agreement is
+    /// by-construction; comparing two separate live snapshots would only race
+    /// application churn between the calls (PR #59 review). Assert on ONE
+    /// captured snapshot instead.
+    #[test]
+    #[ignore = "requires macOS GUI environment"]
+    fn enumerate_audio_applications_scoped_is_well_formed() {
+        let (scoped, is_fallback) =
+            enumerate_audio_applications_scoped().expect("scoped enumeration should succeed");
+        assert!(
+            !scoped.is_empty(),
+            "a macOS desktop should report at least one application (fallback={is_fallback})"
+        );
+        for app in &scoped {
+            assert!(app.process_id > 0, "PID must be non-zero: {app:?}");
+        }
+    }
+
     #[test]
     #[ignore = "requires macOS 14.4+ audio hardware"]
     fn enumerate_audio_applications_filters_below_unfiltered_count() {
@@ -2487,17 +2682,21 @@ mod tests {
         assert!(!rollback_range(2).contains(&2));
     }
 
-    /// rsac-af31: after teardown disconnects the channel (sets `event_tx = None`,
-    /// the production teardown's exact operation — WITHOUT freeing the
-    /// intentionally-leaked context), a re-entrant listener proc must OBSERVE the
-    /// channel as gone and no-op. This exercises rsac's own `try_push_event`
-    /// disconnect path (not just `Option::take`): we push an event, drain it,
-    /// then teardown-disconnect and assert a subsequent push delivers NOTHING.
+    /// rsac-e8aa: after the helper thread exits (its receiver drops), a
+    /// notification block that still runs must OBSERVE the channel as
+    /// disconnected and no-op. This exercises `try_push_event`'s `Disconnected`
+    /// path: we push an event, drain it, drop the receiver, then assert a
+    /// subsequent push delivers NOTHING and does not panic/block.
+    ///
+    /// In the block-based design the sender is held directly (no `Option` take):
+    /// the block's `Arc` clone keeps the sender alive while the block can run, so
+    /// the disconnect a late block observes is the *receiver* going away, which
+    /// is what this models.
     #[test]
-    fn try_push_event_noops_after_teardown_disconnect() {
+    fn try_push_event_noops_after_receiver_disconnect() {
         let (tx, rx) = std::sync::mpsc::sync_channel::<DeviceEvent>(WATCH_CHANNEL_CAP);
         let ctx = WatchListenerContext {
-            event_tx: std::sync::Mutex::new(Some(tx)),
+            event_tx: std::sync::Mutex::new(tx),
             previous_devices: std::sync::Mutex::new(std::collections::HashSet::new()),
         };
 
@@ -2506,24 +2705,19 @@ mod tests {
             kind: DeviceKind::Output,
         };
 
-        // Before teardown: a pushed event is delivered through the channel.
+        // Before disconnect: a pushed event is delivered through the channel.
         try_push_event(&ctx, event());
         assert!(
             matches!(rx.try_recv(), Ok(DeviceEvent::DefaultChanged { .. })),
-            "before teardown, try_push_event must deliver the event"
+            "before disconnect, try_push_event must deliver the event"
         );
 
-        // Teardown disconnects the channel exactly as production does: take the
-        // sender out (set the slot to None) without freeing the leaked context.
-        *ctx.event_tx.lock().unwrap() = None;
+        // The helper thread exits and its receiver drops (teardown joins it).
+        drop(rx);
 
-        // After teardown: a re-entrant proc's push must no-op (sender gone), so
-        // nothing reaches the receiver and the call does not panic/block.
+        // After disconnect: a late block's push must no-op (channel gone),
+        // without panicking or blocking.
         try_push_event(&ctx, event());
-        assert!(
-            rx.try_recv().is_err(),
-            "after teardown-disconnect, try_push_event must deliver NOTHING"
-        );
     }
 
     /// rsac-ead3: `is_device_alive` decodes the IsAlive property — `0` is dead,
@@ -2653,7 +2847,7 @@ mod tests {
         seed.insert(0u32);
         seed.insert(u32::MAX);
         let ctx = WatchListenerContext {
-            event_tx: std::sync::Mutex::new(Some(tx)),
+            event_tx: std::sync::Mutex::new(tx),
             previous_devices: std::sync::Mutex::new(seed),
         };
 
@@ -2690,7 +2884,7 @@ mod tests {
     fn try_push_event_drops_when_full_without_blocking() {
         let (tx, _rx) = std::sync::mpsc::sync_channel::<DeviceEvent>(1);
         let ctx = WatchListenerContext {
-            event_tx: std::sync::Mutex::new(Some(tx)),
+            event_tx: std::sync::Mutex::new(tx),
             previous_devices: std::sync::Mutex::new(std::collections::HashSet::new()),
         };
         // Fill the single slot, then push two more; must not block or panic.
@@ -2708,18 +2902,16 @@ mod tests {
     /// `try_push_event` silently no-ops on a disconnected channel (helper thread
     /// already gone during teardown). Device-free.
     ///
-    /// H1 / PS-1 relevance: the macOS watch teardown leaves the
-    /// `WatchListenerContext` intentionally leaked (never freed) so that a late
-    /// or in-flight `watch_listener_proc` always derefs valid memory. This test
-    /// is the unit proof that such a late proc — reaching `try_push_event` after
-    /// the helper's receiver is gone — is a harmless no-op rather than a hang or
-    /// panic.
+    /// rsac-e8aa relevance: a notification block that runs while the helper's
+    /// receiver has already gone (a benign teardown ordering) must find the
+    /// channel disconnected and no-op rather than hang or panic. This is the unit
+    /// proof of that `Disconnected` path.
     #[test]
     fn try_push_event_noop_when_disconnected() {
         let (tx, rx) = std::sync::mpsc::sync_channel::<DeviceEvent>(WATCH_CHANNEL_CAP);
         drop(rx); // disconnect
         let ctx = WatchListenerContext {
-            event_tx: std::sync::Mutex::new(Some(tx)),
+            event_tx: std::sync::Mutex::new(tx),
             previous_devices: std::sync::Mutex::new(std::collections::HashSet::new()),
         };
         try_push_event(
@@ -2731,60 +2923,42 @@ mod tests {
         // No panic; nothing to assert beyond reaching here.
     }
 
-    /// H1 / PS-1: models the macOS teardown's channel-disconnect step on a
-    /// leaked context purely in safe Rust. Teardown takes the `SyncSender` out of
-    /// `event_tx` (sets it to `None`); we assert (i) the helper-equivalent
-    /// `recv()` then returns `Err` (Disconnected — so the real helper thread
-    /// would exit), and (ii) a subsequent `try_push_event` — modelling an
-    /// in-flight proc firing AFTER teardown against the still-valid leaked
-    /// context — is a no-op without panic. Device-free.
+    /// rsac-e8aa: models the block-based teardown's context-free path. Dropping
+    /// the last `Arc<WatchListenerContext>` drops the contained `SyncSender`; we
+    /// assert (i) the helper-equivalent `recv()` then returns `Err` (Disconnected
+    /// — so the real helper thread would exit). This is the FREED-not-leaked
+    /// analogue of the old take-the-sender dance. Device-free.
     #[test]
-    fn teardown_disconnect_stops_delivery_after_leak() {
+    fn dropping_context_disconnects_channel() {
         let (tx, rx) = std::sync::mpsc::sync_channel::<DeviceEvent>(WATCH_CHANNEL_CAP);
-        let ctx = WatchListenerContext {
-            event_tx: std::sync::Mutex::new(Some(tx)),
+        let ctx = std::sync::Arc::new(WatchListenerContext {
+            event_tx: std::sync::Mutex::new(tx),
             previous_devices: std::sync::Mutex::new(std::collections::HashSet::new()),
-        };
+        });
 
-        // Teardown action: take the sender out of the context, dropping it. This
-        // is exactly what the watch() teardown closure does against the leaked
-        // context (minus the unsafe deref, which is irrelevant to this logic).
-        {
-            let mut guard = ctx
-                .event_tx
-                .lock()
-                .unwrap_or_else(|poisoned| poisoned.into_inner());
-            *guard = None;
-        }
+        // Teardown action: the barrier has drained all blocks, so dropping the
+        // last Arc frees the context (and its sender) — exactly what
+        // `WatchTeardown::run` does after `exec_sync`.
+        drop(ctx);
 
-        // (i) With the only sender taken, the receiver observes disconnection —
-        // the real helper's `recv()` loop would end here.
+        // With the only sender gone, the receiver observes disconnection — the
+        // real helper's `recv()` loop would end here.
         match rx.recv() {
             Err(std::sync::mpsc::RecvError) => {}
-            Ok(ev) => panic!("expected Disconnected after teardown, got event {ev:?}"),
+            Ok(ev) => panic!("expected Disconnected after context drop, got event {ev:?}"),
         }
-
-        // (ii) A late/in-flight proc reaching try_push_event after teardown is a
-        // clean no-op against the still-valid (leaked) context.
-        try_push_event(
-            &ctx,
-            DeviceEvent::DeviceRemoved {
-                id: DeviceId("late".into()),
-            },
-        );
-        // No panic, no hang; reaching here is the assertion.
     }
 
-    /// H1 / PS-1: the teardown's "take the sender" step must be poison-safe — a
-    /// proc that panicked while holding `event_tx` (it cannot today, but the
-    /// invariant must hold under the no-panics-in-Drop rule) must not make
-    /// teardown panic. Poison the sender lock, then run the take-and-drop step,
-    /// and assert it recovers without panicking. Device-free.
+    /// rsac-e8aa: `try_push_event` must be poison-safe — a block that panicked
+    /// while holding `event_tx` (it cannot today, but the invariant must hold
+    /// under the no-panics rule) must not make a later push panic. Poison the
+    /// sender lock, then push and assert it recovers without panicking.
+    /// Device-free.
     #[test]
-    fn teardown_take_sender_is_poison_safe() {
+    fn try_push_event_is_poison_safe() {
         let (tx, _rx) = std::sync::mpsc::sync_channel::<DeviceEvent>(WATCH_CHANNEL_CAP);
         let ctx = WatchListenerContext {
-            event_tx: std::sync::Mutex::new(Some(tx)),
+            event_tx: std::sync::Mutex::new(tx),
             previous_devices: std::sync::Mutex::new(std::collections::HashSet::new()),
         };
 
@@ -2798,16 +2972,8 @@ mod tests {
             "sender mutex should be poisoned by the panic above"
         );
 
-        // The teardown take-and-drop step recovers the poisoned guard rather than
-        // unwrapping, so it must not panic.
-        let mut guard = ctx
-            .event_tx
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
-        *guard = None;
-        drop(guard);
-
-        // And a subsequent proc-equivalent push is still a clean no-op.
+        // try_push_event recovers the poisoned guard rather than unwrapping, so
+        // it must not panic.
         try_push_event(
             &ctx,
             DeviceEvent::DeviceRemoved {
@@ -2831,12 +2997,12 @@ mod tests {
     /// window must complete cleanly — no panic, no leaked listener, no hang.
     /// Requires real CoreAudio (the system object must accept listeners).
     ///
-    /// H1 / PS-1: teardown now stops delivery by taking the `SyncSender` out of
-    /// the (intentionally leaked) context to disconnect the channel rather than
-    /// by freeing the context; this still removes every listener and joins the
-    /// helper. The second register-and-drop proves teardown released the prior
-    /// listeners. (The leaked context is bounded and intentional, so a leak
-    /// sanitizer should be configured to expect it — use ASan, not LSan.)
+    /// rsac-e8aa: teardown now removes each block on the serial queue, dispatches
+    /// a sync barrier that drains any in-flight block, then frees the context
+    /// (drops the last `Arc`) and joins the helper. The second register-and-drop
+    /// proves teardown released the prior listeners. No leak — a leak sanitizer
+    /// (LSan) should now find nothing, unlike the old PROC design's intentional
+    /// per-cycle context leak.
     #[test]
     #[ignore = "requires macOS audio hardware"]
     fn watch_registers_and_drops_cleanly() {
@@ -2860,10 +3026,10 @@ mod tests {
     }
 
     /// rsac-3093: a watcher whose handler is never invoked still tears down
-    /// cleanly and promptly (the helper thread exits on sender disconnect — H1:
-    /// teardown takes the sender out of the leaked context, which disconnects
-    /// the channel just as the old `drop(context)` did, so the prompt-join
-    /// guarantee is unchanged). Requires real CoreAudio.
+    /// cleanly and promptly. rsac-e8aa: the helper thread exits when the last
+    /// `Arc<WatchListenerContext>` drops (after the barrier), dropping the sender
+    /// and disconnecting the channel; the added sync barrier (`exec_sync`) also
+    /// completes promptly. Requires real CoreAudio.
     #[test]
     #[ignore = "requires macOS audio hardware"]
     fn watch_drop_joins_helper_thread_promptly() {
@@ -2879,58 +3045,90 @@ mod tests {
         );
     }
 
-    /// H1 / PS-1 UAF model under sanitizer: register a watcher, run its teardown
-    /// (drop), THEN directly invoke `watch_listener_proc` against the same cookie
-    /// to model an in-flight proc that fires after teardown. Pre-fix this would
-    /// deref freed memory (ASan would flag a use-after-free); post-fix the
-    /// context is intentionally leaked, so the deref is valid and the proc simply
-    /// finds the sender taken and no-ops.
+    /// rsac-e8aa (the load-bearing regression test): the watcher's context must
+    /// be **freed, not leaked** at teardown — the exact defect the old PROC
+    /// design accepted. We can't reach the private `Arc` inside `watch()`
+    /// directly, but the design guarantees it via
+    /// [`WatchTeardown::run`]: after the barrier drains all blocks, dropping the
+    /// block and the teardown's `Arc` clone brings the strong count to zero.
+    /// Here we model that with a `Weak`: build the same `Arc<WatchListenerContext>`
+    /// plus a block capturing a clone (as `watch()` does), keep a `Weak`, then
+    /// run the drop order teardown uses and assert the context is gone.
     ///
-    /// Run with: `cargo +nightly test -Zsanitizer=address --target aarch64-apple-darwin`.
-    /// Use the ADDRESS sanitizer (NOT leak): the per-cycle context leak is
-    /// intentional and expected, so a leak sanitizer would report it as a false
-    /// positive.
-    ///
-    /// Note: this re-derives the cookie the same way `watch()` does (a fresh
-    /// leaked context) rather than reaching into the opaque `DeviceWatcher`,
-    /// because the teardown closure is private; it exercises the *soundness*
-    /// argument (deref of a leaked allocation is always valid) directly.
+    /// Device-free: it does not register a CoreAudio listener (which would need a
+    /// live HAL), it exercises the OWNERSHIP invariant that makes teardown
+    /// leak-free — a block clone + a teardown clone, both dropped, frees the
+    /// context.
     #[test]
-    #[ignore = "requires macOS + ASan (cargo +nightly -Zsanitizer=address)"]
-    fn watch_listener_proc_after_teardown_is_sound_under_asan() {
-        // Build a leaked context exactly as watch() does.
-        let (event_tx, event_rx) = std::sync::mpsc::sync_channel::<DeviceEvent>(WATCH_CHANNEL_CAP);
-        let context_ptr: *mut WatchListenerContext =
-            Box::into_raw(Box::new(WatchListenerContext {
-                event_tx: std::sync::Mutex::new(Some(event_tx)),
-                previous_devices: std::sync::Mutex::new(current_device_id_set()),
-            }));
+    fn watch_context_is_freed_not_leaked() {
+        let (event_tx, _event_rx) = std::sync::mpsc::sync_channel::<DeviceEvent>(WATCH_CHANNEL_CAP);
+        let context = std::sync::Arc::new(WatchListenerContext {
+            event_tx: std::sync::Mutex::new(event_tx),
+            previous_devices: std::sync::Mutex::new(std::collections::HashSet::new()),
+        });
+        // A Weak handle that survives all strong drops — the leak probe.
+        let weak = std::sync::Arc::downgrade(&context);
 
-        // Model the teardown step that disconnects the channel without freeing
-        // the context: take the sender out. (We deliberately do NOT free
-        // context_ptr — that is the whole point of the leak-based fix.)
-        unsafe {
-            let ctx: &WatchListenerContext = &*context_ptr;
-            let mut guard = ctx
-                .event_tx
-                .lock()
-                .unwrap_or_else(|poisoned| poisoned.into_inner());
-            *guard = None;
-        }
-        drop(event_rx); // helper-equivalent receiver gone
+        // The block captures one Arc clone (as watch() does); teardown holds the
+        // other.
+        let block_ctx = std::sync::Arc::clone(&context);
+        let block: WatchBlock = block2::RcBlock::new(
+            move |num_addresses: u32, addresses: *mut std::ffi::c_void| {
+                // SAFETY: identical to the production block body; not invoked here.
+                unsafe {
+                    dispatch_watch_notification(
+                        &block_ctx,
+                        num_addresses,
+                        addresses as *const AudioObjectPropertyAddress,
+                    );
+                }
+            },
+        );
 
-        // Now fire the proc against the cookie AFTER teardown. Under the leak the
-        // deref at the top of watch_listener_proc is valid; the proc no-ops.
-        unsafe {
-            let status = watch_listener_proc(
-                kAudioObjectSystemObject,
-                WATCH_ADDRESSES.len() as u32,
-                WATCH_ADDRESSES.as_ptr(),
-                context_ptr as *mut std::ffi::c_void,
-            );
-            assert_eq!(status, 0, "proc must return noErr even post-teardown");
+        assert!(
+            weak.upgrade().is_some(),
+            "context must be alive while block + teardown clones exist"
+        );
+
+        // Teardown drop order (post-barrier): drop the block (releases its Arc
+        // clone), then the teardown's Arc clone.
+        drop(block);
+        drop(context);
+
+        // The context is FREED — no leak. This is the regression the old design
+        // accepted (it intentionally leaked the context to keep a late proc's
+        // deref sound); the block-queue barrier removes the need.
+        assert!(
+            weak.upgrade().is_none(),
+            "context must be freed after the block and teardown Arc clones drop"
+        );
+    }
+
+    /// rsac-e8aa teardown-then-wait UAF loop: register → drop, N times, with a
+    /// short sleep after each drop, to shake out any use-after-free in the
+    /// remove → barrier → free sequence under a sanitizer. Requires real
+    /// CoreAudio (the HAL must accept block listeners).
+    ///
+    /// Run under ASan on nightly:
+    /// `RUSTFLAGS="-Zsanitizer=address" cargo +nightly test --features feat_macos \
+    ///   --target aarch64-apple-darwin watch_teardown_loop -- --ignored --test-threads=1`.
+    /// CI cannot produce device events deterministically (see
+    /// `tests/ci_audio/device_watch.rs`), so this only validates that repeated
+    /// register/teardown cycles — each draining the barrier and freeing the
+    /// context — never touch freed memory. To force in-flight blocks, toggle the
+    /// default output device between iterations while it runs.
+    #[test]
+    #[ignore = "requires macOS audio hardware + ASan (RUSTFLAGS=-Zsanitizer=address)"]
+    fn watch_teardown_loop_is_uaf_free() {
+        let enumerator = MacosDeviceEnumerator::new();
+        for _ in 0..8 {
+            let watcher = enumerator
+                .watch(Box::new(|_event| {}))
+                .expect("watch() should register on a real CoreAudio system");
+            std::thread::sleep(Duration::from_millis(10));
+            drop(watcher);
+            std::thread::sleep(Duration::from_millis(10));
         }
-        // context_ptr is intentionally never freed (matches the production leak).
     }
 
     /// rsac-3093: `kind()` on macOS now probes stream scopes. On a real host the

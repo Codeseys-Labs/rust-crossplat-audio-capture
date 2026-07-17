@@ -8,7 +8,7 @@ extern crate napi_derive;
 
 use napi::bindgen_prelude::*;
 use napi::threadsafe_function::{ErrorStrategy, ThreadsafeFunction, ThreadsafeFunctionCallMode};
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, RwLock};
 
 // ── Error conversion ─────────────────────────────────────────────────────
@@ -1056,6 +1056,632 @@ impl AudioCapture {
     }
 }
 
+// ── Composition (multi-source channel composition, ADR-0011) ───────────────
+//
+// These classes wrap `rsac::compose::{Group, CompositionBuilder, Composition}`
+// directly (like `AudioCapture` wraps `rsac::AudioCapture`), NOT the C FFI. The
+// `compose` cargo feature is enabled unconditionally in the addon (Cargo.toml),
+// so they are always present. `Composition` reuses `AudioCapture`'s exact
+// `Arc<RwLock<>>` + pump topology and the stop-vs-parked-read fix (rsac-8082):
+// reads and the `CapturingStream::stop(&self)` signal take a shared read guard,
+// the joining inherent `Composition::stop(&mut self)` takes the write guard.
+
+/// A composition group: a named set of capture sources sharing a mixdown
+/// layout. Built with `source`/`sourceWithGain` and a layout
+/// (`mixdownMono`/`mixdownStereo`/`keepChannels`), then handed to
+/// `CompositionBuilder.addGroup`.
+#[napi]
+pub struct Group {
+    inner: Mutex<rsac::compose::Group>,
+}
+
+#[napi]
+impl Group {
+    /// Create a group with the given name and the default stereo layout. The
+    /// name must be non-empty and unique within a composition (both enforced at
+    /// `build()`).
+    #[napi(constructor)]
+    pub fn new(name: String) -> Self {
+        Group {
+            inner: Mutex::new(rsac::compose::Group::new(name)),
+        }
+    }
+
+    /// Add a capture source with unit gain (1.0). `spec` uses the canonical
+    /// target grammar (`"system"`, `"device:<id>"`, `"app:<id>"`, `"name:<n>"`,
+    /// `"tree:<pid>"`). Throws on an invalid spec.
+    #[napi]
+    pub fn source(&self, spec: String) -> Result<()> {
+        self.source_with_gain(spec, 1.0)
+    }
+
+    /// Add a capture source with an explicit linear mixdown gain (1.0 = unity).
+    /// The gain must be finite and >= 0; an invalid gain throws eagerly.
+    #[napi]
+    pub fn source_with_gain(&self, spec: String, gain: f64) -> Result<()> {
+        // Validate AFTER narrowing to f32: a finite f64 above f32::MAX (e.g.
+        // f64::MAX) becomes +inf in the cast, which the f64 check would let
+        // through (PR #59 review).
+        let gain32 = gain as f32;
+        if !gain32.is_finite() || gain32 < 0.0 {
+            return Err(napi::Error::new(
+                napi::Status::InvalidArg,
+                format!(
+                    "[ERR_RSAC_CONFIGURATION] gain {gain} is invalid (must be finite and >= 0 \
+                     after f32 narrowing)"
+                ),
+            ));
+        }
+        let target: rsac::CaptureTarget = spec.parse().map_err(audio_err_to_napi)?;
+        let mut g = self.inner.lock().map_err(lock_poisoned)?;
+        *g = g.clone().source_with_gain(target, gain32);
+        Ok(())
+    }
+
+    /// Fold every source to mono and sum into one output channel.
+    #[napi]
+    pub fn mixdown_mono(&self) -> Result<()> {
+        self.set_layout_js(rsac::compose::GroupLayout::Mono)
+    }
+
+    /// Fold every source to stereo and sum into two output channels.
+    #[napi]
+    pub fn mixdown_stereo(&self) -> Result<()> {
+        self.set_layout_js(rsac::compose::GroupLayout::Stereo)
+    }
+
+    /// Pass the group's single source through with its native channel count.
+    #[napi]
+    pub fn keep_channels(&self) -> Result<()> {
+        let mut g = self.inner.lock().map_err(lock_poisoned)?;
+        *g = g.clone().keep_channels();
+        Ok(())
+    }
+}
+
+impl Group {
+    fn set_layout_js(&self, layout: rsac::compose::GroupLayout) -> Result<()> {
+        let mut g = self.inner.lock().map_err(lock_poisoned)?;
+        *g = g.clone().mixdown(layout);
+        Ok(())
+    }
+
+    /// Clone the inner `Group` (for handing to a builder).
+    fn snapshot(&self) -> Result<rsac::compose::Group> {
+        self.inner.lock().map(|g| g.clone()).map_err(lock_poisoned)
+    }
+}
+
+/// Options accepted by `CompositionBuilder.create`.
+#[napi(object)]
+pub struct CompositionBuilderOptions {
+    /// Session sample rate in Hz (default 48000).
+    pub sample_rate: Option<u32>,
+    /// Saturating clamp of the summed output to [-1.0, 1.0] (default false).
+    pub clamp_output: Option<bool>,
+    /// Composed tick (output buffer) duration in ms (default 10).
+    pub quantum_ms: Option<u32>,
+    /// How long to wait for the master source before a fallback tick, ms (default 250).
+    pub stall_timeout_ms: Option<u32>,
+    /// Per-source buffering bound in ms (default 1000).
+    pub max_buffer_ms: Option<u32>,
+}
+
+/// Builder for a multi-source `Composition` (ADR-0011).
+#[napi]
+pub struct CompositionBuilder {
+    inner: Mutex<Option<rsac::compose::CompositionBuilder>>,
+}
+
+#[napi]
+impl CompositionBuilder {
+    /// Create a composition builder with optional session settings.
+    #[napi(factory)]
+    pub fn create(opts: Option<CompositionBuilderOptions>) -> Self {
+        let opts = opts.unwrap_or(CompositionBuilderOptions {
+            sample_rate: None,
+            clamp_output: None,
+            quantum_ms: None,
+            stall_timeout_ms: None,
+            max_buffer_ms: None,
+        });
+        let builder = rsac::compose::CompositionBuilder::new()
+            .sample_rate(opts.sample_rate.unwrap_or(48_000))
+            .clamp_output(opts.clamp_output.unwrap_or(false))
+            .quantum(std::time::Duration::from_millis(u64::from(
+                opts.quantum_ms.unwrap_or(10),
+            )))
+            .stall_timeout(std::time::Duration::from_millis(u64::from(
+                opts.stall_timeout_ms.unwrap_or(250),
+            )))
+            .max_buffer(std::time::Duration::from_millis(u64::from(
+                opts.max_buffer_ms.unwrap_or(1000),
+            )));
+        CompositionBuilder {
+            inner: Mutex::new(Some(builder)),
+        }
+    }
+
+    /// Append a group (cloned into the builder).
+    #[napi]
+    pub fn add_group(&self, group: &Group) -> Result<()> {
+        let g = group.snapshot()?;
+        let mut guard = self.inner.lock().map_err(lock_poisoned)?;
+        let b = guard.as_ref().ok_or_else(builder_consumed)?;
+        *guard = Some(b.clone().group(g));
+        Ok(())
+    }
+
+    /// Run every device-independent validation `build()` performs, without
+    /// building. Throws on an invalid configuration.
+    #[napi]
+    pub fn preflight(&self) -> Result<()> {
+        let guard = self.inner.lock().map_err(lock_poisoned)?;
+        let b = guard.as_ref().ok_or_else(builder_consumed)?;
+        b.preflight().map_err(audio_err_to_napi)
+    }
+
+    /// Validate and build a (not-yet-started) `Composition`. No devices are
+    /// touched here. Throws on an invalid configuration.
+    #[napi]
+    pub fn build(&self) -> Result<Composition> {
+        let guard = self.inner.lock().map_err(lock_poisoned)?;
+        let b = guard.as_ref().ok_or_else(builder_consumed)?;
+        // Clone-then-build so this JS builder object stays reusable (the core
+        // build() consumes the builder value; here a JS object outlives one
+        // build call, so leave the builder in place).
+        let composition = b.clone().build().map_err(audio_err_to_napi)?;
+        Ok(Composition {
+            inner: Arc::new(RwLock::new(composition)),
+            callback: Arc::new(Mutex::new(None)),
+            end_callback: Arc::new(Mutex::new(None)),
+            pump_active: Arc::new(AtomicBool::new(false)),
+            pump_generation: Arc::new(AtomicU64::new(0)),
+        })
+    }
+}
+
+/// A multi-source composed capture session (ADR-0011). Created via
+/// `CompositionBuilder.build`; inert until `start()`.
+///
+/// An explicit `stop()` discards the buffered composed tail; read until the
+/// terminal error before stopping to capture everything (the natural end
+/// drains the tail first).
+#[napi]
+pub struct Composition {
+    /// The wrapped `rsac::Composition` behind an `RwLock` so a blocking reader
+    /// can park under a shared read guard — same topology + rsac-8082 fix as
+    /// `AudioCapture`. Reads and the `CapturingStream::stop(&self)` signal take
+    /// the shared read guard; the joining inherent `Composition::stop(&mut self)`
+    /// takes the write guard.
+    inner: Arc<RwLock<rsac::Composition>>,
+    /// Active data callback (ThreadsafeFunction). Held to prevent GC.
+    callback: DataCallback,
+    /// Optional terminal-observability callback, fired once when the pump ends.
+    end_callback: EndCallback,
+    /// Whether the push-model data pump thread is running (spawn guard).
+    pump_active: Arc<AtomicBool>,
+    /// Monotonic pump generation (PR #59 review): each spawned pump owns the
+    /// generation current at spawn time and loops only while it still owns it.
+    /// Cancellation bumps the generation, so a stale pump can NEVER be
+    /// resurrected by a rapid `offData()`→`onData()` flip of the bool alone
+    /// (the old pump observes the generation change and exits; only the new
+    /// generation's pump delivers).
+    pump_generation: Arc<AtomicU64>,
+}
+
+#[napi]
+impl Composition {
+    /// Start the composition (build + start one capture per source). If an
+    /// `onData` callback is registered, a background pump thread is spawned.
+    #[napi]
+    pub fn start(&self) -> Result<()> {
+        // Fast path under a shared guard (rsac-8082): a redundant start on a
+        // running composition must not request the exclusive write guard, which
+        // would queue behind a parked reader's shared guard.
+        let already_running = {
+            let inner = self.inner.read().map_err(lock_poisoned)?;
+            inner.is_running()
+        };
+        if !already_running {
+            let mut inner = self.inner.write().map_err(lock_poisoned)?;
+            inner.start().map_err(audio_err_to_napi)?;
+        }
+
+        let has_callback = {
+            let cb = self.callback.lock().map_err(lock_poisoned)?;
+            cb.is_some()
+        };
+        if has_callback && !self.pump_active.load(Ordering::SeqCst) {
+            self.start_data_pump()?;
+        }
+        Ok(())
+    }
+
+    /// Stop the composition: signal the ring + engine (waking a parked reader)
+    /// and join the compositor thread. Discards the buffered tail.
+    #[napi]
+    pub fn stop(&self) -> Result<()> {
+        // Bump the generation FIRST: any live pump loses ownership immediately
+        // and can never be resurrected by a later flag flip (PR #59 review).
+        self.pump_generation.fetch_add(1, Ordering::SeqCst);
+        self.pump_active.store(false, Ordering::SeqCst);
+
+        // rsac-8082: FIRST take a read guard to signal via
+        // CapturingStream::stop(&self) — shared with a parked reader, so it never
+        // blocks — which ends the ring + flags the engine and wakes the reader;
+        // then take the write guard for the joining inherent stop.
+        {
+            let inner = self.inner.read().map_err(lock_poisoned)?;
+            let _ = rsac::CapturingStream::stop(&*inner);
+        }
+        let mut inner = self.inner.write().map_err(lock_poisoned)?;
+        // Fully-qualified inherent stop: `Composition` also implements the trait
+        // `CapturingStream::stop(&self)` (signal-only, no join), and bare
+        // `inner.stop()` would resolve to THAT by autoref — leaving the engine
+        // thread unjoined. Call the joining lifecycle stop explicitly.
+        rsac::Composition::stop(&mut inner).map_err(audio_err_to_napi)?;
+        Ok(())
+    }
+
+    /// Whether the composed stream is currently running.
+    #[napi(getter)]
+    pub fn is_running(&self) -> Result<bool> {
+        let inner = self.inner.read().map_err(lock_poisoned)?;
+        Ok(inner.is_running())
+    }
+
+    /// Read the next composed buffer (non-blocking). Returns `null` if no data
+    /// is available yet; terminal-observable (throws the fatal terminal error
+    /// once the composition ends and drains).
+    #[napi]
+    pub fn read(&self) -> Result<Option<AudioChunk>> {
+        let inner = self.inner.read().map_err(lock_poisoned)?;
+        let result = inner.read_chunk_nonblocking().map_err(audio_err_to_napi)?;
+        Ok(result.map(|buf| AudioChunk::from_rsac_buffer(&buf)))
+    }
+
+    /// Read the next composed buffer, blocking until data is available.
+    /// Terminal-observable. WARNING: blocks the calling thread.
+    #[napi]
+    pub fn read_blocking(&self) -> Result<AudioChunk> {
+        let inner = self.inner.read().map_err(lock_poisoned)?;
+        let result = inner.read_chunk_blocking().map_err(audio_err_to_napi)?;
+        Ok(AudioChunk::from_rsac_buffer(&result))
+    }
+
+    /// Read the next composed buffer asynchronously (non-blocking, off the main
+    /// thread). Returns `null` if no data is available yet.
+    #[napi]
+    pub async fn read_async(&self) -> Result<Option<AudioChunk>> {
+        let inner = self.inner.clone();
+        let result =
+            tokio::task::spawn_blocking(move || -> napi::Result<Option<rsac::AudioBuffer>> {
+                let comp = inner.read().map_err(lock_poisoned)?;
+                comp.read_chunk_nonblocking().map_err(audio_err_to_napi)
+            })
+            .await
+            .map_err(join_err)??;
+        Ok(result.map(|buf| AudioChunk::from_rsac_buffer(&buf)))
+    }
+
+    /// Read the next composed buffer asynchronously, blocking the worker thread
+    /// until data is available (does not block the event loop).
+    /// Terminal-observable.
+    #[napi]
+    pub async fn read_blocking_async(&self) -> Result<AudioChunk> {
+        let inner = self.inner.clone();
+        let result = tokio::task::spawn_blocking(move || -> napi::Result<rsac::AudioBuffer> {
+            let comp = inner.read().map_err(lock_poisoned)?;
+            comp.read_chunk_blocking().map_err(audio_err_to_napi)
+        })
+        .await
+        .map_err(join_err)??;
+        Ok(AudioChunk::from_rsac_buffer(&result))
+    }
+
+    /// Register a callback for push-based composed-audio delivery. Only one
+    /// callback is active at a time; calling again replaces it.
+    #[napi(ts_args_type = "callback: (chunk: AudioChunk) => void")]
+    pub fn on_data(
+        &self,
+        callback: ThreadsafeFunction<AudioChunk, ErrorStrategy::Fatal>,
+    ) -> Result<()> {
+        {
+            let mut cb_guard = self.callback.lock().map_err(lock_poisoned)?;
+            *cb_guard = Some(callback);
+        }
+        let is_running = {
+            let inner = self.inner.read().map_err(lock_poisoned)?;
+            inner.is_running()
+        };
+        if is_running && !self.pump_active.load(Ordering::SeqCst) {
+            self.start_data_pump()?;
+        }
+        Ok(())
+    }
+
+    /// Register a callback that fires exactly once when push-based delivery ends,
+    /// carrying *why* it ended (a non-null message on a fatal terminal, `null`
+    /// on a clean stop). Parity with the `AudioCapture` `onEnd`.
+    #[napi(ts_args_type = "callback: (error: string | null) => void")]
+    pub fn on_end(
+        &self,
+        callback: ThreadsafeFunction<Option<String>, ErrorStrategy::Fatal>,
+    ) -> Result<()> {
+        let mut cb_guard = self.end_callback.lock().map_err(lock_poisoned)?;
+        *cb_guard = Some(callback);
+        Ok(())
+    }
+
+    /// Remove the registered data callback and stop the pump. The `onEnd`
+    /// callback is left registered for a later session; use `offEnd` to clear it.
+    #[napi]
+    pub fn off_data(&self) -> Result<()> {
+        // Generation bump makes cancellation immune to a rapid re-`onData()`
+        // setting pump_active back to true before the old pump observes false:
+        // the old pump checks its OWN generation and exits (PR #59 review).
+        self.pump_generation.fetch_add(1, Ordering::SeqCst);
+        self.pump_active.store(false, Ordering::SeqCst);
+        let mut cb_guard = self.callback.lock().map_err(lock_poisoned)?;
+        *cb_guard = None;
+        Ok(())
+    }
+
+    /// Remove the registered terminal-observability callback (see `onEnd`).
+    #[napi]
+    pub fn off_end(&self) -> Result<()> {
+        let mut cb_guard = self.end_callback.lock().map_err(lock_poisoned)?;
+        *cb_guard = None;
+        Ok(())
+    }
+
+    /// Number of composed-ring overruns (composed buffers dropped because the
+    /// consumer read slower than the compositor produced). 0 before start.
+    #[napi(getter)]
+    pub fn overrun_count(&self) -> Result<u32> {
+        let inner = self.inner.read().map_err(lock_poisoned)?;
+        Ok(rsac::CapturingStream::overrun_count(&*inner) as u32)
+    }
+
+    /// Number of composed output channels (0 before a successful start).
+    #[napi(getter)]
+    pub fn channel_count(&self) -> Result<u16> {
+        let inner = self.inner.read().map_err(lock_poisoned)?;
+        Ok(inner.channel_map().map(|m| m.channels()).unwrap_or(0))
+    }
+
+    /// Name of the group producing composed output channel `channel` (0-based),
+    /// or `null` if not started or out of bounds.
+    #[napi]
+    pub fn channel_group(&self, channel: u32) -> Result<Option<String>> {
+        let inner = self.inner.read().map_err(lock_poisoned)?;
+        Ok(inner
+            .channel_map()
+            .and_then(|m| m.entries().get(channel as usize).map(|e| e.group.clone())))
+    }
+
+    /// Index of composed output channel `channel` within its group (0-based;
+    /// e.g. 0 = L, 1 = R for a stereo group), or `null` if not started or out of
+    /// bounds.
+    #[napi]
+    pub fn channel_in_group(&self, channel: u32) -> Result<Option<i32>> {
+        let inner = self.inner.read().map_err(lock_poisoned)?;
+        Ok(inner.channel_map().and_then(|m| {
+            m.entries()
+                .get(channel as usize)
+                .map(|e| i32::from(e.channel_in_group))
+        }))
+    }
+
+    /// Point-in-time composition counters, or `null` if not started.
+    #[napi]
+    pub fn stats(&self) -> Result<Option<JsCompositionStats>> {
+        let inner = self.inner.read().map_err(lock_poisoned)?;
+        Ok(inner.stats().map(|s| JsCompositionStats {
+            ticks: bigint_from_u64(s.ticks),
+            fallback_ticks: bigint_from_u64(s.fallback_ticks),
+            num_sources: bigint_from_u64(s.sources.len() as u64),
+        }))
+    }
+
+    /// Per-source counters for the source at `index` (flat declaration order),
+    /// or `null` if not started or `index` is out of bounds.
+    #[napi]
+    pub fn source_stats(&self, index: u32) -> Result<Option<JsSourceStats>> {
+        let inner = self.inner.read().map_err(lock_poisoned)?;
+        Ok(inner
+            .stats()
+            .and_then(|s| s.sources.into_iter().nth(index as usize))
+            .map(|src| JsSourceStats {
+                group: src.group,
+                target: src.target,
+                buffers_received: bigint_from_u64(src.buffers_received),
+                padded_frames: bigint_from_u64(src.padded_frames),
+                trimmed_frames: bigint_from_u64(src.trimmed_frames),
+                gap_padded_frames: bigint_from_u64(src.gap_padded_frames),
+                inner_dropped: bigint_from_u64(src.inner_dropped),
+                resampling: src.resampling,
+                ended: src.ended,
+            }))
+    }
+
+    /// Total composed buffers dropped by this composition's subscribe pumps
+    /// because a subscriber's bounded channel was full. 0 before start.
+    #[napi]
+    pub fn subscriber_dropped_count(&self) -> Result<BigInt> {
+        let inner = self.inner.read().map_err(lock_poisoned)?;
+        Ok(bigint_from_u64(inner.subscriber_dropped_count()))
+    }
+}
+
+impl Composition {
+    /// Spawn the composed-audio data pump — a copy of `AudioCapture`'s
+    /// `start_data_pump` reading `read_chunk_nonblocking`, with the same
+    /// recoverable-error log throttle and terminal `onEnd` firing.
+    fn start_data_pump(&self) -> Result<()> {
+        let inner = self.inner.clone();
+        let callback = self.callback.clone();
+        let end_callback = self.end_callback.clone();
+        let pump_active = self.pump_active.clone();
+        let pump_generation = self.pump_generation.clone();
+
+        // This pump owns the generation value current at spawn time; any
+        // cancellation (stop/offData) bumps it, ending ownership even if
+        // pump_active is set true again by a rapid re-onData (PR #59 review).
+        let my_generation = pump_generation.fetch_add(1, Ordering::SeqCst) + 1;
+        pump_active.store(true, Ordering::SeqCst);
+
+        let spawn_result = std::thread::Builder::new()
+            .name("rsac-napi-compose-pump".into())
+            .spawn(move || {
+                let mut end_reason: Option<String> = None;
+                let mut recoverable_errors: u64 = 0;
+                while pump_active.load(Ordering::SeqCst)
+                    && pump_generation.load(Ordering::SeqCst) == my_generation
+                {
+                    let maybe_buf = {
+                        let comp = match inner.read() {
+                            Ok(c) => c,
+                            Err(_) => break,
+                        };
+                        comp.read_chunk_nonblocking()
+                    };
+                    match maybe_buf {
+                        Ok(Some(buf)) => {
+                            recoverable_errors = 0;
+                            let chunk = AudioChunk::from_rsac_buffer(&buf);
+                            let cb = match callback.lock() {
+                                Ok(c) => c,
+                                Err(_) => break,
+                            };
+                            if let Some(ref tsfn) = *cb {
+                                tsfn.call(chunk, ThreadsafeFunctionCallMode::NonBlocking);
+                            }
+                        }
+                        Ok(None) => {
+                            std::thread::sleep(std::time::Duration::from_millis(1));
+                        }
+                        Err(ref e) if e.is_fatal() => {
+                            eprintln!("rsac-napi compose pump ended (terminal): {}", e);
+                            end_reason = Some(e.to_string());
+                            break;
+                        }
+                        Err(e) => {
+                            if should_log_recoverable(recoverable_errors) {
+                                if recoverable_errors == 0 {
+                                    eprintln!(
+                                        "rsac-napi compose pump read error (retrying): {}",
+                                        e
+                                    );
+                                } else {
+                                    eprintln!(
+                                        "rsac-napi compose pump read error (retrying; \
+                                         {} more suppressed since last line): {}",
+                                        RECOVERABLE_LOG_EVERY - 1,
+                                        e
+                                    );
+                                }
+                            }
+                            recoverable_errors = recoverable_errors.saturating_add(1);
+                            std::thread::sleep(std::time::Duration::from_millis(1));
+                        }
+                    }
+                }
+                // Clear the running flag only if this pump still OWNS the
+                // generation — a stale pump exiting after a rapid re-onData
+                // must not kill the successor pump's flag (PR #59 review).
+                if pump_generation.load(Ordering::SeqCst) == my_generation {
+                    pump_active.store(false, Ordering::SeqCst);
+                }
+
+                let end_tsfn = match end_callback.lock() {
+                    Ok(guard) => guard.clone(),
+                    Err(_) => None,
+                };
+                if let Some(tsfn) = end_tsfn {
+                    tsfn.call(end_reason, ThreadsafeFunctionCallMode::NonBlocking);
+                }
+            });
+        match spawn_result {
+            Ok(_) => Ok(()),
+            Err(e) => {
+                // Roll the flag back so a later onData()/start() can retry —
+                // leaving it true would permanently wedge pump spawning
+                // (PR #59 review).
+                self.pump_active.store(false, Ordering::SeqCst);
+                Err(napi::Error::new(
+                    napi::Status::GenericFailure,
+                    format!("Failed to spawn compose data pump thread: {}", e),
+                ))
+            }
+        }
+    }
+}
+
+/// A point-in-time snapshot of a running composition's counters. Counters are
+/// `BigInt` (u64) to avoid silent precision loss on long-running sessions.
+#[napi(object)]
+pub struct JsCompositionStats {
+    /// Composed buffers (ticks) emitted so far.
+    pub ticks: BigInt,
+    /// Ticks emitted by the wall-clock stall fallback (master had no data).
+    pub fallback_ticks: BigInt,
+    /// Number of composed sources, in flat declaration order.
+    pub num_sources: BigInt,
+}
+
+/// A point-in-time snapshot of one composed source's counters. Exposes the full
+/// Rust `SourceStats` set (including `gapPaddedFrames` / `innerDropped`, which
+/// the C FFI struct omits). u64 counters are `BigInt`.
+#[napi(object)]
+pub struct JsSourceStats {
+    /// Name of the group the source belongs to.
+    pub group: String,
+    /// The source's capture target in canonical grammar (e.g. `"system"`).
+    pub target: String,
+    /// Buffers received from the inner capture so far.
+    pub buffers_received: BigInt,
+    /// Frames of silence inserted because the source was behind at tick time.
+    pub padded_frames: BigInt,
+    /// Frames trimmed because the source drifted past the buffering bound.
+    pub trimmed_frames: BigInt,
+    /// Frames of silence inserted to compensate intra-source timestamp gaps.
+    pub gap_padded_frames: BigInt,
+    /// Ring-overflow drops inside the source's own capture (upstream loss).
+    pub inner_dropped: BigInt,
+    /// Whether this source is being resampled to the session rate.
+    pub resampling: bool,
+    /// Whether the source's stream has ended.
+    pub ended: bool,
+}
+
+// ── napi error helpers (shared by the compose surface) ─────────────────────
+
+/// Map a poisoned lock to a napi error (deduped across the compose methods).
+fn lock_poisoned<E: std::fmt::Display>(e: E) -> napi::Error {
+    napi::Error::new(
+        napi::Status::GenericFailure,
+        format!("Lock poisoned: {}", e),
+    )
+}
+
+/// Map a tokio join error to a napi error.
+fn join_err<E: std::fmt::Display>(e: E) -> napi::Error {
+    napi::Error::new(
+        napi::Status::GenericFailure,
+        format!("Task join error: {}", e),
+    )
+}
+
+/// The error for operating on a `CompositionBuilder` whose value was taken.
+fn builder_consumed() -> napi::Error {
+    napi::Error::new(
+        napi::Status::GenericFailure,
+        "CompositionBuilder has been consumed".to_string(),
+    )
+}
+
 // ── Device enumeration ───────────────────────────────────────────────────
 
 /// Information about an audio device.
@@ -1649,5 +2275,154 @@ mod tests {
         // Clean up: signal so the parked reader (and its read guard) is released.
         inner.read().unwrap().request_stop();
         let _ = reader.join().expect("reader thread joins");
+    }
+
+    // ── rsac-fba7: compose classification + gain validation + lock topology ──
+    //
+    // A real `rsac::Composition` needs devices, and the `#[napi]` surface needs a
+    // node runtime — so, like the capture tests above, these pin the
+    // napi-environment-independent logic: (1) the terminal-error classification
+    // the compose read path + pump rely on, (2) the eager gain rejection
+    // `Group.source_with_gain` performs, and (3) the stop-vs-parked-read RwLock
+    // topology `Composition` shares with `AudioCapture`, via a compose-flavoured
+    // `SilentComposition` stand-in whose receivers mirror `Composition`.
+
+    /// The compose read path + pump end on, and only on, a FATAL terminal
+    /// (`StreamEnded`); a not-started read is a RECOVERABLE `StreamReadError`.
+    /// This is the same classification the napi pump's `is_fatal()` branch uses.
+    #[test]
+    fn compose_read_terminal_classification() {
+        let ended = rsac::AudioError::StreamEnded {
+            reason: "Composition ended (all sources terminal, ring drained)".into(),
+        };
+        assert!(ended.is_fatal());
+        assert!(!ended.is_recoverable());
+
+        let not_started = rsac::AudioError::StreamReadError {
+            reason: "not started".into(),
+        };
+        assert!(not_started.is_recoverable());
+        assert!(!not_started.is_fatal());
+    }
+
+    /// `Group.sourceWithGain` rejects a non-finite or negative gain eagerly. Pin
+    /// the exact predicate the method uses — validation happens AFTER the f32
+    /// narrowing, so a finite f64 above f32::MAX (which casts to +inf) is
+    /// rejected too (PR #59 review) — matching the C FFI
+    /// `invalid_gain_rejected_eagerly` and the Python binding.
+    #[test]
+    fn compose_gain_validation_predicate() {
+        let reject = |g: f64| {
+            let g32 = g as f32;
+            !g32.is_finite() || g32 < 0.0
+        };
+        for bad in [
+            -0.5f64,
+            f64::NAN,
+            f64::INFINITY,
+            f64::NEG_INFINITY,
+            f64::MAX, // finite as f64, +inf after f32 narrowing
+        ] {
+            assert!(reject(bad), "gain {bad} must be rejected");
+        }
+        for ok in [0.0f64, 1.0, 0.8, 4.0] {
+            assert!(!reject(ok), "gain {ok} must be accepted");
+        }
+    }
+
+    /// A stand-in for a *silent* running `rsac::Composition`: `read_chunk_blocking`
+    /// parks until signalled terminal via `request_stop` (the
+    /// `CapturingStream::stop(&self)` analogue), and `stop(&mut self)` is the
+    /// joining lifecycle mutator. Copy of the capture `SilentCapture` renamed for
+    /// compose (same receivers as core).
+    struct SilentComposition {
+        terminal: AtomicBool,
+        parked: AtomicBool,
+    }
+
+    impl SilentComposition {
+        fn new() -> Self {
+            Self {
+                terminal: AtomicBool::new(false),
+                parked: AtomicBool::new(false),
+            }
+        }
+
+        fn read_chunk_blocking(&self) -> Result<()> {
+            self.parked.store(true, Ordering::SeqCst);
+            let deadline = Instant::now() + Duration::from_secs(10);
+            while !self.terminal.load(Ordering::SeqCst) {
+                if Instant::now() > deadline {
+                    return Err(napi::Error::from_reason("read timed out (deadlock)"));
+                }
+                std::thread::sleep(Duration::from_millis(1));
+            }
+            Err(napi::Error::from_reason("StreamEnded"))
+        }
+
+        fn request_stop(&self) {
+            self.terminal.store(true, Ordering::SeqCst);
+        }
+
+        fn stop(&mut self) {
+            self.terminal.store(true, Ordering::SeqCst);
+        }
+    }
+
+    /// The FIXED `Composition.stop()` topology (what the napi `stop()` now does):
+    /// read-guard `request_stop()` (shared with the parked reader → never blocks)
+    /// → drop → write-guard `stop()`. With a reader parked under a read guard,
+    /// this must complete promptly (the napi side needs no GIL dance — a woken
+    /// Rust reader unwinds and drops its guard directly).
+    #[test]
+    fn composition_stop_does_not_deadlock_parked_blocking_read() {
+        let inner = Arc::new(RwLock::new(SilentComposition::new()));
+
+        let reader = {
+            let inner = Arc::clone(&inner);
+            std::thread::spawn(move || {
+                let guard = inner.read().expect("read guard");
+                guard.read_chunk_blocking()
+            })
+        };
+
+        let deadline = Instant::now() + Duration::from_secs(5);
+        loop {
+            if inner.read().unwrap().parked.load(Ordering::SeqCst) {
+                break;
+            }
+            assert!(Instant::now() < deadline, "reader never parked");
+            std::thread::yield_now();
+        }
+
+        let stopper = {
+            let inner = Arc::clone(&inner);
+            std::thread::spawn(move || {
+                {
+                    let guard = inner.read().expect("read guard for request_stop");
+                    guard.request_stop();
+                }
+                let mut guard = inner.write().expect("write guard for stop");
+                guard.stop();
+            })
+        };
+
+        let stop_deadline = Instant::now() + Duration::from_secs(5);
+        while !stopper.is_finished() {
+            assert!(
+                Instant::now() < stop_deadline,
+                "Composition.stop() deadlocked against a parked blocking read (rsac-8082 regression)"
+            );
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        stopper.join().expect("stopper thread joins");
+
+        let read_result = reader.join().expect("reader thread joins");
+        let err = read_result.expect_err("silent composition read ends terminal");
+        assert!(
+            err.reason.contains("StreamEnded"),
+            "reader must wake on the terminal signal, not the deadlock safety net; got: {}",
+            err.reason
+        );
     }
 }

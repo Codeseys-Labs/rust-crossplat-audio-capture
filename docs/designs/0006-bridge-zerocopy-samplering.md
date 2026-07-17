@@ -144,6 +144,16 @@ feature as an internal A/B alternative, with the following invariants recorded:
 This plane must be **either promoted or removed** — it must not remain indefinitely as
 an unwired, unbenchmarked feature.
 
+**Status update (rsac-1da3):** as of `bench.yml`, criterion benches now execute on a
+weekly schedule + `workflow_dispatch` (previously `cargo bench` had zero CI callers —
+this ADR's promote-criteria data could never accumulate). The workflow archives
+`target/criterion/**` baselines for both the default feature set and `--features
+bridge-zerocopy`, but neither `benches/bridge.rs` nor `benches/observability.rs` yet
+constructs a `SampleRing` — promote-criterion #1 below (an actual A/B of `SampleRing`
+vs. the default ring) is still unimplemented. Tracked as a follow-on seed (filed
+alongside rsac-1da3) rather than folded into this ADR's decision, which still requires
+that data.
+
 **Promote** (wire into a backend) when *all* hold:
 1. A benchmark in `benches/bridge.rs` (behind `--features bridge-zerocopy`) A/Bs
    `SampleRing` against the default `AudioBuffer` ring on the same 1024-frame stereo

@@ -45,7 +45,12 @@ ifeq ($(UNAME_S),Darwin)
     # feature (mirrors bindings/rsac-napi + bindings/rsac-python's per-target
     # `features = ["feat_<os>"]` convention) so the real CoreAudio backend
     # actually compiles in.
-    FFI_FEATURES := feat_macos
+    #
+    # `compose` is appended so librsac_ffi.a exports the rsac_composition_* /
+    # rsac_group_* symbols the Go compose wrapper (compose.go) links against
+    # (rsac-fba7). Without it the staticlib has no compose symbols and cgo's
+    # `#define RSAC_FEATURE_COMPOSE` would reference undefined externals at link.
+    FFI_FEATURES := feat_macos,compose
 else ifeq ($(UNAME_S),Linux)
     STATIC_LIB := librsac_ffi.a
     # NOTE: no `-lspa-0.2` — SPA (libspa-0.2) is a header/plugin API with NO
@@ -53,7 +58,8 @@ else ifeq ($(UNAME_S),Linux)
     # so `-lspa-0.2` makes ld fail with "cannot find -lspa-0.2". PipeWire itself
     # is the only system .so the staticlib needs at link time.
     EXTRA_LDFLAGS := -lpipewire-0.3 -lpthread -ldl -lm
-    FFI_FEATURES := feat_linux
+    # `compose` appended for the rsac_composition_*/rsac_group_* symbols (rsac-fba7).
+    FFI_FEATURES := feat_linux,compose
 else
     # Windows (MSYS2/MinGW). Build rsac-ffi for the *-pc-windows-gnu target so
     # cargo emits librsac_ffi.a (GNU archive) that cgo's gcc can link.
@@ -67,7 +73,8 @@ else
     # cannot resolve. So we MUST build the GNU target explicitly.
     # `rustup target add x86_64-pc-windows-gnu` is a prerequisite.
     RUST_TARGET := x86_64-pc-windows-gnu
-    FFI_FEATURES := feat_windows
+    # `compose` appended for the rsac_composition_*/rsac_group_* symbols (rsac-fba7).
+    FFI_FEATURES := feat_windows,compose
 endif
 
 # When RUST_TARGET is set (Windows), build + read from target/<triple>/release;
@@ -132,7 +139,7 @@ test-pure: rust-ffi
 	@echo "==> Running Go-only logic tests..."
 	CGO_ENABLED=1 \
 	CGO_LDFLAGS="-L$(LIB_DIR) -lrsac_ffi $(EXTRA_LDFLAGS)" \
-	go test -v -count=1 -run 'TestErrorCode|TestError_|TestErr|TestCaptureTarget|TestAudioBuffer|TestCaptureBuilder|TestDeviceKind|TestStream_Context|TestCallbackHandle|TestStreamResult|TestCapabilities' ./...
+	go test -v -count=1 -run 'TestErrorCode|TestError_|TestErr|TestCaptureTarget|TestAudioBuffer|TestCaptureBuilder|TestDeviceKind|TestStream_Context|TestCallbackHandle|TestStreamResult|TestCapabilities|TestComposition|TestGroup|TestCompositionBuilder' ./...
 
 ## lint: Run golangci-lint on the Go package.
 lint:

@@ -44,37 +44,38 @@ const MISSING_APP_NAME: &str = "ThisApplicationDefinitelyDoesNotExist_12345";
 /// absent and the tests failed on every real macOS host.
 ///
 /// Instead, ask the same introspection surface the resolver consults —
-/// `list_audio_applications()` — and target whatever it returns. This is
+/// `list_audio_applications_scoped()` — and target whatever it returns. This is
 /// self-consistent by construction (we feed the resolver a name the
 /// enumeration itself produced, covering both the NSWorkspace-intersected
 /// path and the "PID n" fallback), gives real coverage whenever *anything*
 /// is playing audio (a media app, or a tone spawned by the harness), and
 /// skips honestly when nothing is.
+///
+/// rsac-f547: fallback detection is no longer a heuristic (`apps.len() > 10 ||
+/// name == "Finder"`). The enumeration now reports its
+/// [`ApplicationScope`](rsac::ApplicationScope) directly, so we skip honestly
+/// whenever the list is the unfiltered `AllRunningFallback` superset — the exact
+/// condition the old heuristic approximated.
 fn discover_audio_producing_app() -> Option<String> {
-    match rsac::list_audio_applications() {
-        Ok(apps) => {
-            // Fallback detection (review finding, PR #45): when the CoreAudio
-            // audio-process query is unavailable or reports NO active PIDs,
-            // enumerate_audio_applications() deliberately returns the FULL
-            // unfiltered NSWorkspace list rather than an empty one — in that
-            // mode apps.first() could be Finder/Terminal/any silent GUI app,
-            // and targeting it would "pass" without exercising the
-            // audio-producing path this test exists to cover. The filtered
-            // list is characteristically small (active audio producers only)
-            // and never contains Finder (which cannot produce audio);
-            // the fallback list is the whole GUI session. Use both signals
-            // to detect the fallback and skip honestly instead.
-            let looks_like_fallback = apps.len() > 10 || apps.iter().any(|a| a.name == "Finder");
-            if looks_like_fallback {
+    match rsac::list_audio_applications_scoped() {
+        Ok(enumeration) => {
+            // When the CoreAudio audio-process query is unavailable or reports
+            // NO active PIDs, the enumeration deliberately returns the FULL
+            // unfiltered NSWorkspace list (a superset that may contain
+            // Finder/Terminal/any silent GUI app) rather than an empty one.
+            // Targeting an entry from that list would "pass" without exercising
+            // the audio-producing path this test exists to cover, so skip
+            // honestly when the reported scope is the fallback superset.
+            if enumeration.scope != rsac::ApplicationScope::ExactAudioProducers {
                 eprintln!(
-                    "[ci_audio] SKIP: enumeration returned the unfiltered NSWorkspace \
-                     fallback ({} apps) — the audio-process query found no active \
-                     producers, so there is no audio-producing app to target",
-                    apps.len()
+                    "[ci_audio] SKIP: enumeration is the unfiltered fallback superset \
+                     ({} apps) — the audio-process query found no active producers, so \
+                     there is no audio-producing app to target",
+                    enumeration.applications.len()
                 );
                 return None;
             }
-            let name = apps.first().map(|a| a.name.clone());
+            let name = enumeration.applications.first().map(|a| a.name.clone());
             match &name {
                 Some(n) => eprintln!("[ci_audio] discovered audio-producing app: '{n}'"),
                 None => eprintln!(
@@ -86,7 +87,7 @@ fn discover_audio_producing_app() -> Option<String> {
             name
         }
         Err(e) => {
-            eprintln!("[ci_audio] SKIP: list_audio_applications failed: {e:?}");
+            eprintln!("[ci_audio] SKIP: list_audio_applications_scoped failed: {e:?}");
             None
         }
     }

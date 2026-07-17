@@ -157,6 +157,9 @@ const {
   listDevices,
   getDefaultDevice,
   platformCapabilities,
+  Group,
+  CompositionBuilder,
+  Composition,
 } = nativeBinding
 
 module.exports.AudioCapture = AudioCapture
@@ -164,3 +167,6 @@ module.exports.CaptureTarget = CaptureTarget
 module.exports.listDevices = listDevices
 module.exports.getDefaultDevice = getDefaultDevice
 module.exports.platformCapabilities = platformCapabilities
+module.exports.Group = Group
+module.exports.CompositionBuilder = CompositionBuilder
+module.exports.Composition = Composition

@@ -344,6 +344,248 @@ export declare class AudioCapture {
 }
 
 /**
+ * Options accepted by {@link CompositionBuilder.create}.
+ */
+export interface CompositionBuilderOptions {
+  /** Session sample rate in Hz (default 48000). Sources at a different rate are resampled. */
+  sampleRate?: number | null;
+  /** Saturating clamp of the summed output to [-1.0, 1.0] (default false). */
+  clampOutput?: boolean | null;
+  /** Composed tick (output buffer) duration in ms (default 10). */
+  quantumMs?: number | null;
+  /** How long to wait for the master source before a wall-clock fallback tick, in ms (default 250). */
+  stallTimeoutMs?: number | null;
+  /** Per-source buffering bound in ms (default 1000). */
+  maxBufferMs?: number | null;
+}
+
+/**
+ * A composition group: a named set of capture sources sharing a mixdown layout
+ * (multi-source channel composition, ADR-0011).
+ *
+ * Build it up with `source`/`sourceWithGain` and a layout
+ * (`mixdownMono`/`mixdownStereo`/`keepChannels`), then hand it to
+ * {@link CompositionBuilder.addGroup}.
+ *
+ * @example
+ * ```ts
+ * const voice = new Group('voice');
+ * voice.mixdownMono();
+ * voice.source('name:Discord');
+ * voice.sourceWithGain('name:Zoom', 0.8);
+ * ```
+ */
+export declare class Group {
+  /**
+   * Create a group with the given name and the default stereo layout. The name
+   * must be non-empty and unique within a composition (both enforced at
+   * `CompositionBuilder.build()`).
+   */
+  constructor(name: string);
+  /**
+   * Add a capture source with unit gain (1.0). `spec` uses the canonical target
+   * grammar (`"system"`, `"device:<id>"`, `"app:<id>"`, `"name:<n>"`,
+   * `"tree:<pid>"`). Throws (`ERR_RSAC_CONFIGURATION`) on an invalid spec.
+   */
+  source(spec: string): void;
+  /**
+   * Add a capture source with an explicit linear mixdown gain (1.0 = unity).
+   * The gain must be finite and >= 0; an invalid gain throws eagerly.
+   */
+  sourceWithGain(spec: string, gain: number): void;
+  /** Fold every source in the group to mono and sum into one output channel. */
+  mixdownMono(): void;
+  /** Fold every source to stereo and sum into two output channels (the default). */
+  mixdownStereo(): void;
+  /**
+   * Pass the group's single source through with its native channel count. A
+   * keep-channels group must contain exactly one source (enforced at `build()`).
+   */
+  keepChannels(): void;
+}
+
+/**
+ * Builder for a multi-source {@link Composition} (ADR-0011). Configure the
+ * session knobs via {@link CompositionBuilder.create}, add groups, optionally
+ * `preflight()`, then `build()`.
+ */
+export declare class CompositionBuilder {
+  /** Create a composition builder with optional session settings. */
+  static create(opts?: CompositionBuilderOptions | undefined | null): CompositionBuilder;
+  /** Append a group (cloned into the builder). Groups contribute output channels in the order added. */
+  addGroup(group: Group): void;
+  /**
+   * Run every device-independent validation `build()` performs, without
+   * building. Throws (`ERR_RSAC_CONFIGURATION` / …) on an invalid configuration.
+   */
+  preflight(): void;
+  /**
+   * Validate and build a (not-yet-started) {@link Composition}. No devices are
+   * touched here — the inner captures are created and started by
+   * `Composition.start()`. Throws on an invalid configuration.
+   */
+  build(): Composition;
+}
+
+/**
+ * A multi-source composed capture session (ADR-0011). Created via
+ * {@link CompositionBuilder.build}; inert until `start()`.
+ *
+ * Mixes each group down according to its layout and appends the groups'
+ * channels into one interleaved stream. The blocking readers
+ * (`readBlocking`/`readBlockingAsync`) and the `onData` pump are
+ * terminal-observable (they end on the fatal terminal, reported via `onEnd`).
+ *
+ * An explicit `stop()` discards any buffered composed tail; read until the
+ * terminal error before stopping to capture everything (the composition's
+ * natural end — all sources ended — drains the tail first).
+ *
+ * @example
+ * ```ts
+ * const g = new Group('main');
+ * g.source('system');
+ * const comp = CompositionBuilder.create({ sampleRate: 48000 });
+ * comp.addGroup(g);
+ * const c = comp.build();
+ * c.onData((chunk) => console.log(chunk.channels));
+ * c.start();
+ * // ... later ...
+ * c.stop();
+ * ```
+ */
+export declare class Composition {
+  /**
+   * Start the composition (build + start one capture per source, resolve the
+   * composed layout, spawn the compositor thread). If an `onData` callback is
+   * registered, a background pump thread is spawned. Starting twice is a no-op.
+   */
+  start(): void;
+  /**
+   * Stop the composition: signal the ring + engine (waking any parked reader)
+   * and join the compositor thread. Discards the buffered composed tail.
+   */
+  stop(): void;
+  /** Whether the composed stream is currently running. */
+  readonly isRunning: boolean;
+  /**
+   * Read the next composed buffer (non-blocking). Returns `null` if no data is
+   * available yet. **Terminal-observable**: throws the fatal terminal error
+   * once the composition ends and drains.
+   */
+  read(): AudioChunk | null;
+  /**
+   * Read the next composed buffer, blocking until data is available.
+   * **Terminal-observable**. WARNING: blocks the Node.js event loop — prefer
+   * `readBlockingAsync()` or `onData()`.
+   */
+  readBlocking(): AudioChunk;
+  /**
+   * Read the next composed buffer asynchronously (non-blocking, off the main
+   * thread). Returns `null` if no data is available yet.
+   */
+  readAsync(): Promise<AudioChunk | null>;
+  /**
+   * Read the next composed buffer asynchronously, blocking the worker thread
+   * until data is available (does not block the event loop).
+   * **Terminal-observable**.
+   */
+  readBlockingAsync(): Promise<AudioChunk>;
+  /**
+   * Register a callback for push-based composed-audio delivery. Only one
+   * callback is active at a time; calling again replaces it. If the composition
+   * is running the pump starts immediately, otherwise on `start()`.
+   */
+  onData(callback: (chunk: AudioChunk) => void): void;
+  /**
+   * Register a callback that fires exactly once when push-based delivery ends,
+   * carrying *why* it ended: the formatted terminal error message (a non-null
+   * `string`) on a fatal terminal, or `null` on a clean stop. Parity with the
+   * `AudioCapture` `onEnd`; persists across sessions and is cleared only by
+   * `offEnd()`.
+   */
+  onEnd(callback: (error: string | null) => void): void;
+  /**
+   * Remove the registered data callback and stop the pump. An `onEnd` callback
+   * is left registered for a later session; use `offEnd()` to clear it.
+   */
+  offData(): void;
+  /** Remove the registered terminal-observability callback (see `onEnd`). */
+  offEnd(): void;
+  /**
+   * Number of composed-ring overruns (composed buffers dropped because the
+   * consumer read slower than the compositor produced). `0` before start. This
+   * counts loss at the composed ring only; per-source upstream loss is in
+   * `sourceStats()`.
+   */
+  readonly overrunCount: number;
+  /** Number of composed output channels (`0` before a successful start). */
+  readonly channelCount: number;
+  /**
+   * Name of the group producing composed output channel `channel` (0-based), or
+   * `null` if the composition is not started or `channel` is out of bounds.
+   */
+  channelGroup(channel: number): string | null;
+  /**
+   * Index of composed output channel `channel` within its group (0-based; e.g.
+   * 0 = L, 1 = R for a stereo group), or `null` if not started or out of bounds.
+   */
+  channelInGroup(channel: number): number | null;
+  /** Point-in-time composition counters, or `null` if not started. */
+  stats(): CompositionStats | null;
+  /**
+   * Per-source counters for the source at `index` (flat declaration order), or
+   * `null` if not started or `index` is out of bounds.
+   */
+  sourceStats(index: number): SourceStats | null;
+  /**
+   * Total composed buffers dropped by this composition's subscribe pumps
+   * because a subscriber's bounded channel was full. `0` before start.
+   */
+  subscriberDroppedCount(): bigint;
+}
+
+/**
+ * A point-in-time snapshot of a running {@link Composition}'s counters.
+ *
+ * Counters are `bigint` (Rust `u64`) so they do not silently lose precision past
+ * `Number.MAX_SAFE_INTEGER` on a long-running session.
+ */
+export interface CompositionStats {
+  /** Composed buffers (ticks) emitted so far. */
+  ticks: bigint;
+  /** Ticks emitted by the wall-clock stall fallback (the master had no data). */
+  fallbackTicks: bigint;
+  /** Number of composed sources, in flat declaration order. */
+  numSources: bigint;
+}
+
+/**
+ * A point-in-time snapshot of one composed source's counters. Exposes the full
+ * Rust `SourceStats` set — including `gapPaddedFrames` / `innerDropped`, which
+ * the C FFI struct omits. u64 counters are `bigint`.
+ */
+export interface SourceStats {
+  /** Name of the group the source belongs to. */
+  group: string;
+  /** The source's capture target in canonical grammar (e.g. `"system"`). */
+  target: string;
+  /** Buffers received from the inner capture so far. */
+  buffersReceived: bigint;
+  /** Frames of silence inserted because the source was behind at tick time. */
+  paddedFrames: bigint;
+  /** Frames trimmed because the source drifted past the buffering bound. */
+  trimmedFrames: bigint;
+  /** Frames of silence inserted to compensate intra-source timestamp gaps. */
+  gapPaddedFrames: bigint;
+  /** Ring-overflow drops inside the source's own capture (loss upstream of the compositor). */
+  innerDropped: bigint;
+  /** Whether this source is being resampled to the session rate. */
+  resampling: boolean;
+  /** Whether the source's stream has ended. */
+  ended: boolean;
+}
+
+/**
  * A point-in-time snapshot of an {@link AudioCapture}'s diagnostic counters.
  *
  * Cumulative counters are `bigint` (Rust `u64`) so they do not silently lose

@@ -620,7 +620,7 @@ typedef enum {
 typedef struct {
     uint64_t ticks;          /**< Composed buffers (ticks) emitted so far. */
     uint64_t fallback_ticks; /**< Wall-clock fallback ticks (master stalled). */
-    size_t   num_sources;    /**< Composed sources; valid indices are 0..num_sources. */
+    size_t   num_sources;    /**< Composed sources; valid indices are [0, num_sources). */
 } RsacCompositionStats;
 
 /**
@@ -909,7 +909,7 @@ rsac_error_t rsac_composition_stats(const RsacComposition* comp,
 
 /**
  * Fills *out with the counters of the source at `index` (flat declaration
- * order; valid indices are 0..num_sources from rsac_composition_stats()).
+ * order; valid indices are [0, num_sources) from rsac_composition_stats()).
  * Returns RSAC_ERROR_STREAM_READ before start and
  * RSAC_ERROR_INVALID_PARAMETER if `index` is out of bounds.
  */

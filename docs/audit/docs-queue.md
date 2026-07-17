@@ -3,7 +3,8 @@
 Recursive documentation audit. Items move TODO → DOING → DONE. New gaps
 surfaced during work are appended to TODO.
 
-Scope: rsac core + bindings + CI/infra. Excludes `apps/audio-graph/` submodule.
+Scope: rsac core + bindings + CI/infra. Excludes the `audio-graph` app (a
+standalone downstream checkout, not a tracked submodule).
 
 ## TODO
 

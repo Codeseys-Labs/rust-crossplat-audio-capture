@@ -105,6 +105,46 @@ impl AudioSource {
     }
 }
 
+// ── Application enumeration scope (rsac-f547) ────────────────────────────
+
+/// Whether an application enumeration is exactly the platform's audio producers,
+/// or a superset because the audio-process filter was unavailable.
+///
+/// # Stability
+/// `#[non_exhaustive]`: out-of-crate matches need a trailing `_ =>` arm.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum ApplicationScope {
+    /// The list contains exactly the applications the platform reports as
+    /// producing audio: Windows active sessions (`AudioSessionStateActive`),
+    /// Linux PipeWire audio nodes, macOS 14.4+ CoreAudio audio-process objects.
+    ExactAudioProducers,
+    /// The audio-process filter was unavailable, so the list is the full set of
+    /// running applications and may include silent ones. Currently reachable
+    /// only on macOS < 14.4, or when the macOS CoreAudio process-object query is
+    /// unavailable or reports no active PIDs (see the macOS backend fallback).
+    AllRunningFallback,
+    /// The backend enumeration itself failed (e.g. PipeWire unreachable, a
+    /// WASAPI/CoreAudio query error), so the (empty) list is *incomplete* —
+    /// not evidence that no applications are producing audio. Discovery stays
+    /// best-effort (the error is swallowed), but scoped callers can distinguish
+    /// "no producers found" from "could not look".
+    EnumerationFailed,
+}
+
+/// Result of a scope-aware application enumeration: the sources plus whether the
+/// list is exact or a fallback superset. Prefer this over
+/// [`list_audio_applications`] when you must distinguish "these apps are
+/// producing audio" from "here is every running app because filtering was
+/// unavailable" (e.g. an app-picker UI, or a test discovering a capture target).
+#[derive(Debug, Clone)]
+pub struct ApplicationEnumeration {
+    /// Discovered application sources (each `AudioSourceKind::Application`).
+    pub applications: Vec<AudioSource>,
+    /// Whether `applications` is exact or an unfiltered fallback superset.
+    pub scope: ApplicationScope,
+}
+
 // ── Convenience constructors for CaptureTarget ──────────────────────────
 
 impl CaptureTarget {
@@ -186,8 +226,9 @@ pub fn list_audio_sources() -> AudioResult<Vec<AudioSource>> {
         }
     }
 
-    // 3. Enumerate applications (platform-specific)
-    list_audio_applications_into(&mut sources);
+    // 3. Enumerate applications (platform-specific). The system-source listing
+    //    does not surface the enumeration scope, so discard it here.
+    let _scope = list_audio_applications_scoped_into(&mut sources);
 
     Ok(sources)
 }
@@ -196,49 +237,95 @@ pub fn list_audio_sources() -> AudioResult<Vec<AudioSource>> {
 ///
 /// Returns application info in a cross-platform format. On platforms where
 /// application enumeration is not supported, returns an empty list.
+///
+/// # Filtered vs. fallback
+///
+/// On macOS the returned list is normally *exactly* the applications CoreAudio
+/// reports as producing audio (14.4+), but on macOS < 14.4 — or when the
+/// CoreAudio process-object query is unavailable / reports no active PIDs — it
+/// silently falls back to the full set of running applications (a superset that
+/// may include silent ones). This function cannot distinguish the two modes;
+/// use [`list_audio_applications_scoped`] when you must (e.g. an app-picker UI,
+/// or a test discovering a real capture target). Windows and Linux always return
+/// the exact audio-producer set.
 pub fn list_audio_applications() -> AudioResult<Vec<AudioSource>> {
-    let mut sources = Vec::new();
-    list_audio_applications_into(&mut sources);
-    Ok(sources)
+    Ok(list_audio_applications_scoped()?.applications)
 }
 
-/// Internal: appends audio applications to the provided vec.
+/// Like [`list_audio_applications`], but also reports the enumeration
+/// [`ApplicationScope`] so callers can tell an exact audio-producer list from an
+/// unfiltered fallback superset.
+///
+/// On Windows and Linux the scope is always
+/// [`ApplicationScope::ExactAudioProducers`]. On macOS it is
+/// [`ApplicationScope::AllRunningFallback`] when the CoreAudio audio-process
+/// filter was unavailable (macOS < 14.4, or the process-object query was
+/// unavailable / found no active PIDs), and
+/// [`ApplicationScope::ExactAudioProducers`] otherwise.
+pub fn list_audio_applications_scoped() -> AudioResult<ApplicationEnumeration> {
+    let mut applications = Vec::new();
+    let scope = list_audio_applications_scoped_into(&mut applications);
+    Ok(ApplicationEnumeration {
+        applications,
+        scope,
+    })
+}
+
+/// Internal: appends audio applications to the provided vec and returns the
+/// enumeration [`ApplicationScope`].
 #[cfg(all(target_os = "macos", feature = "feat_macos"))]
-fn list_audio_applications_into(sources: &mut Vec<AudioSource>) {
-    if let Ok(apps) = crate::audio::macos::enumerate_audio_applications() {
-        for app in apps {
-            sources.push(AudioSource {
-                id: format!("app:{}", app.process_id),
-                name: app.name.clone(),
-                kind: AudioSourceKind::Application {
-                    pid: app.process_id,
-                    app_name: app.name,
-                    bundle_id: app.bundle_id,
-                },
-            });
+fn list_audio_applications_scoped_into(sources: &mut Vec<AudioSource>) -> ApplicationScope {
+    match crate::audio::macos::enumerate_audio_applications_scoped() {
+        Ok((apps, is_fallback)) => {
+            for app in apps {
+                sources.push(AudioSource {
+                    id: format!("app:{}", app.process_id),
+                    name: app.name.clone(),
+                    kind: AudioSourceKind::Application {
+                        pid: app.process_id,
+                        app_name: app.name,
+                        bundle_id: app.bundle_id,
+                    },
+                });
+            }
+            if is_fallback {
+                ApplicationScope::AllRunningFallback
+            } else {
+                ApplicationScope::ExactAudioProducers
+            }
         }
+        // Enumeration failed: push nothing and say so — an empty list from a
+        // failed query is INCOMPLETE, not an exact "no producers" answer
+        // (PR #59 review). Errors are swallowed to keep discovery best-effort.
+        Err(_) => ApplicationScope::EnumerationFailed,
     }
 }
 
 #[cfg(all(target_os = "windows", feature = "feat_windows"))]
-fn list_audio_applications_into(sources: &mut Vec<AudioSource>) {
-    if let Ok(sessions) = crate::audio::windows::enumerate_application_audio_sessions() {
-        for session in sessions {
-            sources.push(AudioSource {
-                id: format!("app:{}", session.process_id),
-                name: session.display_name.clone(),
-                kind: AudioSourceKind::Application {
-                    pid: session.process_id,
-                    app_name: session.display_name,
-                    bundle_id: None,
-                },
-            });
+fn list_audio_applications_scoped_into(sources: &mut Vec<AudioSource>) -> ApplicationScope {
+    // Windows filters to `AudioSessionStateActive`, so a successful query is
+    // always the exact audio-producer set; a failed query is incomplete.
+    match crate::audio::windows::enumerate_application_audio_sessions() {
+        Ok(sessions) => {
+            for session in sessions {
+                sources.push(AudioSource {
+                    id: format!("app:{}", session.process_id),
+                    name: session.display_name.clone(),
+                    kind: AudioSourceKind::Application {
+                        pid: session.process_id,
+                        app_name: session.display_name,
+                        bundle_id: None,
+                    },
+                });
+            }
+            ApplicationScope::ExactAudioProducers
         }
+        Err(_) => ApplicationScope::EnumerationFailed,
     }
 }
 
 #[cfg(all(target_os = "linux", feature = "feat_linux"))]
-fn list_audio_applications_into(sources: &mut Vec<AudioSource>) {
+fn list_audio_applications_scoped_into(sources: &mut Vec<AudioSource>) -> ApplicationScope {
     // Linux PipeWire application discovery via the **native** in-process registry
     // (H4 part 2 / rsac-8ebb), reached through the `crate::audio` facade exactly
     // like the macOS / Windows arms above. This replaces the former `pw-dump`
@@ -250,22 +337,29 @@ fn list_audio_applications_into(sources: &mut Vec<AudioSource>) {
     // best-effort and must never fail `list_audio_sources`. PID dedup is handled
     // natively (`PwAppSnapshot` is keyed by PID), but we still guard against an
     // id already present in `sources` for parity with the other backends.
-    if let Ok(apps) = crate::audio::linux::enumerate_audio_applications() {
-        for app in apps {
-            let id = format!("app:{}", app.process_id);
-            if sources.iter().any(|s| s.id == id) {
-                continue;
+    match crate::audio::linux::enumerate_audio_applications() {
+        Ok(apps) => {
+            for app in apps {
+                let id = format!("app:{}", app.process_id);
+                if sources.iter().any(|s| s.id == id) {
+                    continue;
+                }
+                sources.push(AudioSource {
+                    id,
+                    name: app.name.clone(),
+                    kind: AudioSourceKind::Application {
+                        pid: app.process_id,
+                        app_name: app.name,
+                        bundle_id: None,
+                    },
+                });
             }
-            sources.push(AudioSource {
-                id,
-                name: app.name.clone(),
-                kind: AudioSourceKind::Application {
-                    pid: app.process_id,
-                    app_name: app.name,
-                    bundle_id: None,
-                },
-            });
+            // A successful native PipeWire audio-node snapshot is always exact.
+            ApplicationScope::ExactAudioProducers
         }
+        // PipeWire unreachable (no daemon/socket): the empty list is
+        // incomplete, not a "no producers" answer (PR #59 review).
+        Err(_) => ApplicationScope::EnumerationFailed,
     }
 }
 
@@ -274,7 +368,10 @@ fn list_audio_applications_into(sources: &mut Vec<AudioSource>) {
     all(target_os = "windows", feature = "feat_windows"),
     all(target_os = "linux", feature = "feat_linux"),
 )))]
-fn list_audio_applications_into(_sources: &mut Vec<AudioSource>) {}
+fn list_audio_applications_scoped_into(_sources: &mut Vec<AudioSource>) -> ApplicationScope {
+    // Unsupported platform: the empty list is an exact (if trivial) audio-producer set.
+    ApplicationScope::ExactAudioProducers
+}
 
 // ── Permission helpers ──────────────────────────────────────────────────
 
@@ -631,6 +728,75 @@ mod tests {
                 other => {
                     panic!("list_audio_applications yielded a non-Application source: {other:?}")
                 }
+            }
+        }
+    }
+
+    /// `list_audio_applications_scoped()` is best-effort and well-formed: it
+    /// returns `Ok`, every source is an `Application`, and on the always-exact
+    /// backends (Windows / Linux CI) the reported scope is
+    /// `ExactAudioProducers`. Mirrors
+    /// `list_audio_applications_is_best_effort_and_well_formed` (rsac-f547).
+    #[test]
+    fn list_audio_applications_scoped_is_well_formed() {
+        let enumeration =
+            list_audio_applications_scoped().expect("list_audio_applications_scoped is infallible");
+
+        for source in &enumeration.applications {
+            assert!(
+                source.id.starts_with("app:"),
+                "application source id must be `app:<pid>`-prefixed, got {:?}",
+                source.id
+            );
+            match &source.kind {
+                AudioSourceKind::Application { pid, .. } => {
+                    assert_eq!(
+                        source.id,
+                        format!("app:{pid}"),
+                        "id must encode the same PID as the kind"
+                    );
+                }
+                other => panic!(
+                    "list_audio_applications_scoped yielded a non-Application source: {other:?}"
+                ),
+            }
+        }
+
+        // Windows and Linux report the exact audio-producer set on success
+        // (Windows filters to AudioSessionStateActive; Linux returns the native
+        // PipeWire audio-node snapshot) — or EnumerationFailed when the backend
+        // query itself fails (headless CI: no PipeWire daemon in the unit-test
+        // job, no WASAPI session access). They can never report the macOS-only
+        // AllRunningFallback superset.
+        #[cfg(any(
+            all(target_os = "windows", feature = "feat_windows"),
+            all(target_os = "linux", feature = "feat_linux"),
+        ))]
+        assert_ne!(
+            enumeration.scope,
+            ApplicationScope::AllRunningFallback,
+            "Windows/Linux enumeration is exact-on-success or EnumerationFailed — \
+             never the unfiltered fallback superset"
+        );
+    }
+
+    /// The unscoped `list_audio_applications()` is a loss-free projection of the
+    /// scoped variant's `applications` (rsac-f547). The delegation is
+    /// by-construction (`Ok(list_audio_applications_scoped()?.applications)`),
+    /// so comparing two SEPARATE live snapshots would only race application
+    /// churn between the calls (PR #59 review) — instead assert the projection
+    /// property on ONE captured enumeration: every projected source is a
+    /// well-formed Application whose id encodes its PID.
+    #[test]
+    fn list_audio_applications_is_scoped_projection() {
+        let scoped = list_audio_applications_scoped().expect("infallible");
+        let projected = scoped.applications;
+        for source in &projected {
+            match &source.kind {
+                AudioSourceKind::Application { pid, .. } => {
+                    assert_eq!(source.id, format!("app:{pid}"));
+                }
+                other => panic!("projection yielded a non-Application source: {other:?}"),
             }
         }
     }

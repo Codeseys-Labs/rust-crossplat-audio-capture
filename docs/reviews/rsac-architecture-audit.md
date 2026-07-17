@@ -2,7 +2,7 @@
 
 **Date:** 2026-04-24
 **Reviewer:** Claude architecture-audit agent (read-only)
-**Scope:** rsac root library (NOT apps/audio-graph submodule)
+**Scope:** rsac root library (NOT the `audio-graph` app — a standalone downstream checkout, not a tracked submodule)
 
 ## Executive Summary
 

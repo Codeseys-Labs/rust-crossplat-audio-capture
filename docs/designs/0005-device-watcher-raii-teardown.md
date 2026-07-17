@@ -3,19 +3,28 @@
 **Status:** Accepted
 **Date:** 2026-05-30
 **Scope:** `src/core/interface.rs` (`DeviceWatcher`), `src/audio/windows/wasapi.rs`
-(`watch` teardown + `SendWatcherTeardown`), `src/audio/macos/coreaudio.rs`
-(`watch` teardown + `SendContextPtr`), `src/audio/linux/thread.rs`
+(`watch` teardown + `WatchTeardown`), `src/audio/linux/thread.rs`
 (`spawn_device_watcher` teardown)
 **Verdict:** `DeviceWatcher` is an RAII guard whose `Drop` runs a **take-once**
 `Option<Box<dyn FnOnce() + Send>>` teardown closure: it **unregisters the OS
 listener first, then joins the notify thread**, and is **best-effort and never
 panics**. On Windows the teardown also pins the COM apartment via
 `Arc<ComInitializer>` so `CoUninitialize()` cannot race a live callback. On macOS
-the in-flight-proc teardown race (CoreAudio gives no barrier that an executing
-`watch_listener_proc` has finished when `AudioObjectRemovePropertyListener`
-returns) is closed with an **intentional bounded leak** of the listener context
-so a late proc always derefs valid memory (§5); the fully race-free
-dispatch-queue rewrite is **deferred** (§5/§6). Pairs with ADR-0004.
+the in-flight-callback teardown race is now **RESOLVED** (rsac-e8aa / GH #32): the
+watcher uses **block-based** listeners (`AudioObjectAddPropertyListenerBlock`) on
+a **self-owned serial dispatch queue**, and teardown removes the block on that
+same queue then dispatches a **synchronous no-op barrier** which — by serial-queue
+FIFO ordering — cannot return until every in-flight block has finished, after
+which the `Arc<WatchListenerContext>` is dropped (**freed, not leaked**). This
+eliminates both the previously-intentional context leak and the race (§5) on
+the expected path. If `AudioObjectRemovePropertyListenerBlock` itself reports a
+failure (never observed; no documented failure mode for a registered listener),
+teardown falls back to the pre-fix bounded leak for that watcher — block,
+context, and queue are intentionally leaked and the helper detached, so a late
+dispatch can never touch freed memory. The leak is thus confined to an
+OS-reported removal failure instead of being unconditional. The
+device-*alive* listener (`DeviceAliveContext`) remains on the PROC API +
+`tearing_down` guard as a follow-up. Pairs with ADR-0004.
 
 ## 1. Context
 
@@ -117,21 +126,20 @@ join the notify thread**:
   `drop(teardown_state)`, so the apartment outlives Unregister + join even
   though the field is never read.
 
-- **macOS** (`coreaudio.rs`): (1) `AudioObjectRemovePropertyListener` for all
-  three `WATCH_ADDRESSES` (best-effort — stops *new* notifications); (2) **take
-  the `SyncSender` out of the context** — `event_tx` is a
-  `Mutex<Option<SyncSender<DeviceEvent>>>`, and teardown sets it to `None`
-  (recovering a poisoned lock, never `unwrap`ping), dropping the last live sender
-  so the `rsac-macos-device-watch` helper's `recv()` returns `Err` and its loop
-  ends; (3) `join()` the helper, ignoring a panicked-handler join error. The
-  `WatchListenerContext` itself is **intentionally leaked** (`Box::into_raw`,
-  reclaimed only on the pre-add construction-error path — see §5), so step (2)
-  disconnects delivery *without* freeing the allocation a late proc may still
-  deref. The raw `*mut WatchListenerContext` crosses into the closure inside
-  `SendContextPtr` (`unsafe impl Send`), captured *whole* so Rust 2021
-  disjoint-capture does not strip the wrapper's `Send`; it now identifies the
-  listener registration and addresses the leaked context for step (2), but no
-  longer owns/keeps-alive a `Box` (there is none).
+- **macOS** (`coreaudio.rs`, `WatchTeardown::run`, rsac-e8aa): (1)
+  `AudioObjectRemovePropertyListenerBlock` for all three `WATCH_ADDRESSES` on the
+  self-owned serial queue (no *new* block scheduled after it returns); (2) a
+  **serial-queue sync barrier** (`queue.exec_sync(|| {})`) which cannot start
+  until every in-flight notification block has finished, so on return no block is
+  running or pending; (3) drop the block's `Arc<WatchListenerContext>` clone and
+  the teardown's clone → the context is **freed** and its `SyncSender` drops, so
+  the `rsac-macos-device-watch` helper's `recv()` returns `Err` and its loop
+  ends; (4) `join()` the helper, ignoring a panicked-handler join error; (5) drop
+  the queue last. Everything the teardown owns — the `DispatchRetained<
+  DispatchQueue>`, the `RcBlock`, the `Arc`, and the `JoinHandle` — is bundled in
+  a `WatchTeardown` newtype (`unsafe impl Send`) captured *whole* by the closure
+  so Rust 2021 disjoint-capture does not strip the wrapper's `Send` (the block's
+  `RcBlock` is otherwise `!Send`; it only ever *executes* on the owned queue).
 
 - **Linux** (`thread.rs`, `spawn_device_watcher`): the closure owns the
   `JoinHandle` in an `Option` (single owner → cannot double-join) and a shared
@@ -152,47 +160,53 @@ take-once `Option` makes the whole teardown idempotent.
   user `FnMut`; Linux stops + joins the loop thread that calls it. Both reclaim
   the consumer thread, so no handler invocation can outlive `drop`. On **macOS**
   the user handler runs only on the helper thread, which teardown joins after
-  disconnecting the channel, so the *handler* likewise cannot run after `drop`
-  returns; the residual concurrency is the CoreAudio *proc* (which never calls
-  the user handler — it only pushes onto the now-disconnected channel and
-  no-ops). See the next bullet.
+  freeing the context (which drops the sender and disconnects the channel), so
+  the *handler* likewise cannot run after `drop` returns; the residual
+  concurrency is the CoreAudio notification *block* (which never calls the user
+  handler — it only pushes onto the channel), and the barrier below guarantees no
+  block runs after teardown either. See the next bullet.
 
-- **macOS in-flight-proc race — FIXED via an intentional bounded leak (H1 /
-  PS-1).** CoreAudio's PROC-based listener gives **no** guarantee that an
-  already-executing `watch_listener_proc` has finished when
-  `AudioObjectRemovePropertyListener` returns (Apple's docs promise only that no
-  *new* notifications fire), and the proc dereferences its `client_data`
-  context. The previous design `drop(context)` immediately after removing the
-  listeners, leaving a **use-after-free window** for a proc that began before the
-  drop. There is no app-side barrier that closes this window safely — locking
-  across the destructor/remove gap can deadlock on the HAL's own internal
-  recursive mutex.
+- **macOS in-flight-callback race — RESOLVED via block listeners on a serial
+  dispatch queue (rsac-e8aa / GH #32).** CoreAudio's PROC-based listener gave
+  **no** guarantee that an already-executing `watch_listener_proc` had finished
+  when `AudioObjectRemovePropertyListener` returned (Apple's docs promise only
+  that no *new* notifications fire), and the proc dereferenced its `client_data`
+  context — a **use-after-free window** for a proc that began before the drop.
+  The earlier wave closed this with an **intentional bounded leak** of the
+  context (never freeing it made a late deref always valid); that stopgap traded
+  a per-cycle leak for soundness.
 
-  The race is now closed by making the deref **always valid**: the
-  `WatchListenerContext` is **intentionally leaked** (`Box::into_raw`; never
-  reclaimed on the success or spawn-failure paths — reclaimed only on the pre-add
-  construction-error path, where no listener was ever registered so no proc can
-  fire). A late or in-flight proc therefore always dereferences valid, `'static`
-  memory. Event **delivery** is stopped not by freeing the context but by
-  disconnecting the channel: `event_tx` is a `Mutex<Option<SyncSender>>` and
-  teardown takes the sender out (`None`); a proc that fires afterward finds the
-  sender taken (or the channel `Disconnected`) and is a no-op
-  (`try_push_event`). The proc's old safety comment ("the context outlives every
-  listener; teardown removes the listeners before freeing it") **overstated** the
-  guarantee and has been rewritten to state the actual leak-based invariant.
+  This is now replaced by the race-free design the stopgap deferred:
 
-  **Residual tradeoff:** a bounded one-time leak per `watch()`/drop cycle — one
-  `WatchListenerContext` (a sender slot plus a `HashSet` of device ids, tens of
-  bytes). Watchers are long-lived and few, so this is acceptable as a stopgap.
+  1. All three listeners register via **`AudioObjectAddPropertyListenerBlock`** on
+     **one self-owned serial dispatch queue** (`dispatch2::DispatchQueue` with
+     `DispatchQueueAttr::SERIAL`). Every notification block therefore runs
+     serialized on that queue.
+  2. The block captures an `Arc<WatchListenerContext>` clone, keeping the context
+     alive for exactly as long as a block can run. Context is held by `Arc`, not
+     leaked, and `event_tx` is a plain `Mutex<SyncSender>` (the `Option`/take
+     dance is gone; the `Mutex` remains only because a `SyncSender` is `Send` but
+     not `Sync` and the block is a shared `Fn`).
+  3. Teardown, on the drop thread, runs **remove → barrier → free → join**: remove
+     each block on the same queue (no *new* block scheduled after it returns),
+     then `queue.exec_sync(|| {})` — a synchronous no-op that, by serial-queue
+     FIFO ordering, cannot start until every previously-enqueued block has
+     finished. When it returns, no block is in flight or pending, so dropping the
+     block's `Arc` clone and teardown's `Arc` clone **frees** the context with no
+     use-after-free window.
 
-  **Deferred proper fix (tracked, `deferred-review`):** migrate to
-  `AudioObjectAddPropertyListenerBlock` on a **self-owned serial dispatch
-  queue**, removing the listener on that same queue (the Chromium/Itsuki
-  pattern). Because removal and dispatch are serialised on one queue, this
-  eliminates **both** the race and the leak. It is deferred because it is a
-  larger change (a different CoreAudio API surface + a dispatch-queue lifecycle)
-  than the one-wave safety stopgap. Tracked as a GitHub issue with the
-  `deferred-review` label, mirroring the rigor of the Go UAF issue (#28); see §6.
+  **Synchronization primitive is the serial queue, not atomics:** block N
+  completes-before block N+1 begins; the `exec_sync` enqueued after the removals
+  completes-before returning only once all prior blocks complete. **No
+  HAL-recursive-mutex deadlock** (the reason app-side locking was rejected here):
+  the barrier is a `dispatch_sync` on **our own** queue, never an app lock held
+  across the HAL's `Remove`; and teardown never runs on the watch queue, so it
+  cannot self-deadlock. This eliminates **both** the leak and the race.
+
+  **Remaining follow-up:** the device-*alive* listener (`DeviceAliveContext`,
+  used to detect spontaneous device death) still uses the PROC API + the
+  `tearing_down` Release/Acquire guard; migrating it to the same block-queue
+  pattern is a separate, out-of-scope task.
 
 - **No self-join hazard in the watcher teardowns.** The teardown runs on the
   thread that drops the `DeviceWatcher`, which is never the notify thread it
@@ -210,35 +224,39 @@ take-once `Option` makes the whole teardown idempotent.
 
 - **Bounded teardown latency.** Windows join is bounded by
   `NOTIFY_THREAD_POLL_INTERVAL`; Linux join is bounded by the 50 ms iterate tick;
-  macOS join completes once teardown takes the sender out of the context and the
-  resulting channel disconnect ends the helper's `recv()`. None block
-  unboundedly.
+  macOS teardown removes each block, runs a serial-queue sync barrier that
+  completes as soon as any in-flight block returns (bounded by one block's short
+  push-onto-channel body), then frees the context — dropping the sender ends the
+  helper's `recv()`. None block unboundedly.
 
 ## 6. References
 
 - 2026-05-30 architecture critique: *"macOS device-watch teardown has a
   use-after-free window on the listener context"* (HIGH, concurrency-threading —
-  the §5 race, now **fixed via the intentional bounded leak**), and *"GAP:
-  DeviceWatcher RAII teardown / lifecycle contract"* (folded into the
-  device-watch ADR family).
-- **Deferred proper fix (H1 / PS-1):** GitHub issue (`deferred-review` label) to
-  migrate the macOS watcher to `AudioObjectAddPropertyListenerBlock` on a
-  self-owned serial dispatch queue with remove-on-same-queue (Chromium/Itsuki
-  pattern), eliminating both the leak and any residual race. Linked from the
-  leak's `WatchListenerContext` doc comment in `coreaudio.rs`.
-- Prior art for the stopgap: Hush #826 (*"deliberately leak … callback data that
-  may still be referenced by the HAL"*); TypeWhisper #209 (app-side locking
-  cannot bridge the destructor/remove gap and can deadlock on the HAL's recursive
-  mutex); cpal's own admission that its trust-the-OS approach *"could lead to a
-  use-after-free."*
+  the §5 race, now **RESOLVED via block listeners on a serial dispatch queue**,
+  rsac-e8aa / GH #32), and *"GAP: DeviceWatcher RAII teardown / lifecycle
+  contract"* (folded into the device-watch ADR family).
+- **Shipped fix (rsac-e8aa / GH #32):** migrate the macOS watcher to
+  `AudioObjectAddPropertyListenerBlock` on a self-owned serial dispatch queue
+  with remove-on-same-queue + sync barrier (the Chromium/Itsuki pattern),
+  eliminating both the leak and the race. Adds direct `dispatch2`/`block2` macOS
+  dependencies.
+- Prior art: Hush #826 (*"deliberately leak … callback data that may still be
+  referenced by the HAL"* — the stopgap this fix replaces); TypeWhisper #209
+  (app-side locking cannot bridge the destructor/remove gap and can deadlock on
+  the HAL's recursive mutex — why the barrier is a `dispatch_sync` on our own
+  queue, not an app lock); cpal's own admission that its trust-the-OS approach
+  *"could lead to a use-after-free."*
 - `src/core/interface.rs` — `DeviceWatcher` (take-once `Option<Box<dyn FnOnce()
   + Send>>`, `Drop`, `from_teardown`).
 - `src/audio/windows/wasapi.rs` — `DeviceEnumerator::watch` teardown,
   `SendWatcherTeardown` + its `Arc<ComInitializer>` apartment pin.
 - `src/audio/macos/coreaudio.rs` — `DeviceEnumerator::watch` teardown
-  (unregister → take sender / disconnect → join), the intentionally leaked
-  `WatchListenerContext` (`event_tx: Mutex<Option<SyncSender>>`),
-  `SendContextPtr`, and `watch_listener_proc`'s leak-based deref invariant.
+  (remove → barrier → free → join via `WatchTeardown::run`), the block-based
+  `WatchListenerContext` (`Arc`, `event_tx: Mutex<SyncSender>`), the locally
+  hand-declared `AudioObject{Add,Remove}PropertyListenerBlock` prototypes, and
+  the `WatchBlock` / `WatchTeardown` types. The device-*alive* listener
+  (`DeviceAliveContext`) remains on the PROC API — a follow-up.
 - `src/audio/linux/thread.rs` — `spawn_device_watcher` teardown (flag + join;
   RAII listener drop on the loop thread).
 - Companion: ADR-0004 (device-change-notification delivery model — the threading
