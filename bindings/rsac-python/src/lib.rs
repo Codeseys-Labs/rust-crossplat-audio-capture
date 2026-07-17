@@ -1560,9 +1560,13 @@ impl PyGroup {
     ///     ConfigurationError: If ``spec`` is not a valid target string or the
     ///         gain is not finite and >= 0.
     fn source_with_gain(&self, spec: &str, gain: f64) -> PyResult<()> {
-        if !gain.is_finite() || gain < 0.0 {
+        // Validate AFTER narrowing to f32: a finite f64 above f32::MAX becomes
+        // +inf in the cast, which an f64-only check would let through
+        // (PR #59 review).
+        let gain32 = gain as f32;
+        if !gain32.is_finite() || gain32 < 0.0 {
             return Err(ConfigurationError::new_err(format!(
-                "gain {gain} is invalid (must be finite and >= 0)"
+                "gain {gain} is invalid (must be finite and >= 0 after f32 narrowing)"
             )));
         }
         let target = rsac::CaptureTarget::from_str(spec).map_err(audio_error_to_pyerr)?;
@@ -1570,7 +1574,7 @@ impl PyGroup {
             .inner
             .lock()
             .map_err(|e| PyRuntimeError::new_err(format!("Lock poisoned: {}", e)))?;
-        *g = g.clone().source_with_gain(target, gain as f32);
+        *g = g.clone().source_with_gain(target, gain32);
         Ok(())
     }
 
@@ -2787,11 +2791,22 @@ mod tests {
     /// `Group.source_with_gain` rejects a non-finite or negative gain eagerly
     /// (matches the C FFI `invalid_gain_rejected_eagerly`). The check is the
     /// binding's own (before the core builder would also reject it), so pin the
-    /// exact predicate the Python method uses: `!finite || < 0`.
+    /// exact predicate the Python method uses — validation happens AFTER the
+    /// f32 narrowing, so a finite f64 above f32::MAX (casts to +inf) is
+    /// rejected too (PR #59 review).
     #[test]
     fn compose_gain_validation_predicate() {
-        let reject = |g: f64| !g.is_finite() || g < 0.0;
-        for bad in [-0.5f64, f64::NAN, f64::INFINITY, f64::NEG_INFINITY] {
+        let reject = |g: f64| {
+            let g32 = g as f32;
+            !g32.is_finite() || g32 < 0.0
+        };
+        for bad in [
+            -0.5f64,
+            f64::NAN,
+            f64::INFINITY,
+            f64::NEG_INFINITY,
+            f64::MAX, // finite as f64, +inf after f32 narrowing
+        ] {
             assert!(reject(bad), "gain {bad} must be rejected");
         }
         for ok in [0.0f64, 1.0, 0.8, 4.0] {

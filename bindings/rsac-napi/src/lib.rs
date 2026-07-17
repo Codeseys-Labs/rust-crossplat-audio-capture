@@ -8,7 +8,7 @@ extern crate napi_derive;
 
 use napi::bindgen_prelude::*;
 use napi::threadsafe_function::{ErrorStrategy, ThreadsafeFunction, ThreadsafeFunctionCallMode};
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, RwLock};
 
 // ── Error conversion ─────────────────────────────────────────────────────
@@ -1099,17 +1099,22 @@ impl Group {
     /// The gain must be finite and >= 0; an invalid gain throws eagerly.
     #[napi]
     pub fn source_with_gain(&self, spec: String, gain: f64) -> Result<()> {
-        if !gain.is_finite() || gain < 0.0 {
+        // Validate AFTER narrowing to f32: a finite f64 above f32::MAX (e.g.
+        // f64::MAX) becomes +inf in the cast, which the f64 check would let
+        // through (PR #59 review).
+        let gain32 = gain as f32;
+        if !gain32.is_finite() || gain32 < 0.0 {
             return Err(napi::Error::new(
                 napi::Status::InvalidArg,
                 format!(
-                    "[ERR_RSAC_CONFIGURATION] gain {gain} is invalid (must be finite and >= 0)"
+                    "[ERR_RSAC_CONFIGURATION] gain {gain} is invalid (must be finite and >= 0 \
+                     after f32 narrowing)"
                 ),
             ));
         }
         let target: rsac::CaptureTarget = spec.parse().map_err(audio_err_to_napi)?;
         let mut g = self.inner.lock().map_err(lock_poisoned)?;
-        *g = g.clone().source_with_gain(target, gain as f32);
+        *g = g.clone().source_with_gain(target, gain32);
         Ok(())
     }
 
@@ -1231,6 +1236,7 @@ impl CompositionBuilder {
             callback: Arc::new(Mutex::new(None)),
             end_callback: Arc::new(Mutex::new(None)),
             pump_active: Arc::new(AtomicBool::new(false)),
+            pump_generation: Arc::new(AtomicU64::new(0)),
         })
     }
 }
@@ -1253,8 +1259,15 @@ pub struct Composition {
     callback: DataCallback,
     /// Optional terminal-observability callback, fired once when the pump ends.
     end_callback: EndCallback,
-    /// Whether the push-model data pump thread is running.
+    /// Whether the push-model data pump thread is running (spawn guard).
     pump_active: Arc<AtomicBool>,
+    /// Monotonic pump generation (PR #59 review): each spawned pump owns the
+    /// generation current at spawn time and loops only while it still owns it.
+    /// Cancellation bumps the generation, so a stale pump can NEVER be
+    /// resurrected by a rapid `offData()`→`onData()` flip of the bool alone
+    /// (the old pump observes the generation change and exits; only the new
+    /// generation's pump delivers).
+    pump_generation: Arc<AtomicU64>,
 }
 
 #[napi]
@@ -1289,6 +1302,9 @@ impl Composition {
     /// and join the compositor thread. Discards the buffered tail.
     #[napi]
     pub fn stop(&self) -> Result<()> {
+        // Bump the generation FIRST: any live pump loses ownership immediately
+        // and can never be resurrected by a later flag flip (PR #59 review).
+        self.pump_generation.fetch_add(1, Ordering::SeqCst);
         self.pump_active.store(false, Ordering::SeqCst);
 
         // rsac-8082: FIRST take a read guard to signal via
@@ -1402,6 +1418,10 @@ impl Composition {
     /// callback is left registered for a later session; use `offEnd` to clear it.
     #[napi]
     pub fn off_data(&self) -> Result<()> {
+        // Generation bump makes cancellation immune to a rapid re-`onData()`
+        // setting pump_active back to true before the old pump observes false:
+        // the old pump checks its OWN generation and exits (PR #59 review).
+        self.pump_generation.fetch_add(1, Ordering::SeqCst);
         self.pump_active.store(false, Ordering::SeqCst);
         let mut cb_guard = self.callback.lock().map_err(lock_poisoned)?;
         *cb_guard = None;
@@ -1504,15 +1524,22 @@ impl Composition {
         let callback = self.callback.clone();
         let end_callback = self.end_callback.clone();
         let pump_active = self.pump_active.clone();
+        let pump_generation = self.pump_generation.clone();
 
+        // This pump owns the generation value current at spawn time; any
+        // cancellation (stop/offData) bumps it, ending ownership even if
+        // pump_active is set true again by a rapid re-onData (PR #59 review).
+        let my_generation = pump_generation.fetch_add(1, Ordering::SeqCst) + 1;
         pump_active.store(true, Ordering::SeqCst);
 
-        std::thread::Builder::new()
+        let spawn_result = std::thread::Builder::new()
             .name("rsac-napi-compose-pump".into())
             .spawn(move || {
                 let mut end_reason: Option<String> = None;
                 let mut recoverable_errors: u64 = 0;
-                while pump_active.load(Ordering::SeqCst) {
+                while pump_active.load(Ordering::SeqCst)
+                    && pump_generation.load(Ordering::SeqCst) == my_generation
+                {
                     let maybe_buf = {
                         let comp = match inner.read() {
                             Ok(c) => c,
@@ -1561,7 +1588,12 @@ impl Composition {
                         }
                     }
                 }
-                pump_active.store(false, Ordering::SeqCst);
+                // Clear the running flag only if this pump still OWNS the
+                // generation — a stale pump exiting after a rapid re-onData
+                // must not kill the successor pump's flag (PR #59 review).
+                if pump_generation.load(Ordering::SeqCst) == my_generation {
+                    pump_active.store(false, Ordering::SeqCst);
+                }
 
                 let end_tsfn = match end_callback.lock() {
                     Ok(guard) => guard.clone(),
@@ -1570,14 +1602,20 @@ impl Composition {
                 if let Some(tsfn) = end_tsfn {
                     tsfn.call(end_reason, ThreadsafeFunctionCallMode::NonBlocking);
                 }
-            })
-            .map_err(|e| {
-                napi::Error::new(
+            });
+        match spawn_result {
+            Ok(_) => Ok(()),
+            Err(e) => {
+                // Roll the flag back so a later onData()/start() can retry —
+                // leaving it true would permanently wedge pump spawning
+                // (PR #59 review).
+                self.pump_active.store(false, Ordering::SeqCst);
+                Err(napi::Error::new(
                     napi::Status::GenericFailure,
                     format!("Failed to spawn compose data pump thread: {}", e),
-                )
-            })?;
-        Ok(())
+                ))
+            }
+        }
     }
 }
 
@@ -2268,12 +2306,23 @@ mod tests {
     }
 
     /// `Group.sourceWithGain` rejects a non-finite or negative gain eagerly. Pin
-    /// the exact predicate the method uses (`!finite || < 0`), matching the C FFI
+    /// the exact predicate the method uses — validation happens AFTER the f32
+    /// narrowing, so a finite f64 above f32::MAX (which casts to +inf) is
+    /// rejected too (PR #59 review) — matching the C FFI
     /// `invalid_gain_rejected_eagerly` and the Python binding.
     #[test]
     fn compose_gain_validation_predicate() {
-        let reject = |g: f64| !g.is_finite() || g < 0.0;
-        for bad in [-0.5f64, f64::NAN, f64::INFINITY, f64::NEG_INFINITY] {
+        let reject = |g: f64| {
+            let g32 = g as f32;
+            !g32.is_finite() || g32 < 0.0
+        };
+        for bad in [
+            -0.5f64,
+            f64::NAN,
+            f64::INFINITY,
+            f64::NEG_INFINITY,
+            f64::MAX, // finite as f64, +inf after f32 narrowing
+        ] {
             assert!(reject(bad), "gain {bad} must be rejected");
         }
         for ok in [0.0f64, 1.0, 0.8, 4.0] {

@@ -781,17 +781,23 @@ mod tests {
     }
 
     /// The unscoped `list_audio_applications()` is a loss-free projection of the
-    /// scoped variant's `applications` — proves the delegation drops only the
-    /// scope, never any source (rsac-f547).
+    /// scoped variant's `applications` (rsac-f547). The delegation is
+    /// by-construction (`Ok(list_audio_applications_scoped()?.applications)`),
+    /// so comparing two SEPARATE live snapshots would only race application
+    /// churn between the calls (PR #59 review) — instead assert the projection
+    /// property on ONE captured enumeration: every projected source is a
+    /// well-formed Application whose id encodes its PID.
     #[test]
-    fn list_audio_applications_matches_scoped_applications() {
-        let plain = list_audio_applications().expect("infallible");
+    fn list_audio_applications_is_scoped_projection() {
         let scoped = list_audio_applications_scoped().expect("infallible");
-        assert_eq!(plain.len(), scoped.applications.len());
-        for (a, b) in plain.iter().zip(scoped.applications.iter()) {
-            assert_eq!(a.id, b.id);
-            assert_eq!(a.name, b.name);
-            assert_eq!(a.kind, b.kind);
+        let projected = scoped.applications;
+        for source in &projected {
+            match &source.kind {
+                AudioSourceKind::Application { pid, .. } => {
+                    assert_eq!(source.id, format!("app:{pid}"));
+                }
+                other => panic!("projection yielded a non-Application source: {other:?}"),
+            }
         }
     }
 

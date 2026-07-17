@@ -31,6 +31,7 @@ import (
 	"runtime"
 	"sync"
 	"sync/atomic"
+	"time"
 	"unsafe"
 )
 
@@ -94,7 +95,11 @@ func (g *Group) SetLayout(layout GroupLayout) error {
 	if g.handle == nil {
 		return ErrClosed
 	}
-	return newError(C.rsac_group_set_layout(g.handle, C.int32_t(layout)))
+	// KeepAlive: g has a finalizer; without this the GC could collect g (and
+	// free the handle) between reading g.handle and the cgo call returning.
+	rc := C.rsac_group_set_layout(g.handle, C.int32_t(layout))
+	runtime.KeepAlive(g)
+	return newError(rc)
 }
 
 // AddSource adds a capture source with unit gain (1.0). The spec uses the same
@@ -110,7 +115,9 @@ func (g *Group) AddSource(spec string) error {
 	}
 	cspec := C.CString(spec)
 	defer C.free(unsafe.Pointer(cspec))
-	return newError(C.rsac_group_add_source(g.handle, cspec))
+	rc := C.rsac_group_add_source(g.handle, cspec)
+	runtime.KeepAlive(g)
+	return newError(rc)
 }
 
 // AddSourceWithGain adds a capture source with an explicit linear mixdown gain
@@ -122,7 +129,9 @@ func (g *Group) AddSourceWithGain(spec string, gain float32) error {
 	}
 	cspec := C.CString(spec)
 	defer C.free(unsafe.Pointer(cspec))
-	return newError(C.rsac_group_add_source_with_gain(g.handle, cspec, C.float(gain)))
+	rc := C.rsac_group_add_source_with_gain(g.handle, cspec, C.float(gain))
+	runtime.KeepAlive(g)
+	return newError(rc)
 }
 
 // Free releases a group handle that was never consumed by a successful
@@ -180,7 +189,9 @@ func (b *CompositionBuilder) SetSampleRate(rate uint32) error {
 	if b.handle == nil {
 		return ErrClosed
 	}
-	return newError(C.rsac_composition_builder_set_sample_rate(b.handle, C.uint32_t(rate)))
+	rc := C.rsac_composition_builder_set_sample_rate(b.handle, C.uint32_t(rate))
+	runtime.KeepAlive(b)
+	return newError(rc)
 }
 
 // SetClampOutput enables (true) or disables (false) saturating output clamping
@@ -193,7 +204,9 @@ func (b *CompositionBuilder) SetClampOutput(clamp bool) error {
 	if clamp {
 		c = 1
 	}
-	return newError(C.rsac_composition_builder_set_clamp_output(b.handle, c))
+	rc := C.rsac_composition_builder_set_clamp_output(b.handle, c)
+	runtime.KeepAlive(b)
+	return newError(rc)
 }
 
 // SetQuantumMs sets the composed tick quantum (output buffer duration) in
@@ -202,7 +215,9 @@ func (b *CompositionBuilder) SetQuantumMs(millis uint64) error {
 	if b.handle == nil {
 		return ErrClosed
 	}
-	return newError(C.rsac_composition_builder_set_quantum_ms(b.handle, C.uint64_t(millis)))
+	rc := C.rsac_composition_builder_set_quantum_ms(b.handle, C.uint64_t(millis))
+	runtime.KeepAlive(b)
+	return newError(rc)
 }
 
 // SetStallTimeoutMs sets how long the compositor waits for the master-clock
@@ -212,7 +227,9 @@ func (b *CompositionBuilder) SetStallTimeoutMs(millis uint64) error {
 	if b.handle == nil {
 		return ErrClosed
 	}
-	return newError(C.rsac_composition_builder_set_stall_timeout_ms(b.handle, C.uint64_t(millis)))
+	rc := C.rsac_composition_builder_set_stall_timeout_ms(b.handle, C.uint64_t(millis))
+	runtime.KeepAlive(b)
+	return newError(rc)
 }
 
 // SetMaxBufferMs sets the per-source buffering bound in milliseconds (default
@@ -222,7 +239,9 @@ func (b *CompositionBuilder) SetMaxBufferMs(millis uint64) error {
 	if b.handle == nil {
 		return ErrClosed
 	}
-	return newError(C.rsac_composition_builder_set_max_buffer_ms(b.handle, C.uint64_t(millis)))
+	rc := C.rsac_composition_builder_set_max_buffer_ms(b.handle, C.uint64_t(millis))
+	runtime.KeepAlive(b)
+	return newError(rc)
 }
 
 // AddGroup appends a group to the composition. Groups contribute output
@@ -238,6 +257,8 @@ func (b *CompositionBuilder) AddGroup(g *Group) error {
 		return newError(C.RSAC_ERROR_NULL_POINTER)
 	}
 	rc := C.rsac_composition_builder_add_group(b.handle, g.handle)
+	runtime.KeepAlive(b)
+	runtime.KeepAlive(g)
 	if rc != C.RSAC_OK {
 		// On any error the group is untouched and the caller still owns it.
 		return newError(rc)
@@ -257,7 +278,9 @@ func (b *CompositionBuilder) Preflight() error {
 	if b.handle == nil {
 		return ErrClosed
 	}
-	return newError(C.rsac_composition_builder_preflight(b.handle))
+	rc := C.rsac_composition_builder_preflight(b.handle)
+	runtime.KeepAlive(b)
+	return newError(rc)
 }
 
 // Build validates the configuration and creates a (not yet started)
@@ -547,6 +570,21 @@ func (c *Composition) StreamWithErrors(ctx context.Context) <-chan StreamResult 
 	return ch
 }
 
+// pollBackoff sleeps ~1ms (context-aware) between empty/recoverable polls so
+// an idle or not-started composition doesn't spin a CPU core (PR #59 review).
+// One composed quantum is 10ms by default, so 1ms adds no perceptible latency.
+// Returns false when the context was cancelled during the wait.
+func pollBackoff(ctx context.Context) bool {
+	t := time.NewTimer(time.Millisecond)
+	defer t.Stop()
+	select {
+	case <-ctx.Done():
+		return false
+	case <-t.C:
+		return true
+	}
+}
+
 func (c *Composition) streamLoop(ctx context.Context, ch chan<- AudioBuffer) {
 	defer close(ch)
 	for {
@@ -559,13 +597,17 @@ func (c *Composition) streamLoop(ctx context.Context, ch chan<- AudioBuffer) {
 		buf, ok, err := c.TryReadBuffer()
 		if err != nil {
 			if IsRecoverable(err) && !errors.Is(err, ErrClosed) {
-				runtime.Gosched()
+				if !pollBackoff(ctx) {
+					return
+				}
 				continue
 			}
 			return // fatal terminal (or closed): stop delivering, close channel
 		}
 		if !ok {
-			runtime.Gosched()
+			if !pollBackoff(ctx) {
+				return
+			}
 			continue
 		}
 		select {
@@ -581,7 +623,13 @@ func (c *Composition) streamLoopWithErrors(ctx context.Context, ch chan<- Stream
 	for {
 		select {
 		case <-ctx.Done():
-			ch <- StreamResult{Err: ctx.Err()}
+			// Best-effort cancellation report: if the buffered channel is full
+			// (consumer stopped reading), do NOT block — an unconditional send
+			// here would leak this goroutine forever (PR #59 review).
+			select {
+			case ch <- StreamResult{Err: ctx.Err()}:
+			default:
+			}
 			return
 		default:
 		}
@@ -592,7 +640,9 @@ func (c *Composition) streamLoopWithErrors(ctx context.Context, ch chan<- Stream
 			// AudioCapture.StreamWithErrors); the fatal terminal (or ErrClosed) is
 			// delivered as the final item then closes the channel.
 			if IsRecoverable(err) && !errors.Is(err, ErrClosed) {
-				runtime.Gosched()
+				if !pollBackoff(ctx) {
+					return
+				}
 				continue
 			}
 			select {
@@ -602,7 +652,9 @@ func (c *Composition) streamLoopWithErrors(ctx context.Context, ch chan<- Stream
 			return
 		}
 		if !ok {
-			runtime.Gosched()
+			if !pollBackoff(ctx) {
+				return
+			}
 			continue
 		}
 		select {

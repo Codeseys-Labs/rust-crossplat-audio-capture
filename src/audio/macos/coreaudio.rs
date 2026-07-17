@@ -1171,17 +1171,30 @@ impl WatchTeardown {
             dispatch2::DispatchRetained::as_ptr(&queue).as_ptr() as *mut std::ffi::c_void;
         let block_raw = block2::RcBlock::as_ptr(&block) as *mut std::ffi::c_void;
 
-        // 1. Remove every block on the same queue — stops NEW dispatch.
+        // 1. Remove every block on the same queue — stops NEW dispatch. Track
+        //    failures: a non-zero OSStatus means CoreAudio may STILL retain the
+        //    copied block for that selector, so the freed-not-leaked fast path
+        //    below would no longer be sound (PR #59 review).
+        let mut removal_failed = false;
         for address in WATCH_ADDRESSES.iter() {
             // SAFETY: same object/queue/block as the registrations in `watch()`;
             // `block_raw`/`queue_raw` address the still-owned `block`/`queue`.
-            unsafe {
+            let status = unsafe {
                 AudioObjectRemovePropertyListenerBlock(
                     kAudioObjectSystemObject,
                     address,
                     queue_raw,
                     block_raw,
+                )
+            };
+            if status != 0 {
+                log::warn!(
+                    "rsac macOS device-watch: AudioObjectRemovePropertyListenerBlock \
+                     failed (OSStatus {status}) for selector {} — falling back to the \
+                     leak-on-teardown path for this watcher",
+                    address.mSelector
                 );
+                removal_failed = true;
             }
         }
 
@@ -1190,6 +1203,23 @@ impl WatchTeardown {
         //    when it returns no block is in flight or pending. This is the
         //    in-flight barrier the old PROC API lacked.
         queue.exec_sync(|| {});
+
+        if removal_failed {
+            // A listener may still be registered: a future notification could
+            // dispatch the (CoreAudio-copied) block onto `queue`, and the block's
+            // captured `Arc` keeps `context` alive — so the helper's sender never
+            // drops and `helper.join()` would hang. Fall back to the pre-fix
+            // documented behavior for exactly this watcher: leak the block, the
+            // context, and the queue (all still valid for any late dispatch) and
+            // detach the helper thread. This is the same bounded leak ADR-0005 §5
+            // shipped unconditionally; it is now confined to the (never observed)
+            // removal-failure path.
+            std::mem::forget(block);
+            std::mem::forget(context);
+            std::mem::forget(queue);
+            drop(helper); // JoinHandle drop = detach
+            return;
+        }
 
         // 3. Drop the block (releasing its captured `Arc` clone), then the
         //    teardown's `Arc` clone → strong count hits 0 → context freed and its
@@ -1514,21 +1544,39 @@ impl DeviceEnumerator for MacosDeviceEnumerator {
             };
             if status != 0 {
                 // Roll back the listeners registered so far (indices `0..i`).
+                let mut rollback_failed = false;
                 for prior in WATCH_ADDRESSES.iter().take(rollback_range(i).end) {
                     // SAFETY: same arguments as the matching successful add above;
                     // removing an already-registered block on the same queue.
-                    unsafe {
+                    let rb = unsafe {
                         AudioObjectRemovePropertyListenerBlock(
                             kAudioObjectSystemObject,
                             prior,
                             queue_raw,
                             block_raw,
-                        );
+                        )
+                    };
+                    if rb != 0 {
+                        rollback_failed = true;
                     }
                 }
-                // No leak: dropping `block`, `context`, and `queue` at end of
-                // scope releases everything (no listener remains that could run a
-                // block, so no in-flight deref to protect).
+                // Drain any block already dispatched before the removals landed.
+                queue.exec_sync(|| {});
+                if rollback_failed {
+                    // A prior listener may survive: leak block/context/queue so a
+                    // late dispatch never touches freed memory (same bounded
+                    // fallback as WatchTeardown::run — PR #59 review).
+                    log::warn!(
+                        "rsac macOS device-watch: listener rollback failed — leaking \
+                         watch context to stay dispatch-safe"
+                    );
+                    std::mem::forget(block);
+                    std::mem::forget(context);
+                    std::mem::forget(queue);
+                }
+                // Otherwise no leak: dropping `block`, `context`, and `queue` at
+                // end of scope releases everything (no listener remains that
+                // could run a block, so no in-flight deref to protect).
                 return Err(AudioError::BackendError {
                     backend: "CoreAudio".into(),
                     operation: "watch".into(),
@@ -1560,21 +1608,37 @@ impl DeviceEnumerator for MacosDeviceEnumerator {
             Err(e) => {
                 // Spawn failed: remove every block on the queue, then run the same
                 // barrier before dropping so no in-flight block outlives the
-                // context. Unlike the PROC path this frees everything (no leak).
+                // context. Unlike the PROC path this frees everything (no leak) —
+                // unless a removal itself fails, in which case leak to stay
+                // dispatch-safe (same fallback as WatchTeardown::run).
+                let mut removal_failed = false;
                 for address in WATCH_ADDRESSES.iter() {
                     // SAFETY: mirrors the successful registrations above.
-                    unsafe {
+                    let rb = unsafe {
                         AudioObjectRemovePropertyListenerBlock(
                             kAudioObjectSystemObject,
                             address,
                             queue_raw,
                             block_raw,
-                        );
+                        )
+                    };
+                    if rb != 0 {
+                        removal_failed = true;
                     }
                 }
                 // Barrier: drain any block already dispatched before the removals.
                 queue.exec_sync(|| {});
-                // `block`, `context`, `queue` drop here — freed, not leaked.
+                if removal_failed {
+                    log::warn!(
+                        "rsac macOS device-watch: listener removal failed during \
+                         spawn-failure rollback — leaking watch context to stay \
+                         dispatch-safe"
+                    );
+                    std::mem::forget(block);
+                    std::mem::forget(context);
+                    std::mem::forget(queue);
+                }
+                // Otherwise `block`, `context`, `queue` drop here — freed, not leaked.
                 return Err(AudioError::BackendError {
                     backend: "CoreAudio".into(),
                     operation: "watch".into(),
@@ -2400,19 +2464,24 @@ mod tests {
         }
     }
 
-    /// rsac-f547: the scope-carrying enumeration's application list (`.0`) must
-    /// exactly equal the plain `enumerate_audio_applications()` — the plain fn is
-    /// defined as the scoped fn with the bool discarded, so they cannot diverge.
+    /// rsac-f547: the scope-carrying enumeration returns a well-formed list.
+    /// The plain fn is defined as the scoped fn with the bool discarded (see
+    /// `enumerate_audio_applications` at the top of this file), so agreement is
+    /// by-construction; comparing two separate live snapshots would only race
+    /// application churn between the calls (PR #59 review). Assert on ONE
+    /// captured snapshot instead.
     #[test]
     #[ignore = "requires macOS GUI environment"]
-    fn enumerate_audio_applications_scoped_agrees_with_plain() {
-        let (scoped, _is_fallback) =
+    fn enumerate_audio_applications_scoped_is_well_formed() {
+        let (scoped, is_fallback) =
             enumerate_audio_applications_scoped().expect("scoped enumeration should succeed");
-        let plain = enumerate_audio_applications().expect("plain enumeration should succeed");
-        assert_eq!(
-            scoped, plain,
-            "scoped `.0` must equal the plain enumeration"
+        assert!(
+            !scoped.is_empty(),
+            "a macOS desktop should report at least one application (fallback={is_fallback})"
         );
+        for app in &scoped {
+            assert!(app.process_id > 0, "PID must be non-zero: {app:?}");
+        }
     }
 
     #[test]

@@ -16,7 +16,13 @@ a **self-owned serial dispatch queue**, and teardown removes the block on that
 same queue then dispatches a **synchronous no-op barrier** which — by serial-queue
 FIFO ordering — cannot return until every in-flight block has finished, after
 which the `Arc<WatchListenerContext>` is dropped (**freed, not leaked**). This
-eliminates both the previously-intentional context leak and the race (§5). The
+eliminates both the previously-intentional context leak and the race (§5) on
+the expected path. If `AudioObjectRemovePropertyListenerBlock` itself reports a
+failure (never observed; no documented failure mode for a registered listener),
+teardown falls back to the pre-fix bounded leak for that watcher — block,
+context, and queue are intentionally leaked and the helper detached, so a late
+dispatch can never touch freed memory. The leak is thus confined to an
+OS-reported removal failure instead of being unconditional. The
 device-*alive* listener (`DeviceAliveContext`) remains on the PROC API +
 `tearing_down` guard as a follow-up. Pairs with ADR-0004.
 

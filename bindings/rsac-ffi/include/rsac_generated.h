@@ -341,7 +341,7 @@ typedef struct RsacCompositionStats {
     /**
      * Number of composed sources, in flat declaration order. `0` before
      * start. Valid indices for the per-source accessors are
-     * `0..num_sources`.
+     * `[0, num_sources)` (half-open).
      */
     uintptr_t num_sources;
 } RsacCompositionStats;
@@ -1355,7 +1355,7 @@ enum rsac_error_t rsac_composition_stats(const struct RsacComposition *comp,
 /**
  * Fills `*out` with the [`RsacSourceStats`] counters of the source at
  * `index` (flat declaration order across all groups; valid indices are
- * `0..num_sources` from [`rsac_composition_stats`]).
+ * `[0, num_sources)` (half-open) from [`rsac_composition_stats`]).
  *
  * Returns `RSAC_ERROR_NULL_POINTER` if `comp` or `out` is null,
  * `RSAC_ERROR_STREAM_READ` if the composition has not been started (per-source
