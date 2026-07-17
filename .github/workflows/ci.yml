@@ -126,17 +126,13 @@ jobs:
       - uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5
         with:
           persist-credentials: false
-      - uses: dtolnay/rust-toolchain@e081816240890017053eacbb1bdf337761dc5582 # 1.95.0
+      - uses: ./.github/actions/rust-setup
         with:
           components: rustfmt, clippy
-      - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
 
       - name: Install PipeWire dev libraries
         if: matrix.os == 'linux'
-        run: |
-          sudo add-apt-repository ppa:pipewire-debian/pipewire-upstream -y
-          sudo apt-get update
-          sudo apt-get install -y libpipewire-0.3-dev libspa-0.2-dev pkg-config
+        uses: ./.github/actions/pipewire-setup
 
       # rustfmt is platform-independent; run the check once on the Linux leg.
       - name: Check formatting
@@ -172,14 +168,10 @@ jobs:
       - uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5
         with:
           persist-credentials: false
-      - uses: dtolnay/rust-toolchain@e081816240890017053eacbb1bdf337761dc5582 # 1.95.0
-      - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
+      - uses: ./.github/actions/rust-setup
 
       - name: Install PipeWire dev libraries
-        run: |
-          sudo add-apt-repository ppa:pipewire-debian/pipewire-upstream -y
-          sudo apt-get update
-          sudo apt-get install -y libpipewire-0.3-dev libspa-0.2-dev pkg-config
+        uses: ./.github/actions/pipewire-setup
 
       - name: Cargo check
         run: cargo check --lib --no-default-features --features feat_linux
@@ -224,8 +216,7 @@ jobs:
       - uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5
         with:
           persist-credentials: false
-      - uses: dtolnay/rust-toolchain@e081816240890017053eacbb1bdf337761dc5582 # 1.95.0
-      - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
+      - uses: ./.github/actions/rust-setup
 
       - name: Cargo check
         run: cargo check --lib --no-default-features --features feat_windows
@@ -321,8 +312,7 @@ jobs:
       - uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5
         with:
           persist-credentials: false
-      - uses: dtolnay/rust-toolchain@e081816240890017053eacbb1bdf337761dc5582 # 1.95.0
-      - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
+      - uses: ./.github/actions/rust-setup
 
       - name: Grant audio permissions for CI
         run: |
@@ -446,11 +436,14 @@ jobs:
       - uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5
         with:
           persist-credentials: false
-      - uses: dtolnay/rust-toolchain@e081816240890017053eacbb1bdf337761dc5582 # 1.95.0
+      - uses: ./.github/actions/rust-setup
         with:
           targets: aarch64-unknown-linux-gnu
-      - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
 
+      # Combined cross-gcc + host PipeWire install: kept inline (not the
+      # pipewire-setup composite) because it also installs the aarch64 cross
+      # toolchain the composite does not cover, and shares a single apt-get
+      # update across both package sets.
       - name: Install cross-compilation tools
         run: |
           sudo apt-get update
@@ -514,10 +507,9 @@ jobs:
       - uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5
         with:
           persist-credentials: false
-      - uses: dtolnay/rust-toolchain@e081816240890017053eacbb1bdf337761dc5582 # 1.95.0
+      - uses: ./.github/actions/rust-setup
         with:
           targets: aarch64-linux-android
-      - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
 
       - name: Cross-check the Android backend (feat_android)
         run: |
@@ -621,10 +613,9 @@ jobs:
       - uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5
         with:
           persist-credentials: false
-      - uses: dtolnay/rust-toolchain@e081816240890017053eacbb1bdf337761dc5582 # 1.95.0
+      - uses: ./.github/actions/rust-setup
         with:
           targets: aarch64-apple-ios
-      - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
 
       - name: Cross-check the iOS backend (feat_ios)
         run: |
@@ -664,14 +655,12 @@ jobs:
       - uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5
         with:
           persist-credentials: false
-      - uses: dtolnay/rust-toolchain@e081816240890017053eacbb1bdf337761dc5582 # 1.95.0
-      - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
+      - uses: ./.github/actions/rust-setup
 
       - name: Install PipeWire dev libraries
-        run: |
-          sudo add-apt-repository ppa:pipewire-debian/pipewire-upstream -y
-          sudo apt-get update
-          sudo apt-get install -y libpipewire-0.3-dev libspa-0.2-dev pkg-config libclang-dev
+        uses: ./.github/actions/pipewire-setup
+        with:
+          extra-packages: libclang-dev
 
       - name: Check rsac-ffi (C FFI)
         run: cargo check -p rsac-ffi
@@ -843,18 +832,16 @@ jobs:
       - uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5
         with:
           persist-credentials: false
-      - uses: dtolnay/rust-toolchain@e081816240890017053eacbb1bdf337761dc5582 # 1.95.0
-      - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
+      - uses: ./.github/actions/rust-setup
       - uses: actions/setup-go@41dfa10bad2bb2ae585af6ee5bb4d7d973ad74ed # v5
         with:
           go-version: '1.22'
 
       - name: Install PipeWire dev libraries (Linux)
         if: runner.os == 'Linux'
-        run: |
-          sudo add-apt-repository ppa:pipewire-debian/pipewire-upstream -y
-          sudo apt-get update
-          sudo apt-get install -y libpipewire-0.3-dev libspa-0.2-dev pkg-config libclang-dev
+        uses: ./.github/actions/pipewire-setup
+        with:
+          extra-packages: libclang-dev
 
       # cgo links through MinGW gcc on Windows, which needs the GNU .a — so the
       # FFI crate must be built for the *-pc-windows-gnu target. Add it here.
@@ -893,11 +880,14 @@ jobs:
       - uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5
         with:
           persist-credentials: false
-      - uses: dtolnay/rust-toolchain@e081816240890017053eacbb1bdf337761dc5582 # 1.95.0
+      - uses: ./.github/actions/rust-setup
         with:
           targets: aarch64-unknown-linux-gnu
-      - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
 
+      # Combined cross-gcc + host PipeWire install: kept inline (not the
+      # pipewire-setup composite) because it also installs the aarch64 cross
+      # toolchain the composite does not cover, and shares a single apt-get
+      # update across both package sets.
       - name: Install cross toolchain + host PipeWire dev libs
         run: |
           sudo apt-get update
@@ -955,14 +945,10 @@ jobs:
       - uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5
         with:
           persist-credentials: false
-      - uses: dtolnay/rust-toolchain@e081816240890017053eacbb1bdf337761dc5582 # 1.95.0
-      - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
+      - uses: ./.github/actions/rust-setup
 
       - name: Install PipeWire dev libraries
-        run: |
-          sudo add-apt-repository ppa:pipewire-debian/pipewire-upstream -y
-          sudo apt-get update
-          sudo apt-get install -y libpipewire-0.3-dev libspa-0.2-dev pkg-config
+        uses: ./.github/actions/pipewire-setup
 
       - name: Check feature combination (async-stream + sink-wav + test-utils + compose)
         run: cargo check --no-default-features --features feat_linux,async-stream,sink-wav,test-utils,compose
@@ -1000,14 +986,10 @@ jobs:
       - uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5
         with:
           persist-credentials: false
-      - uses: dtolnay/rust-toolchain@e081816240890017053eacbb1bdf337761dc5582 # 1.95.0
-      - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
+      - uses: ./.github/actions/rust-setup
 
       - name: Install PipeWire dev libraries
-        run: |
-          sudo add-apt-repository ppa:pipewire-debian/pipewire-upstream -y
-          sudo apt-get update
-          sudo apt-get install -y libpipewire-0.3-dev libspa-0.2-dev pkg-config
+        uses: ./.github/actions/pipewire-setup
 
       - name: Install cargo-hack
         uses: taiki-e/install-action@0fd46367812ee04360509b4169d9f659d6892bb2 # v2
@@ -1039,20 +1021,15 @@ jobs:
       - uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5
         with:
           persist-credentials: false
-      - uses: dtolnay/rust-toolchain@e081816240890017053eacbb1bdf337761dc5582 # 1.95.0
+      - uses: ./.github/actions/rust-setup
         with:
           components: llvm-tools-preview
-      - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
-        with:
           # Distinct prefix: llvm-cov instruments with -C instrument-coverage,
           # so its artifacts must not poison the plain 1.95 caches.
-          prefix-key: v0-rust-llvm-cov
+          cache-prefix-key: v0-rust-llvm-cov
 
       - name: Install PipeWire dev libraries
-        run: |
-          sudo add-apt-repository ppa:pipewire-debian/pipewire-upstream -y
-          sudo apt-get update
-          sudo apt-get install -y libpipewire-0.3-dev libspa-0.2-dev pkg-config
+        uses: ./.github/actions/pipewire-setup
 
       - name: Install cargo-llvm-cov
         uses: taiki-e/install-action@0fd46367812ee04360509b4169d9f659d6892bb2 # v2
@@ -1164,14 +1141,10 @@ jobs:
       - uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5
         with:
           persist-credentials: false
-      - uses: dtolnay/rust-toolchain@e081816240890017053eacbb1bdf337761dc5582 # 1.95.0
-      - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
+      - uses: ./.github/actions/rust-setup
 
       - name: Install PipeWire dev libraries
-        run: |
-          sudo add-apt-repository ppa:pipewire-debian/pipewire-upstream -y
-          sudo apt-get update
-          sudo apt-get install -y libpipewire-0.3-dev libspa-0.2-dev pkg-config
+        uses: ./.github/actions/pipewire-setup
 
       - name: cargo doc (no-deps, all-features, docs.rs flags)
         env:
@@ -1217,8 +1190,7 @@ jobs:
       - uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5
         with:
           persist-credentials: false
-      - uses: dtolnay/rust-toolchain@e081816240890017053eacbb1bdf337761dc5582 # 1.95.0
-      - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
+      - uses: ./.github/actions/rust-setup
 
       - name: Install cargo-deny
         uses: taiki-e/install-action@0fd46367812ee04360509b4169d9f659d6892bb2 # v2
