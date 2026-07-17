@@ -1313,6 +1313,12 @@ impl PyAudioCapture {
                 .lock()
                 .map_err(|e| PyRuntimeError::new_err(format!("Lock poisoned: {}", e)))?;
             *iter_guard = true;
+            // Drop the iterating guard BEFORE start(): start() releases the GIL
+            // inside allow_threads, so holding `iterating` across it recreates
+            // the GIL-vs-lock circular wait (rsac-8082 class) — a second thread
+            // entering __iter__ would block on `iterating` while holding the
+            // GIL, and this thread could never re-acquire the GIL to unwind.
+            drop(iter_guard);
 
             // Auto-start if not already running. This is a read-only check
             // (`is_running()` takes `&self`), so a shared read guard suffices; the
