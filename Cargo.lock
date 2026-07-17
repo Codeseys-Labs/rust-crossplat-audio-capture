@@ -1705,7 +1705,7 @@ checksum = "d6f6ff9a378485b298a5286656da665ba74413d36db0979633275d2e708145d4"
 
 [[package]]
 name = "rsac"
-version = "0.4.1"
+version = "0.4.2"
 dependencies = [
  "atomic-waker",
  "audioadapter-buffers",
@@ -1752,14 +1752,14 @@ dependencies = [
 
 [[package]]
 name = "rsac-android-native"
-version = "0.4.1"
+version = "0.4.2"
 dependencies = [
  "rsac",
 ]
 
 [[package]]
 name = "rsac-ffi"
-version = "0.4.1"
+version = "0.4.2"
 dependencies = [
  "cbindgen",
  "log",
@@ -1768,7 +1768,7 @@ dependencies = [
 
 [[package]]
 name = "rsac-napi"
-version = "0.4.1"
+version = "0.4.2"
 dependencies = [
  "napi",
  "napi-build",
@@ -1781,7 +1781,7 @@ dependencies = [
 
 [[package]]
 name = "rsac-python"
-version = "0.4.1"
+version = "0.4.2"
 dependencies = [
  "pyo3",
  "rsac",
