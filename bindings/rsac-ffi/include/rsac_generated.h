@@ -469,6 +469,23 @@ enum rsac_error_t rsac_builder_set_target_app_by_id(struct RsacBuilder *builder,
  * The symbol exists on every platform so the C ABI is uniform; on
  * non-Android platforms the call is rejected with
  * `RSAC_ERROR_PLATFORM_NOT_SUPPORTED`.
+ *
+ * **Single-owner contract (caller's responsibility):** each retained
+ * `MediaProjection` handle must be supplied to exactly one builder that is
+ * built exactly once, then never reused. The retained handle owns exactly one
+ * `DeleteGlobalRef`; releasing it twice is undefined behavior. Re-run the
+ * consent flow to capture a second session rather than reusing a handle.
+ *
+ * The library only enforces this for a *cloned* builder/config: cloning a
+ * builder that carries the token shares one internal deletion latch, so a
+ * second `rsac_builder_build()` from the clone fails with
+ * `RSAC_ERROR_STREAM_FAILED` rather than double-releasing the `GlobalRef`.
+ * It does **not** deduplicate on the raw `int64_t` value: passing the *same*
+ * handle to `rsac_builder_set_android_projection` on two independently
+ * constructed builders creates two independent latches, so both builds
+ * succeed and each stream's teardown releases the same `GlobalRef` — a
+ * double-delete (UB). Guard against this on the caller side (one handle → one
+ * builder). The handle stays `int64_t` — no C ABI change.
  */
  enum rsac_error_t rsac_builder_set_android_projection(struct RsacBuilder *builder, int64_t token) ;
 

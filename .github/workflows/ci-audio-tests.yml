@@ -751,6 +751,7 @@ jobs:
       binding_python: ${{ steps.record.outputs.binding_python }}
       binding_node:   ${{ steps.record.outputs.binding_node }}
       binding_go:     ${{ steps.record.outputs.binding_go }}
+      binding_go_race: ${{ steps.record.outputs.binding_go_race }}
     steps:
       - uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5
         with:
@@ -830,6 +831,18 @@ jobs:
           trap 'kill -- "-$PLAYER_PID" 2>/dev/null || true' EXIT  # negative PID = whole setsid group (reaps the looping player)
           make test-e2e 2>&1 | tee ../../ci-bindings-go.log
 
+      - name: Go race test (real device, cgo boundary)
+        id: race_go
+        continue-on-error: true
+        timeout-minutes: 15   # -race roughly doubles runtime + CGO call overhead vs. the 12-min smoke step
+        working-directory: bindings/rsac-go
+        env:
+          RSAC_TEST_CAPTURE_TIMEOUT_SECS: "15"
+        run: |
+          PLAYER_PID="$(bash ../../scripts/ci-linux-tone-loop.sh)"
+          trap 'kill -- "-$PLAYER_PID" 2>/dev/null || true' EXIT
+          make test-race 2>&1 | tee ../../ci-bindings-go-race.log
+
       - name: Record binding outcomes
         id: record
         if: always()
@@ -838,10 +851,11 @@ jobs:
             echo "binding_python=${{ steps.smoke_python.outcome }}"
             echo "binding_node=${{ steps.smoke_node.outcome }}"
             echo "binding_go=${{ steps.smoke_go.outcome }}"
+            echo "binding_go_race=${{ steps.race_go.outcome }}"
           } >> "$GITHUB_OUTPUT"
 
       - name: Diagnostics on failure
-        if: ${{ failure() || steps.smoke_python.outcome == 'failure' || steps.smoke_node.outcome == 'failure' || steps.smoke_go.outcome == 'failure' }}
+        if: ${{ failure() || steps.smoke_python.outcome == 'failure' || steps.smoke_node.outcome == 'failure' || steps.smoke_go.outcome == 'failure' || steps.race_go.outcome == 'failure' }}
         run: |
           pactl list short sinks || true
           pactl list short sources || true
@@ -889,6 +903,7 @@ jobs:
           BIND_PYTHON: ${{ needs.linux-audio-bindings.outputs.binding_python }}
           BIND_NODE: ${{ needs.linux-audio-bindings.outputs.binding_node }}
           BIND_GO: ${{ needs.linux-audio-bindings.outputs.binding_go }}
+          BIND_GO_RACE: ${{ needs.linux-audio-bindings.outputs.binding_go_race }}
         run: |
           cat > ci-audio-gap-report.md <<EOF
           # Audio CI Coverage Gap Report
@@ -911,6 +926,7 @@ jobs:
           | Linux binding python | ${BIND_PYTHON:-n/a} |
           | Linux binding node | ${BIND_NODE:-n/a} |
           | Linux binding go | ${BIND_GO:-n/a} |
+          | Linux binding go (race) | ${BIND_GO_RACE:-n/a} |
 
           ## Deferred Seeds
 
@@ -941,6 +957,7 @@ jobs:
           BIND_PYTHON: ${{ needs.linux-audio-bindings.outputs.binding_python }}
           BIND_NODE: ${{ needs.linux-audio-bindings.outputs.binding_node }}
           BIND_GO: ${{ needs.linux-audio-bindings.outputs.binding_go }}
+          BIND_GO_RACE: ${{ needs.linux-audio-bindings.outputs.binding_go_race }}
         run: |
           set -u
           echo "============================================================"
@@ -966,6 +983,7 @@ jobs:
           echo "  Python: ${BIND_PYTHON:-n/a}"
           echo "  Node:   ${BIND_NODE:-n/a}"
           echo "  Go:     ${BIND_GO:-n/a}"
+          echo "  Go (race): ${BIND_GO_RACE:-n/a}"
           echo ""
           echo "============================================================"
 
@@ -1033,7 +1051,7 @@ jobs:
             echo "FAILED: linux-audio-bindings job result '${BIND_RESULT}' (setup/route gate failure)"
             FAILED=1
           else
-            for pair in "python:${BIND_PYTHON}" "node:${BIND_NODE}" "go:${BIND_GO}"; do
+            for pair in "python:${BIND_PYTHON}" "node:${BIND_NODE}" "go:${BIND_GO}" "go_race:${BIND_GO_RACE}"; do
               name="${pair%%:*}"; res="${pair#*:}"
               if [ "$res" != "success" ] && [ "$res" != "skipped" ]; then
                 echo "FAILED: binding $name smoke returned '${res:-<empty>}'"

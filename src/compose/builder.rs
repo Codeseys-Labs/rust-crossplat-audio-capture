@@ -19,6 +19,24 @@ pub(crate) const MAX_COMPOSED_CHANNELS: u16 = 32;
 /// each source is a full platform capture with its own ring and OS stream).
 pub(crate) const MAX_SOURCES: usize = 16;
 
+/// The single source of truth for the per-source linear-gain predicate: a gain
+/// must be finite and non-negative (rsac-5a2d). Shared by build-time validation
+/// ([`CompositionBuilder::validate`]) and the live
+/// [`Composition::set_gain`](Composition::set_gain) setter so the two can never
+/// drift. `ctx` is a caller-supplied fragment describing where the gain came
+/// from (e.g. `"in group 'voice'"`) and is folded into the error message.
+///
+/// Callers that narrow from `f64` (the bindings) MUST call this *after* the
+/// narrowing cast — a value finite in `f64` can become `inf` in `f32`.
+pub(crate) fn validate_gain(gain: f32, ctx: &str) -> AudioResult<()> {
+    if !gain.is_finite() || gain < 0.0 {
+        return Err(AudioError::ConfigurationError {
+            message: format!("Source gain {gain} {ctx} is invalid (must be finite and >= 0)"),
+        });
+    }
+    Ok(())
+}
+
 /// How a [`Group`]'s sources map onto the composed output channels.
 #[non_exhaustive]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -398,15 +416,7 @@ impl CompositionBuilder {
             }
 
             for (target, gain) in group.sources() {
-                if !gain.is_finite() || *gain < 0.0 {
-                    return Err(AudioError::ConfigurationError {
-                        message: format!(
-                            "Source gain {} in group '{}' is invalid (must be finite and >= 0)",
-                            gain,
-                            group.name()
-                        ),
-                    });
-                }
+                validate_gain(*gain, &format!("in group '{}'", group.name()))?;
                 // Per-target capability validation is delegated to the single
                 // source of truth: the capture builder's own preflight.
                 AudioCaptureBuilder::new()

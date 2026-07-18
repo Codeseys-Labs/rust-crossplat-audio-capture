@@ -158,6 +158,26 @@ impl Harness {
         out
     }
 
+    /// Reads the next composed buffer (blocking-poll to a deadline) and returns
+    /// its first sample. Panics if none arrives in ~5 s or the stream ends.
+    /// Used by the live gain/mute tests (rsac-5a2d).
+    fn read_first_sample(&self) -> f32 {
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        loop {
+            match self.stream.try_read_chunk() {
+                Ok(Some(b)) => return b.data()[0],
+                Ok(None) => {
+                    assert!(
+                        std::time::Instant::now() < deadline,
+                        "engine produced no buffer in time"
+                    );
+                    std::thread::sleep(Duration::from_millis(1));
+                }
+                Err(e) => panic!("unexpected error while reading: {e:?}"),
+            }
+        }
+    }
+
     fn shutdown(mut self) {
         self.stop_flag.store(true, Ordering::SeqCst);
         if let Some(j) = self.join.take() {
@@ -799,6 +819,258 @@ fn per_source_gain_is_applied() {
     let buffers = harness.drain_to_end();
     let v = buffers[0].data()[0];
     assert!((v - 0.75).abs() < 1e-6, "0.5*1.0 + 0.5*0.5 = 0.75, got {v}");
+    harness.shutdown();
+}
+
+/// rsac-5a2d: the build-time `SourceSpec.gain` seeds the *effective* runtime
+/// gain via `Engine::new`, with no setter call — the first composed frame
+/// already reflects 0.5, proving the seeding point (not the leaked `0.0`
+/// `SourceStatsShared::default()` bits).
+#[test]
+fn build_time_gain_seeds_effective_gain() {
+    let (a, _) = ScriptedSource::ending(vec![const_buffer(1.0, 1, 48_000, 480)]);
+    let harness = Harness::spawn(
+        cfg(
+            1,
+            vec![GroupSpec {
+                layout: GroupLayout::Mono,
+                offset: 0,
+                width: 1,
+            }],
+            vec![SourceSpec {
+                gain: 0.5,
+                group: 0,
+                channels: 0,
+                clock_candidate: false,
+            }],
+            0,
+        ),
+        vec![Box::new(a)],
+    );
+    let buffers = harness.drain_to_end();
+    let v = buffers[0].data()[0];
+    assert!((v - 0.5).abs() < 1e-6, "1.0 * seeded 0.5 = 0.5, got {v}");
+    harness.shutdown();
+}
+
+/// rsac-5a2d: writing the live gain atomic mid-stream changes the mixed output
+/// on the *next* tick, and it REPLACES (not multiplies) the seeded gain. A DC
+/// source seeded at gain 1.0 reads ~1.0; after storing 0.5 a subsequent buffer
+/// reads ~0.5. Proves the engine reads the atomic each tick — exactly what the
+/// public `set_gain` does under the hood.
+#[test]
+fn live_set_gain_changes_mixed_output_on_next_tick() {
+    let (a, _) = ScriptedSource::live(
+        (0..2000)
+            .map(|_| const_buffer(1.0, 1, 48_000, 480))
+            .collect(),
+    );
+    let harness = Harness::spawn(
+        cfg(
+            1,
+            vec![GroupSpec {
+                layout: GroupLayout::Mono,
+                offset: 0,
+                width: 1,
+            }],
+            vec![SourceSpec {
+                gain: 1.0,
+                group: 0,
+                channels: 0,
+                clock_candidate: false,
+            }],
+            0,
+        ),
+        vec![Box::new(a)],
+    );
+
+    // Read a pre-change buffer: must reflect the seeded gain 1.0.
+    let before = harness.read_first_sample();
+    assert!(
+        (before - 1.0).abs() < 1e-6,
+        "pre-change buffer reflects seeded gain 1.0, got {before}"
+    );
+
+    // Live gain change — identical to what `Composition::set_gain` performs.
+    harness.stats.sources[0]
+        .gain_bits
+        .store(f32::to_bits(0.5), Ordering::Relaxed);
+
+    // Poll subsequent buffers until one reflects the new gain (~1 quantum
+    // latency; allow a few in-flight buffers to clear).
+    let deadline = std::time::Instant::now() + Duration::from_secs(5);
+    loop {
+        let v = harness.read_first_sample();
+        if (v - 0.5).abs() < 1e-6 {
+            break;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "gain change never reached the composed output (last={v})"
+        );
+    }
+    harness.shutdown();
+}
+
+/// rsac-5a2d: setting the mute flag silences the source; clearing it restores
+/// the (untouched) gain. Proves mute is a separate flag from gain.
+#[test]
+fn mute_silences_then_unmute_restores() {
+    let (a, _) = ScriptedSource::live(
+        (0..2000)
+            .map(|_| const_buffer(0.8, 1, 48_000, 480))
+            .collect(),
+    );
+    let harness = Harness::spawn(
+        cfg(
+            1,
+            vec![GroupSpec {
+                layout: GroupLayout::Mono,
+                offset: 0,
+                width: 1,
+            }],
+            vec![SourceSpec {
+                gain: 1.0,
+                group: 0,
+                channels: 0,
+                clock_candidate: false,
+            }],
+            0,
+        ),
+        vec![Box::new(a)],
+    );
+
+    // Baseline: nonzero output.
+    let before = harness.read_first_sample();
+    assert!((before - 0.8).abs() < 1e-6, "baseline 0.8, got {before}");
+
+    // Mute → a later fully-populated buffer must be all-silence.
+    harness.stats.sources[0]
+        .muted
+        .store(true, Ordering::Relaxed);
+    let deadline = std::time::Instant::now() + Duration::from_secs(5);
+    loop {
+        let v = harness.read_first_sample();
+        if v.abs() < 1e-9 {
+            break;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "muted source never went silent (last={v})"
+        );
+    }
+
+    // Unmute → output returns to the untouched gain (0.8), proving gain_bits
+    // was never disturbed by muting.
+    harness.stats.sources[0]
+        .muted
+        .store(false, Ordering::Relaxed);
+    let deadline = std::time::Instant::now() + Duration::from_secs(5);
+    loop {
+        let v = harness.read_first_sample();
+        if (v - 0.8).abs() < 1e-6 {
+            break;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "unmute did not restore the prior gain (last={v})"
+        );
+    }
+    harness.shutdown();
+}
+
+/// rsac-5a2d: a muted source still drains its FIFO (drain-before-gain order
+/// preserved), so a second live unmuted source's output is unaffected and
+/// stays time-aligned — muting one lane does not desync the others.
+#[test]
+fn muted_source_still_drains_fifo() {
+    // Source 0 (group 0): muted immediately.
+    let (muted_src, _) = ScriptedSource::live(
+        (0..2000)
+            .map(|_| const_buffer(0.5, 1, 48_000, 480))
+            .collect(),
+    );
+    // Source 1 (group 1, master): stays audible at 0.3.
+    let (live_src, _) = ScriptedSource::live(
+        (0..2000)
+            .map(|_| const_buffer(0.3, 1, 48_000, 480))
+            .collect(),
+    );
+
+    let harness = Harness::spawn(
+        cfg(
+            2,
+            vec![
+                GroupSpec {
+                    layout: GroupLayout::Mono,
+                    offset: 0,
+                    width: 1,
+                },
+                GroupSpec {
+                    layout: GroupLayout::Mono,
+                    offset: 1,
+                    width: 1,
+                },
+            ],
+            vec![
+                SourceSpec {
+                    gain: 1.0,
+                    group: 0,
+                    channels: 0,
+                    clock_candidate: false,
+                },
+                SourceSpec {
+                    gain: 1.0,
+                    group: 1,
+                    channels: 0,
+                    clock_candidate: false,
+                },
+            ],
+            1,
+        ),
+        vec![Box::new(muted_src), Box::new(live_src)],
+    );
+
+    harness.stats.sources[0]
+        .muted
+        .store(true, Ordering::Relaxed);
+
+    // Read several buffers: the muted lane (ch 0) is silent, the live lane
+    // (ch 1) stays at its steady value — the muted source did not desync it.
+    for _ in 0..5 {
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        loop {
+            match harness.stream.try_read_chunk() {
+                Ok(Some(b)) => {
+                    let d = b.data();
+                    // Fully-populated frames only (skip any padded tail frames).
+                    for f in 0..b.num_frames() {
+                        assert!(
+                            d[f * 2].abs() < 1e-9,
+                            "muted lane must be silent, got {}",
+                            d[f * 2]
+                        );
+                    }
+                    // The live lane must show its steady value on at least the
+                    // first frame (padding only ever trails, never leads here).
+                    assert!(
+                        (d[1] - 0.3).abs() < 1e-6,
+                        "live lane unaffected by muting the other source, got {}",
+                        d[1]
+                    );
+                    break;
+                }
+                Ok(None) => {
+                    assert!(
+                        std::time::Instant::now() < deadline,
+                        "engine produced no buffer"
+                    );
+                    std::thread::sleep(Duration::from_millis(1));
+                }
+                Err(e) => panic!("unexpected error: {e:?}"),
+            }
+        }
+    }
     harness.shutdown();
 }
 
@@ -1452,4 +1724,207 @@ fn unstarted_composition_reads_error_and_reports_honestly() {
     let f = CapturingStream::format(&composition);
     assert_eq!(f.sample_rate, 48_000);
     assert_eq!(f.channels, 2);
+}
+
+// ── Live gain/mute public-handle control (device-free) ─────────────────
+// (rsac-5a2d) These build a device-free Composition and attach an external
+// shared stats block via `attach_stats_for_tests`, so the PUBLIC setter/getter
+// path (`set_gain`/`set_muted`/`gain`/`is_muted`) is under test end-to-end
+// without a device-backed engine. The composition has two groups —
+// "a" (2 sources) and "b" (1 source) — to exercise group-name + within-group
+// index resolution.
+
+/// Builds a device-free composition (groups "a": 2 srcs, "b": 1 src) with a
+/// 3-source shared stats block attached, all seeded to gain 1.0 / unmuted (the
+/// `Engine::new` seeding is not exercised here; the setters write directly).
+fn control_composition() -> super::Composition {
+    let mut composition = CompositionBuilder::new()
+        .group(
+            Group::new("a")
+                .source(crate::core::config::CaptureTarget::SystemDefault)
+                .source(crate::core::config::CaptureTarget::SystemDefault)
+                .mixdown(GroupLayout::Mono),
+        )
+        .group(
+            Group::new("b")
+                .source(crate::core::config::CaptureTarget::SystemDefault)
+                .mixdown(GroupLayout::Mono),
+        )
+        .build()
+        .expect("device-free build");
+    let stats = Arc::new(EngineStatsShared {
+        sources: (0..3)
+            .map(|_| {
+                let s = SourceStatsShared::default();
+                s.gain_bits.store(f32::to_bits(1.0), Ordering::Relaxed);
+                Arc::new(s)
+            })
+            .collect(),
+        ..Default::default()
+    });
+    composition.attach_stats_for_tests(stats);
+    composition
+}
+
+#[test]
+fn set_gain_rejects_invalid_value() {
+    let c = control_composition();
+    for bad in [-0.5f32, f32::NAN, f32::INFINITY] {
+        assert!(
+            matches!(
+                c.set_gain("a", 0, bad),
+                Err(AudioError::ConfigurationError { .. })
+            ),
+            "gain {bad} must be rejected"
+        );
+    }
+    // A valid value still succeeds (guard against a blanket-reject bug).
+    assert!(c.set_gain("a", 0, 0.0).is_ok());
+    assert!(c.set_gain("a", 0, 2.0).is_ok());
+}
+
+#[test]
+fn set_gain_rejects_unknown_group_and_oob_index() {
+    let c = control_composition();
+    assert!(matches!(
+        c.set_gain("nope", 0, 1.0),
+        Err(AudioError::ConfigurationError { .. })
+    ));
+    // Group "a" has 2 sources → index 2 is out of range.
+    assert!(matches!(
+        c.set_gain("a", 2, 1.0),
+        Err(AudioError::ConfigurationError { .. })
+    ));
+    // Group "b" has 1 source → index 1 is out of range.
+    assert!(matches!(
+        c.set_gain("b", 1, 1.0),
+        Err(AudioError::ConfigurationError { .. })
+    ));
+    // Same bounds errors on set_muted / getters.
+    assert!(matches!(
+        c.set_muted("nope", 0, true),
+        Err(AudioError::ConfigurationError { .. })
+    ));
+    assert!(matches!(
+        c.gain("a", 2),
+        Err(AudioError::ConfigurationError { .. })
+    ));
+    assert!(matches!(
+        c.is_muted("nope", 0),
+        Err(AudioError::ConfigurationError { .. })
+    ));
+}
+
+#[test]
+fn set_gain_and_get_gain_roundtrip() {
+    let c = control_composition();
+    // Address the second source of group "a" (flat index 1) and the sole
+    // source of group "b" (flat index 2) to prove resolution walks groups.
+    c.set_gain("a", 1, 0.25).expect("valid set_gain");
+    c.set_gain("b", 0, 0.75).expect("valid set_gain");
+    assert!((c.gain("a", 1).unwrap() - 0.25).abs() < 1e-6);
+    assert!((c.gain("b", 0).unwrap() - 0.75).abs() < 1e-6);
+
+    // stats() reflects the same values in flat declaration order.
+    let stats = c.stats().expect("stats present");
+    assert!((stats.sources[1].gain - 0.25).abs() < 1e-6);
+    assert!((stats.sources[2].gain - 0.75).abs() < 1e-6);
+    assert!(!stats.sources[1].muted);
+
+    // Mute roundtrip.
+    assert!(!c.is_muted("a", 1).unwrap());
+    c.set_muted("a", 1, true).expect("valid set_muted");
+    assert!(c.is_muted("a", 1).unwrap());
+    assert!(c.stats().unwrap().sources[1].muted);
+    // Muting did not disturb the stored gain.
+    assert!((c.gain("a", 1).unwrap() - 0.25).abs() < 1e-6);
+    c.set_muted("a", 1, false).expect("unmute");
+    assert!(!c.is_muted("a", 1).unwrap());
+}
+
+#[test]
+fn control_on_unstarted_composition_is_not_initialized() {
+    // No stats attached → not started.
+    let c = CompositionBuilder::new()
+        .group(
+            Group::new("a")
+                .source(crate::core::config::CaptureTarget::SystemDefault)
+                .mixdown(GroupLayout::Mono),
+        )
+        .build()
+        .expect("device-free build");
+
+    for err in [
+        c.set_gain("a", 0, 0.5).expect_err("set_gain not started"),
+        c.set_muted("a", 0, true)
+            .expect_err("set_muted not started"),
+        c.gain("a", 0).expect_err("gain not started"),
+        c.is_muted("a", 0).expect_err("is_muted not started"),
+    ] {
+        assert!(matches!(err, AudioError::StreamReadError { .. }));
+        assert_eq!(err.lifecycle_stage(), Some(LifecycleStage::NotInitialized));
+    }
+}
+
+/// After the composition stops/ends, no compositor tick will ever apply a
+/// mutation — the setters must refuse (NotRunning) instead of reporting a
+/// success that never takes effect; the getters keep reading the last-applied
+/// values (rsac-5a2d review, PR #62).
+#[test]
+fn live_controls_refuse_after_composition_ends() {
+    let (src, _) = ScriptedSource::ending(vec![const_buffer(0.5, 1, 48_000, 480)]);
+    let harness = Harness::spawn(
+        cfg(
+            1,
+            vec![GroupSpec {
+                layout: GroupLayout::Mono,
+                offset: 0,
+                width: 1,
+            }],
+            vec![SourceSpec {
+                gain: 1.0,
+                group: 0,
+                channels: 0,
+                clock_candidate: false,
+            }],
+            0,
+        ),
+        vec![Box::new(src)],
+    );
+    // Wait for the engine to finish (ring parked in Stopping, is_running false).
+    let deadline = std::time::Instant::now() + Duration::from_secs(5);
+    while harness.stream.is_running() {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "engine never finished"
+        );
+        std::thread::sleep(Duration::from_millis(1));
+    }
+
+    let mut composition = CompositionBuilder::new()
+        .group(
+            Group::new("g")
+                .source(crate::core::config::CaptureTarget::SystemDefault)
+                .mixdown(GroupLayout::Mono),
+        )
+        .build()
+        .expect("device-free build");
+    composition.attach_stream_for_tests(Arc::clone(&harness.stream));
+    composition.attach_stats_for_tests(Arc::clone(&harness.stats));
+    assert!(!composition.is_running(), "precondition: engine finished");
+
+    for err in [
+        composition
+            .set_gain("g", 0, 0.5)
+            .expect_err("set_gain after end"),
+        composition
+            .set_muted("g", 0, true)
+            .expect_err("set_muted after end"),
+    ] {
+        assert!(matches!(err, AudioError::StreamReadError { .. }));
+        assert_eq!(err.lifecycle_stage(), Some(LifecycleStage::NotRunning));
+    }
+    // Getters still read the last-applied values of the ended composition.
+    assert!((composition.gain("g", 0).unwrap() - 1.0).abs() < 1e-6);
+    assert!(!composition.is_muted("g", 0).unwrap());
 }
