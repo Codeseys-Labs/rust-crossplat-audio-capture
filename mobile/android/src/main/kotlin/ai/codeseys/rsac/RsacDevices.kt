@@ -136,9 +136,14 @@ object RsacDevices {
      * Rust → Java: stop + tear down the callback for [handle]. Idempotent.
      *
      * Unregisters the callback from the [AudioManager], then `quitSafely()` +
-     * bounded-`join()` the [HandlerThread]. After this returns, no
-     * [nativeDevicesChanged] for [handle] can newly fire (an in-flight call is
-     * kept safe on the Rust side by its registry-id lookup).
+     * bounded-`join()` the [HandlerThread]. This stops new callbacks and
+     * usually drains in-flight ones, but the join is BOUNDED so it cannot
+     * prove a slow in-flight [nativeDevicesChanged] has returned. The
+     * guarantee that the consumer's handler never fires after the watcher is
+     * dropped comes from the Rust side: its teardown clears an `active` flag
+     * under the same per-watcher lock the callback holds while firing, so a
+     * late/in-flight call either finishes before teardown or no-ops
+     * (rsac-d3e2).
      */
     @JvmStatic
     fun unregisterDeviceCallback(handle: Long) {

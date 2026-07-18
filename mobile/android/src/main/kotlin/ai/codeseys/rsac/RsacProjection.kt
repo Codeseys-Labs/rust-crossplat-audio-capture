@@ -225,6 +225,9 @@ object RsacProjection {
         val projection: MediaProjection? = try {
             manager.getMediaProjection(p.resultCode, p.data)
         } catch (e: SecurityException) {
+            // No projection was acquired, so nothing will ever stop the FGS we
+            // just started — stop it here, else it leaks (rsac-cabf review).
+            RsacCaptureService.stop(context)
             p.callback.onDenied(
                 "getMediaProjection failed after the FGS reached the " +
                     "foreground: ${e.message}"
@@ -232,13 +235,27 @@ object RsacProjection {
             return
         }
         if (projection == null) {
+            RsacCaptureService.stop(context)
             p.callback.onDenied("MediaProjectionManager returned no projection")
             return
         }
         // Hand ownership to Rust: GlobalRef + opaque token. From here, release
         // (DeleteGlobalRef + MediaProjection.stop()) is Rust's job, tied to
-        // the owning capture's Drop.
-        p.callback.onToken(nativeRetainProjection(projection))
+        // the owning capture's Drop. nativeRetainProjection returns 0 when the
+        // GlobalRef could not be created — that is a failure, not a token, so
+        // stop the FGS and deny rather than handing a 0 to onToken (a 0 token
+        // would otherwise fail stream creation much later with a vaguer error).
+        val token = nativeRetainProjection(projection)
+        if (token == 0L) {
+            projection.stop()
+            RsacCaptureService.stop(context)
+            p.callback.onDenied(
+                "failed to retain the MediaProjection natively (librsac " +
+                    "returned a null token)"
+            )
+            return
+        }
+        p.callback.onToken(token)
     }
 
     /**

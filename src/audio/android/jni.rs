@@ -509,8 +509,9 @@ fn find_session(id: i64) -> Option<Arc<IngestSession>> {
 /// Per-watch state shared between [`watch_input_devices`] and the
 /// Java-entered [`native_devices_changed`].
 struct DeviceWatchEntry {
-    /// Handler + previous id-set, locked per callback fire. Uncontended in
-    /// practice: exactly one AAR `HandlerThread` fires per watcher.
+    /// Handler + previous id-set + active flag, locked per callback fire.
+    /// Uncontended in practice: exactly one AAR `HandlerThread` fires per
+    /// watcher.
     inner: Mutex<DeviceWatchInner>,
 }
 
@@ -521,6 +522,17 @@ struct DeviceWatchInner {
     /// baseline (`"default"` / `"playback-capture"` are never diffed; they
     /// are always present).
     previous: HashSet<i32>,
+    /// Cleared by teardown UNDER this lock. `native_devices_changed` checks it
+    /// (also under the lock) before invoking `on_event`, so once teardown
+    /// returns no further handler call can happen — even if the AAR's bounded
+    /// `HandlerThread` join timed out with a `nativeDevicesChanged` still in
+    /// flight. The in-flight call holds the lock for its whole fire, so
+    /// teardown's lock acquisition blocks until it finishes; a call that has
+    /// not yet taken the lock sees `active == false` and does nothing. This is
+    /// the guarantee the registry-id lookup alone cannot give (the `Arc` clone
+    /// keeps the entry alive, but that is exactly what would let a late handler
+    /// run past `DeviceWatcher::drop` — rsac-d3e2 review).
+    active: bool,
 }
 
 /// The live-watcher registry. Same id-not-pointer discipline as [`SESSIONS`]:
@@ -546,6 +558,7 @@ fn register_watcher(on_event: DeviceEventHandler, initial: HashSet<i32>) -> i64 
         inner: Mutex::new(DeviceWatchInner {
             on_event,
             previous: initial,
+            active: true,
         }),
     });
     watchers()
@@ -784,6 +797,14 @@ unsafe extern "system" fn native_devices_changed(_env: *mut JNIEnv, _class: jcla
             .inner
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
+        // Teardown clears `active` under this same lock (after the Java
+        // unregister+join), so a fire that races an unwatch either runs
+        // entirely before teardown takes the lock, or sees `active == false`
+        // here and does nothing — no `on_event` after `DeviceWatcher::drop`
+        // returns (rsac-d3e2 review).
+        if !inner.active {
+            return;
+        }
         let (events, next) = super::diff_device_events(&inner.previous, &current);
         for event in events {
             (inner.on_event)(event);
@@ -1720,7 +1741,25 @@ pub(super) fn watch_input_devices(on_event: DeviceEventHandler) -> AudioResult<D
     // HandlerThread join) BEFORE dropping the Rust entry — mirror of the
     // playback path's "unregister session before asking Kotlin to stop".
     Ok(DeviceWatcher::from_teardown(Box::new(move || {
+        // 1. Java: unregister the AudioManager callback + quitSafely + bounded
+        //    HandlerThread join. This stops NEW callbacks and usually drains
+        //    in-flight ones — but the join is bounded, so it cannot prove a
+        //    slow in-flight nativeDevicesChanged has returned.
         unregister_device_callback_java(handle);
+        // 2. Take the per-watcher lock and clear `active`. If a fire is still
+        //    in flight it holds this lock for its whole duration, so this
+        //    blocks until it finishes; any later fire sees active==false and
+        //    no-ops. After this returns, on_event can never run again —
+        //    satisfying the DeviceEnumerator::watch teardown contract even
+        //    though the Arc keeps the entry alive for a stale in-flight call.
+        if let Some(entry) = find_watcher(handle) {
+            entry
+                .inner
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .active = false;
+        }
+        // 3. Drop the registry entry.
         unregister_watcher(handle);
     })))
 }
