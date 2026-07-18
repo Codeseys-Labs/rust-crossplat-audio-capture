@@ -76,6 +76,35 @@ test('compose device-free build + not-started contract', () => {
   assert.doesNotThrow(() => comp.stop());
 });
 
+test('compose live-control not-started contract', () => {
+  // All four live-control calls on a built-but-unstarted composition throw
+  // ERR_RSAC_STREAM (the runtime roundtrip / bounds / not-running paths need a
+  // started composition → a real device, so they are device-gated elsewhere).
+  // Mirrors the Python smoke.py and Go compose_test.go not-started contracts.
+  const g = new rsac.Group('main');
+  g.source('system');
+  const builder = rsac.CompositionBuilder.create({ sampleRate: 48000 });
+  builder.addGroup(g);
+  const comp = builder.build();
+
+  const calls = {
+    setGain: () => comp.setGain('main', 0, 0.5),
+    setMuted: () => comp.setMuted('main', 0, true),
+    gain: () => comp.gain('main', 0),
+    isMuted: () => comp.isMuted('main', 0),
+  };
+  for (const [label, call] of Object.entries(calls)) {
+    // The napi layer embeds the structured code as a bracketed message
+    // prefix ([ERR_RSAC_STREAM] …, see audio_err_to_napi) rather than an
+    // err.code field — match it exactly, not a loose /STREAM/ fragment.
+    assert.throws(
+      call,
+      (err) => /\[ERR_RSAC_STREAM\]/.test(err.message),
+      `not-started comp.${label}() should throw [ERR_RSAC_STREAM]`
+    );
+  }
+});
+
 test('compose builder validation rejects a zero quantum', () => {
   const g = new rsac.Group('main');
   g.source('system');

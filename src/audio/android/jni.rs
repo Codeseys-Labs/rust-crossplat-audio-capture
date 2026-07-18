@@ -86,8 +86,8 @@ use std::sync::atomic::{AtomicBool, AtomicI64, AtomicPtr, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
 
 use jni_sys::{
-    jclass, jfloatArray, jint, jlong, jmethodID, jobject, jvalue, JNIEnv, JNINativeMethod, JavaVM,
-    JNI_EDETACHED, JNI_ERR, JNI_OK, JNI_VERSION_1_6,
+    jclass, jfloatArray, jint, jlong, jmethodID, jobject, jstring, jvalue, JNIEnv, JNINativeMethod,
+    JavaVM, JNI_EDETACHED, JNI_ERR, JNI_OK, JNI_VERSION_1_6,
 };
 
 use crate::bridge::ring_buffer::{BridgeProducer, BridgeShared};
@@ -110,6 +110,37 @@ macro_rules! jni_call {
             $env $(, $arg)*
         )
     };
+}
+
+/// Decodes a `java.lang.String` local ref into a Rust `String`.
+///
+/// Uses `GetStringChars` (UTF-16), **not** `GetStringUTFChars`: on ART the
+/// latter returns *modified UTF-8* (CESU-8), in which supplementary-plane
+/// code points (emoji, rare CJK) are encoded as 6-byte surrogate-pair
+/// sequences that are invalid standard UTF-8 — `CStr::to_string_lossy` would
+/// mangle them to U+FFFD. UTF-16 + [`String::from_utf16_lossy`] round-trips
+/// the full BMP + supplementary planes. Returns `None` if the JVM copy
+/// fails.
+///
+/// # Safety
+///
+/// `env` must be a valid `JNIEnv` for the current thread and `jstr` a live
+/// `java.lang.String` local ref. The chars are released before returning.
+unsafe fn jstring_to_string(env: *mut JNIEnv, jstr: jstring) -> Option<String> {
+    // SAFETY: `jstr` is a live java.lang.String ref; chars are released
+    // before this function returns.
+    let chars = unsafe { jni_call!(env, GetStringChars, jstr, ptr::null_mut()) };
+    if chars.is_null() {
+        return None;
+    }
+    let len = unsafe { jni_call!(env, GetStringLength, jstr) };
+    // SAFETY: `chars` points to `len` valid `jchar` (u16) UTF-16 code units
+    // owned by the JVM until released; `len` is non-negative from a live
+    // String.
+    let units = unsafe { std::slice::from_raw_parts(chars, len.max(0) as usize) };
+    let text = String::from_utf16_lossy(units);
+    unsafe { jni_call!(env, ReleaseStringChars, jstr, chars) };
+    Some(text)
 }
 
 // ── Cached JavaVM ────────────────────────────────────────────────────────
@@ -192,6 +223,20 @@ pub(super) struct AarCache {
     pub resolver_class: jclass,
     /// `PackageResolver.uidForPackage(Landroid/content/Context;Ljava/lang/String;)Ljava/lang/Integer;` (static).
     pub resolver_uid_for_package: jmethodID,
+    /// The device-enumeration half — `None` when `RsacDevices` is absent
+    /// (an older AAR paired with a newer `librsac.so`). Kept optional so a
+    /// missing enumeration class degrades only `enumerate_input_device_records`
+    /// (and the device-selection capability), never the already-resolved
+    /// playback-capture classes above.
+    pub devices: Option<DevicesCache>,
+}
+
+/// The `ai.codeseys.rsac.RsacDevices` class + method id (rsac-ad8a).
+pub(super) struct DevicesCache {
+    /// `ai/codeseys/rsac/RsacDevices` (GlobalRef) — input-device enumeration.
+    pub class: jclass,
+    /// `RsacDevices.inputDevices(Landroid/content/Context;)Ljava/lang/String;` (static).
+    pub input_devices: jmethodID,
 }
 
 // SAFETY: the raw pointers in the cache are JNI GlobalRefs and method ids —
@@ -352,18 +397,9 @@ pub(super) unsafe fn take_exception_message(env: *mut JNIEnv) -> Option<String> 
                 jni_call!(env, DeleteLocalRef, nested);
             }
         } else if !jstr.is_null() {
-            // SAFETY: `jstr` is a live java.lang.String local ref; the chars
-            // are released before the ref is deleted.
-            let chars = unsafe { jni_call!(env, GetStringUTFChars, jstr, ptr::null_mut()) };
-            if !chars.is_null() {
-                // SAFETY: `chars` is a valid NUL-terminated (modified-)UTF-8
-                // buffer owned by the JVM until released.
-                let text = unsafe { std::ffi::CStr::from_ptr(chars) }
-                    .to_string_lossy()
-                    .into_owned();
-                unsafe { jni_call!(env, ReleaseStringUTFChars, jstr, chars) };
-                message = Some(text);
-            }
+            // SAFETY: `jstr` is a live java.lang.String local ref; the helper
+            // releases the chars before returning.
+            message = unsafe { jstring_to_string(env, jstr) };
         }
         if !jstr.is_null() {
             unsafe { jni_call!(env, DeleteLocalRef, jstr) };
@@ -735,6 +771,25 @@ unsafe fn build_aar_cache(env: *mut JNIEnv) -> Option<AarCache> {
             true,
         )?;
 
+        // RsacDevices is OPTIONAL: its absence (older AAR, newer librsac.so)
+        // must degrade only device enumeration, not the playback-capture
+        // classes resolved above. find_class_global clears the pending
+        // ClassNotFoundException on failure, so the cache build continues.
+        let devices = (|| {
+            let class = find_class_global(env, c"ai/codeseys/rsac/RsacDevices")?;
+            let input_devices = get_method(
+                env,
+                class,
+                c"inputDevices",
+                c"(Landroid/content/Context;)Ljava/lang/String;",
+                true,
+            )?;
+            Some(DevicesCache {
+                class,
+                input_devices,
+            })
+        })();
+
         // Natives on CaptureBridge (companion `@JvmStatic external` methods
         // compile to static natives on the enclosing class).
         //
@@ -795,6 +850,7 @@ unsafe fn build_aar_cache(env: *mut JNIEnv) -> Option<AarCache> {
             service_unregister_bridge,
             resolver_class,
             resolver_uid_for_package,
+            devices,
         })
     }
 }
@@ -897,6 +953,13 @@ pub unsafe extern "system" fn JNI_OnLoad(vm: *mut JavaVM, _reserved: *mut c_void
         match cache_value {
             Some(cache) => {
                 let aar_present = cache.aar.is_some();
+                // Publish the device-enumeration availability to the
+                // capabilities layer (core can't reach into audio/ — module
+                // DAG), so supports_device_selection reports honestly
+                // (rsac-ad8a).
+                crate::core::capabilities::set_android_device_enumeration_available(
+                    cache.aar.as_ref().is_some_and(|aar| aar.devices.is_some()),
+                );
                 let _ = CACHE.set(cache);
                 log::debug!(
                     "rsac JNI_OnLoad: class cache ready (AAR classes {})",
@@ -1262,6 +1325,105 @@ pub(super) fn resolve_uid_for_package(package: &str) -> AudioResult<i32> {
             jni_call!(env, DeleteLocalRef, boxed_uid);
         }
         jni_call!(env, DeleteLocalRef, jname);
+        jni_call!(env, DeleteLocalRef, context);
+    }
+    result
+}
+
+/// Enumerates the current audio input devices via the AAR's
+/// `RsacDevices.inputDevices`, returning the raw flat delimited record string
+/// (`id␟type␟name` records joined by `␞`; see `RsacDevices.kt` for the wire
+/// contract). The pure Rust parser (`super::parse_input_device_records`)
+/// turns it into typed records.
+///
+/// Uses `ActivityThread.currentApplication()` as the `Context`, exactly like
+/// [`resolve_uid_for_package`]. Any failure — no `JavaVM` (host-test /
+/// pure-NDK), the AAR classes absent, a null context, or a pending Java
+/// exception — returns `Err(DeviceEnumerationError)`. The sole caller
+/// (`AndroidDeviceEnumerator::enumerate_devices`) treats **any** `Err` as
+/// "fall back to the default-route sentinel + playback device", so this
+/// never surfaces to users as a hard failure.
+pub(super) fn enumerate_input_device_records() -> AudioResult<String> {
+    let cache = cache()?;
+    let devices =
+        aar_cache()?
+            .devices
+            .as_ref()
+            .ok_or_else(|| AudioError::DeviceEnumerationError {
+                reason: "the loaded rsac AAR does not provide RsacDevices \
+                     (older AAR paired with a newer librsac.so) — device \
+                     enumeration falls back to the default route"
+                    .to_string(),
+                context: None,
+            })?;
+    let guard = attach_current_thread()?;
+    let env = guard.env();
+
+    // ── Application context ──────────────────────────────────────────
+    // SAFETY: static method on the cached ActivityThread class; no args.
+    let context = unsafe {
+        jni_call!(
+            env,
+            CallStaticObjectMethodA,
+            cache.activity_thread_class,
+            cache.current_application,
+            ptr::null()
+        )
+    };
+    let exception = unsafe { take_exception_message(env) };
+    if context.is_null() || exception.is_some() {
+        return Err(AudioError::DeviceEnumerationError {
+            reason: format!(
+                "could not obtain an application Context via \
+                 ActivityThread.currentApplication(){}",
+                exception.map(|m| format!(": {}", m)).unwrap_or_default()
+            ),
+            context: None,
+        });
+    }
+
+    // ── inputDevices(context) → String ───────────────────────────────
+    let args = [jvalue { l: context }];
+    // SAFETY: static method on the cached RsacDevices class; one Context arg.
+    let jstr = unsafe {
+        jni_call!(
+            env,
+            CallStaticObjectMethodA,
+            devices.class,
+            devices.input_devices,
+            args.as_ptr()
+        )
+    };
+    let exception = unsafe { take_exception_message(env) };
+    let result = if let Some(msg) = exception {
+        Err(AudioError::DeviceEnumerationError {
+            reason: format!("RsacDevices.inputDevices threw: {}", msg),
+            context: None,
+        })
+    } else if jstr.is_null() {
+        // Kotlin returns "" on failure, never null; a null here means the
+        // call did not complete normally.
+        Err(AudioError::DeviceEnumerationError {
+            reason: "RsacDevices.inputDevices returned null".to_string(),
+            context: None,
+        })
+    } else {
+        // SAFETY: `jstr` is a live java.lang.String local ref; the helper
+        // releases the chars before returning.
+        match unsafe { jstring_to_string(env, jstr) } {
+            Some(text) => Ok(text),
+            None => Err(AudioError::DeviceEnumerationError {
+                reason: "GetStringChars failed for the device record string".to_string(),
+                context: None,
+            }),
+        }
+    };
+
+    // SAFETY: live local refs from this frame.
+    unsafe {
+        if !jstr.is_null() {
+            jni_call!(env, DeleteLocalRef, jstr);
+        }
         jni_call!(env, DeleteLocalRef, context);
     }
     result

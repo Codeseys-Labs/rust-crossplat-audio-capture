@@ -21,7 +21,8 @@ use super::builder::{
     ChannelMap, ChannelOrigin, CompositionPlan, GroupLayout, MAX_COMPOSED_CHANNELS,
 };
 use super::engine::{
-    Engine, EngineConfig, EngineStatsShared, GroupSpec, SourceReader, SourceSpec, SourceStatsShared,
+    Engine, EngineConfig, EngineStatsShared, GroupSpec, GroupStatsShared, SourceReader, SourceSpec,
+    SourceStatsShared,
 };
 
 /// How long `start()` polls a keep-channels source for its negotiated format
@@ -308,6 +309,18 @@ pub struct SourceStats {
     pub muted: bool,
 }
 
+/// Point-in-time state for one composition group (rsac-1ce7).
+#[non_exhaustive]
+#[derive(Debug, Clone)]
+pub struct GroupStats {
+    /// The group's name (declaration order matches `CompositionStats::groups`).
+    pub group: String,
+    /// The group's current master gain — the live multiplier applied on top of
+    /// every member source's own gain on the next tick. Seeded to `1.0`;
+    /// updated by [`Composition::set_group_gain`](Composition::set_group_gain).
+    pub gain: f32,
+}
+
 /// Point-in-time snapshot of a running composition.
 #[non_exhaustive]
 #[derive(Debug, Clone)]
@@ -318,6 +331,8 @@ pub struct CompositionStats {
     pub fallback_ticks: u64,
     /// Per-source counters, in flat declaration order.
     pub sources: Vec<SourceStats>,
+    /// Per-group master-gain state, in group declaration order (rsac-1ce7).
+    pub groups: Vec<GroupStats>,
 }
 
 // ── Composition ─────────────────────────────────────────────────────────
@@ -537,6 +552,9 @@ impl Composition {
             sources: (0..source_specs.len())
                 .map(|_| Arc::new(SourceStatsShared::default()))
                 .collect(),
+            groups: (0..group_specs.len())
+                .map(|_| Arc::new(GroupStatsShared::default()))
+                .collect(),
             ..Default::default()
         });
         let readers: Vec<Box<dyn SourceReader>> = captures
@@ -708,10 +726,20 @@ impl Composition {
                 muted: s.muted.load(Ordering::Relaxed),
             })
             .collect();
+        let groups = shared
+            .groups
+            .iter()
+            .zip(self.plan.groups.iter())
+            .map(|(g, plan_group)| GroupStats {
+                group: plan_group.name().to_string(),
+                gain: f32::from_bits(g.gain_bits.load(Ordering::Relaxed)),
+            })
+            .collect();
         Some(CompositionStats {
             ticks: shared.ticks.load(Ordering::Relaxed),
             fallback_ticks: shared.fallback_ticks.load(Ordering::Relaxed),
             sources,
+            groups,
         })
     }
 
@@ -767,10 +795,12 @@ impl Composition {
         Ok(())
     }
 
-    /// Reads back a source's current effective mix gain (rsac-5a2d) — the value
-    /// a subsequent tick will apply. Same addressing and started/bounds errors
-    /// as [`set_gain`](Self::set_gain). Also available for every source at once
-    /// via [`SourceStats::gain`] in a [`stats()`](Self::stats) snapshot.
+    /// Reads back a source's current stored per-source gain (rsac-5a2d) — the
+    /// [`set_gain`](Self::set_gain) value (or the build-time seed). The mixed
+    /// output additionally depends on the source's mute flag and the group's
+    /// master gain ([`set_group_gain`](Self::set_group_gain)). Same addressing
+    /// and started/bounds errors as `set_gain`. Also available for every source
+    /// at once via [`SourceStats::gain`] in a [`stats()`](Self::stats) snapshot.
     ///
     /// # Errors
     ///
@@ -797,6 +827,64 @@ impl Composition {
         let stats = self.started_stats()?;
         let flat = self.resolve_source(group, source_idx)?;
         Ok(stats.sources[flat].muted.load(Ordering::Relaxed))
+    }
+
+    /// Sets the **group master gain** on a **running** composition (rsac-1ce7):
+    /// a live linear multiplier applied **on top of** every member source's own
+    /// gain, addressed by group **name**. Seeded to `1.0` (identity) at start.
+    ///
+    /// It is orthogonal to the per-source controls: it does not replace
+    /// [`set_gain`](Self::set_gain) (the effective contribution of a source is
+    /// `source_gain * group_gain`) and does not touch
+    /// [`set_muted`](Self::set_muted) — a group gain of `0.0` silences the group
+    /// but leaves each source's mute flag and gain untouched, so raising it
+    /// restores the group. Takes effect on the **next compositor tick**
+    /// (~1 quantum; default 10 ms).
+    ///
+    /// # Errors
+    ///
+    /// - [`AudioError::StreamReadError`] — [`NotInitialized`](crate::core::error::LifecycleStage::NotInitialized)
+    ///   if not started; [`NotRunning`](crate::core::error::LifecycleStage::NotRunning)
+    ///   if stopped or ended (no tick would apply the change).
+    /// - [`AudioError::ConfigurationError`] if `group` is unknown, or `gain` is
+    ///   not finite and ≥ 0.
+    pub fn set_group_gain(&self, group: &str, gain: f32) -> AudioResult<()> {
+        let stats = self.running_stats()?;
+        let gi = self.resolve_group(group)?;
+        super::builder::validate_gain(gain, &format!("for group '{group}' master gain"))?;
+        stats.groups[gi]
+            .gain_bits
+            .store(gain.to_bits(), Ordering::Relaxed);
+        Ok(())
+    }
+
+    /// Reads back a group's current master gain (rsac-1ce7) — the value the next
+    /// tick will apply. Same addressing as [`set_group_gain`](Self::set_group_gain);
+    /// also available for every group at once via [`GroupStats::gain`] in a
+    /// [`stats()`](Self::stats) snapshot. Keeps working on a stopped composition.
+    ///
+    /// # Errors
+    ///
+    /// - [`AudioError::StreamReadError`] (NotInitialized) if not started.
+    /// - [`AudioError::ConfigurationError`] if `group` is unknown.
+    pub fn group_gain(&self, group: &str) -> AudioResult<f32> {
+        let stats = self.started_stats()?;
+        let gi = self.resolve_group(group)?;
+        Ok(f32::from_bits(
+            stats.groups[gi].gain_bits.load(Ordering::Relaxed),
+        ))
+    }
+
+    /// Resolves a group **name** to its flat group index (declaration order,
+    /// matching `stats().groups` and the engine's group vector) (rsac-1ce7).
+    fn resolve_group(&self, group: &str) -> AudioResult<usize> {
+        self.plan
+            .groups
+            .iter()
+            .position(|g| g.name() == group)
+            .ok_or_else(|| AudioError::ConfigurationError {
+                message: format!("Unknown composition group '{group}'"),
+            })
     }
 
     /// The shared engine stats block, or the not-started error (rsac-5a2d) —

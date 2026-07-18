@@ -1411,4 +1411,94 @@ enum rsac_error_t rsac_composition_source_stats(const struct RsacComposition *co
  const char *rsac_composition_source_target(const struct RsacComposition *comp, uintptr_t index) ;
 #endif
 
+#if defined(RSAC_FEATURE_COMPOSE)
+/**
+ * Sets a source's live mix gain on a **running** composition (rsac-5a2d).
+ *
+ * The source is addressed by its group `name` (a NUL-terminated UTF-8 string)
+ * plus its `source_idx` **within that group** (0-based, declaration order —
+ * this is *not* the flat cross-group index the `_source_*` accessors take).
+ * `gain` must be finite and ≥ 0; it is validated by the core (after any f32
+ * narrowing the caller performed), not eagerly here.
+ *
+ * Returns `RSAC_ERROR_NULL_POINTER` if `comp` or `group` is null,
+ * `RSAC_ERROR_INVALID_PARAMETER` if `group` is not valid UTF-8,
+ * `RSAC_ERROR_STREAM_READ` if the composition has not been started or has
+ * stopped/ended (no tick would apply the change), and
+ * `RSAC_ERROR_CONFIGURATION` for an unknown group, an out-of-range
+ * `source_idx`, or an invalid `gain`.
+ */
+
+enum rsac_error_t rsac_composition_set_gain(const struct RsacComposition *comp,
+                                            const char *group,
+                                            uintptr_t source_idx,
+                                            float gain)
+;
+#endif
+
+#if defined(RSAC_FEATURE_COMPOSE)
+/**
+ * Mutes (`muted` nonzero) or unmutes (`muted` 0) a source on a **running**
+ * composition (rsac-5a2d). Muting is a separate flag from gain: while muted the
+ * source contributes silence; unmuting restores its gain untouched. Addressed
+ * exactly like [`rsac_composition_set_gain`].
+ *
+ * Returns `RSAC_ERROR_NULL_POINTER` if `comp` or `group` is null,
+ * `RSAC_ERROR_INVALID_PARAMETER` if `group` is not valid UTF-8,
+ * `RSAC_ERROR_STREAM_READ` before start / after stop or end, and
+ * `RSAC_ERROR_CONFIGURATION` for an unknown group or out-of-range `source_idx`.
+ */
+
+enum rsac_error_t rsac_composition_set_muted(const struct RsacComposition *comp,
+                                             const char *group,
+                                             uintptr_t source_idx,
+                                             int32_t muted)
+;
+#endif
+
+#if defined(RSAC_FEATURE_COMPOSE)
+/**
+ * Reads back a source's current stored per-source gain into `*out_gain`
+ * (rsac-5a2d) — the `rsac_composition_set_gain` value (or the build-time
+ * seed). The actual mixed output also depends on the source's mute flag and
+ * the group's master gain. Same addressing as [`rsac_composition_set_gain`].
+ * Unlike the setter this **keeps working on a stopped or ended composition**
+ * — it only fails before the first successful start.
+ *
+ * Returns `RSAC_ERROR_NULL_POINTER` if `comp`, `group`, or `out_gain` is null,
+ * `RSAC_ERROR_INVALID_PARAMETER` if `group` is not valid UTF-8,
+ * `RSAC_ERROR_STREAM_READ` only if the composition has never been started, and
+ * `RSAC_ERROR_CONFIGURATION` for an unknown group or out-of-range `source_idx`.
+ * `out_gain` is an out-parameter, not a handle — nothing to free; it is written
+ * only on `RSAC_OK`.
+ */
+
+enum rsac_error_t rsac_composition_gain(const struct RsacComposition *comp,
+                                        const char *group,
+                                        uintptr_t source_idx,
+                                        float *out_gain)
+;
+#endif
+
+#if defined(RSAC_FEATURE_COMPOSE)
+/**
+ * Reads back whether a source is currently muted into `*out_muted` (0/1)
+ * (rsac-5a2d). Same addressing and stopped-composition behavior as
+ * [`rsac_composition_gain`].
+ *
+ * Returns `RSAC_ERROR_NULL_POINTER` if `comp`, `group`, or `out_muted` is null,
+ * `RSAC_ERROR_INVALID_PARAMETER` if `group` is not valid UTF-8,
+ * `RSAC_ERROR_STREAM_READ` only if the composition has never been started, and
+ * `RSAC_ERROR_CONFIGURATION` for an unknown group or out-of-range `source_idx`.
+ * `out_muted` is an out-parameter, not a handle — nothing to free; it is
+ * written only on `RSAC_OK`.
+ */
+
+enum rsac_error_t rsac_composition_is_muted(const struct RsacComposition *comp,
+                                            const char *group,
+                                            uintptr_t source_idx,
+                                            int32_t *out_muted)
+;
+#endif
+
 #endif  /* RSAC_H */

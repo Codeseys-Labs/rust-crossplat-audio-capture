@@ -10,7 +10,7 @@
 //! | `Device(DeviceId("default"))` | ✅ default-input (microphone) capture via AAudio — pure NDK, no Java |
 //! | `SystemDefault` | 🟡 **playback capture** (`AudioPlaybackCapture`, ADR-0013 — all capturable playback, NOT the microphone) via the rsac AAR's Kotlin loop ([`playback`]); requires API 29+, `RECORD_AUDIO`, and a MediaProjection consent token ([`with_android_projection`]) — compiled, unverified on-device (rsac-e6d3) |
 //! | `Application` / `ApplicationByName` / `ProcessTree` | 🟡 UID-filtered playback capture (tree ≡ app: all of an Android app's processes share one UID) — same requirements/status as `SystemDefault` |
-//! | `Device(other id)` | ❌ real input-device ids (mic/USB/BT from `AudioManager.getDevices`) need the Java `AudioManager` list — rsac-ad8a |
+//! | `Device(other id)` | 🟡 real input-device ids via the AAR `AudioManager.getDevices` list + `AAudioStreamBuilder_setDeviceId` (rsac-ad8a) — compiled, unverified on-device (rsac-e6d3) |
 //!
 //! [`PlatformCapabilities::query`](crate::core::capabilities::PlatformCapabilities::query)
 //! reports exactly this (`backend_name = "AAudio"`; the playback-capture
@@ -76,32 +76,139 @@ pub use playback::AndroidPlaybackDevice;
 
 /// The [`DeviceId`] string of the single logical Android input device.
 ///
-/// Real input-device enumeration (built-in mic vs USB vs BT ids) requires
-/// the Java `AudioManager.getDevices` list, which arrives with the rsac AAR
-/// (rsac-c4b8). Until then rsac exposes exactly one logical device,
-/// `"default"`, meaning "the default AAudio input route". The empty string
-/// is also accepted as an alias when resolving a [`CaptureTarget::Device`]
-/// (matching the Windows and iOS backends' default-endpoint convention).
+/// This is the default-route sentinel: `"default"` means "the default AAudio
+/// input route" (whatever the OS routes — mic / headset / BT / USB). The
+/// empty string is accepted as an alias when resolving a
+/// [`CaptureTarget::Device`] (matching the Windows and iOS backends'
+/// default-endpoint convention). Real input-device ids (built-in mic vs USB
+/// vs BT) are the numeric `AudioDeviceInfo.getId()` values enumerated via the
+/// AAR's `AudioManager.getDevices` list (rsac-ad8a); a numeric id routes
+/// through [`AAudioStreamBuilder_setDeviceId`](super::aaudio::AAudioStreamBuilder_setDeviceId)
+/// and only a non-numeric / non-positive id yields
+/// [`AudioError::DeviceNotFound`].
 ///
 /// [`CaptureTarget::Device`]: crate::core::config::CaptureTarget::Device
 pub(crate) const DEFAULT_INPUT_DEVICE_ID: &str = "default";
+
+// ── Real input-device records (rsac-ad8a) ────────────────────────────────
+
+/// Field separator (US, U+001F) in the `RsacDevices.inputDevices` wire
+/// format — separates `id␟type␟name` within one record.
+const FIELD_SEP: char = '\u{001f}';
+
+/// Record separator (RS, U+001E) — joins per-device records.
+const RECORD_SEP: char = '\u{001e}';
+
+/// One real input device parsed from the AAR's `AudioManager.getDevices`
+/// list (rsac-ad8a). Pure data — no FFI.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct AndroidInputDevice {
+    /// The `AudioDeviceInfo.getId()` value (always positive on-device).
+    pub id: i32,
+    /// The `AudioDeviceInfo.getType()` value (an `AudioDeviceInfo.TYPE_*`).
+    pub type_code: i32,
+    /// The device label (`getProductName()`), or a synthesized name.
+    pub name: String,
+}
+
+/// A human-readable name for a device whose `getProductName()` was empty,
+/// derived from the common `AudioDeviceInfo.TYPE_*` codes.
+///
+/// Only a small, stable subset is mapped by name; anything else gets a
+/// generic label carrying the id, so a name is always non-empty.
+fn synthesize_input_name(type_code: i32, id: i32) -> String {
+    // AudioDeviceInfo.TYPE_* constants (stable framework values).
+    let kind = match type_code {
+        15 => "Built-in mic",     // TYPE_BUILTIN_MIC
+        3 => "Wired headset mic", // TYPE_WIRED_HEADSET
+        4 => "Wired headphones",  // TYPE_WIRED_HEADPHONES
+        7 => "Bluetooth SCO mic", // TYPE_BLUETOOTH_SCO
+        11 => "USB audio device", // TYPE_USB_DEVICE
+        12 => "USB accessory",    // TYPE_USB_ACCESSORY
+        22 => "USB headset",      // TYPE_USB_HEADSET
+        18 => "Telephony",        // TYPE_TELEPHONY
+        _ => return format!("Audio input {id}"),
+    };
+    kind.to_string()
+}
+
+/// Parses the flat delimited record string produced by
+/// `RsacDevices.inputDevices` (see `RsacDevices.kt`) into typed records.
+///
+/// Wire format: `id␟typeInt␟name` records, joined by `␞`. All parsing is
+/// **defensive** — a malformed record is skipped (never a panic, never an
+/// error), and valid neighbours are kept:
+///
+/// - split on `␞`; skip blank records;
+/// - split each record on `␟`, require ≥ 3 fields;
+/// - `id` and `type_code` parse as `i32` (skip the record if either fails);
+/// - `id` must be `> 0` (0 is the AAudio `AAUDIO_UNSPECIFIED` sentinel, and
+///   real `AudioDeviceInfo` ids are positive);
+/// - an empty name is synthesized from the type code
+///   ([`synthesize_input_name`]).
+///
+/// Trailing / blank separators are ignored.
+fn parse_input_device_records(raw: &str) -> Vec<AndroidInputDevice> {
+    let mut devices = Vec::new();
+    for record in raw.split(RECORD_SEP) {
+        if record.is_empty() {
+            continue;
+        }
+        let mut fields = record.split(FIELD_SEP);
+        let (Some(id_str), Some(type_str), Some(name)) =
+            (fields.next(), fields.next(), fields.next())
+        else {
+            // Fewer than 3 fields — malformed, skip.
+            continue;
+        };
+        let Ok(id) = id_str.parse::<i32>() else {
+            continue;
+        };
+        let Ok(type_code) = type_str.parse::<i32>() else {
+            continue;
+        };
+        if id <= 0 {
+            // 0 = UNSPECIFIED sentinel; negatives are never valid ids.
+            continue;
+        }
+        let name = if name.is_empty() {
+            synthesize_input_name(type_code, id)
+        } else {
+            name.to_string()
+        };
+        devices.push(AndroidInputDevice {
+            id,
+            type_code,
+            name,
+        });
+    }
+    devices
+}
 
 // ── AndroidDeviceEnumerator ──────────────────────────────────────────────
 
 /// [`DeviceEnumerator`] for Android (AAudio mic + `AudioPlaybackCapture`
 /// playback).
 ///
-/// Enumeration lists exactly **two logical devices** (mirroring the iOS
-/// enumerator's mic + broadcast shape):
+/// Enumeration always lists, in order:
 ///
-/// - `"default"` ([`AndroidAudioDevice`]): the default AAudio input route
-///   (microphone / headset / BT / USB — whatever the OS routes).
+/// - `"default"` ([`AndroidAudioDevice::new`]): the default AAudio input
+///   route (microphone / headset / BT / USB — whatever the OS routes),
+///   `is_default`. Always first, so `devices[0]` is a stable "let the OS
+///   route the default input" handle, still targetable via `Device("default")`.
+/// - Zero or more **real input devices** ([`AndroidAudioDevice::from_real`]),
+///   one per `AudioDeviceInfo` in the AAR's
+///   `AudioManager.getDevices(GET_DEVICES_INPUTS)` list (rsac-ad8a), each
+///   pinnable via `Device(<numeric id>)` → `AAudioStreamBuilder_setDeviceId`.
 /// - `"playback-capture"` ([`AndroidPlaybackDevice`]): the playback-capture
 ///   endpoint (`AudioPlaybackCapture` behind MediaProjection consent),
 ///   serving `SystemDefault` and the per-app tiers.
 ///
-/// Real input-device ids (`AudioManager.getDevices`) need the Java side and
-/// arrive with rsac-ad8a; they are deliberately not faked here.
+/// **JNI-absent fallback:** when the Java list cannot be obtained (host
+/// tests / pure-NDK consumers with no `JavaVM`, the AAR classes absent, or
+/// the Java call threw), the real-device middle section is empty and
+/// enumeration yields exactly `[default sentinel, playback]` — honest (no
+/// fabricated devices) and unchanged from the pre-rsac-ad8a behaviour.
 #[derive(Debug, Clone, Copy)]
 pub struct AndroidDeviceEnumerator;
 
@@ -123,13 +230,29 @@ impl Default for AndroidDeviceEnumerator {
 }
 
 impl DeviceEnumerator for AndroidDeviceEnumerator {
-    /// Lists the two logical Android devices: the default AAudio input
-    /// (microphone) and the playback-capture endpoint.
+    /// Lists the Android devices: the default AAudio input sentinel, any real
+    /// input devices from the AAR's `AudioManager.getDevices` list, and the
+    /// playback-capture endpoint.
+    ///
+    /// When the Java list is unavailable (no `JavaVM` on host tests / pure-NDK
+    /// consumers, the AAR classes absent, or the Java call threw), the
+    /// real-device section is empty and the result is exactly
+    /// `[default sentinel, playback]` — the pre-rsac-ad8a behaviour, kept
+    /// honest and host-stable.
     fn enumerate_devices(&self) -> AudioResult<Vec<Box<dyn AudioDevice>>> {
-        Ok(vec![
-            Box::new(AndroidAudioDevice::new()),
-            Box::new(AndroidPlaybackDevice::new()),
-        ])
+        let mut devices: Vec<Box<dyn AudioDevice>> = Vec::new();
+        // devices[0]: the stable default-route sentinel (is_default).
+        devices.push(Box::new(AndroidAudioDevice::new()));
+        // Real input devices, when the JNI path can reach the AAR list. Any
+        // Err (host / NDK-only / AAR-absent / Java threw) falls back silently.
+        if let Ok(raw) = jni::enumerate_input_device_records() {
+            for rec in parse_input_device_records(&raw) {
+                devices.push(Box::new(AndroidAudioDevice::from_real(&rec)));
+            }
+        }
+        // The playback-capture endpoint stays last.
+        devices.push(Box::new(AndroidPlaybackDevice::new()));
+        Ok(devices)
     }
 
     /// Returns the playback-capture device — rsac's *default device* on
@@ -151,26 +274,56 @@ impl DeviceEnumerator for AndroidDeviceEnumerator {
 
     // watch(): inherits the trait default (PlatformNotSupported) —
     // consistent with `supports_device_change_notifications: false` in
-    // PlatformCapabilities::android(). Input-route change notifications are
-    // AudioManager/AudioDeviceCallback territory, which belongs to the Java
-    // side (rsac-ad8a).
+    // PlatformCapabilities::android(). Input-route change notifications
+    // (`AudioManager.registerAudioDeviceCallback`, AAR territory) are a
+    // tracked follow-up (rsac-d3e2, under epic rsac-5823), NOT part of the
+    // rsac-ad8a device-selection work in this backend.
 }
 
 // ── AndroidAudioDevice ───────────────────────────────────────────────────
 
-/// The single logical Android audio input device (the default AAudio
-/// input).
+/// An Android audio **input** device.
 ///
 /// A metadata-only handle: constructing it touches no OS resources. The
 /// AAudio stream is created lazily in
-/// [`create_stream`](AudioDevice::create_stream).
-#[derive(Debug, Clone, Copy)]
-pub struct AndroidAudioDevice;
+/// [`create_stream`](AudioDevice::create_stream), routed by
+/// `config.capture_target` (the caller sets `Device(self.id())`).
+///
+/// Two flavours:
+///
+/// - [`new`](Self::new): the **default-route sentinel** (`DeviceId("default")`,
+///   `is_default`), meaning "let the OS route the default input".
+/// - [`from_real`](Self::from_real): a **real** device from the AAR's
+///   `AudioManager.getDevices` list, carrying its numeric
+///   `AudioDeviceInfo.getId()` and product name (rsac-ad8a).
+#[derive(Debug, Clone)]
+pub struct AndroidAudioDevice {
+    id: DeviceId,
+    name: String,
+    is_default: bool,
+}
 
 impl AndroidAudioDevice {
-    /// Creates the logical default-input device handle.
+    /// Creates the default-route input sentinel (`DeviceId("default")`,
+    /// `is_default`) — the stable `devices[0]` handle.
     pub fn new() -> Self {
-        Self
+        Self {
+            id: DeviceId(DEFAULT_INPUT_DEVICE_ID.to_string()),
+            name: "Default audio input (AAudio)".to_string(),
+            is_default: true,
+        }
+    }
+
+    /// Creates a handle for a **real** enumerated input device: its numeric
+    /// `AudioDeviceInfo.getId()` becomes the [`DeviceId`] string (which
+    /// [`resolve_mic_target`](thread::resolve_mic_target) parses back to the
+    /// AAudio device id), carrying the device name; never `is_default`.
+    pub(crate) fn from_real(rec: &AndroidInputDevice) -> Self {
+        Self {
+            id: DeviceId(rec.id.to_string()),
+            name: rec.name.clone(),
+            is_default: false,
+        }
     }
 }
 
@@ -182,15 +335,15 @@ impl Default for AndroidAudioDevice {
 
 impl AudioDevice for AndroidAudioDevice {
     fn id(&self) -> DeviceId {
-        DeviceId(DEFAULT_INPUT_DEVICE_ID.to_string())
+        self.id.clone()
     }
 
     fn name(&self) -> String {
-        "Default audio input (AAudio)".to_string()
+        self.name.clone()
     }
 
     fn is_default(&self) -> bool {
-        true
+        self.is_default
     }
 
     /// Advisory format list: F32 and I16 at common Android rates,
@@ -249,8 +402,12 @@ impl AudioDevice for AndroidAudioDevice {
     /// - [`AudioError::PlatformNotSupported`] for `SystemDefault` and
     ///   `Application*` / `ProcessTree` (playback-capture tiers, served by
     ///   [`AndroidPlaybackDevice`], not this mic device).
-    /// - [`AudioError::DeviceNotFound`] for a `Device` id other than
-    ///   `"default"` (real ids arrive with rsac-ad8a).
+    /// - [`AudioError::DeviceNotFound`] only for an **invalid** `Device` id:
+    ///   non-numeric or non-positive. `"default"` / `""` route the default
+    ///   input; a positive numeric id routes through
+    ///   `AAudioStreamBuilder_setDeviceId` (rsac-ad8a). A syntactically valid
+    ///   id the OS later rejects surfaces as
+    ///   [`AudioError::StreamCreationFailed`] from the open path, not here.
     /// - [`AudioError::StreamCreationFailed`] /
     ///   [`AudioError::StreamStartFailed`] from the AAudio open/start path
     ///   (typically: the `RECORD_AUDIO` runtime permission is missing — a
@@ -376,5 +533,117 @@ mod tests {
         assert_eq!(info.kind, DeviceKind::Input);
         assert!(info.is_default);
         assert!(info.default_format.is_some());
+    }
+
+    // ── Real input-device record parsing (rsac-ad8a) ─────────────────
+
+    /// Builds a wire record string from `(id, type, name)` tuples using the
+    /// real US/RS separators (so the test also pins the delimiter bytes).
+    fn wire(records: &[(&str, &str, &str)]) -> String {
+        records
+            .iter()
+            .map(|(id, ty, name)| format!("{id}{FIELD_SEP}{ty}{FIELD_SEP}{name}"))
+            .collect::<Vec<_>>()
+            .join(&RECORD_SEP.to_string())
+    }
+
+    #[test]
+    fn parse_happy_path_multi_record_preserves_order() {
+        let raw = wire(&[
+            ("5", "15", "Built-in Mic"),
+            ("11", "3", "USB-C Headset"),
+            ("42", "7", "BT Earbuds"),
+        ]);
+        let devices = parse_input_device_records(&raw);
+        assert_eq!(devices.len(), 3);
+        assert_eq!(
+            devices[0],
+            AndroidInputDevice {
+                id: 5,
+                type_code: 15,
+                name: "Built-in Mic".to_string()
+            }
+        );
+        assert_eq!(devices[1].id, 11);
+        assert_eq!(devices[1].name, "USB-C Headset");
+        assert_eq!(devices[2].id, 42);
+    }
+
+    #[test]
+    fn parse_empty_string_is_empty_vec() {
+        assert!(parse_input_device_records("").is_empty());
+    }
+
+    #[test]
+    fn parse_skips_malformed_records_keeps_valid_neighbours() {
+        // Records: missing field, non-numeric id, id==0, id<0, blank, then a
+        // valid one and a valid one before them. Interleave valid + invalid.
+        let raw = wire(&[
+            ("7", "15", "Good One"),  // valid
+            ("notint", "15", "Bad"),  // non-numeric id → skip
+            ("9", "notint", "BadTy"), // non-numeric type → skip
+            ("0", "15", "Zero"),      // id == 0 (UNSPECIFIED) → skip
+            ("-3", "15", "Neg"),      // id < 0 → skip
+            ("13", "11", "Good Two"), // valid
+        ]);
+        // Splice in a record with too few fields and a blank record.
+        let raw = format!("{raw}{RECORD_SEP}justonefield{RECORD_SEP}{RECORD_SEP}");
+        let devices = parse_input_device_records(&raw);
+        let names: Vec<&str> = devices.iter().map(|d| d.name.as_str()).collect();
+        assert_eq!(names, vec!["Good One", "Good Two"]);
+        assert_eq!(devices[0].id, 7);
+        assert_eq!(devices[1].id, 13);
+    }
+
+    #[test]
+    fn parse_trailing_separator_is_ignored() {
+        let raw = format!("{}{RECORD_SEP}", wire(&[("5", "15", "Mic")]));
+        let devices = parse_input_device_records(&raw);
+        assert_eq!(devices.len(), 1);
+        assert_eq!(devices[0].id, 5);
+    }
+
+    #[test]
+    fn parse_empty_name_is_synthesized_from_type_code() {
+        let raw = wire(&[("5", "15", ""), ("11", "11", ""), ("9", "999", "")]);
+        let devices = parse_input_device_records(&raw);
+        // TYPE_BUILTIN_MIC, TYPE_USB_DEVICE, then an unknown type → generic
+        // label carrying the id (never empty).
+        assert_eq!(devices[0].name, "Built-in mic");
+        assert_eq!(devices[1].name, "USB audio device");
+        assert_eq!(devices[2].name, "Audio input 9");
+        assert!(devices.iter().all(|d| !d.name.is_empty()));
+    }
+
+    #[test]
+    fn parse_name_with_spaces_and_unicode_round_trips() {
+        let raw = wire(&[("5", "15", "Bosch Mikrofon 日本語 🎙")]);
+        let devices = parse_input_device_records(&raw);
+        assert_eq!(devices[0].name, "Bosch Mikrofon 日本語 🎙");
+    }
+
+    // ── AndroidAudioDevice identity (rsac-ad8a) ──────────────────────
+
+    #[test]
+    fn from_real_carries_numeric_id_and_is_not_default() {
+        let rec = AndroidInputDevice {
+            id: 11,
+            type_code: 22,
+            name: "USB Headset".to_string(),
+        };
+        let device = AndroidAudioDevice::from_real(&rec);
+        assert_eq!(device.id(), DeviceId("11".to_string()));
+        assert_eq!(device.name(), "USB Headset");
+        assert!(!device.is_default());
+        assert_eq!(device.kind().unwrap(), DeviceKind::Input);
+    }
+
+    #[test]
+    fn new_preserves_default_sentinel_invariants() {
+        let device = AndroidAudioDevice::new();
+        assert_eq!(device.id(), DeviceId(DEFAULT_INPUT_DEVICE_ID.to_string()));
+        assert_eq!(device.name(), "Default audio input (AAudio)");
+        assert!(device.is_default());
+        assert_eq!(device.kind().unwrap(), DeviceKind::Input);
     }
 }

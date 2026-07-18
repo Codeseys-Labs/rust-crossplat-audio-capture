@@ -26,6 +26,7 @@ Target resolution, error classification, and stream semantics live in Rust
 | `RsacCaptureService.kt` | Foreground service (`mediaProjection` type): notification plumbing, start/stop, stops registered bridges on destroy |
 | `CaptureBridge.kt` | Dedicated Java capture thread: `AudioPlaybackCaptureConfiguration` + `AudioRecord` (`ENCODING_PCM_FLOAT`), blocking reads into one reused buffer → `nativePush` per period |
 | `PackageResolver.kt` | `packageName → UID` (PackageManager) and `PID → UID` (`/proc/<pid>/status`) for the ADR-0013 mapping |
+| `RsacDevices.kt` | Input-device enumeration (`AudioManager.getDevices`) as a flat `id␟type␟name` / `␞`-joined string — a **Rust → Java** lookup (regular `fun`, **not** an `external fun`, so absent from the JNI symbol-contract table below), mirroring `PackageResolver` (rsac-ad8a) |
 | `src/main/AndroidManifest.xml` | Permissions + the `mediaProjection`-typed service (merged into the host app) |
 
 ## JNI symbol contract
@@ -125,3 +126,4 @@ use site:
 | `RsacProjection.kt` | Does `getMediaProjection()` itself throw on API 34+ without the running FGS, or only capture start? |
 | `RsacProjection.kt` (`NATIVE_LIBRARY_NAME`) | cdylib artifact name from cargo-ndk must be `librsac.so` |
 | `CaptureBridge.kt` (`stop()`) | `AudioRecord.stop()` reliably unblocks `READ_BLOCKING` within the join timeout on-device |
+| `RsacDevices.kt` (`inputDevices`) | On-device `AudioManager.getDevices(GET_DEVICES_INPUTS)` output shape: real `getId()` values are positive, `getProductName()` labels contain no `␞`/`␟`, and the default-input ordering assumption holds (rsac-e6d3) |

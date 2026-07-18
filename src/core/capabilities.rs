@@ -280,7 +280,8 @@ impl PlatformCapabilities {
     }
 
     /// Android capabilities — AAudio microphone slice (rsac-20cd) +
-    /// `AudioPlaybackCapture` playback tiers (rsac-77f1).
+    /// `AudioPlaybackCapture` playback tiers (rsac-77f1) + real input-device
+    /// selection (rsac-ad8a).
     ///
     /// Honest current state: the compiled backend captures the default audio
     /// input via AAudio (`CaptureTarget::Device`) on every supported API
@@ -291,6 +292,21 @@ impl PlatformCapabilities {
     /// version-probing pattern as macOS's Process Tap gate. On API < 29 the
     /// playback flags are honestly `false` (`AudioPlaybackCaptureConfiguration`
     /// does not exist there).
+    ///
+    /// `supports_device_selection` (rsac-ad8a) is **runtime-gated on the AAR
+    /// enumeration path**: `true` only when `JNI_OnLoad` resolved the
+    /// `RsacDevices` class (see
+    /// [`set_android_device_enumeration_available`]). The AAR's
+    /// `AudioManager.getDevices` list enumerates real input devices and
+    /// `AAudioStreamBuilder_setDeviceId` routes to them (getDevices API 23,
+    /// setDeviceId API 26 — both predate minSdk 29), but a pure-NDK consumer
+    /// (no `System.loadLibrary`, no AAR, or an older AAR without
+    /// `RsacDevices`) only sees the default-route fallback list, where real
+    /// numeric ids are rejected before `setDeviceId` is reached — claiming
+    /// selection support there would mislead device pickers.
+    /// `supports_device_change_notifications` stays `false`
+    /// (`AudioManager.registerAudioDeviceCallback` is a tracked follow-up,
+    /// rsac-d3e2).
     ///
     /// `requires_user_consent: true` when the playback tiers are available:
     /// the [`AndroidProjectionToken`](crate::core::config::AndroidProjectionToken)
@@ -306,10 +322,14 @@ impl PlatformCapabilities {
             supports_system_capture: playback_capture, // AudioPlaybackCapture (rsac-77f1)
             supports_application_capture: playback_capture, // addMatchingUid
             supports_process_tree_capture: playback_capture, // PID→UID (tree ≡ app)
-            // Only the default AAudio input + the logical playback endpoint
-            // are reachable without the Java AudioManager device list
-            // (arrives with rsac-ad8a).
-            supports_device_selection: false,
+            // Device selection (rsac-ad8a) is honest about the enumeration
+            // path: true only when JNI_OnLoad resolved RsacDevices (the
+            // AAudio backend then routes Device(id) via setDeviceId). A
+            // pure-NDK / AAR-less process only has the default-route
+            // fallback list, so selection is reported false there.
+            // Change-notifications (AudioManager.registerAudioDeviceCallback)
+            // remain a tracked follow-up (rsac-d3e2).
+            supports_device_selection: android_device_enumeration_available(),
             supports_device_change_notifications: false,
             // The MediaProjection token is the config-time consent artifact
             // for the playback tiers (ADR-0013); meaningless below API 29
@@ -381,6 +401,34 @@ impl PlatformCapabilities {
 }
 
 // ── macOS version detection ──────────────────────────────────────────────
+
+/// Whether the Android AAR device-enumeration path (`RsacDevices`) resolved
+/// at library load (rsac-ad8a).
+///
+/// The module DAG forbids `core → audio`, so the JNI layer **pushes** this
+/// fact here: `JNI_OnLoad` (src/audio/android/jni.rs) calls
+/// [`set_android_device_enumeration_available`] after building its class
+/// cache. Defaults to `false`, which is the honest answer for a pure-NDK
+/// process (no `System.loadLibrary`, `JNI_OnLoad` never runs) or an older
+/// AAR without `RsacDevices` — in both, only the default-route fallback
+/// device list exists and `Device(id)` selection cannot work.
+#[cfg(target_os = "android")]
+static ANDROID_DEVICE_ENUMERATION_AVAILABLE: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
+/// Records whether the AAR `RsacDevices` enumeration path is available —
+/// called once from `JNI_OnLoad` (rsac-ad8a). See
+/// [`android_device_enumeration_available`].
+#[cfg(target_os = "android")]
+pub fn set_android_device_enumeration_available(available: bool) {
+    ANDROID_DEVICE_ENUMERATION_AVAILABLE.store(available, std::sync::atomic::Ordering::Release);
+}
+
+/// See [`set_android_device_enumeration_available`].
+#[cfg(target_os = "android")]
+pub fn android_device_enumeration_available() -> bool {
+    ANDROID_DEVICE_ENUMERATION_AVAILABLE.load(std::sync::atomic::Ordering::Acquire)
+}
 
 /// Returns the Android API level (SDK version) of the running device, or
 /// `0` when it cannot be determined.
@@ -733,7 +781,28 @@ mod tests {
             "the MediaProjection token is required exactly when the playback \
              tiers exist (ADR-0013)"
         );
-        assert!(!caps.supports_device_selection, "rsac-ad8a pending");
+        // Device selection tracks the runtime AAR-enumeration flag exactly
+        // (rsac-ad8a): false in this JVM-less test process (JNI_OnLoad never
+        // ran), true once RsacDevices resolved at load.
+        assert_eq!(
+            caps.supports_device_selection,
+            android_device_enumeration_available(),
+            "supports_device_selection must mirror the RsacDevices runtime gate"
+        );
+        set_android_device_enumeration_available(true);
+        assert!(
+            PlatformCapabilities::query().supports_device_selection,
+            "AudioManager device list + setDeviceId once RsacDevices resolved (rsac-ad8a)"
+        );
+        set_android_device_enumeration_available(false);
+        assert!(
+            !PlatformCapabilities::query().supports_device_selection,
+            "pure-NDK / AAR-less: only the fallback list exists"
+        );
+        assert!(
+            !caps.supports_device_change_notifications,
+            "AudioDeviceCallback deferred"
+        );
         assert!(caps.supports_format(SampleFormat::F32));
         assert!(caps.supports_sample_rate(48000));
     }

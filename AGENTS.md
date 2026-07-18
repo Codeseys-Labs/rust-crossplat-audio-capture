@@ -157,7 +157,7 @@ Gradle AAR + xcodebuild SwiftPM builds incl. `librsac.so` in jniLibs with its
 | **Device — default mic** (`Device("default")`) | 🟡 compiled, unverified (rsac-20cd) | 🟡 compiled, unverified (rsac-9e02) |
 | **System default** (= playback capture, ADR-0013) | 🟡 compiled, unverified (rsac-77f1: AAR Kotlin `AudioRecord` loop + JNI ingest; needs `with_android_projection` token + FGS, API 29+) | 🟡 compiled, unverified (rsac-b3aa: ReplayKit ring consumer; needs `with_ios_app_group` + embedded extension + user-started broadcast) |
 | **Application / ByName / ProcessTree** | 🟡 compiled, unverified (rsac-77f1: UID filters; tree ≡ app — same requirements as SystemDefault) | ❌ permanent — no iOS API (never soften) |
-| **Device selection (real device list)** | ⏳ rsac-ad8a (Java AudioManager via AAR) | ❌ session-routed, not free selection |
+| **Device selection (real device list)** | 🟡 compiled, unverified (rsac-ad8a: AudioManager.getDevices list via AAR + AAudioStreamBuilder_setDeviceId; on-device shape unverified — rsac-e6d3) | ❌ session-routed, not free selection |
 
 ---
 

@@ -246,6 +246,13 @@ extern "C" {
         channel_count: i32,
     );
 
+    /// `AAudioStreamBuilder_setDeviceId` — route capture to a specific device
+    /// id (the `AudioDeviceInfo.getId()` value from the AAR's
+    /// `AudioManager.getDevices` list), or [`AAUDIO_UNSPECIFIED`] for the
+    /// default input route. Stable AAudio ABI since API 26 (below the
+    /// module's `minSdk 29`), so unconditionally linkable.
+    pub fn AAudioStreamBuilder_setDeviceId(builder: *mut AAudioStreamBuilder, device_id: i32);
+
     /// `AAudioStreamBuilder_setPerformanceMode` — request
     /// [`AAUDIO_PERFORMANCE_MODE_LOW_LATENCY`] (or another mode hint).
     pub fn AAudioStreamBuilder_setPerformanceMode(

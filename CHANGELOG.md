@@ -20,6 +20,33 @@ Releases with no ABI change omit the subsection (or state "No C ABI changes").
 
 ### Added
 
+- **Bindings (live gain/mute):** exposed `Composition::set_gain` / `set_muted`
+  (+ `gain` / `is_muted` getters, rsac-5a2d) across all four binding layers —
+  C FFI (`rsac_composition_set_gain` / `_set_muted` / `_gain` / `_is_muted`),
+  Node/napi (`setGain`/`setMuted`/`gain`/`isMuted`), Python
+  (`set_gain`/`set_muted`/`gain`/`is_muted`), and Go
+  (`SetGain`/`SetMuted`/`Gain`/`IsMuted`). Sources addressed by group name +
+  within-group index. Setters refuse on a not-started/stopped/ended composition
+  (STREAM_READ / StreamError / ErrStreamRead); getters keep reading a stopped
+  composition. Gain is validated by the core after the f64→f32 narrowing in the
+  dynamically-typed bindings, so a finite-in-f64 value that narrows to inf is
+  rejected. napi/python wrappers take the shared read guard (rsac-8082 topology,
+  &self methods); Go guards the handle mutex + KeepAlive. (rsac-9dec)
+- **Compose (group master gain):** `Composition::set_group_gain` / `group_gain`
+  apply a live per-**group** master gain on a running composition — a linear
+  multiplier applied **on top of** every member source's own gain
+  (`set_gain`), effective on the next compositor tick (~1 quantum). Addressed by
+  group name; seeded to `1.0` (identity) at start. Orthogonal to `set_muted`
+  (a group gain of `0.0` silences the group without touching any source's mute
+  or gain). Backed by a lock-free per-group atomic read on the (non-RT)
+  compositor thread — no RT-path change. Same lifecycle/validation contract as
+  `set_gain`: the setter refuses (`StreamReadError`, `NotInitialized` before
+  start / `NotRunning` after stop/end) and `ConfigurationError` for an unknown
+  group or a non-finite/negative gain; the getter keeps reading the last-applied
+  value on a stopped composition. `CompositionStats` gains a `groups: Vec<GroupStats>`
+  field (new `#[non_exhaustive]` struct) exposing every group's current gain in
+  one snapshot. Additive-only; `cargo-semver-checks` reports `minor`. No C ABI
+  change this release; language bindings handled separately. (rsac-1ce7)
 - **Compose (live mixing):** `Composition::set_gain` / `set_muted` (+ `gain` /
   `is_muted` getters) apply per-source level and mute changes on a **running**
   composition, effective on the next compositor tick (~1 quantum latency).
@@ -32,7 +59,7 @@ Releases with no ABI change omit the subsection (or state "No C ABI changes").
   tick would ever apply the change (CodeRabbit PR #62); the getters keep
   reading the last-applied values. `SourceStats` gains `gain` / `muted`
   fields (the `#[non_exhaustive]` struct makes this non-breaking). Group-level
-  master gain is deferred (tracked in rsac-1ce7). No C ABI / bindings change this
+  master gain is provided by `set_group_gain` (rsac-1ce7). No C ABI / bindings change this
   release. Additive-only; `cargo-semver-checks` reports `minor`. (rsac-5a2d)
 - **Bindings (Node/napi):** `Composition`, `CompositionBuilder`, `Group` classes
   exposing multi-source channel composition (ADR-0011) — the same
@@ -97,6 +124,28 @@ Releases with no ABI change omit the subsection (or state "No C ABI changes").
   started"/"stopped" from "not yet running" (rsac-feb4). Additive-only;
   `StreamReadError`'s shape is unchanged and `cargo-semver-checks 0.48.0`
   confirms "no semver update required" against v0.4.2.
+- **core (Android):** real input-device enumeration and selection (rsac-ad8a).
+  `enumerate_devices()` now lists the real input devices from the AAR's
+  `AudioManager.getDevices` list (via a new `RsacDevices` Rust→Java helper +
+  JNI) between the default-route sentinel and the playback-capture endpoint,
+  and `CaptureTarget::Device(<numeric AudioDeviceInfo id>)` routes to a
+  specific device via the new `AAudioStreamBuilder_setDeviceId` binding; only a
+  non-numeric / non-positive id yields `DeviceNotFound`. `PlatformCapabilities`
+  now reports `supports_device_selection: true` (unconditional —
+  `getDevices` API 23, `setDeviceId` API 26, both predate minSdk 29);
+  `supports_device_change_notifications` stays `false` (deferred, rsac-d3e2).
+  When the JNI list is unavailable (host tests / pure-NDK consumers with no
+  `JavaVM`, the AAR classes absent, or the Java call threw), enumeration falls
+  back to the pre-existing two-device list (default mic sentinel + playback) —
+  no fabricated devices. Rust-internal + Kotlin change: no C ABI / bindings
+  change (`index.d.ts` / `__init__.pyi` / `rsac_generated.h` untouched); the
+  public `DeviceEnumerator` / `AudioDevice` surface is additive-only.
+  Device names (and Java exception messages) are decoded from the JNI
+  `java.lang.String` via `GetStringChars` (UTF-16), not `GetStringUTFChars`
+  (modified UTF-8 / CESU-8), so supplementary-plane code points in a
+  `productName` (emoji, rare CJK) survive the boundary instead of being
+  mangled to U+FFFD. Compiled for `aarch64-linux-android`; on-device
+  verification is rsac-e6d3.
 
 ### Changed
 
@@ -203,10 +252,20 @@ Releases with no ABI change omit the subsection (or state "No C ABI changes").
 
 ### C ABI changes
 
-- No C ABI changes. `rsac_builder_set_android_projection` keeps its `int64_t`
-  signature; the single-owner `MediaProjection` token contract (rsac-3407) is
-  documented on the symbol. The library enforces it only for a *cloned*
-  builder/config (which share one deletion latch → the second
+- **New exported symbols (MAJOR for the FFI surface).** Added four
+  `RSAC_FEATURE_COMPOSE`-gated functions to `rsac-ffi`:
+  `rsac_composition_set_gain(const RsacComposition*, const char* group, size_t source_idx, float gain)`,
+  `rsac_composition_set_muted(const RsacComposition*, const char* group, size_t source_idx, int32_t muted)`,
+  `rsac_composition_gain(const RsacComposition*, const char* group, size_t source_idx, float* out_gain)`,
+  `rsac_composition_is_muted(const RsacComposition*, const char* group, size_t source_idx, int32_t* out_muted)`.
+  Existing symbols and layouts are unchanged; this is purely additive to the
+  header, but new exported entry points are a MAJOR bump for consumers who pin
+  the shared library. Regenerate `rsac_generated.h` (cbindgen) and mirror the
+  prototypes in the curated `rsac.h`. (rsac-9dec)
+- No change to existing symbols. `rsac_builder_set_android_projection` keeps its
+  `int64_t` signature; the single-owner `MediaProjection` token contract
+  (rsac-3407) is documented on the symbol. The library enforces it only for a
+  *cloned* builder/config (which share one deletion latch → the second
   `rsac_builder_build()` fails with `RSAC_ERROR_STREAM_FAILED`); it does **not**
   deduplicate on the raw `int64_t`, so supplying the same handle to two
   independently constructed builders is an unguarded double-delete (UB) that

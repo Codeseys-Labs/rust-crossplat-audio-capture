@@ -995,6 +995,164 @@ pub unsafe extern "C" fn rsac_composition_source_target(
     }
 }
 
+// ── Live per-source gain / mute (rsac-5a2d) ──────────────────────────────
+
+/// Sets a source's live mix gain on a **running** composition (rsac-5a2d).
+///
+/// The source is addressed by its group `name` (a NUL-terminated UTF-8 string)
+/// plus its `source_idx` **within that group** (0-based, declaration order —
+/// this is *not* the flat cross-group index the `_source_*` accessors take).
+/// `gain` must be finite and ≥ 0; it is validated by the core (after any f32
+/// narrowing the caller performed), not eagerly here.
+///
+/// Returns `RSAC_ERROR_NULL_POINTER` if `comp` or `group` is null,
+/// `RSAC_ERROR_INVALID_PARAMETER` if `group` is not valid UTF-8,
+/// `RSAC_ERROR_STREAM_READ` if the composition has not been started or has
+/// stopped/ended (no tick would apply the change), and
+/// `RSAC_ERROR_CONFIGURATION` for an unknown group, an out-of-range
+/// `source_idx`, or an invalid `gain`.
+#[no_mangle]
+pub unsafe extern "C" fn rsac_composition_set_gain(
+    comp: *const RsacComposition,
+    group: *const c_char,
+    source_idx: usize,
+    gain: f32,
+) -> rsac_error_t {
+    catch(|| {
+        if comp.is_null() {
+            set_last_error("composition is null");
+            return rsac_error_t::RSAC_ERROR_NULL_POINTER;
+        }
+        let group_str = match unsafe { read_c_str(group, "group") } {
+            Ok(s) => s,
+            Err(code) => return code,
+        };
+        let c = unsafe { &*comp };
+        match c.inner.set_gain(group_str, source_idx, gain) {
+            Ok(()) => rsac_error_t::RSAC_OK,
+            Err(e) => handle_rsac_error(e),
+        }
+    })
+}
+
+/// Mutes (`muted` nonzero) or unmutes (`muted` 0) a source on a **running**
+/// composition (rsac-5a2d). Muting is a separate flag from gain: while muted the
+/// source contributes silence; unmuting restores its gain untouched. Addressed
+/// exactly like [`rsac_composition_set_gain`].
+///
+/// Returns `RSAC_ERROR_NULL_POINTER` if `comp` or `group` is null,
+/// `RSAC_ERROR_INVALID_PARAMETER` if `group` is not valid UTF-8,
+/// `RSAC_ERROR_STREAM_READ` before start / after stop or end, and
+/// `RSAC_ERROR_CONFIGURATION` for an unknown group or out-of-range `source_idx`.
+#[no_mangle]
+pub unsafe extern "C" fn rsac_composition_set_muted(
+    comp: *const RsacComposition,
+    group: *const c_char,
+    source_idx: usize,
+    muted: i32,
+) -> rsac_error_t {
+    catch(|| {
+        if comp.is_null() {
+            set_last_error("composition is null");
+            return rsac_error_t::RSAC_ERROR_NULL_POINTER;
+        }
+        let group_str = match unsafe { read_c_str(group, "group") } {
+            Ok(s) => s,
+            Err(code) => return code,
+        };
+        let c = unsafe { &*comp };
+        match c.inner.set_muted(group_str, source_idx, muted != 0) {
+            Ok(()) => rsac_error_t::RSAC_OK,
+            Err(e) => handle_rsac_error(e),
+        }
+    })
+}
+
+/// Reads back a source's current stored per-source gain into `*out_gain`
+/// (rsac-5a2d) — the `rsac_composition_set_gain` value (or the build-time
+/// seed). The actual mixed output also depends on the source's mute flag and
+/// the group's master gain. Same addressing as [`rsac_composition_set_gain`].
+/// Unlike the setter this **keeps working on a stopped or ended composition**
+/// — it only fails before the first successful start.
+///
+/// Returns `RSAC_ERROR_NULL_POINTER` if `comp`, `group`, or `out_gain` is null,
+/// `RSAC_ERROR_INVALID_PARAMETER` if `group` is not valid UTF-8,
+/// `RSAC_ERROR_STREAM_READ` only if the composition has never been started, and
+/// `RSAC_ERROR_CONFIGURATION` for an unknown group or out-of-range `source_idx`.
+/// `out_gain` is an out-parameter, not a handle — nothing to free; it is written
+/// only on `RSAC_OK`.
+#[no_mangle]
+pub unsafe extern "C" fn rsac_composition_gain(
+    comp: *const RsacComposition,
+    group: *const c_char,
+    source_idx: usize,
+    out_gain: *mut f32,
+) -> rsac_error_t {
+    catch(|| {
+        if comp.is_null() {
+            set_last_error("composition is null");
+            return rsac_error_t::RSAC_ERROR_NULL_POINTER;
+        }
+        if out_gain.is_null() {
+            set_last_error("out_gain pointer is null");
+            return rsac_error_t::RSAC_ERROR_NULL_POINTER;
+        }
+        let group_str = match unsafe { read_c_str(group, "group") } {
+            Ok(s) => s,
+            Err(code) => return code,
+        };
+        let c = unsafe { &*comp };
+        match c.inner.gain(group_str, source_idx) {
+            Ok(g) => {
+                unsafe { *out_gain = g };
+                rsac_error_t::RSAC_OK
+            }
+            Err(e) => handle_rsac_error(e),
+        }
+    })
+}
+
+/// Reads back whether a source is currently muted into `*out_muted` (0/1)
+/// (rsac-5a2d). Same addressing and stopped-composition behavior as
+/// [`rsac_composition_gain`].
+///
+/// Returns `RSAC_ERROR_NULL_POINTER` if `comp`, `group`, or `out_muted` is null,
+/// `RSAC_ERROR_INVALID_PARAMETER` if `group` is not valid UTF-8,
+/// `RSAC_ERROR_STREAM_READ` only if the composition has never been started, and
+/// `RSAC_ERROR_CONFIGURATION` for an unknown group or out-of-range `source_idx`.
+/// `out_muted` is an out-parameter, not a handle — nothing to free; it is
+/// written only on `RSAC_OK`.
+#[no_mangle]
+pub unsafe extern "C" fn rsac_composition_is_muted(
+    comp: *const RsacComposition,
+    group: *const c_char,
+    source_idx: usize,
+    out_muted: *mut i32,
+) -> rsac_error_t {
+    catch(|| {
+        if comp.is_null() {
+            set_last_error("composition is null");
+            return rsac_error_t::RSAC_ERROR_NULL_POINTER;
+        }
+        if out_muted.is_null() {
+            set_last_error("out_muted pointer is null");
+            return rsac_error_t::RSAC_ERROR_NULL_POINTER;
+        }
+        let group_str = match unsafe { read_c_str(group, "group") } {
+            Ok(s) => s,
+            Err(code) => return code,
+        };
+        let c = unsafe { &*comp };
+        match c.inner.is_muted(group_str, source_idx) {
+            Ok(m) => {
+                unsafe { *out_muted = i32::from(m) };
+                rsac_error_t::RSAC_OK
+            }
+            Err(e) => handle_rsac_error(e),
+        }
+    })
+}
+
 // ── Tests ────────────────────────────────────────────────────────────────
 
 #[cfg(test)]
@@ -1178,7 +1336,84 @@ mod tests {
             rsac_error_t::RSAC_ERROR_NULL_POINTER
         );
 
+        // Live per-source gain/mute (rsac-5a2d): null comp is rejected for all
+        // four; the getters additionally reject a null out-param with a
+        // dangling-but-non-null comp (the out-param check returns first).
+        let group = CString::new("g").unwrap();
+        assert_eq!(
+            unsafe { rsac_composition_set_gain(ptr::null(), group.as_ptr(), 0, 1.0) },
+            rsac_error_t::RSAC_ERROR_NULL_POINTER
+        );
+        assert_eq!(
+            unsafe { rsac_composition_set_muted(ptr::null(), group.as_ptr(), 0, 1) },
+            rsac_error_t::RSAC_ERROR_NULL_POINTER
+        );
+        let mut out_gain: f32 = 0.0;
+        assert_eq!(
+            unsafe { rsac_composition_gain(ptr::null(), group.as_ptr(), 0, &mut out_gain) },
+            rsac_error_t::RSAC_ERROR_NULL_POINTER
+        );
+        assert_eq!(
+            unsafe { rsac_composition_gain(dangling, group.as_ptr(), 0, ptr::null_mut()) },
+            rsac_error_t::RSAC_ERROR_NULL_POINTER
+        );
+        let mut out_muted: i32 = 0;
+        assert_eq!(
+            unsafe { rsac_composition_is_muted(ptr::null(), group.as_ptr(), 0, &mut out_muted) },
+            rsac_error_t::RSAC_ERROR_NULL_POINTER
+        );
+        assert_eq!(
+            unsafe { rsac_composition_is_muted(dangling, group.as_ptr(), 0, ptr::null_mut()) },
+            rsac_error_t::RSAC_ERROR_NULL_POINTER
+        );
+
         unsafe { rsac_composition_free(ptr::null_mut()) };
+    }
+
+    /// Live per-source gain/mute on a built-but-not-started composition: every
+    /// call goes through the composition's not-started guard and surfaces the
+    /// recoverable `RSAC_ERROR_STREAM_READ` (the runtime roundtrip, bounds, and
+    /// not-running paths need a started composition — device-gated, see §6).
+    #[test]
+    fn live_control_before_start_is_stream_read() {
+        let group = new_group("main");
+        add_system_source(group);
+        let builder = new_builder();
+        assert_eq!(
+            unsafe { rsac_composition_builder_add_group(builder, group) },
+            rsac_error_t::RSAC_OK
+        );
+        let mut comp: *mut RsacComposition = ptr::null_mut();
+        assert_eq!(
+            unsafe { rsac_composition_builder_build(builder, &mut comp) },
+            rsac_error_t::RSAC_OK
+        );
+        assert!(!comp.is_null());
+
+        let g = CString::new("main").unwrap();
+        assert_eq!(
+            unsafe { rsac_composition_set_gain(comp, g.as_ptr(), 0, 0.5) },
+            rsac_error_t::RSAC_ERROR_STREAM_READ
+        );
+        assert_eq!(
+            unsafe { rsac_composition_set_muted(comp, g.as_ptr(), 0, 1) },
+            rsac_error_t::RSAC_ERROR_STREAM_READ
+        );
+        let mut out_gain: f32 = -1.0;
+        assert_eq!(
+            unsafe { rsac_composition_gain(comp, g.as_ptr(), 0, &mut out_gain) },
+            rsac_error_t::RSAC_ERROR_STREAM_READ
+        );
+        let mut out_muted: i32 = -1;
+        assert_eq!(
+            unsafe { rsac_composition_is_muted(comp, g.as_ptr(), 0, &mut out_muted) },
+            rsac_error_t::RSAC_ERROR_STREAM_READ
+        );
+        // The last error message is populated and non-empty.
+        let msg = unsafe { CStr::from_ptr(crate::rsac_error_message()) };
+        assert!(!msg.to_bytes().is_empty());
+
+        unsafe { rsac_composition_free(comp) };
     }
 
     // ── Builder validation error paths through the FFI ─────────────────
