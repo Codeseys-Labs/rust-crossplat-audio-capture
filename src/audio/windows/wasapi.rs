@@ -106,7 +106,15 @@ impl WindowsApplicationCapture {
     ///
     /// # Arguments
     /// * `process_id` - PID of the target process
-    /// * `include_tree` - Whether to include child processes in capture
+    /// * `include_tree` - Selects the WASAPI process-loopback mode. `true` uses
+    ///   `PROCESS_LOOPBACK_MODE_INCLUDE_TARGET_PROCESS_TREE` (capture the target
+    ///   PID **and** its descendants). `false` uses
+    ///   `PROCESS_LOOPBACK_MODE_EXCLUDE_TARGET_PROCESS_TREE`, which captures
+    ///   everything **except** that tree — *not* "the target only, no children".
+    ///   The OS mode is binary; there is no strict single-process variant. To
+    ///   capture a single application, pass `true` (INCLUDE-tree of a leaf
+    ///   process is exactly single-process capture). See
+    ///   [ADR-0017](../../../docs/designs/0017-windows-application-capture-include-tree.md).
     ///
     /// # Example
     /// ```rust,no_run

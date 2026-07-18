@@ -48,8 +48,12 @@ impl std::fmt::Display for DeviceId {
 /// application name. When a [`CaptureTarget::Application`] is resolved the
 /// backend parses `ApplicationId.0` as a `u32` PID:
 ///
-/// - **Windows (WASAPI):** process-loopback capture of that single PID
-///   (`include_tree = false`).
+/// - **Windows (WASAPI):** process-loopback capture of that PID using
+///   include-tree mode (`PROCESS_LOOPBACK_MODE_INCLUDE_TARGET_PROCESS_TREE`),
+///   which for a leaf process is exactly single-process capture; audio from
+///   any audio-producing descendants is included too, since the OS mode has no
+///   "this PID only, excluding descendants" variant (rsac-5b59). See
+///   [`CaptureTarget::Application`].
 /// - **Linux (PipeWire):** the first `Stream/Output/Audio` node whose
 ///   `application.process.id` equals the PID.
 /// - **macOS (CoreAudio):** a Process Tap on that single PID.
@@ -241,9 +245,20 @@ pub enum CaptureTarget {
     /// in the [`ApplicationId`] string (see [`ApplicationId`] — the string is a
     /// decimal PID on every platform, not a name or session id).
     ///
-    /// This captures **only that one process's** audio, **not** its child
-    /// processes — use [`ProcessTree`](Self::ProcessTree) for the subtree. A
-    /// non-numeric id, or a PID producing no audio, →
+    /// This targets a **single application**; use [`ProcessTree`](Self::ProcessTree)
+    /// when you explicitly want the subtree. Descendant handling is a documented
+    /// per-platform divergence:
+    ///
+    /// - **Linux (PipeWire) / macOS (CoreAudio):** captures **only** the one
+    ///   process's audio (no descendants).
+    /// - **Windows (WASAPI):** the OS process-loopback mode is binary — it can
+    ///   capture a PID's tree or the complement of that tree, but has no
+    ///   "this PID only, excluding descendants" mode. rsac uses the include-tree
+    ///   mode, which for a leaf process is exactly single-process capture; if the
+    ///   target has audio-producing children their audio is included too
+    ///   (rsac-5b59).
+    ///
+    /// A non-numeric id, or a PID producing no audio, →
     /// [`AudioError::ApplicationNotFound`](crate::core::error::AudioError::ApplicationNotFound)
     /// (Windows may report
     /// [`ApplicationCaptureFailed`](crate::core::error::AudioError::ApplicationCaptureFailed)

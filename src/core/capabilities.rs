@@ -215,7 +215,7 @@ impl PlatformCapabilities {
     fn windows() -> Self {
         Self {
             supports_system_capture: true,
-            supports_application_capture: true, // WASAPI session capture
+            supports_application_capture: true, // WASAPI process-loopback capture
             supports_process_tree_capture: true, // WASAPI include_tree=true
             supports_device_selection: true,
             // IMMNotificationClient watch() arm is implemented (rsac-e360).

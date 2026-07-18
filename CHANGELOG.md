@@ -218,6 +218,22 @@ Releases with no ABI change omit the subsection (or state "No C ABI changes").
 
 ### Fixed
 
+- **Windows per-PID `Application(pid)` / `ApplicationByName` capture delivered
+  only silence (rsac-5b59).** The WASAPI process-loopback backend created the
+  loopback client with `include_tree = false`, which wasapi-rs maps to
+  `PROCESS_LOOPBACK_MODE_EXCLUDE_TARGET_PROCESS_TREE` — "capture everything
+  **except** this PID's tree". When the target app was the only audio source,
+  that captured its complement (silence), even though `ProcessTree(pid)` of the
+  same process captured the tone correctly (it used the INCLUDE mode). The
+  WASAPI mode is binary (INCLUDE-/EXCLUDE-target-tree; there is no
+  "single-PID-only" mode), so single-application capture now passes
+  `include_tree = true`: INCLUDE-tree of a leaf process is exactly
+  single-process capture. If the target has audio-producing children, Windows
+  necessarily includes them too — a documented per-platform divergence on
+  `CaptureTarget::Application` (Linux/macOS remain single-process; see the
+  variant docs and [ADR-0017](docs/designs/0017-windows-application-capture-include-tree.md)).
+  Removes the CI `RSAC_CI_AUDIO_DETERMINISTIC=0` opt-out that previously masked
+  this on the Windows process tier's Application step.
 - **macOS device-watch teardown no longer leaks the `WatchListenerContext` or
   races an in-flight callback (GH #32 / ADR-0005 §5).**
   `DeviceEnumerator::watch` now registers block-based CoreAudio listeners
