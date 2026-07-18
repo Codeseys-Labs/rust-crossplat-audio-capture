@@ -120,4 +120,4 @@ mod stream;
 mod tests;
 
 pub use builder::{ChannelMap, ChannelOrigin, CompositionBuilder, Group, GroupLayout};
-pub use stream::{Composition, CompositionStats, SourceStats};
+pub use stream::{Composition, CompositionStats, GroupStats, SourceStats};

@@ -14,7 +14,8 @@ use crate::core::interface::CapturingStream;
 
 use super::builder::{CompositionBuilder, Group, GroupLayout};
 use super::engine::{
-    Engine, EngineConfig, EngineStatsShared, GroupSpec, SourceReader, SourceSpec, SourceStatsShared,
+    Engine, EngineConfig, EngineStatsShared, GroupSpec, GroupStatsShared, SourceReader, SourceSpec,
+    SourceStatsShared,
 };
 use super::stream::{assemble_pipeline, ComposedStreamView};
 
@@ -114,6 +115,9 @@ impl Harness {
         let stats = Arc::new(EngineStatsShared {
             sources: (0..readers.len())
                 .map(|_| Arc::new(SourceStatsShared::default()))
+                .collect(),
+            groups: (0..cfg.groups.len())
+                .map(|_| Arc::new(GroupStatsShared::default()))
                 .collect(),
             ..Default::default()
         });
@@ -1074,6 +1078,353 @@ fn muted_source_still_drains_fifo() {
     harness.shutdown();
 }
 
+// ── Group master gain (rsac-1ce7) ───────────────────────────────────────
+
+/// rsac-1ce7: `Engine::new` seeds every group master gain to identity (1.0),
+/// so a composition with no `set_group_gain` call mixes exactly as before —
+/// the first composed frame reflects the source gain unchanged (not the leaked
+/// `0.0` `GroupStatsShared::default()` bits). Mirrors
+/// `build_time_gain_seeds_effective_gain` one level up.
+#[test]
+fn group_gain_seeds_to_unity() {
+    let (a, _) = ScriptedSource::ending(vec![const_buffer(1.0, 1, 48_000, 480)]);
+    let harness = Harness::spawn(
+        cfg(
+            1,
+            vec![GroupSpec {
+                layout: GroupLayout::Mono,
+                offset: 0,
+                width: 1,
+            }],
+            vec![SourceSpec {
+                gain: 1.0,
+                group: 0,
+                channels: 0,
+                clock_candidate: false,
+            }],
+            0,
+        ),
+        vec![Box::new(a)],
+    );
+    let buffers = harness.drain_to_end();
+    let v = buffers[0].data()[0];
+    assert!(
+        (v - 1.0).abs() < 1e-6,
+        "seeded group gain 1.0 → 1.0, got {v}"
+    );
+    harness.shutdown();
+}
+
+/// rsac-1ce7: writing the live group-gain atomic mid-stream scales the mixed
+/// output on the *next* tick — exactly what `Composition::set_group_gain` does
+/// under the hood. A DC source at source gain 1.0 reads ~1.0; after storing a
+/// group gain of 0.5, a subsequent buffer reads ~0.5.
+#[test]
+fn live_set_group_gain_multiplies_on_next_tick() {
+    let (a, _) = ScriptedSource::live(
+        (0..2000)
+            .map(|_| const_buffer(1.0, 1, 48_000, 480))
+            .collect(),
+    );
+    let harness = Harness::spawn(
+        cfg(
+            1,
+            vec![GroupSpec {
+                layout: GroupLayout::Mono,
+                offset: 0,
+                width: 1,
+            }],
+            vec![SourceSpec {
+                gain: 1.0,
+                group: 0,
+                channels: 0,
+                clock_candidate: false,
+            }],
+            0,
+        ),
+        vec![Box::new(a)],
+    );
+
+    let before = harness.read_first_sample();
+    assert!(
+        (before - 1.0).abs() < 1e-6,
+        "pre-change buffer reflects seeded group gain 1.0, got {before}"
+    );
+
+    // Live group-gain change — identical to what `set_group_gain` performs.
+    harness.stats.groups[0]
+        .gain_bits
+        .store(f32::to_bits(0.5), Ordering::Relaxed);
+
+    let deadline = std::time::Instant::now() + Duration::from_secs(5);
+    loop {
+        let v = harness.read_first_sample();
+        if (v - 0.5).abs() < 1e-6 {
+            break;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "group-gain change never reached the composed output (last={v})"
+        );
+    }
+    harness.shutdown();
+}
+
+/// rsac-1ce7: the group master gain MULTIPLIES the per-source gain (does not
+/// replace it). Source gain 0.5 × group gain 0.5 → 0.25. A live source is
+/// polled until convergence so the measured buffer definitely postdates the
+/// group-gain store (avoiding a race with the engine's first tick).
+#[test]
+fn group_gain_multiplies_source_gain_not_replaces() {
+    let (a, _) = ScriptedSource::live(
+        (0..4000)
+            .map(|_| const_buffer(1.0, 1, 48_000, 480))
+            .collect(),
+    );
+    let harness = Harness::spawn(
+        cfg(
+            1,
+            vec![GroupSpec {
+                layout: GroupLayout::Mono,
+                offset: 0,
+                width: 1,
+            }],
+            vec![SourceSpec {
+                gain: 0.5,
+                group: 0,
+                channels: 0,
+                clock_candidate: false,
+            }],
+            0,
+        ),
+        vec![Box::new(a)],
+    );
+
+    // Seeded source gain 0.5 × seeded group gain 1.0 → baseline 0.5.
+    let before = harness.read_first_sample();
+    assert!(
+        (before - 0.5).abs() < 1e-6,
+        "baseline = source gain 0.5 × group gain 1.0 = 0.5, got {before}"
+    );
+
+    // Group gain 0.5 → output converges to 0.5 × 0.5 = 0.25 (multiply).
+    harness.stats.groups[0]
+        .gain_bits
+        .store(f32::to_bits(0.5), Ordering::Relaxed);
+    let deadline = std::time::Instant::now() + Duration::from_secs(5);
+    loop {
+        let v = harness.read_first_sample();
+        if (v - 0.25).abs() < 1e-6 {
+            break;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "source 0.5 × group 0.5 = 0.25 never reached output (last={v})"
+        );
+    }
+    harness.shutdown();
+}
+
+/// rsac-1ce7: the group master gain scales EVERY source in that group, and a
+/// source in a *different* group is unaffected — proving per-group scoping via
+/// `spec.group`.
+#[test]
+fn group_gain_scales_all_sources_in_group() {
+    // Group 0 (mono): two sources, values 0.5 and 0.3 → baseline sum 0.8.
+    let (a0, _) = ScriptedSource::live(
+        (0..4000)
+            .map(|_| const_buffer(0.5, 1, 48_000, 480))
+            .collect(),
+    );
+    let (a1, _) = ScriptedSource::live(
+        (0..4000)
+            .map(|_| const_buffer(0.3, 1, 48_000, 480))
+            .collect(),
+    );
+    // Group 1 (mono, master): one source at 0.7 — must stay unaffected.
+    let (b0, _) = ScriptedSource::live(
+        (0..4000)
+            .map(|_| const_buffer(0.7, 1, 48_000, 480))
+            .collect(),
+    );
+
+    let harness = Harness::spawn(
+        cfg(
+            2,
+            vec![
+                GroupSpec {
+                    layout: GroupLayout::Mono,
+                    offset: 0,
+                    width: 1,
+                },
+                GroupSpec {
+                    layout: GroupLayout::Mono,
+                    offset: 1,
+                    width: 1,
+                },
+            ],
+            vec![
+                SourceSpec {
+                    gain: 1.0,
+                    group: 0,
+                    channels: 0,
+                    clock_candidate: false,
+                },
+                SourceSpec {
+                    gain: 1.0,
+                    group: 0,
+                    channels: 0,
+                    clock_candidate: false,
+                },
+                SourceSpec {
+                    gain: 1.0,
+                    group: 1,
+                    channels: 0,
+                    clock_candidate: false,
+                },
+            ],
+            2,
+        ),
+        vec![Box::new(a0), Box::new(a1), Box::new(b0)],
+    );
+
+    // Baseline: group 0 sums to 0.8, group 1 stays at 0.7.
+    let read_frame = |h: &Harness| -> (f32, f32) {
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        loop {
+            match h.stream.try_read_chunk() {
+                Ok(Some(b)) => {
+                    let d = b.data();
+                    return (d[0], d[1]);
+                }
+                Ok(None) => {
+                    assert!(std::time::Instant::now() < deadline, "no buffer in time");
+                    std::thread::sleep(Duration::from_millis(1));
+                }
+                Err(e) => panic!("unexpected error: {e:?}"),
+            }
+        }
+    };
+    let (g0, g1) = read_frame(&harness);
+    assert!((g0 - 0.8).abs() < 1e-6, "group 0 baseline 0.8, got {g0}");
+    assert!((g1 - 0.7).abs() < 1e-6, "group 1 baseline 0.7, got {g1}");
+
+    // Scale group 0 by 0.5 → converges to 0.4; group 1 stays 0.7.
+    harness.stats.groups[0]
+        .gain_bits
+        .store(f32::to_bits(0.5), Ordering::Relaxed);
+    let deadline = std::time::Instant::now() + Duration::from_secs(5);
+    loop {
+        let (g0, g1) = read_frame(&harness);
+        assert!(
+            (g1 - 0.7).abs() < 1e-6,
+            "group 1 must be unaffected by group 0's gain, got {g1}"
+        );
+        if (g0 - 0.4).abs() < 1e-6 {
+            break;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "group 0 never converged to 0.4 (last={g0})"
+        );
+    }
+    harness.shutdown();
+}
+
+/// rsac-1ce7: a group gain of 0.0 silences the whole group but leaves each
+/// source's `muted`/`gain_bits` untouched — raising the group gain restores the
+/// group. Complement (mute-orthogonality): a muted source stays silent even at
+/// group gain 2.0 (mute zeroes the source contribution first).
+#[test]
+fn group_gain_zero_silences_but_preserves_mute_and_gain() {
+    let (a, _) = ScriptedSource::live(
+        (0..4000)
+            .map(|_| const_buffer(0.5, 1, 48_000, 480))
+            .collect(),
+    );
+    let harness = Harness::spawn(
+        cfg(
+            1,
+            vec![GroupSpec {
+                layout: GroupLayout::Mono,
+                offset: 0,
+                width: 1,
+            }],
+            vec![SourceSpec {
+                gain: 1.0,
+                group: 0,
+                channels: 0,
+                clock_candidate: false,
+            }],
+            0,
+        ),
+        vec![Box::new(a)],
+    );
+
+    // Baseline nonzero.
+    let before = harness.read_first_sample();
+    assert!((before - 0.5).abs() < 1e-6, "baseline 0.5, got {before}");
+
+    // Group gain 0.0 → silence.
+    harness.stats.groups[0]
+        .gain_bits
+        .store(f32::to_bits(0.0), Ordering::Relaxed);
+    let deadline = std::time::Instant::now() + Duration::from_secs(5);
+    loop {
+        let v = harness.read_first_sample();
+        if v.abs() < 1e-9 {
+            break;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "group gain 0.0 never silenced the group (last={v})"
+        );
+    }
+    // The source's mute flag and gain are untouched.
+    assert!(!harness.stats.sources[0].muted.load(Ordering::Relaxed));
+    assert!(
+        (f32::from_bits(harness.stats.sources[0].gain_bits.load(Ordering::Relaxed)) - 1.0).abs()
+            < 1e-6,
+        "source gain must be untouched by group gain 0.0"
+    );
+
+    // Raise group gain back to 1.0 → group returns.
+    harness.stats.groups[0]
+        .gain_bits
+        .store(f32::to_bits(1.0), Ordering::Relaxed);
+    let deadline = std::time::Instant::now() + Duration::from_secs(5);
+    loop {
+        let v = harness.read_first_sample();
+        if (v - 0.5).abs() < 1e-6 {
+            break;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "raising the group gain did not restore the group (last={v})"
+        );
+    }
+
+    // Mute-orthogonality: mute the source, set group gain 2.0 → still silent.
+    harness.stats.sources[0]
+        .muted
+        .store(true, Ordering::Relaxed);
+    harness.stats.groups[0]
+        .gain_bits
+        .store(f32::to_bits(2.0), Ordering::Relaxed);
+    let deadline = std::time::Instant::now() + Duration::from_secs(5);
+    loop {
+        let v = harness.read_first_sample();
+        if v.abs() < 1e-9 {
+            break;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "a muted source must stay silent regardless of group gain (last={v})"
+        );
+    }
+    harness.shutdown();
+}
+
 /// Regression guard for the ended-master pacing flaw: when the configured
 /// master source ends while another source stays live, the clock is
 /// re-elected to the live source and output continues at **full data rate**
@@ -1760,6 +2111,13 @@ fn control_composition() -> super::Composition {
                 Arc::new(s)
             })
             .collect(),
+        groups: (0..2)
+            .map(|_| {
+                let g = GroupStatsShared::default();
+                g.gain_bits.store(f32::to_bits(1.0), Ordering::Relaxed);
+                Arc::new(g)
+            })
+            .collect(),
         ..Default::default()
     });
     composition.attach_stats_for_tests(stats);
@@ -1842,6 +2200,82 @@ fn set_gain_and_get_gain_roundtrip() {
     assert!(!c.is_muted("a", 1).unwrap());
 }
 
+/// rsac-1ce7: `set_group_gain` then `group_gain` roundtrips; `stats().groups`
+/// reflects the same value in declaration order; a sibling group stays 1.0.
+#[test]
+fn set_group_gain_and_group_gain_roundtrip() {
+    let c = control_composition();
+    c.set_group_gain("a", 0.5).expect("valid set_group_gain");
+    assert!((c.group_gain("a").unwrap() - 0.5).abs() < 1e-6);
+    // Sibling group "b" is untouched (seeded 1.0).
+    assert!((c.group_gain("b").unwrap() - 1.0).abs() < 1e-6);
+
+    // stats().groups reflects the same values in declaration order.
+    let stats = c.stats().expect("stats present");
+    assert_eq!(stats.groups.len(), 2);
+    assert_eq!(stats.groups[0].group, "a");
+    assert_eq!(stats.groups[1].group, "b");
+    assert!((stats.groups[0].gain - 0.5).abs() < 1e-6);
+    assert!((stats.groups[1].gain - 1.0).abs() < 1e-6);
+}
+
+/// rsac-1ce7: `set_group_gain` rejects a non-finite/negative gain with
+/// `ConfigurationError`; a valid 0.0/2.0 still succeeds.
+#[test]
+fn set_group_gain_rejects_invalid_value() {
+    let c = control_composition();
+    for bad in [-0.5f32, f32::NAN, f32::INFINITY] {
+        assert!(
+            matches!(
+                c.set_group_gain("a", bad),
+                Err(AudioError::ConfigurationError { .. })
+            ),
+            "group gain {bad} must be rejected"
+        );
+    }
+    assert!(c.set_group_gain("a", 0.0).is_ok());
+    assert!(c.set_group_gain("a", 2.0).is_ok());
+}
+
+/// rsac-1ce7: `set_group_gain`/`group_gain` reject an unknown group name with
+/// `ConfigurationError`.
+#[test]
+fn set_group_gain_rejects_unknown_group() {
+    let c = control_composition();
+    assert!(matches!(
+        c.set_group_gain("nope", 1.0),
+        Err(AudioError::ConfigurationError { .. })
+    ));
+    assert!(matches!(
+        c.group_gain("nope"),
+        Err(AudioError::ConfigurationError { .. })
+    ));
+}
+
+/// rsac-1ce7: on a not-started composition (no stats attached),
+/// `set_group_gain`/`group_gain` error with `StreamReadError` classified
+/// `NotInitialized`.
+#[test]
+fn group_gain_on_unstarted_is_not_initialized() {
+    let c = CompositionBuilder::new()
+        .group(
+            Group::new("a")
+                .source(crate::core::config::CaptureTarget::SystemDefault)
+                .mixdown(GroupLayout::Mono),
+        )
+        .build()
+        .expect("device-free build");
+
+    for err in [
+        c.set_group_gain("a", 0.5)
+            .expect_err("set_group_gain not started"),
+        c.group_gain("a").expect_err("group_gain not started"),
+    ] {
+        assert!(matches!(err, AudioError::StreamReadError { .. }));
+        assert_eq!(err.lifecycle_stage(), Some(LifecycleStage::NotInitialized));
+    }
+}
+
 #[test]
 fn control_on_unstarted_composition_is_not_initialized() {
     // No stats attached → not started.
@@ -1920,6 +2354,11 @@ fn live_controls_refuse_after_composition_ends() {
         composition
             .set_muted("g", 0, true)
             .expect_err("set_muted after end"),
+        // rsac-1ce7: the group-gain setter refuses after the composition ends,
+        // same as the per-source setters.
+        composition
+            .set_group_gain("g", 0.5)
+            .expect_err("set_group_gain after end"),
     ] {
         assert!(matches!(err, AudioError::StreamReadError { .. }));
         assert_eq!(err.lifecycle_stage(), Some(LifecycleStage::NotRunning));
@@ -1927,4 +2366,6 @@ fn live_controls_refuse_after_composition_ends() {
     // Getters still read the last-applied values of the ended composition.
     assert!((composition.gain("g", 0).unwrap() - 1.0).abs() < 1e-6);
     assert!(!composition.is_muted("g", 0).unwrap());
+    // rsac-1ce7: the group-gain getter keeps reading the last value (seeded 1.0).
+    assert!((composition.group_gain("g").unwrap() - 1.0).abs() < 1e-6);
 }

@@ -32,6 +32,21 @@ Releases with no ABI change omit the subsection (or state "No C ABI changes").
   dynamically-typed bindings, so a finite-in-f64 value that narrows to inf is
   rejected. napi/python wrappers take the shared read guard (rsac-8082 topology,
   &self methods); Go guards the handle mutex + KeepAlive. (rsac-9dec)
+- **Compose (group master gain):** `Composition::set_group_gain` / `group_gain`
+  apply a live per-**group** master gain on a running composition — a linear
+  multiplier applied **on top of** every member source's own gain
+  (`set_gain`), effective on the next compositor tick (~1 quantum). Addressed by
+  group name; seeded to `1.0` (identity) at start. Orthogonal to `set_muted`
+  (a group gain of `0.0` silences the group without touching any source's mute
+  or gain). Backed by a lock-free per-group atomic read on the (non-RT)
+  compositor thread — no RT-path change. Same lifecycle/validation contract as
+  `set_gain`: the setter refuses (`StreamReadError`, `NotInitialized` before
+  start / `NotRunning` after stop/end) and `ConfigurationError` for an unknown
+  group or a non-finite/negative gain; the getter keeps reading the last-applied
+  value on a stopped composition. `CompositionStats` gains a `groups: Vec<GroupStats>`
+  field (new `#[non_exhaustive]` struct) exposing every group's current gain in
+  one snapshot. Additive-only; `cargo-semver-checks` reports `minor`. No C ABI
+  change this release; language bindings handled separately. (rsac-1ce7)
 - **Compose (live mixing):** `Composition::set_gain` / `set_muted` (+ `gain` /
   `is_muted` getters) apply per-source level and mute changes on a **running**
   composition, effective on the next compositor tick (~1 quantum latency).
@@ -44,7 +59,7 @@ Releases with no ABI change omit the subsection (or state "No C ABI changes").
   tick would ever apply the change (CodeRabbit PR #62); the getters keep
   reading the last-applied values. `SourceStats` gains `gain` / `muted`
   fields (the `#[non_exhaustive]` struct makes this non-breaking). Group-level
-  master gain is deferred (tracked in rsac-1ce7). No C ABI / bindings change this
+  master gain is provided by `set_group_gain` (rsac-1ce7). No C ABI / bindings change this
   release. Additive-only; `cargo-semver-checks` reports `minor`. (rsac-5a2d)
 - **Bindings (Node/napi):** `Composition`, `CompositionBuilder`, `Group` classes
   exposing multi-source channel composition (ADR-0011) — the same

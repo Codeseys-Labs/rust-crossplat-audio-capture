@@ -95,6 +95,21 @@ pub(crate) struct SourceStatsShared {
     pub muted: AtomicBool,
 }
 
+/// Lock-free per-group counters shared between the engine thread and the
+/// public [`Composition`](super::Composition) handle (rsac-1ce7).
+#[derive(Debug, Default)]
+pub(crate) struct GroupStatsShared {
+    /// Group master gain, as `f32` bits (`to_bits`/`from_bits`). A live linear
+    /// multiplier applied **on top of** each member source's effective gain,
+    /// read once per group-member per tick in [`Engine::emit_tick`]. Seeded to
+    /// `1.0` (identity) in [`Engine::new`] — the `Default` bits `0` (= `0.0`)
+    /// never leak. Written by
+    /// [`Composition::set_group_gain`](super::Composition::set_group_gain),
+    /// read by the (non-RT) compositor thread. `Relaxed`: one writer, one
+    /// reader, no cross-field ordering invariant (last-writer-wins fader).
+    pub gain_bits: AtomicU32,
+}
+
 /// Lock-free composition-wide counters.
 #[derive(Debug, Default)]
 pub(crate) struct EngineStatsShared {
@@ -104,6 +119,8 @@ pub(crate) struct EngineStatsShared {
     pub fallback_ticks: AtomicU64,
     /// Per-source counters, in flat declaration order.
     pub sources: Vec<Arc<SourceStatsShared>>,
+    /// Per-group master-gain state, in group declaration order (rsac-1ce7).
+    pub groups: Vec<Arc<GroupStatsShared>>,
 }
 
 // ── Engine configuration ────────────────────────────────────────────────
@@ -246,6 +263,13 @@ impl Engine {
                 }
             })
             .collect();
+        debug_assert_eq!(stats.groups.len(), cfg.groups.len());
+        // rsac-1ce7: seed every group master gain to identity (1.0) at the
+        // single construction point, so the default 0.0 bits never leak and a
+        // composition with no set_group_gain call mixes exactly as before.
+        for g in &stats.groups {
+            g.gain_bits.store(f32::to_bits(1.0), Ordering::Relaxed);
+        }
         let total_channels = usize::from(cfg.composed_format.channels);
         let quantum = cfg.quantum_frames;
         Self {
@@ -699,16 +723,24 @@ impl Engine {
             let ch = usize::from(s.spec.channels.max(1));
             let group = &self.cfg.groups[s.spec.group];
 
-            // rsac-5a2d: the effective per-source gain is the live atomic
-            // (seeded from `SourceSpec.gain` in `Engine::new`, updated by
-            // `Composition::set_gain`), zeroed while muted. Read once per source
-            // per tick on this non-RT compositor thread; the FIFO still drains
-            // below regardless, so a muted/zero-gain source stays time-aligned.
-            let gain = if s.stats.muted.load(Ordering::Relaxed) {
+            // rsac-5a2d / rsac-1ce7: effective mix gain =
+            //   (muted ? 0.0 : source_gain) * group_master_gain
+            // Both live atomics, read once per source per tick on this non-RT
+            // compositor thread. Mute zeroes the source contribution first; the
+            // group master gain (rsac-1ce7) then scales the whole group on top,
+            // and never clears the mute. The FIFO still drains below regardless,
+            // so a muted/zero-gain source stays time-aligned.
+            let source_gain = if s.stats.muted.load(Ordering::Relaxed) {
                 0.0
             } else {
                 f32::from_bits(s.stats.gain_bits.load(Ordering::Relaxed))
             };
+            let group_gain = f32::from_bits(
+                self.stats.groups[s.spec.group]
+                    .gain_bits
+                    .load(Ordering::Relaxed),
+            );
+            let gain = source_gain * group_gain;
 
             let have_frames = s.fifo_frames();
             let take = have_frames.min(frames);
