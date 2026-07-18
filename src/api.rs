@@ -388,6 +388,39 @@ impl AudioCaptureBuilder {
             _ => {}
         }
 
+        // ── Validate sample rate ────────────────────────────────────
+        // Parameter validation runs BEFORE the consent preflights below: an
+        // invalid config is an invalid config regardless of consent state,
+        // and reporting UserConsentRequired for a channels=0 build would
+        // send the caller chasing a consent dialog that cannot help. (Found
+        // by the first-ever run of the cfg(ios) unit tests on the simulator
+        // leg, rsac-97c8 — 15 param-validation tests misreported consent.)
+        if !SUPPORTED_SAMPLE_RATES.contains(&self.config.sample_rate) {
+            return Err(AudioError::InvalidParameter {
+                param: "sample_rate".into(),
+                reason: format!(
+                    "Unsupported sample rate: {} Hz. Supported: {}",
+                    self.config.sample_rate,
+                    PlatformCapabilities::supported_sample_rates_display()
+                ),
+            });
+        }
+
+        // ── Validate channels ───────────────────────────────────────
+        if self.config.channels == 0 {
+            return Err(AudioError::ConfigurationError {
+                message: "Channels must be greater than 0.".to_string(),
+            });
+        }
+        if self.config.channels > MAX_CHANNELS {
+            return Err(AudioError::ConfigurationError {
+                message: format!(
+                    "Number of channels ({}) exceeds the maximum supported ({}).",
+                    self.config.channels, MAX_CHANNELS
+                ),
+            });
+        }
+
         // ── Consent preflight (mobile, ADR-0013 / rsac-82d4) ─────────
         // Live as of rsac-77f1 (the Android playback backend): it fires only
         // when the platform *claims* the requested playback-capture tier AND
@@ -451,33 +484,6 @@ impl AudioCaptureBuilder {
                         .to_string(),
                 });
             }
-        }
-
-        // ── Validate sample rate ────────────────────────────────────
-        if !SUPPORTED_SAMPLE_RATES.contains(&self.config.sample_rate) {
-            return Err(AudioError::InvalidParameter {
-                param: "sample_rate".into(),
-                reason: format!(
-                    "Unsupported sample rate: {} Hz. Supported: {}",
-                    self.config.sample_rate,
-                    PlatformCapabilities::supported_sample_rates_display()
-                ),
-            });
-        }
-
-        // ── Validate channels ───────────────────────────────────────
-        if self.config.channels == 0 {
-            return Err(AudioError::ConfigurationError {
-                message: "Channels must be greater than 0.".to_string(),
-            });
-        }
-        if self.config.channels > MAX_CHANNELS {
-            return Err(AudioError::ConfigurationError {
-                message: format!(
-                    "Number of channels ({}) exceeds the maximum supported ({}).",
-                    self.config.channels, MAX_CHANNELS
-                ),
-            });
         }
 
         Ok(())

@@ -253,6 +253,13 @@ Releases with no ABI change omit the subsection (or state "No C ABI changes").
 
 ### Fixed
 
+- **Builder preflight: parameter validation now precedes the mobile consent
+  checks.** On Android/iOS, a config that was *both* invalid (channels = 0,
+  unsupported sample rate) *and* missing its consent artifact reported
+  `UserConsentRequired` instead of the configuration error — sending callers
+  chasing a consent dialog that could not help. Found by the first-ever
+  execution of the `cfg(ios)` unit tests on the new simulator leg (15
+  param-validation tests misreported; rsac-97c8). Desktop behavior unchanged.
 - **Windows per-PID `Application(pid)` / `ApplicationByName` capture delivered
   only silence (rsac-5b59).** The WASAPI process-loopback backend created the
   loopback client with `include_tree = false`, which wasapi-rs maps to
