@@ -8,10 +8,12 @@
 // faithful to the Go-side logic, but NEVER calls into the real cgo path
 // (C.rsac_capture_read / C.rsac_capture_request_stop / C.rsac_capture_free).
 // This file closes that gap: it drives the actual AudioCapture against a
-// live SystemDefault stream so `go test -race` can catch a real memory-safety
-// bug at the cgo boundary that a Go-only stub structurally cannot exercise
-// (e.g. a race between the FFI's own internal locking and Go's WaitGroup
-// barrier, or a use-after-free of the *C.RsacCapture handle itself).
+// live SystemDefault stream. -race instruments Go memory only: it catches
+// races on the Go-side handle pointer, `closed` flag, and WaitGroup misuse
+// that a stub structurally cannot exercise. A use-after-free of the C-heap
+// object itself is invisible to -race — it surfaces as a crash (step
+// failure), not a race report; real-path drift detection and that crash
+// surface are the incremental coverage over the stub suite.
 //
 // Gating: this needs a LIVE audio device continuously producing buffers (not
 // necessarily a routed deterministic tone — no content assertion is made

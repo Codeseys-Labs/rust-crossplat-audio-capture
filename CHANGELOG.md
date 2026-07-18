@@ -29,7 +29,7 @@ Releases with no ABI change omit the subsection (or state "No C ABI changes").
   prior gain. Backed by lock-free per-source atomics read on the (non-RT)
   compositor thread — no RT-path change. `SourceStats` gains `gain` / `muted`
   fields (the `#[non_exhaustive]` struct makes this non-breaking). Group-level
-  master gain is deferred (follow-up seed). No C ABI / bindings change this
+  master gain is deferred (tracked in rsac-1ce7). No C ABI / bindings change this
   release. Additive-only; `cargo-semver-checks` reports `minor`. (rsac-5a2d)
 - **Bindings (Node/napi):** `Composition`, `CompositionBuilder`, `Group` classes
   exposing multi-source channel composition (ADR-0011) — the same

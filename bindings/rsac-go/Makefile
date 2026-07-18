@@ -172,9 +172,10 @@ test-race: rust-ffi
 	@# Wiring guard: mirrors test-e2e's -list | grep defense — a renamed test
 	@# or dropped build file would otherwise pass vacuously ("no tests to run").
 	@CGO_ENABLED=1 CGO_LDFLAGS="-L$(LIB_DIR) -lrsac_ffi $(EXTRA_LDFLAGS)" \
-	go test -tags rsac_audio_e2e -list 'TestRealDevice_.*_NoRace' ./... \
-	  | grep -q '^TestRealDevice_CloseDuringRead_NoRace$$' \
-	  || { echo "test-race: TestRealDevice_CloseDuringRead_NoRace not discovered under tag rsac_audio_e2e — wiring broken"; exit 1; }
+	go test -tags rsac_audio_e2e -list 'TestRealDevice_.*_NoRace' ./... > /tmp/rsac-race-list.txt \
+	  && grep -q '^TestRealDevice_CloseDuringRead_NoRace$$' /tmp/rsac-race-list.txt \
+	  && grep -q '^TestRealDevice_StreamCancelDuringClose_NoRace$$' /tmp/rsac-race-list.txt \
+	  || { echo "test-race: expected both TestRealDevice_*_NoRace tests discovered under tag rsac_audio_e2e — wiring broken"; cat /tmp/rsac-race-list.txt; exit 1; }
 	CGO_ENABLED=1 \
 	CGO_LDFLAGS="-L$(LIB_DIR) -lrsac_ffi $(EXTRA_LDFLAGS)" \
 	go test -race -v -count=1 -tags rsac_audio_e2e -run 'TestRealDevice_.*_NoRace' -timeout 60s ./...
