@@ -89,7 +89,7 @@ endif
 
 # ── Targets ──────────────────────────────────────────────────────────────
 
-.PHONY: all build rust-ffi go-build test test-pure test-e2e clean lint fmt help
+.PHONY: all build rust-ffi go-build test test-pure test-e2e test-race clean lint fmt help
 
 ## all: Build the Rust staticlib and verify the Go package compiles.
 all: build
@@ -159,6 +159,25 @@ test-e2e: rust-ffi
 	CGO_ENABLED=1 \
 	CGO_LDFLAGS="-L$(LIB_DIR) -lrsac_ffi $(EXTRA_LDFLAGS)" \
 	go test -v -count=1 -tags rsac_audio_e2e -run TestSystemCaptureSmoke ./...
+
+## test-race: Build the FFI staticlib + run the tag-gated real-device race test under -race.
+##
+## Same rsac_audio_e2e tag as test-e2e (both gate on a live audio route; a
+## second tag would double the wiring for no isolation benefit). Separate
+## target/CI step from test-e2e because it runs under -race (roughly 2x
+## runtime + heavier CGO call overhead) and its pass/fail should be recorded
+## independently.
+test-race: rust-ffi
+	@echo "==> Running real-device cgo-boundary race test (tag rsac_audio_e2e, -race)..."
+	@# Wiring guard: mirrors test-e2e's -list | grep defense — a renamed test
+	@# or dropped build file would otherwise pass vacuously ("no tests to run").
+	@CGO_ENABLED=1 CGO_LDFLAGS="-L$(LIB_DIR) -lrsac_ffi $(EXTRA_LDFLAGS)" \
+	go test -tags rsac_audio_e2e -list 'TestRealDevice_.*_NoRace' ./... \
+	  | grep -q '^TestRealDevice_CloseDuringRead_NoRace$$' \
+	  || { echo "test-race: TestRealDevice_CloseDuringRead_NoRace not discovered under tag rsac_audio_e2e — wiring broken"; exit 1; }
+	CGO_ENABLED=1 \
+	CGO_LDFLAGS="-L$(LIB_DIR) -lrsac_ffi $(EXTRA_LDFLAGS)" \
+	go test -race -v -count=1 -tags rsac_audio_e2e -run 'TestRealDevice_.*_NoRace' -timeout 60s ./...
 
 ## lint: Run golangci-lint on the Go package.
 lint:
