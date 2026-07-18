@@ -215,7 +215,7 @@ impl PlatformCapabilities {
     fn windows() -> Self {
         Self {
             supports_system_capture: true,
-            supports_application_capture: true, // WASAPI session capture
+            supports_application_capture: true, // WASAPI process-loopback capture
             supports_process_tree_capture: true, // WASAPI include_tree=true
             supports_device_selection: true,
             // IMMNotificationClient watch() arm is implemented (rsac-e360).
@@ -304,9 +304,17 @@ impl PlatformCapabilities {
     /// `RsacDevices`) only sees the default-route fallback list, where real
     /// numeric ids are rejected before `setDeviceId` is reached — claiming
     /// selection support there would mislead device pickers.
-    /// `supports_device_change_notifications` stays `false`
-    /// (`AudioManager.registerAudioDeviceCallback` is a tracked follow-up,
-    /// rsac-d3e2).
+    ///
+    /// `supports_device_change_notifications` (rsac-d3e2) is **runtime-gated
+    /// on the AAR callback path**: `true` only when `JNI_OnLoad` resolved
+    /// `RsacDevices.registerDeviceCallback` / `unregisterDeviceCallback` and
+    /// registered the `nativeDevicesChanged` native (see
+    /// [`set_android_device_change_notifications_available`]) — the
+    /// `AudioManager.registerAudioDeviceCallback` re-enumerate + diff path
+    /// behind [`DeviceEnumerator::watch`](crate::core::interface::DeviceEnumerator::watch).
+    /// A pure-NDK consumer or an older AAR whose `RsacDevices` predates the
+    /// callback methods honestly reports `false` — exactly the rsac-ad8a
+    /// device-selection gating pattern.
     ///
     /// `requires_user_consent: true` when the playback tiers are available:
     /// the [`AndroidProjectionToken`](crate::core::config::AndroidProjectionToken)
@@ -327,10 +335,14 @@ impl PlatformCapabilities {
             // AAudio backend then routes Device(id) via setDeviceId). A
             // pure-NDK / AAR-less process only has the default-route
             // fallback list, so selection is reported false there.
-            // Change-notifications (AudioManager.registerAudioDeviceCallback)
-            // remain a tracked follow-up (rsac-d3e2).
             supports_device_selection: android_device_enumeration_available(),
-            supports_device_change_notifications: false,
+            // Change notifications (rsac-d3e2) mirror the same honesty
+            // pattern: true only when JNI_OnLoad resolved the RsacDevices
+            // callback methods (register/unregisterDeviceCallback) and
+            // registered nativeDevicesChanged — the AudioDeviceCallback
+            // re-enumerate + diff path behind watch(). False for pure-NDK /
+            // older-AAR consumers, where watch() cannot work.
+            supports_device_change_notifications: android_device_change_notifications_available(),
             // The MediaProjection token is the config-time consent artifact
             // for the playback tiers (ADR-0013); meaningless below API 29
             // where those tiers don't exist.
@@ -428,6 +440,36 @@ pub fn set_android_device_enumeration_available(available: bool) {
 #[cfg(target_os = "android")]
 pub fn android_device_enumeration_available() -> bool {
     ANDROID_DEVICE_ENUMERATION_AVAILABLE.load(std::sync::atomic::Ordering::Acquire)
+}
+
+/// Whether the Android AAR device-change-notification path resolved at
+/// library load (rsac-d3e2).
+///
+/// Same push pattern as [`ANDROID_DEVICE_ENUMERATION_AVAILABLE`] (the module
+/// DAG forbids `core → audio`): `JNI_OnLoad` (src/audio/android/jni.rs) calls
+/// [`set_android_device_change_notifications_available`] after resolving
+/// `RsacDevices.registerDeviceCallback` / `unregisterDeviceCallback` and
+/// registering the `nativeDevicesChanged` native. Defaults to `false` — the
+/// honest answer for a pure-NDK process (`JNI_OnLoad` never runs) or an
+/// older AAR whose `RsacDevices` predates the callback methods, where
+/// `DeviceEnumerator::watch` cannot deliver notifications.
+#[cfg(target_os = "android")]
+static ANDROID_DEVICE_CHANGE_NOTIFICATIONS_AVAILABLE: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
+/// Records whether the AAR `RsacDevices` change-notification path is
+/// available — called once from `JNI_OnLoad` (rsac-d3e2). See
+/// [`android_device_change_notifications_available`].
+#[cfg(target_os = "android")]
+pub fn set_android_device_change_notifications_available(available: bool) {
+    ANDROID_DEVICE_CHANGE_NOTIFICATIONS_AVAILABLE
+        .store(available, std::sync::atomic::Ordering::Release);
+}
+
+/// See [`set_android_device_change_notifications_available`].
+#[cfg(target_os = "android")]
+pub fn android_device_change_notifications_available() -> bool {
+    ANDROID_DEVICE_CHANGE_NOTIFICATIONS_AVAILABLE.load(std::sync::atomic::Ordering::Acquire)
 }
 
 /// Returns the Android API level (SDK version) of the running device, or
@@ -799,9 +841,24 @@ mod tests {
             !PlatformCapabilities::query().supports_device_selection,
             "pure-NDK / AAR-less: only the fallback list exists"
         );
+        // Change notifications track the runtime AAR-callback flag exactly
+        // (rsac-d3e2): false in this JVM-less test process (JNI_OnLoad never
+        // ran), true once the RsacDevices callback methods resolved at load.
+        assert_eq!(
+            caps.supports_device_change_notifications,
+            android_device_change_notifications_available(),
+            "supports_device_change_notifications must mirror the RsacDevices \
+             callback runtime gate"
+        );
+        set_android_device_change_notifications_available(true);
         assert!(
-            !caps.supports_device_change_notifications,
-            "AudioDeviceCallback deferred"
+            PlatformCapabilities::query().supports_device_change_notifications,
+            "AudioDeviceCallback path once RsacDevices callback methods resolved (rsac-d3e2)"
+        );
+        set_android_device_change_notifications_available(false);
+        assert!(
+            !PlatformCapabilities::query().supports_device_change_notifications,
+            "pure-NDK / older-AAR: no callback path"
         );
         assert!(caps.supports_format(SampleFormat::F32));
         assert!(caps.supports_sample_rate(48000));

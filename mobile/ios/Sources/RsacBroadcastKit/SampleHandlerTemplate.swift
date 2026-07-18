@@ -95,14 +95,27 @@ open class RsacBroadcastSampleHandler: RPBroadcastSampleHandler {
 
     override open func broadcastFinished() {
         lock.lock()
-        heartbeatTimer?.cancel()
+        let timer = heartbeatTimer
         heartbeatTimer = nil
-        let p = producer
+        // `producer` is created iff the heartbeat timer is (see
+        // ensureProducer). The producer's final heartbeat + unmap runs in the
+        // timer's cancel handler (startHeartbeatTimer), NOT inline here:
+        // DispatchSource runs the cancel handler after any in-flight event
+        // handler completes and guarantees no further event handler fires, so
+        // close()'s munmap can never race a heartbeat tick that would touch
+        // the ring after the mapping is gone (finding 9). Dropping the
+        // property reference is safe — the cancel handler retains the
+        // producer until it runs.
         producer = nil
         lock.unlock()
 
-        // Final heartbeat + unmap; the file stays for the consumer to drain.
-        p?.close()
+        if let timer = timer {
+            timer.cancel()
+        }
+        // The file stays mapped-and-drainable until the cancel handler's
+        // close(); the consumer's terminal signal is heartbeat staleness, so
+        // this advisory notification's ordering relative to close() is
+        // immaterial (see RingProducer.close()).
         postDarwinNotification(RsacDarwinNotification.finished)
     }
 
@@ -292,6 +305,13 @@ open class RsacBroadcastSampleHandler: RPBroadcastSampleHandler {
         // Captures the producer instance directly — no shared mutable state;
         // stampHeartbeat is a single atomic store, safe from this queue.
         timer.setEventHandler { p.stampHeartbeat() }
+        // close() (final heartbeat + munmap) runs HERE, in the cancel handler,
+        // so it is ordered strictly after any in-flight event handler and no
+        // tick can touch the ring after munmap (finding 9). The handler
+        // retains `p` until it runs, so broadcastFinished may drop the
+        // `producer` property reference immediately. DispatchSource runs a
+        // cancel handler at most once.
+        timer.setCancelHandler { p.close() }
         timer.resume()
         heartbeatTimer = timer
     }

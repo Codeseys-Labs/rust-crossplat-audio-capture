@@ -27,8 +27,11 @@
 //!   [`with_android_projection`]; playback builds without one fail the
 //!   preflight with `UserConsentRequired`.
 //! - **Foreground service** (playback capture, API 34+) — a
-//!   `mediaProjection`-typed FGS must be running before capture starts;
-//!   `RsacCaptureService.start(context)` provides one.
+//!   `mediaProjection`-typed FGS must be confirmed-foreground before the
+//!   projection is acquired. `RsacProjection.request` starts
+//!   `RsacCaptureService` itself on the consent-success path and acquires the
+//!   projection from within the service; hosts must NOT start it earlier
+//!   (rsac-cabf).
 //!
 //! [`with_android_projection`]: crate::api::AudioCaptureBuilder::with_android_projection
 //!
@@ -70,7 +73,10 @@ use crate::bridge::state::StreamState;
 use crate::bridge::{calculate_capacity, create_bridge, BridgeStream};
 use crate::core::config::{AudioFormat, DeviceId, SampleFormat, StreamConfig};
 use crate::core::error::{AudioError, AudioResult};
-use crate::core::interface::{AudioDevice, CapturingStream, DeviceEnumerator, DeviceKind};
+use crate::core::interface::{
+    AudioDevice, CapturingStream, DeviceEnumerator, DeviceEvent, DeviceEventHandler, DeviceKind,
+    DeviceWatcher,
+};
 
 pub use playback::AndroidPlaybackDevice;
 
@@ -185,6 +191,36 @@ fn parse_input_device_records(raw: &str) -> Vec<AndroidInputDevice> {
     devices
 }
 
+/// Diffs a previous input-device id-set against the currently enumerated
+/// devices, producing the [`DeviceEvent::DeviceAdded`] /
+/// [`DeviceEvent::DeviceRemoved`] events and the next id-set (rsac-d3e2).
+///
+/// Pure data — cfg-independent of any FFI, unit-tested on the host. Adds are
+/// emitted first (in `current` order, carrying the device name and
+/// `DeviceKind::Input` — only input devices are enumerated), then removals.
+/// The `"default"` sentinel and `"playback-capture"` endpoint never appear
+/// here: only real numeric `AudioDeviceInfo.getId()` ids are diffed.
+pub(crate) fn diff_device_events(
+    previous: &std::collections::HashSet<i32>,
+    current: &[AndroidInputDevice],
+) -> (Vec<DeviceEvent>, std::collections::HashSet<i32>) {
+    let current_ids: std::collections::HashSet<i32> = current.iter().map(|d| d.id).collect();
+    let mut events = Vec::new();
+    for dev in current.iter().filter(|d| !previous.contains(&d.id)) {
+        events.push(DeviceEvent::DeviceAdded {
+            id: DeviceId(dev.id.to_string()),
+            name: dev.name.clone(),
+            kind: DeviceKind::Input,
+        });
+    }
+    for id in previous.difference(&current_ids) {
+        events.push(DeviceEvent::DeviceRemoved {
+            id: DeviceId(id.to_string()),
+        });
+    }
+    (events, current_ids)
+}
+
 // ── AndroidDeviceEnumerator ──────────────────────────────────────────────
 
 /// [`DeviceEnumerator`] for Android (AAudio mic + `AudioPlaybackCapture`
@@ -272,12 +308,27 @@ impl DeviceEnumerator for AndroidDeviceEnumerator {
         Ok(Box::new(AndroidPlaybackDevice::new()))
     }
 
-    // watch(): inherits the trait default (PlatformNotSupported) —
-    // consistent with `supports_device_change_notifications: false` in
-    // PlatformCapabilities::android(). Input-route change notifications
-    // (`AudioManager.registerAudioDeviceCallback`, AAR territory) are a
-    // tracked follow-up (rsac-d3e2, under epic rsac-5823), NOT part of the
-    // rsac-ad8a device-selection work in this backend.
+    /// Subscribes to input-device add/remove notifications via the AAR's
+    /// `AudioManager.registerAudioDeviceCallback` (rsac-d3e2).
+    ///
+    /// Emits [`DeviceEvent::DeviceAdded`] / [`DeviceEvent::DeviceRemoved`]
+    /// (always `DeviceKind::Input`, numeric `AudioDeviceInfo.getId()` ids)
+    /// by re-enumerating + diffing the AAR input-device list on each
+    /// callback fire — the events are therefore always consistent with what
+    /// [`enumerate_devices`](Self::enumerate_devices) returns. It does
+    /// **not** emit `DefaultChanged` / `StateChanged`: `AudioDeviceCallback`
+    /// exposes no default-route or state signal, and claiming them would
+    /// violate the honest-capabilities rule.
+    ///
+    /// Events are delivered on the AAR's dedicated `HandlerThread` (never
+    /// the main looper, never an RT audio thread). Errors with
+    /// [`AudioError::PlatformNotSupported`] when the AAR callback path is
+    /// unavailable (pure-NDK / older AAR) — consistent with
+    /// `supports_device_change_notifications` in
+    /// [`PlatformCapabilities::query`](crate::core::capabilities::PlatformCapabilities::query).
+    fn watch(&self, on_event: DeviceEventHandler) -> AudioResult<DeviceWatcher> {
+        jni::watch_input_devices(on_event)
+    }
 }
 
 // ── AndroidAudioDevice ───────────────────────────────────────────────────
@@ -620,6 +671,86 @@ mod tests {
         let raw = wire(&[("5", "15", "Bosch Mikrofon 日本語 🎙")]);
         let devices = parse_input_device_records(&raw);
         assert_eq!(devices[0].name, "Bosch Mikrofon 日本語 🎙");
+    }
+
+    // ── Device-change diffing (rsac-d3e2) ────────────────────────────
+
+    fn dev(id: i32, name: &str) -> AndroidInputDevice {
+        AndroidInputDevice {
+            id,
+            type_code: 15,
+            name: name.to_string(),
+        }
+    }
+
+    #[test]
+    fn diff_empty_previous_emits_adds() {
+        let previous = std::collections::HashSet::new();
+        let current = [dev(5, "Built-in Mic"), dev(11, "USB Headset")];
+        let (events, next) = diff_device_events(&previous, &current);
+        assert_eq!(events.len(), 2);
+        assert_eq!(
+            events[0],
+            DeviceEvent::DeviceAdded {
+                id: DeviceId("5".to_string()),
+                name: "Built-in Mic".to_string(),
+                kind: DeviceKind::Input,
+            }
+        );
+        assert_eq!(
+            events[1],
+            DeviceEvent::DeviceAdded {
+                id: DeviceId("11".to_string()),
+                name: "USB Headset".to_string(),
+                kind: DeviceKind::Input,
+            }
+        );
+        assert_eq!(next, [5, 11].into_iter().collect());
+    }
+
+    #[test]
+    fn diff_detects_added_and_removed() {
+        let previous: std::collections::HashSet<i32> = [5, 11].into_iter().collect();
+        let current = [dev(11, "USB Headset"), dev(42, "BT Earbuds")];
+        let (events, next) = diff_device_events(&previous, &current);
+        assert_eq!(events.len(), 2, "one add + one remove");
+        assert_eq!(
+            events[0],
+            DeviceEvent::DeviceAdded {
+                id: DeviceId("42".to_string()),
+                name: "BT Earbuds".to_string(),
+                kind: DeviceKind::Input,
+            }
+        );
+        assert_eq!(
+            events[1],
+            DeviceEvent::DeviceRemoved {
+                id: DeviceId("5".to_string()),
+            }
+        );
+        assert_eq!(next, [11, 42].into_iter().collect());
+    }
+
+    #[test]
+    fn diff_no_change_is_empty() {
+        let previous: std::collections::HashSet<i32> = [5, 11].into_iter().collect();
+        let current = [dev(5, "Built-in Mic"), dev(11, "USB Headset")];
+        let (events, next) = diff_device_events(&previous, &current);
+        assert!(events.is_empty(), "identical topology emits nothing");
+        assert_eq!(next, previous);
+    }
+
+    #[test]
+    fn diff_added_carries_name_and_input_kind() {
+        let previous = std::collections::HashSet::new();
+        let current = [dev(7, "Bosch Mikrofon 日本語 🎙")];
+        let (events, _) = diff_device_events(&previous, &current);
+        let DeviceEvent::DeviceAdded { id, name, kind } = &events[0] else {
+            panic!("expected DeviceAdded, got {:?}", events[0]);
+        };
+        assert_eq!(id, &DeviceId("7".to_string()));
+        assert_eq!(name, "Bosch Mikrofon 日本語 🎙");
+        assert_eq!(*kind, DeviceKind::Input);
     }
 
     // ── AndroidAudioDevice identity (rsac-ad8a) ──────────────────────

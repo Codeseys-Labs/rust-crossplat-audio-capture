@@ -399,6 +399,7 @@ mod jni_lockstep {
             "nativeRetainProjection",
             "(Landroid/media/projection/MediaProjection;)J",
         ),
+        (RSAC_DEVICES_KT, "nativeDevicesChanged", "(J)V"),
     ];
 
     #[test]
@@ -432,6 +433,7 @@ mod jni_lockstep {
         for (src, file) in [
             (CAPTURE_BRIDGE_KT, "CaptureBridge.kt"),
             (RSAC_PROJECTION_KT, "RsacProjection.kt"),
+            (RSAC_DEVICES_KT, "RsacDevices.kt"),
         ] {
             let declared = src.matches("external fun ").count();
             let covered = CONTRACT.iter().filter(|(s, _, _)| *s == src).count();
@@ -451,6 +453,7 @@ mod jni_lockstep {
         for class in [
             "ai/codeseys/rsac/CaptureBridge",
             "ai/codeseys/rsac/RsacProjection",
+            "ai/codeseys/rsac/RsacDevices",
         ] {
             assert!(
                 JNI_RS.contains(&format!("c\"{class}\"")),
@@ -458,7 +461,7 @@ mod jni_lockstep {
                  RegisterNatives"
             );
         }
-        for kt in [CAPTURE_BRIDGE_KT, RSAC_PROJECTION_KT] {
+        for kt in [CAPTURE_BRIDGE_KT, RSAC_PROJECTION_KT, RSAC_DEVICES_KT] {
             assert!(
                 kt.contains("package ai.codeseys.rsac"),
                 "the Kotlin sources must stay in the ai.codeseys.rsac package \
@@ -500,6 +503,49 @@ mod jni_lockstep {
             RSAC_DEVICES_KT.contains("package ai.codeseys.rsac"),
             "RsacDevices.kt must stay in the ai.codeseys.rsac package the Rust \
              lookup resolves"
+        );
+        // rsac-d3e2: the change-notification half. register/unregister are
+        // Rust→Java calls pinned like inputDevices; nativeDevicesChanged is
+        // an `external fun` also covered by the CONTRACT table above (the
+        // name pins here carry the drift protection — its (J)V signature is
+        // shared with nativeSessionEnded, so a bare signature `contains`
+        // would not detect drift on its own).
+        assert!(
+            RSAC_DEVICES_KT.contains("fun registerDeviceCallback("),
+            "RsacDevices.kt lost `fun registerDeviceCallback(` — update the \
+             Rust lookup (src/audio/android/jni.rs) and this guard together"
+        );
+        assert!(
+            JNI_RS.contains("c\"registerDeviceCallback\""),
+            "src/audio/android/jni.rs no longer resolves \
+             `registerDeviceCallback` — keep it lockstep with RsacDevices.kt"
+        );
+        assert!(
+            JNI_RS.contains("c\"(Landroid/content/Context;J)Z\""),
+            "the registerDeviceCallback JNI signature drifted in jni.rs — the \
+             Kotlin signature (Context, Long) -> Boolean and the lookup must \
+             move together"
+        );
+        assert!(
+            RSAC_DEVICES_KT.contains("fun unregisterDeviceCallback("),
+            "RsacDevices.kt lost `fun unregisterDeviceCallback(` — update the \
+             Rust lookup (src/audio/android/jni.rs) and this guard together"
+        );
+        assert!(
+            JNI_RS.contains("c\"unregisterDeviceCallback\""),
+            "src/audio/android/jni.rs no longer resolves \
+             `unregisterDeviceCallback` — keep it lockstep with RsacDevices.kt"
+        );
+        assert!(
+            RSAC_DEVICES_KT.contains("external fun nativeDevicesChanged("),
+            "RsacDevices.kt lost `external fun nativeDevicesChanged(` — update \
+             the Rust registration (src/audio/android/jni.rs) and this guard \
+             together"
+        );
+        assert!(
+            JNI_RS.contains("c\"nativeDevicesChanged\""),
+            "src/audio/android/jni.rs no longer registers \
+             `nativeDevicesChanged` — keep it lockstep with RsacDevices.kt"
         );
     }
 

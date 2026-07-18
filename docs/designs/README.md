@@ -24,4 +24,5 @@ its Scope says so.
 | [ADR-0014](0014-tauri-integration-model.md) | Tauri integration model: direct library dependency on desktop, `tauri-plugin-rsac` as the mobile vehicle | Proposed | 2026-07-04 |
 | [ADR-0015](0015-macos-tcc-audiocapture-preflight.md) | macOS system-audio-capture permission preflight (private TCC SPI) | Accepted | 2026-07-06 |
 | [ADR-0016](0016-macos-process-tap-silent-zeros-guard.md) | macOS Process-Tap silent-zeros diagnostic (denied-permission guard) | Accepted | 2026-07-06 |
+| [ADR-0017](0017-windows-application-capture-include-tree.md) | Windows `Application(pid)` capture routes through process-loopback INCLUDE-tree | Accepted | 2026-07-18 |
 | [abi3-decision](abi3-decision.md) | abi3 vs per-version Python wheels | Accepted | 2026-04-17 |

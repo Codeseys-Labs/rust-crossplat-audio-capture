@@ -114,10 +114,30 @@ public final class RsacRingProducer {
         guard fd >= 0 else {
             throw ProducerError.fileCreationFailed(path, errno: errno)
         }
-        guard ftruncate(fd, off_t(size)) == 0 else {
+        // GROW-ONLY: a previous broadcast may have created a LARGER ring
+        // (higher rate / more channels) that a host consumer is still mapped
+        // to. An unconditional ftruncate to this generation's (smaller) size
+        // would pull mapped pages out from under that reader → SIGBUS on its
+        // next access. Only ever grow the file. A file larger than this
+        // geometry is harmless: the consumer validates file_len >= needed
+        // against the header (src/audio/ios/broadcast.rs) and never addresses
+        // the surplus tail, and publishHeader re-initialises the header
+        // through the mapping so stale old-generation content is never read.
+        var st = stat()
+        guard fstat(fd, &st) == 0 else {
+            // Fail CLOSED: a fallback of "assume size 0 → ftruncate to size"
+            // would SHRINK an already-larger file if fstat spuriously failed,
+            // reintroducing the shrink-under-reader hazard this guards against.
             let e = errno
             Darwin.close(fd) // bare close() resolves to RingProducer.close()
             throw ProducerError.fileCreationFailed(path, errno: e)
+        }
+        if st.st_size < off_t(size) {
+            guard ftruncate(fd, off_t(size)) == 0 else {
+                let e = errno
+                Darwin.close(fd) // bare close() resolves to RingProducer.close()
+                throw ProducerError.fileCreationFailed(path, errno: e)
+            }
         }
 
         guard let mapped = mmap(nil, size, PROT_READ | PROT_WRITE, MAP_SHARED, fd, 0),

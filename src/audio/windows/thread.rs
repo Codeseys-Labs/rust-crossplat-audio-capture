@@ -767,9 +767,20 @@ fn wasapi_capture_thread_main(
 /// |------------------------|------------------------------------------------------|
 /// | `SystemDefault`        | Default render device → loopback capture              |
 /// | `Device(id)`           | Find device by ID → loopback capture                 |
-/// | `Application(app_id)`  | Parse PID from app_id → process loopback              |
-/// | `ApplicationByName(_)` | Resolve name → PID via sysinfo → process loopback     |
+/// | `Application(app_id)`  | Parse PID from app_id → process loopback, `include_tree = true` (rsac-5b59) |
+/// | `ApplicationByName(_)` | Resolve name → PID via sysinfo → process loopback, `include_tree = true` (rsac-5b59) |
 /// | `ProcessTree(pid)`     | Process loopback with `include_tree = true`           |
+///
+/// # Process-loopback mode is binary (rsac-5b59)
+///
+/// `AUDIOCLIENT_PROCESS_LOOPBACK_MODE` has only two values: INCLUDE- and
+/// EXCLUDE-target-process-tree. There is no "this PID only" mode. wasapi-rs maps
+/// `new_application_loopback_client(pid, include_tree)`'s bool to those:
+/// `true` → INCLUDE (capture the PID's tree), `false` → EXCLUDE (capture
+/// *everything except* the PID's tree). All three per-app/tree targets therefore
+/// pass `true`; `false` would capture the complement of the requested app (the
+/// original silence bug). INCLUDE-tree of a leaf process is exactly
+/// single-process capture.
 fn create_audio_client(config: &WindowsCaptureConfig) -> AudioResult<wasapi::AudioClient> {
     match &config.target {
         CaptureTarget::SystemDefault => {
@@ -846,7 +857,24 @@ fn create_audio_client(config: &WindowsCaptureConfig) -> AudioResult<wasapi::Aud
                     ),
                 })?;
 
-            wasapi::AudioClient::new_application_loopback_client(pid, false).map_err(|e| {
+            // include_tree=TRUE — capture the target PID (and any descendants).
+            //
+            // rsac-5b59: the WASAPI process-loopback mode is binary
+            // (`AUDIOCLIENT_PROCESS_LOOPBACK_MODE`): wasapi-rs maps
+            // `include_tree=false` to `PROCESS_LOOPBACK_MODE_EXCLUDE_TARGET_PROCESS_TREE`
+            // (capture *everything except* this PID's tree) and `true` to
+            // `PROCESS_LOOPBACK_MODE_INCLUDE_TARGET_PROCESS_TREE` (capture this
+            // PID's tree). There is NO "this PID only, excluding descendants" mode
+            // — so passing `false` here made `Application(pid)` capture the
+            // COMPLEMENT of the requested app, i.e. silence when it is the only
+            // audio source (the CI symptom: ProcessTree of the same player got the
+            // 440 Hz tone at RMS≈0.53, Application got only silence). INCLUDE-tree
+            // of a leaf process == single-process capture, so `true` is the correct
+            // — and only expressible — mapping for single-app capture. When the
+            // target has audio-producing children, Windows necessarily includes
+            // them too (documented per-platform divergence on
+            // `CaptureTarget::Application`).
+            wasapi::AudioClient::new_application_loopback_client(pid, true).map_err(|e| {
                 AudioError::ApplicationCaptureFailed {
                     app_id: app_id.0.clone(),
                     reason: format!("Failed to create application loopback client: {}", e),
@@ -870,7 +898,12 @@ fn create_audio_client(config: &WindowsCaptureConfig) -> AudioResult<wasapi::Aud
                 pid
             );
 
-            wasapi::AudioClient::new_application_loopback_client(pid, false).map_err(|e| {
+            // include_tree=TRUE — same rationale as the `Application(pid)` arm
+            // (rsac-5b59): `ApplicationByName` resolves to a PID and then behaves
+            // like `Application` (single app). The WASAPI process-loopback mode is
+            // binary; `false` == EXCLUDE-target-tree captured the complement of the
+            // app (silence). INCLUDE-tree of a leaf == single-process capture.
+            wasapi::AudioClient::new_application_loopback_client(pid, true).map_err(|e| {
                 AudioError::ApplicationCaptureFailed {
                     app_id: format!("{}(pid={})", name, pid),
                     reason: format!("Failed to create application loopback client: {}", e),

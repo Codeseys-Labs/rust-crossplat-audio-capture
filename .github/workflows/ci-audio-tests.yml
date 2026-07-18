@@ -460,20 +460,22 @@ jobs:
         env:
           RSAC_TEST_CAPTURE_TIMEOUT_SECS: "15"
         run: |
-          # Evidence exception (rsac-0f33): per-PID Application capture has NEVER
-          # delivered content on windows-latest (the spawned player's session is
-          # not found for its PID), while ProcessTree loopback of the SAME player
-          # captures the tone (RMS≈0.53). This ONE invocation opts out of the
-          # job-wide deterministic mode; the process-tree step below stays hard.
-          # Build/start/panic regressions here still fail the tier.
-          $env:RSAC_CI_AUDIO_DETERMINISTIC = "0"
+          # rsac-5b59: per-PID Application capture now runs DETERMINISTIC like the
+          # other steps. The former silence was NOT a session-attribution problem —
+          # the WASAPI process-loopback backend was passing include_tree=false,
+          # which maps to PROCESS_LOOPBACK_MODE_EXCLUDE_TARGET_PROCESS_TREE, i.e.
+          # "capture everything EXCEPT this PID's tree" → the complement of the
+          # player → silence. The fix passes include_tree=true (INCLUDE-tree of a
+          # leaf == single-process capture), so Application(pid) of the spawned
+          # PlayLooping player now captures the same 440 Hz tone ProcessTree did.
+          # The job-wide RSAC_CI_AUDIO_DETERMINISTIC=1 from the endpoint gate
+          # applies unchanged (no per-step opt-out).
           # $LASTEXITCODE after every cargo pipe (PR #56 outside-diff review).
           cargo test --test ci_audio app_capture `
             --no-default-features --features feat_windows,compose `
             -- --test-threads=1 --nocapture `
             2>&1 | Tee-Object -FilePath ci-audio-process.log
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
-          $env:RSAC_CI_AUDIO_DETERMINISTIC = "1"
           cargo test --test ci_audio process_tree_capture `
             --no-default-features --features feat_windows,compose `
             -- --test-threads=1 --nocapture `

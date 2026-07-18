@@ -20,10 +20,12 @@ import java.util.concurrent.atomic.AtomicBoolean
  *
  * 1. The host app calls [request] with a [ComponentActivity]. rsac launches
  *    the system consent dialog via the ActivityResult API.
- * 2. On user approval, the resulting [MediaProjection] is handed to the
- *    native side ([nativeRetainProjection]), which wraps it in a JNI
- *    `GlobalRef` and returns an **opaque token** (`jlong`, pointer-sized
- *    across FFI).
+ * 2. On user approval, rsac stashes the consent result and starts
+ *    [RsacCaptureService]; once that service is confirmed-foreground it calls
+ *    back into [onForegroundServiceReady], which acquires the
+ *    [MediaProjection] and hands it to the native side
+ *    ([nativeRetainProjection]) — a JNI `GlobalRef` wrapped as an **opaque
+ *    token** (`jlong`, pointer-sized across FFI) delivered via [Callback.onToken].
  * 3. The token crosses into Rust and is given to
  *    `AudioCaptureBuilder::with_android_projection(AndroidProjectionToken)`.
  * 4. Token lifetime is owned by Rust: released (`DeleteGlobalRef` +
@@ -31,19 +33,29 @@ import java.util.concurrent.atomic.AtomicBoolean
  *    **One token = one projection session** — do not reuse a token across
  *    captures.
  *
- * There is deliberately no process-global token registry (no hidden state);
- * the token is returned to the caller and nowhere else.
+ * There is deliberately no process-global token *registry* — the token is
+ * returned to the caller and nowhere else. The one piece of transient state
+ * is a single-slot `pending` consent acquisition bridging [request] to the
+ * service callback (a concurrent second [request] is rejected, not queued).
  *
- * ### Ordering on API 34+ (Android 14)
+ * ### Ordering on API 34+ (Android 14) — and why acquisition is deferred
  *
- * Apps targeting SDK 34+ must have a `mediaProjection`-typed foreground
- * service running before media-projection capture may start — start
- * [RsacCaptureService] (or the host's own equivalent) before/around the
- * consent flow. See README.md § Lifecycle ordering.
- * // CI-VERIFY: whether MediaProjectionManager.getMediaProjection() itself
- * // throws SecurityException on API 34+ without the running FGS, or whether
- * // enforcement only triggers at capture start — adjust the KDoc/README
- * // ordering guidance to match observed behavior on an API 34+ emulator.
+ * Two platform constraints collide (API Q+, still enforced on 14):
+ * - [MediaProjectionManager.getMediaProjection] internally calls
+ *   `IMediaProjection.start()`, which throws `SecurityException` unless a
+ *   `mediaProjection`-typed foreground service is **already
+ *   confirmed-foreground**.
+ * - That FGS may be started only **after** consent is granted — starting it
+ *   earlier throws `SecurityException`.
+ *
+ * So [request] cannot acquire the projection inline: it stashes the consent
+ * result, starts [RsacCaptureService], and the service — after its
+ * synchronous `startForeground()` returns (type registered) — drives
+ * [onForegroundServiceReady] to acquire the projection and deliver the token.
+ * **Hosts must NOT call [RsacCaptureService.start] before [request]** — a
+ * pre-consent typed-FGS start throws `SecurityException` (now caught and
+ * surfaced as [Callback.onDenied] rather than crashing). The host only stops
+ * the service ([RsacCaptureService.stop]) after dropping the capture.
  *
  * ### Native availability
  *
@@ -142,29 +154,119 @@ object RsacProjection {
                 return@register
             }
 
-            val projection: MediaProjection? = try {
-                manager.getMediaProjection(result.resultCode, data)
-            } catch (e: SecurityException) {
-                // API 34+: thrown when no mediaProjection foreground service
-                // is running, or the consent data was already consumed.
+            // getMediaProjection() internally calls IMediaProjection.start(),
+            // which the platform (API Q+, enforced through 14) rejects unless
+            // a mediaProjection-typed foreground service is ALREADY
+            // confirmed-foreground — yet that FGS may only be started AFTER
+            // consent exists (starting it earlier throws SecurityException).
+            // Both constraints are met by acquiring the projection INSIDE the
+            // service, right after startForeground() returns (a synchronous
+            // AMS binder call, so the FGS type is registered on return).
+            // Stash the consent result, start the service, and let
+            // RsacCaptureService.onStartCommand drive onForegroundServiceReady
+            // to finish the handoff. Same-main-thread ordering guarantees
+            // `pending` is set before onStartCommand runs (rsac-cabf).
+            //
+            // `pending` is a single slot: reject a second concurrent request()
+            // rather than overwrite (which would orphan the first callback —
+            // it would never fire onToken/onDenied). Callbacks run on the main
+            // thread, so this check-then-set is race-free.
+            if (pending != null) {
                 callback.onDenied(
-                    "getMediaProjection failed: ${e.message} (on API 34+ a " +
-                        "mediaProjection foreground service must be running " +
-                        "first — see README.md § Lifecycle ordering)"
+                    "another media-projection consent request is already in " +
+                        "progress; retry after it completes"
                 )
                 return@register
             }
-            if (projection == null) {
-                callback.onDenied("MediaProjectionManager returned no projection")
-                return@register
+            pending = PendingAcquisition(result.resultCode, data, callback)
+            try {
+                RsacCaptureService.start(activity)
+            } catch (e: Exception) {
+                pending = null
+                callback.onDenied(
+                    "failed to start the mediaProjection foreground service " +
+                        "after consent: ${e.message}"
+                )
             }
-
-            // Hand ownership to Rust: GlobalRef + opaque token. From here,
-            // release (DeleteGlobalRef + MediaProjection.stop()) is Rust's
-            // job, tied to the owning capture's Drop.
-            callback.onToken(nativeRetainProjection(projection))
         }
         launcher.launch(manager.createScreenCaptureIntent())
+    }
+
+    /** A consent result awaiting the foreground service to reach the foreground. */
+    private class PendingAcquisition(
+        val resultCode: Int,
+        val data: Intent,
+        val callback: Callback,
+    )
+
+    @Volatile
+    private var pending: PendingAcquisition? = null
+
+    /**
+     * Called by [RsacCaptureService.onStartCommand] AFTER `startForeground()`
+     * has put the `mediaProjection` FGS in the foreground — the earliest legal
+     * moment to call [MediaProjectionManager.getMediaProjection] on API Q+,
+     * which internally requires a running mediaProjection FGS (rsac-cabf).
+     * Runs on the main thread (onStartCommand); a no-op when no consent
+     * acquisition is pending. [context] is the service, used to obtain the
+     * [MediaProjectionManager]. Delivers the token (or the denial) to the
+     * stashed callback exactly once.
+     *
+     * // CI-VERIFY (rsac-e6d3): confirm on an API 34+ emulator that
+     * // getMediaProjection succeeds here (FGS confirmed-foreground on
+     * // startForeground's synchronous return) — the SecurityException arm
+     * // should not fire in the happy path.
+     */
+    internal fun onForegroundServiceReady(context: Context) {
+        val p = pending ?: return
+        pending = null
+        val manager = context.getSystemService(Context.MEDIA_PROJECTION_SERVICE)
+            as MediaProjectionManager
+        val projection: MediaProjection? = try {
+            manager.getMediaProjection(p.resultCode, p.data)
+        } catch (e: SecurityException) {
+            // No projection was acquired, so nothing will ever stop the FGS we
+            // just started — stop it here, else it leaks (rsac-cabf review).
+            RsacCaptureService.stop(context)
+            p.callback.onDenied(
+                "getMediaProjection failed after the FGS reached the " +
+                    "foreground: ${e.message}"
+            )
+            return
+        }
+        if (projection == null) {
+            RsacCaptureService.stop(context)
+            p.callback.onDenied("MediaProjectionManager returned no projection")
+            return
+        }
+        // Hand ownership to Rust: GlobalRef + opaque token. From here, release
+        // (DeleteGlobalRef + MediaProjection.stop()) is Rust's job, tied to
+        // the owning capture's Drop. nativeRetainProjection returns 0 when the
+        // GlobalRef could not be created — that is a failure, not a token, so
+        // stop the FGS and deny rather than handing a 0 to onToken (a 0 token
+        // would otherwise fail stream creation much later with a vaguer error).
+        val token = nativeRetainProjection(projection)
+        if (token == 0L) {
+            projection.stop()
+            RsacCaptureService.stop(context)
+            p.callback.onDenied(
+                "failed to retain the MediaProjection natively (librsac " +
+                    "returned a null token)"
+            )
+            return
+        }
+        p.callback.onToken(token)
+    }
+
+    /**
+     * Called by [RsacCaptureService] when it could not reach the foreground
+     * (e.g. `startForeground` threw), so a pending consent acquisition is not
+     * left hanging. No-op when nothing is pending. Runs on the main thread.
+     */
+    internal fun onForegroundServiceFailed(reason: String) {
+        val p = pending ?: return
+        pending = null
+        p.callback.onDenied(reason)
     }
 
     /**
