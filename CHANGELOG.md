@@ -86,6 +86,21 @@ Releases with no ABI change omit the subsection (or state "No C ABI changes").
 
 ### Changed
 
+- **core (Android) — BREAKING:** `AndroidProjectionToken` is no longer `Copy`/
+  `Hash`; it now enforces single-owner deletion of the `MediaProjection`
+  `GlobalRef` via a shared consume-latch, fixing a safe-Rust JNI double-delete
+  (UB) when a builder/`StreamConfig` carrying a token was cloned and built
+  twice. The first capture stream built from a token (or any `Clone`/
+  `StreamConfig` copy) claims sole deletion ownership; a second `build()` from a
+  clone is now refused with `StreamCreationFailed` rather than double-releasing
+  the ref. The shared claim is per token *instance* (and its clones), not per
+  raw `i64`: wrapping the same handle in two separate `from_raw` calls yields
+  independent latches and is an unguarded double-delete — mint a token once and
+  clone it. `Clone`, `PartialEq`, `Eq`, and the `from_raw`/`as_raw`/
+  `with_android_projection` signatures are retained. This surface is
+  `#[cfg(target_os = "android")]`, so the host `cargo-semver-checks` gate does
+  not observe it; the removal of `Copy`/`Hash` is nonetheless a breaking change
+  for Android consumers and gates the next release at **0.5.0** (rsac-3407).
 - Mobile backend deps (`jni-sys`; `objc2-avf-audio`/`block2`/`objc2`/
   `objc2-foundation` on iOS) are now `optional` and tied to `feat_android`/
   `feat_ios`, completing the `cfg(all(target_os, feature))` double-gate the
@@ -169,6 +184,17 @@ Releases with no ABI change omit the subsection (or state "No C ABI changes").
   outside that PR's diff (rsac-1a34). No public API change.
 
 ### Security
+
+### C ABI changes
+
+- No C ABI changes. `rsac_builder_set_android_projection` keeps its `int64_t`
+  signature; the single-owner `MediaProjection` token contract (rsac-3407) is
+  documented on the symbol. The library enforces it only for a *cloned*
+  builder/config (which share one deletion latch → the second
+  `rsac_builder_build()` fails with `RSAC_ERROR_STREAM_FAILED`); it does **not**
+  deduplicate on the raw `int64_t`, so supplying the same handle to two
+  independently constructed builders is an unguarded double-delete (UB) that
+  C/Flutter callers must avoid by construction (one handle → one builder).
 
 ## [0.4.2] - 2026-07-17
 

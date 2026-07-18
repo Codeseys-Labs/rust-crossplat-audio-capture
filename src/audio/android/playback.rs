@@ -416,15 +416,17 @@ fn create_playback_capture(
     terminal: Arc<BridgeShared>,
 ) -> AudioResult<(AndroidPlaybackStream, AudioFormat)> {
     // ── Consent token (normally enforced by the build() preflight) ──
-    let token = config
-        .android_projection
-        .ok_or_else(|| AudioError::UserConsentRequired {
-            feature: "Android playback capture".to_string(),
-            missing: "MediaProjection token — obtain one via \
+    let token =
+        config
+            .android_projection
+            .as_ref()
+            .ok_or_else(|| AudioError::UserConsentRequired {
+                feature: "Android playback capture".to_string(),
+                missing: "MediaProjection token — obtain one via \
                       RsacProjection.request() and pass it to \
                       AudioCaptureBuilder::with_android_projection()"
-                .to_string(),
-        })?;
+                    .to_string(),
+            })?;
     if token.as_raw() == 0 {
         return Err(AudioError::StreamCreationFailed {
             reason: "the Android projection token is 0 — the consent flow \
@@ -451,6 +453,30 @@ fn create_playback_capture(
     // ── Target → UID (ADR-0013) ──────────────────────────────────────
     let match_uid = resolve_match_uid(&config.capture_target)?;
 
+    // ── Claim sole deletion ownership (single-owner latch, rsac-3407) ──
+    // The token is `Clone` (so `StreamConfig`/builder stay `Clone`) but not
+    // `Copy`; the shared consume-latch guarantees that at most one stream in a
+    // token's clone lineage ever holds a deletable raw handle, so exactly one
+    // `DeleteGlobalRef` runs. A second `build()` from a cloned config/builder
+    // is refused here rather than double-releasing the JNI `GlobalRef` (UB).
+    //
+    // Claimed *after* every fallible preflight (channel/UID validation) so a
+    // post-consume validation error can't strand the claim: once we consume,
+    // the only remaining failure path is `create_and_start_bridge`, whose error
+    // arm calls `release_claim()` to re-arm the token for retry. Consuming
+    // earlier would leave the shared latch stuck `true` (and the `GlobalRef`
+    // undeleted) on a channel/UID error, refusing every retry with the token.
+    let raw = token
+        .try_consume()
+        .ok_or_else(|| AudioError::StreamCreationFailed {
+            reason: "this MediaProjection consent token has already been handed to \
+                 another capture stream; each retained projection handle owns \
+                 exactly one capture session — re-run the consent flow rather \
+                 than cloning the token or its StreamConfig"
+                .to_string(),
+            context: None,
+        })?;
+
     let delivered = AudioFormat {
         sample_rate: requested.sample_rate,
         channels: requested.channels,
@@ -471,7 +497,7 @@ fn create_playback_capture(
 
     // ── Kotlin pipeline: construct → register → start ────────────────
     let bridge = match jni::create_and_start_bridge(
-        token.as_raw() as jobject,
+        raw as jobject,
         session_id,
         delivered.sample_rate,
         delivered.channels,
@@ -482,8 +508,10 @@ fn create_playback_capture(
         Err(e) => {
             // Nothing Java-side is running; reclaim the session so the
             // producer (and its ring) is dropped rather than leaked. The
-            // projection token stays with the caller (they may retry).
+            // projection token stays with the caller (they may retry), so
+            // release the deletion claim we took above.
             jni::unregister_session(session_id);
+            token.release_claim();
             return Err(e);
         }
     };
@@ -502,7 +530,7 @@ fn create_playback_capture(
         AndroidPlaybackStream {
             handles: Mutex::new(PlaybackHandles {
                 bridge,
-                projection_token: token.as_raw(),
+                projection_token: raw,
             }),
             session_id,
             is_active,
@@ -573,6 +601,20 @@ mod tests {
             }
             other => panic!("expected InvalidParameter, got {other:?}"),
         }
+    }
+
+    // ── Single-owner token ownership (rsac-3407) ─────────────────────
+    #[test]
+    fn cloned_token_second_consume_is_refused() {
+        // Pure-latch mirror of what a duplicate create_playback_capture would
+        // hit: the second stream built from a cloned token/StreamConfig fails
+        // its try_consume, so it never obtains a deletable raw handle (no
+        // double DeleteGlobalRef). No JNI involved.
+        use crate::core::config::AndroidProjectionToken;
+        let token = AndroidProjectionToken::from_raw(123);
+        let cloned = token.clone();
+        assert_eq!(token.try_consume(), Some(123));
+        assert_eq!(cloned.try_consume(), None);
     }
 
     #[test]

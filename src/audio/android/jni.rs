@@ -1133,9 +1133,14 @@ pub(super) fn stop_and_release_projection(token_raw: i64) {
     };
     let env = guard.env();
     let projection = token_raw as jobject;
-    // SAFETY: the token is the GlobalRef minted by native_retain_projection
-    // (a 0/stale token is the producer's contract violation, documented on
-    // AndroidProjectionToken); stop() is idempotent on MediaProjection.
+    // SAFETY: the token is the GlobalRef minted by native_retain_projection.
+    // The raw handle reaches this delete site exactly once per projection: the
+    // owning stream obtained it via `AndroidProjectionToken::try_consume`
+    // (config.rs), whose shared single-owner latch lets at most one stream in a
+    // token's clone lineage ever hold a deletable handle — so this runs exactly
+    // once, never a double `DeleteGlobalRef`. (A 0/stale token is caught by the
+    // early return above and the `as_raw() == 0` check in create_playback_capture.)
+    // stop() is idempotent on MediaProjection.
     unsafe {
         jni_call!(
             env,
