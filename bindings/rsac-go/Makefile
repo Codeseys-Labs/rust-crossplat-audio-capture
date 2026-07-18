@@ -89,7 +89,7 @@ endif
 
 # ── Targets ──────────────────────────────────────────────────────────────
 
-.PHONY: all build rust-ffi go-build test clean lint fmt help
+.PHONY: all build rust-ffi go-build test test-pure test-e2e clean lint fmt help
 
 ## all: Build the Rust staticlib and verify the Go package compiles.
 all: build
@@ -140,6 +140,25 @@ test-pure: rust-ffi
 	CGO_ENABLED=1 \
 	CGO_LDFLAGS="-L$(LIB_DIR) -lrsac_ffi $(EXTRA_LDFLAGS)" \
 	go test -v -count=1 -run 'TestErrorCode|TestError_|TestErr|TestCaptureTarget|TestAudioBuffer|TestCaptureBuilder|TestDeviceKind|TestStream_Context|TestCallbackHandle|TestStreamResult|TestCapabilities|TestComposition|TestGroup|TestCompositionBuilder' ./...
+
+## test-e2e: Build the FFI staticlib + run the tag-gated deterministic capture smoke.
+##
+## rsac_audio_e2e is the build tag that excludes capture_smoke_test.go from the
+## default matrix (`go test ./...` / `go vet` / `make test-pure`); ONLY this
+## target passes it. Linux-CI-only: the smoke self-skips unless the job exports
+## RSAC_CI_AUDIO_DETERMINISTIC=1 (the deterministic PipeWire route). CGO_LDFLAGS
+## lives here in one place, mirroring the `test` target.
+test-e2e: rust-ffi
+	@echo "==> Running deterministic capture smoke (tag rsac_audio_e2e)..."
+	@# Wiring guard: `-run X` with zero matches exits 0 ("no tests to run"),
+	@# so a renamed test or dropped build file would pass vacuously. Mirror
+	@# the Rust tiers' `--list | grep` defense (ci-audio-tests.yml).
+	@CGO_ENABLED=1 CGO_LDFLAGS="-L$(LIB_DIR) -lrsac_ffi $(EXTRA_LDFLAGS)" \
+	go test -tags rsac_audio_e2e -list 'TestSystemCaptureSmoke' ./... | grep -q '^TestSystemCaptureSmoke$$' \
+	  || { echo "test-e2e: TestSystemCaptureSmoke not discovered under tag rsac_audio_e2e — wiring broken"; exit 1; }
+	CGO_ENABLED=1 \
+	CGO_LDFLAGS="-L$(LIB_DIR) -lrsac_ffi $(EXTRA_LDFLAGS)" \
+	go test -v -count=1 -tags rsac_audio_e2e -run TestSystemCaptureSmoke ./...
 
 ## lint: Run golangci-lint on the Go package.
 lint:

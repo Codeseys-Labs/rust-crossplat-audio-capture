@@ -80,9 +80,10 @@ The mic path needs none of this. System capture needs all of it:
   UI must be a *prompt to start*, never a "capturing…" state you set
   yourself.
 - **The user can stop it at any time** (Control Center, red status bar/pill).
-  The host-side stream then ends with a **fatal terminal** (`finished`
-  Darwin notification, or missed heartbeats if the extension was killed) —
-  design your consumer for streams that end without your code asking.
+  The host-side (Rust) stream then ends with a **fatal terminal**, detected
+  via heartbeat staleness (the Rust consumer polls the ring header and does
+  not listen for the extension's `finished` Darwin notification) — design
+  your consumer for streams that end without your code asking.
 - **Captures everything.** ReplayKit app-audio is the mixed output of the
   whole device — there is **no per-app filter on iOS, permanently**
   (`Application`/`ApplicationByName`/`ProcessTree` report

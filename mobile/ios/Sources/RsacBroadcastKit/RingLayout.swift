@@ -87,8 +87,10 @@ import Foundation
 // consumer compares against its own CLOCK_MONOTONIC reading. The producer
 // stamps at least every `heartbeatIntervalMillis`; a stamp older than
 // `heartbeatTimeoutMillis` means the extension was killed or the broadcast
-// ended without a Darwin notification ⇒ producer terminal signal (ADR-0010)
-// ⇒ the host stream ends with the fatal terminal (ADR-0003).
+// ended ⇒ producer terminal signal (ADR-0010) ⇒ the host stream ends with the
+// fatal terminal (ADR-0003). Heartbeat staleness is the sole terminal signal
+// the Rust consumer observes; it never watches the `finished` Darwin
+// notification (that is a Swift-side advisory only — see ADR-0013).
 //
 // ── Sizing guidance ────────────────────────────────────────────────────────
 //
@@ -182,11 +184,15 @@ public enum RsacRingLayout {
 // ═══════════════════════════════════════════════════════════════════════════
 // Darwin notification names — the signaling half of the contract.
 //
-// Posted on CFNotificationCenterGetDarwinNotifyCenter() by the extension;
-// observed by the host app / Rust consumer (rsac-b3aa listens for the same
-// strings). Darwin notifications carry NO payload — state lives in the ring
-// header. Defined here, in one place, so the producer template and any
-// future Swift consumer share them; the Rust side mirrors the literals.
+// Posted on CFNotificationCenterGetDarwinNotifyCenter() by the extension.
+// NOT observed by the Rust host consumer (rsac-b3aa,
+// src/audio/ios/broadcast.rs): the Rust side's start/stop/liveness contract
+// is heartbeat-poll-only (bounded publish-word polling +
+// heartbeatTimeoutMillis staleness — see the "Heartbeat" section above).
+// Darwin notifications carry NO payload — state lives in the ring header.
+// Defined here, in one place, as an OPTIONAL signal for a future Swift-side
+// host-app observer (e.g. driving UI state without polling the ring); the
+// Rust backend does not require or listen for them.
 // ═══════════════════════════════════════════════════════════════════════════
 
 /// Darwin notification names posted by the broadcast extension.
