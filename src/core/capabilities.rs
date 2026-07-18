@@ -402,18 +402,6 @@ impl PlatformCapabilities {
 
 // ── macOS version detection ──────────────────────────────────────────────
 
-/// Returns the Android API level (SDK version) of the running device, or
-/// `0` when it cannot be determined.
-///
-/// Reads the `ro.build.version.sdk` system property via
-/// `__system_property_get` (a stable libc export on every Android version)
-/// — no JNI, no subprocess; the same in-process version-probing pattern as
-/// [`get_macos_version`]'s sysctl. A read/parse failure returns `0`, so
-/// version-gated capabilities honestly report `false` rather than claiming
-/// an API that may not exist.
-///
-/// Used by [`PlatformCapabilities`] to gate the playback-capture tiers
-/// (`AudioPlaybackCaptureConfiguration` requires API 29+).
 /// Whether the Android AAR device-enumeration path (`RsacDevices`) resolved
 /// at library load (rsac-ad8a).
 ///
@@ -442,6 +430,18 @@ pub fn android_device_enumeration_available() -> bool {
     ANDROID_DEVICE_ENUMERATION_AVAILABLE.load(std::sync::atomic::Ordering::Acquire)
 }
 
+/// Returns the Android API level (SDK version) of the running device, or
+/// `0` when it cannot be determined.
+///
+/// Reads the `ro.build.version.sdk` system property via
+/// `__system_property_get` (a stable libc export on every Android version)
+/// — no JNI, no subprocess; the same in-process version-probing pattern as
+/// [`get_macos_version`]'s sysctl. A read/parse failure returns `0`, so
+/// version-gated capabilities honestly report `false` rather than claiming
+/// an API that may not exist.
+///
+/// Used by [`PlatformCapabilities`] to gate the playback-capture tiers
+/// (`AudioPlaybackCaptureConfiguration` requires API 29+).
 #[cfg(target_os = "android")]
 pub fn get_android_sdk_version() -> u32 {
     use std::os::raw::c_char;
