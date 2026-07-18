@@ -49,13 +49,17 @@ test('SystemDefault capture delivers non-silence and stops cleanly', { skip: !DE
 
   cap.stop();
   assert.equal(cap.isRunning, false, 'isRunning false after stop()');
-  // readBlocking() is terminal-observable — it must throw the FATAL terminal
-  // (StreamEnded, kind Stream → [ERR_RSAC_STREAM] "Stream ended: …"), not a
-  // recoverable "not running" downgrade (the rsac-477d regression class).
+  // Post-stop read throws a LIFECYCLE error, never returns a chunk. Core's
+  // restart-by-recreation contract RELEASES the stream on stop(), so a
+  // sequential stop-then-read throws the NotInitialized lifecycle error
+  // ("Stream is not initialized…" — verified live, CI run 29621951762);
+  // StreamEnded appears only while a terminal stream is still PRESENT
+  // (racing/parked reads — the rsac-477d case). Accept exactly those two.
   assert.throws(
     () => cap.readBlocking(),
     (err) =>
-      /\[ERR_RSAC_STREAM\]/.test(err.message) && /Stream ended/i.test(err.message),
-    'readBlocking() after stop() must throw the fatal StreamEnded terminal'
+      /\[ERR_RSAC_STREAM\]/.test(err.message) &&
+      (/Stream ended/i.test(err.message) || /not initialized/i.test(err.message)),
+    'readBlocking() after stop() must throw the StreamEnded or NotInitialized lifecycle error'
   );
 });

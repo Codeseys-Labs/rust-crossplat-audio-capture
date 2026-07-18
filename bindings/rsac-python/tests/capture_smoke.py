@@ -57,19 +57,25 @@ cap.stop()
 if cap.is_running:
     failures.append("is_running must be False after stop()")
 
-# 5. terminal-observable: blocking read() after stop() raises the stream's true
-#    FATAL terminal (StreamEnded → StreamError with "Stream ended: ..."), not a
-#    recoverable "not running" downgrade (the rsac-477d regression class).
+# 5. post-stop read raises a LIFECYCLE error, never returns a buffer. Core's
+#    restart-by-recreation contract RELEASES the stream on stop(), so a
+#    sequential stop-then-read yields the NotInitialized lifecycle error
+#    ("Stream is not initialized. Call start() first." — verified live, CI run
+#    29621951762). StreamEnded appears only while a terminal stream is still
+#    PRESENT (racing/parked reads — the rsac-477d case). Accept exactly those
+#    two; reject "Stream is not running" (the 477d downgrade wording) and
+#    anything else.
 try:
     cap.read()
-    failures.append("read() after stop() should raise the terminal error")
+    failures.append("read() after stop() should raise, not return a buffer")
 except rsac.StreamError as e:
-    if "stream ended" in str(e).lower():
-        print("post-stop read raised the fatal StreamEnded terminal: ok")
+    msg = str(e).lower()
+    if "stream ended" in msg or "not initialized" in msg:
+        print(f"post-stop read raised the documented lifecycle error: ok ({e})")
     else:
         failures.append(
-            f"read() after stop() raised StreamError but not the StreamEnded "
-            f"terminal (got: {e}) — recoverable downgrade regression?"
+            f"read() after stop() raised an off-contract StreamError: {e} "
+            f"(expected StreamEnded or NotInitialized)"
         )
 except rsac.RsacError as e:
     failures.append(

@@ -17,6 +17,7 @@ package rsac_test
 
 import (
 	"os"
+	"strings"
 	"testing"
 	"time"
 
@@ -77,13 +78,21 @@ func TestSystemCaptureSmoke(t *testing.T) {
 	if cap.IsRunning() {
 		t.Fatal("IsRunning must be false after Stop()")
 	}
-	// terminal-observable: a blocking read after Stop returns the FATAL
-	// terminal (ErrStreamFailed covers StreamEnded), not a recoverable
-	// downgrade (the rsac-477d regression class) and not a nil error.
+	// Post-stop read returns a LIFECYCLE error, never a buffer. Core's
+	// restart-by-recreation contract RELEASES the stream on Stop(), so a
+	// sequential stop-then-read yields the NotInitialized lifecycle error
+	// ("Stream is not initialized. Call start() first." — verified live,
+	// CI run 29621951762); StreamEnded appears only while a terminal stream
+	// is still PRESENT (racing/parked reads — the rsac-477d case). Note the
+	// FFI maps NotInitialized onto ErrStreamRead (recoverable in the lossy
+	// code projection), so we assert on the MESSAGE, not recoverability.
 	if _, rerr := cap.ReadBuffer(); rerr == nil {
-		t.Fatal("ReadBuffer() after Stop() must return a terminal error")
-	} else if rsac.IsRecoverable(rerr) {
-		t.Fatalf("ReadBuffer() after Stop() returned a RECOVERABLE error (%v) — "+
-			"the terminal must be fatal (StreamEnded/ErrStreamFailed)", rerr)
+		t.Fatal("ReadBuffer() after Stop() must return a lifecycle error")
+	} else {
+		msg := strings.ToLower(rerr.Error())
+		if !strings.Contains(msg, "not initialized") && !strings.Contains(msg, "stream ended") {
+			t.Fatalf("ReadBuffer() after Stop() returned an off-contract error: %v "+
+				"(expected the NotInitialized or StreamEnded lifecycle error)", rerr)
+		}
 	}
 }
