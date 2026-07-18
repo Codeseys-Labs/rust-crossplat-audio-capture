@@ -20,6 +20,24 @@ Releases with no ABI change omit the subsection (or state "No C ABI changes").
 
 ### Added
 
+- **Android (device-change notifications):** `AndroidDeviceEnumerator::watch()`
+  now delivers input-device hot-plug notifications via the AAR's
+  `AudioManager.registerAudioDeviceCallback` (rsac-d3e2), emitting
+  `DeviceEvent::DeviceAdded`/`DeviceRemoved` by re-enumerating + diffing the
+  input-device list on each callback fire (add/remove only —
+  `AudioDeviceCallback` has no default-route or state signal, so
+  `DefaultChanged`/`StateChanged` are never claimed). Events are delivered on
+  a dedicated AAR `HandlerThread` (never the main looper or an RT audio
+  thread); the diff baseline is seeded before registration so the
+  register-time immediate callback produces no initial-add flood.
+  `PlatformCapabilities::supports_device_change_notifications` on Android is
+  now runtime-gated, flipping to `true` only when `JNI_OnLoad` resolved the
+  `RsacDevices` callback methods and registered `nativeDevicesChanged`
+  (`false` for pure-NDK / older-AAR consumers — exactly the rsac-ad8a
+  device-selection gate pattern). Compile-proof only; on-device verification
+  is tracked in rsac-e6d3. Completes the honest-capabilities story from
+  rsac-ad8a (#63).
+
 - **Bindings (live gain/mute):** exposed `Composition::set_gain` / `set_muted`
   (+ `gain` / `is_muted` getters, rsac-5a2d) across all four binding layers —
   C FFI (`rsac_composition_set_gain` / `_set_muted` / `_gain` / `_is_muted`),

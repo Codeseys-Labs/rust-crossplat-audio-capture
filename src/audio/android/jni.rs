@@ -77,7 +77,7 @@
 
 #![cfg(all(target_os = "android", feature = "feat_android"))]
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::ffi::c_void;
 use std::os::raw::c_char;
 use std::panic::{catch_unwind, AssertUnwindSafe};
@@ -93,6 +93,7 @@ use jni_sys::{
 use crate::bridge::ring_buffer::{BridgeProducer, BridgeShared};
 use crate::bridge::state::StreamState;
 use crate::core::error::{AudioError, AudioResult};
+use crate::core::interface::{DeviceEventHandler, DeviceWatcher};
 
 use super::thread::count_external_drop;
 
@@ -231,12 +232,27 @@ pub(super) struct AarCache {
     pub devices: Option<DevicesCache>,
 }
 
-/// The `ai.codeseys.rsac.RsacDevices` class + method id (rsac-ad8a).
+/// The `ai.codeseys.rsac.RsacDevices` class + method ids (rsac-ad8a).
 pub(super) struct DevicesCache {
     /// `ai/codeseys/rsac/RsacDevices` (GlobalRef) — input-device enumeration.
     pub class: jclass,
     /// `RsacDevices.inputDevices(Landroid/content/Context;)Ljava/lang/String;` (static).
     pub input_devices: jmethodID,
+    /// The change-notification half (rsac-d3e2) — `None` when this AAR's
+    /// `RsacDevices` predates `registerDeviceCallback` /
+    /// `unregisterDeviceCallback`, or the `nativeDevicesChanged`
+    /// `RegisterNatives` failed. Degrades change notifications only
+    /// (`watch()` errors, the capability reports `false`); the
+    /// `inputDevices` enumeration path (rsac-ad8a) is unaffected.
+    pub callback: Option<DeviceCallbackCache>,
+}
+
+/// The `RsacDevices` change-notification method ids (rsac-d3e2).
+pub(super) struct DeviceCallbackCache {
+    /// `RsacDevices.registerDeviceCallback(Landroid/content/Context;J)Z` (static).
+    pub register: jmethodID,
+    /// `RsacDevices.unregisterDeviceCallback(J)V` (static).
+    pub unregister: jmethodID,
 }
 
 // SAFETY: the raw pointers in the cache are JNI GlobalRefs and method ids —
@@ -488,6 +504,74 @@ fn find_session(id: i64) -> Option<Arc<IngestSession>> {
         .cloned()
 }
 
+// ── Device-watcher registry (rsac-d3e2) ──────────────────────────────────
+
+/// Per-watch state shared between [`watch_input_devices`] and the
+/// Java-entered [`native_devices_changed`].
+struct DeviceWatchEntry {
+    /// Handler + previous id-set, locked per callback fire. Uncontended in
+    /// practice: exactly one AAR `HandlerThread` fires per watcher.
+    inner: Mutex<DeviceWatchInner>,
+}
+
+struct DeviceWatchInner {
+    /// The consumer's event handler (`FnMut(DeviceEvent) + Send + 'static`).
+    on_event: DeviceEventHandler,
+    /// The real input-device ids seen by the previous enumeration — the diff
+    /// baseline (`"default"` / `"playback-capture"` are never diffed; they
+    /// are always present).
+    previous: HashSet<i32>,
+}
+
+/// The live-watcher registry. Same id-not-pointer discipline as [`SESSIONS`]:
+/// `unregisterDeviceCallback` joins the AAR `HandlerThread` with a **bounded**
+/// timeout, so it cannot *prove* no `nativeDevicesChanged` is still in flight
+/// — a stale id after unregistration finds nothing (no-op), and an in-flight
+/// call keeps the entry alive via its cloned `Arc`.
+static WATCHERS: OnceLock<Mutex<HashMap<i64, Arc<DeviceWatchEntry>>>> = OnceLock::new();
+
+/// Monotonic watcher-id source (ids are never reused — ABA-proof).
+static NEXT_WATCHER_ID: AtomicI64 = AtomicI64::new(1);
+
+fn watchers() -> &'static Mutex<HashMap<i64, Arc<DeviceWatchEntry>>> {
+    WATCHERS.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+/// Registers a new device watcher and returns its opaque id (the `handle`
+/// the Kotlin `AudioDeviceCallback` passes back on every
+/// `nativeDevicesChanged`).
+fn register_watcher(on_event: DeviceEventHandler, initial: HashSet<i32>) -> i64 {
+    let id = NEXT_WATCHER_ID.fetch_add(1, Ordering::Relaxed);
+    let entry = Arc::new(DeviceWatchEntry {
+        inner: Mutex::new(DeviceWatchInner {
+            on_event,
+            previous: initial,
+        }),
+    });
+    watchers()
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .insert(id, entry);
+    id
+}
+
+/// Removes a watcher from the registry (idempotent).
+fn unregister_watcher(id: i64) {
+    watchers()
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .remove(&id);
+}
+
+/// Looks up a live watcher by id.
+fn find_watcher(id: i64) -> Option<Arc<DeviceWatchEntry>> {
+    watchers()
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .get(&id)
+        .cloned()
+}
+
 // ── JVM-entered natives ──────────────────────────────────────────────────
 
 /// `CaptureBridge.nativePush` — ingests one read period from the Java
@@ -665,6 +749,49 @@ unsafe extern "system" fn native_retain_projection(
     .unwrap_or(0)
 }
 
+/// `RsacDevices.nativeDevicesChanged` — the AAR `AudioDeviceCallback` fired
+/// (rsac-d3e2).
+///
+/// Re-enumerates the input-device list and diffs it against the watcher's
+/// previous id-set ([`super::diff_device_events`]), invoking `on_event` for
+/// each add/remove. Runs on the AAR's dedicated `HandlerThread` — non-RT and
+/// alloc-safe, satisfying the `DeviceEventHandler` delivery contract. The
+/// callback also fires for output-only topology changes; those diff to empty
+/// against the input-only enumeration and emit nothing.
+///
+/// An enumeration failure skips the fire entirely (the previous set is kept)
+/// rather than treating it as "all devices removed" — a transient Java
+/// failure must not flap the consumer's device list.
+///
+/// # Safety
+///
+/// Invoked only by the JVM through the `RegisterNatives` registration with
+/// the lockstep signature `(J)V`. Never panics across the JNI boundary.
+unsafe extern "system" fn native_devices_changed(_env: *mut JNIEnv, _class: jclass, handle: jlong) {
+    let _ = catch_unwind(AssertUnwindSafe(|| {
+        let Some(entry) = find_watcher(handle) else {
+            // Unknown/stale watcher (normal during teardown) — no-op.
+            return;
+        };
+        // The HandlerThread is a JVM thread, so the attach guard inside
+        // enumerate_input_device_records reuses the existing attachment
+        // (GetEnv succeeds; no detach on drop).
+        let Ok(raw) = enumerate_input_device_records() else {
+            return;
+        };
+        let current = super::parse_input_device_records(&raw);
+        let mut inner = entry
+            .inner
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let (events, next) = super::diff_device_events(&inner.previous, &current);
+        for event in events {
+            (inner.on_event)(event);
+        }
+        inner.previous = next;
+    }));
+}
+
 // ── JNI_OnLoad ───────────────────────────────────────────────────────────
 
 /// Resolves a class as a GlobalRef, or `None` (exception cleared) when it
@@ -784,9 +911,51 @@ unsafe fn build_aar_cache(env: *mut JNIEnv) -> Option<AarCache> {
                 c"(Landroid/content/Context;)Ljava/lang/String;",
                 true,
             )?;
+            // The change-notification half (rsac-d3e2) is itself optional
+            // within RsacDevices: an AAR whose RsacDevices predates the
+            // callback methods still enumerates (rsac-ad8a) but reports no
+            // change notifications. get_method clears the pending
+            // NoSuchMethodError on failure, so the build continues.
+            let callback = (|| {
+                let register = get_method(
+                    env,
+                    class,
+                    c"registerDeviceCallback",
+                    c"(Landroid/content/Context;J)Z",
+                    true,
+                )?;
+                let unregister =
+                    get_method(env, class, c"unregisterDeviceCallback", c"(J)V", true)?;
+                // Register the Java→Rust native ON the RsacDevices class.
+                //
+                // LOCKSTEP: name + signature must match the `external fun`
+                // in RsacDevices.kt — guarded by the host-run `jni_lockstep`
+                // tests in src/audio/mod.rs.
+                let natives = [JNINativeMethod {
+                    name: c"nativeDevicesChanged".as_ptr() as *mut c_char,
+                    signature: c"(J)V".as_ptr() as *mut c_char,
+                    fnPtr: native_devices_changed as *mut c_void,
+                }];
+                let res = jni_call!(
+                    env,
+                    RegisterNatives,
+                    class,
+                    natives.as_ptr(),
+                    natives.len() as jint
+                );
+                if res != JNI_OK {
+                    jni_call!(env, ExceptionClear);
+                    return None;
+                }
+                Some(DeviceCallbackCache {
+                    register,
+                    unregister,
+                })
+            })();
             Some(DevicesCache {
                 class,
                 input_devices,
+                callback,
             })
         })();
 
@@ -959,6 +1128,17 @@ pub unsafe extern "system" fn JNI_OnLoad(vm: *mut JavaVM, _reserved: *mut c_void
                 // (rsac-ad8a).
                 crate::core::capabilities::set_android_device_enumeration_available(
                     cache.aar.as_ref().is_some_and(|aar| aar.devices.is_some()),
+                );
+                // Same pattern for the change-notification gate (rsac-d3e2):
+                // supports_device_change_notifications is true only when the
+                // RsacDevices callback methods resolved AND the
+                // nativeDevicesChanged RegisterNatives succeeded.
+                crate::core::capabilities::set_android_device_change_notifications_available(
+                    cache
+                        .aar
+                        .as_ref()
+                        .and_then(|aar| aar.devices.as_ref())
+                        .is_some_and(|d| d.callback.is_some()),
                 );
                 let _ = CACHE.set(cache);
                 log::debug!(
@@ -1429,6 +1609,157 @@ pub(super) fn enumerate_input_device_records() -> AudioResult<String> {
     result
 }
 
+/// Subscribes to input-device change notifications via the AAR's
+/// `AudioManager.registerAudioDeviceCallback` path (rsac-d3e2).
+///
+/// Seeds the diff baseline from a fresh enumeration **before** registering,
+/// so Android's register-time immediate `onAudioDevicesAdded(current)` diffs
+/// to empty — consumers receive only *changes*, never an initial-add flood
+/// (a device added in the seed→register window is present in the immediate
+/// fire's re-enumeration and absent from the seed, so it is still reported).
+///
+/// The returned watcher's teardown unregisters the Java side FIRST
+/// (`RsacDevices.unregisterDeviceCallback`: `AudioManager` unregister +
+/// bounded `HandlerThread` join) and only then drops the Rust entry — the
+/// no-callback-after-free order. The `Arc` registry is belt-and-suspenders
+/// for a timed-out join: an in-flight `nativeDevicesChanged` holds its own
+/// clone and a stale id is a no-op.
+pub(super) fn watch_input_devices(on_event: DeviceEventHandler) -> AudioResult<DeviceWatcher> {
+    let cache = cache()?;
+    let devices =
+        aar_cache()?
+            .devices
+            .as_ref()
+            .ok_or_else(|| AudioError::PlatformNotSupported {
+                feature: "device change notifications".to_string(),
+                platform: "android".to_string(),
+            })?;
+    let cb = devices
+        .callback
+        .as_ref()
+        .ok_or_else(|| AudioError::PlatformNotSupported {
+            feature: "device change notifications".to_string(),
+            platform: "android".to_string(),
+        })?;
+    let guard = attach_current_thread()?;
+    let env = guard.env();
+
+    // ── Application context ──────────────────────────────────────────
+    // SAFETY: static method on the cached ActivityThread class; no args.
+    let context = unsafe {
+        jni_call!(
+            env,
+            CallStaticObjectMethodA,
+            cache.activity_thread_class,
+            cache.current_application,
+            ptr::null()
+        )
+    };
+    let exception = unsafe { take_exception_message(env) };
+    if context.is_null() || exception.is_some() {
+        return Err(AudioError::BackendError {
+            backend: "AAudio".to_string(),
+            operation: "watch".to_string(),
+            message: format!(
+                "could not obtain an application Context via \
+                 ActivityThread.currentApplication(){}",
+                exception.map(|m| format!(": {}", m)).unwrap_or_default()
+            ),
+            context: None,
+        });
+    }
+
+    // Seed `previous` from a fresh enumeration BEFORE registering, so the
+    // register-time immediate onAudioDevicesAdded diffs to empty. A failed
+    // seed enumeration degrades to an empty baseline (the immediate fire
+    // then reports the current devices as adds — still correct data, just
+    // without the flood suppression).
+    let initial: HashSet<i32> = enumerate_input_device_records()
+        .ok()
+        .map(|raw| {
+            super::parse_input_device_records(&raw)
+                .iter()
+                .map(|d| d.id)
+                .collect()
+        })
+        .unwrap_or_default();
+    let handle = register_watcher(on_event, initial);
+
+    // ── RsacDevices.registerDeviceCallback(context, handle) ─────────
+    let args = [jvalue { l: context }, jvalue { j: handle }];
+    // SAFETY: static method on the cached RsacDevices class; (Context, long)
+    // args as cached.
+    let ok = unsafe {
+        jni_call!(
+            env,
+            CallStaticBooleanMethodA,
+            devices.class,
+            cb.register,
+            args.as_ptr()
+        )
+    };
+    let exception = unsafe { take_exception_message(env) };
+    // SAFETY: `context` is a live local ref from this frame.
+    unsafe { jni_call!(env, DeleteLocalRef, context) };
+    if exception.is_some() || ok == 0 {
+        unregister_watcher(handle);
+        return Err(AudioError::BackendError {
+            backend: "AAudio".to_string(),
+            operation: "watch".to_string(),
+            message: format!(
+                "RsacDevices.registerDeviceCallback failed (no AudioManager, \
+                 or the handle was already registered){}",
+                exception.map(|m| format!(": {}", m)).unwrap_or_default()
+            ),
+            context: None,
+        });
+    }
+
+    // Teardown order: unregister Java (AudioManager callback + bounded
+    // HandlerThread join) BEFORE dropping the Rust entry — mirror of the
+    // playback path's "unregister session before asking Kotlin to stop".
+    Ok(DeviceWatcher::from_teardown(Box::new(move || {
+        unregister_device_callback_java(handle);
+        unregister_watcher(handle);
+    })))
+}
+
+/// Asks the AAR to tear down the `AudioDeviceCallback` registration for
+/// `handle` (`RsacDevices.unregisterDeviceCallback`: `AudioManager`
+/// unregister + `quitSafely` + bounded `HandlerThread` join). Exceptions are
+/// folded into log warnings — teardown must not fail (mirrors
+/// [`stop_and_release_bridge`]).
+fn unregister_device_callback_java(handle: i64) {
+    let Ok(aar) = aar_cache() else { return };
+    let Some(devices) = aar.devices.as_ref() else {
+        return;
+    };
+    let Some(cb) = devices.callback.as_ref() else {
+        return;
+    };
+    let Ok(guard) = attach_current_thread() else {
+        return;
+    };
+    let env = guard.env();
+    let args = [jvalue { j: handle }];
+    // SAFETY: static method on the cached RsacDevices class; one long arg.
+    unsafe {
+        jni_call!(
+            env,
+            CallStaticVoidMethodA,
+            devices.class,
+            cb.unregister,
+            args.as_ptr()
+        );
+        if let Some(msg) = take_exception_message(env) {
+            log::warn!(
+                "RsacDevices.unregisterDeviceCallback threw: {}; continuing teardown",
+                msg
+            );
+        }
+    }
+}
+
 // ── Compile-time assertions ──────────────────────────────────────────────
 
 /// The registered native fn pointers must have the exact JNI-expected
@@ -1447,3 +1778,5 @@ const _NATIVE_SESSION_ENDED: unsafe extern "system" fn(*mut JNIEnv, jclass, jlon
     native_session_ended;
 const _NATIVE_RETAIN_PROJECTION: unsafe extern "system" fn(*mut JNIEnv, jclass, jobject) -> jlong =
     native_retain_projection;
+const _NATIVE_DEVICES_CHANGED: unsafe extern "system" fn(*mut JNIEnv, jclass, jlong) =
+    native_devices_changed;
