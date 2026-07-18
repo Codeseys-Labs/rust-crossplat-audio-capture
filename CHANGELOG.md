@@ -234,6 +234,31 @@ Releases with no ABI change omit the subsection (or state "No C ABI changes").
   variant docs and [ADR-0017](docs/designs/0017-windows-application-capture-include-tree.md)).
   Removes the CI `RSAC_CI_AUDIO_DETERMINISTIC=0` opt-out that previously masked
   this on the Windows process tier's Application step.
+- **Mobile glue — three runtime-hazard fixes from the PR #36/#40 review
+  (rsac-cabf; reasoning-verified, on-device verification tracked in rsac-e6d3
+  (Android) / rsac-97c8 (iOS)).**
+  - **Android API 34+ mediaProjection FGS ordering `SecurityException`:** two
+    platform constraints collide — a `mediaProjection`-typed FGS may be started
+    only *after* consent, yet `getMediaProjection()` internally requires that
+    FGS to already be *confirmed-foreground*. The old flow (host starts the FGS
+    before `request()`) failed the first; naively starting it inline after
+    consent fails the second. `RsacProjection.request` now stashes the consent
+    result, starts `RsacCaptureService`, and acquires the projection from
+    within the service after `startForeground()` returns (confirmed-foreground),
+    delivering the token via the existing `onToken` callback. Hosts must not
+    start the service before `request()` (README/KDoc updated); a stray
+    pre-consent start is caught and surfaced as `onDenied` rather than crashing.
+  - **iOS heartbeat tick racing `munmap`:** `broadcastFinished` cancelled the
+    heartbeat `DispatchSource` and then `munmap`'d the ring inline, but
+    `cancel()` does not wait for an in-flight tick — a tick could touch the ring
+    after unmap. The producer's `close()` (final heartbeat + `munmap`) now runs
+    in the timer's `setCancelHandler`, which `DispatchSource` orders strictly
+    after any running event handler and guarantees fires no further ticks.
+  - **iOS ring shrink under a live reader:** `RingProducer` `ftruncate`'d
+    unconditionally on broadcast start, which could shrink a still-mapped
+    previous-generation ring under the host reader (SIGBUS). Truncation is now
+    grow-only (`fstat` then `ftruncate` only when the new geometry is larger);
+    the consumer already tolerates a larger-than-needed file.
 - **macOS device-watch teardown no longer leaks the `WatchListenerContext` or
   races an in-flight callback (GH #32 / ADR-0005 §5).**
   `DeviceEnumerator::watch` now registers block-based CoreAudio listeners

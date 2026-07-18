@@ -25,8 +25,11 @@ import java.util.concurrent.CopyOnWriteArrayList
  *
  * ### Lifecycle contract
  *
- * - [start] before media-projection capture begins (on API 34+ the OS
- *   enforces that a mediaProjection FGS is running).
+ * - [start] must run AFTER MediaProjection consent is granted but before
+ *   capture begins — on API 34+ starting a mediaProjection-typed FGS before
+ *   consent throws SecurityException (rsac-cabf). [RsacProjection.request]
+ *   calls [start] itself on the consent-success path; hosts must not call it
+ *   earlier.
  * - [CaptureBridge]s register themselves here ([registerBridge]) while
  *   running; when the service is destroyed — [stop], task removal, or the
  *   system reclaiming it — every registered bridge is stopped so no capture
@@ -62,11 +65,28 @@ class RsacCaptureService : Service() {
                     intent?.getStringExtra(EXTRA_NOTIFICATION_TEXT)
                         ?: DEFAULT_NOTIFICATION_TEXT,
                 )
-                startForeground(
-                    NOTIFICATION_ID,
-                    notification,
-                    ServiceInfo.FOREGROUND_SERVICE_TYPE_MEDIA_PROJECTION,
-                )
+                try {
+                    startForeground(
+                        NOTIFICATION_ID,
+                        notification,
+                        ServiceInfo.FOREGROUND_SERVICE_TYPE_MEDIA_PROJECTION,
+                    )
+                } catch (e: Exception) {
+                    // e.g. ForegroundServiceStartNotAllowedException, or the
+                    // pre-consent SecurityException if a host started this
+                    // service itself before RsacProjection.request(). Fail the
+                    // pending acquisition instead of crashing (rsac-cabf).
+                    RsacProjection.onForegroundServiceFailed(
+                        "the mediaProjection foreground service failed to start: ${e.message}"
+                    )
+                    stopSelf()
+                    return START_NOT_STICKY
+                }
+                // The FGS is now confirmed-foreground (startForeground is a
+                // synchronous AMS binder call), so this is the earliest legal
+                // moment to acquire the MediaProjection (rsac-cabf). No-op
+                // unless RsacProjection.request stashed a pending consent.
+                RsacProjection.onForegroundServiceReady(this)
             }
         }
         // Capture must not restart without a fresh consent token, so never
@@ -129,8 +149,10 @@ class RsacCaptureService : Service() {
 
         /**
          * Starts the service in the foreground (mediaProjection type). Call
-         * before media-projection capture begins — mandatory ordering on
-         * API 34+.
+         * AFTER MediaProjection consent is granted and before capture begins.
+         * On API 34+ starting this typed FGS before consent throws
+         * SecurityException, so [RsacProjection.request] invokes this on the
+         * consent-success path — hosts should not call it earlier (rsac-cabf).
          */
         @JvmStatic
         @JvmOverloads

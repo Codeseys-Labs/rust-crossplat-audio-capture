@@ -27,8 +27,11 @@
 //!   [`with_android_projection`]; playback builds without one fail the
 //!   preflight with `UserConsentRequired`.
 //! - **Foreground service** (playback capture, API 34+) — a
-//!   `mediaProjection`-typed FGS must be running before capture starts;
-//!   `RsacCaptureService.start(context)` provides one.
+//!   `mediaProjection`-typed FGS must be confirmed-foreground before the
+//!   projection is acquired. `RsacProjection.request` starts
+//!   `RsacCaptureService` itself on the consent-success path and acquires the
+//!   projection from within the service; hosts must NOT start it earlier
+//!   (rsac-cabf).
 //!
 //! [`with_android_projection`]: crate::api::AudioCaptureBuilder::with_android_projection
 //!

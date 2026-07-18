@@ -72,13 +72,11 @@ follow-up seed.
 2. **Runtime permission** — request `RECORD_AUDIO` (required even for
    playback capture) before building a capture.
 
-3. **Start the foreground service** (mandatory ordering on API 34+):
-
-   ```kotlin
-   RsacCaptureService.start(context)
-   ```
-
-4. **Run the consent flow** from a `ComponentActivity`:
+3. **Run the consent flow** from a `ComponentActivity`. `request` starts the
+   `mediaProjection` foreground service for you, on the consent-success path
+   — **do not** call `RsacCaptureService.start()` yourself beforehand: on
+   API 34+ starting a `mediaProjection`-typed FGS before consent exists throws
+   `SecurityException` (rsac-cabf).
 
    ```kotlin
    RsacProjection.request(activity, object : RsacProjection.Callback {
@@ -87,7 +85,7 @@ follow-up seed.
    })
    ```
 
-5. **Hand the token to Rust.**
+4. **Hand the token to Rust.**
    - **Dioxus / direct Rust:** pass the `Long` across your JNI/FFI boundary
      and call `AudioCaptureBuilder::with_android_projection(AndroidProjectionToken(token))`.
    - **Flutter / C consumers:** pass it as `int64_t` through rsac-ffi:
@@ -96,7 +94,7 @@ follow-up seed.
      over JNI (rsac-77f1), audio flows through the normal
      `BridgeStream` → `read_chunk()` pipeline.
 
-6. **Stop:** drop the capture on the Rust side (releases the token and stops
+5. **Stop:** drop the capture on the Rust side (releases the token and stops
    the bridge), then `RsacCaptureService.stop(context)`.
 
 Mic-only capture (`CaptureTarget::Device("default")`) needs none of the

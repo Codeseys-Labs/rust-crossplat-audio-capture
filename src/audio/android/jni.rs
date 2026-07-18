@@ -1217,9 +1217,10 @@ pub(super) fn create_and_start_bridge(
                 "CaptureBridge construction failed: {}. Common causes: the \
                  RECORD_AUDIO runtime permission is not granted, the \
                  MediaProjection token was already consumed by another \
-                 capture (one token = one session), or no mediaProjection \
-                 foreground service is running (API 34+ requires \
-                 RsacCaptureService.start() before capture)",
+                 capture (one token = one session), or the mediaProjection \
+                 foreground service is no longer running (API 34+ requires it \
+                 foreground for the capture's lifetime; RsacProjection.request \
+                 starts it — do not stop it before dropping the capture)",
                 msg
             ),
             context: None,
