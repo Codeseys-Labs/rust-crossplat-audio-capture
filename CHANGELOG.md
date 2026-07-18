@@ -43,6 +43,18 @@ Releases with no ABI change omit the subsection (or state "No C ABI changes").
   `RsacProjection` (inherits PR#64's deferred-FGS-acquire ordering). Compile-proof:
   desktop builds+clippies in the workspace CI, `android/`+`ios/` source-shipped;
   joined to the version-lockstep set. Mobile runtime tracks rsac-e6d3/rsac-97c8.
+- **Android (emulator runtime-verification CI leg):** new opt-in
+  `ci-android-emu.yml` workflow (rsac-e6d3) boots an API 30 x86_64 AVD
+  (KVM-probed — skips with a loud summary on KVM-less runners rather than
+  failing red), cross-builds the crate test binaries via cargo-ndk, and
+  executes them on the emulator over adb — finally *running* the previously
+  compile-only `cfg(android)` unit tests plus a new
+  `tests/android_emu_smoke.rs` that drives `CaptureTarget::Device("default")`
+  through the public API asserting frame delivery + format sanity (the
+  emulator mic is synthetic — content is never asserted) and the honest
+  `SystemDefault`-without-consent refusal. Results are labelled
+  **emulator-verified**, never device-verified; the AGENTS mobile-matrix
+  cells flip only after the first green run supplies evidence.
 - **Android (device-change notifications):** `AndroidDeviceEnumerator::watch()`
   now delivers input-device hot-plug notifications via the AAR's
   `AudioManager.registerAudioDeviceCallback` (rsac-d3e2), emitting
