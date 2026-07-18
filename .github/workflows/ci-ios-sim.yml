@@ -1,0 +1,354 @@
+name: iOS Simulator Runtime Leg
+
+# =============================================================================
+# rsac-97c8 — iOS Simulator RUNTIME verification (the iOS twin of the Android
+# emulator leg rsac-e6d3). Boots an iPhone simulator on a macOS-15 Blacksmith
+# runner and EXECUTES rsac's Rust code against a live AVAudioEngine input tap.
+#
+# HONESTY: the simulator is NOT a device. Every result here is labelled
+# `simulator-verified`. It proves the AVAudioEngine tap delivers frames through
+# the rsac public API and runs the previously-dormant cfg(ios) unit tests. A
+# physical-device pass and the interleaved-delivery / start-failure-rollback
+# paths remain a runbook (see docs/MOBILE_BACKEND_DESIGN.md and the disposition
+# table in the PR body). This leg is opt-in (workflow_dispatch) + fires on iOS
+# source changes; it is NOT a required PR gate until the acceptance criteria in
+# the PR body are observed green on a runner.
+#
+# Test-harness mechanism: the crate test binaries are built for
+# aarch64-apple-ios-sim (Blacksmith macos-15 is Apple Silicon) and executed
+# inside the booted simulator via `xcrun simctl spawn` — a libtest binary is
+# an ordinary Mach-O, needs no bundle and no signing. Two load-bearing
+# gotchas this file honors:
+#   1. Child env vars cross the simctl boundary ONLY via the SIMCTL_CHILD_
+#      prefix (a plain RSAC_CI_IOS_SIM=1 on the runner never reaches the
+#      spawned test process).
+#   2. Test executables are discovered from cargo's --message-format=json
+#      output, never guessed from target/ paths.
+# =============================================================================
+
+on:
+  workflow_dispatch:
+    inputs:
+      require_frames:
+        description: >-
+          Hard-fail the frames-delivered smoke instead of skip-with-summary
+          when the simulator input route yields no frames (set once a runner
+          has proven the host-mic route is reliable).
+        type: boolean
+        default: false
+  pull_request:
+    branches: [main, master, 'release/**']
+    paths:
+      - 'src/audio/ios/**'
+      - 'src/core/capabilities.rs'
+      - 'tests/ios_sim_smoke.rs'
+      - 'Cargo.toml'
+      - 'Cargo.lock'
+      - '.github/workflows/ci-ios-sim.yml'
+      - '.github/actions/**'
+
+concurrency:
+  group: ios-sim-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+  RUST_BACKTRACE: 1
+  RUST_LOG: rsac=debug
+  IOS_SIM_TARGET: aarch64-apple-ios-sim
+
+jobs:
+  ios-sim:
+    name: iOS Simulator Runtime Leg
+    timeout-minutes: 40
+    runs-on: blacksmith-6vcpu-macos-15
+    defaults:
+      run:
+        # bash keyword shell => -eo pipefail, so a `cargo … | tee log` pipe
+        # cannot mask a real failure behind tee's exit 0 (same reasoning as
+        # ci-audio-tests.yml's macOS job).
+        shell: bash
+    outputs:
+      runtime: ${{ steps.pick.outputs.runtime }}
+      device_udid: ${{ steps.pick.outputs.udid }}
+      unit_tests: ${{ steps.record.outputs.unit_tests }}
+      frames_smoke: ${{ steps.record.outputs.frames_smoke }}
+    steps:
+      - uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5
+        with:
+          persist-credentials: false
+
+      - uses: ./.github/actions/rust-setup
+        with:
+          targets: aarch64-apple-ios-sim
+          cache-key: ios-sim
+
+      # ── Toolchain provenance (honest logging) ─────────────────────────────
+      - name: Log Xcode / SDK provenance
+        run: |
+          xcode-select -p
+          xcodebuild -version
+          xcrun --sdk iphonesimulator --show-sdk-version
+          echo "runner arch: $(uname -m)"   # expect arm64 => aarch64-*-sim is correct
+
+      # ── Probe: available iOS runtimes; pick newest iPhone simulator ───────
+      # skip-with-summary (exit 0, NOT a failure) if the image ships no iOS
+      # runtime — the leg is advisory and must never red-flag a PR because an
+      # image lacks a simulator runtime.
+      - name: Probe iOS runtimes and select a device
+        id: pick
+        run: |
+          echo "## iOS Simulator probe" >> "$GITHUB_STEP_SUMMARY"
+          xcrun simctl list runtimes --json > runtimes.json
+          {
+            echo '```'
+            xcrun simctl list runtimes || true
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+
+          # Newest *available* iOS runtime identifier + version, via python3
+          # (ships on the macOS image). Empty => no usable runtime.
+          RT_LINE="$(python3 - <<'PY'
+          import json
+          rts = json.load(open("runtimes.json"))["runtimes"]
+          ios = [r for r in rts if r.get("platform") == "iOS" or "iOS" in r.get("name", "")]
+          ios = [r for r in ios if r.get("isAvailable") or r.get("availability") == "(available)"]
+          def ver(r):
+              try:
+                  return tuple(int(x) for x in r["version"].split("."))
+              except Exception:
+                  return (0,)
+          ios.sort(key=ver)
+          print(f'{ios[-1]["identifier"]} {ios[-1]["version"]}' if ios else "")
+          PY
+          )"
+          RT_ID="${RT_LINE%% *}"
+          RT_VER="${RT_LINE##* }"
+
+          if [ -z "$RT_ID" ]; then
+            echo "::warning::No available iOS simulator runtime on this image — skipping the runtime leg (compile coverage still lives in the mobile-ios job)."
+            echo "**Result: SKIPPED (no iOS runtime on image).**" >> "$GITHUB_STEP_SUMMARY"
+            echo "runtime=none" >> "$GITHUB_OUTPUT"
+            echo "udid=" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          # Newest iPhone device type available for that runtime.
+          DTYPE="$(xcrun simctl list devicetypes --json \
+            | python3 -c 'import json,sys;d=json.load(sys.stdin)["devicetypes"];ip=[x for x in d if x["identifier"].startswith("com.apple.CoreSimulator.SimDeviceType.iPhone")];print(ip[-1]["identifier"] if ip else "")')"
+          if [ -z "$DTYPE" ]; then
+            echo "::warning::iOS runtime $RT_VER present but no iPhone device type — skipping."
+            echo "**Result: SKIPPED (no iPhone device type).**" >> "$GITHUB_STEP_SUMMARY"
+            echo "runtime=none" >> "$GITHUB_OUTPUT"
+            echo "udid=" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          UDID="$(xcrun simctl create "rsac-ci-iphone" "$DTYPE" "$RT_ID")"
+          echo "Created simulator $UDID (runtime iOS $RT_VER, $DTYPE)"
+          echo "**Selected:** iOS \`$RT_VER\` on \`$DTYPE\` (udid \`$UDID\`)." >> "$GITHUB_STEP_SUMMARY"
+          echo "runtime=$RT_VER" >> "$GITHUB_OUTPUT"
+          echo "udid=$UDID" >> "$GITHUB_OUTPUT"
+
+      - name: Boot the simulator
+        if: steps.pick.outputs.runtime != 'none'
+        run: |
+          xcrun simctl boot "${{ steps.pick.outputs.udid }}"
+          # Block until fully booted (bounded by the job timeout).
+          xcrun simctl bootstatus "${{ steps.pick.outputs.udid }}" -b
+
+      # ── TCC microphone grant (best-effort; investigated) ──────────────────
+      # `simctl privacy … grant microphone <bundle-id>` keys on a BUNDLE ID.
+      # A bare libtest binary spawned via `simctl spawn` has no bundle, so a
+      # blanket grant cannot target it. We attempt the wildcard `all` service
+      # grant (harmless if unsupported) and otherwise rely on the fact that the
+      # simulator proxies the HOST mic into AVAudioSession and, for a spawned
+      # non-app process, typically does not enforce a TCC prompt. The smoke
+      # asserts DELIVERY, not content, and degrades to skip-with-summary if the
+      # route is blocked — so a missing grant is a documented outcome, never a
+      # false red. (Full app-wrapped TCC grant is a documented follow-up; see
+      # PR body "needs-real-device / needs-wrapped-app".)
+      - name: Best-effort TCC microphone grant
+        if: steps.pick.outputs.runtime != 'none'
+        run: |
+          xcrun simctl privacy "${{ steps.pick.outputs.udid }}" grant microphone all 2>&1 || \
+            echo "::notice::simctl privacy microphone grant not applicable to bare binaries — smoke degrades to skip-with-summary if the route is blocked."
+
+      # ── Build the crate test binaries for the simulator target ────────────
+      - name: Build crate test binaries (feat_ios, sim target)
+        if: steps.pick.outputs.runtime != 'none'
+        run: |
+          # --message-format=json so we can discover executables rather than
+          # guess target/ paths. Build lib unit tests + the ios_sim_smoke
+          # integration test.
+          cargo test --no-run \
+            --target "$IOS_SIM_TARGET" \
+            --no-default-features --features feat_ios \
+            --lib --test ios_sim_smoke \
+            --message-format=json > build.jsonl 2> build.log || {
+              echo "::error::sim-target test build failed"
+              tail -n 100 build.log
+              exit 1
+            }
+          python3 - <<'PY' > test-binaries.txt
+          import json
+          exes = []
+          for line in open("build.jsonl"):
+              line = line.strip()
+              if not line.startswith("{"):
+                  continue
+              try:
+                  m = json.loads(line)
+              except Exception:
+                  continue
+              # profile.test (not target.test!) distinguishes libtest
+              # harnesses from ordinary bins: `cargo test --no-run` also
+              # builds the crate's [[bin]] targets (integration tests may
+              # invoke them) and those carry target.test=true (the "can be
+              # tested" default) with profile.test=false. Keying on
+              # target.test would wrongly spawn app_capture_test /
+              # pipewire_test in the simulator (verified locally against
+              # real cargo JSON output, 2026-07-18).
+              if (
+                  m.get("reason") == "compiler-artifact"
+                  and m.get("executable")
+                  and m.get("profile", {}).get("test")
+              ):
+                  exes.append(m["executable"])
+          print("\n".join(dict.fromkeys(exes)))
+          PY
+          echo "Discovered test binaries:"
+          cat test-binaries.txt
+          test -s test-binaries.txt || { echo "::error::no test executables discovered"; exit 1; }
+
+      # ── Execute the DORMANT cfg(ios) unit tests on the simulator ──────────
+      # These compile under --tests for iOS today but have NEVER RUN
+      # (avaudio.rs gather_* + scratch_capacity, mod.rs enumerate/default/
+      # supported_formats/describe, thread.rs target classification). Running
+      # the lib test binary in the booted sim finally executes them. HARD gate.
+      - name: Run dormant cfg(ios) unit tests (simulator)
+        id: unit
+        if: steps.pick.outputs.runtime != 'none'
+        env:
+          SIMCTL_CHILD_RUST_BACKTRACE: "1"
+          SIMCTL_CHILD_RUST_LOG: "rsac=debug"
+        run: |
+          rc=0
+          # Spawn every discovered test binary EXCEPT the ios_sim_smoke one
+          # (run separately, env-gated) — detected by filename.
+          while IFS= read -r exe; do
+            case "$exe" in
+              *ios_sim_smoke*) continue ;;
+            esac
+            echo "== spawning unit tests: $exe =="
+            xcrun simctl spawn "${{ steps.pick.outputs.udid }}" "$exe" \
+              --test-threads=1 --nocapture 2>&1 | tee -a ios-unit.log || rc=$?
+          done < test-binaries.txt
+          exit $rc
+
+      # ── Frames-delivered SMOKE via the rsac public API ─────────────────────
+      # Env-gated (RSAC_CI_IOS_SIM=1) exactly like the Linux deterministic
+      # legs. Asserts DELIVERY + a sane negotiated format, NOT content (the
+      # host mic may be silent in CI). skip-with-summary if the sim input route
+      # is unavailable, UNLESS workflow_dispatch input `require_frames=true`.
+      - name: Frames-delivered smoke (simulator, public API)
+        id: smoke
+        if: steps.pick.outputs.runtime != 'none'
+        env:
+          SIMCTL_CHILD_RSAC_CI_IOS_SIM: "1"
+          SIMCTL_CHILD_RSAC_TEST_CAPTURE_TIMEOUT_SECS: "15"
+          SIMCTL_CHILD_RSAC_CI_IOS_REQUIRE_FRAMES: ${{ (github.event_name == 'workflow_dispatch' && inputs.require_frames) && '1' || '0' }}
+          SIMCTL_CHILD_RUST_BACKTRACE: "1"
+          SIMCTL_CHILD_RUST_LOG: "rsac=debug"
+        run: |
+          SMOKE_BIN="$(grep ios_sim_smoke test-binaries.txt | head -n1)"
+          test -n "$SMOKE_BIN" || { echo "::error::ios_sim_smoke binary not built"; exit 1; }
+          xcrun simctl spawn "${{ steps.pick.outputs.udid }}" "$SMOKE_BIN" \
+            --test-threads=1 --nocapture 2>&1 | tee ios-smoke.log
+
+      - name: Record tier results
+        id: record
+        if: always()
+        run: |
+          echo "unit_tests=${{ steps.unit.outcome }}" >> "$GITHUB_OUTPUT"
+          echo "frames_smoke=${{ steps.smoke.outcome }}" >> "$GITHUB_OUTPUT"
+
+      - name: Teardown simulator
+        if: always() && steps.pick.outputs.udid != ''
+        run: |
+          xcrun simctl shutdown "${{ steps.pick.outputs.udid }}" 2>/dev/null || true
+          xcrun simctl delete "${{ steps.pick.outputs.udid }}" 2>/dev/null || true
+
+      - name: Upload simulator logs
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: ios-sim-logs
+          path: |
+            ios-unit.log
+            ios-smoke.log
+            build.log
+            runtimes.json
+            test-binaries.txt
+          if-no-files-found: ignore
+          retention-days: 14
+
+  summary:
+    name: iOS Simulator Leg — Summary
+    needs: ios-sim
+    if: always()
+    timeout-minutes: 5
+    runs-on: blacksmith-4vcpu-ubuntu-2404
+    permissions:
+      contents: read
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - name: Report (simulator-verified only)
+        env:
+          RT: ${{ needs.ios-sim.outputs.runtime }}
+          UNIT: ${{ needs.ios-sim.outputs.unit_tests }}
+          SMOKE: ${{ needs.ios-sim.outputs.frames_smoke }}
+          JOB: ${{ needs.ios-sim.result }}
+        run: |
+          set -u
+          {
+            echo "# iOS Simulator Runtime Leg — Summary (simulator-verified)"
+            echo ""
+            echo "| Item | Result | Verification class |"
+            echo "|---|---|---|"
+            echo "| ios-sim job | ${JOB:-n/a} | — |"
+            echo "| iOS runtime selected | ${RT:-n/a} | probe |"
+            echo "| Dormant cfg(ios) unit tests | ${UNIT:-n/a} | simulator-verified |"
+            echo "| Frames-delivered smoke (public API) | ${SMOKE:-n/a} | simulator-verified |"
+            echo ""
+            echo "> The simulator is NOT a device. Physical-device capture, the"
+            echo "> interleaved-delivery fast path, and start-failure rollback"
+            echo "> remain a runbook (needs-real-device)."
+          } >> "$GITHUB_STEP_SUMMARY"
+
+          # Gate policy (advisory leg): a whole-job SKIP (no iOS runtime) is
+          # allowed. If a runtime WAS selected, the dormant unit tests are a
+          # HARD gate; the frames smoke is soft (skip-with-summary happens
+          # inside the test) unless the smoke step itself hard-failed.
+          if [ "${JOB}" != "success" ]; then
+            echo "FAILED: ios-sim job result = ${JOB}"
+            exit 1
+          fi
+          if [ "${RT:-none}" = "none" ] || [ -z "${RT}" ]; then
+            echo "iOS runtime unavailable on the image — leg skipped (advisory)."
+            exit 0
+          fi
+          FAILED=0
+          if [ "${UNIT}" != "success" ]; then
+            echo "FAILED: dormant cfg(ios) unit tests = ${UNIT}"
+            FAILED=1
+          fi
+          if [ "${SMOKE}" != "success" ]; then
+            echo "NOTE: frames smoke = ${SMOKE} (soft; see logs)."
+          fi
+          exit $FAILED

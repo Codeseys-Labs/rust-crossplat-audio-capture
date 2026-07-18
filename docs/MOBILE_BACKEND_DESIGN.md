@@ -294,7 +294,15 @@ Staged, honest about what each stage proves:
    tests executed; MediaProjection consent automation via `uiautomator` once
    rsac-77f1 lands); `rsac-97c8` does the iOS twin (simulator mic first,
    physical device as stretch, broadcast-extension end-to-end once rsac-b3aa
-   lands). **Do not claim "tested on Android/iOS" until these are green** —
+   lands). The **simulator half of rsac-97c8 is delivered** as the opt-in
+   `ci-ios-sim.yml` leg: it boots an iPhone simulator on a macOS-15 runner,
+   executes the previously-dormant `cfg(ios)` unit tests via
+   `xcrun simctl spawn`, and runs a frames-delivered public-API smoke
+   (`tests/ios_sim_smoke.rs`, env-gated on `RSAC_CI_IOS_SIM=1`). Results are
+   labelled **simulator-verified** only — the simulator is not a device; the
+   physical-device pass, interleaved-delivery fast path, and
+   start-failure-rollback verification remain seeded (needs-real-device).
+   **Do not claim "tested on Android/iOS" until these are green** —
    same discipline as the desktop verification table in AGENTS.md §6.
 3. **Stage 3 — seeded (delivery):** real Android device enumeration/selection
    (`rsac-ad8a`), glue distribution — Maven AAR + SwiftPM guidance

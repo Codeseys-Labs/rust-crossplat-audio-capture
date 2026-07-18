@@ -276,6 +276,19 @@ env_logger = "0.11.11"
 [target.'cfg(not(any(target_os = "ios", target_os = "android")))'.dev-dependencies]
 criterion = "0.8.2" # Benchmarking
 
+[target.'cfg(target_os = "ios")'.dev-dependencies]
+# rsac-97c8: the ios_sim_smoke integration test plays the host-app role and
+# activates a record-capable AVAudioSession itself (the library deliberately
+# never touches the shared session — src/audio/ios/mod.rs "Host-app
+# responsibilities"). Session bindings live here, in test-only scope, so no
+# production code path gains a session dependency. AVAudioSessionTypes carries
+# the category/mode extern statics + AVAudioSessionCategoryOptions used by the
+# test; AVAudioSession carries the sharedInstance/setCategory/setActive
+# surface.
+objc2-avf-audio = { version = "0.3", features = [
+    "AVAudioSession", "AVAudioSessionTypes",
+] }
+
 [[bin]]
 name = "rsac"
 path = "src/main.rs"

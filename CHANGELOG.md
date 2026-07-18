@@ -20,6 +20,22 @@ Releases with no ABI change omit the subsection (or state "No C ABI changes").
 
 ### Added
 
+- **iOS (simulator runtime-verification CI leg):** new opt-in
+  `ci-ios-sim.yml` workflow (rsac-97c8) boots an iPhone simulator on a
+  macOS-15 runner, builds the crate test binaries for
+  `aarch64-apple-ios-sim`, and executes them via `xcrun simctl spawn` —
+  finally *running* the previously compile-only `cfg(ios)` unit tests
+  (avaudio gather/scratch, mod enumeration, thread target classification)
+  plus a new `tests/ios_sim_smoke.rs` frames-delivered smoke that drives
+  `CaptureTarget::Device("default")` through the public API against a live
+  `AVAudioEngine` input tap (env-gated on `RSAC_CI_IOS_SIM=1`; the test
+  plays the host-app role and activates a `.playAndRecord` AVAudioSession
+  itself via a new iOS-only `objc2-avf-audio` dev-dependency — no production
+  code path gains a session dependency). Results are labelled
+  **simulator-verified**, never device-verified; physical-device capture,
+  the interleaved-delivery fast path, and start-failure rollback remain a
+  runbook. (rsac-97c8)
+
 - **Android (device-change notifications):** `AndroidDeviceEnumerator::watch()`
   now delivers input-device hot-plug notifications via the AAR's
   `AudioManager.registerAudioDeviceCallback` (rsac-d3e2), emitting
