@@ -136,12 +136,27 @@ jobs:
             exit 0
           fi
 
-          # Newest iPhone device type available for that runtime.
-          DTYPE="$(xcrun simctl list devicetypes --json \
-            | python3 -c 'import json,sys;d=json.load(sys.stdin)["devicetypes"];ip=[x for x in d if x["identifier"].startswith("com.apple.CoreSimulator.SimDeviceType.iPhone")];print(ip[-1]["identifier"] if ip else "")')"
+          # An iPhone device type COMPATIBLE with the selected runtime — from
+          # the runtime's own supportedDeviceTypes (first-run lesson: picking
+          # the globally-newest iPhone type paired it with an incompatible
+          # runtime and `simctl create` failed with SimError 403
+          # "Incompatible device").
+          DTYPE="$(python3 - "$RT_ID" <<'PY'
+          import json, sys
+          rt_id = sys.argv[1]
+          rts = json.load(open("runtimes.json"))["runtimes"]
+          rt = next((r for r in rts if r["identifier"] == rt_id), None)
+          phones = [
+              d["identifier"]
+              for d in (rt or {}).get("supportedDeviceTypes", [])
+              if d["identifier"].startswith("com.apple.CoreSimulator.SimDeviceType.iPhone")
+          ]
+          print(phones[-1] if phones else "")
+          PY
+          )"
           if [ -z "$DTYPE" ]; then
-            echo "::warning::iOS runtime $RT_VER present but no iPhone device type — skipping."
-            echo "**Result: SKIPPED (no iPhone device type).**" >> "$GITHUB_STEP_SUMMARY"
+            echo "::warning::iOS runtime $RT_VER present but no compatible iPhone device type — skipping."
+            echo "**Result: SKIPPED (no compatible iPhone device type).**" >> "$GITHUB_STEP_SUMMARY"
             echo "runtime=none" >> "$GITHUB_OUTPUT"
             echo "udid=" >> "$GITHUB_OUTPUT"
             exit 0

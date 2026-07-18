@@ -24,8 +24,14 @@ use crate::{Error, Result};
 #[cfg(target_os = "android")]
 const PLUGIN_IDENTIFIER: &str = "ai.codeseys.rsac.tauri";
 
-#[cfg(target_os = "ios")]
-tauri::ios_plugin_binding!(init_plugin_rsac);
+// NOTE (iOS stub): `PluginApi::register_ios_plugin` is feature-gated behind
+// tauri's `wry` feature (plugin/mobile.rs: `#[cfg(all(target_os = "ios",
+// feature = "wry"))]`), which this crate deliberately drops
+// (default-features = false — no webview runtime in a library plugin). The
+// iOS half is a stub anyway (§8: consent is an Android-only concept; the iOS
+// broadcast path needs no dialog), so no native plugin is registered on iOS
+// and `request_consent` fails honestly instead. Revisit when the iOS half
+// grows real native commands (tracked with the runtime seeds).
 
 /// Response from the Kotlin `requestConsent` command. The `token` is the opaque
 /// `MediaProjection` `GlobalRef` handle minted by `RsacProjection` (jlong),
@@ -42,14 +48,15 @@ struct ConsentResponse {
 
 pub fn init<R: Runtime, C: DeserializeOwned>(
     _app: &AppHandle<R>,
-    api: PluginApi<R, C>,
+    #[cfg_attr(target_os = "ios", allow(unused_variables))] api: PluginApi<R, C>,
 ) -> Result<Rsac<R>> {
     #[cfg(target_os = "android")]
     let handle = api.register_android_plugin(PLUGIN_IDENTIFIER, "RsacTauriPlugin")?;
-    #[cfg(target_os = "ios")]
-    let handle = api.register_ios_plugin(init_plugin_rsac)?;
     Ok(Rsac {
+        #[cfg(target_os = "android")]
         handle,
+        #[cfg(target_os = "ios")]
+        _runtime: std::marker::PhantomData,
         sessions: Sessions::default(),
         // No consent token until request_consent succeeds on Android.
         #[cfg(target_os = "android")]
@@ -57,9 +64,14 @@ pub fn init<R: Runtime, C: DeserializeOwned>(
     })
 }
 
-/// Mobile `Rsac<R>`: consent via the native plugin, capture via shared sessions.
+/// Mobile `Rsac<R>`: consent via the native plugin (Android), capture via
+/// shared sessions. On iOS no native plugin is registered (stub — see the
+/// module note above).
 pub struct Rsac<R: Runtime> {
+    #[cfg(target_os = "android")]
     handle: PluginHandle<R>,
+    #[cfg(target_os = "ios")]
+    _runtime: std::marker::PhantomData<fn() -> R>,
     sessions: Sessions,
     /// The single live Android projection token (wrapped once from the raw
     /// jlong; cloned onto each builder). `None` until consent is granted.
@@ -68,6 +80,22 @@ pub struct Rsac<R: Runtime> {
 }
 
 impl<R: Runtime> Rsac<R> {
+    #[cfg(target_os = "ios")]
+    pub fn request_consent(&self) -> Result<ConsentResult> {
+        // Consent is an Android-only concept (MediaProjection); the iOS
+        // broadcast path needs no dialog and no native plugin is registered
+        // (stub). Honest denial, never a panic.
+        Ok(ConsentResult {
+            granted: false,
+            reason: Some(
+                "consent is not applicable on iOS (MediaProjection is Android-only); \
+                 system capture uses the broadcast extension path"
+                    .into(),
+            ),
+        })
+    }
+
+    #[cfg(target_os = "android")]
     pub fn request_consent(&self) -> Result<ConsentResult> {
         // Empty payload — the Kotlin side drives the dialog off the activity.
         let resp: ConsentResponse = self

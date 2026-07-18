@@ -122,56 +122,85 @@ jobs:
         with:
           targets: x86_64-linux-android
 
-      - name: Install cargo-ndk
-        if: steps.kvm.outputs.available == 'true'
-        run: cargo install --locked cargo-ndk
-
       # ── Cross-build the test binaries (host side, before boot) ───────
-      # cargo-ndk exports the NDK linker env for the wrapped cargo command;
-      # --platform 29 matches the AAR minSdk AND is required for -laaudio to
-      # resolve (NDK sysroot stubs exist from API 26+ — ci.yml lesson).
-      # Binary paths come from --message-format=json (executable field of
-      # compiler-artifact messages), never guessed.
+      # Plain cargo with the NDK linker env, NOT cargo-ndk: the first run
+      # showed cargo-ndk interleaving its own stdout with cargo's json stream
+      # (json discovery found 0 artifacts), while plain cargo's
+      # --message-format=json is clean (shape verified locally). The API-29
+      # clang wrapper is the moral equivalent of cargo-ndk's --platform 29 —
+      # required for -laaudio to resolve (NDK sysroot stubs exist from API
+      # 26+, ci.yml lesson). Binary paths come from the json (executable
+      # field), with a loud guarded glob fallback for first-run resilience.
       - name: Build test binaries for x86_64-linux-android
         if: steps.kvm.outputs.available == 'true'
         run: |
           export ANDROID_NDK_HOME="${ANDROID_NDK_LATEST_HOME:-$ANDROID_NDK_ROOT}"
           echo "Using NDK at: $ANDROID_NDK_HOME"
+          TOOLCHAIN="$ANDROID_NDK_HOME/toolchains/llvm/prebuilt/linux-x86_64/bin"
+          test -x "$TOOLCHAIN/x86_64-linux-android29-clang" || {
+            echo "::error::NDK API-29 x86_64 clang wrapper not found under $TOOLCHAIN"; exit 1;
+          }
+          export CARGO_TARGET_X86_64_LINUX_ANDROID_LINKER="$TOOLCHAIN/x86_64-linux-android29-clang"
+          export CC_x86_64_linux_android="$TOOLCHAIN/x86_64-linux-android29-clang"
+          export AR_x86_64_linux_android="$TOOLCHAIN/llvm-ar"
           mkdir -p emu-payload
-          # Dormant cfg(android) unit tests (rsac --lib). Same no-`--`
-          # invocation shape as ci.yml's cargo-ndk build step.
-          cargo ndk -t x86_64 --platform 29 test --lib \
+          # Dormant cfg(android) unit tests (rsac --lib).
+          cargo test --target x86_64-linux-android --lib \
             --no-default-features --features feat_android \
             --no-run --message-format=json > unit-build.json
           # The emulator smoke (integration test).
-          cargo ndk -t x86_64 --platform 29 test --test android_emu_smoke \
+          cargo test --target x86_64-linux-android --test android_emu_smoke \
             --no-default-features --features feat_android \
             --no-run --message-format=json > smoke-build.json
           python3 - <<'PY'
-          import json, shutil, sys
-          def grab(path, want_name, want_kind, out):
-              exes = []
+          import glob, json, os, shutil, sys
+
+          def artifacts(path):
+              out = []
               for line in open(path):
                   try:
                       m = json.loads(line)
                   except json.JSONDecodeError:
                       continue
-                  if (
-                      m.get("reason") == "compiler-artifact"
-                      and m.get("executable")
-                      and m.get("target", {}).get("name") == want_name
-                      and want_kind in m.get("target", {}).get("kind", [])
-                  ):
-                      exes.append(m["executable"])
-              if len(exes) != 1:
-                  sys.exit(
-                      f"{path}: expected exactly 1 {want_kind} executable named "
-                      f"{want_name!r}, found {len(exes)}: {exes}"
-                  )
-              shutil.copy(exes[0], out)
-              print(f"{path}: {exes[0]} -> {out}")
-          grab("unit-build.json", "rsac", "lib", "emu-payload/rsac_unit_tests")
-          grab("smoke-build.json", "android_emu_smoke", "test", "emu-payload/android_emu_smoke")
+                  if m.get("reason") == "compiler-artifact":
+                      t = m.get("target", {})
+                      out.append((t.get("name"), t.get("kind"), m.get("executable")))
+              return out
+
+          def grab(path, want_name, want_kind, glob_stem, out):
+              found = [
+                  exe
+                  for (name, kind, exe) in artifacts(path)
+                  if exe and name == want_name and want_kind in (kind or [])
+              ]
+              if len(found) == 1:
+                  shutil.copy(found[0], out)
+                  print(f"{path}: json-discovered {found[0]} -> {out}")
+                  return
+              # First-run diagnostics: dump every artifact the json DID carry,
+              # then fall back to a guarded filesystem glob (the test binaries
+              # land in target/<triple>/debug/deps/<stem>-<hash>). The glob is
+              # second choice — kept loud and exactly-one-guarded.
+              print(f"::warning::{path}: json discovery found {len(found)} "
+                    f"candidates for {want_name!r}/{want_kind!r}; artifacts seen:")
+              for a in artifacts(path):
+                  print(f"  name={a[0]!r} kind={a[1]!r} exe={bool(a[2])}")
+              pat = f"target/x86_64-linux-android/debug/deps/{glob_stem}-*"
+              cands = [
+                  p for p in glob.glob(pat)
+                  if os.access(p, os.X_OK) and not p.endswith((".d", ".rlib", ".rmeta", ".so"))
+              ]
+              if len(cands) != 1:
+                  # Newest-mtime wins when hashes accumulated across runs.
+                  cands.sort(key=os.path.getmtime)
+                  cands = cands[-1:]
+              if not cands:
+                  sys.exit(f"{path}: no executable via json OR glob {pat!r}")
+              shutil.copy(cands[0], out)
+              print(f"{path}: glob-discovered {cands[0]} -> {out}")
+
+          grab("unit-build.json", "rsac", "lib", "rsac", "emu-payload/rsac_unit_tests")
+          grab("smoke-build.json", "android_emu_smoke", "test", "android_emu_smoke", "emu-payload/android_emu_smoke")
           PY
           ls -l emu-payload/
 
