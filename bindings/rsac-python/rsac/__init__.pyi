@@ -630,6 +630,27 @@ class Composition:
         """Composed buffers dropped by subscribe pumps (0 before start)."""
         ...
 
+    def set_gain(self, group: str, source_idx: int, gain: float) -> None:
+        """Set a source's live mix gain on a running composition. Addressed by
+        group name + within-group index. Raises StreamError if not started /
+        stopped / ended, ConfigurationError for an unknown group, out-of-range
+        index, or a gain that is not finite and >= 0."""
+        ...
+
+    def set_muted(self, group: str, source_idx: int, muted: bool) -> None:
+        """Mute/unmute a source (separate from gain; unmute restores it). Same
+        addressing and errors as set_gain."""
+        ...
+
+    def gain(self, group: str, source_idx: int) -> float:
+        """Read back a source's current effective gain. Works on a stopped
+        composition; raises StreamError only before start."""
+        ...
+
+    def is_muted(self, group: str, source_idx: int) -> bool:
+        """Read back whether a source is muted. Same errors as gain()."""
+        ...
+
     def close(self) -> None:
         """Close the composition and release all resources."""
         ...

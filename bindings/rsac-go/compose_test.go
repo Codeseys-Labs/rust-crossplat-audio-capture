@@ -258,6 +258,59 @@ func TestComposition_NotStartedContract(t *testing.T) {
 	}
 }
 
+// TestComposition_LiveControlBeforeStart asserts the not-started + closed
+// contract for the live per-source gain/mute controls (rsac-5a2d) without
+// touching a device: every call on a built-but-unstarted composition returns
+// an *Error with ErrStreamRead, and after Close they return ErrClosed. The
+// runtime roundtrip / bounds / not-running paths need a started composition
+// (a real device) and are covered elsewhere.
+func TestComposition_LiveControlBeforeStart(t *testing.T) {
+	b, err := NewCompositionBuilder()
+	if err != nil {
+		t.Fatalf("NewCompositionBuilder: %v", err)
+	}
+	g := mustGroup(t, "main", "system")
+	if err := b.AddGroup(g); err != nil {
+		t.Fatalf("AddGroup: %v", err)
+	}
+	comp, err := b.Build()
+	if err != nil {
+		t.Fatalf("Build: %v", err)
+	}
+
+	assertStreamRead := func(name string, err error) {
+		t.Helper()
+		var e *Error
+		if !errors.As(err, &e) || e.Code != ErrStreamRead {
+			t.Errorf("%s before Start = %v, want *Error{ErrStreamRead}", name, err)
+		}
+	}
+	assertStreamRead("SetGain", comp.SetGain("main", 0, 0.5))
+	assertStreamRead("SetMuted", comp.SetMuted("main", 0, true))
+	if _, err := comp.Gain("main", 0); true {
+		assertStreamRead("Gain", err)
+	}
+	if _, err := comp.IsMuted("main", 0); true {
+		assertStreamRead("IsMuted", err)
+	}
+
+	if err := comp.Close(); err != nil {
+		t.Fatalf("Close: %v", err)
+	}
+	if err := comp.SetGain("main", 0, 0.5); !errors.Is(err, ErrClosed) {
+		t.Errorf("SetGain after Close = %v, want ErrClosed", err)
+	}
+	if err := comp.SetMuted("main", 0, true); !errors.Is(err, ErrClosed) {
+		t.Errorf("SetMuted after Close = %v, want ErrClosed", err)
+	}
+	if _, err := comp.Gain("main", 0); !errors.Is(err, ErrClosed) {
+		t.Errorf("Gain after Close = %v, want ErrClosed", err)
+	}
+	if _, err := comp.IsMuted("main", 0); !errors.Is(err, ErrClosed) {
+		t.Errorf("IsMuted after Close = %v, want ErrClosed", err)
+	}
+}
+
 // TestComposition_CloseIdempotent pins idempotent Close on a device-free
 // composition.
 func TestComposition_CloseIdempotent(t *testing.T) {

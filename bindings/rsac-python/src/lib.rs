@@ -2078,6 +2078,67 @@ impl PyComposition {
             .unwrap_or(0))
     }
 
+    /// Set a source's live mix gain on a running composition (rsac-5a2d).
+    /// Addressed by group name + within-group index. Python floats are f64 and
+    /// are narrowed to f32 before the core validates them, so a finite value
+    /// that narrows to inf is rejected as ConfigurationError. Takes the shared
+    /// read guard while holding the GIL, WITHOUT allow_threads — the core store
+    /// is a lock-free atomic that never blocks or re-enters allow_threads, and
+    /// the read guard coexists with the parked blocking reader (rsac-8082).
+    fn set_gain(&self, group: &str, source_idx: usize, gain: f64) -> PyResult<()> {
+        let guard = self
+            .inner
+            .read()
+            .map_err(|e| PyRuntimeError::new_err(format!("Lock poisoned: {}", e)))?;
+        let comp = guard
+            .as_ref()
+            .ok_or_else(|| PyRuntimeError::new_err("Composition has been closed"))?;
+        comp.set_gain(group, source_idx, gain as f32)
+            .map_err(audio_error_to_pyerr)
+    }
+
+    /// Mute/unmute a source on a running composition (rsac-5a2d). Separate from
+    /// gain; unmute restores the prior gain. Same addressing/guard as
+    /// ``set_gain``.
+    fn set_muted(&self, group: &str, source_idx: usize, muted: bool) -> PyResult<()> {
+        let guard = self
+            .inner
+            .read()
+            .map_err(|e| PyRuntimeError::new_err(format!("Lock poisoned: {}", e)))?;
+        let comp = guard
+            .as_ref()
+            .ok_or_else(|| PyRuntimeError::new_err("Composition has been closed"))?;
+        comp.set_muted(group, source_idx, muted)
+            .map_err(audio_error_to_pyerr)
+    }
+
+    /// Read back a source's current effective gain (rsac-5a2d). Works on a
+    /// stopped composition; raises StreamError only before start.
+    fn gain(&self, group: &str, source_idx: usize) -> PyResult<f32> {
+        let guard = self
+            .inner
+            .read()
+            .map_err(|e| PyRuntimeError::new_err(format!("Lock poisoned: {}", e)))?;
+        let comp = guard
+            .as_ref()
+            .ok_or_else(|| PyRuntimeError::new_err("Composition has been closed"))?;
+        comp.gain(group, source_idx).map_err(audio_error_to_pyerr)
+    }
+
+    /// Read back whether a source is muted (rsac-5a2d). Same errors as
+    /// ``gain``.
+    fn is_muted(&self, group: &str, source_idx: usize) -> PyResult<bool> {
+        let guard = self
+            .inner
+            .read()
+            .map_err(|e| PyRuntimeError::new_err(format!("Lock poisoned: {}", e)))?;
+        let comp = guard
+            .as_ref()
+            .ok_or_else(|| PyRuntimeError::new_err("Composition has been closed"))?;
+        comp.is_muted(group, source_idx)
+            .map_err(audio_error_to_pyerr)
+    }
+
     /// Close the composition and release all resources.
     fn close(&self, py: Python<'_>) -> PyResult<()> {
         py.allow_threads(|| self.teardown_close())

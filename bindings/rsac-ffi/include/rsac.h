@@ -936,6 +936,64 @@ const char* rsac_composition_source_group(const RsacComposition* comp,
 const char* rsac_composition_source_target(const RsacComposition* comp,
                                            size_t index);
 
+/* ── Live per-source gain / mute (rsac-5a2d) ── */
+
+/**
+ * Sets a source's live mix gain on a RUNNING composition. `comp` is const
+ * (the underlying method takes &self). The source is addressed by its group
+ * `group` (a NUL-terminated UTF-8 string) plus its `source_idx` WITHIN that
+ * group (0-based, declaration order) — NOT the flat cross-group index the
+ * rsac_composition_source_*() accessors take. `gain` must be finite and >= 0;
+ * it is validated by the core after any f32 narrowing the caller performed
+ * (a value finite in the caller's double that narrows to inf as a float is
+ * rejected). Returns RSAC_ERROR_NULL_POINTER if comp or group is null,
+ * RSAC_ERROR_INVALID_PARAMETER if group is not valid UTF-8,
+ * RSAC_ERROR_STREAM_READ before start or after stop/end (no tick would apply
+ * the change), and RSAC_ERROR_CONFIGURATION for an unknown group,
+ * out-of-range index, or invalid gain.
+ */
+rsac_error_t rsac_composition_set_gain(const RsacComposition* comp,
+                                       const char* group,
+                                       size_t source_idx,
+                                       float gain);
+
+/**
+ * Mutes (`muted` nonzero) or unmutes (`muted` 0) a source on a RUNNING
+ * composition. Muting is a separate flag from gain: while muted the source
+ * contributes silence; unmuting restores its gain untouched. Same addressing
+ * and errors as rsac_composition_set_gain() (minus the invalid-gain case).
+ */
+rsac_error_t rsac_composition_set_muted(const RsacComposition* comp,
+                                        const char* group,
+                                        size_t source_idx,
+                                        int32_t muted);
+
+/**
+ * Reads a source's current effective mix gain into *out_gain. Same addressing
+ * as rsac_composition_set_gain(). Unlike the setter this KEEPS WORKING on a
+ * stopped or ended composition — it fails with RSAC_ERROR_STREAM_READ only
+ * before the first successful start. Returns RSAC_ERROR_NULL_POINTER if comp,
+ * group, or out_gain is null, RSAC_ERROR_INVALID_PARAMETER for a non-UTF-8
+ * group, and RSAC_ERROR_CONFIGURATION for an unknown group or out-of-range
+ * index. *out_gain is an out-parameter, not a handle (nothing to free); it is
+ * written only on RSAC_OK.
+ */
+rsac_error_t rsac_composition_gain(const RsacComposition* comp,
+                                   const char* group,
+                                   size_t source_idx,
+                                   float* out_gain);
+
+/**
+ * Reads whether a source is currently muted into *out_muted (0/1). Same
+ * addressing and stopped-composition behavior as rsac_composition_gain().
+ * *out_muted is an out-parameter, not a handle (nothing to free); it is
+ * written only on RSAC_OK.
+ */
+rsac_error_t rsac_composition_is_muted(const RsacComposition* comp,
+                                       const char* group,
+                                       size_t source_idx,
+                                       int32_t* out_muted);
+
 #endif /* RSAC_FEATURE_COMPOSE */
 
 /* ── Version info ───────────────────────────────────────────────────── */

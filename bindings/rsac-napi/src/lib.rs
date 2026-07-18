@@ -1560,6 +1560,52 @@ impl Composition {
         let inner = self.inner.read().map_err(lock_poisoned)?;
         Ok(bigint_from_u64(inner.subscriber_dropped_count()))
     }
+
+    /// Set a source's live mix gain on a running composition (rsac-5a2d).
+    /// Addressed by group name + within-group source index. JS numbers arrive
+    /// as f64 and are narrowed to f32 before the core validates them, so a
+    /// finite-but-huge JS value that narrows to `inf` is rejected as
+    /// `ERR_RSAC_CONFIGURATION`. Uses the shared read guard (the core method is
+    /// `&self`; the exclusive write guard is reserved for the joining stop — see
+    /// rsac-8082).
+    #[napi]
+    pub fn set_gain(&self, group: String, source_idx: u32, gain: f64) -> Result<()> {
+        let inner = self.inner.read().map_err(lock_poisoned)?;
+        inner
+            .set_gain(&group, source_idx as usize, gain as f32)
+            .map_err(audio_err_to_napi)
+    }
+
+    /// Mute/unmute a source on a running composition (rsac-5a2d). Separate from
+    /// gain: unmute restores the prior gain. Same addressing/guard as
+    /// [`Self::set_gain`].
+    #[napi]
+    pub fn set_muted(&self, group: String, source_idx: u32, muted: bool) -> Result<()> {
+        let inner = self.inner.read().map_err(lock_poisoned)?;
+        inner
+            .set_muted(&group, source_idx as usize, muted)
+            .map_err(audio_err_to_napi)
+    }
+
+    /// Read back a source's current effective gain (rsac-5a2d). Works on a
+    /// stopped composition; only throws `ERR_RSAC_STREAM` before start.
+    #[napi]
+    pub fn gain(&self, group: String, source_idx: u32) -> Result<f64> {
+        let inner = self.inner.read().map_err(lock_poisoned)?;
+        Ok(inner
+            .gain(&group, source_idx as usize)
+            .map_err(audio_err_to_napi)? as f64)
+    }
+
+    /// Read back whether a source is muted (rsac-5a2d). Same errors as
+    /// [`Self::gain`].
+    #[napi]
+    pub fn is_muted(&self, group: String, source_idx: u32) -> Result<bool> {
+        let inner = self.inner.read().map_err(lock_poisoned)?;
+        inner
+            .is_muted(&group, source_idx as usize)
+            .map_err(audio_err_to_napi)
+    }
 }
 
 impl Composition {

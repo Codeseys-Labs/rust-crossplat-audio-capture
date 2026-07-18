@@ -84,6 +84,23 @@ comp.stop()
 comp.stop()
 print("composition not-started contract: ok")
 
+# ── live per-source gain/mute, not-started contract (rsac-5a2d) ────────
+# All four live-control calls on a built-but-unstarted composition must raise
+# StreamError (the runtime roundtrip / bounds / not-running paths need a
+# started composition → a real device, so they are device-gated elsewhere).
+for label, call in (
+    ("set_gain", lambda: comp.set_gain("main", 0, 0.5)),
+    ("set_muted", lambda: comp.set_muted("main", 0, True)),
+    ("gain", lambda: comp.gain("main", 0)),
+    ("is_muted", lambda: comp.is_muted("main", 0)),
+):
+    try:
+        call()
+        failures.append(f"not-started comp.{label}() should raise StreamError")
+    except rsac.StreamError:
+        pass
+print("composition live-control not-started contract: ok")
+
 # A zero-quantum builder must fail preflight with ConfigurationError.
 g2 = rsac.Group("main")
 g2.source("system")

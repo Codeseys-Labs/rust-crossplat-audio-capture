@@ -793,3 +793,86 @@ func (c *Composition) SourceTarget(index int) (string, bool) {
 	}
 	return C.GoString(ctarget), true
 }
+
+// ── Live per-source gain / mute (rsac-5a2d) ────────────────────────────────
+
+// SetGain sets a source's live mix gain on a running composition. The source is
+// addressed by its group name plus its within-group source index (0-based,
+// declaration order) — NOT the flat cross-group index the Source* accessors
+// take. Returns an *Error with ErrStreamRead if the composition is not started,
+// stopped, or ended, and ErrConfiguration for an unknown group, out-of-range
+// index, or a gain that is not finite and >= 0 (validated by the core/FFI).
+func (c *Composition) SetGain(group string, sourceIdx int, gain float32) error {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if c.closed {
+		return ErrClosed
+	}
+	cgroup := C.CString(group)
+	defer C.free(unsafe.Pointer(cgroup))
+	rc := C.rsac_composition_set_gain(c.handle, cgroup, C.size_t(sourceIdx), C.float(gain))
+	runtime.KeepAlive(c)
+	return newError(rc)
+}
+
+// SetMuted mutes (muted=true) or unmutes (muted=false) a source on a running
+// composition. Muting is a separate flag from gain: unmute restores the prior
+// gain. Same addressing and errors as [Composition.SetGain] (minus the
+// invalid-gain case).
+func (c *Composition) SetMuted(group string, sourceIdx int, muted bool) error {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if c.closed {
+		return ErrClosed
+	}
+	cgroup := C.CString(group)
+	defer C.free(unsafe.Pointer(cgroup))
+	var cmuted C.int32_t
+	if muted {
+		cmuted = 1
+	}
+	rc := C.rsac_composition_set_muted(c.handle, cgroup, C.size_t(sourceIdx), cmuted)
+	runtime.KeepAlive(c)
+	return newError(rc)
+}
+
+// Gain reads back a source's current effective mix gain. Same addressing as
+// [Composition.SetGain]. Unlike the setter this keeps working on a stopped or
+// ended composition; it returns an *Error with ErrStreamRead only before the
+// first successful start, and ErrConfiguration for an unknown group or
+// out-of-range index.
+func (c *Composition) Gain(group string, sourceIdx int) (float32, error) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if c.closed {
+		return 0, ErrClosed
+	}
+	cgroup := C.CString(group)
+	defer C.free(unsafe.Pointer(cgroup))
+	var out C.float
+	rc := C.rsac_composition_gain(c.handle, cgroup, C.size_t(sourceIdx), &out)
+	runtime.KeepAlive(c)
+	if rc != C.RSAC_OK {
+		return 0, newError(rc)
+	}
+	return float32(out), nil
+}
+
+// IsMuted reads back whether a source is currently muted. Same addressing and
+// stopped-composition behavior as [Composition.Gain].
+func (c *Composition) IsMuted(group string, sourceIdx int) (bool, error) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if c.closed {
+		return false, ErrClosed
+	}
+	cgroup := C.CString(group)
+	defer C.free(unsafe.Pointer(cgroup))
+	var out C.int32_t
+	rc := C.rsac_composition_is_muted(c.handle, cgroup, C.size_t(sourceIdx), &out)
+	runtime.KeepAlive(c)
+	if rc != C.RSAC_OK {
+		return false, newError(rc)
+	}
+	return out != 0, nil
+}

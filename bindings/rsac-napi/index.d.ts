@@ -542,6 +542,19 @@ export declare class Composition {
    * because a subscriber's bounded channel was full. `0` before start.
    */
   subscriberDroppedCount(): bigint;
+  /** Set a source's live mix gain on a running composition. Addressed by group
+   *  name + within-group source index (declaration order). Throws
+   *  ERR_RSAC_STREAM if not started / stopped / ended, ERR_RSAC_CONFIGURATION
+   *  for an unknown group, out-of-range index, or a gain that is not finite ≥ 0. */
+  setGain(group: string, sourceIdx: number, gain: number): void;
+  /** Mute/unmute a source on a running composition (separate from gain; unmute
+   *  restores the prior gain). Same addressing/errors as setGain. */
+  setMuted(group: string, sourceIdx: number, muted: boolean): void;
+  /** Read back a source's current effective gain. Works on a stopped
+   *  composition; throws ERR_RSAC_STREAM only before start. */
+  gain(group: string, sourceIdx: number): number;
+  /** Read back whether a source is muted. Same errors as gain(). */
+  isMuted(group: string, sourceIdx: number): boolean;
 }
 
 /**

@@ -20,6 +20,18 @@ Releases with no ABI change omit the subsection (or state "No C ABI changes").
 
 ### Added
 
+- **Bindings (live gain/mute):** exposed `Composition::set_gain` / `set_muted`
+  (+ `gain` / `is_muted` getters, rsac-5a2d) across all four binding layers —
+  C FFI (`rsac_composition_set_gain` / `_set_muted` / `_gain` / `_is_muted`),
+  Node/napi (`setGain`/`setMuted`/`gain`/`isMuted`), Python
+  (`set_gain`/`set_muted`/`gain`/`is_muted`), and Go
+  (`SetGain`/`SetMuted`/`Gain`/`IsMuted`). Sources addressed by group name +
+  within-group index. Setters refuse on a not-started/stopped/ended composition
+  (STREAM_READ / StreamError / ErrStreamRead); getters keep reading a stopped
+  composition. Gain is validated by the core after the f64→f32 narrowing in the
+  dynamically-typed bindings, so a finite-in-f64 value that narrows to inf is
+  rejected. napi/python wrappers take the shared read guard (rsac-8082 topology,
+  &self methods); Go guards the handle mutex + KeepAlive. (rsac-9dec)
 - **Compose (live mixing):** `Composition::set_gain` / `set_muted` (+ `gain` /
   `is_muted` getters) apply per-source level and mute changes on a **running**
   composition, effective on the next compositor tick (~1 quantum latency).
@@ -203,10 +215,20 @@ Releases with no ABI change omit the subsection (or state "No C ABI changes").
 
 ### C ABI changes
 
-- No C ABI changes. `rsac_builder_set_android_projection` keeps its `int64_t`
-  signature; the single-owner `MediaProjection` token contract (rsac-3407) is
-  documented on the symbol. The library enforces it only for a *cloned*
-  builder/config (which share one deletion latch → the second
+- **New exported symbols (MAJOR for the FFI surface).** Added four
+  `RSAC_FEATURE_COMPOSE`-gated functions to `rsac-ffi`:
+  `rsac_composition_set_gain(const RsacComposition*, const char* group, size_t source_idx, float gain)`,
+  `rsac_composition_set_muted(const RsacComposition*, const char* group, size_t source_idx, int32_t muted)`,
+  `rsac_composition_gain(const RsacComposition*, const char* group, size_t source_idx, float* out_gain)`,
+  `rsac_composition_is_muted(const RsacComposition*, const char* group, size_t source_idx, int32_t* out_muted)`.
+  Existing symbols and layouts are unchanged; this is purely additive to the
+  header, but new exported entry points are a MAJOR bump for consumers who pin
+  the shared library. Regenerate `rsac_generated.h` (cbindgen) and mirror the
+  prototypes in the curated `rsac.h`. (rsac-9dec)
+- No change to existing symbols. `rsac_builder_set_android_projection` keeps its
+  `int64_t` signature; the single-owner `MediaProjection` token contract
+  (rsac-3407) is documented on the symbol. The library enforces it only for a
+  *cloned* builder/config (which share one deletion latch → the second
   `rsac_builder_build()` fails with `RSAC_ERROR_STREAM_FAILED`); it does **not**
   deduplicate on the raw `int64_t`, so supplying the same handle to two
   independently constructed builders is an unguarded double-delete (UB) that
