@@ -124,6 +124,28 @@ Releases with no ABI change omit the subsection (or state "No C ABI changes").
   started"/"stopped" from "not yet running" (rsac-feb4). Additive-only;
   `StreamReadError`'s shape is unchanged and `cargo-semver-checks 0.48.0`
   confirms "no semver update required" against v0.4.2.
+- **core (Android):** real input-device enumeration and selection (rsac-ad8a).
+  `enumerate_devices()` now lists the real input devices from the AAR's
+  `AudioManager.getDevices` list (via a new `RsacDevices` Rust→Java helper +
+  JNI) between the default-route sentinel and the playback-capture endpoint,
+  and `CaptureTarget::Device(<numeric AudioDeviceInfo id>)` routes to a
+  specific device via the new `AAudioStreamBuilder_setDeviceId` binding; only a
+  non-numeric / non-positive id yields `DeviceNotFound`. `PlatformCapabilities`
+  now reports `supports_device_selection: true` (unconditional —
+  `getDevices` API 23, `setDeviceId` API 26, both predate minSdk 29);
+  `supports_device_change_notifications` stays `false` (deferred, rsac-d3e2).
+  When the JNI list is unavailable (host tests / pure-NDK consumers with no
+  `JavaVM`, the AAR classes absent, or the Java call threw), enumeration falls
+  back to the pre-existing two-device list (default mic sentinel + playback) —
+  no fabricated devices. Rust-internal + Kotlin change: no C ABI / bindings
+  change (`index.d.ts` / `__init__.pyi` / `rsac_generated.h` untouched); the
+  public `DeviceEnumerator` / `AudioDevice` surface is additive-only.
+  Device names (and Java exception messages) are decoded from the JNI
+  `java.lang.String` via `GetStringChars` (UTF-16), not `GetStringUTFChars`
+  (modified UTF-8 / CESU-8), so supplementary-plane code points in a
+  `productName` (emoji, rare CJK) survive the boundary instead of being
+  mangled to U+FFFD. Compiled for `aarch64-linux-android`; on-device
+  verification is rsac-e6d3.
 
 ### Changed
 

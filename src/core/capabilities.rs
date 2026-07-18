@@ -280,7 +280,8 @@ impl PlatformCapabilities {
     }
 
     /// Android capabilities — AAudio microphone slice (rsac-20cd) +
-    /// `AudioPlaybackCapture` playback tiers (rsac-77f1).
+    /// `AudioPlaybackCapture` playback tiers (rsac-77f1) + real input-device
+    /// selection (rsac-ad8a).
     ///
     /// Honest current state: the compiled backend captures the default audio
     /// input via AAudio (`CaptureTarget::Device`) on every supported API
@@ -291,6 +292,14 @@ impl PlatformCapabilities {
     /// version-probing pattern as macOS's Process Tap gate. On API < 29 the
     /// playback flags are honestly `false` (`AudioPlaybackCaptureConfiguration`
     /// does not exist there).
+    ///
+    /// `supports_device_selection: true` is **unconditional** (rsac-ad8a):
+    /// the AAR's `AudioManager.getDevices` list enumerates real input devices
+    /// and `AAudioStreamBuilder_setDeviceId` routes to them — both predate
+    /// minSdk 29 (getDevices API 23, setDeviceId API 26).
+    /// `supports_device_change_notifications` stays `false`
+    /// (`AudioManager.registerAudioDeviceCallback` is a tracked follow-up,
+    /// rsac-d3e2).
     ///
     /// `requires_user_consent: true` when the playback tiers are available:
     /// the [`AndroidProjectionToken`](crate::core::config::AndroidProjectionToken)
@@ -306,10 +315,14 @@ impl PlatformCapabilities {
             supports_system_capture: playback_capture, // AudioPlaybackCapture (rsac-77f1)
             supports_application_capture: playback_capture, // addMatchingUid
             supports_process_tree_capture: playback_capture, // PID→UID (tree ≡ app)
-            // Only the default AAudio input + the logical playback endpoint
-            // are reachable without the Java AudioManager device list
-            // (arrives with rsac-ad8a).
-            supports_device_selection: false,
+            // Device selection is live (rsac-ad8a): the AAR's
+            // `AudioManager.getDevices` list enumerates real input devices and
+            // `AAudioStreamBuilder_setDeviceId` routes to them. Unconditional
+            // (not SDK-gated): getDevices (API 23) and setDeviceId (API 26)
+            // both predate minSdk 29. Change-notifications
+            // (`AudioManager.registerAudioDeviceCallback`) remain a tracked
+            // follow-up (rsac-d3e2).
+            supports_device_selection: true,
             supports_device_change_notifications: false,
             // The MediaProjection token is the config-time consent artifact
             // for the playback tiers (ADR-0013); meaningless below API 29
@@ -733,7 +746,14 @@ mod tests {
             "the MediaProjection token is required exactly when the playback \
              tiers exist (ADR-0013)"
         );
-        assert!(!caps.supports_device_selection, "rsac-ad8a pending");
+        assert!(
+            caps.supports_device_selection,
+            "AudioManager device list + setDeviceId (rsac-ad8a)"
+        );
+        assert!(
+            !caps.supports_device_change_notifications,
+            "AudioDeviceCallback deferred"
+        );
         assert!(caps.supports_format(SampleFormat::F32));
         assert!(caps.supports_sample_rate(48000));
     }

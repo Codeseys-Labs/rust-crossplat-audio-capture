@@ -386,6 +386,8 @@ mod jni_lockstep {
         include_str!("../../mobile/android/src/main/kotlin/ai/codeseys/rsac/CaptureBridge.kt");
     const RSAC_PROJECTION_KT: &str =
         include_str!("../../mobile/android/src/main/kotlin/ai/codeseys/rsac/RsacProjection.kt");
+    const RSAC_DEVICES_KT: &str =
+        include_str!("../../mobile/android/src/main/kotlin/ai/codeseys/rsac/RsacDevices.kt");
 
     /// One registered native: (Kotlin source, `external fun` name, JNI
     /// signature string registered in jni.rs).
@@ -463,6 +465,42 @@ mod jni_lockstep {
                  the Rust registration resolves"
             );
         }
+    }
+
+    #[test]
+    fn rsac_devices_input_devices_stays_lockstep() {
+        // `RsacDevices.inputDevices` is a Rust→Java call (like
+        // PackageResolver.uidForPackage), NOT an `external fun`, so it has no
+        // RegisterNatives guard — a rename on either side would be a
+        // runtime-only UnsatisfiedLinkError-equivalent (a missing method id).
+        // Pin the method name, the JNI signature, and the class name from the
+        // source text so a rename fails `cargo test --lib` on every platform.
+        // (The same pin could cover PackageResolver.uidForPackage; that is
+        // out of scope for rsac-ad8a.)
+        assert!(
+            RSAC_DEVICES_KT.contains("fun inputDevices("),
+            "RsacDevices.kt lost `fun inputDevices(` — update the Rust lookup \
+             (src/audio/android/jni.rs) and this guard together"
+        );
+        assert!(
+            JNI_RS.contains("c\"inputDevices\""),
+            "src/audio/android/jni.rs no longer resolves the `inputDevices` \
+             method — keep it lockstep with RsacDevices.kt"
+        );
+        assert!(
+            JNI_RS.contains("c\"(Landroid/content/Context;)Ljava/lang/String;\""),
+            "the inputDevices JNI signature drifted in jni.rs — the Kotlin \
+             signature (Context) -> String and the lookup must move together"
+        );
+        assert!(
+            JNI_RS.contains("c\"ai/codeseys/rsac/RsacDevices\""),
+            "src/audio/android/jni.rs must resolve the RsacDevices class"
+        );
+        assert!(
+            RSAC_DEVICES_KT.contains("package ai.codeseys.rsac"),
+            "RsacDevices.kt must stay in the ai.codeseys.rsac package the Rust \
+             lookup resolves"
+        );
     }
 
     #[test]

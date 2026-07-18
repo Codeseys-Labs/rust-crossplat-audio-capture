@@ -78,16 +78,16 @@ use super::aaudio::{
     aaudio_data_callback_result_t, aaudio_format_t, aaudio_result_t, result_name, result_to_error,
     AAudioStream, AAudioStreamBuilder, AAudioStreamBuilder_delete, AAudioStreamBuilder_openStream,
     AAudioStreamBuilder_setChannelCount, AAudioStreamBuilder_setDataCallback,
-    AAudioStreamBuilder_setDirection, AAudioStreamBuilder_setErrorCallback,
-    AAudioStreamBuilder_setFormat, AAudioStreamBuilder_setPerformanceMode,
-    AAudioStreamBuilder_setSampleRate, AAudioStream_close, AAudioStream_getChannelCount,
-    AAudioStream_getFormat, AAudioStream_getSampleRate, AAudioStream_getState,
-    AAudioStream_requestStart, AAudioStream_requestStop, AAudioStream_waitForStateChange,
-    AAudio_createStreamBuilder, AAUDIO_CALLBACK_RESULT_CONTINUE, AAUDIO_CALLBACK_RESULT_STOP,
-    AAUDIO_DIRECTION_INPUT, AAUDIO_FORMAT_PCM_FLOAT, AAUDIO_FORMAT_PCM_I16,
-    AAUDIO_FORMAT_UNSPECIFIED, AAUDIO_OK, AAUDIO_PERFORMANCE_MODE_LOW_LATENCY,
-    AAUDIO_STREAM_STATE_STARTED, AAUDIO_STREAM_STATE_STARTING, AAUDIO_STREAM_STATE_STOPPING,
-    AAUDIO_UNSPECIFIED,
+    AAudioStreamBuilder_setDeviceId, AAudioStreamBuilder_setDirection,
+    AAudioStreamBuilder_setErrorCallback, AAudioStreamBuilder_setFormat,
+    AAudioStreamBuilder_setPerformanceMode, AAudioStreamBuilder_setSampleRate, AAudioStream_close,
+    AAudioStream_getChannelCount, AAudioStream_getFormat, AAudioStream_getSampleRate,
+    AAudioStream_getState, AAudioStream_requestStart, AAudioStream_requestStop,
+    AAudioStream_waitForStateChange, AAudio_createStreamBuilder, AAUDIO_CALLBACK_RESULT_CONTINUE,
+    AAUDIO_CALLBACK_RESULT_STOP, AAUDIO_DIRECTION_INPUT, AAUDIO_FORMAT_PCM_FLOAT,
+    AAUDIO_FORMAT_PCM_I16, AAUDIO_FORMAT_UNSPECIFIED, AAUDIO_OK,
+    AAUDIO_PERFORMANCE_MODE_LOW_LATENCY, AAUDIO_STREAM_STATE_STARTED, AAUDIO_STREAM_STATE_STARTING,
+    AAUDIO_STREAM_STATE_STOPPING, AAUDIO_UNSPECIFIED,
 };
 use super::DEFAULT_INPUT_DEVICE_ID;
 
@@ -382,25 +382,38 @@ fn is_default_input_id(id: &str) -> bool {
     id.is_empty() || id.eq_ignore_ascii_case(DEFAULT_INPUT_DEVICE_ID)
 }
 
-/// Validates a [`CaptureTarget`] against the Android **mic slice**
-/// (ADR-0013).
+/// Resolves a [`CaptureTarget`] to the AAudio device id to route to, against
+/// the Android **mic slice** (ADR-0013).
+///
+/// Returns [`AAUDIO_UNSPECIFIED`] for the default input route, or a positive
+/// `AudioDeviceInfo` id (from the AAR's `AudioManager.getDevices` list,
+/// rsac-ad8a) to pin via [`AAudioStreamBuilder_setDeviceId`].
 ///
 /// | Target | Outcome |
 /// |---|---|
-/// | `Device("default")` (or `""`) | `Ok(())` — the default AAudio input |
-/// | `Device(other)` | [`AudioError::DeviceNotFound`] — real input-device ids need the Java `AudioManager` list (rsac-ad8a) |
+/// | `Device("default")` (or `""`) | `Ok(AAUDIO_UNSPECIFIED)` — the default AAudio input |
+/// | `Device(<positive int>)` | `Ok(id)` — pin that enumerated input device |
+/// | `Device(other)` | [`AudioError::DeviceNotFound`] — non-numeric or non-positive id |
 /// | `SystemDefault` | [`AudioError::PlatformNotSupported`] — served by the **playback-capture device** (`super::playback`, rsac-77f1), not the mic |
 /// | `Application` / `ApplicationByName` / `ProcessTree` | [`AudioError::PlatformNotSupported`] — served by the playback-capture device (UID-filtered `AudioPlaybackCapture`; tree ≡ app on Android) |
+///
+/// A syntactically valid positive id that the OS later rejects is **not**
+/// caught here — it surfaces from the open path as
+/// [`AudioError::StreamCreationFailed`].
 ///
 /// The match is intentionally exhaustive (no wildcard): a new
 /// `CaptureTarget` variant must be classified here before the crate
 /// compiles for Android.
-fn ensure_mic_target(target: &CaptureTarget) -> AudioResult<()> {
+fn resolve_mic_target(target: &CaptureTarget) -> AudioResult<i32> {
     match target {
-        CaptureTarget::Device(id) if is_default_input_id(&id.0) => Ok(()),
-        CaptureTarget::Device(id) => Err(AudioError::DeviceNotFound {
-            device_id: id.0.clone(),
-        }),
+        CaptureTarget::Device(id) if is_default_input_id(&id.0) => Ok(AAUDIO_UNSPECIFIED),
+        CaptureTarget::Device(id) => match id.0.parse::<i32>() {
+            Ok(device_id) if device_id > 0 => Ok(device_id),
+            // Non-numeric or non-positive: not a routable enumerated id.
+            _ => Err(AudioError::DeviceNotFound {
+                device_id: id.0.clone(),
+            }),
+        },
         CaptureTarget::SystemDefault => Err(AudioError::PlatformNotSupported {
             feature: "system-audio capture through the Android microphone \
                       device: SystemDefault maps to AudioPlaybackCapture — all \
@@ -759,7 +772,9 @@ pub(crate) fn create_android_capture(
     producer: BridgeProducer,
     terminal: Arc<BridgeShared>,
 ) -> AudioResult<(AndroidPlatformStream, AudioFormat)> {
-    ensure_mic_target(target)?;
+    // AAUDIO_UNSPECIFIED for the default route, or a positive enumerated
+    // AudioDeviceInfo id to pin (rsac-ad8a). Invalid ids fail here.
+    let device_id = resolve_mic_target(target)?;
 
     let is_active = Arc::new(AtomicBool::new(true));
 
@@ -796,6 +811,14 @@ pub(crate) fn create_android_capture(
     // contexts, valid for the stream's whole lifetime (ownership dance).
     unsafe {
         AAudioStreamBuilder_setDirection(builder, AAUDIO_DIRECTION_INPUT);
+        // Pin the enumerated device only when one is requested, so the
+        // default-route path is byte-for-byte unchanged (rsac-ad8a). The
+        // device pin is intentionally left set across the format-negotiation
+        // retry below: a wrong *format* must not silently re-route to a
+        // different device.
+        if device_id != AAUDIO_UNSPECIFIED {
+            AAudioStreamBuilder_setDeviceId(builder, device_id);
+        }
         AAudioStreamBuilder_setPerformanceMode(builder, AAUDIO_PERFORMANCE_MODE_LOW_LATENCY);
         AAudioStreamBuilder_setFormat(builder, AAUDIO_FORMAT_PCM_FLOAT);
         AAudioStreamBuilder_setSampleRate(
@@ -856,15 +879,26 @@ pub(crate) fn create_android_capture(
         // SAFETY: no stream is open (both attempts failed), so no callback
         // ever ran — the contexts have no referents.
         unsafe { reclaim_contexts(data_ctx, error_ctx) };
+        let device_cause = if device_id != AAUDIO_UNSPECIFIED {
+            format!(
+                ", the requested input device id ({}) was rejected or is no \
+                 longer present (routed via AAudioStreamBuilder_setDeviceId — \
+                 re-enumerate the device list)",
+                device_id
+            )
+        } else {
+            String::new()
+        };
         return Err(AudioError::StreamCreationFailed {
             reason: format!(
-                "AAudioStreamBuilder_openStream failed for the default audio \
+                "AAudioStreamBuilder_openStream failed for the requested audio \
                  input: {} ({}). Common causes: the RECORD_AUDIO runtime \
                  permission has not been granted (a HOST-APP responsibility — \
                  rsac's mobile/android helpers wrap the request flow), or no \
-                 audio input device is available on this device/emulator",
+                 audio input device is available on this device/emulator{}",
                 result_name(res),
-                res
+                res,
+                device_cause
             ),
             context: Some(BackendContext {
                 backend_name: "AAudio".to_string(),
@@ -1080,28 +1114,40 @@ mod tests {
     // ── Target classification (mic slice, ADR-0013) ──────────────────
 
     #[test]
-    fn default_device_ids_are_accepted() {
+    fn default_device_ids_resolve_to_unspecified() {
         for id in ["default", "DEFAULT", "Default", ""] {
             let target = CaptureTarget::Device(DeviceId(id.to_string()));
-            assert!(
-                ensure_mic_target(&target).is_ok(),
-                "id {id:?} must select the mic"
+            assert_eq!(
+                resolve_mic_target(&target).expect("default id must resolve"),
+                AAUDIO_UNSPECIFIED,
+                "id {id:?} must select the default route"
             );
         }
     }
 
     #[test]
-    fn unknown_device_id_is_device_not_found() {
-        let target = CaptureTarget::Device(DeviceId("17".to_string()));
-        match ensure_mic_target(&target).unwrap_err() {
-            AudioError::DeviceNotFound { device_id } => assert_eq!(device_id, "17"),
-            other => panic!("expected DeviceNotFound, got {other:?}"),
+    fn positive_numeric_device_id_resolves_to_that_id() {
+        let target = CaptureTarget::Device(DeviceId("11".to_string()));
+        assert_eq!(
+            resolve_mic_target(&target).expect("positive id must resolve"),
+            11
+        );
+    }
+
+    #[test]
+    fn non_numeric_and_non_positive_device_ids_are_device_not_found() {
+        for id in ["abc", "0", "-3"] {
+            let target = CaptureTarget::Device(DeviceId(id.to_string()));
+            match resolve_mic_target(&target).unwrap_err() {
+                AudioError::DeviceNotFound { device_id } => assert_eq!(device_id, id),
+                other => panic!("expected DeviceNotFound for {id:?}, got {other:?}"),
+            }
         }
     }
 
     #[test]
     fn system_default_is_routed_to_playback_capture_not_the_mic() {
-        let err = ensure_mic_target(&CaptureTarget::SystemDefault).unwrap_err();
+        let err = resolve_mic_target(&CaptureTarget::SystemDefault).unwrap_err();
         assert_eq!(err.kind(), ErrorKind::Platform);
         match err {
             AudioError::PlatformNotSupported { feature, platform } => {
@@ -1134,7 +1180,7 @@ mod tests {
             CaptureTarget::ProcessTree(ProcessId(1234)),
         ];
         for target in targets {
-            match ensure_mic_target(&target).unwrap_err() {
+            match resolve_mic_target(&target).unwrap_err() {
                 AudioError::PlatformNotSupported { feature, platform } => {
                     assert_eq!(platform, "android");
                     assert!(
