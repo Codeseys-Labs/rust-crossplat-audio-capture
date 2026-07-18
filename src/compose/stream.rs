@@ -292,6 +292,18 @@ pub struct SourceStats {
     pub resampling: bool,
     /// Whether the source's stream has ended.
     pub ended: bool,
+    /// The source's current effective linear mix gain (rsac-5a2d) — the value
+    /// applied on the next compositor tick, seeded from the build-time
+    /// `Group::source_with_gain` level and updated by
+    /// [`Composition::set_gain`](Composition::set_gain). Independent of
+    /// [`muted`](Self::muted): muting does not change this, so unmute restores
+    /// it. A UI can render every fader position from one
+    /// [`stats()`](Composition::stats) call.
+    pub gain: f32,
+    /// Whether this source is currently muted (rsac-5a2d) — set by
+    /// [`Composition::set_muted`](Composition::set_muted). While `true` the
+    /// source contributes silence regardless of [`gain`](Self::gain).
+    pub muted: bool,
 }
 
 /// Point-in-time snapshot of a running composition.
@@ -690,12 +702,134 @@ impl Composition {
                 inner_dropped: s.inner_dropped.load(Ordering::Relaxed),
                 resampling: s.resampling.load(Ordering::Relaxed),
                 ended: s.ended.load(Ordering::Relaxed),
+                gain: f32::from_bits(s.gain_bits.load(Ordering::Relaxed)),
+                muted: s.muted.load(Ordering::Relaxed),
             })
             .collect();
         Some(CompositionStats {
             ticks: shared.ticks.load(Ordering::Relaxed),
             fallback_ticks: shared.fallback_ticks.load(Ordering::Relaxed),
             sources,
+        })
+    }
+
+    /// Sets the live per-source mix gain on a **running** composition
+    /// (rsac-5a2d). Addressed by group **name** + the source's **index within
+    /// that group** (declaration order, matching
+    /// [`Group::sources`](super::Group::sources) and
+    /// [`channel_map().group_range`](ChannelMap::group_range)).
+    ///
+    /// The change **replaces** the source's effective gain (it does not
+    /// multiply the build-time value) and takes effect on the **next
+    /// compositor tick** — up to ~1 quantum of latency (the default quantum is
+    /// 10 ms). It is independent of [`set_muted`](Self::set_muted): a muted
+    /// source stays silent, but its gain is remembered and restored on unmute.
+    ///
+    /// # Errors
+    ///
+    /// - [`AudioError::StreamReadError`] (classifies as
+    ///   [`LifecycleStage::NotInitialized`](crate::core::error::LifecycleStage::NotInitialized))
+    ///   if the composition is not started.
+    /// - [`AudioError::ConfigurationError`] if `group` is unknown, `source_idx`
+    ///   is out of range for that group, or `gain` is not finite and ≥ 0.
+    pub fn set_gain(&self, group: &str, source_idx: usize, gain: f32) -> AudioResult<()> {
+        let stats = self.started_stats()?;
+        let flat = self.resolve_source(group, source_idx)?;
+        super::builder::validate_gain(
+            gain,
+            &format!("for source {source_idx} in group '{group}'"),
+        )?;
+        stats.sources[flat]
+            .gain_bits
+            .store(gain.to_bits(), Ordering::Relaxed);
+        Ok(())
+    }
+
+    /// Mutes or unmutes a source on a **running** composition (rsac-5a2d).
+    /// Addressed exactly like [`set_gain`](Self::set_gain). Muting is a separate
+    /// flag from the gain: while muted the source contributes silence; unmuting
+    /// restores the gain untouched. Effective on the next compositor tick.
+    ///
+    /// # Errors
+    ///
+    /// - [`AudioError::StreamReadError`] (NotInitialized) if not started.
+    /// - [`AudioError::ConfigurationError`] if `group` is unknown or
+    ///   `source_idx` is out of range.
+    pub fn set_muted(&self, group: &str, source_idx: usize, muted: bool) -> AudioResult<()> {
+        let stats = self.started_stats()?;
+        let flat = self.resolve_source(group, source_idx)?;
+        stats.sources[flat].muted.store(muted, Ordering::Relaxed);
+        Ok(())
+    }
+
+    /// Reads back a source's current effective mix gain (rsac-5a2d) — the value
+    /// a subsequent tick will apply. Same addressing and started/bounds errors
+    /// as [`set_gain`](Self::set_gain). Also available for every source at once
+    /// via [`SourceStats::gain`] in a [`stats()`](Self::stats) snapshot.
+    ///
+    /// # Errors
+    ///
+    /// - [`AudioError::StreamReadError`] (NotInitialized) if not started.
+    /// - [`AudioError::ConfigurationError`] if `group`/`source_idx` don't
+    ///   resolve.
+    pub fn gain(&self, group: &str, source_idx: usize) -> AudioResult<f32> {
+        let stats = self.started_stats()?;
+        let flat = self.resolve_source(group, source_idx)?;
+        Ok(f32::from_bits(
+            stats.sources[flat].gain_bits.load(Ordering::Relaxed),
+        ))
+    }
+
+    /// Reads back whether a source is currently muted (rsac-5a2d). Same
+    /// addressing and errors as [`gain`](Self::gain).
+    ///
+    /// # Errors
+    ///
+    /// - [`AudioError::StreamReadError`] (NotInitialized) if not started.
+    /// - [`AudioError::ConfigurationError`] if `group`/`source_idx` don't
+    ///   resolve.
+    pub fn is_muted(&self, group: &str, source_idx: usize) -> AudioResult<bool> {
+        let stats = self.started_stats()?;
+        let flat = self.resolve_source(group, source_idx)?;
+        Ok(stats.sources[flat].muted.load(Ordering::Relaxed))
+    }
+
+    /// The shared engine stats block, or the not-started error (rsac-5a2d) —
+    /// the control-family analogue of [`started_stream`](Self::started_stream),
+    /// yielding the same NotInitialized-classified `StreamReadError`.
+    fn started_stats(&self) -> AudioResult<&Arc<EngineStatsShared>> {
+        self.stats
+            .as_ref()
+            .ok_or_else(|| AudioError::StreamReadError {
+                reason: REASON_COMPOSITION_NOT_STARTED.to_string(),
+            })
+    }
+
+    /// Resolves `(group name, within-group source index)` to the flat source
+    /// index used by the shared stats vector (rsac-5a2d) by walking the plan's
+    /// groups in declaration order — the same ordering `stats().sources` and
+    /// the engine's source vector use. Returns
+    /// [`AudioError::ConfigurationError`] for an unknown group or an
+    /// out-of-range index.
+    fn resolve_source(&self, group: &str, source_idx: usize) -> AudioResult<usize> {
+        let mut flat = 0usize;
+        for g in &self.plan.groups {
+            let n = g.sources().len();
+            if g.name() == group {
+                if source_idx < n {
+                    return Ok(flat + source_idx);
+                }
+                return Err(AudioError::ConfigurationError {
+                    message: format!(
+                        "Source index {source_idx} out of range for group '{group}' \
+                         ({n} source(s))"
+                    ),
+                });
+            }
+            flat += n;
+        }
+        Err(AudioError::ConfigurationError {
+            message: format!("Unknown composition group '{group}'"),
         })
     }
 
@@ -865,6 +999,14 @@ impl Composition {
     /// be exercised without device-backed inner captures.
     pub(crate) fn attach_stream_for_tests(&mut self, view: Arc<ComposedStreamView>) {
         self.stream = Some(view);
+    }
+
+    /// Test seam (rsac-5a2d): attach an externally assembled shared stats block
+    /// so the PUBLIC control setters/getters (`set_gain` / `set_muted` /
+    /// `gain` / `is_muted`) can be exercised end-to-end without a
+    /// device-backed engine.
+    pub(crate) fn attach_stats_for_tests(&mut self, stats: Arc<EngineStatsShared>) {
+        self.stats = Some(stats);
     }
 }
 

@@ -8,7 +8,7 @@
 //! each inner capture, which are untouched).
 
 use std::collections::VecDeque;
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -77,6 +77,22 @@ pub(crate) struct SourceStatsShared {
     pub inner_dropped: AtomicU64,
     pub resampling: AtomicBool,
     pub ended: AtomicBool,
+    /// Effective per-source mix gain, as `f32` bits (`to_bits`/`from_bits`)
+    /// (rsac-5a2d). Seeded from `SourceSpec.gain` in [`Engine::new`] and read
+    /// once per source per tick in [`Engine::emit_tick`], replacing the
+    /// build-frozen `SourceSpec.gain`. Written by the public
+    /// [`Composition::set_gain`](super::Composition::set_gain) setter, read by
+    /// the (non-RT) compositor thread. `Relaxed`: one writer per knob
+    /// (last-writer-wins fader semantics), one reader, no cross-field or
+    /// cross-memory ordering invariant. `Default` bits `0` (= `0.0`) never
+    /// leak because `Engine::new` always seeds this from the spec.
+    pub gain_bits: AtomicU32,
+    /// Whether this source is muted (rsac-5a2d). Separate from `gain_bits` so
+    /// unmute restores the prior gain untouched; the effective mix gain is
+    /// `if muted { 0.0 } else { from_bits(gain_bits) }`. Written by
+    /// [`Composition::set_muted`](super::Composition::set_muted), read once per
+    /// tick. `Relaxed`, same rationale as `gain_bits`.
+    pub muted: AtomicBool,
 }
 
 /// Lock-free composition-wide counters.
@@ -207,17 +223,27 @@ impl Engine {
             .into_iter()
             .zip(cfg.sources.iter().cloned())
             .zip(stats.sources.iter().cloned())
-            .map(|((reader, spec), stats)| SourceState {
-                reader,
-                spec,
-                fifo: VecDeque::new(),
-                resampler: None,
-                resampler_in_rate: 0,
-                warned_channel_adapt: false,
-                warned_ragged: false,
-                expected_next: None,
-                ended: false,
-                stats,
+            .map(|((reader, spec), stats)| {
+                // rsac-5a2d: seed the runtime gain from the build-time value at
+                // the single construction point every path (production + test
+                // harness) funnels through, so the `SourceStatsShared::default()`
+                // bits (`0.0`) never leak and the "build-time gain seeds the
+                // initial level" contract holds. Mute defaults to `false`.
+                stats
+                    .gain_bits
+                    .store(f32::to_bits(spec.gain), Ordering::Relaxed);
+                SourceState {
+                    reader,
+                    spec,
+                    fifo: VecDeque::new(),
+                    resampler: None,
+                    resampler_in_rate: 0,
+                    warned_channel_adapt: false,
+                    warned_ragged: false,
+                    expected_next: None,
+                    ended: false,
+                    stats,
+                }
             })
             .collect();
         let total_channels = usize::from(cfg.composed_format.channels);
@@ -673,6 +699,17 @@ impl Engine {
             let ch = usize::from(s.spec.channels.max(1));
             let group = &self.cfg.groups[s.spec.group];
 
+            // rsac-5a2d: the effective per-source gain is the live atomic
+            // (seeded from `SourceSpec.gain` in `Engine::new`, updated by
+            // `Composition::set_gain`), zeroed while muted. Read once per source
+            // per tick on this non-RT compositor thread; the FIFO still drains
+            // below regardless, so a muted/zero-gain source stays time-aligned.
+            let gain = if s.stats.muted.load(Ordering::Relaxed) {
+                0.0
+            } else {
+                f32::from_bits(s.stats.gain_bits.load(Ordering::Relaxed))
+            };
+
             let have_frames = s.fifo_frames();
             let take = have_frames.min(frames);
             let pad = frames - take;
@@ -698,7 +735,7 @@ impl Engine {
                 src,
                 ch,
                 take,
-                s.spec.gain,
+                gain,
                 group.layout,
                 group.offset,
                 group.width,

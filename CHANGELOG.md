@@ -20,6 +20,17 @@ Releases with no ABI change omit the subsection (or state "No C ABI changes").
 
 ### Added
 
+- **Compose (live mixing):** `Composition::set_gain` / `set_muted` (+ `gain` /
+  `is_muted` getters) apply per-source level and mute changes on a **running**
+  composition, effective on the next compositor tick (~1 quantum latency).
+  Sources are addressed by group name + within-group index (declaration order).
+  Gain **replaces** the build-time `Group::source_with_gain` value (which now
+  seeds the initial level); mute is a separate flag, so unmute restores the
+  prior gain. Backed by lock-free per-source atomics read on the (non-RT)
+  compositor thread — no RT-path change. `SourceStats` gains `gain` / `muted`
+  fields (the `#[non_exhaustive]` struct makes this non-breaking). Group-level
+  master gain is deferred (follow-up seed). No C ABI / bindings change this
+  release. Additive-only; `cargo-semver-checks` reports `minor`. (rsac-5a2d)
 - **Bindings (Node/napi):** `Composition`, `CompositionBuilder`, `Group` classes
   exposing multi-source channel composition (ADR-0011) — the same
   `Arc<RwLock<>>` + pump topology and stop-vs-parked-read fix as `AudioCapture`
