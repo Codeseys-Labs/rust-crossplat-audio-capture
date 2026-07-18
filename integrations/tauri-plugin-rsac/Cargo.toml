@@ -1,0 +1,60 @@
+[package]
+name = "tauri-plugin-rsac"
+# lockstep: MUST equal root rsac version — joins the version-lockstep set
+# (§6, ADR-0014). Bump via scripts/bump-version.sh; ci.yml's version-lockstep
+# gate asserts equality with root rsac on release tags. Keep this line free of
+# a trailing comment: the bump/lockstep extractors match `version = "X"` only
+# when nothing follows the closing quote.
+version = "0.4.2"
+edition = "2021"
+# match root MSRV floor (Cargo.toml:9)
+rust-version = "1.87"
+# publishing deferred repo-wide (rsac-aaea)
+publish = false
+description = "Tauri v2 plugin: mobile consent flow + JS-facing capture API for rsac (ADR-0014)"
+license = "MIT OR Apache-2.0"
+repository = "https://github.com/Codeseys-Labs/rust-crossplat-audio-capture"
+
+# `links` reserves a unique key so Tauri's build-time permission/plugin discovery
+# can locate this crate's `permissions/` (mirrors the upstream plugin convention).
+links = "tauri-plugin-rsac"
+
+[dependencies]
+# `default-features = false`: this plugin embeds NO webview, so it drops tauri's
+# default `wry`/webview runtime (tauri-runtime-wry, wry, webview2-com). Mirrors
+# every official plugin (dialog, fs). NOTE: this does NOT drop the gtk/webkit2gtk
+# system-lib requirement on Linux — tauri-runtime itself (a non-optional dep of
+# `tauri`, independent of the webview features) pulls gtk + webkit2gtk-sys
+# unconditionally on Linux, so the desktop-check CI leg still installs
+# libgtk-3-dev + libwebkit2gtk-4.1-dev (see ci.yml check-bindings).
+tauri = { version = "2", default-features = false }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+thiserror = "2"
+log = "0.4"
+# Path dep + version pin — mirrors bindings/rsac-ffi/Cargo.toml:52 exactly.
+# The version pin is what a future publish records; joins version-lockstep.
+rsac = { path = "../../", version = "0.4.2", default-features = false }
+
+[build-dependencies]
+tauri-plugin = { version = "2", features = ["build"] }
+
+# Mobile targets compile rsac with its platform backend so the
+# `#[cfg(target_os = "android")] with_android_projection` /
+# `#[cfg(target_os = "ios")] with_ios_app_group` methods (src/api.rs:181-209) are
+# in scope. Desktop passthrough uses the desktop backend the host app already
+# enables (do NOT force a feat_* on desktop from here). Feature lists pinned
+# against mobile/android-native/Cargo.toml (feat_android) and the iOS backend.
+#
+# These target blocks intentionally carry NO `version` pin (only `features`):
+# they name the SAME `rsac` dependency as the base `[dependencies]` entry
+# above, so Cargo unifies them and the single versioned pin there is
+# authoritative. This also keeps scripts/bump-version.sh correct — its
+# rewrite_internal_rsac_dep_version rewrites the first inline pin per file, so
+# having exactly one versioned pin per manifest avoids a stale android/ios pin
+# after a bump (mobile/android-native pins none for the same reason).
+[target.'cfg(target_os = "android")'.dependencies]
+rsac = { path = "../../", default-features = false, features = ["feat_android"] }
+
+[target.'cfg(target_os = "ios")'.dependencies]
+rsac = { path = "../../", default-features = false, features = ["feat_ios"] }

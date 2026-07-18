@@ -1,0 +1,28 @@
+"$schema" = "schemas/schema.json"
+
+# Default permission set for tauri-plugin-rsac (ADR-0014 §4).
+#
+# Enables the read-only introspection commands, the capture lifecycle
+# (start/stop), the derived-meter subscription, and the consent flow.
+#
+# DELIBERATELY EXCLUDES `allow-subscribe-raw`: moving raw interleaved f32
+# samples across Tauri IPC is the documented slow path (ADR-0014 §4.2,
+# 0014:84). Derived-data-by-default is enforced HERE, at the capability layer —
+# a host must explicitly grant `allow-subscribe-raw` in its capability file to
+# opt into raw-buffer delivery. The default set never does.
+[default]
+description = """
+Allows rsac audio capture from JavaScript: list capturable sources, query
+platform capabilities, request capture consent, start/stop captures, and
+subscribe to DERIVED per-chunk meter events (rsac://chunk-meta). Does NOT
+grant raw-sample delivery (subscribe_raw) — that requires the explicit
+allow-subscribe-raw permission (derived-data-by-default, ADR-0014 §4.2).
+"""
+permissions = [
+    "allow-list-targets",
+    "allow-capabilities",
+    "allow-request-consent",
+    "allow-start-capture",
+    "allow-stop-capture",
+    "allow-subscribe-meta",
+]

@@ -1,0 +1,12 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!--
+  tauri-plugin-rsac Android manifest.
+
+  The MediaProjection consent flow, the mediaProjection-typed foreground
+  service (RsacCaptureService), and the required permissions
+  (FOREGROUND_SERVICE, FOREGROUND_SERVICE_MEDIA_PROJECTION, RECORD_AUDIO) are
+  declared by the first-party rsac AAR (mobile/android) that this plugin
+  bridges to — not re-declared here. This plugin adds no capture policy or
+  permissions of its own (ADR-0012 ownership boundary).
+-->
+<manifest xmlns:android="http://schemas.android.com/apk/res/android" />

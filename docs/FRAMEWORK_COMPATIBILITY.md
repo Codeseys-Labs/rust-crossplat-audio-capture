@@ -24,7 +24,7 @@ backend design (Android/iOS) see
 
 | Framework / runtime | Desktop (Win/Linux/macOS) | Android | iOS | Integration path |
 |---|---|---|---|---|
-| **Tauri v2** | ✅ verified (audio-graph) | 🟡 blocked on runtime proof | 🟡 blocked on runtime proof | Direct Rust dependency; mobile via `tauri-plugin-rsac` (planned, [ADR-0014](designs/0014-tauri-integration-model.md)) |
+| **Tauri v2** | ✅ verified (audio-graph) | 🟡 blocked on runtime proof | 🟡 blocked on runtime proof | Direct Rust dependency; mobile via `tauri-plugin-rsac` (ships compile-proof, [ADR-0014](designs/0014-tauri-integration-model.md) Accepted) |
 | **Dioxus** | 🟢 expected | 🟡 blocked on runtime proof | 🟡 blocked on runtime proof | Direct Rust dependency (rsac is UI-framework-agnostic) |
 | **Electron** | ✅ documented (napi, main process) | n/a | n/a | `@rsac/audio` (napi-rs) |
 | **Deno 2** | 🟢 expected | n/a | n/a | `npm:@rsac/audio` (Node-API compat) or `Deno.dlopen` over rsac-ffi |
@@ -70,16 +70,21 @@ earns its keep in exactly two situations: (a) **mobile** — Tauri v2 plugins ar
 the sanctioned vehicle for shipping the Kotlin/Swift glue and consent flows a
 mobile backend requires; (b) a reusable **JS-facing API** (invoke/events with
 Tauri's permission system) shared across multiple Tauri apps. This is recorded
-as *proposed* in [ADR-0014](designs/0014-tauri-integration-model.md): audio-graph
-keeps its direct dependency on desktop; the plugin is planned as the mobile
-vehicle (wave 5).
+as **Accepted** in [ADR-0014](designs/0014-tauri-integration-model.md):
+audio-graph keeps its direct dependency on desktop; the plugin ships as the
+mobile vehicle (wave 5). Derived-data-by-default is enforced via the plugin's
+permission set — raw-sample delivery (`subscribe_raw`) is opt-in, requiring an
+explicit `allow-subscribe-raw` grant.
 
 **Mobile: 🟡 blocked on runtime proofs.** Tauri v2 builds for Android/iOS today, and
-rsac already *compiles* for those targets as an honest stub
-(`PlatformCapabilities::unsupported()`, `AudioError::PlatformNotSupported` —
-src/audio/mod.rs, src/core/capabilities.rs). Real capture requires the backends
-in [`MOBILE_BACKEND_DESIGN.md`](MOBILE_BACKEND_DESIGN.md); the consent flow
-(Android MediaProjection) ships in the planned plugin.
+rsac already *compiles* for those targets. The consent flow (Android
+MediaProjection) ships in `tauri-plugin-rsac`
+(`integrations/`, [ADR-0014](designs/0014-tauri-integration-model.md) Accepted)
+— **compile-shipping today; mobile runtime still blocked on rsac-e6d3 /
+rsac-97c8**. The plugin wraps `mobile/android/`'s `RsacProjection` consent flow
+and `mobile/ios/` glue behind Tauri commands/permissions (a thin forwarder — it
+inherits PR#64's deferred foreground-service-acquire ordering, adding no capture
+policy of its own).
 
 ## Dioxus
 
@@ -219,4 +224,9 @@ The committed backlog is the **mobile push**, tracked as `sd` epics:
 umbrella `rsac-0991` → Android backend `rsac-5823` (wave 3), iOS backend
 `rsac-57cb` (wave 4), framework delivery / `tauri-plugin-rsac` `rsac-71d2`
 (wave 5). The core consent surface (rsac-82d4) and the rsac-napi per-target
-dependency migration (rsac-e8a3) are already landed.
+dependency migration (rsac-e8a3) are already landed. The wave-5
+`tauri-plugin-rsac` **skeleton landed compile-proof** (rsac-f21c,
+`integrations/`) — desktop builds/clippies in CI, `android/`+`ios/` are
+source-shipped, and derived-data-by-default is enforced via the permission set
+(raw opt-in); framework **runtime** verification remains guidance-on-demand and
+mobile runtime stays blocked on rsac-e6d3 / rsac-97c8.

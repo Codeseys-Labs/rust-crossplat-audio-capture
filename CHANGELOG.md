@@ -36,6 +36,13 @@ Releases with no ABI change omit the subsection (or state "No C ABI changes").
   the interleaved-delivery fast path, and start-failure rollback remain a
   runbook. (rsac-97c8)
 
+- **Tauri v2 plugin (`tauri-plugin-rsac`, ADR-0014):** mobile consent-flow + JS
+  capture API at `integrations/tauri-plugin-rsac`; derived-meter events by
+  default (`rsac://chunk-meta`), raw samples opt-in (`rsac://chunk-raw`, gated
+  behind `allow-subscribe-raw`). The Android bridge is a thin forwarder onto
+  `RsacProjection` (inherits PR#64's deferred-FGS-acquire ordering). Compile-proof:
+  desktop builds+clippies in the workspace CI, `android/`+`ios/` source-shipped;
+  joined to the version-lockstep set. Mobile runtime tracks rsac-e6d3/rsac-97c8.
 - **Android (device-change notifications):** `AndroidDeviceEnumerator::watch()`
   now delivers input-device hot-plug notifications via the AAR's
   `AudioManager.registerAudioDeviceCallback` (rsac-d3e2), emitting

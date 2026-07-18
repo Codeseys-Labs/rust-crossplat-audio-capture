@@ -1,0 +1,13 @@
+# Automatically generated - DO NOT EDIT!
+
+"$schema" = "../../schemas/schema.json"
+
+[[permission]]
+identifier = "allow-subscribe-meta"
+description = "Enables the subscribe_meta command without any pre-configured scope."
+commands.allow = ["subscribe_meta"]
+
+[[permission]]
+identifier = "deny-subscribe-meta"
+description = "Denies the subscribe_meta command without any pre-configured scope."
+commands.deny = ["subscribe_meta"]

@@ -1,0 +1,13 @@
+# Automatically generated - DO NOT EDIT!
+
+"$schema" = "../../schemas/schema.json"
+
+[[permission]]
+identifier = "allow-subscribe-raw"
+description = "Enables the subscribe_raw command without any pre-configured scope."
+commands.allow = ["subscribe_raw"]
+
+[[permission]]
+identifier = "deny-subscribe-raw"
+description = "Denies the subscribe_raw command without any pre-configured scope."
+commands.deny = ["subscribe_raw"]

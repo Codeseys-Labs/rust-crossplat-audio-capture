@@ -22,6 +22,10 @@ exclude = [
     # Makefile, C bridge — no Cargo.toml) would otherwise ship in the tarball.
     "/apps",
     "/bindings",
+    # Tauri plugin (Rust + Kotlin/Swift glue, TS bindings) — built by
+    # cargo/Gradle/Xcode, distributed on its own cadence; never in the rsac
+    # tarball. Workspace membership (below) is orthogonal to packaging.
+    "/integrations",
     # Mobile platform glue (Kotlin AAR + SwiftPM package; ADR-0012) — built by
     # Gradle/Xcode, not cargo; never ships in the crates.io tarball.
     "/mobile",
@@ -412,6 +416,10 @@ members = [
     # Lives under /mobile, which is excluded from the crates.io package —
     # workspace membership is orthogonal to packaging.
     "mobile/android-native",
+    # Tauri v2 plugin (ADR-0014). Lives under /integrations, excluded from the
+    # crates.io package (see [package].exclude) — membership is orthogonal to
+    # packaging; the desktop target builds + clippies in the workspace CI.
+    "integrations/tauri-plugin-rsac",
 ]
 exclude = ["apps/audio-graph/src-tauri"]
 
