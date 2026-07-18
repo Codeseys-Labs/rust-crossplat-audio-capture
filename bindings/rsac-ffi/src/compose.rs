@@ -1068,10 +1068,12 @@ pub unsafe extern "C" fn rsac_composition_set_muted(
     })
 }
 
-/// Reads back a source's current effective mix gain into `*out_gain`
-/// (rsac-5a2d). Same addressing as [`rsac_composition_set_gain`]. Unlike the
-/// setter this **keeps working on a stopped or ended composition** — it only
-/// fails before the first successful start.
+/// Reads back a source's current stored per-source gain into `*out_gain`
+/// (rsac-5a2d) — the `rsac_composition_set_gain` value (or the build-time
+/// seed). The actual mixed output also depends on the source's mute flag and
+/// the group's master gain. Same addressing as [`rsac_composition_set_gain`].
+/// Unlike the setter this **keeps working on a stopped or ended composition**
+/// — it only fails before the first successful start.
 ///
 /// Returns `RSAC_ERROR_NULL_POINTER` if `comp`, `group`, or `out_gain` is null,
 /// `RSAC_ERROR_INVALID_PARAMETER` if `group` is not valid UTF-8,

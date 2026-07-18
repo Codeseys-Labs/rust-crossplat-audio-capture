@@ -643,8 +643,10 @@ class Composition:
         ...
 
     def gain(self, group: str, source_idx: int) -> float:
-        """Read back a source's current effective gain. Works on a stopped
-        composition; raises StreamError only before start."""
+        """Read back a source's current stored per-source gain (the set_gain
+        value or build-time seed; output also depends on mute and group master
+        gain). Works on a stopped composition; raises StreamError only before
+        start."""
         ...
 
     def is_muted(self, group: str, source_idx: int) -> bool:

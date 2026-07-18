@@ -94,7 +94,14 @@ test('compose live-control not-started contract', () => {
     isMuted: () => comp.isMuted('main', 0),
   };
   for (const [label, call] of Object.entries(calls)) {
-    assert.throws(call, /STREAM/, `not-started comp.${label}() should throw ERR_RSAC_STREAM`);
+    // The napi layer embeds the structured code as a bracketed message
+    // prefix ([ERR_RSAC_STREAM] …, see audio_err_to_napi) rather than an
+    // err.code field — match it exactly, not a loose /STREAM/ fragment.
+    assert.throws(
+      call,
+      (err) => /\[ERR_RSAC_STREAM\]/.test(err.message),
+      `not-started comp.${label}() should throw [ERR_RSAC_STREAM]`
+    );
   }
 });
 

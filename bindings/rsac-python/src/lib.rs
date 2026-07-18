@@ -2112,8 +2112,10 @@ impl PyComposition {
             .map_err(audio_error_to_pyerr)
     }
 
-    /// Read back a source's current effective gain (rsac-5a2d). Works on a
-    /// stopped composition; raises StreamError only before start.
+    /// Read back a source's current stored per-source gain (rsac-5a2d) — the
+    /// set_gain value (or build-time seed); actual output also depends on mute
+    /// and the group master gain. Works on a stopped composition; raises
+    /// StreamError only before start.
     fn gain(&self, group: &str, source_idx: usize) -> PyResult<f32> {
         let guard = self
             .inner

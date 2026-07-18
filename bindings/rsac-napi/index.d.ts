@@ -550,8 +550,9 @@ export declare class Composition {
   /** Mute/unmute a source on a running composition (separate from gain; unmute
    *  restores the prior gain). Same addressing/errors as setGain. */
   setMuted(group: string, sourceIdx: number, muted: boolean): void;
-  /** Read back a source's current effective gain. Works on a stopped
-   *  composition; throws ERR_RSAC_STREAM only before start. */
+  /** Read back a source's current stored per-source gain (the setGain value
+   *  or build-time seed; output also depends on mute and group master gain).
+   *  Works on a stopped composition; throws ERR_RSAC_STREAM only before start. */
   gain(group: string, sourceIdx: number): number;
   /** Read back whether a source is muted. Same errors as gain(). */
   isMuted(group: string, sourceIdx: number): boolean;

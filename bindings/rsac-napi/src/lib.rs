@@ -1587,8 +1587,10 @@ impl Composition {
             .map_err(audio_err_to_napi)
     }
 
-    /// Read back a source's current effective gain (rsac-5a2d). Works on a
-    /// stopped composition; only throws `ERR_RSAC_STREAM` before start.
+    /// Read back a source's current stored per-source gain (rsac-5a2d) — the
+    /// setGain value (or build-time seed); actual output also depends on mute
+    /// and the group master gain. Works on a stopped composition; only throws
+    /// `ERR_RSAC_STREAM` before start.
     #[napi]
     pub fn gain(&self, group: String, source_idx: u32) -> Result<f64> {
         let inner = self.inner.read().map_err(lock_poisoned)?;

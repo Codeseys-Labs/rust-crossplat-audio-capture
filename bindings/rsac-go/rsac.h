@@ -937,7 +937,9 @@ rsac_error_t rsac_composition_set_muted(const RsacComposition* comp,
                                         int32_t muted);
 
 /**
- * Reads a source's current effective mix gain into *out_gain. Same addressing
+ * Reads a source's current stored per-source gain into *out_gain — the
+ * set_gain value (or build-time seed); actual output also depends on the
+ * source's mute flag and the group's master gain. Same addressing
  * as rsac_composition_set_gain(). Unlike the setter this KEEPS WORKING on a
  * stopped or ended composition — it fails with RSAC_ERROR_STREAM_READ only
  * before the first successful start. Returns RSAC_ERROR_NULL_POINTER if comp,

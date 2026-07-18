@@ -795,10 +795,12 @@ impl Composition {
         Ok(())
     }
 
-    /// Reads back a source's current effective mix gain (rsac-5a2d) — the value
-    /// a subsequent tick will apply. Same addressing and started/bounds errors
-    /// as [`set_gain`](Self::set_gain). Also available for every source at once
-    /// via [`SourceStats::gain`] in a [`stats()`](Self::stats) snapshot.
+    /// Reads back a source's current stored per-source gain (rsac-5a2d) — the
+    /// [`set_gain`](Self::set_gain) value (or the build-time seed). The mixed
+    /// output additionally depends on the source's mute flag and the group's
+    /// master gain ([`set_group_gain`](Self::set_group_gain)). Same addressing
+    /// and started/bounds errors as `set_gain`. Also available for every source
+    /// at once via [`SourceStats::gain`] in a [`stats()`](Self::stats) snapshot.
     ///
     /// # Errors
     ///

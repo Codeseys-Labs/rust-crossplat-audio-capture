@@ -31,7 +31,7 @@ pub(crate) const MAX_SOURCES: usize = 16;
 pub(crate) fn validate_gain(gain: f32, ctx: &str) -> AudioResult<()> {
     if !gain.is_finite() || gain < 0.0 {
         return Err(AudioError::ConfigurationError {
-            message: format!("Source gain {gain} {ctx} is invalid (must be finite and >= 0)"),
+            message: format!("Gain {gain} {ctx} is invalid (must be finite and >= 0)"),
         });
     }
     Ok(())

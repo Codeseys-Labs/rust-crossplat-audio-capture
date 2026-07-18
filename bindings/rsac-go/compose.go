@@ -836,7 +836,9 @@ func (c *Composition) SetMuted(group string, sourceIdx int, muted bool) error {
 	return newError(rc)
 }
 
-// Gain reads back a source's current effective mix gain. Same addressing as
+// Gain reads back a source's current stored per-source gain — the SetGain
+// value (or the build-time seed); the actual mixed output also depends on the
+// source's mute flag and the group's master gain. Same addressing as
 // [Composition.SetGain]. Unlike the setter this keeps working on a stopped or
 // ended composition; it returns an *Error with ErrStreamRead only before the
 // first successful start, and ErrConfiguration for an unknown group or

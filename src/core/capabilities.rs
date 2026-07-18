@@ -293,10 +293,17 @@ impl PlatformCapabilities {
     /// playback flags are honestly `false` (`AudioPlaybackCaptureConfiguration`
     /// does not exist there).
     ///
-    /// `supports_device_selection: true` is **unconditional** (rsac-ad8a):
-    /// the AAR's `AudioManager.getDevices` list enumerates real input devices
-    /// and `AAudioStreamBuilder_setDeviceId` routes to them — both predate
-    /// minSdk 29 (getDevices API 23, setDeviceId API 26).
+    /// `supports_device_selection` (rsac-ad8a) is **runtime-gated on the AAR
+    /// enumeration path**: `true` only when `JNI_OnLoad` resolved the
+    /// `RsacDevices` class (see
+    /// [`set_android_device_enumeration_available`]). The AAR's
+    /// `AudioManager.getDevices` list enumerates real input devices and
+    /// `AAudioStreamBuilder_setDeviceId` routes to them (getDevices API 23,
+    /// setDeviceId API 26 — both predate minSdk 29), but a pure-NDK consumer
+    /// (no `System.loadLibrary`, no AAR, or an older AAR without
+    /// `RsacDevices`) only sees the default-route fallback list, where real
+    /// numeric ids are rejected before `setDeviceId` is reached — claiming
+    /// selection support there would mislead device pickers.
     /// `supports_device_change_notifications` stays `false`
     /// (`AudioManager.registerAudioDeviceCallback` is a tracked follow-up,
     /// rsac-d3e2).
@@ -315,14 +322,14 @@ impl PlatformCapabilities {
             supports_system_capture: playback_capture, // AudioPlaybackCapture (rsac-77f1)
             supports_application_capture: playback_capture, // addMatchingUid
             supports_process_tree_capture: playback_capture, // PID→UID (tree ≡ app)
-            // Device selection is live (rsac-ad8a): the AAR's
-            // `AudioManager.getDevices` list enumerates real input devices and
-            // `AAudioStreamBuilder_setDeviceId` routes to them. Unconditional
-            // (not SDK-gated): getDevices (API 23) and setDeviceId (API 26)
-            // both predate minSdk 29. Change-notifications
-            // (`AudioManager.registerAudioDeviceCallback`) remain a tracked
-            // follow-up (rsac-d3e2).
-            supports_device_selection: true,
+            // Device selection (rsac-ad8a) is honest about the enumeration
+            // path: true only when JNI_OnLoad resolved RsacDevices (the
+            // AAudio backend then routes Device(id) via setDeviceId). A
+            // pure-NDK / AAR-less process only has the default-route
+            // fallback list, so selection is reported false there.
+            // Change-notifications (AudioManager.registerAudioDeviceCallback)
+            // remain a tracked follow-up (rsac-d3e2).
+            supports_device_selection: android_device_enumeration_available(),
             supports_device_change_notifications: false,
             // The MediaProjection token is the config-time consent artifact
             // for the playback tiers (ADR-0013); meaningless below API 29
@@ -407,6 +414,34 @@ impl PlatformCapabilities {
 ///
 /// Used by [`PlatformCapabilities`] to gate the playback-capture tiers
 /// (`AudioPlaybackCaptureConfiguration` requires API 29+).
+/// Whether the Android AAR device-enumeration path (`RsacDevices`) resolved
+/// at library load (rsac-ad8a).
+///
+/// The module DAG forbids `core → audio`, so the JNI layer **pushes** this
+/// fact here: `JNI_OnLoad` (src/audio/android/jni.rs) calls
+/// [`set_android_device_enumeration_available`] after building its class
+/// cache. Defaults to `false`, which is the honest answer for a pure-NDK
+/// process (no `System.loadLibrary`, `JNI_OnLoad` never runs) or an older
+/// AAR without `RsacDevices` — in both, only the default-route fallback
+/// device list exists and `Device(id)` selection cannot work.
+#[cfg(target_os = "android")]
+static ANDROID_DEVICE_ENUMERATION_AVAILABLE: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
+/// Records whether the AAR `RsacDevices` enumeration path is available —
+/// called once from `JNI_OnLoad` (rsac-ad8a). See
+/// [`android_device_enumeration_available`].
+#[cfg(target_os = "android")]
+pub fn set_android_device_enumeration_available(available: bool) {
+    ANDROID_DEVICE_ENUMERATION_AVAILABLE.store(available, std::sync::atomic::Ordering::Release);
+}
+
+/// See [`set_android_device_enumeration_available`].
+#[cfg(target_os = "android")]
+pub fn android_device_enumeration_available() -> bool {
+    ANDROID_DEVICE_ENUMERATION_AVAILABLE.load(std::sync::atomic::Ordering::Acquire)
+}
+
 #[cfg(target_os = "android")]
 pub fn get_android_sdk_version() -> u32 {
     use std::os::raw::c_char;
@@ -746,9 +781,23 @@ mod tests {
             "the MediaProjection token is required exactly when the playback \
              tiers exist (ADR-0013)"
         );
-        assert!(
+        // Device selection tracks the runtime AAR-enumeration flag exactly
+        // (rsac-ad8a): false in this JVM-less test process (JNI_OnLoad never
+        // ran), true once RsacDevices resolved at load.
+        assert_eq!(
             caps.supports_device_selection,
-            "AudioManager device list + setDeviceId (rsac-ad8a)"
+            android_device_enumeration_available(),
+            "supports_device_selection must mirror the RsacDevices runtime gate"
+        );
+        set_android_device_enumeration_available(true);
+        assert!(
+            PlatformCapabilities::query().supports_device_selection,
+            "AudioManager device list + setDeviceId once RsacDevices resolved (rsac-ad8a)"
+        );
+        set_android_device_enumeration_available(false);
+        assert!(
+            !PlatformCapabilities::query().supports_device_selection,
+            "pure-NDK / AAR-less: only the fallback list exists"
         );
         assert!(
             !caps.supports_device_change_notifications,

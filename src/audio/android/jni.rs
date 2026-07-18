@@ -223,10 +223,20 @@ pub(super) struct AarCache {
     pub resolver_class: jclass,
     /// `PackageResolver.uidForPackage(Landroid/content/Context;Ljava/lang/String;)Ljava/lang/Integer;` (static).
     pub resolver_uid_for_package: jmethodID,
+    /// The device-enumeration half — `None` when `RsacDevices` is absent
+    /// (an older AAR paired with a newer `librsac.so`). Kept optional so a
+    /// missing enumeration class degrades only `enumerate_input_device_records`
+    /// (and the device-selection capability), never the already-resolved
+    /// playback-capture classes above.
+    pub devices: Option<DevicesCache>,
+}
+
+/// The `ai.codeseys.rsac.RsacDevices` class + method id (rsac-ad8a).
+pub(super) struct DevicesCache {
     /// `ai/codeseys/rsac/RsacDevices` (GlobalRef) — input-device enumeration.
-    pub devices_class: jclass,
+    pub class: jclass,
     /// `RsacDevices.inputDevices(Landroid/content/Context;)Ljava/lang/String;` (static).
-    pub devices_input_devices: jmethodID,
+    pub input_devices: jmethodID,
 }
 
 // SAFETY: the raw pointers in the cache are JNI GlobalRefs and method ids —
@@ -761,14 +771,24 @@ unsafe fn build_aar_cache(env: *mut JNIEnv) -> Option<AarCache> {
             true,
         )?;
 
-        let devices_class = find_class_global(env, c"ai/codeseys/rsac/RsacDevices")?;
-        let devices_input_devices = get_method(
-            env,
-            devices_class,
-            c"inputDevices",
-            c"(Landroid/content/Context;)Ljava/lang/String;",
-            true,
-        )?;
+        // RsacDevices is OPTIONAL: its absence (older AAR, newer librsac.so)
+        // must degrade only device enumeration, not the playback-capture
+        // classes resolved above. find_class_global clears the pending
+        // ClassNotFoundException on failure, so the cache build continues.
+        let devices = (|| {
+            let class = find_class_global(env, c"ai/codeseys/rsac/RsacDevices")?;
+            let input_devices = get_method(
+                env,
+                class,
+                c"inputDevices",
+                c"(Landroid/content/Context;)Ljava/lang/String;",
+                true,
+            )?;
+            Some(DevicesCache {
+                class,
+                input_devices,
+            })
+        })();
 
         // Natives on CaptureBridge (companion `@JvmStatic external` methods
         // compile to static natives on the enclosing class).
@@ -830,8 +850,7 @@ unsafe fn build_aar_cache(env: *mut JNIEnv) -> Option<AarCache> {
             service_unregister_bridge,
             resolver_class,
             resolver_uid_for_package,
-            devices_class,
-            devices_input_devices,
+            devices,
         })
     }
 }
@@ -934,6 +953,13 @@ pub unsafe extern "system" fn JNI_OnLoad(vm: *mut JavaVM, _reserved: *mut c_void
         match cache_value {
             Some(cache) => {
                 let aar_present = cache.aar.is_some();
+                // Publish the device-enumeration availability to the
+                // capabilities layer (core can't reach into audio/ — module
+                // DAG), so supports_device_selection reports honestly
+                // (rsac-ad8a).
+                crate::core::capabilities::set_android_device_enumeration_available(
+                    cache.aar.as_ref().is_some_and(|aar| aar.devices.is_some()),
+                );
                 let _ = CACHE.set(cache);
                 log::debug!(
                     "rsac JNI_OnLoad: class cache ready (AAR classes {})",
@@ -1319,7 +1345,17 @@ pub(super) fn resolve_uid_for_package(package: &str) -> AudioResult<i32> {
 /// never surfaces to users as a hard failure.
 pub(super) fn enumerate_input_device_records() -> AudioResult<String> {
     let cache = cache()?;
-    let aar = aar_cache()?;
+    let devices =
+        aar_cache()?
+            .devices
+            .as_ref()
+            .ok_or_else(|| AudioError::DeviceEnumerationError {
+                reason: "the loaded rsac AAR does not provide RsacDevices \
+                     (older AAR paired with a newer librsac.so) — device \
+                     enumeration falls back to the default route"
+                    .to_string(),
+                context: None,
+            })?;
     let guard = attach_current_thread()?;
     let env = guard.env();
 
@@ -1353,8 +1389,8 @@ pub(super) fn enumerate_input_device_records() -> AudioResult<String> {
         jni_call!(
             env,
             CallStaticObjectMethodA,
-            aar.devices_class,
-            aar.devices_input_devices,
+            devices.class,
+            devices.input_devices,
             args.as_ptr()
         )
     };
