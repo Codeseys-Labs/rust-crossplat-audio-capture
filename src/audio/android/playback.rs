@@ -611,7 +611,8 @@ mod tests {
         // its try_consume, so it never obtains a deletable raw handle (no
         // double DeleteGlobalRef). No JNI involved.
         use crate::core::config::AndroidProjectionToken;
-        let token = AndroidProjectionToken::from_raw(123);
+        // SAFETY: fabricated handle; never reaches JNI in this latch-only test.
+        let token = unsafe { AndroidProjectionToken::from_raw(123) };
         let cloned = token.clone();
         assert_eq!(token.try_consume(), Some(123));
         assert_eq!(cloned.try_consume(), None);

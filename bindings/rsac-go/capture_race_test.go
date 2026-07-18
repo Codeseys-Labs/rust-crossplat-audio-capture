@@ -33,6 +33,7 @@ import (
 	"context"
 	"os"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -72,6 +73,12 @@ func TestRealDevice_CloseDuringRead_NoRace(t *testing.T) {
 	cap := newRaceCapture(t)
 
 	const n = 12
+	// closeStarted is stored BEFORE Close() begins, so any reader error caused
+	// by the close observes it as true — errors reported through preCloseErrs
+	// are genuine pre-close lifecycle failures, which would otherwise let the
+	// scenario pass vacuously (readers all dead before the race even starts).
+	var closeStarted atomic.Bool
+	preCloseErrs := make(chan error, n)
 	var wg sync.WaitGroup
 	for i := 0; i < n; i++ {
 		wg.Add(1)
@@ -80,11 +87,17 @@ func TestRealDevice_CloseDuringRead_NoRace(t *testing.T) {
 			for {
 				if idx%2 == 0 {
 					if _, err := cap.ReadBuffer(); err != nil {
-						return // ErrClosed / terminal — reader exits, bounded
+						if !closeStarted.Load() {
+							preCloseErrs <- err
+						}
+						return // ErrClosed / terminal post-close — reader exits, bounded
 					}
 				} else {
 					_, ok, err := cap.TryReadBuffer()
 					if err != nil {
+						if !closeStarted.Load() {
+							preCloseErrs <- err
+						}
 						return
 					}
 					if !ok {
@@ -96,6 +109,7 @@ func TestRealDevice_CloseDuringRead_NoRace(t *testing.T) {
 	}
 
 	time.Sleep(100 * time.Millisecond) // let readers park in the real C call
+	closeStarted.Store(true)
 	start := time.Now()
 	if err := cap.Close(); err != nil {
 		t.Fatalf("close: %v", err)
@@ -110,6 +124,10 @@ func TestRealDevice_CloseDuringRead_NoRace(t *testing.T) {
 	case <-done:
 	case <-time.After(10 * time.Second):
 		t.Fatal("reader goroutines did not exit within 10s of Close()")
+	}
+	close(preCloseErrs)
+	for err := range preCloseErrs {
+		t.Errorf("reader failed before Close() started: %v", err)
 	}
 }
 
@@ -135,13 +153,19 @@ func TestRealDevice_StreamCancelDuringClose_NoRace(t *testing.T) {
 	time.Sleep(100 * time.Millisecond)
 	var wg sync.WaitGroup
 	wg.Add(2)
+	closeErr := make(chan error, 1)
 	go func() { defer wg.Done(); cancel() }()
-	go func() { defer wg.Done(); _ = cap.Close() }()
+	go func() { defer wg.Done(); closeErr <- cap.Close() }()
 	wg.Wait()
 
 	select {
 	case <-drained:
 	case <-time.After(10 * time.Second):
 		t.Fatal("Stream() channel did not close within 10s of cancel+Close")
+	}
+	// The concurrent Close() must itself succeed — swallowing its error would
+	// let a broken close path pass as long as the channel still drained.
+	if err := <-closeErr; err != nil {
+		t.Errorf("concurrent Close() failed: %v", err)
 	}
 }

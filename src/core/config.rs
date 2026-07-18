@@ -103,8 +103,10 @@ impl std::fmt::Display for ProcessId {
 /// carries it — shares that single claim; a second `build()` from a clone is
 /// refused with [`StreamCreationFailed`](crate::core::error::AudioError::StreamCreationFailed)
 /// rather than double-releasing the ref. The type is deliberately **not**
-/// `Copy`. A stale, `0`, or hand-rolled value is caught at stream creation and
-/// surfaces as an actionable error, never UB.
+/// `Copy`. A `0` value is caught at stream creation and surfaces as an
+/// actionable error; a stale or hand-rolled non-zero handle is **not**
+/// detectable and is excluded by [`from_raw`](Self::from_raw)'s unsafe
+/// contract.
 ///
 /// The shared claim is per *token instance* (and its clones), **not** per raw
 /// `i64` value: two tokens built by separate [`from_raw`](Self::from_raw) calls
@@ -138,14 +140,18 @@ impl AndroidProjectionToken {
     /// Wraps a raw consent-token handle produced by the rsac Android consent
     /// helper (`RsacProjection.request(activity)`).
     ///
-    /// The value is opaque to Rust; correctness is the producer's contract.
+    /// # Safety
     ///
-    /// Each call mints a **fresh** single-owner deletion latch, so wrapping the
-    /// same raw handle in two separate `from_raw` calls produces two tokens
-    /// that can *each* be consumed for deletion — a double-delete of one
-    /// `GlobalRef` (UB). Call this once per retained handle and `Clone` the
-    /// result to share the claim; never re-wrap the same handle.
-    pub fn from_raw(raw: i64) -> Self {
+    /// `raw` must be a live JNI `GlobalRef` handle minted by
+    /// `RsacProjection.request(activity)` (or `0`, which stream creation
+    /// rejects with an actionable error), and the **same handle must not be
+    /// wrapped more than once**: each call mints a *fresh* single-owner
+    /// deletion latch, so two `from_raw` calls over one handle produce two
+    /// tokens that can each be consumed for deletion — a double
+    /// `DeleteGlobalRef` (UB). Call this once per retained handle and `Clone`
+    /// the result to share the claim. A stale (already-deleted) handle is
+    /// **not** detected — it reaches JNI as a dangling ref.
+    pub unsafe fn from_raw(raw: i64) -> Self {
         Self {
             raw,
             consumed: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
@@ -1369,10 +1375,17 @@ mod tests {
     // Android-only: the type is `#[cfg(target_os = "android")]`, so these
     // compile/run only under `--target aarch64-linux-android` (emulator leg).
 
+    /// Fabricated token for latch-contract tests. SAFETY: these handles never
+    /// reach JNI — the tests exercise only the Rust-side consume latch.
+    #[cfg(target_os = "android")]
+    fn test_token(raw: i64) -> AndroidProjectionToken {
+        unsafe { AndroidProjectionToken::from_raw(raw) }
+    }
+
     #[cfg(target_os = "android")]
     #[test]
     fn projection_token_try_consume_is_single_shot() {
-        let token = AndroidProjectionToken::from_raw(42);
+        let token = test_token(42);
         assert_eq!(token.try_consume(), Some(42));
         assert_eq!(token.try_consume(), None);
         assert_eq!(token.try_consume(), None);
@@ -1384,7 +1397,7 @@ mod tests {
         // Pins the anti-double-delete contract: a cloned token (as happens
         // when a StreamConfig/builder carrying it is cloned) shares the single
         // deletion claim, so only the first stream can consume it.
-        let a = AndroidProjectionToken::from_raw(7);
+        let a = test_token(7);
         let b = a.clone();
         assert_eq!(a.try_consume(), Some(7));
         assert_eq!(b.try_consume(), None);
@@ -1395,7 +1408,7 @@ mod tests {
     fn projection_token_release_claim_re_arms_for_retry() {
         // Mirrors create_playback_capture's failure arm: a failed attempt
         // releases the claim so the same token can be retried.
-        let token = AndroidProjectionToken::from_raw(9);
+        let token = test_token(9);
         assert_eq!(token.try_consume(), Some(9));
         token.release_claim();
         assert_eq!(token.try_consume(), Some(9));
@@ -1405,22 +1418,16 @@ mod tests {
     #[cfg(target_os = "android")]
     #[test]
     fn projection_token_as_raw_stable_and_eq_is_raw_only() {
-        let a = AndroidProjectionToken::from_raw(5);
+        let a = test_token(5);
         let b = a.clone();
         assert_eq!(a.as_raw(), 5);
         assert_eq!(b.as_raw(), 5);
         // Equality is on the raw handle only; latch state is irrelevant.
-        assert_eq!(
-            AndroidProjectionToken::from_raw(5),
-            AndroidProjectionToken::from_raw(5)
-        );
-        let consumed = AndroidProjectionToken::from_raw(5);
+        assert_eq!(test_token(5), test_token(5));
+        let consumed = test_token(5);
         let _ = consumed.try_consume();
-        assert_eq!(consumed, AndroidProjectionToken::from_raw(5));
-        assert_ne!(
-            AndroidProjectionToken::from_raw(5),
-            AndroidProjectionToken::from_raw(6)
-        );
+        assert_eq!(consumed, test_token(5));
+        assert_ne!(test_token(5), test_token(6));
     }
 
     #[cfg(target_os = "android")]
@@ -1428,7 +1435,7 @@ mod tests {
     fn stream_config_carrying_a_token_preserves_eq() {
         // Guards the derived-`Eq` ripple: StreamConfig still satisfies
         // PartialEq/Eq with a token present.
-        let token = AndroidProjectionToken::from_raw(11);
+        let token = test_token(11);
         let mut cfg = StreamConfig::default();
         cfg.android_projection = Some(token.clone());
         let cloned = cfg.clone();

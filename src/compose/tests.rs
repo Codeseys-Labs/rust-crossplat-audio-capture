@@ -1865,3 +1865,66 @@ fn control_on_unstarted_composition_is_not_initialized() {
         assert_eq!(err.lifecycle_stage(), Some(LifecycleStage::NotInitialized));
     }
 }
+
+/// After the composition stops/ends, no compositor tick will ever apply a
+/// mutation — the setters must refuse (NotRunning) instead of reporting a
+/// success that never takes effect; the getters keep reading the last-applied
+/// values (rsac-5a2d review, PR #62).
+#[test]
+fn live_controls_refuse_after_composition_ends() {
+    let (src, _) = ScriptedSource::ending(vec![const_buffer(0.5, 1, 48_000, 480)]);
+    let harness = Harness::spawn(
+        cfg(
+            1,
+            vec![GroupSpec {
+                layout: GroupLayout::Mono,
+                offset: 0,
+                width: 1,
+            }],
+            vec![SourceSpec {
+                gain: 1.0,
+                group: 0,
+                channels: 0,
+                clock_candidate: false,
+            }],
+            0,
+        ),
+        vec![Box::new(src)],
+    );
+    // Wait for the engine to finish (ring parked in Stopping, is_running false).
+    let deadline = std::time::Instant::now() + Duration::from_secs(5);
+    while harness.stream.is_running() {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "engine never finished"
+        );
+        std::thread::sleep(Duration::from_millis(1));
+    }
+
+    let mut composition = CompositionBuilder::new()
+        .group(
+            Group::new("g")
+                .source(crate::core::config::CaptureTarget::SystemDefault)
+                .mixdown(GroupLayout::Mono),
+        )
+        .build()
+        .expect("device-free build");
+    composition.attach_stream_for_tests(Arc::clone(&harness.stream));
+    composition.attach_stats_for_tests(Arc::clone(&harness.stats));
+    assert!(!composition.is_running(), "precondition: engine finished");
+
+    for err in [
+        composition
+            .set_gain("g", 0, 0.5)
+            .expect_err("set_gain after end"),
+        composition
+            .set_muted("g", 0, true)
+            .expect_err("set_muted after end"),
+    ] {
+        assert!(matches!(err, AudioError::StreamReadError { .. }));
+        assert_eq!(err.lifecycle_stage(), Some(LifecycleStage::NotRunning));
+    }
+    // Getters still read the last-applied values of the ended composition.
+    assert!((composition.gain("g", 0).unwrap() - 1.0).abs() < 1e-6);
+    assert!(!composition.is_muted("g", 0).unwrap());
+}

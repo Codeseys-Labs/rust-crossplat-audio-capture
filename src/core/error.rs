@@ -684,7 +684,7 @@ impl AudioError {
             | REASON_NO_ACTIVE_STREAM
             | REASON_CAPTURE_NOT_STARTED
             | REASON_COMPOSITION_NOT_STARTED => LifecycleStage::NotInitialized,
-            REASON_NOT_RUNNING => LifecycleStage::NotRunning,
+            REASON_NOT_RUNNING | REASON_COMPOSITION_NOT_RUNNING => LifecycleStage::NotRunning,
             _ => LifecycleStage::Unknown,
         })
     }
@@ -716,6 +716,13 @@ pub(crate) const REASON_CAPTURE_NOT_STARTED: &str =
 /// `NotInitialized` — semantically "no stream exists yet".
 pub(crate) const REASON_COMPOSITION_NOT_STARTED: &str =
     "Composition is not started. Call start() first.";
+
+/// See [`REASON_NOT_INITIALIZED`]. Compose analogue of [`REASON_NOT_RUNNING`]:
+/// a live-control mutator (`set_gain` / `set_muted`) called after the
+/// composition stopped or ended — no compositor tick will ever apply the
+/// change, so reporting success would be a lie (rsac-5a2d review).
+pub(crate) const REASON_COMPOSITION_NOT_RUNNING: &str =
+    "Composition is not running (stopped or ended); live controls require a running composition.";
 
 /// Structured cause of a lifecycle [`AudioError::StreamReadError`]
 /// (rsac-feb4) — see [`AudioError::lifecycle_stage`].

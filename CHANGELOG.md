@@ -27,7 +27,10 @@ Releases with no ABI change omit the subsection (or state "No C ABI changes").
   Gain **replaces** the build-time `Group::source_with_gain` value (which now
   seeds the initial level); mute is a separate flag, so unmute restores the
   prior gain. Backed by lock-free per-source atomics read on the (non-RT)
-  compositor thread — no RT-path change. `SourceStats` gains `gain` / `muted`
+  compositor thread — no RT-path change. The setters refuse (`StreamReadError`,
+  `LifecycleStage::NotRunning`) once the composition has stopped or ended — no
+  tick would ever apply the change (CodeRabbit PR #62); the getters keep
+  reading the last-applied values. `SourceStats` gains `gain` / `muted`
   fields (the `#[non_exhaustive]` struct makes this non-breaking). Group-level
   master gain is deferred (tracked in rsac-1ce7). No C ABI / bindings change this
   release. Additive-only; `cargo-semver-checks` reports `minor`. (rsac-5a2d)
@@ -107,7 +110,9 @@ Releases with no ABI change omit the subsection (or state "No C ABI changes").
   the ref. The shared claim is per token *instance* (and its clones), not per
   raw `i64`: wrapping the same handle in two separate `from_raw` calls yields
   independent latches and is an unguarded double-delete — mint a token once and
-  clone it. `Clone`, `PartialEq`, `Eq`, and the `from_raw`/`as_raw`/
+  clone it. `from_raw` is accordingly now `unsafe fn`, encoding the
+  validity + once-per-handle contract in the API (CodeRabbit PR #62).
+  `Clone`, `PartialEq`, `Eq`, and the `as_raw`/
   `with_android_projection` signatures are retained. This surface is
   `#[cfg(target_os = "android")]`, so the host `cargo-semver-checks` gate does
   not observe it; the removal of `Copy`/`Hash` is nonetheless a breaking change

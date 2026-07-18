@@ -12,7 +12,9 @@ use crate::bridge::state::StreamState;
 use crate::bridge::stream::{BridgeStream, PlatformStream};
 use crate::core::buffer::AudioBuffer;
 use crate::core::config::{AudioFormat, SampleFormat};
-use crate::core::error::{AudioError, AudioResult, REASON_COMPOSITION_NOT_STARTED};
+use crate::core::error::{
+    AudioError, AudioResult, REASON_COMPOSITION_NOT_RUNNING, REASON_COMPOSITION_NOT_STARTED,
+};
 use crate::core::interface::CapturingStream;
 
 use super::builder::{
@@ -729,11 +731,13 @@ impl Composition {
     ///
     /// - [`AudioError::StreamReadError`] (classifies as
     ///   [`LifecycleStage::NotInitialized`](crate::core::error::LifecycleStage::NotInitialized))
-    ///   if the composition is not started.
+    ///   if the composition is not started, or as
+    ///   [`LifecycleStage::NotRunning`](crate::core::error::LifecycleStage::NotRunning)
+    ///   if it has stopped or ended — no tick would ever apply the change.
     /// - [`AudioError::ConfigurationError`] if `group` is unknown, `source_idx`
     ///   is out of range for that group, or `gain` is not finite and ≥ 0.
     pub fn set_gain(&self, group: &str, source_idx: usize, gain: f32) -> AudioResult<()> {
-        let stats = self.started_stats()?;
+        let stats = self.running_stats()?;
         let flat = self.resolve_source(group, source_idx)?;
         super::builder::validate_gain(
             gain,
@@ -752,11 +756,12 @@ impl Composition {
     ///
     /// # Errors
     ///
-    /// - [`AudioError::StreamReadError`] (NotInitialized) if not started.
+    /// - [`AudioError::StreamReadError`] (NotInitialized) if not started;
+    ///   (NotRunning) if stopped or ended.
     /// - [`AudioError::ConfigurationError`] if `group` is unknown or
     ///   `source_idx` is out of range.
     pub fn set_muted(&self, group: &str, source_idx: usize, muted: bool) -> AudioResult<()> {
-        let stats = self.started_stats()?;
+        let stats = self.running_stats()?;
         let flat = self.resolve_source(group, source_idx)?;
         stats.sources[flat].muted.store(muted, Ordering::Relaxed);
         Ok(())
@@ -803,6 +808,30 @@ impl Composition {
             .ok_or_else(|| AudioError::StreamReadError {
                 reason: REASON_COMPOSITION_NOT_STARTED.to_string(),
             })
+    }
+
+    /// [`started_stats`](Self::started_stats), additionally requiring the
+    /// composed stream to still be running (rsac-5a2d review): after an
+    /// explicit stop or a natural end the stats block is retained but no
+    /// compositor tick will ever apply a mutation, so the live-control
+    /// **setters** must refuse rather than report a success that never takes
+    /// effect. The getters intentionally keep using `started_stats` — reading
+    /// the last-applied gain/mute of a stopped composition is meaningful.
+    fn running_stats(&self) -> AudioResult<&Arc<EngineStatsShared>> {
+        let stats = self.started_stats()?;
+        let running = self
+            .stream
+            .as_ref()
+            .map(|s| s.is_running())
+            // Test seam: stats attached without a stream view means the
+            // engine-less control harness — treat as running.
+            .unwrap_or(true);
+        if !running {
+            return Err(AudioError::StreamReadError {
+                reason: REASON_COMPOSITION_NOT_RUNNING.to_string(),
+            });
+        }
+        Ok(stats)
     }
 
     /// Resolves `(group name, within-group source index)` to the flat source

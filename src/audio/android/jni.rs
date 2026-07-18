@@ -1138,8 +1138,10 @@ pub(super) fn stop_and_release_projection(token_raw: i64) {
     // owning stream obtained it via `AndroidProjectionToken::try_consume`
     // (config.rs), whose shared single-owner latch lets at most one stream in a
     // token's clone lineage ever hold a deletable handle — so this runs exactly
-    // once, never a double `DeleteGlobalRef`. (A 0/stale token is caught by the
-    // early return above and the `as_raw() == 0` check in create_playback_capture.)
+    // once, never a double `DeleteGlobalRef`. (Only a 0 token is caught — by
+    // the early return above and the `as_raw() == 0` check in
+    // create_playback_capture; a stale non-zero handle is NOT detectable here
+    // and is excluded by `from_raw`'s unsafe contract.)
     // stop() is idempotent on MediaProjection.
     unsafe {
         jni_call!(

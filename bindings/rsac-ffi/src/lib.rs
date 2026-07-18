@@ -639,9 +639,12 @@ pub unsafe extern "C" fn rsac_builder_set_android_projection(
         #[cfg(target_os = "android")]
         {
             let b = unsafe { &mut *builder };
-            b.inner = b.inner.clone().with_android_projection(
-                rsac::core::config::AndroidProjectionToken::from_raw(token),
-            );
+            // SAFETY: validity and once-per-handle wrapping are the C caller's
+            // documented contract (see the header docs on this function); the
+            // FFI layer cannot dedup raw int64 handles across calls.
+            b.inner = b.inner.clone().with_android_projection(unsafe {
+                rsac::core::config::AndroidProjectionToken::from_raw(token)
+            });
             rsac_error_t::RSAC_OK
         }
         #[cfg(not(target_os = "android"))]
