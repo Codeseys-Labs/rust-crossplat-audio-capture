@@ -9,12 +9,17 @@
 // cannot get a usable input route.
 //
 // A plain UIApplicationMain with no scene/window is enough: the hosted test
-// runs inside this process; the app never needs to render anything.
+// runs inside this process; the app never needs to render anything. The
+// delegate must be a real UIApplicationDelegate conformer — UIResponder alone
+// is not one, and an invalid delegate class can trip UIKit/XCTest launch
+// checks before the hosted tests run (CodeRabbit PR #66).
 import UIKit
+
+final class RsacHarnessAppDelegate: UIResponder, UIApplicationDelegate {}
 
 UIApplicationMain(
     CommandLine.argc,
     CommandLine.unsafeArgv,
     nil,
-    NSStringFromClass(UIResponder.self)
+    NSStringFromClass(RsacHarnessAppDelegate.self)
 )

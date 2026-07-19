@@ -51,9 +51,18 @@ adb shell "cd /data/local/tmp && RUST_BACKTRACE=1 \
 # then run connectedDebugAndroidTest.
 echo "=== instrumented androidTest (real app uid + RECORD_AUDIO, shipped C ABI) ==="
 adb logcat -c || true
+# Capture gradle's exit instead of letting set -e abort here: a failing test
+# run (including the intended rsac_require_frames=1 hard-fail path) is EXACTLY
+# when the logcat evidence below matters most — dump it first, then propagate
+# the failure (CodeRabbit PR #66).
+GRADLE_STATUS=0
 gradle -p mobile/android connectedDebugAndroidTest --no-daemon --stacktrace \
   "-Pandroid.testInstrumentationRunnerArguments.rsac_require_frames=${REQUIRE_FRAMES:-0}" \
-  2>&1 | tee instrumented.log
+  2>&1 | tee instrumented.log || GRADLE_STATUS=$?
 # -d: dump-and-exit (never stream/hang). The RsacFramesTest tag carries the
 # frames/negotiated-format evidence and any SKIP-WITH-SUMMARY line.
 adb logcat -d -s RsacFramesTest TestRunner 2>&1 | tee instrumented-logcat.log || true
+if [ "$GRADLE_STATUS" -ne 0 ]; then
+  echo "::error::connectedDebugAndroidTest failed (exit $GRADLE_STATUS) — see instrumented.log + instrumented-logcat.log"
+  exit "$GRADLE_STATUS"
+fi
