@@ -1,0 +1,15 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!--
+  rsac-255b — androidTest manifest for the self-instrumenting test APK.
+
+  RECORD_AUDIO already merges in from the library's main manifest, but it is
+  redeclared here explicitly so the TEST APK's permission never depends on
+  manifest-merge scoping (GrantPermissionRule can only grant a permission the
+  installed package actually declares). Mic path only: no MediaProjection,
+  no foreground-service permissions needed here.
+-->
+<manifest xmlns:android="http://schemas.android.com/apk/res/android">
+
+    <uses-permission android:name="android.permission.RECORD_AUDIO" />
+
+</manifest>
