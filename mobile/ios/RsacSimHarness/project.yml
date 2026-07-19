@@ -1,0 +1,94 @@
+# rsac-f18f — xcodegen spec for the iOS SIMULATOR frames-delivered TCC harness.
+#
+# WHY an Xcode project (not a bare SwiftPM testTarget): a libtest binary spawned
+# via `simctl spawn` has NO bundle → no TCC target → AVAudioSession reports an
+# unusable input route (0 Hz / 0 ch). An app-HOSTED XCTest bundle runs inside a
+# real .app whose Info.plist carries NSMicrophoneUsageDescription and whose fixed
+# bundle id (ai.codeseys.rsac.simharness) can be TCC-granted with
+# `simctl privacy <udid> grant microphone <bundle-id>` BEFORE first launch. The
+# test then drives rsac through its C API (rsac-ffi) and asserts frames are
+# delivered with a sane negotiated format — never content.
+#
+# GENERATED, COMMITTED, RUNNER-INDEPENDENT: the .xcodeproj is generated from this
+# spec with `xcodegen generate` and COMMITTED. CI consumes the committed project
+# directly (xcodebuild), so the runner needs NO xcodegen. Regenerate + recommit
+# after editing this file: `cd mobile/ios/RsacSimHarness && xcodegen generate`.
+#
+# librsac_ffi.a is built by the workflow for aarch64-apple-ios-sim and linked via
+# the relative LIBRARY_SEARCH_PATHS below (repo-root/target/... resolves from
+# SRCROOT). Headers come from bindings/rsac-ffi/include via the bridging header.
+name: RsacSimHarness
+options:
+  bundleIdPrefix: ai.codeseys.rsac
+  deploymentTarget:
+    iOS: "15.0"
+  createIntermediateGroups: true
+  generateEmptyDirectories: true
+settings:
+  base:
+    SWIFT_VERSION: "5.0"
+    # Simulator library products need neither signing nor a provisioning profile.
+    CODE_SIGNING_ALLOWED: "NO"
+    CODE_SIGNING_REQUIRED: "NO"
+    CODE_SIGN_IDENTITY: ""
+targets:
+  # ── Near-empty host app: exists only to own a bundle + Info.plist so the
+  #    hosted XCTest inherits a real TCC identity. No UI, no window needed. ──
+  RsacSimHarnessApp:
+    type: application
+    platform: iOS
+    sources:
+      - path: App
+    settings:
+      base:
+        PRODUCT_BUNDLE_IDENTIFIER: ai.codeseys.rsac.simharness
+        INFOPLIST_FILE: App/Info.plist
+        GENERATE_INFOPLIST_FILE: "NO"
+        MARKETING_VERSION: "0.4.2"
+        CURRENT_PROJECT_VERSION: "1"
+  # ── App-hosted unit test: runs INSIDE the host app process, so TCC keys on
+  #    the app's bundle id and NSMicrophoneUsageDescription comes from the app's
+  #    Info.plist. Links librsac_ffi.a + the frameworks the iOS backend needs. ──
+  RsacSimHarnessTests:
+    type: bundle.unit-test
+    platform: iOS
+    sources:
+      - path: Tests
+    dependencies:
+      - target: RsacSimHarnessApp
+    settings:
+      base:
+        PRODUCT_BUNDLE_IDENTIFIER: ai.codeseys.rsac.simharness.tests
+        GENERATE_INFOPLIST_FILE: "YES"
+        # C interop: the bridging header pulls in the curated rsac-ffi C API.
+        SWIFT_OBJC_BRIDGING_HEADER: Tests/RsacSimHarnessTests-Bridging-Header.h
+        TEST_HOST: "$(BUILT_PRODUCTS_DIR)/RsacSimHarnessApp.app/RsacSimHarnessApp"
+        BUNDLE_LOADER: "$(TEST_HOST)"
+        # rsac.h lives here; relative to SRCROOT (mobile/ios/RsacSimHarness).
+        HEADER_SEARCH_PATHS:
+          - "$(SRCROOT)/../../../bindings/rsac-ffi/include"
+        # The workflow's `cargo build -p rsac-ffi --target aarch64-apple-ios-sim
+        # --release` drops librsac_ffi.a here (default cargo target dir at the
+        # repo root). Relative to SRCROOT so no absolute path is baked in.
+        LIBRARY_SEARCH_PATHS:
+          - "$(SRCROOT)/../../../target/aarch64-apple-ios-sim/release"
+        # A Rust staticlib bundles all its Rust deps (rsac, objc2, …); only the
+        # Apple frameworks those deps message into must be linked here.
+        # AVFAudio: AVAudioEngine mic tap + the test's AVAudioSession activation.
+        # Foundation: objc2-foundation (NSString/NSError/…) + the ObjC runtime.
+        OTHER_LDFLAGS:
+          - "-lrsac_ffi"
+          - "-framework"
+          - "AVFAudio"
+          - "-framework"
+          - "Foundation"
+schemes:
+  RsacSimHarness:
+    build:
+      targets:
+        RsacSimHarnessApp: all
+        RsacSimHarnessTests: all
+    test:
+      targets:
+        - RsacSimHarnessTests
+      gatherCoverageData: false

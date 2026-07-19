@@ -40,10 +40,16 @@ Releases with no ABI change omit the subsection (or state "No C ABI changes").
   `AVAudioEngine` input tap (env-gated on `RSAC_CI_IOS_SIM=1`; the test
   plays the host-app role and activates a `.playAndRecord` AVAudioSession
   itself via a new iOS-only `objc2-avf-audio` dev-dependency — no production
-  code path gains a session dependency). Results are labelled
-  **simulator-verified**, never device-verified; physical-device capture,
-  the interleaved-delivery fast path, and start-failure rollback remain a
-  runbook. (rsac-97c8)
+  code path gains a session dependency). The leg additionally carries an
+  **app-hosted TCC harness** (`mobile/ios/RsacSimHarness/`, rsac-f18f): a
+  minimal xcodegen-generated app whose hosted XCTest inherits a
+  TCC-grantable bundle identity (`simctl privacy grant microphone` before
+  first launch), drives the rsac C ABI (`librsac_ffi.a`,
+  `aarch64-apple-ios-sim`) from Swift, and asserts frame delivery + format
+  sanity — closing the no-bundle/no-route gap the bare `simctl spawn` smoke
+  documented. Results are labelled **simulator-verified**, never
+  device-verified; physical-device capture, the interleaved-delivery fast
+  path, and start-failure rollback remain a runbook. (rsac-97c8)
 
 - **Tauri v2 plugin (`tauri-plugin-rsac`, ADR-0014):** mobile consent-flow + JS
   capture API at `integrations/tauri-plugin-rsac`; derived-meter events by

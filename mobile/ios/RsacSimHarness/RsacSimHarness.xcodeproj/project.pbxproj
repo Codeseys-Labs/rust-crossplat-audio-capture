@@ -1,0 +1,425 @@
+// !$*UTF8*$!
+{
+	archiveVersion = 1;
+	classes = {
+	};
+	objectVersion = 77;
+	objects = {
+
+/* Begin PBXBuildFile section */
+		5B82A1FCDAAA017126939C9F /* RsacSimHarnessTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = FA55ACCE0A40458E093026B5 /* RsacSimHarnessTests.swift */; };
+		C4933D7CA280E26AC800AEFD /* main.swift in Sources */ = {isa = PBXBuildFile; fileRef = BBAE387EFE1E404894C76245 /* main.swift */; };
+/* End PBXBuildFile section */
+
+/* Begin PBXContainerItemProxy section */
+		2600EB86152DD9ADF03B48B6 /* PBXContainerItemProxy */ = {
+			isa = PBXContainerItemProxy;
+			containerPortal = 8B39A0A3D1365C0E23DE8D54 /* Project object */;
+			proxyType = 1;
+			remoteGlobalIDString = D33095E234E319AEA601F703;
+			remoteInfo = RsacSimHarnessApp;
+		};
+/* End PBXContainerItemProxy section */
+
+/* Begin PBXFileReference section */
+		41C75112173DA4C42068941D /* RsacSimHarnessTests-Bridging-Header.h */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.c.h; path = "RsacSimHarnessTests-Bridging-Header.h"; sourceTree = "<group>"; };
+		8C2F35DB94832E955D08B9E0 /* Info.plist */ = {isa = PBXFileReference; lastKnownFileType = text.plist; path = Info.plist; sourceTree = "<group>"; };
+		B5E43D5A6DE50119F04F9FC6 /* RsacSimHarnessTests.xctest */ = {isa = PBXFileReference; includeInIndex = 0; lastKnownFileType = wrapper.cfbundle; path = RsacSimHarnessTests.xctest; sourceTree = BUILT_PRODUCTS_DIR; };
+		BBAE387EFE1E404894C76245 /* main.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = main.swift; sourceTree = "<group>"; };
+		EC806601ADE53315CF8E376A /* RsacSimHarnessApp.app */ = {isa = PBXFileReference; includeInIndex = 0; lastKnownFileType = wrapper.application; path = RsacSimHarnessApp.app; sourceTree = BUILT_PRODUCTS_DIR; };
+		FA55ACCE0A40458E093026B5 /* RsacSimHarnessTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = RsacSimHarnessTests.swift; sourceTree = "<group>"; };
+/* End PBXFileReference section */
+
+/* Begin PBXGroup section */
+		05AEE9BCB895114C56590904 /* Products */ = {
+			isa = PBXGroup;
+			children = (
+				EC806601ADE53315CF8E376A /* RsacSimHarnessApp.app */,
+				B5E43D5A6DE50119F04F9FC6 /* RsacSimHarnessTests.xctest */,
+			);
+			name = Products;
+			sourceTree = "<group>";
+		};
+		3823DE17D78CF336C20789AA = {
+			isa = PBXGroup;
+			children = (
+				54677A9ECF3DC5E31B89323D /* App */,
+				F5FBB7096EEE0CD0F9F2054A /* Tests */,
+				05AEE9BCB895114C56590904 /* Products */,
+			);
+			sourceTree = "<group>";
+		};
+		54677A9ECF3DC5E31B89323D /* App */ = {
+			isa = PBXGroup;
+			children = (
+				8C2F35DB94832E955D08B9E0 /* Info.plist */,
+				BBAE387EFE1E404894C76245 /* main.swift */,
+			);
+			path = App;
+			sourceTree = "<group>";
+		};
+		F5FBB7096EEE0CD0F9F2054A /* Tests */ = {
+			isa = PBXGroup;
+			children = (
+				41C75112173DA4C42068941D /* RsacSimHarnessTests-Bridging-Header.h */,
+				FA55ACCE0A40458E093026B5 /* RsacSimHarnessTests.swift */,
+			);
+			path = Tests;
+			sourceTree = "<group>";
+		};
+/* End PBXGroup section */
+
+/* Begin PBXNativeTarget section */
+		92ED781BFB6749D405012E55 /* RsacSimHarnessTests */ = {
+			isa = PBXNativeTarget;
+			buildConfigurationList = 5F9C36236DE8FA786D5AD5F5 /* Build configuration list for PBXNativeTarget "RsacSimHarnessTests" */;
+			buildPhases = (
+				9D37304640F7F04D2AA78D25 /* Sources */,
+			);
+			buildRules = (
+			);
+			dependencies = (
+				151EA5194B96133DC1DC22AC /* PBXTargetDependency */,
+			);
+			name = RsacSimHarnessTests;
+			packageProductDependencies = (
+			);
+			productName = RsacSimHarnessTests;
+			productReference = B5E43D5A6DE50119F04F9FC6 /* RsacSimHarnessTests.xctest */;
+			productType = "com.apple.product-type.bundle.unit-test";
+		};
+		D33095E234E319AEA601F703 /* RsacSimHarnessApp */ = {
+			isa = PBXNativeTarget;
+			buildConfigurationList = C2850D35608116C254FB6352 /* Build configuration list for PBXNativeTarget "RsacSimHarnessApp" */;
+			buildPhases = (
+				F9CF52BA97CA9E54EE730A0E /* Sources */,
+			);
+			buildRules = (
+			);
+			dependencies = (
+			);
+			name = RsacSimHarnessApp;
+			packageProductDependencies = (
+			);
+			productName = RsacSimHarnessApp;
+			productReference = EC806601ADE53315CF8E376A /* RsacSimHarnessApp.app */;
+			productType = "com.apple.product-type.application";
+		};
+/* End PBXNativeTarget section */
+
+/* Begin PBXProject section */
+		8B39A0A3D1365C0E23DE8D54 /* Project object */ = {
+			isa = PBXProject;
+			attributes = {
+				BuildIndependentTargetsInParallel = YES;
+				LastUpgradeCheck = 1430;
+				TargetAttributes = {
+				};
+			};
+			buildConfigurationList = B813FCA4F5E135A97C1C8415 /* Build configuration list for PBXProject "RsacSimHarness" */;
+			developmentRegion = en;
+			hasScannedForEncodings = 0;
+			knownRegions = (
+				Base,
+				en,
+			);
+			mainGroup = 3823DE17D78CF336C20789AA;
+			minimizedProjectReferenceProxies = 1;
+			preferredProjectObjectVersion = 77;
+			productRefGroup = 05AEE9BCB895114C56590904 /* Products */;
+			projectDirPath = "";
+			projectRoot = "";
+			targets = (
+				D33095E234E319AEA601F703 /* RsacSimHarnessApp */,
+				92ED781BFB6749D405012E55 /* RsacSimHarnessTests */,
+			);
+		};
+/* End PBXProject section */
+
+/* Begin PBXSourcesBuildPhase section */
+		9D37304640F7F04D2AA78D25 /* Sources */ = {
+			isa = PBXSourcesBuildPhase;
+			buildActionMask = 2147483647;
+			files = (
+				5B82A1FCDAAA017126939C9F /* RsacSimHarnessTests.swift in Sources */,
+			);
+			runOnlyForDeploymentPostprocessing = 0;
+		};
+		F9CF52BA97CA9E54EE730A0E /* Sources */ = {
+			isa = PBXSourcesBuildPhase;
+			buildActionMask = 2147483647;
+			files = (
+				C4933D7CA280E26AC800AEFD /* main.swift in Sources */,
+			);
+			runOnlyForDeploymentPostprocessing = 0;
+		};
+/* End PBXSourcesBuildPhase section */
+
+/* Begin PBXTargetDependency section */
+		151EA5194B96133DC1DC22AC /* PBXTargetDependency */ = {
+			isa = PBXTargetDependency;
+			target = D33095E234E319AEA601F703 /* RsacSimHarnessApp */;
+			targetProxy = 2600EB86152DD9ADF03B48B6 /* PBXContainerItemProxy */;
+		};
+/* End PBXTargetDependency section */
+
+/* Begin XCBuildConfiguration section */
+		487B8513759297A82F8DFDF7 /* Debug */ = {
+			isa = XCBuildConfiguration;
+			buildSettings = {
+				BUNDLE_LOADER = "$(TEST_HOST)";
+				GENERATE_INFOPLIST_FILE = YES;
+				HEADER_SEARCH_PATHS = (
+					"$(SRCROOT)/../../../bindings/rsac-ffi/include",
+				);
+				LD_RUNPATH_SEARCH_PATHS = (
+					"$(inherited)",
+					"@executable_path/Frameworks",
+					"@loader_path/Frameworks",
+				);
+				LIBRARY_SEARCH_PATHS = (
+					"$(SRCROOT)/../../../target/aarch64-apple-ios-sim/release",
+				);
+				OTHER_LDFLAGS = (
+					"-lrsac_ffi",
+					"-framework",
+					AVFAudio,
+					"-framework",
+					Foundation,
+				);
+				PRODUCT_BUNDLE_IDENTIFIER = ai.codeseys.rsac.simharness.tests;
+				SDKROOT = iphoneos;
+				SWIFT_OBJC_BRIDGING_HEADER = "Tests/RsacSimHarnessTests-Bridging-Header.h";
+				TARGETED_DEVICE_FAMILY = "1,2";
+				TEST_HOST = "$(BUILT_PRODUCTS_DIR)/RsacSimHarnessApp.app/RsacSimHarnessApp";
+			};
+			name = Debug;
+		};
+		67F61170C8ACBDCA6BF60524 /* Release */ = {
+			isa = XCBuildConfiguration;
+			buildSettings = {
+				ASSETCATALOG_COMPILER_APPICON_NAME = AppIcon;
+				CODE_SIGN_IDENTITY = "iPhone Developer";
+				CURRENT_PROJECT_VERSION = 1;
+				GENERATE_INFOPLIST_FILE = NO;
+				INFOPLIST_FILE = App/Info.plist;
+				LD_RUNPATH_SEARCH_PATHS = (
+					"$(inherited)",
+					"@executable_path/Frameworks",
+				);
+				MARKETING_VERSION = 0.4.2;
+				PRODUCT_BUNDLE_IDENTIFIER = ai.codeseys.rsac.simharness;
+				SDKROOT = iphoneos;
+				TARGETED_DEVICE_FAMILY = "1,2";
+			};
+			name = Release;
+		};
+		798F4504306026F4B98F68DE /* Release */ = {
+			isa = XCBuildConfiguration;
+			buildSettings = {
+				ALWAYS_SEARCH_USER_PATHS = NO;
+				CLANG_ANALYZER_NONNULL = YES;
+				CLANG_ANALYZER_NUMBER_OBJECT_CONVERSION = YES_AGGRESSIVE;
+				CLANG_CXX_LANGUAGE_STANDARD = "gnu++14";
+				CLANG_CXX_LIBRARY = "libc++";
+				CLANG_ENABLE_MODULES = YES;
+				CLANG_ENABLE_OBJC_ARC = YES;
+				CLANG_ENABLE_OBJC_WEAK = YES;
+				CLANG_WARN_BLOCK_CAPTURE_AUTORELEASING = YES;
+				CLANG_WARN_BOOL_CONVERSION = YES;
+				CLANG_WARN_COMMA = YES;
+				CLANG_WARN_CONSTANT_CONVERSION = YES;
+				CLANG_WARN_DEPRECATED_OBJC_IMPLEMENTATIONS = YES;
+				CLANG_WARN_DIRECT_OBJC_ISA_USAGE = YES_ERROR;
+				CLANG_WARN_DOCUMENTATION_COMMENTS = YES;
+				CLANG_WARN_EMPTY_BODY = YES;
+				CLANG_WARN_ENUM_CONVERSION = YES;
+				CLANG_WARN_INFINITE_RECURSION = YES;
+				CLANG_WARN_INT_CONVERSION = YES;
+				CLANG_WARN_NON_LITERAL_NULL_CONVERSION = YES;
+				CLANG_WARN_OBJC_IMPLICIT_RETAIN_SELF = YES;
+				CLANG_WARN_OBJC_LITERAL_CONVERSION = YES;
+				CLANG_WARN_OBJC_ROOT_CLASS = YES_ERROR;
+				CLANG_WARN_QUOTED_INCLUDE_IN_FRAMEWORK_HEADER = YES;
+				CLANG_WARN_RANGE_LOOP_ANALYSIS = YES;
+				CLANG_WARN_STRICT_PROTOTYPES = YES;
+				CLANG_WARN_SUSPICIOUS_MOVE = YES;
+				CLANG_WARN_UNGUARDED_AVAILABILITY = YES_AGGRESSIVE;
+				CLANG_WARN_UNREACHABLE_CODE = YES;
+				CLANG_WARN__DUPLICATE_METHOD_MATCH = YES;
+				CODE_SIGNING_ALLOWED = NO;
+				CODE_SIGNING_REQUIRED = NO;
+				CODE_SIGN_IDENTITY = "";
+				COPY_PHASE_STRIP = NO;
+				DEBUG_INFORMATION_FORMAT = "dwarf-with-dsym";
+				ENABLE_NS_ASSERTIONS = NO;
+				ENABLE_STRICT_OBJC_MSGSEND = YES;
+				GCC_C_LANGUAGE_STANDARD = gnu11;
+				GCC_NO_COMMON_BLOCKS = YES;
+				GCC_WARN_64_TO_32_BIT_CONVERSION = YES;
+				GCC_WARN_ABOUT_RETURN_TYPE = YES_ERROR;
+				GCC_WARN_UNDECLARED_SELECTOR = YES;
+				GCC_WARN_UNINITIALIZED_AUTOS = YES_AGGRESSIVE;
+				GCC_WARN_UNUSED_FUNCTION = YES;
+				GCC_WARN_UNUSED_VARIABLE = YES;
+				IPHONEOS_DEPLOYMENT_TARGET = 15.0;
+				MTL_ENABLE_DEBUG_INFO = NO;
+				MTL_FAST_MATH = YES;
+				PRODUCT_NAME = "$(TARGET_NAME)";
+				SDKROOT = iphoneos;
+				SWIFT_COMPILATION_MODE = wholemodule;
+				SWIFT_OPTIMIZATION_LEVEL = "-O";
+				SWIFT_VERSION = 5.0;
+			};
+			name = Release;
+		};
+		7A37D037389422824D9C0BF5 /* Debug */ = {
+			isa = XCBuildConfiguration;
+			buildSettings = {
+				ASSETCATALOG_COMPILER_APPICON_NAME = AppIcon;
+				CODE_SIGN_IDENTITY = "iPhone Developer";
+				CURRENT_PROJECT_VERSION = 1;
+				GENERATE_INFOPLIST_FILE = NO;
+				INFOPLIST_FILE = App/Info.plist;
+				LD_RUNPATH_SEARCH_PATHS = (
+					"$(inherited)",
+					"@executable_path/Frameworks",
+				);
+				MARKETING_VERSION = 0.4.2;
+				PRODUCT_BUNDLE_IDENTIFIER = ai.codeseys.rsac.simharness;
+				SDKROOT = iphoneos;
+				TARGETED_DEVICE_FAMILY = "1,2";
+			};
+			name = Debug;
+		};
+		8A75456FB61F6E22B597EE89 /* Release */ = {
+			isa = XCBuildConfiguration;
+			buildSettings = {
+				BUNDLE_LOADER = "$(TEST_HOST)";
+				GENERATE_INFOPLIST_FILE = YES;
+				HEADER_SEARCH_PATHS = (
+					"$(SRCROOT)/../../../bindings/rsac-ffi/include",
+				);
+				LD_RUNPATH_SEARCH_PATHS = (
+					"$(inherited)",
+					"@executable_path/Frameworks",
+					"@loader_path/Frameworks",
+				);
+				LIBRARY_SEARCH_PATHS = (
+					"$(SRCROOT)/../../../target/aarch64-apple-ios-sim/release",
+				);
+				OTHER_LDFLAGS = (
+					"-lrsac_ffi",
+					"-framework",
+					AVFAudio,
+					"-framework",
+					Foundation,
+				);
+				PRODUCT_BUNDLE_IDENTIFIER = ai.codeseys.rsac.simharness.tests;
+				SDKROOT = iphoneos;
+				SWIFT_OBJC_BRIDGING_HEADER = "Tests/RsacSimHarnessTests-Bridging-Header.h";
+				TARGETED_DEVICE_FAMILY = "1,2";
+				TEST_HOST = "$(BUILT_PRODUCTS_DIR)/RsacSimHarnessApp.app/RsacSimHarnessApp";
+			};
+			name = Release;
+		};
+		CD00632D34C17A0D2D908A29 /* Debug */ = {
+			isa = XCBuildConfiguration;
+			buildSettings = {
+				ALWAYS_SEARCH_USER_PATHS = NO;
+				CLANG_ANALYZER_NONNULL = YES;
+				CLANG_ANALYZER_NUMBER_OBJECT_CONVERSION = YES_AGGRESSIVE;
+				CLANG_CXX_LANGUAGE_STANDARD = "gnu++14";
+				CLANG_CXX_LIBRARY = "libc++";
+				CLANG_ENABLE_MODULES = YES;
+				CLANG_ENABLE_OBJC_ARC = YES;
+				CLANG_ENABLE_OBJC_WEAK = YES;
+				CLANG_WARN_BLOCK_CAPTURE_AUTORELEASING = YES;
+				CLANG_WARN_BOOL_CONVERSION = YES;
+				CLANG_WARN_COMMA = YES;
+				CLANG_WARN_CONSTANT_CONVERSION = YES;
+				CLANG_WARN_DEPRECATED_OBJC_IMPLEMENTATIONS = YES;
+				CLANG_WARN_DIRECT_OBJC_ISA_USAGE = YES_ERROR;
+				CLANG_WARN_DOCUMENTATION_COMMENTS = YES;
+				CLANG_WARN_EMPTY_BODY = YES;
+				CLANG_WARN_ENUM_CONVERSION = YES;
+				CLANG_WARN_INFINITE_RECURSION = YES;
+				CLANG_WARN_INT_CONVERSION = YES;
+				CLANG_WARN_NON_LITERAL_NULL_CONVERSION = YES;
+				CLANG_WARN_OBJC_IMPLICIT_RETAIN_SELF = YES;
+				CLANG_WARN_OBJC_LITERAL_CONVERSION = YES;
+				CLANG_WARN_OBJC_ROOT_CLASS = YES_ERROR;
+				CLANG_WARN_QUOTED_INCLUDE_IN_FRAMEWORK_HEADER = YES;
+				CLANG_WARN_RANGE_LOOP_ANALYSIS = YES;
+				CLANG_WARN_STRICT_PROTOTYPES = YES;
+				CLANG_WARN_SUSPICIOUS_MOVE = YES;
+				CLANG_WARN_UNGUARDED_AVAILABILITY = YES_AGGRESSIVE;
+				CLANG_WARN_UNREACHABLE_CODE = YES;
+				CLANG_WARN__DUPLICATE_METHOD_MATCH = YES;
+				CODE_SIGNING_ALLOWED = NO;
+				CODE_SIGNING_REQUIRED = NO;
+				CODE_SIGN_IDENTITY = "";
+				COPY_PHASE_STRIP = NO;
+				DEBUG_INFORMATION_FORMAT = dwarf;
+				ENABLE_STRICT_OBJC_MSGSEND = YES;
+				ENABLE_TESTABILITY = YES;
+				GCC_C_LANGUAGE_STANDARD = gnu11;
+				GCC_DYNAMIC_NO_PIC = NO;
+				GCC_NO_COMMON_BLOCKS = YES;
+				GCC_OPTIMIZATION_LEVEL = 0;
+				GCC_PREPROCESSOR_DEFINITIONS = (
+					"$(inherited)",
+					"DEBUG=1",
+				);
+				GCC_WARN_64_TO_32_BIT_CONVERSION = YES;
+				GCC_WARN_ABOUT_RETURN_TYPE = YES_ERROR;
+				GCC_WARN_UNDECLARED_SELECTOR = YES;
+				GCC_WARN_UNINITIALIZED_AUTOS = YES_AGGRESSIVE;
+				GCC_WARN_UNUSED_FUNCTION = YES;
+				GCC_WARN_UNUSED_VARIABLE = YES;
+				IPHONEOS_DEPLOYMENT_TARGET = 15.0;
+				MTL_ENABLE_DEBUG_INFO = INCLUDE_SOURCE;
+				MTL_FAST_MATH = YES;
+				ONLY_ACTIVE_ARCH = YES;
+				PRODUCT_NAME = "$(TARGET_NAME)";
+				SDKROOT = iphoneos;
+				SWIFT_ACTIVE_COMPILATION_CONDITIONS = DEBUG;
+				SWIFT_OPTIMIZATION_LEVEL = "-Onone";
+				SWIFT_VERSION = 5.0;
+			};
+			name = Debug;
+		};
+/* End XCBuildConfiguration section */
+
+/* Begin XCConfigurationList section */
+		5F9C36236DE8FA786D5AD5F5 /* Build configuration list for PBXNativeTarget "RsacSimHarnessTests" */ = {
+			isa = XCConfigurationList;
+			buildConfigurations = (
+				487B8513759297A82F8DFDF7 /* Debug */,
+				8A75456FB61F6E22B597EE89 /* Release */,
+			);
+			defaultConfigurationIsVisible = 0;
+			defaultConfigurationName = Debug;
+		};
+		B813FCA4F5E135A97C1C8415 /* Build configuration list for PBXProject "RsacSimHarness" */ = {
+			isa = XCConfigurationList;
+			buildConfigurations = (
+				CD00632D34C17A0D2D908A29 /* Debug */,
+				798F4504306026F4B98F68DE /* Release */,
+			);
+			defaultConfigurationIsVisible = 0;
+			defaultConfigurationName = Debug;
+		};
+		C2850D35608116C254FB6352 /* Build configuration list for PBXNativeTarget "RsacSimHarnessApp" */ = {
+			isa = XCConfigurationList;
+			buildConfigurations = (
+				7A37D037389422824D9C0BF5 /* Debug */,
+				67F61170C8ACBDCA6BF60524 /* Release */,
+			);
+			defaultConfigurationIsVisible = 0;
+			defaultConfigurationName = Debug;
+		};
+/* End XCConfigurationList section */
+	};
+	rootObject = 8B39A0A3D1365C0E23DE8D54 /* Project object */;
+}
