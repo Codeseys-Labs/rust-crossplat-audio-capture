@@ -59,6 +59,14 @@ impl Sessions {
         if let Some(size) = config.buffer_size {
             builder = builder.buffer_size(Some(size));
         }
+        // iOS: thread the App Group (required by SystemDefault, ADR-0013) —
+        // ignored elsewhere; the field's docs say so (CodeRabbit PR #65).
+        #[cfg(target_os = "ios")]
+        if let Some(ref group) = config.ios_app_group {
+            builder = builder.with_ios_app_group(group.clone());
+        }
+        #[cfg(not(target_os = "ios"))]
+        let _ = &config.ios_app_group;
 
         // Platform hook (Android token threading; identity on desktop).
         let builder = configure(builder)?;
@@ -69,7 +77,7 @@ impl Sessions {
         let id = format!("capture-{}", self.next_id.fetch_add(1, Ordering::Relaxed));
         self.map
             .lock()
-            .expect("sessions mutex poisoned")
+            .unwrap_or_else(|e| e.into_inner())
             .insert(id.clone(), running);
 
         Ok(StartCaptureResult {
@@ -84,7 +92,7 @@ impl Sessions {
         if let Some(mut running) = self
             .map
             .lock()
-            .expect("sessions mutex poisoned")
+            .unwrap_or_else(|e| e.into_inner())
             .remove(capture_id)
         {
             // Explicit stop makes teardown authoritative; Drop would also stop.
@@ -102,7 +110,7 @@ impl Sessions {
         channel: Channel<ChunkMeta>,
     ) -> Result<()> {
         let rx = {
-            let map = self.map.lock().expect("sessions mutex poisoned");
+            let map = self.map.lock().unwrap_or_else(|e| e.into_inner());
             let running = map
                 .get(capture_id)
                 .ok_or_else(|| Error::Plugin(format!("unknown capture id: {capture_id}")))?;
@@ -132,7 +140,7 @@ impl Sessions {
     /// reachable when the host granted `allow-subscribe-raw` (§5).
     pub(crate) fn subscribe_raw(&self, capture_id: &str, channel: Channel<ChunkRaw>) -> Result<()> {
         let rx = {
-            let map = self.map.lock().expect("sessions mutex poisoned");
+            let map = self.map.lock().unwrap_or_else(|e| e.into_inner());
             let running = map
                 .get(capture_id)
                 .ok_or_else(|| Error::Plugin(format!("unknown capture id: {capture_id}")))?;
@@ -259,8 +267,18 @@ pub(crate) fn list_targets() -> Result<Vec<TargetInfo>> {
                 // honestly rather than mislabel them.
                 _ => "unknown",
             };
+            // Round-trip guarantee: every id this command returns must be
+            // accepted by start_capture's target_str() parser. The system
+            // source's enumeration id is "system-default", which the parser
+            // does NOT accept ("system"/"default" only) — map it (CodeRabbit
+            // PR #65).
+            let id = if matches!(s.kind, rsac::AudioSourceKind::SystemDefault) {
+                "system".to_string()
+            } else {
+                s.id
+            };
             TargetInfo {
-                id: s.id,
+                id,
                 name: s.name,
                 kind: kind.to_string(),
             }

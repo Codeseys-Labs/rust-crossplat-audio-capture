@@ -101,10 +101,12 @@ await stopCapture(captureId)
 ## Events — derived data by default
 
 `subscribeMeta` streams `rsac://chunk-meta` events: per-chunk RMS/peak (linear
-+ dBFS), per-channel meters, frame count, duration, and the negotiated format —
-all computed Rust-side (alloc-free, NaN-safe) from each `AudioBuffer` before it
-is dropped. **Raw samples never cross IPC on this path.** This mirrors the
-proven napi `ChunkMeta` shape.
++ dBFS), per-channel meters, frame count, duration, and the negotiated format.
+The meter primitives are computed by rsac core (alloc-free, NaN-safe); the
+event assembly itself (per-channel vectors + the format string) allocates, but
+runs on the plugin's consumer-side pump thread — never the OS audio callback.
+**Raw samples never cross IPC on this path.** This mirrors the proven napi
+`ChunkMeta` shape.
 
 ### Raw samples (the slow path)
 

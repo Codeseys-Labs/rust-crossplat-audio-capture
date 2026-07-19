@@ -46,6 +46,8 @@ use mobile::Rsac;
 /// Extension trait giving [`tauri::App`], [`tauri::AppHandle`], and the window
 /// managers access to the rsac plugin delegate.
 pub trait RsacExt<R: Runtime> {
+    /// The plugin delegate registered by [`init`], for calling the rsac
+    /// commands from Rust (the JS guest API wraps the same surface).
     fn rsac(&self) -> &Rsac<R>;
 }
 

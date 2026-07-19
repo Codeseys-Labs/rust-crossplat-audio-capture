@@ -124,7 +124,7 @@ impl<R: Runtime> Rsac<R> {
                 // bounded by user actions and by the host's FGS lifecycle rather
                 // than reclaimed here (tracked as a seed).
                 let token = unsafe { rsac::AndroidProjectionToken::from_raw(raw) };
-                *self.projection.lock().expect("projection mutex poisoned") = Some(token);
+                *self.projection.lock().unwrap_or_else(|e| e.into_inner()) = Some(token);
             }
         }
 
@@ -145,7 +145,7 @@ impl<R: Runtime> Rsac<R> {
         // target needs an artifact it lacks (honest failure, not a panic).
         #[cfg(target_os = "android")]
         let configure = |builder: rsac::AudioCaptureBuilder| {
-            let guard = self.projection.lock().expect("projection mutex poisoned");
+            let guard = self.projection.lock().unwrap_or_else(|e| e.into_inner());
             match guard.as_ref() {
                 Some(token) => Ok(builder.with_android_projection(token.clone())),
                 None => Ok(builder),

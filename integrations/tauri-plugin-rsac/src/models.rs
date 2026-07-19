@@ -26,6 +26,13 @@ pub struct CaptureConfig {
     /// Ring-buffer depth in **slots** (not frames); honored on Windows today
     /// (see `AudioCaptureBuilder::buffer_size`). `None` → backend default.
     pub buffer_size: Option<usize>,
+    /// iOS only: the App Group identifier shared with the embedded
+    /// RsacBroadcastKit extension (`"group.…"`), required by `SystemDefault`
+    /// captures (ADR-0013 — threaded to
+    /// `AudioCaptureBuilder::with_ios_app_group`). Ignored on every other
+    /// platform. `None` on an iOS system capture yields the honest
+    /// `UserConsentRequired` preflight error.
+    pub ios_app_group: Option<String>,
 }
 
 // ── Command responses (plugin → webview) ─────────────────────────────────
@@ -48,7 +55,9 @@ pub struct ConsentResult {
 #[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct FormatInfo {
+    /// Negotiated sample rate in Hz.
     pub sample_rate: u32,
+    /// Negotiated channel count.
     pub channels: u16,
     /// Sample format as a lowercase string (`"f32"`, `"i16"`, …).
     pub sample_format: String,
@@ -70,7 +79,8 @@ pub struct StartCaptureResult {
 #[serde(rename_all = "camelCase")]
 pub struct TargetInfo {
     /// Canonical id usable as a `start_capture` target string
-    /// (e.g. `"system-default"`, `"device:hw:0,0"`, `"app:1234"`).
+    /// (e.g. `"system"`, `"device:hw:0,0"`, `"app:1234"`) — every id this
+    /// command returns round-trips through the target parser.
     pub id: String,
     /// Human-readable display name.
     pub name: String,
@@ -85,17 +95,26 @@ pub struct TargetInfo {
 #[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct Capabilities {
+    /// System-mix (loopback) capture is available.
     pub supports_system_capture: bool,
+    /// Per-application capture is available.
     pub supports_application_capture: bool,
+    /// Process-tree capture is available.
     pub supports_process_tree_capture: bool,
+    /// Non-default input devices can be selected.
     pub supports_device_selection: bool,
+    /// Device hot-plug notifications are available.
     pub supports_device_change_notifications: bool,
+    /// A consent artifact (MediaProjection token / App Group) is required
+    /// for the capture tiers that claim support.
     pub requires_user_consent: bool,
     /// Supported sample formats as lowercase strings.
     pub supported_sample_formats: Vec<String>,
     /// Inclusive `(min, max)` sample-rate range in Hz.
     pub sample_rate_range: (u32, u32),
+    /// Maximum channel count the backend accepts.
     pub max_channels: u16,
+    /// Backend identifier (e.g. `"CoreAudio"`, `"WASAPI"`, `"PipeWire"`).
     pub backend_name: String,
 }
 
@@ -106,16 +125,27 @@ pub struct Capabilities {
 #[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ChunkMeta {
+    /// Chunk sample rate in Hz.
     pub sample_rate: u32,
+    /// Chunk channel count.
     pub channels: u16,
+    /// Frames in this chunk (samples per channel).
     pub frames: usize,
+    /// Chunk duration in seconds.
     pub duration_secs: f64,
+    /// RMS level across all samples, linear `0.0..=1.0`.
     pub rms: f32,
+    /// Peak (max absolute) level, linear `0.0..=1.0`.
     pub peak: f32,
+    /// RMS in dBFS (`-inf` at silence).
     pub rms_dbfs: f32,
+    /// Peak in dBFS (`-inf` at silence).
     pub peak_dbfs: f32,
+    /// Per-channel RMS levels in channel order.
     pub channel_rms: Vec<f32>,
+    /// Per-channel peak levels in channel order.
     pub channel_peak: Vec<f32>,
+    /// The negotiated stream format.
     pub format: FormatInfo,
 }
 
@@ -125,8 +155,11 @@ pub struct ChunkMeta {
 #[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ChunkRaw {
+    /// Chunk sample rate in Hz.
     pub sample_rate: u32,
+    /// Chunk channel count.
     pub channels: u16,
+    /// Frames in this chunk (samples per channel).
     pub frames: usize,
     /// Interleaved f32 PCM samples (`frames * channels` values).
     pub samples: Vec<f32>,
@@ -140,11 +173,18 @@ pub struct ChunkRaw {
 #[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct StreamStatsInfo {
+    /// RT-callback buffers dropped because the bridge ring was full.
     pub overruns: u64,
+    /// Buffers captured from the OS since start.
     pub buffers_captured: u64,
+    /// Buffers dropped before reaching the consumer.
     pub buffers_dropped: u64,
+    /// Buffers pushed into the bridge ring.
     pub buffers_pushed: u64,
+    /// Seconds since the capture started.
     pub uptime_secs: f64,
+    /// Whether the stream is currently running.
     pub is_running: bool,
+    /// Human-readable negotiated format (e.g. `"48000 Hz, 2 ch, f32"`).
     pub format_description: String,
 }

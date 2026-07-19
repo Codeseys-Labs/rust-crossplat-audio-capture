@@ -56,5 +56,18 @@ tauri-plugin = { version = "2", features = ["build"] }
 [target.'cfg(target_os = "android")'.dependencies]
 rsac = { path = "../../", default-features = false, features = ["feat_android"] }
 
+# Desktop backends: a plugin-only install (`tauri-plugin-rsac` with no separate
+# `rsac` dependency) must not report the "unsupported" capabilities stub — the
+# documented desktop passthrough has to work out of the box (CodeRabbit PR #65).
+# One block per desktop OS so each pulls only its own backend.
+[target.'cfg(target_os = "windows")'.dependencies]
+rsac = { path = "../../", default-features = false, features = ["feat_windows"] }
+
+[target.'cfg(target_os = "macos")'.dependencies]
+rsac = { path = "../../", default-features = false, features = ["feat_macos"] }
+
+[target.'cfg(target_os = "linux")'.dependencies]
+rsac = { path = "../../", default-features = false, features = ["feat_linux"] }
+
 [target.'cfg(target_os = "ios")'.dependencies]
 rsac = { path = "../../", default-features = false, features = ["feat_ios"] }

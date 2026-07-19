@@ -40,7 +40,11 @@ on:
     branches: [main, master, 'release/**']
     paths:
       - 'src/audio/ios/**'
-      - 'src/core/capabilities.rs'
+      # The smoke exercises the whole public capture path — shared-layer
+      # regressions must retrigger runtime verification (CodeRabbit PR #65).
+      - 'src/api.rs'
+      - 'src/bridge/**'
+      - 'src/core/**'
       - 'tests/ios_sim_smoke.rs'
       - 'Cargo.toml'
       - 'Cargo.lock'

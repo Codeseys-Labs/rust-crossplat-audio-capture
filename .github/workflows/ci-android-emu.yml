@@ -48,13 +48,18 @@ on:
     branches: [main, master, 'release/**']
     paths:
       - 'src/audio/android/**'
-      - 'src/core/capabilities.rs'
+      # The smoke exercises the whole public capture path — shared-layer
+      # regressions must retrigger runtime verification (CodeRabbit PR #65).
+      - 'src/api.rs'
+      - 'src/bridge/**'
+      - 'src/core/**'
       - 'tests/android_emu_smoke.rs'
       - 'mobile/android-native/**'
       - 'Cargo.toml'
       - 'Cargo.lock'
       - '.github/workflows/ci-android-emu.yml'
       - '.github/actions/**'
+      - 'scripts/ci-android-emu-payload.sh'
 
 concurrency:
   group: android-emu-${{ github.workflow }}-${{ github.ref }}

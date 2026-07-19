@@ -25,7 +25,7 @@
 
 use std::time::{Duration, Instant};
 
-use rsac::{AudioCaptureBuilder, CaptureTarget, DeviceId};
+use rsac::{AudioCaptureBuilder, AudioError, CaptureTarget, DeviceId};
 
 fn android_emu_enabled() -> bool {
     matches!(std::env::var("RSAC_CI_ANDROID_EMU").as_deref(), Ok("1"))
@@ -61,12 +61,18 @@ fn android_emu_system_default_refuses_without_consent() {
         .with_target(CaptureTarget::SystemDefault)
         .build()
         .expect_err("SystemDefault without a projection token must refuse at preflight");
-    let msg = format!("{err}");
-    assert!(
-        msg.contains("consent") || msg.contains("with_android_projection"),
-        "refusal must be the documented UserConsentRequired guidance, got: {msg}"
-    );
-    eprintln!("[android-emu] honest refusal verified: {msg}");
+    // Concrete variant, not display-text matching: an unrelated error whose
+    // message mentions "consent" must not pass (CodeRabbit PR #65).
+    match &err {
+        AudioError::UserConsentRequired { missing, .. } => {
+            assert!(
+                missing.contains("with_android_projection"),
+                "refusal guidance must name the builder method, got: {missing}"
+            );
+        }
+        other => panic!("expected UserConsentRequired, got: {other:?}"),
+    }
+    eprintln!("[android-emu] honest refusal verified: {err}");
 }
 
 #[test]

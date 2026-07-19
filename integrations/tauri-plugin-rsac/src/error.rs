@@ -5,6 +5,8 @@
 
 use serde::{ser::SerializeStruct, Serialize, Serializer};
 
+/// Command-boundary result alias: every plugin command returns
+/// `Result<T>` with the structured [`Error`] payload.
 pub type Result<T> = std::result::Result<T, Error>;
 
 /// Errors surfaced across the plugin command boundary.
