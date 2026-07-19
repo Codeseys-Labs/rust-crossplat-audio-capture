@@ -154,7 +154,7 @@ Gradle AAR + xcodebuild SwiftPM builds incl. `librsac.so` in jniLibs with its
 
 | Capture Mode | Android (AAudio + AudioPlaybackCapture) | iOS (AVAudioEngine) |
 |---|---|---|
-| **Device — default mic** (`Device("default")`) | 🟡 compiled, unverified (rsac-20cd) | 🟡 compiled, unverified (rsac-9e02) |
+| **Device — default mic** (`Device("default")`) | 🟢 **emulator-verified** (PR #66, CI run 29680252107: instrumented androidTest, real app uid + RECORD_AUDIO, drove the shipped rsac-ffi C ABI on an API 30 x86_64 AVD — 3 buffers / 2193 frames @ 48 kHz mono delivered; real-device verification still open, rsac-e6d3) | 🟡 compiled, unverified (rsac-9e02; the PR #66 TCC harness proved the whole app-hosted chain but headless runners expose no host-mic route — sim frames evidence needs a virtual audio route or a local runbook, rsac-f18f) |
 | **System default** (= playback capture, ADR-0013) | 🟡 compiled, unverified (rsac-77f1: AAR Kotlin `AudioRecord` loop + JNI ingest; needs `with_android_projection` token + FGS, API 29+) | 🟡 compiled, unverified (rsac-b3aa: ReplayKit ring consumer; needs `with_ios_app_group` + embedded extension + user-started broadcast) |
 | **Application / ByName / ProcessTree** | 🟡 compiled, unverified (rsac-77f1: UID filters; tree ≡ app — same requirements as SystemDefault) | ❌ permanent — no iOS API (never soften) |
 | **Device selection (real device list)** | 🟡 compiled, unverified (rsac-ad8a: AudioManager.getDevices list via AAR + AAudioStreamBuilder_setDeviceId; on-device shape unverified — rsac-e6d3) | ❌ session-routed, not free selection |
