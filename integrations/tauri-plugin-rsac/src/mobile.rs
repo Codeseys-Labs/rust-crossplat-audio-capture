@@ -9,6 +9,12 @@
 // trap; .claude/skills/rsac-android-mediaprojection-fgs-ordering). The returned
 // `Long` token is wrapped ONCE via `AndroidProjectionToken::from_raw` and
 // threaded onto the builder at `start_capture` (§8 steps 5-6).
+//
+// ASYNC INVOCATION (rsac-209c): the forward uses
+// `PluginHandle::run_mobile_plugin_async(...).await`, NOT the blocking
+// `run_mobile_plugin` — the latter's `mpsc::recv()` parks a runtime worker for
+// the multi-second consent dialog. Do NOT "fix" this back to the blocking call.
+// The mechanism (Kotlin forwarder, token wiring) is otherwise unchanged.
 
 use serde::de::DeserializeOwned;
 use tauri::ipc::Channel;
@@ -81,7 +87,7 @@ pub struct Rsac<R: Runtime> {
 
 impl<R: Runtime> Rsac<R> {
     #[cfg(target_os = "ios")]
-    pub fn request_consent(&self) -> Result<ConsentResult> {
+    pub async fn request_consent(&self) -> Result<ConsentResult> {
         // Consent is an Android-only concept (MediaProjection); the iOS
         // broadcast path needs no dialog and no native plugin is registered
         // (stub). Honest denial, never a panic.
@@ -96,11 +102,16 @@ impl<R: Runtime> Rsac<R> {
     }
 
     #[cfg(target_os = "android")]
-    pub fn request_consent(&self) -> Result<ConsentResult> {
+    pub async fn request_consent(&self) -> Result<ConsentResult> {
         // Empty payload — the Kotlin side drives the dialog off the activity.
+        // `run_mobile_plugin_async` (tauri 2.11.5) awaits a `oneshot` on the
+        // async runtime instead of the blocking `run_mobile_plugin`'s
+        // `mpsc::recv()`, so the multi-second MediaProjection consent dialog no
+        // longer parks a runtime worker thread (rsac-209c).
         let resp: ConsentResponse = self
             .handle
-            .run_mobile_plugin("requestConsent", ())
+            .run_mobile_plugin_async("requestConsent", ())
+            .await
             .map_err(Error::from)?;
 
         #[cfg(target_os = "android")]
@@ -112,19 +123,32 @@ impl<R: Runtime> Rsac<R> {
                 // single-owner contract, config.rs:147-157) and clone onto each
                 // builder.
                 //
-                // LEAK NOTE: `AndroidProjectionToken` has no `Drop` — its
-                // GlobalRef is released (and the MediaProjection stopped) only
-                // when a capture stream `try_consume`s the token and its
-                // teardown runs `stop_and_release_projection`. If consent is
-                // granted twice WITHOUT starting a capture in between, replacing
-                // the stored token here drops the prior wrapper but NOT its
-                // GlobalRef, leaking that ref (and leaving the earlier grant's
-                // FGS running until the host stops it). rsac exposes no
-                // release-without-consume API to this crate, so the leak is
-                // bounded by user actions and by the host's FGS lifecycle rather
-                // than reclaimed here (tracked as a seed).
+                // RE-GRANT RECLAMATION (rsac-efea): `AndroidProjectionToken`
+                // has no `Drop` — its GlobalRef is normally released (and the
+                // MediaProjection stopped) when a capture stream `try_consume`s
+                // the token and its teardown runs `stop_and_release_projection`.
+                // When consent is granted twice WITHOUT starting a capture in
+                // between, we now reclaim the prior grant via
+                // `rsac::release_projection_token` before overwriting it — that
+                // stops the earlier MediaProjection and frees its GlobalRef
+                // instead of leaking it (and leaving the earlier grant's FGS
+                // running). If a capture already consumed the prior token,
+                // `release_projection_token` is a no-op (that stream owns the
+                // release). The residual leak window is now only a process
+                // crash between `take()` and the store below — bounded by
+                // process lifetime and reclaimed by the OS on teardown.
                 let token = unsafe { rsac::AndroidProjectionToken::from_raw(raw) };
-                *self.projection.lock().unwrap_or_else(|e| e.into_inner()) = Some(token);
+                // Hold one guard across take + release + store so a concurrent
+                // `start_capture` can't observe an empty slot mid-swap.
+                // `release_projection_token` runs JNI (one `DeleteGlobalRef`)
+                // under this mutex; that is fine — this is a tauri async-command
+                // thread, not the OS audio callback (ADR-0001's no-blocking rule
+                // is scoped to the RT callback, not command threads).
+                let mut guard = self.projection.lock().unwrap_or_else(|e| e.into_inner());
+                if let Some(prev) = guard.take() {
+                    rsac::release_projection_token(prev);
+                }
+                *guard = Some(token);
             }
         }
 

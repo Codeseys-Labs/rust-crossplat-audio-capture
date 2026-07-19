@@ -20,6 +20,15 @@ Releases with no ABI change omit the subsection (or state "No C ABI changes").
 
 ### Added
 
+- **core/audio (Android):** new `rsac::release_projection_token(token)` — releases
+  an **unconsumed** `AndroidProjectionToken` (stops its `MediaProjection` +
+  frees the `GlobalRef`) without starting a capture, for the "consent granted,
+  never captured" reclamation path. No-op (returns `false`) when a capture
+  stream already owns the token's deletion latch, so it can never double-delete.
+  Additive on an `#[cfg(all(target_os = "android", feature = "feat_android"))]`
+  surface, so the host `cargo-semver-checks` gate does not observe it (same as
+  the `AndroidProjectionToken` note in PR #62 / rsac-3407); it is a **minor**
+  bump for Android consumers. (rsac-efea)
 - **iOS (simulator runtime-verification CI leg):** new opt-in
   `ci-ios-sim.yml` workflow (rsac-97c8) boots an iPhone simulator on a
   macOS-15 runner, builds the crate test binaries for
@@ -202,6 +211,12 @@ Releases with no ABI change omit the subsection (or state "No C ABI changes").
 
 ### Changed
 
+- **Tauri v2 plugin (`tauri-plugin-rsac`):** `request_consent` now invokes the
+  Kotlin consent command via `PluginHandle::run_mobile_plugin_async` (tauri
+  2.11.5) instead of the blocking `run_mobile_plugin`, so the multi-second
+  MediaProjection consent dialog no longer parks an async runtime worker
+  (`request_consent` and the desktop/iOS delegates become `async fn` for a
+  uniform command signature). (rsac-209c)
 - **core (Android) — BREAKING:** `AndroidProjectionToken` is no longer `Copy`/
   `Hash`; it now enforces single-owner deletion of the `MediaProjection`
   `GlobalRef` via a shared consume-latch, fixing a safe-Rust JNI double-delete
@@ -253,6 +268,10 @@ Releases with no ABI change omit the subsection (or state "No C ABI changes").
 
 ### Fixed
 
+- **Tauri v2 plugin:** re-granting consent without an intervening capture now
+  releases the prior `MediaProjection` token via `rsac::release_projection_token`
+  before overwriting it, fixing a `GlobalRef` + FGS leak; the residual leak
+  window shrinks to a process crash mid-swap. (rsac-efea)
 - **Builder preflight: parameter validation now precedes the mobile consent
   checks.** On Android/iOS, a config that was *both* invalid (channels = 0,
   unsupported sample rate) *and* missing its consent artifact reported

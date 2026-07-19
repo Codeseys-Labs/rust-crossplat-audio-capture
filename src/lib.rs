@@ -119,6 +119,11 @@ pub use crate::core::config::{
 // targets only; see `AudioCaptureBuilder::with_android_projection`.
 #[cfg(target_os = "android")]
 pub use crate::core::config::AndroidProjectionToken;
+// Release-without-consume reclamation for an unconsumed `AndroidProjectionToken`
+// (rsac-efea). Lives in `audio::android`, which is itself gated on
+// `feature = "feat_android"`, so this re-export must carry the same double-gate.
+#[cfg(all(target_os = "android", feature = "feat_android"))]
+pub use crate::audio::android::release_projection_token;
 pub use crate::core::error::{
     AudioError, AudioResult, BackendContext, ErrorKind, LifecycleStage, Recoverability,
     UserFacingError,
