@@ -634,6 +634,8 @@ mod tests {
         all(target_os = "windows", feature = "feat_windows"),
         all(target_os = "macos", feature = "feat_macos"),
         all(target_os = "linux", feature = "feat_linux"),
+        all(target_os = "android", feature = "feat_android"),
+        all(target_os = "ios", feature = "feat_ios"),
     ));
 
     #[test]
@@ -690,6 +692,8 @@ mod tests {
             all(target_os = "windows", feature = "feat_windows"),
             all(target_os = "macos", feature = "feat_macos"),
             all(target_os = "linux", feature = "feat_linux"),
+            all(target_os = "android", feature = "feat_android"),
+            all(target_os = "ios", feature = "feat_ios"),
         ))]
         {
             // A backend is compiled in → must NOT be the unsupported stub.
@@ -703,6 +707,8 @@ mod tests {
             all(target_os = "windows", feature = "feat_windows"),
             all(target_os = "macos", feature = "feat_macos"),
             all(target_os = "linux", feature = "feat_linux"),
+            all(target_os = "android", feature = "feat_android"),
+            all(target_os = "ios", feature = "feat_ios"),
         )))]
         {
             // No backend compiled in (e.g. feat_linux on Windows) → honest stub.
@@ -722,12 +728,16 @@ mod tests {
             all(target_os = "windows", feature = "feat_windows"),
             all(target_os = "macos", feature = "feat_macos"),
             all(target_os = "linux", feature = "feat_linux"),
+            all(target_os = "android", feature = "feat_android"),
+            all(target_os = "ios", feature = "feat_ios"),
         ))]
         assert!(caps.supports_format(SampleFormat::F32));
         #[cfg(not(any(
             all(target_os = "windows", feature = "feat_windows"),
             all(target_os = "macos", feature = "feat_macos"),
             all(target_os = "linux", feature = "feat_linux"),
+            all(target_os = "android", feature = "feat_android"),
+            all(target_os = "ios", feature = "feat_ios"),
         )))]
         assert!(!caps.supports_format(SampleFormat::F32));
     }
