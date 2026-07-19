@@ -929,6 +929,12 @@ mod tests {
             return;
         }
         let caps = PlatformCapabilities::query();
+        // iOS is F32-only (the AVAudioEngine bridge payload); every other
+        // backend (desktop trio + Android AAudio) advertises I16. Surfaced by
+        // the simulator leg's first run of these tests (rsac-97c8).
+        #[cfg(all(target_os = "ios", feature = "feat_ios"))]
+        assert!(!caps.supports_format(SampleFormat::I16));
+        #[cfg(not(all(target_os = "ios", feature = "feat_ios")))]
         assert!(caps.supports_format(SampleFormat::I16));
     }
 
@@ -938,7 +944,20 @@ mod tests {
             return;
         }
         let caps = PlatformCapabilities::query();
+        // I32 is a desktop-trio format: Android AAudio delivers I16/F32
+        // natively and iOS is F32-only. Surfaced by the emulator/simulator
+        // legs' first runs (rsac-e6d3 / rsac-97c8).
+        #[cfg(any(
+            all(target_os = "windows", feature = "feat_windows"),
+            all(target_os = "macos", feature = "feat_macos"),
+            all(target_os = "linux", feature = "feat_linux"),
+        ))]
         assert!(caps.supports_format(SampleFormat::I32));
+        #[cfg(any(
+            all(target_os = "android", feature = "feat_android"),
+            all(target_os = "ios", feature = "feat_ios"),
+        ))]
+        assert!(!caps.supports_format(SampleFormat::I32));
     }
 
     // ── I24 support (platform-specific) ─────────────────────────────
