@@ -71,7 +71,9 @@ use std::time::Duration;
 
 use crate::bridge::state::StreamState;
 use crate::bridge::{calculate_capacity, create_bridge, BridgeStream};
-use crate::core::config::{AudioFormat, DeviceId, SampleFormat, StreamConfig};
+use crate::core::config::{
+    AndroidProjectionToken, AudioFormat, DeviceId, SampleFormat, StreamConfig,
+};
 use crate::core::error::{AudioError, AudioResult};
 use crate::core::interface::{
     AudioDevice, CapturingStream, DeviceEnumerator, DeviceEvent, DeviceEventHandler, DeviceKind,
@@ -79,6 +81,45 @@ use crate::core::interface::{
 };
 
 pub use playback::AndroidPlaybackDevice;
+
+/// Releases an **unconsumed** [`AndroidProjectionToken`] without starting a
+/// capture: stops its `MediaProjection` and deletes the `GlobalRef`.
+///
+/// This is the "consent granted, never captured" reclamation path. The normal
+/// release path is a capture stream's teardown
+/// ([`jni::stop_and_release_projection`], driven from the platform stream's
+/// drop); call this only for a token that will *never* be handed to a stream
+/// (e.g. a host that re-requests consent before starting a capture and must
+/// reclaim the prior grant).
+///
+/// # Semantics
+/// - Claims the token's single-owner deletion latch via `try_consume()`. On
+///   success, runs exactly one `MediaProjection.stop()` + `DeleteGlobalRef`
+///   (the same path a stream's drop uses) and returns `true`.
+/// - If the latch is **already consumed** (a stream in this token's clone
+///   lineage already owns deletion), this is a **no-op that returns `false`**
+///   and logs at debug — the owning stream will release on its own drop, so
+///   double-releasing here would be a double `DeleteGlobalRef` (UB). No-op is
+///   the honest, non-UB choice; an error would imply the caller must act, but
+///   there is nothing left to do.
+/// - A `0` raw handle is caught by `stop_and_release_projection`'s early return.
+///
+/// Returns whether this call performed the release.
+pub fn release_projection_token(token: AndroidProjectionToken) -> bool {
+    match token.try_consume() {
+        Some(raw) => {
+            jni::stop_and_release_projection(raw);
+            true
+        }
+        None => {
+            log::debug!(
+                "release_projection_token: token already consumed by a capture \
+                 stream; nothing to release (the owning stream frees the GlobalRef)"
+            );
+            false
+        }
+    }
+}
 
 /// The [`DeviceId`] string of the single logical Android input device.
 ///
@@ -776,5 +817,59 @@ mod tests {
         assert_eq!(device.name(), "Default audio input (AAudio)");
         assert!(device.is_default());
         assert_eq!(device.kind().unwrap(), DeviceKind::Input);
+    }
+
+    // ── release_projection_token (rsac-efea) ─────────────────────────
+    //
+    // These exercise ONLY the single-owner latch + return value of
+    // `release_projection_token`. They are safe to run in a libtest binary
+    // with no `JNI_OnLoad`: `stop_and_release_projection` early-returns on a
+    // `0` handle, and on a non-zero handle `cache()` returns `Err` (no cached
+    // method IDs without JNI_OnLoad) so it returns before any JNI call fires.
+    // They therefore assert latch/return semantics only — never a real
+    // `DeleteGlobalRef`, which is emulator/device territory.
+
+    /// Fabricated token for latch-contract tests. SAFETY: the handle never
+    /// reaches a real `DeleteGlobalRef` — see the module-level note above.
+    fn test_token(raw: i64) -> AndroidProjectionToken {
+        unsafe { AndroidProjectionToken::from_raw(raw) }
+    }
+
+    #[test]
+    fn release_projection_token_consumes_unclaimed() {
+        // A fresh, never-consumed token: release claims the latch and reports
+        // that it performed the release.
+        let token = test_token(42);
+        assert!(release_projection_token(token));
+    }
+
+    #[test]
+    fn release_projection_token_noops_on_already_consumed() {
+        // A capture stream (simulated by `a.try_consume()`) already owns the
+        // deletion latch shared across clones; releasing a sibling clone is a
+        // no-op so the owning stream's drop performs the single delete.
+        let a = test_token(7);
+        let b = a.clone();
+        assert_eq!(a.try_consume(), Some(7));
+        assert!(!release_projection_token(b));
+    }
+
+    #[test]
+    fn release_projection_token_zero_handle_is_true_noop() {
+        // A `0` token: the latch is raw-agnostic so `try_consume` succeeds and
+        // the call returns `true`, while `stop_and_release_projection(0)`
+        // early-returns without touching JNI — reclaimed harmlessly.
+        let token = test_token(0);
+        assert!(release_projection_token(token));
+    }
+
+    #[test]
+    fn release_projection_token_claims_shared_latch() {
+        // Pins that release actually claims the shared latch: after releasing
+        // one clone, a sibling clone can no longer consume the token.
+        let a = test_token(5);
+        let b = a.clone();
+        assert!(release_projection_token(a));
+        assert_eq!(b.try_consume(), None);
     }
 }

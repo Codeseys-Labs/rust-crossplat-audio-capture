@@ -29,9 +29,25 @@ name: Android Emulator Runtime Leg
 # UNVERIFIED (platform.xml grants shell only INTERNET; any access would come
 # via shell's privileged/debuggable status or audio-GID membership on the
 # emulator image) — the frames smoke therefore soft-fails to skip-with-summary
-# if the route is refused, and the first green run is what settles it. If the
-# route proves permission-blocked, the follow-up is an instrumented
-# androidTest app that holds RECORD_AUDIO properly.
+# if the route is refused, and the first green run is what settles it. First
+# observed run: the route IS permission-blocked for shell-uid
+# (AAudioStream_requestStart -> AAUDIO_ERROR_INTERNAL), hence the tier below.
+#
+# Instrumented tier (rsac-255b): `gradle connectedDebugAndroidTest` builds a
+# SELF-INSTRUMENTING test APK from mobile/android/src/androidTest/ — a real
+# installed package whose uid holds RECORD_AUDIO (GrantPermissionRule) — and
+# drives CaptureTarget::Device("default") through the SHIPPED rsac C ABI:
+# the host phase cross-builds librsac_ffi.so as a cdylib (new signal — ci.yml
+# only ever `cargo check`s rsac-ffi for Android) plus a test-only C JNI shim
+# (plain NDK clang, no CMake — externalNativeBuild is module-global and would
+# leak the shim into the production AAR), both dropped into the git-ignored
+# src/androidTest/jniLibs/x86_64/. Gradle reuses the SAME booted AVD inside
+# the emulator-runner `script:` (a second runner invocation would re-boot the
+# AVD and blow the timeout budget). Mic path ONLY: RECORD_AUDIO, never
+# MediaProjection/FGS/consent. Zero frames / a refused route degrades to a
+# loud assumption-skip unless `require_frames` — same discipline as the
+# shell-uid smoke. This tier is ADVISORY until observed green (then, as a
+# follow-up: flip require_frames and/or promote to a required check).
 # =============================================================================
 
 on:
@@ -55,6 +71,11 @@ on:
       - 'src/core/**'
       - 'tests/android_emu_smoke.rs'
       - 'mobile/android-native/**'
+      # rsac-255b instrumented tier: the androidTest sources + gradle config
+      # live under mobile/android/, and the test APK drives the shipped C ABI
+      # built from bindings/rsac-ffi/.
+      - 'mobile/android/**'
+      - 'bindings/rsac-ffi/**'
       - 'Cargo.toml'
       - 'Cargo.lock'
       - '.github/workflows/ci-android-emu.yml'
@@ -209,6 +230,75 @@ jobs:
           PY
           ls -l emu-payload/
 
+      # ── Instrumented-tier host phase (rsac-255b) ─────────────────────
+      # JDK 17 + SDK platform-35 + gradle 8.11.1: copied verbatim from the
+      # proven ci.yml mobile-android job (AGP 8.x requires JDK 17; version
+      # pins are "expected; CI trues up").
+      - name: Select JDK 17 (AGP 8.x requirement)
+        if: steps.kvm.outputs.available == 'true'
+        run: echo "JAVA_HOME=${JAVA_HOME_17_X64}" >> "$GITHUB_ENV"
+
+      - name: Install Android SDK platform for compileSdk 35
+        if: steps.kvm.outputs.available == 'true'
+        run: |
+          SDKMANAGER="$ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager"
+          yes | "$SDKMANAGER" --licenses > /dev/null || true
+          "$SDKMANAGER" "platforms;android-35" "build-tools;35.0.0"
+
+      - uses: gradle/actions/setup-gradle@48b5f213c81028ace310571dc5ec0fbbca0b2947 # v4
+        if: steps.kvm.outputs.available == 'true'
+        with:
+          gradle-version: "8.11.1"
+
+      - name: Install cargo-ndk
+        if: steps.kvm.outputs.available == 'true'
+        run: cargo install --locked cargo-ndk
+
+      # librsac_ffi.so as a real x86_64-linux-android CDYLIB — new signal:
+      # ci.yml only ever `cargo check`s rsac-ffi for Android, which never
+      # links (-laaudio resolution needs --platform 29: NDK sysroot stubs
+      # exist from API 26+, ci.yml lesson). cargo-ndk is fine here (no
+      # --message-format=json involved — the json-corruption lesson applies
+      # to artifact discovery, and the cdylib's -o output path is
+      # deterministic). The .so lands in the git-ignored androidTest jniLibs
+      # so it is packaged into the TEST APK only, never the production AAR.
+      - name: Build librsac_ffi.so into androidTest jniLibs (x86_64)
+        if: steps.kvm.outputs.available == 'true'
+        run: |
+          export ANDROID_NDK_HOME="${ANDROID_NDK_LATEST_HOME:-$ANDROID_NDK_ROOT}"
+          echo "Using NDK at: $ANDROID_NDK_HOME"
+          cargo ndk -t x86_64 --platform 29 -o ffi-jnilibs \
+            build --release -p rsac-ffi \
+            --no-default-features --features feat_android
+          mkdir -p mobile/android/src/androidTest/jniLibs/x86_64
+          cp ffi-jnilibs/x86_64/librsac_ffi.so \
+            mobile/android/src/androidTest/jniLibs/x86_64/
+          ls -l mobile/android/src/androidTest/jniLibs/x86_64/
+
+      # The test-only JNI shim: plain NDK clang, deliberately NO CMake /
+      # externalNativeBuild (module-global — it would build the shim into
+      # every variant including the production AAR's jni/).
+      - name: Compile the androidTest C shim (librsac_androidtest_shim.so)
+        if: steps.kvm.outputs.available == 'true'
+        run: |
+          export ANDROID_NDK_HOME="${ANDROID_NDK_LATEST_HOME:-$ANDROID_NDK_ROOT}"
+          TOOLCHAIN="$ANDROID_NDK_HOME/toolchains/llvm/prebuilt/linux-x86_64/bin"
+          JNILIBS="mobile/android/src/androidTest/jniLibs/x86_64"
+          "$TOOLCHAIN/x86_64-linux-android29-clang" \
+            -shared -fPIC -O2 -Wall -Wextra -Werror \
+            -I bindings/rsac-ffi/include \
+            -L "$JNILIBS" -lrsac_ffi \
+            -o "$JNILIBS/librsac_androidtest_shim.so" \
+            mobile/android/src/androidTest/cpp/rsac_androidtest_shim.c
+          # The shim must depend on the shipped .so by soname, and must not
+          # have leaked any unresolved rsac_* symbols.
+          "$TOOLCHAIN/llvm-readelf" -d "$JNILIBS/librsac_androidtest_shim.so" \
+            | grep -q 'librsac_ffi\.so' || {
+              echo "FAIL: shim lacks a DT_NEEDED entry for librsac_ffi.so"
+              exit 1
+            }
+          ls -l "$JNILIBS"
+
       # ── Boot the AVD and run the payload ─────────────────────────────
       - name: Run tests on the emulator
         if: steps.kvm.outputs.available == 'true'
@@ -249,7 +339,16 @@ jobs:
               unit-tests.log smoke.log 2>/dev/null || echo "logs missing — see artifacts"
             echo '```'
             echo ""
-            echo "_emulator-verified, not device-verified (rsac-e6d3)._"
+            echo "### Instrumented tier (rsac-255b — real app uid + RECORD_AUDIO, shipped C ABI)"
+            echo ""
+            echo '```'
+            grep -iE "BUILD SUCCESSFUL|BUILD FAILED|tests? (passed|failed|completed)|connectedDebugAndroidTest" \
+              instrumented.log 2>/dev/null || echo "instrumented.log missing — see artifacts"
+            grep -E "drive result|frames delivered|SKIP-WITH-SUMMARY" \
+              instrumented-logcat.log 2>/dev/null || echo "no RsacFramesTest logcat evidence — see artifacts"
+            echo '```'
+            echo ""
+            echo "_emulator-verified, not device-verified (rsac-e6d3 / rsac-255b)._"
           } >> "$GITHUB_STEP_SUMMARY"
 
       - name: Upload logs
@@ -260,5 +359,9 @@ jobs:
           path: |
             unit-tests.log
             smoke.log
+            instrumented.log
+            instrumented-logcat.log
+            mobile/android/build/outputs/androidTest-results/**
+            mobile/android/build/reports/androidTests/**
           if-no-files-found: ignore
           retention-days: 14

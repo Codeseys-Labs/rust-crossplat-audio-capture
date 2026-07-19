@@ -13,7 +13,7 @@ use crate::{Result, RsacExt};
 /// token. Desktop: immediate `granted: true` (no consent artifact required).
 #[command]
 pub(crate) async fn request_consent<R: Runtime>(app: AppHandle<R>) -> Result<ConsentResult> {
-    app.rsac().request_consent()
+    app.rsac().request_consent().await
 }
 
 /// Builds + starts a capture for `target` with the given `config`, returning an

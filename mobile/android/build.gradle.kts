@@ -29,6 +29,12 @@ android {
         // API 29 (Android 10): floor for AudioPlaybackCaptureConfiguration.
         minSdk = 29
         consumerProguardFiles("consumer-rules.pro")
+        // rsac-255b: instrumented frames-delivered evidence (mic path). For a
+        // library module the androidTest APK is self-instrumenting — it is
+        // both the instrumentation and the app-under-test, giving the test a
+        // real uid that can hold RECORD_AUDIO (adb's shell uid cannot open an
+        // AAudio input stream — PR #65 lesson).
+        testInstrumentationRunner = "androidx.test.runner.AndroidJUnitRunner"
     }
 
     buildTypes {
@@ -49,6 +55,16 @@ android {
     // jniLibs is picked up by AGP's default sourceSet; nothing to configure.
     // The JNI surface is registered from librsac.so's JNI_OnLoad (rsac-77f1).
     // See README.md § Native library.
+    //
+    // rsac-255b: the TEST APK additionally carries librsac_ffi.so (the
+    // shipped C ABI, cargo-ndk-built) + librsac_androidtest_shim.so (a
+    // test-only JNI bridge, plain-NDK-clang-built from
+    // src/androidTest/cpp/rsac_androidtest_shim.c) in
+    // src/androidTest/jniLibs/x86_64/ — CI-generated, git-ignored, and
+    // packaged into the androidTest APK ONLY (never the production AAR).
+    // Deliberately NOT android.externalNativeBuild/CMake: that block is
+    // module-global and would build the shim into every variant incl. the
+    // AAR's jni/. See ci-android-emu.yml (the instrumented tier).
 
     publishing {
         // Maven/GitHub Packages distribution is a follow-up seed; singleVariant
@@ -74,4 +90,9 @@ dependencies {
     implementation("androidx.core:core-ktx:1.15.0")       // NotificationCompat, ContextCompat
     implementation("androidx.activity:activity-ktx:1.9.3") // ComponentActivity + ActivityResult API
     implementation("androidx.annotation:annotation:1.9.1")
+
+    // rsac-255b instrumented tier (test APK only). Versions expected; CI trues up.
+    androidTestImplementation("androidx.test.ext:junit:1.2.1")
+    androidTestImplementation("androidx.test:runner:1.6.2")
+    androidTestImplementation("androidx.test:rules:1.6.1") // GrantPermissionRule
 }

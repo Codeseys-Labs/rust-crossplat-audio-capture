@@ -46,6 +46,11 @@ on:
       - 'src/bridge/**'
       - 'src/core/**'
       - 'tests/ios_sim_smoke.rs'
+      # The app-hosted TCC harness (rsac-f18f) drives rsac through rsac-ffi's C
+      # API, so a change to either the harness or the FFI surface must retrigger
+      # the runtime leg.
+      - 'mobile/ios/RsacSimHarness/**'
+      - 'bindings/rsac-ffi/**'
       - 'Cargo.toml'
       - 'Cargo.lock'
       - '.github/workflows/ci-ios-sim.yml'
@@ -67,7 +72,9 @@ env:
 jobs:
   ios-sim:
     name: iOS Simulator Runtime Leg
-    timeout-minutes: 40
+    # +10 for the app-hosted TCC harness: an extra cargo staticlib build for the
+    # sim target plus two xcodebuild passes (build-for-testing + test).
+    timeout-minutes: 50
     runs-on: blacksmith-6vcpu-macos-15
     defaults:
       run:
@@ -80,6 +87,7 @@ jobs:
       device_udid: ${{ steps.pick.outputs.udid }}
       unit_tests: ${{ steps.record.outputs.unit_tests }}
       frames_smoke: ${{ steps.record.outputs.frames_smoke }}
+      frames_app: ${{ steps.record.outputs.frames_app }}
     steps:
       - uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5
         with:
@@ -288,12 +296,107 @@ jobs:
           xcrun simctl spawn "${{ steps.pick.outputs.udid }}" "$SMOKE_BIN" \
             --test-threads=1 --nocapture 2>&1 | tee ios-smoke.log
 
+      # ── APP-HOSTED frames-delivered smoke (TCC-granted; rsac-f18f) ─────────
+      # The bare-binary smoke above has no bundle → no TCC target, so its input
+      # route can read 0 Hz / 0 ch. This leg builds the rsac-ffi staticlib for
+      # the sim target, then drives rsac's C API from an app-HOSTED XCTest whose
+      # host app (ai.codeseys.rsac.simharness) carries NSMicrophoneUsageDescription
+      # and is TCC-granted BEFORE first launch. Same skip-with-summary honesty as
+      # the bare smoke (require_frames flips it hard). See
+      # mobile/ios/RsacSimHarness/README.md.
+
+      - name: Build librsac_ffi.a for the simulator target (feat_ios)
+        id: ffilib
+        if: steps.pick.outputs.runtime != 'none'
+        run: |
+          # STATICLIB ONLY via `cargo rustc --crate-type staticlib`: the crate
+          # declares crate-type = ["cdylib", "staticlib"], so a plain
+          # `cargo build` drops BOTH librsac_ffi.dylib and .a into this exact
+          # LIBRARY_SEARCH_PATHS dir — and ld64 binds -lrsac_ffi to the DYLIB
+          # (empirically verified), whose install name is an absolute runner
+          # path. Forcing the crate type produces only the .a (review F1).
+          cargo rustc -p rsac-ffi \
+            --target "$IOS_SIM_TARGET" \
+            --release \
+            --no-default-features --features feat_ios \
+            --crate-type staticlib 2>&1 | tee ffi-build.log
+          LIB="target/$IOS_SIM_TARGET/release/librsac_ffi.a"
+          test -f "$LIB" || { echo "::error::$LIB not produced"; exit 1; }
+          # Belt-and-braces: no dylib may shadow the archive in the search path.
+          if ls "target/$IOS_SIM_TARGET/release/"librsac_ffi*.dylib 2>/dev/null; then
+            echo "::error::unexpected librsac_ffi dylib alongside the staticlib — ld64 would bind to it"
+            exit 1
+          fi
+          echo "Built $LIB ($(du -h "$LIB" | cut -f1))"
+
+      - name: Build the app-hosted harness for testing (build-for-testing)
+        id: buildfortest
+        if: steps.pick.outputs.runtime != 'none' && steps.ffilib.outcome == 'success'
+        working-directory: mobile/ios/RsacSimHarness
+        env:
+          UDID: ${{ steps.pick.outputs.udid }}
+        run: |
+          set -o pipefail
+          # -derivedDataPath keeps the built .app + .xctestrun in a known place
+          # so the install + test-without-building steps can find them. No
+          # signing on the simulator (the committed project sets
+          # CODE_SIGNING_ALLOWED=NO; reassert on the CLI for good measure).
+          xcodebuild build-for-testing \
+            -project RsacSimHarness.xcodeproj \
+            -scheme RsacSimHarness \
+            -destination "platform=iOS Simulator,id=$UDID" \
+            -derivedDataPath build \
+            CODE_SIGNING_ALLOWED=NO CODE_SIGNING_REQUIRED=NO CODE_SIGN_IDENTITY="" \
+            2>&1 | tee "$GITHUB_WORKSPACE/ios-app-build.log"
+
+      # Install the freshly-built app and grant microphone TCC BEFORE the test
+      # first launches it — the whole point of the wrapped app. A grant on a
+      # not-yet-installed / running app cannot pre-authorize the first session.
+      - name: Install app + grant microphone TCC (before first launch)
+        id: tccgrant
+        if: steps.pick.outputs.runtime != 'none' && steps.buildfortest.outcome == 'success'
+        working-directory: mobile/ios/RsacSimHarness
+        env:
+          UDID: ${{ steps.pick.outputs.udid }}
+          APP_BUNDLE_ID: ai.codeseys.rsac.simharness
+        run: |
+          APP="$(find build/Build/Products -maxdepth 2 -name 'RsacSimHarnessApp.app' -type d | head -n1)"
+          test -n "$APP" || { echo "::error::built RsacSimHarnessApp.app not found"; exit 1; }
+          echo "Installing $APP"
+          xcrun simctl install "$UDID" "$APP"
+          # Grant is keyed on the app bundle id; the hosted test inherits it.
+          xcrun simctl privacy "$UDID" grant microphone "$APP_BUNDLE_ID"
+          echo "Granted microphone to $APP_BUNDLE_ID on $UDID."
+
+      - name: App-hosted frames-delivered smoke (test-without-building)
+        id: appsmoke
+        if: steps.pick.outputs.runtime != 'none' && steps.tccgrant.outcome == 'success'
+        working-directory: mobile/ios/RsacSimHarness
+        env:
+          UDID: ${{ steps.pick.outputs.udid }}
+          # The simulator does NOT inherit the runner shell env — xcodebuild
+          # forwards only TEST_RUNNER_-prefixed vars into the test process (the
+          # xcodebuild analog of the SIMCTL_CHILD_ lesson). The test strips the
+          # prefix when reading (ProcessInfo sees RSAC_CI_IOS_SIM, etc.).
+          TEST_RUNNER_RSAC_CI_IOS_SIM: "1"
+          TEST_RUNNER_RSAC_TEST_CAPTURE_TIMEOUT_SECS: "15"
+          TEST_RUNNER_RSAC_CI_IOS_REQUIRE_FRAMES: ${{ (github.event_name == 'workflow_dispatch' && inputs.require_frames) && '1' || '0' }}
+        run: |
+          set -o pipefail
+          xcodebuild test-without-building \
+            -project RsacSimHarness.xcodeproj \
+            -scheme RsacSimHarness \
+            -destination "platform=iOS Simulator,id=$UDID" \
+            -derivedDataPath build \
+            2>&1 | tee "$GITHUB_WORKSPACE/ios-app-smoke.log"
+
       - name: Record tier results
         id: record
         if: always()
         run: |
           echo "unit_tests=${{ steps.unit.outcome }}" >> "$GITHUB_OUTPUT"
           echo "frames_smoke=${{ steps.smoke.outcome }}" >> "$GITHUB_OUTPUT"
+          echo "frames_app=${{ steps.appsmoke.outcome }}" >> "$GITHUB_OUTPUT"
 
       - name: Teardown simulator
         if: always() && steps.pick.outputs.udid != ''
@@ -312,6 +415,9 @@ jobs:
             build.log
             runtimes.json
             test-binaries.txt
+            ffi-build.log
+            ios-app-build.log
+            ios-app-smoke.log
           if-no-files-found: ignore
           retention-days: 14
 
@@ -332,6 +438,7 @@ jobs:
           RT: ${{ needs.ios-sim.outputs.runtime }}
           UNIT: ${{ needs.ios-sim.outputs.unit_tests }}
           SMOKE: ${{ needs.ios-sim.outputs.frames_smoke }}
+          APP: ${{ needs.ios-sim.outputs.frames_app }}
           JOB: ${{ needs.ios-sim.result }}
         run: |
           set -u
@@ -343,7 +450,8 @@ jobs:
             echo "| ios-sim job | ${JOB:-n/a} | — |"
             echo "| iOS runtime selected | ${RT:-n/a} | probe |"
             echo "| Dormant cfg(ios) unit tests | ${UNIT:-n/a} | simulator-verified |"
-            echo "| Frames-delivered smoke (public API) | ${SMOKE:-n/a} | simulator-verified |"
+            echo "| Frames-delivered smoke (bare binary, public API) | ${SMOKE:-n/a} | simulator-verified |"
+            echo "| Frames-delivered smoke (app-hosted, TCC-granted, C API) | ${APP:-n/a} | simulator-verified |"
             echo ""
             echo "> The simulator is NOT a device. Physical-device capture, the"
             echo "> interleaved-delivery fast path, and start-failure rollback"
@@ -352,8 +460,8 @@ jobs:
 
           # Gate policy (advisory leg): a whole-job SKIP (no iOS runtime) is
           # allowed. If a runtime WAS selected, the dormant unit tests are a
-          # HARD gate; the frames smoke is soft (skip-with-summary happens
-          # inside the test) unless the smoke step itself hard-failed.
+          # HARD gate; both frames smokes are soft (skip-with-summary happens
+          # inside the test) unless a smoke step itself hard-failed.
           if [ "${JOB}" != "success" ]; then
             echo "FAILED: ios-sim job result = ${JOB}"
             exit 1
@@ -368,6 +476,9 @@ jobs:
             FAILED=1
           fi
           if [ "${SMOKE}" != "success" ]; then
-            echo "NOTE: frames smoke = ${SMOKE} (soft; see logs)."
+            echo "NOTE: frames smoke (bare binary) = ${SMOKE} (soft; see logs)."
+          fi
+          if [ "${APP}" != "success" ]; then
+            echo "NOTE: frames smoke (app-hosted) = ${APP} (soft; see logs)."
           fi
           exit $FAILED

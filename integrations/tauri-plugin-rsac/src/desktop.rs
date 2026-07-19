@@ -28,7 +28,11 @@ pub fn init<R: Runtime, C: DeserializeOwned>(
 }
 
 impl<R: Runtime> Rsac<R> {
-    pub fn request_consent(&self) -> Result<ConsentResult> {
+    // `async fn` for a uniform command signature with the Android delegate,
+    // which awaits `run_mobile_plugin_async` (rsac-209c); desktop has no await
+    // (no consent artifact) but the shared cfg-agnostic command call site
+    // requires one signature across all three delegates.
+    pub async fn request_consent(&self) -> Result<ConsentResult> {
         // Desktop loopback needs no consent artifact — return success so the JS
         // API is uniform across platforms (ADR-0014 §4.3 passthrough).
         Ok(ConsentResult {
