@@ -20,6 +20,41 @@ Releases with no ABI change omit the subsection (or state "No C ABI changes").
 
 ### Added
 
+- **iOS (simulator runtime-verification CI leg):** new opt-in
+  `ci-ios-sim.yml` workflow (rsac-97c8) boots an iPhone simulator on a
+  macOS-15 runner, builds the crate test binaries for
+  `aarch64-apple-ios-sim`, and executes them via `xcrun simctl spawn` —
+  finally *running* the previously compile-only `cfg(ios)` unit tests
+  (avaudio gather/scratch, mod enumeration, thread target classification)
+  plus a new `tests/ios_sim_smoke.rs` frames-delivered smoke that drives
+  `CaptureTarget::Device("default")` through the public API against a live
+  `AVAudioEngine` input tap (env-gated on `RSAC_CI_IOS_SIM=1`; the test
+  plays the host-app role and activates a `.playAndRecord` AVAudioSession
+  itself via a new iOS-only `objc2-avf-audio` dev-dependency — no production
+  code path gains a session dependency). Results are labelled
+  **simulator-verified**, never device-verified; physical-device capture,
+  the interleaved-delivery fast path, and start-failure rollback remain a
+  runbook. (rsac-97c8)
+
+- **Tauri v2 plugin (`tauri-plugin-rsac`, ADR-0014):** mobile consent-flow + JS
+  capture API at `integrations/tauri-plugin-rsac`; derived-meter events by
+  default (`rsac://chunk-meta`), raw samples opt-in (`rsac://chunk-raw`, gated
+  behind `allow-subscribe-raw`). The Android bridge is a thin forwarder onto
+  `RsacProjection` (inherits PR#64's deferred-FGS-acquire ordering). Compile-proof:
+  desktop builds+clippies in the workspace CI, `android/`+`ios/` source-shipped;
+  joined to the version-lockstep set. Mobile runtime tracks rsac-e6d3/rsac-97c8.
+- **Android (emulator runtime-verification CI leg):** new opt-in
+  `ci-android-emu.yml` workflow (rsac-e6d3) boots an API 30 x86_64 AVD
+  (KVM-probed — skips with a loud summary on KVM-less runners rather than
+  failing red), cross-builds the crate test binaries via cargo-ndk, and
+  executes them on the emulator over adb — finally *running* the previously
+  compile-only `cfg(android)` unit tests plus a new
+  `tests/android_emu_smoke.rs` that drives `CaptureTarget::Device("default")`
+  through the public API asserting frame delivery + format sanity (the
+  emulator mic is synthetic — content is never asserted) and the honest
+  `SystemDefault`-without-consent refusal. Results are labelled
+  **emulator-verified**, never device-verified; the AGENTS mobile-matrix
+  cells flip only after the first green run supplies evidence.
 - **Android (device-change notifications):** `AndroidDeviceEnumerator::watch()`
   now delivers input-device hot-plug notifications via the AAR's
   `AudioManager.registerAudioDeviceCallback` (rsac-d3e2), emitting
@@ -218,6 +253,13 @@ Releases with no ABI change omit the subsection (or state "No C ABI changes").
 
 ### Fixed
 
+- **Builder preflight: parameter validation now precedes the mobile consent
+  checks.** On Android/iOS, a config that was *both* invalid (channels = 0,
+  unsupported sample rate) *and* missing its consent artifact reported
+  `UserConsentRequired` instead of the configuration error — sending callers
+  chasing a consent dialog that could not help. Found by the first-ever
+  execution of the `cfg(ios)` unit tests on the new simulator leg (15
+  param-validation tests misreported; rsac-97c8). Desktop behavior unchanged.
 - **Windows per-PID `Application(pid)` / `ApplicationByName` capture delivered
   only silence (rsac-5b59).** The WASAPI process-loopback backend created the
   loopback client with `include_tree = false`, which wasapi-rs maps to

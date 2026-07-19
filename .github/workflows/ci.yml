@@ -541,6 +541,14 @@ jobs:
       - name: Cross-check rsac-ffi for Android (feat_android)
         run: cargo check -p rsac-ffi --target aarch64-linux-android --no-default-features --features feat_android
 
+      # rsac-f21c / ADR-0014 §7: the plugin's #[cfg(mobile)] mobile.rs
+      # (register_android_plugin, run_mobile_plugin, AndroidProjectionToken
+      # threading) is cross-checked here. On the android target the plugin's
+      # rsac dep pulls feat_android so with_android_projection is in scope.
+      # [CI-VERIFY] item #2.
+      - name: Cross-check tauri-plugin-rsac for Android (#[cfg(mobile)])
+        run: cargo check -p tauri-plugin-rsac --target aarch64-linux-android
+
       # rsac-0aa9: build librsac.so for real with the NDK linker — the first
       # step that actually LINKS the backend (#[link(name = "aaudio")]);
       # cargo check never does. Output lands in the AAR's jniLibs so the
@@ -648,6 +656,14 @@ jobs:
       - name: Cross-check rsac-ffi for iOS (feat_ios)
         run: cargo check -p rsac-ffi --target aarch64-apple-ios --no-default-features --features feat_ios
 
+      # rsac-f21c / ADR-0014 §7: cross-check the plugin's #[cfg(mobile)] path for
+      # iOS (register_ios_plugin / ios_plugin_binding!). On the ios target the
+      # plugin's rsac dep pulls feat_ios so with_ios_app_group is in scope.
+      # [CI-VERIFY] item #2 — this leg (full Xcode on the macOS runner) is the
+      # authoritative check; the dev box lacks the iphoneos SDK cc-rs needs.
+      - name: Cross-check tauri-plugin-rsac for iOS (#[cfg(mobile)])
+        run: cargo check -p tauri-plugin-rsac --target aarch64-apple-ios
+
       - name: Build the SwiftPM package for iOS (both products)
         working-directory: mobile/ios
         run: |
@@ -679,7 +695,14 @@ jobs:
       - name: Install PipeWire dev libraries
         uses: ./.github/actions/pipewire-setup
         with:
-          extra-packages: libclang-dev
+          # libclang-dev: bindgen for the binding crates.
+          # libgtk-3-dev + libwebkit2gtk-4.1-dev: tauri-runtime (a non-optional
+          # dep of `tauri`, pulled even with default-features=false) declares
+          # gtk + webkit2gtk-sys as UNCONDITIONAL Linux deps, whose build scripts
+          # probe pkg-config for gtk+-3.0/webkitgtk. Without these the
+          # tauri-plugin-rsac desktop check below hard-fails on
+          # gtk-sys/gdk-sys/atk-sys/javascriptcore-rs-sys/soup3-sys.
+          extra-packages: libclang-dev libgtk-3-dev libwebkit2gtk-4.1-dev
 
       - name: Check rsac-ffi (C FFI)
         run: cargo check -p rsac-ffi
@@ -704,6 +727,19 @@ jobs:
           cargo clippy -p rsac-ffi --all-targets --features compose -- -D warnings
           cargo clippy -p rsac-napi --all-targets -- -D warnings
           cargo clippy -p rsac-python --all-targets -- -D warnings
+
+      # rsac-f21c / ADR-0014: the Tauri v2 plugin is a workspace member with its
+      # own deps (Tauri). Hold its DESKTOP target to the repo -D warnings bar
+      # with an explicit leg (same pattern/rationale as rsac-3e24). The plugin's
+      # `tauri` dep is `default-features = false` (no webview), which drops the
+      # wry runtime — but tauri-runtime still pulls gtk + webkit2gtk-sys
+      # unconditionally on Linux, so libgtk-3-dev + libwebkit2gtk-4.1-dev are
+      # installed in the pipewire-setup step above (verified locally by
+      # cross-target `cargo check`; the one-line dep tweak alone is NOT enough).
+      - name: Check + clippy tauri-plugin-rsac (desktop)
+        run: |
+          cargo check -p tauri-plugin-rsac
+          cargo clippy -p tauri-plugin-rsac --all-targets -- -D warnings
 
       # rsac-1413 / BP-5: the curated include/rsac.h (which rsac-go links against)
       # must never silently drift from the cbindgen-generated twin. build.rs runs
@@ -1336,7 +1372,7 @@ jobs:
   #     crate between releases) does not block day-to-day CI. The hard
   #     gate runs at tag time, which is the point of no return.
   version-lockstep:
-    name: Version Lockstep (rsac + bindings)
+    name: Version Lockstep (rsac + bindings + tauri-plugin)
     timeout-minutes: 5
     needs: lint
     runs-on: blacksmith-4vcpu-ubuntu-2404
@@ -1380,6 +1416,10 @@ jobs:
           V[bindings/rsac-python/Cargo.toml]=$(toml_pkg_version bindings/rsac-python/Cargo.toml)
           V[bindings/rsac-python/pyproject.toml]=$(toml_pkg_version bindings/rsac-python/pyproject.toml)
           V[mobile/android-native/Cargo.toml]=$(toml_pkg_version mobile/android-native/Cargo.toml)
+          # Tauri v2 plugin (ADR-0014) joins the lockstep set. The loop below
+          # folds these into the divergence warning + the tag-time hard-gate.
+          V[integrations/tauri-plugin-rsac/Cargo.toml]=$(toml_pkg_version integrations/tauri-plugin-rsac/Cargo.toml)
+          V[integrations/tauri-plugin-rsac/guest-js/package.json]=$(json_top_version integrations/tauri-plugin-rsac/guest-js/package.json)
 
           echo "Discovered versions:"
           for f in "${!V[@]}"; do

@@ -1,13 +1,13 @@
 # ADR 0014 — Tauri integration model: direct library dependency on desktop, `tauri-plugin-rsac` as the mobile vehicle
 
-**Status:** Proposed
-**Date:** 2026-07-04
-**Scope:** a future `tauri-plugin-rsac` crate (location TBD at implementation
-— candidate: a new `integrations/` top-level dir, excluded from the crates.io
-package), `apps/audio-graph` integration guidance,
+**Status:** Accepted
+**Date:** 2026-07-04 (accepted 2026-07-18)
+**Scope:** the `tauri-plugin-rsac` crate at **`integrations/tauri-plugin-rsac`**
+(a new `integrations/` top-level dir, excluded from the crates.io package,
+joined to the version-lockstep set), `apps/audio-graph` integration guidance,
 [`docs/FRAMEWORK_COMPATIBILITY.md`](../FRAMEWORK_COMPATIBILITY.md) (Tauri
 section).
-**Verdict (proposed):** Tauri v2 apps on **desktop** should consume rsac as a
+**Verdict (accepted):** Tauri v2 apps on **desktop** should consume rsac as a
 **direct Rust dependency** — audio-graph's current integration is the
 recommended shape and does not change. A **`tauri-plugin-rsac`** is built in
 wave 5 as (a) the sanctioned vehicle for the mobile consent flow (wrapping the
@@ -17,10 +17,12 @@ ADR-0012 into Tauri's plugin packaging), and (b) an optional JS guest API
 permission system. audio-graph adopts the plugin **only if/when it targets
 mobile**.
 
-> Proposed, not accepted: the plugin does not exist yet, and the final call on
-> its API surface and audio-graph's adoption belongs to the wave-5
-> implementation once the mobile backends (waves 3–4) are real. Flip to
-> Accepted (or supersede) at that point.
+> **Accepted at wave-5 implementation (rsac-f21c).** The plugin ships
+> compile-proof: desktop builds + clippies in the workspace CI; `android/` +
+> `ios/` are source-shipped, bridging the ADR-0012 AAR / SwiftPM glue; mobile
+> **runtime** verification remains blocked on rsac-e6d3 / rsac-97c8 (unchanged
+> from ADR-0012's honesty posture). audio-graph's desktop integration is
+> unchanged.
 
 ## 1. Context
 
@@ -47,7 +49,7 @@ Android/iOS-native code and permissions into an app.
 
 ## 3. Considered options
 
-### Option A — Direct dep on desktop; plugin as mobile vehicle + optional JS API (proposed)
+### Option A — Direct dep on desktop; plugin as mobile vehicle + optional JS API (accepted)
 
 - ✅ Desktop keeps the zero-IPC, full-API integration that already ships.
 - ✅ Plugin work lands exactly when it has value (mobile glue exists to wrap).
@@ -73,7 +75,7 @@ Android/iOS-native code and permissions into an app.
   ADR-0012's batteries-included stance exists to prevent.
 - ❌ No JS-facing API for non-Rust Tauri teams.
 
-## 4. Decision (proposed)
+## 4. Decision (accepted)
 
 **Option A.** Sub-points for the wave-5 implementer:
 
@@ -98,3 +100,37 @@ Android/iOS-native code and permissions into an app.
   version-lockstep set).
 - Neutral: Dioxus/Flutter consumers are unaffected — they consume the AAR /
   SwiftPM glue directly per ADR-0012.
+
+## 6. Implementation notes (accepted)
+
+Deltas discovered during the wave-5 implementation (rsac-f21c):
+
+1. **Location confirmed `integrations/`** (was a candidate at proposal time):
+   the crate lives at `integrations/tauri-plugin-rsac`, is added to
+   `[workspace].members`, and is excluded from the crates.io `rsac` package via
+   `[package].exclude += "/integrations"`. Workspace membership is orthogonal
+   to packaging (bindings already do this).
+2. **Derived-data-by-default is enforced at the *permission layer*, not just by
+   convention.** `subscribe_raw` is excluded from the default permission set, so
+   raw interleaved-f32 samples require an explicit `allow-subscribe-raw` grant
+   in the host's capability file. The default `rsac://chunk-meta` path carries
+   only derived meters/format (computed Rust-side, alloc-free, before the buffer
+   is dropped — the napi `ChunkMeta` precedent).
+3. **Plugin identifier is `rsac`** → the invoke namespace is `plugin:rsac|*` and
+   the event channels use the `rsac://…` scheme (`rsac://chunk-meta`,
+   `rsac://chunk-raw`, and the reserved-not-yet-emitted `rsac://stats` — its
+   `StreamStatsInfo` wire shape is defined but no code path emits it yet).
+4. **Desktop `request_consent` is a no-op success** (desktop
+   `requires_user_consent == false`, `src/core/capabilities.rs`), keeping the JS
+   API uniform across platforms (§4.3 passthrough). iOS likewise resolves
+   success — its consent artifact is the App Group id supplied Rust-side
+   (ADR-0013), not a native dialog.
+5. **The Android consent bridge is a thin forwarder onto `RsacProjection`** — it
+   inherits PR#64's deferred-FGS-acquire ordering rather than re-implementing
+   it. The Kotlin `RsacTauriPlugin` never starts the `mediaProjection` FGS
+   itself (pre-consent typed-FGS start → `SecurityException` on API 34+).
+6. **Compile-proof shipping.** Desktop builds + clippies in the workspace CI;
+   `android/` (Gradle) + `ios/` (SwiftPM) are source-shipped and the
+   `#[cfg(mobile)]` Rust is cross-checked for both mobile triples. Mobile
+   *runtime* verification (consent → capture → meter on device) is deferred to
+   rsac-e6d3 / rsac-97c8 and filed as a follow-up example-app seed.

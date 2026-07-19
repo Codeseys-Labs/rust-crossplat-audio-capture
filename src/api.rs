@@ -388,6 +388,39 @@ impl AudioCaptureBuilder {
             _ => {}
         }
 
+        // ── Validate sample rate ────────────────────────────────────
+        // Parameter validation runs BEFORE the consent preflights below: an
+        // invalid config is an invalid config regardless of consent state,
+        // and reporting UserConsentRequired for a channels=0 build would
+        // send the caller chasing a consent dialog that cannot help. (Found
+        // by the first-ever run of the cfg(ios) unit tests on the simulator
+        // leg, rsac-97c8 — 15 param-validation tests misreported consent.)
+        if !SUPPORTED_SAMPLE_RATES.contains(&self.config.sample_rate) {
+            return Err(AudioError::InvalidParameter {
+                param: "sample_rate".into(),
+                reason: format!(
+                    "Unsupported sample rate: {} Hz. Supported: {}",
+                    self.config.sample_rate,
+                    PlatformCapabilities::supported_sample_rates_display()
+                ),
+            });
+        }
+
+        // ── Validate channels ───────────────────────────────────────
+        if self.config.channels == 0 {
+            return Err(AudioError::ConfigurationError {
+                message: "Channels must be greater than 0.".to_string(),
+            });
+        }
+        if self.config.channels > MAX_CHANNELS {
+            return Err(AudioError::ConfigurationError {
+                message: format!(
+                    "Number of channels ({}) exceeds the maximum supported ({}).",
+                    self.config.channels, MAX_CHANNELS
+                ),
+            });
+        }
+
         // ── Consent preflight (mobile, ADR-0013 / rsac-82d4) ─────────
         // Live as of rsac-77f1 (the Android playback backend): it fires only
         // when the platform *claims* the requested playback-capture tier AND
@@ -451,33 +484,6 @@ impl AudioCaptureBuilder {
                         .to_string(),
                 });
             }
-        }
-
-        // ── Validate sample rate ────────────────────────────────────
-        if !SUPPORTED_SAMPLE_RATES.contains(&self.config.sample_rate) {
-            return Err(AudioError::InvalidParameter {
-                param: "sample_rate".into(),
-                reason: format!(
-                    "Unsupported sample rate: {} Hz. Supported: {}",
-                    self.config.sample_rate,
-                    PlatformCapabilities::supported_sample_rates_display()
-                ),
-            });
-        }
-
-        // ── Validate channels ───────────────────────────────────────
-        if self.config.channels == 0 {
-            return Err(AudioError::ConfigurationError {
-                message: "Channels must be greater than 0.".to_string(),
-            });
-        }
-        if self.config.channels > MAX_CHANNELS {
-            return Err(AudioError::ConfigurationError {
-                message: format!(
-                    "Number of channels ({}) exceeds the maximum supported ({}).",
-                    self.config.channels, MAX_CHANNELS
-                ),
-            });
         }
 
         Ok(())
@@ -4633,8 +4639,14 @@ mod tests {
     /// enumerating any device.
     #[test]
     fn preflight_ok_for_valid_default_config() {
+        // Device target: valid on every platform WITHOUT a consent artifact
+        // (SystemDefault honestly requires consent on mobile, ADR-0013 —
+        // first surfaced when the emulator/simulator legs ran these dormant
+        // tests, rsac-e6d3/97c8). This test is about parameter validity.
         let builder = AudioCaptureBuilder::new()
-            .with_target(CaptureTarget::SystemDefault)
+            .with_target(CaptureTarget::Device(crate::core::config::DeviceId(
+                "default".to_string(),
+            )))
             .sample_rate(48000)
             .channels(2);
         assert!(
@@ -4684,11 +4696,20 @@ mod tests {
         }
     }
 
+    /// A consent-free target valid on every platform: parameter-validation
+    /// tests must not couple to SystemDefault's mobile consent requirement
+    /// (ADR-0013; surfaced by the runtime legs, rsac-e6d3/97c8).
+    fn consent_free_builder() -> AudioCaptureBuilder {
+        AudioCaptureBuilder::new().with_target(CaptureTarget::Device(
+            crate::core::config::DeviceId("default".to_string()),
+        ))
+    }
+
     /// preflight() accepts the channel-count boundaries 1 and 32.
     #[test]
     fn preflight_accepts_channel_boundaries() {
-        assert!(AudioCaptureBuilder::new().channels(1).preflight().is_ok());
-        assert!(AudioCaptureBuilder::new().channels(32).preflight().is_ok());
+        assert!(consent_free_builder().channels(1).preflight().is_ok());
+        assert!(consent_free_builder().channels(32).preflight().is_ok());
     }
 
     /// preflight() accepts every rate in the supported whitelist.
@@ -4696,10 +4717,7 @@ mod tests {
     fn preflight_accepts_all_supported_sample_rates() {
         for rate in SUPPORTED_SAMPLE_RATES {
             assert!(
-                AudioCaptureBuilder::new()
-                    .sample_rate(rate)
-                    .preflight()
-                    .is_ok(),
+                consent_free_builder().sample_rate(rate).preflight().is_ok(),
                 "rate {rate} should pass preflight"
             );
         }
@@ -4721,8 +4739,20 @@ mod tests {
 
         let result = builder.preflight();
         if caps.supports_application_capture {
-            // The capability check must pass (any later failure would be from a
-            // step preflight does not perform; preflight itself returns Ok).
+            // The capability check must pass. On mobile, a supported
+            // Application tier ALSO requires the consent artifact (ADR-0013),
+            // so the honest outcome there is UserConsentRequired, not Ok
+            // (surfaced by the emulator leg, rsac-e6d3).
+            #[cfg(any(target_os = "android", target_os = "ios"))]
+            {
+                if caps.requires_user_consent {
+                    assert!(
+                        matches!(result, Err(AudioError::UserConsentRequired { .. })),
+                        "consent-gated app capture must ask for the artifact, got {result:?}"
+                    );
+                    return;
+                }
+            }
             assert!(
                 result.is_ok(),
                 "preflight must pass app capability when supported"

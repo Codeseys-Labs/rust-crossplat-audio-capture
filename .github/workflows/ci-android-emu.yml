@@ -1,0 +1,264 @@
+name: Android Emulator Runtime Leg
+
+# =============================================================================
+# rsac-e6d3 — Android emulator RUNTIME verification (the Android twin of the
+# iOS simulator leg rsac-97c8 / ci-ios-sim.yml). Boots an API 30 x86_64 AVD
+# and EXECUTES rsac's Rust code against a live AAudio input route.
+#
+# HONESTY: the emulator is NOT a device. Every result here is labelled
+# `emulator-verified`. It proves the AAudio input path delivers frames through
+# the rsac public API, runs the previously-dormant cfg(android) unit tests
+# (capabilities, record parsing, conversion helpers), and asserts the honest
+# SystemDefault-without-consent refusal. MediaProjection playback tiers need
+# consent-dialog automation (uiautomator) and stay a follow-up extension of
+# this leg; a physical-device pass stays a runbook. This leg is NOT a required
+# PR gate until its acceptance criteria are observed green on a runner.
+#
+# KVM: hardware acceleration is mandatory for a usable x86_64 emulator.
+# Blacksmith (blacksmith-4vcpu-ubuntu-2404) KVM support is UNVERIFIED — the
+# probe step below SKIPS the whole payload with a loud step summary when
+# /dev/kvm is absent (a skipped leg that says why beats a red X). If the
+# probe shows Blacksmith lacks KVM, flip `runs-on` to ubuntu-latest
+# (GH-hosted runners expose KVM after the udev rule below).
+#
+# Test-harness mechanism: libtest binaries are cross-built for
+# x86_64-linux-android via cargo-ndk (which wires the NDK linker), discovered
+# from cargo's --message-format=json output (never guessed from target/
+# paths), pushed to /data/local/tmp, and executed via adb shell. Whether the
+# `shell` uid can open an AAudio INPUT stream without an app context is
+# UNVERIFIED (platform.xml grants shell only INTERNET; any access would come
+# via shell's privileged/debuggable status or audio-GID membership on the
+# emulator image) — the frames smoke therefore soft-fails to skip-with-summary
+# if the route is refused, and the first green run is what settles it. If the
+# route proves permission-blocked, the follow-up is an instrumented
+# androidTest app that holds RECORD_AUDIO properly.
+# =============================================================================
+
+on:
+  workflow_dispatch:
+    inputs:
+      require_frames:
+        description: >-
+          Hard-fail the frames-delivered smoke instead of skip-with-summary
+          when the emulator input route yields no frames (set once a runner
+          has proven the synthetic-mic route is reliable).
+        type: boolean
+        default: false
+  pull_request:
+    branches: [main, master, 'release/**']
+    paths:
+      - 'src/audio/android/**'
+      # The smoke exercises the whole public capture path — shared-layer
+      # regressions must retrigger runtime verification (CodeRabbit PR #65).
+      - 'src/api.rs'
+      - 'src/bridge/**'
+      - 'src/core/**'
+      - 'tests/android_emu_smoke.rs'
+      - 'mobile/android-native/**'
+      - 'Cargo.toml'
+      - 'Cargo.lock'
+      - '.github/workflows/ci-android-emu.yml'
+      - '.github/actions/**'
+      - 'scripts/ci-android-emu-payload.sh'
+
+concurrency:
+  group: android-emu-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+  RUST_BACKTRACE: 1
+  ANDROID_TARGET: x86_64-linux-android
+  # API 30: >=29 per the seed (AAudio + playback-capture era), and 30's
+  # x86_64 google_apis image boots reliably under the emulator-runner action.
+  EMU_API_LEVEL: 30
+
+jobs:
+  android-emu:
+    name: Android Emulator Runtime Leg
+    timeout-minutes: 35
+    runs-on: blacksmith-4vcpu-ubuntu-2404
+    defaults:
+      run:
+        # bash keyword shell => -eo pipefail (a `cargo … | tee` pipe cannot
+        # mask a failure behind tee's exit 0).
+        shell: bash
+    steps:
+      - uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5
+        with:
+          persist-credentials: false
+
+      # ── KVM probe (the whole leg hinges on this) ─────────────────────
+      # GH-hosted ubuntu runners need the udev rule to open /dev/kvm without
+      # root; apply it opportunistically, then probe. No KVM => skip-loud.
+      - name: Probe KVM
+        id: kvm
+        run: |
+          echo 'KERNEL=="kvm", GROUP="kvm", MODE="0666", OPTIONS+="static_node=kvm"' \
+            | sudo tee /etc/udev/rules.d/99-kvm4all.rules >/dev/null 2>&1 || true
+          sudo udevadm control --reload-rules 2>/dev/null || true
+          sudo udevadm trigger --name-match=kvm 2>/dev/null || true
+          if [ -r /dev/kvm ] && [ -w /dev/kvm ]; then
+            echo "available=true" >> "$GITHUB_OUTPUT"
+            echo "KVM: available ($(ls -l /dev/kvm))"
+          else
+            echo "available=false" >> "$GITHUB_OUTPUT"
+            {
+              echo "## ⚠️ Android emulator leg SKIPPED — no KVM"
+              echo ""
+              echo "\`/dev/kvm\` is absent or unreadable on this runner"
+              echo "(\`blacksmith-4vcpu-ubuntu-2404\`). A software-rendered"
+              echo "emulator is too slow/flaky to be signal, so the runtime"
+              echo "payload was skipped — this is NOT a pass and NOT a"
+              echo "failure: the Android runtime-verification evidence"
+              echo "(rsac-e6d3) has still never been produced."
+              echo ""
+              echo "Fix: run this workflow on a KVM-capable runner —"
+              echo "GH-hosted \`ubuntu-latest\` exposes KVM (flip \`runs-on\`),"
+              echo "or ask Blacksmith about nested virtualization."
+            } >> "$GITHUB_STEP_SUMMARY"
+          fi
+
+      - uses: ./.github/actions/rust-setup
+        if: steps.kvm.outputs.available == 'true'
+        with:
+          targets: x86_64-linux-android
+
+      # ── Cross-build the test binaries (host side, before boot) ───────
+      # Plain cargo with the NDK linker env, NOT cargo-ndk: the first run
+      # showed cargo-ndk interleaving its own stdout with cargo's json stream
+      # (json discovery found 0 artifacts), while plain cargo's
+      # --message-format=json is clean (shape verified locally). The API-29
+      # clang wrapper is the moral equivalent of cargo-ndk's --platform 29 —
+      # required for -laaudio to resolve (NDK sysroot stubs exist from API
+      # 26+, ci.yml lesson). Binary paths come from the json (executable
+      # field), with a loud guarded glob fallback for first-run resilience.
+      - name: Build test binaries for x86_64-linux-android
+        if: steps.kvm.outputs.available == 'true'
+        run: |
+          export ANDROID_NDK_HOME="${ANDROID_NDK_LATEST_HOME:-$ANDROID_NDK_ROOT}"
+          echo "Using NDK at: $ANDROID_NDK_HOME"
+          TOOLCHAIN="$ANDROID_NDK_HOME/toolchains/llvm/prebuilt/linux-x86_64/bin"
+          test -x "$TOOLCHAIN/x86_64-linux-android29-clang" || {
+            echo "::error::NDK API-29 x86_64 clang wrapper not found under $TOOLCHAIN"; exit 1;
+          }
+          export CARGO_TARGET_X86_64_LINUX_ANDROID_LINKER="$TOOLCHAIN/x86_64-linux-android29-clang"
+          export CC_x86_64_linux_android="$TOOLCHAIN/x86_64-linux-android29-clang"
+          export AR_x86_64_linux_android="$TOOLCHAIN/llvm-ar"
+          mkdir -p emu-payload
+          # Dormant cfg(android) unit tests (rsac --lib).
+          cargo test --target x86_64-linux-android --lib \
+            --no-default-features --features feat_android \
+            --no-run --message-format=json > unit-build.json
+          # The emulator smoke (integration test).
+          cargo test --target x86_64-linux-android --test android_emu_smoke \
+            --no-default-features --features feat_android \
+            --no-run --message-format=json > smoke-build.json
+          python3 - <<'PY'
+          import glob, json, os, shutil, sys
+
+          def artifacts(path):
+              out = []
+              for line in open(path):
+                  try:
+                      m = json.loads(line)
+                  except json.JSONDecodeError:
+                      continue
+                  if m.get("reason") == "compiler-artifact":
+                      t = m.get("target", {})
+                      out.append((t.get("name"), t.get("kind"), m.get("executable")))
+              return out
+
+          def grab(path, want_name, want_kind, glob_stem, out):
+              found = [
+                  exe
+                  for (name, kind, exe) in artifacts(path)
+                  if exe and name == want_name and want_kind in (kind or [])
+              ]
+              if len(found) == 1:
+                  shutil.copy(found[0], out)
+                  print(f"{path}: json-discovered {found[0]} -> {out}")
+                  return
+              # First-run diagnostics: dump every artifact the json DID carry,
+              # then fall back to a guarded filesystem glob (the test binaries
+              # land in target/<triple>/debug/deps/<stem>-<hash>). The glob is
+              # second choice — kept loud and exactly-one-guarded.
+              print(f"::warning::{path}: json discovery found {len(found)} "
+                    f"candidates for {want_name!r}/{want_kind!r}; artifacts seen:")
+              for a in artifacts(path):
+                  print(f"  name={a[0]!r} kind={a[1]!r} exe={bool(a[2])}")
+              pat = f"target/x86_64-linux-android/debug/deps/{glob_stem}-*"
+              cands = [
+                  p for p in glob.glob(pat)
+                  if os.access(p, os.X_OK) and not p.endswith((".d", ".rlib", ".rmeta", ".so"))
+              ]
+              if len(cands) != 1:
+                  # Newest-mtime wins when hashes accumulated across runs.
+                  cands.sort(key=os.path.getmtime)
+                  cands = cands[-1:]
+              if not cands:
+                  sys.exit(f"{path}: no executable via json OR glob {pat!r}")
+              shutil.copy(cands[0], out)
+              print(f"{path}: glob-discovered {cands[0]} -> {out}")
+
+          grab("unit-build.json", "rsac", "lib", "rsac", "emu-payload/rsac_unit_tests")
+          grab("smoke-build.json", "android_emu_smoke", "test", "android_emu_smoke", "emu-payload/android_emu_smoke")
+          PY
+          ls -l emu-payload/
+
+      # ── Boot the AVD and run the payload ─────────────────────────────
+      - name: Run tests on the emulator
+        if: steps.kvm.outputs.available == 'true'
+        id: emu
+        uses: reactivecircus/android-emulator-runner@1dcd0090116d15e7c562f8db72807de5e036a4ed # v2.34.0
+        with:
+          api-level: 30
+          arch: x86_64
+          target: google_apis
+          # NOTE: deliberately NOT -noaudio (the action's default includes it):
+          # -noaudio disables the whole audio subsystem, which would make the
+          # frames-delivered smoke structurally unable to deliver — a silent
+          # null-backend mic is fine (we assert delivery, not content), a
+          # DISABLED one is self-defeating (review finding #1).
+          emulator-options: >-
+            -no-window -gpu swiftshader_indirect -no-boot-anim
+            -no-snapshot -camera-back none
+          disable-animations: true
+          # The action boots, runs `script`, and tears down. Everything below
+          # runs on the HOST with adb available; set -eo pipefail is ours to
+          # enforce (the action uses `sh -c`).
+          # A FILE, not inline shell: the action runs `script:` via
+          # `/usr/bin/sh -c`, where a multi-line single-quoted `bash -c`
+          # block is a syntax error (first-run lesson: "Unterminated quoted
+          # string"). The payload script owns its own set -euo pipefail.
+          script: bash scripts/ci-android-emu-payload.sh
+        env:
+          REQUIRE_FRAMES: ${{ github.event_name == 'workflow_dispatch' && inputs.require_frames && '1' || '0' }}
+
+      - name: Summarize
+        if: steps.kvm.outputs.available == 'true' && always()
+        run: |
+          {
+            echo "## Android emulator leg (API ${EMU_API_LEVEL}, x86_64)"
+            echo ""
+            echo '```'
+            grep -E "test result|delivered|negotiated|honest refusal|skip-with-summary" \
+              unit-tests.log smoke.log 2>/dev/null || echo "logs missing — see artifacts"
+            echo '```'
+            echo ""
+            echo "_emulator-verified, not device-verified (rsac-e6d3)._"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Upload logs
+        if: steps.kvm.outputs.available == 'true' && always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: android-emu-logs
+          path: |
+            unit-tests.log
+            smoke.log
+          if-no-files-found: ignore
+          retention-days: 14
