@@ -1,0 +1,387 @@
+# Non-Rust supply-chain audit gates (rsac-c383).
+#
+# ci.yml's `supply-chain` job (cargo-deny) covers the Rust dependency graph
+# only. This workflow covers the OTHER four dependency surfaces the bindings
+# introduce: npm (rsac-napi + tauri-plugin-rsac guest-js), Python (rsac-python),
+# Go (rsac-go), and Gradle/Kotlin (mobile/android). SwiftPM (mobile/ios) has no
+# external dependencies today, so it gets a tripwire instead of a scanner (see
+# the `swiftpm-guard` job below).
+#
+# Policy (per-ecosystem — every job below is a hard gate; no job in this
+# workflow uses `continue-on-error` or `|| true` on its scan/audit step):
+#   - npm/bun:   `bun audit --audit-level=high` — bun's own severity filter
+#                means LOW/MODERATE advisories are not even reported, only
+#                HIGH/CRITICAL block the job. This is the one ecosystem with
+#                an explicit severity floor (an --audit-level flag exists);
+#                the others below block on ANY known advisory, see per-job
+#                comments for why that's the right bar for each surface.
+#   - python/Go: block on ANY known advisory (pip-audit / govulncheck have no
+#                comparable severity-threshold flag) — acceptable because both
+#                dependency trees here are shallow (see the job comments).
+#   - osv-scanner: blocks on any vulnerability found (its own default
+#                `fail-on-vuln: true`), across every ecosystem it recognizes
+#                under bindings/, integrations/ and mobile/ — a cross-check
+#                layer, not a per-severity-tuned gate. The scan is scoped to
+#                those non-Rust dirs on purpose: the root Cargo.lock is
+#                EXCLUDED because cargo-deny (ci.yml's supply-chain job)
+#                already owns the Rust graph, and OSV double-reporting Rust
+#                advisories here would make this workflow red for findings
+#                that are triaged through the deny.toml pipeline (concretely:
+#                Cargo.lock pins pyo3 0.24.2, which OSV flags as
+#                RUSTSEC-2026-0176/-0177 — a repo-root `--recursive ./` scan
+#                fails on it today; that advisory is Rust-lane triage work,
+#                not a non-Rust gate failure).
+#   - licenses:  BLOCK on any dependency license outside the allow-list.
+#                The allow-list mirrors deny.toml's [licenses].allow exactly
+#                (kept in one place mentally — if you touch one, touch both).
+#
+# No `|| true` on any blocking-tier command: the scanner/audit tool's real
+# exit code is what fails the job. This is deliberate — a swallowed non-zero
+# exit is exactly the failure mode this workflow exists to prevent.
+#
+# Triggers: path-filtered per ecosystem (each job only runs when its own
+# manifests / lockfiles change) PLUS a weekly cron, because supply-chain risk
+# moves without a commit to this repo (a new CVE can land against a pinned
+# dependency at any time). The cron runs every job unconditionally (no path
+# filter applies to `schedule`).
+#
+# Where a SCHEDULED failure surfaces (there is no PR to go red on): GitHub
+# emails the user who last touched the cron schedule (i.e. this file's last
+# committer) on the first failure of a scheduled run — plus the Actions tab
+# and the workflow badge. That is the notification path today; if the repo
+# grows a team-notification channel (Slack webhook / repo-watch routing),
+# wire a failure step here. Note GitHub auto-disables cron on repos with no
+# activity for 60 days — any commit re-enables it.
+#
+# ── Verification recipe (rsac-c383 acceptance: prove a seeded bad dep fails
+#    the gate) — do NOT commit a real vulnerable/disallowed dependency to the
+#    tree; instead, on a throwaway branch:
+#     npm/bun:    add `"lodash": "4.17.15"` to bindings/rsac-napi/package.json
+#                 devDependencies, push -> the `npm-audit` job's
+#                 `bun audit --audit-level=high` step must fail (GHSA-p6mc-m468-83gw
+#                 et al. are HIGH+ on 4.17.15).
+#     python:     add `"pyyaml==5.3"` (or another CVE-bearing pin) to
+#                 bindings/rsac-python/pyproject.toml — either [project]
+#                 dependencies or an optional-dependencies extra (the job
+#                 resolves --all-extras) — and re-run: `uvx pip-audit` on the
+#                 resolved file must fail (verified locally 2026-07-20:
+#                 pip-audit exits 1 with PYSEC-2020-96/PYSEC-2021-142 on a
+#                 pyyaml==5.3 pin, exits 0 without it).
+#     go:         `go get golang.org/x/text@v0.3.0` in bindings/rsac-go (a
+#                 known-vulnerable old pin) — `govulncheck ./...` must fail.
+#     gradle:     add a dependency on a package with a known OSV advisory
+#                 (e.g. an old `com.squareup.okhttp3:okhttp` pin) to
+#                 mobile/android/build.gradle.kts AND commit the generated
+#                 gradle.lockfile — the `osv-scanner` job must fail (it scans
+#                 every supported lockfile under bindings/, integrations/ and
+#                 mobile/, so it is a cross-check layer for those surfaces,
+#                 not just Gradle; note osv-scanner reads lockfiles, not bare
+#                 build.gradle.kts).
+#     license:    add a GPL-licensed devDependency to package.json /
+#                 pyproject.toml — the matching `-license` step must fail
+#                 (outside the allow-list).
+#    In each case, confirm the failure is the REAL tool exit code (check the
+#    job's red X + log tail), not a workflow-level `continue-on-error` masking
+#    it — the blocking-tier steps below carry none.
+
+name: Supply Chain (non-Rust)
+
+on:
+  push:
+    branches: [main, master]
+    paths:
+      # bindings/rsac-napi/bun.lock is .gitignore'd (never committed — see
+      # .gitignore), so package.json alone is the trigger for the npm surface.
+      - 'bindings/rsac-napi/package.json'
+      - 'integrations/tauri-plugin-rsac/guest-js/package.json'
+      - 'bindings/rsac-python/pyproject.toml'
+      - 'bindings/rsac-go/go.mod'
+      - 'bindings/rsac-go/go.sum'
+      - 'mobile/android/build.gradle.kts'
+      - 'mobile/android/settings.gradle.kts'
+      - 'mobile/ios/Package.swift'
+      - '.github/workflows/supply-chain.yml'
+  pull_request:
+    branches: [main, master, 'release/**']
+    paths:
+      # bindings/rsac-napi/bun.lock is .gitignore'd (never committed — see
+      # .gitignore), so package.json alone is the trigger for the npm surface.
+      - 'bindings/rsac-napi/package.json'
+      - 'integrations/tauri-plugin-rsac/guest-js/package.json'
+      - 'bindings/rsac-python/pyproject.toml'
+      - 'bindings/rsac-go/go.mod'
+      - 'bindings/rsac-go/go.sum'
+      - 'mobile/android/build.gradle.kts'
+      - 'mobile/android/settings.gradle.kts'
+      - 'mobile/ios/Package.swift'
+      - '.github/workflows/supply-chain.yml'
+  schedule:
+    # Weekly, Monday 07:00 UTC (one hour after bench.yml's cron so the two
+    # scheduled workflows don't contend for the same runner pool slot).
+    # Unlike the push/pull_request triggers above, path filters do NOT apply
+    # to schedule — every ecosystem job below runs on every cron fire.
+    - cron: '0 7 * * 1'
+  workflow_dispatch:
+
+env:
+  RUST_BACKTRACE: 1
+
+# Guard against forks: the weekly cron would otherwise fire against a fork
+# lacking the same runner pool / package registries reachability, producing
+# recurring failed scheduled runs (mirrors bench.yml / release*.yml).
+permissions:
+  contents: read
+
+concurrency:
+  group: supply-chain-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+jobs:
+  # ── npm/bun: rsac-napi + tauri-plugin-rsac guest-js ─────────────────────
+  # bun is the repo's chosen package manager for the napi binding (mise.toml:
+  # "Bun-first npm pipeline"; release-npm.yml uses `bun install` + `bunx`).
+  # `bun audit` shells out to the npm registry's advisory API and its exit
+  # code is non-zero on any advisory at/above --audit-level. License check
+  # runs via license-checker-rseidelsohn (a maintained fork of the abandoned
+  # license-checker) against the SAME allow-list as deny.toml's [licenses].
+  npm-audit:
+    name: npm/bun Audit + License (${{ matrix.dir }})
+    if: github.repository == 'Codeseys-Labs/rust-crossplat-audio-capture'
+    runs-on: blacksmith-4vcpu-ubuntu-2404
+    timeout-minutes: 10
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - dir: bindings/rsac-napi
+          - dir: integrations/tauri-plugin-rsac/guest-js
+    steps:
+      - uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5
+        with:
+          persist-credentials: false
+
+      - uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6 # v2
+        with:
+          bun-version: latest
+
+      # tauri-plugin-rsac's guest-js has no lockfile (peer-dep-only package,
+      # see integrations/tauri-plugin-rsac/guest-js/package.json) — `bun
+      # install` with nothing to install is a harmless no-op, and `bun audit`
+      # / license-checker correctly report an empty tree rather than erroring.
+      - name: bun install
+        working-directory: ${{ matrix.dir }}
+        run: bun install
+
+      # BLOCKING: no continue-on-error, no `|| true`. --audit-level=high means
+      # LOW/MODERATE advisories are not reported at all (bun audit's own
+      # filtering) — this is the intentional "block on high/critical" line.
+      - name: bun audit (block on high/critical)
+        working-directory: ${{ matrix.dir }}
+        run: bun audit --audit-level=high
+
+      # BLOCKING: license allow-list mirrors deny.toml's [licenses].allow.
+      # 0BSD is added here because @napi-rs/cli's transitive tree can carry
+      # it (napi-rs ecosystem convention) — deny.toml's Rust tree has not
+      # needed it yet, hence the one-license divergence; if it appears in
+      # the Rust graph too, add it to deny.toml as well so the two stay in
+      # sync in spirit.
+      - name: license-checker (allow-list gate)
+        working-directory: ${{ matrix.dir }}
+        run: |
+          bunx license-checker-rseidelsohn \
+            --onlyAllow "MIT;Apache-2.0;Apache-2.0 WITH LLVM-exception;BSD-2-Clause;BSD-3-Clause;Unicode-3.0;Unicode-DFS-2016;ISC;Zlib;0BSD" \
+            --excludePrivatePackages
+
+  # ── Python: rsac-python ─────────────────────────────────────────────────
+  # rsac-python's own runtime dependency surface is minimal (PyO3 extension
+  # module; the only dep is the OPTIONAL numpy extra, per pyproject.toml).
+  # `pip-audit <dir>` on a maturin project audits nothing useful: it warns
+  # "does not contain dependencies list" because there is no [project]
+  # dependencies key and it never resolves optional-dependencies. So the gate
+  # explicitly resolves ALL extras with `uv pip compile --all-extras` first
+  # (repo convention: uv, never global pip — see project memory / mise.toml's
+  # python pin) and audits the pinned resolution. --universal keeps the
+  # resolution platform-independent so the Linux runner also covers pins that
+  # only apply on macOS/Windows markers.
+  python-audit:
+    name: Python (pip-audit)
+    if: github.repository == 'Codeseys-Labs/rust-crossplat-audio-capture'
+    runs-on: blacksmith-4vcpu-ubuntu-2404
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5
+        with:
+          persist-credentials: false
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@d0cc045d04ccac9d8b7881df0226f9e82c39688e # v6
+        with:
+          enable-cache: true
+
+      # Resolve pyproject.toml (INCLUDING optional extras — numpy) to a
+      # pinned requirements file. This step failing (unresolvable dep) is
+      # itself a legitimate gate failure.
+      - name: Resolve dependency surface (all extras)
+        run: |
+          uv pip compile --universal --all-extras \
+            bindings/rsac-python/pyproject.toml \
+            -o /tmp/rsac-python-requirements.txt
+          cat /tmp/rsac-python-requirements.txt
+
+      # BLOCKING: pip-audit's exit code is non-zero whenever ANY known
+      # vulnerability is found (it does not have a severity-threshold flag
+      # comparable to npm's --audit-level) — so this gate is effectively
+      # block-on-any-known-advisory for the Python surface, which is
+      # deliberately stricter than the npm/Go tiers. That is acceptable here:
+      # rsac-python's whole dependency tree is 1-2 packages deep (PyO3 +
+      # optional numpy), so false-positive noise risk is low. --no-deps +
+      # --disable-pip is safe because the uv resolution above is already the
+      # full transitive closure. (Verified locally 2026-07-20: exit 0 on the
+      # real resolution, exit 1 when pyyaml==5.3 is seeded into the file.)
+      - name: pip-audit (resolved surface, all extras)
+        run: uvx pip-audit -r /tmp/rsac-python-requirements.txt --disable-pip --no-deps
+
+  # ── Go: rsac-go ──────────────────────────────────────────────────────────
+  # govulncheck is call-graph-aware (Go's own vuln DB tooling) — it reports
+  # only vulnerabilities in code actually reachable from rsac-go's package
+  # graph, which is the right blocking bar (a vulnerable function that is
+  # never called is not exploitable through this binding). go-licenses checks
+  # every transitive Go module dependency's license against the same
+  # allow-list as deny.toml.
+  go-audit:
+    name: Go (govulncheck + go-licenses)
+    if: github.repository == 'Codeseys-Labs/rust-crossplat-audio-capture'
+    runs-on: blacksmith-4vcpu-ubuntu-2404
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5
+        with:
+          persist-credentials: false
+
+      - uses: actions/setup-go@41dfa10bad2bb2ae585af6ee5bb4d7d973ad74ed # v5
+        with:
+          go-version: '1.22'
+
+      # Version-pinned (not @latest) to match the rest of this workflow's
+      # SHA-pinned-actions discipline — an unpinned scanner install is itself
+      # a supply-chain exposure. Bump deliberately; go.sum verification of the
+      # module download applies either way, but a pin makes the executed code
+      # reviewable. (govulncheck always fetches the LIVE vuln DB at
+      # https://vuln.go.dev regardless of its own binary version, so pinning
+      # does not stale the advisory data.)
+      - name: Install govulncheck
+        run: go install golang.org/x/vuln/cmd/govulncheck@v1.6.0
+
+      - name: Install go-licenses
+        run: go install github.com/google/go-licenses@v1.6.0
+
+      # BLOCKING: govulncheck ./... exits non-zero when a call-reachable
+      # vulnerability is found. rsac-go has no cgo build tags gating packages
+      # differently per-OS, so a single Linux-runner invocation covers the
+      # whole module.
+      - name: govulncheck
+        working-directory: bindings/rsac-go
+        run: govulncheck ./...
+
+      # BLOCKING: go-licenses check exits non-zero on any disallowed license
+      # among the module's dependencies. `--ignore` excludes the module's own
+      # package (its actual license is declared at the repo root LICENSE
+      # file, one level above bindings/rsac-go, which go-licenses' per-package
+      # license search does not walk up to — a known go-licenses limitation,
+      # not a real license gap). Allow-list mirrors deny.toml's
+      # [licenses].allow one-for-one, including "Apache-2.0 WITH
+      # LLVM-exception" — unlikely in a Go tree, but kept so the three
+      # ecosystem allow-lists (deny.toml / npm / Go) never diverge silently.
+      - name: go-licenses check (allow-list gate)
+        working-directory: bindings/rsac-go
+        run: |
+          go-licenses check ./... \
+            --allowed_licenses="MIT,Apache-2.0,Apache-2.0 WITH LLVM-exception,BSD-2-Clause,BSD-3-Clause,ISC,Unicode-3.0,Unicode-DFS-2016,Zlib" \
+            --ignore github.com/Codeseys-Labs/rust-crossplat-audio-capture/bindings/rsac-go
+
+  # ── Cross-ecosystem cross-check: osv-scanner ────────────────────────────
+  # OSV-Scanner recursively discovers and scans every supported package
+  # source under the scanned dirs in one pass. Today that is ONLY
+  # bindings/rsac-go/go.mod (verified 2026-07-20, local osv-scanner 2.4.0:
+  # "Scanned .../rsac-go/go.mod file and found 1 package" — bare
+  # package.json / pyproject.toml without lockfiles are not package sources
+  # osv-scanner reads; the dedicated npm/python jobs above own those
+  # surfaces). Its value is forward-looking: the moment any committed
+  # lockfile appears (npm package-lock.json, Gradle gradle.lockfile, SwiftPM
+  # Package.resolved, uv.lock, ...) it is scanned with zero workflow
+  # changes, which makes this the first automated coverage Gradle/Kotlin
+  # will get (mobile/android has no committed dependency-lock file yet; see
+  # the tracked follow-up in the seed closing this out).
+  #
+  # Scope is bindings/ + integrations/ + mobile/ — NOT `--recursive ./`.
+  # The repo-root Cargo.lock is deliberately out of scope: cargo-deny
+  # (ci.yml's `supply-chain` job, deny.toml [advisories]) already gates the
+  # Rust graph, and scanning Cargo.lock here would double-report Rust
+  # advisories through a second pipeline with no deny.toml ignore mechanism
+  # (verified 2026-07-20: `osv-scanner scan source -L Cargo.lock` exits 1 on
+  # the pre-existing pyo3 0.24.2 RUSTSEC-2026-0176/-0177 advisories, while
+  # the scoped scan below exits 0 — the root scan would hard-fail every
+  # weekly cron until the Rust lane bumps pyo3).
+  #
+  # BLOCKING: fail-on-vuln stays at its default `true` — no override, no
+  # continue-on-error.
+  osv-scanner:
+    name: OSV-Scanner (cross-ecosystem)
+    if: github.repository == 'Codeseys-Labs/rust-crossplat-audio-capture'
+    permissions:
+      # Required to upload SARIF results to Security > Code Scanning.
+      actions: read
+      contents: read
+      security-events: write
+    uses: google/osv-scanner-action/.github/workflows/osv-scanner-reusable.yml@9a498708959aeaef5ef730655706c5a1df1edbc2 # v2.3.8
+    with:
+      scan-args: |-
+        --recursive
+        ./bindings
+        ./integrations
+        ./mobile
+
+  # ── SwiftPM guard: mobile/ios has no external deps today ────────────────
+  # mobile/ios/Package.swift declares zero `.package(url: ...)` dependencies
+  # (RsacAudio/RsacBroadcastKit/CRsacRingAtomics are all in-tree targets). No
+  # scanner is wired up for SwiftPM because there is nothing yet to scan. This
+  # job is the documented tripwire (rsac-c383's SwiftPM acceptance clause): it
+  # greps Package.swift for a `.package(` dependency declaration and FAILS
+  # loudly if one appears, so the day an external Swift dependency is added,
+  # CI blocks the PR until this workflow is extended with a real SwiftPM
+  # audit job (there is no mature swift-native OSV/audit CLI as of writing;
+  # revisit via `swift package show-dependencies` + osv-scanner's
+  # experimental SwiftPM lockfile support, or the same osv-scanner job above
+  # once mobile/ios grows a Package.resolved).
+  swiftpm-guard:
+    name: SwiftPM Guard (no external deps tripwire)
+    runs-on: blacksmith-4vcpu-ubuntu-2404
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5
+        with:
+          persist-credentials: false
+
+      - name: Assert mobile/ios/Package.swift declares no external dependencies
+        run: |
+          set -euo pipefail
+          PKG="mobile/ios/Package.swift"
+          if [ ! -f "$PKG" ]; then
+            echo "::error::$PKG not found — update this guard's path if mobile/ios moved."
+            exit 1
+          fi
+          # `.package(` is how SwiftPM declares BOTH remote (url:) and local
+          # (path:) package dependencies. A local path: dependency on another
+          # in-repo Swift package would still be worth a human look (it may
+          # itself carry external deps), so the tripwire fires on any form.
+          if grep -qE '\.package\(' "$PKG"; then
+            echo "::error::$PKG now declares a .package(...) dependency. mobile/ios has NO audit"
+            echo "::error::job wired up (SwiftPM has no mature OSV/audit CLI at the time this guard"
+            echo "::error::was written — see the comment above the swiftpm-guard job in"
+            echo "::error::.github/workflows/supply-chain.yml). Extend this workflow with a real"
+            echo "::error::SwiftPM advisory + license gate before merging, then relax or remove"
+            echo "::error::this tripwire."
+            grep -nE '\.package\(' "$PKG"
+            exit 1
+          fi
+          echo "OK: mobile/ios/Package.swift has no external .package(...) dependencies."
