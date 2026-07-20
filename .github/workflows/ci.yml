@@ -541,6 +541,14 @@ jobs:
       - name: Cross-check rsac-ffi for Android (feat_android)
         run: cargo check -p rsac-ffi --target aarch64-linux-android --no-default-features --features feat_android
 
+      # rsac-e6d3: the test-only playback driver cdylib is otherwise compiled
+      # ONLY inside ci-android-emu.yml's KVM-gated step — without this check a
+      # Rust error in its cfg(feat_android) driver module would be invisible
+      # whenever KVM is absent (the emu leg skips). check-not-build is enough:
+      # linking is proven by the emu leg's cargo-ndk build + llvm-nm assert.
+      - name: Cross-check rsac-androidtest-native for Android (feat_android)
+        run: cargo check -p rsac-androidtest-native --target aarch64-linux-android --no-default-features --features feat_android
+
       # rsac-f21c / ADR-0014 §7: the plugin's #[cfg(mobile)] mobile.rs
       # (register_android_plugin, run_mobile_plugin, AndroidProjectionToken
       # threading) is cross-checked here. On the android target the plugin's

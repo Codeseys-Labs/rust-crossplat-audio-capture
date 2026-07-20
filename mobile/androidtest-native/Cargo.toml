@@ -1,0 +1,49 @@
+[package]
+name = "rsac-androidtest-native"
+version = "0.4.2"
+edition = "2021"
+# TEST-ONLY, never published and never shipped in any artifact. Excluded from
+# the crates.io tarball (lives under /mobile) and from the version-lockstep
+# gate's hardcoded manifest set (ci.yml) — but kept in workspace-version step
+# for tidiness.
+publish = false
+description = "TEST-ONLY Android cdylib driving rsac's public playback-capture API from an instrumented androidTest (rsac-e6d3). Produces librsac.so; never ships."
+license = "MIT OR Apache-2.0"
+repository = "https://github.com/Codeseys-Labs/rust-crossplat-audio-capture"
+
+# The lib name is `rsac` on purpose: RsacProjection.isNativeAvailable() (the
+# shipped consent flow) hard-codes System.loadLibrary("rsac"), so the .so that
+# both mints the projection token (nativeRetainProjection, registered by rsac's
+# JNI_OnLoad) and consumes it (this crate's driver export → rsac's public
+# playback API) MUST be one and the same librsac.so — otherwise two .so files
+# each statically link rsac and a token minted in one is not consumable in the
+# other (disjoint statics). This collides in *lib name* (not package name) with
+# mobile/android-native, which also emits `rsac`/librsac.so; that is safe
+# because the two are never compiled in a single cargo invocation (always built
+# with an explicit `-p`, into distinct `-o` output dirs) — see
+# ci-android-emu.yml. cargo only errors on an output-filename collision when
+# both artifacts are emitted by the same build, which never happens here.
+[lib]
+name = "rsac"
+crate-type = ["cdylib"]
+
+[features]
+default = []
+# Passthrough to rsac's Android backend (mirrors rsac-ffi's feat_android
+# forwarding). Enabling it LINKS the Android JNI + AAudio backend into this
+# cdylib and gates the driver module in src/lib.rs. The required check is
+# `cargo check --target x86_64-linux-android --no-default-features
+#  --features feat_android -p rsac-androidtest-native`.
+feat_android = ["rsac/feat_android"]
+
+[dependencies]
+# The whole rsac library, re-exported (`pub use rsac`) so its #[no_mangle]
+# JNI_OnLoad and Android backend link into this cdylib — the same keep-alive
+# trick as mobile/android-native. default-features off; the backend is pulled
+# in only via this crate's `feat_android` passthrough above.
+rsac = { path = "../..", default-features = false }
+# Declarations-only JNI transcription (the same crate rsac itself uses for the
+# JNI boundary — pinned to the already-resolved 0.3 to avoid adding a second
+# jni-sys to the lockfile). Only used to hand back the jlong[] result and the
+# last-error jstring.
+jni-sys = "0.3"

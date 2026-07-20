@@ -416,6 +416,14 @@ members = [
     # Lives under /mobile, which is excluded from the crates.io package —
     # workspace membership is orthogonal to packaging.
     "mobile/android-native",
+    # TEST-ONLY Android cdylib that drives rsac's public PLAYBACK API from the
+    # instrumented androidTest playback tier (rsac-e6d3). publish = false;
+    # built only by ci-android-emu.yml into the git-ignored androidTest
+    # jniLibs. Shares the `rsac` lib name with android-native on purpose (the
+    # shipped System.loadLibrary("rsac") must load ONE librsac.so so token
+    # mint + consume share rsac's statics) — never co-compiled with it, so no
+    # output collision. See the crate's Cargo.toml + src/lib.rs.
+    "mobile/androidtest-native",
     # Tauri v2 plugin (ADR-0014). Lives under /integrations, excluded from the
     # crates.io package (see [package].exclude) — membership is orthogonal to
     # packaging; the desktop target builds + clippies in the workspace CI.

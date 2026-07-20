@@ -1,15 +1,43 @@
 <?xml version="1.0" encoding="utf-8"?>
 <!--
-  rsac-255b — androidTest manifest for the self-instrumenting test APK.
+  rsac-e6d3 — androidTest manifest for the self-instrumenting test APK.
 
-  RECORD_AUDIO already merges in from the library's main manifest, but it is
-  redeclared here explicitly so the TEST APK's permission never depends on
-  manifest-merge scoping (GrantPermissionRule can only grant a permission the
-  installed package actually declares). Mic path only: no MediaProjection,
-  no foreground-service permissions needed here.
+  MIC tier (rsac-255b): RECORD_AUDIO is redeclared here explicitly so the TEST
+  APK's permission never depends on manifest-merge scoping (GrantPermissionRule
+  can only grant a permission the installed package actually declares).
+
+  PLAYBACK tier (rsac-e6d3): the MediaProjection consent flow additionally
+  needs the foreground-service permissions and the mediaProjection-typed
+  RsacCaptureService, plus a foreground test Activity to launch the consent
+  dialog from. RsacCaptureService and the FGS permissions merge in from the
+  library's main manifest, but — same defensive posture as RECORD_AUDIO above —
+  the FGS uses-permissions are redeclared here so the test APK never depends on
+  merge scoping, and the test-only Activity is declared here (it exists only in
+  androidTest, so it can only be declared here).
 -->
 <manifest xmlns:android="http://schemas.android.com/apk/res/android">
 
     <uses-permission android:name="android.permission.RECORD_AUDIO" />
+    <uses-permission android:name="android.permission.FOREGROUND_SERVICE" />
+    <uses-permission android:name="android.permission.FOREGROUND_SERVICE_MEDIA_PROJECTION" />
+
+    <!--
+      allowAudioPlaybackCapture=true: the test process plays a MEDIA tone and
+      captures it via SystemDefault. AudioPlaybackCapture only picks up
+      playback the PLAYING app permits; the default is true for apps targeting
+      API 29+, but we set it explicitly so capturability never hinges on the
+      test APK's resolved targetSdk (minSdk is 29). USAGE_MEDIA is capturable
+      by third parties (unlike USAGE_VOICE_COMMUNICATION).
+    -->
+    <application android:allowAudioPlaybackCapture="true">
+        <!--
+          Foreground host Activity for the consent flow. exported=false; it is
+          launched only in-process by ActivityScenario. No launcher intent
+          filter — the test drives it directly.
+        -->
+        <activity
+            android:name="ai.codeseys.rsac.RsacTestActivity"
+            android:exported="false" />
+    </application>
 
 </manifest>
