@@ -477,6 +477,7 @@ verified platforms.
 
 - Docker-based Linux devcontainer remains available; the old Docker test matrix is retired in favor of CI and local hardware testing
 - macOS backend includes compatibility with macOS 14.4–15 (Sonoma/Sequoia) and macOS 26 (Tahoe) via 3-path API fallback. See [macOS Version Compatibility](docs/MACOS_VERSION_COMPATIBILITY.md).
+- The TCC-gated macOS Process-Tap capture paths run as an on-demand **self-hosted** CI leg ([`ci-audio-macos-tcc.yml`](.github/workflows/ci-audio-macos-tcc.yml) + [`docs/SELF_HOSTED_TCC_RUNNER.md`](docs/SELF_HOSTED_TCC_RUNNER.md)) — **kit ready, runner pending owner setup** (not claimed green).
 
 ### Architecture alignment
 

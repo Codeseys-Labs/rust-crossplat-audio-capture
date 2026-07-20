@@ -490,6 +490,32 @@ enum rsac_error_t rsac_builder_set_target_app_by_id(struct RsacBuilder *builder,
  enum rsac_error_t rsac_builder_set_android_projection(struct RsacBuilder *builder, int64_t token) ;
 
 /**
+ * Supplies the App Group identifier for iOS system-audio capture (iOS
+ * targets only).
+ *
+ * `app_group` is the shared App Group identifier (e.g.
+ * `"group.com.example.myapp.rsac"`). iOS serves `SystemDefault` capture
+ * through a ReplayKit Broadcast Upload Extension writing into a ring in the
+ * shared App Group container (ADR-0013); the group id is the config-time
+ * consent artifact the backend needs to find that container — the iOS analog
+ * of `rsac_builder_set_android_projection()`'s token. On iOS builds the
+ * string is copied onto the builder's config; `SystemDefault` builds without
+ * one fail `rsac_builder_build()` with `RSAC_ERROR_CONFIGURATION`.
+ * Microphone (`device:`) targets never need one.
+ *
+ * The symbol exists on every platform so the C ABI is uniform; on non-iOS
+ * platforms the call is rejected with `RSAC_ERROR_PLATFORM_NOT_SUPPORTED`.
+ *
+ * Returns `RSAC_ERROR_NULL_POINTER` if `builder` or `app_group` is null, and
+ * `RSAC_ERROR_INVALID_PARAMETER` if `app_group` is not valid UTF-8 (both
+ * checked on every platform, before the platform gate).
+ */
+
+enum rsac_error_t rsac_builder_set_ios_app_group(struct RsacBuilder *builder,
+                                                 const char *app_group)
+;
+
+/**
  * Sets the desired sample rate in Hz.
  */
  enum rsac_error_t rsac_builder_set_sample_rate(struct RsacBuilder *builder, uint32_t sample_rate) ;

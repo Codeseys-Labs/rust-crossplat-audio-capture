@@ -20,6 +20,32 @@ Releases with no ABI change omit the subsection (or state "No C ABI changes").
 
 ### Added
 
+- **bindings (C FFI):** new `rsac_builder_set_ios_app_group(builder, app_group)`
+  — iOS App Group consent configuration reaches the C ABI, completing mobile
+  consent parity with the Rust builder (`with_ios_app_group`). Uniform-ABI
+  contract like its Android sibling: the symbol exists on every platform;
+  null/invalid-UTF-8 arguments error before the platform gate; non-iOS returns
+  `RSAC_ERROR_PLATFORM_NOT_SUPPORTED`. (rsac-c209)
+- **bindings (Go):** `CaptureBuilder.WithAndroidProjection(token)` and
+  `CaptureBuilder.WithIOSAppGroup(group)` — the mobile consent setters reach
+  Go, staged on the builder and applied at `Build()`. Wrong-platform calls
+  surface the documented `ErrPlatformNotSupported` code + message. New parity
+  tests pin the Go surface to the FFI header bidirectionally. (rsac-c209)
+- **CI/release:** non-Rust supply-chain audit gates (`supply-chain.yml`:
+  npm/Python/Go advisories + license allowlists, cross-ecosystem osv-scanner,
+  weekly cron) (rsac-c383); cross-manifest version-lockstep gate now runs
+  inside all three registry publish workflows before any upload
+  (`scripts/check-version-lockstep.sh`, 9 manifests + 2 internal pins)
+  (rsac-e06e); `cargo publish --locked`, yanked-crate denial, build-info
+  recording, and an advisory CycloneDX SBOM artifact (rsac-8d55); publish
+  workflows converted to OIDC trusted publishing — no long-lived registry
+  tokens (rsac-aaea, workflows stay disabled until registry-side setup);
+  self-hosted macOS TCC-gated audio E2E kit — on-demand workflow + attended
+  onboarding scripts + runbook (rsac-ad28, runner pending owner setup).
+- **build (napi):** committed `bun.lock` with frozen installs everywhere and
+  an exact Bun pin (1.3.14) across CI/release — a missing or drifted lockfile
+  now fails loudly instead of silently re-resolving. (rsac-e652)
+
 - **core/audio (Android):** new `rsac::release_projection_token(token)` — releases
   an **unconsumed** `AndroidProjectionToken` (stops its `MediaProjection` +
   frees the `GlobalRef`) without starting a capture, for the "consent granted,

@@ -10,11 +10,17 @@
 # version input. Bump bindings/rsac-napi/package.json version in lockstep
 # with the root Cargo.toml before publishing (see docs/RELEASE_PROCESS.md).
 #
-# Required GitHub secret:
-#   NPM_TOKEN — npm automation token with publish rights on @rsac scope.
-#               Create at https://www.npmjs.com/settings/<user>/tokens
-#               (type: Automation). Add via Settings → Secrets and
-#               variables → Actions → New repository secret.
+# Authentication: npm Trusted Publishing (OIDC, GA 2025) — NO long-lived
+# secret. The publish-npm job requests `id-token: write`; the npm CLI
+# (upgraded to >= 11.5.1 at publish time) auto-detects the GitHub OIDC
+# environment, authenticates with a short-lived token, and generates
+# provenance automatically. The previous NPM_TOKEN repo secret is no longer
+# used. A Trusted Publisher must be configured on npmjs.com for the main
+# @rsac/audio package AND every @rsac/audio-<platform> sub-package, each
+# pointing at this repo + release-npm.yml (npmjs.com → package Settings →
+# Trusted publisher; see docs/RELEASE_PROCESS.md §"npm Trusted Publishing
+# setup"). Until every sub-package has one, publishing falls back to a token
+# for any package that lacks a publisher — track this in the setup doc.
 #
 # Security note: this workflow is tag-triggered only. No untrusted
 # event payloads (issue bodies, PR titles, commit messages, etc.) are
@@ -168,9 +174,16 @@ jobs:
           node-version: '20'
           registry-url: 'https://registry.npmjs.org'
 
+      # rsac-e652: pin an exact Bun version (not `latest`) so a Bun release
+      # can't silently change lockfile-resolution/install behavior out from
+      # under a release build. Keep this in lockstep with ci.yml/
+      # ci-audio-tests.yml's setup-bun steps — bump all three together.
       - uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6 # v2
         with:
-          bun-version: latest
+          bun-version: '1.3.14'
+          # Cache poisoning hardening (privileged/publish workflow): no shared
+          # Actions cache restore.
+          no-cache: true
 
       - name: Install PipeWire dev libraries (Linux)
         if: matrix.install_deps
@@ -190,6 +203,24 @@ jobs:
         working-directory: .
         run: sudo apt-get install -y gcc-arm-linux-gnueabihf
 
+      # Provenance recording (rsac-8d55(c)): snapshot the toolchain + the OS
+      # package versions this Linux leg installed (PipeWire + any cross
+      # toolchain) into the job log and a per-target build-info file uploaded
+      # below. Linux legs only (macOS/Windows install no apt packages).
+      # Best-effort — never fails the build.
+      - name: Record build info (toolchain + OS package versions)
+        if: matrix.install_deps
+        working-directory: ${{ github.workspace }}
+        run: bash scripts/record-build-info.sh "build-info-${{ matrix.napi-target }}.txt" gcc-aarch64-linux-gnu gcc-arm-linux-gnueabihf
+
+      - name: Upload build-info artifact (Linux legs)
+        if: matrix.install_deps
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: build-info-napi-${{ matrix.napi-target }}
+          path: build-info-${{ matrix.napi-target }}.txt
+          if-no-files-found: warn
+
       - name: Setup Zig (musl targets)
         if: matrix.zigbuild
         uses: mlugg/setup-zig@d1434d08867e3ee9daa34448df10607b98908d29 # v2
@@ -202,8 +233,17 @@ jobs:
         with:
           tool: cargo-zigbuild
 
-      - name: bun install
-        run: bun install --frozen-lockfile || bun install
+      # rsac-e652: no unfrozen fallback — a stale bun.lock (drifted from
+      # package.json) FAILS loudly instead of silently re-resolving and
+      # publishing with unpinned dependency versions. The explicit `test -f`
+      # guard is load-bearing: bun install --frozen-lockfile silently
+      # REGENERATES a missing lockfile instead of failing (verified locally,
+      # bun 1.3.14), so without it a deleted bun.lock would pass this step
+      # silently and publish anyway.
+      - name: bun install --frozen-lockfile
+        run: |
+          test -f bun.lock || { echo "::error::bindings/rsac-napi/bun.lock is missing — commit a lockfile (bun install)."; exit 1; }
+          bun install --frozen-lockfile
 
       - name: napi build
         # Build path selection:
@@ -249,7 +289,13 @@ jobs:
     runs-on: blacksmith-4vcpu-ubuntu-2404
     permissions:
       contents: read
-      # `npm publish --provenance` mints a provenance attestation via OIDC.
+      # npm Trusted Publishing (GA 2025): the npm CLI (>= 11.5.1) auto-detects
+      # the GitHub OIDC environment and authenticates with a short-lived token
+      # instead of a long-lived NPM_TOKEN — and generates provenance
+      # attestations automatically. Requires id-token: write. A Trusted
+      # Publisher must be configured on npmjs.com for the main @rsac/audio
+      # package AND every @rsac/audio-<platform> sub-package (see
+      # docs/RELEASE_PROCESS.md §"npm Trusted Publishing setup").
       id-token: write
     defaults:
       run:
@@ -285,17 +331,59 @@ jobs:
             exit 1
           fi
 
+      # Full cross-manifest version-lockstep gate (rsac-e06e). The step above
+      # only checks the tag/dispatch version against rsac-napi's package.json;
+      # this asserts that EVERY lockstep manifest + the rsac-ffi internal dep
+      # pin agree (hard-fail on any divergence) BEFORE `napi prepublish`
+      # publishes the platform sub-packages to npm. Same script the ci.yml
+      # version-lockstep job runs. Pinned to the workspace root because this
+      # job's default working-directory is bindings/rsac-napi.
+      - name: Verify version lockstep across all manifests
+        working-directory: ${{ github.workspace }}
+        run: bash scripts/check-version-lockstep.sh
+
       - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
         with:
           node-version: '20'
           registry-url: 'https://registry.npmjs.org'
+          # Cache poisoning hardening: this job holds id-token: write and
+          # publishes — never restore a shared Actions cache a branch build
+          # could have poisoned (GitHub's own guidance for privileged jobs).
+          package-manager-cache: false
 
+      # npm Trusted Publishing needs npm CLI >= 11.5.1 for OIDC auto-detection
+      # + automatic provenance. Node 20 ships npm 10.x, which predates it, so
+      # upgrade the system npm here. Both `napi prepublish` (sub-packages) and
+      # the main-package publish below shell out to this npm on PATH, so the
+      # upgrade covers the whole publish path. Pinned to a known-good 11.x.
+      - name: Upgrade npm to a Trusted-Publishing-capable version
+        working-directory: ${{ github.workspace }}
+        run: |
+          npm install -g npm@11.5.1
+          echo "npm version: $(npm --version)"
+
+      # rsac-e652: pin an exact Bun version (not `latest`) so a Bun release
+      # can't silently change lockfile-resolution/install behavior out from
+      # under a release build. Keep this in lockstep with ci.yml/
+      # ci-audio-tests.yml's setup-bun steps — bump all three together.
       - uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6 # v2
         with:
-          bun-version: latest
+          bun-version: '1.3.14'
+          # Cache poisoning hardening (privileged/publish workflow): no shared
+          # Actions cache restore.
+          no-cache: true
 
-      - name: bun install
-        run: bun install --frozen-lockfile || bun install
+      # rsac-e652: no unfrozen fallback — a stale bun.lock (drifted from
+      # package.json) FAILS loudly instead of silently re-resolving and
+      # publishing with unpinned dependency versions. The explicit `test -f`
+      # guard is load-bearing: bun install --frozen-lockfile silently
+      # REGENERATES a missing lockfile instead of failing (verified locally,
+      # bun 1.3.14), so without it a deleted bun.lock would pass this step
+      # silently and publish anyway.
+      - name: bun install --frozen-lockfile
+        run: |
+          test -f bun.lock || { echo "::error::bindings/rsac-napi/bun.lock is missing — commit a lockfile (bun install)."; exit 1; }
+          bun install --frozen-lockfile
 
       - name: Download all .node artifacts
         uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
@@ -339,19 +427,17 @@ jobs:
 
       # rsac-e93b: `napi prepublish -t npm` does more than "generate" the
       # platform packages — it PUBLISHES each @rsac/audio-<platform>
-      # sub-package to npm, so this step needs the npm auth token
-      # (NODE_AUTH_TOKEN feeds the .npmrc written by setup-node's
-      # registry-url; NPM_CONFIG_TOKEN covers direct npm-config reads).
-      # Without it the sub-package publishes fail auth (E401/ENEEDAUTH).
+      # sub-package to npm by shelling out to `npm publish` (the system npm on
+      # PATH, upgraded to a Trusted-Publishing-capable version above). Under
+      # Trusted Publishing (GA 2025) that npm auto-detects the OIDC environment
+      # and authenticates with a short-lived token — NO NPM_TOKEN needed. Every
+      # @rsac/audio-<platform> sub-package must therefore have its own Trusted
+      # Publisher configured on npmjs.com (see docs/RELEASE_PROCESS.md).
       # We keep this explicit step (rather than relying on package.json's
       # `prepublishOnly` lifecycle hook) so we control --skip-gh-release —
       # GitHub Releases are created by release-tag.yml/release.yml, and this
       # job's token has no contents:write scope anyway.
       - name: napi prepublish (publish platform sub-packages)
-        env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
-          NPM_CONFIG_TOKEN: ${{ secrets.NPM_TOKEN }}
         run: bunx @napi-rs/cli prepublish -t npm --skip-gh-release
 
       # --ignore-scripts is load-bearing: package.json declares
@@ -360,8 +446,9 @@ jobs:
       # platform sub-package a second time (E403 already-published), failing
       # the release after a partial publish. The sub-packages were published
       # by the explicit step above; this step publishes ONLY the main package.
+      # Uses the system npm (>= 11.5.1) directly — NOT `bunx npm` — so npm's
+      # OIDC auto-detection runs under the real npm CLI. Under Trusted
+      # Publishing, provenance is generated automatically, so the explicit
+      # --provenance flag is no longer required (harmless to omit).
       - name: Publish main package (sub-packages already published above)
-        env:
-          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
-          NPM_CONFIG_TOKEN: ${{ secrets.NPM_TOKEN }}
-        run: bunx npm publish --access public --provenance --ignore-scripts
+        run: npm publish --access public --ignore-scripts

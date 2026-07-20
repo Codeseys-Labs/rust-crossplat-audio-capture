@@ -6,7 +6,7 @@
 #
 #   1. release-prepare.yml (THIS FILE)  — workflow_dispatch; computes the next
 #      non-major version, runs scripts/bump-version.sh, and opens a reviewable
-#      "release: vX.Y.Z" PR (bump of the 5 manifests + CHANGELOG rotation).
+#      "release: vX.Y.Z" PR (bump of the 9 manifests + CHANGELOG rotation).
 #   2. release-tag.yml                  — on push to master, detects a merged
 #      "release: v…" squash commit and creates + pushes the annotated tag.
 #   3. release.yml / release-npm.yml / release-pypi.yml — fan out off that tag.
@@ -145,10 +145,10 @@ jobs:
       # This workflow otherwise runs no cargo command, so it had no toolchain.
       - uses: dtolnay/rust-toolchain@e081816240890017053eacbb1bdf337761dc5582 # 1.95.0
 
-      # Bump the 5 manifests + rotate the CHANGELOG. The script computes its own
+      # Bump the 9 manifests + rotate the CHANGELOG. The script computes its own
       # UTC date (date -u +%Y-%m-%d) for the dated CHANGELOG header; we run it
       # under an explicit UTC TZ so that date is unambiguous on the runner.
-      - name: Apply version bump (5 manifests + CHANGELOG rotation)
+      - name: Apply version bump (9 manifests + CHANGELOG rotation)
         env:
           TZ: UTC
         run: bash scripts/bump-version.sh "${{ steps.next.outputs.version }}"
@@ -196,7 +196,7 @@ jobs:
             Automated release preparation (`${{ inputs.bump }}` bump) from
             `${{ steps.next.outputs.current }}` → `${{ steps.next.outputs.version }}`.
 
-            This PR bumps the seven lockstep manifests and rotates the CHANGELOG:
+            This PR bumps the nine lockstep manifests and rotates the CHANGELOG:
 
             - `Cargo.toml`
             - `bindings/rsac-ffi/Cargo.toml`

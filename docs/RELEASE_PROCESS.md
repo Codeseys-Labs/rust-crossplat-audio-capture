@@ -51,11 +51,17 @@ The three publish workflows below run when a tag is pushed by something OTHER
 than a workflow's `GITHUB_TOKEN` (i.e. path 2, or path 1 with the release App
 secrets configured) — they never trigger off anything but a `v*.*.*` tag push.
 
-| Workflow | Registry | Matrix | Key jobs | Required secret |
+All three workflows now authenticate via **registry Trusted Publishing
+(OIDC)** — no long-lived registry secrets. Each publish job requests
+`id-token: write` and the registry accepts a short-lived, workflow-scoped
+token. A one-time Trusted Publisher must be configured per registry (see
+[§ Trusted Publishing setup (OIDC)](#trusted-publishing-setup-oidc)).
+
+| Workflow | Registry | Matrix | Key jobs | Auth |
 |---|---|---|---|---|
-| `.github/workflows/release.yml` | crates.io | linux/win/mac | `verify` → `publish` → `github-release` | `CARGO_REGISTRY_TOKEN` |
-| `.github/workflows/release-npm.yml` | npm (`@rsac/audio`) | 8 napi-rs targets (5 required + 3 best-effort) | `verify-napi-build` (×8) → `publish-npm` | `NPM_TOKEN` |
-| `.github/workflows/release-pypi.yml` | PyPI (`rsac`) | 4 abi3 wheels (linux x86_64 + aarch64, macOS universal2, windows x64) + sdist | `build-wheels` (×4) + `build-sdist` → `publish-pypi` | none — PyPI Trusted Publishing / OIDC |
+| `.github/workflows/release.yml` | crates.io | linux/win/mac | `verify` → `publish` → `github-release` | Trusted Publishing / OIDC (`rust-lang/crates-io-auth-action`) |
+| `.github/workflows/release-npm.yml` | npm (`@rsac/audio`) | 8 napi-rs targets (5 required + 3 best-effort) | `verify-napi-build` (×8) → `publish-npm` | Trusted Publishing / OIDC (npm CLI ≥ 11.5.1 auto-detect) |
+| `.github/workflows/release-pypi.yml` | PyPI (`rsac`) | 4 abi3 wheels (linux x86_64 + aarch64, macOS universal2, windows x64) + sdist | `build-wheels` (×4) + `build-sdist` → `publish-pypi` | Trusted Publishing / OIDC (`pypa/gh-action-pypi-publish`) |
 
 ### `release.yml` (crates.io)
 
@@ -81,9 +87,21 @@ secrets configured) — they never trigger off anything but a `v*.*.*` tag push.
    Linux runner first runs a version guard (on a tag push the tag must
    match `Cargo.toml`'s `[package].version`; on a `workflow_dispatch`
    with `dry_run=false` the `version` input is required and must match —
-   dry runs may omit it), then executes
-   `cargo publish --dry-run` and then `cargo publish`. Uses the
-   `CARGO_REGISTRY_TOKEN` repo secret.
+   dry runs may omit it), then runs the **full cross-manifest lockstep
+   gate** (`scripts/check-version-lockstep.sh` — the same script the
+   `version-lockstep` CI job uses; it hard-fails if any lockstep manifest
+   or the rsac-ffi internal dep pin diverges) **before** any upload path,
+   records build provenance (toolchain + OS package versions), then
+   executes `cargo publish --locked --dry-run` and `cargo publish
+   --locked` (`--locked` resolves against the committed `Cargo.lock` for a
+   reproducible publish). Authentication is **crates.io Trusted Publishing
+   (OIDC)** — the job requests `id-token: write` and exchanges the GitHub
+   OIDC token for a short-lived crates.io API token via
+   `rust-lang/crates-io-auth-action` (auto-revoked when the job ends); the
+   previous `CARGO_REGISTRY_TOKEN` repo secret is no longer used. After the
+   publish it generates a **CycloneDX SBOM** and uploads it plus the
+   build-info file as a release artifact (both strictly advisory — SBOM
+   tool failure warns, never fails the release).
 4. **`github-release`** — depends on `publish`; extracts the CHANGELOG
    section matching the tag version and publishes a GitHub Release via
    `softprops/action-gh-release@v2`.
@@ -163,17 +181,26 @@ release:
 
 2. **`publish-npm`** — depends on all eight matrix entries (but the
    best-effort ones are gated by `continue-on-error`, so their failure
-   does not block this job). Downloads every available `.node` into
-   `bindings/rsac-napi/artifacts/`, runs `bunx @napi-rs/cli artifacts
+   does not block this job). Runs the **full cross-manifest lockstep
+   gate** (`scripts/check-version-lockstep.sh`) before any upload,
+   **upgrades the system npm to ≥ 11.5.1** (Node 20 ships npm 10.x, which
+   predates OIDC trusted publishing), downloads every available `.node`
+   into `bindings/rsac-napi/artifacts/`, runs `bunx @napi-rs/cli artifacts
    --dir artifacts` to move them into place, then `bunx @napi-rs/cli
    prepublish -t npm --skip-gh-release` — which itself **publishes** the
-   per-platform sub-packages (`@rsac/audio-darwin-arm64`, etc.) to npm,
-   so that step carries the npm auth env — and finally `bunx npm publish
-   --access public --provenance --ignore-scripts` for the main package
+   per-platform sub-packages (`@rsac/audio-darwin-arm64`, etc.) to npm by
+   shelling out to the (upgraded) system `npm` — and finally `npm publish
+   --access public --ignore-scripts` for the main package
    (`--ignore-scripts` because package.json's `prepublishOnly` hook would
    otherwise re-run `napi prepublish` and double-publish the
-   sub-packages). Uses `NPM_TOKEN` as `NODE_AUTH_TOKEN` /
-   `NPM_CONFIG_TOKEN` on both steps.
+   sub-packages). Authentication is **npm Trusted Publishing (OIDC)**: the
+   job requests `id-token: write` and the npm CLI auto-detects the OIDC
+   environment, authenticates with a short-lived token, and generates
+   provenance automatically (so the explicit `--provenance` flag is no
+   longer needed). No `NPM_TOKEN` secret. **Every** package published —
+   the main `@rsac/audio` **and each** `@rsac/audio-<platform>`
+   sub-package — must have its own Trusted Publisher configured on
+   npmjs.com (see [§ Trusted Publishing setup](#trusted-publishing-setup-oidc)).
 
 ### `release-pypi.yml` (PyPI)
 
@@ -225,24 +252,73 @@ release:
 
 ### One-time setup
 
-Before the **first** tag push, a maintainer must configure credentials
-for each registry they plan to publish to — two repo secrets plus one
-PyPI-side Trusted Publisher configuration (PyPI uses OIDC, not a
-secret):
+All three registries now authenticate via **Trusted Publishing (OIDC)** —
+there are **no long-lived registry secrets** to create. Instead, a
+maintainer configures a Trusted Publisher on each registry's web UI once,
+pointing it at this repository + the publishing workflow. The full
+per-registry procedure is in
+[§ Trusted Publishing setup (OIDC)](#trusted-publishing-setup-oidc).
 
-| Registry | What to configure | Source |
-|---|---|---|
-| crates.io | repo secret `CARGO_REGISTRY_TOKEN` | <https://crates.io/me> → API Tokens, scope `publish-update` (+ `publish-new` if not yet published) |
-| npm | repo secret `NPM_TOKEN` | <https://www.npmjs.com/settings/~/tokens> → new **Automation** token with publish rights on the `@rsac` scope |
-| PyPI | **Trusted Publisher** on the PyPI `rsac` project — no repo secret | <https://docs.pypi.org/trusted-publishers/> → add a GitHub publisher with owner `Codeseys-Labs`, repository `rust-crossplat-audio-capture`, workflow `release-pypi.yml` (no environment). For the very first publish use PyPI's "pending publisher" flow, which reserves the project name against this repo + workflow. |
+Until a registry's Trusted Publisher is configured, that registry's
+`publish-*` job fails (crates.io/npm reject the OIDC token exchange; PyPI
+rejects the upload) — the other two flows continue independently. In that
+state, fall back to the manual procedure below (§2–§6) for the affected
+registry.
 
-Add the two secrets via **Settings → Secrets and variables → Actions →
-New repository secret**. The PyPI side is configured on pypi.org, not
-in GitHub.
+> **Migrating off the old token secrets.** The previous
+> `CARGO_REGISTRY_TOKEN` and `NPM_TOKEN` repo secrets (and the earlier
+> `MATURIN_PYPI_TOKEN`) are no longer read by any workflow. After the first
+> successful Trusted-Publishing release to each registry, delete the stale
+> secrets from **Settings → Secrets and variables → Actions** so they
+> cannot be misused.
 
-A missing credential causes its workflow's `publish-*` job to fail —
-the other two flows continue independently. In that state, fall back
-to the manual procedure below (§2–§6) for the affected registry.
+### Trusted Publishing setup (OIDC)
+
+One-time, web-UI-only configuration per registry. Each publisher binds a
+registry package to this exact repository + workflow, so only a run of that
+workflow in this repo can mint a publish token. No secret is stored in
+GitHub. Owner: `Codeseys-Labs`; repository:
+`rust-crossplat-audio-capture`.
+
+**crates.io** (`rsac` crate) — replaces `CARGO_REGISTRY_TOKEN`.
+1. Publish `rsac` once with a classic token if it does not yet exist
+   (Trusted Publishing configures an *existing* crate).
+2. On <https://crates.io> → the `rsac` crate → **Settings → Trusted
+   Publishing → Add** a GitHub publisher: repository owner `Codeseys-Labs`,
+   repository name `rust-crossplat-audio-capture`, workflow filename
+   `release.yml`, environment blank.
+3. `release.yml`'s `publish` job (`id-token: write`) then exchanges the
+   OIDC token via `rust-lang/crates-io-auth-action` at publish time.
+
+**npm** (`@rsac/audio` **and every** `@rsac/audio-<platform>` sub-package)
+— replaces `NPM_TOKEN`.
+1. Each package must exist on npm first (publish once with a token if new).
+   The platform sub-packages are `@rsac/audio-darwin-x64`,
+   `-darwin-arm64`, `-linux-x64-gnu`, `-linux-arm64-gnu`,
+   `-win32-x64-msvc` (plus any best-effort ones that built:
+   `-linux-x64-musl`, `-linux-arm64-musl`, `-linux-arm-gnueabihf`).
+2. For **each** package on <https://www.npmjs.com> → package **Settings →
+   Trusted publisher →** GitHub Actions: organization/owner
+   `Codeseys-Labs`, repository `rust-crossplat-audio-capture`, workflow
+   filename `release-npm.yml`, environment blank.
+3. `release-npm.yml`'s `publish-npm` job (`id-token: write`) upgrades npm
+   to ≥ 11.5.1, which auto-detects OIDC and publishes with automatic
+   provenance.
+   > Any sub-package **without** a Trusted Publisher will fail its publish
+   > under OIDC. If you cannot configure all sub-packages at once, keep a
+   > temporary `NPM_TOKEN` fallback for the missing ones (npm falls back to
+   > a token when no OIDC publisher matches) and remove it once every
+   > package has a publisher.
+
+**PyPI** (`rsac` project) — already OIDC; no change needed.
+1. On <https://pypi.org> → the `rsac` project → **Publishing → Add a new
+   publisher** (GitHub): owner `Codeseys-Labs`, repository
+   `rust-crossplat-audio-capture`, workflow `release-pypi.yml`, environment
+   blank. For the very **first** publish use PyPI's *pending publisher*
+   flow (<https://docs.pypi.org/trusted-publishers/>), which reserves the
+   project name against this repo + workflow before the project exists.
+2. `release-pypi.yml`'s `publish-pypi` job (`id-token: write`) uploads via
+   `pypa/gh-action-pypi-publish` with no token input.
 
 ### Using the automated flow
 
@@ -251,7 +327,7 @@ release (see §2 for the pre-release checklist):
 
 ```bash
 # Bump the version + promote CHANGELOG entries under a dated heading.
-# scripts/bump-version.sh rewrites all seven lockstep manifests + rotates
+# scripts/bump-version.sh rewrites all nine lockstep manifests + rotates
 # the CHANGELOG — see §2 "CHANGELOG promotion" and §3 "Version bump".
 git add -A
 git commit -m "rsac X.Y.Z"
@@ -350,7 +426,7 @@ There is deliberately **no `major` option**. `release-prepare.yml`
    refuses anyway if a future edit ever does) and **refuses if the tag
    `vX.Y.Z` already exists**.
 2. Runs `bash scripts/bump-version.sh <computed-version>` (under
-   `TZ=UTC`), which rewrites **all seven** lockstep manifests
+   `TZ=UTC`), which rewrites **all nine** lockstep manifests
    (`Cargo.toml`, `bindings/rsac-ffi/Cargo.toml` — including its internal
    `rsac = { path = "../../", version = "…" }` dependency pin —
    `bindings/rsac-napi/{Cargo.toml,package.json}`,
@@ -376,7 +452,7 @@ writes to `master`.
 
 Treat the `release: vX.Y.Z` PR like any other PR: review the manifest
 diff and the CHANGELOG rotation. The CI **`version-lockstep` gate must be
-green** on the PR before merging — it cross-checks that all **seven** manifests
+green** on the PR before merging — it cross-checks that all **nine** manifests
 (root `Cargo.toml`, the rsac-ffi / rsac-napi / rsac-python `Cargo.toml`s, the
 napi `package.json`, the python `pyproject.toml`, and the Android native shim)
 carry the same version.
@@ -384,7 +460,7 @@ Because this gate runs on the PR/master push that subsequently gets tagged, the
 tagged commit is already lockstep-verified before `release-tag.yml` tags it. (At
 *tag* time, `release.yml` additionally re-checks the tag matches the root
 `Cargo.toml`, and `ci.yml` *also* re-runs on the `v*.*.*` tag push — its `on:`
-block includes a `tags: ['v*.*.*', '!v*-*']` trigger — so the full seven-manifest
+block includes a `tags: ['v*.*.*', '!v*-*']` trigger — so the full nine-manifest
 lockstep gate runs again at tag time as well as on push/PR.)
 
 > **Merge it as a SQUASH merge, and do NOT edit the commit subject.** The
@@ -467,12 +543,15 @@ GitHub Release appears:
   (it has a `workflow_dispatch` with a `dry_run` toggle; set `dry_run:
   false` **and enter the expected `X.Y.Z` in the `version` input** to
   publish for real — the publish job refuses a real dispatch publish
-  without a `version` that matches `Cargo.toml`). Needs the
-  `CARGO_REGISTRY_TOKEN` secret.
+  without a `version` that matches `Cargo.toml`). Authenticates via
+  crates.io Trusted Publishing (OIDC) — requires the crates.io Trusted
+  Publisher (see [§ Trusted Publishing setup](#trusted-publishing-setup-oidc)).
 - **npm** (`@rsac/audio`) — Actions → **Release npm**
   (`release-npm.yml`) → *Run workflow*, enter `X.Y.Z`, and set `publish:
   true`. With `publish` left false, the workflow only builds/smokes the
-  artifacts. Needs the `NPM_TOKEN` secret.
+  artifacts. Authenticates via npm Trusted Publishing (OIDC) — requires the
+  npm Trusted Publisher on the main package **and** every platform
+  sub-package.
 - **PyPI** (`rsac`) — Actions → **Release PyPI** (`release-pypi.yml`) →
   *Run workflow*, enter `X.Y.Z`, and set `publish: true`. With `publish`
   left false, the workflow only builds/smokes wheels and sdist. Publishes
@@ -518,7 +597,7 @@ secrets are never an error: the workflow logs the fallback, pushes with
   major-crossing release commit. A `X` → `X+1` (or pre-1.0 `0.x` →
   `0.(x+1)` per the ABI policy in §"Versioning & ABI contract") bump must
   be done **manually**: run `scripts/bump-version.sh <new-major.0.0>`
-  (which rewrites all seven manifests, `bindings/rsac-ffi/Cargo.toml`
+  (which rewrites all nine manifests, `bindings/rsac-ffi/Cargo.toml`
   included), commit with a normal (non-`release:`) message, then tag and
   push by hand per §4.
 - **The `bindings/rsac-go/vX.Y.Z` Go module tag on a manual release.**
@@ -537,7 +616,7 @@ secrets are never an error: the workflow logs the fallback, pushes with
 - **Idempotent tagging** — `release-tag.yml` never re-creates an existing
   local or remote tag.
 - **`version-lockstep`** gates the release PR and is re-checked on the tag
-  by `release.yml`; the seven manifests must agree before anything ships.
+  by `release.yml`; the nine manifests must agree before anything ships.
 - **Repo-guarded** — both workflows only run on
   `Codeseys-Labs/rust-crossplat-audio-capture`.
 - **Major-proof** — three independent guards (no `major` input, prepare
@@ -568,24 +647,24 @@ carry version `X.Y.Z`:
 | `bindings/rsac-python/pyproject.toml` | `[project].version` | PyPI package `rsac` |
 | `mobile/android-native/Cargo.toml` | `[package].version` | Android `librsac.so` shim packaged into the AAR |
 
-Run `bash scripts/bump-version.sh X.Y.Z` to rewrite **all seven** manifests
+Run `bash scripts/bump-version.sh X.Y.Z` to rewrite **all nine** manifests
 in one shot — including `bindings/rsac-ffi/Cargo.toml` and its internal
 `rsac = { path = "../../", version = "…" }` dependency pin — plus the
 CHANGELOG rotation. The
-`version-lockstep` CI job re-checks all seven values on every push/PR
+`version-lockstep` CI job re-checks all nine values on every push/PR
 (warning on a mid-cycle skew). Because the release PR's merge commit is a
 push to `master`, this gate runs — and must be green — on the exact commit that
 `release-tag.yml` then tags, so a mismatched manifest never reaches the tag.
 At *tag* time, `release.yml`'s `verify` job independently re-checks the pushed
 tag against the root `Cargo.toml` before publishing (a second, registry-side
-gate), and `ci.yml` re-runs its full seven-manifest lockstep on the `v*.*.*` tag
+gate), and `ci.yml` re-runs its full nine-manifest lockstep on the `v*.*.*` tag
 push too (its `on:` block has a `tags: ['v*.*.*', '!v*-*']` trigger), so the
 lockstep gate covers push/PR *and* tag time. A mismatched manifest must never
 reach a registry.
 
 > Mid-cycle skew is tolerated by CI (warning only) so a binding can lag
 > the root crate between releases, but it must be reconciled before
-> tagging. As of this writing all seven lockstep manifests agree at `0.4.1`
+> tagging. As of this writing all nine lockstep manifests agree at `0.4.1`
 > (`bump-version.sh` has kept them in lockstep since it grew the
 > rsac-ffi rewrite).
 
@@ -720,7 +799,9 @@ Before you start a release, confirm all of the following:
 - **Push access to `master`** on `github.com/…/rust-crossplat-audio-capture`.
   Tag pushes are used as the release trigger, so you also need permission to
   push tags.
-- **crates.io API token** exported in your shell:
+- **crates.io API token** exported in your shell — **only for a manual,
+  local `cargo publish`** (the CI flow uses Trusted Publishing / OIDC and
+  needs no token; OIDC is not available to a local shell):
   ```bash
   export CARGO_REGISTRY_TOKEN="cio_…"
   ```
@@ -742,9 +823,9 @@ Before you start a release, confirm all of the following:
 > `scripts/bump-version.sh` for you (§3), opens the bump PR, and pushes the
 > tag (§4) on merge; the tag push then does §5 and §7 step 4. These manual
 > steps remain the path for a **MAJOR** bump (the automation refuses one),
-> when the `CARGO_REGISTRY_TOKEN` secret is unset, or when a maintainer
-> needs to override the automation. `scripts/bump-version.sh` now exists
-> and rewrites all seven manifests + rotates the CHANGELOG — §3 is
+> when a registry's Trusted Publisher is not yet configured, or when a
+> maintainer needs to override the automation. `scripts/bump-version.sh` now exists
+> and rewrites all nine manifests + rotates the CHANGELOG — §3 is
 > still a manual *invocation* of it, not a hand-edit.
 
 ---
@@ -836,7 +917,7 @@ Do **not** hand-edit the version anymore — drive it through
 `scripts/bump-version.sh`, the same script the automated **Release
 Prepare** workflow runs. It takes an **explicit** `X.Y.Z` (it does *not*
 compute minor/patch — that arithmetic lives in `release-prepare.yml`) and
-rewrites all seven lockstep manifests plus rotates the CHANGELOG:
+rewrites all nine lockstep manifests plus rotates the CHANGELOG:
 
 ```bash
 # Preview the edits without writing them:
@@ -857,7 +938,7 @@ This rewrites, in one shot:
 - `CHANGELOG.md` — `## [Unreleased]` → `## [X.Y.Z] - <UTC date>` with a
   fresh `Unreleased` scaffold
 
-That covers all seven lockstep manifests — there is no manual reconcile
+That covers all nine lockstep manifests — there is no manual reconcile
 step left. The `version-lockstep` CI job checks
 all seven agree and hard-fails on a tag if any disagree.
 
@@ -930,7 +1011,7 @@ above). Both fire on the same `v*.*.*` tag push as `release.yml`.
 
 Before tagging, bump the binding manifests in lockstep with the root
 `Cargo.toml` — `bash scripts/bump-version.sh X.Y.Z` does this for you
-(all seven manifests, including `bindings/rsac-napi/package.json`,
+(all nine manifests, including `bindings/rsac-napi/package.json`,
 `bindings/rsac-python/pyproject.toml`, and `mobile/android-native/Cargo.toml`;
 see §3).
 
@@ -1084,19 +1165,21 @@ Portable shell — BSD + GNU grep/curl, `shellcheck` clean. The script
 reads its own default version from the root `Cargo.toml` so it needs no
 arguments during a standard release.
 
-### GitHub Actions secrets path
+### GitHub Actions Trusted Publishing path
 
-Before the first tag push, the publisher must add three repository
-secrets via **Settings → Secrets and variables → Actions → New
-repository secret**:
+There are **no repository secrets to add** — all three registries
+authenticate via Trusted Publishing (OIDC). Before the first tag push the
+publisher configures a Trusted Publisher on each registry's web UI,
+pointing it at this repo + the publishing workflow:
 
-| Secret name              | Registry   | Token source |
-|--------------------------|------------|--------------|
-| `CARGO_REGISTRY_TOKEN`   | crates.io  | <https://crates.io/me> → API Tokens (scope `publish-update`, plus `publish-new` on first publish) |
-| `NPM_TOKEN`              | npmjs      | <https://www.npmjs.com/settings/~/tokens> → new **Automation** token with publish rights on the `@rsac` scope |
-| PyPI Trusted Publisher   | PyPI       | Configure PyPI Trusted Publishing for this repo + `release-pypi.yml`; no long-lived token is used |
+| Registry | Configure | Where |
+|----------|-----------|-------|
+| crates.io | Trusted Publisher → `release.yml` | <https://crates.io> → `rsac` crate → Settings → Trusted Publishing |
+| npmjs     | Trusted Publisher → `release-npm.yml` on the main package **and every** `@rsac/audio-<platform>` sub-package | <https://www.npmjs.com> → package Settings → Trusted publisher |
+| PyPI      | Trusted Publisher → `release-pypi.yml` | <https://pypi.org> → `rsac` project → Publishing (pending-publisher flow for the first upload) |
 
-Each credential feeds exactly one `publish-*` job. A missing credential
+Full step-by-step: [§ Trusted Publishing setup (OIDC)](#trusted-publishing-setup-oidc).
+Each publisher scopes exactly one `publish-*` job. A missing publisher
 fails that registry's workflow only — the other two proceed independently.
 
 ### Test-first-before-production flow
@@ -1156,14 +1239,15 @@ Tracked here so follow-up release-automation tasks can pick them up:
   §3–§4. The manual §1–§9 flow remains the fallback whenever the
   automation is unavailable or a maintainer needs to override it.
 - All three registry workflows exist (`release.yml`, `release-npm.yml`,
-  `release-pypi.yml`). Before the first tag push, the corresponding
-  credentials must be configured: repo secrets `CARGO_REGISTRY_TOKEN` +
-  `NPM_TOKEN` under **Settings → Secrets and variables → Actions**, and a
-  PyPI **Trusted Publisher** on the `rsac` project (OIDC — no repo
-  secret; see §"One-time setup").
-  A missing credential fails only the affected `publish-*` job; the other
-  flows continue. Fall back to §2–§6 for the affected registry.
-- `scripts/bump-version.sh X.Y.Z` rewrites all seven manifests — the root
+  `release-pypi.yml`) and authenticate via **Trusted Publishing (OIDC)** —
+  **no repo secrets**. Before the first tag push, configure a Trusted
+  Publisher per registry on its web UI (crates.io crate Settings, npmjs
+  package Settings for the main package **and every** platform sub-package,
+  PyPI project Publishing) pointing at this repo + the publishing workflow
+  — see §"Trusted Publishing setup (OIDC)". A missing publisher fails only
+  the affected `publish-*` job; the other flows continue. Fall back to
+  §2–§6 for the affected registry.
+- `scripts/bump-version.sh X.Y.Z` rewrites all nine manifests — the root
   `Cargo.toml`, `bindings/rsac-ffi/Cargo.toml` (including its internal `rsac`
   dependency version pin), `bindings/rsac-napi/{Cargo.toml,package.json}`, and
   `bindings/rsac-python/{Cargo.toml,pyproject.toml}`, and

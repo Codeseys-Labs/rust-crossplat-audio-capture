@@ -209,6 +209,43 @@ rsac_error_t rsac_builder_set_target_process_tree(RsacBuilder* builder,
 rsac_error_t rsac_builder_set_target_str(RsacBuilder* builder,
                                          const char* spec);
 
+/**
+ * Supplies the Android MediaProjection consent token (Android targets only).
+ *
+ * `token` is the opaque int64 handle produced by the rsac Android consent
+ * helper (a JNI GlobalRef to the MediaProjection). On Android builds it is
+ * stored on the builder; playback-capture targets without it fail
+ * rsac_builder_build() with RSAC_ERROR_CONFIGURATION once an Android backend
+ * advertises the capability. Microphone ("device:") targets never need one.
+ *
+ * The symbol exists on every platform so the C ABI is uniform; on non-Android
+ * platforms the call returns RSAC_ERROR_PLATFORM_NOT_SUPPORTED.
+ */
+rsac_error_t rsac_builder_set_android_projection(RsacBuilder* builder,
+                                                 int64_t token);
+
+/**
+ * Supplies the App Group identifier for iOS system-audio capture (iOS
+ * targets only).
+ *
+ * `app_group` is the shared App Group identifier (e.g.
+ * "group.com.example.myapp.rsac") — the config-time consent artifact the iOS
+ * ReplayKit broadcast transport needs; the iOS analog of
+ * rsac_builder_set_android_projection()'s token. On iOS builds it is copied
+ * onto the builder's config; SystemDefault builds without one fail
+ * rsac_builder_build() with RSAC_ERROR_CONFIGURATION. Microphone ("device:")
+ * targets never need one.
+ *
+ * The symbol exists on every platform so the C ABI is uniform; on non-iOS
+ * platforms the call returns RSAC_ERROR_PLATFORM_NOT_SUPPORTED.
+ *
+ * Returns RSAC_ERROR_NULL_POINTER if builder or app_group is null, and
+ * RSAC_ERROR_INVALID_PARAMETER if app_group is not valid UTF-8 (both checked
+ * on every platform, before the platform gate).
+ */
+rsac_error_t rsac_builder_set_ios_app_group(RsacBuilder* builder,
+                                            const char* app_group);
+
 /** Sets the desired sample rate in Hz. */
 rsac_error_t rsac_builder_set_sample_rate(RsacBuilder* builder,
                                           uint32_t sample_rate);

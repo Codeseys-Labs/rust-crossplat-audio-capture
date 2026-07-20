@@ -125,33 +125,39 @@ step "header symbol-set diff (curated rsac.h vs generated rsac_generated.h)"
   diff -u "$CURATED_SYMS" "$GENERATED_SYMS"
 ) || { echo "gate-bindings: curated rsac.h has drifted from the generated header's symbol set." >&2; FAILED=1; }
 
-# ── napi leg: build + node --test (needs Bun or npm, from mise) ────────
+# ── napi leg: build + node --test (needs Bun, from mise) ───────────────
+# rsac-e652: Bun is the single package manager for rsac-napi — a committed
+# bun.lock is the only lockfile in the tree (no package-lock.json), so this
+# leg no longer falls back to npm. --frozen-lockfile mirrors ci.yml/
+# release-npm.yml exactly: a stale bun.lock FAILS loudly instead of silently
+# re-resolving. The explicit `-f` check is load-bearing: bun install
+# --frozen-lockfile silently REGENERATES a missing lockfile instead of
+# failing (verified locally, bun 1.3.14), so without it a deleted bun.lock
+# would pass this leg silently.
 step "napi build + node --test"
 if command -v bun >/dev/null 2>&1; then
-  NAPI_PKG_MGR=(bun)
-elif command -v npm >/dev/null 2>&1; then
-  NAPI_PKG_MGR=(npm)
-else
-  skip "napi leg — neither bun nor npm on PATH (mise install provisions bun)"
-  NAPI_PKG_MGR=()
-fi
-if [ "${#NAPI_PKG_MGR[@]}" -gt 0 ]; then
   (
     cd bindings/rsac-napi
-    "${NAPI_PKG_MGR[@]}" install --no-fund --no-audit 2>/dev/null || "${NAPI_PKG_MGR[@]}" install
-    "${NAPI_PKG_MGR[@]}" run build
+    if [ ! -f bun.lock ]; then
+      echo "gate-bindings: bindings/rsac-napi/bun.lock is missing — commit a lockfile (bun install)." >&2
+      exit 1
+    fi
+    bun install --frozen-lockfile
+    bun run build
     # `run test` (not bare `test`): bun's bare `bun test` invokes bun's OWN
     # native test runner and ignores package.json's "test" script entirely,
-    # which would silently skip the `node --test` invocation ci.yml's `npm
-    # test` actually runs. `run test` resolves the package.json script on
-    # both npm and bun, keeping this leg honest to what CI executes.
-    "${NAPI_PKG_MGR[@]}" run test
+    # which would silently skip the `node --test` invocation ci.yml's `bun
+    # test` actually runs. `run test` resolves the package.json script,
+    # keeping this leg honest to what CI executes.
+    bun run test
   ) || FAILED=1
   # napi build regenerates index.d.ts/index.js from the compiled addon's
   # symbol table; the checked-in copies are hand-curated (JSDoc prose differs
   # from napi-rs's auto-generated comments byte-for-byte). Never let a local
   # gate run silently leave the working tree dirty with regenerated bindings.
   git -C bindings/rsac-napi checkout -- index.d.ts index.js 2>/dev/null || true
+else
+  skip "napi leg — bun not on PATH (mise install provisions bun)"
 fi
 
 # ── python leg: maturin develop + import smoke (needs a venv + maturin) ─

@@ -11,7 +11,14 @@
 [advisories]
 # Fail the build on any security advisory in the dependency tree.
 version = 2
-yanked = "warn"
+# Hard-fail on a yanked crate in the resolved tree (rsac-8d55). A yanked
+# release is one the author pulled (bad build, security hole, accidental
+# publish); shipping one undermines release reproducibility. Verified clean
+# before flipping — `cargo deny check advisories` reported no yanked crates in
+# the current Cargo.lock (2026-07-20). If a future dependency yanks a version,
+# this fails CI: pin/replace the dep, or (only with a documented reason) add a
+# time-boxed exception here and cite it.
+yanked = "deny"
 
 [licenses]
 version = 2
