@@ -3,11 +3,9 @@ name: Bench (advisory)
 # Executes the criterion benches that compile but are never run by any other
 # workflow (rsac-1da3) — cargo build --all-targets / --tests only COMPILE
 # benches/bridge.rs and benches/observability.rs, they never RUN them, so
-# there is no throughput/latency signal and the ADR-0006 bridge-zerocopy
-# promote-or-remove data can never accumulate. This workflow is purely
-# advisory: it never gates a PR or a release, it only archives baselines on a
-# schedule (and on manual dispatch) so future runs have something to diff
-# against by eye. See docs/designs/0006-bridge-zerocopy-samplering.md.
+# there is no throughput/latency signal. This workflow is purely advisory: it
+# never gates a PR or a release, it only archives baselines on a schedule (and
+# on manual dispatch) so future runs have something to diff against by eye.
 
 on:
   schedule:
@@ -54,17 +52,6 @@ jobs:
         run: |
           cargo bench --bench bridge -- --quick --save-baseline default
           cargo bench --bench observability -- --quick --save-baseline default
-
-      # bridge-zerocopy A/B — advisory input to ADR-0006's promote-or-remove
-      # gate (docs/designs/0006-bridge-zerocopy-samplering.md §6). benches/bridge.rs's
-      # `bridge_ab/samplering/*` vs. `bridge_ab/audiobuffer/*` groups (feature-gated,
-      # so only compiled/run here) directly A/B SampleRing against the default
-      # AudioBuffer ring on the same push+pop round trip; this step is what
-      # accumulates that promote-criterion data run over run.
-      - name: cargo bench (bridge-zerocopy feature, --quick)
-        run: |
-          cargo bench --bench bridge --features bridge-zerocopy -- --quick --save-baseline zerocopy
-          cargo bench --bench observability --features bridge-zerocopy -- --quick --save-baseline zerocopy
 
       - name: Upload criterion baselines
         if: always()
