@@ -85,6 +85,7 @@ jobs:
     outputs:
       runtime: ${{ steps.pick.outputs.runtime }}
       device_udid: ${{ steps.pick.outputs.udid }}
+      host_input_route: ${{ steps.vaudio.outputs.route }}
       unit_tests: ${{ steps.record.outputs.unit_tests }}
       frames_smoke: ${{ steps.record.outputs.frames_smoke }}
       frames_app: ${{ steps.record.outputs.frames_app }}
@@ -179,6 +180,93 @@ jobs:
           echo "**Selected:** iOS \`$RT_VER\` on \`$DTYPE\` (udid \`$UDID\`)." >> "$GITHUB_STEP_SUMMARY"
           echo "runtime=$RT_VER" >> "$GITHUB_OUTPUT"
           echo "udid=$UDID" >> "$GITHUB_OUTPUT"
+
+      # ── Virtual audio input route (rsac-f18f) ─────────────────────────────
+      # Headless macOS runners expose NO host default audio INPUT device, so the
+      # simulator's AVAudioEngine input node reports 0 Hz / 0 ch ("no active
+      # audio input route") regardless of TCC state — the bare + app-hosted
+      # frames smokes then only ever soft-fail (skip-with-summary). The iOS
+      # simulator uses the HOST's default input device as its mic, so installing
+      # a virtual audio device (BlackHole) on the host and making it the default
+      # input BEFORE the simulator boots gives the sim a real input route.
+      # BlackHole delivers (silent) buffers with a valid 48kHz/2ch format, and
+      # the smokes assert DELIVERY + format sanity — never content — so silence
+      # is fine.
+      #
+      # Runs before "Boot the simulator" so the device exists and is the
+      # default input by the time the sim establishes its mic route. (CoreAudio
+      # default-device changes generally propagate to running clients too, so
+      # this ordering is the safe choice rather than a proven hard requirement.)
+      #
+      # Every action here is INDIVIDUALLY tolerant + LOUD: brew install may fail
+      # on a locked-down image, and the coreaudiod restart may be denied by the
+      # runner's sudo policy. Any failure emits a ::warning + a step-summary line
+      # and continues (route=0). It NEVER fails the leg — the frames evidence is
+      # a bonus on top of the always-green harness-chain proof.
+      - name: Virtual audio input route (BlackHole → host default input)
+        id: vaudio
+        if: steps.pick.outputs.runtime != 'none'
+        run: |
+          echo "## Virtual audio input route" >> "$GITHUB_STEP_SUMMARY"
+
+          # Emit route=0 + a summary line and continue (never leg-fatal). The
+          # signal travels as a step output → job output → summary job; nothing
+          # in-job consumes it.
+          no_route() {
+            echo "::warning::$1"
+            echo "- no virtual input route — frames evidence unavailable this run ($1)" >> "$GITHUB_STEP_SUMMARY"
+            echo "route=0" >> "$GITHUB_OUTPUT"
+          }
+
+          # ── Install the HAL plugin + the input-device switcher ──────────────
+          if ! brew install blackhole-2ch switchaudio-osx 2>&1; then
+            no_route "brew install blackhole-2ch/switchaudio-osx failed (locked-down image?)"
+            exit 0
+          fi
+          if ! command -v SwitchAudioSource >/dev/null 2>&1; then
+            no_route "SwitchAudioSource not on PATH after install"
+            exit 0
+          fi
+
+          # ── Reload coreaudiod so the freshly-installed HAL plugin loads ─────
+          # kickstart -k is the supported restart; fall back to killall. Both may
+          # be denied by the runner sudo policy — tolerate and keep polling
+          # (the plugin sometimes registers without a restart).
+          echo "Restarting coreaudiod so the BlackHole HAL plugin loads…"
+          sudo launchctl kickstart -k system/com.apple.audio.coreaudiod 2>&1 \
+            || sudo killall coreaudiod 2>&1 \
+            || echo "::notice::could not restart coreaudiod (sudo policy?) — polling anyway."
+
+          # ── Poll (≤30s) for the BlackHole input device to appear ────────────
+          echo "Inputs before:"
+          SwitchAudioSource -a -t input 2>&1 || true
+          found=0
+          for _ in $(seq 1 30); do
+            if SwitchAudioSource -a -t input 2>/dev/null | grep -qi "BlackHole 2ch"; then
+              found=1
+              break
+            fi
+            sleep 1
+          done
+          if [ "$found" -ne 1 ]; then
+            no_route "BlackHole 2ch input never appeared within 30s (coreaudiod reload likely denied)"
+            exit 0
+          fi
+
+          # ── Make it the host DEFAULT INPUT (what the sim samples at boot) ────
+          if ! SwitchAudioSource -t input -s "BlackHole 2ch" 2>&1; then
+            no_route "could not set BlackHole 2ch as the default input"
+            exit 0
+          fi
+
+          CUR="$(SwitchAudioSource -t input -c 2>/dev/null || echo '<unknown>')"
+          echo "Inputs after (current default input: $CUR):"
+          SwitchAudioSource -a -t input 2>&1 || true
+          {
+            echo "- virtual input route ACTIVE — default input is \`$CUR\`"
+            echo "- frames evidence available this run (route present)"
+          } >> "$GITHUB_STEP_SUMMARY"
+          echo "route=1" >> "$GITHUB_OUTPUT"
 
       - name: Boot the simulator
         if: steps.pick.outputs.runtime != 'none'
@@ -436,12 +524,25 @@ jobs:
       - name: Report (simulator-verified only)
         env:
           RT: ${{ needs.ios-sim.outputs.runtime }}
+          ROUTE: ${{ needs.ios-sim.outputs.host_input_route }}
           UNIT: ${{ needs.ios-sim.outputs.unit_tests }}
           SMOKE: ${{ needs.ios-sim.outputs.frames_smoke }}
           APP: ${{ needs.ios-sim.outputs.frames_app }}
           JOB: ${{ needs.ios-sim.result }}
         run: |
           set -u
+          # Honest one-shot diagnosis of the frames smokes: a soft-fail means
+          # something different depending on whether a host input route existed.
+          # With no route (ROUTE!=1) zero frames is EXPECTED (headless runner has
+          # no default input). With a route present (ROUTE=1) a soft-fail is a
+          # real signal worth chasing (grant/route wiring), not just "silent CI".
+          if [ "${ROUTE:-0}" = "1" ]; then
+            ROUTE_TXT="present (BlackHole virtual input)"
+            FRAMES_NOTE="a soft-fail here means route present but ZERO frames — investigate (TCC/route wiring), not just a silent runner"
+          else
+            ROUTE_TXT="absent (no host default input on this runner)"
+            FRAMES_NOTE="frames smokes soft-fail EXPECTED — no virtual input route was established this run"
+          fi
           {
             echo "# iOS Simulator Runtime Leg — Summary (simulator-verified)"
             echo ""
@@ -449,10 +550,13 @@ jobs:
             echo "|---|---|---|"
             echo "| ios-sim job | ${JOB:-n/a} | — |"
             echo "| iOS runtime selected | ${RT:-n/a} | probe |"
+            echo "| Host input route (virtual audio) | ${ROUTE_TXT} | probe |"
             echo "| Dormant cfg(ios) unit tests | ${UNIT:-n/a} | simulator-verified |"
             echo "| Frames-delivered smoke (bare binary, public API) | ${SMOKE:-n/a} | simulator-verified |"
             echo "| Frames-delivered smoke (app-hosted, TCC-granted, C API) | ${APP:-n/a} | simulator-verified |"
             echo ""
+            echo "> Frames evidence: ${FRAMES_NOTE}."
+            echo ">"
             echo "> The simulator is NOT a device. Physical-device capture, the"
             echo "> interleaved-delivery fast path, and start-failure rollback"
             echo "> remain a runbook (needs-real-device)."
