@@ -182,6 +182,15 @@ for m in \
 done
 
 # ── report ──────────────────────────────────────────────────────────────
+# Fail-closed FIRST: if any extraction failed, VERS[0] may not even be the
+# root Cargo.toml (record() appends to the next free index), so binding ROOT
+# or printing divergences before this check would mislead whoever is
+# debugging a blocked release (CodeRabbit PR #69).
+if [ "$FAIL_EXTRACT" -ne 0 ]; then
+    gha_error "one or more manifest versions could not be extracted — refusing to proceed (fail-closed)"
+    exit 1
+fi
+
 ROOT="${VERS[0]}"   # Cargo.toml is recorded first — the source of truth.
 echo "Discovered versions:"
 i=0
@@ -194,12 +203,6 @@ done
 # bindings/rsac-go/vX.Y.Z — docs/RELEASE_PROCESS.md). Recorded so the gap is
 # intentional, not an oversight.
 echo "note: rsac-go carries no manifest version (tagged out-of-band as bindings/rsac-go/vX.Y.Z)"
-
-# Fail-closed: an unextractable version is ALWAYS fatal, even under --warn-only.
-if [ "$FAIL_EXTRACT" -ne 0 ]; then
-    gha_error "one or more manifest versions could not be extracted — refusing to proceed (fail-closed)"
-    exit 1
-fi
 
 # Divergence from the root source of truth.
 DIVERGED=0

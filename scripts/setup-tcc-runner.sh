@@ -239,6 +239,11 @@ sox -n -r 48000 -c 2 -b 32 -e floating-point "$TONE" synth 25 sine 440
 # probe_capture <capture-wav> <seconds> → 0 if a 440 Hz tone was captured.
 probe_capture() {
   local out="$1" secs="$2" tone_pid
+  # A stale WAV from an earlier successful run must not stand in for a fresh
+  # probe: if record_to_file dies before opening the sink, verify_audio would
+  # otherwise "verify" old audio and report a live grant that isn't
+  # (CodeRabbit PR #69).
+  rm -f "$out"
   afplay "$TONE" & tone_pid=$!
   sleep 1
   ( cd "$REPO_ROOT" && cargo run --quiet --example record_to_file \

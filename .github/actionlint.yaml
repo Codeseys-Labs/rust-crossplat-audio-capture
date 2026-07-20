@@ -1,0 +1,9 @@
+# Custom runner labels actionlint should accept (it only knows GitHub-hosted
+# labels by default). blacksmith-* are the managed runner pool; tcc-audio is
+# the self-hosted macOS TCC-gated audio runner (docs/SELF_HOSTED_TCC_RUNNER.md).
+self-hosted-runner:
+  labels:
+    - tcc-audio
+    - blacksmith-4vcpu-ubuntu-2404
+    - blacksmith-4vcpu-windows-2025
+    - blacksmith-6vcpu-macos-15
