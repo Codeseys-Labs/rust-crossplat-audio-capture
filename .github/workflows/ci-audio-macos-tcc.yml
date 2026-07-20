@@ -1,0 +1,250 @@
+name: Audio Integration Tests (macOS TCC — self-hosted)
+
+# =============================================================================
+# macOS Audio-Capture (kTCCServiceAudioCapture) E2E leg on a SELF-HOSTED runner.
+#
+# This is the ONE tier that managed CI cannot cover: the macOS Process Tap
+# paths (SystemDefault / Application / ProcessTree) are gated by
+# kTCCServiceAudioCapture, which requires a one-time INTERACTIVE grant and thus
+# cannot be granted on Blacksmith / GitHub-hosted runners (see
+# docs/CI_AUDIO_TESTING.md §2 "The TCC gate"). Managed macOS therefore skips
+# those paths via require_*!(); this workflow runs them for real on a machine
+# whose Audio Capture permission was granted once, attended, by the owner.
+#
+# ─────────────────────────────────────────────────────────────────────────────
+# SECURITY POSTURE — READ BEFORE ENABLING (public repo + self-hosted = danger).
+# ─────────────────────────────────────────────────────────────────────────────
+# Triggers are workflow_dispatch + a weekly cron ONLY. This workflow MUST NEVER
+# gain a `pull_request` or `pull_request_target` trigger: a self-hosted runner
+# on a PUBLIC repo that executes PR-authored code is remote code execution on
+# the owner's physical Mac (any forker could open a PR that runs `cargo test`
+# with arbitrary build.rs / test code as the owner's user). dispatch + cron only
+# run code that already lives on a trusted branch.
+#
+# The owner MUST ALSO harden the runner in the GitHub UI:
+#   Settings → Actions → Runners → (this runner) → restrict to this repository,
+#   and Settings → Actions → General → "Fork pull request workflows from
+#   outside collaborators" → require approval for ALL outside collaborators.
+# The `if: github.repository == …` job guard below stops the cron from firing on
+# forks, but it is defense-in-depth, NOT a substitute for the runner
+# restrictions above.
+#
+# ─────────────────────────────────────────────────────────────────────────────
+# RUNNER LABEL CONTRACT
+# ─────────────────────────────────────────────────────────────────────────────
+# runs-on: [self-hosted, macos, tcc-audio]. The runner is installed + labelled
+# by scripts/setup-tcc-runner.sh (owner runs it ONCE from a VS Code terminal —
+# VS Code's bundle is the only proven Audio-Capture grant path on the owner's
+# machine; see docs/SELF_HOSTED_TCC_RUNNER.md). After a reboot/logout the runner
+# process dies and the owner re-launches it with scripts/start-tcc-runner.sh.
+#
+# ─────────────────────────────────────────────────────────────────────────────
+# GRANT MECHANICS (docs/SELF_HOSTED_TCC_RUNNER.md, ADR-0016, skill
+# macos-tcc-grant-latency-vs-silence-watchdog)
+# ─────────────────────────────────────────────────────────────────────────────
+# A denied/lost Audio-Capture grant is SILENTLY DECEPTIVE on macOS: the tap
+# still "starts" (noErr) and delivers all-zero buffers with no error, OR — for a
+# STALE grant keyed to an old binary hash — hangs indefinitely inside
+# AudioHardwareCreateProcessTap. So the guard step below runs a short (~12 s)
+# probe capture of a played 440 Hz tone and FAILS the whole job if the capture
+# is silent or hangs — a TCC-gated tier that has lost its grant is a FAILURE,
+# not a skip. 12 s comfortably exceeds both the ~6.7 s fresh-grant propagation
+# latency and the ADR-0016 10 s silence-warn window.
+# =============================================================================
+
+on:
+  workflow_dispatch:
+  schedule:
+    # Weekly, Monday 07:00 UTC (offset from bench.yml's 06:00). On-demand tier —
+    # never a PR/release gate; it exists to catch grant/permission rot over time.
+    - cron: '0 7 * * 1'
+
+env:
+  CARGO_TERM_COLOR: always
+  RUST_BACKTRACE: 1
+  RUST_LOG: rsac=debug
+
+# PR-controlled code never reaches this workflow (no pull_request trigger), but
+# keep the token read-only regardless.
+permissions:
+  contents: read
+
+# The runner has ONE physical default audio device — two concurrent runs would
+# fight over it (tone player vs. tap) and produce flaky captures. Serialize with
+# no cancellation so an in-flight run always completes cleanly.
+concurrency:
+  group: macos-tcc-audio-device
+  cancel-in-progress: false
+
+jobs:
+  macos-tcc-audio:
+    name: "macOS Audio (self-hosted, TCC-granted)"
+    # Fork guard (defense-in-depth; see the security header): the weekly cron
+    # must not fire against a self-hosted runner from a fork context.
+    if: github.repository == 'Codeseys-Labs/rust-crossplat-audio-capture'
+    runs-on: [self-hosted, macos, tcc-audio]
+    # Proven full-suite runtime is ~23 s (owner's M4, 2026-07-07); 15 min is a
+    # generous backstop that also covers a cold compile on the self-hosted cache.
+    timeout-minutes: 15
+    # `bash` keyword shell (`-eo pipefail`) so a failing `cargo test … | tee log`
+    # propagates instead of being masked by tee's exit 0 (mirrors macos-audio in
+    # ci-audio-tests.yml).
+    defaults:
+      run:
+        shell: bash
+    # The three gates that turn the skip-early macOS paths into REAL capture:
+    #  • RSAC_CI_AUDIO_AVAILABLE=1   — audio_infrastructure_available() fast-path.
+    #  • RSAC_CI_MACOS_TCC_GRANTED=1 — require_*!() gates do NOT skip Process Tap.
+    #  • RSAC_CI_AUDIO_DETERMINISTIC=1 — content (non-silence / tone) assertions
+    #    become HARD instead of soft-logged, so a silent capture fails loudly.
+    # These affect the TEST SUITE's gating only; the guard step below proves the
+    # physical grant is live independently of any env var.
+    env:
+      RSAC_CI_AUDIO_AVAILABLE: "1"
+      RSAC_CI_AUDIO_DETERMINISTIC: "1"
+      RSAC_CI_MACOS_TCC_GRANTED: "1"
+      RSAC_TEST_CAPTURE_TIMEOUT_SECS: "15"
+    steps:
+      - uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5
+        with:
+          persist-credentials: false
+      - uses: ./.github/actions/rust-setup
+        with:
+          cache-key: macos-tcc-audio
+
+      - name: Ensure probe tooling (coreutils gtimeout + sox)
+        run: |
+          # Idempotent: no-ops when the setup script already installed them.
+          command -v gtimeout >/dev/null 2>&1 || brew install coreutils
+          command -v sox >/dev/null 2>&1 || brew install sox
+
+      # Compile the probe examples AND the ci_audio test binary ONCE, OUTSIDE any
+      # gtimeout — a cold compile can take minutes and must not eat the probe's
+      # timeout budget. `cargo run`/`cargo test` in the gated steps below then
+      # just re-run the already-built artifacts.
+      - name: Build probe examples + ci_audio binary (compile once)
+        run: |
+          cargo build --example record_to_file --example verify_audio \
+            --no-default-features --features "feat_macos,cli,sink-wav"
+          cargo test --test ci_audio --no-run \
+            --no-default-features --features "feat_macos,compose"
+
+      # ── TCC grant guard — fail fast if the grant was lost/reset ─────────────
+      # Plays a 440 Hz tone to the default output, captures SystemDefault (Process
+      # Tap — the TCC-gated path) for 12 s, and asserts the capture carries the
+      # tone. Silence == denied/lost grant (ADR-0016); a gtimeout kill == a stale
+      # grant hang. Either FAILS the job with an actionable re-grant message.
+      - name: TCC grant guard (probe capture)
+        id: guard
+        run: |
+          set -uo pipefail
+          TONE=/tmp/rsac_tcc_probe_tone.wav
+          CAP=/tmp/rsac_tcc_probe.wav
+
+          # 25 s tone > the 12 s capture, so the system output is never silent
+          # during the tap window (a silent output would look like a denied grant).
+          sox -n -r 48000 -c 2 -b 32 -e floating-point "$TONE" synth 25 sine 440
+
+          # afplay routes to the default output; the SystemDefault Process Tap
+          # captures that output mix. Reap the player on step exit.
+          afplay "$TONE" &
+          TONE_PID=$!
+          trap 'kill "$TONE_PID" 2>/dev/null || true' EXIT
+          sleep 1
+
+          # Capture 12 s. gtimeout 60 s is the hard belt: a STALE grant hangs
+          # AudioHardwareCreateProcessTap indefinitely with no error.
+          set +e
+          gtimeout --preserve-status 60 \
+            cargo run --quiet --example record_to_file \
+            --no-default-features --features "feat_macos,cli,sink-wav" \
+            -- --output "$CAP" --duration 12
+          cap_rc=$?
+          set -e
+          if [ "$cap_rc" -ne 0 ]; then
+            echo "::error::TCC probe capture failed (exit ${cap_rc}). Exit 143 (128+SIGTERM under gtimeout --preserve-status, per ci-audio-tests.yml's documented pattern) == a gtimeout kill, the signature of a STALE Audio-Capture grant hanging AudioHardwareCreateProcessTap. Re-run 'bash scripts/setup-tcc-runner.sh' ATTENDED from a VS Code terminal (it will tccutil reset + re-grant). See docs/SELF_HOSTED_TCC_RUNNER.md."
+            exit 1
+          fi
+
+          # A silent (all-zero) capture with no error is the signature of a
+          # denied/lost kTCCServiceAudioCapture grant. verify_audio exits non-zero
+          # when it cannot detect the 440 Hz tone (i.e. on silence).
+          set +e
+          cargo run --quiet --example verify_audio \
+            --no-default-features --features "feat_macos,cli" \
+            -- --input "$CAP" --frequency 440 --amplitude-threshold 0.001 --verbose \
+            2>&1 | tee /tmp/rsac_tcc_probe_verify.log
+          verify_rc=${PIPESTATUS[0]}
+          set -e
+          if [ "$verify_rc" -ne 0 ]; then
+            echo "::error::TCC probe captured only silence (no 440 Hz tone detected) — the runner LOST its Audio-Capture grant. A TCC-gated tier that loses its grant is a FAILURE, not a skip. Re-run 'bash scripts/setup-tcc-runner.sh' ATTENDED from a VS Code terminal to re-grant. See docs/SELF_HOSTED_TCC_RUNNER.md."
+            exit 1
+          fi
+          echo "TCC grant confirmed LIVE — probe captured a non-silent 440 Hz tone."
+
+      # ── Full ci_audio suite — REAL TCC-granted capture ─────────────────────
+      # With all three gates set, require_*!() no longer skips the Process Tap
+      # tiers and RSAC_CI_AUDIO_DETERMINISTIC makes their content assertions HARD.
+      # This runs the WHOLE ci_audio binary (system / application / process-tree /
+      # device / compose live-tap / lifecycle) — the 42/42-GREEN suite proven on
+      # the owner's M4 (2026-07-07). On real M4 hardware with a live grant the
+      # headless-VM AUHAL/Process-Tap hangs do NOT occur, so a gtimeout kill here
+      # is a real regression and is NOT tolerated.
+      - name: Full ci_audio suite (real capture)
+        id: suite
+        run: |
+          set -uo pipefail
+          set +e
+          gtimeout --preserve-status 600 \
+            cargo test --test ci_audio \
+            --no-default-features --features "feat_macos,compose" \
+            -- --test-threads=1 --nocapture 2>&1 | tee ci-audio-macos-tcc.log
+          rc=${PIPESTATUS[0]}
+          set -e
+          [ "$rc" -eq 0 ] || { echo "::error::ci_audio suite failed (exit ${rc})."; exit "$rc"; }
+
+          # enumeration_matrix (separate binary): its "no silent empty list"
+          # assertion only has teeth with RSAC_CI_AUDIO_AVAILABLE=1 (set above).
+          gtimeout --preserve-status 120 \
+            cargo test --test enumeration_matrix \
+            --no-default-features --features "feat_macos,compose" \
+            -- --nocapture 2>&1 | tee -a ci-audio-macos-tcc.log
+
+      - name: Step summary (content-assert / RMS evidence)
+        if: always()
+        run: |
+          {
+            echo "## macOS TCC self-hosted audio — evidence"
+            echo ""
+            echo "Runner: \`$(hostname)\` — labels \`self-hosted, macos, tcc-audio\`"
+            echo "Env gates: \`RSAC_CI_AUDIO_AVAILABLE=1 RSAC_CI_AUDIO_DETERMINISTIC=1 RSAC_CI_MACOS_TCC_GRANTED=1\`"
+            echo ""
+            echo "### Test result lines"
+            echo '```'
+            grep -E "test result:" ci-audio-macos-tcc.log 2>/dev/null || echo "(no test result lines captured — see uploaded log)"
+            echo '```'
+            echo "### RMS / tone-content evidence (hard asserts under DETERMINISTIC=1)"
+            echo '```'
+            grep -E "RMS energy|tone|amplitude|Detected frequency|non-silent" ci-audio-macos-tcc.log 2>/dev/null | head -50 || echo "(none captured)"
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Diagnostics on failure
+        if: failure()
+        run: |
+          system_profiler SPAudioDataType 2>/dev/null || true
+          ps aux | grep -i coreaudio || true
+          sw_vers || true
+          echo "--- probe verify log ---"
+          cat /tmp/rsac_tcc_probe_verify.log 2>/dev/null || true
+
+      - name: Upload logs
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: macos-tcc-audio-logs
+          path: |
+            ci-audio-macos-tcc.log
+            /tmp/rsac_tcc_probe_verify.log
+          retention-days: 14
+          if-no-files-found: ignore
