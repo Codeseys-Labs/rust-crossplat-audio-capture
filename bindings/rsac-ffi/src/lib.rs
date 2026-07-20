@@ -656,6 +656,61 @@ pub unsafe extern "C" fn rsac_builder_set_android_projection(
     })
 }
 
+/// Supplies the App Group identifier for iOS system-audio capture (iOS
+/// targets only).
+///
+/// `app_group` is the shared App Group identifier (e.g.
+/// `"group.com.example.myapp.rsac"`). iOS serves `SystemDefault` capture
+/// through a ReplayKit Broadcast Upload Extension writing into a ring in the
+/// shared App Group container (ADR-0013); the group id is the config-time
+/// consent artifact the backend needs to find that container — the iOS analog
+/// of `rsac_builder_set_android_projection()`'s token. On iOS builds the
+/// string is copied onto the builder's config; `SystemDefault` builds without
+/// one fail `rsac_builder_build()` with `RSAC_ERROR_CONFIGURATION`.
+/// Microphone (`device:`) targets never need one.
+///
+/// The symbol exists on every platform so the C ABI is uniform; on non-iOS
+/// platforms the call is rejected with `RSAC_ERROR_PLATFORM_NOT_SUPPORTED`.
+///
+/// Returns `RSAC_ERROR_NULL_POINTER` if `builder` or `app_group` is null, and
+/// `RSAC_ERROR_INVALID_PARAMETER` if `app_group` is not valid UTF-8 (both
+/// checked on every platform, before the platform gate).
+#[no_mangle]
+pub unsafe extern "C" fn rsac_builder_set_ios_app_group(
+    builder: *mut RsacBuilder,
+    app_group: *const c_char,
+) -> rsac_error_t {
+    catch(|| {
+        if builder.is_null() {
+            set_last_error("builder is null");
+            return rsac_error_t::RSAC_ERROR_NULL_POINTER;
+        }
+        if app_group.is_null() {
+            set_last_error("app_group is null");
+            return rsac_error_t::RSAC_ERROR_NULL_POINTER;
+        }
+        let group = match unsafe { CStr::from_ptr(app_group) }.to_str() {
+            Ok(s) => s,
+            Err(_) => {
+                set_last_error("app_group is not valid UTF-8");
+                return rsac_error_t::RSAC_ERROR_INVALID_PARAMETER;
+            }
+        };
+        #[cfg(target_os = "ios")]
+        {
+            let b = unsafe { &mut *builder };
+            b.inner = b.inner.clone().with_ios_app_group(group);
+            rsac_error_t::RSAC_OK
+        }
+        #[cfg(not(target_os = "ios"))]
+        {
+            let _ = group;
+            set_last_error("rsac_builder_set_ios_app_group is only meaningful on iOS");
+            rsac_error_t::RSAC_ERROR_PLATFORM_NOT_SUPPORTED
+        }
+    })
+}
+
 /// Sets the desired sample rate in Hz.
 #[no_mangle]
 pub unsafe extern "C" fn rsac_builder_set_sample_rate(
@@ -1994,6 +2049,61 @@ mod tests {
         );
         let code = unsafe { rsac_builder_set_android_projection(builder, 42) };
         assert_eq!(code, rsac_error_t::RSAC_ERROR_PLATFORM_NOT_SUPPORTED);
+        unsafe { rsac_builder_free(builder) };
+    }
+
+    // ── set_ios_app_group: null + off-platform contract (rsac-c209) ──────
+
+    #[test]
+    fn set_ios_app_group_rejects_null_builder() {
+        let group = CString::new("group.com.example.app.rsac").unwrap();
+        let code = unsafe { rsac_builder_set_ios_app_group(ptr::null_mut(), group.as_ptr()) };
+        assert_eq!(code, rsac_error_t::RSAC_ERROR_NULL_POINTER);
+    }
+
+    #[test]
+    fn set_ios_app_group_rejects_null_group() {
+        let mut builder: *mut RsacBuilder = ptr::null_mut();
+        assert_eq!(
+            unsafe { rsac_builder_new(&mut builder) },
+            rsac_error_t::RSAC_OK
+        );
+        let code = unsafe { rsac_builder_set_ios_app_group(builder, ptr::null()) };
+        assert_eq!(code, rsac_error_t::RSAC_ERROR_NULL_POINTER);
+        unsafe { rsac_builder_free(builder) };
+    }
+
+    /// Off iOS the symbol must exist (uniform C ABI) but honestly refuse:
+    /// the App Group id is meaningless without the ReplayKit broadcast
+    /// extension transport. Mirrors set_android_projection_rejected_off_android.
+    #[cfg(not(target_os = "ios"))]
+    #[test]
+    fn set_ios_app_group_rejected_off_ios() {
+        let mut builder: *mut RsacBuilder = ptr::null_mut();
+        assert_eq!(
+            unsafe { rsac_builder_new(&mut builder) },
+            rsac_error_t::RSAC_OK
+        );
+        let group = CString::new("group.com.example.app.rsac").unwrap();
+        let code = unsafe { rsac_builder_set_ios_app_group(builder, group.as_ptr()) };
+        assert_eq!(code, rsac_error_t::RSAC_ERROR_PLATFORM_NOT_SUPPORTED);
+        unsafe { rsac_builder_free(builder) };
+    }
+
+    /// Invalid UTF-8 is a caller bug reported the same way on EVERY platform
+    /// (validated before the platform gate), so this asserts on all hosts.
+    #[test]
+    fn set_ios_app_group_rejects_invalid_utf8() {
+        let mut builder: *mut RsacBuilder = ptr::null_mut();
+        assert_eq!(
+            unsafe { rsac_builder_new(&mut builder) },
+            rsac_error_t::RSAC_OK
+        );
+        // 0xFF is never valid UTF-8; keep the NUL terminator explicit.
+        let bad = [0xFFu8, 0x00];
+        let code =
+            unsafe { rsac_builder_set_ios_app_group(builder, bad.as_ptr() as *const c_char) };
+        assert_eq!(code, rsac_error_t::RSAC_ERROR_INVALID_PARAMETER);
         unsafe { rsac_builder_free(builder) };
     }
 

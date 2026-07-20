@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"math"
+	"runtime"
 	"runtime/cgo"
 	"sync"
 	"sync/atomic"
@@ -751,6 +752,81 @@ func TestCaptureBuilder_WithTargetString(t *testing.T) {
 	if b.target.spec != "app:777" {
 		t.Errorf("WithTargetString spec = %q, want %q", b.target.spec, "app:777")
 	}
+}
+
+// ── Mobile consent builder methods (rsac-c209) ──────────────────────────
+//
+// The desktop CI hosts (linux/windows/macos) are neither Android nor iOS, so
+// Build() with a staged mobile consent artifact must surface the FFI's
+// documented off-platform rejection. Per the Go error-projection contract
+// (the FFI code projection is lossy), assert the CODE plus the DOCUMENTED
+// MESSAGE — never IsRecoverable.
+
+func TestCaptureBuilder_WithAndroidProjection_Staged(t *testing.T) {
+	b := NewCaptureBuilder().WithAndroidProjection(42).SampleRate(44100)
+	if !b.hasAndroidProjection || b.androidProjection != 42 {
+		t.Errorf("WithAndroidProjection not staged: has=%v token=%d, want has=true token=42",
+			b.hasAndroidProjection, b.androidProjection)
+	}
+	if b.sampleRate != 44100 {
+		t.Error("WithAndroidProjection should be chainable with other setters")
+	}
+	// An unset artifact must never be sent (desktop Build paths unaffected).
+	if NewCaptureBuilder().hasAndroidProjection {
+		t.Error("fresh builder must not stage an Android projection token")
+	}
+}
+
+func TestCaptureBuilder_WithIOSAppGroup_Staged(t *testing.T) {
+	b := NewCaptureBuilder().WithIOSAppGroup("group.com.example.app.rsac").Channels(1)
+	if !b.hasIOSAppGroup || b.iosAppGroup != "group.com.example.app.rsac" {
+		t.Errorf("WithIOSAppGroup not staged: has=%v group=%q, want has=true group=group.com.example.app.rsac",
+			b.hasIOSAppGroup, b.iosAppGroup)
+	}
+	if b.channels != 1 {
+		t.Error("WithIOSAppGroup should be chainable with other setters")
+	}
+	if NewCaptureBuilder().hasIOSAppGroup {
+		t.Error("fresh builder must not stage an iOS App Group")
+	}
+}
+
+// mustBeOffPlatformError asserts err is the FFI's documented wrong-platform
+// rejection: code ErrPlatformNotSupported carrying the exact documented
+// message (asserted on the message per the lossy-projection contract).
+func mustBeOffPlatformError(t *testing.T, err error, wantMsg string) {
+	t.Helper()
+	if err == nil {
+		t.Fatal("Build with a wrong-platform consent artifact should error on a desktop host")
+	}
+	var rsacErr *Error
+	if !errors.As(err, &rsacErr) {
+		t.Fatalf("error should be *Error, got %T (%v)", err, err)
+	}
+	if rsacErr.Code != ErrPlatformNotSupported {
+		t.Errorf("code = %v, want PlatformNotSupported", rsacErr.Code)
+	}
+	if rsacErr.Message != wantMsg {
+		t.Errorf("message = %q, want %q", rsacErr.Message, wantMsg)
+	}
+}
+
+func TestCaptureBuilder_WithAndroidProjection_ErrorsOffAndroid(t *testing.T) {
+	if runtime.GOOS == "android" {
+		t.Skip("wrong-platform path only exists off Android")
+	}
+	_, err := NewCaptureBuilder().WithAndroidProjection(42).Build()
+	mustBeOffPlatformError(t, err,
+		"rsac_builder_set_android_projection is only meaningful on Android")
+}
+
+func TestCaptureBuilder_WithIOSAppGroup_ErrorsOffIOS(t *testing.T) {
+	if runtime.GOOS == "ios" {
+		t.Skip("wrong-platform path only exists off iOS")
+	}
+	_, err := NewCaptureBuilder().WithIOSAppGroup("group.com.example.app.rsac").Build()
+	mustBeOffPlatformError(t, err,
+		"rsac_builder_set_ios_app_group is only meaningful on iOS")
 }
 
 // ── Concurrent Close-during-Read barrier (issue #28, H2) ─────────────────

@@ -615,6 +615,13 @@ type CaptureBuilder struct {
 	target     CaptureTarget
 	sampleRate uint32
 	channels   uint16
+	// Mobile consent artifacts (rsac-c209). Staged here and applied at Build()
+	// via the corresponding FFI setters; an unset artifact is never sent, so
+	// desktop builds that don't touch the mobile surface are unaffected.
+	androidProjection    int64
+	hasAndroidProjection bool
+	iosAppGroup          string
+	hasIOSAppGroup       bool
 }
 
 // NewCaptureBuilder creates a new builder with default settings:
@@ -691,6 +698,52 @@ func (b *CaptureBuilder) SetTargetString(spec string) error {
 	return nil
 }
 
+// WithAndroidProjection supplies the Android MediaProjection consent token
+// (Android targets only).
+//
+// token is the opaque int64 handle produced by the rsac Android consent helper
+// (a JNI GlobalRef to the MediaProjection — see docs/MOBILE_BACKEND_DESIGN.md
+// and ADR-0013). It is applied at [CaptureBuilder.Build] via
+// rsac_builder_set_android_projection; on Android, playback-capture targets
+// without one fail Build with ErrConfiguration once an Android backend
+// advertises the capability. Microphone ("device:") targets never need one.
+//
+// Platform behavior: the FFI symbol exists on every platform, but on
+// non-Android platforms Build returns an *Error with code
+// ErrPlatformNotSupported (message "rsac_builder_set_android_projection is
+// only meaningful on Android").
+//
+// Single-owner contract (caller's responsibility): each retained
+// MediaProjection handle must be supplied to exactly one builder that is built
+// exactly once, then never reused — see the rsac.h docs on
+// rsac_builder_set_android_projection for the double-release hazard.
+func (b *CaptureBuilder) WithAndroidProjection(token int64) *CaptureBuilder {
+	b.androidProjection = token
+	b.hasAndroidProjection = true
+	return b
+}
+
+// WithIOSAppGroup supplies the App Group identifier for iOS system-audio
+// capture (iOS targets only).
+//
+// group is the shared App Group identifier (e.g.
+// "group.com.example.myapp.rsac") — the config-time consent artifact the iOS
+// ReplayKit broadcast transport needs to locate the shared container
+// (ADR-0013); the iOS analog of [CaptureBuilder.WithAndroidProjection]'s
+// token. It is applied at [CaptureBuilder.Build] via
+// rsac_builder_set_ios_app_group; on iOS, SystemDefault builds without one
+// fail Build with ErrConfiguration. Microphone ("device:") targets never need
+// one.
+//
+// Platform behavior: the FFI symbol exists on every platform, but on non-iOS
+// platforms Build returns an *Error with code ErrPlatformNotSupported
+// (message "rsac_builder_set_ios_app_group is only meaningful on iOS").
+func (b *CaptureBuilder) WithIOSAppGroup(group string) *CaptureBuilder {
+	b.iosAppGroup = group
+	b.hasIOSAppGroup = true
+	return b
+}
+
 // SampleRate sets the desired sample rate in Hz.
 // Common values: 22050, 32000, 44100, 48000, 88200, 96000.
 func (b *CaptureBuilder) SampleRate(rate uint32) *CaptureBuilder {
@@ -743,6 +796,25 @@ func (b *CaptureBuilder) Build() (*AudioCapture, error) {
 	if rc != C.RSAC_OK {
 		C.rsac_builder_free(cbuilder)
 		return nil, newError(rc)
+	}
+
+	// Apply staged mobile consent artifacts (rsac-c209). Only sent when the
+	// caller opted in via WithAndroidProjection / WithIOSAppGroup; on the
+	// wrong platform the FFI rejects with RSAC_ERROR_PLATFORM_NOT_SUPPORTED
+	// (see each setter's doc), surfaced here as an *Error.
+	if b.hasAndroidProjection {
+		if rc = C.rsac_builder_set_android_projection(cbuilder, C.int64_t(b.androidProjection)); rc != C.RSAC_OK {
+			C.rsac_builder_free(cbuilder)
+			return nil, newError(rc)
+		}
+	}
+	if b.hasIOSAppGroup {
+		cgroup := C.CString(b.iosAppGroup)
+		defer C.free(unsafe.Pointer(cgroup))
+		if rc = C.rsac_builder_set_ios_app_group(cbuilder, cgroup); rc != C.RSAC_OK {
+			C.rsac_builder_free(cbuilder)
+			return nil, newError(rc)
+		}
 	}
 
 	// Set audio parameters.
