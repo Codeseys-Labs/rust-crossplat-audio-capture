@@ -1,6 +1,6 @@
 # ADR 0018 — audio-graph mobile adoption: defer, keep desktop-only, record re-evaluation triggers
 
-**Status:** Proposed (awaiting owner ratification)
+**Status:** Accepted (owner ratified 2026-07-20 — Option B: defer, desktop-only; re-evaluation triggers in §5)
 **Date:** 2026-07-20
 **Scope:** `apps/audio-graph` (standalone checkout, gitignored per `/apps/` —
 not a tracked submodule) integration posture; relationship to
