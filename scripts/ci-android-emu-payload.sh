@@ -60,9 +60,12 @@ gradle -p mobile/android connectedDebugAndroidTest --no-daemon --stacktrace \
   "-Pandroid.testInstrumentationRunnerArguments.rsac_require_frames=${REQUIRE_FRAMES:-0}" \
   2>&1 | tee instrumented.log || GRADLE_STATUS=$?
 # -d: dump-and-exit (never stream/hang). RsacFramesTest (mic tier) and
-# RsacPlaybackTest (playback tier, rsac-e6d3) carry the frames/negotiated-format
-# evidence and any SKIP-WITH-SUMMARY line; TestRunner carries the JUnit result.
-adb logcat -d -s RsacFramesTest RsacPlaybackTest TestRunner 2>&1 | tee instrumented-logcat.log || true
+# RsacPlaybackTest (playback tiers: SystemDefault + Application/
+# ApplicationByName/ProcessTree UID-filtered, rsac-e6d3) carry the
+# frames/negotiated-format evidence; RsacDevicesTest carries the device-
+# enumeration evidence (rsac-ad8a); each also carries any SKIP-WITH-SUMMARY
+# line; TestRunner carries the JUnit result.
+adb logcat -d -s RsacFramesTest RsacPlaybackTest RsacDevicesTest TestRunner 2>&1 | tee instrumented-logcat.log || true
 if [ "$GRADLE_STATUS" -ne 0 ]; then
   echo "::error::connectedDebugAndroidTest failed (exit $GRADLE_STATUS) — see instrumented.log + instrumented-logcat.log"
   exit "$GRADLE_STATUS"
