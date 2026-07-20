@@ -232,6 +232,14 @@ jobs:
             exit 1
           fi
 
+      # Full cross-manifest version-lockstep gate (rsac-e06e). The step above
+      # only checks the tag/dispatch version against rsac-python's
+      # pyproject.toml; this asserts that EVERY lockstep manifest + the
+      # rsac-ffi internal dep pin agree (hard-fail on any divergence) BEFORE
+      # the PyPI upload. Same script the ci.yml version-lockstep job runs.
+      - name: Verify version lockstep across all manifests
+        run: bash scripts/check-version-lockstep.sh
+
       - name: Download all build artifacts
         uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
         with:

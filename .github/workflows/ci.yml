@@ -1403,88 +1403,26 @@ jobs:
         with:
           persist-credentials: false
 
+      # The whole extraction + comparison lives in
+      # scripts/check-version-lockstep.sh (the single source of truth shared
+      # with the three registry publish workflows — no logic is duplicated in
+      # YAML anymore). On a `vX.Y.Z` tag push we pass `--expect <tag-version>`,
+      # which HARD-FAILS on any manifest that does not equal the tag — the
+      # point of no return. On ordinary pushes / PRs we pass `--warn-only`, so a
+      # deliberate mid-cycle skew (a binding lagging the root crate between
+      # releases) only warns and does not block day-to-day CI. An
+      # unextractable version is a hard failure regardless (the script
+      # fail-closes on it).
       - name: Check rsac + binding versions are in lockstep
         shell: bash
         run: |
           set -euo pipefail
-
-          # Extract the first `version = "X.Y.Z"` inside the [package] /
-          # [project] section of a TOML manifest. Mirrors the extractor in
-          # scripts/bump-version.sh so the two stay in agreement.
-          toml_pkg_version() {
-            awk '
-              /^\[package\][[:space:]]*$/ || /^\[project\][[:space:]]*$/ { in_sec = 1; next }
-              /^\[/ { if ($0 !~ /^\[(package|project)\][[:space:]]*$/) in_sec = 0 }
-              in_sec && /^[[:space:]]*version[[:space:]]*=[[:space:]]*"[^"]+"[[:space:]]*$/ {
-                match($0, /"[^"]+"/); print substr($0, RSTART + 1, RLENGTH - 2); exit
-              }
-            ' "$1"
-          }
-          # Top-level (2-space indent) "version" key of a package.json.
-          json_top_version() {
-            awk '
-              /^  "version"[[:space:]]*:[[:space:]]*"[^"]+"[[:space:]]*,?[[:space:]]*$/ {
-                colon = index($0, ":"); rest = substr($0, colon + 1)
-                match(rest, /"[^"]+"/); print substr(rest, RSTART + 1, RLENGTH - 2); exit
-              }
-            ' "$1"
-          }
-
-          declare -A V
-          V[Cargo.toml]=$(toml_pkg_version Cargo.toml)
-          V[bindings/rsac-ffi/Cargo.toml]=$(toml_pkg_version bindings/rsac-ffi/Cargo.toml)
-          V[bindings/rsac-napi/Cargo.toml]=$(toml_pkg_version bindings/rsac-napi/Cargo.toml)
-          V[bindings/rsac-napi/package.json]=$(json_top_version bindings/rsac-napi/package.json)
-          V[bindings/rsac-python/Cargo.toml]=$(toml_pkg_version bindings/rsac-python/Cargo.toml)
-          V[bindings/rsac-python/pyproject.toml]=$(toml_pkg_version bindings/rsac-python/pyproject.toml)
-          V[mobile/android-native/Cargo.toml]=$(toml_pkg_version mobile/android-native/Cargo.toml)
-          # Tauri v2 plugin (ADR-0014) joins the lockstep set. The loop below
-          # folds these into the divergence warning + the tag-time hard-gate.
-          V[integrations/tauri-plugin-rsac/Cargo.toml]=$(toml_pkg_version integrations/tauri-plugin-rsac/Cargo.toml)
-          V[integrations/tauri-plugin-rsac/guest-js/package.json]=$(json_top_version integrations/tauri-plugin-rsac/guest-js/package.json)
-
-          echo "Discovered versions:"
-          for f in "${!V[@]}"; do
-            printf '  %-42s %s\n' "$f" "${V[$f]:-<none>}"
-            if [ -z "${V[$f]:-}" ]; then
-              echo "::error::could not extract a version from $f"
-              exit 1
-            fi
-          done
-
-          ROOT="${V[Cargo.toml]}"
-          DIVERGED=0
-          for f in "${!V[@]}"; do
-            if [ "${V[$f]}" != "$ROOT" ]; then
-              DIVERGED=1
-              echo "DIVERGENCE: $f is ${V[$f]}, root Cargo.toml is $ROOT"
-            fi
-          done
-
-          # rsac-go has no version field — releases are tagged
-          # bindings/rsac-go/vX.Y.Z (see docs/RELEASE_PROCESS.md). Nothing
-          # to compare in-tree; recorded here so the absence is intentional.
-          echo "note: rsac-go carries no manifest version (tagged out-of-band as bindings/rsac-go/vX.Y.Z)"
-
           if [[ "${GITHUB_REF:-}" == refs/tags/v* ]]; then
             TAG_VERSION="${GITHUB_REF#refs/tags/v}"
             echo "release tag detected: v${TAG_VERSION} — enforcing lockstep + tag match"
-            FAIL=0
-            for f in "${!V[@]}"; do
-              if [ "${V[$f]}" != "$TAG_VERSION" ]; then
-                FAIL=1
-                echo "::error::$f version ${V[$f]} does not match release tag v${TAG_VERSION}"
-              fi
-            done
-            if [ "$FAIL" -ne 0 ]; then
-              echo "::error::version lockstep violated on release tag — refusing to proceed"
-              exit 1
-            fi
-            echo "OK: all manifests match release tag v${TAG_VERSION}"
-          elif [ "$DIVERGED" -ne 0 ]; then
-            echo "::warning::rsac + binding versions are not in lockstep (see above). This only HARD-FAILS on a release tag; bump every manifest to match before tagging (scripts/bump-version.sh)."
+            bash scripts/check-version-lockstep.sh --expect "${TAG_VERSION}"
           else
-            echo "OK: rsac + all bindings agree at $ROOT"
+            bash scripts/check-version-lockstep.sh --warn-only
           fi
 
   # ── Semver gate for release PRs (interim home) ──────────────────────
