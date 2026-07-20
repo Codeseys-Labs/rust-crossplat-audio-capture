@@ -35,13 +35,21 @@
 //!
 //! # Honesty
 //!
-//! A pass here is **emulator-verified** for the `SystemDefault` playback tier
-//! only. It proves the MediaProjection → FGS → `AudioPlaybackCapture` →
-//! `CaptureBridge` → JNI ingest → bridge → public read path delivers frames
-//! under a real app uid. It says NOTHING about the
-//! `Application`/`ApplicationByName`/`ProcessTree` UID-filtered tiers, and it
-//! is never device-verified. Content is never inspected — only frame counts
-//! and the negotiated format.
+//! A pass here is **emulator-verified**, never device-verified. Content is
+//! never inspected — only frame counts and the negotiated format.
+//!
+//! - The `SystemDefault` tier proves the MediaProjection → FGS →
+//!   `AudioPlaybackCapture` → `CaptureBridge` → JNI ingest → bridge → public
+//!   read path delivers frames under a real app uid.
+//! - The `Application` / `ApplicationByName` / `ProcessTree` tiers
+//!   (`driveTargetedPlaybackCapture`) are **self-capture**: the test targets
+//!   its own uid / package / pid. They verify the UID-filter PLUMBING
+//!   (target → `resolve_match_uid` → `addMatchingUid` → frames from a
+//!   matching-uid app) — NOT that capturing a *different* app's audio works or
+//!   is correctly scoped. Cross-app UID filtering stays UNVERIFIED here.
+//! - `driveEnumerateDevices` proves rsac's public device-enumeration facade
+//!   returns a non-empty list through the AAR (rsac-ad8a); it inspects no
+//!   audio.
 
 // Re-export rsac so its #[no_mangle] JNI_OnLoad (and the whole Android backend
 // it registers) is linked into this cdylib. Present on every target — on a
@@ -60,7 +68,10 @@ mod driver {
 
     use jni_sys::{jint, jlong, jlongArray, jobject, jstring, JNIEnv};
 
-    use rsac::{AndroidProjectionToken, AudioCaptureBuilder, CaptureTarget, SampleFormat};
+    use rsac::{
+        get_device_enumerator, AndroidProjectionToken, ApplicationId, AudioCaptureBuilder,
+        CaptureTarget, DeviceKind, ProcessId, SampleFormat,
+    };
 
     /// Last human-readable failure, captured at the failing stage and read
     /// back by the Kotlin side via `lastNativeError()` on the same
@@ -96,17 +107,35 @@ mod driver {
     const CODE_FORMAT_NONE: i64 = 3;
     const CODE_READ_ERROR: i64 = 4;
 
-    /// Drives `CaptureTarget::SystemDefault` playback capture through rsac's
-    /// PUBLIC API end-to-end, mirroring `tests/android_emu_smoke.rs`:
+    /// Drives one playback-capture `target` through rsac's PUBLIC API
+    /// end-to-end, mirroring `tests/android_emu_smoke.rs`:
     ///
-    /// `from_raw(token) → with_target(SystemDefault) → with_android_projection
-    /// → sample_rate → channels → build() → start() → format() → bounded
+    /// `from_raw(token) → with_target(target) → with_android_projection →
+    /// sample_rate → channels → build() → start() → format() → bounded
     /// read_buffer() poll (count frames, never content) → request_stop()`.
+    ///
+    /// The `target` is the ONLY thing that varies across the tiers
+    /// (`SystemDefault` vs the `Application`/`ApplicationByName`/`ProcessTree`
+    /// UID-filtered variants); the token lifecycle, format-sanity, poll, and
+    /// teardown are identical, so both driver exports funnel through here.
     ///
     /// Returns `[errorCode, buffers, frames, negRate, negChannels,
     /// negSampleFormat]`. On a build/start/format failure the negotiated
     /// fields stay 0/0/-1 and `last_error()` carries the `AudioError` text.
-    fn drive(token_raw: i64, sample_rate: i32, channels: i32, timeout_ms: i32) -> [i64; 6] {
+    ///
+    /// Token economics: exactly ONE `from_raw` per call, and the token is
+    /// moved into `build()`, which consumes its single-owner deletion latch
+    /// exactly once (rsac-3407). Every early-return arm below has already
+    /// handed the token to `build()` (which owns release-on-drop on success,
+    /// or reclaims/re-arms it on its own failure path), so no arm here leaks
+    /// or double-consumes.
+    fn drive(
+        token_raw: i64,
+        target: CaptureTarget,
+        sample_rate: i32,
+        channels: i32,
+        timeout_ms: i32,
+    ) -> [i64; 6] {
         let mut out: [i64; 6] = [CODE_OK, 0, 0, 0, 0, -1];
         set_last_error(String::new());
 
@@ -119,7 +148,7 @@ mod driver {
         let token = unsafe { AndroidProjectionToken::from_raw(token_raw) };
 
         let mut capture = match AudioCaptureBuilder::new()
-            .with_target(CaptureTarget::SystemDefault)
+            .with_target(target)
             .with_android_projection(token)
             .sample_rate(sample_rate.max(0) as u32)
             .channels(channels.max(0) as u16)
@@ -211,7 +240,13 @@ mod driver {
         timeout_ms: jint,
     ) -> jlongArray {
         let out = catch_unwind(AssertUnwindSafe(|| {
-            drive(token_raw, sample_rate, channels, timeout_ms)
+            drive(
+                token_raw,
+                CaptureTarget::SystemDefault,
+                sample_rate,
+                channels,
+                timeout_ms,
+            )
         }))
         .unwrap_or_else(|_| {
             set_last_error("driver panicked (contained at the JNI boundary)".to_string());
@@ -222,6 +257,58 @@ mod driver {
         // vtable is fully populated on ART; a missing entry means the process
         // is unrecoverably broken (contained by the catch_unwind above only on
         // the Rust-entered `drive`, so guard the raw calls explicitly).
+        unsafe { new_long_array_6(env, &out) }
+    }
+
+    /// The `kind` discriminant of `driveTargetedPlaybackCapture` → the rsac
+    /// [`CaptureTarget`] variant, resolving `arg` per the mission contract:
+    ///
+    /// | kind | target | `arg` |
+    /// |---|---|---|
+    /// | 0 | `SystemDefault` | ignored |
+    /// | 1 | `Application(uid)` | NUMERIC app UID string (ADR-0013) |
+    /// | 2 | `ApplicationByName(package)` | package name |
+    /// | 3 | `ProcessTree(pid)` | decimal PID string |
+    ///
+    /// A pid that does not parse as `u32` (kind 3) is reported via
+    /// `last_error()` and `None` — the caller turns that into a build-failed
+    /// code without ever wrapping the token. `Application`/`ApplicationByName`
+    /// carry `arg` verbatim (rsac's `resolve_match_uid` validates the UID
+    /// string / resolves the package), so an empty/garbage value surfaces as a
+    /// real `AudioError` from `build()` rather than being pre-judged here.
+    fn target_for(kind: i32, arg: String) -> Option<CaptureTarget> {
+        match kind {
+            0 => Some(CaptureTarget::SystemDefault),
+            1 => Some(CaptureTarget::Application(ApplicationId(arg))),
+            2 => Some(CaptureTarget::ApplicationByName(arg)),
+            3 => match arg.trim().parse::<u32>() {
+                Ok(pid) => Some(CaptureTarget::ProcessTree(ProcessId(pid))),
+                Err(e) => {
+                    set_last_error(format!("ProcessTree arg {:?} is not a u32 pid: {e}", arg));
+                    None
+                }
+            },
+            other => {
+                set_last_error(format!(
+                    "unknown targeted-drive kind {other} (expected 0=SystemDefault, \
+                     1=Application, 2=ApplicationByName, 3=ProcessTree)"
+                ));
+                None
+            }
+        }
+    }
+
+    /// Allocates a fresh Java `long[6]` and fills it from `out`, returning the
+    /// array (or `null` only when the JVM allocation itself fails, OOME
+    /// already pending). Shared by both driver exports so the JNI array
+    /// handoff lives in one place.
+    ///
+    /// # Safety
+    ///
+    /// `env` must be a valid `JNIEnv` for the current thread.
+    unsafe fn new_long_array_6(env: *mut JNIEnv, out: &[i64; 6]) -> jlongArray {
+        // SAFETY: the vtable is fully populated on ART; a missing entry means
+        // the process is unrecoverably broken.
         unsafe {
             let new_long_array = (**env)
                 .NewLongArray
@@ -235,6 +322,92 @@ mod driver {
                 .expect("JNI vtable missing SetLongArrayRegion");
             set_region(env, arr, 0, 6, out.as_ptr());
             arr
+        }
+    }
+
+    /// `NativePlaybackDriver.driveTargetedPlaybackCapture` — JNI signature
+    /// `(JILjava/lang/String;III)[J`.
+    ///
+    /// The UID-filtered-tier twin of [`drivePlaybackCapture`](
+    /// Java_ai_codeseys_rsac_NativePlaybackDriver_drivePlaybackCapture): same
+    /// `long[6]` slot contract, same token economics (one `from_raw`, one
+    /// consume via `build()`), but the [`CaptureTarget`] is selected by `kind`
+    /// + `arg` (see [`target_for`]).
+    ///
+    /// # HONESTY (load-bearing)
+    ///
+    /// This is a **self-capture** drive: the test APK targets its OWN uid /
+    /// package / pid. A pass therefore verifies the UID-filter PLUMBING —
+    /// target → `resolve_match_uid` → `addMatchingUid(matchUid)` → frames
+    /// delivered from an app whose uid MATCHES the filter. It does NOT verify
+    /// that capturing a DIFFERENT app's audio works or is correctly scoped;
+    /// cross-app UID filtering stays unverified (see the Kotlin test header).
+    ///
+    /// Resolved by the JVM's standard lazy `Java_*` lookup after
+    /// `System.loadLibrary("rsac")`; no `RegisterNatives` (that is rsac's
+    /// `JNI_OnLoad`'s job for the shipped natives). Never lets a panic cross
+    /// the JNI frame. Returns a fresh `long[6]`, or `null` only if the JVM
+    /// array allocation itself fails.
+    #[no_mangle]
+    pub extern "system" fn Java_ai_codeseys_rsac_NativePlaybackDriver_driveTargetedPlaybackCapture(
+        env: *mut JNIEnv,
+        _thiz: jobject,
+        token_raw: jlong,
+        kind: jint,
+        arg: jstring,
+        sample_rate: jint,
+        channels: jint,
+        timeout_ms: jint,
+    ) -> jlongArray {
+        // SAFETY: `env` is valid for this instrumentation thread; `arg` is a
+        // live java.lang.String local ref (or null, which decodes to "").
+        let arg_str = unsafe { jstring_to_string(env, arg) };
+
+        let out = catch_unwind(AssertUnwindSafe(|| match target_for(kind, arg_str) {
+            Some(target) => drive(token_raw, target, sample_rate, channels, timeout_ms),
+            // Bad kind / unparseable pid: last_error() already set by
+            // target_for. The token was NEVER wrapped, so nothing to release.
+            None => [CODE_BUILD_FAILED, 0, 0, 0, 0, -1],
+        }))
+        .unwrap_or_else(|_| {
+            set_last_error("driver panicked (contained at the JNI boundary)".to_string());
+            [-1, 0, 0, 0, 0, -1]
+        });
+
+        // SAFETY: `env` valid for this thread (as above).
+        unsafe { new_long_array_6(env, &out) }
+    }
+
+    /// Decodes a `java.lang.String` local ref into an owned `String`, or `""`
+    /// on a null ref or a failed JVM copy. Uses `GetStringUTFChars` (the
+    /// driver's `arg`s are ASCII: a numeric uid/pid or a package name), and
+    /// mirrors rsac's own defensive `env`-vtable handling.
+    ///
+    /// # Safety
+    ///
+    /// `env` must be a valid `JNIEnv` for the current thread and `jstr` either
+    /// null or a live `java.lang.String` local ref.
+    unsafe fn jstring_to_string(env: *mut JNIEnv, jstr: jstring) -> String {
+        if jstr.is_null() {
+            return String::new();
+        }
+        // SAFETY: vtable populated on ART; `jstr` is a live String ref.
+        unsafe {
+            let get_utf = (**env)
+                .GetStringUTFChars
+                .expect("JNI vtable missing GetStringUTFChars");
+            let chars = get_utf(env, jstr, std::ptr::null_mut());
+            if chars.is_null() {
+                return String::new();
+            }
+            let text = std::ffi::CStr::from_ptr(chars)
+                .to_string_lossy()
+                .into_owned();
+            let release = (**env)
+                .ReleaseStringUTFChars
+                .expect("JNI vtable missing ReleaseStringUTFChars");
+            release(env, jstr, chars);
+            text
         }
     }
 
@@ -260,17 +433,122 @@ mod driver {
         }
     }
 
+    /// `NativePlaybackDriver.driveEnumerateDevices` — JNI signature
+    /// `()Ljava/lang/String;`.
+    ///
+    /// Drives rsac's PUBLIC device-enumeration facade
+    /// (`get_device_enumerator()?.enumerate_devices()`) — the exact path a
+    /// consumer app uses — and returns a parseable summary the Kotlin side
+    /// asserts on (rsac-ad8a):
+    ///
+    /// ```text
+    /// count=<N>;<id>|<name>|<Input|Output>;<id>|<name>|<Input|Output>;…
+    /// ```
+    ///
+    /// or `ERROR: <text>` on failure. The delimiters (`;` between records,
+    /// `|` within a record) are stripped from any name so the grammar can't be
+    /// broken by a device label.
+    ///
+    /// # How the Context reaches Rust (load-bearing)
+    ///
+    /// `AndroidDeviceEnumerator::enumerate_devices` obtains its `Context`
+    /// entirely inside rsac's JNI layer via
+    /// `ActivityThread.currentApplication()` (see
+    /// `src/audio/android/jni.rs::enumerate_input_device_records`) — NO
+    /// context-publication step is required from the caller. That call
+    /// succeeds once `librsac.so`'s `JNI_OnLoad` has run (which
+    /// `System.loadLibrary("rsac")` in `NativePlaybackDriver`'s initializer
+    /// already did) AND an `Application` object exists — which it always does
+    /// inside an instrumented test process. So this export needs no token, no
+    /// projection, and no extra wiring beyond the library already being loaded.
+    ///
+    /// If the AAR `RsacDevices` class did not resolve at load, enumeration
+    /// silently falls back to `[default-route sentinel, playback-capture]`
+    /// (2 devices) — still a valid, honest result, just without the real
+    /// input-device middle section.
+    #[no_mangle]
+    pub extern "system" fn Java_ai_codeseys_rsac_NativePlaybackDriver_driveEnumerateDevices(
+        env: *mut JNIEnv,
+        _thiz: jobject,
+    ) -> jstring {
+        let summary =
+            catch_unwind(AssertUnwindSafe(enumerate_devices_summary)).unwrap_or_else(|_| {
+                "ERROR: enumeration panicked (contained at the JNI boundary)".to_string()
+            });
+
+        let c = std::ffi::CString::new(summary.replace('\0', "")).unwrap_or_default();
+        // SAFETY: `env` valid for this thread; `c` is a live NUL-terminated
+        // buffer for the duration of the call.
+        unsafe {
+            let new_string_utf = (**env)
+                .NewStringUTF
+                .expect("JNI vtable missing NewStringUTF");
+            new_string_utf(env, c.as_ptr())
+        }
+    }
+
+    /// Renders rsac's enumerated devices into the flat summary string the
+    /// Kotlin `devicesEnumerated` test parses. Never panics (the caller also
+    /// `catch_unwind`s); enumeration errors become `ERROR: <text>`.
+    fn enumerate_devices_summary() -> String {
+        let enumerator = match get_device_enumerator() {
+            Ok(e) => e,
+            Err(e) => return format!("ERROR: get_device_enumerator: {e}"),
+        };
+        let devices = match enumerator.enumerate_devices() {
+            Ok(d) => d,
+            Err(e) => return format!("ERROR: enumerate_devices: {e}"),
+        };
+
+        let mut summary = format!("count={}", devices.len());
+        for device in &devices {
+            let kind = match device.kind() {
+                Ok(DeviceKind::Input) => "Input",
+                Ok(DeviceKind::Output) => "Output",
+                Err(_) => "Unknown",
+            };
+            summary.push(';');
+            summary.push_str(&sanitize_field(&device.id().0));
+            summary.push('|');
+            summary.push_str(&sanitize_field(&device.name()));
+            summary.push('|');
+            summary.push_str(kind);
+        }
+        summary
+    }
+
+    /// Strips the summary's structural delimiters (`;` `|`) from a field so a
+    /// device id/name can never break the Kotlin parser's grammar. Names are
+    /// otherwise arbitrary product strings.
+    fn sanitize_field(s: &str) -> String {
+        s.replace([';', '|'], " ")
+    }
+
     // ── Compile-time signature guards ────────────────────────────────────
     // Pin the exported fn pointers to their JNI-expected shapes so a
     // parameter drift is a compile error, mirroring jni.rs's _NATIVE_* asserts.
     const _DRIVE: extern "system" fn(*mut JNIEnv, jobject, jlong, jint, jint, jint) -> jlongArray =
         Java_ai_codeseys_rsac_NativePlaybackDriver_drivePlaybackCapture;
+    const _DRIVE_TARGETED: extern "system" fn(
+        *mut JNIEnv,
+        jobject,
+        jlong,
+        jint,
+        jstring,
+        jint,
+        jint,
+        jint,
+    ) -> jlongArray = Java_ai_codeseys_rsac_NativePlaybackDriver_driveTargetedPlaybackCapture;
+    const _DRIVE_ENUMERATE: extern "system" fn(*mut JNIEnv, jobject) -> jstring =
+        Java_ai_codeseys_rsac_NativePlaybackDriver_driveEnumerateDevices;
     const _LAST_ERROR: extern "system" fn(*mut JNIEnv, jobject) -> jstring =
         Java_ai_codeseys_rsac_NativePlaybackDriver_lastNativeError;
 
     #[allow(dead_code)]
     fn _assert_guards_referenced() {
         let _ = _DRIVE;
+        let _ = _DRIVE_TARGETED;
+        let _ = _DRIVE_ENUMERATE;
         let _ = _LAST_ERROR;
     }
 }

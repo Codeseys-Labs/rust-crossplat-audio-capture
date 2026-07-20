@@ -9,12 +9,17 @@ name: Android Emulator Runtime Leg
 # `emulator-verified`. It proves the AAudio input path delivers frames through
 # the rsac public API, runs the previously-dormant cfg(android) unit tests
 # (capabilities, record parsing, conversion helpers), and asserts the honest
-# SystemDefault-without-consent refusal. The MediaProjection SystemDefault
-# playback tier is now exercised too (playback tier below — appops-auto-approved
-# consent, no uiautomator needed); the Application/ApplicationByName/ProcessTree
-# UID-filtered playback tiers stay unverified, and a physical-device pass stays
-# a runbook. This leg is NOT a required PR gate until its acceptance criteria
-# are observed green on a runner.
+# SystemDefault-without-consent refusal. The MediaProjection playback tiers are
+# now exercised too (playback tier below — appops-auto-approved consent, no
+# uiautomator needed): SystemDefault AND the Application/ApplicationByName/
+# ProcessTree UID-filtered tiers. The UID-filtered tiers are SELF-CAPTURE (the
+# test targets its own uid / package / pid), so they verify the UID-filter
+# PLUMBING (target → resolve_match_uid → addMatchingUid → frames from a
+# matching-uid app) — NOT that capturing a DIFFERENT app's audio works or is
+# correctly scoped; cross-app UID filtering stays unverified. Device
+# enumeration (rsac-ad8a) is exercised too (RsacDevicesTest, no consent). A
+# physical-device pass stays a runbook. This leg is NOT a required PR gate
+# until its acceptance criteria are observed green on a runner.
 #
 # KVM: hardware acceleration is mandatory for a usable x86_64 emulator.
 # Blacksmith (blacksmith-4vcpu-ubuntu-2404) KVM support is UNVERIFIED — the
@@ -51,21 +56,36 @@ name: Android Emulator Runtime Leg
 # shell-uid smoke. This tier is ADVISORY until observed green (then, as a
 # follow-up: flip require_frames and/or promote to a required check).
 #
-# Playback tier (rsac-e6d3): the SAME test APK also drives
-# CaptureTarget::SystemDefault (AudioPlaybackCapture / MediaProjection) through
-# rsac's PUBLIC capture API. The host phase builds a THIRD native lib — the
-# test-only mobile/androidtest-native cdylib as librsac.so — which re-exports
-# rsac's JNI_OnLoad (so RsacProjection.nativeRetainProjection is registered)
-# and exports the NativePlaybackDriver Java_* symbols. The test pre-grants the
+# Playback tier (rsac-e6d3): the SAME test APK also drives the
+# AudioPlaybackCapture / MediaProjection tiers through rsac's PUBLIC capture
+# API. The host phase builds a THIRD native lib — the test-only
+# mobile/androidtest-native cdylib as librsac.so — which re-exports rsac's
+# JNI_OnLoad (so RsacProjection.nativeRetainProjection is registered) and
+# exports the NativePlaybackDriver Java_* symbols. The test pre-grants the
 # PROJECT_MEDIA appop via the UiAutomation shell so the API 30 consent dialog
 # auto-approves (no uiautomator), mints a real token through the shipped
 # RsacProjection flow, plays a USAGE_MEDIA tone as capturable playback, and
-# asserts frames-delivered + negotiated-format sanity (never content). The mic
-# tier and this playback tier keep DISJOINT native-library sets on purpose
+# asserts frames-delivered + negotiated-format sanity (never content). Four
+# @Tests run: systemDefaultTier (no UID filter) plus applicationTier (numeric
+# uid), applicationByNameTier (package name), and processTreeTier (pid) — the
+# ADR-0013 UID-filtered variants. Those three are SELF-CAPTURE: the test
+# targets its OWN uid / package / pid, so a pass verifies the UID-filter
+# PLUMBING (target → resolve_match_uid → CaptureBridge.addMatchingUid → frames
+# from a matching-uid app), NOT that capturing a DIFFERENT app's audio works or
+# is correctly scoped — cross-app UID filtering stays UNVERIFIED. The mic tier
+# and this playback tier keep DISJOINT native-library sets on purpose
 # (librsac_ffi.so+shim vs librsac.so): both link rsac and export JNI_OnLoad, so
 # the winning RegisterNatives must be the .so that both mints and consumes the
-# token — see NativePlaybackDriver.kt. SystemDefault ONLY: the UID-filtered
-# tiers stay unverified. Same soft-skip-unless-`require_frames` discipline.
+# token — see NativePlaybackDriver.kt. Same soft-skip-unless-`require_frames`
+# discipline.
+#
+# Device-enumeration evidence (rsac-ad8a): the SAME driver .so also exports
+# driveEnumerateDevices, and RsacDevicesTest.devicesEnumerated drives rsac's
+# PUBLIC device-enumeration facade (no projection token — rsac gets its Context
+# via ActivityThread.currentApplication() inside its own JNI layer) and asserts
+# a non-empty, unique-id device list including the playback-capture endpoint.
+# A real built-in-mic input entry is asserted only when the AAR RsacDevices
+# path resolved (else an honest soft-skip on the default-route fallback list).
 # =============================================================================
 
 on:
@@ -357,12 +377,15 @@ jobs:
           JNILIBS="mobile/android/src/androidTest/jniLibs/x86_64"
           mkdir -p "$JNILIBS"
           cp playback-jnilibs/x86_64/librsac.so "$JNILIBS/"
-          # Sanity: the driver .so must export both the driver entry points AND
-          # rsac's JNI_OnLoad (re-exported via `pub use rsac`), else the token
-          # mint would have no registrant in this .so.
+          # Sanity: the driver .so must export ALL the driver entry points
+          # (SystemDefault + UID-filtered targeted drive + device enumeration +
+          # last-error) AND rsac's JNI_OnLoad (re-exported via `pub use rsac`),
+          # else the token mint would have no registrant in this .so.
           TOOLCHAIN="$ANDROID_NDK_HOME/toolchains/llvm/prebuilt/linux-x86_64/bin"
           for sym in JNI_OnLoad \
             Java_ai_codeseys_rsac_NativePlaybackDriver_drivePlaybackCapture \
+            Java_ai_codeseys_rsac_NativePlaybackDriver_driveTargetedPlaybackCapture \
+            Java_ai_codeseys_rsac_NativePlaybackDriver_driveEnumerateDevices \
             Java_ai_codeseys_rsac_NativePlaybackDriver_lastNativeError; do
             "$TOOLCHAIN/llvm-nm" -D --defined-only "$JNILIBS/librsac.so" | grep -q " $sym\$" || {
               echo "FAIL: librsac.so (playback driver) does not export $sym"

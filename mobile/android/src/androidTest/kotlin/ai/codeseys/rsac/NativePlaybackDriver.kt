@@ -64,6 +64,52 @@ object NativePlaybackDriver {
         timeoutMs: Int,
     ): LongArray
 
+    /**
+     * Drives ONE UID-filtered playback tier end-to-end through rsac's public
+     * API — the twin of [drivePlaybackCapture] with the [CaptureTarget]
+     * selected by [kind] + [arg]:
+     *
+     * | [kind] | target | [arg] |
+     * |---|---|---|
+     * | 0 | `SystemDefault` | ignored |
+     * | 1 | `Application(uid)` | the **numeric** app UID string (ADR-0013) |
+     * | 2 | `ApplicationByName(package)` | the package name |
+     * | 3 | `ProcessTree(pid)` | the decimal PID string |
+     *
+     * HONESTY: this is a SELF-CAPTURE drive (the test targets its own uid /
+     * package / pid), so a pass verifies the UID-filter plumbing (target →
+     * resolve → `addMatchingUid` → frames from a matching-uid app), NOT
+     * cross-app capture — see [RsacPlaybackInstrumentedTest]'s header.
+     *
+     * @return `[errorCode, buffers, frames, negRate, negChannels,
+     *   negSampleFormat]` — same slot contract as [drivePlaybackCapture];
+     *   [lastNativeError] carries the `AudioError` text on a hard error.
+     */
+    external fun driveTargetedPlaybackCapture(
+        tokenRaw: Long,
+        kind: Int,
+        arg: String,
+        sampleRate: Int,
+        channels: Int,
+        timeoutMs: Int,
+    ): LongArray
+
+    /**
+     * Drives rsac's PUBLIC device-enumeration facade
+     * (`get_device_enumerator()?.enumerate_devices()`) and returns a parseable
+     * summary (rsac-ad8a):
+     *
+     * ```text
+     * count=<N>;<id>|<name>|<Input|Output>;…
+     * ```
+     *
+     * or `ERROR: <text>` on failure. Needs no projection token: rsac obtains
+     * its `Context` inside its own JNI layer via
+     * `ActivityThread.currentApplication()`, which succeeds once this object's
+     * `System.loadLibrary("rsac")` has run `JNI_OnLoad` in the test process.
+     */
+    external fun driveEnumerateDevices(): String
+
     /** The `AudioError` text captured at the last failing stage ("" if none). */
     external fun lastNativeError(): String
 }
