@@ -18,8 +18,11 @@ research/
 
 # Binding smoke-test scratch (ci.yml check-bindings + local runs, rsac-e1f7)
 .venv-smoke/
+# bindings/rsac-napi/bun.lock is the committed, canonical lockfile (rsac-e652)
+# — Bun is the single package manager for this binding; do NOT re-add it here.
+# npm's lockfile format is unused/uncommitted (bun.lock is authoritative), so
+# an incidental `npm install` locally must not dirty the tree.
 bindings/rsac-napi/package-lock.json
-bindings/rsac-napi/bun.lock
 
 # Logs
 logs/

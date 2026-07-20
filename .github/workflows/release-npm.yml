@@ -168,9 +168,13 @@ jobs:
           node-version: '20'
           registry-url: 'https://registry.npmjs.org'
 
+      # rsac-e652: pin an exact Bun version (not `latest`) so a Bun release
+      # can't silently change lockfile-resolution/install behavior out from
+      # under a release build. Keep this in lockstep with ci.yml/
+      # ci-audio-tests.yml's setup-bun steps — bump all three together.
       - uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6 # v2
         with:
-          bun-version: latest
+          bun-version: '1.3.14'
 
       - name: Install PipeWire dev libraries (Linux)
         if: matrix.install_deps
@@ -202,8 +206,17 @@ jobs:
         with:
           tool: cargo-zigbuild
 
-      - name: bun install
-        run: bun install --frozen-lockfile || bun install
+      # rsac-e652: no unfrozen fallback — a stale bun.lock (drifted from
+      # package.json) FAILS loudly instead of silently re-resolving and
+      # publishing with unpinned dependency versions. The explicit `test -f`
+      # guard is load-bearing: bun install --frozen-lockfile silently
+      # REGENERATES a missing lockfile instead of failing (verified locally,
+      # bun 1.3.14), so without it a deleted bun.lock would pass this step
+      # silently and publish anyway.
+      - name: bun install --frozen-lockfile
+        run: |
+          test -f bun.lock || { echo "::error::bindings/rsac-napi/bun.lock is missing — commit a lockfile (bun install)."; exit 1; }
+          bun install --frozen-lockfile
 
       - name: napi build
         # Build path selection:
@@ -290,12 +303,25 @@ jobs:
           node-version: '20'
           registry-url: 'https://registry.npmjs.org'
 
+      # rsac-e652: pin an exact Bun version (not `latest`) so a Bun release
+      # can't silently change lockfile-resolution/install behavior out from
+      # under a release build. Keep this in lockstep with ci.yml/
+      # ci-audio-tests.yml's setup-bun steps — bump all three together.
       - uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6 # v2
         with:
-          bun-version: latest
+          bun-version: '1.3.14'
 
-      - name: bun install
-        run: bun install --frozen-lockfile || bun install
+      # rsac-e652: no unfrozen fallback — a stale bun.lock (drifted from
+      # package.json) FAILS loudly instead of silently re-resolving and
+      # publishing with unpinned dependency versions. The explicit `test -f`
+      # guard is load-bearing: bun install --frozen-lockfile silently
+      # REGENERATES a missing lockfile instead of failing (verified locally,
+      # bun 1.3.14), so without it a deleted bun.lock would pass this step
+      # silently and publish anyway.
+      - name: bun install --frozen-lockfile
+        run: |
+          test -f bun.lock || { echo "::error::bindings/rsac-napi/bun.lock is missing — commit a lockfile (bun install)."; exit 1; }
+          bun install --frozen-lockfile
 
       - name: Download all .node artifacts
         uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
