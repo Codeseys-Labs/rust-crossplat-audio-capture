@@ -30,6 +30,18 @@
 //!   loop against the new bulk `slice::align_to::<f32>()` reinterpret. Pure
 //!   conversion, no WASAPI/COM — so it builds and runs on any host. See the
 //!   `wasapi_byte_decode` group below for the measured before/after.
+//! - **bridge_ab** (feature `bridge-zerocopy` only) — the default `AudioBuffer`
+//!   ring (`create_bridge`) vs. the opt-in zero-copy `SampleRing` plane
+//!   (`create_sample_ring`) on the identical producer-push + consumer-drain
+//!   round trip, across mono/stereo × small/typical/large chunk sizes. A
+//!   `bridge_ab_push/*` sibling times ONLY the producer push (`iter_custom`,
+//!   drain untimed) — the isolated producer-side cost ADR-0006 §6
+//!   promote-criterion #1 names, which the round trip structurally masks
+//!   (SampleRing pays a consumer-side reconstruction copy the default ring's
+//!   moved `Vec` never does). This is the A/B data ADR-0006's
+//!   promote-or-remove decision needs (see
+//!   `docs/designs/0006-bridge-zerocopy-samplering.md` §6). A no-op when the
+//!   feature is off, since `SampleRing*` does not exist without it.
 //!
 //! All hot values flow through [`std::hint::black_box`] (re-exported by criterion)
 //! so the optimizer cannot elide the work being measured.
@@ -249,11 +261,310 @@ fn bench_wasapi_byte_decode(c: &mut Criterion) {
     group.finish();
 }
 
+// ── bridge_ab: SampleRing vs. AudioBuffer (ADR-0006 promote-or-remove data) ─
+//
+// `--features bridge-zerocopy` only. A/Bs the default `AudioBuffer` ring
+// (`create_bridge`) against the opt-in zero-copy `SampleRing` plane
+// (`create_sample_ring`, `docs/designs/0006-bridge-zerocopy-samplering.md`)
+// on the IDENTICAL producer-push + consumer-drain round trip, at the same
+// chunk sizes, same sample counts, same warm-up discipline as the rest of
+// this file — so the numbers are apples-to-apples and feed ADR-0006 §6
+// promote-criterion #1. Group/benchmark names are stable and greppable
+// (`bridge_ab/samplering/...` vs. `bridge_ab/audiobuffer/...`) so `bench.yml`
+// and any future extraction script can select them by substring.
+#[cfg(feature = "bridge-zerocopy")]
+mod bridge_ab {
+    use std::hint::black_box;
+    use std::time::{Duration, Instant};
+
+    use criterion::{BenchmarkId, Criterion, Throughput};
+
+    use rsac::bridge::ring_buffer::{
+        calculate_capacity, create_bridge, create_sample_ring, BridgeConsumer, BridgeProducer,
+        SampleRingConsumer, SampleRingProducer,
+    };
+    use rsac::core::config::AudioFormat;
+
+    /// One (channels, frames) case per row of the A/B matrix. Frame counts mirror
+    /// the sizes already used elsewhere in this file: a small ~10 ms WASAPI-style
+    /// packet (480 frames, see `WASAPI_PACKET_FRAMES` above), the typical 1024-frame
+    /// period the rest of `bridge.rs` benches against (`FRAMES`/`SAMPLES` above),
+    /// and a large 4096-frame period (matches `SCRATCH_MIN_FRAMES` /
+    /// `TAP_BUFFER_FRAMES` sizing used by the Android/iOS backends).
+    struct Case {
+        label: &'static str,
+        channels: u16,
+        frames: usize,
+    }
+
+    const CASES: &[Case] = &[
+        Case {
+            label: "mono_small",
+            channels: 1,
+            frames: super::WASAPI_PACKET_FRAMES, // 480
+        },
+        Case {
+            label: "stereo_small",
+            channels: 2,
+            frames: super::WASAPI_PACKET_FRAMES, // 480
+        },
+        Case {
+            label: "mono_typical",
+            channels: 1,
+            frames: super::FRAMES, // 1024
+        },
+        Case {
+            label: "stereo_typical",
+            channels: 2,
+            frames: super::FRAMES, // 1024
+        },
+        Case {
+            label: "mono_large",
+            channels: 1,
+            frames: 4096,
+        },
+        Case {
+            label: "stereo_large",
+            channels: 2,
+            frames: 4096,
+        },
+    ];
+
+    /// Build a deterministic interleaved slice of `samples` `f32`s — the same
+    /// generator shape as [`super::make_slice`], parameterized on size so every
+    /// case (and both sides of the A/B) pushes an identical payload.
+    fn make_case_slice(samples: usize) -> Vec<f32> {
+        (0..samples).map(|i| (i as f32) * 1e-4).collect()
+    }
+
+    /// Warm the default `AudioBuffer` ring's free-list, mirroring [`super::warm_up`].
+    fn warm_up_audiobuffer(
+        producer: &mut BridgeProducer,
+        consumer: &mut BridgeConsumer,
+        slice: &[f32],
+        channels: u16,
+        sample_rate: u32,
+    ) {
+        for _ in 0..64 {
+            producer.push_samples_or_drop(slice, channels, sample_rate);
+            let _ = consumer.pop();
+        }
+    }
+
+    /// Warm the `SampleRing`'s sample + metadata rings the same way — pushing
+    /// and draining a few cycles before timing starts — so both sides of the A/B
+    /// are measured in steady state, not during ring warm-up.
+    fn warm_up_sample_ring(
+        producer: &mut SampleRingProducer,
+        consumer: &mut SampleRingConsumer,
+        slice: &[f32],
+        channels: u16,
+        sample_rate: u32,
+    ) {
+        for _ in 0..64 {
+            producer.push_samples_or_drop(slice, channels, sample_rate);
+            let _ = consumer.pop();
+        }
+    }
+
+    /// The default `AudioBuffer` ring side of the A/B: identical push+pop round
+    /// trip to [`super::bench_push_pop_roundtrip`], parameterized over the case
+    /// matrix so it can be compared directly against the `SampleRing` side below.
+    fn bench_audiobuffer_side(c: &mut Criterion) {
+        let sample_rate = super::SAMPLE_RATE;
+        let capacity = calculate_capacity(Some(64), 4);
+
+        let mut group = c.benchmark_group("bridge_ab/audiobuffer");
+        for case in CASES {
+            let samples = case.frames * case.channels as usize;
+            let slice = make_case_slice(samples);
+            group.throughput(Throughput::Elements(samples as u64));
+            group.bench_with_input(BenchmarkId::from_parameter(case.label), case, |b, case| {
+                let (mut producer, mut consumer) = create_bridge(capacity, AudioFormat::default());
+                warm_up_audiobuffer(
+                    &mut producer,
+                    &mut consumer,
+                    &slice,
+                    case.channels,
+                    sample_rate,
+                );
+
+                b.iter(|| {
+                    let pushed = producer.push_samples_or_drop(
+                        black_box(&slice),
+                        case.channels,
+                        sample_rate,
+                    );
+                    black_box(pushed);
+                    let popped = consumer.pop();
+                    black_box(popped);
+                });
+            });
+        }
+        group.finish();
+    }
+
+    /// The zero-copy `SampleRing` side of the A/B: identical push+pop round trip
+    /// and case matrix, but through `create_sample_ring` instead of
+    /// `create_bridge` — the producer writes straight into the ring's
+    /// uninitialized slots (no `Vec`/`AudioBuffer` on this call) via
+    /// `write_chunk_uninit` + `CopyToUninit` (see `SampleRingProducer` docs in
+    /// `src/bridge/ring_buffer.rs`), and the consumer reconstructs an
+    /// `AudioBuffer` equivalent to what the default ring would deliver.
+    fn bench_samplering_side(c: &mut Criterion) {
+        let sample_rate = super::SAMPLE_RATE;
+        let capacity_chunks = calculate_capacity(Some(64), 4);
+
+        let mut group = c.benchmark_group("bridge_ab/samplering");
+        for case in CASES {
+            let samples = case.frames * case.channels as usize;
+            let slice = make_case_slice(samples);
+            // Ring sized PER CASE (`capacity_chunks * this case's samples`), not
+            // by the matrix maximum: a shared largest-case ring (~2 MB) would
+            // make the linear producer/consumer cursor sweep touch cold cache
+            // lines on the small/mono cases — a footprint asymmetry the
+            // AudioBuffer side (tiny recycled Vec working set) never pays, and
+            // therefore bias, not signal.
+            let sample_capacity = capacity_chunks * samples;
+            group.throughput(Throughput::Elements(samples as u64));
+            group.bench_with_input(BenchmarkId::from_parameter(case.label), case, |b, case| {
+                let (mut producer, mut consumer) =
+                    create_sample_ring(sample_capacity, capacity_chunks, AudioFormat::default());
+                warm_up_sample_ring(
+                    &mut producer,
+                    &mut consumer,
+                    &slice,
+                    case.channels,
+                    sample_rate,
+                );
+
+                b.iter(|| {
+                    let pushed = producer.push_samples_or_drop(
+                        black_box(&slice),
+                        case.channels,
+                        sample_rate,
+                    );
+                    black_box(pushed);
+                    let popped = consumer.pop();
+                    black_box(popped);
+                });
+            });
+        }
+        group.finish();
+    }
+
+    /// Producer-side-only push cost — the metric ADR-0006 §6 promote-criterion
+    /// #1 actually names ("producer-side win: lower p99 push cost and/or fewer
+    /// copies"). The round-trip groups above cannot isolate it: on the pop
+    /// side, `SampleRing` pays a second payload memcpy (ring → reconstructed
+    /// `AudioBuffer`) while the default ring MOVES its recycled `Vec` out with
+    /// no copy — so a producer-side win is structurally masked in a round
+    /// trip. Here `iter_custom` times ONLY `push_samples_or_drop`; the drain
+    /// that keeps the ring unsaturated (steady-state recycle path, never the
+    /// drop path) happens outside the timed region. The `Instant` read
+    /// overhead is identical on both sides, so the comparison stays fair.
+    fn bench_push_only_sides(c: &mut Criterion) {
+        let sample_rate = super::SAMPLE_RATE;
+        let capacity_chunks = calculate_capacity(Some(64), 4);
+
+        let mut group = c.benchmark_group("bridge_ab_push/audiobuffer");
+        for case in CASES {
+            let samples = case.frames * case.channels as usize;
+            let slice = make_case_slice(samples);
+            group.throughput(Throughput::Elements(samples as u64));
+            group.bench_with_input(BenchmarkId::from_parameter(case.label), case, |b, case| {
+                let (mut producer, mut consumer) =
+                    create_bridge(capacity_chunks, AudioFormat::default());
+                warm_up_audiobuffer(
+                    &mut producer,
+                    &mut consumer,
+                    &slice,
+                    case.channels,
+                    sample_rate,
+                );
+                b.iter_custom(|iters| {
+                    let mut total = Duration::ZERO;
+                    for _ in 0..iters {
+                        let start = Instant::now();
+                        let pushed = producer.push_samples_or_drop(
+                            black_box(&slice),
+                            case.channels,
+                            sample_rate,
+                        );
+                        total += start.elapsed();
+                        black_box(pushed);
+                        let _ = consumer.pop();
+                    }
+                    total
+                });
+            });
+        }
+        group.finish();
+
+        let mut group = c.benchmark_group("bridge_ab_push/samplering");
+        for case in CASES {
+            let samples = case.frames * case.channels as usize;
+            let slice = make_case_slice(samples);
+            // Per-case ring sizing — same cache-fairness rationale as the
+            // round-trip group above.
+            let sample_capacity = capacity_chunks * samples;
+            group.throughput(Throughput::Elements(samples as u64));
+            group.bench_with_input(BenchmarkId::from_parameter(case.label), case, |b, case| {
+                let (mut producer, mut consumer) =
+                    create_sample_ring(sample_capacity, capacity_chunks, AudioFormat::default());
+                warm_up_sample_ring(
+                    &mut producer,
+                    &mut consumer,
+                    &slice,
+                    case.channels,
+                    sample_rate,
+                );
+                b.iter_custom(|iters| {
+                    let mut total = Duration::ZERO;
+                    for _ in 0..iters {
+                        let start = Instant::now();
+                        let pushed = producer.push_samples_or_drop(
+                            black_box(&slice),
+                            case.channels,
+                            sample_rate,
+                        );
+                        total += start.elapsed();
+                        black_box(pushed);
+                        let _ = consumer.pop();
+                    }
+                    total
+                });
+            });
+        }
+        group.finish();
+    }
+
+    pub(super) fn bench_bridge_ab(c: &mut Criterion) {
+        bench_audiobuffer_side(c);
+        bench_samplering_side(c);
+        bench_push_only_sides(c);
+    }
+}
+
+#[cfg(feature = "bridge-zerocopy")]
+fn bench_bridge_ab(c: &mut Criterion) {
+    bridge_ab::bench_bridge_ab(c);
+}
+
+#[cfg(not(feature = "bridge-zerocopy"))]
+fn bench_bridge_ab(_c: &mut Criterion) {
+    // No-op without the feature: `SampleRing*` does not exist, so there is
+    // nothing to A/B. Kept as a real (empty) criterion target rather than
+    // conditionally omitted from `criterion_group!` so the group list below
+    // stays a single unconditional statement regardless of feature state.
+}
+
 criterion_group!(
     benches,
     bench_push_throughput,
     bench_push_pop_roundtrip,
     bench_capacity_sweep,
-    bench_wasapi_byte_decode
+    bench_wasapi_byte_decode,
+    bench_bridge_ab
 );
 criterion_main!(benches);

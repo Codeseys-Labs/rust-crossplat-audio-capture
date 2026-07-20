@@ -113,16 +113,15 @@ feature as an internal A/B alternative, with the following invariants recorded:
    the floor matters ("0.3.4: write_chunk_uninit + CopyToUninit for bridge-zerocopy").
    Do not relax this floor while `bridge-zerocopy` exists.
 
-5. **No backend and no benchmark uses it today (honest status).** The only call sites of
-   `create_sample_ring` / `SampleRing*` in the tree are the
-   `#[cfg(all(test, feature = "bridge-zerocopy"))] mod sample_ring_tests` unit tests
-   (data round-trip, timestamp preservation, FIFO+wrap, atomic-drop-when-full,
-   `available_chunks`). No `src/audio/*` backend constructs a `SampleRing`, and — despite
-   the `Cargo.toml` comment saying it is "A/B'd in benches/bridge.rs" — `benches/bridge.rs`
-   exercises only the default `create_bridge` + `push_samples_or_drop` path. **It is
-   implemented and unit-tested, not benched and not wired.** (The "benched" framing in the
-   critique and the Cargo.toml comment overstates the current state; the benchmark wiring
-   is part of the promote criteria below.)
+5. **No backend uses it today; the A/B bench now does (honest status).** The only call
+   sites of `create_sample_ring` / `SampleRing*` in the tree are
+   `#[cfg(all(test, feature = "bridge-zerocopy"))] mod sample_ring_tests` (data
+   round-trip, timestamp preservation, FIFO+wrap, atomic-drop-when-full,
+   `available_chunks`) and, as of the `bridge_ab` groups in `benches/bridge.rs`
+   (feature-gated on `bridge-zerocopy`), the promote-criterion #1 benchmark itself. No
+   `src/audio/*` backend constructs a `SampleRing` — that remains unwired (promote
+   criterion #2, §6). The `Cargo.toml` "A/B'd in benches/bridge.rs" comment is now
+   accurate for the benchmark half of the claim; the wiring half is still open.
 
 ## 5. Consequences
 
@@ -148,17 +147,24 @@ an unwired, unbenchmarked feature.
 weekly schedule + `workflow_dispatch` (previously `cargo bench` had zero CI callers —
 this ADR's promote-criteria data could never accumulate). The workflow archives
 `target/criterion/**` baselines for both the default feature set and `--features
-bridge-zerocopy`, but neither `benches/bridge.rs` nor `benches/observability.rs` yet
-constructs a `SampleRing` — promote-criterion #1 below (an actual A/B of `SampleRing`
-vs. the default ring) is still unimplemented. Tracked as a follow-on seed (filed
-alongside rsac-1da3) rather than folded into this ADR's decision, which still requires
-that data.
+bridge-zerocopy`.
+
+**Status update (rsac-6508):** `benches/bridge.rs` now carries the `bridge_ab`
+groups (`bridge_ab/samplering/*` vs. `bridge_ab/audiobuffer/*`, behind
+`--features bridge-zerocopy`) that A/B `SampleRing` against the default
+`AudioBuffer` ring on the identical producer-push + consumer-drain round trip,
+at mono/stereo × small/typical/large chunk sizes. `bench.yml`'s weekly
+`bridge-zerocopy` leg now exercises it every run, so promote-criterion #1's
+data starts accumulating from this point forward. The *decision* itself is
+still open — it needs repeatable data across multiple runs/targets, not a
+single sample — and criteria #2 (backend wiring) and #3 (`rt_alloc` probe on
+the `SampleRing` producer) remain unimplemented.
 
 **Promote** (wire into a backend) when *all* hold:
-1. A benchmark in `benches/bridge.rs` (behind `--features bridge-zerocopy`) A/Bs
-   `SampleRing` against the default `AudioBuffer` ring on the same 1024-frame stereo
-   period, and shows a measurable, repeatable producer-side win (lower p99 push cost
-   and/or fewer copies) on at least one supported target. This also makes the existing
+1. The `bridge_ab` benchmark in `benches/bridge.rs` (behind `--features
+   bridge-zerocopy`) shows a measurable, repeatable producer-side win (lower
+   p99 push cost and/or fewer copies) on at least one supported target, across
+   multiple accumulated `bench.yml` runs. This also makes the existing
    `Cargo.toml` "A/B'd in benches/bridge.rs" comment true.
 2. At least one interleaved-`f32` backend (PipeWire or CoreAudio, which already hand the
    producer a contiguous `&[f32]` — see the Linux `align_to::<f32>()` reinterpret) is
