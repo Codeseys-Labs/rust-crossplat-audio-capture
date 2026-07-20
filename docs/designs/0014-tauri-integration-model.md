@@ -23,6 +23,13 @@ mobile**.
 > **runtime** verification remains blocked on rsac-e6d3 / rsac-97c8 (unchanged
 > from ADR-0012's honesty posture). audio-graph's desktop integration is
 > unchanged.
+>
+> **Mobile adoption question (rsac-0ac9) resolved separately, deferred.**
+> Whether/when audio-graph itself targets mobile via this plugin — the
+> question left open by §4's "audio-graph adopts the plugin only if/when it
+> targets mobile" — is analyzed and recommended-against-for-now in
+> [ADR-0018](0018-audio-graph-mobile-adoption.md) (Proposed, awaiting owner
+> ratification). That ADR does not change anything decided here.
 
 ## 1. Context
 
