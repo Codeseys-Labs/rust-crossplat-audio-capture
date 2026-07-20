@@ -95,4 +95,11 @@ dependencies {
     androidTestImplementation("androidx.test.ext:junit:1.2.1")
     androidTestImplementation("androidx.test:runner:1.6.2")
     androidTestImplementation("androidx.test:rules:1.6.1") // GrantPermissionRule
+    // rsac-e6d3 playback tier: ActivityScenario (launches RsacTestActivity to
+    // host the MediaProjection consent flow). The consent dialog is auto-
+    // approved via `appops set … PROJECT_MEDIA allow` through the
+    // instrumentation UiAutomation shell, so no uiautomator dependency is
+    // needed; add androidx.test.uiautomator:uiautomator:2.3.0 only if a future
+    // image ignores the appop and a dialog click becomes the fallback.
+    androidTestImplementation("androidx.test:core:1.6.1") // ActivityScenario
 }

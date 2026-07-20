@@ -3341,6 +3341,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "rsac-androidtest-native"
+version = "0.4.2"
+dependencies = [
+ "jni-sys 0.3.1",
+ "rsac",
+]
+
+[[package]]
 name = "rsac-ffi"
 version = "0.4.2"
 dependencies = [

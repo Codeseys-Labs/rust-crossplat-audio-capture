@@ -9,10 +9,12 @@ name: Android Emulator Runtime Leg
 # `emulator-verified`. It proves the AAudio input path delivers frames through
 # the rsac public API, runs the previously-dormant cfg(android) unit tests
 # (capabilities, record parsing, conversion helpers), and asserts the honest
-# SystemDefault-without-consent refusal. MediaProjection playback tiers need
-# consent-dialog automation (uiautomator) and stay a follow-up extension of
-# this leg; a physical-device pass stays a runbook. This leg is NOT a required
-# PR gate until its acceptance criteria are observed green on a runner.
+# SystemDefault-without-consent refusal. The MediaProjection SystemDefault
+# playback tier is now exercised too (playback tier below — appops-auto-approved
+# consent, no uiautomator needed); the Application/ApplicationByName/ProcessTree
+# UID-filtered playback tiers stay unverified, and a physical-device pass stays
+# a runbook. This leg is NOT a required PR gate until its acceptance criteria
+# are observed green on a runner.
 #
 # KVM: hardware acceleration is mandatory for a usable x86_64 emulator.
 # Blacksmith (blacksmith-4vcpu-ubuntu-2404) KVM support is UNVERIFIED — the
@@ -48,6 +50,22 @@ name: Android Emulator Runtime Leg
 # loud assumption-skip unless `require_frames` — same discipline as the
 # shell-uid smoke. This tier is ADVISORY until observed green (then, as a
 # follow-up: flip require_frames and/or promote to a required check).
+#
+# Playback tier (rsac-e6d3): the SAME test APK also drives
+# CaptureTarget::SystemDefault (AudioPlaybackCapture / MediaProjection) through
+# rsac's PUBLIC capture API. The host phase builds a THIRD native lib — the
+# test-only mobile/androidtest-native cdylib as librsac.so — which re-exports
+# rsac's JNI_OnLoad (so RsacProjection.nativeRetainProjection is registered)
+# and exports the NativePlaybackDriver Java_* symbols. The test pre-grants the
+# PROJECT_MEDIA appop via the UiAutomation shell so the API 30 consent dialog
+# auto-approves (no uiautomator), mints a real token through the shipped
+# RsacProjection flow, plays a USAGE_MEDIA tone as capturable playback, and
+# asserts frames-delivered + negotiated-format sanity (never content). The mic
+# tier and this playback tier keep DISJOINT native-library sets on purpose
+# (librsac_ffi.so+shim vs librsac.so): both link rsac and export JNI_OnLoad, so
+# the winning RegisterNatives must be the .so that both mints and consumes the
+# token — see NativePlaybackDriver.kt. SystemDefault ONLY: the UID-filtered
+# tiers stay unverified. Same soft-skip-unless-`require_frames` discipline.
 # =============================================================================
 
 on:
@@ -76,6 +94,9 @@ on:
       # built from bindings/rsac-ffi/.
       - 'mobile/android/**'
       - 'bindings/rsac-ffi/**'
+      # rsac-e6d3 playback tier: the test-only driver cdylib (librsac.so) that
+      # drives the public SystemDefault playback API from the instrumented test.
+      - 'mobile/androidtest-native/**'
       - 'Cargo.toml'
       - 'Cargo.lock'
       - '.github/workflows/ci-android-emu.yml'
@@ -216,12 +237,23 @@ jobs:
                   p for p in glob.glob(pat)
                   if os.access(p, os.X_OK) and not p.endswith((".d", ".rlib", ".rmeta", ".so"))
               ]
-              if len(cands) != 1:
-                  # Newest-mtime wins when hashes accumulated across runs.
-                  cands.sort(key=os.path.getmtime)
-                  cands = cands[-1:]
               if not cands:
                   sys.exit(f"{path}: no executable via json OR glob {pat!r}")
+              if len(cands) != 1:
+                  # Multiple hashed binaries accumulated across runs (a warm
+                  # target dir). Picking newest-mtime here could silently run a
+                  # STALE cached binary and fake runtime evidence — the whole
+                  # point of this leg is that the evidence is real. Hard-fail
+                  # with the candidate list instead (CodeRabbit PR #65,
+                  # fix-now): the caller must clean target/ (or the json path,
+                  # which is unambiguous, must work) rather than gamble on mtime.
+                  listing = "\n".join(f"  {c}" for c in sorted(cands))
+                  sys.exit(
+                      f"{path}: glob {pat!r} matched {len(cands)} executables; "
+                      f"refusing to guess which is current (a stale pick would "
+                      f"fake runtime evidence). Clean target/ and re-run. "
+                      f"Candidates:\n{listing}"
+                  )
               shutil.copy(cands[0], out)
               print(f"{path}: glob-discovered {cands[0]} -> {out}")
 
@@ -299,6 +331,46 @@ jobs:
             }
           ls -l "$JNILIBS"
 
+      # ── Playback-tier driver cdylib (rsac-e6d3) ──────────────────────
+      # librsac.so for the PLAYBACK instrumented test: the test-only
+      # mobile/androidtest-native cdylib re-exports rsac's JNI_OnLoad (so
+      # loading it registers RsacProjection.nativeRetainProjection) AND exports
+      # the NativePlaybackDriver Java_* symbols that drive the public
+      # SystemDefault capture API. Same cargo-ndk pattern as the librsac_ffi.so
+      # step (no --message-format=json; the cdylib's -o path is deterministic).
+      # Distinct -o output dir so it never collides with the ffi build's, then
+      # copied into the SAME androidTest jniLibs (packaged into the test APK
+      # only, never the AAR). This .so is named librsac.so on purpose —
+      # RsacProjection hard-codes System.loadLibrary("rsac") — and is never
+      # co-built with mobile/android-native's identically-named cdylib (each is
+      # a separate `-p` invocation into its own dir), so no cargo output
+      # collision. The mic tier (librsac_ffi.so + shim) and this playback tier
+      # keep disjoint library sets on purpose (see NativePlaybackDriver.kt).
+      - name: Build librsac.so (playback driver) into androidTest jniLibs (x86_64)
+        if: steps.kvm.outputs.available == 'true'
+        run: |
+          export ANDROID_NDK_HOME="${ANDROID_NDK_LATEST_HOME:-$ANDROID_NDK_ROOT}"
+          echo "Using NDK at: $ANDROID_NDK_HOME"
+          cargo ndk -t x86_64 --platform 29 -o playback-jnilibs \
+            build --release -p rsac-androidtest-native \
+            --no-default-features --features feat_android
+          JNILIBS="mobile/android/src/androidTest/jniLibs/x86_64"
+          mkdir -p "$JNILIBS"
+          cp playback-jnilibs/x86_64/librsac.so "$JNILIBS/"
+          # Sanity: the driver .so must export both the driver entry points AND
+          # rsac's JNI_OnLoad (re-exported via `pub use rsac`), else the token
+          # mint would have no registrant in this .so.
+          TOOLCHAIN="$ANDROID_NDK_HOME/toolchains/llvm/prebuilt/linux-x86_64/bin"
+          for sym in JNI_OnLoad \
+            Java_ai_codeseys_rsac_NativePlaybackDriver_drivePlaybackCapture \
+            Java_ai_codeseys_rsac_NativePlaybackDriver_lastNativeError; do
+            "$TOOLCHAIN/llvm-nm" -D "$JNILIBS/librsac.so" | grep -q " $sym\$" || {
+              echo "FAIL: librsac.so (playback driver) does not export $sym"
+              exit 1
+            }
+          done
+          ls -l "$JNILIBS"
+
       # ── Boot the AVD and run the payload ─────────────────────────────
       - name: Run tests on the emulator
         if: steps.kvm.outputs.available == 'true'
@@ -339,13 +411,15 @@ jobs:
               unit-tests.log smoke.log 2>/dev/null || echo "logs missing — see artifacts"
             echo '```'
             echo ""
-            echo "### Instrumented tier (rsac-255b — real app uid + RECORD_AUDIO, shipped C ABI)"
+            echo "### Instrumented tier (real app uid + RECORD_AUDIO)"
+            echo ""
+            echo "_rsac-255b mic tier (shipped C ABI) + rsac-e6d3 playback tier (SystemDefault, public API via MediaProjection)._"
             echo ""
             echo '```'
             grep -iE "BUILD SUCCESSFUL|BUILD FAILED|tests? (passed|failed|completed)|connectedDebugAndroidTest" \
               instrumented.log 2>/dev/null || echo "instrumented.log missing — see artifacts"
             grep -E "drive result|frames delivered|SKIP-WITH-SUMMARY" \
-              instrumented-logcat.log 2>/dev/null || echo "no RsacFramesTest logcat evidence — see artifacts"
+              instrumented-logcat.log 2>/dev/null || echo "no RsacFramesTest/RsacPlaybackTest logcat evidence — see artifacts"
             echo '```'
             echo ""
             echo "_emulator-verified, not device-verified (rsac-e6d3 / rsac-255b)._"
