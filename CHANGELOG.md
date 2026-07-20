@@ -20,6 +20,20 @@ Releases with no ABI change omit the subsection (or state "No C ABI changes").
 
 ### Added
 
+### Changed
+
+### Deprecated
+
+### Removed
+
+### Fixed
+
+### Security
+
+## [0.4.3] - 2026-07-20
+
+### Added
+
 - **bindings (C FFI):** new `rsac_builder_set_ios_app_group(builder, app_group)`
   — iOS App Group consent configuration reaches the C ABI, completing mobile
   consent parity with the Rust builder (`with_ios_app_group`). Uniform-ABI
@@ -265,7 +279,12 @@ Releases with no ABI change omit the subsection (or state "No C ABI changes").
   `with_android_projection` signatures are retained. This surface is
   `#[cfg(target_os = "android")]`, so the host `cargo-semver-checks` gate does
   not observe it; the removal of `Copy`/`Hash` is nonetheless a breaking change
-  for Android consumers and gates the next release at **0.5.0** (rsac-3407).
+  for Android consumers (rsac-3407). *Release note (owner decision
+  2026-07-20): shipped in 0.4.3 regardless — rsac has never been published to
+  any registry (rsac-43e4/rsac-aaea), so no consumer can resolve `0.4.x` by
+  semver range and pick this up automatically; git consumers pin by rev/tag.
+  Strict in-range semver discipline applies from the first registry publish
+  onward.*
 - Mobile backend deps (`jni-sys`; `objc2-avf-audio`/`block2`/`objc2`/
   `objc2-foundation` on iOS) are now `optional` and tied to `feat_android`/
   `feat_ios`, completing the `cfg(all(target_os, feature))` double-gate the
