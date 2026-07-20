@@ -283,8 +283,9 @@ option):
   rsac-0ac9 referencing this ADR. Optionally file a low-priority tracking
   seed for "re-evaluate audio-graph mobile adoption" with the §5 triggers
   copied into its body, `blockedBy` the seeds named in trigger 3
-  (rsac-e6d3, rsac-97c8, rsac-b3aa) so `sd ready` doesn't surface it until at
-  least one closes.
+  (rsac-e6d3, rsac-97c8, rsac-b3aa) — note `blockedBy` semantics keep it
+  hidden from `sd ready` until ALL three close; if the intended trigger is
+  any-one-closes, skip `blockedBy` and rely on the §5 triggers text instead.
 - **If the owner instead ratifies A:** file seeds for (a) audio-graph mobile
   UI rework (source-picker redesign + responsive layout), (b)
   `tauri android init` / `tauri ios init` scaffolding in the audio-graph

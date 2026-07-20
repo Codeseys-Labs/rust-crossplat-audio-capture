@@ -85,7 +85,10 @@ jobs:
     runs-on: [self-hosted, macos, tcc-audio]
     # Proven full-suite runtime is ~23 s (owner's M4, 2026-07-07); 15 min is a
     # generous backstop that also covers a cold compile on the self-hosted cache.
-    timeout-minutes: 15
+    # Budget: the internally-bounded steps alone can consume ~13 min worst
+    # case (guard 60s + suite gtimeout 600s + compose 120s) BEFORE cargo
+    # build time; 15 could kill a healthy first (cold-cache) run mid-suite.
+    timeout-minutes: 25
     # `bash` keyword shell (`-eo pipefail`) so a failing `cargo test … | tee log`
     # propagates instead of being masked by tee's exit 0 (mirrors macos-audio in
     # ci-audio-tests.yml).
