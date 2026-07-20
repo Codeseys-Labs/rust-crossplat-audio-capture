@@ -364,7 +364,7 @@ jobs:
           for sym in JNI_OnLoad \
             Java_ai_codeseys_rsac_NativePlaybackDriver_drivePlaybackCapture \
             Java_ai_codeseys_rsac_NativePlaybackDriver_lastNativeError; do
-            "$TOOLCHAIN/llvm-nm" -D "$JNILIBS/librsac.so" | grep -q " $sym\$" || {
+            "$TOOLCHAIN/llvm-nm" -D --defined-only "$JNILIBS/librsac.so" | grep -q " $sym\$" || {
               echo "FAIL: librsac.so (playback driver) does not export $sym"
               exit 1
             }

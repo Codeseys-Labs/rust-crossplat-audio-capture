@@ -6,7 +6,8 @@
 `create_sample_ring`, `ChunkMeta`), `Cargo.toml` feature `bridge-zerocopy`
 **Verdict:** Ship a parallel sample-domain SPSC ring behind the **default-off**
 `bridge-zerocopy` feature as an internal A/B alternative to the default `AudioBuffer`
-ring. It is implemented and unit-tested but **wired into no backend and no benchmark
+ring. It is implemented, unit-tested, and A/B-benched (`benches/bridge.rs`
+`bridge_ab*` groups, accumulating via `bench.yml`) but **wired into no backend
 today**; record the promote-or-remove criteria so it does not rot as undocumented
 near-dead surface.
 
