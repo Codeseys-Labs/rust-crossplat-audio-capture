@@ -20,6 +20,20 @@ Releases with no ABI change omit the subsection (or state "No C ABI changes").
 
 ### Added
 
+### Changed
+
+### Deprecated
+
+### Removed
+
+### Fixed
+
+### Security
+
+## [0.4.3] - 2026-07-20
+
+### Added
+
 - **bindings (C FFI):** new `rsac_builder_set_ios_app_group(builder, app_group)`
   — iOS App Group consent configuration reaches the C ABI, completing mobile
   consent parity with the Rust builder (`with_ios_app_group`). Uniform-ABI
