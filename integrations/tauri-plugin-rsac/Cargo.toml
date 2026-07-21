@@ -5,7 +5,7 @@ name = "tauri-plugin-rsac"
 # gate asserts equality with root rsac on release tags. Keep this line free of
 # a trailing comment: the bump/lockstep extractors match `version = "X"` only
 # when nothing follows the closing quote.
-version = "0.4.3"
+version = "0.4.4"
 edition = "2021"
 # match root MSRV floor (Cargo.toml:9)
 rust-version = "1.87"
@@ -34,7 +34,7 @@ thiserror = "2"
 log = "0.4"
 # Path dep + version pin — mirrors bindings/rsac-ffi/Cargo.toml:52 exactly.
 # The version pin is what a future publish records; joins version-lockstep.
-rsac = { path = "../../", version = "0.4.3", default-features = false }
+rsac = { path = "../../", version = "0.4.4", default-features = false }
 
 [build-dependencies]
 tauri-plugin = { version = "2", features = ["build"] }
