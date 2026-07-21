@@ -26,6 +26,20 @@ Releases with no ABI change omit the subsection (or state "No C ABI changes").
 
 ### Removed
 
+### Fixed
+
+### Security
+
+## [0.4.4] - 2026-07-21
+
+### Added
+
+### Changed
+
+### Deprecated
+
+### Removed
+
 - **`bridge-zerocopy` feature + the `SampleRing` data plane** — the opt-in,
   default-off zero-copy `SampleRing` producer plane (`SampleRingProducer` /
   `SampleRingConsumer` / `create_sample_ring`) is removed under
