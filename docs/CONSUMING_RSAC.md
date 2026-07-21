@@ -100,7 +100,6 @@ Canonical matrix with host-dependency notes: [`features.md`](features.md).
 | `tracing` | route internal events to the `tracing` facade |
 | `cli` | the demo binary's deps — never needed by library consumers |
 | `test-utils` | mock-backend helpers for your tests |
-| `bridge-zerocopy` | benchmark-only alternative data plane — **not** a consumer perf switch |
 
 ### Discovery, capabilities, and diagnostics
 

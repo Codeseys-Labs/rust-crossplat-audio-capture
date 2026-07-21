@@ -160,23 +160,22 @@ ignored).
 > sites outside its own tests. It is reserved for wiring once each backend knows
 > its negotiated period.
 
-## Zero-copy sample ring (`bridge-zerocopy`, benchmark-only)
+## Zero-copy sample ring — prototyped, measured, removed
 
-The default data plane allocates one owned `AudioBuffer` per chunk (recycled via
-the free-list ring, so steady-state allocation-free, but not *copy*-free). An
-opt-in `SampleRing` plane — gated behind the **default-off** `bridge-zerocopy`
-feature — writes interleaved `f32` straight into the ring's uninitialised slots
-via `rtrb`'s `write_chunk_uninit` + `CopyToUninit`, eliminating the per-buffer
-`Vec`.
+An opt-in `SampleRing` producer plane once lived behind a `bridge-zerocopy`
+feature: it wrote interleaved `f32` straight into the ring's uninitialised slots
+via `rtrb`'s `write_chunk_uninit` + `CopyToUninit`, avoiding the per-buffer `Vec`
+on the producer. It was never wired into a backend, A/B-benchmarked against the
+default `AudioBuffer` ring, and **removed** on 2026-07-20 under
+[ADR-0006](designs/0006-bridge-zerocopy-samplering.md)'s promote-or-remove gate.
 
-> **Honest status — implemented and tested, but not wired into any backend
-> (tracked, critique PERF-02).** No code in `src/audio/` constructs a
-> `SampleRing`; it is exercised only by the A/B comparison in
-> `benches/bridge.rs`. Enabling `bridge-zerocopy` compiles the extra types but
-> does not change a real capture's runtime path. Consequently the literal
-> "zero-copy ring buffer → consumer" promise is delivered only by this
-> not-yet-wired path; the shipping default is *allocation-free in steady state*.
-> See [`features.md`](features.md) for the feature flag.
+The producer-side win was small, target-specific (present on x86_64, absent on
+Apple Silicon and on large chunks), and immaterial against the ~10 ms callback
+budget; end-to-end the plane *lost* in every measured environment, because the
+consumer had to pay a reconstruction copy the default ring's moved `Vec` never
+does. The shipping default remains *allocation-free in steady state* (not
+literally copy-free), and that is the honest characterisation. ADR-0006 §6
+records the full data.
 
 ## What rsac does *not* optimise (by design)
 
@@ -199,15 +198,15 @@ not DSP:
 Two criterion benches ship in-tree (`harness = false`, so they do not affect
 `cargo build`/`cargo test`):
 
-- `benches/bridge.rs` — the producer/consumer data plane, including the
-  `bridge-zerocopy` A/B comparison.
+- `benches/bridge.rs` — the producer/consumer data plane (steady-state push
+  throughput, push→pop round trip, a capacity sweep, and the WASAPI byte→f32
+  decode micro-benchmark).
 - `benches/observability.rs` — the consumer-side read path (`stream_stats`,
   `backpressure_report`, and `AudioBuffer` meters) with an RT-safety regression
   guard.
 
 ```bash
 cargo bench --bench bridge
-cargo bench --bench bridge --features bridge-zerocopy   # include the zero-copy plane
 cargo bench --bench observability
 ```
 

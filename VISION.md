@@ -112,9 +112,10 @@ pipeline.
   ring slots via a free-list return ring — see
   [`docs/designs/0001-rt-allocation-guarantee.md`](docs/designs/0001-rt-allocation-guarantee.md)),
   with one owned `AudioBuffer` materialized per delivered chunk on the non-RT
-  consumer side. A true zero-copy `SampleRing` plane (no intermediate `Vec`)
-  exists behind the off-by-default `bridge-zerocopy` feature and is wired only to
-  the benchmark today; it is not yet on any backend's default path.
+  consumer side. (An opt-in zero-copy `SampleRing` producer plane was prototyped
+  and A/B-benchmarked behind a `bridge-zerocopy` feature but removed — it lost
+  end-to-end in every measured environment; see
+  [`docs/designs/0006-bridge-zerocopy-samplering.md`](docs/designs/0006-bridge-zerocopy-samplering.md).)
 
 ### Multi-source
 
@@ -226,9 +227,6 @@ they are documented above as part of the in-scope surface:
 - **Honor `buffer_size` / period-aware ring sizing on macOS + Linux** —
   `calculate_capacity_for_period` is implemented and tested but only Windows
   threads the requested `buffer_size` through today.
-- **Promote or retire the `bridge-zerocopy` `SampleRing` plane** — wire it into
-  an interleaved-f32 backend (PipeWire / CoreAudio) and measure, or keep it as
-  an opt-in A/B path. (The default path is already alloc-free in steady state.)
 
 Each of these is tracked on `Codeseys-Labs/rust-crossplat-audio-capture` and/or
 in [`docs/reviews/`](docs/reviews/).
