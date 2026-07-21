@@ -1,6 +1,6 @@
 {
   "name": "tauri-plugin-rsac-api",
-  "version": "0.4.3",
+  "version": "0.5.0",
   "description": "JS/TS guest API for tauri-plugin-rsac (ADR-0014)",
   "license": "MIT OR Apache-2.0",
   "type": "module",
