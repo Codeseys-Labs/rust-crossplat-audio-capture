@@ -13,7 +13,7 @@ its Scope says so.
 | [ADR-0003](0003-terminal-stream-error.md) | Distinguish terminal stream end from recoverable read errors | Accepted | 2026-05-29 |
 | [ADR-0004](0004-device-change-notifications.md) | Device-change-notification delivery model (per-platform) | Accepted | 2026-05-30 |
 | [ADR-0005](0005-device-watcher-raii-teardown.md) | `DeviceWatcher` RAII teardown / lifecycle contract | Accepted | 2026-05-30 |
-| [ADR-0006](0006-bridge-zerocopy-samplering.md) | `bridge-zerocopy` `SampleRing`: an opt-in, default-off alternative data plane | Accepted | 2026-05-30 |
+| [ADR-0006](0006-bridge-zerocopy-samplering.md) | `bridge-zerocopy` `SampleRing`: an opt-in, default-off alternative data plane | Accepted — resolved: REMOVED (2026-07-20) | 2026-05-30 |
 | [ADR-0007](0007-capacity-period-sizing.md) | Period-derived ring sizing and `buffer_size` semantics | Accepted | 2026-05-30 |
 | [ADR-0008](0008-cache-padded-atomics.md) | Hand-rolled `CachePadded` for false-sharing mitigation in `BridgeShared` | Accepted | 2026-05-30 |
 | [ADR-0009](0009-tracing-log-shim.md) | `tracing`/`log` dual-backend instrumentation shim with an RT-path prohibition | Accepted | 2026-05-30 |

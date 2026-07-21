@@ -278,7 +278,6 @@ docker/                     # Linux devcontainer + optional native VM lab; legac
   - `sink-wav` — `WavFileSink` adapter
   - `test-utils` — Test utility exports
   - `tracing` — Optional `tracing` facade integration for internal instrumentation
-  - `bridge-zerocopy` — Default-off sample-domain ring used for benchmarking / future data-plane decisions
   - `compose` — Multi-source channel composition (`src/compose/`; adds `rubato` + `audioadapter-buffers`) — ADR-0011
   - `cli` — Demo binaries' deps (`clap`, `color-eyre`, `ctrlc`, `env_logger`); NOT in defaults, so library consumers don't pull them
   - `macos-tcc-spi` — real `check_audio_capture_permission()` preflight via the private `TCCAccessPreflight` SPI, `dlopen`'d at runtime (ADR-0015); off by default so the published artifact carries no private-symbol usage
@@ -365,9 +364,8 @@ non-Linux contributor's local gate — confirmed live (rsac-ef88): an injected
 `--features feat_linux,compose,cli` inside the devcontainer image.
 `gate:linux` runs the same `clippy --all-targets --features
 feat_linux,compose,cli -D warnings` + `fmt --check` ci.yml's `lint
-(feat_linux)` leg runs — plus the Feature Combo job's two optional-feature
-clippy sweeps (`feat_linux,async-stream,sink-wav,test-utils,compose` and
-`feat_linux,bridge-zerocopy`) — via `docker run` against
+(feat_linux)` leg runs — plus the Feature Combo job's optional-feature
+clippy sweep (`feat_linux,async-stream,sink-wav,test-utils,compose`) — via `docker run` against
 `docker/linux/Dockerfile.test` (the same image `.devcontainer/` builds), with
 named-volume caches for the cargo registry and target dir so warm re-runs are
 fast. It needs Docker (OrbStack/Docker Desktop/native); without it, the task
@@ -764,7 +762,7 @@ Full playbook (when to stack vs parallel PRs, exact commands, pitfalls):
 - **Mobile — runtime verification** (the honest gap has materially closed): Android mic + SystemDefault playback are emulator-verified and iOS mic is simulator-verified (PRs #66/#67 — see the matrix cells above for run citations). Still open: Android UID-filtered playback tiers, iOS ReplayKit playback (rsac-b3aa), and every real-DEVICE cell (rsac-e6d3 device half, rsac-97c8)
 - **Mobile — delivery**: real Android device enumeration (rsac-ad8a), AAR Maven + SwiftPM distribution (rsac-05b6), `tauri-plugin-rsac` (rsac-f21c) + the audio-graph decision (rsac-0ac9, ADR-0014) — the rsac-ffi mobile-triple cross-checks landed (rsac-7a18)
 - Additional sink adapters
-- Performance benchmarking and optimization — the SampleRing-vs-AudioBuffer A/B landed in `benches/bridge.rs` (`bridge_ab*`, PR #67) and accumulates via `bench.yml`; ADR-0006's promote-or-remove decision waits on repeatable multi-run data (rsac-6508)
+- Performance benchmarking and optimization — the SampleRing-vs-AudioBuffer A/B (ADR-0006) resolved to REMOVE on 2026-07-20: the zero-copy `SampleRing` producer plane lost end-to-end in every measured environment and was deleted; `benches/bridge.rs` keeps the default-plane groups (push/roundtrip/capacity/wasapi-decode)
 - macOS 15 (Sequoia) testing on real hardware (expected to work via Path 2, untested)
 - **Linux `ApplicationByName` happy-path integration test** — Windows has `application_by_name_windows`; the Linux happy path (pinned `pw-dump` node name) is still absent and macOS's is `#[ignore]`d behind TCC
 - **First crates.io publish** — the crate is not yet on crates.io; source/git dependency snippets are canonical until the registry publish lane is re-enabled

@@ -79,11 +79,6 @@ test-utils = [] # Feature to enable test utilities
 # Streaming/data-plane features
 async-stream = ["dep:atomic-waker"]  # Async Stream support (adds atomic-waker for async notification)
 sink-wav = []                        # WavFileSink sink adapter (hound is always available)
-# rsac-3616: opt-in sample-domain SPSC ring (interleaved f32 written via rtrb
-# write_chunk_uninit + CopyToUninit) that avoids the per-buffer Vec/AudioBuffer
-# allocation on the producer's RT thread. Default OFF — the AudioBuffer ring
-# remains the default path; this is A/B'd in benches/bridge.rs.
-bridge-zerocopy = []
 # rsac-624c: opt-in structured instrumentation. Default OFF — with the feature
 # off, rsac_event!/rsac_span! fall back to `log::` (behavior-identical, no extra
 # deps). With it on, they emit tracing events/spans and `install_default_tracing`
@@ -114,7 +109,7 @@ macos-tcc-spi = []
 [dependencies]
 # Core dependencies
 futures-core = "0.3.32"
-rtrb = "0.3.4"                                               # Lock-free SPSC ring buffer for audio data bridge (0.3.4: write_chunk_uninit + CopyToUninit for bridge-zerocopy)
+rtrb = "0.3.4"                                               # Lock-free SPSC ring buffer for the audio data bridge (AudioBuffer + free-list return rings)
 atomic-waker = { version = "1.1.2", optional = true }           # Async waker for ring buffer notification (behind async-stream feature)
 thiserror = "2.0.18"                                       # For error handling
 log = "0.4.29"                                                 # For logging

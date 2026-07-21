@@ -152,7 +152,6 @@ papered over:
 | `buffer_size` honored only on Windows | `wasapi.rs` uses `calculate_capacity(config.buffer_size, 4)`; macOS/Linux hardcode `calculate_capacity(None, 4)` (=64). `buffer_size` is a **ring slot count**, not frames. | same ADR |
 | Buffer timestamps always `None` | every backend calls `push_samples_or_drop` (no timestamp); `push_samples_or_drop_at` is unused. | critique DF-01 |
 | Negotiated format not recorded | no backend calls `set_negotiated_format`, so `format()` always returns the *requested* format. | critique PERF-07 |
-| `bridge-zerocopy` `SampleRing` plane | a parallel zero-copy data plane exists behind the `bridge-zerocopy` feature; default build uses the `AudioBuffer` ring (alloc-free in steady state, not zero-copy). | ADR for the zero-copy plane (0004-0009 set) |
 
 ---
 

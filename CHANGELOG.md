@@ -26,6 +26,17 @@ Releases with no ABI change omit the subsection (or state "No C ABI changes").
 
 ### Removed
 
+- **`bridge-zerocopy` feature + the `SampleRing` data plane** — the opt-in,
+  default-off zero-copy `SampleRing` producer plane (`SampleRingProducer` /
+  `SampleRingConsumer` / `create_sample_ring`) is removed under
+  [ADR-0006](docs/designs/0006-bridge-zerocopy-samplering.md)'s promote-or-remove
+  gate. A/B benchmarking across five environments showed the producer-side win
+  was small, target-specific (x86_64 only), and immaterial (~10–30 ns against a
+  ~10 ms callback budget), while the end-to-end round trip lost in every measured
+  environment. The feature was never wired into any backend and never published,
+  so this is **not a breaking change** for any consumer. The default
+  `AudioBuffer` ring (alloc-free in steady state) is unchanged. (ADR-0006 §6)
+
 ### Fixed
 
 ### Security

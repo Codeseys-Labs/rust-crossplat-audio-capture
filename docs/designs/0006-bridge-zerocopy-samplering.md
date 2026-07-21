@@ -1,7 +1,7 @@
 # ADR 0006 — `bridge-zerocopy` `SampleRing`: an opt-in, default-off alternative data plane
 
-**Status:** Accepted
-**Date:** 2026-05-30
+**Status:** Accepted — resolved: **REMOVED (2026-07-20)** (see §6 Outcome)
+**Date:** 2026-05-30 (accepted); 2026-07-20 (removed)
 **Scope:** `src/bridge/ring_buffer.rs` (`SampleRingProducer`/`SampleRingConsumer`,
 `create_sample_ring`, `ChunkMeta`), `Cargo.toml` feature `bridge-zerocopy`
 **Verdict:** Ship a parallel sample-domain SPSC ring behind the **default-off**
@@ -10,6 +10,14 @@ ring. It is implemented, unit-tested, and A/B-benched (`benches/bridge.rs`
 `bridge_ab*` groups, accumulating via `bench.yml`) but **wired into no backend
 today**; record the promote-or-remove criteria so it does not rot as undocumented
 near-dead surface.
+
+> **Outcome (2026-07-20): the remove arm executed.** The A/B data (§6 Outcome
+> below) showed the producer-side win was small, target-specific, and immaterial,
+> while the end-to-end round trip lost in every measured environment. The
+> `SampleRing*` types, `create_sample_ring`, the bridge `ChunkMeta`, the
+> `bridge-zerocopy` feature, and the A/B bench were deleted in commit `6e31d64`;
+> the default `AudioBuffer` plane keeps its accepted "alloc-free producer in
+> steady state" wording. This ADR is retained (not deleted) as the record of why.
 
 ## 1. Context
 
@@ -179,6 +187,50 @@ the `SampleRing` producer) remain unimplemented.
 after this ADR, no backend is wired and the benchmark shows no advantage — and instead
 keep only the (already accepted) "alloc-free producer in steady state" wording for the
 default plane.
+
+### Outcome (2026-07-20): REMOVED
+
+**Decision: remove.** Promote fails on merit despite a technical criterion-#1 pass
+on a single target. The remove arm of §6 executed.
+
+**Data.** Five environments: four `bench.yml` CI runs on x86_64 Blacksmith (run
+IDs `29721536958`, `29728591283`, `29787765381`, `29787771364`) plus one local
+Apple Silicon run (2026-07-20). Ratios are `SampleRing` mean-time ÷ `AudioBuffer`
+mean-time — **< 1.00 means `SampleRing` is faster, > 1.00 means it is slower.**
+
+| Metric | Chunk class | x86_64 (CI, Blacksmith) | Apple Silicon (local) | Reading |
+|---|---|---|---|---|
+| Push-only (`bridge_ab_push/*`, criterion #1's metric) | small | 0.80–0.92 | 1.03–1.40 | real producer win on x86 small chunks; **loses** on Apple Silicon |
+| Push-only | typical | 0.69–0.99 | 1.03–1.40 | producer win on x86; **loses** on Apple Silicon |
+| Push-only | large | 1.25–1.64 | 1.03–1.40 | **loses everywhere** — architectural: `write_chunk_uninit` wrap-splits large copies, while the default plane's recycled `Vec` is always contiguous |
+| Round-trip (`bridge_ab/*`, end-to-end) | all | 1.14–2.48 | 1.14–2.48 | **`SampleRing` loses every case in every environment** — the consumer pays a reconstruction copy the default ring's moved `Vec` never does |
+
+Dispersion was ≤ 3.2% relative std-dev across runs — the differences are
+repeatable signal, not noise.
+
+**Materiality.** The best-case producer win is ~10–30 ns per callback against a
+~10 ms period budget (~0.0003% of the budget). The end-to-end cost is strictly
+worse. Promote-criterion #2 (backend wiring) would make every consumer pay the
+consumer-side reconstruction tax for an unobservable producer-side gain — a net
+regression on the path that actually ships. Criterion #1 passed only on x86_64
+small/typical push-only, and only because the round trip structurally masks the
+reconstruction copy; isolating the producer does not make the plane worth
+shipping when the delivered path loses.
+
+**What was removed** (commit `6e31d64`): `SampleRingProducer` /
+`SampleRingConsumer`, `create_sample_ring`, the bridge `ChunkMeta` sidecar type
+and its `NO_TIMESTAMP` sentinel, `mod sample_ring_tests`, the `CopyToUninit`
+import (`src/bridge/ring_buffer.rs`); the `bridge_ab` / `bridge_ab_push`
+benchmark module and its cfg stubs (`benches/bridge.rs`); the
+`bridge-zerocopy = []` feature (`Cargo.toml`); and the CI/script legs that
+exercised the feature (`ci.yml`, `bench.yml`, `scripts/gate-linux.sh`). The
+`rtrb = "0.3.4"` pin is retained (still the bridge's ring), with its comment
+reworded to drop the vanished zerocopy rationale. The default `AudioBuffer`
+plane is byte-identical and keeps its "alloc-free producer in steady state"
+guarantee (ADR-0001). The feature was never wired into any backend and never
+published, so this removes no consumer-visible surface — **not a breaking
+change.** (Note: the unrelated `ChunkMeta` metering type in
+`integrations/tauri-plugin-rsac`, a napi precedent, is untouched.)
 
 ## 7. References
 

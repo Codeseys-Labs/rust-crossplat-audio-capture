@@ -1031,21 +1031,18 @@ jobs:
         run: cargo check --no-default-features --features feat_linux,async-stream,sink-wav,test-utils,compose
 
       # rsac-3e24: clippy the optional features under -D warnings. The root lint
-      # job lints only feat_<os>, so a lint that fires solely under bridge-zerocopy
-      # (e.g. drop_non_drop on the SampleRing path) never gated CI. Lint the full
-      # optional-feature set + bridge-zerocopy here.
+      # job lints only feat_<os>, so a lint that fires solely under an optional
+      # feature never gated CI. Lint the full optional-feature set here.
       - name: Clippy optional features (-D warnings)
         run: |
           cargo clippy --all-targets --no-default-features --features feat_linux,async-stream,sink-wav,test-utils,compose -- -D warnings
-          cargo clippy --all-targets --no-default-features --features feat_linux,bridge-zerocopy -- -D warnings
 
-      # rsac-86c7: async-stream + bridge-zerocopy unit tests (11 + 6 tests) are
-      # clippy'd above but were never EXECUTED by any `--lib` leg. Run them here
-      # — this job already isolates the optional-feature build.
-      - name: Run unit tests (async-stream + bridge-zerocopy)
+      # rsac-86c7: async-stream unit tests are clippy'd above but were never
+      # EXECUTED by any `--lib` leg. Run them here — this job already isolates
+      # the optional-feature build.
+      - name: Run unit tests (async-stream)
         run: |
           cargo test --lib --no-default-features --features feat_linux,async-stream,sink-wav,test-utils,compose
-          cargo test --lib --no-default-features --features feat_linux,bridge-zerocopy
 
       - name: Run doctests
         # Build doctests with the same feature set so doc examples that touch
@@ -1056,7 +1053,7 @@ jobs:
   # ── Feature powerset (cargo-hack, Linux) ───────────────────────────
   # The hand-picked feature-combo-doctests job above checks ONE combination;
   # this checks the POWERSET: async-stream / sink-wav / test-utils /
-  # bridge-zerocopy / tracing / compose / cli — and any future features — get
+  # tracing / compose / cli — and any future features — get
   # covered combinatorially, so a bad pairwise interaction (a cfg that only
   # compiles with one feature on and another off) can't slip through.
   # feat_windows / feat_macos are excluded because their platform deps cannot
@@ -1081,10 +1078,11 @@ jobs:
         with:
           tool: cargo-hack
 
-      # rsac-0a1f: compose + cli grew the non-excluded feature set to 8, so a
-      # FULL powerset is 256 combos — past this job's 30-min budget. --depth 2
-      # bounds it to every single feature + every PAIR (37 combos), which is
-      # exactly the pairwise-interaction guarantee this job exists to provide.
+      # rsac-0a1f: a FULL powerset over the non-excluded feature set is
+      # exponential — far past this job's 30-min budget. --depth 2 bounds it
+      # to every single feature + every PAIR, which is exactly the
+      # pairwise-interaction guarantee this job exists to provide (cargo-hack
+      # prints the actual combo count at runtime).
       - name: Check feature powerset
         run: cargo hack check --feature-powerset --depth 2 --no-dev-deps --exclude-features feat_windows,feat_macos --keep-going
 
