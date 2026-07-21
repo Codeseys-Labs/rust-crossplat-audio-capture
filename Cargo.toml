@@ -432,24 +432,6 @@ exclude = ["apps/audio-graph/src-tauri"]
 # compiles every gated module so every public item is reachable; the
 # `docsrs` cfg lets `#[cfg_attr(docsrs, doc(...))]` annotations render the
 # platform-availability badges in the docs.rs UI.
-# One-time semver-lint exception (owner decision 2026-07-21): the
-# bridge-zerocopy removal (ADR-0006 resolved REMOVE, PR #71) deleted the
-# FEATURE plus its feature-gated pub items (`create_sample_ring`,
-# `SampleRing*`), tripping `feature_missing` + `function_missing` +
-# `struct_missing` (all formally major; the checker enables all features
-# on both sides). rsac has never been published to any registry, the
-# feature was never wired into a backend, and every consumer is a git
-# dependency pinned by rev/tag — so the owner chose to ship this in patch
-# 0.4.4 rather than 0.5.0. Downgraded to `warn` so the release gate
-# records the breakage loudly without blocking THIS release only.
-# REVERT (delete this whole table) immediately after v0.4.4 tags — these
-# three lints protect the entire public API, not just SampleRing, and
-# from the first registry publish onward removals must gate bumps again.
-[package.metadata.cargo-semver-checks.lints]
-feature_missing = "warn"
-function_missing = "warn"
-struct_missing = "warn"
-
 [package.metadata.docs.rs]
 all-features = true
 rustdoc-args = ["--cfg", "docsrs"]
