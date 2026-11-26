@@ -557,6 +557,20 @@ installed (`mise run setup`), the commit-msg hook
 ([`scripts/hooks/commit-msg.sh`](scripts/hooks/commit-msg.sh)) enforces this
 mechanically.
 
+### Branch rules on `master`
+
+`master` has a repository ruleset (id `28200733`, applied 2026-11-26, decision P3 in
+[`docs/DESKTOP_REFINEMENT.md`](docs/DESKTOP_REFINEMENT.md)): changes arrive through a
+pull request (no approval is required), the only merge method is squash, and
+force-pushes and deletion are refused. Nobody bypasses it, administrators included,
+and it requires no status check, because CI never starts by itself. A direct
+`git push origin master` is rejected; open a pull request instead. Release tags are
+not affected (they are pushed by `release-tag.yml`), and neither are other branches.
+
+To inspect or change it:
+`gh api repos/Codeseys-Labs/rust-crossplat-audio-capture/rulesets/28200733`; to remove
+it, the same path with `-X DELETE`.
+
 ### Code review dispositions — file an issue for anything not fixed in the PR
 
 Every review comment (from a human, CodeRabbit, or an agent) must reach one of
