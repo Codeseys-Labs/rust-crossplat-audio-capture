@@ -9,21 +9,6 @@
 #include <stdlib.h>
 
 /**
- * Device kind for enumeration.
- *
- * This is a **constants-only** type at the ABI boundary:
- * [`rsac_default_device`] takes its `kind` parameter as a plain `int32_t`,
- * never as this enum by value, because materializing an out-of-range integer
- * as a fieldless Rust enum is immediate undefined behavior — before any
- * range check could run (rsac-a273). Out-of-range values are rejected with
- * `RSAC_ERROR_INVALID_PARAMETER` instead.
- */
-typedef enum rsac_device_kind_t {
-    RSAC_DEVICE_INPUT = 0,
-    RSAC_DEVICE_OUTPUT = 1,
-} rsac_device_kind_t;
-
-/**
  * Error codes returned by all rsac FFI functions.
  */
 typedef enum rsac_error_t {
@@ -85,6 +70,46 @@ typedef enum rsac_error_t {
     RSAC_ERROR_PANIC = 99,
 } rsac_error_t;
 
+/**
+ * Sample wire/storage format, mirroring [`rsac::SampleFormat`].
+ *
+ * All audio data is delivered as interleaved `f32` regardless of this value;
+ * it describes the negotiated wire format the backend reports.
+ */
+typedef enum rsac_sample_format_t {
+    /**
+     * Signed 16-bit integer.
+     */
+    RSAC_SAMPLE_FORMAT_I16 = 0,
+    /**
+     * Signed 24-bit integer (packed in a 32-bit container).
+     */
+    RSAC_SAMPLE_FORMAT_I24 = 1,
+    /**
+     * Signed 32-bit integer.
+     */
+    RSAC_SAMPLE_FORMAT_I32 = 2,
+    /**
+     * 32-bit IEEE 754 floating-point (the library's internal standard).
+     */
+    RSAC_SAMPLE_FORMAT_F32 = 3,
+} rsac_sample_format_t;
+
+/**
+ * Device kind for enumeration.
+ *
+ * This is a **constants-only** type at the ABI boundary:
+ * [`rsac_default_device`] takes its `kind` parameter as a plain `int32_t`,
+ * never as this enum by value, because materializing an out-of-range integer
+ * as a fieldless Rust enum is immediate undefined behavior — before any
+ * range check could run (rsac-a273). Out-of-range values are rejected with
+ * `RSAC_ERROR_INVALID_PARAMETER` instead.
+ */
+typedef enum rsac_device_kind_t {
+    RSAC_DEVICE_INPUT = 0,
+    RSAC_DEVICE_OUTPUT = 1,
+} rsac_device_kind_t;
+
 #if defined(RSAC_FEATURE_COMPOSE)
 /**
  * How a composition group's sources map onto the composed output channels.
@@ -121,31 +146,6 @@ typedef enum rsac_group_layout_t {
 #endif
 } rsac_group_layout_t;
 #endif
-
-/**
- * Sample wire/storage format, mirroring [`rsac::SampleFormat`].
- *
- * All audio data is delivered as interleaved `f32` regardless of this value;
- * it describes the negotiated wire format the backend reports.
- */
-typedef enum rsac_sample_format_t {
-    /**
-     * Signed 16-bit integer.
-     */
-    RSAC_SAMPLE_FORMAT_I16 = 0,
-    /**
-     * Signed 24-bit integer (packed in a 32-bit container).
-     */
-    RSAC_SAMPLE_FORMAT_I24 = 1,
-    /**
-     * Signed 32-bit integer.
-     */
-    RSAC_SAMPLE_FORMAT_I32 = 2,
-    /**
-     * 32-bit IEEE 754 floating-point (the library's internal standard).
-     */
-    RSAC_SAMPLE_FORMAT_F32 = 3,
-} rsac_sample_format_t;
 
 /**
  * Opaque handle to an `AudioBuffer`.

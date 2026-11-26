@@ -1,8 +1,8 @@
 # cargo-deny configuration for rsac supply-chain CI gate.
 #
 # Run by the `supply-chain` job in .github/workflows/ci.yml via:
-#   cargo deny check advisories bans licenses sources
-#
+#   cargo deny --workspace --all-features check advisories bans licenses sources
+
 # Philosophy (initial, conservative): hard-fail on known security advisories
 # and disallowed licenses; only *warn* on duplicate transitive dependency
 # versions rather than hard-banning them, so a benign version skew in the tree
@@ -19,6 +19,15 @@ version = 2
 # this fails CI: pin/replace the dep, or (only with a documented reason) add a
 # time-boxed exception here and cite it.
 yanked = "deny"
+# Scope "unmaintained" notices to crates a workspace member depends on
+# DIRECTLY. cargo-deny changed this default from "all" to "workspace" in
+# 0.22.0, while CI's installer still resolves 0.19.x, so the scope is pinned
+# here to keep every version on one policy. An unmaintained notice on a
+# transitive dependency has no fix in this repository (today: unic-* and
+# proc-macro-error under tauri's tree, in the graph since CI checks
+# `--workspace`), and it is not a vulnerability. Vulnerability advisories and
+# yanked crates still fail on the whole tree.
+unmaintained = "workspace"
 
 [licenses]
 version = 2
@@ -35,10 +44,21 @@ allow = [
     "ISC",
     "Zlib",
 ]
+# Crate-scoped MPL-2.0 exceptions (never allow MPL-2.0 globally for the rsac library):
+# - `cbindgen`: build-dependency of `bindings/rsac-ffi` only (header codegen).
+# - `cssparser`, `cssparser-macros`, `dtoa-short`, `selectors`, `option-ext`:
+#   transitive dependencies of `tauri 2.x` in `integrations/tauri-plugin-rsac` (publish = false).
+exceptions = [
+    { allow = ["MPL-2.0"], crate = "cbindgen" },
+    { allow = ["MPL-2.0"], crate = "cssparser" },
+    { allow = ["MPL-2.0"], crate = "cssparser-macros" },
+    { allow = ["MPL-2.0"], crate = "dtoa-short" },
+    { allow = ["MPL-2.0"], crate = "selectors" },
+    { allow = ["MPL-2.0"], crate = "option-ext" },
+]
 # Require a high confidence threshold when inferring a license from a crate's
 # LICENSE file text (default is 0.8).
 confidence-threshold = 0.8
-
 [bans]
 # Duplicate versions of the same crate are common in large trees and are not a
 # correctness problem on their own. Warn rather than hard-fail initially.

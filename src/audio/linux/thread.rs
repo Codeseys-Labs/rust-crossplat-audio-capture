@@ -85,6 +85,22 @@ pub(crate) enum ResolvedTarget {
     Serial(String),
 }
 
+/// Compute the PipeWire `StreamFlags` for a resolved capture target.
+///
+/// `SystemDefault` intentionally omits `DONT_RECONNECT` so WirePlumber can
+/// follow default-sink changes natively. Explicit `Serial` targets (specific
+/// device, application, or process tree) set `DONT_RECONNECT` so a vanished
+/// target cannot silently fall back to capturing the system default monitor.
+fn stream_flags_for_target(resolved: &ResolvedTarget) -> pipewire::stream::StreamFlags {
+    use pipewire::stream::StreamFlags;
+    match resolved {
+        ResolvedTarget::SystemDefault => StreamFlags::AUTOCONNECT | StreamFlags::MAP_BUFFERS,
+        ResolvedTarget::Serial(_) => {
+            StreamFlags::AUTOCONNECT | StreamFlags::MAP_BUFFERS | StreamFlags::DONT_RECONNECT
+        }
+    }
+}
+
 // ── Snapshot types ─────────────────────────────────────────────────────────
 
 /// A single audio node discovered via the native PipeWire registry.
@@ -344,6 +360,21 @@ fn spa_audio_format_to_sample_format(
     }
 }
 
+/// Returns the contiguous, whole interleaved frames in an SPA chunk and the
+/// number of trailing bytes discarded from its last, incomplete frame.
+#[cfg(feature = "feat_linux")]
+fn capture_chunk_frames(raw: &[u8], offset: usize, size: usize, channels: u16) -> (&[u8], usize) {
+    if raw.is_empty() || channels == 0 {
+        return (&[], 0);
+    }
+    // SPA offsets are cyclic within the mapping. The chunk size may exceed
+    // the contiguous bytes remaining after the offset.
+    let region = &raw[offset % raw.len()..];
+    let len = size.min(region.len());
+    let trailing = len % (usize::from(channels) * std::mem::size_of::<f32>());
+    (&region[..len - trailing], trailing)
+}
+
 /// Decode every **complete** little-endian `f32` from a byte slice whose start
 /// is not 4-byte-aligned, into the caller-supplied reusable `scratch` (#30).
 ///
@@ -439,11 +470,9 @@ struct CaptureStreamData {
     /// and `Drop` runs with ownership after the listener hook is removed, so
     /// no concurrent reader exists.
     misaligned_chunks: u64,
-    /// Cumulative count of trailing bytes that formed a truncated partial
-    /// sample (unrecoverable by realignment) across all misaligned chunks
-    /// (rsac-9096). Same write/read discipline as
-    /// [`misaligned_chunks`](Self::misaligned_chunks).
-    misaligned_truncated_bytes: u64,
+    /// Bytes discarded from incomplete trailing frames, including on otherwise
+    /// aligned chunks. Same write/read discipline as [`misaligned_chunks`](Self::misaligned_chunks).
+    partial_frame_bytes: u64,
 }
 
 /// rsac-9096: emit the misaligned-chunk diagnostic from a **non-RT** point.
@@ -459,14 +488,12 @@ struct CaptureStreamData {
 /// so no further callback can fire — surfaces the one-shot summary.
 impl Drop for CaptureStreamData {
     fn drop(&mut self) {
-        if self.misaligned_chunks > 0 {
+        if self.misaligned_chunks > 0 || self.partial_frame_bytes > 0 {
             log::warn!(
-                "PipeWire delivered {} non-word-aligned audio chunk(s) during this \
-                 capture session (realigned via copy in the process callback); {} \
-                 trailing byte(s) formed truncated partial samples and were not \
-                 recoverable.",
+                "PipeWire capture: {} non-word-aligned chunk(s) realigned; \
+                 {} trailing byte(s) discarded from incomplete frames.",
                 self.misaligned_chunks,
-                self.misaligned_truncated_bytes
+                self.partial_frame_bytes
             );
         }
     }
@@ -1129,7 +1156,9 @@ pub(crate) fn app_name_matches(candidate: &str, query: &str) -> bool {
     // apps report names like "VLC.EXE") from the basename for the final
     // comparison — never a broad substring match.
     let stem = match base.len().checked_sub(4) {
-        Some(cut) if base[cut..].eq_ignore_ascii_case(".exe") => &base[..cut],
+        Some(cut) if base.is_char_boundary(cut) && base[cut..].eq_ignore_ascii_case(".exe") => {
+            &base[..cut]
+        }
         _ => base,
     };
     stem.eq_ignore_ascii_case(q)
@@ -1620,7 +1649,7 @@ fn pw_thread_main(
     use pipewire::node::Node;
     use pipewire::properties::properties;
     use pipewire::registry::Listener as RegistryListener;
-    use pipewire::stream::{StreamBox, StreamFlags, StreamListener};
+    use pipewire::stream::{StreamBox, StreamListener};
     // PipeWire's own stream-state enum (the `.state_changed` callback arg),
     // aliased to avoid clashing with the bridge's `StreamState`
     // (`crate::bridge::state::StreamState`) used by the clean-exit teardown
@@ -1980,6 +2009,7 @@ fn pw_thread_main(
                     *pipewire::keys::STREAM_MONITOR => "true",
                 };
 
+                let flags = stream_flags_for_target(&resolved);
                 match &resolved {
                     ResolvedTarget::SystemDefault => {
                         // No TARGET_OBJECT — captures from the default output
@@ -2028,7 +2058,7 @@ fn pw_thread_main(
                     // the bridge's worst-case stereo period seed (ADR-0001).
                     realign_scratch: Vec::with_capacity(2048),
                     misaligned_chunks: 0,
-                    misaligned_truncated_bytes: 0,
+                    partial_frame_bytes: 0,
                 };
 
                 // ── Register stream listener with callbacks ──
@@ -2164,9 +2194,7 @@ fn pw_thread_main(
 
                         let data = &mut datas[0];
 
-                        // Honor the SPA chunk's offset/size: the valid audio
-                        // region is `[offset, offset + size)` within the mapped
-                        // buffer, NOT always `[0, size)`.
+                        // Copy chunk metadata before mutably borrowing the mapped data.
                         let chunk = data.chunk();
                         let offset = chunk.offset() as usize;
                         let size = chunk.size() as usize;
@@ -2178,13 +2206,16 @@ fn pw_thread_main(
                         let sample_rate = user_data.sample_rate;
 
                         if let Some(raw_bytes) = data.data() {
-                            // Clamp the valid region to the actually-mapped bytes
-                            // to stay memory-safe regardless of offset/size.
-                            let end = offset.saturating_add(size).min(raw_bytes.len());
-                            if offset >= end {
+                            let (valid, trailing) =
+                                capture_chunk_frames(raw_bytes, offset, size, channels);
+                            if trailing != 0 {
+                                user_data.partial_frame_bytes = user_data
+                                    .partial_frame_bytes
+                                    .saturating_add(trailing as u64);
+                            }
+                            if valid.is_empty() {
                                 return;
                             }
-                            let valid = &raw_bytes[offset..end];
 
                             // Reinterpret the negotiated F32LE bytes as `&[f32]`
                             // instead of a per-sample `from_le_bytes` loop. On the
@@ -2226,10 +2257,8 @@ fn pw_thread_main(
                                 // would SILENTLY DROP (up to a whole sample). Re-decode
                                 // every complete f32 from the raw bytes via
                                 // `from_le_bytes` into the pre-sized reusable scratch
-                                // (alloc-free in steady state — ADR-0001) so no whole
-                                // sample is lost regardless of the start offset. Only a
-                                // genuinely truncated trailing partial sample (byte
-                                // length not a multiple of 4) is unrecoverable.
+                                // (alloc-free in steady state — ADR-0001). `valid`
+                                // already excludes any trailing partial frame.
                                 //
                                 // NOTE (rsac-9096): a `debug_assert!` on the head/tail
                                 // sizes used to live here, but (a) `align_to`'s
@@ -2242,8 +2271,7 @@ fn pw_thread_main(
                                 // Correctness never depended on it: the decode below
                                 // reads the raw bytes directly, however align_to
                                 // split them.
-                                let truncated_bytes =
-                                    decode_unaligned_f32_le(valid, &mut user_data.realign_scratch);
+                                decode_unaligned_f32_le(valid, &mut user_data.realign_scratch);
                                 // rsac-9096: NO logging here — this closure runs
                                 // inside PipeWire's C `.process` callback (real-time
                                 // path, outside any panic guard), where `log::warn!`
@@ -2255,9 +2283,6 @@ fn pw_thread_main(
                                 // one-shot summary.
                                 user_data.misaligned_chunks =
                                     user_data.misaligned_chunks.saturating_add(1);
-                                user_data.misaligned_truncated_bytes = user_data
-                                    .misaligned_truncated_bytes
-                                    .saturating_add(truncated_bytes as u64);
                                 if !user_data.realign_scratch.is_empty() {
                                     // Disjoint field borrows: `realign_scratch` is read
                                     // immutably while `producer` is used — allowed.
@@ -2333,12 +2358,9 @@ fn pw_thread_main(
 
                 // ── Connect the stream ──
 
-                if let Err(e) = stream.connect(
-                    libspa::utils::Direction::Input,
-                    None,
-                    StreamFlags::AUTOCONNECT | StreamFlags::MAP_BUFFERS,
-                    &mut params,
-                ) {
+                if let Err(e) =
+                    stream.connect(libspa::utils::Direction::Input, None, flags, &mut params)
+                {
                     let _ = response_tx.send(Err(AudioError::BackendError {
                         backend: "PipeWire".to_string(),
                         operation: "stream_connect".to_string(),
@@ -3471,6 +3493,20 @@ mod tests {
         }
     }
 
+    #[test]
+    fn stream_flags_set_dont_reconnect_only_for_explicit_serial_targets() {
+        use pipewire::stream::StreamFlags;
+        let sys = stream_flags_for_target(&ResolvedTarget::SystemDefault);
+        assert!(sys.contains(StreamFlags::AUTOCONNECT));
+        assert!(sys.contains(StreamFlags::MAP_BUFFERS));
+        assert!(!sys.contains(StreamFlags::DONT_RECONNECT));
+
+        let explicit = stream_flags_for_target(&ResolvedTarget::Serial("42".to_string()));
+        assert!(explicit.contains(StreamFlags::AUTOCONNECT));
+        assert!(explicit.contains(StreamFlags::MAP_BUFFERS));
+        assert!(explicit.contains(StreamFlags::DONT_RECONNECT));
+    }
+
     // ── Native registry resolution (H4 part 3 / rsac-nat1) ───────────
     //
     // These exercise the PURE matching helpers against synthetic snapshots, so
@@ -3515,6 +3551,13 @@ mod tests {
         // But ".exe" must be a real suffix, not a fuzzy match.
         assert!(!app_name_matches("exe", "")); // guard: short candidates
         assert!(app_name_matches("exe", "exe")); // 3-char name, no strip
+    }
+
+    #[test]
+    fn test_app_name_matches_utf8_basename() {
+        // Four bytes from the end lands inside 音; checking for ".exe" must not panic.
+        assert!(!app_name_matches("a音乐", "player"));
+        assert!(app_name_matches("/opt/a音乐.ExE", "a音乐"));
     }
 
     #[test]
@@ -3947,6 +3990,19 @@ mod tests {
         assert!(spa_audio_format_to_sample_format(Spa::F64LE).is_none());
         assert!(spa_audio_format_to_sample_format(Spa::F32BE).is_none());
         assert!(spa_audio_format_to_sample_format(Spa::F32P).is_none());
+    }
+
+    #[test]
+    fn test_capture_chunk_frames_wraps_offset_and_trims_partial_frames() {
+        let bytes = [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15];
+        assert_eq!(
+            capture_chunk_frames(&bytes, 33, usize::MAX, 2),
+            (&bytes[1..9], 7)
+        );
+        assert_eq!(capture_chunk_frames(&bytes, 16, 9, 2), (&bytes[..8], 1));
+        assert_eq!(capture_chunk_frames(&bytes, 15, 4, 1), (&bytes[15..15], 1));
+        assert_eq!(capture_chunk_frames(&[], usize::MAX, 8, 2), (&[][..], 0));
+        assert_eq!(capture_chunk_frames(&bytes, 0, 8, 0), (&[][..], 0));
     }
 
     // ── Misaligned-edge f32 realignment (#30) ────────────────────────

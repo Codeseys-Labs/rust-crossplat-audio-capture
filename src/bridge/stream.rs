@@ -317,6 +317,19 @@ impl<S: PlatformStream + Sync + 'static> CapturingStream for BridgeStream<S> {
         self.shared.drop_window_snapshot()
     }
 
+    fn readable_buffers(&self) -> Option<usize> {
+        // In this state a read returns no queued data, whatever the ring holds.
+        if !self.shared.state.is_readable() {
+            return Some(0);
+        }
+        // Never wait: while a blocking read holds the consumer the count is
+        // unknown, and a poisoned consumer reads as unknown, never as a guess.
+        self.consumer
+            .try_lock()
+            .ok()
+            .map(|consumer| consumer.available_buffers())
+    }
+
     // FH-5 waker contract: `BridgeStream` registers the waker into the
     // lock-free `AtomicWaker` on the shared bridge state and returns `true`,
     // committing to wake it. That promise is kept by `BridgeProducer`, which
@@ -1152,5 +1165,49 @@ mod tests {
         assert!(stream.is_running());
         stream.shared().state.force_set(StreamState::Stopped);
         assert!(!stream.is_running());
+    }
+
+    #[test]
+    fn readable_buffers_reports_the_queued_backlog() {
+        let (mut producer, stream) = create_test_stream();
+        assert_eq!(stream.readable_buffers(), Some(0));
+
+        producer.push(test_buffer(0.1)).unwrap();
+        producer.push(test_buffer(0.2)).unwrap();
+        assert_eq!(stream.readable_buffers(), Some(2));
+
+        assert!(stream.try_read_chunk().unwrap().is_some());
+        assert_eq!(stream.readable_buffers(), Some(1));
+    }
+
+    #[test]
+    fn readable_buffers_never_waits_for_a_reader_holding_the_consumer() {
+        let (mut producer, stream) = create_test_stream();
+        producer.push(test_buffer(0.1)).unwrap();
+
+        // As a parked blocking read does.
+        let held = stream.consumer.lock().unwrap();
+        assert_eq!(stream.readable_buffers(), None, "unknown, not awaited");
+        drop(held);
+        assert_eq!(stream.readable_buffers(), Some(1));
+    }
+
+    #[test]
+    fn readable_buffers_is_zero_once_queued_data_is_unreadable() {
+        let (mut producer, stream) = create_test_stream();
+        producer.push(test_buffer(0.1)).unwrap();
+        assert_eq!(stream.readable_buffers(), Some(1));
+
+        stream.stop().unwrap();
+
+        assert_eq!(
+            stream.readable_buffers(),
+            Some(0),
+            "a stopped stream hands out none of what it still queues"
+        );
+        assert!(matches!(
+            stream.try_read_chunk(),
+            Err(AudioError::StreamEnded { .. })
+        ));
     }
 }

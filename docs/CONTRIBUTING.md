@@ -11,24 +11,28 @@ architectural context read [`AGENTS.md`](../AGENTS.md) and
 automatically; do not install against a different channel or your local
 clippy results will drift from CI's.
 
-- Channel: see `rust-toolchain.toml` (currently `1.95.0`).
+- Channel: see `rust-toolchain.toml` (currently `1.95.0`); the minimum
+  supported Rust version is **1.88**.
 - Components: `rustfmt`, `clippy`.
 - Bumping the toolchain is intentional — see the comment at the top of
   `rust-toolchain.toml` for the rationale. Run
   `cargo clippy --all-targets -- -D warnings` locally with the new
   toolchain before pushing the bump so new lints do not land cold in CI.
 
-**Everything else** (Bun, Node, Go, Python for the bindings; lefthook for
-git hooks) is pinned via [`mise.toml`](../mise.toml). One-shot setup:
+**Other tools:** Bun, Node, Go and Python versions are shared by CI and local
+development through [`.tool-versions`](../.tool-versions).
+[`mise.toml`](../mise.toml) pins `betterleaks` and `lefthook` and defines tasks.
+One-shot setup:
 
 ```bash
 # install mise: https://mise.jdx.dev  (winget install jdx.mise / brew install mise)
-mise install        # installs the pinned polyglot toolchain + lefthook
-mise run setup      # installs the git hooks (lefthook install)
+mise install        # install runtimes, betterleaks and lefthook
+mise run setup      # install git hooks (lefthook install)
+mise run secrets    # betterleaks full-history scan
 ```
 
-mise is a convenience, not a requirement — every task below also shows
-the direct command. mise deliberately does **not** manage Rust.
+Use `mise run secrets:staged` for the staged-diff scan. mise is optional;
+Rust remains managed by rustup, not mise.
 
 ### Platform build dependencies
 
@@ -87,7 +91,7 @@ build error.
 (or `lefthook install`) activates them per-clone:
 
 - **pre-commit** — `cargo fmt --all -- --check` (only when `.rs` files
-  are staged).
+  are staged) and a staged `betterleaks` secret scan.
 - **commit-msg** — rejects `Co-Authored-By:` trailers and tool bylines
   (the AGENTS.md §6 commit conventions, enforced mechanically).
 - **pre-push** — runs the gate.
@@ -161,17 +165,28 @@ More detail in [`docs/CI_AUDIO_TESTING.md`](CI_AUDIO_TESTING.md).
 
 ## 4. CI matrix
 
-Pull requests trigger three workflows:
+CI is **manually dispatched** — no build/test workflow runs on `pull_request`
+or on a branch push, because the full matrix is expensive. Before asking for
+review, run what the change needs and link the run in the PR:
 
-- `.github/workflows/ci.yml` — lint + unit tests on Linux / Windows /
-  macOS + bindings check + downstream `audio-graph` build.
-- `.github/workflows/ci-audio-tests.yml` — 9-job (platforms × modes)
-  audio integration matrix. See the "6 of 9 REAL" truth table in
-  [`docs/CI_AUDIO_TESTING.md`](CI_AUDIO_TESTING.md) for which cells are
-  exercised end-to-end versus gated by macOS platform-security limits.
-- Release workflows (`release.yml`, `release-npm.yml`,
-  `release-pypi.yml`) trigger on stable tags and also support guarded
-  manual dispatch for release rehearsals or registry publish recovery.
+```bash
+gh workflow run ci.yml --ref <branch>                # scoped by the branch's diff against master
+gh workflow run ci.yml --ref <branch> -f full=true   # whole matrix, incl. mobile legs + coverage; add -f semver=true for the release semver gate
+gh workflow run ci-audio-tests.yml --ref <branch> -f platform=linux   # real-audio E2E, one platform
+```
+
+[`ci.yml`](../.github/workflows/ci.yml) provides desktop lint, unit tests,
+MSRV, feature and binding checks. The only automatic PR check is the
+independent [`changelog-guard.yml`](../.github/workflows/changelog-guard.yml);
+the weekly non-Rust supply-chain scan and stable release tags also run on
+their own. A PR with no dispatched run has no CI evidence, and compile
+coverage is not runtime verification.
+
+CI uses Blacksmith for ordinary compile lanes and GitHub-hosted Windows for
+audio. See [`docs/CI_AUDIO_TESTING.md`](CI_AUDIO_TESTING.md) and the
+[desktop release bar](DESKTOP_REFINEMENT.md#v05-desktop-bar). Release
+workflows support stable tags and guarded manual dispatch; see
+[`docs/RELEASE_PROCESS.md`](RELEASE_PROCESS.md).
 
 ## 5. Docs
 

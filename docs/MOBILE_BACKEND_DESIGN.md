@@ -1,16 +1,24 @@
 # Mobile Backend Design — Android & iOS
 
-> **Status: fully implemented (compile-checked only, no on-device runtime
-> proof yet).** Implemented behind `feat_android`/`feat_ios`: the AAudio /
+> **Status (2026-11-25): Experimental / parked while desktop (`v0.5`) is refined.**
+> Android and iOS backends remain in-tree behind `feat_android`/`feat_ios`, with
+> emulator-verified Android mic + self-capture playback + device enumeration
+> (PRs #66–#68) and simulator-verified iOS mic (PR #67), while **no physical
+> Android/iOS device verification has run yet** (see
+> [`DESKTOP_REFINEMENT.md`](DESKTOP_REFINEMENT.md) for the physical-device
+> unfreeze checklist). Cross-target compilation and AAR/SwiftPM glue remain
+> preserved; runtime emulator/simulator workflows (`ci-android-emu.yml`,
+> `ci-ios-sim.yml`) are manually triggerable and narrowly scoped to mobile paths.
+>
+> Implemented behind `feat_android`/`feat_ios`: the AAudio /
 > AVAudioEngine `Device("default")` microphone slices (rsac-20cd /
 > rsac-9e02), the iOS `SystemDefault` ReplayKit ring consumer (rsac-b3aa,
 > `src/audio/ios/broadcast.rs`, App Group id via
 > `AudioCaptureBuilder::with_ios_app_group`), and Android playback capture —
 > all four `AudioPlaybackCapture` tiers via the AAR's Kotlin loop + JNI
 > ingest (rsac-77f1, `src/audio/android/{jni,playback}.rs`, consent token
-> via `with_android_projection`) — cross-target check + clippy green, **no
-> runtime verification on any device yet** (seeds rsac-e6d3 / rsac-97c8).
-> First-party glue lives in `mobile/{android,ios}/` and **builds in CI**,
+> via `with_android_projection`).
+> First-party glue lives in `mobile/{android,ios}/` and builds in CI,
 > including `librsac.so` packaged into the AAR's jniLibs with its
 > `JNI_OnLoad` export asserted (rsac-0aa9/rsac-77f1).
 > **Where implementation and this doc diverge, the code (and
@@ -327,4 +335,4 @@ Staged, honest about what each stage proves:
 |---|---|
 | Batteries-included packaging (rsac owns AAR + SwiftPM), `mobile/` layout, backends in-crate | [ADR-0012](designs/0012-mobile-platform-strategy.md) |
 | CaptureTarget mobile mapping, ReplayKit-as-SystemDefault, mmap-ring transport, explicit builder token + preflight | [ADR-0013](designs/0013-mobile-capturetarget-semantics.md) |
-| Tauri integration model (direct dep on desktop; plugin as mobile vehicle) — *proposed* | [ADR-0014](designs/0014-tauri-integration-model.md) |
+| Tauri integration model (direct dep on desktop; plugin as mobile vehicle) — *accepted* | [ADR-0014](designs/0014-tauri-integration-model.md) |

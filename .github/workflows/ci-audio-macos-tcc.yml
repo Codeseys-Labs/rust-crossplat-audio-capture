@@ -14,19 +14,21 @@ name: Audio Integration Tests (macOS TCC — self-hosted)
 # ─────────────────────────────────────────────────────────────────────────────
 # SECURITY POSTURE — READ BEFORE ENABLING (public repo + self-hosted = danger).
 # ─────────────────────────────────────────────────────────────────────────────
-# Triggers are workflow_dispatch + a weekly cron ONLY. This workflow MUST NEVER
-# gain a `pull_request` or `pull_request_target` trigger: a self-hosted runner
-# on a PUBLIC repo that executes PR-authored code is remote code execution on
-# the owner's physical Mac (any forker could open a PR that runs `cargo test`
-# with arbitrary build.rs / test code as the owner's user). dispatch + cron only
-# run code that already lives on a trusted branch.
+# Trigger is workflow_dispatch ONLY (no cron: the owner has no always-on
+# self-hosted macOS runner, so a scheduled run would just queue for 24h and
+# fail red every Monday). This workflow MUST NEVER gain a `pull_request` or
+# `pull_request_target` trigger: a self-hosted runner on a PUBLIC repo that
+# executes PR-authored code is remote code execution on the owner's physical
+# Mac (any forker could open a PR that runs `cargo test` with arbitrary
+# build.rs / test code as the owner's user). dispatch only runs code that
+# already lives on a trusted branch, started attended by the owner.
 #
 # The owner MUST ALSO harden the runner in the GitHub UI:
 #   Settings → Actions → Runners → (this runner) → restrict to this repository,
 #   and Settings → Actions → General → "Fork pull request workflows from
 #   outside collaborators" → require approval for ALL outside collaborators.
-# The `if: github.repository == …` job guard below stops the cron from firing on
-# forks, but it is defense-in-depth, NOT a substitute for the runner
+# The `if: github.repository == …` job guard below stops a dispatch from running
+# on forks, but it is defense-in-depth, NOT a substitute for the runner
 # restrictions above.
 #
 # ─────────────────────────────────────────────────────────────────────────────
@@ -54,10 +56,6 @@ name: Audio Integration Tests (macOS TCC — self-hosted)
 
 on:
   workflow_dispatch:
-  schedule:
-    # Weekly, Monday 07:00 UTC (offset from bench.yml's 06:00). On-demand tier —
-    # never a PR/release gate; it exists to catch grant/permission rot over time.
-    - cron: '0 7 * * 1'
 
 env:
   CARGO_TERM_COLOR: always
@@ -79,8 +77,8 @@ concurrency:
 jobs:
   macos-tcc-audio:
     name: "macOS Audio (self-hosted, TCC-granted)"
-    # Fork guard (defense-in-depth; see the security header): the weekly cron
-    # must not fire against a self-hosted runner from a fork context.
+    # Fork guard (defense-in-depth; see the security header): a dispatch must
+    # not run against a self-hosted runner from a fork context.
     if: github.repository == 'Codeseys-Labs/rust-crossplat-audio-capture'
     runs-on: [self-hosted, macos, tcc-audio]
     # Proven full-suite runtime is ~23 s (owner's M4, 2026-07-07); 15 min is a

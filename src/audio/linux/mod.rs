@@ -290,9 +290,11 @@ impl LinuxDeviceEnumerator {
     /// `object.serial` (the metadata stores names, not ids — same contract as
     /// the old `pw-metadata` path).
     ///
-    /// Returns [`AudioError::DeviceNotFound`] if the snapshot produced no
-    /// matching device, or propagates a spawn/roundtrip error so the caller can
-    /// fall back to the subprocess path.
+    /// Returns [`AudioError::DeviceNotFound`] only when the registry snapshot
+    /// is non-empty and holds no device of `kind`. An empty snapshot is
+    /// ambiguous and reports `BackendError` (see `no_native_default`). A
+    /// spawn/roundtrip error is propagated so the caller can fall back to the
+    /// subprocess path.
     ///
     /// [`PipeWireThread`]: crate::audio::linux::thread::PipeWireThread
     /// [`AudioError::DeviceNotFound`]: crate::core::error::AudioError::DeviceNotFound
@@ -343,9 +345,7 @@ impl LinuxDeviceEnumerator {
         });
         by_kind
             .map(to_device)
-            .ok_or_else(|| crate::core::error::AudioError::DeviceNotFound {
-                device_id: format!("default_{:?}", kind),
-            })
+            .ok_or_else(|| no_native_default(kind, snapshot.is_empty()))
     }
 
     /// Parse pw-cli list-objects Node output
@@ -780,20 +780,26 @@ impl crate::core::interface::DeviceEnumerator for LinuxDeviceEnumerator {
         let kind = crate::core::interface::DeviceKind::Output;
 
         #[cfg(feature = "feat_linux")]
-        {
-            match self.get_pipewire_default_device_native(kind) {
-                Ok(device) => return Ok(Box::new(device)),
-                Err(e) => {
-                    log::debug!(
-                        "PipeWire: native default_device failed ({}); trying subprocess fallback",
-                        e
-                    );
-                    // Fall through to the subprocess path below.
+        let native_absence = match self.get_pipewire_default_device_native(kind) {
+            Ok(device) => return Ok(Box::new(device)),
+            Err(e) => {
+                log::debug!(
+                    "PipeWire: native default_device failed ({}); trying subprocess fallback",
+                    e
+                );
+                // Fall through to the subprocess path below, keeping a
+                // confirmed absence (see `prefer_confirmed_absence`).
+                match e {
+                    crate::core::error::AudioError::DeviceNotFound { .. } => Some(e),
+                    _ => None,
                 }
             }
-        }
+        };
+        #[cfg(not(feature = "feat_linux"))]
+        let native_absence: Option<crate::core::error::AudioError> = None;
 
-        let device = self.get_pipewire_default_device(kind)?;
+        let device =
+            prefer_confirmed_absence(self.get_pipewire_default_device(kind), native_absence)?;
         Ok(Box::new(device))
     }
 
@@ -825,6 +831,64 @@ impl crate::core::interface::DeviceEnumerator for LinuxDeviceEnumerator {
         on_event: crate::core::interface::DeviceEventHandler,
     ) -> crate::core::error::Result<crate::core::interface::DeviceWatcher> {
         crate::audio::linux::thread::spawn_device_watcher(on_event)
+    }
+}
+
+/// The native lookup's error when its registry snapshot holds no device of
+/// `kind`: `DeviceNotFound` when the snapshot lists audio nodes, else the same
+/// `BackendError` as an unreachable PipeWire.
+///
+/// Occupancy stands in for a completion signal the snapshot roundtrip does not
+/// report yet (GitHub issue #102), so two known limits remain until it does:
+///
+/// - when the last audio node disappears while PipeWire stays reachable, the
+///   registry is genuinely empty and still reads as `BackendError`, so
+///   auto-recovery spends its retry budget instead of waiting for the device;
+/// - a registry that filled only partially before a failed sync can list other
+///   nodes without the sink, and so reads as a confirmed absence: recovery
+///   waits for a device instead of retrying.
+#[cfg(feature = "feat_linux")]
+fn no_native_default(
+    kind: crate::core::interface::DeviceKind,
+    registry_is_empty: bool,
+) -> crate::core::error::AudioError {
+    if registry_is_empty {
+        crate::core::error::AudioError::BackendError {
+            backend: "PipeWire".into(),
+            operation: "get_default_device".into(),
+            message: format!(
+                "the native PipeWire registry listed no audio nodes while resolving the \
+                 default device for {kind:?}; is PipeWire running?"
+            ),
+            context: None,
+        }
+    } else {
+        crate::core::error::AudioError::DeviceNotFound {
+            device_id: format!("default_{kind:?}"),
+        }
+    }
+}
+
+/// `default_device()`'s answer once the native lookup has failed: the
+/// subprocess fallback's result, except that the fallback's "enumerated
+/// nothing" `BackendError` gives way to a `DeviceNotFound` the native registry
+/// already confirmed (`native_absence`). The native lookup confirms absence
+/// only when its registry snapshot listed audio nodes but none of the
+/// requested kind (`no_native_default`), so the absence stays
+/// distinguishable from an unreachable PipeWire: auto-recovery waits for a
+/// device on the former and spends its retry budget on the latter. An empty
+/// native snapshot confirms nothing, so with a fallback that also enumerates
+/// nothing the answer stays `BackendError` and still spends the budget — even
+/// when the last device was really removed. That limit, and a partially
+/// filled registry reading as a confirmed absence, wait on the snapshot
+/// roundtrip reporting completion (GitHub issue #102).
+fn prefer_confirmed_absence<T>(
+    fallback: crate::core::error::Result<T>,
+    native_absence: Option<crate::core::error::AudioError>,
+) -> crate::core::error::Result<T> {
+    match (fallback, native_absence) {
+        (Err(crate::core::error::AudioError::BackendError { .. }), Some(absent)) => Err(absent),
+        (fallback, _) => fallback,
     }
 }
 
@@ -1003,6 +1067,68 @@ mod tests {
                 panic!("Unexpected error from default_device: {:?}", e);
             }
         }
+    }
+
+    #[test]
+    fn a_confirmed_absence_survives_a_subprocess_fallback_that_enumerates_nothing() {
+        use crate::core::error::AudioError;
+
+        let enumerated_nothing = || AudioError::BackendError {
+            backend: "PipeWire".into(),
+            operation: "get_default_device".into(),
+            message: "no audio nodes".into(),
+            context: None,
+        };
+        let no_sink = || AudioError::DeviceNotFound {
+            device_id: "default_Output".into(),
+        };
+
+        // The native registry listed audio nodes but no sink: still "no
+        // device", so auto-recovery waits for one instead of spending budget.
+        assert!(matches!(
+            prefer_confirmed_absence::<()>(Err(enumerated_nothing()), Some(no_sink())),
+            Err(AudioError::DeviceNotFound { .. })
+        ));
+        // Without that confirmation, enumerating nothing stays a backend error.
+        assert!(matches!(
+            prefer_confirmed_absence::<()>(Err(enumerated_nothing()), None),
+            Err(AudioError::BackendError { .. })
+        ));
+        // The fallback's own answers are kept otherwise.
+        assert!(matches!(
+            prefer_confirmed_absence(Ok(7_u8), Some(no_sink())),
+            Ok(7)
+        ));
+        assert!(matches!(
+            prefer_confirmed_absence::<()>(Err(no_sink()), None),
+            Err(AudioError::DeviceNotFound { .. })
+        ));
+    }
+
+    #[cfg(feature = "feat_linux")]
+    #[test]
+    fn only_a_non_empty_native_registry_confirms_an_absent_default() {
+        use crate::core::error::AudioError;
+        use crate::core::interface::DeviceKind;
+
+        // Nodes listed, none of the kind: a confirmed absence, which survives
+        // a fallback that enumerates nothing.
+        assert!(matches!(
+            no_native_default(DeviceKind::Output, false),
+            AudioError::DeviceNotFound { .. }
+        ));
+        // No nodes at all is ambiguous: reported like an unreachable PipeWire.
+        // `default_device()` keeps only a `DeviceNotFound` from the native
+        // lookup, so this case passes no confirmation on and, with a fallback
+        // that enumerates nothing, still spends the retry budget.
+        match no_native_default(DeviceKind::Output, true) {
+            AudioError::BackendError { backend, .. } => assert_eq!(backend, "PipeWire"),
+            other => panic!("expected BackendError, got {other:?}"),
+        }
+        assert!(matches!(
+            prefer_confirmed_absence::<()>(Err(no_native_default(DeviceKind::Output, true)), None),
+            Err(AudioError::BackendError { .. })
+        ));
     }
 
     // ── pw-cli parser Unit Tests ────────────────────────────────────

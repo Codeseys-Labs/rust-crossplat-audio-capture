@@ -5,9 +5,9 @@ name = "rsac-ffi"
 # one version.
 version = "0.4.4"
 edition = "2021"
-# Mirror the parent crate's MSRV floor (1.87): rsac-ffi builds against rsac and
+# Mirror the parent crate's MSRV floor (1.88): rsac-ffi builds against rsac and
 # must not require a newer toolchain than the library it wraps.
-rust-version = "1.87"
+rust-version = "1.88"
 description = "C FFI bindings for the rsac (Rust Cross-Platform Audio Capture) library"
 license = "MIT OR Apache-2.0"
 repository = "https://github.com/Codeseys-Labs/rust-crossplat-audio-capture"
@@ -53,4 +53,4 @@ rsac = { path = "../../", version = "0.4.4", default-features = false }
 log = "0.4"
 
 [build-dependencies]
-cbindgen = "0.28"
+cbindgen = "0.29.4"

@@ -4,47 +4,37 @@
 name: CI
 
 on:
+  # Manual dispatch is the ONLY way to run this matrix on a branch (cost
+  # control): there is no `pull_request` trigger and no branch `push` trigger.
+  # Run it from the Actions tab, or:
+  #   gh workflow run ci.yml --ref <branch>               # diff-scoped (see `changes`)
+  #   gh workflow run ci.yml --ref <branch> -f full=true  # whole matrix (semver gate: add -f semver=true)
+  # Check runs attach to the dispatched commit, so they still show on that
+  # commit's open PR. The only automatic PR check is changelog-guard.yml.
+  workflow_dispatch:
+    inputs:
+      full:
+        description: >-
+          Run the whole matrix (mobile legs and advisory coverage included)
+          regardless of which paths the branch changed. Does not include the
+          release semver gate; see `semver`. Default: scope the run by the
+          branch's diff against the default branch.
+        type: boolean
+        default: false
+      semver:
+        description: >-
+          Also run the release semver gate (cargo-semver-checks against the
+          previous stable tag). Always on for release/vX.Y.Z branches.
+        type: boolean
+        default: false
   push:
-    # release/** intentionally dropped from the push filter (KEPT in
-    # pull_request below): every release-branch commit lands via a PR per
-    # AGENTS.md's PR-vs-direct rule, so push+pull_request both matched and
-    # double-fired the full matrix (66 duplicate checks observed on PR #55).
-    # The pull_request trigger alone gives release/** branches full coverage.
-    branches: [main, master]
-    # Skip branch pushes that only touch docs / backlog / bookkeeping files —
-    # the docs-only fast path (the `changes` job below) only covers
-    # pull_request events, so a direct push of e.g. `.seeds/issues.jsonl` used
-    # to run the whole 23-job matrix (~15.4 job-min) for a 1-line diff.
-    #
-    # NOTE: per GitHub semantics, paths/paths-ignore filters are NOT evaluated
-    # for tag pushes ("Path filters are not evaluated for pushes of tags"), so
-    # the `tags:` trigger below (and the version-lockstep tag-time hard-gate it
-    # feeds) still fires on every `v*.*.*` tag regardless of the changed paths.
-    paths-ignore:
-      - 'docs/**'
-      - '.seeds/**'
-      - '.kilo/**'
-      - '.mulch/**'
-      - '**/*.md'
-      - 'LICENSE'
-    # Also run on stable semver tags so the version-lockstep job's tag-time
-    # hard-gate (which asserts all seven manifests equal the tag) actually fires
-    # at the point of no return — it was previously dead code (ci.yml had no
-    # tags: trigger). Pre-release shapes (v*-rc.1) are excluded.
+    # Stable semver tags still fire automatically so the version-lockstep job's
+    # tag-time hard gate (all manifests equal the tag) runs at the point of no
+    # return. Pre-release shapes (v*-rc.1) are excluded. A `push` filter with
+    # only `tags:` never matches a branch push.
     tags:
       - 'v*.*.*'
       - '!v*-*'
-  pull_request:
-    # `labeled`/`unlabeled` are added on top of the defaults (opened,
-    # synchronize, reopened) so the changelog-guard job's `changelog-not-needed`
-    # escape hatch takes effect the moment the label is applied. Without them,
-    # adding the label after the PR opens does not re-trigger CI, and even a
-    # manual "Re-run" replays the original event payload (labels captured at
-    # trigger time) — so a maintainer would otherwise have to push a fresh
-    # commit just to make the label visible to the guard.
-    types: [opened, synchronize, reopened, labeled, unlabeled]
-    branches: [main, master, 'release/**']
-  workflow_dispatch:
 
 env:
   CARGO_TERM_COLOR: always
@@ -54,60 +44,89 @@ env:
 permissions:
   contents: read
 
-# Cancel superseded runs on the same ref (saves runner minutes on PR pushes).
+# A newer manual dispatch on the same ref supersedes the older one; tag runs
+# (the release gate) are never cancelled.
 concurrency:
   group: ci-${{ github.workflow }}-${{ github.ref }}
-  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+  cancel-in-progress: ${{ github.event_name == 'workflow_dispatch' }}
 
 jobs:
-  # ── Docs-only fast path (rsac-61ce) ──────────────────────────────────
-  # PRs that touch only documentation/backlog files skip the whole compile
-  # matrix: this job classifies the PR's changed files, `lint` runs only
-  # when code changed, and every other job has `needs: lint`, so a skipped
-  # lint transitively skips the rest. Skipped jobs count as PASSING for
-  # branch-protection required checks (documented GitHub behavior), so the
-  # pattern stays merge-safe if protection is enabled later (master had no
-  # protection/rulesets when this landed — checked 2026-07-05).
+  # ── Diff-scoped manual runs (rsac-61ce) ──────────────────────────────
+  # A manual dispatch on a branch classifies the files that branch changed
+  # relative to the default branch (merge-base diff — the file set a PR from
+  # the branch shows). `lint` runs only when code changed, and every other job
+  # has `needs: lint`, so a docs-only branch skips the whole compile matrix.
   #
-  # Fail-open by design: anything that is not a pull_request (pushes; tags —
-  # the version-lockstep tag-time hard gate must always fire; dispatch) or
-  # that cannot be classified runs the full matrix.
+  # Fail-open by design: tag pushes (the version-lockstep tag-time hard gate
+  # must always fire), a dispatch on the default branch, `full: true`, and
+  # anything that cannot be classified all run the full matrix.
+  #
+  # `mobile` gates the heavy Gradle AAR + Xcode SwiftPM legs (mobile-android,
+  # mobile-ios): they run only when the diff touches mobile-relevant paths.
+  # Those paths include the shared layers (src/core, src/bridge, src/api), so
+  # a shared-layer change that breaks a mobile cfg still surfaces.
   changes:
     name: Classify changed paths
     runs-on: blacksmith-4vcpu-ubuntu-2404
     timeout-minutes: 5
     permissions:
-      pull-requests: read
+      contents: read
     outputs:
       code: ${{ steps.filter.outputs.code }}
+      mobile: ${{ steps.filter.outputs.mobile }}
     steps:
-      - name: Detect docs-only PR
+      - name: Classify changed paths
         id: filter
         env:
           GH_TOKEN: ${{ github.token }}
-          PR_NUMBER: ${{ github.event.pull_request.number }}
+          FULL: ${{ inputs.full }}
+          DEFAULT_BRANCH: ${{ github.event.repository.default_branch }}
         run: |
-          if [ "${GITHUB_EVENT_NAME}" != "pull_request" ]; then
-            echo "code=true" >> "$GITHUB_OUTPUT"
-            echo "not a pull_request event — running the full matrix"
+          out() { echo "$1" >> "$GITHUB_OUTPUT"; }
+          run_full() {
+            out "code=true"
+            out "mobile=true"
+            echo "$1 — running the full matrix"
             exit 0
+          }
+          if [ "${GITHUB_EVENT_NAME}" != "workflow_dispatch" ]; then
+            run_full "not a manual dispatch (${GITHUB_EVENT_NAME})"
           fi
-          FILES=$(gh api "repos/${GITHUB_REPOSITORY}/pulls/${PR_NUMBER}/files" --paginate -q '.[].filename') || FILES="__api_error__"
-          if [ "$FILES" = "__api_error__" ] || [ -z "$FILES" ]; then
-            echo "code=true" >> "$GITHUB_OUTPUT"
-            echo "could not classify changed files — failing open (full matrix)"
-            exit 0
+          if [ "${FULL}" = "true" ]; then
+            run_full "full=true requested"
+          fi
+          if [ "${GITHUB_REF_NAME}" = "${DEFAULT_BRANCH}" ]; then
+            run_full "dispatched on the default branch"
+          fi
+          # Merge-base diff against the default branch. The compare API lists at
+          # most 300 files, so a list at the cap may be truncated: fail open.
+          FILES=$(gh api "repos/${GITHUB_REPOSITORY}/compare/${DEFAULT_BRANCH}...${GITHUB_SHA}" -q '.files[].filename') || FILES=""
+          if [ -z "$FILES" ] || [ "$(printf '%s\n' "$FILES" | wc -l)" -ge 300 ]; then
+            run_full "could not classify changed files (API error, or an empty or truncated diff)"
           fi
           printf 'changed files:\n%s\n' "$FILES"
           NON_DOCS=$(printf '%s\n' "$FILES" \
             | grep -vE '^(docs/|\.seeds/|\.kilo/|\.mulch/|LICENSE)' \
             | grep -vE '\.md$' || true)
           if [ -z "$NON_DOCS" ]; then
-            echo "code=false" >> "$GITHUB_OUTPUT"
-            echo "docs-only PR — skipping the compile matrix"
+            out "code=false"
+            out "mobile=false"
+            echo "docs-only branch — skipping the compile matrix"
+            exit 0
+          fi
+          out "code=true"
+          printf 'code changes detected:\n%s\n' "$NON_DOCS"
+          # Mobile-relevant paths: the two mobile backends, the mobile/ trees,
+          # the C FFI and the Tauri plugin that wrap them, workspace-level
+          # dependency/toolchain files, and this workflow's own plumbing.
+          MOBILE=$(printf '%s\n' "$FILES" \
+            | grep -E '^(src/audio/(android|ios)/|src/(api|bridge|core)/|src/lib\.rs$|mobile/|bindings/rsac-ffi/|integrations/tauri-plugin-rsac/|tests/(android|ios)_|Cargo\.(toml|lock)$|rust-toolchain\.toml$|build\.rs$|\.github/workflows/ci\.yml$|\.github/actions/)' || true)
+          if [ -n "$MOBILE" ]; then
+            out "mobile=true"
+            printf 'mobile changes detected:\n%s\n' "$MOBILE"
           else
-            echo "code=true" >> "$GITHUB_OUTPUT"
-            printf 'code changes detected:\n%s\n' "$NON_DOCS"
+            out "mobile=false"
+            echo "no mobile-relevant changes — skipping the mobile legs"
           fi
 
   # ── Lint (clippy matrix across all 3 OS) ────────────────────────────
@@ -157,7 +176,7 @@ jobs:
       # (src/main.rs would lose its -D warnings coverage). `compose` is
       # platform-independent; lint it on every leg too.
       - name: Run Clippy
-        run: cargo clippy --all-targets --no-default-features --features ${{ matrix.feature }},compose,cli -- -D warnings
+        run: cargo clippy --all-targets --no-default-features --features ${{ matrix.feature }},compose,cli,hotplug-recovery -- -D warnings
 
       # FH-2: the bare `--no-default-features` build (NO platform feature) must
       # still compile. It broke on Windows (E0432) because a bin gated only on
@@ -190,12 +209,12 @@ jobs:
       # `compose` (composed_capture example) gate targets via required-features
       # — without them --all-targets silently skips those targets.
       - name: Build all targets
-        run: cargo build --all-targets --no-default-features --features feat_linux,compose,cli
+        run: cargo build --all-targets --no-default-features --features feat_linux,compose,cli,hotplug-recovery
 
       # rsac-0a1f: `compose` is platform-independent (mock/scripted sources),
       # so its unit tests run in the lib suite on every OS leg.
       - name: Cargo test (unit tests)
-        run: cargo test --lib --no-default-features --features feat_linux,compose
+        run: cargo test --lib --no-default-features --features feat_linux,compose,hotplug-recovery
 
       # TC-01: ADR-0001's headline alloc-free producer guarantee is proved ONLY
       # by tests/rt_alloc.rs, which is an integration test and so was never run
@@ -236,7 +255,7 @@ jobs:
       # excludes feat_windows/feat_macos, so this leg is the only place
       # async-stream ever compiles against the WASAPI backend.
       - name: Build all targets
-        run: cargo build --all-targets --no-default-features --features feat_windows,compose,cli,async-stream
+        run: cargo build --all-targets --no-default-features --features feat_windows,compose,cli,async-stream,hotplug-recovery
 
       # TC-07: the Windows unit step used to be continue-on-error on the WHOLE
       # `cargo test --lib` run, so the ~40 inline wasapi.rs tests + 21 thread.rs
@@ -251,9 +270,10 @@ jobs:
       # as narrow as possible if device-dependent test names change.
       # The device-dependent unit tests open a real WASAPI client / default
       # endpoint / IMMNotificationClient, which need the Windows Audio service
-      # (Audiosrv) + an audio endpoint — both ABSENT on the Blacksmith Windows
-      # runner (AGENTS.md §6), where they fail with RPC-unavailable (0x800706BA)
-      # / service-not-installed (0x80070424). They are partitioned out of the
+      # (Audiosrv) + an audio endpoint. The Blacksmith Windows image has had the
+      # service since the 2026-11-26 probe (AGENTS.md §6), but it ships no
+      # audio device and this job installs none, so these tests cannot be
+      # required to pass here. They are partitioned out of the
       # hard-fail step (via --skip) and re-run as a tolerated step. Everything
       # NOT in this list (parse_session_identifier, get_process_name_by_pid,
       # backend_context, data_flow_to_kind, application_session_info, …) is pure
@@ -266,10 +286,10 @@ jobs:
         shell: bash
         run: |
           DEVICE_SKIPS="--skip enumerate --skip default_device --skip device_enumeration --skip device_id --skip device_supported_formats --skip audio_device_ --skip create_stream --skip find_device --skip watch_ --skip create_audio_client"
-          cargo test --lib --no-default-features --features feat_windows,compose -- --test-threads=1 $DEVICE_SKIPS
+          cargo test --lib --no-default-features --features feat_windows,compose,hotplug-recovery -- --test-threads=1 $DEVICE_SKIPS
 
       # Device-dependent subset ONLY (the families --skip'd above). Tolerated
-      # because the Blacksmith Windows runner has no audio subsystem; this step
+      # because this job has no audio device on the Blacksmith Windows runner; this step
       # runs ONLY those families, so it can never mask the hard-fail partition.
       # Mirrors release.yml's tolerated device step — keep the filters in sync.
       - name: Cargo test (device-dependent tests, tolerated)
@@ -277,7 +297,7 @@ jobs:
         shell: bash
         run: |
           for f in enumerate default_device device_enumeration device_id device_supported_formats audio_device_ create_stream find_device watch_ create_audio_client; do
-            cargo test --lib --no-default-features --features feat_windows,compose -- --test-threads=1 "$f" || true
+            cargo test --lib --no-default-features --features feat_windows,compose,hotplug-recovery -- --test-threads=1 "$f" || true
           done
 
       # TC-01: ADR-0001 alloc-free producer proof (process-wide allocator, own
@@ -299,7 +319,7 @@ jobs:
       # compile against feat_windows (the powerset job is Linux-only).
       - name: Cargo test (doctests)
         shell: bash
-        run: cargo test --doc --no-default-features --features feat_windows,compose,sink-wav,cli,async-stream
+        run: cargo test --doc --no-default-features --features feat_windows,compose,sink-wav,cli,async-stream,hotplug-recovery
 
       - name: Report audio service status
         if: always()
@@ -354,7 +374,7 @@ jobs:
       # excludes feat_windows/feat_macos, so this leg is the only place
       # async-stream ever compiles against the CoreAudio backend.
       - name: Build all targets
-        run: cargo build --all-targets --no-default-features --features feat_macos,compose,cli,async-stream
+        run: cargo build --all-targets --no-default-features --features feat_macos,compose,cli,async-stream,hotplug-recovery
 
       # TC-03: src/audio/macos/tap.rs's only process-tap-creating test —
       # test_new_system_creates_tap (calls CoreAudioProcessTap::new_system ->
@@ -370,7 +390,7 @@ jobs:
       # tests run in this leg too.
       - name: Cargo test (unit tests)
         timeout-minutes: 5
-        run: cargo test --lib --no-default-features --features feat_macos,compose
+        run: cargo test --lib --no-default-features --features feat_macos,compose,hotplug-recovery
 
       # rsac-86c7: macos-tcc-spi's 1 test (preflight_returns_a_status_without_panicking,
       # src/audio/macos/permission.rs) is target_os-gated like feat_macos itself, so it
@@ -401,7 +421,7 @@ jobs:
       # compile against feat_macos (the powerset job is Linux-only).
       - name: Cargo test (doctests)
         timeout-minutes: 10
-        run: cargo test --doc --no-default-features --features feat_macos,compose,sink-wav,cli,async-stream
+        run: cargo test --doc --no-default-features --features feat_macos,compose,sink-wav,cli,async-stream,hotplug-recovery
 
       # OPTION B (existence check): Blacksmith macOS runners lack TCC grants for
       # Process Tap capture (see macos-process job in ci-audio-tests.yml —
@@ -520,7 +540,8 @@ jobs:
   mobile-android:
     name: Android Mobile Leg (cross-check + AAR)
     timeout-minutes: 25
-    needs: lint
+    needs: [changes, lint]
+    if: needs.changes.outputs.mobile == 'true'
     runs-on: blacksmith-4vcpu-ubuntu-2404
     steps:
       - uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5
@@ -569,7 +590,7 @@ jobs:
       - name: Build librsac.so into jniLibs (arm64-v8a + x86_64)
         run: |
           # ANDROID_NDK_LATEST_HOME / ANDROID_NDK_ROOT are runner-process env
-          # (visible to the shell, NOT to ${{ env.* }} expressions — first-run
+          # (visible to the shell, NOT to the `env` expression context — first-run
           # lesson: mapping it via `env:` yielded an empty string and broke
           # cargo-ndk's NDK detection).
           export ANDROID_NDK_HOME="${ANDROID_NDK_LATEST_HOME:-$ANDROID_NDK_ROOT}"
@@ -642,7 +663,8 @@ jobs:
   mobile-ios:
     name: iOS Mobile Leg (cross-check + SwiftPM)
     timeout-minutes: 25
-    needs: lint
+    needs: [changes, lint]
+    if: needs.changes.outputs.mobile == 'true'
     runs-on: blacksmith-6vcpu-macos-15
     steps:
       - uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5
@@ -857,17 +879,50 @@ jobs:
           maturin develop -m bindings/rsac-python/Cargo.toml
           python bindings/rsac-python/tests/smoke.py
 
+      # One cp39-abi3 wheel must load on the abi3 floor (3.9) AND the newest
+      # supported CPython (3.13). `maturin develop` above only proves the
+      # runner's own interpreter, and release-pypi.yml's equivalent smoke runs
+      # at tag time — too late to catch a PyO3 bump that breaks either end.
+      - uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5
+        with:
+          python-version: |
+            3.9
+            3.13
+
+      # `--compatibility linux` skips the manylinux audit: this wheel links the
+      # runner's libpipewire and is only ever installed on this runner.
+      - name: Python abi3 wheel smoke (CPython 3.9 + 3.13)
+        env:
+          PYO3_USE_ABI3_FORWARD_COMPATIBILITY: "1"
+        run: |
+          . .venv-smoke/bin/activate
+          maturin build --compatibility linux \
+            -m bindings/rsac-python/Cargo.toml --out target/abi3-smoke/dist
+          deactivate
+          WHEEL="$(ls target/abi3-smoke/dist/*.whl | head -1)"
+          echo "abi3 wheel: ${WHEEL}"
+          case "${WHEEL}" in
+            *-abi3-*) ;;
+            *) echo "::error::expected a cp39-abi3 wheel, got ${WHEEL}"; exit 1 ;;
+          esac
+          for PYBIN in python3.9 python3.13; do
+            echo "=== smoke on $("$PYBIN" --version) ==="
+            "$PYBIN" -m venv "target/abi3-smoke/venv-${PYBIN}"
+            "target/abi3-smoke/venv-${PYBIN}/bin/python" -m pip install --quiet "${WHEEL}"
+            "target/abi3-smoke/venv-${PYBIN}/bin/python" bindings/rsac-python/tests/smoke.py
+          done
+
       - name: Set up Node for the napi smoke test
         uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
         with:
-          node-version: 22
+          node-version-file: .tool-versions
 
       # rsac-e652: Bun is the single package manager for rsac-napi (matches
       # release-npm.yml). Pin the exact same version everywhere it's set up
       # so lockfile-resolution behavior can't drift between CI legs.
       - uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6 # v2
         with:
-          bun-version: '1.3.14'
+          bun-version-file: .tool-versions
 
       # --frozen-lockfile, no fallback: a stale bun.lock (drifted from
       # package.json) FAILS loudly here instead of at release time
@@ -910,9 +965,11 @@ jobs:
         with:
           persist-credentials: false
       - uses: ./.github/actions/rust-setup
+      # go.mod, not .tool-versions: this setup-go pin (v5.1.0) reads the whole
+      # .tool-versions file as one version string (support arrived in v6.1.0).
       - uses: actions/setup-go@41dfa10bad2bb2ae585af6ee5bb4d7d973ad74ed # v5
         with:
-          go-version: '1.22'
+          go-version-file: bindings/rsac-go/go.mod
 
       - name: Install PipeWire dev libraries (Linux)
         if: runner.os == 'Linux'
@@ -1039,10 +1096,12 @@ jobs:
 
       # rsac-86c7: async-stream unit tests are clippy'd above but were never
       # EXECUTED by any `--lib` leg. Run them here — this job already isolates
-      # the optional-feature build.
-      - name: Run unit tests (async-stream)
+      # the optional-feature build. `hotplug-recovery` is added for this step
+      # only: the per-OS unit jobs enable it without `async-stream`, so the
+      # recovery tests gated on `async-stream` would otherwise run nowhere.
+      - name: Run unit tests (async-stream + hotplug-recovery)
         run: |
-          cargo test --lib --no-default-features --features feat_linux,async-stream,sink-wav,test-utils,compose
+          cargo test --lib --no-default-features --features feat_linux,async-stream,sink-wav,test-utils,compose,hotplug-recovery
 
       - name: Run doctests
         # Build doctests with the same feature set so doc examples that touch
@@ -1098,6 +1157,9 @@ jobs:
     name: Coverage (cargo-llvm-cov, advisory)
     timeout-minutes: 30
     needs: lint
+    # Advisory trend data with no merge-decision value: the instrumented
+    # rebuild runs on tags and on `full: true` dispatches only.
+    if: github.event_name != 'workflow_dispatch' || inputs.full
     continue-on-error: true
     runs-on: blacksmith-4vcpu-ubuntu-2404
     steps:
@@ -1157,47 +1219,58 @@ jobs:
           # Advisory job: never fail on an upload hiccup.
           fail_ci_if_error: false
 
-  # ── MSRV check (Rust 1.87, Linux) ───────────────────────────────────
-  # Guards rust-version = "1.87" (Cargo.toml:9) from rotting under the pinned
-  # 1.95 toolchain: every other job compiles with 1.95.0 (rust-toolchain.toml),
-  # so a post-1.87 API creeping into src/ would otherwise surface only for
-  # downstream consumers building on the MSRV. This is also the tripwire for
-  # new optional deps exceeding the MSRV: --all-features compiles the `compose`
-  # deps (rubato + audioadapter-buffers) and the `cli` deps (clap, color-eyre,
-  # ctrlc, env_logger), and --all-targets includes the cli-gated bins/examples.
-  # RUSTUP_TOOLCHAIN is set at the job level because the
-  # repo's rust-toolchain.toml (1.95.0) would otherwise override the installed
-  # default for every cargo/rustc invocation, silently un-MSRVing the job.
+  # ── MSRV check (Rust 1.88, Linux + Windows) ─────────────────────────
+  # Guards rust-version = "1.88" (Cargo.toml:9) from rotting under the pinned
+  # 1.95 toolchain. Runs on BOTH Linux and Windows (free GH windows-2025) so
+  # Windows-only dependencies (e.g. sysinfo 0.38.4, which raised the real MSRV
+  # to 1.88 while the former Linux-only check stayed green at 1.87) can never
+  # silently violate the declared MSRV again.
   msrv:
-    name: MSRV Check (Rust 1.87)
+    name: MSRV Check (Rust 1.88, ${{ matrix.os }})
     timeout-minutes: 25
     needs: lint
-    runs-on: blacksmith-4vcpu-ubuntu-2404
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: linux
+            runner: blacksmith-4vcpu-ubuntu-2404
+          - os: windows
+            runner: windows-2025
+    runs-on: ${{ matrix.runner }}
     env:
-      RUSTUP_TOOLCHAIN: "1.87.0"
+      RUSTUP_TOOLCHAIN: "1.88.0"
     steps:
       - uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5
         with:
           persist-credentials: false
       # Same SHA-pinned action commit as the 1.95.0 pins above; the
       # `toolchain` input overrides the ref-derived version with the MSRV.
-      - uses: dtolnay/rust-toolchain@e081816240890017053eacbb1bdf337761dc5582 # action pin as above; toolchain input = 1.87.0
+      - uses: dtolnay/rust-toolchain@e081816240890017053eacbb1bdf337761dc5582 # action pin as above; toolchain input = 1.88.0
         with:
-          toolchain: "1.87.0"
-      # Distinct cache prefix so MSRV (1.87) artifacts never poison the 1.95
+          toolchain: "1.88.0"
+      # Distinct cache prefix so MSRV (1.88) artifacts never poison the 1.95
       # caches shared by every other job.
       - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
         with:
-          prefix-key: v0-rust-msrv-1-87
+          prefix-key: v0-rust-msrv-1-88-${{ matrix.os }}
 
       - name: Install PipeWire dev libraries
-        run: |
-          sudo add-apt-repository ppa:pipewire-debian/pipewire-upstream -y
-          sudo apt-get update
-          sudo apt-get install -y libpipewire-0.3-dev libspa-0.2-dev pkg-config
+        if: matrix.os == 'linux'
+        uses: ./.github/actions/pipewire-setup
 
+      # `--locked` on both steps: the MSRV claim is about the COMMITTED
+      # lockfile, so a drifted Cargo.lock must fail instead of silently
+      # re-resolving to a dependency with a newer rust-version.
       - name: Cargo check (MSRV)
-        run: cargo check --all-features --all-targets
+        run: cargo check --locked --all-features --all-targets
+
+      # rsac-napi and tauri-plugin-rsac declare the same 1.88 floor and
+      # rsac-ffi ships with them. Windows only: tauri's Linux build needs the
+      # gtk/webkit dev libraries this job does not install.
+      - name: Cargo check binding crates (MSRV)
+        if: matrix.os == 'windows'
+        run: cargo check --locked -p rsac-ffi -p rsac-napi -p tauri-plugin-rsac
 
   # ── docs.rs render gate (cargo doc) ─────────────────────────────────
   # rsac L14(b): Cargo.toml carries a [package.metadata.docs.rs] block
@@ -1278,81 +1351,38 @@ jobs:
       - name: Self-test the module-DAG guard
         run: bash scripts/check-module-dag.sh --self-test
 
-  # ── CHANGELOG process guard (rsac-7437) ─────────────────────────────
-  # Every PR touching src/ or bindings/ must record its change in
-  # CHANGELOG.md's [Unreleased] section, or carry the changelog-not-needed
-  # label for genuinely internal changes (test-only, CI-only, docs-only diffs
-  # that also happen to touch src/ comments, etc.). Root cause: 0.4.1's
-  # release notes shipped incomplete because PRs #41-#49 fixed code but never
-  # touched CHANGELOG.md (caught only by a manual post-release audit).
-  # Independent of `changes`/`lint` (must not skip silently). Applies to ALL
-  # PR base branches including release/** — release-stacking layer PRs use
-  # the changelog-not-needed label per-layer (see AGENTS.md §6) rather than
-  # a blanket base-branch exemption the guard can't audit.
-  changelog-guard:
-    name: CHANGELOG Guard
-    if: github.event_name == 'pull_request'
-    timeout-minutes: 5
+  # ── Secret scan (betterleaks) ───────────────────────────────────────
+  # Independent of `changes`/`lint` on purpose: a docs-only branch (where the
+  # compile matrix is skipped) is exactly where a pasted token lands, so it
+  # must always be scanned. Every run scans the full history (seconds on this
+  # repo). Rules and allowlist: .betterleaks.toml. The scanner
+  # version is pinned once, in mise.toml (jdx/mise-action installs just
+  # betterleaks). --redact keeps matched values out of the public logs; never
+  # pass -v/--validation (sends findings to provider APIs).
+  secrets:
+    name: Secret Scan (betterleaks)
+    timeout-minutes: 10
     runs-on: blacksmith-4vcpu-ubuntu-2404
     permissions:
       contents: read
-      pull-requests: read
     steps:
       - uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5
         with:
           persist-credentials: false
           fetch-depth: 0
 
-      - name: Check CHANGELOG.md [Unreleased] touched (or label escape hatch)
-        env:
-          BASE_SHA: ${{ github.event.pull_request.base.sha }}
-          HEAD_SHA: ${{ github.event.pull_request.head.sha }}
-          PR_LABELS_JSON: ${{ toJson(github.event.pull_request.labels.*.name) }}
+      - uses: jdx/mise-action@924e7c586e33d7d4bae9c14e26c5d22e2beb6e78 # v5.3.0
+        with:
+          install_args: betterleaks
+          cache: false
+          github_token: ${{ github.token }}
+
+      - name: Scan (full history)
         run: |
           set -euo pipefail
-          if echo "$PR_LABELS_JSON" | grep -q '"changelog-not-needed"'; then
-            echo "OK: PR carries the changelog-not-needed label — skipping."
-            exit 0
-          fi
-
-          MERGE_BASE="$(git merge-base "$BASE_SHA" "$HEAD_SHA")"
-          CHANGED="$(git diff --name-only "$MERGE_BASE" "$HEAD_SHA")"
-          printf 'changed files:\n%s\n' "$CHANGED"
-
-          TOUCHES_SRC="$(printf '%s\n' "$CHANGED" | grep -E '^(src/|bindings/)' || true)"
-          if [ -z "$TOUCHES_SRC" ]; then
-            echo "OK: no src/ or bindings/ changes — CHANGELOG not required."
-            exit 0
-          fi
-
-          if printf '%s\n' "$CHANGED" | grep -q '^CHANGELOG\.md$'; then
-            # Confirm the [Unreleased] section itself changed, not just some
-            # other part of the file (e.g. a stray whitespace fix in an older
-            # release block). Extract the section body — everything between the
-            # `## [Unreleased]` header and the next `## [` header — at both the
-            # merge-base and the head, and compare. Anchoring on the extracted
-            # section (not on `git diff` output, whose lines carry +/-/space
-            # prefixes) is the only reliable approach: an entry added under a
-            # subsection like `### Fixed` puts the diff hunk several lines below
-            # the `## [Unreleased]` header, so the header never appears in the
-            # diff context and a diff-line-anchored awk misses it entirely.
-            # `|| true` keeps `set -euo pipefail` from aborting the step when
-            # CHANGELOG.md does not exist at the merge-base (e.g. a PR that adds
-            # the file for the first time): `git show` exits non-zero there, and
-            # under pipefail that would otherwise hard-fail the whole job.
-            base_unreleased="$( { git show "$MERGE_BASE:CHANGELOG.md" 2>/dev/null || true; } \
-              | awk '/^## \[Unreleased\]/{f=1;next} /^## \[/{f=0} f')"
-            head_unreleased="$( { git show "$HEAD_SHA:CHANGELOG.md" 2>/dev/null || true; } \
-              | awk '/^## \[Unreleased\]/{f=1;next} /^## \[/{f=0} f')"
-            if [ "$base_unreleased" != "$head_unreleased" ]; then
-              echo "OK: CHANGELOG.md [Unreleased] section was modified."
-              exit 0
-            fi
-          fi
-
-          echo "::error::This PR touches src/ or bindings/ but does not update CHANGELOG.md's [Unreleased] section."
-          echo "::error::Add an entry under [Unreleased], or apply the 'changelog-not-needed' label if this change has no user-facing effect (test-only, internal refactor, CI-only)."
-          exit 1
+          betterleaks version
+          betterleaks config check .betterleaks.toml
+          betterleaks git . --config .betterleaks.toml --redact --no-banner
 
   supply-chain:
     name: Supply Chain (cargo-deny)
@@ -1371,7 +1401,7 @@ jobs:
           tool: cargo-deny
 
       - name: Run cargo-deny
-        run: cargo deny check advisories bans licenses sources
+        run: cargo deny --workspace --all-features check advisories bans licenses sources
 
   # ── Version lockstep guard (rsac + 4 bindings) ──────────────────────
   # Enforces the versioning/ABI contract documented in
@@ -1406,7 +1436,7 @@ jobs:
       # with the three registry publish workflows — no logic is duplicated in
       # YAML anymore). On a `vX.Y.Z` tag push we pass `--expect <tag-version>`,
       # which HARD-FAILS on any manifest that does not equal the tag — the
-      # point of no return. On ordinary pushes / PRs we pass `--warn-only`, so a
+      # point of no return. On a manual dispatch we pass `--warn-only`, so a
       # deliberate mid-cycle skew (a binding lagging the root crate between
       # releases) only warns and does not block day-to-day CI. An
       # unextractable version is a hard failure regardless (the script
@@ -1423,33 +1453,30 @@ jobs:
             bash scripts/check-version-lockstep.sh --warn-only
           fi
 
-  # ── Semver gate for release PRs (interim home) ──────────────────────
+  # ── Semver gate for release branches (interim home) ─────────────────
   # cargo-semver-checks (the public-API compatibility gate) normally lives in
   # release.yml's tag-triggered publish pipeline — but release.yml is currently
   # disabled_manually (seed rsac-aaea: missing crates.io/npm/PyPI publish
-  # credentials). While it's disabled there is NO path, automatic OR manual, that
-  # runs the semver gate at all, so any breaking API change could ship into a
-  # release undetected. This job is the interim home: it runs the SAME check at
-  # PR-review time, but ONLY on the "release: vX.Y.Z" PR that release-prepare.yml
-  # opens against master (matched by title, NOT by target branch). That scoping
-  # is deliberate — it must NOT fire on ordinary feature PRs, nor on the
-  # release-stacking layer PRs that merge into a frozen release/** branch and
-  # intentionally bundle breaking changes before the single version bump
-  # (docs/reviews/rsac-backlog-blueprints-2026-05-30.md warned a naively-scoped
-  # gate would false-positive-block exactly those). PR-time feedback is strictly
-  # earlier than tag-time, so KEEP this job even after release.yml is re-enabled.
+  # credentials). While it's disabled this job is the only path that runs the
+  # semver gate before a tag, so a breaking API change cannot ship into a
+  # release undetected.
+  #
+  # Scoping is deliberate. It runs on a manual dispatch of the release bump
+  # branch (release-prepare.yml always names it release/vX.Y.Z) or when the
+  # dispatcher sets `semver: true`. It must NOT run on ordinary feature
+  # branches, nor on release-stacking integration/layer branches
+  # (release/X.Y.Z, no `v`) that intentionally bundle breaking changes before
+  # the single version bump (docs/reviews/rsac-backlog-blueprints-2026-05-30.md
+  # warned a naively-scoped gate would false-positive-block exactly those).
+  # Pre-tag feedback is strictly earlier than tag time, so KEEP this job even
+  # after release.yml is re-enabled.
   #
   # Baseline resolution mirrors release.yml's `git describe ... HEAD^`: on the
-  # release PR, HEAD^ is master's tip before the merge, and the previous stable
-  # v*.*.* tag is reachable from there.
-  semver-checks-release-pr:
-    name: Semver Gate (release PR)
-    # Keyed on the STRUCTURAL release signal (release-prepare's bump branch is
-    # always release/vX.Y.Z targeting master) OR the release title, so renaming
-    # the PR title alone cannot skip the gate (review PR #56). Layer PRs in the
-    # release-stacking SDLC have base release/X.Y.Z, not master — excluded by
-    # the base check.
-    if: "github.event_name == 'pull_request' && github.base_ref == 'master' && (startsWith(github.head_ref, 'release/') || startsWith(github.event.pull_request.title, 'release: v'))"
+  # bump branch, HEAD^ is master's tip before the bump commit, and the previous
+  # stable v*.*.* tag is reachable from there.
+  semver-checks-release:
+    name: Semver Gate (release branch)
+    if: "github.event_name == 'workflow_dispatch' && (inputs.semver || startsWith(github.ref_name, 'release/v'))"
     timeout-minutes: 20
     runs-on: blacksmith-4vcpu-ubuntu-2404
     steps:

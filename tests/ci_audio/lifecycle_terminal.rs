@@ -1,6 +1,6 @@
 //! Terminal read-behavior & `request_stop()` integration tests.
 //!
-//! The unit suite in `src/api.rs` already exercises `request_stop()` and the
+//! The unit suite in `src/api/tests.rs` already exercises `request_stop()` and the
 //! terminal-read contract against a `MockCapturingStream`:
 //!   * `request_stop_signals_stream_once` / `_is_idempotent` / `_no_stream_is_noop`
 //!   * `request_stop_unblocks_parked_blocking_read` (parked `read_buffer_blocking`

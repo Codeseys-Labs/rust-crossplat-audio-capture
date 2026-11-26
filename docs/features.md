@@ -9,12 +9,13 @@ This document enumerates every Cargo feature exposed by `rsac`, what it enables,
 | `feat_windows` | yes | Windows | WASAPI backend: system + loopback + per-process + process-tree capture, WASAPI device enumeration, session enumeration | Windows 10+ host. No extra system packages (WASAPI ships with the OS). Rust target `x86_64-pc-windows-msvc` or `x86_64-pc-windows-gnu`. |
 | `feat_linux` | yes | Linux | PipeWire backend: system + per-app + process-tree capture via monitor streams, PipeWire device enumeration, `pw-dump` node resolution | `libpipewire-0.3-dev`, `libspa-0.2-dev`, `pkg-config`, `clang`/`libclang-dev`, `llvm-dev`. Runtime: PipeWire 0.3.44+ daemon active. |
 | `feat_macos` | yes | macOS | CoreAudio backend: system capture, per-process + process-tree capture via Process Tap, aggregate device construction, `NSWorkspace` application enumeration | Xcode Command Line Tools. Process Tap requires **macOS 14.4+**. Audio Capture (`kTCCServiceAudioCapture`) TCC permission required at capture time — distinct from Screen Recording. |
-| `feat_android` | yes | Android | AAudio mic capture plus AudioPlaybackCapture playback tiers through first-party AAR/JNI glue | Compile-checked only; runtime unverified. Playback capture requires Android API 29+, MediaProjection consent token, and foreground service integration. |
-| `feat_ios` | yes | iOS | AVAudioEngine mic capture plus ReplayKit `SystemDefault` ring consumer through first-party SwiftPM glue | Compile-checked only; runtime unverified. System capture requires App Group + embedded Broadcast Upload Extension + user-started ReplayKit broadcast. |
+| `feat_android` | yes | Android | Experimental, parked AAudio mic and AudioPlaybackCapture via AAR/JNI glue | Compile and selected emulator evidence exist; physical-device verification remains open. Playback capture requires Android API 29+, MediaProjection consent and foreground service integration. |
+| `feat_ios` | yes | iOS | Experimental, parked AVAudioEngine mic and ReplayKit `SystemDefault` consumer via SwiftPM glue | Mic has simulator evidence; ReplayKit and physical-device verification remain open. System capture requires an App Group, embedded Broadcast Upload Extension and user-started broadcast. |
 | `default` | — | all | Meta-feature: `feat_windows`, `feat_linux`, `feat_macos`, `feat_android`, and `feat_ios` | Each enabled backend's requirements above; two-way `target_os` gates make non-matching entries inert. |
 | `async-stream` | no | all | `AudioCapture::audio_data_stream()` returning a `futures_core::Stream<Item = AudioResult<AudioBuffer>>`; also required by `examples/async_capture.rs` | Pulls in `atomic-waker` dep. Consumer needs an async runtime (Tokio, smol, etc.). |
+| `hotplug-recovery` | no | Windows, Linux, macOS | Opt-in automatic recovery for desktop `SystemDefault` capture; see [ADR-0019](designs/0019-hotplug-auto-recovery.md) for policy and limitations | No additional dependencies. Device, application and process-tree targets and mobile are outside the recovery scope. |
 | `sink-wav` | no | all | `WavFileSink` adapter (writes captured audio to a WAV file through the `AudioSink` trait) | `hound` is always a hard dependency, so no extra install — the gate is API-surface only. |
-| `compose` | no | all | Multi-source channel composition ([ADR-0011](designs/0011-compose-feature.md)): `CompositionBuilder` / `Composition` in `rsac::compose` — groups of `CaptureTarget`s mixed to Mono/Stereo channels (per-source gain) or kept as native channels, appended into one interleaved multi-channel stream with transparent resampling to the session rate; also required by `examples/composed_capture.rs` and the `compose::` ci_audio integration module | Pulls in `rubato` (FFT resampler → `realfft`, `num-complex`) and `audioadapter-buffers`. No system packages. |
+| `compose` | no | all | Multi-source channel composition ([ADR-0011](designs/0011-compose-feature.md)): groups mix to Mono/Stereo or retain a single source's negotiated channels, with rate alignment and live gain/mute controls | Pulls in `rubato` and `audioadapter-buffers`. No system packages. |
 | `cli` | no | all | The demo binaries' dependency set — required by the `rsac` CLI (`[[bin]]`), `standardized_test`, and the `verify_audio` / `basic_capture` / `record_to_file` examples (all declare `required-features = ["cli"]`). Library consumers who don't enable it no longer compile these deps at all. | Pulls in `clap` (derive), `color-eyre`, `ctrlc`, `env_logger`. |
 | `macos-tcc-spi` | no | macOS | Real `check_audio_capture_permission()` preflight ([ADR-0015](designs/0015-macos-tcc-audiocapture-preflight.md)): queries the `kTCCServiceAudioCapture` authorization via the **private** `TCCAccessPreflight` SPI, `dlopen`'d at runtime (never linked). Feature OFF (the default) keeps the honest `NotDetermined` stub, so published artifacts carry no private-symbol usage. Any SPI resolution failure degrades to `NotDetermined`. | No extra deps (uses `libc` dlopen/dlsym + `core-foundation`, already macOS deps). Private SPI — may break on future macOS releases; see the ADR's risk section. |
 | `tracing` | **no** | all | Routes the internal `rsac_event!` / `rsac_span!` instrumentation macros to the [`tracing`](https://docs.rs/tracing) facade and makes `rsac::install_default_tracing()` available. With the feature **off**, the same macros expand to `log::` calls (behavior-identical), so logging works either way — this flag only changes the *backend*. | Pulls in the `tracing` facade crate only (no `tracing-subscriber`); the consumer installs their own subscriber. |
@@ -22,7 +23,7 @@ This document enumerates every Cargo feature exposed by `rsac`, what it enables,
 
 ## Platform-feature semantics
 
-The platform `feat_*` flags are a two-way gate: code inside a platform backend is compiled **only** when both `target_os` matches and the feature is on. See `src/audio/mod.rs` for the `cfg(all(target_os = "…", feature = "feat_…"))` guards. Mobile features currently prove cross-target compilation and packaging only; keep Android/iOS runtime claims tied to the runtime-verification seeds.
+The platform `feat_*` flags are a two-way gate: a backend is compiled only when both `target_os` and its feature match. Android and iOS remain experimental and parked, with distinct compile, emulator/simulator and physical-device evidence; see [AGENTS.md §3](../AGENTS.md#3-current-state) and the [unfreeze checklist](DESKTOP_REFINEMENT.md#mobile-freeze-and-unfreeze).
 
 ### PipeWire crate version gate (`v0_3_65`)
 
@@ -143,14 +144,12 @@ sink-wav = ["rsac/sink-wav"]
 
 ### All-platform / docs.rs builds
 
-There is **no separate `all-backends` feature** and none is needed: the
-crate's existing default feature set enables all platform feature flags
-meta-feature is the all-backends opt-in. Because `feat_*` is two-way
-gated on `target_os`, turning all three on still compiles only the host
-backend on any single runner — so a docs.rs-style `--all-features`
-(or `default`) build is safe everywhere and is what
+There is **no separate `all-backends` feature**: the default feature set enables
+all five platform flags. Because each `feat_*` is also gated on `target_os`,
+enabling them still compiles only the host backend on a single runner. A
+docs.rs-style `--all-features` (or `default`) build is what
 `[package.metadata.docs.rs]` (`all-features = true`) relies on. To force
-all three backends *on* from a binding (e.g. a deliberate
+all five backend flags on from a binding (e.g. a deliberate
 `cargo doc --all-features` of the binding crate), depend on `rsac`
 without `default-features = false`, or add a binding-local
 `all-backends = ["rsac/feat_windows", "rsac/feat_linux", "rsac/feat_macos", "rsac/feat_android", "rsac/feat_ios"]`
@@ -198,7 +197,9 @@ The following are always compiled and have no opt-out:
 
 ## Version note
 
-This matrix reflects `rsac` at the 0.4 line. Future provider-architecture work may add feature flags for cloud-backed capture providers — those will be listed here as they land.
+The minimum supported Rust version is **1.88**. The pinned development toolchain
+may be newer; see [`rust-toolchain.toml`](../rust-toolchain.toml). The mobile
+features remain in the default set despite their experimental, parked status.
 
 `rsac` and its bindings bump in lockstep on every semver tag, and any
 change to the `rsac-ffi` C ABI is a MAJOR bump for the FFI surface. See

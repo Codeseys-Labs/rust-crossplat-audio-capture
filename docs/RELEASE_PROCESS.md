@@ -69,11 +69,11 @@ token. A one-time Trusted Publisher must be configured per registry (see
    `blacksmith-4vcpu-windows-2025`, and `blacksmith-6vcpu-macos-15`, each
    building all targets and running `cargo test --lib` against its platform
    feature **plus `compose`** (`feat_<os>,compose`). Mirrors the `test-*`
-   jobs in `ci.yml`, including the Windows "no audio subsystem" handling:
+   jobs in `ci.yml`, including the Windows "no audio endpoint" handling:
    the Windows `--lib` suite is **partitioned**, not blanket-tolerated —
    the platform-independent + non-audio tests hard-fail, and only the
-   device-touching WASAPI subset (which needs Audiosrv + a real endpoint,
-   absent on Blacksmith Windows runners) is `--skip`ped into a separate
+   device-touching WASAPI subset (which needs a real audio endpoint, absent
+   on the Blacksmith Windows unit-test legs) is `--skip`ped into a separate
    `continue-on-error` step. See
    [§ What `ci.yml` now gates](#what-ciyml-now-gates-architecture-critique-closures)
    for the same partition on the CI side.
@@ -322,25 +322,101 @@ GitHub. Owner: `Codeseys-Labs`; repository:
 
 ### Using the automated flow
 
-From a clean `master` with CI already green on the commit you intend to
-release (see §2 for the pre-release checklist):
+From a clean `master` checkout that nobody else is editing (see §2 for the
+pre-release checklist). One rule applies to every manual release: **the commit
+you tag must have a green, manually dispatched CI run.** That commit is the
+version-bump commit, so CI is dispatched after the bump is pushed and before
+the tag is made.
+
+After the tag, crates.io publishing is gated by `release.yml`'s `verify` and
+`semver-checks` jobs. The npm and PyPI workflows run independently of it, each
+behind its own build, a tag-versus-manifest version check and the lockstep
+check. The tag-time `ci.yml` run
+starts in parallel with all of them and gates nothing, which is why the
+dispatched run before the tag is the one that matters.
+
+Bump first: `bash scripts/bump-version.sh X.Y.Z` rewrites all nine lockstep
+manifests and rotates the CHANGELOG (§2 "CHANGELOG promotion", §3 "Version
+bump"). Review the diff, then run the three blocks below **one at a time**.
+They are separate on purpose: the tag block must not run before the dispatched
+run has finished. Block 3 is the only command in this document that creates a
+stable `vX.Y.Z` tag; §3, §4 and the RC sections point here.
 
 ```bash
-# Bump the version + promote CHANGELOG entries under a dated heading.
-# scripts/bump-version.sh rewrites all nine lockstep manifests + rotates
-# the CHANGELOG — see §2 "CHANGELOG promotion" and §3 "Version bump".
-git add -A
-git commit -m "rsac X.Y.Z"
-git push origin master
-
-# Tag and push — this is the workflow trigger.
-git tag -a vX.Y.Z -m "rsac X.Y.Z"
-git push origin vX.Y.Z
+# Block 1: refresh the lockfile, commit, push and dispatch CI, as ONE `&&`
+# chain so a failure stops the paste. bump-version.sh never touches
+# Cargo.lock; `cargo update --workspace` relocks only the workspace crates.
+# `git add -u` stages tracked files only (the bump creates no new file).
+# BUMP_SHA pins the bump commit for the next two blocks.
+cargo update --workspace &&
+  git add -u &&
+  git commit -m "rsac X.Y.Z" &&
+  BUMP_SHA="$(git rev-parse HEAD)" &&
+  git push origin master &&
+  gh workflow run ci.yml --ref master -f full=true -f semver=true
 ```
 
-Watch the Actions tab. If `verify` fails, delete the tag locally and
-remotely (`git tag -d vX.Y.Z && git push --delete origin vX.Y.Z`), fix
-the underlying issue, and re-tag. crates.io publishes are irrevocable,
+```bash
+# Block 2: find the run that was dispatched on the bump commit and wait for
+# it. `--commit` matters: `--ref master` resolves when the dispatch is queued,
+# so a commit that landed on master in between would have been tested instead,
+# and this lookup then finds nothing. A run takes a few seconds to appear; if
+# RUN_ID comes back empty right after block 1, run this block again. Dispatch
+# ci-audio-tests.yml as well for the audio matrix.
+RUN_ID="$(gh run list --workflow ci.yml --branch master --event workflow_dispatch \
+    --commit "$BUMP_SHA" --limit 1 --json databaseId --jq '.[0].databaseId')" &&
+  [ -n "$RUN_ID" ] &&
+  gh run watch "$RUN_ID" --exit-status
+```
+
+```bash
+# Block 3: tag the bump commit, as one chain. It refuses unless the run from
+# block 2 finished green on the bump commit, HEAD is still that commit, and
+# the tree is clean (the lockstep check reads files on disk, so an uncommitted
+# fix would pass it while the tag records the committed mismatch). Nothing
+# else checks a hand-made tag before it exists, and pushing it is the publish
+# trigger.
+[ "$(gh run view "$RUN_ID" --json headSha,conclusion --jq '.headSha + " " + .conclusion')" = "$BUMP_SHA success" ] &&
+  [ "$(git rev-parse HEAD)" = "$BUMP_SHA" ] &&
+  git diff --quiet && git diff --cached --quiet &&
+  bash scripts/check-version-lockstep.sh --expect X.Y.Z &&
+  git tag -a vX.Y.Z -m "rsac X.Y.Z" "$BUMP_SHA" &&
+  git push origin vX.Y.Z
+```
+
+Watch the Actions tab. If `verify` fails, do not touch the tag yet.
+`release-npm.yml` and `release-pypi.yml` run in parallel with `release.yml` and
+can publish even though `verify` failed, and a run that has already started
+uploads what it built from the old commit without rechecking the tag. So first
+wait for every run the tag started (`release.yml`, `release-npm.yml`,
+`release-pypi.yml`) to finish, or cancel it and confirm it is cancelled. Only
+then check whether anything was published for `X.Y.Z`: `rsac` on crates.io
+(<https://crates.io/crates/rsac>), `rsac` on PyPI
+(<https://pypi.org/project/rsac/>), and on npm both `@rsac/audio`
+(<https://www.npmjs.com/package/@rsac/audio>) **and every platform
+sub-package** (`@rsac/audio-<platform>`). An npm run publishes the
+sub-packages before the main package, so the main package's page can look
+clean after a partial publish. If **no** package on any registry has `X.Y.Z`,
+delete the tag locally and remotely
+(`git tag -d vX.Y.Z && git push --delete origin vX.Y.Z`), fix the underlying
+issue, and tag again through the checked sequence above. A fix that needs a
+new commit needs its own green dispatched run: push it, set `BUMP_SHA` to it,
+dispatch `ci.yml` as in block 1, then run blocks 2 and 3. The earlier run
+covered the old commit only. If **any** package already has it, or you cannot
+establish that for every package, leave the tag where it is and ship the fix
+as a new version: re-tagging would make the same version name point at
+different commits across registries.
+
+The Go module tag `bindings/rsac-go/vX.Y.Z`, which the automated flow pushes
+with the crate tag, is a package in this sense, and its state cannot be
+established: the Go module proxy keeps the first copy of a version anyone asks
+it for, and asking it yourself makes it fetch. If that tag was pushed, treat
+`X.Y.Z` as published and ship the fix as a new version. Only a release whose Go
+tag was never pushed (a manual release stopped before that step) can be
+re-tagged, and then both tags are created together on the fixed commit.
+
+crates.io publishes are
+irrevocable,
 so `publish` is gated behind a successful `verify` + `semver-checks` — but a failure
 inside `publish` (e.g. transient network, token rotation) is not safe
 to re-run blindly if `cargo publish` already succeeded. Inspect
@@ -451,17 +527,30 @@ writes to `master`.
 ### Step 2 — review and SQUASH-MERGE the release PR
 
 Treat the `release: vX.Y.Z` PR like any other PR: review the manifest
-diff and the CHANGELOG rotation. The CI **`version-lockstep` gate must be
-green** on the PR before merging — it cross-checks that all **nine** manifests
+diff and the CHANGELOG rotation. CI is manually dispatched, so **dispatch it on
+the release branch and wait for green before merging**
+(`gh workflow run ci.yml --ref release/vX.Y.Z -f full=true`; without
+`full=true` the run is scoped by the branch diff). Dispatch with the branch up
+to date with `master`, then merge that exact commit before `master` advances
+again: the PR head at merge time must be the run's `headSha`
+(`gh run view <run-id> --json headSha,conclusion`), and a later commit on the
+release branch needs a new dispatch. `release-tag.yml` tags the squash-merge
+commit as soon as it lands, so that commit is covered only if its tree is the
+tree the run tested. Its **`version-lockstep` gate**
+cross-checks that all **nine** manifests
 (root `Cargo.toml`, the rsac-ffi / rsac-napi / rsac-python `Cargo.toml`s, the
 napi `package.json`, the python `pyproject.toml`, and the Android native shim)
-carry the same version.
-Because this gate runs on the PR/master push that subsequently gets tagged, the
-tagged commit is already lockstep-verified before `release-tag.yml` tags it. (At
-*tag* time, `release.yml` additionally re-checks the tag matches the root
-`Cargo.toml`, and `ci.yml` *also* re-runs on the `v*.*.*` tag push — its `on:`
-block includes a `tags: ['v*.*.*', '!v*-*']` trigger — so the full nine-manifest
-lockstep gate runs again at tag time as well as on push/PR.)
+carry the same version (a skew only warns on a dispatched run, so read the job
+output), and a `release/vX.Y.Z` dispatch also runs the semver gate. The hard
+gates are automatic: `release-tag.yml` runs the same nine-manifest lockstep
+check with `--expect X.Y.Z` on the merge commit and refuses to create the tag
+on any mismatch; at tag time `release.yml` re-checks the tag against the root
+`Cargo.toml`, and `ci.yml` fires on the `v*.*.*` tag push — its `on:` block
+keeps a `tags: ['v*.*.*', '!v*-*']` trigger — and hard-fails on drift.
+Those tag-time runs need a tag push that can start workflows. A tag pushed by
+hand or with the release App token does; a tag `release-tag.yml` pushes with the
+default `GITHUB_TOKEN` (no App credentials) starts none, so dispatch `ci.yml`
+and `ci-audio-tests.yml` on the tag yourself in that case.
 
 > **Merge it as a SQUASH merge, and do NOT edit the commit subject.** The
 > tag automation in step 3 keys on the squash-merge commit *subject* being
@@ -651,16 +740,23 @@ Run `bash scripts/bump-version.sh X.Y.Z` to rewrite **all nine** manifests
 in one shot — including `bindings/rsac-ffi/Cargo.toml` and its internal
 `rsac = { path = "../../", version = "…" }` dependency pin — plus the
 CHANGELOG rotation. The
-`version-lockstep` CI job re-checks all nine values on every push/PR
-(warning on a mid-cycle skew). Because the release PR's merge commit is a
-push to `master`, this gate runs — and must be green — on the exact commit that
-`release-tag.yml` then tags, so a mismatched manifest never reaches the tag.
+`version-lockstep` CI job re-checks all nine values on every `ci.yml` run
+(warning on a mid-cycle skew). CI is manually dispatched, so dispatch it on the
+release branch before merging the release PR. The merge commit gets no CI run
+of its own; instead `release-tag.yml` hard-checks the same nine-manifest
+lockstep (`--expect X.Y.Z`) before it creates the tag, so a mismatched manifest
+never reaches a tag that workflow creates. It is the only pre-tag gate: a
+hand-made tag (§4) has no automatic check, so run
+`bash scripts/check-version-lockstep.sh --expect X.Y.Z` before `git tag`;
+otherwise drift is caught only after the tag exists.
 At *tag* time, `release.yml`'s `verify` job independently re-checks the pushed
 tag against the root `Cargo.toml` before publishing (a second, registry-side
-gate), and `ci.yml` re-runs its full nine-manifest lockstep on the `v*.*.*` tag
+gate), and `ci.yml` runs its full nine-manifest lockstep on the `v*.*.*` tag
 push too (its `on:` block has a `tags: ['v*.*.*', '!v*-*']` trigger), so the
-lockstep gate covers push/PR *and* tag time. A mismatched manifest must never
-reach a registry.
+lockstep gate covers the tagging step *and* tag time. A mismatched
+manifest must never reach a registry.
+(As above: a `GITHUB_TOKEN`-pushed tag starts no workflow, so those tag-time
+runs must be dispatched by hand.)
 
 > Mid-cycle skew is tolerated by CI (warning only) so a binding can lag
 > the root crate between releases, but it must be reconciled before
@@ -781,14 +877,24 @@ before uploading.
 
 ### Promoting an RC to a stable release
 
-Once the RC is validated, tag the stable version and push:
+Once the RC is validated, promote it through the checked sequence in
+[Using the automated flow](#using-the-automated-flow); do not tag by hand
+outside its block 3. The commit to tag must be on `master`, be its head when
+CI is dispatched (`--ref master` tests the head) and carry the stable version
+in all nine manifests: if it does not yet, bump as in §3 (block 1). If it
+already does, skip block 1's commit, set `BUMP_SHA="$(git rev-parse HEAD)"`
+and dispatch `ci.yml` on `master`
+(`gh workflow run ci.yml --ref master -f full=true -f semver=true`) unless a
+`ci.yml` run dispatched on `master` with `full=true` and `semver=true` already
+exists for that commit. Block 2 looks only on `master` and cannot tell which
+inputs a run had: a run on an RC branch for the same commit does not count,
+and neither does a default dispatch, which is scoped by the diff and skips the
+semver gate. When unsure, dispatch again. Then run blocks 2 and 3. A commit
+that lands on `master` after the dispatch does not invalidate the run: block 3
+tags `$BUMP_SHA`, the commit the run tested, not the branch head.
 
-```bash
-git tag -a v0.2.0 -m "rsac 0.2.0"
-git push origin v0.2.0
-```
-
-That push triggers all three registry workflows in parallel.
+The tag push triggers all three registry workflows in parallel, and nothing
+else checks the commit first.
 
 ---
 
@@ -848,7 +954,20 @@ cargo fmt --all -- --check
 RUSTDOCFLAGS="-D warnings" cargo doc --no-deps --all-features
 ```
 
-Then confirm **per-platform CI is green** on the commit you intend to tag.
+For a manual release, CI evidence is required on the commit that gets tagged,
+which is the version-bump commit from §3, so the required dispatch happens
+there (see §3), not here. Dispatching on the pre-bump commit as well
+(`gh workflow run ci.yml --ref <branch> -f full=true -f semver=true`, plus
+`ci-audio-tests.yml` for the audio matrix) is optional: it catches a red
+matrix before you bump. CI is manual, so no run exists until you start one.
+In the release-prepare flow the dispatched run covers the release-branch tree
+only, and `release-tag.yml` tags the squash-merge commit as soon as it lands,
+so that commit cannot be dispatched before its tag exists; the requirement
+there is on the release PR head instead. Keep the release branch up to date
+with `master` when you dispatch and when you merge, and merge only the head the
+green run tested (its `headSha`), so the merge commit's tree is the tree that
+was tested; if `master` advanced or the branch got another commit in between,
+update it and dispatch again before merging.
 The workflows live in `.github/workflows/` (`ci.yml`,
 `ci-audio-tests.yml`, and the platform-specific splits). Check the Actions
 tab — do not rely solely on local results, since Linux PipeWire, Windows
@@ -921,10 +1040,10 @@ rewrites all nine lockstep manifests plus rotates the CHANGELOG:
 
 ```bash
 # Preview the edits without writing them:
-bash scripts/bump-version.sh 0.3.0 --dry-run    # or: mise run release:bump -- 0.3.0 --dry-run
+bash scripts/bump-version.sh 0.2.0 --dry-run    # or: mise run release:bump -- 0.2.0 --dry-run
 
 # Apply them:
-bash scripts/bump-version.sh 0.3.0              # or: mise run release:bump -- 0.3.0
+bash scripts/bump-version.sh 0.2.0              # or: mise run release:bump -- 0.2.0
 ```
 
 This rewrites, in one shot:
@@ -940,19 +1059,23 @@ This rewrites, in one shot:
 
 That covers all nine lockstep manifests — there is no manual reconcile
 step left. The `version-lockstep` CI job checks
-all seven agree and hard-fails on a tag if any disagree.
+they all agree and hard-fails on a tag if any disagree.
 
-Commit (use a normal subject for a manual/major release; reserve the
-`release: vX.Y.Z` subject for the automated PR, since `release-tag.yml`
-auto-tags any `release:` squash commit):
+Commit, push and dispatch CI with **block 1** of
+[Using the automated flow](#using-the-automated-flow), then wait for the run
+with **block 2**. Use a normal subject for a manual/major release (for the
+worked example, `chore: release 0.2.0`); reserve the `release: vX.Y.Z` subject
+for the automated PR, since `release-tag.yml` auto-tags a commit on `master`
+whose subject is exactly `release: vX.Y.Z`, optionally followed by ` (#N)`.
 
-```bash
-git add -A
-git commit -m "chore: release 0.3.0"
-```
-
-Push and ensure CI — including `version-lockstep` — is green on the bump
-commit before proceeding.
+Block 1 also runs `cargo update --workspace`: `bump-version.sh` never touches
+`Cargo.lock`, and both the dispatched CI (the MSRV job's `cargo check
+--locked`) and `cargo publish --locked` read the committed lockfile. CI is
+manual, so no run exists until block 1 dispatches one, and the run must be on
+the bump commit, which is the commit that gets tagged; block 2 looks the run up
+by that commit. A version mismatch only warns in `version-lockstep` on a
+dispatched run (a manifest it cannot read still fails the job), so read its
+output; the hard check is `check-version-lockstep.sh --expect` in block 3.
 
 ---
 
@@ -967,10 +1090,11 @@ commit before proceeding.
 Annotated tags only — do not use lightweight tags. The tag name is
 `v<semver>`; pushing it is the event all three publish workflows key on.
 
-```bash
-git tag -a v0.2.0 -m "rsac 0.2.0"
-git push origin v0.2.0
-```
+Tag with **block 3** of [Using the automated flow](#using-the-automated-flow)
+(for the worked example, `X.Y.Z` is `0.2.0`). It is the only stable-tag command
+in this document on purpose: it refuses to tag unless the dispatched run finished
+green on the bump commit, `HEAD` is still that commit, the tree is clean and
+the manifests are in lockstep at the expected version.
 
 If `release-tag.yml` already pushed the tag for you, this is a no-op (it
 refuses to re-tag an existing `vX.Y.Z`); only run it by hand when the tag
@@ -1201,13 +1325,12 @@ risking a real upload:
    end but `publish` stops at `cargo publish --dry-run` and never
    uploads. For npm/PyPI, run **Release npm** / **Release PyPI** with
    `publish` left false to build/smoke their artifacts without uploading.
-3. **Promote the RC to a real release.** Once the dry-run is green,
-   tag the stable version — this push is the real trigger:
-   ```bash
-   git tag -a v0.2.0 -m "rsac 0.2.0"
-   git push origin v0.2.0
-   ```
-   All three registry workflows fire in parallel against the same tag.
+3. **Promote the RC to a real release.** Once the dry-run is green, tag the
+   stable version as described in "Promoting an RC to a stable release": the
+   checked sequence in [Using the automated flow](#using-the-automated-flow).
+   A dry-run of `release.yml` is not the pre-tag CI run; the commit you tag
+   still needs a green dispatched `ci.yml` run. The tag push is the real
+   trigger: all three registry workflows fire in parallel against it.
 4. **Immediately after `publish` reports success**, run the
    verification script:
    ```bash
@@ -1255,7 +1378,7 @@ Tracked here so follow-up release-automation tasks can pick them up:
   `rsac-go` — on the automated path
   `release-tag.yml` pushes `bindings/rsac-go/vX.Y.Z` for you; on a manual
   release push it separately (see §"Versioning & ABI contract" (c)). The `version-lockstep` CI job in
-  `ci.yml` catches any manifest that drifts: it warns on push/PR and
+  `ci.yml` catches any manifest that drifts: it warns on a dispatched run and
   hard-fails on a release tag.
 - `release-npm.yml` builds five napi-rs triples; other targets
   (`linux-x64-musl`, `linux-arm-gnueabihf`, FreeBSD, Android) are not

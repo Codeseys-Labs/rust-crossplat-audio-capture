@@ -57,6 +57,28 @@ try:
 except Exception:
     print("garbage target spec rejected: ok")
 
+# ── AudioCapture target-argument forms (PyO3 extraction contract) ─────
+# `target` accepts omission, an explicit None, or a CaptureTarget; anything
+# else is a TypeError raised at argument extraction, before any device work.
+# Construction resolves the default device, so a headless machine may raise a
+# backend error for the valid forms — tolerated here; a TypeError is not.
+for label, kwargs in (
+    ("omitted", {}),
+    ("None", {"target": None}),
+    ("CaptureTarget", {"target": rsac.CaptureTarget.system_default()}),
+):
+    try:
+        rsac.AudioCapture(**kwargs)
+    except TypeError as exc:
+        failures.append(f"AudioCapture(target={label}) rejected a valid target form: {exc}")
+    except Exception as exc:  # headless CI: no default device is acceptable
+        print(f"AudioCapture(target={label}): extraction ok, backend unavailable ({exc})")
+try:
+    rsac.AudioCapture(target="system")
+    failures.append("AudioCapture(target=<str>) should raise TypeError")
+except TypeError:
+    print("AudioCapture target forms: ok")
+
 # ── composition (device-free build + not-started contract) ────────────
 # The composition classes are always present (the `compose` cargo feature is
 # enabled unconditionally in the wheel). A "system"-source composition BUILDS

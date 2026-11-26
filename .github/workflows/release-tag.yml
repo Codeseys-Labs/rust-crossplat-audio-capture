@@ -68,8 +68,11 @@
 #     (a major bump stays fully manual — release-prepare.yml never produces one,
 #     but this is belt-and-suspenders against a hand-crafted release commit).
 #   • Idempotent: never re-tags an existing local OR remote vX.Y.Z tag.
-#   • The tagged commit is the squash-merge commit on master, which already
-#     passed ci.yml's version-lockstep gate as part of the merged PR.
+#   • Lockstep defense: refuses unless scripts/check-version-lockstep.sh
+#     --expect X.Y.Z passes on the release commit (every lockstep manifest and
+#     internal rsac pin). CI is manually dispatched, so this step — not a
+#     ci.yml run on the merged PR — is what guarantees the tagged commit is in
+#     lockstep before the tag exists.
 
 name: Release Tag on Merge
 
@@ -175,6 +178,18 @@ jobs:
             exit 1
           fi
           echo "OK: version + major match Cargo.toml"
+
+      # Lockstep defense: every lockstep manifest and internal rsac dependency
+      # pin must equal the parsed version BEFORE the tag exists. ci.yml's
+      # version-lockstep job only warns on a manual dispatch, and its hard
+      # tag-push run fires after the tag is already public. Same script the
+      # registry publish workflows call.
+      - name: Verify all manifests are in lockstep at the parsed version
+        if: steps.detect.outputs.is_release == 'true'
+        shell: bash
+        env:
+          PARSED_VERSION: ${{ steps.detect.outputs.version }}
+        run: bash scripts/check-version-lockstep.sh --expect "${PARSED_VERSION}"
 
       # Idempotency: never re-tag. Check both the local tag set and the remote
       # (a previous run, or a manual tag, may already exist). If present, skip

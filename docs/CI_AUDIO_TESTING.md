@@ -7,34 +7,40 @@ The canonical loop retrospective is
 [`docs/reviews/ci-audio-final-status-2026-04-25.md`](reviews/ci-audio-final-status-2026-04-25.md);
 this document distills the durable facts from it.
 
-## 1. Truth table (6 of 9 cells REAL)
+## 1. Truth table (7 of 9 cells REAL)
 
-Each cell is a separate GitHub Actions job in
+Each cell is one tier (a step group) of the per-platform job in
 [`.github/workflows/ci-audio-tests.yml`](../.github/workflows/ci-audio-tests.yml).
 
 |  | **Linux** (PipeWire) | **Windows** (WASAPI) | **macOS** (CoreAudio) |
 |---|---|---|---|
 | **System capture** | REAL | REAL (VB-CABLE) | SKIP-EARLY (TCC) |
-| **Device capture** | REAL | REAL (VB-CABLE) | ERRORS-GRACEFULLY (AUHAL) |
+| **Device capture** | REAL | REAL (VB-CABLE) | REAL on GitHub-hosted (BlackHole; content check is soft) |
 | **Process capture** | REAL | REAL (Process Loopback) | SKIP-EARLY (TCC) |
 
-The three macOS gaps are not bugs in rsac — they are platform-security
-constraints that cannot be worked around on managed headless runners.
-All three macOS paths are verified on real hardware by manual QA before
-each release (see [`VISION.md`](../VISION.md) § "How We Verify the
-Vision").
+The two Process Tap gaps (System, Process) are platform-security
+constraints: managed headless runners cannot grant the TCC service they
+need. The Device cell was an environment hang on Blacksmith macOS. Since
+`macos-audio` moved to GitHub-hosted `macos-15` with BlackHole pinned as the
+default output and input, the first run there (45738663823, 2026-11-26)
+captured 94 buffers / 48,128 frames with a non-silent first buffer, which makes
+it 7 of 9. One caveat: the macOS job does not set
+`RSAC_CI_AUDIO_DETERMINISTIC`, so silence in that cell would warn, not fail.
+All three macOS paths are
+verified on real hardware by manual QA before each release (see
+[`VISION.md`](../VISION.md) § "How We Verify the Vision").
 
 ### What "REAL" means
 
-For the six REAL cells, every CI run:
+For the REAL cells, every dispatched run:
 
 1. Installs the platform's audio stack (PipeWire for Linux, VB-CABLE for
-   Windows, BlackHole for macOS device-path — currently failing, see
-   below).
+   Windows, BlackHole for the macOS device path).
 2. Routes a 440 Hz test tone through the OS's default output.
 3. Captures through the rsac public API.
 4. Asserts the captured `AudioBuffer` has non-silent data (`max
-   amplitude > 0.001`) and measurable RMS energy.
+   amplitude > 0.001`) and measurable RMS energy. This is a hard assertion on
+   the six Linux and Windows cells and a warning on the macOS Device cell.
 
 Reference evidence: Linux runs capture >40 K frames per test; Windows
 reports ~137 buffers at RMS 0.570 from VB-CABLE loopback.
@@ -47,13 +53,18 @@ reports ~137 buffers at RMS 0.570 from VB-CABLE loopback.
   env var set, the test returns immediately with a diagnostic banner
   rather than blocking 10–18 minutes inside
   `AudioHardwareCreateProcessTap`.
-- **ERRORS-GRACEFULLY:** macOS Device Capture targeting BlackHole on a
-  Firecracker headless VM hits `AUHAL.start()`, which hangs ~11 minutes
-  then errors `OSStatus 2003332927` (`kAudio_UnimplementedError`).
-  CoreAudio appears to expect a functional *output* audio path even when
-  capturing an input-capable virtual device, and that path does not
-  exist in the managed VM class. A step-level `gtimeout
-  --preserve-status 120` caps the wasted budget.
+- **ERRORS-GRACEFULLY (historical, Blacksmith only):** on
+  `blacksmith-6vcpu-macos-15`, macOS Device
+  capture targeting BlackHole hit `AUHAL.start()`, which hung ~11 minutes
+  and then failed with `OSStatus 2003332927`. That value is `0x77686F3F`,
+  the FourCC `'who?'`, which is `kAudioHardwareUnknownPropertyError` (the
+  object does not know the requested property). Earlier versions of this
+  document misread it as `kAudio_UnimplementedError` (`-4`). The cause is
+  not proven. The two candidates are a missing functional default *output*
+  path on the headless VM and a missing Microphone grant for the job's
+  responsible process (see [The TCC gate](#the-tcc-gate)).
+  `AudioOutputUnitStart` takes no timeout, so the Device tier runs under
+  `gtimeout 120` and tolerates exit 124 only.
 
 ## 2. Test gate macros
 
@@ -76,12 +87,59 @@ when the environment lacks the prerequisites".
 `macos_tcc_available()` returns `true` iff `target_os = "macos"` and
 `RSAC_CI_MACOS_TCC_GRANTED=1` (non-macOS hosts always return `true`).
 
-Why: `CATapDescription::initStereoGlobalTapButExcludeProcesses:`
-(and every other `AudioHardwareCreateProcessTap` call) is gated by
-`kTCCServiceAudioCapture`. This is *not* the same TCC service as
-`kTCCServiceScreenCapture` — GitHub Actions' runner-images pre-grant
-Screen Capture to `/bin/bash` but not Audio Capture. Only a self-hosted
-macOS runner with a one-time interactive TCC grant can lift this gate.
+macOS gates rsac's capture paths on different TCC services. A grant for one
+says nothing about the others:
+
+| rsac path | API | TCC service |
+|---|---|---|
+| `SystemDefault`, `Application*`, `ProcessTree` | `AudioHardwareCreateProcessTap` (`CATapDescription`, including `initStereoGlobalTapButExcludeProcesses:`) | `kTCCServiceAudioCapture` (System Audio Recording) |
+| `Device` | AUHAL input on a HAL device, BlackHole included | `kTCCServiceMicrophone` |
+| none (ScreenCaptureKit, not used by rsac) | `SCStream` | `kTCCServiceScreenCapture` (Screen Recording) |
+
+GitHub-hosted macOS images pre-seed TCC in
+[`configure-tccdb-macos.sh`](https://github.com/actions/runner-images/blob/main/images/macos/scripts/build/configure-tccdb-macos.sh)
+(read 2026-11-25):
+
+- `kTCCServiceMicrophone`: `/opt/hca/hosted-compute-agent`,
+  `/opt/hca/start_hca.sh`, `/usr/local/opt/runner/provisioner/provisioner`,
+  `/usr/local/opt/runner/runprovisioner.sh`, and (user database)
+  `com.apple.CoreSimulator.SimulatorTrampoline`. Not `/bin/bash`.
+- `kTCCServiceScreenCapture`: `/bin/bash`, the agent and the provisioner.
+- `kTCCServiceAudioCapture`: no rows.
+
+TCC charges a request to the *responsible* process, which on a
+GitHub-hosted runner is the agent. A `cargo test` binary started by a job
+step may therefore pass the Microphone check on `macos-15` [INFERENCE, not
+yet observed]. Blacksmith runs its own runner agent, which is consistent
+with (but does not prove) the Device-tier hang there. On the same
+Blacksmith runner class the iOS simulator leg did deliver BlackHole frames
+(PR #67, run 29717781236); the simulator reaches the mic through
+`SimulatorTrampoline`, not through the job's shell.
+
+Nothing on a managed runner grants `kTCCServiceAudioCapture`. The system
+TCC database is SIP-protected, so a job cannot insert the row, and the
+consent prompt needs a person. Only a self-hosted macOS runner with a
+one-time interactive grant
+([`SELF_HOSTED_TCC_RUNNER.md`](SELF_HOSTED_TCC_RUNNER.md)) can lift this
+gate.
+
+### Why LABSN `background-music` does not help on macOS
+
+The macOS half of `LABSN/sound-ci-helpers`
+([`macos/setup_sound.sh`](https://github.com/LABSN/sound-ci-helpers/blob/main/macos/setup_sound.sh))
+installs the `background-music` cask and restarts `coreaudiod`. Nothing
+else. That adds one more HAL virtual device, the same plug-in mechanism as
+BlackHole, and changes no TCC state:
+
+- The Process Tap tiers still need `kTCCServiceAudioCapture`. No virtual
+  device supplies it.
+- The Device tier already has BlackHole. Reading Background Music's input
+  is Microphone-gated the same way, and the device depends on its
+  companion app (`BGMApp`), which BlackHole does not.
+- LABSN's own CI only checks that an output device enumerates. It never
+  starts a capture.
+
+The workflow uses LABSN on Windows only, for VB-CABLE.
 
 ## 3. Test file layout
 
@@ -111,7 +169,13 @@ centralised in `helpers.rs` so the tests themselves stay portable.
 
 ## 4. Platform-specific setup the workflow performs
 
-### Linux — `linux-system` / `linux-device` / `linux-process`
+**Triggers.** The workflow runs on `workflow_dispatch` (input `platform`:
+`all`, `linux`, `windows`, `macos` or `bindings`; default `all`) and on stable
+`v*.*.*` tags. There is no `pull_request` or branch-push trigger; dispatch it
+on a branch when a change needs real-audio evidence
+(`gh workflow run ci-audio-tests.yml --ref <branch> -f platform=<p>`).
+
+### Linux — `linux-audio` job (system / device / process tiers)
 
 - Ubuntu 24.04 on `blacksmith-4vcpu-ubuntu-2404`.
 - Installs PipeWire + WirePlumber + `pipewire-pulse` from
@@ -130,7 +194,7 @@ centralised in `helpers.rs` so the tests themselves stay portable.
 - `pw-play` (or `paplay`, pinned via `PULSE_SINK`) streams a 440 Hz float
   WAV tone during the tests.
 
-### Windows — `windows-system` / `windows-device` / `windows-process`
+### Windows — `windows-audio` job (system / device / process tiers)
 
 - `windows-latest` runner.
 - [`LABSN/sound-ci-helpers@v1`](https://github.com/LABSN/sound-ci-helpers)
@@ -147,19 +211,22 @@ centralised in `helpers.rs` so the tests themselves stay portable.
   16-bit PCM before playback. The float WAV is still used by the
   capture-side assertions.
 
-### macOS — `macos-system` / `macos-device` / `macos-process`
+### macOS — `macos-audio` job (system / device / process tiers)
 
-- `blacksmith-6vcpu-macos-15` runner.
-- BlackHole 2ch is installed via Homebrew as a *future hook* for a
-  non-TCC "BlackHole-as-input" capture path; the current build does not
-  yet wire it to switch the default output, so it does not (by itself)
-  make any capture path deterministic. `coreutils` is installed for
-  `gtimeout`.
+- GitHub-hosted `macos-15` runner, free on this public repository. It
+  moved off `blacksmith-6vcpu-macos-15`, which bills at 20× a Linux minute
+  and whose Device tier hung on every run.
+- Installs `blackhole-2ch`, `switchaudio-osx` and `coreutils` (for
+  `gtimeout`), restarts `coreaudiod` (`launchctl kickstart -kp`, falling
+  back to `killall`), then pins BlackHole 2ch as the default output **and**
+  input with `SwitchAudioSource`, mirroring the iOS simulator leg in
+  [`ci-ios-sim.yml`](../.github/workflows/ci-ios-sim.yml). Each step warns
+  and continues on failure.
 - All Process Tap paths (System / Application / ProcessTree) skip early
-  via `require_*_capture!()` because `kTCCServiceAudioCapture` cannot be
+  via `require_*_capture!()`, because `kTCCServiceAudioCapture` cannot be
   granted on a managed runner.
-- Step-level `gtimeout --preserve-status 120` bounds the
-  device-path wasted budget.
+- The Device tier runs under `gtimeout 120` and tolerates exit 124 only
+  (the known AUHAL hang); any other non-zero exit fails the tier.
 
 ## 5. Workflow knobs
 
@@ -195,11 +262,11 @@ review § "Key learnings" for the full post-mortem.
 
 | Issue | Status | Notes |
 |---|---|---|
-| **rsac#26** — macOS device-path hang | fix-in-progress | Needs 1-2 green runs to validate. |
+| **rsac#26** — macOS device-path hang | not reproduced on GitHub-hosted | `macos-audio` runs on GitHub-hosted `macos-15` with BlackHole as default I/O. First run (45738663823, 2026-11-26): `device_capture` exited 0 in 2.25 s and its log shows a first non-silent buffer (RMS 0.57) and 94 buffers / 48,128 frames, so AUHAL did not hang. That is log evidence, not an assertion: the macOS job does not set `RSAC_CI_AUDIO_DETERMINISTIC`, so silence would only have warned. The hang was only ever seen on the Blacksmith macOS image. |
 | **rsac#21** — failing-test signalling | requires opt-in PR | User-driven. |
 | **rsac#19** — Alpine musl + PipeWire runtime | blocked on infra session | 4-6h Alpine Docker + audio. |
 | **rsac#16** — docs.rs post-publish spot-check | gated on first `cargo publish` | `scripts/verify-docs-rs.sh` is ready. |
-| macOS BlackHole-Device path on GH-hosted | future work | Different runner class may not have the AUHAL hang. |
+| Blacksmith Windows audio stack | probed 2026-11-26: `AUDIO_STACK_USABLE` | Run 45738685950: the image is now Desktop Experience with `AudioSrv` running and a VB-CABLE playback endpoint (details in AGENTS.md §6). The hybrid stays because GitHub-hosted `windows-latest` is free and proven; the `ci_audio` windows tier has never run on Blacksmith. |
 
 ## 8. Related docs
 
@@ -207,4 +274,6 @@ review § "Key learnings" for the full post-mortem.
 - [`docs/CONTRIBUTING.md`](CONTRIBUTING.md) — how to run integration tests locally.
 - [`docs/LOCAL_TESTING_GUIDE.md`](LOCAL_TESTING_GUIDE.md) — manual QA on real hardware (Windows / macOS / Linux).
 - [`docs/MACOS_VERSION_COMPATIBILITY.md`](MACOS_VERSION_COMPATIBILITY.md) — macOS API / version matrix, including the TCC landscape.
+- [`docs/SELF_HOSTED_TCC_RUNNER.md`](SELF_HOSTED_TCC_RUNNER.md) — the one route to a `kTCCServiceAudioCapture` grant in CI.
+- [`docs/audit/2026-11-25-codebase-ci-market-audit.md`](audit/2026-11-25-codebase-ci-market-audit.md) — runner-vendor comparison, LABSN analysis and the 2026-11-25 CI changes.
 - Skill: `headless-ci-audio-hangs` v1.1 — diagnostic runbook.

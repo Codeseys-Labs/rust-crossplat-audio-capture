@@ -1,6 +1,6 @@
 //! `AudioCapture::subscribe()` integration tests.
 //!
-//! Unit-level coverage in `src/api.rs` exercises `subscribe()` through a
+//! Unit-level coverage in `src/api/tests.rs` exercises `subscribe()` through a
 //! `MockCapturingStream`: it locks the error-shape contract (not-running
 //! returns `StreamReadError`), buffer fan-out, and the two exit paths of
 //! the background `rsac-subscribe` thread (stream stop, receiver drop).
@@ -43,7 +43,7 @@ fn fail_or_skip(label: &str, detail: &str) {
 /// least one `AudioBuffer` on the mpsc channel within a bounded timeout.
 ///
 /// This is the integration-level complement to `subscribe_receives_buffers`
-/// in `src/api.rs` (which feeds a mock). The mock proves the wiring; this
+/// in `src/api/tests.rs` (which feeds a mock). The mock proves the wiring; this
 /// test proves the wiring is connected to a real OS audio callback and
 /// that the `try_read_chunk` → `tx.send` loop survives a round-trip
 /// through the platform backend (PipeWire on Linux, WASAPI on Windows,

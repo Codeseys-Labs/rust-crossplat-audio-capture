@@ -10,10 +10,12 @@
 # scripts/bump-version.sh rewrites, and asserts they all agree.
 #
 # It is deliberately the ONE place that logic lives: `.github/workflows/ci.yml`'s
-# `version-lockstep` job calls it (warn-only on push/PR, hard-fail on a tag), and
-# the three registry publish workflows (release.yml, release-npm.yml,
-# release-pypi.yml) call it with `--expect X.Y.Z` BEFORE any publish or dry-run
-# upload path, so a mismatched manifest can never reach a registry. Keeping the
+# `version-lockstep` job calls it (warn-only on a dispatched run; on a tag push
+# with `--expect X.Y.Z`, hard-fail), and the three registry publish workflows
+# (release.yml, release-npm.yml, release-pypi.yml) call it BEFORE any publish
+# or dry-run upload path, right after their own tag-versus-manifest check, so a
+# mismatched manifest can never reach a registry. release-tag.yml and the
+# manual pre-tag chain in docs/RELEASE_PROCESS.md also pass `--expect`. Keeping the
 # extraction + comparison here means the CI job and the release workflows share
 # identical semantics with zero duplication.
 #

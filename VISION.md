@@ -1,15 +1,14 @@
 # rsac — Vision & Scope
 
-> A streaming-first, cross-platform audio capture library for Rust —
-> from any source, into any downstream.
+> An application-aware desktop audio capture and session library for Rust,
+> with experimental, parked mobile backends.
 
 ## One-line Positioning
 
-**rsac** is the only Rust library that captures per-application and
-per-process-tree audio, per-device input, and whole-system audio —
-from a single unified API, across Windows, macOS, and Linux —
-without forcing the consumer into a specific downstream (recording,
-streaming transcription, DSP, or mixing).
+**rsac** brings system, device, application and process-tree capture under
+one API for Windows, macOS and Linux, without prescribing recording,
+transcription, DSP or other downstream processing. Platform capabilities
+and verification differ; see [desktop refinement](docs/DESKTOP_REFINEMENT.md).
 
 ## Problem We Solve
 
@@ -127,8 +126,8 @@ pipeline.
   another for `Application(chrome)` (for transcription).
 - With the opt-in `compose` feature, multiple sources can also be
   **composed into one multi-channel stream** — groups of sources mixed to
-  mono/stereo channels or kept as native channels, appended in declaration
-  order (see "Channel composition" below and
+  mono/stereo channels or kept at their negotiated channel width, appended in
+  declaration order (see "Channel composition" below and
   [ADR-0011](docs/designs/0011-compose-feature.md)).
 
 ### Cross-platform parity
@@ -147,6 +146,12 @@ pipeline.
   Node (napi) bindings expose the same surface: `stream_stats()`, format query,
   metering, string targets, and idiomatic context managers / RAII. Python ships
   a single `cp39-abi3` wheel (CPython stable ABI, 3.9+).
+
+Android and iOS are experimental and parked, not desktop-parity promises.
+Their features remain enabled by default; compile, emulator/simulator and
+physical-device evidence are distinct. See
+[AGENTS.md §3](AGENTS.md#3-current-state) and the
+[mobile freeze checklist](docs/DESKTOP_REFINEMENT.md#mobile-freeze-and-unfreeze).
 
 ## What's Out of Scope (by design)
 
@@ -170,11 +175,12 @@ That stance was **amended** by
 **channel composition** is now in scope, behind the opt-in `compose` cargo
 feature. A `CompositionBuilder` takes *groups* of `CaptureTarget`s; each group
 either mixes down to Mono/Stereo (gain-weighted plain summation) or passes a
-single source's native channels through, and the groups append — in
+single source's negotiated channels through, and the groups append — in
 declaration order — into one interleaved-f32 multi-channel stream speaking the
-same `CapturingStream` contract as a single capture. Sources at a different
-negotiated rate are resampled (via `rubato`) to the session rate on a
-dedicated non-RT compositor thread.
+same `CapturingStream` contract as a single capture. Desktop sources currently
+request two channels; passthrough does not promise the device's native width.
+Sources at a different negotiated rate are resampled (via `rubato`) to the
+session rate on a dedicated non-RT compositor thread.
 
 Why the change: heterogeneous rates (Windows process loopback cannot
 autoconvert) and cross-source alignment (app taps go silent; sources start at
@@ -188,6 +194,17 @@ works:
 ```rust
 let mixed: Vec<f32> = buf_a.data().iter().zip(buf_b.data()).map(|(a, b)| a + b).collect();
 ```
+
+Live source gain/mute and group gain are already available on `Composition`.
+For one-source rate alignment, use a single `Group` with `.keep_channels()` in
+a `CompositionBuilder` at the desired session rate. This incurs a compositor
+thread and quantum buffering; it is not a general resampling service.
+
+For recording or encoding, implement `AudioSink` downstream and use `drain_to`;
+codec adapters can live in companion crates. For a voice pipeline, compose
+microphone and loopback as separate groups and pass them downstream for VAD,
+echo cancellation and reference policy. Compose does not promise hardware-clock
+alignment. See [companion-crate seams](docs/DESKTOP_REFINEMENT.md#companion-crate-seams).
 
 ## Recently Shipped (was on the roadmap, now in-scope)
 
@@ -205,6 +222,10 @@ they are documented above as part of the in-scope surface:
   (`compose`) — no hand-rolled read loop. The earlier `pipe_to` name is retired
   (rsac-2135).
 - **`stream_stats()` / `backpressure_report()`** diagnostics.
+- **Compose live controls and bindings** — per-source gain/mute and group gain;
+  Python, Node and Go expose composition alongside the C FFI.
+- **Ring-slot configuration** — all five backends honor `buffer_size`, including
+  the fixed macOS production path; it is a slot count, not frames.
 - **`DeviceWatcher` + `watch()`** device-change notifications (all 3 platforms).
 - **Cross-platform `supported_formats()` / `describe()`** — including Linux
   (PipeWire) native device + app enumeration.
@@ -218,47 +239,34 @@ they are documented above as part of the in-scope surface:
   is validated on Alpine containers.
 - **docs.rs rendering verification** (rsac#16) — one-shot post-publish
   check via `scripts/verify-docs-rs.sh`.
-- **Populate `AudioBuffer::timestamp()`** — ✅ shipped: all three backends
-  stamp stream-position timestamps on the RT push path (frames offered ÷
-  rate; drops appear as timestamp gaps), and composed buffers are stamped the
-  same way. The refinement to per-backend *device clocks* (WASAPI
-  `GetPosition`, PipeWire `pw_time`, CoreAudio `mSampleTime`) stays tracked
-  in rsac-ec25 (device-gated).
-- **Honor `buffer_size` / period-aware ring sizing on macOS + Linux** —
-  `calculate_capacity_for_period` is implemented and tested but only Windows
-  threads the requested `buffer_size` through today.
+- **`hotplug-recovery`** — default-off desktop default-device recovery; see
+  [ADR-0019](docs/designs/0019-hotplug-auto-recovery.md) for scope, lifecycle,
+  defaults and verification gates.
+- **Device clocks** — stream-position timestamps are shipped; validated
+  hardware-clock metadata remains future work, without changing compose alignment.
+- **Period-aware ring sizing** — `calculate_capacity_for_period` is implemented
+  but unwired pending effective per-backend period negotiation before allocation.
+  Explicit slot requests already work on Windows, Linux, macOS, Android and iOS
+  ([desktop refinement D4](docs/DESKTOP_REFINEMENT.md#d4--ring-sizing-and-clocks); original decision in [ADR-0007](docs/designs/0007-capacity-period-sizing.md)).
 
 Each of these is tracked on `Codeseys-Labs/rust-crossplat-audio-capture` and/or
 in [`docs/reviews/`](docs/reviews/).
 
 ## How We Verify the Vision
 
-### Unit tests (on every commit)
+### Routine and audio lanes
 
-- **Default matrix** (`.github/workflows/ci.yml`): 3 platforms × (lint
-  + unit tests + bindings check + downstream audio-graph build).
-  The library unit suite (300+ tests — exact count varies by platform
-  and feature set) plus the `ci_audio` integration suite (~40+ tests
-  across subscribe, process_tree, application_by_name, application_by_pid,
-  device enumeration, overrun, multi-source, lifecycle) are gated behind
-  `require_audio!()` / `#[ignore]` so CI doesn't need real audio hardware.
+CI is manually dispatched. The main [`ci.yml`](.github/workflows/ci.yml) runs
+desktop lint, unit, MSRV and binding checks scoped by the branch's diff; it and
+the expensive virtual-audio and mobile runtime workflows run only when someone
+dispatches them, plus stable release tags. A PR without a dispatched run has no
+CI evidence, and a skipped hardware-gated test is not runtime evidence.
 
-### Integration tests with real audio (gated)
-
-- **`.github/workflows/ci-audio-tests.yml`**: 9-job matrix
-  (3 platforms × 3 modes: system / device / process) with virtual
-  audio sources (PipeWire dummy sink on Linux, VB-CABLE on Windows,
-  loopback via BlackHole or platform-native on macOS).
-- Triggered on push to `main`/`master`, pull requests, and
-  `workflow_dispatch` (it provisions a virtual audio runtime per job, so
-  it is heavier than the default unit-test matrix).
-
-### Runner-specific
-
-- **Blacksmith 4vcpu/6vcpu runners** (Linux, Windows, macOS) are
-  preferred over GitHub-hosted for speed + audio subsystem support.
-  (Audio-device availability per runner was confirmed by a one-shot
-  probe workflow, since deleted; the results live in AGENTS.md §6.)
+CI is hybrid: ordinary desktop lanes use Blacksmith runners; Windows and macOS
+audio integration use GitHub-hosted runners, which are free for a public
+repository and where the suite is proven. macOS Process Tap tests additionally require TCC
+permission. See [CI audio testing](docs/CI_AUDIO_TESTING.md) and the
+[v0.5 release bar](docs/DESKTOP_REFINEMENT.md#v05-desktop-bar).
 
 ### Post-publish verification
 
@@ -295,4 +303,4 @@ in [`docs/reviews/`](docs/reviews/).
 
 ---
 
-_Last revised: 2026-05-30_
+_Last revised: 2026-11-25_

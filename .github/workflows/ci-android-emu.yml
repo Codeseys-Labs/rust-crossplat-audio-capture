@@ -98,34 +98,14 @@ on:
           has proven the synthetic-mic route is reliable).
         type: boolean
         default: false
-  pull_request:
-    branches: [main, master, 'release/**']
-    paths:
-      - 'src/audio/android/**'
-      # The smoke exercises the whole public capture path — shared-layer
-      # regressions must retrigger runtime verification (CodeRabbit PR #65).
-      - 'src/api.rs'
-      - 'src/bridge/**'
-      - 'src/core/**'
-      - 'tests/android_emu_smoke.rs'
-      - 'mobile/android-native/**'
-      # rsac-255b instrumented tier: the androidTest sources + gradle config
-      # live under mobile/android/, and the test APK drives the shipped C ABI
-      # built from bindings/rsac-ffi/.
-      - 'mobile/android/**'
-      - 'bindings/rsac-ffi/**'
-      # rsac-e6d3 playback tier: the test-only driver cdylib (librsac.so) that
-      # drives the public SystemDefault playback API from the instrumented test.
-      - 'mobile/androidtest-native/**'
-      - 'Cargo.toml'
-      - 'Cargo.lock'
-      - '.github/workflows/ci-android-emu.yml'
-      - '.github/actions/**'
-      - 'scripts/ci-android-emu-payload.sh'
+  # Manual dispatch only (CI cost policy): this leg boots an AVD (35m cap).
+  # ci.yml's `mobile-android` job covers Android COMPILATION whenever a
+  # dispatched branch touches mobile-relevant paths; dispatch this workflow
+  # when a change needs emulator runtime verification.
 
 concurrency:
   group: android-emu-${{ github.workflow }}-${{ github.ref }}
-  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+  cancel-in-progress: true
 
 permissions:
   contents: read

@@ -25,7 +25,16 @@ no run. See [`docs/troubleshooting.md`](troubleshooting.md) § cross-compilation
 
 ### 1. Automated CI (the source of truth)
 
-Two workflows run on every push/PR to `main`/`master`.
+Two workflows carry it. Both are **manually dispatched**
+(`gh workflow run <workflow> --ref <branch>`) and also run on stable `v*.*.*`
+tags; nothing runs automatically on a push or PR except the changelog guard.
+
+The tag runs have one exception. If the release App credentials are absent,
+`release-tag.yml` pushes the tag with the default `GITHUB_TOKEN`, and GitHub
+starts no workflow from such a push. Neither workflow runs for that tag, so
+dispatch both on it by hand (`gh workflow run ci.yml --ref vX.Y.Z -f full=true`,
+`gh workflow run ci-audio-tests.yml --ref vX.Y.Z`) before treating the release
+as CI-verified.
 
 #### `ci.yml` — lint, unit tests, cross-compile checks
 
@@ -41,10 +50,11 @@ Runs on all three platforms plus bindings and supporting gates:
 | Binding / Go / docs / supply-chain / DAG gates | `blacksmith-4vcpu-ubuntu-2404` (+ Go matrix on all 3) | FFI/Python/Node/Go bindings, `cargo doc`, `cargo-deny`, module-DAG guard, version lockstep |
 
 Windows unit tests run on the **Blacksmith Windows** runner (compile + unit
-logic only). That runner's Firecracker microVM has **no audio subsystem at all**
-(`AudioSrv`, `AudioEndpointBuilder`, `AudioSes.dll` are absent — see AGENTS.md
-§6), so device-touching WASAPI unit tests are split out via `--skip` and re-run
-as a tolerated (`continue-on-error`) step; the pure-logic tests hard-fail.
+logic only). The image has had an audio service stack since the 2026-11-26
+probe (see AGENTS.md §6), but it ships no audio device — the probe's baseline
+found none — and this job installs no virtual one. Device-touching WASAPI unit
+tests are therefore split out via `--skip` and re-run as a tolerated
+(`continue-on-error`) step; the pure-logic tests hard-fail.
 
 #### `ci-audio-tests.yml` — audio integration tests
 

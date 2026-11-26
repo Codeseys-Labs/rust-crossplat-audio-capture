@@ -14,6 +14,8 @@ pub mod error;
 pub mod interface;
 pub mod introspection;
 pub mod processing;
+#[cfg(feature = "hotplug-recovery")]
+pub mod recovery;
 
 // ── Re-exports ───────────────────────────────────────────────────────────
 

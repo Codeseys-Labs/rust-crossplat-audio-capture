@@ -28,78 +28,66 @@ name: Audio Integration Tests
 #                           hard-verifies VB-CABLE as the default playback
 #                           endpoint, which every tier's tone route flows
 #                           through (rsac-0f33).
-#   ⏳ macOS (CoreAudio) — gated on managed CI (rsac-fba6). Process Tap based
-#                           system, application, and process-tree capture
+#   ⏳ macOS (CoreAudio) — gated on managed CI (rsac-fba6). Runs on the FREE
+#                           GitHub-hosted macos-15 (this repo is public, so
+#                           standard hosted runners cost $0 — unlike the 20x-rate
+#                           blacksmith-6vcpu-macos-15 it used before). Process Tap
+#                           based system, application, and process-tree capture
 #                           require kTCCServiceAudioCapture, which cannot be
-#                           granted non-interactively on Blacksmith/GitHub-hosted
-#                           runners, so those code paths skip-early via
-#                           require_*!() gates rather than exercising real
-#                           capture — but a panic/build break in any tier now
-#                           fails the job AND the summary gate, same as Linux
-#                           and Windows. Full capture validation still requires
-#                           real hardware or a self-hosted, pre-consented macOS
-#                           runner.
+#                           granted non-interactively on managed runners, so those
+#                           code paths skip-early via require_*!() gates rather
+#                           than exercising real capture — but a panic/build break
+#                           in any tier now fails the job AND the summary gate,
+#                           same as Linux and Windows. BlackHole 2ch is installed
+#                           and pinned as the default output AND input
+#                           (SwitchAudioSource, mirroring ci-ios-sim.yml) so the
+#                           Device tier has a real HAL endpoint. On the hosted
+#                           image AUHAL `.start()` delivers frames (run
+#                           45738663823: 94 buffers / 48128 frames from
+#                           BlackHole in 2.25 s); it hung on Blacksmith macOS,
+#                           the Microphone TCC grant being the suspected
+#                           difference. Full Process Tap validation still requires real
+#                           hardware or a self-hosted, pre-consented macOS runner
+#                           (ci-audio-macos-tcc.yml, manual dispatch only).
 #
-#   Runs on stable tags (advisory, not a release.yml gate — see rsac-75bf).
+# Triggers (cost control — the whole suite is expensive): manual
+# `workflow_dispatch` only (optional `platform` input to run ONE platform job),
+# plus stable semver tags so a release re-proves the audio matrix at the tag
+# (advisory, not a release.yml gate — see rsac-75bf). There is NO branch-push
+# and NO pull_request trigger; dispatch it on a branch when a change needs
+# real-audio evidence:
+#   gh workflow run ci-audio-tests.yml --ref <branch> -f platform=linux
 # =============================================================================
 
 on:
   push:
-    # release/** intentionally dropped from the push filter (KEPT in
-    # pull_request below): every release-branch commit lands via a PR, so
-    # push+pull_request double-fired this audio matrix (mirrors the same fix
-    # in ci.yml). The existing path filter is unchanged.
-    branches: [main, master]
-    # Also run on stable semver tags so a release actually re-proves the audio
-    # matrix at the tag (not just whatever the last master-push run happened
-    # to cover) — mirrors ci.yml's tags: trigger. Per GitHub semantics,
-    # paths/paths-ignore are NOT evaluated for tag pushes, so this fires
-    # unconditionally on v*.*.* regardless of the paths: filter below.
-    # Pre-release shapes (v*-rc.1) are excluded, same as ci.yml.
+    # Stable semver tags only, so a release re-proves the audio matrix at the
+    # tag — mirrors ci.yml. A `push` filter with only `tags:` never matches a
+    # branch push. Pre-release shapes (v*-rc.1) are excluded, same as ci.yml.
     tags:
       - 'v*.*.*'
       - '!v*-*'
-    paths:
-      - 'src/**'
-      - 'tests/**'
-      - 'examples/**'
-      - 'bindings/**'
-      - 'Cargo.toml'
-      - 'Cargo.lock'
-      - 'scripts/ci-linux-audio-route.sh'
-      - 'scripts/ci-linux-tone-loop.sh'
-      - 'scripts/ci-windows-audio-default.ps1'
-      - '.github/workflows/ci-audio-tests.yml'
-      - '.github/actions/**'
-  pull_request:
-    branches: [main, master, 'release/**']
-    paths:
-      - 'src/**'
-      - 'tests/**'
-      - 'examples/**'
-      - 'bindings/**'
-      - 'Cargo.toml'
-      - 'Cargo.lock'
-      - 'scripts/ci-linux-audio-route.sh'
-      - 'scripts/ci-linux-tone-loop.sh'
-      - 'scripts/ci-windows-audio-default.ps1'
-      - '.github/workflows/ci-audio-tests.yml'
-      - '.github/actions/**'
   workflow_dispatch:
+    inputs:
+      platform:
+        description: >-
+          Run only one platform's job (cost control) or everything. The summary
+          gate treats the deselected jobs as skipped.
+        type: choice
+        options: [all, linux, windows, macos, bindings]
+        default: all
 
 env:
   CARGO_TERM_COLOR: always
   RUST_BACKTRACE: 1
   RUST_LOG: rsac=debug
 
-# Cancel superseded runs on the same ref (mirrors ci.yml). Without this a rapid
-# sequence of pushes to the same PR branch ran every prior in-flight audio
-# matrix to completion (nothing cancelled it), wasting ~14 job-min per
-# superseded run. cancel-in-progress only on pull_request so a real push to
-# main/master is never cancelled mid-flight.
+# Never cancel in-flight runs: every run is a release tag or an explicit
+# dispatch, neither of which should be cancelled mid-flight by a later one.
+# Runs on the same ref queue instead.
 concurrency:
   group: audio-${{ github.workflow }}-${{ github.ref }}
-  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+  cancel-in-progress: false
 
 # PR-controlled code (tests, local composite actions) runs after checkout —
 # keep the token read-only and out of the persisted git credentials.
@@ -118,6 +106,7 @@ jobs:
   linux-audio:
     name: "Linux Audio (system+device+process)"
     runs-on: blacksmith-4vcpu-ubuntu-2404
+    if: github.event_name != 'workflow_dispatch' || inputs.platform == 'all' || inputs.platform == 'linux'
     # Budget: setup/compile + the three tier step caps (15+15+15) + margin —
     # a hung early tier must never eat later tiers' budget (review PR #56).
     # matching the former per-tier job timeouts). Real runs finish in minutes.
@@ -289,10 +278,10 @@ jobs:
 
   # ===========================================================================
   # Windows tiers — VB-CABLE virtual audio driver — FIRST-CLASS (hard-gated)
-  # NOTE: Blacksmith Windows VMs (Firecracker) have no audio subsystem at all
-  # (AudioSrv, AudioEndpointBuilder, AudioSes.dll are all absent).
-  # We use GitHub-hosted windows-latest for audio integration tests, which
-  # has a full Windows audio stack. Blacksmith handles compilation/unit tests.
+  # NOTE: these tiers run on GitHub-hosted windows-latest: free for a public
+  # repository and proven with VB-CABLE. The Blacksmith Windows image gained an
+  # audio stack by the 2026-11-26 probe (AGENTS.md §6) but has never run this
+  # suite; Blacksmith handles compilation/unit tests.
   #
   # rsac M5: Windows is a first-class tier. Every tier step's real pass/fail is
   # exported as a job output and gated by the summary job. The shared endpoint
@@ -304,6 +293,7 @@ jobs:
   windows-audio:
     name: "Windows Audio (system+device+process)"
     runs-on: windows-latest
+    if: github.event_name != 'workflow_dispatch' || inputs.platform == 'all' || inputs.platform == 'windows'
     # Backstop only: each tier carries its own step-level timeout-minutes (20,
     # matching the former per-tier job timeouts).
     timeout-minutes: 70
@@ -521,7 +511,7 @@ jobs:
           if-no-files-found: ignore
 
   # ===========================================================================
-  # macOS tiers — CoreAudio + BlackHole (advisory: excluded from the gate)
+  # macOS tiers — CoreAudio + BlackHole on GitHub-hosted macos-15 (gated)
   #
   # Process Tap capture (system/application/process-tree) needs
   # kTCCServiceAudioCapture, which cannot be granted non-interactively on
@@ -535,7 +525,12 @@ jobs:
   # ===========================================================================
   macos-audio:
     name: "macOS Audio (system+device+process)"
-    runs-on: blacksmith-6vcpu-macos-15
+    # GitHub-hosted (free on this public repo), NOT blacksmith-6vcpu-macos-15
+    # (billed at 20x a Linux minute; its Device tier hung until gtimeout on
+    # every run — the Microphone TCC grant not covering Blacksmith's runner
+    # agent is the suspected cause, UNVERIFIED).
+    runs-on: macos-15
+    if: github.event_name != 'workflow_dispatch' || inputs.platform == 'all' || inputs.platform == 'macos'
     # Backstop only: each tier carries its own step-level timeout-minutes
     # (system 15 / device 10 / process 20 — matching the former per-tier jobs),
     # and every cargo invocation is additionally bounded by gtimeout.
@@ -563,17 +558,47 @@ jobs:
         with:
           cache-key: macos-audio
 
-      - name: Install BlackHole (non-TCC input path hook) + coreutils
+      - name: Install BlackHole + SwitchAudioSource + coreutils; pin BlackHole 2ch as default I/O
         run: |
-          # BlackHole is a future hook for a non-TCC "BlackHole as input" path;
-          # the current build doesn't yet expose that target. coreutils provides
-          # `gtimeout`, the hard belt bounding each cargo test invocation below.
-          brew install blackhole-2ch || echo "BlackHole installation failed (expected in CI)"
-          brew install coreutils || echo "coreutils install failed"
-          sudo killall coreaudiod 2>/dev/null || true
-          sleep 5
+          # coreutils provides `gtimeout`, the hard belt bounding each cargo test
+          # invocation below. BlackHole 2ch is the virtual HAL endpoint the Device
+          # tier drives; switchaudio-osx makes it the DEFAULT output AND input
+          # (mirrors ci-ios-sim.yml's virtual-route step, which delivered frames
+          # on a managed runner). Every step is tolerant + loud: a failed install
+          # degrades the Device tier to the documented gtimeout-tolerated path
+          # instead of failing setup.
+          brew install blackhole-2ch switchaudio-osx || echo "::warning::BlackHole/switchaudio-osx install failed"
+          brew install coreutils || echo "::warning::coreutils install failed"
+
+          # Reload coreaudiod so the freshly-installed HAL plugin loads (kickstart
+          # is the supported restart; killall is the fallback; either may be
+          # denied by sudo policy — keep polling regardless).
+          sudo launchctl kickstart -kp system/com.apple.audio.coreaudiod 2>&1 \
+            || sudo killall coreaudiod 2>&1 \
+            || echo "::notice::could not restart coreaudiod (sudo policy?) — polling anyway."
+
+          # Poll (<=30s) for the BlackHole device, then pin it as default I/O.
+          if command -v SwitchAudioSource >/dev/null 2>&1; then
+            found=0
+            for _ in $(seq 1 30); do
+              outputs="$(SwitchAudioSource -a -t output 2>/dev/null || true)"
+              if grep -qi "BlackHole 2ch" <<<"$outputs"; then found=1; break; fi
+              sleep 1
+            done
+            if [ "$found" -eq 1 ]; then
+              SwitchAudioSource -t output -s "BlackHole 2ch" || echo "::warning::could not set BlackHole 2ch as default output"
+              SwitchAudioSource -t input -s "BlackHole 2ch" || echo "::warning::could not set BlackHole 2ch as default input"
+              echo "default output: $(SwitchAudioSource -t output -c 2>/dev/null || echo '<unknown>')"
+              echo "default input:  $(SwitchAudioSource -t input -c 2>/dev/null || echo '<unknown>')"
+            else
+              echo "::warning::BlackHole 2ch never appeared within 30s (coreaudiod reload likely denied)"
+            fi
+          else
+            echo "::warning::SwitchAudioSource not on PATH after install"
+          fi
+
           if system_profiler SPAudioDataType 2>/dev/null | grep -qi "output"; then
-            echo "RSAC_CI_AUDIO_AVAILABLE=1" >> $GITHUB_ENV
+            echo "RSAC_CI_AUDIO_AVAILABLE=1" >> "$GITHUB_ENV"
           fi
 
       # Compile the ci_audio test binary ONCE (feat_macos) so all three tiers
@@ -613,9 +638,11 @@ jobs:
             -- --test-threads=1 --nocapture 2>&1 | tee -a ci-audio-system.log
 
       # ── Device tier ─────────────────────────────────────────────────────
-      # rsac#26: AUHAL `.start()` on BlackHole-as-input hangs 10-11 min before
-      # erroring on a headless runner; test code handles the error gracefully
-      # and `gtimeout 120` caps the hang.
+      # rsac#26: AUHAL `.start()` on BlackHole-as-input hung 10-11 min before
+      # erroring on the Blacksmith runner; test code handles the error gracefully
+      # and `gtimeout 120` caps the hang. On GitHub-hosted macos-15 with
+      # BlackHole pinned as the default I/O (step above) it may now deliver real
+      # frames — UNVERIFIED until observed; the tolerance below stays either way.
       - name: Device capture tier
         id: tier_device
         timeout-minutes: 10
@@ -743,6 +770,7 @@ jobs:
   linux-audio-bindings:
     name: "Linux Audio Bindings (python+node+go)"
     runs-on: blacksmith-4vcpu-ubuntu-2404
+    if: github.event_name != 'workflow_dispatch' || inputs.platform == 'all' || inputs.platform == 'bindings'
     timeout-minutes: 45
     # `bash` keyword shell (`-eo pipefail`) so a failing binding smoke propagates
     # through the `| tee log` pipe instead of being masked by tee's exit 0.
@@ -763,16 +791,20 @@ jobs:
           cache-key: linux-audio-bindings
       - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
         with:
-          node-version: 22
-      # rsac-e652: Bun is the single package manager for rsac-napi — pin the
-      # same exact version used in ci.yml/release-npm.yml so lockfile
-      # resolution can't drift between CI legs.
+          node-version-file: .tool-versions
+      # rsac-e652: Bun is the single package manager for rsac-napi — the exact
+      # version lives once, in .tool-versions (shared with ci.yml /
+      # release-npm.yml / supply-chain.yml and mise) so lockfile resolution
+      # can't drift between CI legs.
       - uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6 # v2
         with:
-          bun-version: '1.3.14'
+          bun-version-file: .tool-versions
+      # go.mod, not .tool-versions: this setup-go pin (v5.1.0) reads the whole
+      # .tool-versions file as one version string (support arrived in v6.1.0).
+      # The module's own `go` directive is the version CI builds against.
       - uses: actions/setup-go@41dfa10bad2bb2ae585af6ee5bb4d7d973ad74ed # v5
         with:
-          go-version: '1.22'
+          go-version-file: bindings/rsac-go/go.mod
 
       # daemon:true installs the full audio stack + dev headers (libpipewire/
       # libspa/libclang), bootstraps PipeWire, creates ci_test_sink, and runs
@@ -889,7 +921,9 @@ jobs:
   # macOS used to be excluded here because kTCCServiceAudioCapture cannot be
   # granted on a managed runner — but its require_*!() skip-early gates mean a
   # tier failure here is a real panic/build break, not a TCC limitation, so it
-  # now folds into the same gate the Windows block uses.
+  # now folds into the same gate the Windows block uses. A workflow_dispatch
+  # `platform` subset leaves the deselected jobs 'skipped', which every block
+  # below tolerates.
   # =============================================================================
 
   summary:
@@ -947,7 +981,7 @@ jobs:
           |---|---|---|
           | ~~Linux hard content assertions~~ SHIPPED | The deterministic route (\`RSAC_CI_AUDIO_DETERMINISTIC=1\`) hard-gates non-silence in the Rust system tier (\`system_capture.rs\`) and, since rsac-3635, in all three binding smokes (\`linux-audio-bindings\` job). | — (done; row kept for history) |
           | ~~Linux \`ApplicationByName\` happy-path filter~~ SHIPPED | \`application_by_name_linux.rs\` resolves the player's pinned \`application.name\` via pw-dump and hard-asserts tone content (PR #58). | — (done; row kept for history) |
-          | Windows device/process content assertions | The jobs hard-gate build/start/panic coverage, but the per-device and per-process tone route is not proven like the system VB-CABLE default route. | Prove the child player feeds the targeted endpoint/process loopback deterministically, then enable \`RSAC_CI_AUDIO_DETERMINISTIC=1\` for those jobs. |
+          | ~~Windows device/process content assertions~~ SHIPPED | The Windows device and process tiers now run deterministic like the system tier: rsac-0f33 (VB-CABLE default-endpoint gate) + rsac-5b59 (per-device / per-process tone route proven) hard-gate content with \`RSAC_CI_AUDIO_DETERMINISTIC=1\`. | — (done; row kept for history) |
           | macOS first-class managed-runner capture | Process Tap requires \`kTCCServiceAudioCapture\`, which cannot be granted non-interactively on managed runners. | Use a self-hosted macOS runner with pre-granted Audio Capture permission and set \`RSAC_CI_MACOS_TCC_GRANTED=1\`. |
           EOF
           cat ci-audio-gap-report.md >> "$GITHUB_STEP_SUMMARY"
@@ -1004,7 +1038,11 @@ jobs:
 
           # Linux is PRIMARY. A setup failure (job result != success, e.g. a
           # broken PipeWire route gate) OR any tier != success fails the gate.
-          if [ "${LINUX_RESULT}" != "success" ]; then
+          # A whole-job 'skipped' only happens for a workflow_dispatch platform
+          # subset that deselected Linux — allowed.
+          if [ "${LINUX_RESULT}" = "skipped" ]; then
+            echo "Linux audio job skipped (workflow_dispatch platform subset) — allowed."
+          elif [ "${LINUX_RESULT}" != "success" ]; then
             echo "FAILED: Linux audio job result '${LINUX_RESULT}' (setup/infra failure)"
             FAILED=1
           else
@@ -1017,11 +1055,11 @@ jobs:
             done
           fi
 
-          # Windows is a first-class tier. A whole-job 'skipped' (path filter
-          # excluded the workflow leg) is allowed; a setup failure or any failing
-          # tier is a real regression.
+          # Windows is a first-class tier. A whole-job 'skipped' (dispatch
+          # platform subset excluded it) is allowed; a setup failure or any
+          # failing tier is a real regression.
           if [ "${WINDOWS_RESULT}" = "skipped" ]; then
-            echo "Windows audio job skipped (path filter) — allowed."
+            echo "Windows audio job skipped (workflow_dispatch platform subset) — allowed."
           elif [ "${WINDOWS_RESULT}" != "success" ]; then
             echo "FAILED: Windows audio job result '${WINDOWS_RESULT}' (setup/infra failure)"
             FAILED=1
@@ -1036,10 +1074,10 @@ jobs:
           fi
 
           # macOS is now first-class-lite: job setup failures / tier failures
-          # gate, but 'skipped' (e.g. path-filter exclusion) is tolerated —
+          # gate, but 'skipped' (dispatch platform subset) is tolerated —
           # mirrors the Windows block above.
           if [ "${MACOS_RESULT}" = "skipped" ]; then
-            echo "macOS audio job skipped (path filter) — allowed."
+            echo "macOS audio job skipped (workflow_dispatch platform subset) — allowed."
           elif [ "${MACOS_RESULT}" != "success" ]; then
             echo "FAILED: macOS audio job result '${MACOS_RESULT}' (setup/infra failure or a gated tier failed)"
             FAILED=1
@@ -1056,10 +1094,10 @@ jobs:
           # Linux bindings are hard-gated (Linux is PRIMARY): the deterministic
           # PipeWire route gate runs at this job's setup, so a job result !=
           # success is a setup/route failure, and any binding smoke != success
-          # is a real regression. 'skipped' (path filter excluded the workflow
-          # leg) is tolerated per the per-language loop.
+          # is a real regression. 'skipped' (dispatch platform subset excluded
+          # the job) is tolerated per the per-language loop.
           if [ "${BIND_RESULT}" = "skipped" ]; then
-            echo "Linux audio bindings job skipped (path filter) — allowed."
+            echo "Linux audio bindings job skipped (workflow_dispatch platform subset) — allowed."
           elif [ "${BIND_RESULT}" != "success" ]; then
             echo "FAILED: linux-audio-bindings job result '${BIND_RESULT}' (setup/route gate failure)"
             FAILED=1

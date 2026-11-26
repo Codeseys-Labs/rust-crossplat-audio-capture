@@ -4,14 +4,11 @@ name: Bench (advisory)
 # workflow (rsac-1da3) — cargo build --all-targets / --tests only COMPILE
 # benches/bridge.rs and benches/observability.rs, they never RUN them, so
 # there is no throughput/latency signal. This workflow is purely advisory: it
-# never gates a PR or a release, it only archives baselines on a schedule (and
-# on manual dispatch) so future runs have something to diff against by eye.
+# never gates a PR or a release, it only archives baselines on manual dispatch
+# so future runs have something to diff against by eye.
 
 on:
-  schedule:
-    # Weekly, Monday 06:00 UTC. Advisory only — no PR/push trigger; this must
-    # never affect PR turnaround time or release gating.
-    - cron: '0 6 * * 1'
+  # Manual only (CI cost policy): no cron, no PR/push trigger.
   workflow_dispatch:
 
 env:
@@ -28,9 +25,8 @@ concurrency:
 jobs:
   bench:
     name: "Criterion benches (Linux, quick mode)"
-    # Guard against forks: the weekly cron would otherwise fire against a
-    # Blacksmith runner forks cannot provision, producing recurring failed
-    # scheduled runs + notifications (mirrors release*.yml).
+    # Forks cannot provision the Blacksmith runner: skip there instead of
+    # queueing a job that never starts (mirrors release*.yml).
     if: github.repository == 'Codeseys-Labs/rust-crossplat-audio-capture'
     runs-on: blacksmith-4vcpu-ubuntu-2404
     timeout-minutes: 20

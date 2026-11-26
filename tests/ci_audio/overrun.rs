@@ -1,6 +1,6 @@
 //! Ring-buffer overrun integration test (G8 — `overrun_count()`).
 //!
-//! Unit-level coverage in `src/api.rs` proves `overrun_count()` reflects the
+//! Unit-level coverage in `src/api/tests.rs` proves `overrun_count()` reflects the
 //! mock stream's counter. What the mock can't prove: that a *real* OS audio
 //! callback, producing buffers faster than a deliberately-stalled consumer
 //! drains them, actually drives the lock-free ring buffer to overflow and

@@ -48,11 +48,13 @@ pub enum GroupLayout {
     /// Fold every source in the group to stereo and gain-weighted-sum them
     /// into **two** output channels. Mono sources are duplicated to L/R;
     /// stereo sources pass through; wider sources are folded even→L / odd→R
-    /// (per-side mean).
+    /// (per-side mean). Inner captures request two channels by default, so the
+    /// OS mixer normally downmixes wider device audio before composition.
     Stereo,
-    /// Pass the group's **single** source through with its native channel
-    /// count (determined at [`Composition::start`]). v1 restriction: a
-    /// keep-channels group must contain exactly one source.
+    /// Pass the group's **single** source through at its negotiated capture
+    /// width (determined at [`Composition::start`]), not necessarily the device's
+    /// native width. Inner captures request two channels by default; any OS
+    /// downmix has already happened. A keep-channels group must contain one source.
     KeepChannels,
 }
 

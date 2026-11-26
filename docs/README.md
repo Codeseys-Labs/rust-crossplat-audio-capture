@@ -24,11 +24,12 @@ not guidance. Entry points (⭐) are the places to start.
 |---|---|
 | ⭐ [`ARCHITECTURE.md`](ARCHITECTURE.md) | Accurate 3-layer architecture overview (start here) |
 | [`PERFORMANCE.md`](PERFORMANCE.md) | RT-safety story, ring sizing, backpressure diagnostics |
-| [`MOBILE_BACKEND_DESIGN.md`](MOBILE_BACKEND_DESIGN.md) | Android/iOS backend design and compile-checked status; runtime verification pending |
+| [`DESKTOP_REFINEMENT.md`](DESKTOP_REFINEMENT.md) | Desktop-first v0.5 bar, D1–D5 multi-model deliberation record, mobile freeze/unfreeze checklist |
+| [`MOBILE_BACKEND_DESIGN.md`](MOBILE_BACKEND_DESIGN.md) | Android/iOS backend design (experimental/parked; emulator/simulator-verified, physical devices pending) |
 | [`MACOS_VERSION_COMPATIBILITY.md`](MACOS_VERSION_COMPATIBILITY.md) | macOS 14.4–26 API compatibility matrix |
 | [`MACOS26_PROCESS_TAP_FIX.md`](MACOS26_PROCESS_TAP_FIX.md) | Dated fix record: the 3-path Process Tap fallback |
 | [`OBJC2_MIGRATION_PLAN.md`](OBJC2_MIGRATION_PLAN.md) | Completed cocoa/objc → objc2 migration record |
-| [`designs/`](designs/README.md) | **ADRs 0001–0016** — durable decisions (indexed) |
+| [`designs/`](designs/README.md) | **ADRs 0001–0019** — durable decisions (indexed) |
 | [`architecture/`](architecture/) | Original design docs — **historical**, divergence-banner'd; code wins |
 | [`reviews/`](reviews/) | Review-loop retrospectives (point-in-time snapshots) |
 
@@ -45,6 +46,7 @@ not guidance. Entry points (⭐) are the places to start.
 | [`STACKED_PRS.md`](STACKED_PRS.md) | gh-native stacked-PR playbook |
 | [`CONTRIBUTING.md` §6](CONTRIBUTING.md#6-commit-style) / [`AGENTS.md` §6](../AGENTS.md) | Commit + review-disposition rules |
 | [`audit/docs-queue.md`](audit/docs-queue.md) | Documentation audit queue |
+| [`audit/2026-11-25-codebase-ci-market-audit.md`](audit/2026-11-25-codebase-ci-market-audit.md) | Full codebase, CI/runner, Blaze/tooling, and submodule harvest audit (2026-11-25) |
 | [`history/`](history/README.md) | **Archived snapshots** — frozen, do not follow |
 
 Not listed here = it was moved to [`history/`](history/README.md) in a rot

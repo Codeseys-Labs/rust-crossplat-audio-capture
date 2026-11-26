@@ -7,8 +7,9 @@
 # Scope note (2026-07-05 cleanup, rsac-a3c4): earlier versions also tried
 # x86_64-pc-windows-msvc and {x86_64,aarch64}-apple-darwin via `cross` —
 # cross-rs ships no MSVC or Darwin images, so those legs could never
-# succeed. For Windows use `make check-windows-docker` (cargo-xwin); for
-# macOS use `make check-macos-docker` or real hardware/CI.
+# succeed. Windows and macOS checks need CI or real hardware.
+#
+# Run via `mise run check:cross` (needs Docker + `cross`) or directly.
 
 set -e
 

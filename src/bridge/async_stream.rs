@@ -163,7 +163,17 @@ impl Stream for AsyncAudioStream<'_> {
             Ok(None) => {
                 // Truly empty. Check if the producer is still active.
                 if !this.stream.is_stream_producing() {
-                    return Poll::Ready(None); // Stream done, no more data coming.
+                    // Producer done. As above, do one final non-blocking
+                    // drain: a buffer that became readable after the read
+                    // just above (one a `stop()` preserved, say) must not be
+                    // lost to the end of the stream.
+                    return match this.stream.try_read_chunk() {
+                        Ok(Some(buffer)) => {
+                            this.self_wake_budget = NON_WAKING_SELF_WAKE_BUDGET;
+                            Poll::Ready(Some(Ok(buffer)))
+                        }
+                        _ => Poll::Ready(None), // Stream done, no more data coming.
+                    };
                 }
 
                 if waker_registered {

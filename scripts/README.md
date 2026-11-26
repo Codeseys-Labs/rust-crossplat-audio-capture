@@ -33,7 +33,7 @@ deleted in the 2026-07-05 rot cleanup (rsac-a3c4) — recover via
 
 | Script | Purpose | Called by |
 |---|---|---|
-| `cross-compile-check.sh` | `cross`-based check for Linux targets (Darwin/MSVC legs are impossible with cross-rs) | `make cross-compile`, humans |
+| `cross-compile-check.sh` | `cross`-based check for Linux targets (Darwin/MSVC legs are impossible with cross-rs) | `mise run check:cross`, humans |
 
 ## Retired Docker matrix
 

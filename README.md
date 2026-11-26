@@ -297,14 +297,14 @@ rsac = { git = "https://github.com/Codeseys-Labs/rust-crossplat-audio-capture" }
 
 | Feature | Default | Adds |
 |---|---|---|
-| `feat_windows` / `feat_linux` / `feat_macos` | ✅ | Desktop platform backends |
-| `feat_android` / `feat_ios` | ✅ | Mobile backend code paths; compile-checked only, not runtime-verified |
+| `feat_windows` / `feat_linux` / `feat_macos` | ✅ | Desktop platform backends (Tier 1) |
+| `feat_android` / `feat_ios` | ✅ | Mobile backends (experimental/parked: emulator/simulator-verified, physical devices pending) |
+| `hotplug-recovery` | — | Opt-in `SystemDefault` device-change auto-recovery (zero deps; ADR-0019) |
 | `compose` | — | Multi-source channel composition (`rubato` + `audioadapter-buffers`) |
 | `cli` | — | The `rsac` demo binary's deps (`clap`, `color-eyre`, `ctrlc`, `env_logger`) — library consumers don't pay for them |
 | `async-stream` | — | `futures_core::Stream` support (`atomic-waker`) |
 | `sink-wav` | — | `WavFileSink` |
 | `tracing` | — | Structured `tracing` events/spans (facade only) |
-
 See [`docs/features.md`](docs/features.md) for the full matrix.
 
 ### Platform Dependencies
@@ -336,9 +336,9 @@ Full index (every doc, with status): [`docs/README.md`](docs/README.md).
 - [`docs/troubleshooting.md`](docs/troubleshooting.md) — High-signal fixes for the most common build and runtime errors (PipeWire libs missing, Xcode CLT, TCC permission, WASAPI session contention, etc.).
 - [`docs/CONSUMING_RSAC.md`](docs/CONSUMING_RSAC.md) — How downstream projects consume any rsac surface: Rust crate, C FFI, Python, Node/Bun, Go, CLI — with the working install/link recipe for each.
 - [`docs/FRAMEWORK_COMPATIBILITY.md`](docs/FRAMEWORK_COMPATIBILITY.md) — Using rsac from Tauri v2, Dioxus, Electron, Deno, Bun, Flutter, and more — per-framework status (verified / expected / blocked) and integration recipes.
-- [`docs/MOBILE_BACKEND_DESIGN.md`](docs/MOBILE_BACKEND_DESIGN.md) — Android (`AudioPlaybackCapture` + AAudio) and iOS (AVAudioEngine + ReplayKit) backend design and compile-checked implementation status; mobile runtime verification remains pending ([ADR-0012](docs/designs/0012-mobile-platform-strategy.md), [ADR-0013](docs/designs/0013-mobile-capturetarget-semantics.md)).
+- [`docs/MOBILE_BACKEND_DESIGN.md`](docs/MOBILE_BACKEND_DESIGN.md) — Android (`AudioPlaybackCapture` + AAudio) and iOS (AVAudioEngine + ReplayKit) backend design (experimental/parked: emulator/simulator-verified, physical devices pending; [ADR-0012](docs/designs/0012-mobile-platform-strategy.md), [ADR-0013](docs/designs/0013-mobile-capturetarget-semantics.md), [`docs/DESKTOP_REFINEMENT.md`](docs/DESKTOP_REFINEMENT.md)).
 - [`docs/architecture/`](docs/architecture/) — Detailed design documents for the core, bridge, and backend layers.
-- [`docs/CI_AUDIO_TESTING.md`](docs/CI_AUDIO_TESTING.md) — How audio integration tests run in CI across all three platforms (6 of 9 cells REAL on every run; macOS gaps explained).
+- [`docs/CI_AUDIO_TESTING.md`](docs/CI_AUDIO_TESTING.md) — How audio integration tests run in CI across all three platforms (7 of 9 cells capture real audio when the suite is dispatched; macOS gaps explained).
 - [`docs/RELEASE_PROCESS.md`](docs/RELEASE_PROCESS.md) — End-to-end procedure for cutting a new `rsac` release: pre-release checks, version bump, tag, `cargo publish`, verification, and rollback.
 
 ## Architecture

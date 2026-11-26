@@ -1,0 +1,37 @@
+# .betterleaks.toml — secret-scan config for rsac (betterleaks v1.10.1, pinned in mise.toml).
+#
+# NOT auto-loaded by betterleaks v1: mise tasks (`mise run secrets`,
+# `mise run secrets:staged`), lefthook and the ci.yml `secrets` job all pass
+# `--config .betterleaks.toml` explicitly.
+#
+# Deliberately minimal: extend the built-in ruleset and allow only the known
+# non-secrets below. Do NOT set top-level `prefilter` / `filter` here — they
+# REPLACE the built-in ones (lockfile/vendor/image path skips and the
+# `${{ secrets.X }}` / `$VAR` placeholder filter) instead of adding to them.
+#
+# v2 migration: v2 rejects `[[allowlists]]` (use a top-level `filter`
+# expression instead). Revisit this file when bumping the pin to 2.x.
+title = "rsac"
+
+[extend]
+useDefault = true
+
+# First full-history scan (2026-11-25) reported 9 findings, all non-secrets.
+# Allowed by rule + exact secret value (never by path), so a real secret added
+# to the same files would still be reported.
+
+# Throwaway local-only VM-lab credentials from the since-retired dockur/Docker
+# Windows test matrix (docker-compose*.yml, docker/windows/Dockerfile).
+[[allowlists]]
+description = "Retired dockur Windows VM-lab throwaway credentials (git history only)"
+targetRules = ["generic-password"]
+regexTarget = "secret"
+regexes = ['''^(?:audiotest|AudioTest123|TestPass123)$''']
+
+# The napi target triple in an early release-npm.yml matrix entry
+# (`napi-target: win32-x64-msvc`), matched by the generic-api-key heuristic.
+[[allowlists]]
+description = "napi target triple, not a key (release-npm.yml history)"
+targetRules = ["generic-api-key"]
+regexTarget = "secret"
+regexes = ['''^win32-x64-msvc$''']

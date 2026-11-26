@@ -20,15 +20,105 @@ Releases with no ABI change omit the subsection (or state "No C ABI changes").
 
 ### Added
 
+- **Opt-in `hotplug-recovery` feature (`ADR-0019`)** — default-off, zero-dependency
+  device-hotplug auto-recovery for desktop `SystemDefault` capture via
+  `AudioCaptureBuilder::with_auto_recovery(AutoRecoveryConfig)`, `RecoveryState`,
+  `RecoverySnapshot`, `RecoveryEvent`, `AudioCapture::recovery_snapshot()`,
+  `AudioCapture::subscribe_recovery_events()`, and `AudioBuffer::stream_generation()`.
+  Events and snapshots carry a `session` id that changes with each newly opened capture
+  session, so an event left queued by an earlier session is distinguishable after a
+  restart. A quiet supervised stream still returns `AudioError::Timeout` from blocking
+  reads, as an unsupervised one does.
+- **`CapturingStream::readable_buffers()`** — provided method (default `None`) reporting
+  how many buffers are queued and readable right now. It never blocks: `BridgeStream`
+  returns `None` while another reader holds the stream and `Some(0)` once queued data is
+  no longer readable. Auto-recovery uses it to drain exactly the backlog present when it
+  retires a stream.
+- **Secret scanning (`betterleaks`)** — pinned `betterleaks` 1.10.1 via `mise.toml`
+  and `.betterleaks.toml`, wired into `lefthook.yml` (`pre-commit`) and `ci.yml`
+  (`secrets` job).
+- **Unified runtime pins (`.tool-versions`)** — single source of truth for Bun, Node,
+  Go, and Python shared between `mise` and GitHub Actions workflows.
+- **Blacksmith Windows audio re-probed** — a one-shot probe (run 45738685950, workflow
+  removed afterwards) found the image is now Desktop Experience with `AudioSrv` running
+  and a usable VB-CABLE endpoint; recorded in `AGENTS.md`. Windows audio integration
+  stays on GitHub-hosted `windows-latest` (free and proven).
+- **Audit & planning records** — `docs/audit/2026-11-25-codebase-ci-market-audit.md`,
+  `docs/DESKTOP_REFINEMENT.md`, and `docs/designs/0019-hotplug-auto-recovery.md`.
+
 ### Changed
+
+- **MSRV raised to `1.88`** (`Cargo.toml` and `ci.yml` Linux + Windows MSRV legs) to
+  reflect `sysinfo 0.38.4`'s actual Rust 1.88 requirement on Windows/macOS.
+- **Dependencies upgraded:** `rtrb` `0.3.4` → `0.4.1`, `wasapi` `0.23.0` → `0.27.0`
+  (Windows), `rubato` `3.0.0` → `5.1.0` + `audioadapter-buffers` `3.0.0` → `5.2.0`
+  (`compose`, preserving identical 2-subchunk `BlackmanHarris2` FFT geometry),
+  `pyo3` `0.24` → `0.30.1` (`bindings/rsac-python`, retaining `abi3-py39` and
+  `gil_used = true`), `cbindgen` `0.28` → `0.29.4` (`bindings/rsac-ffi`,
+  regenerated `rsac_generated.h`), Tier-1 patch/minor updates (`tokio 1.54.1`,
+  `rand 0.10.4`, `clap 4.6.10`, `libc 0.2.191`, `log 0.4.35`, `serde 1.0.229`,
+  `serde_json 1.0.154`, `thiserror 2.0.21`, `tracing 0.1.44`, Apple `objc2`/`coreaudio`
+  patch releases), and workspace `resolver = "3"` (MSRV-aware resolution).
+- **Modularized `src/api/`** — split the 5,365-line `src/api.rs` into focused submodules
+  with identical public re-exports and hardened `scripts/check-module-dag.sh` to fail
+  closed on missing scan roots.
+- **CI is manually dispatched** — `ci.yml`, `ci-audio-tests.yml`, the mobile
+  emulator/simulator workflows and `bench.yml` no longer run on `pull_request`, branch
+  pushes or cron; start them with `gh workflow run <workflow> --ref <branch>`. A `ci.yml`
+  branch dispatch scopes itself by the branch's diff against `master` (`-f full=true`
+  forces the whole matrix; the release semver gate is a separate `-f semver=true`).
+  Still automatic: the PR changelog guard, the weekly non-Rust
+  supply-chain scan, and stable `v*.*.*` tags.
+- **CI cost & coverage changes** — split `changelog-guard` into its own workflow so PR
+  label edits re-run only that job; moved `macos-audio` to GitHub-hosted `macos-15` with
+  `SwitchAudioSource` + BlackHole 2ch; removed the dead weekly cron on
+  `ci-audio-macos-tcc.yml`; the MSRV job checks the committed lockfile (`--locked`) and
+  the binding crates; `check-bindings` smokes one abi3 wheel on CPython 3.9 and 3.13.
+- **Reference submodules updated** — bumped `wasapi-rs` (v0.27.0), `rtrb` (0.4.1),
+  `pipewire-rs` (v0.10.1), `obs-pipewire-audio-capture` (1.2.2),
+  `screencapturekit-rs` (v12.0.0), and `cpal` (`44ba7ad`).
 
 ### Deprecated
 
 ### Removed
 
+- Root `Makefile` (superseded by `mise.toml`, including `mise run check:cross`;
+  `bindings/rsac-go/Makefile` is kept).
+
 ### Fixed
 
+- **Windows WASAPI (`SILENT` packets & COM teardown):** explicitly zero packets flagged
+  `AUDCLNT_BUFFERFLAGS_SILENT`, drop COM interfaces (`capture_client`, `h_event`,
+  `audio_client`) before `wasapi::deinitialize()`, and bound the WASAPI init handshake
+  to 5 seconds (`recv_timeout`). The device enumerator now holds COM alive with an MTA
+  usage cookie, which may be released from any thread, instead of a per-thread
+  `CoInitializeEx`/`CoUninitialize` pair. Callers whose thread is already in a non-MTA
+  COM apartment (for example an STA UI thread) are still refused with
+  `RPC_E_CHANGED_MODE`, as before.
+- **Linux PipeWire:** fixed multi-byte UTF-8 slicing panic in `.exe` suffix stripping,
+  normalized cyclic SPA chunk offsets with whole-frame clamping, and added
+  `StreamFlags::DONT_RECONNECT` on explicit serial targets so vanished app/device
+  streams cannot silently fall back to capturing system audio. `default_device()` now
+  returns `DeviceNotFound` (was `BackendError`) when the PipeWire registry lists audio
+  devices but none of the requested kind; an empty registry still reports `BackendError`.
+  The FFI, Go and Node bindings surface this as their device-not-found error code.
+- **macOS CoreAudio:** honored `StreamConfig::buffer_size` in
+  `CoreAudioDevice::create_stream` (closing the last backend parity gap).
+- **Async stream (`async-stream`):** a buffer that became readable while the stream was
+  stopping, between the last read and the end-of-stream check, is now yielded before
+  the stream ends instead of being dropped.
+- **`lefthook.yml` on Windows:** routed hooks through `mise run` instead of bare `bash`
+  to avoid resolving WSL's `System32/bash.exe`.
+
 ### Security
+
+- Added `betterleaks` v1.10.1 secret scanning in pre-commit hooks and CI.
+- Expanded `ci.yml`'s `supply-chain` job to `cargo deny --workspace --all-features`
+  with crate-scoped `MPL-2.0` exceptions for `cbindgen` and `tauri`-only transitives,
+  and closed `RUSTSEC-2026-0176`/`-0177` (`pyo3 0.30.1`), `RUSTSEC-2026-0386`
+  (`tokio 1.54.1`, skipping yanked `1.54.0` / `RUSTSEC-2026-0384`),
+  `RUSTSEC-2026-0097` (`rand 0.10.4` + non-yanked `chacha20 0.10.2`),
+  `RUSTSEC-2026-0592` (`url`), and `RUSTSEC-2026-0594` (`cookie`).
 
 ## [0.4.4] - 2026-07-21
 

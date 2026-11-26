@@ -53,6 +53,8 @@ pub struct AudioBuffer {
     /// Timestamp of the first sample (relative to stream start).
     /// `None` if no timestamp was assigned.
     timestamp: Option<Duration>,
+    /// Identifies the stream instance that produced these samples.
+    stream_generation: u64,
 }
 
 impl Default for AudioBuffer {
@@ -62,6 +64,7 @@ impl Default for AudioBuffer {
             data: Vec::new(),
             format: AudioFormat::default(),
             timestamp: None,
+            stream_generation: 0,
         }
     }
 }
@@ -88,6 +91,7 @@ impl AudioBuffer {
                 sample_format: SampleFormat::F32,
             },
             timestamp: None,
+            stream_generation: 0,
         }
     }
 
@@ -102,6 +106,7 @@ impl AudioBuffer {
             data,
             format,
             timestamp: None,
+            stream_generation: 0,
         }
     }
 
@@ -117,6 +122,7 @@ impl AudioBuffer {
             data,
             format,
             timestamp: Some(timestamp),
+            stream_generation: 0,
         }
     }
 
@@ -137,6 +143,7 @@ impl AudioBuffer {
                 sample_format: SampleFormat::F32,
             },
             timestamp: None,
+            stream_generation: 0,
         }
     }
 
@@ -177,6 +184,24 @@ impl AudioBuffer {
     /// Returns the timestamp of the first sample, if set.
     pub fn timestamp(&self) -> Option<Duration> {
         self.timestamp
+    }
+
+    /// Returns this buffer's stream generation. Newly constructed buffers have
+    /// generation zero; recovery can tag buffers to distinguish a reopened stream.
+    pub fn stream_generation(&self) -> u64 {
+        self.stream_generation
+    }
+
+    /// Tags this buffer with the generation of the stream that produced it.
+    pub fn set_stream_generation(&mut self, generation: u64) {
+        self.stream_generation = generation;
+    }
+
+    /// Returns the same buffer tagged with `generation`, without copying samples.
+    #[must_use]
+    pub fn with_stream_generation(mut self, generation: u64) -> Self {
+        self.stream_generation = generation;
+        self
     }
 
     /// Returns a reference to the interleaved data.
@@ -421,8 +446,7 @@ impl AudioBuffer {
     }
 }
 
-// `AudioBuffer` holds only `Vec<f32>`, `AudioFormat`, and `Option<Duration>`,
-// all of which are `Send + Sync`, so the compiler derives both auto-traits.
+// All fields are `Send + Sync`, so the compiler derives both auto-traits.
 // We deliberately do NOT hand-write `unsafe impl Send/Sync`: doing so would
 // suppress the compiler's safety net if a non-`Send`/`Sync` field were ever
 // added (e.g. a raw pointer or `Rc`), silently making the type unsound. The
@@ -435,6 +459,29 @@ const _: () = {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn constructors_start_at_generation_zero() {
+        for buffer in [
+            AudioBuffer::default(),
+            AudioBuffer::new(vec![], 2, 48000),
+            AudioBuffer::empty(2, 48000),
+            AudioBuffer::from_interleaved(vec![], 2, 48000),
+            AudioBuffer::with_format(vec![], AudioFormat::default()),
+            AudioBuffer::with_timestamp(vec![], AudioFormat::default(), Duration::ZERO),
+        ] {
+            assert_eq!(buffer.stream_generation(), 0);
+        }
+    }
+
+    #[test]
+    fn stream_generation_can_be_set_and_replaced() {
+        let mut buffer = AudioBuffer::new(vec![0.5], 1, 48000).with_stream_generation(1);
+        assert_eq!(buffer.stream_generation(), 1);
+        buffer.set_stream_generation(7);
+        assert_eq!(buffer.stream_generation(), 7);
+        assert_eq!(buffer.data(), &[0.5]);
+    }
 
     #[test]
     fn new_basic() {
