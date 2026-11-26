@@ -1268,8 +1268,10 @@ impl DeviceEnumerator for WindowsDeviceEnumerator {
     /// unregisters the client it registered and releases its COM objects before
     /// it exits: once `drop` returns, no `on_event` call is running and none
     /// starts. The join takes up to one 100 ms poll interval after the flag is
-    /// set, plus any `on_event` call or `DeviceAdded` resolution already
-    /// running, plus the unregister and release.
+    /// set, plus any `on_event` call, overflow report (a `log` call, so the
+    /// application's logger) or `DeviceAdded` resolution already running, plus
+    /// the unregister and release. Once the flag is set the helper runs no
+    /// application code; an overflow count not yet reported is dropped.
     ///
     /// Dropping the watcher from inside `on_event` is the one supported
     /// re-entrant case: `drop` returns while that call is still running, no new
@@ -1495,11 +1497,13 @@ fn device_watch_thread_main(
 /// `resolve_added` (a COM call on the helper), and passes every event to
 /// `on_event`, until `shutdown` is set or the channel closes.
 ///
-/// The flag is read after every wake, before any resolution or handler call;
-/// again after a resolution, which can take time; and after every handler
-/// call, so a drop from inside the handler ends delivery when it returns.
-/// Notices the callback dropped on a full channel are logged here, on the
-/// helper, never on the MMDevice thread.
+/// The flag is read after every wake, before the overflow report and before
+/// any resolution or handler call; again after a resolution, which can take
+/// time; and after every handler call, so a drop from inside the handler ends
+/// delivery when it returns. Notices the callback dropped on a full channel
+/// are logged here, on the helper, never on the MMDevice thread. Once
+/// shutdown is requested the helper runs no application code, not even the
+/// logger, so a count not yet reported is dropped.
 fn deliver_notices(
     rx: &mpsc::Receiver<WatchNotice>,
     shutdown: &AtomicBool,
@@ -1509,10 +1513,10 @@ fn deliver_notices(
 ) {
     loop {
         let received = rx.recv_timeout(NOTIFY_THREAD_POLL_INTERVAL);
-        report_dropped_notices(dropped);
         if shutdown.load(Ordering::Acquire) {
             return;
         }
+        report_dropped_notices(dropped);
         let notice = match received {
             Ok(notice) => notice,
             Err(mpsc::RecvTimeoutError::Timeout) => continue,
@@ -2683,12 +2687,13 @@ mod tests {
         );
     }
 
-    /// A notice dequeued after a teardown was requested starts no resolution
-    /// (a COM call on the helper) and no handler call.
+    /// A notice dequeued after a teardown was requested starts no overflow
+    /// report (the application's logger), no resolution (a COM call on the
+    /// helper) and no handler call.
     #[test]
     fn test_delivery_after_shutdown_starts_no_resolution() {
         let shutdown = AtomicBool::new(true);
-        let dropped = AtomicUsize::new(0);
+        let dropped = AtomicUsize::new(3);
         let (resolved, delivered) = deliver_queued(
             vec![
                 WatchNotice::Added(DeviceId("new".to_string())),
@@ -2697,6 +2702,11 @@ mod tests {
             &shutdown,
             &dropped,
             || {},
+        );
+        assert_eq!(
+            dropped.load(Ordering::Relaxed),
+            3,
+            "no overflow report may run after shutdown"
         );
         assert!(resolved.is_empty(), "resolved after shutdown: {resolved:?}");
         assert!(
@@ -3032,6 +3042,11 @@ mod tests {
         files
     }
 
+    /// The only `unsafe impl` items under `src/audio/windows/` are the
+    /// allowlisted ones, each with a `// SAFETY:` comment directly above it.
+    /// It scans source text with comments and literals blanked, not macro
+    /// expansions, so an `unsafe` token passed into a macro that emits the
+    /// `impl` is not seen; code review covers that case.
     #[test]
     fn unsafe_impl_allowlist() {
         let not_allowed =

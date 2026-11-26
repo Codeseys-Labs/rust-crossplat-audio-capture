@@ -36,13 +36,13 @@ Choose **a stateless control plane, and one owner thread per watcher**. The `MMD
 - `WindowsDeviceEnumerator` holds only an MTA usage pin: the cookie from `CoIncrementMTAUsage`, released with `CoDecrementMTAUsage`, which Microsoft documents as valid on a thread other than the one that incremented. `WindowsAudioDevice` holds plain data read at enumeration (endpoint id, friendly name, data-flow kind or the error reading it, default flag) and the shared pin. Both are `Send + Sync` through the auto traits.
 - Each call creates, uses and releases its COM objects within the call, on the calling thread. `supported_formats()` looks the endpoint up by id; an endpoint that no longer exists yields the default-format fallback, never another endpoint's formats.
 - No call changes the caller's apartment. `ComInitializer::new()` keeps its strict check (an STA caller is refused with `RPC_E_CHANGED_MODE`) for the capture worker thread and the deprecated `WindowsApplicationCapture`.
-- The only `unsafe impl` items under `src/audio/windows/` are `Send` and `Sync` for the pin, and `Send` for the deprecated `WindowsApplicationCapture`, which goes at the 0.5.0 cutover. The `unsafe_impl_allowlist` unit test enforces this.
+- The only `unsafe impl` items under `src/audio/windows/` are `Send` and `Sync` for the pin, and `Send` for the deprecated `WindowsApplicationCapture`, which goes at the 0.5.0 cutover. The `unsafe_impl_allowlist` unit test checks the source text: it scans every `.rs` file under the directory with comments and literals blanked, not macro expansions, so an `unsafe` token passed into a macro that emits an `impl Send` is not seen. Code review covers that case.
 
 ### Watcher ownership
 
 - `watch()` makes no COM call. It spawns `rsac-wasapi-device-watch`, which initialises COM as MTA itself, creates its own `IMMDeviceEnumerator` and the `IMMNotificationClient`, registers the client, and reports the outcome over a zero-capacity channel.
 - `watch()` waits at most `WATCH_REGISTRATION_TIMEOUT` (five seconds). A reported failure is returned at once. With no report in time, `watch()` returns `AudioError::Timeout`; because the channel holds nothing, a later report fails on the helper, which then unregisters if it registered, releases everything and exits without ever calling the handler. On every failure the helper owns its cleanup and `watch()` does not join it: the join would also wait for the handler's destructor, which may wait on the caller.
-- The notification client holds no COM pointer, only the bounded sender and an overflow counter. Each callback copies the event data and `try_send`s it, nothing else: no user code, no logger, no COM call. On a full channel it drops the notice and increments the counter; the helper logs the count when it next wakes.
+- The notification client holds no COM pointer, only the bounded sender and an overflow counter. Each callback copies the event data and `try_send`s it, nothing else: no user code, no logger, no COM call. On a full channel it drops the notice and increments the counter; the helper logs the count when it next wakes, unless shutdown has been requested.
 - The helper resolves a `DeviceAdded` name and kind with its own enumerator before it calls the handler.
 
 ### Teardown
@@ -53,13 +53,13 @@ The teardown closure captures only a shutdown flag and the helper's `JoinHandle`
 2. Returns, if the dropping thread is the helper (the watcher was dropped from inside its own handler).
 3. Otherwise joins the helper. A panic payload from the helper is dropped under `catch_unwind`; if that drop panics, the second payload is leaked, so nothing unwinds out of `DeviceWatcher::drop`.
 
-The helper reads the flag after every wake, before any resolution or handler call; again after a resolution; and after every handler call. Once it sees the flag it leaves the delivery loop and, on its own thread, unregisters the client pointer it registered, releases the client (and with it the sender) and its enumerator, drops the receiver, calls `CoUninitialize` and exits. A panicking handler unwinds the helper through the same drops.
+The helper reads the flag after every wake, before the overflow report and before any resolution or handler call; again after a resolution; and after every handler call. Once it sees the flag it runs no application code (no handler, no logger) and leaves the delivery loop; an overflow count not yet reported is dropped. It then, on its own thread, unregisters the client pointer it registered, releases the client (and with it the sender) and its enumerator, drops the receiver, calls `CoUninitialize` and exits. A panicking handler unwinds the helper through the same drops.
 
 ### Lifetime guarantee
 
 - After `drop` returns on a thread other than the helper, no handler call is running and none starts.
 - When the watcher is dropped from inside its own handler, `drop` returns while that call is still running; no new call starts after it, and the helper tears down once the handler returns.
-- Teardown latency: up to one `NOTIFY_THREAD_POLL_INTERVAL` (100 ms) after the flag is set, plus any handler call or `DeviceAdded` resolution already running, plus the unregister and release.
+- Teardown latency: up to one `NOTIFY_THREAD_POLL_INTERVAL` (100 ms) after the flag is set, plus any helper-side application code already running (a handler call, or the overflow report, which calls the application's logger), plus any `DeviceAdded` resolution already running, plus the unregister and release. The overflow report is skipped once shutdown is requested, so only one that started before the request can delay the join.
 
 ### Restriction
 
@@ -68,7 +68,7 @@ The helper reads the flag after every wake, before any resolution or handler cal
 ### Consequences
 
 - Threads in an STA, such as GUI main threads, can enumerate devices, query them, list audio sessions and watch.
-- Each control-plane call creates its own in-process `IMMDeviceEnumerator`.
+- `WindowsDeviceEnumerator::new()`, `enumerate_devices()`, `default_device()`, `supported_formats()` (and so `describe()`) and `enumerate_application_audio_sessions()` each create their own in-process `IMMDeviceEnumerator`; the cached getters `id()`, `name()`, `kind()` and `is_default()` create none and make no COM call.
 - `is_default()` reports whether the endpoint was the default render endpoint at enumeration; `kind()` returns the kind read at enumeration.
 - `enumerate_devices()` and `default_device()` can fail with `create_device_enumerator`; `watch()` can return `AudioError::Timeout`.
 - ADR-0005's run-once, best-effort, no-panic teardown still holds on Windows.
@@ -79,7 +79,7 @@ The helper reads the flag after every wake, before any resolution or handler cal
 
 - Good, because no COM pointer crosses a thread and the handles need no `unsafe impl`.
 - Good, because callers keep their apartment, and STA callers work.
-- Bad, because every call recreates the enumerator, and device data is a snapshot taken at enumeration.
+- Bad, because every enumeration and format query recreates the enumerator, and device data is a snapshot taken at enumeration.
 
 ### One process-wide COM owner thread
 

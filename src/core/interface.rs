@@ -530,7 +530,10 @@ pub enum DeviceEvent {
 /// synchronously for the thread that drops the guard: a handler that sends a
 /// blocking message to a UI thread (for example `SendMessage` to a window
 /// owned by it) deadlocks if that thread is dropping the guard at the same
-/// time. Post the update (a channel, `PostMessage`) and return.
+/// time. Post the update (a channel, `PostMessage`) and return. Dropping the
+/// guard from inside its own handler is supported on Windows only (`drop`
+/// then returns while that call is still running, and no new call starts);
+/// on the other backends do not drop it from the handler.
 ///
 /// The guard owns a backend-specific teardown closure; it is `Send` so it can be
 /// moved across threads, and its `Drop` is best-effort and never panics.
