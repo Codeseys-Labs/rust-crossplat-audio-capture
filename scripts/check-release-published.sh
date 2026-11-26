@@ -6,6 +6,8 @@
 # Usage: bash scripts/check-release-published.sh X.Y.Z [--remote NAME]
 #        bash scripts/check-release-published.sh --self-test
 # Default remote: origin. GH_BIN and CURL_BIN override gh and curl.
+# RELEASE_REPO overrides the GitHub owner/name derived from --remote. If the
+# repository cannot be determined, all three workflow probes are indeterminate.
 # --self-test checks the npm platform list against the napi manifest offline.
 #
 # Exit: 0 safe to re-tag; 1 published; 2 usage; 3 indeterminate (do not
@@ -91,8 +93,16 @@ else state=clean
 fi
 report go-tag "$state"
 
+REPO=${RELEASE_REPO:-}
+if [[ -z $REPO ]] && url=$(git remote get-url "$remote" 2>/dev/null); then
+    github_url='^(https://github\.com/|git@github\.com:|ssh://git@github\.com/)([A-Za-z0-9_-]+/[A-Za-z0-9_.-]+)$'
+    url=${url%/}
+    if [[ ${url%.git} =~ $github_url ]]; then REPO=${BASH_REMATCH[2]}; fi
+fi
 for workflow in release.yml release-npm.yml release-pypi.yml; do
-    if count=$("$GH_BIN" run list --workflow "$workflow" --event push --branch "v$version" --limit 20 --json status --jq '[.[] | select(.status != "completed")] | length' 2>/dev/null) && [[ ${count%$'\r'} =~ ^0+$ ]]; then
+    if [[ -n $REPO ]] &&
+        count=$("$GH_BIN" run list --repo "$REPO" --workflow "$workflow" --event push --branch "v$version" --limit 20 --json status --jq '[.[] | select(.status != "completed")] | length' 2>/dev/null) &&
+        [[ ${count%$'\r'} =~ ^0+$ ]]; then
         report "$workflow" clean
     else
         report "$workflow" indeterminate
@@ -101,7 +111,7 @@ done
 
 probe_registry() {
     local code state
-    if code=$("$CURL_BIN" -sS -o /dev/null -w '%{http_code}' -A 'rsac-release-check (https://github.com/Codeseys-Labs/rust-crossplat-audio-capture)' "$2" 2>/dev/null); then
+    if code=$("$CURL_BIN" -sS -o /dev/null -w '%{http_code}' --max-time 20 -A 'rsac-release-check (https://github.com/Codeseys-Labs/rust-crossplat-audio-capture)' "$2" 2>/dev/null); then
         case ${code%$'\r'} in
             200) state=published ;;
             404) state=clean ;;

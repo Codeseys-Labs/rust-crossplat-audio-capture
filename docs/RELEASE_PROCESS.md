@@ -368,10 +368,15 @@ Go tag, in-flight runs, crates.io, PyPI and npm (including every platform
 package). Use its final line to decide:
 
 - `safe-to-retag X.Y.Z` (exit 0): delete `vX.Y.Z` locally and remotely, fix
-  the issue and repeat the sequence above for the corrected commit.
+  the issue and follow the sequence above for the corrected commit. Just
+  before re-tagging, run `bash scripts/check-release-published.sh X.Y.Z`
+  again. Re-tag only if it still says `safe-to-retag X.Y.Z`.
 - `published X.Y.Z` (exit 1): leave the tag untouched and ship a new version.
   A pushed Go tag counts as published because a Go proxy can retain it.
 - `indeterminate X.Y.Z` (exit 3): treat as published. Do not move the tag.
+
+GitHub can re-run a finished tag-triggered workflow from the same commit.
+Do not start such a re-run for a tag that has been deleted or moved.
 
 crates.io publishes are
 irrevocable,
@@ -761,9 +766,12 @@ recursion-safe — no workflow in this repo triggers on the
 `bindings/rsac-go/…` tag shape, since every `tags:` filter is `v*.*.*`
 and a single `*` in a tag glob never crosses `/`). For a manual release use
 the tag script in [Using the automated flow](#using-the-automated-flow).
+For `2.0.0` and later, the Go module path in `bindings/rsac-go/go.mod` must
+end in `/vN`, where `N` is the release major (for example, `/v2` for
+`2.0.0`). If the module has not made that change, use `--no-go-tag`.
 
-Consumers then `go get
-github.com/Codeseys-Labs/rust-crossplat-audio-capture/bindings/rsac-go@vX.Y.Z`. The `version-lockstep`
+Consumers use `go get <module-path>@vX.Y.Z` with the `module` path from
+the tagged `go.mod`, including the major suffix when applicable. The `version-lockstep`
 CI job notes rsac-go's absence of an in-tree version explicitly so the
 gap is intentional, not an oversight.
 
