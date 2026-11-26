@@ -895,19 +895,20 @@ cargo fmt --all -- --check
 RUSTDOCFLAGS="-D warnings" cargo doc --no-deps --all-features
 ```
 
-CI evidence is required on the commit that gets tagged, which is the
-version-bump commit from §3, so the required dispatch happens there (see §3),
-not here. Dispatching on the pre-bump commit as well
+For a manual release, CI evidence is required on the commit that gets tagged,
+which is the version-bump commit from §3, so the required dispatch happens
+there (see §3), not here. Dispatching on the pre-bump commit as well
 (`gh workflow run ci.yml --ref <branch> -f full=true -f semver=true`, plus
 `ci-audio-tests.yml` for the audio matrix) is optional: it catches a red
 matrix before you bump. CI is manual, so no run exists until you start one.
 In the release-prepare flow the dispatched run covers the release-branch tree
 only, and `release-tag.yml` tags the squash-merge commit as soon as it lands,
-so that commit cannot be dispatched before its tag exists. Keep the release
-branch up to date with `master` when you dispatch and when you merge, so the
-merge commit's tree is the tree that was tested; if `master` advanced or the
-branch got another commit in between, update it and dispatch again before
-merging.
+so that commit cannot be dispatched before its tag exists; the requirement
+there is on the release PR head instead. Keep the release branch up to date
+with `master` when you dispatch and when you merge, and merge only the head the
+green run tested (its `headSha`), so the merge commit's tree is the tree that
+was tested; if `master` advanced or the branch got another commit in between,
+update it and dispatch again before merging.
 The workflows live in `.github/workflows/` (`ci.yml`,
 `ci-audio-tests.yml`, and the platform-specific splits). Check the Actions
 tab — do not rely solely on local results, since Linux PipeWire, Windows
