@@ -329,7 +329,8 @@ after the bump is pushed and before the tag is made.
 
 After the tag, crates.io publishing is gated by `release.yml`'s `verify` and
 `semver-checks` jobs. The npm and PyPI workflows run independently of it, each
-behind its own build and `--expect` lockstep check. The tag-time `ci.yml` run
+behind its own build, a tag-versus-manifest version check and the lockstep
+check. The tag-time `ci.yml` run
 starts in parallel with all of them and gates nothing, which is why the
 dispatched run before the tag is the one that matters.
 
@@ -479,10 +480,14 @@ writes to `master`.
 Treat the `release: vX.Y.Z` PR like any other PR: review the manifest
 diff and the CHANGELOG rotation. CI is manually dispatched, so **dispatch it on
 the release branch and wait for green before merging**
-(`gh workflow run ci.yml --ref release/vX.Y.Z`). Dispatch with the branch up to
-date with `master`, and merge before `master` advances again: `release-tag.yml`
-tags the squash-merge commit as soon as it lands, so that commit is covered only
-if its tree is the tree the run tested. Its **`version-lockstep` gate**
+(`gh workflow run ci.yml --ref release/vX.Y.Z -f full=true`; without
+`full=true` the run is scoped by the branch diff). Dispatch with the branch up
+to date with `master`, then merge that exact commit before `master` advances
+again: the PR head at merge time must be the run's `headSha`
+(`gh run view <run-id> --json headSha,conclusion`), and a later commit on the
+release branch needs a new dispatch. `release-tag.yml` tags the squash-merge
+commit as soon as it lands, so that commit is covered only if its tree is the
+tree the run tested. Its **`version-lockstep` gate**
 cross-checks that all **nine** manifests
 (root `Cargo.toml`, the rsac-ffi / rsac-napi / rsac-python `Cargo.toml`s, the
 napi `package.json`, the python `pyproject.toml`, and the Android native shim)
@@ -900,8 +905,9 @@ In the release-prepare flow the dispatched run covers the release-branch tree
 only, and `release-tag.yml` tags the squash-merge commit as soon as it lands,
 so that commit cannot be dispatched before its tag exists. Keep the release
 branch up to date with `master` when you dispatch and when you merge, so the
-merge commit's tree is the tree that was tested; if `master` advanced in
-between, update the branch and dispatch again before merging.
+merge commit's tree is the tree that was tested; if `master` advanced or the
+branch got another commit in between, update it and dispatch again before
+merging.
 The workflows live in `.github/workflows/` (`ci.yml`,
 `ci-audio-tests.yml`, and the platform-specific splits). Check the Actions
 tab — do not rely solely on local results, since Linux PipeWire, Windows
@@ -974,10 +980,10 @@ rewrites all nine lockstep manifests plus rotates the CHANGELOG:
 
 ```bash
 # Preview the edits without writing them:
-bash scripts/bump-version.sh 0.3.0 --dry-run    # or: mise run release:bump -- 0.3.0 --dry-run
+bash scripts/bump-version.sh 0.2.0 --dry-run    # or: mise run release:bump -- 0.2.0 --dry-run
 
 # Apply them:
-bash scripts/bump-version.sh 0.3.0              # or: mise run release:bump -- 0.3.0
+bash scripts/bump-version.sh 0.2.0              # or: mise run release:bump -- 0.2.0
 ```
 
 This rewrites, in one shot:
@@ -1000,8 +1006,9 @@ Commit (use a normal subject for a manual/major release; reserve the
 auto-tags any `release:` squash commit):
 
 ```bash
-git add -A
-git commit -m "chore: release 0.3.0"
+git add -A &&
+  git commit -m "chore: release 0.2.0" &&
+  BUMP_SHA="$(git rev-parse HEAD)"   # the commit CI must test and §4 tags
 ```
 
 Push, then dispatch CI on the bump commit
@@ -1029,11 +1036,13 @@ Annotated tags only — do not use lightweight tags. The tag name is
 
 ```bash
 # The manual path has no automatic pre-tag check: run it yourself, on a clean
-# tree (the check reads files on disk, not the commit being tagged). `&&`
-# stops the paste before `git tag` if anything fails.
-git diff --quiet && git diff --cached --quiet &&
+# tree at the bump commit CI tested ($BUMP_SHA from §3; the check reads files
+# on disk, not the commit being tagged). `&&` stops the paste before `git tag`
+# if anything fails, and the tag names that commit explicitly.
+[ "$(git rev-parse HEAD)" = "$BUMP_SHA" ] &&
+  git diff --quiet && git diff --cached --quiet &&
   bash scripts/check-version-lockstep.sh --expect 0.2.0 &&
-  git tag -a v0.2.0 -m "rsac 0.2.0" &&
+  git tag -a v0.2.0 -m "rsac 0.2.0" "$BUMP_SHA" &&
   git push origin v0.2.0
 ```
 
