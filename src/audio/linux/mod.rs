@@ -14,7 +14,7 @@
 //! blocks on discovery while pumping audio. Resolution is **native-first**
 //! (H4 part 3 / `rsac-nat1`): it takes an in-process registry snapshot on a
 //! short-lived `PipeWireThread` and matches it, using the `pw-dump` subprocess
-//! only as a fallback when the native path cannot resolve.
+//! only if the snapshot completed without a match or the native thread could not start.
 //!
 //! - `SystemDefault` — attach a monitor stream to the default sink node
 //!   (no `TARGET_OBJECT`; `STREAM_CAPTURE_SINK` + `STREAM_MONITOR` route it).
@@ -92,10 +92,9 @@ pub struct LinuxApplicationInfo {
 /// `core` crate reaches application discovery through the `crate::audio` facade
 /// (the module DAG is preserved — `core` never depends on `audio` internals).
 ///
-/// Returns an error if the PipeWire thread cannot be spawned or the snapshot
-/// roundtrip fails; the caller may then fall back to the subprocess path. An
-/// empty-but-successful snapshot returns `Ok(vec![])` (no apps are currently
-/// producing audio).
+/// Returns an error if the PipeWire thread cannot start or the snapshot
+/// roundtrip fails or times out. `Ok(vec![])` means the completed snapshot
+/// contained no audio-producing applications.
 #[cfg(feature = "feat_linux")]
 pub fn enumerate_audio_applications() -> crate::core::error::Result<Vec<LinuxApplicationInfo>> {
     use crate::audio::linux::thread::PipeWireThread;
@@ -117,8 +116,8 @@ pub fn enumerate_audio_applications() -> crate::core::error::Result<Vec<LinuxApp
 /// implementation for Linux.
 ///
 /// Enumerates audio nodes via the native in-process PipeWire registry, falling
-/// back to the `pw-cli`/`pw-dump` subprocess tools when the native path fails
-/// (see [`DeviceEnumerator::enumerate_devices`](crate::core::interface::DeviceEnumerator::enumerate_devices)
+/// back to the `pw-cli`/`pw-dump` subprocess tools when the native thread
+/// cannot start (see [`DeviceEnumerator::enumerate_devices`](crate::core::interface::DeviceEnumerator::enumerate_devices)
 /// on this type). Obtain one through
 /// [`get_device_enumerator`](crate::audio::get_device_enumerator) rather than
 /// constructing it directly in cross-platform code.
@@ -161,6 +160,16 @@ impl LinuxDeviceEnumerator {
             }
         }
 
+        // The subprocess path has no completion signal: empty output cannot
+        // distinguish a missing tool or daemon from a machine with no nodes.
+        if devices.is_empty() {
+            return Err(crate::core::error::AudioError::BackendError {
+                backend: "PipeWire".into(),
+                operation: "enumerate_devices".into(),
+                message: "Failed to enumerate PipeWire audio nodes via pw-cli and pw-dump".into(),
+                context: None,
+            });
+        }
         Ok(devices)
     }
 
@@ -201,25 +210,6 @@ impl LinuxDeviceEnumerator {
         // Fallback: try to find any suitable device from our enumerated list
         let devices = self.get_pipewire_devices()?;
 
-        // If the enumerated list is empty, both `pw-cli list-objects` and
-        // `pw-dump` produced no audio nodes — almost certainly an enumeration
-        // failure (PipeWire not running, tools missing, permission issues,
-        // timeout) rather than "no audio devices on this machine." Surface it
-        // as a `BackendError` so callers can pattern-match for platform-
-        // specific recovery, matching the Windows/macOS error shape.
-        if devices.is_empty() {
-            return Err(crate::core::error::AudioError::BackendError {
-                backend: "PipeWire".into(),
-                operation: "get_default_device".into(),
-                message: format!(
-                    "Failed to enumerate PipeWire audio nodes via pw-cli and pw-dump \
-                     while resolving default device for {:?}; is PipeWire running?",
-                    kind
-                ),
-                context: None,
-            });
-        }
-
         match kind {
             crate::core::interface::DeviceKind::Input => {
                 if let Some(device) = devices.into_iter().find(|d| d.is_input) {
@@ -249,10 +239,8 @@ impl LinuxDeviceEnumerator {
     /// so it round-trips through [`CaptureTarget::Device`] without a second
     /// lookup.
     ///
-    /// Returns an error if the PipeWire thread cannot be spawned or the
-    /// snapshot roundtrip fails; the caller may then fall back to the
-    /// subprocess path. An empty-but-successful snapshot returns `Ok(vec![])`
-    /// (the caller decides how to treat "no devices").
+    /// `Ok(vec![])` means the registry roundtrip completed with no audio nodes.
+    /// An incomplete roundtrip returns a backend error, never a partial list.
     ///
     /// [`PipeWireThread`]: crate::audio::linux::thread::PipeWireThread
     /// [`PwDeviceSnapshot`]: crate::audio::linux::thread::PwDeviceSnapshot
@@ -290,11 +278,9 @@ impl LinuxDeviceEnumerator {
     /// `object.serial` (the metadata stores names, not ids — same contract as
     /// the old `pw-metadata` path).
     ///
-    /// Returns [`AudioError::DeviceNotFound`] only when the registry snapshot
-    /// is non-empty and holds no device of `kind`. An empty snapshot is
-    /// ambiguous and reports `BackendError` (see `no_native_default`). A
-    /// spawn/roundtrip error is propagated so the caller can fall back to the
-    /// subprocess path.
+    /// Returns [`AudioError::DeviceNotFound`] when the completed registry
+    /// snapshot has no device of `kind`, even if it has no nodes at all.
+    /// Incomplete registry or metadata roundtrips return a backend error.
     ///
     /// [`PipeWireThread`]: crate::audio::linux::thread::PipeWireThread
     /// [`AudioError::DeviceNotFound`]: crate::core::error::AudioError::DeviceNotFound
@@ -304,48 +290,10 @@ impl LinuxDeviceEnumerator {
         kind: crate::core::interface::DeviceKind,
     ) -> crate::core::error::Result<LinuxAudioDevice> {
         use crate::audio::linux::thread::PipeWireThread;
-        use crate::core::interface::DeviceKind;
 
         let pw_thread = PipeWireThread::spawn()?;
         let default = pw_thread.snapshot_default()?;
-        let snapshot = pw_thread.snapshot_devices()?;
-
-        // Map a snapshot node to a LinuxAudioDevice (id = round-trippable
-        // object.serial; kind from media.class).
-        let to_device = |d: &crate::audio::linux::thread::PwDeviceSnapshot| LinuxAudioDevice {
-            id: d.id.clone(),
-            name: d.name.clone(),
-            is_input: d.media_class.contains("Audio/Source"),
-            is_output: d.media_class.contains("Audio/Sink"),
-        };
-
-        // Prefer the metadata-named default, resolved against the snapshot so
-        // the returned id is a real, round-trippable object.serial. The
-        // `default` metadata keys on `node.name`, so match against the
-        // snapshot's verbatim `node_name` (also accept the display name / id
-        // for robustness across daemon versions).
-        let default_name = match kind {
-            DeviceKind::Output => default.sink_name.as_deref(),
-            DeviceKind::Input => default.source_name.as_deref(),
-        };
-        if let Some(name) = default_name {
-            if let Some(resolved) = snapshot
-                .iter()
-                .find(|d| d.node_name == name || d.name == name || d.id == name)
-            {
-                return Ok(to_device(resolved));
-            }
-        }
-
-        // No metadata default (or it didn't resolve): fall back to the first
-        // device of the requested kind.
-        let by_kind = snapshot.iter().find(|d| match kind {
-            DeviceKind::Input => d.media_class.contains("Audio/Source"),
-            DeviceKind::Output => d.media_class.contains("Audio/Sink"),
-        });
-        by_kind
-            .map(to_device)
-            .ok_or_else(|| no_native_default(kind, snapshot.is_empty()))
+        default_from_snapshot(kind, &default, pw_thread.snapshot_devices())
     }
 
     /// Parse pw-cli list-objects Node output
@@ -565,6 +513,9 @@ impl crate::core::interface::AudioDevice for LinuxAudioDevice {
         false
     }
 
+    /// Advisory discovery: an incomplete PipeWire roundtrip is logged at debug
+    /// level and yields no format hints. This infallible query does not
+    /// determine the format negotiated when the stream connects.
     fn supported_formats(&self) -> Vec<crate::core::config::AudioFormat> {
         // ADVISORY DISCOVERY ONLY (audit finding L2 / EF-3, PR-5 / rsac-7469).
         //
@@ -707,55 +658,24 @@ impl crate::core::interface::AudioDevice for LinuxAudioDevice {
 
 // Implement DeviceEnumerator trait
 impl crate::core::interface::DeviceEnumerator for LinuxDeviceEnumerator {
+    /// A completed native snapshot with no audio nodes returns `Ok(vec![])`.
+    /// A failed or timed-out roundtrip returns `AudioError::BackendError`.
     fn enumerate_devices(
         &self,
     ) -> crate::core::error::Result<Vec<Box<dyn crate::core::interface::AudioDevice>>> {
-        // Prefer the native in-process registry path (H4 / rsac-bfd8): no
-        // `pw-cli`/`pw-dump` subprocess. The subprocess path is kept as a
-        // fallback until the native path is proven on headless/Flatpak setups
-        // — e.g. `pw-dump` removed from PATH must still yield devices natively.
         #[cfg(feature = "feat_linux")]
         let pw_devices = match self.get_pipewire_devices_native() {
-            // A non-empty native snapshot is authoritative.
-            Ok(devices) if !devices.is_empty() => devices,
-            // Native produced nothing (or failed): try the subprocess path so a
-            // misconfiguration in one path can't mask a working other path.
-            // L4 honest-failure: if BOTH are empty we still surface BackendError
-            // below rather than fabricating a default.
-            native_result => {
-                if let Err(ref e) = native_result {
-                    log::debug!(
-                        "PipeWire: native enumerate failed ({}); trying subprocess fallback",
-                        e
-                    );
-                }
-                self.get_pipewire_devices().unwrap_or_default()
+            Err(e @ crate::core::error::AudioError::BackendInitializationFailed { .. }) => {
+                log::debug!("PipeWire native enumeration unavailable ({e}); trying subprocess");
+                self.get_pipewire_devices()
             }
-        };
+            snapshot => snapshot,
+        }?;
 
         #[cfg(not(feature = "feat_linux"))]
         // Without the PipeWire bindings there is no native path; use the
         // subprocess tools directly. Propagate any error to the caller.
         let pw_devices = self.get_pipewire_devices()?;
-
-        // An empty result means the native in-process registry (and, as a
-        // fallback, `pw-cli`/`pw-dump`) produced no audio nodes — almost
-        // certainly "PipeWire unavailable" (daemon down, tools missing,
-        // permission/timeout) rather than a machine with zero audio devices.
-        // Surface it as a `BackendError` instead of fabricating a synthetic
-        // "default" device with an invalid `TARGET_OBJECT` (audit finding L4) —
-        // this matches the Windows/macOS error shape so callers get a
-        // consistent, honest signal.
-        if pw_devices.is_empty() {
-            return Err(crate::core::error::AudioError::BackendError {
-                backend: "PipeWire".into(),
-                operation: "enumerate_devices".into(),
-                message: "Failed to enumerate PipeWire audio nodes via the native registry \
-                          (and the pw-cli/pw-dump fallback); is PipeWire running?"
-                    .into(),
-                context: None,
-            });
-        }
 
         let mut devices: Vec<Box<dyn crate::core::interface::AudioDevice>> =
             Vec::with_capacity(pw_devices.len());
@@ -766,40 +686,24 @@ impl crate::core::interface::DeviceEnumerator for LinuxDeviceEnumerator {
         Ok(devices)
     }
 
+    /// Returns the default output device. If a completed native snapshot has
+    /// no output device, returns `AudioError::DeviceNotFound`. An incomplete
+    /// roundtrip returns `AudioError::BackendError`; partial nodes are not used.
     fn default_device(
         &self,
     ) -> crate::core::error::Result<Box<dyn crate::core::interface::AudioDevice>> {
-        // Resolve the actual default output device from PipeWire (output is the
-        // relevant side for loopback capture).
-        //
-        // Prefer the native registry + `default` metadata path (H4 /
-        // rsac-bfd8): no `pw-metadata`/`pw-dump` subprocess. Fall back to the
-        // subprocess path until the native one is proven on headless/Flatpak.
-        // Both paths honour L4 honest-failure: a missing default surfaces as
-        // `DeviceNotFound`/`BackendError`, never a fabricated synthetic default.
         let kind = crate::core::interface::DeviceKind::Output;
 
         #[cfg(feature = "feat_linux")]
-        let native_absence = match self.get_pipewire_default_device_native(kind) {
-            Ok(device) => return Ok(Box::new(device)),
-            Err(e) => {
-                log::debug!(
-                    "PipeWire: native default_device failed ({}); trying subprocess fallback",
-                    e
-                );
-                // Fall through to the subprocess path below, keeping a
-                // confirmed absence (see `prefer_confirmed_absence`).
-                match e {
-                    crate::core::error::AudioError::DeviceNotFound { .. } => Some(e),
-                    _ => None,
-                }
+        let device = match self.get_pipewire_default_device_native(kind) {
+            Err(e @ crate::core::error::AudioError::BackendInitializationFailed { .. }) => {
+                log::debug!("PipeWire native default lookup unavailable ({e}); trying subprocess");
+                self.get_pipewire_default_device(kind)
             }
-        };
+            result => result,
+        }?;
         #[cfg(not(feature = "feat_linux"))]
-        let native_absence: Option<crate::core::error::AudioError> = None;
-
-        let device =
-            prefer_confirmed_absence(self.get_pipewire_default_device(kind), native_absence)?;
+        let device = self.get_pipewire_default_device(kind)?;
         Ok(Box::new(device))
     }
 
@@ -834,62 +738,44 @@ impl crate::core::interface::DeviceEnumerator for LinuxDeviceEnumerator {
     }
 }
 
-/// The native lookup's error when its registry snapshot holds no device of
-/// `kind`: `DeviceNotFound` when the snapshot lists audio nodes, else the same
-/// `BackendError` as an unreachable PipeWire.
-///
-/// Occupancy stands in for a completion signal the snapshot roundtrip does not
-/// report yet (GitHub issue #102), so two known limits remain until it does:
-///
-/// - when the last audio node disappears while PipeWire stays reachable, the
-///   registry is genuinely empty and still reads as `BackendError`, so
-///   auto-recovery spends its retry budget instead of waiting for the device;
-/// - a registry that filled only partially before a failed sync can list other
-///   nodes without the sink, and so reads as a confirmed absence: recovery
-///   waits for a device instead of retrying.
+/// Prefer the metadata-named node, otherwise the first node of the same kind.
+/// Only a completed snapshot can establish that a device is absent.
 #[cfg(feature = "feat_linux")]
-fn no_native_default(
+fn default_from_snapshot(
     kind: crate::core::interface::DeviceKind,
-    registry_is_empty: bool,
-) -> crate::core::error::AudioError {
-    if registry_is_empty {
-        crate::core::error::AudioError::BackendError {
-            backend: "PipeWire".into(),
-            operation: "get_default_device".into(),
-            message: format!(
-                "the native PipeWire registry listed no audio nodes while resolving the \
-                 default device for {kind:?}; is PipeWire running?"
-            ),
-            context: None,
-        }
-    } else {
-        crate::core::error::AudioError::DeviceNotFound {
-            device_id: format!("default_{kind:?}"),
-        }
-    }
-}
+    default: &thread::PwDefaultSnapshot,
+    snapshot: crate::core::error::AudioResult<Vec<thread::PwDeviceSnapshot>>,
+) -> crate::core::error::AudioResult<LinuxAudioDevice> {
+    use crate::core::interface::DeviceKind;
 
-/// `default_device()`'s answer once the native lookup has failed: the
-/// subprocess fallback's result, except that the fallback's "enumerated
-/// nothing" `BackendError` gives way to a `DeviceNotFound` the native registry
-/// already confirmed (`native_absence`). The native lookup confirms absence
-/// only when its registry snapshot listed audio nodes but none of the
-/// requested kind (`no_native_default`), so the absence stays
-/// distinguishable from an unreachable PipeWire: auto-recovery waits for a
-/// device on the former and spends its retry budget on the latter. An empty
-/// native snapshot confirms nothing, so with a fallback that also enumerates
-/// nothing the answer stays `BackendError` and still spends the budget — even
-/// when the last device was really removed. That limit, and a partially
-/// filled registry reading as a confirmed absence, wait on the snapshot
-/// roundtrip reporting completion (GitHub issue #102).
-fn prefer_confirmed_absence<T>(
-    fallback: crate::core::error::Result<T>,
-    native_absence: Option<crate::core::error::AudioError>,
-) -> crate::core::error::Result<T> {
-    match (fallback, native_absence) {
-        (Err(crate::core::error::AudioError::BackendError { .. }), Some(absent)) => Err(absent),
-        (fallback, _) => fallback,
+    let (class, default_name) = match kind {
+        DeviceKind::Input => ("Audio/Source", default.source_name.as_deref()),
+        DeviceKind::Output => ("Audio/Sink", default.sink_name.as_deref()),
+    };
+    let mut selected = None;
+    for node in snapshot? {
+        if !node.media_class.contains(class) {
+            continue;
+        }
+        if default_name
+            .is_none_or(|name| node.node_name == name || node.name == name || node.id == name)
+        {
+            selected = Some(node);
+            break;
+        }
+        if selected.is_none() {
+            selected = Some(node);
+        }
     }
+    let node = selected.ok_or_else(|| crate::core::error::AudioError::DeviceNotFound {
+        device_id: format!("default_{kind:?}"),
+    })?;
+    Ok(LinuxAudioDevice {
+        id: node.id,
+        name: node.name,
+        is_input: node.media_class.contains("Audio/Source"),
+        is_output: node.media_class.contains("Audio/Sink"),
+    })
 }
 
 // ── Tests ────────────────────────────────────────────────────────────────
@@ -1021,10 +907,6 @@ mod tests {
         // fabricated "default" device or a panic.
         match result {
             Ok(devices) => {
-                assert!(
-                    !devices.is_empty(),
-                    "Ok must mean real devices, never an empty/fabricated list"
-                );
                 for device in &devices {
                     assert!(!device.name().is_empty());
                     assert_ne!(
@@ -1069,66 +951,96 @@ mod tests {
         }
     }
 
+    #[cfg(feature = "feat_linux")]
     #[test]
-    fn a_confirmed_absence_survives_a_subprocess_fallback_that_enumerates_nothing() {
-        use crate::core::error::AudioError;
+    fn completed_empty_snapshot_has_no_default() {
+        use crate::core::{error::AudioError, interface::DeviceKind};
 
-        let enumerated_nothing = || AudioError::BackendError {
-            backend: "PipeWire".into(),
-            operation: "get_default_device".into(),
-            message: "no audio nodes".into(),
-            context: None,
-        };
-        let no_sink = || AudioError::DeviceNotFound {
-            device_id: "default_Output".into(),
-        };
-
-        // The native registry listed audio nodes but no sink: still "no
-        // device", so auto-recovery waits for one instead of spending budget.
-        assert!(matches!(
-            prefer_confirmed_absence::<()>(Err(enumerated_nothing()), Some(no_sink())),
-            Err(AudioError::DeviceNotFound { .. })
-        ));
-        // Without that confirmation, enumerating nothing stays a backend error.
-        assert!(matches!(
-            prefer_confirmed_absence::<()>(Err(enumerated_nothing()), None),
-            Err(AudioError::BackendError { .. })
-        ));
-        // The fallback's own answers are kept otherwise.
-        assert!(matches!(
-            prefer_confirmed_absence(Ok(7_u8), Some(no_sink())),
-            Ok(7)
-        ));
-        assert!(matches!(
-            prefer_confirmed_absence::<()>(Err(no_sink()), None),
-            Err(AudioError::DeviceNotFound { .. })
-        ));
+        for kind in [DeviceKind::Input, DeviceKind::Output] {
+            assert!(matches!(
+                default_from_snapshot(kind, &Default::default(), Ok(vec![])),
+                Err(AudioError::DeviceNotFound { device_id }) if device_id == format!("default_{kind:?}")
+            ));
+        }
     }
 
     #[cfg(feature = "feat_linux")]
     #[test]
-    fn only_a_non_empty_native_registry_confirms_an_absent_default() {
-        use crate::core::error::AudioError;
+    fn completed_snapshot_with_only_the_other_kind_has_no_default() {
+        use crate::core::{error::AudioError, interface::DeviceKind};
+
+        for (kind, other_class) in [
+            (DeviceKind::Input, "Audio/Sink"),
+            (DeviceKind::Output, "Audio/Source"),
+        ] {
+            let other = thread::PwDeviceSnapshot {
+                id: "42".into(),
+                name: "Other device".into(),
+                node_name: "other".into(),
+                media_class: other_class.into(),
+            };
+            // Even stale default metadata pointing at this node cannot change its kind.
+            let default = thread::PwDefaultSnapshot {
+                sink_name: Some("other".into()),
+                source_name: Some("other".into()),
+            };
+            assert!(matches!(
+                default_from_snapshot(kind, &default, Ok(vec![other])),
+                Err(AudioError::DeviceNotFound { device_id }) if device_id == format!("default_{kind:?}")
+            ));
+        }
+    }
+
+    #[cfg(feature = "feat_linux")]
+    #[test]
+    fn completed_snapshot_prefers_the_named_device_then_the_first_of_its_kind() {
         use crate::core::interface::DeviceKind;
 
-        // Nodes listed, none of the kind: a confirmed absence, which survives
-        // a fallback that enumerates nothing.
-        assert!(matches!(
-            no_native_default(DeviceKind::Output, false),
-            AudioError::DeviceNotFound { .. }
-        ));
-        // No nodes at all is ambiguous: reported like an unreachable PipeWire.
-        // `default_device()` keeps only a `DeviceNotFound` from the native
-        // lookup, so this case passes no confirmation on and, with a fallback
-        // that enumerates nothing, still spends the retry budget.
-        match no_native_default(DeviceKind::Output, true) {
-            AudioError::BackendError { backend, .. } => assert_eq!(backend, "PipeWire"),
-            other => panic!("expected BackendError, got {other:?}"),
+        let snapshot = || {
+            ["first", "second"]
+                .into_iter()
+                .map(|name| thread::PwDeviceSnapshot {
+                    id: name.into(),
+                    name: name.into(),
+                    node_name: name.into(),
+                    media_class: "Audio/Sink".into(),
+                })
+                .collect()
+        };
+        for (sink_name, expected) in [
+            (Some("second"), "second"),
+            (Some("gone"), "first"),
+            (None, "first"),
+        ] {
+            let default = thread::PwDefaultSnapshot {
+                sink_name: sink_name.map(String::from),
+                source_name: None,
+            };
+            let device =
+                default_from_snapshot(DeviceKind::Output, &default, Ok(snapshot())).unwrap();
+            assert_eq!(device.id, expected);
         }
-        assert!(matches!(
-            prefer_confirmed_absence::<()>(Err(no_native_default(DeviceKind::Output, true)), None),
-            Err(AudioError::BackendError { .. })
-        ));
+    }
+
+    #[cfg(feature = "feat_linux")]
+    #[test]
+    fn incomplete_snapshot_preserves_the_backend_error_for_each_kind() {
+        use crate::core::{error::AudioError, interface::DeviceKind};
+
+        for kind in [DeviceKind::Input, DeviceKind::Output] {
+            for op in ["core.sync", "core.done"] {
+                let error = AudioError::BackendError {
+                    backend: "PipeWire".into(),
+                    operation: op.into(),
+                    message: "incomplete roundtrip".into(),
+                    context: None,
+                };
+                assert!(matches!(
+                    default_from_snapshot(kind, &Default::default(), Err(error)),
+                    Err(AudioError::BackendError { operation, .. }) if operation == op
+                ));
+            }
+        }
     }
 
     // ── pw-cli parser Unit Tests ────────────────────────────────────
@@ -1536,8 +1448,7 @@ mod pipewire_integration_tests {
     fn test_native_enumerate_devices_no_pw_dump_subprocess() {
         // Acceptance: with PipeWire running the native path returns audio nodes
         // with NO subprocess. We can't strip PATH from inside the test, but we
-        // can prove the native path alone yields devices (the enumerate path
-        // prefers it and only falls back on empty/err).
+        // can exercise the native path directly without relying on installed tools.
         if !pipewire_thread_spawnable() {
             eprintln!("Skipping test_native_enumerate_devices_no_pw_dump_subprocess: PipeWire bindings cannot connect");
             return;
@@ -1648,8 +1559,7 @@ mod pipewire_integration_tests {
                 );
             }
             Err(crate::core::error::AudioError::DeviceNotFound { .. })
-            | Err(crate::core::error::AudioError::BackendError { .. })
-            | Err(crate::core::error::AudioError::Timeout { .. }) => {
+            | Err(crate::core::error::AudioError::BackendError { .. }) => {
                 // Honest failure when no output node / wedged daemon — fine.
             }
             Err(e) => panic!("Unexpected error from native default_device: {:?}", e),
@@ -1681,7 +1591,7 @@ mod pipewire_integration_tests {
 
         if !watch_spawnable() {
             // No reachable daemon: watch() must surface a bounded init failure
-            // (BackendInitializationFailed / Timeout), never hang or panic.
+            // or an incomplete roundtrip, never hang or panic.
             match enumerator.watch(Box::new(|_ev| {})) {
                 Ok(_watcher) => {
                     // Unexpectedly spawnable after all — fine; dropping here
@@ -1691,6 +1601,9 @@ mod pipewire_integration_tests {
                     backend,
                     ..
                 }) => {
+                    assert_eq!(backend, "PipeWire");
+                }
+                Err(crate::core::error::AudioError::BackendError { backend, .. }) => {
                     assert_eq!(backend, "PipeWire");
                 }
                 Err(crate::core::error::AudioError::Timeout { .. }) => {}
