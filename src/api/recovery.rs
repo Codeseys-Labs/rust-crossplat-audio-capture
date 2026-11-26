@@ -74,12 +74,18 @@
 //! across generations that die before delivering — is added when a replacement
 //! is installed.
 //!
-//! An absent-device wait's deadline also bounds a probe still in flight. A
-//! probe completes when the helper publishes its result, timestamped under the
+//! An absent-device wait re-probes on device events and every `max_backoff`.
+//! If the supervisor is waiting rather than probing when the deadline passes,
+//! it runs one final probe without a wait deadline. Finding a device recovers
+//! as usual; finding none ends the wait without spending retry budget.
+//! A probe started before the deadline is still bounded by it. A probe
+//! completes when the helper publishes its result, timestamped under the
 //! result mailbox's lock (its format screen runs before that, any cleanup
 //! after): a result published before the deadline is applied even when
-//! collected later, and one published after it — or none at all by the
-//! deadline — ends the wait. The retry budget is restored only once a read
+//! collected later, and one published at or after it — or none at all by the
+//! deadline — ends the wait.
+//!
+//! The retry budget is restored only once a read
 //! finds a generation still running `stable_period` after it was installed
 //! (adopted from the helper by a poll; generation 0 when the session opened) —
 //! a loss a reader notices late, or the tail a stopped generation still
@@ -91,10 +97,19 @@
 //! reader installed), or a stop restarts that clock, and once a stop is
 //! requested a read ends instead of timing out.
 //!
-//! Default-device changes proactively retire a running stream on Windows and
-//! macOS only; on Linux the session manager (WirePlumber) re-routes
-//! `SystemDefault` natively, so a default change merely wakes an absent-device
-//! wait and recovery otherwise reacts to stream invalidation.
+//! # Platforms and the device-change watcher
+//!
+//! In 0.5.0 auto-recovery runs on Windows and Linux. It is refused at
+//! preflight on macOS, Android, and iOS (see [`check_auto_recovery`]).
+//!
+//! Windows proactively reopens a running stream on a default-device change.
+//! The watcher is the only trigger while the old endpoint keeps working, so
+//! a failed registration fails `start()` before it opens a stream. On Linux
+//! the session manager (WirePlumber) re-routes `SystemDefault` natively. A
+//! default change merely wakes an absent-device wait, and a failed registration
+//! logs a warning but does not prevent startup. If the backend does not support
+//! notifications, capture starts without a watcher and still recovers from
+//! stream invalidation (see [`watch_default_device`]).
 
 use crate::audio::get_device_enumerator;
 use crate::bridge::calculate_capacity;
@@ -144,7 +159,8 @@ const READ_TIMEOUT: Duration = Duration::from_secs(1);
 /// Whether an output default-device change proactively retires a running
 /// stream. Windows and macOS keep `SystemDefault` bound to the old endpoint, so
 /// they must reopen; on Linux the session manager re-routes natively and a
-/// reopen would only cost an outage and a generation change.
+/// reopen would only cost an outage and a generation change. It also decides
+/// what a failed watcher registration means (see [`watch_default_device`]).
 const PROACTIVE_DEFAULT_SWITCH: bool = cfg!(not(target_os = "linux"));
 
 /// Opens a replacement backend stream on the device recovery follows.
@@ -202,20 +218,43 @@ fn is_non_retryable(error: &AudioError) -> bool {
 
 // ── Builder preflight ────────────────────────────────────────────────────
 
-/// Rejects auto-recovery on mobile: their capture paths are consent-gated and
-/// have no replug semantics the supervisor could follow.
-#[cfg(any(target_os = "android", target_os = "ios"))]
-pub(super) fn preflight_auto_recovery(_target: &CaptureTarget) -> AudioResult<()> {
-    Err(AudioError::PlatformNotSupported {
-        feature: "capture auto-recovery (hotplug-recovery)".to_string(),
-        platform: std::env::consts::OS.to_string(),
-    })
+/// The `feature` of the [`AudioError::PlatformNotSupported`] that refuses
+/// auto-recovery on macOS in 0.5.0 (see [`check_auto_recovery`]).
+const MACOS_WITHHELD: &str =
+    "capture auto-recovery (hotplug-recovery): not yet verified on macOS; see ADR-0021";
+
+/// Auto-recovery's builder preflight on the platform this build targets.
+pub(super) fn preflight_auto_recovery(target: &CaptureTarget) -> AudioResult<()> {
+    check_auto_recovery(std::env::consts::OS, target)
 }
 
-/// Accepts only [`CaptureTarget::SystemDefault`]: following any other target
-/// across a replug needs a stable replug key the backends do not provide yet.
-#[cfg(not(any(target_os = "android", target_os = "ios")))]
-pub(super) fn preflight_auto_recovery(target: &CaptureTarget) -> AudioResult<()> {
+/// Whether auto-recovery may supervise `target` on `platform`, a
+/// [`std::env::consts::OS`] value. It takes the platform as an argument so
+/// every platform's outcome is tested on any host.
+///
+/// - Android and iOS are refused for every target: their capture paths are
+///   consent-gated and have no replug semantics the supervisor could follow.
+/// - macOS is refused for every target in 0.5.0. Its recovery path has never
+///   been observed on hardware, and it has a known selector mismatch: the
+///   watcher follows the default-output device while `SystemDefault` capture
+///   binds the system-output device (issue #107). The feature has never been
+///   released, so refusing it breaks nobody; it is enabled again together
+///   with that fix and an attended run (ADR-0021).
+/// - Elsewhere only [`CaptureTarget::SystemDefault`] is accepted: following
+///   any other target across a replug needs a stable replug key the backends
+///   do not provide yet.
+fn check_auto_recovery(platform: &str, target: &CaptureTarget) -> AudioResult<()> {
+    let withheld = match platform {
+        "android" | "ios" => Some("capture auto-recovery (hotplug-recovery)"),
+        "macos" => Some(MACOS_WITHHELD),
+        _ => None,
+    };
+    if let Some(feature) = withheld {
+        return Err(AudioError::PlatformNotSupported {
+            feature: feature.to_string(),
+            platform: platform.to_string(),
+        });
+    }
     match target {
         CaptureTarget::SystemDefault => Ok(()),
         other => Err(AudioError::ConfigurationError {
@@ -230,7 +269,7 @@ pub(super) fn preflight_auto_recovery(target: &CaptureTarget) -> AudioResult<()>
 
 // ── Wiring ───────────────────────────────────────────────────────────────
 
-/// Starts a supervised capture for `AudioCapture::start()`: arms the
+/// Starts a supervised capture for `AudioCapture::start()`: registers the
 /// device-change watcher, then opens generation zero through the same factory
 /// every replacement uses — on the default device current now, not the one
 /// `build()` resolved — and supervises it under `hub`'s policy.
@@ -238,24 +277,41 @@ pub(super) fn preflight_auto_recovery(target: &CaptureTarget) -> AudioResult<()>
 /// Because the watcher is armed first, a default change before the open is
 /// reflected in it, and one after is recorded in the trigger and handled by
 /// the first poll (at worst a redundant switch to the device generation zero
-/// already bound). Returns the factory's error when nothing can be opened.
+/// already bound). Returns the registration's error where a failed
+/// registration fails the start (see [`watch_default_device`]): then nothing
+/// is opened and no session begins. Returns the factory's error when nothing
+/// can be opened.
 pub(super) fn start_supervised(
     stream_config: &StreamConfig,
     hub: &Arc<RecoveryHub>,
 ) -> AudioResult<Box<dyn CapturingStream>> {
-    let trigger = Arc::new(RecoveryTrigger::default());
-    let watcher = watch_default_device(&trigger);
     // Every generation's ring holds at most this many buffers: the backends
     // size it with this same computation.
     let ring_slots = calculate_capacity(stream_config.buffer_size, RING_MIN_SLOTS);
-    let stream = RecoveryStream::open(
+    let stream = start_supervised_with(
         default_device_factory(stream_config.clone()),
-        trigger,
-        watcher,
-        Arc::clone(hub),
+        register_device_watcher,
+        PROACTIVE_DEFAULT_SWITCH,
+        hub,
         ring_slots,
     )?;
     Ok(Box::new(stream))
+}
+
+/// [`start_supervised`] over an injected stream `factory` and watcher
+/// registration `register`, on a platform whose default-device changes are
+/// `proactive` switches or not.
+fn start_supervised_with(
+    factory: StreamFactory,
+    register: impl FnOnce(DeviceEventHandler) -> AudioResult<DeviceWatcher>,
+    proactive: bool,
+    hub: &Arc<RecoveryHub>,
+    ring_slots: usize,
+) -> AudioResult<RecoveryStream> {
+    let trigger = Arc::new(RecoveryTrigger::new(proactive));
+    // A registration that fails the start does so here, before the open.
+    let watcher = watch_default_device(&trigger, proactive, register)?;
+    RecoveryStream::open(factory, trigger, watcher, Arc::clone(hub), ring_slots)
 }
 
 /// Opens a stream on whatever the system default device is when called.
@@ -267,23 +323,54 @@ fn default_device_factory(config: StreamConfig) -> StreamFactory {
     })
 }
 
-/// Subscribes `trigger` to device-change notifications. Without them (the
-/// backend returns `PlatformNotSupported`) recovery still reacts to stream
-/// invalidation, just not proactively to default-device changes.
-fn watch_default_device(trigger: &Arc<RecoveryTrigger>) -> Option<DeviceWatcher> {
+/// Subscribes `trigger` to device-change notifications through `register`,
+/// before any stream is opened. A failed registration means, by its error and
+/// by whether default changes are `proactive` switches:
+///
+/// - `PlatformNotSupported`: the backend has no notifications at all. The
+///   capture runs without a watcher and still recovers from stream
+///   invalidation, just not proactively from default-device changes.
+/// - Any other error, `proactive` (Windows, macOS): the watcher is the only
+///   trigger for a default switch, since the old endpoint keeps working, so a
+///   capture without one would look healthy and silently stop following the
+///   default. The error is returned, failing the start.
+/// - Any other error, not `proactive` (Linux): the session manager follows the
+///   default natively, so the capture runs without a watcher, and the failure
+///   is logged once as a warning.
+///
+/// No supervisor exists yet, so nothing here logs under its lock.
+fn watch_default_device(
+    trigger: &Arc<RecoveryTrigger>,
+    proactive: bool,
+    register: impl FnOnce(DeviceEventHandler) -> AudioResult<DeviceWatcher>,
+) -> AudioResult<Option<DeviceWatcher>> {
     let handler_trigger = Arc::clone(trigger);
     let handler: DeviceEventHandler =
         Box::new(move |event: DeviceEvent| handler_trigger.on_device_event(&event));
-    match get_device_enumerator().and_then(|enumerator| enumerator.watch(handler)) {
-        Ok(watcher) => Some(watcher),
-        Err(e) => {
+    match register(handler) {
+        Ok(watcher) => Ok(Some(watcher)),
+        Err(e @ AudioError::PlatformNotSupported { .. }) => {
             log::info!(
                 "auto-recovery: device-change notifications unavailable ({e}); \
                  recovering from stream invalidation only"
             );
-            None
+            Ok(None)
+        }
+        Err(e) if proactive => Err(e),
+        Err(e) => {
+            log::warn!(
+                "auto-recovery: device-change registration failed ({e}); the session \
+                 manager follows the default device natively, and recovery reacts to \
+                 stream invalidation only"
+            );
+            Ok(None)
         }
     }
+}
+
+/// Registers `handler` with the platform's device enumerator.
+fn register_device_watcher(handler: DeviceEventHandler) -> AudioResult<DeviceWatcher> {
+    get_device_enumerator()?.watch(handler)
 }
 
 // ── Hub: policy, events, snapshot ────────────────────────────────────────
@@ -839,6 +926,7 @@ enum Phase {
     /// Waiting out the backoff before the next reopen attempt.
     Backoff { until: Instant },
     /// No device is present; waiting for one without spending the budget.
+    /// Once `deadline` passes, one final probe decides whether the wait ends.
     WaitingForDevice {
         deadline: Instant,
         next_probe: Instant,
@@ -846,16 +934,37 @@ enum Phase {
     /// One reopen is in flight on the helper thread. Polls return `Ok(None)`
     /// until its result is collected.
     Reopening {
-        /// The device-wait deadline this probe belongs to, when it is one. It
-        /// keeps running while the probe is in flight; an ordinary reopen has
-        /// no deadline.
-        wait_deadline: Option<Instant>,
+        /// The absent-device wait this reopen probes for, when it is a probe;
+        /// an ordinary reopen has none.
+        probe: Option<Probe>,
         /// A proactive reopen: free when it succeeds, charged to the retry
         /// budget when it fails.
         uncharged: bool,
     },
     /// Recovery gave up; every read returns `StreamEnded { reason }`.
     Exhausted { reason: String },
+}
+
+/// The absent-device wait a reopen probes for (see [`Phase::Reopening`]).
+#[derive(Clone, Copy)]
+enum Probe {
+    /// A probe while the wait runs. Its `deadline` keeps running while the
+    /// probe is in flight and bounds it: a result published after it, or none
+    /// at all by then, ends the wait.
+    Waiting { deadline: Instant },
+    /// The last probe when the deadline passes with no probe in flight. This
+    /// probe is not subject to the wait deadline; finding no device ends the wait.
+    Final,
+}
+
+impl Probe {
+    /// The deadline bounding this probe while it is in flight, if any.
+    fn deadline(self) -> Option<Instant> {
+        match self {
+            Self::Waiting { deadline } => Some(deadline),
+            Self::Final => None,
+        }
+    }
 }
 
 /// Supervisor state, owned by whichever consumer thread is polling.
@@ -1303,33 +1412,32 @@ impl RecoveryStream {
                 } => {
                     let arrived = self.trigger.take_device_arrived();
                     let changed = self.trigger.take_default_changed();
-                    let next_probe = if arrived || changed {
-                        next_probe.min(deadline_after(now, settle))
-                    } else {
-                        next_probe
-                    };
-                    m.phase = Phase::WaitingForDevice {
-                        deadline,
-                        next_probe,
-                    };
-                    // Expiry wins over a due probe, so a zero `max_backoff` or a
-                    // late poll can never open a device past the wait.
                     if now >= deadline {
-                        self.give_up_waiting(m, journal);
-                        continue;
-                    }
-                    if now >= next_probe {
-                        self.start_reopen(m, Some(deadline), false);
+                        // One last lookup catches a device that returned
+                        // without an event, even if no timed probe was due.
+                        self.start_reopen(m, Some(Probe::Final), false);
+                    } else {
+                        let next_probe = if arrived || changed {
+                            next_probe.min(deadline_after(now, settle))
+                        } else {
+                            next_probe
+                        };
+                        if now >= next_probe {
+                            self.start_reopen(m, Some(Probe::Waiting { deadline }), false);
+                        } else {
+                            m.phase = Phase::WaitingForDevice {
+                                deadline,
+                                next_probe,
+                            };
+                        }
                     }
                     // One probe per poll: yield instead of spinning.
                     return Ok(None);
                 }
-                Phase::Reopening {
-                    wait_deadline,
-                    uncharged,
-                } => {
-                    // An absent-device wait's deadline keeps running while its
-                    // probe is in flight; an ordinary reopen has none.
+                Phase::Reopening { probe, uncharged } => {
+                    // A waiting probe's deadline keeps running while it is in
+                    // flight; an ordinary reopen and the final probe have none.
+                    let wait_deadline = probe.and_then(Probe::deadline);
                     let expired = wait_deadline.is_some_and(|deadline| now >= deadline);
                     match self.core.collect_reopen(expired) {
                         // Still in flight: never block the reader.
@@ -1353,14 +1461,7 @@ impl RecoveryStream {
                             continue;
                         }
                         Some(reopened) => {
-                            self.finish_reopen(
-                                m,
-                                reopened,
-                                wait_deadline,
-                                uncharged,
-                                doomed,
-                                journal,
-                            );
+                            self.finish_reopen(m, reopened, probe, uncharged, doomed, journal);
                             match m.phase {
                                 // Keep going: read the new stream, or surface the end.
                                 Phase::Running | Phase::Exhausted { .. } => continue,
@@ -1559,14 +1660,11 @@ impl RecoveryStream {
 
     /// Starts the single in-flight reopen on a helper thread and enters
     /// `Reopening`. Only ever called from a phase with no open in flight.
-    fn start_reopen(&self, m: &mut Machine, wait_deadline: Option<Instant>, uncharged: bool) {
+    fn start_reopen(&self, m: &mut Machine, probe: Option<Probe>, uncharged: bool) {
         // The open binds whatever the default is now, so a change noted before
         // it started needs no second switch; later ones are kept.
         self.trigger.take_default_changed();
-        m.phase = Phase::Reopening {
-            wait_deadline,
-            uncharged,
-        };
+        m.phase = Phase::Reopening { probe, uncharged };
         let core = Arc::clone(&self.core);
         let gate = m.gate;
         let clock = Arc::clone(&self.clock);
@@ -1588,7 +1686,7 @@ impl RecoveryStream {
         &self,
         m: &mut Machine,
         reopened: Reopened,
-        wait_deadline: Option<Instant>,
+        probe: Option<Probe>,
         uncharged: bool,
         doomed: &mut Doomed,
         journal: &mut Journal,
@@ -1603,14 +1701,22 @@ impl RecoveryStream {
                 self.exhaust(m, detail, FORMAT_CHANGED_REASON.to_string(), journal);
             }
             Outcome::Failed(AudioError::DeviceNotFound { device_id }) => {
+                let deadline = match probe {
+                    // The wait's final probe found no device either: the wait
+                    // is over.
+                    Some(Probe::Final) => {
+                        self.give_up_waiting(m, journal);
+                        return;
+                    }
+                    Some(Probe::Waiting { deadline }) => deadline,
+                    None => deadline_after(now, self.hub.config.device_wait_timeout),
+                };
                 // Nothing to open yet: wait for a device without spending
                 // budget, re-probing on device events and every `max_backoff`.
                 journal.record(
                     log::Level::Info,
                     format_args!("auto-recovery: no capture device present ({device_id}); waiting"),
                 );
-                let deadline = wait_deadline
-                    .unwrap_or_else(|| deadline_after(now, self.hub.config.device_wait_timeout));
                 m.phase = Phase::WaitingForDevice {
                     deadline,
                     next_probe: deadline_after(now, self.hub.config.max_backoff),
@@ -1673,7 +1779,9 @@ impl RecoveryStream {
         });
     }
 
-    /// Ends an absent-device wait whose deadline passed.
+    /// Ends an absent-device wait whose deadline passed: its final probe found
+    /// no device, or a probe still in flight at the deadline published nothing
+    /// in time.
     fn give_up_waiting(&self, m: &mut Machine, journal: &mut Journal) {
         let reason = format!(
             "auto-recovery gave up: no capture device appeared within {:?}",
@@ -3024,10 +3132,7 @@ mod tests {
             .with_max_backoff(Duration::from_secs(1))
             .with_device_wait_timeout(ms(30));
         let old = MockStream::new(stereo(RATE), vec![Step::End("device unplugged")]);
-        let absent = AudioError::DeviceNotFound {
-            device_id: "default_render".to_string(),
-        };
-        let opener = Opener::new(vec![Err(absent)]);
+        let opener = Opener::new(vec![Err(not_found()), Err(not_found())]);
         let h = Harness::new(policy, &old, opener.factory());
 
         let (buffers, err) = read_until_err(&h.stream);
@@ -3039,12 +3144,131 @@ mod tests {
             }
             other => panic!("expected StreamEnded, got {other:?}"),
         }
-        assert_eq!(opener.calls(), 1);
+        // In addition to the initial failed reopen, expiry now runs one last
+        // probe even though the next timed probe was not yet due.
+        assert_eq!(opener.calls(), 2);
         match h.events().as_slice() {
             [RecoveryEvent::DeviceInvalidated { .. }, RecoveryEvent::RetryScheduled { attempt: 1, .. }, RecoveryEvent::Exhausted { attempts: 1, .. }] =>
                 {}
             other => panic!("unexpected events: {other:?}"),
         }
+    }
+
+    /// Run a scripted reopen to completion at the poll's pinned time.
+    fn reopen_inline(attempt: Box<dyn FnOnce() + Send>) -> std::io::Result<()> {
+        attempt();
+        Ok(())
+    }
+
+    /// An absent-device wait whose next timed probe is after the deadline.
+    struct LongProbeInterval {
+        h: Harness,
+        clock: TestClock,
+        wait_started: Instant,
+        device_present: Arc<AtomicBool>,
+        calls: Arc<AtomicUsize>,
+    }
+
+    impl LongProbeInterval {
+        fn start() -> Self {
+            let policy = fast_policy()
+                .with_initial_backoff(Duration::ZERO)
+                .with_max_backoff(Duration::from_secs(30))
+                .with_device_wait_timeout(Duration::from_secs(5));
+            let old = MockStream::new(stereo(RATE), vec![Step::End("device unplugged")]);
+            let new = MockStream::new(stereo(RATE), vec![Step::Buffer(buffer(0))]);
+            let device_present = Arc::new(AtomicBool::new(false));
+            let calls = Arc::new(AtomicUsize::new(0));
+            let present = Arc::clone(&device_present);
+            let opens = Arc::clone(&calls);
+            let factory = Box::new(move || {
+                opens.fetch_add(1, Ordering::SeqCst);
+                if present.load(Ordering::SeqCst) {
+                    Ok(new.boxed())
+                } else {
+                    Err(not_found())
+                }
+            });
+            let clock = TestClock::default();
+            let wait_started = Instant::now();
+            clock.pin(wait_started);
+            let h = Harness::build(
+                policy,
+                &old,
+                factory,
+                RecoveryTrigger::default(),
+                |stream| {
+                    stream.clock = clock.source();
+                    stream.spawn_reopen = reopen_inline;
+                },
+            );
+
+            // The first reopen discovers the missing device and the next poll
+            // collects its result. Neither requires advancing the clock.
+            assert!(matches!(h.stream.try_read_chunk(), Ok(None)));
+            assert!(matches!(h.stream.try_read_chunk(), Ok(None)));
+            assert_eq!(calls.load(Ordering::SeqCst), 1);
+            assert!(with_machine(&h.stream, |m| matches!(
+                m.phase,
+                Phase::WaitingForDevice { .. }
+            )));
+            Self {
+                h,
+                clock,
+                wait_started,
+                device_present,
+                calls,
+            }
+        }
+
+        fn pin(&self, elapsed_secs: u64) {
+            self.clock
+                .pin(self.wait_started + Duration::from_secs(elapsed_secs));
+        }
+
+        fn calls(&self) -> usize {
+            self.calls.load(Ordering::SeqCst)
+        }
+    }
+
+    #[test]
+    fn the_final_probe_recovers_a_device_that_returned_without_an_event() {
+        let wait = LongProbeInterval::start();
+        wait.pin(4);
+        wait.device_present.store(true, Ordering::SeqCst);
+        assert!(matches!(wait.h.stream.try_read_chunk(), Ok(None)));
+        assert_eq!(wait.calls(), 1, "no probe before the deadline");
+
+        wait.pin(5);
+        assert!(matches!(wait.h.stream.try_read_chunk(), Ok(None)));
+        assert_eq!(wait.calls(), 2, "one final probe at the deadline");
+        let recovered = wait.h.stream.try_read_chunk().unwrap().unwrap();
+        assert_eq!(recovered.stream_generation(), 1);
+        let snapshot = wait.h.hub.snapshot();
+        assert_eq!(snapshot.state, RecoveryState::Running);
+        assert_eq!((snapshot.attempt, snapshot.successful_recoveries), (1, 1));
+    }
+
+    #[test]
+    fn a_device_still_absent_after_the_final_probe_exhausts_the_wait() {
+        let wait = LongProbeInterval::start();
+        wait.pin(4);
+        assert!(matches!(wait.h.stream.try_read_chunk(), Ok(None)));
+        assert_eq!(wait.calls(), 1, "no probe before the deadline");
+
+        wait.pin(5);
+        assert!(matches!(wait.h.stream.try_read_chunk(), Ok(None)));
+        assert_eq!(wait.calls(), 2, "one final probe at the deadline");
+        for _ in 0..2 {
+            assert!(matches!(
+                wait.h.stream.try_read_chunk(),
+                Err(AudioError::StreamEnded { reason }) if reason.contains("no capture device appeared")
+            ));
+        }
+        assert_eq!(wait.calls(), 2, "an exhausted wait cannot probe again");
+        let snapshot = wait.h.hub.snapshot();
+        assert_eq!(snapshot.state, RecoveryState::Exhausted);
+        assert_eq!((snapshot.attempt, snapshot.successful_recoveries), (1, 0));
     }
 
     #[test]
@@ -3157,9 +3381,38 @@ mod tests {
         ));
     }
 
+    #[test]
+    fn auto_recovery_preflight_depends_on_platform_and_target() {
+        let system = CaptureTarget::SystemDefault;
+        let device = CaptureTarget::Device(crate::core::config::DeviceId("usb-mic".to_string()));
+        for platform in ["windows", "linux"] {
+            assert!(check_auto_recovery(platform, &system).is_ok());
+            assert!(matches!(
+                check_auto_recovery(platform, &device),
+                Err(AudioError::ConfigurationError { .. })
+            ));
+        }
+        for (os, expected_feature) in [
+            (
+                "macos",
+                "capture auto-recovery (hotplug-recovery): not yet verified on macOS; see ADR-0021",
+            ),
+            ("android", "capture auto-recovery (hotplug-recovery)"),
+            ("ios", "capture auto-recovery (hotplug-recovery)"),
+        ] {
+            for target in [&system, &device] {
+                assert!(matches!(
+                    check_auto_recovery(os, target),
+                    Err(AudioError::PlatformNotSupported { feature, platform })
+                        if feature == expected_feature && platform == os
+                ));
+            }
+        }
+    }
+
     #[cfg(not(any(target_os = "android", target_os = "ios")))]
     #[test]
-    fn preflight_rejects_every_target_but_system_default() {
+    fn builder_enforces_auto_recovery_scope() {
         use crate::core::config::{ApplicationId, DeviceId, ProcessId};
 
         let targets = [
@@ -3172,19 +3425,44 @@ mod tests {
             let builder = AudioCaptureBuilder::new()
                 .with_target(target.clone())
                 .with_auto_recovery(AutoRecoveryConfig::new());
-            match builder.preflight() {
-                Err(AudioError::ConfigurationError { message }) => {
-                    assert!(message.contains("SystemDefault"), "{message}")
+            let check = |error| match error {
+                #[cfg(target_os = "macos")]
+                AudioError::PlatformNotSupported { feature, platform } => {
+                    assert_eq!(feature, MACOS_WITHHELD);
+                    assert_eq!(platform, "macos");
                 }
-                other => panic!("{target}: expected ConfigurationError, got {other:?}"),
-            }
-            assert!(
-                matches!(builder.build(), Err(AudioError::ConfigurationError { .. })),
-                "{target}: build() runs the same gate before any device work"
+                #[cfg(not(target_os = "macos"))]
+                AudioError::ConfigurationError { message } => {
+                    assert!(message.contains("SystemDefault"), "{message}");
+                }
+                other => panic!("{target}: unexpected preflight error: {other:?}"),
+            };
+            check(
+                builder
+                    .preflight()
+                    .expect_err("target refused by preflight"),
             );
+            let Err(error) = builder.build() else {
+                panic!("{target}: build() must run the same gate before any device work");
+            };
+            check(error);
         }
         let system = AudioCaptureBuilder::new().with_auto_recovery(AutoRecoveryConfig::new());
-        assert!(system.preflight().is_ok());
+        #[cfg(target_os = "macos")]
+        assert!(matches!(
+            system.preflight(),
+            Err(AudioError::PlatformNotSupported { feature, platform })
+                if feature == MACOS_WITHHELD && platform == "macos"
+        ));
+        #[cfg(not(target_os = "macos"))]
+        if crate::core::capabilities::PlatformCapabilities::query().supports_system_capture {
+            assert!(system.preflight().is_ok());
+        } else {
+            assert!(matches!(
+                system.preflight(),
+                Err(AudioError::PlatformNotSupported { .. })
+            ));
+        }
     }
 
     #[cfg(any(target_os = "android", target_os = "ios"))]
@@ -3555,52 +3833,50 @@ mod tests {
     }
 
     #[test]
-    fn a_zero_max_backoff_with_a_missing_device_yields_per_poll_and_exhausts_at_the_deadline() {
+    fn a_zero_max_backoff_with_a_missing_device_yields_per_poll_and_exhausts_after_the_deadline() {
+        // The due probe at expiry becomes the final lookup. No retry spins
+        // in a single poll or reopens the wait after that lookup fails.
         let policy = fast_policy()
             .with_initial_backoff(Duration::ZERO)
             .with_max_backoff(Duration::ZERO)
             .with_device_wait_timeout(ms(40));
         let old = MockStream::new(stereo(RATE), vec![Step::End("device unplugged")]);
-        let probes = Arc::new(AtomicUsize::new(0));
-        let counted = Arc::clone(&probes);
-        let factory: StreamFactory = Box::new(move || {
-            counted.fetch_add(1, Ordering::SeqCst);
-            Err(not_found())
-        });
-        let h = Harness::new(policy, &old, factory);
-
+        let opener = Opener::new(vec![Err(not_found()), Err(not_found()), Err(not_found())]);
+        let clock = TestClock::default();
         let started = Instant::now();
-        let mut empty_polls = 0_usize;
-        let err = loop {
-            assert!(
-                started.elapsed() < Duration::from_secs(5),
-                "the wait never expired"
-            );
-            match h.stream.try_read_chunk() {
-                Ok(None) => {
-                    empty_polls += 1;
-                    std::thread::sleep(POLL_INTERVAL);
-                }
-                Ok(Some(_)) => panic!("no device ever appeared"),
-                Err(e) => break e,
-            }
-        };
+        clock.pin(started);
+        let h = Harness::build(
+            policy,
+            &old,
+            opener.factory(),
+            RecoveryTrigger::default(),
+            |stream| {
+                stream.clock = clock.source();
+                stream.spawn_reopen = reopen_inline;
+            },
+        );
 
-        match err {
-            AudioError::StreamEnded { reason } => {
-                assert!(reason.contains("no capture device appeared"), "{reason}")
-            }
-            other => panic!("expected StreamEnded, got {other:?}"),
+        // Each open and collection yields in its own poll, even though the
+        // spawner ran the helper inline and zero backoff makes the next probe due.
+        for expected_calls in [1, 1, 2, 2] {
+            assert!(matches!(h.stream.try_read_chunk(), Ok(None)));
+            assert_eq!(opener.calls(), expected_calls);
         }
-        assert!(
-            started.elapsed() >= ms(40),
-            "expiry waits the full device_wait_timeout"
-        );
-        assert!(
-            empty_polls > 1,
-            "an unsuccessful probe yields to the caller instead of retrying in one poll"
-        );
-        assert!(probes.load(Ordering::SeqCst) >= 1);
+        assert!(with_machine(&h.stream, |m| matches!(
+            m.phase,
+            Phase::WaitingForDevice { .. }
+        )));
+
+        clock.pin(started + ms(40));
+        assert!(matches!(h.stream.try_read_chunk(), Ok(None)));
+        assert_eq!(opener.calls(), 3, "expiry starts exactly one more probe");
+        for _ in 0..2 {
+            assert!(matches!(
+                h.stream.try_read_chunk(),
+                Err(AudioError::StreamEnded { reason }) if reason.contains("no capture device appeared")
+            ));
+        }
+        assert_eq!(opener.calls(), 3, "no further probe after exhaustion");
         assert_eq!(h.hub.snapshot().state, RecoveryState::Exhausted);
     }
 
@@ -3961,7 +4237,7 @@ mod tests {
         wait_for(|| {
             let _ = stream.try_read_chunk();
             deadline = with_machine(stream, |m| match m.phase {
-                Phase::Reopening { wait_deadline, .. } => wait_deadline,
+                Phase::Reopening { probe, .. } => probe.and_then(Probe::deadline),
                 _ => None,
             });
             deadline.is_some()
@@ -4003,7 +4279,7 @@ mod tests {
     fn set_wait_deadline(stream: &RecoveryStream, deadline: Instant) {
         with_machine(stream, |m| match &mut m.phase {
             Phase::Reopening {
-                wait_deadline: Some(wait),
+                probe: Some(Probe::Waiting { deadline: wait }),
                 ..
             } => *wait = deadline,
             _ => panic!("no absent-device probe is in flight"),
@@ -4099,6 +4375,161 @@ mod tests {
         assert!(matches!(failed, Err(AudioError::DeviceNotFound { .. })));
         let snapshot = idle.snapshot();
         assert_eq!((snapshot.session, snapshot.state), (0, RecoveryState::Idle));
+    }
+
+    fn watcher_timeout() -> AudioError {
+        AudioError::Timeout {
+            operation: "watch device changes".to_string(),
+            duration: Duration::from_secs(5),
+        }
+    }
+
+    /// Registration errors that fail the start leave the opener, hub and
+    /// event subscription untouched.
+    fn refused_proactive_start(error: AudioError) -> AudioError {
+        let hub = Arc::new(RecoveryHub::new(fast_policy()));
+        let events = hub.subscribe().expect("first subscriber");
+        let before = hub.snapshot();
+        let live = MockStream::new(stereo(RATE), vec![]);
+        let opener = Opener::new(vec![Ok(live)]);
+
+        let start = start_supervised_with(opener.factory(), |_| Err(error), true, &hub, RING_SLOTS);
+        let Err(error) = start else {
+            panic!("a failed proactive watcher registration must fail the start");
+        };
+        assert_eq!(opener.calls(), 0);
+        assert_eq!(hub.snapshot(), before);
+        assert!(matches!(events.try_recv(), Err(mpsc::TryRecvError::Empty)));
+        error
+    }
+
+    #[test]
+    fn a_proactive_watcher_timeout_fails_start_before_a_stream_opens() {
+        let error = refused_proactive_start(watcher_timeout());
+        assert!(matches!(
+            error,
+            AudioError::Timeout { operation, duration }
+                if operation == "watch device changes" && duration == Duration::from_secs(5)
+        ));
+    }
+
+    #[test]
+    fn a_proactive_watcher_backend_error_fails_start_before_a_stream_opens() {
+        let error = refused_proactive_start(AudioError::BackendError {
+            backend: "WASAPI".to_string(),
+            operation: "watch device changes".to_string(),
+            message: "registration rejected".to_string(),
+            context: None,
+        });
+        assert!(matches!(
+            error,
+            AudioError::BackendError { backend, operation, message, context: None }
+                if backend == "WASAPI"
+                    && operation == "watch device changes"
+                    && message == "registration rejected"
+        ));
+    }
+
+    #[test]
+    fn a_proactive_start_can_recover_from_invalidation_without_backend_notifications() {
+        let policy = fast_policy().with_initial_backoff(Duration::ZERO);
+        let hub = Arc::new(RecoveryHub::new(policy));
+        let old = MockStream::new(stereo(RATE), vec![Step::End("device unplugged")]);
+        let new = MockStream::new(stereo(RATE), vec![Step::Buffer(buffer(0))]);
+        let opener = Opener::new(vec![Ok(old), Ok(new)]);
+        let mut stream = start_supervised_with(
+            opener.factory(),
+            |_| {
+                Err(AudioError::PlatformNotSupported {
+                    feature: "device change notifications".to_string(),
+                    platform: "test".to_string(),
+                })
+            },
+            true,
+            &hub,
+            RING_SLOTS,
+        )
+        .expect("a backend without notifications can still start");
+        assert!(stream.is_running());
+        assert!(lock(&stream.watcher).is_none());
+        assert_eq!(hub.snapshot().state, RecoveryState::Running);
+        assert_eq!(opener.calls(), 1);
+        stream.spawn_reopen = reopen_inline;
+        assert!(matches!(stream.try_read_chunk(), Ok(None)));
+        let recovered = stream.try_read_chunk().unwrap().unwrap();
+        assert_eq!(recovered.stream_generation(), 1);
+        assert_eq!(opener.calls(), 2);
+        assert_eq!(hub.snapshot().successful_recoveries, 1);
+        stream.stop().expect("stop");
+    }
+
+    #[test]
+    fn a_non_proactive_watcher_timeout_warns_once_and_starts_without_a_watcher() {
+        let live = MockStream::new(stereo(RATE), vec![]);
+        let hub = Arc::new(RecoveryHub::new(fast_policy()));
+        let opener = Opener::new(vec![Ok(live.clone())]);
+        // The startup warning occurs before the new supervisor exists. Route
+        // this thread's records to the existing test logger using a bystander.
+        let h = Harness::new(fast_policy(), &live, Opener::new(vec![]).factory());
+        let probe = LogProbe::new(&h.stream);
+        let armed = Armed::new(&probe);
+        let stream = start_supervised_with(
+            opener.factory(),
+            |_| Err(watcher_timeout()),
+            false,
+            &hub,
+            RING_SLOTS,
+        )
+        .expect("a non-proactive platform follows the default natively");
+        drop(armed);
+        assert!(stream.is_running());
+        assert!(lock(&stream.watcher).is_none());
+        assert_eq!(hub.snapshot().state, RecoveryState::Running);
+        assert_eq!(opener.calls(), 1);
+        let records = probe.records();
+        let [warn] = records.as_slice() else {
+            panic!("expected one registration warning, got {records:?}");
+        };
+        assert_eq!(warn.level, log::Level::Warn);
+        assert!(warn.message.contains("device-change registration failed"));
+        stream.stop().expect("stop");
+    }
+
+    #[test]
+    fn a_registration_failure_does_not_spend_a_session_id_on_restart() {
+        let hub = Arc::new(RecoveryHub::new(fast_policy()));
+        let live = MockStream::new(stereo(RATE), vec![Step::Buffer(buffer(0))]);
+        let opener = Opener::new(vec![Ok(live)]);
+        let first = start_supervised_with(
+            opener.factory(),
+            |_| Err(watcher_timeout()),
+            true,
+            &hub,
+            RING_SLOTS,
+        );
+        assert!(matches!(first, Err(AudioError::Timeout { .. })));
+        let (watcher, released) = mock_watcher(None);
+        let stream = start_supervised_with(
+            opener.factory(),
+            |_| {
+                assert_eq!(opener.calls(), 0, "register before the factory opens");
+                Ok(watcher)
+            },
+            true,
+            &hub,
+            RING_SLOTS,
+        )
+        .expect("retry with a working watcher");
+        assert_eq!(opener.calls(), 1);
+        let snapshot = hub.snapshot();
+        assert_eq!(
+            (snapshot.session, snapshot.state),
+            (1, RecoveryState::Running)
+        );
+        assert!(stream.is_running());
+        assert!(!released.load(Ordering::SeqCst));
+        stream.stop().expect("stop");
+        assert!(released.load(Ordering::SeqCst));
     }
 
     #[test]

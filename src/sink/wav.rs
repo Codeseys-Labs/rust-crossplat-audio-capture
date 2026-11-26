@@ -58,6 +58,18 @@ impl WavFileSink {
     ///
     /// The WAV file is created immediately. The format determines the
     /// WAV header parameters (sample rate, channels, bit depth).
+    ///
+    /// # Build it from a delivered buffer's format
+    ///
+    /// `format` must be the format of the audio you are about to write, which for
+    /// a capture is the format of the **first delivered
+    /// [`AudioBuffer`]** (`buffer.sample_rate()` / `buffer.channels()`). Do not
+    /// take it from `AudioCapture::format()` right after `start()`: that can
+    /// still be the *requested* format (when the negotiated one is published is
+    /// backend timing; Linux does so asynchronously), and a header that
+    /// disagrees with the delivered audio makes [`write`](AudioSink::write)
+    /// reject the first buffer. Write that first buffer through the sink, then
+    /// continue with the rest (see the example on `RunningCapture::drain_to`).
     pub fn new<P: AsRef<Path>>(path: P, format: &AudioFormat) -> AudioResult<Self> {
         let spec = Self::format_to_spec(format)?;
         let writer = WavWriter::create(path, spec).map_err(|e| AudioError::InternalError {

@@ -430,15 +430,9 @@ fn cmd_record(
     }
     eprintln!();
 
-    // Set up WAV writer
-    let spec = hound::WavSpec {
-        channels,
-        sample_rate,
-        bits_per_sample: 32,
-        sample_format: hound::SampleFormat::Float,
-    };
-    let mut wav_writer =
-        hound::WavWriter::create(&output, spec).wrap_err("Failed to create WAV file")?;
+    // The WAV writer is created from the first delivered buffer (see the read
+    // loop), so its header matches the audio actually written.
+    let mut wav_writer: Option<hound::WavWriter<std::io::BufWriter<std::fs::File>>> = None;
 
     // Build the capture session
     let mut capture = AudioCaptureBuilder::new()
@@ -462,6 +456,10 @@ fn cmd_record(
     let mut total_frames: u64 = 0;
     let mut total_samples_written: u64 = 0;
 
+    // Set when the recording ends early (a delivered-format change, a WAV write
+    // failure, a fatal read error): the prefix written so far is finalised and
+    // reported as a PARTIAL recording with a non-zero exit, never as complete.
+    let mut record_error: Option<String> = None;
     let deadline = duration.map(Duration::from_secs);
 
     while running.load(Ordering::SeqCst) {
@@ -474,15 +472,67 @@ fn cmd_record(
 
         match capture.read_buffer() {
             Ok(Some(buffer)) => {
+                // The WAV header is taken from the first DELIVERED buffer, not
+                // from the requested rate/channels or from `capture.format()`
+                // right after start(): that can still be the requested format
+                // (when the negotiated one is published is backend timing),
+                // and the device may deliver a different format than requested.
+                let writer = match wav_writer.as_mut() {
+                    Some(w) => w,
+                    None => {
+                        eprintln!(
+                            "    Delivered:      {} Hz, {} ch",
+                            buffer.sample_rate(),
+                            buffer.channels()
+                        );
+                        let spec = hound::WavSpec {
+                            channels: buffer.channels(),
+                            sample_rate: buffer.sample_rate(),
+                            bits_per_sample: 32,
+                            sample_format: hound::SampleFormat::Float,
+                        };
+                        wav_writer.insert(
+                            hound::WavWriter::create(&output, spec)
+                                .wrap_err("Failed to create WAV file")?,
+                        )
+                    }
+                };
+                // A WAV header is fixed for the file's lifetime; stop rather than
+                // append samples that the header would misinterpret, and report
+                // a PARTIAL recording.
+                let spec = writer.spec();
+                if spec.channels != buffer.channels() || spec.sample_rate != buffer.sample_rate() {
+                    eprintln!(
+                        "\n⚠  Delivered format changed mid-recording \
+                         ({} Hz, {} ch -> {} Hz, {} ch); stopping",
+                        spec.sample_rate,
+                        spec.channels,
+                        buffer.sample_rate(),
+                        buffer.channels()
+                    );
+                    record_error = Some(format!(
+                        "delivered format changed mid-recording ({} Hz, {} ch -> {} Hz, {} ch)",
+                        spec.sample_rate,
+                        spec.channels,
+                        buffer.sample_rate(),
+                        buffer.channels()
+                    ));
+                    break;
+                }
+
                 let data = buffer.data();
                 let frames = buffer.num_frames();
                 total_frames += frames as u64;
 
                 for &sample in data {
-                    wav_writer
-                        .write_sample(sample)
-                        .wrap_err("Failed to write WAV sample")?;
+                    if let Err(e) = writer.write_sample(sample) {
+                        record_error = Some(format!("failed to write WAV sample: {e}"));
+                        break;
+                    }
                     total_samples_written += 1;
+                }
+                if record_error.is_some() {
+                    break;
                 }
 
                 let elapsed = start.elapsed().as_secs_f64();
@@ -499,14 +549,40 @@ fn cmd_record(
             }
             Err(e) => {
                 eprintln!("\n⚠  Read error: {}", e);
-                break;
+                if e.is_fatal() {
+                    record_error = Some(format!("read error: {e}"));
+                    break;
+                }
+                std::thread::sleep(Duration::from_millis(5));
             }
         }
     }
 
     // Clean shutdown
     capture.stop().wrap_err("Failed to stop capture")?;
-    wav_writer.finalize().wrap_err("Failed to finalize WAV")?;
+    match wav_writer {
+        Some(writer) => writer.finalize().wrap_err("Failed to finalize WAV")?,
+        None => {
+            // Nothing was delivered: no file exists, so say so and stop here —
+            // this is the normal exit for a Ctrl+C or an expired `--duration`
+            // before any audio arrived, not a completion.
+            eprintln!("\n⚠  No audio was delivered, so no WAV file was written");
+            if let Some(reason) = record_error {
+                return Err(std::io::Error::other(reason).into());
+            }
+            return Ok(());
+        }
+    }
+
+    if let Some(reason) = record_error {
+        eprintln!("\n");
+        eprintln!("⚠  PARTIAL recording");
+        eprintln!("───────────────────────────────────");
+        eprintln!("  File:       {}", output);
+        eprintln!("  Frames:     {}", total_frames);
+        eprintln!("  Stopped:    {}", reason);
+        return Err(std::io::Error::other(reason).into());
+    }
 
     let elapsed = start.elapsed();
     eprintln!("\n");

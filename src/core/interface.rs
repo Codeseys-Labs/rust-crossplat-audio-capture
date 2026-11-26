@@ -287,10 +287,16 @@ pub trait CapturingStream: Send + Sync {
     /// cannot be restarted — create a new stream instead.
     fn stop(&self) -> AudioResult<()>;
 
-    /// Returns the actual audio format being produced by the stream.
+    /// Returns the format the stream is producing.
     ///
     /// This may differ from the requested format if the backend negotiated
-    /// a different format with the OS.
+    /// a different format with the OS. When the negotiated format is published
+    /// is backend timing, not a documented transition point: some backends do so
+    /// asynchronously after the stream has started (PipeWire does, from its
+    /// `param_changed` callback), so a value read right after start can still be
+    /// the **requested** format. Never build a format-dependent consumer from
+    /// this method; each delivered [`AudioBuffer`] carries the authoritative
+    /// format — build from the first delivered buffer instead.
     fn format(&self) -> AudioFormat;
 
     /// Returns `true` if the stream is currently capturing audio.

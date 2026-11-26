@@ -252,72 +252,57 @@ impl AudioCapture {
             });
         }
 
-        if self.stream.is_none() {
-            let device_ref =
-                self.device
-                    .as_ref()
-                    .ok_or_else(|| AudioError::StreamCreationFailed {
-                        reason: "Audio device not available to create stream (was None)."
-                            .to_string(),
-                        context: None,
-                    })?;
-            // hotplug-recovery: a supervised capture opens generation zero the
-            // way it opens every replacement, on the default device current at
-            // this start() (not the one build() resolved), and only after the
-            // device-change watcher is armed: a default change before the open
-            // is reflected in it, and one after is handled by the first poll.
-            #[cfg(feature = "hotplug-recovery")]
-            let capturing_stream_obj = match self.recovery.as_ref() {
-                Some(hub) => super::recovery::start_supervised(&self.config.stream_config, hub)?,
-                None => device_ref.create_stream(&self.config.stream_config)?,
-            };
-            #[cfg(not(feature = "hotplug-recovery"))]
-            let capturing_stream_obj = device_ref.create_stream(&self.config.stream_config)?;
-            self.stream = Some(Arc::from(capturing_stream_obj));
-            // Record the start time exactly once, the first time a real stream
-            // is created. The idempotent-restart paths above (running → Ok,
-            // stopped → Err) return before reaching here, so a second start()
-            // on a live stream never resets this. Single non-RT Instant store.
-            self.start_instant = Some(Instant::now());
-        }
-
-        // Verify stream is available
-        let stream_ref = self
-            .stream
+        // Check for poison before opening a stream. With exclusive access, we
+        // can report the error once and clear it: the slot still contains a
+        // valid Option, and a retry can take its callback normally.
+        let pending_callback = match self.callback.get_mut() {
+            Ok(slot) => slot,
+            Err(poisoned) => {
+                let error = AudioError::InternalError {
+                    message: format!("Failed to lock callback mutex: {}", poisoned),
+                    source: None,
+                };
+                self.callback.clear_poison();
+                return Err(error);
+            }
+        };
+        let device_ref = self
+            .device
             .as_ref()
             .ok_or_else(|| AudioError::StreamCreationFailed {
-                reason: "Stream not initialized before starting.".to_string(),
+                reason: "Audio device not available to create stream (was None).".to_string(),
                 context: None,
             })?;
+        // Recovery re-resolves the default at start, after arming the watcher,
+        // so a change since build() is reflected in the open or the first poll.
+        #[cfg(feature = "hotplug-recovery")]
+        let opened = match self.recovery.as_ref() {
+            Some(hub) => super::recovery::start_supervised(&self.config.stream_config, hub)?,
+            None => device_ref.create_stream(&self.config.stream_config)?,
+        };
+        #[cfg(not(feature = "hotplug-recovery"))]
+        let opened = device_ref.create_stream(&self.config.stream_config)?;
+        let stream: Arc<dyn crate::core::interface::CapturingStream> = Arc::from(opened);
+        let started = Instant::now();
 
-        // If a callback was registered via set_callback() AND no pump is already
-        // running, spawn a pump thread that delivers captured buffers to it.
-        // Without this the stored closure is never invoked (the callback
-        // delivery mode would silently do nothing). See
-        // docs/designs/0002-callback-delivery.md.
-        //
-        // Guarding on `self.callback_pump.is_none()` makes a second start() a
-        // no-op for the pump — two pumps must never race for the same ring. The
-        // callback is *moved* into the pump (taken out of the pending slot), so
-        // the pump never holds a lock while running the user closure.
-        if self.callback_pump.is_none() {
-            // A poisoned callback mutex must NOT silently drop a registered
-            // callback (which would leave start() returning Ok with no
-            // delivery); surface it like set_callback/clear_callback do.
-            let taken = match self.callback.lock() {
-                Ok(mut guard) => guard.take(),
-                Err(poisoned) => {
-                    return Err(AudioError::InternalError {
-                        message: format!("Failed to lock callback mutex: {}", poisoned),
-                        source: None,
-                    });
+        // Move the callback into the pump only after opening succeeds. Do not
+        // install the stream until the pump is ready; otherwise a retry would
+        // see a running stream but never deliver callbacks.
+        if let Some(callback) = pending_callback.take() {
+            match Self::spawn_callback_pump(Arc::clone(&stream), callback) {
+                Ok(pump) => self.callback_pump = Some(pump),
+                Err(error) => {
+                    // Stopping also unregisters the watcher on a supervised
+                    // stream. Keep the pump error even if stopping fails.
+                    if let Err(stop_error) = stream.stop() {
+                        log::warn!("Error stopping stream after failed start: {stop_error}");
+                    }
+                    return Err(error);
                 }
-            };
-            if let Some(callback) = taken {
-                let pump = Self::spawn_callback_pump(Arc::clone(stream_ref), callback)?;
-                self.callback_pump = Some(pump);
             }
         }
+        self.stream = Some(stream);
+        self.start_instant = Some(started);
 
         Ok(())
     }
@@ -975,20 +960,45 @@ impl AudioCapture {
         self.start_instant.map(|t| t.elapsed())
     }
 
-    /// Returns the negotiated *delivery* `AudioFormat` the backend actually
-    /// produces, or `None` before [`start()`](Self::start) creates a stream.
+    /// Returns the *delivery* `AudioFormat` this capture is producing, or `None`
+    /// before [`start()`](Self::start) creates a stream.
     ///
-    /// This is the authoritative format atomically published by the bridge: each
-    /// backend records the rate/channels it actually delivers at its negotiation
-    /// point — PipeWire from its `param_changed` callback, WASAPI at mix-format
-    /// open, CoreAudio when the AUHAL stream format is set (PU-1/PERF-07,
-    /// `rsac-2c56`; see [`crate::bridge`]). It can therefore differ from the
-    /// requested config in [`config()`](Self::config) when the device forced a
-    /// negotiation, and the reported `sample_format` is always `F32` because the
-    /// bridge payload is always interleaved f32 regardless of the endpoint's
-    /// native sample type. Reading it is a single `Acquire` load behind the
-    /// underlying stream's `format()` — no allocation and no lock on the data
-    /// plane.
+    /// # Diagnostics only — never build from it
+    ///
+    /// Right after [`start()`](Self::start) returns, this can still be the
+    /// **requested** format. When it changes is backend timing, not a documented
+    /// transition point: PipeWire publishes the negotiated format asynchronously
+    /// from its `param_changed` callback (after `start()` has returned), while
+    /// WASAPI/CoreAudio may have negotiated a closest supported format already
+    /// inside `build()`. So never build a format-dependent consumer — a
+    /// `WavFileSink`, an encoder, a resampler, a playback stream — from this value.
+    /// Each delivered [`AudioBuffer`](crate::core::buffer::AudioBuffer) carries
+    /// the authoritative format
+    /// ([`format()`](crate::core::buffer::AudioBuffer::format) /
+    /// [`sample_rate()`](crate::core::buffer::AudioBuffer::sample_rate) /
+    /// [`channels()`](crate::core::buffer::AudioBuffer::channels)): build from the
+    /// first delivered buffer, exactly as the example on
+    /// [`RunningCapture::drain_to`](crate::api::RunningCapture::drain_to) does.
+    /// This method is fine for diagnostics, and for reading the format once audio
+    /// is flowing.
+    ///
+    /// # Where the value comes from
+    ///
+    /// Each backend records the rate/channels it actually delivers at its
+    /// negotiation point — PipeWire from its `param_changed` callback, WASAPI at
+    /// mix-format open, CoreAudio when the AUHAL stream format is set (PU-1/PERF-07,
+    /// `rsac-2c56`; see [`crate::bridge`]) — and the bridge publishes it
+    /// atomically. After that point it can differ from the requested config in
+    /// [`config()`](Self::config) when the device forced a negotiation. The
+    /// `sample_format` is always `F32` for **delivered audio** (the bridge payload
+    /// is always interleaved f32 regardless of the endpoint's native sample type);
+    /// the pre-publication fallback echoes the request and can carry a different
+    /// `sample_format`.
+    ///
+    /// Reading it is a single `Acquire` load behind the underlying stream's
+    /// `format()` on the ordinary bridge path — no allocation and no lock on the
+    /// data plane. A supervised (`hotplug-recovery`) capture takes the
+    /// active-stream lock first on its query path.
     pub fn format(&self) -> Option<AudioFormat> {
         self.stream.as_ref().map(|s| s.format())
     }
@@ -1288,6 +1298,53 @@ mod tests {
     use crate::core::config::{CaptureTarget, StreamConfig};
     use crate::core::interface::CapturingStream;
     use std::sync::atomic::AtomicUsize;
+
+    #[test]
+    fn poisoned_callback_slot_fails_before_start_and_can_be_retried() {
+        struct PanicOnDrop;
+
+        impl Drop for PanicOnDrop {
+            fn drop(&mut self) {
+                panic!("callback destructor panicked");
+            }
+        }
+
+        let mut capture = AudioCapture {
+            config: AudioCaptureConfig {
+                target: CaptureTarget::SystemDefault,
+                stream_config: StreamConfig::default(),
+            },
+            device: Some(Box::new(crate::bridge::mock::MockAudioDevice::new("mock"))),
+            stream: None,
+            callback: Mutex::new(None),
+            callback_pump: None,
+            start_instant: None,
+            subscriber_dropped: Arc::new(AtomicU64::new(0)),
+            #[cfg(feature = "hotplug-recovery")]
+            recovery: None,
+        };
+        let bomb = PanicOnDrop;
+        capture
+            .set_callback(move |_| {
+                let _keep_alive = &bomb;
+            })
+            .expect("register pending callback");
+        let cleared =
+            std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| capture.clear_callback()));
+        assert!(cleared.is_err());
+        assert!(capture.callback.is_poisoned());
+
+        assert!(matches!(
+            capture.start(),
+            Err(AudioError::InternalError { message, .. }) if message.contains("callback mutex")
+        ));
+        assert!(!capture.is_running());
+        assert!(capture.stream.is_none());
+        assert!(capture.start_instant.is_none());
+        capture.start().expect("retry after callback mutex error");
+        assert!(capture.is_running());
+        capture.stop().expect("stop");
+    }
 
     /// A stream whose read wedges — as a read inside a recovery reopen would —
     /// until the stream is stopped, then returns a buffer (a "late result").

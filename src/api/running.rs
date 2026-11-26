@@ -23,6 +23,16 @@ use std::ops::{Deref, DerefMut};
 /// boilerplate to keep in sync — new `AudioCapture` methods are reachable
 /// automatically.
 ///
+/// # Format
+///
+/// [`format()`](AudioCapture::format) (reachable through the deref) can still
+/// report the **requested** format right after `start()`: when it switches to
+/// the negotiated one is backend timing, not a documented transition point.
+/// Each delivered [`AudioBuffer`](crate::core::buffer::AudioBuffer) carries the
+/// authoritative format, so build format-dependent consumers such as a
+/// `WavFileSink` from the first delivered buffer, as the example on
+/// [`drain_to`](Self::drain_to) does.
+///
 /// # Drop
 ///
 /// Dropping the guard calls [`AudioCapture::stop`] once. `stop()` is idempotent

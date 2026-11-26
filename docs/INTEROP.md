@@ -15,8 +15,12 @@ if let Some(buffer) = capture.read_buffer()? {
 ```
 
 Every recipe below is copy-paste against that surface — no rsac feature flags
-needed. (For multi-source composition, `rsac::compose`'s `Composition` yields
-the exact same `AudioBuffer` type; all recipes apply unchanged.)
+needed except where noted (WAV writing needs `sink-wav`, and the composition
+examples need `compose`). (For multi-source composition, `rsac::compose`'s
+`Composition` yields the exact same `AudioBuffer` type and the same
+`read_chunk_*` / `subscribe` surface, so recipes apply unchanged — use
+`read_chunk_blocking` / `read_chunk_nonblocking`, which both handles have;
+`Composition` has no `read_buffer*`.)
 
 ## dasp (sample/frame DSP)
 
@@ -68,10 +72,12 @@ move |out: &mut [f32], _| {
 }
 ```
 
-Match the output stream's sample rate/channels to `capture.format()` (or
-resample with `rubato`). For `rodio`, wrap the same receiver in a
-`rodio::Source` with `sample_rate()`/`channels()` answering from the captured
-format.
+Match the output stream's sample rate/channels to the format of the first
+*delivered* buffer (`buffer.format()`), or resample with `rubato`. Do not use
+`capture.format()` read right after `start()`: `start()` does not wait for the
+backend's negotiated format, so that value can still be the requested one. For
+`rodio`, wrap the same receiver in a `rodio::Source` with
+`sample_rate()`/`channels()` answering from the first delivered buffer's format.
 
 ## hound (WAV) — prefer the built-in sink
 
@@ -79,8 +85,15 @@ rsac already ships this path: `WavFileSink` (feature `sink-wav`) +
 `drain_to()` writes single- or multi-channel WAV, including composed streams:
 
 ```rust
-let format = capture.format().unwrap_or_default();
-let sink = rsac::WavFileSink::new("out.wav", &format)?;
+use rsac::AudioSink;
+// Build the sink from the first DELIVERED buffer: right after `start()`,
+// `capture.format()` can still be the requested format (Linux publishes the
+// negotiated one asynchronously), and WavFileSink rejects a mismatched buffer.
+// `read_chunk_blocking` (NOT `read_buffer_blocking`) also exists on
+// `Composition`, so the same recipe covers composed streams.
+let first = running.read_chunk_blocking()?;
+let mut sink = rsac::WavFileSink::new("out.wav", first.format())?;
+sink.write(&first)?; // the first buffer is already consumed
 let drain = running.drain_to(sink)?; // background thread, flush/close on end
 ```
 

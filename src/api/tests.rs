@@ -26,8 +26,12 @@ fn builder_defaults_to_system_default() {
 
 #[test]
 fn builder_fails_if_channels_is_zero() {
-    let result = AudioCaptureBuilder::new()
-        .with_target(CaptureTarget::SystemDefault)
+    // Device target (consent-free, never capability-gated): parameter
+    // validation must not depend on SystemDefault being supported. A platform
+    // that reports `!supports_system_capture` (no backend feature compiled
+    // in, macOS < 14.4, Android < API 29) refuses SystemDefault with
+    // PlatformNotSupported before any parameter is examined.
+    let result = consent_free_builder()
         .sample_rate(44100)
         .channels(0)
         .sample_format(SampleFormat::F32)
@@ -43,8 +47,8 @@ fn builder_fails_if_channels_is_zero() {
 
 #[test]
 fn builder_fails_on_unsupported_sample_rate() {
-    let result = AudioCaptureBuilder::new()
-        .with_target(CaptureTarget::SystemDefault)
+    // Device target — see builder_fails_if_channels_is_zero.
+    let result = consent_free_builder()
         .sample_rate(11025) // Not supported
         .channels(1)
         .sample_format(SampleFormat::F32)
@@ -117,7 +121,7 @@ fn builder_default_trait_matches_new() {
 
 #[test]
 fn builder_rejects_sample_rate_zero() {
-    let result = AudioCaptureBuilder::new().sample_rate(0).build();
+    let result = consent_free_builder().sample_rate(0).build();
     assert!(result.is_err());
     match result.unwrap_err() {
         AudioError::InvalidParameter { param, .. } => assert_eq!(param, "sample_rate"),
@@ -127,7 +131,7 @@ fn builder_rejects_sample_rate_zero() {
 
 #[test]
 fn builder_rejects_very_high_sample_rate() {
-    let result = AudioCaptureBuilder::new().sample_rate(999999).build();
+    let result = consent_free_builder().sample_rate(999999).build();
     assert!(result.is_err());
     match result.unwrap_err() {
         AudioError::InvalidParameter { param, .. } => assert_eq!(param, "sample_rate"),
@@ -138,7 +142,7 @@ fn builder_rejects_very_high_sample_rate() {
 #[test]
 fn builder_rejects_nonstandard_sample_rate() {
     // 11025 is a valid audio rate but not in the supported list
-    let result = AudioCaptureBuilder::new().sample_rate(11025).build();
+    let result = consent_free_builder().sample_rate(11025).build();
     assert!(result.is_err());
 }
 
@@ -177,7 +181,7 @@ fn builder_accepts_all_supported_sample_rates() {
 
 #[test]
 fn builder_rejects_channels_above_max() {
-    let result = AudioCaptureBuilder::new()
+    let result = consent_free_builder()
         .channels(33) // MAX_CHANNELS = 32
         .build();
     assert!(result.is_err());
@@ -189,7 +193,7 @@ fn builder_rejects_channels_above_max() {
 
 #[test]
 fn builder_rejects_channels_way_above_max() {
-    let result = AudioCaptureBuilder::new().channels(u16::MAX).build();
+    let result = consent_free_builder().channels(u16::MAX).build();
     assert!(result.is_err());
 }
 
@@ -294,7 +298,7 @@ fn negotiated_format_unsupported_on_linux() {
 /// InvalidParameter error build() would raise, before any device work.
 #[test]
 fn negotiated_format_runs_preflight_first() {
-    let builder = AudioCaptureBuilder::new().sample_rate(11025); // unsupported
+    let builder = consent_free_builder().sample_rate(11025); // unsupported
     match builder.negotiated_format() {
         Err(AudioError::InvalidParameter { param, .. }) => {
             assert_eq!(param, "sample_rate");
@@ -2029,7 +2033,7 @@ fn preflight_ok_for_valid_default_config() {
 /// InvalidParameter{param:"sample_rate"} and does NOT touch a device.
 #[test]
 fn preflight_rejects_unsupported_sample_rate() {
-    let builder = AudioCaptureBuilder::new().sample_rate(11025);
+    let builder = consent_free_builder().sample_rate(11025);
     match builder.preflight().unwrap_err() {
         AudioError::InvalidParameter { param, reason } => {
             assert_eq!(param, "sample_rate");
@@ -2042,7 +2046,7 @@ fn preflight_rejects_unsupported_sample_rate() {
 /// preflight() rejects channels == 0 with ConfigurationError.
 #[test]
 fn preflight_rejects_zero_channels() {
-    let builder = AudioCaptureBuilder::new().channels(0);
+    let builder = consent_free_builder().channels(0);
     match builder.preflight().unwrap_err() {
         AudioError::ConfigurationError { message } => {
             assert_eq!(message, "Channels must be greater than 0.");
@@ -2054,7 +2058,7 @@ fn preflight_rejects_zero_channels() {
 /// preflight() rejects channels > 32 (MAX_CHANNELS) with ConfigurationError.
 #[test]
 fn preflight_rejects_channels_above_max() {
-    let builder = AudioCaptureBuilder::new().channels(33);
+    let builder = consent_free_builder().channels(33);
     match builder.preflight().unwrap_err() {
         AudioError::ConfigurationError { message } => {
             assert!(
@@ -2138,18 +2142,53 @@ fn preflight_application_matches_capability_gate() {
     }
 }
 
+/// preflight() runs the capability gate before parameter validation: on a
+/// platform whose capabilities report `!supports_system_capture`, a
+/// `SystemDefault` builder with an *also*-invalid rate reports
+/// `PlatformNotSupported`, not `InvalidParameter` (issue #98). preflight()
+/// cannot be driven with hand-built capabilities — it queries the host
+/// internally — so the precedence is pinned against
+/// `PlatformCapabilities::query()` on whatever platform runs the test,
+/// mirroring preflight_application_matches_capability_gate; the refusal
+/// itself is pinned against hand-built capabilities in builder.rs's
+/// `check_target_supported` unit tests.
+#[test]
+fn preflight_capability_gate_precedes_rate_validation() {
+    let caps = PlatformCapabilities::query();
+    // SystemDefault (a fresh builder's default target) + an invalid rate:
+    // both halves of preflight would refuse this configuration.
+    let result = AudioCaptureBuilder::new().sample_rate(11025).preflight();
+    if caps.supports_system_capture {
+        // The capability gate passes; the invalid rate must surface.
+        match result {
+            Err(AudioError::InvalidParameter { param, .. }) => assert_eq!(param, "sample_rate"),
+            other => panic!("expected InvalidParameter, got {other:?}"),
+        }
+    } else {
+        // The capability gate refuses first; the invalid rate is never
+        // reached.
+        match result {
+            Err(AudioError::PlatformNotSupported { feature, platform }) => {
+                assert_eq!(feature, "system audio capture");
+                assert_eq!(platform, caps.backend_name);
+            }
+            other => panic!("expected PlatformNotSupported, got {other:?}"),
+        }
+    }
+}
+
 /// The refactor is behavior-preserving: build() still rejects the same
 /// configs preflight() does, with the same error variants (proving build()
 /// routes through preflight()). Mirrors the existing builder_fails_* tests.
 #[test]
 fn build_routes_through_preflight_same_errors() {
     // Zero channels → ConfigurationError, before any device work.
-    match AudioCaptureBuilder::new().channels(0).build().unwrap_err() {
+    match consent_free_builder().channels(0).build().unwrap_err() {
         AudioError::ConfigurationError { .. } => {}
         e => panic!("Expected ConfigurationError from build(), got: {e:?}"),
     }
     // Unsupported rate → InvalidParameter{sample_rate}, before any device work.
-    match AudioCaptureBuilder::new()
+    match consent_free_builder()
         .sample_rate(11025)
         .build()
         .unwrap_err()

@@ -13,7 +13,7 @@ This document enumerates every Cargo feature exposed by `rsac`, what it enables,
 | `feat_ios` | yes | iOS | Experimental, parked AVAudioEngine mic and ReplayKit `SystemDefault` consumer via SwiftPM glue | Mic has simulator evidence; ReplayKit and physical-device verification remain open. System capture requires an App Group, embedded Broadcast Upload Extension and user-started broadcast. |
 | `default` | — | all | Meta-feature: `feat_windows`, `feat_linux`, `feat_macos`, `feat_android`, and `feat_ios` | Each enabled backend's requirements above; two-way `target_os` gates make non-matching entries inert. |
 | `async-stream` | no | all | `AudioCapture::audio_data_stream()` returning a `futures_core::Stream<Item = AudioResult<AudioBuffer>>`; also required by `examples/async_capture.rs` | Pulls in `atomic-waker` dep. Consumer needs an async runtime (Tokio, smol, etc.). |
-| `hotplug-recovery` | no | Windows, Linux, macOS | Opt-in automatic recovery for desktop `SystemDefault` capture; see [ADR-0019](designs/0019-hotplug-auto-recovery.md) for policy and limitations | No additional dependencies. Device, application and process-tree targets and mobile are outside the recovery scope. |
+| `hotplug-recovery` | no | Windows, Linux | Opt-in automatic recovery for desktop `SystemDefault` capture; see [ADR-0019](designs/0019-hotplug-auto-recovery.md) for policy and limitations. Withheld on macOS in 0.5.0 (a build that opts in fails with `PlatformNotSupported`) until an attended run exists: [ADR-0021](designs/0021-hotplug-recovery-0.5-scope.md) | No additional dependencies. Device, application and process-tree targets and mobile are outside the recovery scope. |
 | `sink-wav` | no | all | `WavFileSink` adapter (writes captured audio to a WAV file through the `AudioSink` trait) | `hound` is always a hard dependency, so no extra install — the gate is API-surface only. |
 | `compose` | no | all | Multi-source channel composition ([ADR-0011](designs/0011-compose-feature.md)): groups mix to Mono/Stereo or retain a single source's negotiated channels, with rate alignment and live gain/mute controls | Pulls in `rubato` and `audioadapter-buffers`. No system packages. |
 | `cli` | no | all | The demo binaries' dependency set — required by the `rsac` CLI (`[[bin]]`), `standardized_test`, and the `verify_audio` / `basic_capture` / `record_to_file` examples (all declare `required-features = ["cli"]`). Library consumers who don't enable it no longer compile these deps at all. | Pulls in `clap` (derive), `color-eyre`, `ctrlc`, `env_logger`. |
@@ -176,7 +176,7 @@ feature in a clear error if you forget (see `Cargo.toml` for the full list):
 - `pipewire_diagnostics`, `smoke_alpine` — `feat_linux`
 - `wasapi_session_test` — `feat_windows`
 - `examples/verify_audio.rs`, `examples/basic_capture.rs`,
-  `examples/record_to_file.rs` — `cli`
+  `examples/record_to_file.rs`, `examples/probe_activity.rs` — `cli`
 - `examples/record_to_file.rs` does useful recording only with `sink-wav` too
 - `examples/async_capture.rs` — `async-stream`
 - `examples/composed_capture.rs` — `compose`

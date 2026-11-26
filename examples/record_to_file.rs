@@ -1,10 +1,17 @@
 //! # Record Audio to WAV File
 //!
 //! Example showing how to capture audio and write it to a WAV file using the
-//! rsac library's bundled [`WavFileSink`](rsac::sink::WavFileSink) sink driven
-//! by [`RunningCapture::drain_to`](rsac::RunningCapture::drain_to) — the
-//! lifecycle-correct path that pumps captured buffers into a sink on a
-//! dedicated thread (never the OS audio callback thread).
+//! rsac library's bundled [`WavFileSink`](rsac::sink::WavFileSink) sink.
+//!
+//! This example owns the write loop (read → `sink.write` → check) instead of
+//! handing the sink to [`RunningCapture::drain_to`](rsac::RunningCapture::drain_to):
+//! the drain thread can only *log* a sink error, while an owned loop checks
+//! every read and every write, so a failed or shortened recording is reported
+//! as such instead of claimed to be saved.
+//!
+//! The WAV header comes from the first *delivered* buffer, not from
+//! `capture.format()` right after `start()`, which can still be the requested
+//! format (when it switches to the negotiated one is backend timing).
 //!
 //! Run with: `cargo run --example record_to_file --features "cli sink-wav"`
 //! Or with arguments:
@@ -15,8 +22,7 @@
 
 #[cfg(feature = "sink-wav")]
 fn main() -> Result<(), Box<dyn std::error::Error>> {
-    use rsac::core::config::{AudioFormat, SampleFormat};
-    use rsac::sink::WavFileSink;
+    use rsac::sink::{AudioSink, WavFileSink};
     use rsac::{AudioCaptureBuilder, CaptureTarget};
     use std::sync::atomic::{AtomicBool, Ordering};
     use std::sync::Arc;
@@ -43,25 +49,11 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         println!("Duration: until Ctrl+C");
     }
 
-    // Build AND start the capture in one call → a RunningCapture RAII guard.
-    let capture = AudioCaptureBuilder::new()
-        .with_target(CaptureTarget::SystemDefault)
-        .sample_rate(sample_rate)
-        .channels(channels)
-        .start()?;
-
-    // Use the backend's *negotiated* delivery format for the WAV header when it
-    // is available (the device may have negotiated a different rate/channel
-    // count); fall back to the requested format otherwise. WavFileSink fixes
-    // this format for the file's lifetime and rejects mismatched buffers.
-    let format = capture.format().unwrap_or(AudioFormat {
-        sample_rate,
-        channels,
-        sample_format: SampleFormat::F32,
-    });
-    println!("Capturing {}ch @ {}Hz", format.channels, format.sample_rate);
-
-    let sink = WavFileSink::new(&output_path, &format)?;
+    // ONE clock for the whole recording: `--duration` bounds waiting for the
+    // first buffer AND writing the rest alike, so `--duration 0` (or any
+    // duration that expires first) ends normally without creating a file.
+    let started = Instant::now();
+    let deadline = duration_secs.map(|d| started + Duration::from_secs(d));
 
     // Ctrl+C handler for graceful shutdown.
     let running = Arc::new(AtomicBool::new(true));
@@ -70,36 +62,130 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         r.store(false, Ordering::SeqCst);
     })?;
 
-    // drain_to spawns a background thread that pumps every captured buffer into
-    // the sink (write → … → flush → close) until the stream ends or we stop it.
-    let drain = capture.drain_to(sink)?;
+    // A wait that cannot overshoot `--duration`.
+    let wait = |slice: Duration| {
+        let nap = deadline
+            .map(|dl| dl.saturating_duration_since(Instant::now()))
+            .unwrap_or(slice)
+            .min(slice);
+        std::thread::sleep(nap);
+    };
+
+    // Build AND start the capture in one call → a RunningCapture RAII guard.
+    let capture = AudioCaptureBuilder::new()
+        .with_target(CaptureTarget::SystemDefault)
+        .sample_rate(sample_rate)
+        .channels(channels)
+        .start()?;
+
+    // Take the WAV header from the first DELIVERED buffer, not from
+    // `capture.format()` right after `start()`, which can still be the
+    // requested format: WavFileSink fixes this format for the file's lifetime
+    // and rejects mismatched buffers.
+    println!("Waiting for the first audio buffer...");
+    let first = loop {
+        if !running.load(Ordering::SeqCst) {
+            println!("\nStopped before any audio was delivered; no file written.");
+            return Ok(());
+        }
+        if deadline.is_some_and(|dl| Instant::now() >= dl) {
+            println!("\nDuration limit reached before any audio was delivered; no file written.");
+            return Ok(());
+        }
+        // `read_chunk_nonblocking` (not `read_buffer`) so a dead stream ends
+        // with its real terminal error instead of a downgraded recoverable one.
+        match capture.read_chunk_nonblocking()? {
+            Some(buffer) => break buffer,
+            None => wait(Duration::from_millis(5)),
+        }
+    };
+    let format = first.format().clone();
+    println!("Capturing {}ch @ {}Hz", format.channels, format.sample_rate);
+
+    let mut sink = WavFileSink::new(&output_path, &format)?;
+
+    // Own the write loop: the first buffer (which taught us the format) and
+    // then every buffer read afterwards, each write checked here.
+    let mut first_buf = Some(first);
+    let mut total_frames = 0u64;
+    let mut buffer_count = 0u64;
+    let mut partial: Option<String> = None;
     println!("Recording... Press Ctrl+C to stop.");
 
-    let start = Instant::now();
-    while running.load(Ordering::SeqCst) {
-        if let Some(max_secs) = duration_secs {
-            if start.elapsed() >= Duration::from_secs(max_secs) {
-                println!("\nDuration limit reached.");
-                break;
-            }
+    while partial.is_none() {
+        if !running.load(Ordering::SeqCst) {
+            break;
         }
-        print!("\r  Recording: {:.1}s", start.elapsed().as_secs_f64());
+        if deadline.is_some_and(|dl| Instant::now() >= dl) {
+            println!("\nDuration limit reached.");
+            break;
+        }
+        let buffer = match first_buf.take() {
+            Some(b) => b,
+            None => match capture.read_chunk_nonblocking() {
+                Ok(Some(b)) => b,
+                Ok(None) => {
+                    wait(Duration::from_millis(5));
+                    continue;
+                }
+                Err(e) if e.is_fatal() => {
+                    partial = Some(format!("read failed: {e}"));
+                    break;
+                }
+                // A recoverable read error is a hiccup: log and keep going.
+                Err(e) => {
+                    eprintln!("\n⚠  Transient read error: {e}");
+                    wait(Duration::from_millis(5));
+                    continue;
+                }
+            },
+        };
+        // A WAV header is fixed for the file's lifetime; a mid-recording format
+        // change ends the recording rather than corrupting the file.
+        if buffer.format() != &format {
+            partial = Some(format!(
+                "delivered format changed mid-recording ({}ch@{}Hz -> {}ch@{}Hz)",
+                format.channels,
+                format.sample_rate,
+                buffer.channels(),
+                buffer.sample_rate()
+            ));
+            break;
+        }
+        if let Err(e) = sink.write(&buffer) {
+            partial = Some(format!("write failed: {e}"));
+            break;
+        }
+        total_frames += buffer.num_frames() as u64;
+        buffer_count += 1;
+        print!("\r  Recording: {:.1}s", started.elapsed().as_secs_f64());
         use std::io::Write as _;
         let _ = std::io::stdout().flush();
-        std::thread::sleep(Duration::from_millis(200));
     }
 
-    // Stop draining first: shutdown() joins the drain thread, flushing and
-    // closing the WAV (finalizing its header) before we tear down the capture.
-    drain.shutdown();
-    // Then stop the capture stream (RunningCapture's Drop would also do this,
-    // but doing it explicitly makes the ordering clear).
+    // Finalise the sink on EVERY exit path so the header covers whatever was
+    // written, then tear the capture down (RunningCapture's Drop would too).
+    if let Err(e) = sink.close() {
+        return Err(format!("failed to finalize the WAV file: {e}").into());
+    }
     drop(capture);
 
-    println!("\n\nRecording saved to: {}", output_path);
-    println!("Duration: {:.1}s", start.elapsed().as_secs_f64());
-
-    Ok(())
+    match partial {
+        Some(reason) => {
+            eprintln!("\n⚠  Recording stopped early: {reason}");
+            println!(
+                "\nPartial recording saved to: {} ({} buffers, {} frames)",
+                output_path, buffer_count, total_frames
+            );
+            Err(reason.into())
+        }
+        None => {
+            println!("\n\nRecording saved to: {}", output_path);
+            println!("Duration: {:.1}s", started.elapsed().as_secs_f64());
+            println!("Buffers: {}, Frames: {}", buffer_count, total_frames);
+            Ok(())
+        }
+    }
 }
 
 #[cfg(not(feature = "sink-wav"))]

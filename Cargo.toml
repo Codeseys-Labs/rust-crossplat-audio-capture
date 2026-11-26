@@ -311,6 +311,11 @@ path = "examples/record_to_file.rs"
 required-features = ["cli"]
 
 [[example]]
+name = "probe_activity"
+path = "examples/probe_activity.rs"
+required-features = ["cli"]
+
+[[example]]
 name = "list_devices"
 path = "examples/list_devices.rs"
 

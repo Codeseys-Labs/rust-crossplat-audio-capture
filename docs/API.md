@@ -131,7 +131,13 @@ capture.start()?;          // create the OS stream (idempotent on a running stre
                            //   errors on a stopped one — build a new AudioCapture)
 capture.is_running();      // -> bool
 capture.uptime();          // -> Option<Duration>, monotonic, None before start / after stop
-capture.format();          // -> Option<AudioFormat>, negotiated delivery format
+capture.format();          // -> Option<AudioFormat>; can still be the REQUESTED format
+                           //   right after start() — when it switches to the negotiated
+                           //   one is backend timing (Linux publishes it asynchronously;
+                           //   other platforms may negotiate inside build()). Diagnostics
+                           //   only: each delivered AudioBuffer carries the authoritative
+                           //   format; build sinks and other format-dependent consumers
+                           //   from the first delivered buffer.
 capture.config();          // -> &AudioCaptureConfig
 capture.stop()?;           // stop the OS stream; idempotent
 // Drop also best-effort stops a running stream.
@@ -365,32 +371,91 @@ let (sink, rx) = ChannelSink::new();               // returns BOTH sink and rece
 let mut wav = WavFileSink::new("out.wav", &format)?; // feature `sink-wav`; needs the format
 ```
 
+> **Build format-dependent sinks from a delivered buffer.** Right after
+> `start()`, `capture.format()` can still be the *requested* format — when the
+> backend publishes the negotiated one is backend timing (on Linux it is
+> published asynchronously), and other platforms may have negotiated a closest
+> supported format already inside `build()`. Each delivered `AudioBuffer` carries
+> the authoritative format. A `WavFileSink` built from the requested format has
+> the wrong header when the device delivers something else, and `write` then
+> rejects the first buffer. Take the format from the first delivered buffer, as
+> below.
+
 Built-in driver (`drain_to`) — the recommended path:
 
 ```rust
-capture.start()?;                                  // negotiate the format first
-let format = capture.format().unwrap_or_default(); // Some(_) once started
-let wav = WavFileSink::new("out.wav", &format)?;   // feature `sink-wav`
-let drain = capture.drain_to(wav)?;                // background rsac-drain thread
+capture.start()?;
+// Read the first delivered buffer with the terminal-observable read
+// (`read_chunk_blocking` — NOT `read_buffer_blocking`, which downgrades the
+// end-of-stream to a recoverable error), then build the sink from ITS format.
+let first = capture.read_chunk_blocking()?;
+let format = first.format().clone();
+let mut wav = WavFileSink::new("out.wav", &format)?; // feature `sink-wav`
+wav.write(&first)?;                                  // the first buffer is already consumed
+let drain = capture.drain_to(wav)?;                  // background rsac-drain thread
 std::thread::sleep(std::time::Duration::from_secs(10));
-drain.shutdown();                                  // flush + close + join the thread
+drain.shutdown();                                    // flush + close + join the thread
 capture.stop()?;
 ```
 
 Manual drain pattern (lower-level, when you own the read cadence):
 
 ```rust
-capture.start()?; // format() is Some(_) only after start negotiates it
-let mut wav = WavFileSink::new("out.wav", &capture.format().unwrap_or_default())?;
-// `read_buffer_blocking()` waits for data instead of returning early on a
-// momentary empty ring (as the non-blocking `read_buffer()` would). It returns
-// an error once the stream is no longer running, ending the drain cleanly.
-while let Ok(buffer) = capture.read_buffer_blocking() {
-    wav.write(&buffer)?;
+capture.start()?;
+// `read_chunk_blocking` is the terminal-observable blocking read: it returns
+// `StreamEnded` once the stream is terminal (NOT `read_buffer_blocking`, which
+// downgrades that to a recoverable error and can never end a drain cleanly).
+let first = capture.read_chunk_blocking()?;
+let mut wav = WavFileSink::new("out.wav", first.format())?; // header = delivered format
+wav.write(&first)?;
+loop {
+    match capture.read_chunk_blocking() {
+        Ok(buffer) => wav.write(&buffer)?,
+        // Clean end of stream: the ring is drained, finish the file.
+        Err(AudioError::StreamEnded { .. }) => break,
+        // Recoverable (a transient read / a blocking timeout on a healthy but
+        // quiet stream): retry — a `while let Ok(..)` loop would swallow the
+        // error and truncate the file here.
+        Err(e) if !e.is_fatal() => continue,
+        Err(e) => return Err(e),
+    }
 }
-wav.flush()?;
+wav.close()?; // finalise the header explicitly on every path
 capture.stop()?;
 ```
+
+### Activity probe recipe
+
+To ask "is anything audible on this target right now?", open one capture
+session, read delivered buffers for a bounded wall-clock window, and compute
+peak and RMS over what arrived. [`examples/probe_activity.rs`](../examples/probe_activity.rs)
+is a runnable recipe built only from the public API (it is not a library API):
+
+```bash
+cargo run --example probe_activity --features cli -- system 500
+cargo run --example probe_activity --features cli -- app:firefox 1000
+```
+
+Arguments: a target (`system`, `app:<name>` for an application by name, or
+`pid:<n>` for a process tree) and an optional window in milliseconds (default
+500).
+
+It prints one line (`active`, `silent` or `no audio delivered`, the measured
+values and the delivered format) and exits 0, 1 or 2 respectively; an error the
+public API returns (bad arguments, build/start/read failure) exits 3 — note
+`AudioCapture::stop` logs and swallows a backend stop failure itself, so that one
+never reaches the exit code. `silent` is only a verdict about buffers actually
+observed below the threshold: an application that is running but rendering
+nothing delivers no buffers and reports `no audio delivered` instead. Its
+limits:
+
+- One capture session per probe; there is no persistent monitor.
+- The window bounds the read polling only (not `build()`/`start()`/`stop()`).
+  The first buffer can arrive late, so `no audio delivered` is not proof of
+  silence.
+- Silence is not proof that the target is absent.
+- On platforms without application capture, `app:` and `pid:` targets fail with
+  the library's capability error (exit 3).
 
 ## Composing multiple sources (`compose` feature)
 
