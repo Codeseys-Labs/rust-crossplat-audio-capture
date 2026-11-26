@@ -6,8 +6,8 @@
 # Usage: bash scripts/check-release-published.sh X.Y.Z [--remote NAME]
 #        bash scripts/check-release-published.sh --self-test
 # Default remote: origin. GH_BIN and CURL_BIN override gh and curl.
-# RELEASE_REPO overrides the GitHub owner/name derived from --remote. If the
-# repository cannot be determined, all three workflow probes are indeterminate.
+# RELEASE_REPO overrides the GitHub owner/name derived from --remote. An
+# invalid override or unknown repository makes all three workflow probes indeterminate.
 # --self-test checks the npm platform list against the napi manifest offline.
 #
 # Exit: 0 safe to re-tag; 1 published; 2 usage; 3 indeterminate (do not
@@ -16,6 +16,23 @@ set -euo pipefail
 
 log() { printf 'check-release-published: %s\n' "$*" >&2; }
 usage() { log 'usage: check-release-published.sh X.Y.Z [--remote NAME] | --self-test'; exit 2; }
+
+# gh and curl return one value per probe. Preserve boundaries so malformed
+# output (e.g. a zero followed by a blank line) cannot certify an unused version.
+probe_output() {
+    "$@" 2>/dev/null | {
+        local value
+        if IFS= read -r -d '' value; then return 1; fi
+        if [[ -n $value ]]; then
+            case $value in
+                *$'\r\n') value=${value%$'\r\n'} ;;
+                *) value=${value%$'\n'} ;;
+            esac
+            [[ -n $value && $value != *$'\n'* ]] || return 1
+        fi
+        printf '%s' "$value"
+    }
+}
 
 NPM_PLATFORMS=(win32-x64-msvc darwin-x64 linux-x64-gnu darwin-arm64 linux-arm64-gnu
                linux-x64-musl linux-arm64-musl linux-arm-gnueabihf)
@@ -87,22 +104,25 @@ report() {
         indeterminate) if [[ $verdict != published ]]; then verdict=indeterminate; fi ;;
     esac
 }
-if ! ref=$(git ls-remote --tags "$remote" "refs/tags/bindings/rsac-go/v$version" 2>/dev/null); then state=indeterminate
+if ! ref=$(probe_output git ls-remote --tags "$remote" "refs/tags/bindings/rsac-go/v$version"); then state=indeterminate
 elif [[ -n $ref ]]; then state=published
 else state=clean
 fi
 report go-tag "$state"
 
 REPO=${RELEASE_REPO:-}
-if [[ -z $REPO ]] && url=$(git remote get-url "$remote" 2>/dev/null); then
-    github_url='^(https://github\.com/|git@github\.com:|ssh://git@github\.com/)([A-Za-z0-9_-]+/[A-Za-z0-9_.-]+)$'
+repo_pattern='^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$'
+if [[ -n $REPO ]]; then
+    [[ $REPO =~ $repo_pattern ]] || REPO=''
+elif url=$(probe_output git remote get-url "$remote"); then
+    github_url='^(https://github\.com/|git@github\.com:|ssh://git@github\.com/)([A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+)$'
     url=${url%/}
     if [[ ${url%.git} =~ $github_url ]]; then REPO=${BASH_REMATCH[2]}; fi
 fi
 for workflow in release.yml release-npm.yml release-pypi.yml; do
     if [[ -n $REPO ]] &&
-        count=$("$GH_BIN" run list --repo "$REPO" --workflow "$workflow" --event push --branch "v$version" --limit 20 --json status --jq '[.[] | select(.status != "completed")] | length' 2>/dev/null) &&
-        [[ ${count%$'\r'} =~ ^0+$ ]]; then
+        count=$(probe_output "$GH_BIN" run list --repo "$REPO" --workflow "$workflow" --event push --branch "v$version" --limit 20 --json status --jq '[.[] | select(.status != "completed")] | length') &&
+        [[ $count =~ ^0+$ ]]; then
         report "$workflow" clean
     else
         report "$workflow" indeterminate
@@ -111,8 +131,8 @@ done
 
 probe_registry() {
     local code state
-    if code=$("$CURL_BIN" -sS -o /dev/null -w '%{http_code}' --max-time 20 -A 'rsac-release-check (https://github.com/Codeseys-Labs/rust-crossplat-audio-capture)' "$2" 2>/dev/null); then
-        case ${code%$'\r'} in
+    if code=$(probe_output "$CURL_BIN" -sS -o /dev/null -w '%{http_code}' --max-time 20 -A 'rsac-release-check (https://github.com/Codeseys-Labs/rust-crossplat-audio-capture)' "$2"); then
+        case $code in
             200) state=published ;;
             404) state=clean ;;
             *) state=indeterminate ;;

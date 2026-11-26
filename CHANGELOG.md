@@ -131,6 +131,25 @@ Releases with no ABI change omit the subsection (or state "No C ABI changes").
   partial and ends with a non-zero exit status. `docs/API.md`, `docs/INTEROP.md` and
   the `README.md` composition example were corrected to match (two of them called
   methods `Composition` does not have).
+- **Releases are tagged by one gate** — `release-tag.yml` no longer tags when a
+  `release: vX.Y.Z` commit lands on `master` (it checked the version lockstep and no
+  CI result). It is dispatched with a version and a commit SHA and runs
+  `scripts/tag-release.sh`, now the only code that creates tags. The script requires
+  four dispatched runs on that exact commit, each with an evidence job that fails on any
+  skip (`ci.yml` `Release Readiness`; `ci-audio-tests.yml`, `ci-android-emu.yml` and
+  `ci-ios-sim.yml` with `-f release_evidence=true`), and a workstation note for the
+  Windows default-switch test (`docs/evidence/windows-default-switch.md`) whose tested
+  commit still matches the recovery and WASAPI sources. The two mobile runs and the note
+  can be waived only by naming an open `release-waiver` issue, which is written into the
+  tag message and the GitHub Release. The script reads CI from the repository the tags
+  are pushed to (the push URL, not only the fetch URL), fetches no tags, and validates
+  `RELEASE_REPO`. The workflow runs the gate script of its own revision, never the copy
+  in the commit being tagged, so an old commit cannot be tagged under an older gate; the
+  commit is only data (`RELEASE_GATE_DIR`, and `check-version-lockstep.sh --root`). The
+  tags are pushed with the workflow token, so no tag-triggered run starts. The publish
+  workflows check, right before an upload, that the stable `vX.Y.Z` tag still points at
+  the commit they run on, and no longer rewrite the body of a GitHub Release that
+  already exists.
 
 ### Deprecated
 

@@ -356,7 +356,7 @@ mise run test        # just the CI test-job replica for the host OS
 mise run test:audio  # ci_audio integration suite on this machine (all 3 tiers)
 mise run secrets     # betterleaks full-history scan; staged diff: mise run secrets:staged
 mise run release:bump -- X.Y.Z [--dry-run]  # nine-manifest lockstep bump + CHANGELOG rotation
-mise run release:tag -- X.Y.Z [--dry-run]   # refuses to tag unless the commit has a green full+semver run (Release Readiness); pushes the crate and Go tags atomically
+mise run release:tag -- X.Y.Z [--dry-run]   # the local form of the tag gate (normally run by release-tag.yml): refuses unless the commit has the four evidence runs and a fresh Windows switch note; pushes the crate and Go tags atomically
 mise run release:check-published -- X.Y.Z   # after a failed verify: may the tag be replaced? (Go tag, runs in flight, crates.io, PyPI, npm)
 mise run release:verify-docs                # post-publish docs.rs spot-check
 ```
@@ -457,10 +457,14 @@ build/test workflow fires on `pull_request` or on a branch push. Run what a
 change needs from the Actions tab or with `gh workflow run <workflow> --ref
 <branch>`; check runs attach to the dispatched commit, so they show on that
 commit's open PR. The only automatic runs are the PR changelog guard, the
-weekly non-Rust supply-chain scan, and stable `v*.*.*` tags (the release gate).
-The tag runs start only for a tag pushed by a person or with the release App
-token: a tag `release-tag.yml` pushes with the default `GITHUB_TOKEN` starts no
-workflow, so dispatch `ci.yml` and `ci-audio-tests.yml` on that tag by hand.
+weekly non-Rust supply-chain scan, and stable `v*.*.*` tags.
+A release is tagged by dispatching `release-tag.yml` with a version and a commit
+SHA: it runs `scripts/tag-release.sh`, which requires four dispatched evidence
+runs on that exact commit (`ci.yml -f full=true -f semver=true`, and
+`ci-audio-tests.yml -f platform=all`, `ci-android-emu.yml` and `ci-ios-sim.yml`
+each with `-f release_evidence=true`), and it pushes the tags with the workflow
+token, so no tag-triggered run starts. A tag pushed by a person does start the
+tag-triggered workflows; that is the emergency path only.
 **A PR with no dispatched run has no CI evidence** — say so in the PR instead of
 implying green. See [desktop refinement](docs/DESKTOP_REFINEMENT.md#d5--desktop-release-and-mobile-freeze).
 
@@ -468,6 +472,7 @@ implying green. See [desktop refinement](docs/DESKTOP_REFINEMENT.md#d5--desktop-
 |---|---|---|
 | [`ci.yml`](.github/workflows/ci.yml) | manual dispatch, stable tags | Desktop lint and unit tests, MSRV, feature and binding checks. A branch dispatch scopes itself by the branch's diff against `master` (docs-only → no matrix; mobile legs only for mobile-relevant paths); `-f full=true` forces the whole matrix including coverage, and `-f semver=true` separately adds the release semver gate. Rust MSRV is **1.88**; the pinned development toolchain can be newer. |
 | [`ci-audio-tests.yml`](.github/workflows/ci-audio-tests.yml) | manual dispatch (`-f platform=all\|linux\|windows\|macos\|bindings`), stable tags | Virtual-audio integration on real audio stacks. |
+| [`release-tag.yml`](.github/workflows/release-tag.yml) | manual dispatch (`-f version=X.Y.Z -f sha=<commit>`) | The release gate: runs `scripts/tag-release.sh` on the requested commit, pushes the crate and Go tags, creates the GitHub Release. Nothing is tagged on merge. |
 | [`changelog-guard.yml`](.github/workflows/changelog-guard.yml) | every PR (automatic) | Independent PR changelog guard, including label changes. |
 | [`supply-chain.yml`](.github/workflows/supply-chain.yml) | weekly cron (automatic), manual dispatch | Non-Rust dependency and license audit. |
 | [`ci-android-emu.yml`](.github/workflows/ci-android-emu.yml), [`ci-ios-sim.yml`](.github/workflows/ci-ios-sim.yml) | manual dispatch | Emulator/simulator runtime runs, separate from compile checks; record actual results. |
@@ -709,6 +714,14 @@ Full playbook (when to stack vs parallel PRs, exact commands, pitfalls):
 - Multi-session hygiene: **never `git add -A` in a shared checkout**, always
   stage explicit paths; layer work happens in disposable worktrees;
   `--force-with-lease` only, and only on branches you own.
+- **Never point two worktrees at one `CARGO_TARGET_DIR`.** Cargo names a
+  workspace crate's artifacts without the checkout's path, so two worktrees of
+  this repository share them, and a build from one is "fresh" for the other
+  whenever the other's sources are older. A deliberately broken library built
+  in a scratch worktree was linked into the main worktree's tests this way and
+  produced four failures that looked like a missed device notification. A
+  scratch worktree gets its own target directory; after an accident,
+  `cargo clean -p rsac` and rerun.
 
 ---
 

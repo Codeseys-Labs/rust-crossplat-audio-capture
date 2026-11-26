@@ -1,95 +1,37 @@
-# Release-tag-on-merge: the second half of the release-please-style flow.
+# Release tagging follows the reviewed, squash-merged PR opened by
+# release-prepare.yml. The script checks versions, existing tags and evidence
+# before atomically pushing the crate and Go module tags.
 #
-# The first half (.github/workflows/release-prepare.yml) is a manual
-# workflow_dispatch that computes the next NON-MAJOR version, runs
-# scripts/bump-version.sh, and opens a "release: vX.Y.Z" PR (bump + CHANGELOG
-# rotation) via peter-evans/create-pull-request. A human reviews and
-# SQUASH-MERGES that PR to master.
-#
-# This workflow runs on every push to master, detects the squash-merge of a
-# release PR by the HEAD commit SUBJECT (`release: vX.Y.Z`), and — if the
-# manifest agrees and the tag does not already exist — creates + pushes an
-# annotated `vX.Y.Z` tag AND publishes a GitHub Release for it.
-#
-# ─────────────────────────────────────────────────────────────────────────
-#  TOKEN HANDOFF: registry fan-out is AUTOMATIC when the release App
-#  secrets are configured, and gracefully degrades to GitHub-only when not.
-# ─────────────────────────────────────────────────────────────────────────
-#
-# The publish workflows (release.yml → crates.io, release-npm.yml → npm,
-# release-pypi.yml → PyPI) trigger ONLY on `push: tags: v*.*.*`, and a tag
-# pushed with the default GITHUB_TOKEN does **not** re-trigger other
-# workflows (GitHub Actions' deliberate anti-recursion rule). To make the
-# fan-out fire, this workflow mints a GitHub App installation token via
-# actions/create-github-app-token from two org-level secrets:
-#
-#   RSAC_RELEASE_APP_ID          — the App's numeric App ID
-#   RSAC_RELEASE_APP_PRIVATE_KEY — the App's PEM private key
-#
-# and pushes the vX.Y.Z tag with THAT token. App-token pushes are not
-# subject to the anti-recursion rule, so release.yml / release-npm.yml /
-# release-pypi.yml fire automatically off the tag. (App setup: an org-owned
-# GitHub App with Repository permissions → Contents: Read and write,
-# installed on this repo. See docs/RELEASE_PROCESS.md
-# §"Release App setup (automatic registry fan-out)".)
-#
-# GRACEFUL FALLBACK: when the secrets are absent, behavior is exactly the
-# pre-App state — the tag + GitHub Release are still created with the
-# default GITHUB_TOKEN (both of which it CAN do; only cross-workflow
-# TRIGGERING is blocked), registry publishing stays manual per-registry
-# workflow_dispatch, and the job summary explains what to configure.
-# Secrets cannot be read in `if:` expressions on every context, so a probe
-# step receives them via env, tests emptiness in the script, and exposes an
-# output flag that `if:`-gates the token-mint step; the push steps then pick
-# the credential with a plain shell conditional on the (possibly empty)
-# minted token.
-#
-# GO MODULE TAG: after the crate tag, this workflow also creates + pushes
-# bindings/rsac-go/vX.Y.Z (same version, same selected credential) so Go
-# consumers can `go get
-# github.com/Codeseys-Labs/rust-crossplat-audio-capture/bindings/rsac-go@vX.Y.Z`
-# (the go.mod module path is repo-path-prefixed, which is what makes Go's
-# subdirectory-tag convention resolve from THIS repo). Verified
-# recursion-safe: every `on: push: tags:` filter in this repo is
-# `v*.*.*` (+ `!v*-*`), and a single `*` in a tag glob does not cross `/`,
-# so `bindings/rsac-go/vX.Y.Z` matches nothing.
-#
-# Detection rationale (primary, robust signal):
-#   A squash merge collapses the release PR into a single commit whose subject
-#   is the PR title — "release: vX.Y.Z" (GitHub appends " (#N)"). Matching the
-#   HEAD commit subject with `git log -1 --format=%s` is branch/merge-strategy
-#   independent and needs no API call.
-#
-# Safety:
-#   • Repo-guarded to Codeseys-Labs/rust-crossplat-audio-capture so a fork that
-#     merges a "release:" commit never tags + releases.
-#   • Manifest defense: refuses if Cargo.toml version != the parsed version.
-#   • Major guard: refuses if the parsed major != the current Cargo.toml major
-#     (a major bump stays fully manual — release-prepare.yml never produces one,
-#     but this is belt-and-suspenders against a hand-crafted release commit).
-#   • Idempotent: never re-tags an existing local OR remote vX.Y.Z tag.
-#   • Lockstep defense: refuses unless scripts/check-version-lockstep.sh
-#     --expect X.Y.Z passes on the release commit (every lockstep manifest and
-#     internal rsac pin). CI is manually dispatched, so this step — not a
-#     ci.yml run on the merged PR — is what guarantees the tagged commit is in
-#     lockstep before the tag exists.
-
-name: Release Tag on Merge
+# Tags pushed with GITHUB_TOKEN do not start tag-triggered workflows. Registry
+# publishing (issue #88) needs its own start.
+name: Release Tag
 
 on:
-  push:
-    branches: [master]
+  workflow_dispatch:
+    inputs:
+      version:
+        description: Stable release version (X.Y.Z)
+        type: string
+        required: true
+      sha:
+        description: Merged commit SHA (40 lower-case hexadecimal characters)
+        type: string
+        required: true
+      waive:
+        description: Optional space-separated key=issue-number waivers
+        type: string
+        required: false
+        default: ''
+      run_ids:
+        description: Optional space-separated evidence key=run-id items
+        type: string
+        required: false
+        default: ''
+      dry_run:
+        description: Check the release without creating tags
+        type: boolean
+        default: false
 
-env:
-  CARGO_TERM_COLOR: always
-  RUST_BACKTRACE: 1
-
-# Least privilege: this workflow only pushes tags (vX.Y.Z + the Go module
-# tag) and a Release to its own repo.
-permissions:
-  contents: write
-
-# Serialise tag creation per ref so two quick merges can't race to tag.
 concurrency:
   group: release-tag-${{ github.ref }}
   cancel-in-progress: false
@@ -97,331 +39,244 @@ concurrency:
 jobs:
   tag:
     name: Tag release commit
-    timeout-minutes: 10
-    # Repo guard: only the canonical repo may create release tags. A fork that
-    # merges a "release:" commit must never fan out to the publish workflows.
     if: github.repository == 'Codeseys-Labs/rust-crossplat-audio-capture'
-    runs-on: blacksmith-4vcpu-ubuntu-2404
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    permissions:
+      contents: write
+      actions: read
+      issues: read
     steps:
-      # Full history + persisted credentials: we need the merged commit's
-      # subject and the ability to push an annotated tag back to origin.
-      - uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5
+      - name: Validate dispatch
+        shell: bash
+        env:
+          VERSION: ${{ inputs.version }}
+          SHA: ${{ inputs.sha }}
+          WAIVE: ${{ inputs.waive }}
+          RUN_IDS: ${{ inputs.run_ids }}
+          DISPATCH_REF: ${{ github.ref }}
+        run: |
+          set -euo pipefail
+          [[ "$VERSION" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]] || { echo "::error::version must be X.Y.Z"; exit 1; }
+          [[ "$SHA" =~ ^[0-9a-f]{40}$ ]] || { echo "::error::sha must be 40 lower-case hex characters"; exit 1; }
+          [[ "$DISPATCH_REF" == refs/heads/master ]] || { echo "::error::dispatch on master"; exit 1; }
+          [[ "$WAIVE" != *$'\n'* && "$WAIVE" != *$'\r'* ]] || { echo "::error::waivers must be space-separated"; exit 1; }
+          read -r -a waivers <<< "$WAIVE"
+          for waiver in "${waivers[@]}"; do
+            [[ "$waiver" =~ ^(android-emu|ios-sim|windows-switch)=#?[0-9]+$ ]] || {
+              echo "::error::invalid waiver: $waiver"; exit 1;
+            }
+          done
+          [[ "$RUN_IDS" != *$'\n'* && "$RUN_IDS" != *$'\r'* ]] || { echo "::error::run ids must be space-separated"; exit 1; }
+          read -r -a run_ids <<< "$RUN_IDS"
+          for run_id in "${run_ids[@]}"; do
+            [[ "$run_id" =~ ^(ci|audio|android-emu|ios-sim)=[0-9]+$ ]] || {
+              echo "::error::invalid run id: $run_id"; exit 1;
+            }
+          done
+
+      # The gate code comes from the workflow revision, not the requested SHA.
+      - name: Check out workflow revision
+        uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5
         with:
+          ref: ${{ github.sha }}
+          path: gate
+          persist-credentials: false
+
+      # The requested checkout is data for the trusted gate. Credentials must
+      # persist here because the gate fetches the branch and pushes both tags.
+      - name: Check out requested commit
+        uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5
+        with:
+          ref: ${{ inputs.sha }}
+          path: release-commit
           fetch-depth: 0
           persist-credentials: true
 
-      # Gate: is HEAD a release commit? `git log -1 --format=%s` yields the
-      # squash-merge subject (== the release PR title). Only a subject of the
-      # exact shape `release: vX.Y.Z` proceeds; anything else is a normal merge
-      # and the remaining steps no-op via the `is_release` output.
-      - name: Detect release commit
-        id: detect
-        shell: bash
-        run: |
-          set -euo pipefail
-          SUBJECT="$(git log -1 --format=%s)"
-          echo "HEAD subject: ${SUBJECT}"
-          # Match "release: vX.Y.Z" with an OPTIONAL trailing " (#N)" — GitHub's
-          # default squash-merge subject is the PR title plus a " (#123)" PR-number
-          # suffix, so the anchor must tolerate it. Still rejects pre-release
-          # shapes (v0.3.0-rc.1), a bare "0.3.0", and non-release subjects.
-          if [[ "${SUBJECT}" =~ ^release:\ v([0-9]+)\.([0-9]+)\.([0-9]+)([[:space:]]+\(#[0-9]+\))?$ ]]; then
-            MAJOR="${BASH_REMATCH[1]}"
-            MINOR="${BASH_REMATCH[2]}"
-            PATCH="${BASH_REMATCH[3]}"
-            VERSION="${MAJOR}.${MINOR}.${PATCH}"
-            echo "is_release=true"   >> "$GITHUB_OUTPUT"
-            echo "version=${VERSION}" >> "$GITHUB_OUTPUT"
-            echo "major=${MAJOR}"     >> "$GITHUB_OUTPUT"
-            echo "tag=v${VERSION}"    >> "$GITHUB_OUTPUT"
-            echo "Detected release commit for v${VERSION}"
-          else
-            echo "is_release=false" >> "$GITHUB_OUTPUT"
-            echo "Not a release commit — nothing to tag."
-          fi
-
-      # Manifest defense: the version parsed from the commit subject MUST match
-      # Cargo.toml on this exact commit. A mismatch means the bump and the PR
-      # title disagree — refuse rather than tag a wrong version. (Mirrors the
-      # extractor in scripts/bump-version.sh / ci.yml version-lockstep.)
-      - name: Verify Cargo.toml matches parsed version
-        if: steps.detect.outputs.is_release == 'true'
+      - name: Verify checkout and set bot identity
+        id: checkout
+        working-directory: release-commit
         shell: bash
         env:
-          PARSED_VERSION: ${{ steps.detect.outputs.version }}
-          PARSED_MAJOR: ${{ steps.detect.outputs.major }}
+          SHA: ${{ inputs.sha }}
         run: |
           set -euo pipefail
-          MANIFEST="$(awk '
-            /^\[package\][[:space:]]*$/ { in_sec = 1; next }
-            /^\[/ { if ($0 !~ /^\[package\][[:space:]]*$/) in_sec = 0 }
-            in_sec && /^[[:space:]]*version[[:space:]]*=[[:space:]]*"[^"]+"[[:space:]]*$/ {
-              match($0, /"[^"]+"/); print substr($0, RSTART + 1, RLENGTH - 2); exit
-            }
-          ' Cargo.toml)"
-          echo "parsed version: ${PARSED_VERSION}  Cargo.toml version: ${MANIFEST}"
-          if [ -z "${MANIFEST}" ]; then
-            echo "::error::could not extract a version from Cargo.toml"
-            exit 1
-          fi
-          if [ "${PARSED_VERSION}" != "${MANIFEST}" ]; then
-            echo "::error::release commit version (${PARSED_VERSION}) does not match Cargo.toml version (${MANIFEST}) — refusing to tag"
-            exit 1
-          fi
-          # Major guard: a major bump must never be auto-tagged. The current
-          # major is the manifest major (== parsed major after the check above);
-          # asserting equality here is defense against a hand-crafted release
-          # commit that crosses a major boundary relative to the tree.
-          MANIFEST_MAJOR="${MANIFEST%%.*}"
-          if [ "${PARSED_MAJOR}" != "${MANIFEST_MAJOR}" ]; then
-            echo "::error::major version mismatch (parsed ${PARSED_MAJOR} vs Cargo.toml ${MANIFEST_MAJOR}) — major bumps are manual, refusing to tag"
-            exit 1
-          fi
-          echo "OK: version + major match Cargo.toml"
-
-      # Lockstep defense: every lockstep manifest and internal rsac dependency
-      # pin must equal the parsed version BEFORE the tag exists. ci.yml's
-      # version-lockstep job only warns on a manual dispatch, and its hard
-      # tag-push run fires after the tag is already public. Same script the
-      # registry publish workflows call.
-      - name: Verify all manifests are in lockstep at the parsed version
-        if: steps.detect.outputs.is_release == 'true'
-        shell: bash
-        env:
-          PARSED_VERSION: ${{ steps.detect.outputs.version }}
-        run: bash scripts/check-version-lockstep.sh --expect "${PARSED_VERSION}"
-
-      # Idempotency: never re-tag. Check both the local tag set and the remote
-      # (a previous run, or a manual tag, may already exist). If present, skip
-      # cleanly with a notice — the tag push has already fanned out (or will).
-      - name: Check tag does not already exist
-        if: steps.detect.outputs.is_release == 'true'
-        id: exists
-        shell: bash
-        env:
-          TAG: ${{ steps.detect.outputs.tag }}
-        run: |
-          set -euo pipefail
-          EXISTS=false
-          if git rev-parse -q --verify "refs/tags/${TAG}" >/dev/null 2>&1; then
-            EXISTS=true
-            echo "Local tag ${TAG} already exists."
-          elif git ls-remote --tags origin "refs/tags/${TAG}" | grep -q "refs/tags/${TAG}"; then
-            EXISTS=true
-            echo "Remote tag ${TAG} already exists."
-          fi
-          echo "exists=${EXISTS}" >> "$GITHUB_OUTPUT"
-          if [ "${EXISTS}" = "true" ]; then
-            echo "::notice::Tag ${TAG} already exists — skipping (idempotent, never re-tag)."
-          else
-            echo "Tag ${TAG} does not exist yet — will create."
-          fi
-
-      # Credential probe: secrets are NOT readable inside `if:` expressions on
-      # every context, so the robust pattern is to pass them into env and test
-      # emptiness in a script, exporting an output flag for later `if:` guards.
-      # Never prints the values — only whether the pair is present.
-      - name: Detect release App credentials
-        if: steps.detect.outputs.is_release == 'true'
-        id: app-creds
-        shell: bash
-        env:
-          APP_ID: ${{ secrets.RSAC_RELEASE_APP_ID }}
-          APP_PRIVATE_KEY: ${{ secrets.RSAC_RELEASE_APP_PRIVATE_KEY }}
-        run: |
-          set -euo pipefail
-          if [ -n "${APP_ID}" ] && [ -n "${APP_PRIVATE_KEY}" ]; then
-            echo "available=true" >> "$GITHUB_OUTPUT"
-            echo "Release App credentials found — tag will be pushed with an App installation token (publish workflows will fire)."
-          else
-            echo "available=false" >> "$GITHUB_OUTPUT"
-            echo "Release App credentials absent — falling back to GITHUB_TOKEN (tag + Release only; registry publishes stay manual)."
-          fi
-
-      # Mint the App installation token (scoped by default to this repository).
-      # Only runs when both org secrets exist — the fallback path never touches
-      # this step, so a missing App can't fail the release.
-      - name: Mint GitHub App installation token
-        if: steps.detect.outputs.is_release == 'true' && steps.app-creds.outputs.available == 'true'
-        id: app-token
-        uses: actions/create-github-app-token@fee1f7d63c2ff003460e3d139729b119787bc349 # v2.2.2
-        with:
-          app-id: ${{ secrets.RSAC_RELEASE_APP_ID }}
-          private-key: ${{ secrets.RSAC_RELEASE_APP_PRIVATE_KEY }}
-
-      # Create + push the annotated tag at HEAD (the squash-merge release
-      # commit), so any artifacts come from the exact reviewed +
-      # version-lockstep-passing commit on master.
-      #
-      # Credential selection is a shell conditional on the minted token (empty
-      # when the mint step was skipped — GitHub renders a skipped step's
-      # outputs as empty strings):
-      #   • App token present → the push authenticates via an x-access-token
-      #     remote URL, so the tag DOES re-trigger the on:push:tags publish
-      #     workflows (full registry fan-out).
-      #   • App token absent → push over the checkout's persisted
-      #     GITHUB_TOKEN credentials, exactly the pre-App behavior: the tag is
-      #     created but the anti-recursion rule keeps publishes manual (see
-      #     the publish-path report step below).
-      - name: Create and push annotated tag
-        if: steps.detect.outputs.is_release == 'true' && steps.exists.outputs.exists == 'false'
-        shell: bash
-        env:
-          TAG: ${{ steps.detect.outputs.tag }}
-          VERSION: ${{ steps.detect.outputs.version }}
-          APP_TOKEN: ${{ steps.app-token.outputs.token }}
-        run: |
-          set -euo pipefail
+          [[ "$(git rev-parse HEAD)" == "$SHA" ]] || { echo "::error::checkout SHA mismatch"; exit 1; }
           git config user.name "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
-          git tag -a "${TAG}" -m "Release ${VERSION}"
-          if [ -n "${APP_TOKEN}" ]; then
-            git push "https://x-access-token:${APP_TOKEN}@github.com/${GITHUB_REPOSITORY}.git" "refs/tags/${TAG}"
-            echo "::notice::Pushed annotated tag ${TAG} with the release App token — the registry publish workflows fire automatically."
-          else
-            git push origin "${TAG}"
-            echo "::notice::Pushed annotated tag ${TAG} with GITHUB_TOKEN — registry publishes stay manual (anti-recursion)."
-          fi
+          # Cargo must not execute a compiler or credential helper selected by
+          # a config file from the commit being checked.
+          for config in .cargo/config .cargo/config.toml; do
+            if [[ -e "$config" || -L "$config" ]]; then
+              echo "::error::requested commit contains $config; refusing to execute its Cargo configuration"
+              exit 1
+            fi
+          done
+          toolchain="$(awk -F '"' '/^channel[[:space:]]*=/ { print $2; exit }' "$GITHUB_WORKSPACE/gate/rust-toolchain.toml")"
+          [[ -n "$toolchain" ]] || { echo "::error::trusted toolchain channel is missing"; exit 1; }
+          echo "toolchain=$toolchain" >> "$GITHUB_OUTPUT"
 
-      # Go module tag: bindings/rsac-go is a Go module in a subdirectory, so
-      # Go's module proxy expects the module-path-prefixed tag
-      # bindings/rsac-go/vX.Y.Z pushed in lockstep with the crate tag
-      # (docs/RELEASE_PROCESS.md §"Versioning & ABI contract" (c)). Recursion
-      # is not a concern regardless of credential: every `on: push: tags:`
-      # filter in this repo is `v*.*.*` (+ `!v*-*`), and a single `*` in a tag
-      # glob does not cross `/`, so nothing triggers on this tag path. Uses
-      # whichever credential the main push selected. Idempotent on its own
-      # (independent of the crate tag's `exists` check) so a rerun after a
-      # partial failure — crate tag pushed, Go tag missed — backfills the Go
-      # tag instead of skipping it.
-      - name: Create and push Go module tag
-        if: steps.detect.outputs.is_release == 'true'
+      # Use the trusted revision's pin, not the requested commit's override.
+      - name: Install trusted Rust toolchain
         shell: bash
+        timeout-minutes: 5
         env:
-          VERSION: ${{ steps.detect.outputs.version }}
-          APP_TOKEN: ${{ steps.app-token.outputs.token }}
+          TOOLCHAIN: ${{ steps.checkout.outputs.toolchain }}
+        run: rustup toolchain install "$TOOLCHAIN" --profile minimal --no-self-update
+
+      - name: Gate and tag release
+        id: tag
+        shell: bash
+        working-directory: release-commit
+        timeout-minutes: 15
+        env:
+          VERSION: ${{ inputs.version }}
+          WAIVE: ${{ inputs.waive }}
+          RUN_IDS: ${{ inputs.run_ids }}
+          RELEASE_GATE_DIR: ${{ github.workspace }}/gate
+          RUSTUP_TOOLCHAIN: ${{ steps.checkout.outputs.toolchain }}
+          DRY_RUN: ${{ inputs.dry_run }}
+          GH_TOKEN: ${{ github.token }}
         run: |
           set -euo pipefail
-          GO_TAG="bindings/rsac-go/v${VERSION}"
-          if git rev-parse -q --verify "refs/tags/${GO_TAG}" >/dev/null 2>&1; then
-            echo "::notice::Go module tag ${GO_TAG} already exists locally — skipping (idempotent, never re-tag)."
-            exit 0
-          fi
-          if git ls-remote --tags origin "refs/tags/${GO_TAG}" | grep -q "refs/tags/${GO_TAG}"; then
-            echo "::notice::Go module tag ${GO_TAG} already exists on origin — skipping (idempotent, never re-tag)."
-            exit 0
-          fi
-          git config user.name "github-actions[bot]"
-          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
-          git tag -a "${GO_TAG}" -m "rsac-go ${VERSION}"
-          # Same credential selection as the main tag push.
-          if [ -n "${APP_TOKEN}" ]; then
-            git push "https://x-access-token:${APP_TOKEN}@github.com/${GITHUB_REPOSITORY}.git" "refs/tags/${GO_TAG}"
-          else
-            git push origin "refs/tags/${GO_TAG}"
-          fi
-          echo "::notice::Pushed Go module tag ${GO_TAG} — Go consumers can now 'go get github.com/Codeseys-Labs/rust-crossplat-audio-capture/bindings/rsac-go@v${VERSION}'."
+          args=("$VERSION")
+          if [[ "$DRY_RUN" == true ]]; then args+=(--dry-run); fi
+          read -r -a waivers <<< "$WAIVE"
+          for waiver in "${waivers[@]}"; do args+=(--waive "$waiver"); done
+          read -r -a run_ids <<< "$RUN_IDS"
+          for run_id in "${run_ids[@]}"; do args+=(--run-id "$run_id"); done
+          bash "$RELEASE_GATE_DIR/scripts/tag-release.sh" "${args[@]}"
 
-      # Extract this version's CHANGELOG section for the GitHub Release body.
-      # Pulls the lines between "## [X.Y.Z]" and the next "## [" heading.
-      #
-      # NOTE: this is gated ONLY on is_release, NOT on exists=='false'. The
-      # GitHub Release creation below must run even when the tag already exists,
-      # so that a rerun after a partial failure (tag pushed, but the Release step
-      # errored) still produces the Release body — otherwise we'd be left with a
-      # published tag and no GitHub Release for that version.
-      - name: Extract CHANGELOG section
-        if: steps.detect.outputs.is_release == 'true'
-        id: notes
+      - name: Report remote tags after gate failure
+        if: ${{ failure() && steps.tag.outcome == 'failure' }}
+        working-directory: release-commit
         shell: bash
+        timeout-minutes: 2
         env:
-          VERSION: ${{ steps.detect.outputs.version }}
+          VERSION: ${{ inputs.version }}
+          SHA: ${{ inputs.sha }}
+          DRY_RUN: ${{ inputs.dry_run }}
         run: |
-          set -euo pipefail
-          SECTION="$(awk -v ver="$VERSION" '
-            $0 ~ "^## \\[" ver "\\]" { capture = 1; next }
-            capture && /^## \[/ { exit }
-            capture { print }
-          ' CHANGELOG.md)"
-          if [ -z "${SECTION// /}" ]; then
-            SECTION="Release ${VERSION}. See CHANGELOG.md."
-          fi
+          set -u
+          both_match=true
           {
-            echo "body<<__RSAC_NOTES__"
-            echo "$SECTION"
-            echo "__RSAC_NOTES__"
-          } >> "$GITHUB_OUTPUT"
+            echo "## Remote tags after gate failure"
+            for tag in "v$VERSION" "bindings/rsac-go/v$VERSION"; do
+              ref="refs/tags/$tag"
+              if ! refs="$(git ls-remote --tags origin "$ref" "$ref^{}")"; then
+                echo "- $tag: remote lookup failed"
+                both_match=false
+                continue
+              fi
+              commit="$(awk -v ref="$ref" '$2 == ref { base=$1 } $2 == ref "^{}" { peeled=$1 } END { if (base != "") print (peeled != "" ? peeled : base) }' <<< "$refs")"
+              if [[ -z "$commit" ]]; then
+                echo "- $tag: absent"
+                both_match=false
+              else
+                echo "- $tag: $commit"
+                [[ "$commit" == "$SHA" ]] || both_match=false
+              fi
+            done
+            if [[ "$both_match" == true && "$DRY_RUN" == true ]]; then
+              echo "Dry run: no Release recovery is offered."
+            elif [[ "$both_match" == true ]]; then
+              scratch="refs/release-report/v$VERSION"
+              if ! git fetch --no-tags origin "refs/tags/v$VERSION:$scratch" >/dev/null 2>&1; then
+                echo "Could not fetch the crate tag to verify its annotation; no recovery is offered."
+              elif [[ "$(git rev-parse "$scratch^{}")" != "$SHA" ]]; then
+                echo "The crate tag changed during the report; no recovery is offered."
+              elif [[ "$(git cat-file -t "$scratch")" != tag ]] ||
+                   ! git for-each-ref --format='%(contents)' "$scratch" | grep '^Evidence: ' >/dev/null; then
+                echo "the tags point at the requested commit but were not created by this gate; no recovery is offered"
+              else
+                echo "Both tags point to the requested commit. Prepare release-notes.md from its CHANGELOG section and tag evidence."
+                echo "If no Release exists, create it:"
+                echo '```sh'
+                printf 'gh release create "v%s" --repo Codeseys-Labs/rust-crossplat-audio-capture --verify-tag --title "rsac %s" --notes-file release-notes.md\n' "$VERSION" "$VERSION"
+                echo '```'
+                echo "If a draft exists, publish it instead:"
+                echo '```sh'
+                printf 'gh release edit "v%s" --repo Codeseys-Labs/rust-crossplat-audio-capture --draft=false --title "rsac %s" --notes-file release-notes.md\n' "$VERSION" "$VERSION"
+                echo '```'
+              fi
+            fi
+          } | tee -a "$GITHUB_STEP_SUMMARY"
 
-      # Create (or update) the GitHub Release for the tag. The default
-      # GITHUB_TOKEN CAN create releases (only cross-workflow TRIGGERING is
-      # blocked), so this works identically on both credential paths. softprops/action-gh-release
-      # is pinned and idempotent: it updates an existing Release rather than
-      # erroring, so this step is DECOUPLED from the tag-existence check
-      # (gated only on is_release). That makes a rerun after a partial failure —
-      # tag pushed but a later step errored — recreate/repair the Release instead
-      # of skipping it and leaving a tag with no Release body. The tag itself is
-      # taken from the existing ref when exists=='true' (the create-tag step
-      # above is the one that stays gated on exists=='false', never re-tagging).
+      # A failed API request can leave the Release created despite its response.
+      # Recheck before each attempt; if all attempts fail, the gated tags remain
+      # and a maintainer must create the Release manually as the summary directs.
       - name: Create GitHub Release
-        if: steps.detect.outputs.is_release == 'true'
-        uses: softprops/action-gh-release@c95fe1489396fe8a9eb87c0abf8aa5b2ef267fda # v2.0.8
-        with:
-          tag_name: ${{ steps.detect.outputs.tag }}
-          name: ${{ steps.detect.outputs.tag }}
-          body: ${{ steps.notes.outputs.body }}
-          draft: false
-          prerelease: false
-
-      # Publish-path report. With the App token, the tag push has already
-      # fanned out to the tag-triggered publish workflows — say so. Without
-      # it, keep the loud manual-publish reminder AND write a job-summary
-      # note explaining exactly what to configure, so the fallback is never
-      # mistaken for a broken pipeline. Gated only on is_release (like the
-      # Release step), so a rerun still surfaces it.
-      - name: Report publish path (automatic via App token, or manual)
-        if: steps.detect.outputs.is_release == 'true'
+        id: release
+        if: ${{ !inputs.dry_run }}
+        working-directory: release-commit
         shell: bash
+        timeout-minutes: 5
         env:
-          TAG: ${{ steps.detect.outputs.tag }}
-          APP_AVAILABLE: ${{ steps.app-creds.outputs.available }}
+          VERSION: ${{ inputs.version }}
+          GH_TOKEN: ${{ github.token }}
         run: |
           set -euo pipefail
-          if [ "${APP_AVAILABLE}" = "true" ]; then
-            echo "::notice::Tag ${TAG} + GitHub Release created. The tag was pushed with the release App token, so 'Release' (release.yml), 'Release npm' (release-npm.yml), and 'Release PyPI' (release-pypi.yml) fire automatically — verify them in the Actions tab."
-            {
-              echo "## Release ${TAG} — registry fan-out is AUTOMATIC"
-              echo ""
-              echo "The \`${TAG}\` tag was pushed with a GitHub App installation token"
-              echo "(org secrets \`RSAC_RELEASE_APP_ID\` + \`RSAC_RELEASE_APP_PRIVATE_KEY\`),"
-              echo "so the tag-triggered publish workflows (\`release.yml\`,"
-              echo "\`release-npm.yml\`, \`release-pypi.yml\`) fire automatically."
-              echo "The Go module tag \`bindings/rsac-go/${TAG}\` was pushed in lockstep."
-              echo "Verify the publish runs in the Actions tab."
-            } >> "$GITHUB_STEP_SUMMARY"
+          awk -v ver="$VERSION" '
+            { line = $0; sub(/\r$/, "", line) }
+            !capture && index(line, "## [" ver "] - ") == 1 &&
+              substr(line, length("## [" ver "] - ") + 1) ~ /^[0-9][0-9][0-9][0-9]-[0-9][0-9]-[0-9][0-9]$/ {
+                capture = 1; print line; next
+              }
+            capture && line ~ /^## \[/ { exit }
+            capture { print line }
+          ' CHANGELOG.md > release-notes.md
+          test -s release-notes.md || { echo "::error::missing changelog section"; exit 1; }
+          printf '\n' >> release-notes.md
+          git for-each-ref --format='%(contents)' "refs/tags/v$VERSION" |
+            grep -E '^(Evidence|Waived): ' >> release-notes.md
+          for attempt in 1 2 3; do
+            if draft="$(gh release view "v$VERSION" --json isDraft --jq .isDraft)"; then
+              if [[ "$draft" == false ]]; then
+                echo "GitHub Release v$VERSION is already published."
+                exit 0
+              elif [[ "$draft" == true ]]; then
+                if gh release edit "v$VERSION" --draft=false --title "rsac $VERSION" --notes-file release-notes.md; then
+                  exit 0
+                fi
+              else
+                echo "::warning::unexpected Release draft status: $draft"
+              fi
+            elif gh release create "v$VERSION" --verify-tag --title "rsac $VERSION" --notes-file release-notes.md; then
+              exit 0
+            fi
+            if (( attempt < 3 )); then sleep 5; fi
+          done
+          echo "::error::could not confirm or create GitHub Release v$VERSION"
+          exit 1
+
+      - name: Summarize manual Release recovery
+        if: ${{ failure() && !inputs.dry_run && steps.tag.outcome == 'success' && steps.release.outcome == 'failure' }}
+        shell: bash
+        env:
+          VERSION: ${{ inputs.version }}
+        run: |
+          {
+            echo "## GitHub Release requires manual recovery"
+            echo "The gated tags were pushed. Prepare release-notes.md from this version's CHANGELOG section followed by the tag's Evidence: and Waived: lines."
+            echo "If no Release exists, create it:"
+            echo '```sh'
+            printf 'gh release create "v%s" --repo Codeseys-Labs/rust-crossplat-audio-capture --verify-tag --title "rsac %s" --notes-file release-notes.md\n' "$VERSION" "$VERSION"
+            echo '```'
+            echo "If a draft exists, publish it instead:"
+            echo '```sh'
+            printf 'gh release edit "v%s" --repo Codeseys-Labs/rust-crossplat-audio-capture --draft=false --title "rsac %s" --notes-file release-notes.md\n' "$VERSION" "$VERSION"
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Summarize
+        shell: bash
+        env:
+          VERSION: ${{ inputs.version }}
+          SHA: ${{ inputs.sha }}
+          DRY_RUN: ${{ inputs.dry_run }}
+        run: |
+          if [[ "$DRY_RUN" == true ]]; then
+            echo "Release v$VERSION at $SHA passed the dry run; no tags or release were created." >> "$GITHUB_STEP_SUMMARY"
           else
-            echo "::warning::Tag ${TAG} + GitHub Release created with the default GITHUB_TOKEN. Registry publishing is NOT automatic (GITHUB_TOKEN-pushed tags do not trigger the on:push:tags publish workflows). To publish: run 'Release' (release.yml), 'Release npm' (release-npm.yml), and 'Release PyPI' (release-pypi.yml) via workflow_dispatch with the expected version. See docs/RELEASE_PROCESS.md."
-            {
-              echo "## Release ${TAG} — registry publishing is MANUAL (no release App configured)"
-              echo ""
-              echo "The tag was pushed with the default \`GITHUB_TOKEN\`, which GitHub's"
-              echo "anti-recursion rule prevents from triggering the \`on: push: tags:\`"
-              echo "publish workflows. The tag + GitHub Release exist; nothing has been"
-              echo "published to crates.io / npm / PyPI."
-              echo ""
-              echo "**Publish now (manual):** run \`release.yml\`, \`release-npm.yml\`, and"
-              echo "\`release-pypi.yml\` via *Run workflow* with the expected version"
-              echo "(docs/RELEASE_PROCESS.md §\"Step 4\")."
-              echo ""
-              echo "**Make this automatic:** create an org-owned GitHub App with"
-              echo "Repository permissions → **Contents: Read and write**, install it on"
-              echo "this repository, then add two org secrets visible to this repo:"
-              echo ""
-              echo "| Secret | Value |"
-              echo "|---|---|"
-              echo "| \`RSAC_RELEASE_APP_ID\` | the App's numeric App ID |"
-              echo "| \`RSAC_RELEASE_APP_PRIVATE_KEY\` | the App's PEM private key |"
-              echo ""
-              echo "With both present, this workflow pushes the tag with an App"
-              echo "installation token and the registry fan-out fires automatically."
-            } >> "$GITHUB_STEP_SUMMARY"
+            echo "Release v$VERSION at $SHA was tagged and published on GitHub. Registry publishing needs its own start (issue #88)." >> "$GITHUB_STEP_SUMMARY"
           fi

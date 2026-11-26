@@ -36,6 +36,10 @@ on:
           has proven the host-mic route is reliable).
         type: boolean
         default: false
+      release_evidence:
+        description: Require an iOS simulator runtime and both microphone frame smokes
+        type: boolean
+        default: false
   # Manual dispatch only (CI cost policy): this leg boots a simulator on a
   # 6-vCPU macOS runner (50m cap, ~20x a Linux minute). ci.yml's `mobile-ios`
   # job covers iOS COMPILATION whenever a dispatched branch touches
@@ -75,6 +79,7 @@ jobs:
       unit_tests: ${{ steps.record.outputs.unit_tests }}
       frames_smoke: ${{ steps.record.outputs.frames_smoke }}
       frames_app: ${{ steps.record.outputs.frames_app }}
+      evidence: ${{ steps.evidence.outputs.frames }}
     steps:
       - uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5
         with:
@@ -94,9 +99,8 @@ jobs:
           echo "runner arch: $(uname -m)"   # expect arm64 => aarch64-*-sim is correct
 
       # ── Probe: available iOS runtimes; pick newest iPhone simulator ───────
-      # skip-with-summary (exit 0, NOT a failure) if the image ships no iOS
-      # runtime — the leg is advisory and must never red-flag a PR because an
-      # image lacks a simulator runtime.
+      # Outside release evidence mode, no runtime is an advisory skip; the
+      # release evidence job rejects it.
       - name: Probe iOS runtimes and select a device
         id: pick
         run: |
@@ -361,7 +365,7 @@ jobs:
         env:
           SIMCTL_CHILD_RSAC_CI_IOS_SIM: "1"
           SIMCTL_CHILD_RSAC_TEST_CAPTURE_TIMEOUT_SECS: "15"
-          SIMCTL_CHILD_RSAC_CI_IOS_REQUIRE_FRAMES: ${{ (github.event_name == 'workflow_dispatch' && inputs.require_frames) && '1' || '0' }}
+          SIMCTL_CHILD_RSAC_CI_IOS_REQUIRE_FRAMES: ${{ (inputs.require_frames || inputs.release_evidence) && '1' || '0' }}
           SIMCTL_CHILD_RUST_BACKTRACE: "1"
           SIMCTL_CHILD_RUST_LOG: "rsac=debug"
         run: |
@@ -454,7 +458,7 @@ jobs:
           # prefix when reading (ProcessInfo sees RSAC_CI_IOS_SIM, etc.).
           TEST_RUNNER_RSAC_CI_IOS_SIM: "1"
           TEST_RUNNER_RSAC_TEST_CAPTURE_TIMEOUT_SECS: "15"
-          TEST_RUNNER_RSAC_CI_IOS_REQUIRE_FRAMES: ${{ (github.event_name == 'workflow_dispatch' && inputs.require_frames) && '1' || '0' }}
+          TEST_RUNNER_RSAC_CI_IOS_REQUIRE_FRAMES: ${{ (inputs.require_frames || inputs.release_evidence) && '1' || '0' }}
         run: |
           set -o pipefail
           xcodebuild test-without-building \
@@ -463,6 +467,18 @@ jobs:
             -destination "platform=iOS Simulator,id=$UDID" \
             -derivedDataPath build \
             2>&1 | tee "$GITHUB_WORKSPACE/ios-app-smoke.log"
+
+      # Check positive frame counts as well as step outcomes so a skipped test
+      # or an environment variable lost at the simulator boundary cannot pass.
+      - name: Require both microphone frame results
+        id: evidence
+        if: inputs.release_evidence && steps.pick.outputs.runtime != 'none'
+        timeout-minutes: 1
+        run: |
+          set -euo pipefail
+          grep -E '\[ios-sim\] delivered [1-9][0-9]* buffers, [1-9][0-9]* frames\.' ios-smoke.log
+          grep -E '\[ios-sim-app\] delivered [1-9][0-9]* buffers, [1-9][0-9]* frames\.' ios-app-smoke.log
+          echo "frames=success" >> "$GITHUB_OUTPUT"
 
       - name: Record tier results
         id: record
@@ -572,3 +588,24 @@ jobs:
             echo "NOTE: frames smoke (app-hosted) = ${APP} (soft; see logs)."
           fi
           exit $FAILED
+
+  # Add every new workflow job to this needs list; the CI drift guard only checks ci.yml.
+  release-evidence:
+    name: iOS Release Evidence
+    if: ${{ always() && inputs.release_evidence }}
+    needs: [ios-sim, summary]
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: Check jobs and runtime proof
+        shell: bash
+        env:
+          NEEDS: ${{ toJSON(needs) }}
+          RUNTIME: ${{ needs.ios-sim.outputs.runtime }}
+          FRAMES: ${{ needs.ios-sim.outputs.evidence }}
+        run: |
+          set -euo pipefail
+          jq -r 'to_entries[] | "\(.key) \(.value.result)"' <<< "$NEEDS"
+          jq -e 'all(.[]; .result == "success")' <<< "$NEEDS" > /dev/null
+          [[ -n "$RUNTIME" && "$RUNTIME" != none ]] || { echo "::error::iOS simulator runtime unavailable"; exit 1; }
+          [[ "$FRAMES" == success ]] || { echo "::error::both microphone frame results are required"; exit 1; }

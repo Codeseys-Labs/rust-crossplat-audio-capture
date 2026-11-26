@@ -37,10 +37,11 @@
 #   too, so we track it here as well.
 #
 # ── Usage ──────────────────────────────────────────────────────────────
-#   scripts/check-version-lockstep.sh [--expect X.Y.Z] [--warn-only]
+#   scripts/check-version-lockstep.sh [--root DIR] [--expect X.Y.Z] [--warn-only]
 #
 #   (default)         every manifest + internal pin must equal the root
 #                     Cargo.toml [package].version; exit 1 on any divergence.
+#   --root DIR        read the manifests from DIR instead of the script's checkout.
 #   --expect X.Y.Z    ALSO assert every version equals X.Y.Z (tag / release
 #                     time). Implies a hard fail on any mismatch. Overrides
 #                     --warn-only (a release must never merely warn).
@@ -75,9 +76,13 @@ usage() { sed -n '2,/^$/p' "$0" | sed 's/^# \{0,1\}//'; }
 
 # ── args ────────────────────────────────────────────────────────────────
 EXPECT=""
+REPO_ROOT=""
 WARN_ONLY=0
 while [ "$#" -gt 0 ]; do
     case "$1" in
+        --root)
+            [ "$#" -ge 2 ] && [ -d "$2" ] || { gha_error "--root requires a directory"; exit 2; }
+            REPO_ROOT="$2"; shift 2 ;;
         --expect)
             [ "$#" -ge 2 ] || { gha_error "--expect requires a X.Y.Z argument"; exit 2; }
             EXPECT="$2"; shift 2 ;;
@@ -93,8 +98,8 @@ if [ -n "$EXPECT" ] && ! printf '%s' "$EXPECT" | grep -Eq '^[0-9]+\.[0-9]+\.[0-9
     exit 2
 fi
 
-REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
-cd "$REPO_ROOT"
+if [ -z "$REPO_ROOT" ]; then REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"; fi
+CDPATH= cd -- "$REPO_ROOT"
 
 # ── extractors (mirror scripts/bump-version.sh + ci.yml) ────────────────
 # First `version = "X.Y.Z"` inside the [package] / [project] section of a TOML.
