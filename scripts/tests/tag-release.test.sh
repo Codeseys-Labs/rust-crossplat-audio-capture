@@ -269,13 +269,14 @@ rc=0
 exit "$rc"
 EOF
 
-# Gate stub for the lockstep script inside a RELEASE_GATE_DIR (R6.1): logs its arguments AND its
-# working directory (tab-separated; R6.1a: the gate's script runs with the commit's checkout as
-# cwd), and exits with $FAKE_DIR/gate-lockstep.rc (default 0).
+# Gate stub for the lockstep script inside a RELEASE_GATE_DIR (R6.1): logs its working directory,
+# its argument count and then each argument verbatim on its own line (a path with a space stays
+# one argument; re-splitting a joined "$*" would lose that), and exits with
+# $FAKE_DIR/gate-lockstep.rc (default 0).
 cat > "$WORK/bin/gate-lockstep-stub.sh" <<'EOF'
 #!/usr/bin/env bash
 d="${FAKE_DIR:?FAKE_DIR not set}"
-printf '%s\t%s\n' "$PWD" "$*" >> "$d/gate-lockstep.log"
+{ printf '%s\n' "$PWD" "$#" "$@"; } >> "$d/gate-lockstep.log"
 rc=0
 [ -f "$d/gate-lockstep.rc" ] && rc="$(cat "$d/gate-lockstep.rc")"
 exit "$rc"
@@ -1029,32 +1030,33 @@ gh_issue_form() { # <N>: the waiver verification call of R4.4 as logged
 
 realdir() { ( cd "$1" 2>/dev/null && pwd ) || echo missing; } # <path>: one canonical spelling
 # R6.1a: in RELEASE_GATE_DIR mode the gate's lockstep script is invoked as
-#   bash "$RELEASE_GATE_DIR/scripts/check-version-lockstep.sh" --root <absolute working directory> --expect X.Y.Z
-# (arguments in exactly that order). The gate stub observes its arguments and its working directory; both
-# must be the commit's checkout (R6.1: the gate's script still reads the commit's manifests).
+#   bash "$GATE_DIR/scripts/check-version-lockstep.sh" --root <absolute working directory> --expect X.Y.Z
+# (arguments in exactly that order). The stub logs its working directory, the argument count and each
+# argument verbatim on its own line, so the comparison below never word-splits: a checkout path with a
+# space stays one argument, and a script that wrongly split it is caught. Both the stub's working
+# directory and --root must be the commit's checkout (R6.1: the gate's script still reads the commit's
+# manifests).
 assert_gate_lockstep_call() { # <clause>
-  local clause="$1" line stub_pwd args root
+  local clause="$1" stub_pwd n root lines
   if [ ! -s "$FAKE_DIR/gate-lockstep.log" ]; then
     fail "the gate's lockstep stub was never called [$clause]"
     return 0
   fi
-  line="$(head -n 1 "$FAKE_DIR/gate-lockstep.log")"
-  stub_pwd="${line%%$'\t'*}"
-  args="${line#*$'\t'}"
-  set -- $args
-  if [ "${1:-}" != --root ]; then
-    fail "the gate's lockstep call is '$args', expected it to start with --root [R6.1a, $clause]"
+  stub_pwd="$(sed -n 1p "$FAKE_DIR/gate-lockstep.log")"
+  n="$(sed -n 2p "$FAKE_DIR/gate-lockstep.log")"
+  lines="$(wc -l < "$FAKE_DIR/gate-lockstep.log" | tr -d ' ')"
+  case "$n" in ''|*[!0-9]*) fail "the gate's lockstep log is malformed (line 2 is '$n', expected the argument count) [$clause]"; return 0 ;; esac
+  [ "$lines" = $((n + 2)) ] || fail "the gate's lockstep log has $lines lines, expected 2 + $n arguments [$clause]"
+  if [ "$n" != 4 ]; then
+    fail "the gate's lockstep call has $n arguments [$(sed -n '3,$p' "$FAKE_DIR/gate-lockstep.log" | tr '\n' '|')], expected exactly '--root <dir> --expect X.Y.Z' [R6.1a, $clause]"
     return 0
   fi
-  root="$2"
-  if [ "${3:-}" != --expect ]; then
-    fail "the gate's lockstep call is '$args', expected --expect right after --root <dir> [R6.1a, $clause]"
-    return 0
-  fi
-  assert_eq "$4" "$VER" "the gate's lockstep --expect value [R6.1a, $clause]"
-  [ "$#" = 4 ] || fail "the gate's lockstep call is '$args', expected exactly '--root <dir> --expect X.Y.Z' [R6.1a, $clause]"
+  assert_eq "$(sed -n 3p "$FAKE_DIR/gate-lockstep.log")" --root "the gate's lockstep first argument [R6.1a, $clause]"
+  root="$(sed -n 4p "$FAKE_DIR/gate-lockstep.log")"
+  assert_eq "$(sed -n 5p "$FAKE_DIR/gate-lockstep.log")" --expect "the gate's lockstep third argument (after --root <dir>) [R6.1a, $clause]"
+  assert_eq "$(sed -n 6p "$FAKE_DIR/gate-lockstep.log")" "$VER" "the gate's lockstep --expect value [R6.1a, $clause]"
   assert_eq "$(realdir "$stub_pwd")" "$(realdir "$REPO")" "the working directory of the gate's script [R6.1: the commit's checkout]"
-  assert_eq "$(realdir "${root:-}")" "$(realdir "$REPO")" "the --root value [R6.1a: the commit's checkout, absolute]"
+  assert_eq "$(realdir "$root")" "$(realdir "$REPO")" "the --root value, as ONE argument [R6.1a: the commit's checkout, absolute]"
 }
 assert_gh_calls_name_repo() { # <repo> <clause>: every logged gh call has `--repo <repo>` (R3.1)
   local total=0 named=0
@@ -1839,6 +1841,27 @@ case_gate_note_of_commit() {
   assert_stderr_has "Tested-SHA" "R4.5 / R5.1: the message of exit 20"
   assert_evidence_lines "R6.1 / R4.5" ci=ok:4242 audio=ok:4343 android-emu=ok:4444 ios-sim=ok:4545 windows-switch=missing:
 }
+case_gate_root_with_space() {
+  # R6.1a (bot review): `--root <absolute working directory>` must arrive as ONE argument even when
+  # the checkout path contains a space. The whole sandbox is relocated into "$SB/with space" for this
+  # one case (every helper quotes its paths, so the layout allows it), which makes the gate's --root
+  # argument a path with a space; assert_gate_lockstep_call compares the recorded argument list
+  # without word splitting, so a script that split the path is caught.
+  local spaced="$SB/with space"
+  mkdir -p "$spaced" || return 0
+  must mv "$REPO" "$spaced/repo" || return 0
+  must mv "$REMOTE" "$spaced/remote.git" || return 0
+  REPO="$spaced/repo"
+  REMOTE="$spaced/remote.git"
+  RSAC_PROXY_REPO="$REMOTE"
+  export RSAC_PROXY_REPO
+  must git -C "$REPO" remote set-url origin "$REMOTE" || return 0 # the config still names the old path
+  use_gate_dir || return 0
+  arrange_green
+  run_tag "$VER"
+  expect_both_tagged_full "R6.1a: a sandbox repository path with a space passes in gate mode"
+  assert_gate_lockstep_call "R6.1a: --root is ONE argument equal to the spaced checkout path"
+}
 
 # ── §4 check 3 (R4.2): tags must not exist → exit 12 ───────────────────────
 case_tag_exists() { # <local|remote> <tag> <clause> [extra args...]
@@ -2350,6 +2373,11 @@ case_evidence_first_view_fails_second_would_qualify() { # <key> <first id> <seco
   run_tag "$VER"
   expect_failure 16 "R4.3: a failing CLI call is 'missing' for the key (reading A)"
   assert_only_missing "R4.3" "$k" ""
+  # R5.7: the stop rule -- the first listed run's CLI failure ends the key at once, so the second
+  # listed run (which would qualify) is never viewed. Without this the case would also pass if the
+  # gate went on inspecting and merely kept the first failure.
+  assert_eq "$(gh_count "run view $2 ")" 1 "inspections of the first listed run [R5.7: it was tried]"
+  assert_eq "$(gh_count "run view $3 ")" 0 "inspections of the second listed run [R5.7: never tried]"
 }
 case_evidence_later_run_used() { # <key> <id1> <id2> <id3>
   # World: <key> lists <id1> (failed) <id2> (in progress) <id3> (green); the other keys green; issues: none; note: ok
@@ -3311,6 +3339,7 @@ run_case gate-lockstep-commit-fails-gate-passes case_gate_lockstep 0 1 pass \
   "R6.1: the commit's failing lockstep script does not block: the GATE directory's script decides"
 run_case gate-changelog-of-commit-decides case_gate_changelog_of_commit
 run_case gate-note-of-commit-decides case_gate_note_of_commit
+run_case gate-root-with-space case_gate_root_with_space
 
 # §4 check 3, R4.2: where the tag was found
 run_case tag-exists-local-crate case_tag_exists local "$CRATE_TAG" "§4 check 3 / R4.2: vX.Y.Z exists locally"

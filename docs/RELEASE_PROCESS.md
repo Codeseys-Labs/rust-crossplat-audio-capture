@@ -415,23 +415,27 @@ The automated tag workflow does not start a registry publish
 ([#88](https://github.com/Codeseys-Labs/rust-crossplat-audio-capture/issues/88)).
 When ready to publish, dispatch each registry workflow **at the release tag**:
 
-- **crates.io** — Actions → **Release** (`release.yml`) → *Run workflow*
-  (it has a `workflow_dispatch` with a `dry_run` toggle; set `dry_run:
-  false` **and enter the expected `X.Y.Z` in the `version` input** to
-  publish for real — the publish job refuses a real dispatch publish
-  without a `version` that matches `Cargo.toml`). Authenticates via
-  crates.io Trusted Publishing (OIDC) — requires the crates.io Trusted
-  Publisher (see [§ Trusted Publishing setup](#trusted-publishing-setup-oidc)).
-- **npm** (`@rsac/audio`) — Actions → **Release npm**
-  (`release-npm.yml`) → *Run workflow*, enter `X.Y.Z`, and set `publish:
-  true`. With `publish` left false, the workflow only builds/smokes the
-  artifacts. Authenticates via npm Trusted Publishing (OIDC) — requires the
-  npm Trusted Publisher on the main package **and** every platform
-  sub-package.
-- **PyPI** (`rsac`) — Actions → **Release PyPI** (`release-pypi.yml`) →
-  *Run workflow*, enter `X.Y.Z`, and set `publish: true`. With `publish`
-  left false, the workflow only builds/smokes wheels and sdist. Publishes
-  via PyPI Trusted Publishing / OIDC.
+Replace `X.Y.Z` below with the release version. For a real publish:
+
+```sh
+gh workflow run release.yml --ref vX.Y.Z -f version=X.Y.Z -f dry_run=false
+gh workflow run release-npm.yml --ref vX.Y.Z -f version=X.Y.Z -f publish=true
+gh workflow run release-pypi.yml --ref vX.Y.Z -f version=X.Y.Z -f publish=true
+```
+
+For a rehearsal without a registry upload:
+
+```sh
+gh workflow run release.yml --ref vX.Y.Z -f version=X.Y.Z -f dry_run=true
+gh workflow run release-npm.yml --ref vX.Y.Z -f version=X.Y.Z -f publish=false
+gh workflow run release-pypi.yml --ref vX.Y.Z -f version=X.Y.Z -f publish=false
+```
+
+Real publishes use Trusted Publishing (OIDC). Configure the crates.io and
+PyPI publishers and the npm publisher for `@rsac/audio` **and** every
+platform sub-package; see [Trusted Publishing setup](#trusted-publishing-setup-oidc).
+The npm rehearsal builds and smokes artifacts; the PyPI rehearsal builds and
+smokes wheels and the source distribution.
 
 If a person pushed the release tags, monitor the resulting publish runs
 instead of starting a second set.

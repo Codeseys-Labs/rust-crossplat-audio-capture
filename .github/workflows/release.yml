@@ -465,11 +465,15 @@ jobs:
         env:
           VERSION: ${{ steps.version.outputs.version }}
         run: |
-          # Awk the block between "## [VERSION]" and the next "## [" heading.
+          # Match the same dated heading as the pre-tag gate.
           awk -v v="$VERSION" '
-            $0 ~ "^## \\[" v "\\]" { in_section = 1; print; next }
-            in_section && /^## \[/ { exit }
-            in_section { print }
+            { line = $0; sub(/\r$/, "", line) }
+            !in_section && index(line, "## [" v "] - ") == 1 &&
+              substr(line, length("## [" v "] - ") + 1) ~ /^[0-9][0-9][0-9][0-9]-[0-9][0-9]-[0-9][0-9]$/ {
+                in_section = 1; print line; next
+              }
+            in_section && line ~ /^## \[/ { exit }
+            in_section { print line }
           ' CHANGELOG.md > release_body.md
           if [ ! -s release_body.md ]; then
             echo "No CHANGELOG section found for version ${VERSION}; using fallback body." >&2
@@ -491,5 +495,17 @@ jobs:
           if gh release view "$TAG" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
             echo "GitHub Release $TAG already exists; leaving its body unchanged."
           else
+            # Fetch into a scratch ref so the annotation comes from the
+            # remote tag, even when the checkout did not fetch tags.
+            scratch="refs/release-notes/$TAG"
+            git fetch --no-tags origin "refs/tags/$TAG:$scratch"
+            [[ "$(git rev-parse "$scratch^{}")" == "$GITHUB_SHA" ]] || {
+              echo "::error::remote tag $TAG moved after the publish check"; exit 1;
+            }
+            if [[ "$(git cat-file -t "$scratch")" == tag ]]; then
+              printf '\n' >> release_body.md
+              git for-each-ref --format='%(contents)' "$scratch" |
+                awk '/^(Evidence|Waived): / { print }' >> release_body.md
+            fi
             gh release create "$TAG" --repo "$GITHUB_REPOSITORY" --verify-tag --title "rsac $VERSION" --notes-file release_body.md
           fi

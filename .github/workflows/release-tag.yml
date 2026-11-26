@@ -155,6 +155,7 @@ jobs:
         env:
           VERSION: ${{ inputs.version }}
           SHA: ${{ inputs.sha }}
+          DRY_RUN: ${{ inputs.dry_run }}
         run: |
           set -u
           both_match=true
@@ -176,16 +177,28 @@ jobs:
                 [[ "$commit" == "$SHA" ]] || both_match=false
               fi
             done
-            if [[ "$both_match" == true ]]; then
-              echo "Both tags point to the requested commit. Prepare release-notes.md from its CHANGELOG section and tag evidence."
-              echo "If no Release exists, create it:"
-              echo '```sh'
-              printf 'gh release create "v%s" --repo Codeseys-Labs/rust-crossplat-audio-capture --verify-tag --title "rsac %s" --notes-file release-notes.md\n' "$VERSION" "$VERSION"
-              echo '```'
-              echo "If a draft exists, publish it instead:"
-              echo '```sh'
-              printf 'gh release edit "v%s" --repo Codeseys-Labs/rust-crossplat-audio-capture --draft=false --title "rsac %s" --notes-file release-notes.md\n' "$VERSION" "$VERSION"
-              echo '```'
+            if [[ "$both_match" == true && "$DRY_RUN" == true ]]; then
+              echo "Dry run: no Release recovery is offered."
+            elif [[ "$both_match" == true ]]; then
+              scratch="refs/release-report/v$VERSION"
+              if ! git fetch --no-tags origin "refs/tags/v$VERSION:$scratch" >/dev/null 2>&1; then
+                echo "Could not fetch the crate tag to verify its annotation; no recovery is offered."
+              elif [[ "$(git rev-parse "$scratch^{}")" != "$SHA" ]]; then
+                echo "The crate tag changed during the report; no recovery is offered."
+              elif [[ "$(git cat-file -t "$scratch")" != tag ]] ||
+                   ! git for-each-ref --format='%(contents)' "$scratch" | grep '^Evidence: ' >/dev/null; then
+                echo "the tags point at the requested commit but were not created by this gate; no recovery is offered"
+              else
+                echo "Both tags point to the requested commit. Prepare release-notes.md from its CHANGELOG section and tag evidence."
+                echo "If no Release exists, create it:"
+                echo '```sh'
+                printf 'gh release create "v%s" --repo Codeseys-Labs/rust-crossplat-audio-capture --verify-tag --title "rsac %s" --notes-file release-notes.md\n' "$VERSION" "$VERSION"
+                echo '```'
+                echo "If a draft exists, publish it instead:"
+                echo '```sh'
+                printf 'gh release edit "v%s" --repo Codeseys-Labs/rust-crossplat-audio-capture --draft=false --title "rsac %s" --notes-file release-notes.md\n' "$VERSION" "$VERSION"
+                echo '```'
+              fi
             fi
           } | tee -a "$GITHUB_STEP_SUMMARY"
 
@@ -204,9 +217,13 @@ jobs:
         run: |
           set -euo pipefail
           awk -v ver="$VERSION" '
-            index($0, "## [" ver "]") == 1 { capture = 1; print; next }
-            capture && /^## \[/ { exit }
-            capture { print }
+            { line = $0; sub(/\r$/, "", line) }
+            !capture && index(line, "## [" ver "] - ") == 1 &&
+              substr(line, length("## [" ver "] - ") + 1) ~ /^[0-9][0-9][0-9][0-9]-[0-9][0-9]-[0-9][0-9]$/ {
+                capture = 1; print line; next
+              }
+            capture && line ~ /^## \[/ { exit }
+            capture { print line }
           ' CHANGELOG.md > release-notes.md
           test -s release-notes.md || { echo "::error::missing changelog section"; exit 1; }
           printf '\n' >> release-notes.md
