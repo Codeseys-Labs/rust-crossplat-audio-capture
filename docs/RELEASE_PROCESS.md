@@ -334,10 +334,11 @@ git commit -m "rsac X.Y.Z"
 git push origin master
 
 # Tag and push — this is the workflow trigger. Nothing checks a hand-made tag
-# before it exists, so run the lockstep check yourself first.
-bash scripts/check-version-lockstep.sh --expect X.Y.Z
-git tag -a vX.Y.Z -m "rsac X.Y.Z"
-git push origin vX.Y.Z
+# before it exists, so run the lockstep check first; `&&` stops the paste
+# before `git tag` if the check fails.
+bash scripts/check-version-lockstep.sh --expect X.Y.Z &&
+  git tag -a vX.Y.Z -m "rsac X.Y.Z" &&
+  git push origin vX.Y.Z
 ```
 
 Watch the Actions tab. If `verify` fails, delete the tag locally and
@@ -980,10 +981,11 @@ Annotated tags only — do not use lightweight tags. The tag name is
 `v<semver>`; pushing it is the event all three publish workflows key on.
 
 ```bash
-# The manual path has no automatic pre-tag check: run it yourself.
-bash scripts/check-version-lockstep.sh --expect 0.2.0
-git tag -a v0.2.0 -m "rsac 0.2.0"
-git push origin v0.2.0
+# The manual path has no automatic pre-tag check: run it yourself. `&&`
+# stops the paste before `git tag` if the check fails.
+bash scripts/check-version-lockstep.sh --expect 0.2.0 &&
+  git tag -a v0.2.0 -m "rsac 0.2.0" &&
+  git push origin v0.2.0
 ```
 
 If `release-tag.yml` already pushed the tag for you, this is a no-op (it

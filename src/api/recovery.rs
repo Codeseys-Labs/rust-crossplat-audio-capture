@@ -496,11 +496,10 @@ struct ActiveSlot {
     retired: RetiredCounters,
 }
 
-/// Counters accumulated from every generation recovery has retired.
+/// Backend counters accumulated from every generation recovery has retired.
 #[derive(Default)]
 struct RetiredCounters {
     overruns: u64,
-    captured: u64,
     pushed: u64,
     dropped: u64,
 }
@@ -508,7 +507,6 @@ struct RetiredCounters {
 impl RetiredCounters {
     fn absorb(&mut self, stream: &dyn CapturingStream) {
         self.overruns = self.overruns.saturating_add(stream.overrun_count());
-        self.captured = self.captured.saturating_add(stream.buffers_captured());
         self.pushed = self.pushed.saturating_add(stream.buffers_pushed());
         self.dropped = self.dropped.saturating_add(stream.buffers_dropped());
     }
@@ -911,6 +909,9 @@ struct RecoveryStream {
     machine: Mutex<Machine>,
     /// Set once stopped or exhausted; backs `is_running()`.
     terminal: AtomicBool,
+    /// Buffers handed to the caller, counted where a poll returns one; backs
+    /// `buffers_captured()`.
+    delivered: AtomicU64,
     /// Ring capacity of every generation: the most buffers one can hold, and
     /// so the bound of a tail drain from a stream that cannot count its
     /// backlog.
@@ -988,6 +989,7 @@ impl RecoveryStream {
             }),
             expected_format,
             terminal: AtomicBool::new(false),
+            delivered: AtomicU64::new(0),
             ring_slots,
             read_timeout: READ_TIMEOUT,
             disposer: Box::new(spawn_disposal),
@@ -1557,6 +1559,11 @@ impl RecoveryStream {
         let mut machine = lock(&self.machine);
         let mut doomed = Doomed::new();
         let result = self.advance(&mut machine, &mut doomed);
+        // The one place a buffer reaches the caller (`try_read_chunk` and
+        // `read_chunk` both return this poll's result).
+        if matches!(result, Ok(Some(_))) {
+            self.delivered.fetch_add(1, Ordering::Relaxed);
+        }
         let observed_at = Instant::now();
         let running = matches!(machine.phase, Phase::Running)
             && !self.core.stop_requested.load(Ordering::Acquire);
@@ -1710,8 +1717,12 @@ impl CapturingStream for RecoveryStream {
         self.cumulative(|r| r.overruns, |s| s.overrun_count())
     }
 
+    /// Buffers this stream handed to its caller, across every generation.
+    /// Counted at delivery, not when a backend gave a buffer up: neither a
+    /// tail `stop()` preserved that no read has returned yet, nor a buffer the
+    /// format gate rejected, counts.
     fn buffers_captured(&self) -> u64 {
-        self.cumulative(|r| r.captured, |s| s.buffers_captured())
+        self.delivered.load(Ordering::Relaxed)
     }
 
     fn buffers_pushed(&self) -> u64 {
@@ -2173,6 +2184,11 @@ mod tests {
 
         fn overrun_count(&self) -> u64 {
             self.state.overruns.load(Ordering::SeqCst)
+        }
+
+        /// Counts pops, as the bridge does.
+        fn buffers_captured(&self) -> u64 {
+            self.delivered() as u64
         }
     }
 
@@ -3004,6 +3020,11 @@ mod tests {
                 new.delivered(),
                 1,
                 "{what}: read by recovery, never delivered"
+            );
+            assert_eq!(
+                h.stream.buffers_captured(),
+                1,
+                "{what}: the rejected buffer was never handed to the caller"
             );
             match h.events().as_slice() {
                 [RecoveryEvent::DeviceInvalidated { .. }, RecoveryEvent::RetryScheduled { attempt: 1, .. }, RecoveryEvent::Recovered { generation: 1, .. }, RecoveryEvent::Exhausted {
@@ -4162,21 +4183,78 @@ mod tests {
         // teardown, and stays so across every read below.
         teardown.wait_reached();
 
-        let tail: Vec<AudioBuffer> = (0..2)
-            .map(|_| h.stream.read_chunk().expect("the preserved tail"))
-            .collect();
-        let end = h.stream.read_chunk();
+        // Every read runs on a worker and is awaited with a timeout, so a read
+        // that waits for the teardown fails the test instead of hanging it.
+        let reader = Arc::clone(&h.stream);
+        let (reads_tx, reads_rx) = mpsc::channel();
+        std::thread::spawn(move || {
+            for _ in 0..3 {
+                if reads_tx.send(reader.read_chunk()).is_err() {
+                    return;
+                }
+            }
+        });
+        let mut reads = Vec::new();
+        for _ in 0..3 {
+            match reads_rx.recv_timeout(Duration::from_secs(2)) {
+                Ok(read) => reads.push(read),
+                Err(_) => {
+                    teardown.open();
+                    panic!("a read after stop() waited for the backend's teardown");
+                }
+            }
+        }
+        let still_wedged = !old.stopped();
+        teardown.open();
 
+        let mut reads = reads.into_iter();
+        let tail: Vec<AudioBuffer> = reads
+            .by_ref()
+            .take(2)
+            .map(|read| read.expect("the preserved tail"))
+            .collect();
+        let end = reads.next().expect("a third read");
         assert_eq!(tail[0].timestamp(), Some(ms(0)));
         assert_eq!(tail[1].timestamp(), Some(ms(10)));
         assert!(
             matches!(end, Err(AudioError::StreamEnded { .. })),
             "a stopped read ends, it never times out: {end:?}"
         );
-        assert!(!old.stopped(), "the backend's teardown is still wedged");
-        teardown.open();
+        assert!(
+            still_wedged,
+            "the backend's teardown was still wedged across the reads"
+        );
         stopping.join().expect("stopper thread").expect("stop");
         assert!(old.stopped());
+    }
+
+    #[test]
+    fn buffers_captured_counts_what_the_caller_receives_not_what_stop_preserved() {
+        let old = MockStream::new(stereo(RATE), backlog(3)).strict_stop();
+        let h = Harness::new(fast_policy(), &old, Opener::new(vec![]).factory());
+        read_n(&h.stream, 1);
+        assert_eq!(h.stream.buffers_captured(), 1);
+
+        h.stream.stop().expect("stop");
+
+        assert_eq!(
+            old.delivered(),
+            3,
+            "stop() took the queued tail off the backend"
+        );
+        assert_eq!(
+            h.stream.buffers_captured(),
+            1,
+            "the preserved tail is not counted before a read returns it"
+        );
+        let (tail, err) = read_until_err(&h.stream);
+        assert_eq!(tail.len(), 2);
+        assert!(matches!(err, AudioError::StreamEnded { .. }), "{err:?}");
+        assert_eq!(
+            h.stream.buffers_captured(),
+            3,
+            "every buffer the caller received, and only those"
+        );
     }
 
     #[test]
