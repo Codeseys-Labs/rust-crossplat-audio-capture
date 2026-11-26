@@ -77,6 +77,17 @@ Releases with no ABI change omit the subsection (or state "No C ABI changes").
 - **Reference submodules updated** — bumped `wasapi-rs` (v0.27.0), `rtrb` (0.4.1),
   `pipewire-rs` (v0.10.1), `obs-pipewire-audio-capture` (1.2.2),
   `screencapturekit-rs` (v12.0.0), and `cpal` (`44ba7ad`).
+- **macOS: `PlatformCapabilities::supports_system_capture` follows the OS version** —
+  it was `true` on every macOS version; it is now `true` only on macOS 14.4 and later,
+  like `supports_application_capture` and `supports_process_tree_capture`, because
+  system capture uses the same Process Tap path. A `true` capability does not mean the
+  TCC permission is granted. `AudioCaptureBuilder::preflight()` still checks only
+  application and process-tree targets: a `SystemDefault` request below 14.4 is
+  reported as unsupported here and fails when the capture starts.
+- **Recovery variants are `#[non_exhaustive]`** — the field-carrying variants of
+  `RecoveryEvent` and `RecoveryState::Recovering` (new in this release) must be matched
+  with `..` outside the crate, so fields can be added to them later without a breaking
+  change.
 
 ### Deprecated
 
