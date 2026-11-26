@@ -355,7 +355,7 @@ mise run gate:linux    # feat_linux lint-leg replica (clippy -D warnings + fmt) 
 mise run test        # just the CI test-job replica for the host OS
 mise run test:audio  # ci_audio integration suite on this machine (all 3 tiers)
 mise run secrets     # betterleaks full-history scan; staged diff: mise run secrets:staged
-mise run release:bump -- X.Y.Z [--dry-run]  # seven-manifest lockstep bump + CHANGELOG rotation
+mise run release:bump -- X.Y.Z [--dry-run]  # nine-manifest lockstep bump + CHANGELOG rotation
 mise run release:tag -- X.Y.Z [--dry-run]   # refuses to tag unless the commit has a green full+semver run (Release Readiness); pushes the crate and Go tags atomically
 mise run release:check-published -- X.Y.Z   # after a failed verify: may the tag be replaced? (Go tag, runs in flight, crates.io, PyPI, npm)
 mise run release:verify-docs                # post-publish docs.rs spot-check

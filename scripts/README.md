@@ -26,7 +26,7 @@ deleted in the 2026-07-05 rot cleanup (rsac-a3c4) — recover via
 | `check-module-dag.sh` | Module-DAG reverse-edge guard (`core→bridge→audio→api`) | ci.yml `module-dag` job, `gate.sh --full` |
 | `ci-linux-audio-route.sh` | Deterministic PipeWire routing gate: pins `ci_test_sink` as default, proves the tone→monitor route end-to-end (sox RMS + frequency), then exports `RSAC_CI_AUDIO_DETERMINISTIC=1` (rsac-b106/rsac-6efb) | ci-audio-tests.yml `linux-system`/`linux-device`/`linux-process`, humans on a Linux box |
 | `ci-windows-audio-default.ps1` | Deterministic VB-CABLE endpoint gate: sets + hard-verifies the default playback endpoint, then exports `RSAC_CI_AUDIO_DETERMINISTIC=1` (rsac-0f33) | ci-audio-tests.yml `windows-system`/`windows-device`/`windows-process` |
-| `bump-version.sh` | Bumps the seven version-bearing manifests + rotates CHANGELOG | release-prepare.yml, `mise run release:bump -- X.Y.Z`, humans (see CONTRIBUTING §7) |
+| `bump-version.sh` | Bumps the nine version-bearing manifests + rotates CHANGELOG | release-prepare.yml, `mise run release:bump -- X.Y.Z`, humans (see CONTRIBUTING §7) |
 | `tag-release.sh` | Gate a manual stable release on the checked-out commit and atomically push its annotated tags | `mise run release:tag -- X.Y.Z`, maintainers, release script tests |
 | `check-release-published.sh` | Check the Go tag, in-flight workflows and registries before reusing a version | `mise run release:check-published -- X.Y.Z`, maintainers after a failed release, release script tests |
 | `check-ci-readiness-needs.sh` | Check that Release Readiness depends on every other CI job | ci.yml `release-readiness` and `release-scripts` jobs |
