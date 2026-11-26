@@ -90,7 +90,10 @@ Releases with no ABI change omit the subsection (or state "No C ABI changes").
 - **Windows WASAPI (`SILENT` packets & COM teardown):** explicitly zero packets flagged
   `AUDCLNT_BUFFERFLAGS_SILENT`, drop COM interfaces (`capture_client`, `h_event`,
   `audio_client`) before `wasapi::deinitialize()`, and bound the WASAPI init handshake
-  to 5 seconds (`recv_timeout`).
+  to 5 seconds (`recv_timeout`). The device enumerator now holds COM alive with an MTA
+  usage cookie, which may be released from any thread, instead of a per-thread
+  `CoInitializeEx`/`CoUninitialize` pair. Callers in a single-threaded COM apartment are
+  still refused with `RPC_E_CHANGED_MODE`, as before.
 - **Linux PipeWire:** fixed multi-byte UTF-8 slicing panic in `.exe` suffix stripping,
   normalized cyclic SPA chunk offsets with whole-frame clamping, and added
   `StreamFlags::DONT_RECONNECT` on explicit serial targets so vanished app/device

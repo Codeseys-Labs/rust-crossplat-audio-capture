@@ -33,8 +33,6 @@ use windows::Win32::UI::Shell::PropertiesSystem::IPropertyStore;
 
 // Constants
 const E_NOTFOUND: windows::core::HRESULT = windows::core::HRESULT(-2147024894i32); // 0x80070002
-#[cfg(test)]
-const RPC_E_CHANGED_MODE: windows::core::HRESULT = windows::core::HRESULT(-2147417850i32); // 0x80010106
 const VT_LPWSTR: u16 = 31;
 
 /// Build a [`BackendContext`] carrying the WASAPI `HRESULT` as the structured
@@ -45,7 +43,6 @@ const VT_LPWSTR: u16 = 31;
 /// reading the code back can reinterpret as `u32` / `0x{:08X}` if they want the
 /// conventional hex `HRESULT` rendering. The human-readable message from the
 /// `windows` crate is attached when available.
-#[cfg(test)]
 fn wasapi_backend_context(hr: windows::core::HRESULT) -> BackendContext {
     BackendContext {
         backend_name: "WASAPI".to_string(),
@@ -144,9 +141,8 @@ impl WindowsApplicationCapture {
     ///
     /// This uses wasapi-rs AudioClient::new_application_loopback_client for simplicity
     pub fn initialize(&mut self) -> std::result::Result<(), Box<dyn std::error::Error>> {
-        // Pin the process-wide COM MTA for the lifetime of this capture handle
-        // using the thread-agnostic `ComInitializer` (`CoIncrementMTAUsage` /
-        // `CoDecrementMTAUsage`), avoiding unpaired per-thread `CoInitializeEx`.
+        // Refuse an incompatible caller apartment before activating a client.
+        // The guard then keeps the MTA alive until the client is released.
         let com_initializer = ComInitializer::new()?;
         // Create wasapi-rs AudioClient for application loopback
         let mut audio_client = wasapi::AudioClient::new_application_loopback_client(
@@ -369,21 +365,11 @@ impl WindowsApplicationCapture {
     }
 }
 
-// SAFETY: `WindowsApplicationCapture` wraps a `wasapi::AudioClient`, which holds
-// COM interfaces the `windows`/`wasapi` crates conservatively mark `!Send`. rsac
-// only ever constructs and initializes this client after acquiring a process-wide
-// `ComInitializer` (`CoIncrementMTAUsage`, see `initialize()`), so the COM
-// objects live in the Multi-Threaded Apartment where they are free-threaded and
-// may legally be used or dropped from any thread. This mirrors the identical MTA
-// rationale on `WindowsAudioDevice` / `WindowsDeviceEnumerator` below.
-//
-// NOTE: this type is legacy/RT-unsafe (see the type-level `audit L13` docs); the
-// canonical capture path is `WindowsCaptureThread`, whose WASAPI objects never
-// leave their own dedicated thread and so need no such assertion.
+// SAFETY: `initialize` acquires the IAudioClient only after checking that its
+// caller is in the MTA. This is not a full Send guarantee: #105 tracks later
+// STA use/release and the required same-thread release of the IAudioCaptureClient
+// and its parent IAudioClient.
 unsafe impl Send for WindowsApplicationCapture {}
-
-// Note: Cannot implement Send for external COM types due to orphan rules
-// The thread spawn issue will need to be handled differently
 
 /// RAII wrapper for a Windows HANDLE to ensure it's closed on drop.
 #[derive(Debug)]
@@ -427,16 +413,19 @@ pub struct ComInitializer {
     cookie: CO_MTA_USAGE_COOKIE,
 }
 
-// SAFETY: Win32 `CO_MTA_USAGE_COOKIE` is an opaque process-wide MTA usage token
-// documented as safe to release via `CoDecrementMTAUsage` from any thread.
+// SAFETY: The only field is a cookie. Microsoft explicitly permits decrement
+// on a thread other than the one that incremented:
+// https://learn.microsoft.com/windows/win32/api/combaseapi/nf-combaseapi-codecrementmtausage
 unsafe impl Send for ComInitializer {}
+// SAFETY: Shared references do not expose or operate on the cookie. Only
+// `Drop`, with exclusive access, passes it back to COM once.
 unsafe impl Sync for ComInitializer {}
 
 impl ComInitializer {
-    /// Increments the process-wide COM MTA usage count.
+    /// Pins the process-wide MTA and checks the calling thread belongs to it.
     ///
-    /// Returns `Ok(Self)` on success, or an `AudioError::BackendError` if
-    /// `CoIncrementMTAUsage` fails.
+    /// An uninitialized caller joins the implicit MTA. A caller already in an
+    /// STA retains its apartment and receives a `com_init` backend error.
     pub fn new() -> AudioResult<Self> {
         let cookie = unsafe { CoIncrementMTAUsage() }.map_err(|err| AudioError::BackendError {
             backend: "wasapi".to_string(),
@@ -444,7 +433,38 @@ impl ComInitializer {
             message: format!("CoIncrementMTAUsage failed (HRESULT: {:?})", err),
             context: Some(wasapi_backend_context_err(&err)),
         })?;
-        Ok(Self { cookie })
+        // Own the cookie before the query so every error path releases it.
+        let guard = Self { cookie };
+        let mut apartment = APTTYPE_CURRENT;
+        let mut qualifier = APTTYPEQUALIFIER_NONE;
+        // SAFETY: Both out-pointers refer to live, writable stack variables.
+        unsafe { CoGetApartmentType(&mut apartment, &mut qualifier) }.map_err(|err| {
+            AudioError::BackendError {
+                backend: "wasapi".to_string(),
+                operation: "com_init".to_string(),
+                message: format!("CoGetApartmentType failed: {err}"),
+                context: Some(wasapi_backend_context_err(&err)),
+            }
+        })?;
+        if apartment == APTTYPE_MTA {
+            return Ok(guard);
+        }
+
+        let description = if matches!(apartment, APTTYPE_STA | APTTYPE_MAINSTA) {
+            "a single-threaded apartment"
+        } else {
+            "a non-MTA apartment"
+        };
+        Err(AudioError::BackendError {
+            backend: "wasapi".to_string(),
+            operation: "com_init".to_string(),
+            message: format!(
+                "Already initialized with a different concurrency model: the calling thread is in \
+                 {description} (HRESULT: 0x{:08X})",
+                RPC_E_CHANGED_MODE.0
+            ),
+            context: Some(wasapi_backend_context(RPC_E_CHANGED_MODE)),
+        })
     }
 }
 
@@ -477,11 +497,12 @@ impl WindowsAudioDevice {
     }
 }
 
-// SAFETY: WindowsAudioDevice wraps COM interfaces (IMMDevice) that are created
-// in a Multi-Threaded Apartment (MTA) context via CoInitializeEx(COINIT_MULTITHREADED).
-// In MTA, COM objects are free-threaded and can be safely used from any thread.
-// The Arc<ComInitializer> ensures COM remains initialized while any device exists.
+// SAFETY: The originating enumerator is acquired in the MTA, but its methods
+// obtain the IMMDevice on the enumeration caller. The MTA pin does not establish
+// that a later use or Release on an STA is safe (#105).
 unsafe impl Send for WindowsAudioDevice {}
+// SAFETY: Shared callers are not confined to the MTA; the IMMDevice's agility
+// has not been established (#105).
 unsafe impl Sync for WindowsAudioDevice {}
 
 impl WindowsAudioDevice {
@@ -858,14 +879,8 @@ fn data_flow_to_kind(flow: EDataFlow) -> Option<DeviceKind> {
     }
 }
 
-/// Resolve a device's friendly name and kind from its endpoint id, using the
-/// enumerator that is already valid on the COM notification thread.
-///
-/// Best-effort: returns `("", None)`-ish fallbacks rather than failing, because a
-/// `DeviceAdded` event must still be delivered even if the brand-new endpoint
-/// cannot be fully probed yet (it may still be initializing). Runs on the COM
-/// notification thread, which already has a valid MTA apartment — no extra COM
-/// init needed.
+/// Resolve a newly added device's name and kind from the notification callback.
+/// The endpoint may not be ready yet, so resolution is best-effort.
 fn resolve_added_device(enumerator: &IMMDeviceEnumerator, device_id: &str) -> (String, DeviceKind) {
     // SAFETY: `enumerator` is a live IMMDeviceEnumerator; GetDevice takes a
     // null-terminated wide string. We build one from `device_id`.
@@ -920,8 +935,8 @@ struct WatcherNotificationClient {
     /// Bounded sender to the helper thread. `try_send` so a stalled consumer can
     /// never block the COM notification thread.
     tx: mpsc::SyncSender<DeviceEvent>,
-    /// Enumerator clone used to resolve name/kind for `OnDeviceAdded`. Valid on
-    /// the COM notification thread (free-threaded MTA object).
+    /// Enumerator clone used to resolve name/kind in `OnDeviceAdded`. Its
+    /// use from the notification thread is part of the apartment audit (#105).
     enumerator: IMMDeviceEnumerator,
 }
 
@@ -1057,9 +1072,11 @@ impl WindowsDeviceEnumerator {
     }
 }
 
-// SAFETY: WindowsDeviceEnumerator wraps IMMDeviceEnumerator, also created in MTA.
-// Same MTA thread-safety reasoning as WindowsAudioDevice.
+// SAFETY: `new` checks the caller is in the MTA before acquiring the enumerator.
+// Later use or release on an STA is unchecked (#105).
 unsafe impl Send for WindowsDeviceEnumerator {}
+// SAFETY: The creation check does not constrain the apartments of threads
+// calling the enumerator through a shared reference (#105).
 unsafe impl Sync for WindowsDeviceEnumerator {}
 
 /// New canonical `DeviceEnumerator` trait implementation for `WindowsDeviceEnumerator`.
@@ -1147,10 +1164,7 @@ impl DeviceEnumerator for WindowsDeviceEnumerator {
         // Bounded hand-off channel: COM notification thread → helper thread.
         let (tx, rx) = mpsc::sync_channel::<DeviceEvent>(DEVICE_EVENT_CHANNEL_BOUND);
 
-        // Build the COM notification client and obtain its IMMNotificationClient
-        // interface. `enumerator.clone()` is a ref-count bump on the same
-        // free-threaded MTA object, used inside the callback to resolve added
-        // devices' name/kind.
+        // Keep an enumerator reference in the callback for added-device lookup.
         let client: IMMNotificationClient = WatcherNotificationClient {
             tx,
             enumerator: self.enumerator.clone(),
@@ -1212,22 +1226,8 @@ impl DeviceEnumerator for WindowsDeviceEnumerator {
                 }
             })?;
 
-        // Move the COM objects needed for teardown into a Send holder. Both are
-        // free-threaded MTA objects, so using them (incl. Unregister) from the
-        // thread that drops the DeviceWatcher is sound.
-        //
-        // The `com_initializer` clone PINS the COM apartment for the watcher's
-        // whole lifetime. `watch(&self)` is dispatched on a *borrowed* enumerator
-        // (see `CrossPlatformDeviceEnumerator::watch`), so the legal
-        // `get_enumerator()?.watch(handler)?` pattern drops the
-        // `WindowsDeviceEnumerator` — and its `Arc<ComInitializer>` — as soon as
-        // `watch` returns. Without holding our own `Arc` clone here, that drop
-        // could run `CoUninitialize()` while the IMMNotificationClient is still
-        // registered and before this teardown's `Unregister`, tearing down the
-        // MTA out from under a live callback. Keeping the clone alive until the
-        // teardown closure finishes guarantees ordering: Unregister + join the
-        // helper thread first, then release the apartment. (This mirrors why
-        // `WindowsAudioDevice` also holds the initializer.)
+        // The watcher can outlive this enumerator. Keep the registered client
+        // and a separate MTA pin until unregister and helper-thread join finish.
         let teardown_state = SendWatcherTeardown {
             enumerator: self.enumerator.clone(),
             client,
@@ -1238,7 +1238,8 @@ impl DeviceEnumerator for WindowsDeviceEnumerator {
             // 1. Stop new events: unregister the COM callback first, so no further
             //    OnDevice* fires after this returns. Best-effort — a failed
             //    unregister must not panic in Drop.
-            // SAFETY: free-threaded MTA enumerator + the client we registered.
+            // SAFETY: This is the registered client pointer, but the thread
+            // dropping the watcher may be in another apartment (#105).
             let _ = unsafe {
                 teardown_state
                     .enumerator
@@ -1263,32 +1264,20 @@ impl DeviceEnumerator for WindowsDeviceEnumerator {
     }
 }
 
-/// `Send` holder for the COM objects a [`DeviceWatcher`] teardown closure needs.
-///
-/// `IMMDeviceEnumerator` / `IMMNotificationClient` are not `Send` in the
-/// `windows` crate, but rsac creates them in a Multi-Threaded Apartment
-/// (`COINIT_MULTITHREADED`), where COM objects are free-threaded and may be used
-/// from any thread. The teardown closure must be `Send` (it is boxed as
-/// `FnOnce() + Send` in [`DeviceWatcher`]), so we assert that here, scoped to
-/// exactly these MTA objects.
+/// Holds the original registration pair until [`DeviceWatcher`] teardown.
 struct SendWatcherTeardown {
     enumerator: IMMDeviceEnumerator,
     client: IMMNotificationClient,
-    /// Keeps the COM apartment (MTA) initialized for the watcher's whole
-    /// lifetime, independent of the `WindowsDeviceEnumerator` that created it.
-    /// Dropped last (at the end of the teardown closure), after Unregister +
-    /// helper-thread join, so `CoUninitialize()` can never race a live callback.
-    ///
-    /// Held purely for its `Drop` (RAII lifetime extension) — never read — hence
-    /// `#[allow(dead_code)]`: the value's *existence* is the contract, and
-    /// removing it would reintroduce the apartment-teardown race.
+    /// Holds the MTA pin through unregister and helper-thread join. Dropped
+    /// after the interface fields; it does not set the Drop thread's apartment.
     #[allow(dead_code)]
     com_initializer: Arc<ComInitializer>,
 }
 
-// SAFETY: see the type doc — both wrapped interfaces are MTA free-threaded
-// objects (created under COINIT_MULTITHREADED), safe to use from any thread.
-// `Arc<ComInitializer>` is `Send` already; it is listed for documentation.
+// SAFETY: Only the enumerator's original acquisition is checked for MTA
+// membership. We retain the exact pointer required for unregister; neither
+// unregistering with it nor releasing these references on an STA teardown
+// thread is established safe (#105).
 unsafe impl Send for SendWatcherTeardown {}
 
 /// Information about an active audio session associated with an application.
@@ -1715,15 +1704,44 @@ mod tests {
 
     // ── ComInitializer Tests ─────────────────────────────────────────
 
-    /// Test that ComInitializer can be created (COM init succeeds on Windows).
     #[test]
-    fn test_com_initializer_creation() {
-        let result = ComInitializer::new();
-        assert!(
-            result.is_ok(),
-            "ComInitializer::new() failed: {:?}",
-            result.err()
-        );
+    fn test_com_init_accepts_plain_thread() {
+        std::thread::spawn(|| {
+            let _guard = ComInitializer::new().expect("plain thread should join the MTA");
+        })
+        .join()
+        .expect("plain thread panicked");
+    }
+
+    #[test]
+    fn test_com_init_rejects_sta() {
+        std::thread::spawn(|| {
+            // SAFETY: Initialize this fresh thread as STA and balance the
+            // successful call on this same thread before any assertion.
+            unsafe { CoInitializeEx(None, COINIT_APARTMENTTHREADED) }
+                .ok()
+                .expect("initialize STA");
+            let result = ComInitializer::new();
+            // SAFETY: Balances the successful CoInitializeEx above.
+            unsafe { CoUninitialize() };
+
+            let err = result.expect_err("an STA must not pass the MTA check");
+            let AudioError::BackendError {
+                backend,
+                operation,
+                message,
+                context: Some(context),
+            } = err
+            else {
+                panic!("expected a backend error with HRESULT context, got {err:?}");
+            };
+            assert_eq!(backend, "wasapi");
+            assert_eq!(operation, "com_init");
+            assert!(message.contains("single-threaded apartment"));
+            assert_eq!(context.os_error_code, Some(i64::from(RPC_E_CHANGED_MODE.0)));
+        })
+        .join()
+        .expect("STA thread panicked");
     }
 
     /// Test that ComInitializer is Debug-printable.
