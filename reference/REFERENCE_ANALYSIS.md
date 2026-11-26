@@ -15,7 +15,7 @@ This document compiles the analysis of 10 reference repositories spanning three 
 
 2. **Ring buffer bridge is the correct pattern**: CamillaDSP (Windows), wiremix/OBS (Linux), and AudioCap (macOS) all use ring-buffer-like bridges between OS callback threads and consumer threads. rtrb's SPSC design is ideal for this.
 
-3. **Per-application capture is platform-specific but achievable**: Windows uses process loopback (Win10+), Linux uses PipeWire virtual sinks + link management, macOS uses CoreAudio Process Tap (macOS 14+). All three patterns map cleanly to rsac's `CaptureTarget` enum.
+3. **Per-application capture is platform-specific but achievable**: Windows uses process loopback (Win10+), Linux uses PipeWire virtual sinks + link management, macOS uses CoreAudio Process Tap (macOS 14.4+, the rsac floor). All three patterns map cleanly to rsac's `CaptureTarget` enum.
 
 4. **cpal validates the Host → Device → Stream hierarchy** but doesn't support per-app capture — this is exactly where rsac adds value beyond cpal.
 
@@ -877,7 +877,7 @@ The `BridgeStream` design is validated by all reference projects:
 |---|---|---|---|
 | System audio capture | ✅ (loopback) | ✅ (sink monitor) | ✅ (global Process Tap) |
 | Device selection | ✅ | ✅ | ✅ |
-| Application capture | ✅ (Win10+) | ✅ (PipeWire) | ✅ (macOS 14+) |
+| Application capture | ✅ (Win10+) | ✅ (PipeWire) | ✅ (macOS 14.4+) |
 | Application by name | ✅ (via sysinfo) | ✅ (node properties) | ✅ (process enumeration) |
 | Process tree capture | ✅ (INCLUDE_TARGET_PROCESS_TREE) | ✅ (userspace PID/binary match) | ✅ (CATapDescription array) |
 | Mute on capture | ❌ | ❌ | ✅ (muteBehavior) |
