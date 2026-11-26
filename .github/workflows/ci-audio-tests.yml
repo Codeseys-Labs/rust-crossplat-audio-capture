@@ -936,7 +936,7 @@ jobs:
       - macos-audio
       - linux-audio-bindings
     steps:
-      - name: Write CI gap report seed
+      - name: Write CI gap report
         env:
           LINUX_SYSTEM: ${{ needs.linux-audio.outputs.tier_system }}
           LINUX_DEVICE: ${{ needs.linux-audio.outputs.tier_device }}
@@ -955,7 +955,7 @@ jobs:
           cat > ci-audio-gap-report.md <<EOF
           # Audio CI Coverage Gap Report
 
-          This artifact records first-class coverage claims, current CI gaps, and seeds that need platform evidence before they become hard gates.
+          This artifact records first-class coverage claims, current CI gaps, and work that needs platform evidence before it becomes a hard gate.
 
           ## Job Results (per tier)
 
@@ -975,14 +975,14 @@ jobs:
           | Linux binding go | ${BIND_GO:-n/a} |
           | Linux binding go (race) | ${BIND_GO_RACE:-n/a} |
 
-          ## Deferred Seeds
+          ## Deferred coverage work
 
-          | Seed | Why it is not a hard gate yet | Evidence needed before implementation |
+          | Coverage gap | Why it is not a hard gate yet | Evidence needed before implementation |
           |---|---|---|
           | ~~Linux hard content assertions~~ SHIPPED | The deterministic route (\`RSAC_CI_AUDIO_DETERMINISTIC=1\`) hard-gates non-silence in the Rust system tier (\`system_capture.rs\`) and, since rsac-3635, in all three binding smokes (\`linux-audio-bindings\` job). | — (done; row kept for history) |
           | ~~Linux \`ApplicationByName\` happy-path filter~~ SHIPPED | \`application_by_name_linux.rs\` resolves the player's pinned \`application.name\` via pw-dump and hard-asserts tone content (PR #58). | — (done; row kept for history) |
           | ~~Windows device/process content assertions~~ SHIPPED | The Windows device and process tiers now run deterministic like the system tier: rsac-0f33 (VB-CABLE default-endpoint gate) + rsac-5b59 (per-device / per-process tone route proven) hard-gate content with \`RSAC_CI_AUDIO_DETERMINISTIC=1\`. | — (done; row kept for history) |
-          | macOS first-class managed-runner capture | Process Tap requires \`kTCCServiceAudioCapture\`, which cannot be granted non-interactively on managed runners. | Use a self-hosted macOS runner with pre-granted Audio Capture permission and set \`RSAC_CI_MACOS_TCC_GRANTED=1\`. |
+          | macOS first-class managed-runner capture | Process Tap requires \`kTCCServiceAudioCapture\`, which cannot be granted non-interactively on managed runners. | Use a self-hosted macOS runner with pre-granted Audio Capture permission and set \`RSAC_CI_MACOS_TCC_GRANTED=1\`. See the self-hosted follow-up [#79](https://github.com/Codeseys-Labs/rust-crossplat-audio-capture/issues/79). |
           EOF
           cat ci-audio-gap-report.md >> "$GITHUB_STEP_SUMMARY"
 
@@ -1119,7 +1119,7 @@ jobs:
             echo "All Linux + Windows + macOS tiers + Linux binding smokes passed."
           fi
 
-      - name: Upload CI gap report seed
+      - name: Upload CI gap report
         if: always()
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:

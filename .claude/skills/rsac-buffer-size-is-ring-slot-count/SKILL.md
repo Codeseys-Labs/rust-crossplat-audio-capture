@@ -71,9 +71,8 @@ iterations and logs a nonzero `dropped` with a small nonzero `window`.
 ## Notes
 
 - macOS may derive ring capacity differently — the trap is confirmed for
-  Linux (`calculate_capacity` call site) and Windows (seed rsac-ec25
-  tracks period-derived sizing as future work; if that lands, this skill
-  needs a version bump).
+  Linux (`calculate_capacity` call site) and Windows. Period-derived sizing
+  is tracked in [#78](https://github.com/Codeseys-Labs/rust-crossplat-audio-capture/issues/78). Update this skill when that work lands.
 - The dual meaning is a latent API-design wart; if `buffer_size` is ever
   split into `ring_slots` + `period_frames`, deprecate this skill.
 - See also: `headless-ci-audio-hangs` (same test-suite family).

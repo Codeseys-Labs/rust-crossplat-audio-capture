@@ -106,7 +106,7 @@ jobs:
           fi
           printf 'changed files:\n%s\n' "$FILES"
           NON_DOCS=$(printf '%s\n' "$FILES" \
-            | grep -vE '^(docs/|\.seeds/|\.kilo/|\.mulch/|LICENSE)' \
+            | grep -vE '^(docs/|\.kilo/|\.mulch/|LICENSE)' \
             | grep -vE '\.md$' || true)
           if [ -z "$NON_DOCS" ]; then
             out "code=false"

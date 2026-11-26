@@ -290,7 +290,17 @@ checks and post-publish verification is in
 
 ## 9. Reporting bugs
 
-Open a GitHub issue with:
+Use [GitHub Issues](https://github.com/Codeseys-Labs/rust-crossplat-audio-capture/issues)
+for bugs, features, and project work. Search before filing. Include acceptance criteria
+and end the description with an `(effort: … | verify: … | wave: N)` footer.
+Include the wave when applicable. Add work under its epic as a GitHub
+sub-issue and record blockers with issue dependencies. Link the delivery PR
+and record verification when the issue is closed. See the
+[task management guide](../AGENTS.md#task-management-with-github-issues)
+for the full workflow and the [migration table](history/seeds/SEEDS_TO_ISSUES.md)
+for issues previously tracked in Seeds.
+
+When reporting a bug, include:
 
 - OS and version (e.g., `macOS 14.5`, `Ubuntu 24.04`, `Windows 11 23H2`).
 - Rust version (`rustc --version`).

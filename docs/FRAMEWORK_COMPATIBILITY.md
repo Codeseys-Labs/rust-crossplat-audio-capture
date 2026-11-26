@@ -44,8 +44,10 @@ microphone slices (`feat_android` AAudio / `feat_ios` AVAudioEngine), the iOS
 `SystemDefault` broadcast consumer (ReplayKit ring), and Android playback
 capture — what frameworks want for "system audio" on Android — all four
 `AudioPlaybackCapture` tiers via the AAR Kotlin loop + JNI ingest (rsac-77f1)
-— with **zero runtime verification on any device** (seeds
-rsac-e6d3/rsac-97c8). Once runtime verification lands, every 🟡 above
+— with emulator and simulator evidence for selected modes and **no
+physical-device verification** (per-mode evidence:
+[AGENTS.md §3](../AGENTS.md#3-current-state); physical devices: #89 for iOS,
+the Android epic #82). Once physical-device verification lands, every 🟡 above
 resolves through its listed integration path. Conversely, the ❌ cells are
 Apple/Google/browser policy, and **no framework choice changes them**.
 
@@ -80,8 +82,10 @@ explicit `allow-subscribe-raw` grant.
 rsac already *compiles* for those targets. The consent flow (Android
 MediaProjection) ships in `tauri-plugin-rsac`
 (`integrations/`, [ADR-0014](designs/0014-tauri-integration-model.md) Accepted)
-— **compile-shipping today; mobile runtime still blocked on rsac-e6d3 /
-rsac-97c8**. The plugin wraps `mobile/android/`'s `RsacProjection` consent flow
+— **compile-shipping today; the plugin itself has not been run on a device or
+emulator (#91)**. The `mobile/` glue it wraps has emulator and simulator
+evidence for selected modes and no physical-device verification (#89 for iOS,
+the Android epic #82). The plugin wraps `mobile/android/`'s `RsacProjection` consent flow
 and `mobile/ios/` glue behind Tauri commands/permissions (a thin forwarder — it
 inherits PR#64's deferred foreground-service-acquire ordering, adding no capture
 policy of its own).
@@ -161,9 +165,10 @@ both mobile triples in CI**; the C header is target-independent. Recipe:
 rsac-0aa9); **iOS** — build rsac-ffi as a staticlib for `aarch64-apple-ios`
 and bind via `dart:ffi`, plus a thin Flutter plugin for the Android consent
 flow (backed by the `mobile/android/` AAR) and the iOS broadcast-extension
-template from `mobile/ios/`. Runtime verification tracks
-rsac-e6d3/rsac-97c8 — until those are green, treat mobile Flutter capture as
-unproven.
+template from `mobile/ios/`. No Flutter integration has been run. The backends
+underneath have emulator and simulator evidence for selected modes only
+([AGENTS.md §3](../AGENTS.md#3-current-state); physical devices: #89, #82), so
+treat mobile Flutter capture as unproven.
 
 ## Android and iOS (all frameworks)
 
@@ -189,8 +194,7 @@ honest version:
 
 ## Long tail (no commitments)
 
-Brief honest paragraphs; **no seeds are filed for these** — they ride on the
-same rsac-ffi / direct-dep paths as the frameworks above.
+These frameworks use the rsac-ffi and direct-dependency paths described above.
 
 - **Rust-native GUIs (egui, Iced, Slint, GPUI):** trivially supported on
   desktop — rsac is a plain Rust crate with no UI assumptions; use the builder
@@ -220,13 +224,15 @@ recipes in this document and flip the 🟢 markers to ✅ from their verified
 results — we don't run speculative verification ourselves. (The original
 wave-2 verification seeds were closed as not-planned with this rationale.)
 
-The committed backlog is the **mobile push**, tracked as `sd` epics:
-umbrella `rsac-0991` → Android backend `rsac-5823` (wave 3), iOS backend
-`rsac-57cb` (wave 4), framework delivery / `tauri-plugin-rsac` `rsac-71d2`
-(wave 5). The core consent surface (rsac-82d4) and the rsac-napi per-target
+The **mobile push** is tracked in the umbrella epic [#85](https://github.com/Codeseys-Labs/rust-crossplat-audio-capture/issues/85)
+and its Android backend [#82](https://github.com/Codeseys-Labs/rust-crossplat-audio-capture/issues/82) (wave 3),
+iOS backend [#83](https://github.com/Codeseys-Labs/rust-crossplat-audio-capture/issues/83) (wave 4),
+and framework delivery [#84](https://github.com/Codeseys-Labs/rust-crossplat-audio-capture/issues/84) (wave 5) sub-issues.
+The core consent surface (rsac-82d4) and the rsac-napi per-target
 dependency migration (rsac-e8a3) are already landed. The wave-5
 `tauri-plugin-rsac` **skeleton landed compile-proof** (rsac-f21c,
 `integrations/`) — desktop builds/clippies in CI, `android/`+`ios/` are
 source-shipped, and derived-data-by-default is enforced via the permission set
-(raw opt-in); framework **runtime** verification remains guidance-on-demand and
-mobile runtime stays blocked on rsac-e6d3 / rsac-97c8.
+(raw opt-in). Framework **runtime** verification remains guidance-on-demand.
+The remaining iOS hardware verification is tracked in [#89](https://github.com/Codeseys-Labs/rust-crossplat-audio-capture/issues/89).
+The Android Tauri end-to-end example is tracked in [#91](https://github.com/Codeseys-Labs/rust-crossplat-audio-capture/issues/91).

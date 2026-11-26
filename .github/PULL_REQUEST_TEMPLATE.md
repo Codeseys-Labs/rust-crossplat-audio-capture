@@ -3,7 +3,7 @@
 
 ## What & why
 
-<!-- What does this PR change, and what problem does it solve? Link issues/seeds. -->
+<!-- What does this PR change, and what problem does it solve? Link the GitHub issues this PR addresses. -->
 
 ## Checklist (from CONTRIBUTING §8)
 
