@@ -8,7 +8,7 @@ name = "tauri-plugin-rsac"
 version = "0.4.4"
 edition = "2021"
 # match root MSRV floor (Cargo.toml:9)
-rust-version = "1.87"
+rust-version = "1.88"
 # publishing deferred repo-wide (rsac-aaea)
 publish = false
 description = "Tauri v2 plugin: mobile consent flow + JS-facing capture API for rsac (ADR-0014)"
@@ -27,7 +27,7 @@ links = "tauri-plugin-rsac"
 # `tauri`, independent of the webview features) pulls gtk + webkit2gtk-sys
 # unconditionally on Linux, so the desktop-check CI leg still installs
 # libgtk-3-dev + libwebkit2gtk-4.1-dev (see ci.yml check-bindings).
-tauri = { version = "2", default-features = false }
+tauri = { version = ">=2, <2.12", default-features = false }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 thiserror = "2"
@@ -37,7 +37,7 @@ log = "0.4"
 rsac = { path = "../../", version = "0.4.4", default-features = false }
 
 [build-dependencies]
-tauri-plugin = { version = "2", features = ["build"] }
+tauri-plugin = { version = ">=2, <2.7", features = ["build"] }
 
 # Mobile targets compile rsac with its platform backend so the
 # `#[cfg(target_os = "android")] with_android_projection` /

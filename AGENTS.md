@@ -808,7 +808,7 @@ Full playbook (when to stack vs parallel PRs, exact commands, pitfalls):
 | `futures-core` | Async `Stream` trait (optional, behind `async-stream` feature) |
 | `atomic-waker` | Async notification from ring buffer (optional, behind `async-stream` feature) |
 | `rubato` | FFT resampling for compose-feature rate alignment (optional, behind `compose`) |
-| `audioadapter-buffers` | Interleaved-slice adapters consumed by rubato v3 (optional, behind `compose`) |
+| `audioadapter-buffers` | Interleaved-slice adapters consumed by rubato v5 (optional, behind `compose`) |
 
 ### Platform-specific
 

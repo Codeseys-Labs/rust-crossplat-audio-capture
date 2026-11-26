@@ -40,7 +40,14 @@ Releases with no ABI change omit the subsection (or state "No C ABI changes").
 - **MSRV raised to `1.88`** (`Cargo.toml` and `ci.yml` Linux + Windows MSRV legs) to
   reflect `sysinfo 0.38.4`'s actual Rust 1.88 requirement on Windows/macOS.
 - **Dependencies upgraded:** `rtrb` `0.3.4` → `0.4.1`, `wasapi` `0.23.0` → `0.27.0`
-  (Windows).
+  (Windows), `rubato` `3.0.0` → `5.1.0` + `audioadapter-buffers` `3.0.0` → `5.2.0`
+  (`compose`, preserving identical 2-subchunk `BlackmanHarris2` FFT geometry),
+  `pyo3` `0.24` → `0.30.1` (`bindings/rsac-python`, retaining `abi3-py39` and
+  `gil_used = true`), `cbindgen` `0.28` → `0.29.4` (`bindings/rsac-ffi`,
+  regenerated `rsac_generated.h`), Tier-1 patch/minor updates (`tokio 1.54.1`,
+  `rand 0.10.4`, `clap 4.6.10`, `libc 0.2.191`, `log 0.4.35`, `serde 1.0.229`,
+  `serde_json 1.0.154`, `thiserror 2.0.21`, `tracing 0.1.44`, Apple `objc2`/`coreaudio`
+  patch releases), and workspace `resolver = "3"` (MSRV-aware resolution).
 - **Modularized `src/api/`** — split the 5,365-line `src/api.rs` into focused submodules
   with identical public re-exports and hardened `scripts/check-module-dag.sh` to fail
   closed on missing scan roots.
@@ -78,6 +85,12 @@ Releases with no ABI change omit the subsection (or state "No C ABI changes").
 ### Security
 
 - Added `betterleaks` v1.10.1 secret scanning in pre-commit hooks and CI.
+- Expanded `ci.yml`'s `supply-chain` job to `cargo deny --workspace --all-features`
+  with crate-scoped `MPL-2.0` exceptions for `cbindgen` and `tauri`-only transitives,
+  and closed `RUSTSEC-2026-0176`/`-0177` (`pyo3 0.30.1`), `RUSTSEC-2026-0386`
+  (`tokio 1.54.1`, skipping yanked `1.54.0` / `RUSTSEC-2026-0384`),
+  `RUSTSEC-2026-0097` (`rand 0.10.4` + non-yanked `chacha20 0.10.2`),
+  `RUSTSEC-2026-0592` (`url`), and `RUSTSEC-2026-0594` (`cookie`).
 
 ## [0.4.4] - 2026-07-21
 

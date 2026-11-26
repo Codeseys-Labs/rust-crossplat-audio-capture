@@ -17,7 +17,7 @@ crate-type = ["cdylib"]
 # platform is importable on CPython 3.9–3.13 (rsac#18 / rsac-c353) instead of a
 # wheel per interpreter minor version. `extension-module` keeps Python out of the
 # link line (the interpreter provides the symbols at load time).
-pyo3 = { version = "0.24", features = ["extension-module", "abi3-py39"] }
+pyo3 = { version = "0.30.1", features = ["extension-module", "abi3-py39"] }
 
 # Path dependency to the rsac library crate.
 #

@@ -4,12 +4,12 @@
 //! Runs exclusively on the compositor thread (non-RT — allocation is fine
 //! here; ADR-0001 concerns the OS callback threads, which this code never
 //! touches). Input and output are interleaved f32, adapted for rubato via
-//! `audioadapter`'s [`InterleavedSlice`].
+//! `audioadapter-buffers`' [`InterleavedSlice`].
 
 use std::collections::VecDeque;
 
 use audioadapter_buffers::direct::InterleavedSlice;
-use rubato::{Fft, FixedSync, Indexing, Resampler};
+use rubato::{Fft, FixedSync, Indexing, Resampler, WindowFunction};
 
 use crate::core::error::{AudioError, AudioResult};
 
@@ -64,12 +64,15 @@ impl StreamResampler {
     /// interleaved channels.
     pub fn new(from_rate: u32, to_rate: u32, channels: u16) -> AudioResult<Self> {
         let channels = usize::from(channels.max(1));
-        let inner = Fft::<f32>::new(
+        let inner = Fft::<f32>::new_custom(
             from_rate as usize,
             to_rate as usize,
             CHUNK_FRAMES,
+            // Keep the original FFT size, delay, and anti-alias cutoff.
+            // Fft::new would use CHUNK_FRAMES / 256 = 4 subchunks instead.
             2,
             channels,
+            WindowFunction::BlackmanHarris2,
             FixedSync::Input,
         )
         .map_err(|e| AudioError::ConfigurationError {
@@ -122,16 +125,10 @@ impl StreamResampler {
                 message: format!("resampler output adapter: {e}"),
                 source: None,
             })?;
-            let indexing = Indexing {
-                input_offset: 0,
-                output_offset: 0,
-                active_channels_mask: None,
-                partial_len: None,
-            };
 
             let (consumed_frames, produced_frames) = self
                 .inner
-                .process_into_buffer(&input, &mut output, Some(&indexing))
+                .process_into_buffer(&input, &mut output, None)
                 .map_err(|e| AudioError::InternalError {
                     message: format!("resampler process failed: {e}"),
                     source: None,
@@ -163,10 +160,9 @@ impl StreamResampler {
     /// Mechanism — mirrors rubato's own `process_all_into_buffer` tail
     /// handling:
     ///
-    /// 1. Process `pending` as a partial chunk via rubato v3's
-    ///    `Indexing { partial_len: Some(valid_frames), .. }` (rubato
-    ///    zero-pads the rest of the chunk internally).
-    /// 2. Pump all-zero chunks (`partial_len: Some(0)`) to expel the
+    /// 1. Process `pending` via `Indexing::new().partial_len(valid_frames)`;
+    ///    rubato zero-pads the rest of the chunk internally.
+    /// 2. Pump all-zero chunks (`Indexing::new().partial_len(0)`) to expel the
     ///    remaining delay residue.
     /// 3. Trim so cumulative output == `round(frames_in * to/from)` — exact
     ///    by construction from the `frames_in`/`frames_out` counters; the
@@ -238,12 +234,7 @@ impl StreamResampler {
                 message: format!("resampler flush output adapter: {e}"),
                 source: None,
             })?;
-            let indexing = Indexing {
-                input_offset: 0,
-                output_offset: 0,
-                active_channels_mask: None,
-                partial_len: Some(partial_frames),
-            };
+            let indexing = Indexing::new().partial_len(partial_frames);
 
             let (_consumed_frames, produced_frames) = self
                 .inner

@@ -203,7 +203,7 @@ fn audio_error_to_pyerr(err: rsac::AudioError) -> PyErr {
 ///     CaptureTarget.parse("name:<n>")
 ///     CaptureTarget.parse("tree:<pid>")
 #[pyclass(name = "CaptureTarget", module = "rsac._rsac", frozen)]
-#[derive(Clone, Debug)]
+#[derive(Debug)]
 struct PyCaptureTarget {
     inner: rsac::CaptureTarget,
 }
@@ -851,7 +851,7 @@ impl PyAudioFormat {
 /// is exactly the coroutine-completion protocol the event loop expects.
 #[pyclass(module = "rsac._rsac")]
 struct CompletedAwaitable {
-    value: Option<PyObject>,
+    value: Option<Py<PyAny>>,
 }
 
 #[pymethods]
@@ -873,7 +873,7 @@ impl CompletedAwaitable {
 }
 
 impl CompletedAwaitable {
-    fn new(py: Python<'_>, value: PyObject) -> PyResult<Py<Self>> {
+    fn new(py: Python<'_>, value: Py<PyAny>) -> PyResult<Py<Self>> {
         Py::new(py, CompletedAwaitable { value: Some(value) })
     }
 }
@@ -902,7 +902,7 @@ impl CompletedAwaitable {
 ///     buffer_size: Optional buffer size in frames.
 /// Outcome of the GIL-released lock dances shared by `start()`/`stop()`/`close()`.
 ///
-/// The teardown runs entirely inside `Python::allow_threads` (see the
+/// The teardown runs entirely inside `Python::detach` (see the
 /// `stop`/`close` deadlock-fix comments), so it cannot build a `PyErr` in place
 /// (that needs the GIL). It returns one of these instead and the caller maps it
 /// to the right Python exception *after* the GIL is re-acquired.
@@ -951,14 +951,14 @@ struct PyAudioCapture {
     /// `RwLock` only changes how the slot is guarded, not its contents.
     ///
     /// GIL INTERACTION (rsac-8082 follow-up): the parked reader releases the GIL
-    /// across its blocking read (`py.allow_threads`) but holds its read guard the
-    /// whole time — and `allow_threads` re-acquires the GIL *before* the guard is
+    /// across its blocking read (`py.detach`) but holds its read guard the
+    /// whole time — and `detach` re-acquires the GIL *before* the guard is
     /// dropped. So a teardown that took `.write()` while still holding the GIL
     /// would deadlock: the woken reader blocks re-acquiring the GIL (held by the
     /// teardown) and never unwinds to drop its read guard, while the teardown
     /// blocks on `.write()` behind that guard. `stop()`/`close()`/`__del__`
     /// therefore run the ENTIRE lock dance (read-guard `request_stop` → `write()`
-    /// → teardown) inside `py.allow_threads`, releasing the GIL while they block
+    /// → teardown) inside `py.detach`, releasing the GIL while they block
     /// on `.write()` so the woken reader can re-acquire it and drop its guard.
     inner: RwLock<Option<rsac::AudioCapture>>,
     /// Track if we're acting as an iterator (started via __iter__).
@@ -975,17 +975,19 @@ impl PyAudioCapture {
     #[pyo3(signature = (target=None, sample_rate=48000, channels=2, buffer_size=None))]
     fn new(
         py: Python<'_>,
-        target: Option<PyCaptureTarget>,
+        target: Option<&PyCaptureTarget>,
         sample_rate: u32,
         channels: u16,
         buffer_size: Option<usize>,
     ) -> PyResult<Self> {
+        // `target` is borrowed (PyO3 0.30 no longer automatically extracts a
+        // `#[pyclass]` by value), so copy its inner target once before detaching.
         let rust_target = target
             .map(|t| t.inner.clone())
             .unwrap_or(rsac::CaptureTarget::SystemDefault);
 
         let capture = py
-            .allow_threads(|| {
+            .detach(|| {
                 let mut builder = rsac::AudioCaptureBuilder::new()
                     .with_target(rust_target)
                     .sample_rate(sample_rate)
@@ -1017,7 +1019,7 @@ impl PyAudioCapture {
         // the exclusive write guard, which would otherwise queue forever behind
         // a parked reader's shared guard (and, GIL-held, recreate the circular
         // wait the teardown fix removed).
-        py.allow_threads(|| {
+        py.detach(|| {
             {
                 let guard = self
                     .inner
@@ -1054,16 +1056,16 @@ impl PyAudioCapture {
         // never blocks) and call `request_stop()` — which flips the stream terminal
         // and wakes the reader — then take the write guard for the real `stop()`.
         //
-        // CRITICAL (GIL): the whole dance runs inside `py.allow_threads` so the GIL
+        // CRITICAL (GIL): the whole dance runs inside `py.detach` so the GIL
         // is released while we block on `.write()`. If we held the GIL across
         // `.write()`, the woken reader — which must re-acquire the GIL before its
-        // `allow_threads` returns and drops its read guard — would block on the GIL
+        // `detach` returns and drops its read guard — would block on the GIL
         // we hold, while we block on the write lock behind its guard: a circular
         // wait. Releasing the GIL here lets the reader re-acquire it, unwind, and
         // drop its read guard so our `.write()` proceeds. The closure is pure Rust
         // (no Python), so we return a `TeardownError` and map it to a `PyErr` only
         // after the GIL is back.
-        py.allow_threads(|| self.teardown_stop())
+        py.detach(|| self.teardown_stop())
             .map_err(TeardownError::into_pyerr)
     }
 
@@ -1096,7 +1098,7 @@ impl PyAudioCapture {
             .ok_or_else(|| PyRuntimeError::new_err("AudioCapture has been closed"))?;
 
         // read_buffer() takes &self. Release GIL for the read.
-        let result = py.allow_threads(|| capture.read_buffer());
+        let result = py.detach(|| capture.read_buffer());
 
         match result {
             Ok(Some(buf)) => Ok(Some(PyAudioBuffer { inner: buf })),
@@ -1132,7 +1134,7 @@ impl PyAudioCapture {
             .as_ref()
             .ok_or_else(|| PyRuntimeError::new_err("AudioCapture has been closed"))?;
 
-        let result = py.allow_threads(|| capture.read_chunk_blocking());
+        let result = py.detach(|| capture.read_chunk_blocking());
 
         match result {
             Ok(buf) => Ok(PyAudioBuffer { inner: buf }),
@@ -1212,7 +1214,7 @@ impl PyAudioCapture {
         // Deadlock fix (rsac-8082): like `stop()`, `close()` must not block behind
         // a thread parked in `read()`/`__next__`. It runs the same read-guard
         // `request_stop()` → write-guard dance, and — crucially — runs it entirely
-        // inside `py.allow_threads` so the GIL is released while it blocks on
+        // inside `py.detach` so the GIL is released while it blocks on
         // `.write()`. Holding the GIL across `.write()` would deadlock against a
         // reader that must re-acquire the GIL to unwind and drop its read guard
         // (see the `inner` field's GIL-interaction note). The capture is ALWAYS
@@ -1220,7 +1222,7 @@ impl PyAudioCapture {
         // the core `stop()` error is propagated rather than swallowed so callers —
         // notably `__aexit__`, whose contract surfaces teardown failures when no
         // body exception is in flight — actually learn about a failed teardown.
-        py.allow_threads(|| self.teardown_close())
+        py.detach(|| self.teardown_close())
             .map_err(TeardownError::into_pyerr)
     }
 
@@ -1296,12 +1298,12 @@ impl PyAudioCapture {
         //
         // Same GIL discipline as stop()/close() (rsac-8082): Python GC can run
         // __del__ on a *different* thread than a parked reader, so the read-guard
-        // `request_stop()` → write-guard dance must run inside `py.allow_threads`.
+        // `request_stop()` → write-guard dance must run inside `py.detach`.
         // Holding the GIL across `.write()` would deadlock against a reader that
         // needs the GIL to unwind and drop its read guard. `teardown_close`
         // swallows the poisoned/closed/stop outcomes here — __del__ must never
         // raise or panic.
-        let _ = py.allow_threads(|| self.teardown_close());
+        let _ = py.detach(|| self.teardown_close());
     }
 
     // ── Iterator Protocol ────────────────────────────────────────────
@@ -1315,7 +1317,7 @@ impl PyAudioCapture {
                 .map_err(|e| PyRuntimeError::new_err(format!("Lock poisoned: {}", e)))?;
             *iter_guard = true;
             // Drop the iterating guard BEFORE start(): start() releases the GIL
-            // inside allow_threads, so holding `iterating` across it recreates
+            // inside detach, so holding `iterating` across it recreates
             // the GIL-vs-lock circular wait (rsac-8082 class) — a second thread
             // entering __iter__ would block on `iterating` while holding the
             // GIL, and this thread could never re-acquire the GIL to unwind.
@@ -1395,7 +1397,7 @@ impl PyAudioCapture {
                 // SHARED guard: a concurrent `stop()`/`close()` takes a read guard
                 // of its own to call `request_stop()`, which signals the stream
                 // terminal so this read returns promptly rather than deadlocking.
-                py.allow_threads(|| capture.read_chunk_blocking())
+                py.detach(|| capture.read_chunk_blocking())
                 // `guard` drops at the end of this block.
             };
 
@@ -1417,7 +1419,7 @@ impl PyAudioCapture {
                 // re-locks and re-checks `is_running()`, so a stop that has not
                 // yet reached the fatal terminal ends cleanly via `StopIteration`.
                 Err(e) if e.is_recoverable() => {
-                    py.allow_threads(|| {
+                    py.detach(|| {
                         std::thread::sleep(std::time::Duration::from_millis(1));
                     });
                     continue;
@@ -1445,7 +1447,7 @@ impl PyAudioCapture {
 //
 // These run the read-guard `request_stop()` → write-guard lock dance as PURE
 // RUST, with NO `Python` token in scope, so `stop()`/`close()`/`__del__` can
-// invoke them from inside `py.allow_threads` (GIL released). Keeping them out of
+// invoke them from inside `py.detach` (GIL released). Keeping them out of
 // the `#[pymethods]` block is deliberate: they must not touch the GIL, and the
 // borrow of `&self` here is the plain Rust `&self`, not a PyO3 receiver. Errors
 // come back as `TeardownError` (GIL-free) and the caller maps them to a `PyErr`
@@ -1455,7 +1457,7 @@ impl PyAudioCapture {
     /// (waking a parked reader), drop it, then take the write guard. Returns the
     /// woken/settled write guard's `Option` slot for the caller to finish with.
     ///
-    /// MUST be called with the GIL released (inside `allow_threads`) — see the
+    /// MUST be called with the GIL released (inside `detach`) — see the
     /// `inner` field's GIL-interaction note.
     fn request_stop_then_write(
         &self,
@@ -1511,7 +1513,7 @@ impl PyAudioCapture {
 // gate. `Composition` reuses `PyAudioCapture`'s exact lock topology and GIL
 // discipline (rsac-8082): reads/`&self`-stop-signal under a shared read guard,
 // the joining teardown under the write guard, with the whole dance inside
-// `py.allow_threads` (see the `inner` field note on `PyComposition`).
+// `py.detach` (see the `inner` field note on `PyComposition`).
 
 /// A composition group: a named set of capture sources sharing a mixdown
 /// layout. Built up with :meth:`source` / :meth:`source_with_gain` and a layout
@@ -1881,11 +1883,11 @@ struct PyComposition {
     /// only then do they take the write guard for the joining inherent `stop`.
     ///
     /// GIL INTERACTION (rsac-8082): the parked reader releases the GIL across
-    /// its blocking read (`py.allow_threads`) but holds its read guard the whole
-    /// time — and `allow_threads` re-acquires the GIL *before* the guard drops.
+    /// its blocking read (`py.detach`) but holds its read guard the whole
+    /// time — and `detach` re-acquires the GIL *before* the guard drops.
     /// A teardown that took `.write()` while holding the GIL would deadlock, so
     /// `stop()`/`close()`/`__del__` run the ENTIRE lock dance inside
-    /// `py.allow_threads`.
+    /// `py.detach`.
     inner: RwLock<Option<rsac::Composition>>,
     /// Track iterator state (started via `__iter__`), mirroring `PyAudioCapture`.
     iterating: Mutex<bool>,
@@ -1899,7 +1901,7 @@ impl PyComposition {
     /// The GIL is released while starting (device work). Starting an
     /// already-running composition is a no-op.
     fn start(&self, py: Python<'_>) -> PyResult<()> {
-        py.allow_threads(|| {
+        py.detach(|| {
             {
                 let guard = self
                     .inner
@@ -1923,10 +1925,10 @@ impl PyComposition {
     /// Stop the composition: signal the ring + engine (waking any parked
     /// reader) and join the compositor thread. Discards the buffered tail.
     fn stop(&self, py: Python<'_>) -> PyResult<()> {
-        // rsac-8082: the two-phase dance runs entirely inside allow_threads (GIL
+        // rsac-8082: the two-phase dance runs entirely inside detach (GIL
         // released across `.write()`), calling `CapturingStream::stop(&comp)` as
         // the `&self` signal instead of `AudioCapture::request_stop`.
-        py.allow_threads(|| self.teardown_stop())
+        py.detach(|| self.teardown_stop())
             .map_err(TeardownError::into_pyerr)
     }
 
@@ -1952,7 +1954,7 @@ impl PyComposition {
         let comp = guard
             .as_ref()
             .ok_or_else(|| PyRuntimeError::new_err("Composition has been closed"))?;
-        let result = py.allow_threads(|| comp.read_chunk_nonblocking());
+        let result = py.detach(|| comp.read_chunk_nonblocking());
         match result {
             Ok(Some(buf)) => Ok(Some(PyAudioBuffer { inner: buf })),
             Ok(None) => Ok(None),
@@ -1973,7 +1975,7 @@ impl PyComposition {
         let comp = guard
             .as_ref()
             .ok_or_else(|| PyRuntimeError::new_err("Composition has been closed"))?;
-        let result = py.allow_threads(|| comp.read_chunk_blocking());
+        let result = py.detach(|| comp.read_chunk_blocking());
         match result {
             Ok(buf) => Ok(PyAudioBuffer { inner: buf }),
             Err(e) => Err(audio_error_to_pyerr(e)),
@@ -2082,8 +2084,8 @@ impl PyComposition {
     /// Addressed by group name + within-group index. Python floats are f64 and
     /// are narrowed to f32 before the core validates them, so a finite value
     /// that narrows to inf is rejected as ConfigurationError. Takes the shared
-    /// read guard while holding the GIL, WITHOUT allow_threads — the core store
-    /// is a lock-free atomic that never blocks or re-enters allow_threads, and
+    /// read guard while holding the GIL, WITHOUT detach — the core store
+    /// is a lock-free atomic that never blocks or re-enters detach, and
     /// the read guard coexists with the parked blocking reader (rsac-8082).
     fn set_gain(&self, group: &str, source_idx: usize, gain: f64) -> PyResult<()> {
         let guard = self
@@ -2143,7 +2145,7 @@ impl PyComposition {
 
     /// Close the composition and release all resources.
     fn close(&self, py: Python<'_>) -> PyResult<()> {
-        py.allow_threads(|| self.teardown_close())
+        py.detach(|| self.teardown_close())
             .map_err(TeardownError::into_pyerr)
     }
 
@@ -2191,7 +2193,7 @@ impl PyComposition {
     // ── Finalizer safety net ─────────────────────────────────────────
 
     fn __del__(&self, py: Python<'_>) {
-        let _ = py.allow_threads(|| self.teardown_close());
+        let _ = py.detach(|| self.teardown_close());
     }
 
     // ── Iterator Protocol ────────────────────────────────────────────
@@ -2205,7 +2207,7 @@ impl PyComposition {
                 .map_err(|e| PyRuntimeError::new_err(format!("Lock poisoned: {}", e)))?;
             *iter_guard = true;
             // Drop the iterating guard BEFORE start(): start() releases the GIL
-            // inside allow_threads, so holding `iterating` across it recreates
+            // inside detach, so holding `iterating` across it recreates
             // the GIL-vs-lock circular wait (rsac-8082 class) — same fix as
             // PyAudioCapture::__iter__.
             drop(iter_guard);
@@ -2244,7 +2246,7 @@ impl PyComposition {
                 if !comp.is_running() {
                     return Err(PyStopIteration::new_err("Composition stopped"));
                 }
-                py.allow_threads(|| comp.read_chunk_blocking())
+                py.detach(|| comp.read_chunk_blocking())
             };
 
             match outcome {
@@ -2253,7 +2255,7 @@ impl PyComposition {
                     return Err(PyStopIteration::new_err(e.to_string()));
                 }
                 Err(e) if e.is_recoverable() => {
-                    py.allow_threads(|| {
+                    py.detach(|| {
                         std::thread::sleep(std::time::Duration::from_millis(1));
                     });
                     continue;
@@ -2278,7 +2280,7 @@ impl PyComposition {
 // ── Composition teardown helpers (GIL-released, rsac-8082) ──────────────────
 //
 // Same discipline as `PyAudioCapture`'s helpers: pure Rust, no `Python` token,
-// so `stop()`/`close()`/`__del__` can call them from inside `py.allow_threads`.
+// so `stop()`/`close()`/`__del__` can call them from inside `py.detach`.
 // The `&self` stop SIGNAL uses `CapturingStream::stop` (ends the ring + flags
 // the engine, waking a parked reader) — the composition analogue of
 // `AudioCapture::request_stop`; the write-guard join uses the inherent
@@ -2286,7 +2288,7 @@ impl PyComposition {
 impl PyComposition {
     /// Take a read guard to signal the stream stop (waking a parked reader via
     /// `CapturingStream::stop`), drop it, then take the write guard. MUST run
-    /// with the GIL released (inside `allow_threads`).
+    /// with the GIL released (inside `detach`).
     fn request_stop_then_write(
         &self,
     ) -> std::result::Result<
@@ -2352,7 +2354,7 @@ impl PyComposition {
 #[pyfunction]
 fn list_devices(py: Python<'_>) -> PyResult<Vec<PyAudioDevice>> {
     let devices = py
-        .allow_threads(|| {
+        .detach(|| {
             let enumerator = rsac::get_device_enumerator()?;
             enumerator.enumerate_devices()
         })
@@ -2394,7 +2396,11 @@ fn platform_capabilities() -> PyPlatformCapabilities {
 ///     with rsac.AudioCapture() as cap:
 ///         for buffer in cap:
 ///             print(f"Got {buffer.num_frames} frames, RMS={buffer.rms():.4f}")
-#[pymodule]
+// `gil_used = true` keeps the module's pre-0.28 PyO3 policy: PyO3 0.28+
+// otherwise declares free-threaded (no-GIL) support by default. The rsac-8082
+// lock discipline is designed and regression-tested against a GIL-holding
+// interpreter, and free-threaded CPython support has not been validated.
+#[pymodule(gil_used = true)]
 fn _rsac(m: &Bound<'_, PyModule>) -> PyResult<()> {
     // Register classes
     m.add_class::<PyCaptureTarget>()?;
@@ -2557,7 +2563,7 @@ mod tests {
     // `rsac::AudioCapture` can only be built via the device-backed builder — so a
     // *silent-stream* real capture is not constructible from a unit test without
     // hardware, and this crate links against libpython via `extension-module`
-    // (no `auto-initialize`), so `Python::with_gil` has no interpreter to attach
+    // (no `auto-initialize`), so `Python::attach` has no interpreter to attach
     // to under `cargo test`. We therefore reproduce the exact WRAPPER LOCK
     // TOPOLOGY *and the GIL re-acquisition protocol* the fix depends on, with a
     // faithful stand-in whose receivers mirror core:
@@ -2570,13 +2576,13 @@ mod tests {
     //
     // GIL MODEL (the load-bearing part for Python — the first review's Finding 2):
     // a `gil: Mutex<()>` stands in for CPython's GIL. The reader enters "holding
-    // the GIL", takes its read guard, then models `py.allow_threads` by DROPPING
+    // the GIL", takes its read guard, then models `py.detach` by DROPPING
     // the GIL for the blocking read and RE-ACQUIRING it (blocking) before it can
     // return and drop its read guard. That re-acquire is exactly what turns a
     // GIL-holding `write()` in the teardown into a circular wait:
     //   - reader holds read guard, blocked re-acquiring the GIL;
     //   - teardown holds the GIL, blocked acquiring `write()` behind that guard.
-    // The FIXED teardown runs the whole dance inside `allow_threads` (GIL released
+    // The FIXED teardown runs the whole dance inside `detach` (GIL released
     // across `write()`), so the reader re-acquires the GIL, unwinds, and drops its
     // guard → `write()` proceeds. The BROKEN teardown holds the GIL across
     // `write()` → deadlock. The distinguishing, deterministic signal is whether
@@ -2639,7 +2645,7 @@ mod tests {
     /// Spawn the reader thread and block (bounded) until it has genuinely parked
     /// in the blocking read. Models a Python `read()`/`__next__` step by step:
     /// (1) enter the pymethod holding the GIL; (2) take a SHARED read guard (GIL
-    /// held); (3) `py.allow_threads(|| read_chunk_blocking())` — DROP the GIL, run
+    /// held); (3) `py.detach(|| read_chunk_blocking())` — DROP the GIL, run
     /// the blocking read, then RE-ACQUIRE the GIL (blocking) before returning;
     /// (4) drop the read guard (only reachable once the GIL is re-acquired).
     /// Returns the reader's join handle; it yields the terminal read result.
@@ -2654,14 +2660,14 @@ mod tests {
                 let gil_guard = gil.lock().expect("GIL"); // pymethod entered holding GIL
                 let guard = inner.read().expect("read guard"); // shared read guard (GIL held)
                 let cap = guard.as_ref().expect("capture present");
-                // py.allow_threads(|| read_chunk_blocking()): release the GIL for
+                // py.detach(|| read_chunk_blocking()): release the GIL for
                 // the blocking read...
                 drop(gil_guard);
                 let read_result = cap.read_chunk_blocking();
-                // ...then RE-ACQUIRE the GIL before allow_threads returns. This
+                // ...then RE-ACQUIRE the GIL before detach returns. This
                 // blocks if the teardown is holding the GIL — the deadlock edge.
                 let regil = gil.lock().expect("GIL re-acquire");
-                // The read guard was held across the whole allow_threads; it drops
+                // The read guard was held across the whole detach; it drops
                 // now (only reachable once the GIL is back).
                 drop(guard);
                 drop(regil);
@@ -2704,7 +2710,7 @@ mod tests {
     }
 
     /// FIXED teardown (what Python `stop()`/`close()` now do): run the read-guard
-    /// `request_stop()` → `write()` dance INSIDE `allow_threads`, i.e. with the
+    /// `request_stop()` → `write()` dance INSIDE `detach`, i.e. with the
     /// GIL released across `write()`. Returns whether `write()` acquired promptly.
     #[test]
     fn stop_does_not_deadlock_parked_blocking_read() {
@@ -2716,7 +2722,7 @@ mod tests {
             let (gil, inner) = (Arc::clone(&gil), Arc::clone(&inner));
             std::thread::spawn(move || {
                 let gil_guard = gil.lock().expect("GIL"); // pymethod entered holding GIL
-                                                          // py.allow_threads(|| teardown): release the GIL for the WHOLE
+                                                          // py.detach(|| teardown): release the GIL for the WHOLE
                                                           // dance so the woken reader can re-acquire it and drop its guard.
                 drop(gil_guard);
                 {
@@ -2726,7 +2732,7 @@ mod tests {
                     }
                 }
                 let got = write_take_bounded(&inner, Duration::from_secs(5));
-                // allow_threads re-acquires the GIL before returning.
+                // detach re-acquires the GIL before returning.
                 let _regil = gil.lock().expect("GIL re-acquire");
                 got
             })
@@ -2757,7 +2763,7 @@ mod tests {
     /// old `Mutex` binding does). The woken reader cannot re-acquire the GIL to
     /// drop its read guard, so `write()` never acquires within the deadline — the
     /// circular wait. Asserting the bounded `write()` times out proves the
-    /// `allow_threads` wrap in `stop_does_not_deadlock_parked_blocking_read` is
+    /// `detach` wrap in `stop_does_not_deadlock_parked_blocking_read` is
     /// load-bearing (not just the RwLock split). Both threads still terminate: the
     /// bounded `write()` gives up and releases the GIL, finally letting the reader
     /// unwind — so the test observes the deadlock without leaking threads.
@@ -2972,7 +2978,7 @@ mod tests {
 
     /// FIXED `Composition.stop()`/`close()`: run the read-guard `request_stop`
     /// (the `CapturingStream::stop` signal) → `write()` dance INSIDE
-    /// `allow_threads` (GIL released across `write()`), so the woken reader can
+    /// `detach` (GIL released across `write()`), so the woken reader can
     /// re-acquire the GIL and drop its guard. Copy of the capture test, renamed
     /// for compose.
     #[test]
@@ -2985,7 +2991,7 @@ mod tests {
             let (gil, inner) = (Arc::clone(&gil), Arc::clone(&inner));
             std::thread::spawn(move || {
                 let gil_guard = gil.lock().expect("GIL");
-                drop(gil_guard); // allow_threads: GIL released for the whole dance
+                drop(gil_guard); // detach: GIL released for the whole dance
                 {
                     let g = inner.read().expect("read guard for request_stop");
                     if let Some(comp) = g.as_ref() {
@@ -3017,7 +3023,7 @@ mod tests {
     /// BROKEN teardown for `Composition`: hold the GIL ACROSS `write()`. The
     /// woken reader cannot re-acquire the GIL to drop its read guard, so
     /// `write()` never acquires within the deadline — proving the
-    /// `allow_threads` wrap is load-bearing for compose too.
+    /// `detach` wrap is load-bearing for compose too.
     #[test]
     fn composition_gil_held_across_write_deadlocks_parked_reader() {
         let gil: Gil = Arc::new(Mutex::new(()));

@@ -1362,7 +1362,7 @@ jobs:
           tool: cargo-deny
 
       - name: Run cargo-deny
-        run: cargo deny check advisories bans licenses sources
+        run: cargo deny --workspace --all-features check advisories bans licenses sources
 
   # ── Version lockstep guard (rsac + 4 bindings) ──────────────────────
   # Enforces the versioning/ABI contract documented in

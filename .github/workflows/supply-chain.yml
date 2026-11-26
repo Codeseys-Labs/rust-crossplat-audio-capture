@@ -26,11 +26,13 @@
 #                EXCLUDED because cargo-deny (ci.yml's supply-chain job)
 #                already owns the Rust graph, and OSV double-reporting Rust
 #                advisories here would make this workflow red for findings
-#                that are triaged through the deny.toml pipeline (concretely:
-#                Cargo.lock pins pyo3 0.24.2, which OSV flags as
-#                RUSTSEC-2026-0176/-0177 — a repo-root `--recursive ./` scan
-#                fails on it today; that advisory is Rust-lane triage work,
-#                not a non-Rust gate failure).
+#                that are triaged through the deny.toml pipeline. osv-scanner
+#                has no deny.toml-style ignore mechanism, so any RUSTSEC hit
+#                in Cargo.lock would fail this non-Rust gate even though it is
+#                Rust-lane triage work (precedent: a repo-root `--recursive ./`
+#                scan failed on the pyo3 RUSTSEC-2026-0176/-0177 advisories,
+#                patched in pyo3 >=0.29 and cleared by rsac-python's pyo3 0.30
+#                bump).
 #   - licenses:  BLOCK on any dependency license outside the allow-list.
 #                The allow-list mirrors deny.toml's [licenses].allow exactly
 #                (kept in one place mentally — if you touch one, touch both).
@@ -328,13 +330,10 @@ jobs:
   #
   # Scope is bindings/ + integrations/ + mobile/ — NOT `--recursive ./`.
   # The repo-root Cargo.lock is deliberately out of scope: cargo-deny
-  # (ci.yml's `supply-chain` job, deny.toml [advisories]) already gates the
-  # Rust graph, and scanning Cargo.lock here would double-report Rust
-  # advisories through a second pipeline with no deny.toml ignore mechanism
-  # (verified 2026-07-20: `osv-scanner scan source -L Cargo.lock` exits 1 on
-  # the pre-existing pyo3 0.24.2 RUSTSEC-2026-0176/-0177 advisories, while
-  # the scoped scan below exits 0 — the root scan would hard-fail every
-  # weekly cron until the Rust lane bumps pyo3).
+  # (ci.yml's `supply-chain` job, `cargo deny --workspace --all-features check`,
+  # driven by deny.toml) already owns the full Rust workspace graph, and
+  # scanning Cargo.lock here would double-report Rust advisories outside
+  # deny.toml's triage pipeline.
   #
   # BLOCKING: fail-on-vuln stays at its default `true` — no override, no
   # continue-on-error.
