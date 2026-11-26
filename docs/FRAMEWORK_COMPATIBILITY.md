@@ -44,8 +44,10 @@ microphone slices (`feat_android` AAudio / `feat_ios` AVAudioEngine), the iOS
 `SystemDefault` broadcast consumer (ReplayKit ring), and Android playback
 capture — what frameworks want for "system audio" on Android — all four
 `AudioPlaybackCapture` tiers via the AAR Kotlin loop + JNI ingest (rsac-77f1)
-— with **zero runtime verification on any device** (seeds
-rsac-e6d3/rsac-97c8). Once runtime verification lands, every 🟡 above
+— with emulator and simulator evidence for selected modes and **no
+physical-device verification** (per-mode evidence:
+[AGENTS.md §3](../AGENTS.md#3-current-state); physical devices: #89 for iOS,
+the Android epic #82). Once physical-device verification lands, every 🟡 above
 resolves through its listed integration path. Conversely, the ❌ cells are
 Apple/Google/browser policy, and **no framework choice changes them**.
 
@@ -80,8 +82,10 @@ explicit `allow-subscribe-raw` grant.
 rsac already *compiles* for those targets. The consent flow (Android
 MediaProjection) ships in `tauri-plugin-rsac`
 (`integrations/`, [ADR-0014](designs/0014-tauri-integration-model.md) Accepted)
-— **compile-shipping today; mobile runtime still blocked on rsac-e6d3 /
-rsac-97c8**. The plugin wraps `mobile/android/`'s `RsacProjection` consent flow
+— **compile-shipping today; the plugin itself has not been run on a device or
+emulator (#91)**. The `mobile/` glue it wraps has emulator and simulator
+evidence for selected modes and no physical-device verification (#89 for iOS,
+the Android epic #82). The plugin wraps `mobile/android/`'s `RsacProjection` consent flow
 and `mobile/ios/` glue behind Tauri commands/permissions (a thin forwarder — it
 inherits PR#64's deferred foreground-service-acquire ordering, adding no capture
 policy of its own).
@@ -161,9 +165,10 @@ both mobile triples in CI**; the C header is target-independent. Recipe:
 rsac-0aa9); **iOS** — build rsac-ffi as a staticlib for `aarch64-apple-ios`
 and bind via `dart:ffi`, plus a thin Flutter plugin for the Android consent
 flow (backed by the `mobile/android/` AAR) and the iOS broadcast-extension
-template from `mobile/ios/`. Runtime verification tracks
-rsac-e6d3/rsac-97c8 — until those are green, treat mobile Flutter capture as
-unproven.
+template from `mobile/ios/`. No Flutter integration has been run. The backends
+underneath have emulator and simulator evidence for selected modes only
+([AGENTS.md §3](../AGENTS.md#3-current-state); physical devices: #89, #82), so
+treat mobile Flutter capture as unproven.
 
 ## Android and iOS (all frameworks)
 
