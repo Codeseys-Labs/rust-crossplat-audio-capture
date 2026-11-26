@@ -22,7 +22,9 @@
 //!   active render endpoint ids as `rsac list` prints them.
 //! - `RSAC_HOTPLUG_LOSS=1` enables the loss tests, which hide the current
 //!   default render endpoint via `IPolicyConfig::SetEndpointVisibility`.
-//!   They require `CI=true` or `RSAC_HOTPLUG_ALLOW_DISABLE=1`.
+//!   They require `GITHUB_ACTIONS=true` (a hosted runner) or
+//!   `RSAC_HOTPLUG_ALLOW_DISABLE=1`. Plain `CI=true` is not enough: developer
+//!   tools and agent shells set it on workstations.
 //!
 //! A test whose enabling variable is not `1` prints
 //! `HOTPLUG-SKIP test=<name> reason=<variable> not set`. A test that passes
@@ -1044,21 +1046,25 @@ fn loss_setup(test: &str) -> Option<String> {
         return None;
     }
     // The device-node ("pnp") mode was removed. A caller that still selects it
-    // must not get a different test under the old name.
-    if let Ok(mode) = std::env::var("RSAC_HOTPLUG_LOSS_MODE") {
-        let mode = mode.trim();
+    // must not get a different test under the old name: any value other than
+    // exactly `visibility` (or empty) is refused, including one that is not
+    // valid Unicode.
+    if let Some(mode) = std::env::var_os("RSAC_HOTPLUG_LOSS_MODE") {
         assert!(
             mode.is_empty() || mode == "visibility",
-            "{test}: RSAC_HOTPLUG_LOSS_MODE={mode} is no longer supported: the loss tests only \
+            "{test}: RSAC_HOTPLUG_LOSS_MODE={mode:?} is no longer supported: the loss tests only \
              hide the endpoint. Unset it (and RSAC_HOTPLUG_PNP_INSTANCE_ID)"
         );
     }
-    let on_ci = std::env::var("CI").as_deref() == Ok("true");
+    // `GITHUB_ACTIONS`, not `CI`: many developer tools export `CI=true` on a
+    // workstation, and this test takes an endpoint away.
+    let on_runner = std::env::var("GITHUB_ACTIONS").as_deref() == Ok("true");
     let allowed = std::env::var(ALLOW_DISABLE_VAR).as_deref() == Ok("1");
     assert!(
-        on_ci || allowed,
-        "{test}: refusing to disable an audio endpoint: {LOSS_VAR}=1 also needs CI=true or \
-         {ALLOW_DISABLE_VAR}=1, so that a workstation's device is never disabled by accident"
+        on_runner || allowed,
+        "{test}: refusing to disable an audio endpoint: {LOSS_VAR}=1 also needs \
+         GITHUB_ACTIONS=true or {ALLOW_DISABLE_VAR}=1, so that a workstation's device is never \
+         disabled by accident"
     );
     let endpoint = match read_default(Role::Console) {
         Ok(Some(id)) => id,

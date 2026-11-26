@@ -1,16 +1,20 @@
 //! Linux evidence for native default-sink following, explicit-device binding,
 //! and recovery-budget exhaustion after daemon loss (issues #94 and #102).
 //!
-//! `RSAC_HOTPLUG_LINUX=1` enables the three sink tests. Outside `CI=true`,
+//! `RSAC_HOTPLUG_LINUX=1` enables the three sink tests. Outside a GitHub
+//! Actions runner (`GITHUB_ACTIONS=true`; plain `CI=true` is not enough,
+//! developer tools set it on workstations),
 //! they also require `RSAC_HOTPLUG_ALLOW_DEFAULT_CHANGE=1`: `wpctl set-default`
 //! pins a configured default sink. Cleanup restores the original sink by
 //! name, but leaves it pinned even if WirePlumber originally chose it
 //! automatically.
 //!
 //! `RSAC_HOTPLUG_LINUX_DAEMON_STOP=1` enables the destructive test. Outside
-//! `CI=true`, it also requires `RSAC_HOTPLUG_ALLOW_DAEMON_KILL=1`. It stops
-//! every PipeWire daemon of the current user, not just the fixture's daemon,
-//! and does not restart them. Run it alone and last in a disposable session.
+//! a runner, it also requires `RSAC_HOTPLUG_ALLOW_DAEMON_KILL=1` and, because
+//! its fixture sets the default sink first, `RSAC_HOTPLUG_ALLOW_DEFAULT_CHANGE=1`.
+//! It stops every PipeWire daemon of the current user, not just the fixture's
+//! daemon, and does not restart them. Run it alone and last in a disposable
+//! session.
 
 #![cfg(all(
     target_os = "linux",
@@ -323,9 +327,9 @@ fn wait_for_missing_sink(name: &str) -> Result<(), String> {
 
 fn require_permission(test: &str, allow_var: &str, action: &str) {
     assert!(
-        std::env::var("CI").as_deref() == Ok("true")
+        std::env::var("GITHUB_ACTIONS").as_deref() == Ok("true")
             || std::env::var(allow_var).as_deref() == Ok("1"),
-        "{test}: refusing to {action}; requires CI=true or {allow_var}=1"
+        "{test}: refusing to {action}; requires GITHUB_ACTIONS=true or {allow_var}=1"
     );
 }
 
