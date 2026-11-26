@@ -166,10 +166,10 @@ centralised in `helpers.rs` so the tests themselves stay portable.
 ## 4. Platform-specific setup the workflow performs
 
 **Triggers.** The workflow runs on `workflow_dispatch` (input `platform`:
-`all`, `linux`, `windows`, `macos` or `bindings`; default `all`), on pushes
-to `main`/`master` that touch its path list, and on stable `v*.*.*` tags.
-There is no `pull_request` trigger; PRs get compile, unit and lint coverage
-from [`ci.yml`](../.github/workflows/ci.yml).
+`all`, `linux`, `windows`, `macos` or `bindings`; default `all`) and on stable
+`v*.*.*` tags. There is no `pull_request` or branch-push trigger; dispatch it
+on a branch when a change needs real-audio evidence
+(`gh workflow run ci-audio-tests.yml --ref <branch> -f platform=<p>`).
 
 ### Linux — `linux-audio` job (system / device / process tiers)
 

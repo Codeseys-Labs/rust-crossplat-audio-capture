@@ -256,11 +256,11 @@ in [`docs/reviews/`](docs/reviews/).
 
 ### Routine and audio lanes
 
-The main [`ci.yml`](.github/workflows/ci.yml) runs desktop lint, unit and
-binding checks with change-based filtering. Expensive virtual-audio and mobile
-runtime workflows use narrower triggers or manual dispatch; consult the
-workflow files for their active schedules and path filters. A skipped
-hardware-gated test is not runtime evidence.
+CI is manually dispatched. The main [`ci.yml`](.github/workflows/ci.yml) runs
+desktop lint, unit, MSRV and binding checks scoped by the branch's diff; it and
+the expensive virtual-audio and mobile runtime workflows run only when someone
+dispatches them, plus stable release tags. A PR without a dispatched run has no
+CI evidence, and a skipped hardware-gated test is not runtime evidence.
 
 CI is hybrid: ordinary desktop lanes use Blacksmith runners; Windows audio
 integration uses GitHub-hosted Windows because the Blacksmith Windows image

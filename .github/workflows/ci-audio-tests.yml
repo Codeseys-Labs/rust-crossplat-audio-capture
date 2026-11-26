@@ -50,37 +50,22 @@ name: Audio Integration Tests
 #                           (ci-audio-macos-tcc.yml, manual dispatch only).
 #
 # Triggers (cost control — the whole suite is expensive): manual
-# `workflow_dispatch` (optional `platform` input to run ONE platform job), plus
-# automatic runs on pushes to main/master and stable semver tags. There is NO
-# pull_request trigger — desktop PRs get compile/unit/lint coverage from ci.yml;
-# this E2E suite re-proves the audio matrix post-merge and at the tag (advisory,
-# not a release.yml gate — see rsac-75bf).
+# `workflow_dispatch` only (optional `platform` input to run ONE platform job),
+# plus stable semver tags so a release re-proves the audio matrix at the tag
+# (advisory, not a release.yml gate — see rsac-75bf). There is NO branch-push
+# and NO pull_request trigger; dispatch it on a branch when a change needs
+# real-audio evidence:
+#   gh workflow run ci-audio-tests.yml --ref <branch> -f platform=linux
 # =============================================================================
 
 on:
   push:
-    branches: [main, master]
-    # Also run on stable semver tags so a release actually re-proves the audio
-    # matrix at the tag (not just whatever the last master-push run happened
-    # to cover) — mirrors ci.yml's tags: trigger. Per GitHub semantics,
-    # paths/paths-ignore are NOT evaluated for tag pushes, so this fires
-    # unconditionally on v*.*.* regardless of the paths: filter below.
-    # Pre-release shapes (v*-rc.1) are excluded, same as ci.yml.
+    # Stable semver tags only, so a release re-proves the audio matrix at the
+    # tag — mirrors ci.yml. A `push` filter with only `tags:` never matches a
+    # branch push. Pre-release shapes (v*-rc.1) are excluded, same as ci.yml.
     tags:
       - 'v*.*.*'
       - '!v*-*'
-    paths:
-      - 'src/**'
-      - 'tests/**'
-      - 'examples/**'
-      - 'bindings/**'
-      - 'Cargo.toml'
-      - 'Cargo.lock'
-      - 'scripts/ci-linux-audio-route.sh'
-      - 'scripts/ci-linux-tone-loop.sh'
-      - 'scripts/ci-windows-audio-default.ps1'
-      - '.github/workflows/ci-audio-tests.yml'
-      - '.github/actions/**'
   workflow_dispatch:
     inputs:
       platform:
@@ -96,9 +81,9 @@ env:
   RUST_BACKTRACE: 1
   RUST_LOG: rsac=debug
 
-# Never cancel in-flight runs: with no pull_request trigger every run is a push
-# to main/master, a tag, or an explicit dispatch — none of which should be
-# cancelled mid-flight by a later one. Runs on the same ref queue instead.
+# Never cancel in-flight runs: every run is a release tag or an explicit
+# dispatch, neither of which should be cancelled mid-flight by a later one.
+# Runs on the same ref queue instead.
 concurrency:
   group: audio-${{ github.workflow }}-${{ github.ref }}
   cancel-in-progress: false

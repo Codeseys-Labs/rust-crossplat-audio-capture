@@ -4,43 +4,36 @@
 name: CI
 
 on:
+  # Manual dispatch is the ONLY way to run this matrix on a branch (cost
+  # control): there is no `pull_request` trigger and no branch `push` trigger.
+  # Run it from the Actions tab, or:
+  #   gh workflow run ci.yml --ref <branch>               # diff-scoped (see `changes`)
+  #   gh workflow run ci.yml --ref <branch> -f full=true  # everything
+  # Check runs attach to the dispatched commit, so they still show on that
+  # commit's open PR. The only automatic PR check is changelog-guard.yml.
+  workflow_dispatch:
+    inputs:
+      full:
+        description: >-
+          Run every job (mobile legs and advisory coverage included) regardless
+          of which paths the branch changed. Default: scope the run by the
+          branch's diff against the default branch.
+        type: boolean
+        default: false
+      semver:
+        description: >-
+          Also run the release semver gate (cargo-semver-checks against the
+          previous stable tag). Always on for release/vX.Y.Z branches.
+        type: boolean
+        default: false
   push:
-    # release/** intentionally dropped from the push filter (KEPT in
-    # pull_request below): every release-branch commit lands via a PR per
-    # AGENTS.md's PR-vs-direct rule, so push+pull_request both matched and
-    # double-fired the full matrix (66 duplicate checks observed on PR #55).
-    # The pull_request trigger alone gives release/** branches full coverage.
-    branches: [main, master]
-    # Skip branch pushes that only touch docs / backlog / bookkeeping files —
-    # the docs-only fast path (the `changes` job below) only covers
-    # pull_request events, so a direct push of e.g. `.seeds/issues.jsonl` used
-    # to run the whole 23-job matrix (~15.4 job-min) for a 1-line diff.
-    #
-    # NOTE: per GitHub semantics, paths/paths-ignore filters are NOT evaluated
-    # for tag pushes ("Path filters are not evaluated for pushes of tags"), so
-    # the `tags:` trigger below (and the version-lockstep tag-time hard-gate it
-    # feeds) still fires on every `v*.*.*` tag regardless of the changed paths.
-    paths-ignore:
-      - 'docs/**'
-      - '.seeds/**'
-      - '.kilo/**'
-      - '.mulch/**'
-      - '**/*.md'
-      - 'LICENSE'
-    # Also run on stable semver tags so the version-lockstep job's tag-time
-    # hard-gate (which asserts all seven manifests equal the tag) actually fires
-    # at the point of no return — it was previously dead code (ci.yml had no
-    # tags: trigger). Pre-release shapes (v*-rc.1) are excluded.
+    # Stable semver tags still fire automatically so the version-lockstep job's
+    # tag-time hard gate (all manifests equal the tag) runs at the point of no
+    # return. Pre-release shapes (v*-rc.1) are excluded. A `push` filter with
+    # only `tags:` never matches a branch push.
     tags:
       - 'v*.*.*'
       - '!v*-*'
-  pull_request:
-    # No `types:` list on purpose (defaults: opened, synchronize, reopened):
-    # adding/removing a label must NOT re-run this whole matrix. The only job
-    # that reacts to `labeled`/`unlabeled` (the changelog-not-needed escape
-    # hatch) lives in changelog-guard.yml.
-    branches: [main, master, 'release/**']
-  workflow_dispatch:
 
 env:
   CARGO_TERM_COLOR: always
@@ -50,36 +43,33 @@ env:
 permissions:
   contents: read
 
-# Cancel superseded runs on the same ref (saves runner minutes on PR pushes).
+# A newer manual dispatch on the same ref supersedes the older one; tag runs
+# (the release gate) are never cancelled.
 concurrency:
   group: ci-${{ github.workflow }}-${{ github.ref }}
-  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+  cancel-in-progress: ${{ github.event_name == 'workflow_dispatch' }}
 
 jobs:
-  # ── Docs-only fast path (rsac-61ce) ──────────────────────────────────
-  # PRs that touch only documentation/backlog files skip the whole compile
-  # matrix: this job classifies the PR's changed files, `lint` runs only
-  # when code changed, and every other job has `needs: lint`, so a skipped
-  # lint transitively skips the rest. Skipped jobs count as PASSING for
-  # branch-protection required checks (documented GitHub behavior), so the
-  # pattern stays merge-safe if protection is enabled later (master had no
-  # protection/rulesets when this landed — checked 2026-07-05).
+  # ── Diff-scoped manual runs (rsac-61ce) ──────────────────────────────
+  # A manual dispatch on a branch classifies the files that branch changed
+  # relative to the default branch (merge-base diff — the file set a PR from
+  # the branch shows). `lint` runs only when code changed, and every other job
+  # has `needs: lint`, so a docs-only branch skips the whole compile matrix.
   #
-  # Fail-open by design: anything that is not a pull_request (pushes; tags —
-  # the version-lockstep tag-time hard gate must always fire; dispatch) or
-  # that cannot be classified runs the full matrix.
+  # Fail-open by design: tag pushes (the version-lockstep tag-time hard gate
+  # must always fire), a dispatch on the default branch, `full: true`, and
+  # anything that cannot be classified all run the full matrix.
   #
   # `mobile` gates the heavy Gradle AAR + Xcode SwiftPM legs (mobile-android,
-  # mobile-ios): on a PR they run only when the diff touches mobile-relevant
-  # paths; pushes, tags and dispatch always run them (fail-open), so a shared
-  # layer change (src/core, src/bridge, src/api.rs) that breaks a mobile cfg
-  # still surfaces on the post-merge master push.
+  # mobile-ios): they run only when the diff touches mobile-relevant paths.
+  # Those paths include the shared layers (src/core, src/bridge, src/api), so
+  # a shared-layer change that breaks a mobile cfg still surfaces.
   changes:
     name: Classify changed paths
     runs-on: blacksmith-4vcpu-ubuntu-2404
     timeout-minutes: 5
     permissions:
-      pull-requests: read
+      contents: read
     outputs:
       code: ${{ steps.filter.outputs.code }}
       mobile: ${{ steps.filter.outputs.mobile }}
@@ -88,21 +78,30 @@ jobs:
         id: filter
         env:
           GH_TOKEN: ${{ github.token }}
-          PR_NUMBER: ${{ github.event.pull_request.number }}
+          FULL: ${{ inputs.full }}
+          DEFAULT_BRANCH: ${{ github.event.repository.default_branch }}
         run: |
           out() { echo "$1" >> "$GITHUB_OUTPUT"; }
-          if [ "${GITHUB_EVENT_NAME}" != "pull_request" ]; then
+          run_full() {
             out "code=true"
             out "mobile=true"
-            echo "not a pull_request event — running the full matrix"
+            echo "$1 — running the full matrix"
             exit 0
+          }
+          if [ "${GITHUB_EVENT_NAME}" != "workflow_dispatch" ]; then
+            run_full "not a manual dispatch (${GITHUB_EVENT_NAME})"
           fi
-          FILES=$(gh api "repos/${GITHUB_REPOSITORY}/pulls/${PR_NUMBER}/files" --paginate -q '.[].filename') || FILES="__api_error__"
-          if [ "$FILES" = "__api_error__" ] || [ -z "$FILES" ]; then
-            out "code=true"
-            out "mobile=true"
-            echo "could not classify changed files — failing open (full matrix)"
-            exit 0
+          if [ "${FULL}" = "true" ]; then
+            run_full "full=true requested"
+          fi
+          if [ "${GITHUB_REF_NAME}" = "${DEFAULT_BRANCH}" ]; then
+            run_full "dispatched on the default branch"
+          fi
+          # Merge-base diff against the default branch. The compare API lists at
+          # most 300 files, so a list at the cap may be truncated: fail open.
+          FILES=$(gh api "repos/${GITHUB_REPOSITORY}/compare/${DEFAULT_BRANCH}...${GITHUB_SHA}" -q '.files[].filename') || FILES=""
+          if [ -z "$FILES" ] || [ "$(printf '%s\n' "$FILES" | wc -l)" -ge 300 ]; then
+            run_full "could not classify changed files (API error, or an empty or truncated diff)"
           fi
           printf 'changed files:\n%s\n' "$FILES"
           NON_DOCS=$(printf '%s\n' "$FILES" \
@@ -111,7 +110,7 @@ jobs:
           if [ -z "$NON_DOCS" ]; then
             out "code=false"
             out "mobile=false"
-            echo "docs-only PR — skipping the compile matrix"
+            echo "docs-only branch — skipping the compile matrix"
             exit 0
           fi
           out "code=true"
@@ -878,6 +877,39 @@ jobs:
           maturin develop -m bindings/rsac-python/Cargo.toml
           python bindings/rsac-python/tests/smoke.py
 
+      # One cp39-abi3 wheel must load on the abi3 floor (3.9) AND the newest
+      # supported CPython (3.13). `maturin develop` above only proves the
+      # runner's own interpreter, and release-pypi.yml's equivalent smoke runs
+      # at tag time — too late to catch a PyO3 bump that breaks either end.
+      - uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5
+        with:
+          python-version: |
+            3.9
+            3.13
+
+      # `--compatibility linux` skips the manylinux audit: this wheel links the
+      # runner's libpipewire and is only ever installed on this runner.
+      - name: Python abi3 wheel smoke (CPython 3.9 + 3.13)
+        env:
+          PYO3_USE_ABI3_FORWARD_COMPATIBILITY: "1"
+        run: |
+          . .venv-smoke/bin/activate
+          maturin build --compatibility linux \
+            -m bindings/rsac-python/Cargo.toml --out target/abi3-smoke/dist
+          deactivate
+          WHEEL="$(ls target/abi3-smoke/dist/*.whl | head -1)"
+          echo "abi3 wheel: ${WHEEL}"
+          case "${WHEEL}" in
+            *-abi3-*) ;;
+            *) echo "::error::expected a cp39-abi3 wheel, got ${WHEEL}"; exit 1 ;;
+          esac
+          for PYBIN in python3.9 python3.13; do
+            echo "=== smoke on $("$PYBIN" --version) ==="
+            "$PYBIN" -m venv "target/abi3-smoke/venv-${PYBIN}"
+            "target/abi3-smoke/venv-${PYBIN}/bin/python" -m pip install --quiet "${WHEEL}"
+            "target/abi3-smoke/venv-${PYBIN}/bin/python" bindings/rsac-python/tests/smoke.py
+          done
+
       - name: Set up Node for the napi smoke test
         uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
         with:
@@ -1119,9 +1151,9 @@ jobs:
     name: Coverage (cargo-llvm-cov, advisory)
     timeout-minutes: 30
     needs: lint
-    # Advisory trend data with no PR decision value: skip the instrumented
-    # rebuild on PRs, run it on pushes/tags/dispatch only.
-    if: github.event_name != 'pull_request'
+    # Advisory trend data with no merge-decision value: the instrumented
+    # rebuild runs on tags and on `full: true` dispatches only.
+    if: github.event_name != 'workflow_dispatch' || inputs.full
     continue-on-error: true
     runs-on: blacksmith-4vcpu-ubuntu-2404
     steps:
@@ -1221,8 +1253,19 @@ jobs:
         if: matrix.os == 'linux'
         uses: ./.github/actions/pipewire-setup
 
+      # `--locked` on both steps: the MSRV claim is about the COMMITTED
+      # lockfile, so a drifted Cargo.lock must fail instead of silently
+      # re-resolving to a dependency with a newer rust-version.
       - name: Cargo check (MSRV)
-        run: cargo check --all-features --all-targets
+        run: cargo check --locked --all-features --all-targets
+
+      # rsac-napi and tauri-plugin-rsac declare the same 1.88 floor and
+      # rsac-ffi ships with them. Windows only: tauri's Linux build needs the
+      # gtk/webkit dev libraries this job does not install.
+      - name: Cargo check binding crates (MSRV)
+        if: matrix.os == 'windows'
+        run: cargo check --locked -p rsac-ffi -p rsac-napi -p tauri-plugin-rsac
+
   # ── docs.rs render gate (cargo doc) ─────────────────────────────────
   # rsac L14(b): Cargo.toml carries a [package.metadata.docs.rs] block
   # (all-features = true, rustdoc-args = ["--cfg", "docsrs"]) but nothing in
@@ -1329,21 +1372,12 @@ jobs:
           cache: false
           github_token: ${{ github.token }}
 
-      - name: Scan (PR diff range / full history)
-        env:
-          BASE_SHA: ${{ github.event.pull_request.base.sha }}
-          HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+      - name: Scan (full history)
         run: |
           set -euo pipefail
           betterleaks version
           betterleaks config check .betterleaks.toml
-          if [ "${GITHUB_EVENT_NAME}" = "pull_request" ]; then
-            MERGE_BASE="$(git merge-base "$BASE_SHA" "$HEAD_SHA")"
-            betterleaks git . --config .betterleaks.toml --redact --no-banner \
-              --log-opts="--no-merges ${MERGE_BASE}..${HEAD_SHA}"
-          else
-            betterleaks git . --config .betterleaks.toml --redact --no-banner
-          fi
+          betterleaks git . --config .betterleaks.toml --redact --no-banner
 
   supply-chain:
     name: Supply Chain (cargo-deny)
@@ -1414,33 +1448,30 @@ jobs:
             bash scripts/check-version-lockstep.sh --warn-only
           fi
 
-  # ── Semver gate for release PRs (interim home) ──────────────────────
+  # ── Semver gate for release branches (interim home) ─────────────────
   # cargo-semver-checks (the public-API compatibility gate) normally lives in
   # release.yml's tag-triggered publish pipeline — but release.yml is currently
   # disabled_manually (seed rsac-aaea: missing crates.io/npm/PyPI publish
-  # credentials). While it's disabled there is NO path, automatic OR manual, that
-  # runs the semver gate at all, so any breaking API change could ship into a
-  # release undetected. This job is the interim home: it runs the SAME check at
-  # PR-review time, but ONLY on the "release: vX.Y.Z" PR that release-prepare.yml
-  # opens against master (matched by title, NOT by target branch). That scoping
-  # is deliberate — it must NOT fire on ordinary feature PRs, nor on the
-  # release-stacking layer PRs that merge into a frozen release/** branch and
-  # intentionally bundle breaking changes before the single version bump
-  # (docs/reviews/rsac-backlog-blueprints-2026-05-30.md warned a naively-scoped
-  # gate would false-positive-block exactly those). PR-time feedback is strictly
-  # earlier than tag-time, so KEEP this job even after release.yml is re-enabled.
+  # credentials). While it's disabled this job is the only path that runs the
+  # semver gate before a tag, so a breaking API change cannot ship into a
+  # release undetected.
+  #
+  # Scoping is deliberate. It runs on a manual dispatch of the release bump
+  # branch (release-prepare.yml always names it release/vX.Y.Z) or when the
+  # dispatcher sets `semver: true`. It must NOT run on ordinary feature
+  # branches, nor on release-stacking integration/layer branches
+  # (release/X.Y.Z, no `v`) that intentionally bundle breaking changes before
+  # the single version bump (docs/reviews/rsac-backlog-blueprints-2026-05-30.md
+  # warned a naively-scoped gate would false-positive-block exactly those).
+  # Pre-tag feedback is strictly earlier than tag time, so KEEP this job even
+  # after release.yml is re-enabled.
   #
   # Baseline resolution mirrors release.yml's `git describe ... HEAD^`: on the
-  # release PR, HEAD^ is master's tip before the merge, and the previous stable
-  # v*.*.* tag is reachable from there.
-  semver-checks-release-pr:
-    name: Semver Gate (release PR)
-    # Keyed on the STRUCTURAL release signal (release-prepare's bump branch is
-    # always release/vX.Y.Z targeting master) OR the release title, so renaming
-    # the PR title alone cannot skip the gate (review PR #56). Layer PRs in the
-    # release-stacking SDLC have base release/X.Y.Z, not master — excluded by
-    # the base check.
-    if: "github.event_name == 'pull_request' && github.base_ref == 'master' && (startsWith(github.head_ref, 'release/') || startsWith(github.event.pull_request.title, 'release: v'))"
+  # bump branch, HEAD^ is master's tip before the bump commit, and the previous
+  # stable v*.*.* tag is reachable from there.
+  semver-checks-release:
+    name: Semver Gate (release branch)
+    if: "github.event_name == 'workflow_dispatch' && (inputs.semver || startsWith(github.ref_name, 'release/v'))"
     timeout-minutes: 20
     runs-on: blacksmith-4vcpu-ubuntu-2404
     steps:

@@ -41,11 +41,11 @@
 # exit code is what fails the job. This is deliberate — a swallowed non-zero
 # exit is exactly the failure mode this workflow exists to prevent.
 #
-# Triggers: path-filtered per ecosystem (each job only runs when its own
-# manifests / lockfiles change) PLUS a weekly cron, because supply-chain risk
-# moves without a commit to this repo (a new CVE can land against a pinned
-# dependency at any time). The cron runs every job unconditionally (no path
-# filter applies to `schedule`).
+# Triggers: a weekly cron, because supply-chain risk moves without a commit to
+# this repo (a new CVE can land against a pinned dependency at any time), plus
+# manual dispatch — run it on a branch that changes a non-Rust manifest or
+# lockfile (`gh workflow run supply-chain.yml --ref <branch>`). There are no
+# push/pull_request triggers (CI cost policy). Every job runs on every fire.
 #
 # Where a SCHEDULED failure surfaces (there is no PR to go red on): GitHub
 # emails the user who last touched the cron schedule (i.e. this file's last
@@ -89,37 +89,8 @@
 name: Supply Chain (non-Rust)
 
 on:
-  push:
-    branches: [main, master]
-    paths:
-      - 'bindings/rsac-napi/package.json'
-      - 'bindings/rsac-napi/bun.lock'
-      - 'integrations/tauri-plugin-rsac/guest-js/package.json'
-      - 'bindings/rsac-python/pyproject.toml'
-      - 'bindings/rsac-go/go.mod'
-      - 'bindings/rsac-go/go.sum'
-      - 'mobile/android/build.gradle.kts'
-      - 'mobile/android/settings.gradle.kts'
-      - 'mobile/ios/Package.swift'
-      - '.github/workflows/supply-chain.yml'
-  pull_request:
-    branches: [main, master, 'release/**']
-    paths:
-      - 'bindings/rsac-napi/package.json'
-      - 'bindings/rsac-napi/bun.lock'
-      - 'integrations/tauri-plugin-rsac/guest-js/package.json'
-      - 'bindings/rsac-python/pyproject.toml'
-      - 'bindings/rsac-go/go.mod'
-      - 'bindings/rsac-go/go.sum'
-      - 'mobile/android/build.gradle.kts'
-      - 'mobile/android/settings.gradle.kts'
-      - 'mobile/ios/Package.swift'
-      - '.github/workflows/supply-chain.yml'
   schedule:
-    # Weekly, Monday 07:00 UTC (one hour after bench.yml's cron so the two
-    # scheduled workflows don't contend for the same runner pool slot).
-    # Unlike the push/pull_request triggers above, path filters do NOT apply
-    # to schedule — every ecosystem job below runs on every cron fire.
+    # Weekly, Monday 07:00 UTC. Every ecosystem job below runs on every fire.
     - cron: '0 7 * * 1'
   workflow_dispatch:
 
@@ -134,7 +105,7 @@ permissions:
 
 concurrency:
   group: supply-chain-${{ github.workflow }}-${{ github.ref }}
-  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+  cancel-in-progress: ${{ github.event_name == 'workflow_dispatch' }}
 
 jobs:
   # ── npm/bun: rsac-napi + tauri-plugin-rsac guest-js ─────────────────────

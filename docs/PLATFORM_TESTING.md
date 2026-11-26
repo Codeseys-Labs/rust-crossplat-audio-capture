@@ -25,7 +25,9 @@ no run. See [`docs/troubleshooting.md`](troubleshooting.md) § cross-compilation
 
 ### 1. Automated CI (the source of truth)
 
-Two workflows run on every push/PR to `main`/`master`.
+Two workflows carry it. Both are **manually dispatched**
+(`gh workflow run <workflow> --ref <branch>`) and also run on stable `v*.*.*`
+tags; nothing runs automatically on a push or PR except the changelog guard.
 
 #### `ci.yml` — lint, unit tests, cross-compile checks
 

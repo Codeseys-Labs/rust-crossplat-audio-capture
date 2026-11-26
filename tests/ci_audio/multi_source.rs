@@ -6,7 +6,7 @@
 //! between captures — one stalled consumer can't starve another.
 //!
 //! This file asserts that contract end-to-end through a real platform
-//! backend. The unit tests in `src/api.rs` cover the mock path (two
+//! backend. The unit tests in `src/api/tests.rs` cover the mock path (two
 //! `MockCapturingStream`s run in the same process and produce distinct
 //! buffers). This file covers what the mocks can't: two real captures,
 //! both targeting live audio, both producing buffers from a real OS

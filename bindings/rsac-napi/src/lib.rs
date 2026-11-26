@@ -2197,7 +2197,7 @@ mod tests {
     //   - `stop(&mut self)` is the lifecycle mutator that needs exclusive access.
     //
     // This is the binding-side analogue of core's
-    // `request_stop_unblocks_parked_blocking_read` (src/api.rs). It deadlocks on
+    // `request_stop_unblocks_parked_blocking_read` (src/api/tests.rs). It deadlocks on
     // the OLD shape (a single `Mutex` held across the park, `stop()` taking that
     // same lock) and passes on the NEW shape (`RwLock`: reader parks under a
     // shared read guard; `stop()` takes a read guard to `request_stop()` first,

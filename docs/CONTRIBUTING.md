@@ -165,12 +165,22 @@ More detail in [`docs/CI_AUDIO_TESTING.md`](CI_AUDIO_TESTING.md).
 
 ## 4. CI matrix
 
+CI is **manually dispatched** — no build/test workflow runs on `pull_request`
+or on a branch push, because the full matrix is expensive. Before asking for
+review, run what the change needs and link the run in the PR:
+
+```bash
+gh workflow run ci.yml --ref <branch>                # scoped by the branch's diff against master
+gh workflow run ci.yml --ref <branch> -f full=true   # every job, incl. mobile legs + coverage
+gh workflow run ci-audio-tests.yml --ref <branch> -f platform=linux   # real-audio E2E, one platform
+```
+
 [`ci.yml`](../.github/workflows/ci.yml) provides desktop lint, unit tests,
-binding checks and change-based filtering. The independent
-[`changelog-guard.yml`](../.github/workflows/changelog-guard.yml) checks PR
-changelog discipline. Expensive virtual-audio and mobile runtime workflows
-use narrower triggers or manual dispatch; check their workflow files for the
-active policy. Compile coverage is not runtime verification.
+MSRV, feature and binding checks. The only automatic PR check is the
+independent [`changelog-guard.yml`](../.github/workflows/changelog-guard.yml);
+the weekly non-Rust supply-chain scan and stable release tags also run on
+their own. A PR with no dispatched run has no CI evidence, and compile
+coverage is not runtime verification.
 
 CI uses Blacksmith for ordinary compile lanes and GitHub-hosted Windows for
 audio. See [`docs/CI_AUDIO_TESTING.md`](CI_AUDIO_TESTING.md) and the

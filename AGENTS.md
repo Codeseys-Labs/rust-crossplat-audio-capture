@@ -405,7 +405,7 @@ local check entirely (the exact class of bug rsac-af3d closes).
 mise is a convenience, not a requirement — every task is a thin alias over
 `scripts/gate.sh`, which runs directly under bash (Git bash on Windows).
 
-**Git hooks** ([`lefthook.yml`](lefthook.yml), opt-in per clone, CI is the
+**Git hooks** ([`lefthook.yml`](lefthook.yml), opt-in per clone; a dispatched CI run is the
 backstop): pre-commit checks staged Rust formatting and scans staged changes for
 secrets; commit-msg rejects `Co-Authored-By:` trailers and tool bylines (§6);
 pre-push runs the gate. Escape hatch: `--no-verify`.
@@ -444,18 +444,27 @@ and Linux.
 
 ### CI infrastructure: hybrid runners
 
-CI uses Blacksmith for normal compile lanes and GitHub-hosted Windows for audio
-integration because the Blacksmith Windows image lacks a usable audio stack.
-Workflow files in [`.github/workflows/`](.github/workflows/) define active
-triggers; audio and mobile runtime lanes are cost-controlled, not assumed to run
-on every PR. See [desktop refinement](docs/DESKTOP_REFINEMENT.md#d5--desktop-release-and-mobile-freeze).
+CI uses Blacksmith for normal compile lanes and GitHub-hosted Windows and macOS
+for audio integration because the Blacksmith Windows image lacks a usable audio
+stack.
 
-| Workflow | Purpose |
-|---|---|
-| [`ci.yml`](.github/workflows/ci.yml) | Desktop lint and unit tests, MSRV, feature and binding checks; change filters can skip unrelated PR jobs. Rust MSRV is **1.88**; the pinned development toolchain can be newer. |
-| [`ci-audio-tests.yml`](.github/workflows/ci-audio-tests.yml) | Cost-controlled virtual-audio integration; supports manual dispatch. |
-| [`changelog-guard.yml`](.github/workflows/changelog-guard.yml) | Independent PR changelog guard, including label changes. |
-| Mobile runtime workflows | Emulator/simulator runs are separate from compile checks; inspect workflow triggers and record actual results. |
+**CI is manually dispatched (cost control — the full matrix is expensive).** No
+build/test workflow fires on `pull_request` or on a branch push. Run what a
+change needs from the Actions tab or with `gh workflow run <workflow> --ref
+<branch>`; check runs attach to the dispatched commit, so they show on that
+commit's open PR. The only automatic runs are the PR changelog guard, the
+weekly non-Rust supply-chain scan, and stable `v*.*.*` tags (the release gate).
+**A PR with no dispatched run has no CI evidence** — say so in the PR instead of
+implying green. See [desktop refinement](docs/DESKTOP_REFINEMENT.md#d5--desktop-release-and-mobile-freeze).
+
+| Workflow | Runs on | Purpose |
+|---|---|---|
+| [`ci.yml`](.github/workflows/ci.yml) | manual dispatch, stable tags | Desktop lint and unit tests, MSRV, feature and binding checks. A branch dispatch scopes itself by the branch's diff against `master` (docs-only → no matrix; mobile legs only for mobile-relevant paths); `-f full=true` forces every job including coverage, `-f semver=true` adds the release semver gate. Rust MSRV is **1.88**; the pinned development toolchain can be newer. |
+| [`ci-audio-tests.yml`](.github/workflows/ci-audio-tests.yml) | manual dispatch (`-f platform=all\|linux\|windows\|macos\|bindings`), stable tags | Virtual-audio integration on real audio stacks. |
+| [`changelog-guard.yml`](.github/workflows/changelog-guard.yml) | every PR (automatic) | Independent PR changelog guard, including label changes. |
+| [`supply-chain.yml`](.github/workflows/supply-chain.yml) | weekly cron (automatic), manual dispatch | Non-Rust dependency and license audit. |
+| [`ci-android-emu.yml`](.github/workflows/ci-android-emu.yml), [`ci-ios-sim.yml`](.github/workflows/ci-ios-sim.yml) | manual dispatch | Emulator/simulator runtime runs, separate from compile checks; record actual results. |
+| [`bench.yml`](.github/workflows/bench.yml) | manual dispatch | Advisory criterion baselines. |
 
 **Runner labels:**
 
@@ -610,9 +619,12 @@ Full playbook (when to stack vs parallel PRs, exact commands, pitfalls):
    explicitly-owned in-flight workstreams; record the frozen SHA.
 2. **Create `release/X.Y.Z` from `master`** — the integration branch every
    layer PR targets. Before the first layer PR, commit on it:
-   - `release/**` added to `pull_request` **and** `push` triggers in
-     `ci.yml` + `ci-audio-tests.yml` (otherwise layer PRs run **zero CI** and
-     the failure is silent — it happened);
+   - nothing for CI triggers: CI is manually dispatched (see "CI
+     infrastructure" above), so dispatch `ci.yml` — and `ci-audio-tests.yml`
+     where the layer touches capture paths — on **every layer branch** before
+     merging it. An undispatched layer has run **zero CI**, silently (the
+     pre-manual-CI form of this trap, `release/**` missing from the trigger
+     filters, happened);
    - `.coderabbit.yaml` with `reviews.base_branches: ["release/.*"]`
      (otherwise CodeRabbit refuses the base; the file is read from PR *head*
      branches, so every layer cut from the release branch inherits it).
@@ -623,7 +635,7 @@ Full playbook (when to stack vs parallel PRs, exact commands, pitfalls):
    `git checkout <frozen-sha> -- <layer paths>`, apply the documented
    hand-adjustments, validate locally (the gate + the layer's own suite),
    push, open the PR against `release/X.Y.Z`.
-4. **Review every layer**: full CI matrix + CodeRabbit (nudge with
+4. **Review every layer**: a dispatched full CI matrix + CodeRabbit (nudge with
    `@coderabbitai full review` if it doesn't auto-start) + any other reviewer.
    Triage per §6 dispositions with one addition — the **identity-preserving
    policy**: while the stack is in flight, valid findings become seeds worked
@@ -715,7 +727,7 @@ Full playbook (when to stack vs parallel PRs, exact commands, pitfalls):
 | Add `Co-Authored-By:` trailers or tool bylines to commit messages | This repo requires plain commit messages — no co-author trailers, no "Generated with …" lines (see §6 Git commit conventions; the lefthook commit-msg hook rejects them) |
 | Let a review comment be deferred/rejected with no tracking issue | Every non-fixed review finding must be captured in a GitHub issue before the PR merges, or it silently disappears (see §6 Code review dispositions) |
 | Hand-edit `.seeds/issues.jsonl` | The backlog is CLI-managed — `sd create`/`update`/`close`/`dep` keep timestamps, `closedAt`, and dependency integrity; hand edits trip `sd doctor` (see §6 Task management) |
-| Push without running the gate | `mise run gate` (or `bash scripts/gate.sh`) is the ci.yml lint-job replica — skipping it just moves the failure into CI (see §6 Local DevEx) |
+| Push without running the gate | `mise run gate` (or `bash scripts/gate.sh`) is the ci.yml lint-job replica — CI is manually dispatched, so skipping it means nothing checks the push until someone starts a run (see §6 Local DevEx) |
 
 ---
 

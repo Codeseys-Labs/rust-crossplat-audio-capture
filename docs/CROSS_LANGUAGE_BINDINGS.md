@@ -79,7 +79,7 @@ Notes per row:
 - **Lifetime management.** Python provides both a synchronous context manager
   (`__enter__`/`__exit__`) and an async one (`__aenter__`/`__aexit__`, whose
   bodies are non-blocking and return an immediately-resolved awaitable), plus
-  GIL release (`py.allow_threads`) around blocking reads. Go registers a
+  GIL release (`py.detach`) around blocking reads. Go registers a
   `runtime.SetFinalizer` safety net but documents explicit `Close()` (idempotent)
   as preferred; the finalizer is cleared on explicit close.
 
@@ -252,7 +252,7 @@ devices = rsac.list_devices()
 caps = rsac.platform_capabilities()
 ```
 
-**Key:** GIL release during blocking reads via `py.allow_threads()`. Sample data
+**Key:** GIL release during blocking reads via `py.detach()`. Sample data
 crosses as `to_bytes()` (numpy `frombuffer(..., dtype="<f4")`-compatible LE f32),
 using the provably-sound `f32::to_le_bytes` path — there is no zero-copy
 `rust-numpy` `to_numpy()` method in the shipped binding. The iterator ends

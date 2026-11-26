@@ -41,7 +41,7 @@ tauri-plugin = { version = ">=2, <2.7", features = ["build"] }
 
 # Mobile targets compile rsac with its platform backend so the
 # `#[cfg(target_os = "android")] with_android_projection` /
-# `#[cfg(target_os = "ios")] with_ios_app_group` methods (src/api.rs:181-209) are
+# `#[cfg(target_os = "ios")] with_ios_app_group` methods (src/api/builder.rs) are
 # in scope. Desktop passthrough uses the desktop backend the host app already
 # enables (do NOT force a feat_* on desktop from here). Feature lists pinned
 # against mobile/android-native/Cargo.toml (feat_android) and the iOS backend.

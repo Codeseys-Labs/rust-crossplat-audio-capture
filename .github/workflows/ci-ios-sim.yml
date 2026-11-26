@@ -36,25 +36,15 @@ on:
           has proven the host-mic route is reliable).
         type: boolean
         default: false
-  # Narrow, iOS-only path filter: this leg boots a simulator on a 6-vCPU macOS
-  # runner (50m cap, ~20x a Linux minute), so it must not fire on desktop PRs.
-  # Shared-layer changes (src/api.rs, src/core/**, src/bridge/**, Cargo.*,
-  # bindings/rsac-ffi/**) are NOT triggers — ci.yml's `mobile-ios` job gates
-  # their iOS COMPILATION on every mobile-touching PR and every push to
-  # main/master; run this workflow via workflow_dispatch when a shared-layer
-  # change needs runtime verification.
-  pull_request:
-    branches: [main, master, 'release/**']
-    paths:
-      - 'src/audio/ios/**'
-      - 'tests/ios_sim_smoke.rs'
-      # The app-hosted TCC harness (rsac-f18f) lives under mobile/ios/.
-      - 'mobile/ios/**'
-      - '.github/workflows/ci-ios-sim.yml'
+  # Manual dispatch only (CI cost policy): this leg boots a simulator on a
+  # 6-vCPU macOS runner (50m cap, ~20x a Linux minute). ci.yml's `mobile-ios`
+  # job covers iOS COMPILATION whenever a dispatched branch touches
+  # mobile-relevant paths; dispatch this workflow when a change needs simulator
+  # runtime verification.
 
 concurrency:
   group: ios-sim-${{ github.workflow }}-${{ github.ref }}
-  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+  cancel-in-progress: true
 
 permissions:
   contents: read

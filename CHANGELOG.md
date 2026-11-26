@@ -51,11 +51,17 @@ Releases with no ABI change omit the subsection (or state "No C ABI changes").
 - **Modularized `src/api/`** — split the 5,365-line `src/api.rs` into focused submodules
   with identical public re-exports and hardened `scripts/check-module-dag.sh` to fail
   closed on missing scan roots.
-- **CI cost & trigger optimization** — split `changelog-guard` into its own workflow so
-  PR label edits no longer re-trigger the full CI matrix; moved `macos-audio` to
-  GitHub-hosted `macos-15` with `SwitchAudioSource` + BlackHole 2ch; made full
-  `ci-audio-tests.yml` manual/post-merge/tag-triggered; narrowed mobile emulator/simulator
-  PR path triggers; removed the dead weekly cron on `ci-audio-macos-tcc.yml`.
+- **CI is manually dispatched** — `ci.yml`, `ci-audio-tests.yml`, the mobile
+  emulator/simulator workflows and `bench.yml` no longer run on `pull_request`, branch
+  pushes or cron; start them with `gh workflow run <workflow> --ref <branch>`. A `ci.yml`
+  branch dispatch scopes itself by the branch's diff against `master` (`-f full=true`
+  forces every job). Still automatic: the PR changelog guard, the weekly non-Rust
+  supply-chain scan, and stable `v*.*.*` tags.
+- **CI cost & coverage changes** — split `changelog-guard` into its own workflow so PR
+  label edits re-run only that job; moved `macos-audio` to GitHub-hosted `macos-15` with
+  `SwitchAudioSource` + BlackHole 2ch; removed the dead weekly cron on
+  `ci-audio-macos-tcc.yml`; the MSRV job checks the committed lockfile (`--locked`) and
+  the binding crates; `check-bindings` smokes one abi3 wheel on CPython 3.9 and 3.13.
 - **Reference submodules updated** — bumped `wasapi-rs` (v0.27.0), `rtrb` (0.4.1),
   `pipewire-rs` (v0.10.1), `obs-pipewire-audio-capture` (1.2.2),
   `screencapturekit-rs` (v12.0.0), and `cpal` (`44ba7ad`).

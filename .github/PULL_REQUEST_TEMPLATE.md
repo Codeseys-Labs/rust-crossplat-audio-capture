@@ -10,7 +10,7 @@
 - [ ] `mise run gate` (or `bash scripts/gate.sh`) is clean — fmt, CI-replica clippy `-D warnings`, bare-build smoke.
 - [ ] `mise run gate:full` extras are clean where relevant — lib tests, doctests, `cargo doc` (warning-free), module-DAG guard.
 - [ ] New public items have rustdoc (purpose + example where non-trivial + `# Errors` where applicable).
-- [ ] Relevant CI matrix rows are green (or the PR explains why a row is skipped/`continue-on-error`).
+- [ ] CI was dispatched for this branch and the relevant rows are green — CI is manual (`gh workflow run ci.yml --ref <branch>`, CONTRIBUTING §4) — or the PR states what was not run and why.
 - [ ] Commit messages are imperative and scoped — **no `Co-Authored-By:` trailers or tool bylines** (AGENTS.md §6).
 - [ ] Any behaviour change is mentioned in `CHANGELOG.md` under `[Unreleased]`.
 - [ ] A large change layering along the module DAG is split into a stack of small PRs ([`docs/STACKED_PRS.md`](../docs/STACKED_PRS.md)).

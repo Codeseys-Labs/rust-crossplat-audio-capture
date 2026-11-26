@@ -451,17 +451,18 @@ writes to `master`.
 ### Step 2 — review and SQUASH-MERGE the release PR
 
 Treat the `release: vX.Y.Z` PR like any other PR: review the manifest
-diff and the CHANGELOG rotation. The CI **`version-lockstep` gate must be
-green** on the PR before merging — it cross-checks that all **nine** manifests
+diff and the CHANGELOG rotation. CI is manually dispatched, so **dispatch it on
+the release branch and wait for green before merging**
+(`gh workflow run ci.yml --ref release/vX.Y.Z`). Its **`version-lockstep` gate**
+cross-checks that all **nine** manifests
 (root `Cargo.toml`, the rsac-ffi / rsac-napi / rsac-python `Cargo.toml`s, the
 napi `package.json`, the python `pyproject.toml`, and the Android native shim)
-carry the same version.
-Because this gate runs on the PR/master push that subsequently gets tagged, the
-tagged commit is already lockstep-verified before `release-tag.yml` tags it. (At
-*tag* time, `release.yml` additionally re-checks the tag matches the root
-`Cargo.toml`, and `ci.yml` *also* re-runs on the `v*.*.*` tag push — its `on:`
-block includes a `tags: ['v*.*.*', '!v*-*']` trigger — so the full nine-manifest
-lockstep gate runs again at tag time as well as on push/PR.)
+carry the same version, and a `release/vX.Y.Z` dispatch also runs the semver
+gate. Nothing re-runs CI on the merge commit that `release-tag.yml` tags; the
+automatic backstop is tag time: `release.yml` re-checks the tag matches the root
+`Cargo.toml`, and `ci.yml` fires on the `v*.*.*` tag push — its `on:` block
+keeps a `tags: ['v*.*.*', '!v*-*']` trigger — so the full nine-manifest lockstep
+gate hard-fails at the tag if a manifest drifted.
 
 > **Merge it as a SQUASH merge, and do NOT edit the commit subject.** The
 > tag automation in step 3 keys on the squash-merge commit *subject* being
@@ -651,16 +652,16 @@ Run `bash scripts/bump-version.sh X.Y.Z` to rewrite **all nine** manifests
 in one shot — including `bindings/rsac-ffi/Cargo.toml` and its internal
 `rsac = { path = "../../", version = "…" }` dependency pin — plus the
 CHANGELOG rotation. The
-`version-lockstep` CI job re-checks all nine values on every push/PR
-(warning on a mid-cycle skew). Because the release PR's merge commit is a
-push to `master`, this gate runs — and must be green — on the exact commit that
-`release-tag.yml` then tags, so a mismatched manifest never reaches the tag.
+`version-lockstep` CI job re-checks all nine values on every `ci.yml` run
+(warning on a mid-cycle skew). CI is manually dispatched, so dispatch it on the
+release branch and require green before merging the release PR; the merge
+commit that `release-tag.yml` then tags gets no CI run of its own.
 At *tag* time, `release.yml`'s `verify` job independently re-checks the pushed
 tag against the root `Cargo.toml` before publishing (a second, registry-side
-gate), and `ci.yml` re-runs its full nine-manifest lockstep on the `v*.*.*` tag
+gate), and `ci.yml` runs its full nine-manifest lockstep on the `v*.*.*` tag
 push too (its `on:` block has a `tags: ['v*.*.*', '!v*-*']` trigger), so the
-lockstep gate covers push/PR *and* tag time. A mismatched manifest must never
-reach a registry.
+lockstep gate covers the dispatched release branch *and* tag time. A mismatched
+manifest must never reach a registry.
 
 > Mid-cycle skew is tolerated by CI (warning only) so a binding can lag
 > the root crate between releases, but it must be reconciled before
@@ -848,7 +849,10 @@ cargo fmt --all -- --check
 RUSTDOCFLAGS="-D warnings" cargo doc --no-deps --all-features
 ```
 
-Then confirm **per-platform CI is green** on the commit you intend to tag.
+Then dispatch CI on the commit you intend to tag
+(`gh workflow run ci.yml --ref <branch> -f full=true`, plus
+`ci-audio-tests.yml` for the audio matrix) and confirm **every platform is
+green** — CI is manual, so no run exists until you start one.
 The workflows live in `.github/workflows/` (`ci.yml`,
 `ci-audio-tests.yml`, and the platform-specific splits). Check the Actions
 tab — do not rely solely on local results, since Linux PipeWire, Windows
@@ -1255,7 +1259,7 @@ Tracked here so follow-up release-automation tasks can pick them up:
   `rsac-go` — on the automated path
   `release-tag.yml` pushes `bindings/rsac-go/vX.Y.Z` for you; on a manual
   release push it separately (see §"Versioning & ABI contract" (c)). The `version-lockstep` CI job in
-  `ci.yml` catches any manifest that drifts: it warns on push/PR and
+  `ci.yml` catches any manifest that drifts: it warns on a dispatched run and
   hard-fails on a release tag.
 - `release-npm.yml` builds five napi-rs triples; other targets
   (`linux-x64-musl`, `linux-arm-gnueabihf`, FreeBSD, Android) are not

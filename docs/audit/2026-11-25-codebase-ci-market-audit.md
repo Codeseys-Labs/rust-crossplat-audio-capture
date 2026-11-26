@@ -175,7 +175,7 @@ onboarding (`mise install && mise run setup`) already provides.
 - Wiring: `mise.toml` `[tools] betterleaks = "1.10.1"`; lefthook
   `pre-commit` runs `mise run secrets:staged`; `ci.yml` job `secrets` runs
   independent of `changes`/`lint` via `jdx/mise-action` (SHA-pinned
-  v5.3.0), scanning the PR range on PRs and full history on pushes, with
+  v5.3.0), scanning full history on every dispatched or tag run, with
   `--redact`.
 
 ## 4. CI
@@ -209,10 +209,11 @@ onboarding (`mise install && mise run setup`) already provides.
 | Workflow | Change |
 |---|---|
 | `ci.yml` | `labeled`/`unlabeled` dropped; the label-driven `changelog-guard` job moved to its own `changelog-guard.yml` |
-| `ci.yml` | `changes` classifier adds a `mobile` output; `mobile-android`/`mobile-ios` run only on mobile-relevant PRs (always on push, tag, dispatch) |
-| `ci.yml` | `coverage` skips PRs; `secrets` (betterleaks) added; `msrv` checks 1.88 on Linux and Windows |
-| `ci-audio-tests.yml` | Triggers: `workflow_dispatch` (input `platform`), pushes to `main`/`master`, `v*.*.*` tags; no `pull_request`. `macos-audio` moved to GitHub-hosted `macos-15` with BlackHole pinned as default output and input |
-| `ci-ios-sim.yml`, `ci-android-emu.yml` | Dispatch plus PRs that touch their own mobile paths only |
+| All build/test workflows | Owner decision after the cost analysis above: **manual `workflow_dispatch` only** — no `pull_request` and no branch-push triggers. Automatic runs that remain: `changelog-guard.yml` on PRs, the weekly `supply-chain.yml` cron, and stable `v*.*.*` tags for `ci.yml` + `ci-audio-tests.yml`. `bench.yml` lost its weekly cron |
+| `ci.yml` | `changes` classifier adds a `mobile` output and scopes a branch dispatch by its diff against `master`: docs-only → no matrix; `mobile-android`/`mobile-ios` only for mobile-relevant paths (always on tags, a default-branch dispatch, or `full=true`) |
+| `ci.yml` | `coverage` runs only on tags or `full=true`; `secrets` (betterleaks) added; `msrv` checks 1.88 with `--locked` on Linux and Windows, plus the binding crates on Windows; `check-bindings` smokes one abi3 wheel on CPython 3.9 and 3.13 |
+| `ci-audio-tests.yml` | Triggers: `workflow_dispatch` (input `platform`) and `v*.*.*` tags; no push or `pull_request`. `macos-audio` moved to GitHub-hosted `macos-15` with BlackHole pinned as default output and input |
+| `ci-ios-sim.yml`, `ci-android-emu.yml` | Dispatch only |
 | `ci-audio-macos-tcc.yml` | Weekly cron removed; dispatch only |
 | `probe-blacksmith-windows-audio.yml` | New one-shot probe (below) |
 

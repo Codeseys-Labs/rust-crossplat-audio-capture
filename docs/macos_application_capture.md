@@ -13,7 +13,7 @@ Tap** plus an aggregate device; you drive it entirely through the public
 Application capture records the audio output of a single targeted process (or a
 process and its descendants) rather than the whole system mix. You select what
 to capture with a [`CaptureTarget`](../src/core/config.rs) and hand it to
-[`AudioCaptureBuilder`](../src/api.rs); the macOS backend resolves the target to
+[`AudioCaptureBuilder`](../src/api/builder.rs); the macOS backend resolves the target to
 a Process Tap behind the scenes.
 
 ## Prerequisites

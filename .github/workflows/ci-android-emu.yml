@@ -98,27 +98,14 @@ on:
           has proven the synthetic-mic route is reliable).
         type: boolean
         default: false
-  # Narrow, Android-only path filter: this leg boots an AVD (35m cap), so it must
-  # not fire on desktop PRs. Shared-layer changes (src/api.rs, src/core/**,
-  # src/bridge/**, Cargo.*, bindings/rsac-ffi/**) are NOT triggers — ci.yml's
-  # `mobile-android` job gates their Android COMPILATION on every mobile-touching
-  # PR and every push to main/master; run this workflow via workflow_dispatch
-  # when a shared-layer change needs runtime verification.
-  pull_request:
-    branches: [main, master, 'release/**']
-    paths:
-      - 'src/audio/android/**'
-      - 'tests/android_emu_smoke.rs'
-      # rsac-255b instrumented tier: the androidTest sources + gradle config
-      # live under mobile/android/; rsac-e6d3 playback tier: the test-only
-      # driver cdylib under mobile/androidtest-native/.
-      - 'mobile/android*/**'
-      - '.github/workflows/ci-android-emu.yml'
-      - 'scripts/ci-android-emu-payload.sh'
+  # Manual dispatch only (CI cost policy): this leg boots an AVD (35m cap).
+  # ci.yml's `mobile-android` job covers Android COMPILATION whenever a
+  # dispatched branch touches mobile-relevant paths; dispatch this workflow
+  # when a change needs emulator runtime verification.
 
 concurrency:
   group: android-emu-${{ github.workflow }}-${{ github.ref }}
-  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+  cancel-in-progress: true
 
 permissions:
   contents: read

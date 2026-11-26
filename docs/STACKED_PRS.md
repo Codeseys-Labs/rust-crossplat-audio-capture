@@ -159,7 +159,7 @@ git switch stack/audio  && git rebase stack/bridge && git push --force-with-leas
 | **A `release:`-titled intermediate PR** would cut a spurious tag + Release on squash-merge. | Reserve `release: vX.Y.Z` titles exclusively for the dedicated (never-stacked) release-prepare PR. |
 | **Merging out of order.** GitHub only cleanly merges a contiguous group from the lowest unmerged PR. | Always merge strictly bottom-up. To re-prioritize, rebase the wanted layer down to base — don't merge mid-stack. |
 | **Deep-stack rebase cascade.** A fix at the bottom of a deep stack re-runs CI per layer and can conflict at each. | Keep stacks shallow (3–5) and layers' files disjoint. `rebase.updateRefs` fixes all intermediate refs in one pass when you rebase from the top. |
-| **CI base confusion.** A stacked PR's CI runs against its *base* (the layer below), not `master`. | Each stacked branch contains its parent's commits, so its tree is complete and CI is meaningful — but ensure workflows trigger on `pull_request` to any base, not hard-pinned to `master`. |
+| **CI base confusion.** CI is manually dispatched and runs on the branch you dispatch, not on a PR merge ref. | Each stacked branch contains its parent's commits, so its tree is complete and CI is meaningful — dispatch `ci.yml` on each layer (`gh workflow run ci.yml --ref <branch>`). The diff-scoping compares against `master`, so an upper layer also runs the jobs its parents' paths select. |
 | **Native merge queue is not stack-aware.** | Don't put a stack in the merge queue; merge bottom-up manually with `gh pr merge --squash --delete-branch`. |
 
 ## 5. Quick reference

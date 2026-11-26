@@ -42,8 +42,6 @@ on:
         default: false
   push:
     branches: [ci/probe-blacksmith-windows-audio]
-    paths:
-      - '.github/workflows/probe-blacksmith-windows-audio.yml'
 
 permissions:
   contents: read
