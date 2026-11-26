@@ -168,8 +168,9 @@ type Disposer = Box<dyn Fn(Retired) -> Result<(), Refused> + Send + Sync>;
 type Spawner = fn(Box<dyn FnOnce() + Send>) -> std::io::Result<()>;
 
 /// Reads the supervisor's clock (see the `clock` field of
-/// [`RecoveryStream`]).
-type Clock = Box<dyn Fn() -> Instant + Send + Sync>;
+/// [`RecoveryStream`]); shared with the reopen helpers, which stamp their
+/// results with it.
+type Clock = Arc<dyn Fn() -> Instant + Send + Sync>;
 
 /// Locks `mutex`, recovering the guard when a previous holder panicked: every
 /// value guarded in this module is plain state that stays valid across a panic.
@@ -587,10 +588,11 @@ struct Core {
 /// What a reopen helper produced, and when it published it.
 struct Reopened {
     outcome: Outcome,
-    /// Taken under the `mailbox` lock as the result is stored: the probe's one
-    /// completion point. A poll that abandons an in-flight probe holds the same
-    /// lock, so a result is late exactly when it is published after the
-    /// deadline, whichever side gets the lock first.
+    /// Read from the supervisor's clock under the `mailbox` lock as the
+    /// result is stored: the probe's one completion point. A poll that
+    /// abandons an in-flight probe holds the same lock, so a result is late
+    /// exactly when it is published after the deadline, whichever side gets
+    /// the lock first.
     published_at: Instant,
 }
 
@@ -733,9 +735,10 @@ impl Core {
     }
 
     /// The single-flight reopen: retire the old stream, open a replacement,
-    /// screen its reported format, and publish the result. Disposes of anything
-    /// a concurrent `stop()` or an expired device wait made late.
-    fn run_reopen(&self, gate: FormatGate) {
+    /// screen its reported format, and publish the result, stamped with
+    /// `clock` (the supervisor's). Disposes of anything a concurrent `stop()`
+    /// or an expired device wait made late.
+    fn run_reopen(&self, gate: FormatGate, clock: &Clock) {
         self.retire_active();
         if self.unwanted() {
             // Never open a device just to close it again.
@@ -775,7 +778,7 @@ impl Core {
             } else {
                 *mailbox = Some(Reopened {
                     outcome,
-                    published_at: Instant::now(),
+                    published_at: clock(),
                 });
                 None
             }
@@ -1071,9 +1074,9 @@ struct RecoveryStream {
     /// outside tests.
     spawn_reopen: Spawner,
     /// The supervisor's clock: the instant a poll judges its deadlines and
-    /// the stable period at, and stamps its observation and an installation
-    /// with. [`Instant::now`] outside tests; a reopen helper stamps the result
-    /// it publishes with the real clock.
+    /// the stable period at, and stamps its observation, an installation and
+    /// generation 0's opening with; a reopen helper stamps the result it
+    /// publishes with it too. [`Instant::now`] outside tests.
     clock: Clock,
     /// What a poll retired but could not hand off; released by `stop()` or on
     /// drop, never by a poll.
@@ -1109,6 +1112,8 @@ impl RecoveryStream {
     ) -> Self {
         let expected_format = initial.format();
         let session = hub.begin_session();
+        let clock: Clock = Arc::new(Instant::now);
+        let opened = clock();
         Self {
             hub,
             session,
@@ -1135,7 +1140,7 @@ impl RecoveryStream {
                     authoritative: None,
                 },
                 outage_start: None,
-                healthy_since: Some(Instant::now()),
+                healthy_since: Some(opened),
                 tail: VecDeque::new(),
                 tail_preserved: false,
                 settle_tail: None,
@@ -1147,7 +1152,7 @@ impl RecoveryStream {
             read_timeout: READ_TIMEOUT,
             disposer: Box::new(|retired: Retired| spawn_disposal(retired, spawn_disposal_helper)),
             spawn_reopen: spawn_reopen_helper,
-            clock: Box::new(Instant::now),
+            clock,
             retained: Mutex::new(Retired::default()),
             #[cfg(feature = "async-stream")]
             poll_waker: PollWaker::default(),
@@ -1564,7 +1569,8 @@ impl RecoveryStream {
         };
         let core = Arc::clone(&self.core);
         let gate = m.gate;
-        let spawned = (self.spawn_reopen)(Box::new(move || core.run_reopen(gate)));
+        let clock = Arc::clone(&self.clock);
+        let spawned = (self.spawn_reopen)(Box::new(move || core.run_reopen(gate, &clock)));
         if let Err(e) = spawned {
             let mut mailbox = lock(&self.core.mailbox);
             *mailbox = Some(Reopened {
@@ -1572,7 +1578,7 @@ impl RecoveryStream {
                     message: format!("auto-recovery: cannot spawn the reopen helper: {e}"),
                     source: None,
                 }),
-                published_at: Instant::now(),
+                published_at: (self.clock)(),
             });
         }
     }
@@ -2614,7 +2620,7 @@ mod tests {
         /// The supervisor's side, for its `clock`.
         fn source(&self) -> Clock {
             let pinned = Arc::clone(&self.pinned);
-            Box::new(move || {
+            Arc::new(move || {
                 let at = *lock(&pinned);
                 at.unwrap_or_else(Instant::now)
             })
