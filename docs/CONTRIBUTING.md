@@ -239,7 +239,7 @@ Always reply on the originating comment so the thread can be resolved. See
 
 ## 7. Release procedure
 
-Releases are driven by `scripts/bump-version.sh`, which keeps seven
+Releases are driven by `scripts/bump-version.sh`, which keeps nine
 version-bearing files in sync:
 
 - `Cargo.toml` (root `rsac` crate)
@@ -249,6 +249,8 @@ version-bearing files in sync:
 - `bindings/rsac-python/Cargo.toml`
 - `bindings/rsac-python/pyproject.toml`
 - `mobile/android-native/Cargo.toml`
+- `integrations/tauri-plugin-rsac/Cargo.toml`
+- `integrations/tauri-plugin-rsac/guest-js/package.json`
 
 Plus `CHANGELOG.md` (it rotates the `[Unreleased]` section into a dated
 heading and re-seeds an empty `[Unreleased]`).
