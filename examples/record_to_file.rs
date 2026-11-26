@@ -92,11 +92,19 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             println!("\nDuration limit reached before any audio was delivered; no file written.");
             return Ok(());
         }
+        // Same policy as the write loop below, not `?`: a non-fatal read error
+        // while waiting is a hiccup (log, short sleep, retry within the same
+        // deadline and Ctrl+C checks); only a fatal error aborts here. And
         // `read_chunk_nonblocking` (not `read_buffer`) so a dead stream ends
         // with its real terminal error instead of a downgraded recoverable one.
-        match capture.read_chunk_nonblocking()? {
-            Some(buffer) => break buffer,
-            None => wait(Duration::from_millis(5)),
+        match capture.read_chunk_nonblocking() {
+            Ok(Some(buffer)) => break buffer,
+            Ok(None) => wait(Duration::from_millis(5)),
+            Err(e) if !e.is_fatal() => {
+                eprintln!("⚠  Transient read error while waiting: {e}");
+                wait(Duration::from_millis(5));
+            }
+            Err(e) => return Err(e.into()),
         }
     };
     let format = first.format().clone();

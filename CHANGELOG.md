@@ -41,9 +41,12 @@ Releases with no ABI change omit the subsection (or state "No C ABI changes").
   `with_auto_recovery` fails `preflight()` and `build()` with `PlatformNotSupported`
   until the macOS path has been observed on hardware (ADR-0021); plain capture and the
   device watcher on macOS are unchanged. When the wait for an absent device expires,
-  the supervisor runs one final lookup before it gives up. Verified on Windows by a
-  live default-device switch between two virtual endpoints and by endpoint loss, and on
-  Linux by a live default-sink switch (`tests/ci_audio/hotplug_*.rs`).
+  the supervisor runs one final lookup before it gives up. Observed on real audio
+  stacks (`tests/ci_audio/hotplug_*.rs`): on Windows, a live default-device switch
+  between two virtual endpoints on a workstation and the loss and return of the only
+  endpoint on the hosted runner; on Linux (audio run 45896704998), a live default-sink
+  switch that the stream follows without a reopen, an explicit device target that does
+  not follow, and a stopped daemon. Physical devices and macOS are not covered.
 - **`CapturingStream::readable_buffers()`** — provided method (default `None`) reporting
   how many buffers are queued and readable right now. It never blocks: `BridgeStream`
   returns `None` while another reader holds the stream and `Some(0)` once queued data is

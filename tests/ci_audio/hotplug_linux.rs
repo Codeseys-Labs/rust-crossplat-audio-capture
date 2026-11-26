@@ -1,5 +1,16 @@
 //! Linux evidence for native default-sink following, explicit-device binding,
 //! and recovery-budget exhaustion after daemon loss (issues #94 and #102).
+//!
+//! `RSAC_HOTPLUG_LINUX=1` enables the three sink tests. Outside `CI=true`,
+//! they also require `RSAC_HOTPLUG_ALLOW_DEFAULT_CHANGE=1`: `wpctl set-default`
+//! pins a configured default sink. Cleanup restores the original sink by
+//! name, but leaves it pinned even if WirePlumber originally chose it
+//! automatically.
+//!
+//! `RSAC_HOTPLUG_LINUX_DAEMON_STOP=1` enables the destructive test. Outside
+//! `CI=true`, it also requires `RSAC_HOTPLUG_ALLOW_DAEMON_KILL=1`. It stops
+//! every PipeWire daemon of the current user, not just the fixture's daemon,
+//! and does not restart them. Run it alone and last in a disposable session.
 
 #![cfg(all(
     target_os = "linux",
@@ -31,6 +42,8 @@ use crate::hotplug_common::{
 
 const SWITCH_VAR: &str = "RSAC_HOTPLUG_LINUX";
 const DAEMON_STOP_VAR: &str = "RSAC_HOTPLUG_LINUX_DAEMON_STOP";
+const ALLOW_DEFAULT_CHANGE_VAR: &str = "RSAC_HOTPLUG_ALLOW_DEFAULT_CHANGE";
+const ALLOW_DAEMON_KILL_VAR: &str = "RSAC_HOTPLUG_ALLOW_DAEMON_KILL";
 const A: &str = "rsac_hp_a";
 const B: &str = "rsac_hp_b";
 const CONTROL_TIMEOUT: Duration = Duration::from_secs(5);
@@ -308,11 +321,27 @@ fn wait_for_missing_sink(name: &str) -> Result<(), String> {
     }
 }
 
-fn wait_for_daemon_exit() -> Result<(), String> {
+fn require_permission(test: &str, allow_var: &str, action: &str) {
+    assert!(
+        std::env::var("CI").as_deref() == Ok("true")
+            || std::env::var(allow_var).as_deref() == Ok("1"),
+        "{test}: refusing to {action}; requires CI=true or {allow_var}=1"
+    );
+}
+
+fn require_default_change_permission(test: &str) {
+    require_permission(
+        test,
+        ALLOW_DEFAULT_CHANGE_VAR,
+        "change the configured default sink (cleanup leaves the original sink pinned)",
+    );
+}
+
+fn wait_for_daemon_exit(uid: &str) -> Result<(), String> {
     let deadline = Instant::now() + CONTROL_TIMEOUT;
     loop {
-        let (status, output) = command_until("pgrep", &["-x", "pipewire"], deadline)
-            .map_err(|e| format!("expected no pipewire process after pkill: {e}"))?;
+        let (status, output) = command_until("pgrep", &["-x", "-u", uid, "pipewire"], deadline)
+            .map_err(|e| format!("expected no pipewire process for UID {uid} after pkill: {e}"))?;
         match status.code() {
             Some(1) => return Ok(()), // procps: no matching process
             Some(0) => {}
@@ -321,7 +350,7 @@ fn wait_for_daemon_exit() -> Result<(), String> {
         let remaining = deadline.saturating_duration_since(Instant::now());
         if remaining <= READBACK_INTERVAL {
             return Err(format!(
-                "expected no pipewire process after pkill\n{output}"
+                "expected no pipewire process for UID {uid} after pkill\n{output}"
             ));
         }
         thread::sleep(READBACK_INTERVAL);
@@ -803,6 +832,7 @@ fn hotplug_linux_default_switch_follows_natively() {
     if !enabled(TEST, SWITCH_VAR) {
         return;
     }
+    require_default_change_permission(TEST);
     let fixture = Fixture::new(TEST, true);
     let mut s = Session::open(
         TEST,
@@ -833,6 +863,7 @@ fn hotplug_linux_default_switch_without_recovery_also_follows() {
     if !enabled(TEST, SWITCH_VAR) {
         return;
     }
+    require_default_change_permission(TEST);
     let fixture = Fixture::new(TEST, true);
     let mut s = Session::open(TEST, None, fixture.machine(), fixture.state());
     s.forbid_exhausted = true;
@@ -917,6 +948,7 @@ fn hotplug_linux_explicit_device_does_not_follow_and_ends_when_its_node_vanishes
     if !enabled(TEST, SWITCH_VAR) {
         return;
     }
+    require_default_change_permission(TEST);
     let mut fixture = Fixture::new(TEST, true);
     let mut s = open_device_session(&fixture, A);
     start_on_a(&mut s, &fixture);
@@ -997,6 +1029,13 @@ fn hotplug_linux_daemon_stop_spends_the_retry_budget() {
     if !enabled(TEST, DAEMON_STOP_VAR) {
         return;
     }
+    require_permission(
+        TEST,
+        ALLOW_DAEMON_KILL_VAR,
+        "stop every PipeWire daemon of the current user",
+    );
+    // SAFETY: geteuid only reads the calling process's effective UID.
+    let uid = unsafe { libc::geteuid() }.to_string();
     let mut fixture = Fixture::new(TEST, false);
     let config = AutoRecoveryConfig::new()
         .with_max_attempts(RETRY_BUDGET)
@@ -1010,17 +1049,19 @@ fn hotplug_linux_daemon_stop_spends_the_retry_budget() {
     s.expect_running_snapshot(0, 0);
     s.expect_terminal = true;
     let killed = s.checkpoint();
-    if let Err(e) = run("pkill", &["-x", "pipewire"]) {
+    if let Err(e) = run("pkill", &["-x", "-u", &uid, "pipewire"]) {
         s.fail(&format!(
-            "expected pkill to signal the PipeWire daemon: {e}"
+            "expected pkill to signal the PipeWire daemons for UID {uid}: {e}"
         ));
     }
     // The runner starts PipeWire manually and will discard the stopped audio
     // session. On any exit after a successful kill, still reap the player.
     fixture.daemon_stopped = true;
-    wait_for_daemon_exit().unwrap_or_else(|e| s.fail(&e));
+    wait_for_daemon_exit(&uid).unwrap_or_else(|e| s.fail(&e));
     let verified = s.checkpoint();
-    s.mark("verified pipewire process absent after pkill -x");
+    s.mark(format!(
+        "verified no pipewire process remains for UID {uid}"
+    ));
 
     // Gate the reads on verified daemon loss, but keep the event fence at
     // the kill action so verification cannot hide a scheduled retry.

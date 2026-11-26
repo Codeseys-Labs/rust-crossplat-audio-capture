@@ -12,7 +12,7 @@ use std::time::{Duration, Instant};
 
 use rsac::{
     get_device_enumerator, list_audio_applications_scoped, ApplicationScope, AudioCaptureBuilder,
-    AudioSource, AudioSourceKind, CaptureTarget, PlatformCapabilities, ProcessId,
+    AudioError, AudioSource, AudioSourceKind, CaptureTarget, PlatformCapabilities, ProcessId,
 };
 
 // ── CLI definition ───────────────────────────────────────────────────────
@@ -470,7 +470,12 @@ fn cmd_record(
             }
         }
 
-        match capture.read_buffer() {
+        // `read_chunk_nonblocking`, not `read_buffer`: the simple pull API
+        // downgrades a terminal stream to a *recoverable* error, and this loop
+        // retries recoverable errors — an unbounded recording would then spin
+        // forever after the stream ended, and a bounded one would report
+        // "Recording complete" for a truncated file.
+        match capture.read_chunk_nonblocking() {
             Ok(Some(buffer)) => {
                 // The WAV header is taken from the first DELIVERED buffer, not
                 // from the requested rate/channels or from `capture.format()`
@@ -544,15 +549,31 @@ fn cmd_record(
                     bytes_approx as f64 / 1_048_576.0
                 );
             }
+            // Nothing queued yet: brief sleep, not a busy spin.
             Ok(None) => {
                 std::thread::sleep(Duration::from_millis(5));
             }
-            Err(e) => {
+            // Nothing inside this loop requests a stop (Ctrl+C only flips the
+            // flag; `capture.stop()` runs after the loop), so a `StreamEnded`
+            // here is the stream ending on its own before the user or the
+            // `--duration` limit ended the recording. Everything delivered was
+            // written and the file is finalised, but it is shorter than what
+            // was asked for: report it as PARTIAL, not as a completion.
+            Err(AudioError::StreamEnded { .. }) => {
+                record_error =
+                    Some("the capture stream ended before the recording was stopped".to_string());
+                break;
+            }
+            // Any other terminal error ends the recording through the PARTIAL
+            // path below.
+            Err(e) if e.is_fatal() => {
                 eprintln!("\n⚠  Read error: {}", e);
-                if e.is_fatal() {
-                    record_error = Some(format!("read error: {e}"));
-                    break;
-                }
+                record_error = Some(format!("read error: {e}"));
+                break;
+            }
+            // Genuinely transient: log, brief sleep, retry.
+            Err(e) => {
+                eprintln!("\n⚠  Transient read error: {}", e);
                 std::thread::sleep(Duration::from_millis(5));
             }
         }

@@ -385,10 +385,19 @@ Built-in driver (`drain_to`) — the recommended path:
 
 ```rust
 capture.start()?;
-// Read the first delivered buffer with the terminal-observable read
-// (`read_chunk_blocking` — NOT `read_buffer_blocking`, which downgrades the
-// end-of-stream to a recoverable error), then build the sink from ITS format.
-let first = capture.read_chunk_blocking()?;
+// Acquire the first delivered buffer with the terminal-observable read
+// (`read_chunk_*` — NOT `read_buffer*`, which downgrades the end-of-stream
+// `StreamEnded` to a recoverable error). Retry transient errors — a bare `?`
+// here would abort the recording on a recoverable hiccup — and propagate only
+// fatal ones. Then build the sink from THAT buffer's format.
+let first = loop {
+    match capture.read_chunk_nonblocking() {
+        Ok(Some(buffer)) => break buffer,
+        Ok(None) => std::thread::sleep(std::time::Duration::from_millis(5)),
+        Err(e) if !e.is_fatal() => std::thread::sleep(std::time::Duration::from_millis(5)),
+        Err(e) => return Err(e),
+    }
+};
 let format = first.format().clone();
 let mut wav = WavFileSink::new("out.wav", &format)?; // feature `sink-wav`
 wav.write(&first)?;                                  // the first buffer is already consumed
@@ -405,7 +414,15 @@ capture.start()?;
 // `read_chunk_blocking` is the terminal-observable blocking read: it returns
 // `StreamEnded` once the stream is terminal (NOT `read_buffer_blocking`, which
 // downgrades that to a recoverable error and can never end a drain cleanly).
-let first = capture.read_chunk_blocking()?;
+// Acquire the first buffer the same way, retrying transient errors (a bare `?`
+// would abort the recording on a recoverable hiccup) and propagating fatal ones.
+let first = loop {
+    match capture.read_chunk_blocking() {
+        Ok(buffer) => break buffer,
+        Err(e) if !e.is_fatal() => continue,
+        Err(e) => return Err(e),
+    }
+};
 let mut wav = WavFileSink::new("out.wav", first.format())?; // header = delivered format
 wav.write(&first)?;
 loop {

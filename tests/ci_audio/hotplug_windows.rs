@@ -20,19 +20,18 @@
 //! - `RSAC_HOTPLUG_SWITCH=1` enables the switch tests, which then require
 //!   `RSAC_HOTPLUG_ENDPOINT_A` and `RSAC_HOTPLUG_ENDPOINT_B`: two different
 //!   active render endpoint ids as `rsac list` prints them.
-//! - `RSAC_HOTPLUG_LOSS=1` enables the loss tests, which disable the current
-//!   default render endpoint and therefore also need `CI=true` or
-//!   `RSAC_HOTPLUG_ALLOW_DISABLE=1`. `RSAC_HOTPLUG_LOSS_MODE` is `visibility`
-//!   (default) or `pnp`, which needs `RSAC_HOTPLUG_PNP_INSTANCE_ID`.
+//! - `RSAC_HOTPLUG_LOSS=1` enables the loss tests, which hide the current
+//!   default render endpoint via `IPolicyConfig::SetEndpointVisibility`.
+//!   They require `CI=true` or `RSAC_HOTPLUG_ALLOW_DISABLE=1`.
 //!
 //! A test whose enabling variable is not `1` prints
 //! `HOTPLUG-SKIP test=<name> reason=<variable> not set`. A test that passes
 //! every check prints exactly one `HOTPLUG-EVIDENCE test=<name> result=pass …`
 //! line on stdout, after the machine has been restored; no failure path prints
-//! it. The original default endpoints (eConsole and eMultimedia, and also
-//! eCommunications in the one test that changes it) are restored, and a
-//! disabled endpoint re-enabled, on every exit path, including a failed
-//! assertion unwinding; a restore that fails prints `HOTPLUG-RESTORE-FAILED …`
+//! it. The guards restore the saved default roles (all three for the
+//! communications and loss tests) and make a hidden endpoint visible again
+//! on every exit path, including a failed assertion unwinding. A restore
+//! that fails prints `HOTPLUG-RESTORE-FAILED …`
 //! on stderr.
 //!
 //! Default endpoints are set through the undocumented `IPolicyConfig` COM
@@ -46,8 +45,6 @@
 ))]
 
 use std::ffi::c_void;
-use std::io::{Read, Seek, SeekFrom};
-use std::process::{Command, Stdio};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, PoisonError};
 use std::thread::JoinHandle;
@@ -77,8 +74,6 @@ const ENDPOINT_A_VAR: &str = "RSAC_HOTPLUG_ENDPOINT_A";
 const ENDPOINT_B_VAR: &str = "RSAC_HOTPLUG_ENDPOINT_B";
 const LOSS_VAR: &str = "RSAC_HOTPLUG_LOSS";
 const ALLOW_DISABLE_VAR: &str = "RSAC_HOTPLUG_ALLOW_DISABLE";
-const LOSS_MODE_VAR: &str = "RSAC_HOTPLUG_LOSS_MODE";
-const PNP_INSTANCE_VAR: &str = "RSAC_HOTPLUG_PNP_INSTANCE_ID";
 
 // ── Player format ────────────────────────────────────────────────────────
 
@@ -91,7 +86,9 @@ const E_NOTFOUND: HRESULT = HRESULT(0x8007_0490_u32 as i32);
 
 const RESTORE_TRIES: usize = 3;
 const RESTORE_RETRY_DELAY: Duration = Duration::from_millis(200);
-const PNP_COMMAND_TIMEOUT: Duration = Duration::from_secs(10);
+/// Recovery events carry receipt times rather than emission times. Allow
+/// 100 ms for polling and scheduling skew in the lower bound only.
+const EXHAUST_OBSERVATION_TOLERANCE: Duration = Duration::from_millis(100);
 
 fn same_id(a: &str, b: &str) -> bool {
     a.eq_ignore_ascii_case(b)
@@ -609,123 +606,10 @@ fn switch_endpoints() -> (String, String) {
 
 // ── Endpoint loss (CI only) ──────────────────────────────────────────────
 
-#[derive(Clone, Debug)]
-enum LossMode {
-    /// `IPolicyConfig::SetEndpointVisibility(id, FALSE)`, later `TRUE`.
-    Visibility,
-    /// `Disable-PnpDevice` / `Enable-PnpDevice` on a PnP instance.
-    Pnp { instance_id: String },
-}
-
-impl LossMode {
-    fn from_env() -> Result<Self, String> {
-        match std::env::var(LOSS_MODE_VAR).ok().as_deref().map(str::trim) {
-            None | Some("") | Some("visibility") => Ok(LossMode::Visibility),
-            Some("pnp") => match std::env::var(PNP_INSTANCE_VAR) {
-                Ok(id) if !id.trim().is_empty() => Ok(LossMode::Pnp {
-                    instance_id: id.trim().to_string(),
-                }),
-                _ => Err(format!(
-                    "{LOSS_MODE_VAR}=pnp requires {PNP_INSTANCE_VAR} (the PnP instance id of the \
-                     endpoint's device)"
-                )),
-            },
-            Some(other) => Err(format!(
-                "{LOSS_MODE_VAR}={other} is not one of `visibility`, `pnp`"
-            )),
-        }
-    }
-
-    fn name(&self) -> &'static str {
-        match self {
-            LossMode::Visibility => "visibility",
-            LossMode::Pnp { .. } => "pnp",
-        }
-    }
-}
-
-/// Bounds every PowerShell call, including rollback and node verification.
-/// A file instead of a pipe prevents verbose errors from blocking the child.
-fn pnp_command(instance_id: &str, script: &str) -> Result<(), String> {
-    let mut stderr = tempfile::tempfile().map_err(|e| format!("open pwsh error log: {e}"))?;
-    let log = stderr
-        .try_clone()
-        .map_err(|e| format!("clone pwsh error log: {e}"))?;
-    let mut child = Command::new("pwsh")
-        .args(["-NoProfile", "-NonInteractive", "-Command", script])
-        .env("RSAC_PNP_NODE", instance_id)
-        .stdin(Stdio::null())
-        .stdout(Stdio::null())
-        .stderr(Stdio::from(log))
-        .spawn()
-        .map_err(|e| format!("start pwsh for PnP instance {instance_id}: {e}"))?;
-    let deadline = Instant::now() + PNP_COMMAND_TIMEOUT;
-    let status = loop {
-        let polled = child.try_wait();
-        let at = Instant::now();
-        if let Ok(Some(status)) = &polled {
-            if at <= deadline {
-                break *status;
-            }
-        }
-        if polled.is_err() || at >= deadline {
-            let killed = child.kill();
-            return Err(format!(
-                "pwsh for PnP instance {instance_id} did not finish within \
-                 {PNP_COMMAND_TIMEOUT:?} (last status: {polled:?}, kill: {killed:?})"
-            ));
-        }
-        std::thread::sleep(READBACK_INTERVAL);
-    };
-    if !status.success() {
-        let mut detail = String::new();
-        if stderr.seek(SeekFrom::Start(0)).is_ok() {
-            let _ = stderr.take(4096).read_to_string(&mut detail);
-        }
-        return Err(format!(
-            "pwsh for PnP instance {instance_id} exited with {status}: {detail}"
-        ));
-    }
-    Ok(())
-}
-
-/// Verifies the exact instance is present and is an enabled, healthy MEDIA
-/// node. This does not establish that it owns the selected render endpoint:
-/// the loss test separately verifies that endpoint and its default disappear.
-fn verify_pnp_enabled(instance_id: &str) -> Result<(), String> {
-    pnp_command(
-        instance_id,
-        "$ErrorActionPreference='Stop'; \
-         $id=$env:RSAC_PNP_NODE; \
-         $nodes=@(Get-PnpDevice -PresentOnly -InstanceId $id | \
-           Where-Object { $_.InstanceId -eq $id -and $_.Class -eq 'MEDIA' }); \
-         if ($nodes.Count -ne 1 -or $nodes[0].Status -ne 'OK') { \
-           throw \"expected one present healthy MEDIA node for $id; found $nodes\" \
-         }; \
-         $problem=(Get-PnpDeviceProperty -InstanceId $id \
-           -KeyName 'DEVPKEY_Device_ProblemCode').Data; \
-         if ($null -eq $problem -or $problem -ne 0) { \
-           throw \"MEDIA node $id is not enabled without problems: code $problem\" \
-         }",
-    )
-}
-
-fn run_pnp(enable: bool, instance_id: &str) -> Result<(), String> {
-    let verb = if enable { "Enable" } else { "Disable" };
-    pnp_command(
-        instance_id,
-        &format!(
-            "$ErrorActionPreference='Stop'; \
-             {verb}-PnpDevice -InstanceId $env:RSAC_PNP_NODE -Confirm:$false"
-        ),
-    )
-}
-
-/// Makes the endpoint under test disappear and come back. Once disabled it
-/// re-enables on drop and waits for the endpoint to be active again, printing
-/// `HOTPLUG-RESTORE-FAILED endpoint=<id>` when that fails.
+/// Hides the selected render endpoint. On drop, makes it visible and checks
+/// that it is active again, printing `HOTPLUG-RESTORE-FAILED endpoint=<id>`
+/// if restoration fails.
 struct EndpointLoss {
-    mode: LossMode,
     endpoint: String,
     disabled: bool,
     armed: bool,
@@ -733,9 +617,8 @@ struct EndpointLoss {
 }
 
 impl EndpointLoss {
-    fn new(mode: LossMode, endpoint: &str) -> Self {
+    fn new(endpoint: &str) -> Self {
         Self {
-            mode,
             endpoint: endpoint.to_string(),
             disabled: false,
             armed: false,
@@ -744,9 +627,6 @@ impl EndpointLoss {
     }
 
     fn disable(&mut self, defaults: &mut DefaultsGuard) -> Result<(), String> {
-        if let LossMode::Pnp { instance_id } = &self.mode {
-            verify_pnp_enabled(instance_id)?;
-        }
         verify_default(Role::Console, &self.endpoint)?;
         if endpoint_state(&self.endpoint)? != Some(wasapi::DeviceState::Active) {
             return Err(format!("{} is not active before disable", self.endpoint));
@@ -756,31 +636,23 @@ impl EndpointLoss {
         defaults.arm();
         self.armed = true;
         self.disabled = true;
-        self.apply(false)?;
+        self.set_visibility(false)?;
         wait_until_absent(&self.endpoint)
     }
 
     /// Re-enables the endpoint and waits until it is active again.
     fn enable(&mut self) -> Result<(), String> {
         if self.disabled {
-            self.apply(true)?;
+            self.set_visibility(true)?;
         }
         let deadline = Instant::now() + ENDPOINT_ACTIVE_TIMEOUT;
-        if let LossMode::Pnp { instance_id } = &self.mode {
-            verify_pnp_enabled(instance_id)?;
-        }
         wait_until_active(&self.endpoint, deadline)?;
         self.disabled = false;
         Ok(())
     }
 
-    fn apply(&self, enable: bool) -> Result<(), String> {
-        match &self.mode {
-            LossMode::Visibility => {
-                with_policy_config(|policy| policy.set_endpoint_visibility(&self.endpoint, enable))
-            }
-            LossMode::Pnp { instance_id } => run_pnp(enable, instance_id),
-        }
+    fn set_visibility(&self, visible: bool) -> Result<(), String> {
+        with_policy_config(|policy| policy.set_endpoint_visibility(&self.endpoint, visible))
     }
 
     fn restore(&mut self) -> bool {
@@ -1167,7 +1039,7 @@ fn record_defaults(test: &str, roles: &[Role]) -> DefaultsGuard {
 }
 
 /// Gate and inputs of a loss test: `None` when it skips.
-fn loss_setup(test: &str) -> Option<(LossMode, String)> {
+fn loss_setup(test: &str) -> Option<String> {
     if !enabled(test, LOSS_VAR) {
         return None;
     }
@@ -1178,7 +1050,6 @@ fn loss_setup(test: &str) -> Option<(LossMode, String)> {
         "{test}: refusing to disable an audio endpoint: {LOSS_VAR}=1 also needs CI=true or \
          {ALLOW_DISABLE_VAR}=1, so that a workstation's device is never disabled by accident"
     );
-    let mode = LossMode::from_env().unwrap_or_else(|e| panic!("{test}: {e}"));
     let endpoint = match read_default(Role::Console) {
         Ok(Some(id)) => id,
         Ok(None) => panic!("{test}: there is no default render endpoint to take away"),
@@ -1188,7 +1059,7 @@ fn loss_setup(test: &str) -> Option<(LossMode, String)> {
         Ok(Some(wasapi::DeviceState::Active)) => {}
         other => panic!("{test}: the default render endpoint {endpoint} is not active: {other:?}"),
     }
-    Some((mode, endpoint))
+    Some(endpoint)
 }
 
 // ── Switch tests (RSAC_HOTPLUG_SWITCH=1) ─────────────────────────────────
@@ -1463,13 +1334,13 @@ fn hotplug_communications_role_switch_is_ignored() {
 fn hotplug_loss_exhausts_after_wait() {
     const TEST: &str = "hotplug_loss_exhausts_after_wait";
     let _lock = machine_lock();
-    let Some((mode, endpoint)) = loss_setup(TEST) else {
+    let Some(endpoint) = loss_setup(TEST) else {
         return;
     };
     init_test_logging();
 
     let mut defaults = record_defaults(TEST, &Role::WITH_COMMUNICATIONS);
-    let mut loss = EndpointLoss::new(mode.clone(), &endpoint);
+    let mut loss = EndpointLoss::new(&endpoint);
     let player = start_player(TEST, "A", &endpoint, TONE_A_HZ);
 
     let config = AutoRecoveryConfig::new().with_device_wait_timeout(EXHAUST_DEVICE_WAIT);
@@ -1478,8 +1349,7 @@ fn hotplug_loss_exhausts_after_wait() {
         Some(config),
         machine(vec![player.view()]),
         format!(
-            "test={TEST} mode={} endpoint={endpoint} original {}",
-            mode.name(),
+            "test={TEST} endpoint={endpoint} original {}",
             defaults.describe()
         ),
     );
@@ -1491,41 +1361,61 @@ fn hotplug_loss_exhausts_after_wait() {
 
     // 2. Take the endpoint away.
     s.expect_terminal = true;
-    let disabling = s.checkpoint();
     if let Err(e) = loss.disable(&mut defaults) {
-        s.fail(&format!(
-            "disabling {endpoint} ({}) failed: {e}",
-            mode.name()
-        ));
+        s.fail(&format!("hiding {endpoint} failed: {e}"));
     }
-    let outage = s.elapsed();
+    let outage = s.checkpoint();
     s.mark("verified endpoint loss: inactive or absent and eConsole unset");
 
     // Exhausted.reason is public diagnostic text; give_up_waiting is the
     // only supervisor path that reports it. An initial retry is normal
     // after invalidation, before the first open proves the device is absent.
-    let earliest = outage + EXHAUST_DEVICE_WAIT;
+    // Recovery does not expose when the first lookup returned DeviceNotFound.
+    // Use the first invalidation or default change observed after verified loss
+    // as the start of the supervisor's observable timeline.
+    let deadline = outage.at + EXHAUST_DEVICE_WAIT + EXHAUST_MARGIN;
+    let minimum_wait = EXHAUST_DEVICE_WAIT - EXHAUST_OBSERVATION_TOLERANCE;
     let mut exhausted_at = None;
     s.wait_for_observation(
         "absent-device wait expires, then reads terminate",
-        earliest + EXHAUST_MARGIN,
+        deadline,
         |s, _| {
-            let Some((event, reason)) =
-                s.events()[disabling.events..]
+            let after_outage = &s.events()[outage.events..];
+            let Some((index, reason)) =
+                after_outage
                     .iter()
-                    .find_map(|event| match &event.value {
-                        RecoveryEvent::Exhausted { reason, .. } => Some((event, reason)),
+                    .enumerate()
+                    .find_map(|(index, event)| match &event.value {
+                        RecoveryEvent::Exhausted { reason, .. } => Some((index, reason)),
                         _ => None,
                     })
             else {
                 return Ok(None);
             };
+            let event = &after_outage[index];
+            let Some(start) = after_outage[..index].iter().find(|event| {
+                matches!(
+                    event.value,
+                    RecoveryEvent::DeviceInvalidated { .. } | RecoveryEvent::DefaultChanged { .. }
+                )
+            }) else {
+                return Err(format!(
+                    "Exhausted at {} without a preceding DeviceInvalidated or DefaultChanged \
+                     after verified loss at {}",
+                    fmt_at(event.at),
+                    fmt_at(outage.at)
+                ));
+            };
+            let earliest = start.at + minimum_wait;
             if event.at < earliest
                 || !reason.starts_with("auto-recovery gave up: no capture device appeared within ")
             {
                 return Err(format!(
-                    "expected absent-device expiry no earlier than {}, got {:?} at {}",
+                    "expected absent-device expiry no earlier than {} (recovery began with \
+                     {:?} at {}), got {:?} at {}",
                     fmt_at(earliest),
+                    start.value,
+                    fmt_at(start.at),
                     event.value,
                     fmt_at(event.at)
                 ));
@@ -1567,9 +1457,8 @@ fn hotplug_loss_exhausts_after_wait() {
     let evidence = evidence_line(
         TEST,
         &format!(
-            "mode={} exhausted_ms={} error={error}",
-            mode.name(),
-            s.elapsed_between("absent-device wait", outage, exhausted_at)
+            "exhausted_ms={} error={error}",
+            s.elapsed_between("verified loss to exhaustion", outage.at, exhausted_at)
                 .as_millis()
         ),
     );
@@ -1583,13 +1472,13 @@ fn hotplug_loss_exhausts_after_wait() {
 fn hotplug_loss_then_return_recovers() {
     const TEST: &str = "hotplug_loss_then_return_recovers";
     let _lock = machine_lock();
-    let Some((mode, endpoint)) = loss_setup(TEST) else {
+    let Some(endpoint) = loss_setup(TEST) else {
         return;
     };
     init_test_logging();
 
     let mut defaults = record_defaults(TEST, &Role::WITH_COMMUNICATIONS);
-    let mut loss = EndpointLoss::new(mode.clone(), &endpoint);
+    let mut loss = EndpointLoss::new(&endpoint);
     let player = start_player(TEST, "A", &endpoint, TONE_A_HZ);
 
     let config = AutoRecoveryConfig::new().with_device_wait_timeout(RETURN_DEVICE_WAIT);
@@ -1598,8 +1487,7 @@ fn hotplug_loss_then_return_recovers() {
         Some(config),
         machine(vec![player.view()]),
         format!(
-            "test={TEST} mode={} endpoint={endpoint} original {}",
-            mode.name(),
+            "test={TEST} endpoint={endpoint} original {}",
             defaults.describe()
         ),
     );
@@ -1612,10 +1500,7 @@ fn hotplug_loss_then_return_recovers() {
 
     // 2. Hold a verified outage for at least 2 s while polling recovery.
     if let Err(e) = loss.disable(&mut defaults) {
-        s.fail(&format!(
-            "disabling {endpoint} ({}) failed: {e}",
-            mode.name()
-        ));
+        s.fail(&format!("hiding {endpoint} failed: {e}"));
     }
     let outage = s.elapsed();
     s.mark("verified endpoint loss: inactive or absent and eConsole unset");
@@ -1640,10 +1525,7 @@ fn hotplug_loss_then_return_recovers() {
     let enabling = s.checkpoint();
     s.mark("issuing the endpoint enable command");
     if let Err(e) = loss.enable() {
-        s.fail(&format!(
-            "re-enabling {endpoint} ({}) failed: {e}",
-            mode.name()
-        ));
+        s.fail(&format!("making {endpoint} visible again failed: {e}"));
     }
     let active_at = s.elapsed();
     s.mark(format!(
@@ -1679,8 +1561,7 @@ fn hotplug_loss_then_return_recovers() {
     let evidence = evidence_line(
         TEST,
         &format!(
-            "mode={} recovered_ms={} generation={generation}",
-            mode.name(),
+            "recovered_ms={} generation={generation}",
             s.elapsed_between(
                 "recovery after verified activation",
                 active_at,

@@ -635,9 +635,9 @@ jobs:
       # one, so they print HOTPLUG-SKIP here and run on a workstation (the
       # result is docs/evidence/windows-default-switch.md). The loss tests
       # hide the endpoint (what "Disable" in the Sound panel does). Disabling
-      # the device node instead (RSAC_HOTPLUG_LOSS_MODE=pnp) is not possible
-      # here: Disable-PnpDevice fails with "Generic failure" on the
-      # root-enumerated VB-CABLE node (run 45896704998).
+      # the device node is not possible here: Disable-PnpDevice fails with
+      # "Generic failure" on the root-enumerated VB-CABLE node (run
+      # 45896704998), so the harness has no such mode.
       - name: Hotplug recovery tier (endpoint loss)
         id: tier_hotplug
         continue-on-error: true
@@ -645,7 +645,6 @@ jobs:
         shell: pwsh
         env:
           RSAC_HOTPLUG_LOSS: "1"
-          RSAC_HOTPLUG_LOSS_MODE: visibility
         run: |
           cargo test --test ci_audio hotplug_ `
             --no-default-features --features feat_windows,compose,sink-wav,hotplug-recovery `
@@ -862,6 +861,18 @@ jobs:
               echo "::error::device_capture failed with exit $rc (not a gtimeout kill) — real regression."
               exit "$rc";;
           esac
+          if [ "$RELEASE_EVIDENCE" = "true" ]; then
+            # The test can return successfully after a capture skip, so require
+            # its positive delivery and non-silence markers in release mode.
+            if ! grep -Eq '\[ci_audio\] Device capture complete: [1-9][0-9]* buffers, [1-9][0-9]* total frames' ci-audio-device.log; then
+              echo "::error::missing Device capture completion with positive buffer and frame counts"
+              exit 1
+            fi
+            if ! grep -Fq '[ci_audio] Device capture: first non-silent buffer' ci-audio-device.log; then
+              echo "::error::missing Device capture first non-silent buffer"
+              exit 1
+            fi
+          fi
           gtimeout --preserve-status 60 \
             cargo test --test ci_audio device_enumeration \
             --no-default-features --features feat_macos \

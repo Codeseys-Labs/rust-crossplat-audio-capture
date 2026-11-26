@@ -90,8 +90,16 @@ use rsac::AudioSink;
 // `capture.format()` can still be the requested format (Linux publishes the
 // negotiated one asynchronously), and WavFileSink rejects a mismatched buffer.
 // `read_chunk_blocking` (NOT `read_buffer_blocking`) also exists on
-// `Composition`, so the same recipe covers composed streams.
-let first = running.read_chunk_blocking()?;
+// `Composition`, so the same recipe covers composed streams. Acquire the first
+// buffer with a retry loop — a bare `?` would abort on a transient hiccup —
+// propagating only fatal errors.
+let first = loop {
+    match running.read_chunk_blocking() {
+        Ok(buffer) => break buffer,
+        Err(e) if !e.is_fatal() => continue,
+        Err(e) => return Err(e),
+    }
+};
 let mut sink = rsac::WavFileSink::new("out.wav", first.format())?;
 sink.write(&first)?; // the first buffer is already consumed
 let drain = running.drain_to(sink)?; // background thread, flush/close on end

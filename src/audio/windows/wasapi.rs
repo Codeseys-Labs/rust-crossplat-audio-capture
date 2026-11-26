@@ -1532,6 +1532,9 @@ fn deliver_notices(
                 DeviceEvent::DeviceAdded { id, name, kind }
             }
         };
+        // On the helper thread, never on the MMDevice thread: the one place
+        // that shows whether the OS delivered a notification at all.
+        log::debug!("wasapi: device watcher delivering {event:?}");
         on_event(event);
         if shutdown.load(Ordering::Acquire) {
             return;
