@@ -312,7 +312,7 @@ cargo test --lib --features compose compose::
   `RSAC_CI_AUDIO_DETERMINISTIC=1` (which hard-asserts non-silence) will fail
   captures under an unauthorized terminal — only set it where the TCC grant is
   actually effective.
-- **Process Tap:** Requires macOS 14.4+ (Sonoma). System, application and process-tree capture all use it, so none of them is available on older versions.
+- **Process Tap:** rsac supports system, application and process-tree capture on macOS 14.4 and later (Sonoma), all three through the Process Tap; on older versions `PlatformCapabilities` reports none of them as supported.
 - **Aggregate device:** For app capture, rsac creates a temporary CoreAudio aggregate device automatically.
 - **Xcode requirement:** The build uses CoreAudio system frameworks; Xcode CLI tools must be installed.
 

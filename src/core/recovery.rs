@@ -124,9 +124,10 @@ impl AutoRecoveryConfig {
 /// }
 /// ```
 ///
-/// ```compile_fail
+/// ```compile_fail,E0639
 /// use rsac::RecoveryState;
 ///
+/// // E0639: a `#[non_exhaustive]` variant cannot be built with a struct expression outside its crate.
 /// let _ = RecoveryState::Recovering { attempt: 1 };
 /// ```
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -194,9 +195,10 @@ pub struct RecoverySnapshot {
 /// }
 /// ```
 ///
-/// ```compile_fail
+/// ```compile_fail,E0639
 /// use rsac::RecoveryEvent;
 ///
+/// // E0639: a `#[non_exhaustive]` variant cannot be built with a struct expression outside its crate.
 /// let _ = RecoveryEvent::DefaultChanged { session: 1, generation: 0 };
 /// ```
 #[derive(Debug, Clone, PartialEq, Eq)]
