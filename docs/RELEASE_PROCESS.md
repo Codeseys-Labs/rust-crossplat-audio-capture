@@ -322,30 +322,34 @@ GitHub. Owner: `Codeseys-Labs`; repository:
 
 ### Using the automated flow
 
-From a clean `master` with CI already green on the commit you are about to bump
-(see §2 for the pre-release checklist). The version-bump commit this block
-creates is tagged without a CI run of its own: it differs from the verified
-commit only by version strings and the CHANGELOG rotation, and the lockstep check
-in the chain validates those. What gates publishing of the tagged commit is the
-publish workflows themselves: `release.yml`'s `verify` and `semver-checks` jobs
-and each publish workflow's `--expect` lockstep check. The tag-time `ci.yml` run
-starts in parallel with them; it is evidence after the fact and does not block
-a publish.
+From a clean `master` (see §2 for the pre-release checklist). One rule applies
+to every manual release: **the commit you tag must have a green, manually
+dispatched CI run.** That commit is the version-bump commit, so CI is dispatched
+after the bump is pushed and before the tag is made.
+
+After the tag, crates.io publishing is gated by `release.yml`'s `verify` and
+`semver-checks` jobs. The npm and PyPI workflows run independently of it, each
+behind its own build and `--expect` lockstep check. The tag-time `ci.yml` run
+starts in parallel with all of them and gates nothing, which is why the
+dispatched run before the tag is the one that matters.
 
 ```bash
 # Bump the version + promote CHANGELOG entries under a dated heading.
 # scripts/bump-version.sh rewrites all nine lockstep manifests + rotates
 # the CHANGELOG — see §2 "CHANGELOG promotion" and §3 "Version bump".
 #
-# Then commit, push, check and tag as ONE `&&` chain: a failure at any step
-# stops the paste. Without it, a failed commit would still let the lockstep
-# check pass on the uncommitted manifests and tag the pre-bump HEAD. Nothing
-# else checks a hand-made tag before it exists; pushing it is the workflow
-# trigger.
+# 1. Commit, push and dispatch CI on the bump commit, as ONE `&&` chain so a
+#    failed commit or push stops the paste.
 git add -A &&
   git commit -m "rsac X.Y.Z" &&
   git push origin master &&
-  bash scripts/check-version-lockstep.sh --expect X.Y.Z &&
+  gh workflow run ci.yml --ref master -f full=true -f semver=true
+
+# 2. Wait for that run to finish green (dispatch ci-audio-tests.yml as well for
+#    the audio matrix). Only then check and tag, again as one chain: nothing
+#    else checks a hand-made tag before it exists, and pushing it is the
+#    workflow trigger.
+bash scripts/check-version-lockstep.sh --expect X.Y.Z &&
   git tag -a vX.Y.Z -m "rsac X.Y.Z" &&
   git push origin vX.Y.Z
 ```
@@ -873,16 +877,14 @@ cargo fmt --all -- --check
 RUSTDOCFLAGS="-D warnings" cargo doc --no-deps --all-features
 ```
 
-Then dispatch CI on the commit you are about to bump
+CI evidence is required on the commit that gets tagged, which is the
+version-bump commit from §3, so the required dispatch happens there (see §3),
+not here. Dispatching on the pre-bump commit as well
 (`gh workflow run ci.yml --ref <branch> -f full=true -f semver=true`, plus
-`ci-audio-tests.yml` for the audio matrix) and confirm **every platform is
-green** — CI is manual, so no run exists until you start one. That pre-bump run
-is the only pre-tag CI requirement in the manual path: the bump commit that
-actually gets tagged is covered by the lockstep check, and its publish is gated
-by `release.yml`'s `verify` and `semver-checks` jobs and each publish workflow's
-`--expect` lockstep check; the tag-time `ci.yml` run is parallel, after-the-fact
-evidence (see "Using the automated flow"). In the release-prepare flow the
-dispatched run on the release branch already covers the bumped tree.
+`ci-audio-tests.yml` for the audio matrix) is optional: it catches a red
+matrix before you bump. CI is manual, so no run exists until you start one.
+In the release-prepare flow the dispatched run on the release branch already
+covers the bumped tree.
 The workflows live in `.github/workflows/` (`ci.yml`,
 `ci-audio-tests.yml`, and the platform-specific splits). Check the Actions
 tab — do not rely solely on local results, since Linux PipeWire, Windows
@@ -985,8 +987,13 @@ git add -A
 git commit -m "chore: release 0.3.0"
 ```
 
-Push and ensure CI — including `version-lockstep` — is green on the bump
-commit before proceeding.
+Push, then dispatch CI on the bump commit
+(`gh workflow run ci.yml --ref master -f full=true -f semver=true`, plus
+`ci-audio-tests.yml` for the audio matrix) and wait for every platform to be
+green before proceeding. CI is manual, so no run exists until you start one,
+and this is the commit that gets tagged. `version-lockstep` only warns on a
+dispatched run, so read its output; the hard check is
+`check-version-lockstep.sh --expect` in §4.
 
 ---
 
