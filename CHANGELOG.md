@@ -25,6 +25,15 @@ Releases with no ABI change omit the subsection (or state "No C ABI changes").
   `AudioCaptureBuilder::with_auto_recovery(AutoRecoveryConfig)`, `RecoveryState`,
   `RecoverySnapshot`, `RecoveryEvent`, `AudioCapture::recovery_snapshot()`,
   `AudioCapture::subscribe_recovery_events()`, and `AudioBuffer::stream_generation()`.
+  Events and snapshots carry a `session` id that changes with each newly opened capture
+  session, so an event left queued by an earlier session is distinguishable after a
+  restart. A quiet supervised stream still returns `AudioError::Timeout` from blocking
+  reads, as an unsupervised one does.
+- **`CapturingStream::readable_buffers()`** — provided method (default `None`) reporting
+  how many buffers are queued and readable right now. It never blocks: `BridgeStream`
+  returns `None` while another reader holds the stream and `Some(0)` once queued data is
+  no longer readable. Auto-recovery uses it to drain exactly the backlog present when it
+  retires a stream.
 - **Secret scanning (`betterleaks`)** — pinned `betterleaks` 1.10.1 via `mise.toml`
   and `.betterleaks.toml`, wired into `lefthook.yml` (`pre-commit`) and `ci.yml`
   (`secrets` job).
@@ -84,7 +93,10 @@ Releases with no ABI change omit the subsection (or state "No C ABI changes").
 - **Linux PipeWire:** fixed multi-byte UTF-8 slicing panic in `.exe` suffix stripping,
   normalized cyclic SPA chunk offsets with whole-frame clamping, and added
   `StreamFlags::DONT_RECONNECT` on explicit serial targets so vanished app/device
-  streams cannot silently fall back to capturing system audio.
+  streams cannot silently fall back to capturing system audio. `default_device()` now
+  returns `DeviceNotFound` (was `BackendError`) when the PipeWire registry lists audio
+  devices but none of the requested kind; an empty registry still reports `BackendError`.
+  The FFI, Go and Node bindings surface this as their device-not-found error code.
 - **macOS CoreAudio:** honored `StreamConfig::buffer_size` in
   `CoreAudioDevice::create_stream` (closing the last backend parity gap).
 - **`lefthook.yml` on Windows:** routed hooks through `mise run` instead of bare `bash`

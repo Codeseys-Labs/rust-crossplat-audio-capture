@@ -375,6 +375,26 @@ pub trait CapturingStream: Send + Sync {
         (0, 0)
     }
 
+    /// Returns how many buffers are queued and readable right now, when the
+    /// backend can tell without waiting; `None` (the default) when it cannot.
+    /// Never blocks.
+    ///
+    /// A snapshot of the ring's occupancy, `Some(0)` while the stream is in a
+    /// state where a read returns no queued data (not yet started, or ended).
+    /// The producer may add more at any moment; what can make the count stale
+    /// is a concurrent reader taking some of the counted buffers, or a terminal
+    /// transition making them unreadable. Only with no other reader and a
+    /// stream that stays readable do the next that many non-blocking reads
+    /// return exactly the buffers counted. The bridge-backed
+    /// [`BridgeStream`](crate::bridge::stream) reports it, and returns `None`
+    /// while another read holds its consumer (a parked blocking read) rather
+    /// than wait. Auto-recovery (feature `hotplug-recovery`) uses it to drain
+    /// exactly the backlog readable when it retires a stream, and falls back to
+    /// one ring's worth when the count is unavailable.
+    fn readable_buffers(&self) -> Option<usize> {
+        None
+    }
+
     /// Closes the stream and releases all OS resources.
     ///
     /// **Deprecated.** All real cleanup happens in the stream's `Drop` impl

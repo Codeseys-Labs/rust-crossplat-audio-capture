@@ -219,6 +219,11 @@ impl AudioCapture {
     ///   while [`subscriber_dropped_count`](Self::subscriber_dropped_count)
     ///   is handle-lifetime and survives.
     ///
+    /// With auto-recovery (`AudioCaptureBuilder::with_auto_recovery`, feature
+    /// `hotplug-recovery`), a `start()` that creates a stream opens the system
+    /// default device current at that moment rather than the device `build()`
+    /// resolved, and begins a new recovery session.
+    ///
     /// Calling `start()` while a stream already exists is state-dependent:
     /// a **running** stream makes it an idempotent no-op (`Ok`); a stream
     /// that is present but **no longer running** (a naturally-ended stream
@@ -256,27 +261,18 @@ impl AudioCapture {
                             .to_string(),
                         context: None,
                     })?;
-            // hotplug-recovery: arm the device-change subscription BEFORE
-            // generation zero opens, so a default switch during startup is
-            // observed (and reconciled by the first poll) instead of lost.
+            // hotplug-recovery: a supervised capture opens generation zero the
+            // way it opens every replacement, on the default device current at
+            // this start() (not the one build() resolved), and only after the
+            // device-change watcher is armed: a default change before the open
+            // is reflected in it, and one after is handled by the first poll.
             #[cfg(feature = "hotplug-recovery")]
-            let supervision = self
-                .recovery
-                .as_ref()
-                .map(|_| super::recovery::Supervision::begin());
-            let capturing_stream_obj = device_ref.create_stream(&self.config.stream_config)?;
-            // hotplug-recovery: supervise the stream so a default-device change
-            // or a backend invalidation reopens it (break-before-make).
-            #[cfg(feature = "hotplug-recovery")]
-            let capturing_stream_obj = match (self.recovery.as_ref(), supervision) {
-                (Some(hub), Some(supervision)) => super::recovery::supervise(
-                    capturing_stream_obj,
-                    &self.config.stream_config,
-                    hub,
-                    supervision,
-                ),
-                _ => capturing_stream_obj,
+            let capturing_stream_obj = match self.recovery.as_ref() {
+                Some(hub) => super::recovery::start_supervised(&self.config.stream_config, hub)?,
+                None => device_ref.create_stream(&self.config.stream_config)?,
             };
+            #[cfg(not(feature = "hotplug-recovery"))]
+            let capturing_stream_obj = device_ref.create_stream(&self.config.stream_config)?;
             self.stream = Some(Arc::from(capturing_stream_obj));
             // Record the start time exactly once, the first time a real stream
             // is created. The idempotent-restart paths above (running → Ok,
@@ -1117,8 +1113,11 @@ impl AudioCapture {
     /// Before [`start`](Self::start) the state is
     /// [`Idle`](crate::core::recovery::RecoveryState::Idle); after
     /// [`stop`](Self::stop) it is
-    /// [`Stopped`](crate::core::recovery::RecoveryState::Stopped). `generation`,
-    /// `attempt`, and `successful_recoveries` restart with each `start()`;
+    /// [`Stopped`](crate::core::recovery::RecoveryState::Stopped). `session`
+    /// takes a new id with each newly opened capture session — a `start()`
+    /// that opens a stream (`0` before the first one; a `start()` on a running
+    /// handle or a failed open starts none) — and `generation`, `attempt`, and
+    /// `successful_recoveries` restart with it;
     /// `dropped_events` counts over the handle's lifetime, like the event
     /// subscription itself. Reading it takes one brief lock that recovery never
     /// holds across device work, so it does not block on a reopen in progress.
@@ -1134,7 +1133,10 @@ impl AudioCapture {
     /// falls behind loses the **newest** events rather than stalling recovery,
     /// and each loss is counted in [`RecoverySnapshot::dropped_events`]. The
     /// subscription may be created before [`start`](Self::start) and spans the
-    /// handle's lifetime, including stop/start restarts.
+    /// handle's lifetime, including stop/start restarts. Every event carries
+    /// the `session` that emitted it: compare it with
+    /// [`RecoverySnapshot::session`] to tell events a previous session left
+    /// queued before a restart from the current session's.
     ///
     /// # Errors
     ///

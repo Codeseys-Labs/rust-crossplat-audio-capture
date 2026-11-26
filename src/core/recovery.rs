@@ -12,11 +12,16 @@ pub struct AutoRecoveryConfig {
     pub initial_backoff: Duration,
     /// Upper bound on the exponential backoff between reopen attempts (default: 2 s).
     pub max_backoff: Duration,
-    /// Healthy run duration required to reset the failed-attempt budget (default: 60 s).
+    /// How long a recovered stream must be seen alive after it is installed to reset
+    /// the failed-attempt budget (default: 60 s). The period runs from the instant the
+    /// supervisor installs the stream (generation 0: when the session opens) to a later
+    /// read that finds it alive; a loss noticed late is not evidence of health.
     pub stable_period: Duration,
     /// Debounce window for coalescing rapid device-change notifications (default: 200 ms).
     pub settle_delay: Duration,
     /// Maximum time to wait for a device to reappear when none is present (default: 30 s).
+    /// It also bounds a probe still in flight when it expires: a probe whose result is
+    /// published after the deadline is discarded and the wait ends.
     pub device_wait_timeout: Duration,
 }
 
@@ -60,7 +65,8 @@ impl AutoRecoveryConfig {
         self
     }
 
-    /// Sets how long a recovered stream must stay healthy to reset its retry budget.
+    /// Sets how long a recovered stream must be seen alive after it is installed to
+    /// reset its retry budget.
     #[must_use]
     pub fn with_stable_period(mut self, stable_period: Duration) -> Self {
         self.stable_period = stable_period;
@@ -124,9 +130,17 @@ pub enum RecoveryState {
 #[derive(Debug, Clone, PartialEq, Eq)]
 #[non_exhaustive]
 pub struct RecoverySnapshot {
+    /// Capture session the snapshot describes: `0` before any session opened, then a
+    /// new id for each newly opened capture session — an `AudioCapture::start()` that
+    /// opens a stream. A `start()` on a running handle is a no-op and a failed open
+    /// starts no session; neither changes the id. Events carry the id of the session
+    /// that emitted them, so events a previous session left queued before a restart
+    /// can be told apart from the current session's.
+    pub session: u64,
     /// Supervisor state when the snapshot was taken.
     pub state: RecoveryState,
-    /// Identifier of the most recently published stream generation.
+    /// Identifier of the most recently published stream generation; restarts at 0
+    /// with every session.
     pub generation: u64,
     /// Current attempt within the supervisor's retry budget.
     pub attempt: u32,
@@ -137,16 +151,25 @@ pub struct RecoverySnapshot {
 }
 
 /// Notification of a device change or recovery decision within a capture session.
+///
+/// Every event carries the `session` that emitted it (see [`RecoverySnapshot::session`]):
+/// the subscription spans stop/start restarts, and generation numbers restart at 0 with
+/// each session, so the session id is what distinguishes events a previous session left
+/// queued from the current session's.
 #[derive(Debug, Clone, PartialEq, Eq)]
 #[non_exhaustive]
 pub enum RecoveryEvent {
     /// The system's default capture target changed.
     DefaultChanged {
+        /// Capture session that observed the change.
+        session: u64,
         /// Generation that was current when the change was observed.
         generation: u64,
     },
     /// The backend can no longer deliver data from the current device.
     DeviceInvalidated {
+        /// Capture session whose stream became invalid.
+        session: u64,
         /// Generation whose backend stream became invalid.
         generation: u64,
         /// Diagnostic description of the invalidation.
@@ -154,6 +177,8 @@ pub enum RecoveryEvent {
     },
     /// The supervisor scheduled another attempt to open a replacement stream.
     RetryScheduled {
+        /// Capture session the attempt belongs to.
+        session: u64,
         /// Generation the supervisor is attempting to replace.
         generation: u64,
         /// One-based number of the scheduled attempt.
@@ -163,6 +188,8 @@ pub enum RecoveryEvent {
     },
     /// A replacement stream is ready to supply audio.
     Recovered {
+        /// Capture session the replacement belongs to.
+        session: u64,
         /// Newly published stream generation, also carried by its audio buffers.
         generation: u64,
         /// Measured duration of the interruption before this generation was published.
@@ -170,6 +197,8 @@ pub enum RecoveryEvent {
     },
     /// Recovery ended without a replacement; no further attempts will be made.
     Exhausted {
+        /// Capture session whose recovery ended.
+        session: u64,
         /// Last published generation before recovery ended.
         generation: u64,
         /// Number of attempts spent before recovery ended.

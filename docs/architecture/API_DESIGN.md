@@ -467,6 +467,8 @@ pub trait CapturingStream: Send + Sync {
     fn buffers_dropped(&self) -> u64 { 0 }   // alias of overrun_count
     fn is_producing(&self) -> bool { self.is_running() }
     fn is_under_backpressure(&self) -> bool { false }
+    fn drop_window_snapshot(&self) -> (u64, u64) { (0, 0) }
+    fn readable_buffers(&self) -> Option<usize> { None } // queued backlog, when known
 
     // Deprecated; cleanup happens in Drop
     #[deprecated] fn close(self: Box<Self>) -> AudioResult<()> { Ok(()) }

@@ -185,8 +185,11 @@ impl AudioCaptureBuilder {
     /// Enables automatic recovery when the system default device changes or the
     /// running stream is invalidated *(feature `hotplug-recovery`)*.
     ///
-    /// The started stream is supervised: a default-device change (coalesced
-    /// over [`settle_delay`](AutoRecoveryConfig::settle_delay)) or a terminal
+    /// The started stream is supervised: each [`AudioCapture::start`] that
+    /// opens a stream opens the default device current at that moment (not the
+    /// one `build()` resolved; a `start()` on a running capture is a no-op),
+    /// and a default-device change (coalesced over
+    /// [`settle_delay`](AutoRecoveryConfig::settle_delay)) or a terminal
     /// backend error closes the old stream **before** opening a replacement on
     /// the current default device, retrying with capped exponential backoff per
     /// `config`. Delivered buffers keep a monotonic timeline across reopens and
@@ -196,7 +199,16 @@ impl AudioCaptureBuilder {
     /// [`AudioCapture::subscribe_recovery_events`]. A replacement whose delivery
     /// format differs from the original ends the stream with a fatal
     /// [`AudioError::StreamEnded`] before any sample of the new format is
-    /// delivered.
+    /// delivered. A blocking read of a running but quiet stream still fails
+    /// with [`AudioError::Timeout`] after the ordinary read timeout; time spent
+    /// recovering does not count against it. After
+    /// [`request_stop`](AudioCapture::request_stop), and for readers that
+    /// already hold the stream (a subscription or sink-drain thread) when
+    /// [`stop`](AudioCapture::stop) lands, reads deliver the
+    /// preserved tail and then end with [`AudioError::StreamEnded`]. The owning
+    /// `stop()` releases the handle's stream, so a read through the handle
+    /// afterwards returns the recoverable not-initialized
+    /// [`AudioError::StreamReadError`] instead.
     ///
     /// Only [`CaptureTarget::SystemDefault`] on desktop platforms is supported;
     /// [`preflight`](Self::preflight) (and therefore [`build`](Self::build) /
