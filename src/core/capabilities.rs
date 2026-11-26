@@ -5,8 +5,9 @@
 //! [`PlatformCapabilities`] provides honest reporting of what each platform's
 //! audio backend supports — never pretend a platform can do something it cannot.
 //!
-//! On macOS, capabilities are determined at runtime based on the OS version
-//! (Process Tap requires macOS 14.4+).
+//! On macOS, system, application and process-tree capture are determined at
+//! runtime from the OS version: all three go through the Core Audio Process
+//! Tap, and rsac supports them on macOS 14.4 and later.
 
 use super::config::SampleFormat;
 
@@ -27,13 +28,19 @@ use super::config::SampleFormat;
 /// start:
 ///
 /// 1. **Capability** (this type) — e.g. `supports_application_capture`. If
+///    `supports_application_capture` or `supports_process_tree_capture` is
 ///    `false`, [`AudioCaptureBuilder::build`](crate::api::AudioCaptureBuilder::build)
 ///    fails its preflight with
 ///    [`PlatformNotSupported`](crate::core::error::AudioError::PlatformNotSupported)
-///    before touching any device.
+///    before touching any device for an application or process-tree target.
+///    The preflight checks only those two: `supports_system_capture == false`
+///    (macOS below 14.4) is reported here but not yet enforced there, so a
+///    `SystemDefault` request is not rejected at preflight and fails when the
+///    capture starts.
 /// 2. **Permission** — a *runtime* grant, distinct from capability. On macOS
-///    per-application capture needs the Audio-Capture TCC permission even when
-///    `supports_application_capture == true`; query it with
+///    system and per-application capture need the Audio-Capture TCC permission
+///    even when `supports_system_capture` / `supports_application_capture` is
+///    `true`; query it with
 ///    [`check_audio_capture_permission`](crate::core::introspection::check_audio_capture_permission).
 /// 3. **Readiness / resolution** — whether the specific
 ///    [`CaptureTarget`](crate::core::config::CaptureTarget) resolves *now* (the
@@ -60,9 +67,24 @@ use super::config::SampleFormat;
 ///     // grant, handled when build()/start() is called.
 /// }
 /// ```
+// Every field is mirrored by hand in each binding surface; the `binding_lockstep`
+// tests at the end of this file fail until each surface declares a new field or the
+// pair is listed as omitted there.
 #[derive(Debug, Clone)]
 pub struct PlatformCapabilities {
     /// Whether system-wide audio capture is supported.
+    ///
+    /// On macOS this is `true` only on macOS 14.4 and later. System capture is a
+    /// global Core Audio Process Tap, the same mechanism behind
+    /// [`supports_application_capture`](Self::supports_application_capture) and
+    /// [`supports_process_tree_capture`](Self::supports_process_tree_capture);
+    /// rsac supports these capture modes from 14.4 on, so the three agree on
+    /// every macOS release. Earlier releases report `false`, and so does a macOS
+    /// whose version could not be read.
+    ///
+    /// Capability is not permission: `true` does not mean the user has granted
+    /// the Audio Capture (TCC) permission. That is a runtime grant, checked with
+    /// [`check_audio_capture_permission`](crate::core::introspection::check_audio_capture_permission).
     pub supports_system_capture: bool,
     /// Whether per-application audio capture is supported.
     pub supports_application_capture: bool,
@@ -234,16 +256,39 @@ impl PlatformCapabilities {
         }
     }
 
+    /// macOS capabilities for the running OS release, as reported by
+    /// `get_macos_version`.
     #[cfg(all(target_os = "macos", feature = "feat_macos"))]
     fn macos() -> Self {
-        // Process Tap API requires macOS 14.4+. Detect at runtime.
         let (major, minor, _patch) = get_macos_version();
-        let has_process_tap = major > 14 || (major == 14 && minor >= 4);
+        Self::macos_for_version(major, minor)
+    }
+
+    /// macOS capabilities for OS release `major.minor`.
+    ///
+    /// System, application and process-tree capture all run through the Core
+    /// Audio Process Tap. rsac supports these capture modes on macOS 14.4 and
+    /// later, so the three report `true` together from 14.4 on and `false`
+    /// together below it. `get_macos_version` reports a release it could not
+    /// detect as `0.0`, which is therefore reported as unsupported.
+    ///
+    /// The result is capability, not permission: `true` does not mean the Audio
+    /// Capture TCC grant has been given (see
+    /// [`check_audio_capture_permission`](crate::core::introspection::check_audio_capture_permission)).
+    ///
+    /// The version is an argument rather than detected here so that every host
+    /// can test the 14.4 boundary.
+    #[cfg_attr(
+        not(any(test, all(target_os = "macos", feature = "feat_macos"))),
+        allow(dead_code)
+    )]
+    fn macos_for_version(major: u32, minor: u32) -> Self {
+        let process_tap = major > 14 || (major == 14 && minor >= 4);
 
         Self {
-            supports_system_capture: true,
-            supports_application_capture: has_process_tap, // CoreAudio Process Tap (14.4+)
-            supports_process_tree_capture: has_process_tap, // Multi-PID tap via sysinfo child discovery (14.4+)
+            supports_system_capture: process_tap, // global Process Tap + aggregate device (14.4+)
+            supports_application_capture: process_tap, // CoreAudio Process Tap (14.4+)
+            supports_process_tree_capture: process_tap, // Multi-PID tap via sysinfo child discovery (14.4+)
             supports_device_selection: true,
             // CoreAudio AudioObjectPropertyListener watch() arm landed (rsac-3093):
             // device-list + default-output/input change notifications are wired up.
@@ -536,8 +581,8 @@ pub fn get_android_sdk_version() -> u32 {
 /// - macOS 14.4.1 → `(14, 4, 1)`
 /// - macOS 15.0   → `(15, 0, 0)`
 ///
-/// Used by [`PlatformCapabilities`] to determine Process Tap
-/// availability (requires macOS 14.4+).
+/// Used by [`PlatformCapabilities`] to determine Process Tap availability
+/// (rsac supports it on macOS 14.4 and later).
 #[cfg(target_os = "macos")]
 pub fn get_macos_version() -> (u32, u32, u32) {
     // Try sysctl first (no subprocess needed)
@@ -672,7 +717,8 @@ mod tests {
         #[cfg(all(target_os = "macos", feature = "feat_macos"))]
         {
             assert_eq!(caps.backend_name, "CoreAudio");
-            assert!(caps.supports_system_capture);
+            // `supports_system_capture` tracks the OS version; see
+            // `query_system_capture_reflects_version_on_macos`.
         }
     }
 
@@ -1066,7 +1112,14 @@ mod tests {
 
     // ── Capture capability tests ────────────────────────────────────
 
+    // macOS reports system capture only on 14.4 and later, and Android only from
+    // API 29; `query_system_capture_reflects_version_on_macos` and
+    // `android_reports_sdk_gated_playback_capture_with_consent` pin those two.
     #[test]
+    #[cfg(not(any(
+        all(target_os = "macos", feature = "feat_macos"),
+        target_os = "android"
+    )))]
     fn query_system_capture_supported() {
         if !HAS_BACKEND {
             return;
@@ -1094,6 +1147,19 @@ mod tests {
         assert_eq!(
             caps.supports_application_capture, expected,
             "supports_application_capture should match macOS version ({}.{})",
+            major, minor
+        );
+    }
+
+    #[test]
+    #[cfg(all(target_os = "macos", feature = "feat_macos"))]
+    fn query_system_capture_reflects_version_on_macos() {
+        let caps = PlatformCapabilities::query();
+        let (major, minor, _) = get_macos_version();
+        let expected = major > 14 || (major == 14 && minor >= 4);
+        assert_eq!(
+            caps.supports_system_capture, expected,
+            "supports_system_capture should match macOS version ({}.{})",
             major, minor
         );
     }
@@ -1166,6 +1232,40 @@ mod tests {
 
     // ── macOS version detection tests ────────────────────────────────
 
+    /// The macOS Process Tap gate on every host: `macos_for_version` is pure, so this
+    /// exercises the mapping `PlatformCapabilities::macos()` applies to the detected
+    /// version. System, application and process-tree capture flip together at 14.4.
+    #[test]
+    fn macos_capabilities_gate_on_process_tap_at_14_4() {
+        for (major, minor, expected) in [
+            (0, 0, false), // `get_macos_version()` fallback when detection fails
+            (13, 6, false),
+            (14, 0, false),
+            (14, 3, false),
+            (14, 4, true),
+            (14, 7, true),
+            (15, 0, true),
+            (26, 0, true),
+        ] {
+            let caps = PlatformCapabilities::macos_for_version(major, minor);
+            assert_eq!(
+                caps.supports_system_capture, expected,
+                "supports_system_capture on macOS {major}.{minor}"
+            );
+            assert_eq!(
+                caps.supports_application_capture, expected,
+                "supports_application_capture on macOS {major}.{minor}"
+            );
+            assert_eq!(
+                caps.supports_process_tree_capture, expected,
+                "supports_process_tree_capture on macOS {major}.{minor}"
+            );
+            // The version gates nothing else.
+            assert!(caps.supports_device_selection);
+            assert_eq!(caps.backend_name, "CoreAudio");
+        }
+    }
+
     #[test]
     #[cfg(all(target_os = "macos", feature = "feat_macos"))]
     fn get_macos_version_returns_nonzero() {
@@ -1218,5 +1318,649 @@ mod tests {
         );
         // The slice is a borrowed view of the const — identical contents/length.
         assert_eq!(rates, &PlatformCapabilities::SUPPORTED_SAMPLE_RATES);
+    }
+}
+
+// ── Binding lockstep ─────────────────────────────────────────────────────
+
+/// Binding lockstep drift guard — runs on **every** host, not only where a
+/// binding is built.
+///
+/// Every binding surface re-declares `PlatformCapabilities` by hand, each in its
+/// own naming (C getters, Go struct fields, napi and Tauri `camelCase`, Python
+/// properties). Nothing in a compiler connects them: a field added to the struct
+/// but not to a binding leaves that binding unable to report it, and the
+/// binding's own tests still pass. A field added to the struct must therefore
+/// reach every binding surface, or be listed in `OMITTED` with the reason that
+/// surface does not expose it.
+///
+/// Two halves enforce that:
+///
+/// - `rows` destructures `PlatformCapabilities` with every field named and no
+///   `..`, so adding or removing a field fails to compile until its row exists.
+/// - `every_capability_field_reaches_every_binding_surface` checks, against the
+///   **source text** of each surface (`include_str!`, as `jni_lockstep` does),
+///   that each row's tokens are declared in that surface's capabilities
+///   declaration — or, for an omitted pair, that they are not. A token counts
+///   only as a whole identifier on an active line: text inside a comment or a
+///   Python docstring is removed first, and a longer name that merely contains
+///   the token (`legacy_<token>`) is a different name.
+///
+/// The matchers have negative controls of their own
+/// (`declaration_matchers_see_only_active_whole_identifier_declarations`), and
+/// no token may be claimed by two fields of one surface
+/// (`no_surface_token_is_claimed_by_two_fields`).
+///
+/// Only struct fields are covered. The config-time rate whitelist
+/// (`supported_sample_rates`) is not a field: it derives from
+/// `SUPPORTED_SAMPLE_RATES`.
+///
+/// Packaging note: `/bindings` and `/integrations` are excluded from the
+/// crates.io package (`Cargo.toml` `exclude`). That is safe because this module
+/// is `#[cfg(test)]`: a packaged crate never compiles it, and the guard's job is
+/// repo-side CI, where the files always exist.
+#[cfg(test)]
+mod binding_lockstep {
+    use super::PlatformCapabilities;
+
+    const FFI_HEADER: &str = include_str!("../../bindings/rsac-ffi/include/rsac.h");
+    const GO_SOURCE: &str = include_str!("../../bindings/rsac-go/rsac.go");
+    const NAPI_TYPES: &str = include_str!("../../bindings/rsac-napi/index.d.ts");
+    const PYTHON_STUB: &str = include_str!("../../bindings/rsac-python/rsac/__init__.pyi");
+    const TAURI_MODELS: &str = include_str!("../../integrations/tauri-plugin-rsac/src/models.rs");
+    const TAURI_GUEST_JS: &str =
+        include_str!("../../integrations/tauri-plugin-rsac/guest-js/index.ts");
+
+    /// Fields a surface deliberately does not expose, as
+    /// `(surface name, PlatformCapabilities field, reason)`. The row for the field
+    /// still spells what the surface would call it, so the test can fail when an
+    /// omission goes stale (the surface gained the field).
+    ///
+    /// Empty: every surface declares every field.
+    const OMITTED: &[(&str, &str, &str)] = &[];
+
+    /// Where a surface's capability declarations live inside its source file.
+    #[derive(Clone, Copy)]
+    enum Scope {
+        /// Anywhere in the file.
+        Whole,
+        /// The text after `opener`, up to the next `end`. Keeps an unrelated type
+        /// that happens to share a name from satisfying the check.
+        Block {
+            opener: &'static str,
+            end: &'static str,
+        },
+    }
+
+    /// Comment syntax of a surface's language.
+    #[derive(Clone, Copy)]
+    struct Comments {
+        /// Opens a comment that runs to the end of the line.
+        line: &'static str,
+        /// Opens and closes a comment that may span lines.
+        block: (&'static str, &'static str),
+    }
+
+    /// `//` and `/* ... */`: C, Go, Rust and TypeScript.
+    const C_COMMENTS: Comments = Comments {
+        line: "//",
+        block: ("/*", "*/"),
+    };
+
+    /// `#` comments and `"""` docstrings: a docstring is text, not declarations.
+    const PYTHON_COMMENTS: Comments = Comments {
+        line: "#",
+        block: ("\"\"\"", "\"\"\""),
+    };
+
+    impl Comments {
+        /// `source` with every comment removed, one entry per source line; the
+        /// lines a block comment spans come back empty. The earliest opener on a
+        /// line wins, so a block opener inside a line comment opens nothing.
+        fn strip(self, source: &str) -> Vec<String> {
+            let (open, close) = self.block;
+            let mut in_block = false;
+            let mut lines = Vec::new();
+            for line in source.lines() {
+                let mut active = String::new();
+                let mut rest = line;
+                loop {
+                    if in_block {
+                        let Some(end) = rest.find(close) else { break };
+                        rest = &rest[end + close.len()..];
+                        in_block = false;
+                        continue;
+                    }
+                    let line_at = rest.find(self.line).unwrap_or(rest.len());
+                    let block_at = rest.find(open).unwrap_or(rest.len());
+                    if line_at < block_at {
+                        active.push_str(&rest[..line_at]);
+                        break;
+                    }
+                    if block_at < rest.len() {
+                        active.push_str(&rest[..block_at]);
+                        rest = &rest[block_at + open.len()..];
+                        in_block = true;
+                        continue;
+                    }
+                    active.push_str(rest);
+                    break;
+                }
+                lines.push(active);
+            }
+            lines
+        }
+    }
+
+    /// Byte offsets at which `token` occurs in `line` as a whole identifier: not
+    /// preceded and not followed by a character an identifier is made of.
+    fn identifier_offsets<'a>(line: &'a str, token: &'a str) -> impl Iterator<Item = usize> + 'a {
+        let is_identifier_char = |c: char| c.is_ascii_alphanumeric() || c == '_';
+        line.match_indices(token)
+            .map(|(at, _)| at)
+            .filter(move |&at| {
+                !line[..at].ends_with(is_identifier_char)
+                    && !line[at + token.len()..].starts_with(is_identifier_char)
+            })
+    }
+
+    /// Source text a surface's matcher is checked against; `{T}` stands for a
+    /// token.
+    struct Samples {
+        /// A declaration in the shape the surface really uses: must be found.
+        declared: &'static str,
+        /// Texts in which `{T}` is not an active declaration in the capabilities
+        /// block: commented out in each form the language has, declared in some
+        /// other block, or in a shape that is not the capabilities declaration.
+        /// None may be found.
+        not_declared: &'static [&'static str],
+    }
+
+    /// `(prefix, suffix)` pairs that turn a token into a different identifier.
+    const NEIGHBOURING_IDENTIFIERS: [(&str, &str); 4] =
+        [("legacy_", ""), ("Old", ""), ("", "_v2"), ("", "V2")];
+
+    struct Surface {
+        /// Key used by `OMITTED`.
+        name: &'static str,
+        /// Repo-relative path, for failure messages.
+        path: &'static str,
+        source: &'static str,
+        scope: Scope,
+        comments: Comments,
+        /// Whether a line declares a token in this surface's syntax, given the
+        /// last non-blank line before it and the text on either side of the token
+        /// on the line. Matching the declaration, not the bare token, keeps a
+        /// mention of the name from satisfying the check. It is only asked about
+        /// active lines (comments removed), and the token is always a whole
+        /// identifier there.
+        declares_at: fn(previous: &str, before: &str, after: &str) -> bool,
+        samples: Samples,
+    }
+
+    impl Surface {
+        /// Whether `token` is declared in the capabilities declaration of this
+        /// surface's own source.
+        fn declares(&self, token: &str) -> bool {
+            self.declares_in(self.source, token)
+        }
+
+        /// Whether `token` is an active declaration — outside every comment, as a
+        /// whole identifier — in the capabilities declaration of `source`.
+        fn declares_in(&self, source: &str, token: &str) -> bool {
+            let declarations = self.declarations_in(source);
+            let mut previous = "";
+            for line in declarations.lines() {
+                if identifier_offsets(line, token)
+                    .any(|at| (self.declares_at)(previous, &line[..at], &line[at + token.len()..]))
+                {
+                    return true;
+                }
+                if !line.trim().is_empty() {
+                    previous = line;
+                }
+            }
+            false
+        }
+
+        /// The active text of the capabilities declaration in `source`: comments
+        /// removed, then cut to the surface's scope, so an opener that only
+        /// appears in a comment does not start the scope.
+        fn declarations_in(&self, source: &str) -> String {
+            let active = self.comments.strip(source).join("\n");
+            let Scope::Block { opener, end } = self.scope else {
+                return active;
+            };
+            let start = active.find(opener).unwrap_or_else(|| {
+                panic!(
+                    "{} no longer contains `{opener}` outside a comment: update the scope of this surface in binding_lockstep",
+                    self.path
+                )
+            });
+            let body = &active[start + opener.len()..];
+            let len = body.find(end).unwrap_or_else(|| {
+                panic!(
+                    "{}: the declaration after `{opener}` has no terminating {end:?}: update the scope of this surface in binding_lockstep",
+                    self.path
+                )
+            });
+            body[..len].to_string()
+        }
+    }
+
+    /// The surfaces, in the order `Row::tokens` lists them. Each declaration shape
+    /// below is taken from the surface's current source.
+    fn surfaces() -> [Surface; 6] {
+        [
+            Surface {
+                name: "ffi",
+                path: "bindings/rsac-ffi/include/rsac.h",
+                source: FFI_HEADER,
+                // Free functions: the handle parameter pins a declaration, so a
+                // getter of another handle type does not count.
+                scope: Scope::Whole,
+                comments: C_COMMENTS,
+                declares_at: |_previous, _before, after| {
+                    after.starts_with("(const RsacCapabilities*")
+                },
+                samples: Samples {
+                    declared: "int32_t {T}(const RsacCapabilities* caps);\n",
+                    not_declared: &[
+                        "// int32_t {T}(const RsacCapabilities* caps);\n",
+                        "/* int32_t {T}(const RsacCapabilities* caps); */\n",
+                        "/**\n * int32_t {T}(const RsacCapabilities* caps);\n */\n",
+                        "void other(void); // int32_t {T}(const RsacCapabilities* caps);\n",
+                        "int32_t {T}(const RsacOtherHandle* other);\n",
+                    ],
+                },
+            },
+            Surface {
+                name: "go",
+                path: "bindings/rsac-go/rsac.go",
+                source: GO_SOURCE,
+                scope: Scope::Block {
+                    opener: "type Capabilities struct {",
+                    end: "\n}",
+                },
+                comments: C_COMMENTS,
+                declares_at: |_previous, before, after| {
+                    before.trim().is_empty() && after.starts_with(char::is_whitespace)
+                },
+                samples: Samples {
+                    declared: "type Capabilities struct {\n\t{T} bool\n}\n",
+                    not_declared: &[
+                        "type Capabilities struct {\n\t// {T} bool\n}\n",
+                        "type Capabilities struct {\n\t/* {T} bool */\n}\n",
+                        "type Capabilities struct {\n\t/*\n\t{T} bool\n\t*/\n}\n",
+                        "type Capabilities struct {\n\tOther bool // {T} bool\n}\n",
+                        "type Other struct {\n\t{T} bool\n}\n\ntype Capabilities struct {\n}\n",
+                    ],
+                },
+            },
+            Surface {
+                name: "napi",
+                path: "bindings/rsac-napi/index.d.ts",
+                source: NAPI_TYPES,
+                scope: Scope::Block {
+                    opener: "export interface PlatformCapabilities {",
+                    end: "\n}",
+                },
+                comments: C_COMMENTS,
+                declares_at: |_previous, before, after| {
+                    before.trim().is_empty() && after.starts_with(':')
+                },
+                samples: Samples {
+                    declared: "export interface PlatformCapabilities {\n  {T}: boolean;\n}\n",
+                    not_declared: &[
+                        "export interface PlatformCapabilities {\n  // {T}: boolean;\n}\n",
+                        "export interface PlatformCapabilities {\n  /** {T}: boolean; */\n}\n",
+                        "export interface PlatformCapabilities {\n  /**\n   * {T}: boolean;\n   */\n}\n",
+                        "export interface PlatformCapabilities {\n  /*\n  {T}: boolean;\n  */\n}\n",
+                        "export interface PlatformCapabilities {\n  other: boolean; // {T}: boolean;\n}\n",
+                        "export interface Other {\n  {T}: boolean;\n}\n\nexport interface PlatformCapabilities {\n}\n",
+                    ],
+                },
+            },
+            Surface {
+                name: "python",
+                path: "bindings/rsac-python/rsac/__init__.pyi",
+                source: PYTHON_STUB,
+                scope: Scope::Block {
+                    opener: "class PlatformCapabilities:",
+                    end: "\nclass ",
+                },
+                comments: PYTHON_COMMENTS,
+                // A property: the `@property` decorator is the last active line
+                // before the `def`.
+                declares_at: |previous, before, after| {
+                    previous.trim() == "@property"
+                        && before.trim() == "def"
+                        && after.starts_with("(self)")
+                },
+                samples: Samples {
+                    declared: "class PlatformCapabilities:\n    @property\n    def {T}(self) -> bool: ...\n\nclass End:\n    pass\n",
+                    not_declared: &[
+                        "class PlatformCapabilities:\n    def {T}(self) -> bool: ...\n\nclass End:\n    pass\n",
+                        "class PlatformCapabilities:\n    # @property\n    def {T}(self) -> bool: ...\n\nclass End:\n    pass\n",
+                        "class PlatformCapabilities:\n    @property\n    # def {T}(self) -> bool: ...\n\nclass End:\n    pass\n",
+                        "class PlatformCapabilities:\n    \"\"\"\n    @property\n    def {T}(self) -> bool: ...\n    \"\"\"\n\nclass End:\n    pass\n",
+                        "class Other:\n    @property\n    def {T}(self) -> bool: ...\n\nclass PlatformCapabilities:\n    pass\n\nclass End:\n    pass\n",
+                    ],
+                },
+            },
+            Surface {
+                name: "tauri-models",
+                path: "integrations/tauri-plugin-rsac/src/models.rs",
+                source: TAURI_MODELS,
+                scope: Scope::Block {
+                    opener: "pub struct Capabilities {",
+                    end: "\n}",
+                },
+                comments: C_COMMENTS,
+                declares_at: |_previous, before, after| {
+                    before.trim() == "pub" && after.starts_with(':')
+                },
+                samples: Samples {
+                    declared: "pub struct Capabilities {\n    pub {T}: bool,\n}\n",
+                    not_declared: &[
+                        "pub struct Capabilities {\n    // pub {T}: bool,\n}\n",
+                        "pub struct Capabilities {\n    /// pub {T}: bool,\n}\n",
+                        "pub struct Capabilities {\n    /* pub {T}: bool, */\n}\n",
+                        "pub struct Capabilities {\n    /*\n    pub {T}: bool,\n    */\n}\n",
+                        "pub struct Capabilities {\n    pub other: bool, // pub {T}: bool,\n}\n",
+                        "pub struct Capabilities {\n    {T}: bool,\n}\n",
+                        "pub struct Other {\n    pub {T}: bool,\n}\n\npub struct Capabilities {\n}\n",
+                    ],
+                },
+            },
+            Surface {
+                name: "tauri-guest-js",
+                path: "integrations/tauri-plugin-rsac/guest-js/index.ts",
+                source: TAURI_GUEST_JS,
+                scope: Scope::Block {
+                    opener: "export interface Capabilities {",
+                    end: "\n}",
+                },
+                comments: C_COMMENTS,
+                declares_at: |_previous, before, after| {
+                    before.trim().is_empty() && after.starts_with(':')
+                },
+                samples: Samples {
+                    declared: "export interface Capabilities {\n  {T}: boolean\n}\n",
+                    not_declared: &[
+                        "export interface Capabilities {\n  // {T}: boolean\n}\n",
+                        "export interface Capabilities {\n  /** {T}: boolean */\n}\n",
+                        "export interface Capabilities {\n  /**\n   * {T}: boolean\n   */\n}\n",
+                        "export interface Capabilities {\n  /*\n  {T}: boolean\n  */\n}\n",
+                        "export interface Capabilities {\n  other: boolean // {T}: boolean\n}\n",
+                        "export interface Other {\n  {T}: boolean\n}\n\nexport interface Capabilities {\n}\n",
+                    ],
+                },
+            },
+        ]
+    }
+
+    /// One `PlatformCapabilities` field and what each surface calls it.
+    struct Row {
+        field: &'static str,
+        /// Per surface, in `surfaces()` order: every token the surface declares for
+        /// the field (one field may span several, e.g. min and max of a range).
+        tokens: [&'static [&'static str]; 6],
+    }
+
+    /// Builds the rows from the one list of fields below. The `let` names every
+    /// field of `PlatformCapabilities` and has no `..`, so a field added to or
+    /// removed from the struct fails to compile here until this list matches.
+    macro_rules! rows {
+        ($(
+            $field:ident {
+                ffi: $ffi:expr,
+                go: $go:expr,
+                napi: $napi:expr,
+                python: $python:expr,
+                tauri_models: $tauri_models:expr,
+                tauri_guest_js: $tauri_guest_js:expr $(,)?
+            }
+        ),+ $(,)?) => {{
+            let PlatformCapabilities { $($field: _),+ } = PlatformCapabilities::unsupported();
+            vec![$(Row {
+                field: stringify!($field),
+                tokens: [$ffi, $go, $napi, $python, $tauri_models, $tauri_guest_js],
+            }),+]
+        }};
+    }
+
+    fn rows() -> Vec<Row> {
+        rows! {
+            supports_system_capture {
+                ffi: &["rsac_capabilities_supports_system_capture"],
+                go: &["SupportsSystemCapture"],
+                napi: &["supportsSystemCapture"],
+                python: &["supports_system_capture"],
+                tauri_models: &["supports_system_capture"],
+                tauri_guest_js: &["supportsSystemCapture"],
+            },
+            supports_application_capture {
+                ffi: &["rsac_capabilities_supports_app_capture"],
+                go: &["SupportsAppCapture"],
+                napi: &["supportsApplicationCapture"],
+                python: &["supports_application_capture"],
+                tauri_models: &["supports_application_capture"],
+                tauri_guest_js: &["supportsApplicationCapture"],
+            },
+            supports_process_tree_capture {
+                ffi: &["rsac_capabilities_supports_process_tree"],
+                go: &["SupportsProcessTree"],
+                napi: &["supportsProcessTreeCapture"],
+                python: &["supports_process_tree_capture"],
+                tauri_models: &["supports_process_tree_capture"],
+                tauri_guest_js: &["supportsProcessTreeCapture"],
+            },
+            supports_device_selection {
+                ffi: &["rsac_capabilities_supports_device_selection"],
+                go: &["SupportsDeviceSelection"],
+                napi: &["supportsDeviceSelection"],
+                python: &["supports_device_selection"],
+                tauri_models: &["supports_device_selection"],
+                tauri_guest_js: &["supportsDeviceSelection"],
+            },
+            supports_device_change_notifications {
+                ffi: &["rsac_capabilities_supports_device_change_notifications"],
+                go: &["SupportsDeviceChangeNotifications"],
+                napi: &["supportsDeviceChangeNotifications"],
+                python: &["supports_device_change_notifications"],
+                tauri_models: &["supports_device_change_notifications"],
+                tauri_guest_js: &["supportsDeviceChangeNotifications"],
+            },
+            requires_user_consent {
+                ffi: &["rsac_capabilities_requires_user_consent"],
+                go: &["RequiresUserConsent"],
+                napi: &["requiresUserConsent"],
+                python: &["requires_user_consent"],
+                tauri_models: &["requires_user_consent"],
+                tauri_guest_js: &["requiresUserConsent"],
+            },
+            supported_sample_formats {
+                ffi: &[
+                    "rsac_capabilities_supported_sample_format_count",
+                    "rsac_capabilities_supported_sample_format_at",
+                ],
+                go: &["SupportedSampleFormats"],
+                napi: &["supportedSampleFormats"],
+                python: &["supported_sample_formats"],
+                tauri_models: &["supported_sample_formats"],
+                tauri_guest_js: &["supportedSampleFormats"],
+            },
+            sample_rate_range {
+                ffi: &[
+                    "rsac_capabilities_min_sample_rate",
+                    "rsac_capabilities_max_sample_rate",
+                ],
+                go: &["MinSampleRate", "MaxSampleRate"],
+                napi: &["minSampleRate", "maxSampleRate"],
+                python: &["sample_rate_range"],
+                tauri_models: &["sample_rate_range"],
+                tauri_guest_js: &["sampleRateRange"],
+            },
+            max_channels {
+                ffi: &["rsac_capabilities_max_channels"],
+                go: &["MaxChannels"],
+                napi: &["maxChannels"],
+                python: &["max_channels"],
+                tauri_models: &["max_channels"],
+                tauri_guest_js: &["maxChannels"],
+            },
+            backend_name {
+                ffi: &["rsac_capabilities_backend_name"],
+                go: &["BackendName"],
+                napi: &["backendName"],
+                python: &["backend_name"],
+                tauri_models: &["backend_name"],
+                tauri_guest_js: &["backendName"],
+            },
+        }
+    }
+
+    #[test]
+    fn every_capability_field_reaches_every_binding_surface() {
+        let surfaces = surfaces();
+        for row in rows() {
+            for (surface, tokens) in surfaces.iter().zip(row.tokens) {
+                assert!(
+                    !tokens.is_empty(),
+                    "`{}` names no token for surface `{}`: spell what the surface calls it, \
+                     and list the pair in OMITTED if the surface does not expose it",
+                    row.field,
+                    surface.name
+                );
+                let omitted = OMITTED
+                    .iter()
+                    .any(|(name, field, _)| *name == surface.name && *field == row.field);
+                for token in tokens {
+                    let declared = surface.declares(token);
+                    if omitted {
+                        assert!(
+                            !declared,
+                            "`{}` is listed in OMITTED for `{}`, but {} declares `{token}`: \
+                             remove the omission",
+                            row.field, surface.name, surface.path
+                        );
+                    } else {
+                        assert!(
+                            declared,
+                            "PlatformCapabilities::{} has no active declaration of `{token}` in {}: \
+                             add it to that binding, or list the pair in OMITTED with the reason",
+                            row.field, surface.path
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn omissions_name_real_surfaces_and_fields_and_give_a_reason() {
+        let surfaces = surfaces();
+        let rows = rows();
+        for (surface, field, reason) in OMITTED {
+            assert!(
+                surfaces.iter().any(|s| s.name == *surface),
+                "OMITTED names unknown surface `{surface}`"
+            );
+            assert!(
+                rows.iter().any(|r| r.field == *field),
+                "OMITTED names unknown field `{field}`"
+            );
+            assert!(
+                !reason.trim().is_empty(),
+                "OMITTED entry ({surface}, {field}) has no reason"
+            );
+        }
+    }
+
+    /// A token names one field on a surface. A new row that copied another
+    /// field's tokens would otherwise pass without declaring anything of its own.
+    #[test]
+    fn no_surface_token_is_claimed_by_two_fields() {
+        let surfaces = surfaces();
+        let rows = rows();
+        for (index, surface) in surfaces.iter().enumerate() {
+            let mut owners = std::collections::HashMap::new();
+            for row in &rows {
+                for token in row.tokens[index] {
+                    let first = owners.insert(*token, row.field);
+                    assert!(
+                        first.is_none(),
+                        "`{token}` is claimed by `{}` and by `{}` on surface `{}`: each field \
+                         needs a declaration of its own",
+                        first.unwrap_or_default(),
+                        row.field,
+                        surface.name
+                    );
+                }
+            }
+        }
+    }
+
+    /// The matchers must be able to fail: a token no surface declares is found in
+    /// none of them.
+    #[test]
+    fn declaration_matchers_reject_an_undeclared_token() {
+        for surface in surfaces() {
+            assert!(
+                !surface.declares("rsac_no_such_capability"),
+                "{} matched a token that no surface declares",
+                surface.path
+            );
+        }
+    }
+
+    /// Negative controls, per surface, on synthetic source: the surface's own
+    /// declaration shape is found (so the controls are not vacuous), and none of
+    /// these is — the declaration commented out in every comment form the
+    /// language has, the declaration in another block, a declaration of another
+    /// shape, and a different identifier that contains the token (with a prefix or
+    /// a suffix).
+    #[test]
+    fn declaration_matchers_see_only_active_whole_identifier_declarations() {
+        const TOKEN: &str = "probe_capability";
+        for surface in surfaces() {
+            let samples = &surface.samples;
+            assert!(
+                surface.declares_in(&samples.declared.replace("{T}", TOKEN), TOKEN),
+                "{}: the matcher does not recognise a declaration in the shape the surface uses",
+                surface.path
+            );
+            for (index, template) in samples.not_declared.iter().enumerate() {
+                assert!(
+                    !surface.declares_in(&template.replace("{T}", TOKEN), TOKEN),
+                    "{}: negative control {index} was taken for a declaration of `{TOKEN}`: {template:?}",
+                    surface.path
+                );
+            }
+            for (prefix, suffix) in NEIGHBOURING_IDENTIFIERS {
+                let other = samples
+                    .declared
+                    .replace("{T}", &format!("{prefix}{TOKEN}{suffix}"));
+                assert!(
+                    !surface.declares_in(&other, TOKEN),
+                    "{}: declaring `{prefix}{TOKEN}{suffix}` was taken for declaring `{TOKEN}`",
+                    surface.path
+                );
+            }
+        }
+    }
+
+    /// The earliest comment opener on a line decides what is a comment, and a
+    /// block comment hides the lines it spans.
+    #[test]
+    fn comment_stripping_follows_the_earliest_opener() {
+        assert_eq!(C_COMMENTS.strip("a // b /* c\nd"), ["a ", "d"]);
+        assert_eq!(C_COMMENTS.strip("a /* b // c */ d"), ["a  d"]);
+        assert_eq!(C_COMMENTS.strip("a /* b\n// c */ d\ne"), ["a ", " d", "e"]);
+        assert_eq!(
+            PYTHON_COMMENTS.strip("x # y \"\"\"\n\"\"\"a\"\"\" b"),
+            ["x ", " b"]
+        );
     }
 }

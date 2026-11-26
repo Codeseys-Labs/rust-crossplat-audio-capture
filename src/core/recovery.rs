@@ -108,6 +108,28 @@ impl AutoRecoveryConfig {
 }
 
 /// Lifecycle of a capture session supervised for automatic recovery.
+///
+/// The `Recovering` variant is `#[non_exhaustive]` as well, so a field can be added to it
+/// without a breaking change. Outside this crate it is matched with `..` and cannot be
+/// constructed.
+///
+/// ```
+/// use rsac::RecoveryState;
+///
+/// fn attempt(state: &RecoveryState) -> Option<u32> {
+///     match state {
+///         RecoveryState::Recovering { attempt, .. } => Some(*attempt),
+///         _ => None,
+///     }
+/// }
+/// ```
+///
+/// ```compile_fail,E0639
+/// use rsac::RecoveryState;
+///
+/// // E0639: a `#[non_exhaustive]` variant cannot be built with a struct expression outside its crate.
+/// let _ = RecoveryState::Recovering { attempt: 1 };
+/// ```
 #[derive(Debug, Clone, PartialEq, Eq)]
 #[non_exhaustive]
 pub enum RecoveryState {
@@ -116,6 +138,7 @@ pub enum RecoveryState {
     /// A backend stream is active and no recovery is in progress.
     Running,
     /// The current stream is unavailable and the supervisor is arranging a replacement.
+    #[non_exhaustive]
     Recovering {
         /// Current reopen attempt number.
         attempt: u32,
@@ -156,10 +179,33 @@ pub struct RecoverySnapshot {
 /// the subscription spans stop/start restarts, and generation numbers restart at 0 with
 /// each session, so the session id is what distinguishes events a previous session left
 /// queued from the current session's.
+///
+/// Every struct-like variant is `#[non_exhaustive]` as well, so a field can be added to a
+/// variant without a breaking change. Outside this crate a variant is matched with `..` and
+/// cannot be constructed.
+///
+/// ```
+/// use rsac::RecoveryEvent;
+///
+/// fn generation(event: &RecoveryEvent) -> Option<u64> {
+///     match event {
+///         RecoveryEvent::DefaultChanged { generation, .. } => Some(*generation),
+///         _ => None,
+///     }
+/// }
+/// ```
+///
+/// ```compile_fail,E0639
+/// use rsac::RecoveryEvent;
+///
+/// // E0639: a `#[non_exhaustive]` variant cannot be built with a struct expression outside its crate.
+/// let _ = RecoveryEvent::DefaultChanged { session: 1, generation: 0 };
+/// ```
 #[derive(Debug, Clone, PartialEq, Eq)]
 #[non_exhaustive]
 pub enum RecoveryEvent {
     /// The system's default capture target changed.
+    #[non_exhaustive]
     DefaultChanged {
         /// Capture session that observed the change.
         session: u64,
@@ -167,6 +213,7 @@ pub enum RecoveryEvent {
         generation: u64,
     },
     /// The backend can no longer deliver data from the current device.
+    #[non_exhaustive]
     DeviceInvalidated {
         /// Capture session whose stream became invalid.
         session: u64,
@@ -176,6 +223,7 @@ pub enum RecoveryEvent {
         reason: String,
     },
     /// The supervisor scheduled another attempt to open a replacement stream.
+    #[non_exhaustive]
     RetryScheduled {
         /// Capture session the attempt belongs to.
         session: u64,
@@ -187,6 +235,7 @@ pub enum RecoveryEvent {
         delay: Duration,
     },
     /// A replacement stream is ready to supply audio.
+    #[non_exhaustive]
     Recovered {
         /// Capture session the replacement belongs to.
         session: u64,
@@ -196,6 +245,7 @@ pub enum RecoveryEvent {
         outage: Duration,
     },
     /// Recovery ended without a replacement; no further attempts will be made.
+    #[non_exhaustive]
     Exhausted {
         /// Capture session whose recovery ended.
         session: u64,

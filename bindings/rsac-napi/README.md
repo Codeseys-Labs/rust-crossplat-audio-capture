@@ -134,7 +134,7 @@ Not every target is supported on every platform — check `platformCapabilities(
 
 ## Platform notes
 
-- **macOS**: Per-application capture requires macOS 14.4 or later (Process Tap API).
+- **macOS**: rsac supports system, per-application and process-tree capture on macOS 14.4 and later (all three use the Process Tap API).
 - **Linux**: Requires PipeWire 0.3.44+ and `libpipewire-0.3-dev` at runtime.
 - **Windows**: Process Loopback is available on Windows 10 2004+.
 
