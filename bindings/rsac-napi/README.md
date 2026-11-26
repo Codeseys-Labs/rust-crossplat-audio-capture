@@ -134,7 +134,7 @@ Not every target is supported on every platform — check `platformCapabilities(
 
 ## Platform notes
 
-- **macOS**: Per-application capture requires macOS 14.4 or later (Process Tap API).
+- **macOS**: System, per-application and process-tree capture require macOS 14.4 or later (Process Tap API).
 - **Linux**: Requires PipeWire 0.3.44+ and `libpipewire-0.3-dev` at runtime.
 - **Windows**: Process Loopback is available on Windows 10 2004+.
 

@@ -5,8 +5,9 @@
 //! [`PlatformCapabilities`] provides honest reporting of what each platform's
 //! audio backend supports — never pretend a platform can do something it cannot.
 //!
-//! On macOS, capabilities are determined at runtime based on the OS version
-//! (Process Tap requires macOS 14.4+).
+//! On macOS, system, application and process-tree capture are determined at
+//! runtime from the OS version: all three go through the Process Tap API,
+//! which requires macOS 14.4+.
 
 use super::config::SampleFormat;
 
@@ -32,8 +33,9 @@ use super::config::SampleFormat;
 ///    [`PlatformNotSupported`](crate::core::error::AudioError::PlatformNotSupported)
 ///    before touching any device.
 /// 2. **Permission** — a *runtime* grant, distinct from capability. On macOS
-///    per-application capture needs the Audio-Capture TCC permission even when
-///    `supports_application_capture == true`; query it with
+///    system and per-application capture need the Audio-Capture TCC permission
+///    even when `supports_system_capture` / `supports_application_capture` is
+///    `true`; query it with
 ///    [`check_audio_capture_permission`](crate::core::introspection::check_audio_capture_permission).
 /// 3. **Readiness / resolution** — whether the specific
 ///    [`CaptureTarget`](crate::core::config::CaptureTarget) resolves *now* (the
@@ -60,9 +62,23 @@ use super::config::SampleFormat;
 ///     // grant, handled when build()/start() is called.
 /// }
 /// ```
+// Every field is mirrored by hand in each binding surface; the `binding_lockstep`
+// tests at the end of this file fail until each surface declares a new field or the
+// pair is listed as omitted there.
 #[derive(Debug, Clone)]
 pub struct PlatformCapabilities {
     /// Whether system-wide audio capture is supported.
+    ///
+    /// On macOS this is `true` only on macOS 14.4 or later: system capture is a
+    /// global Core Audio Process Tap, the same API that gates
+    /// [`supports_application_capture`](Self::supports_application_capture) and
+    /// [`supports_process_tree_capture`](Self::supports_process_tree_capture), so
+    /// the three agree on every macOS release. Earlier releases report `false`,
+    /// and so does a macOS whose version could not be read.
+    ///
+    /// Capability is not permission: `true` does not mean the user has granted
+    /// the Audio Capture (TCC) permission. That is a runtime grant, checked with
+    /// [`check_audio_capture_permission`](crate::core::introspection::check_audio_capture_permission).
     pub supports_system_capture: bool,
     /// Whether per-application audio capture is supported.
     pub supports_application_capture: bool,
@@ -234,16 +250,39 @@ impl PlatformCapabilities {
         }
     }
 
+    /// macOS capabilities for the running OS release, as reported by
+    /// `get_macos_version`.
     #[cfg(all(target_os = "macos", feature = "feat_macos"))]
     fn macos() -> Self {
-        // Process Tap API requires macOS 14.4+. Detect at runtime.
         let (major, minor, _patch) = get_macos_version();
-        let has_process_tap = major > 14 || (major == 14 && minor >= 4);
+        Self::macos_for_version(major, minor)
+    }
+
+    /// macOS capabilities for OS release `major.minor`.
+    ///
+    /// System, application and process-tree capture all run through the Core
+    /// Audio Process Tap API, which exists only on macOS 14.4 and later: the
+    /// three report `true` together from 14.4 on and `false` together below it.
+    /// `get_macos_version` reports a release it could not detect as `0.0`, which
+    /// is therefore reported as unsupported.
+    ///
+    /// The result is capability, not permission: `true` does not mean the Audio
+    /// Capture TCC grant has been given (see
+    /// [`check_audio_capture_permission`](crate::core::introspection::check_audio_capture_permission)).
+    ///
+    /// The version is an argument rather than detected here so that every host
+    /// can test the 14.4 boundary.
+    #[cfg_attr(
+        not(any(test, all(target_os = "macos", feature = "feat_macos"))),
+        allow(dead_code)
+    )]
+    fn macos_for_version(major: u32, minor: u32) -> Self {
+        let process_tap = major > 14 || (major == 14 && minor >= 4);
 
         Self {
-            supports_system_capture: true,
-            supports_application_capture: has_process_tap, // CoreAudio Process Tap (14.4+)
-            supports_process_tree_capture: has_process_tap, // Multi-PID tap via sysinfo child discovery (14.4+)
+            supports_system_capture: process_tap, // global Process Tap + aggregate device (14.4+)
+            supports_application_capture: process_tap, // CoreAudio Process Tap (14.4+)
+            supports_process_tree_capture: process_tap, // Multi-PID tap via sysinfo child discovery (14.4+)
             supports_device_selection: true,
             // CoreAudio AudioObjectPropertyListener watch() arm landed (rsac-3093):
             // device-list + default-output/input change notifications are wired up.
@@ -672,7 +711,8 @@ mod tests {
         #[cfg(all(target_os = "macos", feature = "feat_macos"))]
         {
             assert_eq!(caps.backend_name, "CoreAudio");
-            assert!(caps.supports_system_capture);
+            // `supports_system_capture` tracks the OS version; see
+            // `query_system_capture_reflects_version_on_macos`.
         }
     }
 
@@ -1066,7 +1106,10 @@ mod tests {
 
     // ── Capture capability tests ────────────────────────────────────
 
+    // macOS reports system capture only where the Process Tap API exists (14.4+);
+    // `query_system_capture_reflects_version_on_macos` pins that mapping.
     #[test]
+    #[cfg(not(all(target_os = "macos", feature = "feat_macos")))]
     fn query_system_capture_supported() {
         if !HAS_BACKEND {
             return;
@@ -1094,6 +1137,19 @@ mod tests {
         assert_eq!(
             caps.supports_application_capture, expected,
             "supports_application_capture should match macOS version ({}.{})",
+            major, minor
+        );
+    }
+
+    #[test]
+    #[cfg(all(target_os = "macos", feature = "feat_macos"))]
+    fn query_system_capture_reflects_version_on_macos() {
+        let caps = PlatformCapabilities::query();
+        let (major, minor, _) = get_macos_version();
+        let expected = major > 14 || (major == 14 && minor >= 4);
+        assert_eq!(
+            caps.supports_system_capture, expected,
+            "supports_system_capture should match macOS version ({}.{})",
             major, minor
         );
     }
@@ -1166,6 +1222,40 @@ mod tests {
 
     // ── macOS version detection tests ────────────────────────────────
 
+    /// The macOS Process Tap gate on every host: `macos_for_version` is pure, so this
+    /// exercises the mapping `PlatformCapabilities::macos()` applies to the detected
+    /// version. System, application and process-tree capture flip together at 14.4.
+    #[test]
+    fn macos_capabilities_gate_on_process_tap_at_14_4() {
+        for (major, minor, expected) in [
+            (0, 0, false), // `get_macos_version()` fallback when detection fails
+            (13, 6, false),
+            (14, 0, false),
+            (14, 3, false),
+            (14, 4, true),
+            (14, 7, true),
+            (15, 0, true),
+            (26, 0, true),
+        ] {
+            let caps = PlatformCapabilities::macos_for_version(major, minor);
+            assert_eq!(
+                caps.supports_system_capture, expected,
+                "supports_system_capture on macOS {major}.{minor}"
+            );
+            assert_eq!(
+                caps.supports_application_capture, expected,
+                "supports_application_capture on macOS {major}.{minor}"
+            );
+            assert_eq!(
+                caps.supports_process_tree_capture, expected,
+                "supports_process_tree_capture on macOS {major}.{minor}"
+            );
+            // The version gates nothing else.
+            assert!(caps.supports_device_selection);
+            assert_eq!(caps.backend_name, "CoreAudio");
+        }
+    }
+
     #[test]
     #[cfg(all(target_os = "macos", feature = "feat_macos"))]
     fn get_macos_version_returns_nonzero() {
@@ -1218,5 +1308,368 @@ mod tests {
         );
         // The slice is a borrowed view of the const — identical contents/length.
         assert_eq!(rates, &PlatformCapabilities::SUPPORTED_SAMPLE_RATES);
+    }
+}
+
+// ── Binding lockstep ─────────────────────────────────────────────────────
+
+/// Binding lockstep drift guard — runs on **every** host, not only where a
+/// binding is built.
+///
+/// Every binding surface re-declares `PlatformCapabilities` by hand, each in its
+/// own naming (C getters, Go struct fields, napi and Tauri `camelCase`, Python
+/// properties). Nothing in a compiler connects them: a field added to the struct
+/// but not to a binding leaves that binding unable to report it, and the
+/// binding's own tests still pass. A field added to the struct must therefore
+/// reach every binding surface, or be listed in `OMITTED` with the reason that
+/// surface does not expose it.
+///
+/// Two halves enforce that:
+///
+/// - `rows` destructures `PlatformCapabilities` with every field named and no
+///   `..`, so adding or removing a field fails to compile until its row exists.
+/// - `every_capability_field_reaches_every_binding_surface` checks, against the
+///   **source text** of each surface (`include_str!`, as `jni_lockstep` does),
+///   that each row's tokens are declared in that surface's capabilities
+///   declaration — or, for an omitted pair, that they are not.
+///
+/// Only struct fields are covered. The config-time rate whitelist
+/// (`supported_sample_rates`) is not a field: it derives from
+/// `SUPPORTED_SAMPLE_RATES`.
+///
+/// Packaging note: `/bindings` and `/integrations` are excluded from the
+/// crates.io package (`Cargo.toml` `exclude`). That is safe because this module
+/// is `#[cfg(test)]`: a packaged crate never compiles it, and the guard's job is
+/// repo-side CI, where the files always exist.
+#[cfg(test)]
+mod binding_lockstep {
+    use super::PlatformCapabilities;
+
+    const FFI_HEADER: &str = include_str!("../../bindings/rsac-ffi/include/rsac.h");
+    const GO_SOURCE: &str = include_str!("../../bindings/rsac-go/rsac.go");
+    const NAPI_TYPES: &str = include_str!("../../bindings/rsac-napi/index.d.ts");
+    const PYTHON_STUB: &str = include_str!("../../bindings/rsac-python/rsac/__init__.pyi");
+    const TAURI_MODELS: &str = include_str!("../../integrations/tauri-plugin-rsac/src/models.rs");
+    const TAURI_GUEST_JS: &str =
+        include_str!("../../integrations/tauri-plugin-rsac/guest-js/index.ts");
+
+    /// Fields a surface deliberately does not expose, as
+    /// `(surface name, PlatformCapabilities field, reason)`. The row for the field
+    /// still spells what the surface would call it, so the test can fail when an
+    /// omission goes stale (the surface gained the field).
+    ///
+    /// Empty: every surface declares every field.
+    const OMITTED: &[(&str, &str, &str)] = &[];
+
+    /// Where a surface's capability declarations live inside its source file.
+    #[derive(Clone, Copy)]
+    enum Scope {
+        /// Anywhere in the file.
+        Whole,
+        /// The text after `opener`, up to the next `end`. Keeps an unrelated type
+        /// that happens to share a name from satisfying the check.
+        Block {
+            opener: &'static str,
+            end: &'static str,
+        },
+    }
+
+    struct Surface {
+        /// Key used by `OMITTED`.
+        name: &'static str,
+        /// Repo-relative path, for failure messages.
+        path: &'static str,
+        source: &'static str,
+        scope: Scope,
+        /// How a declaration of a token reads in this surface's syntax. Matching
+        /// the declaration, not the bare token, keeps a doc comment that mentions
+        /// the name from satisfying the check.
+        declaration: fn(&str) -> String,
+    }
+
+    impl Surface {
+        /// The part of `source` that declares capabilities.
+        fn declarations(&self) -> &'static str {
+            let source: &'static str = self.source;
+            match self.scope {
+                Scope::Whole => source,
+                Scope::Block { opener, end } => {
+                    let start = source.find(opener).unwrap_or_else(|| {
+                        panic!(
+                            "{} no longer contains `{opener}`: update the scope of this surface in binding_lockstep",
+                            self.path
+                        )
+                    });
+                    let body = &source[start + opener.len()..];
+                    let len = body.find(end).unwrap_or_else(|| {
+                        panic!(
+                            "{}: the declaration after `{opener}` has no terminating {end:?}: update the scope of this surface in binding_lockstep",
+                            self.path
+                        )
+                    });
+                    &body[..len]
+                }
+            }
+        }
+    }
+
+    /// The surfaces, in the order `Row::tokens` lists them. Each declaration shape
+    /// below is taken from the surface's current source.
+    fn surfaces() -> [Surface; 6] {
+        [
+            Surface {
+                name: "ffi",
+                path: "bindings/rsac-ffi/include/rsac.h",
+                source: FFI_HEADER,
+                // Free functions: the handle parameter pins a declaration, so a
+                // comment that mentions a getter does not count.
+                scope: Scope::Whole,
+                declaration: |getter| format!("{getter}(const RsacCapabilities*"),
+            },
+            Surface {
+                name: "go",
+                path: "bindings/rsac-go/rsac.go",
+                source: GO_SOURCE,
+                scope: Scope::Block {
+                    opener: "type Capabilities struct {",
+                    end: "\n}",
+                },
+                declaration: |field| format!("\n\t{field} "),
+            },
+            Surface {
+                name: "napi",
+                path: "bindings/rsac-napi/index.d.ts",
+                source: NAPI_TYPES,
+                scope: Scope::Block {
+                    opener: "export interface PlatformCapabilities {",
+                    end: "\n}",
+                },
+                declaration: |field| format!("\n  {field}: "),
+            },
+            Surface {
+                name: "python",
+                path: "bindings/rsac-python/rsac/__init__.pyi",
+                source: PYTHON_STUB,
+                scope: Scope::Block {
+                    opener: "class PlatformCapabilities:",
+                    end: "\nclass ",
+                },
+                declaration: |property| format!("def {property}(self)"),
+            },
+            Surface {
+                name: "tauri-models",
+                path: "integrations/tauri-plugin-rsac/src/models.rs",
+                source: TAURI_MODELS,
+                scope: Scope::Block {
+                    opener: "pub struct Capabilities {",
+                    end: "\n}",
+                },
+                declaration: |field| format!("pub {field}: "),
+            },
+            Surface {
+                name: "tauri-guest-js",
+                path: "integrations/tauri-plugin-rsac/guest-js/index.ts",
+                source: TAURI_GUEST_JS,
+                scope: Scope::Block {
+                    opener: "export interface Capabilities {",
+                    end: "\n}",
+                },
+                declaration: |field| format!("\n  {field}: "),
+            },
+        ]
+    }
+
+    /// One `PlatformCapabilities` field and what each surface calls it.
+    struct Row {
+        field: &'static str,
+        /// Per surface, in `surfaces()` order: every token the surface declares for
+        /// the field (one field may span several, e.g. min and max of a range).
+        tokens: [&'static [&'static str]; 6],
+    }
+
+    /// Builds the rows from the one list of fields below. The `let` names every
+    /// field of `PlatformCapabilities` and has no `..`, so a field added to or
+    /// removed from the struct fails to compile here until this list matches.
+    macro_rules! rows {
+        ($(
+            $field:ident {
+                ffi: $ffi:expr,
+                go: $go:expr,
+                napi: $napi:expr,
+                python: $python:expr,
+                tauri_models: $tauri_models:expr,
+                tauri_guest_js: $tauri_guest_js:expr $(,)?
+            }
+        ),+ $(,)?) => {{
+            let PlatformCapabilities { $($field: _),+ } = PlatformCapabilities::unsupported();
+            vec![$(Row {
+                field: stringify!($field),
+                tokens: [$ffi, $go, $napi, $python, $tauri_models, $tauri_guest_js],
+            }),+]
+        }};
+    }
+
+    fn rows() -> Vec<Row> {
+        rows! {
+            supports_system_capture {
+                ffi: &["rsac_capabilities_supports_system_capture"],
+                go: &["SupportsSystemCapture"],
+                napi: &["supportsSystemCapture"],
+                python: &["supports_system_capture"],
+                tauri_models: &["supports_system_capture"],
+                tauri_guest_js: &["supportsSystemCapture"],
+            },
+            supports_application_capture {
+                ffi: &["rsac_capabilities_supports_app_capture"],
+                go: &["SupportsAppCapture"],
+                napi: &["supportsApplicationCapture"],
+                python: &["supports_application_capture"],
+                tauri_models: &["supports_application_capture"],
+                tauri_guest_js: &["supportsApplicationCapture"],
+            },
+            supports_process_tree_capture {
+                ffi: &["rsac_capabilities_supports_process_tree"],
+                go: &["SupportsProcessTree"],
+                napi: &["supportsProcessTreeCapture"],
+                python: &["supports_process_tree_capture"],
+                tauri_models: &["supports_process_tree_capture"],
+                tauri_guest_js: &["supportsProcessTreeCapture"],
+            },
+            supports_device_selection {
+                ffi: &["rsac_capabilities_supports_device_selection"],
+                go: &["SupportsDeviceSelection"],
+                napi: &["supportsDeviceSelection"],
+                python: &["supports_device_selection"],
+                tauri_models: &["supports_device_selection"],
+                tauri_guest_js: &["supportsDeviceSelection"],
+            },
+            supports_device_change_notifications {
+                ffi: &["rsac_capabilities_supports_device_change_notifications"],
+                go: &["SupportsDeviceChangeNotifications"],
+                napi: &["supportsDeviceChangeNotifications"],
+                python: &["supports_device_change_notifications"],
+                tauri_models: &["supports_device_change_notifications"],
+                tauri_guest_js: &["supportsDeviceChangeNotifications"],
+            },
+            requires_user_consent {
+                ffi: &["rsac_capabilities_requires_user_consent"],
+                go: &["RequiresUserConsent"],
+                napi: &["requiresUserConsent"],
+                python: &["requires_user_consent"],
+                tauri_models: &["requires_user_consent"],
+                tauri_guest_js: &["requiresUserConsent"],
+            },
+            supported_sample_formats {
+                ffi: &[
+                    "rsac_capabilities_supported_sample_format_count",
+                    "rsac_capabilities_supported_sample_format_at",
+                ],
+                go: &["SupportedSampleFormats"],
+                napi: &["supportedSampleFormats"],
+                python: &["supported_sample_formats"],
+                tauri_models: &["supported_sample_formats"],
+                tauri_guest_js: &["supportedSampleFormats"],
+            },
+            sample_rate_range {
+                ffi: &[
+                    "rsac_capabilities_min_sample_rate",
+                    "rsac_capabilities_max_sample_rate",
+                ],
+                go: &["MinSampleRate", "MaxSampleRate"],
+                napi: &["minSampleRate", "maxSampleRate"],
+                python: &["sample_rate_range"],
+                tauri_models: &["sample_rate_range"],
+                tauri_guest_js: &["sampleRateRange"],
+            },
+            max_channels {
+                ffi: &["rsac_capabilities_max_channels"],
+                go: &["MaxChannels"],
+                napi: &["maxChannels"],
+                python: &["max_channels"],
+                tauri_models: &["max_channels"],
+                tauri_guest_js: &["maxChannels"],
+            },
+            backend_name {
+                ffi: &["rsac_capabilities_backend_name"],
+                go: &["BackendName"],
+                napi: &["backendName"],
+                python: &["backend_name"],
+                tauri_models: &["backend_name"],
+                tauri_guest_js: &["backendName"],
+            },
+        }
+    }
+
+    #[test]
+    fn every_capability_field_reaches_every_binding_surface() {
+        let surfaces = surfaces();
+        for row in rows() {
+            for (surface, tokens) in surfaces.iter().zip(row.tokens) {
+                assert!(
+                    !tokens.is_empty(),
+                    "`{}` names no token for surface `{}`: spell what the surface calls it, \
+                     and list the pair in OMITTED if the surface does not expose it",
+                    row.field,
+                    surface.name
+                );
+                let omitted = OMITTED
+                    .iter()
+                    .any(|(name, field, _)| *name == surface.name && *field == row.field);
+                let declarations = surface.declarations();
+                for token in tokens {
+                    let declared = declarations.contains(&(surface.declaration)(token));
+                    if omitted {
+                        assert!(
+                            !declared,
+                            "`{}` is listed in OMITTED for `{}`, but {} declares `{token}`: \
+                             remove the omission",
+                            row.field, surface.name, surface.path
+                        );
+                    } else {
+                        assert!(
+                            declared,
+                            "PlatformCapabilities::{} has no declaration of `{token}` in {}: \
+                             add it to that binding, or list the pair in OMITTED with the reason",
+                            row.field, surface.path
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn omissions_name_real_surfaces_and_fields_and_give_a_reason() {
+        let surfaces = surfaces();
+        let rows = rows();
+        for (surface, field, reason) in OMITTED {
+            assert!(
+                surfaces.iter().any(|s| s.name == *surface),
+                "OMITTED names unknown surface `{surface}`"
+            );
+            assert!(
+                rows.iter().any(|r| r.field == *field),
+                "OMITTED names unknown field `{field}`"
+            );
+            assert!(
+                !reason.trim().is_empty(),
+                "OMITTED entry ({surface}, {field}) has no reason"
+            );
+        }
+    }
+
+    /// The matchers must be able to fail: a token no surface declares is found in
+    /// none of them.
+    #[test]
+    fn declaration_matchers_reject_an_undeclared_token() {
+        for surface in surfaces() {
+            assert!(
+                !surface
+                    .declarations()
+                    .contains(&(surface.declaration)("rsac_no_such_capability")),
+                "{} matched a token that no surface declares",
+                surface.path
+            );
+        }
     }
 }
