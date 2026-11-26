@@ -402,10 +402,20 @@ delete the tag locally and remotely
 issue, and tag again through the checked sequence above. A fix that needs a
 new commit needs its own green dispatched run: push it, set `BUMP_SHA` to it,
 dispatch `ci.yml` as in block 1, then run blocks 2 and 3. The earlier run
-covered the old commit only. If **any** package already has it, or you cannot establish
-that for every package, leave the tag where it is and ship the fix as a new
-version: re-tagging would make the same version name point at different
-commits across registries. crates.io publishes are
+covered the old commit only. If **any** package already has it, or you cannot
+establish that for every package, leave the tag where it is and ship the fix
+as a new version: re-tagging would make the same version name point at
+different commits across registries.
+
+The Go module tag `bindings/rsac-go/vX.Y.Z`, which the automated flow pushes
+with the crate tag, is a package in this sense, and its state cannot be
+established: the Go module proxy keeps the first copy of a version anyone asks
+it for, and asking it yourself makes it fetch. If that tag was pushed, treat
+`X.Y.Z` as published and ship the fix as a new version. Only a release whose Go
+tag was never pushed (a manual release stopped before that step) can be
+re-tagged, and then both tags are created together on the fixed commit.
+
+crates.io publishes are
 irrevocable,
 so `publish` is gated behind a successful `verify` + `semver-checks` — but a failure
 inside `publish` (e.g. transient network, token rotation) is not safe
