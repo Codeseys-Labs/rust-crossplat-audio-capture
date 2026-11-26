@@ -325,9 +325,12 @@ GitHub. Owner: `Codeseys-Labs`; repository:
 From a clean `master` with CI already green on the commit you are about to bump
 (see §2 for the pre-release checklist). The version-bump commit this block
 creates is tagged without a CI run of its own: it differs from the verified
-commit only by version strings and the CHANGELOG rotation, the lockstep check in
-the chain validates those, and the tag-time `ci.yml` run plus `release.yml`'s
-`verify` job are the gate for the tagged commit before anything is published.
+commit only by version strings and the CHANGELOG rotation, and the lockstep check
+in the chain validates those. What gates publishing of the tagged commit is the
+publish workflows themselves: `release.yml`'s `verify` and `semver-checks` jobs
+and each publish workflow's `--expect` lockstep check. The tag-time `ci.yml` run
+starts in parallel with them; it is evidence after the fact and does not block
+a publish.
 
 ```bash
 # Bump the version + promote CHANGELOG entries under a dated heading.
@@ -875,10 +878,11 @@ Then dispatch CI on the commit you are about to bump
 `ci-audio-tests.yml` for the audio matrix) and confirm **every platform is
 green** — CI is manual, so no run exists until you start one. That pre-bump run
 is the only pre-tag CI requirement in the manual path: the bump commit that
-actually gets tagged is covered by the lockstep check and then by tag-time CI
-and `release.yml`'s `verify` job, which gate publishing (see "Using the
-automated flow"). In the release-prepare flow the dispatched run on the release
-branch already covers the bumped tree.
+actually gets tagged is covered by the lockstep check, and its publish is gated
+by `release.yml`'s `verify` and `semver-checks` jobs and each publish workflow's
+`--expect` lockstep check; the tag-time `ci.yml` run is parallel, after-the-fact
+evidence (see "Using the automated flow"). In the release-prepare flow the
+dispatched run on the release branch already covers the bumped tree.
 The workflows live in `.github/workflows/` (`ci.yml`,
 `ci-audio-tests.yml`, and the platform-specific splits). Check the Actions
 tab — do not rely solely on local results, since Linux PipeWire, Windows
