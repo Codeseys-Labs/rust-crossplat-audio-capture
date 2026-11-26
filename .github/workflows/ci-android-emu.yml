@@ -98,29 +98,22 @@ on:
           has proven the synthetic-mic route is reliable).
         type: boolean
         default: false
+  # Narrow, Android-only path filter: this leg boots an AVD (35m cap), so it must
+  # not fire on desktop PRs. Shared-layer changes (src/api.rs, src/core/**,
+  # src/bridge/**, Cargo.*, bindings/rsac-ffi/**) are NOT triggers — ci.yml's
+  # `mobile-android` job gates their Android COMPILATION on every mobile-touching
+  # PR and every push to main/master; run this workflow via workflow_dispatch
+  # when a shared-layer change needs runtime verification.
   pull_request:
     branches: [main, master, 'release/**']
     paths:
       - 'src/audio/android/**'
-      # The smoke exercises the whole public capture path — shared-layer
-      # regressions must retrigger runtime verification (CodeRabbit PR #65).
-      - 'src/api.rs'
-      - 'src/bridge/**'
-      - 'src/core/**'
       - 'tests/android_emu_smoke.rs'
-      - 'mobile/android-native/**'
       # rsac-255b instrumented tier: the androidTest sources + gradle config
-      # live under mobile/android/, and the test APK drives the shipped C ABI
-      # built from bindings/rsac-ffi/.
-      - 'mobile/android/**'
-      - 'bindings/rsac-ffi/**'
-      # rsac-e6d3 playback tier: the test-only driver cdylib (librsac.so) that
-      # drives the public SystemDefault playback API from the instrumented test.
-      - 'mobile/androidtest-native/**'
-      - 'Cargo.toml'
-      - 'Cargo.lock'
+      # live under mobile/android/; rsac-e6d3 playback tier: the test-only
+      # driver cdylib under mobile/androidtest-native/.
+      - 'mobile/android*/**'
       - '.github/workflows/ci-android-emu.yml'
-      - '.github/actions/**'
       - 'scripts/ci-android-emu-payload.sh'
 
 concurrency:

@@ -1,24 +1,26 @@
-# mise.toml — per-project toolchain + task runner for rsac (rsac-7e19).
+# mise.toml — per-project dev tools + task runner for rsac (rsac-7e19).
 #
-# Scope (deliberate): mise manages the POLYGLOT toolchain the bindings need
-# (Bun, Node, Go, Python) plus dev tools (lefthook), and provides
-# cross-platform tasks. It does NOT manage Rust — rust-toolchain.toml +
-# rustup stay the single source of truth for the Rust toolchain (CI pins
-# via dtolnay/rust-toolchain; the MSRV job depends on rustup override
-# semantics).
+# Scope (deliberate):
+#   - Runtime pins (bun/node/go/python) live in .tool-versions — the one
+#     format that BOTH mise AND CI (oven-sh/setup-bun, actions/setup-node,
+#     actions/setup-go, actions/setup-python via `*-version-file:
+#     .tool-versions`) read, so local and CI versions cannot drift. Bump a
+#     runtime there, not here.
+#   - This file holds the mise-only dev tools (betterleaks, lefthook) and the
+#     cross-platform tasks.
+#   - Rust is NOT managed here — rust-toolchain.toml + rustup stay the single
+#     source of truth for the Rust toolchain (CI pins via
+#     dtolnay/rust-toolchain; the MSRV job depends on rustup override
+#     semantics).
 #
 # Onboarding:   mise install && mise run setup
 # Daily driver: mise run gate   (before pushing; lefthook also runs it on pre-push)
 #
-# CI does not use mise (yet) — versions below mirror what CI installs
-# (setup-go 1.22, napi engines node >=18, Bun-first npm pipeline). If you
-# bump one, check the workflows.
+# CI uses mise only for betterleaks (jdx/mise-action, `install_args:
+# betterleaks`) so the secret-scanner version below is the single pin.
 
 [tools]
-bun = "1"
-node = "22"
-go = "1.22"
-python = "3.12"
+betterleaks = "1.10.1"
 lefthook = "1"
 
 [env]
@@ -69,3 +71,29 @@ run_windows = "pwsh -NoProfile -ExecutionPolicy Bypass -File scripts/run-bash.ps
 description = "Post-publish docs.rs rendering spot-check: mise run release:verify-docs [-- X.Y.Z]"
 run = "bash scripts/verify-docs-rs.sh"
 run_windows = "pwsh -NoProfile -ExecutionPolicy Bypass -File scripts/run-bash.ps1 scripts/verify-docs-rs.sh"
+
+# Hook bodies (called from lefthook.yml). Windows routes through
+# scripts/run-bash.ps1 (Git bash by absolute path), never a bare `bash` that
+# can resolve to WSL's System32\bash.exe.
+[tasks."hook:commit-msg"]
+description = "commit-msg hook body (AGENTS.md §6): mise run hook:commit-msg -- <msg-file>"
+hide = true
+run = "bash scripts/hooks/commit-msg.sh"
+run_windows = "powershell -NoProfile -ExecutionPolicy Bypass -File scripts/run-bash.ps1 scripts/hooks/commit-msg.sh"
+
+# betterleaks v1 does not auto-load .betterleaks.toml, so --config is explicit.
+# --trust-local-git-config: betterleaks' default git-config isolation fails on
+# Windows Git ("fatal: error reading /dev/null") and aborts the whole scan;
+# these tasks only ever scan the developer's own checkout.
+[tasks."secrets:staged"]
+description = "betterleaks: scan the staged diff (lefthook pre-commit)"
+run = "betterleaks git . --pre-commit --staged --trust-local-git-config --config .betterleaks.toml --redact --no-banner"
+
+[tasks.secrets]
+description = "betterleaks: scan the full git history (same scan the CI `secrets` job runs on pushes)"
+run = "betterleaks git . --trust-local-git-config --config .betterleaks.toml --redact --no-banner"
+
+[tasks."check:cross"]
+description = "cross-rs Linux matrix (x64, ARM64, all-features); needs Docker + `cross`"
+run = "bash scripts/cross-compile-check.sh"
+run_windows = "powershell -NoProfile -ExecutionPolicy Bypass -File scripts/run-bash.ps1 scripts/cross-compile-check.sh"

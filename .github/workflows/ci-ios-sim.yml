@@ -10,9 +10,9 @@ name: iOS Simulator Runtime Leg
 # the rsac public API and runs the previously-dormant cfg(ios) unit tests. A
 # physical-device pass and the interleaved-delivery / start-failure-rollback
 # paths remain a runbook (see docs/MOBILE_BACKEND_DESIGN.md and the disposition
-# table in the PR body). This leg is opt-in (workflow_dispatch) + fires on iOS
-# source changes; it is NOT a required PR gate until the acceptance criteria in
-# the PR body are observed green on a runner.
+# table in the PR body). This leg is opt-in (workflow_dispatch) + fires only on
+# PRs touching the iOS backend/harness paths below; it is NOT a required PR gate
+# until the acceptance criteria in the PR body are observed green on a runner.
 #
 # Test-harness mechanism: the crate test binaries are built for
 # aarch64-apple-ios-sim (Blacksmith macos-15 is Apple Silicon) and executed
@@ -36,25 +36,21 @@ on:
           has proven the host-mic route is reliable).
         type: boolean
         default: false
+  # Narrow, iOS-only path filter: this leg boots a simulator on a 6-vCPU macOS
+  # runner (50m cap, ~20x a Linux minute), so it must not fire on desktop PRs.
+  # Shared-layer changes (src/api.rs, src/core/**, src/bridge/**, Cargo.*,
+  # bindings/rsac-ffi/**) are NOT triggers — ci.yml's `mobile-ios` job gates
+  # their iOS COMPILATION on every mobile-touching PR and every push to
+  # main/master; run this workflow via workflow_dispatch when a shared-layer
+  # change needs runtime verification.
   pull_request:
     branches: [main, master, 'release/**']
     paths:
       - 'src/audio/ios/**'
-      # The smoke exercises the whole public capture path — shared-layer
-      # regressions must retrigger runtime verification (CodeRabbit PR #65).
-      - 'src/api.rs'
-      - 'src/bridge/**'
-      - 'src/core/**'
       - 'tests/ios_sim_smoke.rs'
-      # The app-hosted TCC harness (rsac-f18f) drives rsac through rsac-ffi's C
-      # API, so a change to either the harness or the FFI surface must retrigger
-      # the runtime leg.
-      - 'mobile/ios/RsacSimHarness/**'
-      - 'bindings/rsac-ffi/**'
-      - 'Cargo.toml'
-      - 'Cargo.lock'
+      # The app-hosted TCC harness (rsac-f18f) lives under mobile/ios/.
+      - 'mobile/ios/**'
       - '.github/workflows/ci-ios-sim.yml'
-      - '.github/actions/**'
 
 concurrency:
   group: ios-sim-${{ github.workflow }}-${{ github.ref }}

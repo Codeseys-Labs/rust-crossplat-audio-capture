@@ -1,9 +1,17 @@
 # lefthook.yml — git hooks for rsac (rsac-7e19). Opt-in: run
-# `lefthook install` (or `mise run setup`) once per clone; CI remains the
+# `mise run setup` (or `lefthook install`) once per clone; CI remains the
 # backstop for anyone who skips hooks.
 #
+# Every command goes through `mise run <task>` (see mise.toml), never a bare
+# `bash …`: on Windows a bare `bash` on PATH can resolve to WSL's
+# System32\bash.exe (wrong OS, no cargo). mise's per-OS run/run_windows split
+# routes Windows through scripts/run-bash.ps1 (Git bash by absolute path).
+# Hooks therefore need mise on PATH — the documented onboarding
+# (`mise install && mise run setup`) already guarantees it.
+#
 # Speed discipline:
-#   pre-commit  — fast only: rustfmt check (runs only when .rs files are staged)
+#   pre-commit  — fast only: rustfmt check (runs only when .rs files are
+#                 staged) + betterleaks scan of the staged diff
 #   commit-msg  — trailer/byline lint (AGENTS.md §6), milliseconds
 #   pre-push    — the CI-replica gate (clippy -D warnings + bare build)
 #
@@ -14,13 +22,16 @@ pre-commit:
     rustfmt:
       glob: "*.rs"
       run: cargo fmt --all -- --check
+    secrets:
+      run: mise run secrets:staged
+      fail_text: "Likely secret in the staged diff (see .betterleaks.toml), or mise is not on PATH."
 
 commit-msg:
   commands:
     no-tool-bylines:
-      run: bash scripts/hooks/commit-msg.sh {1}
+      run: mise run hook:commit-msg -- {1}
 
 pre-push:
   commands:
     gate:
-      run: bash scripts/gate.sh
+      run: mise run gate

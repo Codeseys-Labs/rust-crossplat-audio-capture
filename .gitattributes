@@ -8,3 +8,6 @@
 # core.autocrlf don't show phantom whole-file diffs / local EOL churn.
 bindings/rsac-ffi/include/*.h text eol=lf
 bindings/rsac-go/rsac.h text eol=lf
+
+# Shell scripts must keep LF endings so bash never chokes on CRLF on Windows checkouts.
+*.sh text eol=lf

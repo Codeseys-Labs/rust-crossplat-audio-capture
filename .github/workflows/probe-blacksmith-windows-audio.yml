@@ -1,0 +1,213 @@
+name: Probe - Blacksmith Windows audio stack (one-shot)
+
+# =============================================================================
+# ONE-SHOT diagnostic — delete this file after recording the verdict in
+# AGENTS.md (CI runner notes). It never gates anything.
+#
+# Question: does blacksmith-4vcpu-windows-2025 get AudioSrv + a render endpoint
+# after installing the Server-Media-Foundation feature and LABSN/sound-ci-helpers
+# (VB-CABLE)? Baseline (AGENTS.md, run 29545897122): Windows Server Core 26100;
+# AudioSrv / AudioEndpointBuilder ABSENT; Server-Media-Foundation "Available" but
+# never installed. Current mitigation: the Blacksmith Windows legs in ci.yml are
+# compile/unit only; the audio E2E runs on GitHub-hosted windows-latest
+# (ci-audio-tests.yml `windows-audio`).
+#
+# Verdicts (printed in the step summary):
+#   AUDIO_STACK_USABLE          services running + VB-CABLE PnP OK + a playback
+#                               endpoint -> Blacksmith Windows could host the
+#                               ci_audio windows tier
+#   PARTIAL                     services exist but no working playback endpoint
+#   RESTART_REQUIRED_UNTESTABLE Server-Media-Foundation needs a reboot a CI job
+#                               cannot take
+#   NO_CHANGE                   AudioSrv/AudioEndpointBuilder still absent
+#
+# The verdict does NOT trust "LABSN exited 0": LABSN's setup script wraps the
+# service restarts in try/catch and can succeed with the device in `Status:
+# Error`. It deliberately avoids a broad `Get-Service` (the MDCoreSvc
+# PermissionDenied abort noted in AGENTS.md).
+#
+# `workflow_dispatch` only runs once this file is on the default branch; the
+# `push` trigger on the probe branch below lets it run from the branch first.
+# =============================================================================
+
+on:
+  workflow_dispatch:
+    inputs:
+      include_macos:
+        description: >-
+          Also probe LABSN/sound-ci-helpers (background-music) on macOS: free
+          GitHub-hosted macos-15 AND blacksmith-6vcpu-macos-15 (the latter bills
+          at 20x a Linux minute).
+        type: boolean
+        default: false
+  push:
+    branches: [ci/probe-blacksmith-windows-audio]
+    paths:
+      - '.github/workflows/probe-blacksmith-windows-audio.yml'
+
+permissions:
+  contents: read
+
+concurrency:
+  group: probe-blacksmith-windows-audio
+  cancel-in-progress: true
+
+jobs:
+  probe:
+    name: Probe Blacksmith Windows audio stack
+    runs-on: blacksmith-4vcpu-windows-2025
+    timeout-minutes: 20
+    # PowerShell 5.1: Install-WindowsFeature / Get-WindowsFeature are native to it.
+    defaults:
+      run:
+        shell: powershell
+    steps:
+      - name: Write probe helpers
+        run: |
+          @'
+          $ErrorActionPreference = 'Continue'
+          function Get-AudioSnapshot([string]$Label) {
+            $cv  = Get-ItemProperty 'HKLM:\SOFTWARE\Microsoft\Windows NT\CurrentVersion'
+            $sys = Join-Path $env:SystemRoot 'System32'
+            $svc = @{}
+            foreach ($n in 'AudioSrv','AudioEndpointBuilder') {
+              $s = Get-Service -Name $n -ErrorAction SilentlyContinue
+              $svc[$n] = if ($s) { [string]$s.Status } else { 'ABSENT' }
+            }
+            $files = [ordered]@{}
+            foreach ($f in 'AudioSes.dll','AudioEndpointBuilder.dll','Audiodg.exe','AudioEng.dll','MMDevAPI.dll') {
+              $files[$f] = Test-Path (Join-Path $sys $f)
+            }
+            $smf = try { [string](Get-WindowsFeature -Name Server-Media-Foundation -ErrorAction Stop).InstallState } catch { 'ERR ' + $_.Exception.Message }
+            $pnp = try {
+              @(Get-PnpDevice -Class MEDIA -ErrorAction Stop |
+                Where-Object { $_.FriendlyName -like '*VB-Audio*' -or $_.FriendlyName -like '*CABLE*' } |
+                ForEach-Object { '{0}|{1}' -f $_.FriendlyName, $_.Status })
+            } catch { @('ERR ' + $_.Exception.Message) }
+            [pscustomobject]@{
+              Label = $Label
+              Sku = '{0} | {1} | build {2}.{3}' -f $cv.ProductName, $cv.InstallationType, $cv.CurrentBuild, $cv.UBR
+              AudioSrv = $svc['AudioSrv']; AudioEndpointBuilder = $svc['AudioEndpointBuilder']
+              MMDevicesRenderKey = (Test-Path 'HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\MMDevices\Audio\Render')
+              Files = $files; ServerMediaFoundation = $smf; VbCablePnp = $pnp
+            }
+          }
+          function Start-AudioServices {
+            foreach ($n in 'AudioEndpointBuilder','AudioSrv') {
+              try { Start-Service -Name $n -ErrorAction Stop; "started $n" } catch { "Start-Service $n -> $($_.Exception.Message)" }
+            }
+          }
+          function Get-Endpoints {
+            try {
+              if (-not (Get-Module -ListAvailable -Name AudioDeviceCmdlets)) {
+                Install-PackageProvider -Name NuGet -MinimumVersion 2.8.5.201 -Force -Scope CurrentUser | Out-Null
+                Install-Module -Name AudioDeviceCmdlets -Force -Scope CurrentUser -AllowClobber | Out-Null
+              }
+              Import-Module AudioDeviceCmdlets -ErrorAction Stop
+              $d = @(Get-AudioDevice -List)
+              [pscustomobject]@{ Total = $d.Count; Playback = @($d | Where-Object { $_.Type -eq 'Playback' }).Count; Error = ''; Names = @($d | ForEach-Object { '{0}:{1}' -f $_.Type, $_.Name }) }
+            } catch { [pscustomobject]@{ Total = -1; Playback = -1; Error = $_.Exception.Message; Names = @() } }
+          }
+          '@ | Set-Content -Path (Join-Path $env:RUNNER_TEMP 'probe-lib.ps1') -Encoding UTF8
+
+      - name: Baseline + install Server-Media-Foundation
+        timeout-minutes: 10
+        run: |
+          . (Join-Path $env:RUNNER_TEMP 'probe-lib.ps1')
+          $baseline = Get-AudioSnapshot 'baseline'
+          $baseline | ConvertTo-Json -Depth 5 | Write-Host
+          Write-Host '=== Install-WindowsFeature Server-Media-Foundation (no -Restart) ==='
+          $inst = $null
+          try { $inst = Install-WindowsFeature -Name Server-Media-Foundation -ErrorAction Stop } catch { Write-Host "Install-WindowsFeature failed: $($_.Exception.Message)" }
+          $instInfo = [pscustomobject]@{
+            Success       = if ($inst) { [bool]$inst.Success } else { $false }
+            RestartNeeded = if ($inst) { [string]$inst.RestartNeeded } else { 'n/a' }
+            ExitCode      = if ($inst) { [string]$inst.ExitCode } else { 'n/a' }
+          }
+          $instInfo | Format-List | Out-Host
+          $afterSmf   = Get-AudioSnapshot 'after-server-media-foundation'
+          $started    = Start-AudioServices
+          $afterStart = Get-AudioSnapshot 'after-start-service'
+          [pscustomobject]@{ Baseline=$baseline; Install=$instInfo; AfterSmf=$afterSmf; StartAttempts=$started; AfterStart=$afterStart } |
+            ConvertTo-Json -Depth 6 | Set-Content (Join-Path $env:RUNNER_TEMP 'stage1.json')
+
+      - name: Install virtual audio (VB-CABLE via LABSN)
+        id: labsn
+        continue-on-error: true
+        timeout-minutes: 10
+        uses: LABSN/sound-ci-helpers@d08c889a7bba7d9b1b059f8f76dac4672ea3a9cf # v1 (v1 tag == v1.0.4; same pin as ci-audio-tests.yml)
+
+      - name: Final snapshot + verdict
+        env:
+          LABSN_OUTCOME: ${{ steps.labsn.outcome }}
+        run: |
+          . (Join-Path $env:RUNNER_TEMP 'probe-lib.ps1')
+          $s1 = Get-Content (Join-Path $env:RUNNER_TEMP 'stage1.json') -Raw | ConvertFrom-Json
+          $null  = Start-AudioServices
+          $final = Get-AudioSnapshot 'final (after LABSN)'
+          $ep    = Get-Endpoints
+          $labsn = $env:LABSN_OUTCOME
+
+          $present = ($final.AudioSrv -ne 'ABSENT') -and ($final.AudioEndpointBuilder -ne 'ABSENT')
+          $running = ($final.AudioSrv -eq 'Running')
+          $vbOk    = @($final.VbCablePnp | Where-Object { $_ -match '\|OK$' }).Count -gt 0
+          if ($running -and $vbOk -and $ep.Playback -gt 0) {
+            $verdict = 'AUDIO_STACK_USABLE'
+            $meaning = 'Blacksmith Windows can host the ci_audio windows tier. Next: run scripts/ci-windows-audio-default.ps1 + the windows ci_audio steps here and compare with windows-latest.'
+          } elseif ($present) {
+            $verdict = 'PARTIAL'
+            $meaning = 'Services exist but no working VB-CABLE playback endpoint. Not usable; keep the hybrid.'
+          } elseif ($s1.Install.RestartNeeded -eq 'Yes') {
+            $verdict = 'RESTART_REQUIRED_UNTESTABLE'
+            $meaning = 'Server-Media-Foundation needs a reboot a CI job cannot take. Treat as NO; keep the hybrid.'
+          } else {
+            $verdict = 'NO_CHANGE'
+            $meaning = 'AudioSrv/AudioEndpointBuilder still absent after Server-Media-Foundation + LABSN. Keep the hybrid: Blacksmith = compile/unit, GitHub-hosted windows-latest = audio.'
+          }
+          $effect = if ($s1.Baseline.AudioSrv -eq 'ABSENT' -and $s1.AfterStart.AudioSrv -eq 'ABSENT') { 'none (AudioSrv absent before and after)' } else { "$($s1.Baseline.AudioSrv) -> $($s1.AfterStart.AudioSrv)" }
+          $md = @(
+            "## VERDICT: $verdict", '', $meaning, '',
+            "- Server-Media-Foundation effect on AudioSrv: $effect",
+            "- Install: Success=$($s1.Install.Success) RestartNeeded=$($s1.Install.RestartNeeded) ExitCode=$($s1.Install.ExitCode)",
+            "- LABSN step outcome: $labsn",
+            "- VB-CABLE PnP: $(@($final.VbCablePnp) -join '; ')",
+            "- AudioDeviceCmdlets: total=$($ep.Total) playback=$($ep.Playback) err='$($ep.Error)'",
+            '', '<details><summary>Snapshots</summary>', '', '```json',
+            ($s1 | ConvertTo-Json -Depth 8), ($final | ConvertTo-Json -Depth 6), '```', '</details>'
+          )
+          ($md -join "`n") | Out-File -FilePath $env:GITHUB_STEP_SUMMARY -Append -Encoding utf8
+          Write-Host "VERDICT: $verdict"
+          Write-Host "::notice title=Blacksmith Windows audio probe::$verdict"
+
+  # Optional: does LABSN's macOS path (background-music) give a usable virtual
+  # device on a free GitHub-hosted macos-15 vs the 20x-rate Blacksmith macOS
+  # runner? It installs only a virtual device + restarts coreaudiod and CANNOT
+  # grant kTCCServiceAudioCapture, so Process Tap tiers would still skip.
+  macos-labsn:
+    if: github.event_name == 'workflow_dispatch' && inputs.include_macos
+    name: LABSN macOS (${{ matrix.runner }})
+    strategy:
+      fail-fast: false
+      matrix:
+        runner: [macos-15, blacksmith-6vcpu-macos-15]
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 15
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - name: Install virtual audio (LABSN background-music)
+        id: labsn
+        continue-on-error: true
+        uses: LABSN/sound-ci-helpers@d08c889a7bba7d9b1b059f8f76dac4672ea3a9cf # v1 (v1 tag == v1.0.4; same pin as ci-audio-tests.yml)
+
+      - name: Verdict
+        env:
+          RUNNER_LABEL: ${{ matrix.runner }}
+          LABSN_OUTCOME: ${{ steps.labsn.outcome }}
+        run: |
+          sw_vers
+          system_profiler SPAudioDataType 2>&1 | tee audio.txt
+          if grep -qi 'Background Music' audio.txt; then V=VIRTUAL_DEVICE_PRESENT; else V=NO_VIRTUAL_DEVICE; fi
+          echo "VERDICT[$RUNNER_LABEL]: $V (LABSN outcome: $LABSN_OUTCOME)"
+          { echo "## macOS $RUNNER_LABEL: $V"; echo "LABSN step: $LABSN_OUTCOME"; echo '```'; cat audio.txt; echo '```'; } >> "$GITHUB_STEP_SUMMARY"

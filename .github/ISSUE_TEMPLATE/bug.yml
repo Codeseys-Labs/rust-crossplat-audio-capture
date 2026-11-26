@@ -15,7 +15,7 @@ body:
         - Windows (WASAPI)
         - Linux (PipeWire)
         - macOS (CoreAudio / Process Tap)
-        - Android / iOS (not yet supported — capture APIs are designed, not shipped)
+        - Android / iOS (experimental / parked — emulator/simulator-verified, physical devices pending)
         - Other / cross-platform
     validations:
       required: true

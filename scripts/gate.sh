@@ -40,9 +40,8 @@ run_lint() {
   step "cargo fmt --all -- --check"
   cargo fmt --all -- --check
 
-  step "clippy -D warnings (CI replica: ${FEAT},compose,cli)"
-  cargo clippy --all-targets --no-default-features --features "${FEAT},compose,cli" -- -D warnings
-
+  step "clippy -D warnings (CI replica: ${FEAT},compose,cli,hotplug-recovery)"
+  cargo clippy --all-targets --no-default-features --features "${FEAT},compose,cli,hotplug-recovery" -- -D warnings
   step "bare-build smoke (cargo build --no-default-features)"
   cargo build --no-default-features
 
@@ -62,11 +61,11 @@ run_lint() {
 
 run_tests() {
   # Per-OS test-job replica (ci.yml test-linux/-windows/-macos core commands).
-  step "lib tests (${FEAT},compose)"
-  cargo test --lib --no-default-features --features "${FEAT},compose"
+  step "lib tests (${FEAT},compose,hotplug-recovery)"
+  cargo test --lib --no-default-features --features "${FEAT},compose,hotplug-recovery"
 
-  step "doctests (${FEAT},compose,sink-wav,cli)"
-  cargo test --doc --no-default-features --features "${FEAT},compose,sink-wav,cli"
+  step "doctests (${FEAT},compose,sink-wav,cli,hotplug-recovery)"
+  cargo test --doc --no-default-features --features "${FEAT},compose,sink-wav,cli,hotplug-recovery"
 }
 
 run_extras() {
