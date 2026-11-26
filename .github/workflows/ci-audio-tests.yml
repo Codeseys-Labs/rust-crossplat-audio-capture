@@ -872,6 +872,11 @@ jobs:
               echo "::error::missing Device capture first non-silent buffer"
               exit 1
             fi
+            # A read error after the first buffer still prints positive counts.
+            if grep -Fq '[ci_audio] Device capture read error' ci-audio-device.log; then
+              echo "::error::Device capture hit a read error; the capture did not complete"
+              exit 1
+            fi
           fi
           gtimeout --preserve-status 60 \
             cargo test --test ci_audio device_enumeration \

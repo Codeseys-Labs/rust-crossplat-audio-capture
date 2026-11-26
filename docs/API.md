@@ -390,6 +390,10 @@ capture.start()?;
 // `StreamEnded` to a recoverable error). Retry transient errors — a bare `?`
 // here would abort the recording on a recoverable hiccup — and propagate only
 // fatal ones. Then build the sink from THAT buffer's format.
+// This loop waits for as long as no audio arrives (a silent WASAPI endpoint
+// delivers nothing at all): real code bounds it with a deadline or a
+// cancellation flag, as `examples/record_to_file.rs` does. The same holds for
+// the manual pattern below.
 let first = loop {
     match capture.read_chunk_nonblocking() {
         Ok(Some(buffer)) => break buffer,

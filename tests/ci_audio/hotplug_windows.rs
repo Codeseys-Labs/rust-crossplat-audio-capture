@@ -1043,6 +1043,16 @@ fn loss_setup(test: &str) -> Option<String> {
     if !enabled(test, LOSS_VAR) {
         return None;
     }
+    // The device-node ("pnp") mode was removed. A caller that still selects it
+    // must not get a different test under the old name.
+    if let Ok(mode) = std::env::var("RSAC_HOTPLUG_LOSS_MODE") {
+        let mode = mode.trim();
+        assert!(
+            mode.is_empty() || mode == "visibility",
+            "{test}: RSAC_HOTPLUG_LOSS_MODE={mode} is no longer supported: the loss tests only \
+             hide the endpoint. Unset it (and RSAC_HOTPLUG_PNP_INSTANCE_ID)"
+        );
+    }
     let on_ci = std::env::var("CI").as_deref() == Ok("true");
     let allowed = std::env::var(ALLOW_DISABLE_VAR).as_deref() == Ok("1");
     assert!(

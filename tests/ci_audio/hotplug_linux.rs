@@ -1034,6 +1034,9 @@ fn hotplug_linux_daemon_stop_spends_the_retry_budget() {
         ALLOW_DAEMON_KILL_VAR,
         "stop every PipeWire daemon of the current user",
     );
+    // The fixture below sets the default sink before the daemon is stopped, so
+    // this test needs that permission as well.
+    require_default_change_permission(TEST);
     // SAFETY: geteuid only reads the calling process's effective UID.
     let uid = unsafe { libc::geteuid() }.to_string();
     let mut fixture = Fixture::new(TEST, false);
