@@ -9,15 +9,12 @@ use crate::core::interface::{
     DeviceWatcher,
 };
 
-use std::ffi::OsStr;
 use std::marker::PhantomData;
 use std::sync::{
     atomic::{AtomicBool, AtomicUsize, Ordering},
     mpsc, Arc,
 };
 use std::time::Duration;
-
-use sysinfo::{ProcessesToUpdate, System};
 
 // --- New BridgeStream Architecture Imports ---
 use super::thread::{WindowsCaptureConfig, WindowsCaptureThread, WindowsPlatformStream};
@@ -72,309 +69,6 @@ fn wasapi_backend_context_err(err: &windows::core::Error) -> BackendContext {
         os_error_message: Some(err.message()),
     }
 }
-
-/// Windows-specific application capture using wasapi-rs library
-/// Based on wasapi-rs examples/record_application.rs for simplicity and reliability
-///
-/// # Legacy / RT-safety warning (audit L13)
-///
-/// This type predates the canonical capture pipeline and duplicates the WASAPI
-/// loopback logic that now lives in
-/// `WindowsCaptureThread` (`super::thread`; `pub(crate)`, so referenced by name
-/// to keep the public-docs build clean). More
-/// importantly, its [`start_capture`](Self::start_capture) /
-/// [`start_capture_with_stop_flag`](Self::start_capture_with_stop_flag) methods
-/// invoke a **user-supplied callback directly on the WASAPI capture thread**.
-/// Any allocation, lock, or blocking call inside that callback runs on the
-/// real-time audio thread and can cause glitches/xruns — exactly the footgun
-/// the `BridgeProducer`/`BridgeStream` data plane exists to prevent.
-///
-/// Prefer the canonical path: build an `AudioCapture` targeting an application
-/// (`CaptureTarget::Application` / `ProcessTree`) and read via the
-/// [`CapturingStream`] API, which delivers buffers on a non-real-time consumer
-/// thread. The static helpers ([`find_process_by_name`](Self::find_process_by_name),
-/// [`list_audio_processes`](Self::list_audio_processes)) remain useful for
-/// process discovery and are not deprecated.
-pub struct WindowsApplicationCapture {
-    process_id: u32,
-    include_tree: bool,
-    // Use wasapi-rs AudioClient for simpler implementation (declared BEFORE
-    // `com_initializer` so Rust drops the COM client before decrementing MTA usage).
-    audio_client: Option<wasapi::AudioClient>,
-    // Process-wide MTA guard acquired on `initialize()` and released on Drop.
-    #[allow(dead_code)]
-    com_initializer: Option<ComInitializer>,
-    // Shared flag to signal capture loop to stop
-    should_stop: Arc<AtomicBool>,
-}
-
-impl WindowsApplicationCapture {
-    /// Create a new application capture instance for the specified process
-    ///
-    /// # Arguments
-    /// * `process_id` - PID of the target process
-    /// * `include_tree` - Selects the WASAPI process-loopback mode. `true` uses
-    ///   `PROCESS_LOOPBACK_MODE_INCLUDE_TARGET_PROCESS_TREE` (capture the target
-    ///   PID **and** its descendants). `false` uses
-    ///   `PROCESS_LOOPBACK_MODE_EXCLUDE_TARGET_PROCESS_TREE`, which captures
-    ///   everything **except** that tree — *not* "the target only, no children".
-    ///   The OS mode is binary; there is no strict single-process variant. To
-    ///   capture a single application, pass `true` (INCLUDE-tree of a leaf
-    ///   process is exactly single-process capture). See
-    ///   [ADR-0017](../../../docs/designs/0017-windows-application-capture-include-tree.md).
-    ///
-    /// # Example
-    /// ```rust,no_run
-    /// use rsac::audio::windows::WindowsApplicationCapture;
-    ///
-    /// let capture = WindowsApplicationCapture::new(1234, true);
-    /// ```
-    pub fn new(
-        process_id: u32,
-        include_tree: bool,
-    ) -> std::result::Result<Self, Box<dyn std::error::Error>> {
-        Ok(Self {
-            process_id,
-            include_tree,
-            audio_client: None,
-            com_initializer: None,
-            should_stop: Arc::new(AtomicBool::new(false)),
-        })
-    }
-
-    /// Initialize the process loopback client using wasapi-rs
-    ///
-    /// This uses wasapi-rs AudioClient::new_application_loopback_client for simplicity
-    pub fn initialize(&mut self) -> std::result::Result<(), Box<dyn std::error::Error>> {
-        // Refuse an incompatible caller apartment before activating a client.
-        // The guard then keeps the MTA alive until the client is released.
-        let com_initializer = ComInitializer::new()?;
-        // Create wasapi-rs AudioClient for application loopback
-        let mut audio_client = wasapi::AudioClient::new_application_loopback_client(
-            self.process_id,
-            self.include_tree,
-        )?;
-
-        // Initialize the audio client with a standard format.
-        let desired_format =
-            wasapi::WaveFormat::new(32, 32, wasapi::SampleType::Float, 48000, 2, None);
-        // C1 fix: this is a process-loopback client (created via
-        // new_application_loopback_client → ActivateAudioInterfaceAsync with
-        // AUDIOCLIENT_ACTIVATION_TYPE_PROCESS_LOOPBACK). That activation path
-        // does NOT support AUDCLNT_STREAMFLAGS_AUTOCONVERTPCM — combining it
-        // with the loopback flags makes IAudioClient::Initialize fail. We must
-        // initialize with the exact desired format and no autoconvert. The
-        // loopback client can't report its mix format (get_mixformat returns
-        // "Not implemented"), so the explicit f32 format above is what we hand
-        // it directly.
-        let mode = wasapi::StreamMode::EventsShared {
-            autoconvert: false,
-            buffer_duration_hns: 0,
-        };
-
-        audio_client.initialize_client(&desired_format, wasapi::Direction::Capture, mode, None)?;
-
-        // Store the initialized client and its MTA guard (field order guarantees
-        // `audio_client` drops before `com_initializer`).
-        self.audio_client = Some(audio_client);
-        self.com_initializer = Some(com_initializer);
-        Ok(())
-    }
-
-    /// Start capturing audio from the target process using wasapi-rs
-    ///
-    /// # Deprecated — RT-unsafe (audit L13)
-    ///
-    /// `callback` is invoked **on the WASAPI capture (real-time) thread**. Doing
-    /// any allocation/lock/blocking work there risks audio glitches. Use the
-    /// canonical `AudioCapture` + [`CapturingStream`] path instead, which
-    /// delivers audio on a non-real-time consumer thread via the bridge ring
-    /// buffer. See the type-level docs on [`WindowsApplicationCapture`].
-    ///
-    /// # Implementation Notes
-    /// - Uses wasapi-rs for simplified audio capture
-    /// - Based on wasapi-rs examples for reliability
-    #[deprecated(
-        note = "RT-unsafe: invokes the callback on the capture thread. Use AudioCapture + CapturingStream (BridgeStream) instead. See L13."
-    )]
-    pub fn start_capture<F>(
-        &mut self,
-        callback: F,
-    ) -> std::result::Result<(), Box<dyn std::error::Error>>
-    where
-        F: Fn(&[f32]) + Send + 'static,
-    {
-        // Internal delegation to the (also deprecated) stop-flag variant.
-        #[allow(deprecated)]
-        self.start_capture_with_stop_flag(callback, None)
-    }
-
-    /// Start capturing audio with an external stop flag.
-    ///
-    /// # Deprecated — RT-unsafe (audit L13)
-    ///
-    /// As with [`start_capture`](Self::start_capture), `callback` runs on the
-    /// real-time WASAPI capture thread. Prefer the canonical `AudioCapture` +
-    /// [`CapturingStream`] pipeline. See the type-level docs.
-    #[deprecated(
-        note = "RT-unsafe: invokes the callback on the capture thread. Use AudioCapture + CapturingStream (BridgeStream) instead. See L13."
-    )]
-    pub fn start_capture_with_stop_flag<F>(
-        &mut self,
-        callback: F,
-        external_stop_flag: Option<Arc<AtomicBool>>,
-    ) -> std::result::Result<(), Box<dyn std::error::Error>>
-    where
-        F: Fn(&[f32]) + Send + 'static,
-    {
-        let audio_client = self
-            .audio_client
-            .as_mut()
-            .ok_or("Audio client not initialized")?;
-
-        // Get event handle and capture client from wasapi-rs
-        let h_event = audio_client.set_get_eventhandle()?;
-        let capture_client = audio_client.get_audiocaptureclient()?;
-
-        // Start the audio stream using wasapi-rs
-        audio_client.start_stream()?;
-
-        // Reset stop flag at start of capture
-        self.should_stop.store(false, Ordering::SeqCst);
-
-        // Pre-allocate reusable buffers outside the loop to avoid per-iteration allocations.
-        let mut sample_queue = std::collections::VecDeque::with_capacity(48000 * 4 * 2 / 10);
-        let mut samples: Vec<f32> = Vec::with_capacity(48000 * 2 / 10);
-
-        // Capture loop based on wasapi-rs examples
-        loop {
-            // Check if we should stop capture (internal or external flag)
-            if self.should_stop.load(Ordering::SeqCst) {
-                break;
-            }
-            if let Some(ref external_flag) = external_stop_flag {
-                if external_flag.load(Ordering::SeqCst) {
-                    break;
-                }
-            }
-
-            // Wait for audio data (shorter timeout to check stop flag more frequently)
-            if h_event.wait_for_event(100).is_err() {
-                // Timeout — check stop flags and continue
-                if self.should_stop.load(Ordering::SeqCst) {
-                    break;
-                }
-                if let Some(ref external_flag) = external_stop_flag {
-                    if external_flag.load(Ordering::SeqCst) {
-                        break;
-                    }
-                }
-                continue;
-            }
-
-            // Get available packet size
-            let packet_length = capture_client.get_next_packet_size()?.unwrap_or(0);
-
-            if packet_length > 0 {
-                // Reuse sample_queue across iterations
-                sample_queue.clear();
-                capture_client.read_from_device_to_deque(&mut sample_queue)?;
-
-                // Convert bytes to f32 samples using efficient slice access
-                if !sample_queue.is_empty() {
-                    samples.clear();
-                    let (front, back) = sample_queue.as_slices();
-                    for chunk in front.chunks_exact(4) {
-                        samples.push(f32::from_le_bytes([chunk[0], chunk[1], chunk[2], chunk[3]]));
-                    }
-                    for chunk in back.chunks_exact(4) {
-                        samples.push(f32::from_le_bytes([chunk[0], chunk[1], chunk[2], chunk[3]]));
-                    }
-
-                    if !samples.is_empty() {
-                        callback(&samples);
-                    }
-                }
-            }
-        }
-
-        Ok(())
-    }
-
-    /// Stop capturing audio
-    pub fn stop_capture(&mut self) -> std::result::Result<(), Box<dyn std::error::Error>> {
-        // Signal the capture loop to stop
-        self.should_stop.store(true, Ordering::SeqCst);
-
-        if let Some(audio_client) = &mut self.audio_client {
-            audio_client.stop_stream()?;
-        }
-
-        // Clear the audio client
-        self.audio_client = None;
-
-        Ok(())
-    }
-
-    /// Check if currently capturing (simplified implementation)
-    pub fn is_capturing(&self) -> bool {
-        self.audio_client.is_some()
-    }
-
-    /// Stop capturing audio (alias for [`stop_capture`](Self::stop_capture)).
-    pub fn stop(&mut self) -> std::result::Result<(), Box<dyn std::error::Error>> {
-        self.stop_capture()
-    }
-
-    /// Find process ID by name (convenience helper)
-    ///
-    /// # Arguments
-    /// * `process_name` - Name of the process to find (e.g., "firefox.exe")
-    /// * `prefer_parent` - If true, return parent PID for process tree capture
-    ///
-    /// # Returns
-    /// Process ID if found, None otherwise
-    pub fn find_process_by_name(process_name: &str, prefer_parent: bool) -> Option<u32> {
-        let mut system = System::new();
-        system.refresh_processes(ProcessesToUpdate::All, true);
-
-        let processes: Vec<_> = system.processes_by_name(OsStr::new(process_name)).collect();
-
-        if let Some(process) = processes.first() {
-            if prefer_parent {
-                // Return parent PID if available, otherwise the process PID
-                Some(
-                    process
-                        .parent()
-                        .map(|p| p.as_u32())
-                        .unwrap_or_else(|| process.pid().as_u32()),
-                )
-            } else {
-                Some(process.pid().as_u32())
-            }
-        } else {
-            None
-        }
-    }
-
-    /// List all processes that could potentially be captured
-    pub fn list_audio_processes() -> Vec<(u32, String)> {
-        let mut system = System::new();
-        system.refresh_processes(ProcessesToUpdate::All, true);
-
-        system
-            .processes()
-            .iter()
-            .map(|(pid, process)| (pid.as_u32(), process.name().to_string_lossy().to_string()))
-            .collect()
-    }
-}
-
-// SAFETY: `initialize` acquires the IAudioClient only after checking that its
-// caller is in the MTA. This is not a full Send guarantee: #105 tracks later
-// STA use/release and the required same-thread release of the IAudioCaptureClient
-// and its parent IAudioClient.
-unsafe impl Send for WindowsApplicationCapture {}
 
 /// RAII wrapper for a Windows HANDLE to ensure it's closed on drop.
 #[derive(Debug)]
@@ -457,11 +151,10 @@ impl Drop for MtaUsagePin {
 /// calling thread to be in it.
 ///
 /// The strict form of the MTA usage pin, for code whose WASAPI objects must live
-/// in the MTA: the capture worker thread creates one before any audio client,
-/// and [`WindowsApplicationCapture::initialize`] does too. A thread that never
-/// initialised COM joins the implicit MTA and passes. A thread already in a
-/// single-threaded apartment (STA) keeps its apartment and gets a `com_init`
-/// backend error carrying `RPC_E_CHANGED_MODE`.
+/// in the MTA: the capture worker thread creates one before any audio client. A
+/// thread that never initialised COM joins the implicit MTA and passes. A thread
+/// already in a single-threaded apartment (STA) keeps its apartment and gets a
+/// `com_init` backend error carrying `RPC_E_CHANGED_MODE`.
 ///
 /// [`WindowsDeviceEnumerator`], [`WindowsAudioDevice`] and
 /// [`enumerate_application_audio_sessions`] do not make this check; they work
@@ -2182,44 +1875,6 @@ mod tests {
         );
     }
 
-    // ── WindowsApplicationCapture Tests ──────────────────────────────
-
-    /// Test WindowsApplicationCapture::new() construction.
-    #[test]
-    fn test_application_capture_creation() {
-        let result = WindowsApplicationCapture::new(1234, false);
-        assert!(result.is_ok(), "new() failed: {:?}", result.err());
-        let capture = result.unwrap();
-        assert!(!capture.is_capturing());
-    }
-
-    /// Test WindowsApplicationCapture::new() with include_tree.
-    #[test]
-    fn test_application_capture_with_tree() {
-        let result = WindowsApplicationCapture::new(5678, true);
-        assert!(result.is_ok());
-    }
-
-    /// Test find_process_by_name returns None for non-existent process.
-    #[test]
-    fn test_find_process_by_name_nonexistent() {
-        let result = WindowsApplicationCapture::find_process_by_name(
-            "nonexistent_process_xyz_12345.exe",
-            false,
-        );
-        assert!(result.is_none(), "Should not find a nonexistent process");
-    }
-
-    /// Test list_audio_processes returns a non-empty list on a running system.
-    #[test]
-    fn test_list_audio_processes() {
-        let processes = WindowsApplicationCapture::list_audio_processes();
-        assert!(
-            !processes.is_empty(),
-            "Expected at least one process on a running system"
-        );
-    }
-
     // ── ApplicationAudioSessionInfo Tests ────────────────────────────
 
     /// Test ApplicationAudioSessionInfo struct construction and equality.
@@ -2845,15 +2500,10 @@ mod tests {
     /// as `(file, header)`. A header is the item's code from `unsafe` to its
     /// first `{` or `;`, comments removed and whitespace collapsed.
     const ALLOWED_UNSAFE_IMPLS: &[(&str, &str)] = &[
-        // The MTA usage pin, the only holder of a `CO_MTA_USAGE_COOKIE`.
+        // The MTA usage pin's impls, the only ones: the pin is the only holder
+        // of a `CO_MTA_USAGE_COOKIE` (ADR-0020).
         ("wasapi.rs", "unsafe impl Send for MtaUsagePin"),
         ("wasapi.rs", "unsafe impl Sync for MtaUsagePin"),
-        // Deprecated legacy type, left unchanged; it is removed, with this
-        // entry, at the 0.5.0 cutover.
-        (
-            "wasapi.rs",
-            "unsafe impl Send for WindowsApplicationCapture",
-        ),
     ];
 
     /// `source` as characters, with every comment (line, block, nested block),

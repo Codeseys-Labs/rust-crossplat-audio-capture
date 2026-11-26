@@ -137,7 +137,16 @@ pub enum ApplicationScope {
 /// [`list_audio_applications`] when you must distinguish "these apps are
 /// producing audio" from "here is every running app because filtering was
 /// unavailable" (e.g. an app-picker UI, or a test discovering a capture target).
+///
+/// # Stability
+///
+/// This struct is `#[non_exhaustive]`: new fields may be added in a minor
+/// release. Obtain a value via [`list_audio_applications_scoped`] and read the
+/// fields by name (or destructure with `..` inside a match); struct-literal
+/// construction and exhaustive destructuring are not available outside the
+/// crate.
 #[derive(Debug, Clone)]
+#[non_exhaustive]
 pub struct ApplicationEnumeration {
     /// Discovered application sources (each `AudioSourceKind::Application`).
     pub applications: Vec<AudioSource>,
