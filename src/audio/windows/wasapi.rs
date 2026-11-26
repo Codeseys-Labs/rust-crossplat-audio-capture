@@ -10,6 +10,7 @@ use crate::core::interface::{
 };
 
 use std::ffi::OsStr;
+use std::marker::PhantomData;
 use std::sync::{
     atomic::{AtomicBool, Ordering},
     mpsc, Arc,
@@ -401,25 +402,74 @@ impl Drop for ProcessHandle {
     }
 }
 
-/// Ensures the process-wide COM Multi-Threaded Apartment (MTA) stays alive
-/// while held and decrements the MTA usage count when dropped.
+/// Keeps the process-wide COM multithreaded apartment (MTA) alive while held.
 ///
-/// Uses Win32 `CoIncrementMTAUsage` / `CoDecrementMTAUsage` (Windows 8+), which
-/// Microsoft documents as thread-agnostic: an `Arc<ComInitializer>` may safely
-/// outlive its creating thread and drop on any thread (including an STA UI
-/// thread) without disturbing that thread's apartment.
+/// Holds only the cookie from `CoIncrementMTAUsage` and returns it with
+/// `CoDecrementMTAUsage` on drop. It makes no apartment check and leaves the
+/// calling thread's apartment as it is: while a pin is alive, a thread that
+/// never initialised COM runs in the implicit MTA, and a thread in an STA or in
+/// the MTA stays where it is. The decrement is valid on any thread, so a pin may
+/// outlive the thread that created it.
 #[derive(Debug)]
-pub struct ComInitializer {
+pub(crate) struct MtaUsagePin {
     cookie: CO_MTA_USAGE_COOKIE,
 }
 
-// SAFETY: The only field is a cookie. Microsoft explicitly permits decrement
-// on a thread other than the one that incremented:
+// SAFETY: The only field is the cookie, and the only operation on it is the
+// single `CoDecrementMTAUsage` in `Drop`. Microsoft documents that call as
+// valid on a thread other than the one that called `CoIncrementMTAUsage`:
 // https://learn.microsoft.com/windows/win32/api/combaseapi/nf-combaseapi-codecrementmtausage
-unsafe impl Send for ComInitializer {}
-// SAFETY: Shared references do not expose or operate on the cookie. Only
-// `Drop`, with exclusive access, passes it back to COM once.
-unsafe impl Sync for ComInitializer {}
+unsafe impl Send for MtaUsagePin {}
+// SAFETY: A shared reference exposes no operation on the cookie; only `Drop`,
+// with exclusive access, passes it to `CoDecrementMTAUsage`, under the
+// any-thread contract cited on the `Send` impl.
+unsafe impl Sync for MtaUsagePin {}
+
+impl MtaUsagePin {
+    /// Increments the process-wide MTA usage count, creating the MTA if needed.
+    pub(crate) fn new() -> AudioResult<Self> {
+        // SAFETY: No arguments. On success the cookie is owned by the returned
+        // value and released exactly once, by `Drop`.
+        let cookie = unsafe { CoIncrementMTAUsage() }.map_err(|err| AudioError::BackendError {
+            backend: "wasapi".to_string(),
+            operation: "com_init".to_string(),
+            message: format!("CoIncrementMTAUsage failed (HRESULT: {:?})", err),
+            context: Some(wasapi_backend_context_err(&err)),
+        })?;
+        Ok(Self { cookie })
+    }
+}
+
+impl Drop for MtaUsagePin {
+    fn drop(&mut self) {
+        // SAFETY: `self.cookie` was returned by the successful
+        // `CoIncrementMTAUsage` in `new` and is released exactly once, here, on
+        // whichever thread drops the pin (valid per the `Send` impl's citation).
+        let _ = unsafe { CoDecrementMTAUsage(self.cookie) };
+    }
+}
+
+/// Pins the process-wide COM multithreaded apartment (MTA) and requires the
+/// calling thread to be in it.
+///
+/// The strict form of the MTA usage pin, for code whose WASAPI objects must live
+/// in the MTA: the capture worker thread creates one before any audio client,
+/// and [`WindowsApplicationCapture::initialize`] does too. A thread that never
+/// initialised COM joins the implicit MTA and passes. A thread already in a
+/// single-threaded apartment (STA) keeps its apartment and gets a `com_init`
+/// backend error carrying `RPC_E_CHANGED_MODE`.
+///
+/// [`WindowsDeviceEnumerator`], [`WindowsAudioDevice`] and
+/// [`enumerate_application_audio_sessions`] do not make this check; they work
+/// on STA threads too.
+///
+/// Dropping it releases the MTA pin, which is valid on any thread. It never
+/// uninitialises COM on the dropping thread.
+#[derive(Debug)]
+pub struct ComInitializer {
+    #[allow(dead_code)] // RAII guard: held for its `Drop`, which releases the MTA pin.
+    pin: MtaUsagePin,
+}
 
 impl ComInitializer {
     /// Pins the process-wide MTA and checks the calling thread belongs to it.
@@ -427,14 +477,10 @@ impl ComInitializer {
     /// An uninitialized caller joins the implicit MTA. A caller already in an
     /// STA retains its apartment and receives a `com_init` backend error.
     pub fn new() -> AudioResult<Self> {
-        let cookie = unsafe { CoIncrementMTAUsage() }.map_err(|err| AudioError::BackendError {
-            backend: "wasapi".to_string(),
-            operation: "com_init".to_string(),
-            message: format!("CoIncrementMTAUsage failed (HRESULT: {:?})", err),
-            context: Some(wasapi_backend_context_err(&err)),
-        })?;
-        // Own the cookie before the query so every error path releases it.
-        let guard = Self { cookie };
+        // Own the pin before the query so every error path releases it.
+        let guard = Self {
+            pin: MtaUsagePin::new()?,
+        };
         let mut apartment = APTTYPE_CURRENT;
         let mut qualifier = APTTYPEQUALIFIER_NONE;
         // SAFETY: Both out-pointers refer to live, writable stack variables.
@@ -468,42 +514,55 @@ impl ComInitializer {
     }
 }
 
-impl Drop for ComInitializer {
-    fn drop(&mut self) {
-        // SAFETY: `self.cookie` was returned by a matching `CoIncrementMTAUsage`
-        // call and is released exactly once here. Safe from any thread.
-        let _ = unsafe { CoDecrementMTAUsage(self.cookie) };
-    }
-}
-
-/// Represents a Windows audio device using WASAPI.
+/// A Windows audio endpoint, as read when it was enumerated.
 ///
-/// This struct holds an `IMMDevice` instance, which is the core representation
-/// of an audio endpoint in WASAPI.
+/// Holds plain data only: the endpoint id, its friendly name and data-flow
+/// kind, and whether it was the default render endpoint, all read at
+/// enumeration, plus an MTA usage pin shared with its enumerator. It holds no
+/// COM interface. [`supported_formats`](AudioDevice::supported_formats) looks the
+/// endpoint up by id and creates, uses and releases its COM objects within the
+/// call, on the calling thread. A device may therefore be used and dropped on
+/// any thread, in any apartment, including after the thread that enumerated it
+/// has exited; it is `Send + Sync` through the auto traits.
 #[derive(Debug)]
 pub struct WindowsAudioDevice {
-    device: IMMDevice,
-    #[allow(dead_code)] // RAII guard: held to keep COM initialized for this device's lifetime
-    com_initializer: Arc<ComInitializer>,
+    id: DeviceId,
+    name: String,
+    kind: std::result::Result<DeviceKind, KindReadFailure>,
+    is_default: bool,
+    /// Keeps the MTA alive, so a calling thread that never initialised COM runs
+    /// in the implicit MTA during `supported_formats`.
+    #[allow(dead_code)] // RAII guard: held for its `Drop`.
+    pin: Arc<MtaUsagePin>,
+}
+
+/// Why an endpoint's data-flow direction could not be read at enumeration.
+/// [`AudioDevice::kind`] rebuilds the `get_device_kind` backend error from it.
+#[derive(Debug, Clone)]
+struct KindReadFailure {
+    message: String,
+    context: Option<BackendContext>,
 }
 
 impl WindowsAudioDevice {
-    /// Creates a new `WindowsAudioDevice` from an `IMMDevice` and a `ComInitializer`.
-    fn new(device: IMMDevice, com_initializer: Arc<ComInitializer>) -> Self {
+    /// Reads `device`'s id, friendly name and kind on the calling thread.
+    ///
+    /// `default_id` is the id of the default render endpoint, read in the same
+    /// call; the device is the default when its id equals it. A field that
+    /// cannot be read takes the value its getter reports for that failure.
+    fn from_endpoint(device: &IMMDevice, default_id: Option<&str>, pin: Arc<MtaUsagePin>) -> Self {
+        let id = read_endpoint_id(device);
+        let is_default = id.is_some() && id.as_deref() == default_id;
         Self {
-            device,
-            com_initializer,
+            id: DeviceId(id.unwrap_or_else(|| "unknown-device".to_string())),
+            name: read_friendly_name(device)
+                .unwrap_or_else(|_| "Unknown Windows Device".to_string()),
+            kind: read_device_kind(device),
+            is_default,
+            pin,
         }
     }
 }
-
-// SAFETY: The originating enumerator is acquired in the MTA, but its methods
-// obtain the IMMDevice on the enumeration caller. The MTA pin does not establish
-// that a later use or Release on an STA is safe (#105).
-unsafe impl Send for WindowsAudioDevice {}
-// SAFETY: Shared callers are not confined to the MTA; the IMMDevice's agility
-// has not been established (#105).
-unsafe impl Sync for WindowsAudioDevice {}
 
 impl WindowsAudioDevice {
     /// Helper function to convert a PWSTR to a String.
@@ -533,44 +592,43 @@ impl WindowsAudioDevice {
 ///   `WindowsCaptureThread` → `BridgeProducer` → ring buffer → `BridgeConsumer` → `BridgeStream`
 impl AudioDevice for WindowsAudioDevice {
     fn id(&self) -> DeviceId {
-        // Use the IMMDevice::GetId() COM method
-        unsafe {
-            if let Ok(id_pwstr) = self.device.GetId() {
-                if let Ok(id_str) = Self::pwstr_to_string(id_pwstr) {
-                    CoTaskMemFree(Some(id_pwstr.as_ptr().cast()));
-                    return DeviceId(id_str);
-                }
-                CoTaskMemFree(Some(id_pwstr.as_ptr().cast()));
-            }
-            DeviceId("unknown-device".to_string())
-        }
+        self.id.clone()
     }
 
     fn name(&self) -> String {
-        self.get_name_internal()
-            .unwrap_or_else(|_| "Unknown Windows Device".to_string())
+        self.name.clone()
     }
 
+    /// `true` when this endpoint was the default render (console) endpoint at
+    /// enumeration: the endpoint
+    /// [`default_device`](DeviceEnumerator::default_device) returns.
     fn is_default(&self) -> bool {
-        // Default detection requires enumerator context — return false.
-        // The enumerator's default_device() handles default selection.
-        false
+        self.is_default
     }
 
+    /// Looks the endpoint up by its id on the calling thread and queries its
+    /// formats. An endpoint that no longer exists, or whose query fails, yields
+    /// the single [`AudioFormat::default`] fallback, never another endpoint's
+    /// formats.
     fn supported_formats(&self) -> Vec<AudioFormat> {
         self.query_supported_formats_internal()
             .unwrap_or_else(|_| vec![AudioFormat::default()])
     }
 
-    /// Resolves the endpoint direction via `IMMEndpoint::GetDataFlow`.
-    ///
-    /// Delegates to the inherent `kind_internal`
-    /// helper so the fallible `IMMEndpoint` probe is shared with any
-    /// crate-internal callers. `eRender` → [`DeviceKind::Output`],
-    /// `eCapture` → [`DeviceKind::Input`]. Stays fallible (resolves the M1
-    /// api-fit clash) rather than collapsing to a default.
+    /// The endpoint direction read via `IMMEndpoint::GetDataFlow` at
+    /// enumeration: `eRender` → [`DeviceKind::Output`], `eCapture` →
+    /// [`DeviceKind::Input`]. Stays fallible rather than collapsing to a
+    /// default: when the direction could not be read, this returns a backend
+    /// error with operation `get_device_kind` and the context of the failed call.
     fn kind(&self) -> AudioResult<DeviceKind> {
-        self.kind_internal()
+        self.kind
+            .clone()
+            .map_err(|failure| AudioError::BackendError {
+                backend: "wasapi".to_string(),
+                operation: "get_device_kind".to_string(),
+                message: failure.message,
+                context: failure.context,
+            })
     }
 
     fn create_stream(&self, config: &StreamConfig) -> AudioResult<Box<dyn CapturingStream>> {
@@ -627,44 +685,36 @@ impl AudioDevice for WindowsAudioDevice {
 }
 
 impl WindowsAudioDevice {
-    /// Query the device's supported audio formats via WASAPI format negotiation.
+    /// Query the endpoint's supported audio formats via WASAPI format negotiation.
     ///
-    /// This queries the device's mix format (its preferred shared-mode format),
-    /// then probes common sample rates to build a list of supported formats.
-    /// The mix format is always first in the returned list.
+    /// Resolves the endpoint by its id through a call-local enumerator on the
+    /// calling thread, with no fallback to another endpoint, then queries the
+    /// device's mix format (its preferred shared-mode format) and probes common
+    /// sample rates. The mix format is always first in the returned list. Every
+    /// COM object is released before this returns; `self.pin` outlives them.
     ///
     /// Uses `IAudioClient::IsFormatSupported` in shared mode, matching the
     /// pattern from camilladsp's `get_supported_wave_format()`.
     fn query_supported_formats_internal(&self) -> AudioResult<Vec<AudioFormat>> {
         let mut formats = Vec::new();
 
-        // Get a wasapi-rs AudioClient through the wasapi-rs Device wrapper,
-        // which gives us access to get_mixformat() and is_supported().
-        let audio_client: wasapi::AudioClient = unsafe {
-            let enumerator =
-                wasapi::DeviceEnumerator::new().map_err(|e| AudioError::BackendError {
+        // Declared in creation order, so they release client, device, enumerator.
+        let enumerator = wasapi::DeviceEnumerator::new().map_err(|e| AudioError::BackendError {
+            backend: "wasapi".to_string(),
+            operation: "query_supported_formats".to_string(),
+            message: format!("Failed to create DeviceEnumerator: {}", e),
+            context: None,
+        })?;
+        let wasapi_device =
+            enumerator
+                .get_device(&self.id.0)
+                .map_err(|e| AudioError::BackendError {
                     backend: "wasapi".to_string(),
                     operation: "query_supported_formats".to_string(),
-                    message: format!("Failed to create DeviceEnumerator: {}", e),
+                    message: format!("Failed to resolve endpoint '{}': {}", self.id.0, e),
                     context: None,
                 })?;
-
-            // Get our device's ID to find the matching wasapi-rs Device
-            let id_pwstr = self.device.GetId().map_err(|hr| AudioError::BackendError {
-                backend: "wasapi".to_string(),
-                operation: "query_supported_formats".to_string(),
-                message: format!("Failed to get device ID (HRESULT: {:?})", hr),
-                context: Some(wasapi_backend_context_err(&hr)),
-            })?;
-            let device_id = if !id_pwstr.is_null() {
-                let id = Self::pwstr_to_string(id_pwstr).unwrap_or_default();
-                CoTaskMemFree(Some(id_pwstr.as_ptr().cast()));
-                id
-            } else {
-                String::new()
-            };
-
-            let wasapi_device = find_wasapi_device_by_id(&enumerator, &device_id)?;
+        let audio_client =
             wasapi_device
                 .get_iaudioclient()
                 .map_err(|e| AudioError::BackendError {
@@ -672,8 +722,7 @@ impl WindowsAudioDevice {
                     operation: "query_supported_formats".to_string(),
                     message: format!("Failed to get IAudioClient: {}", e),
                     context: None,
-                })?
-        };
+                })?;
 
         // Query the device's mix format (its preferred shared-mode format).
         // This is always supported and goes first in the list.
@@ -745,90 +794,80 @@ impl WindowsAudioDevice {
 
         Ok(formats)
     }
+}
 
-    /// Helper method that returns Result for get_name implementation
-    fn get_name_internal(&self) -> AudioResult<String> {
-        unsafe {
-            let property_store: IPropertyStore =
-                self.device.OpenPropertyStore(STGM_READ).map_err(|hr| {
-                    AudioError::BackendError {
-                        backend: "wasapi".to_string(),
-                        operation: "get_device_name".to_string(),
-                        message: format!("IMMDevice::OpenPropertyStore failed (HRESULT: {:?})", hr),
-                        context: Some(wasapi_backend_context_err(&hr)),
-                    }
-                })?;
-
-            let prop_variant = property_store
-                .GetValue(&PKEY_Device_FriendlyName as *const _ as *const _)
-                .map_err(|hr| AudioError::BackendError {
-                    backend: "wasapi".to_string(),
-                    operation: "get_device_name".to_string(),
-                    message: format!(
-                        "IPropertyStore::GetValue for PKEY_Device_FriendlyName failed (HRESULT: {:?})",
-                        hr
-                    ),
-                    context: Some(wasapi_backend_context_err(&hr)),
-                })?;
-
-            let name = if prop_variant.vt() == windows::Win32::System::Variant::VARENUM(VT_LPWSTR) {
-                let name_pwstr = prop_variant.Anonymous.Anonymous.Anonymous.pwszVal;
-                Self::pwstr_to_string(name_pwstr).unwrap_or_else(|_| "Unknown Device".to_string())
-            } else {
-                "Unknown Device".to_string()
-            };
-            // Note: prop_variant is returned by value, no need to clear manually
-            Ok(name)
-        }
+/// Reads `device`'s id on the calling thread; `None` when `GetId` fails.
+fn read_endpoint_id(device: &IMMDevice) -> Option<String> {
+    // SAFETY: `device` is a live IMMDevice. `GetId` returns a string allocated
+    // with `CoTaskMemAlloc`; it is copied, then freed exactly once.
+    unsafe {
+        let id_pwstr = device.GetId().ok()?;
+        let id = WindowsAudioDevice::pwstr_to_string(id_pwstr).ok();
+        CoTaskMemFree(Some(id_pwstr.as_ptr().cast()));
+        id
     }
 }
 
-impl WindowsAudioDevice {
-    /// Determines the kind of device (Input or Output) via `IMMEndpoint`.
-    ///
-    /// Backing implementation for the [`AudioDevice::kind`] trait method. Kept
-    /// as a `pub(crate)` inherent helper (mirroring `get_name_internal` /
-    /// `query_supported_formats_internal`) so the trait method can delegate
-    /// without inherent-vs-trait call ambiguity.
-    pub(crate) fn kind_internal(&self) -> AudioResult<DeviceKind> {
-        // QueryInterface for IMMEndpoint
-        let endpoint: IMMEndpoint = self.device.cast().map_err(|hr| AudioError::BackendError {
-            backend: "wasapi".to_string(),
-            operation: "get_device_kind".to_string(),
-            message: format!(
-                "Failed to cast IMMDevice to IMMEndpoint (HRESULT: {:?})",
-                hr
-            ),
-            context: Some(wasapi_backend_context_err(&hr)),
-        })?;
-
-        unsafe {
-            let data_flow_val = endpoint
-                .GetDataFlow()
+/// Reads `PKEY_Device_FriendlyName` from `device`'s property store on the
+/// calling thread. A value that is not a wide string reads as `"Unknown Device"`.
+fn read_friendly_name(device: &IMMDevice) -> AudioResult<String> {
+    // SAFETY: `device` is a live IMMDevice. The property store and the
+    // PROPVARIANT are owned values released when they drop, and `pwszVal` is
+    // read only when `vt` says the variant holds a wide string.
+    unsafe {
+        let property_store: IPropertyStore =
+            device
+                .OpenPropertyStore(STGM_READ)
                 .map_err(|hr| AudioError::BackendError {
                     backend: "wasapi".to_string(),
-                    operation: "get_device_kind".to_string(),
-                    message: format!("IMMEndpoint::GetDataFlow failed (HRESULT: {:?})", hr),
+                    operation: "get_device_name".to_string(),
+                    message: format!("IMMDevice::OpenPropertyStore failed (HRESULT: {:?})", hr),
                     context: Some(wasapi_backend_context_err(&hr)),
                 })?;
 
-            // EDataFlow is a newtype struct (e.g. EDataFlow(0)), not a Rust enum.
-            // Using `match` with `eRender` as a pattern would create a variable binding,
-            // not compare against the constant. We must use `if` chains instead.
-            if data_flow_val == eRender {
-                Ok(DeviceKind::Output)
-            } else if data_flow_val == eCapture {
-                Ok(DeviceKind::Input)
-            } else {
-                Err(AudioError::BackendError {
-                    backend: "wasapi".to_string(),
-                    operation: "get_device_kind".to_string(),
-                    message: format!("Unknown data flow value: {:?}", data_flow_val),
-                    context: None,
-                })
-            }
-        }
+        let prop_variant = property_store
+            .GetValue(&PKEY_Device_FriendlyName as *const _ as *const _)
+            .map_err(|hr| AudioError::BackendError {
+                backend: "wasapi".to_string(),
+                operation: "get_device_name".to_string(),
+                message: format!(
+                    "IPropertyStore::GetValue for PKEY_Device_FriendlyName failed (HRESULT: {:?})",
+                    hr
+                ),
+                context: Some(wasapi_backend_context_err(&hr)),
+            })?;
+
+        let name = if prop_variant.vt() == windows::Win32::System::Variant::VARENUM(VT_LPWSTR) {
+            let name_pwstr = prop_variant.Anonymous.Anonymous.Anonymous.pwszVal;
+            WindowsAudioDevice::pwstr_to_string(name_pwstr)
+                .unwrap_or_else(|_| "Unknown Device".to_string())
+        } else {
+            "Unknown Device".to_string()
+        };
+        Ok(name)
     }
+}
+
+/// Reads `device`'s direction via `IMMEndpoint::GetDataFlow` on the calling
+/// thread: `eRender` → [`DeviceKind::Output`], `eCapture` → [`DeviceKind::Input`].
+/// Any other flow, or a failed call, is a [`KindReadFailure`].
+fn read_device_kind(device: &IMMDevice) -> std::result::Result<DeviceKind, KindReadFailure> {
+    let endpoint: IMMEndpoint = device.cast().map_err(|hr| KindReadFailure {
+        message: format!(
+            "Failed to cast IMMDevice to IMMEndpoint (HRESULT: {:?})",
+            hr
+        ),
+        context: Some(wasapi_backend_context_err(&hr)),
+    })?;
+    // SAFETY: `endpoint` is the live IMMEndpoint obtained above.
+    let flow = unsafe { endpoint.GetDataFlow() }.map_err(|hr| KindReadFailure {
+        message: format!("IMMEndpoint::GetDataFlow failed (HRESULT: {:?})", hr),
+        context: Some(wasapi_backend_context_err(&hr)),
+    })?;
+    data_flow_to_kind(flow).ok_or_else(|| KindReadFailure {
+        message: format!("Unknown data flow value: {:?}", flow),
+        context: None,
+    })
 }
 
 // ── Device-change notifications (M10 watch() — rsac-e360) ─────────────────
@@ -842,13 +881,20 @@ impl WindowsAudioDevice {
 // re-enter the audio engine. Invoking an arbitrary user `FnMut` directly there
 // risks deadlock and COM re-entrancy.
 //
-// Hand-off pattern (matches the canonical Windows/macOS design in the M10
-// surface and cpal/CamillaDSP): the COM callback only *translates* the event and
-// pushes a [`DeviceEvent`] into a bounded channel — alloc/lock on this thread is
-// permitted (it is NOT the real-time audio callback thread), but it never runs
-// user code. A dedicated helper thread owned by the returned [`DeviceWatcher`]
-// pops events and invokes the user handler. Teardown unregisters the COM client,
-// signals the helper thread, and joins it — no leak, no hang.
+// Hand-off pattern (the canonical Windows/macOS design in the M10 surface): the
+// COM callback only *translates* the event and pushes it into a bounded channel
+// — alloc/lock on this thread is permitted (it is NOT the real-time audio
+// callback thread), but it never runs user code, makes no COM call and holds no
+// COM pointer, only the sender.
+//
+// Ownership: one helper thread per watcher (`rsac-wasapi-device-watch`) creates,
+// uses and releases every COM object of that watcher. It initialises COM as MTA,
+// creates its own enumerator and the notification client, registers, reports the
+// outcome to `watch()`, pops events (resolving a `DeviceAdded` name and kind with
+// its own enumerator) and invokes the user handler. On shutdown it unregisters
+// the same client pointer and releases both interfaces before uninitialising
+// COM, all on that thread. The `DeviceWatcher` teardown only sets a flag and
+// joins the helper — no leak, no hang.
 
 /// Bound on the channel between the COM notification thread and the helper
 /// thread that runs the user handler.
@@ -863,6 +909,11 @@ const DEVICE_EVENT_CHANNEL_BOUND: usize = 64;
 /// re-checking the shutdown flag. Keeps teardown latency bounded without busy
 /// spinning.
 const NOTIFY_THREAD_POLL_INTERVAL: Duration = Duration::from_millis(100);
+
+/// How long `watch()` waits for the helper thread's registration report.
+/// Registration is a few in-process COM calls; the bound only keeps `watch()`
+/// from hanging on a stuck one.
+const WATCH_REGISTRATION_TIMEOUT: Duration = Duration::from_secs(5);
 
 /// Map a WASAPI [`EDataFlow`] to the rsac [`DeviceKind`].
 ///
@@ -879,8 +930,9 @@ fn data_flow_to_kind(flow: EDataFlow) -> Option<DeviceKind> {
     }
 }
 
-/// Resolve a newly added device's name and kind from the notification callback.
-/// The endpoint may not be ready yet, so resolution is best-effort.
+/// Resolve a newly added device's name and kind on the device-watch helper
+/// thread, with that thread's enumerator. The endpoint may not be ready yet, so
+/// resolution is best-effort.
 fn resolve_added_device(enumerator: &IMMDeviceEnumerator, device_id: &str) -> (String, DeviceKind) {
     // SAFETY: `enumerator` is a live IMMDeviceEnumerator; GetDevice takes a
     // null-terminated wide string. We build one from `device_id`.
@@ -901,7 +953,7 @@ fn resolve_added_device(enumerator: &IMMDeviceEnumerator, device_id: &str) -> (S
         .and_then(data_flow_to_kind)
         .unwrap_or(DeviceKind::Input);
 
-    // Friendly name via the property store (mirrors get_name_internal).
+    // Friendly name via the property store (mirrors `read_friendly_name`).
     let name = unsafe { friendly_name_of(&device) }.unwrap_or_default();
 
     (name, kind)
@@ -924,38 +976,45 @@ unsafe fn friendly_name_of(device: &IMMDevice) -> Option<String> {
     }
 }
 
+/// What the notification client hands the device-watch helper thread.
+#[derive(Debug)]
+enum WatchNotice {
+    /// A translated event, delivered as is.
+    Event(DeviceEvent),
+    /// A device was added; the helper resolves its name and kind before delivery.
+    Added(DeviceId),
+}
+
 /// COM notification client that forwards WASAPI endpoint changes onto a channel.
 ///
-/// Registered with `IMMDeviceEnumerator::RegisterEndpointNotificationCallback`.
-/// Its methods run on the MMDevice system notification thread; they only
-/// translate and enqueue events (never run user code) — see the module comment
-/// above for the deadlock rationale.
+/// Created and registered on the device-watch helper thread with
+/// `IMMDeviceEnumerator::RegisterEndpointNotificationCallback`. Its methods run
+/// on the MMDevice system notification thread; they only translate and enqueue
+/// (never run user code, never call COM) — see the module comment above for the
+/// deadlock rationale. It holds no COM pointer, only the sender.
 #[implement(IMMNotificationClient)]
 struct WatcherNotificationClient {
     /// Bounded sender to the helper thread. `try_send` so a stalled consumer can
     /// never block the COM notification thread.
-    tx: mpsc::SyncSender<DeviceEvent>,
-    /// Enumerator clone used to resolve name/kind in `OnDeviceAdded`. Its
-    /// use from the notification thread is part of the apartment audit (#105).
-    enumerator: IMMDeviceEnumerator,
+    tx: mpsc::SyncSender<WatchNotice>,
 }
 
 impl WatcherNotificationClient {
-    /// Enqueue an event without ever blocking the COM notification thread.
-    /// A full buffer means the consumer is behind; we drop the event (a device
+    /// Enqueue a notice without ever blocking the COM notification thread.
+    /// A full buffer means the consumer is behind; we drop the notice (a device
     /// change is idempotent — the consumer can re-enumerate) rather than stall
     /// COM. A disconnected receiver means the watcher is being torn down.
-    fn emit(&self, event: DeviceEvent) {
-        match self.tx.try_send(event) {
+    fn emit(&self, notice: WatchNotice) {
+        match self.tx.try_send(notice) {
             Ok(()) => {}
-            Err(mpsc::TrySendError::Full(ev)) => {
+            Err(mpsc::TrySendError::Full(notice)) => {
                 log::warn!(
                     "wasapi: device-event channel full, dropping notification: {:?}",
-                    ev
+                    notice
                 );
             }
             Err(mpsc::TrySendError::Disconnected(_)) => {
-                // Helper thread gone (teardown in progress) — nothing to do.
+                // Helper thread tearing down — nothing to do.
             }
         }
     }
@@ -973,27 +1032,27 @@ impl IMMNotificationClient_Impl for WatcherNotificationClient_Impl {
         let id = unsafe { pwstrdeviceid.to_string() }.unwrap_or_default();
         // `available` == is the endpoint usable for capture right now.
         let available = dwnewstate == DEVICE_STATE_ACTIVE;
-        self.emit(DeviceEvent::StateChanged {
+        self.emit(WatchNotice::Event(DeviceEvent::StateChanged {
             id: DeviceId(id),
             available,
-        });
+        }));
         Ok(())
     }
 
     fn OnDeviceAdded(&self, pwstrdeviceid: &PCWSTR) -> windows::core::Result<()> {
+        // SAFETY: COM passes a valid null-terminated id for the duration of the call.
         let id = unsafe { pwstrdeviceid.to_string() }.unwrap_or_default();
-        let (name, kind) = resolve_added_device(&self.enumerator, &id);
-        self.emit(DeviceEvent::DeviceAdded {
-            id: DeviceId(id),
-            name,
-            kind,
-        });
+        // The helper thread resolves the name and kind; this callback makes no
+        // COM call.
+        self.emit(WatchNotice::Added(DeviceId(id)));
         Ok(())
     }
 
     fn OnDeviceRemoved(&self, pwstrdeviceid: &PCWSTR) -> windows::core::Result<()> {
         let id = unsafe { pwstrdeviceid.to_string() }.unwrap_or_default();
-        self.emit(DeviceEvent::DeviceRemoved { id: DeviceId(id) });
+        self.emit(WatchNotice::Event(DeviceEvent::DeviceRemoved {
+            id: DeviceId(id),
+        }));
         Ok(())
     }
 
@@ -1019,10 +1078,10 @@ impl IMMNotificationClient_Impl for WatcherNotificationClient_Impl {
         } else {
             unsafe { pwstrdefaultdeviceid.to_string() }.unwrap_or_default()
         };
-        self.emit(DeviceEvent::DefaultChanged {
+        self.emit(WatchNotice::Event(DeviceEvent::DefaultChanged {
             id: DeviceId(id),
             kind,
-        });
+        }));
         Ok(())
     }
 
@@ -1038,46 +1097,57 @@ impl IMMNotificationClient_Impl for WatcherNotificationClient_Impl {
 }
 
 /// Enumerates audio devices available on a Windows system using WASAPI.
+///
+/// Holds no COM interface, only an MTA usage pin shared with the devices it
+/// returns. Each call creates, uses and releases its COM objects within the
+/// call, on the calling thread and in that thread's apartment: the
+/// `MMDeviceEnumerator` class is registered `ThreadingModel=Both`, so COM creates
+/// it directly in an STA or in the MTA, and a thread that never initialised COM
+/// runs in the implicit MTA that the pin keeps alive. No call changes the calling
+/// thread's apartment. The enumerator is `Send + Sync` through the auto traits
+/// and may be shared, used and dropped on any thread, including after the thread
+/// that created it has exited. [`watch`](DeviceEnumerator::watch) keeps its COM
+/// objects on a helper thread of its own.
 #[derive(Debug)]
 pub struct WindowsDeviceEnumerator {
-    // Declared BEFORE `com_initializer`: Rust drops struct fields in declaration
-    // order, so `IMMDeviceEnumerator::Release` must run while the MTA is pinned.
-    enumerator: IMMDeviceEnumerator,
-    com_initializer: Arc<ComInitializer>,
+    /// Cloned into every device this enumerator returns.
+    pin: Arc<MtaUsagePin>,
 }
 
 impl WindowsDeviceEnumerator {
-    /// Creates a new Windows device enumerator.
+    /// Creates a new Windows device enumerator on a thread in any COM apartment
+    /// (STA, MTA, or COM never initialised).
     ///
-    /// This will initialize COM for the lifetime of the enumerator and
-    /// create an `IMMDeviceEnumerator` instance.
+    /// Pins the process-wide MTA, then creates and releases an
+    /// `IMMDeviceEnumerator` on the calling thread, so an unavailable MMDevice
+    /// API is reported here rather than on first use.
+    ///
+    /// # Errors
+    ///
+    /// [`AudioError::BackendError`] with operation `com_init` when the MTA cannot
+    /// be pinned, or `create_device_enumerator` when `CoCreateInstance` fails.
     pub fn new() -> AudioResult<Self> {
-        let com_initializer = Arc::new(ComInitializer::new()?);
-        // SAFETY: CoCreateInstance is called to create a COM object.
-        // The HRESULT is checked for errors.
-        let enumerator: IMMDeviceEnumerator = unsafe {
-            CoCreateInstance(&MMDeviceEnumerator, None, CLSCTX_ALL)
-        }
-        .map_err(|hr| AudioError::BackendError {
+        let pin = Arc::new(MtaUsagePin::new()?);
+        drop(create_imm_device_enumerator()?);
+        Ok(Self { pin })
+    }
+}
+
+/// Creates an `IMMDeviceEnumerator` in the calling thread's apartment. Every
+/// caller releases it on the same thread, before the call that created it
+/// returns.
+fn create_imm_device_enumerator() -> AudioResult<IMMDeviceEnumerator> {
+    // SAFETY: `CoCreateInstance` gets a valid CLSID reference and no outer
+    // object; the interface is used only after the HRESULT is checked.
+    unsafe { CoCreateInstance(&MMDeviceEnumerator, None, CLSCTX_ALL) }.map_err(|hr| {
+        AudioError::BackendError {
             backend: "wasapi".to_string(),
             operation: "create_device_enumerator".to_string(),
             message: format!("Failed to create IMMDeviceEnumerator (HRESULT: {:?})", hr),
             context: Some(wasapi_backend_context_err(&hr)),
-        })?;
-
-        Ok(Self {
-            enumerator,
-            com_initializer,
-        })
-    }
+        }
+    })
 }
-
-// SAFETY: `new` checks the caller is in the MTA before acquiring the enumerator.
-// Later use or release on an STA is unchecked (#105).
-unsafe impl Send for WindowsDeviceEnumerator {}
-// SAFETY: The creation check does not constrain the apartments of threads
-// calling the enumerator through a shared reference (#105).
-unsafe impl Sync for WindowsDeviceEnumerator {}
 
 /// New canonical `DeviceEnumerator` trait implementation for `WindowsDeviceEnumerator`.
 ///
@@ -1085,10 +1155,20 @@ unsafe impl Sync for WindowsDeviceEnumerator {}
 /// platform-agnostic trait contract in `core::interface`.
 impl DeviceEnumerator for WindowsDeviceEnumerator {
     fn enumerate_devices(&self) -> AudioResult<Vec<Box<dyn AudioDevice>>> {
+        // Every interface below is created, used and released in this call, on
+        // the calling thread; `self.pin` outlives all of them.
+        let enumerator = create_imm_device_enumerator()?;
+
+        // The default render endpoint's id marks `is_default`. Best-effort: a
+        // system without a render endpoint still enumerates.
+        // SAFETY: Calling GetDefaultAudioEndpoint on a valid IMMDeviceEnumerator.
+        let default_id = unsafe { enumerator.GetDefaultAudioEndpoint(eRender, eConsole) }
+            .ok()
+            .and_then(|endpoint| read_endpoint_id(&endpoint));
+
         // SAFETY: Calling EnumAudioEndpoints on a valid IMMDeviceEnumerator.
         let collection: IMMDeviceCollection = unsafe {
-            self.enumerator
-                .EnumAudioEndpoints(eAll, DEVICE_STATE_ACTIVE)
+            enumerator.EnumAudioEndpoints(eAll, DEVICE_STATE_ACTIVE)
         }
         .map_err(|hr| AudioError::DeviceEnumerationError {
             reason: format!("Failed to enumerate audio endpoints (HRESULT: {:?})", hr),
@@ -1108,7 +1188,7 @@ impl DeviceEnumerator for WindowsDeviceEnumerator {
         let mut devices: Vec<Box<dyn AudioDevice>> = Vec::with_capacity(count as usize);
         for i in 0..count {
             // SAFETY: Calling Item on a valid IMMDeviceCollection with a valid index.
-            let imm_device: IMMDevice =
+            let endpoint: IMMDevice =
                 unsafe { collection.Item(i) }.map_err(|hr| AudioError::DeviceEnumerationError {
                     reason: format!(
                         "Failed to get device item {} from collection (HRESULT: {:?})",
@@ -1116,24 +1196,28 @@ impl DeviceEnumerator for WindowsDeviceEnumerator {
                     ),
                     context: Some(wasapi_backend_context_err(&hr)),
                 })?;
-            devices.push(Box::new(WindowsAudioDevice::new(
-                imm_device,
-                self.com_initializer.clone(),
+            devices.push(Box::new(WindowsAudioDevice::from_endpoint(
+                &endpoint,
+                default_id.as_deref(),
+                Arc::clone(&self.pin),
             )));
         }
         Ok(devices)
     }
 
     fn default_device(&self) -> AudioResult<Box<dyn AudioDevice>> {
-        // For audio capture, the default render device is most relevant (loopback).
-        let data_flow = eRender;
+        // Created, used and released in this call, on the calling thread.
+        let enumerator = create_imm_device_enumerator()?;
 
+        // For audio capture, the default render device is most relevant (loopback).
         // SAFETY: Calling GetDefaultAudioEndpoint on a valid IMMDeviceEnumerator.
-        match unsafe { self.enumerator.GetDefaultAudioEndpoint(data_flow, eConsole) } {
-            Ok(imm_device) => Ok(Box::new(WindowsAudioDevice::new(
-                imm_device,
-                self.com_initializer.clone(),
-            ))),
+        match unsafe { enumerator.GetDefaultAudioEndpoint(eRender, eConsole) } {
+            Ok(endpoint) => {
+                let mut device =
+                    WindowsAudioDevice::from_endpoint(&endpoint, None, Arc::clone(&self.pin));
+                device.is_default = true;
+                Ok(Box::new(device))
+            }
             Err(hr) if hr.code() == E_NOTFOUND => Err(AudioError::DeviceNotFound {
                 device_id: "default_render".to_string(),
             }),
@@ -1147,138 +1231,241 @@ impl DeviceEnumerator for WindowsDeviceEnumerator {
     /// Subscribe to WASAPI device hot-plug / default-change notifications
     /// (M10 `watch()` — rsac-e360).
     ///
-    /// Registers an [`IMMNotificationClient`] via
-    /// `IMMDeviceEnumerator::RegisterEndpointNotificationCallback`. The COM
-    /// callbacks (run on the MMDevice system notification thread) translate each
-    /// change into a [`DeviceEvent`] and push it onto a bounded channel; a
-    /// dedicated helper thread owned by the returned [`DeviceWatcher`] pops events
-    /// and invokes `on_event`. The user handler therefore **never** runs on the
-    /// COM notification thread, avoiding COM re-entrancy / deadlock (the canonical
-    /// thread hand-off pattern; see the module-level notes by
-    /// `WatcherNotificationClient`, the crate-private COM callback object).
+    /// Callable on any thread, whatever its COM apartment: the caller makes no
+    /// COM call. A dedicated helper thread (`rsac-wasapi-device-watch`) owns
+    /// every COM object of the subscription: it initialises COM as MTA, creates
+    /// its own `IMMDeviceEnumerator` and an [`IMMNotificationClient`], registers
+    /// the client via `RegisterEndpointNotificationCallback`, and reports the
+    /// outcome, which `watch` waits for (at most five seconds). The COM callbacks
+    /// (run on the MMDevice system notification thread) only translate each
+    /// change and push it onto a bounded channel; the helper pops it, resolves a
+    /// `DeviceAdded` name and kind with its own enumerator, and invokes
+    /// `on_event`. The user handler therefore **never** runs on the COM
+    /// notification thread, avoiding COM re-entrancy / deadlock (see the
+    /// module-level notes by `WatcherNotificationClient`, the crate-private COM
+    /// callback object).
     ///
-    /// Dropping the [`DeviceWatcher`] unregisters the COM client, signals the
-    /// helper thread, and joins it — no thread leak, no hang. After `drop`
-    /// returns, `on_event` is guaranteed not to be called again.
+    /// Dropping the [`DeviceWatcher`], on any thread, signals the helper and
+    /// joins it; the helper stops delivery, unregisters the client it
+    /// registered, and releases its COM objects before it exits. After `drop`
+    /// returns, `on_event` is guaranteed not to be called again. Dropping the
+    /// watcher from inside `on_event` returns without joining (the helper cannot
+    /// join itself): `on_event` is not called again, and the helper finishes the
+    /// same teardown once the handler returns.
+    ///
+    /// # Errors
+    ///
+    /// - [`AudioError::BackendError`] when the helper thread cannot be spawned
+    ///   (operation `spawn_device_watch_thread`), COM cannot be initialised on it
+    ///   (`com_init`), its enumerator cannot be created
+    ///   (`create_device_enumerator`), or registration fails
+    ///   (`register_endpoint_notification_callback`).
+    /// - [`AudioError::Timeout`] when the helper does not report within five
+    ///   seconds. The helper then exits on its own once it can, unregistering
+    ///   if it registered, without calling `on_event`.
     fn watch(&self, on_event: DeviceEventHandler) -> AudioResult<DeviceWatcher> {
-        // Bounded hand-off channel: COM notification thread → helper thread.
-        let (tx, rx) = mpsc::sync_channel::<DeviceEvent>(DEVICE_EVENT_CHANNEL_BOUND);
-
-        // Keep an enumerator reference in the callback for added-device lookup.
-        let client: IMMNotificationClient = WatcherNotificationClient {
-            tx,
-            enumerator: self.enumerator.clone(),
-        }
-        .into();
-
-        // Register the callback. From here on, COM may invoke `client` on its
-        // notification thread.
-        // SAFETY: `self.enumerator` is a valid IMMDeviceEnumerator; `client` is a
-        // live IMMNotificationClient we own a reference to.
-        unsafe {
-            self.enumerator
-                .RegisterEndpointNotificationCallback(&client)
-        }
-        .map_err(|hr| AudioError::BackendError {
-            backend: "wasapi".to_string(),
-            operation: "register_endpoint_notification_callback".to_string(),
-            message: format!(
-                "RegisterEndpointNotificationCallback failed (HRESULT: {:?})",
-                hr
-            ),
-            context: Some(wasapi_backend_context_err(&hr)),
-        })?;
-
-        // Shutdown flag observed by the helper thread's recv loop.
         let shutdown = Arc::new(AtomicBool::new(false));
-        let thread_shutdown = shutdown.clone();
+        let thread_shutdown = Arc::clone(&shutdown);
+        // Zero capacity: the helper's `send` succeeds only once this thread has
+        // taken the report, so a report that misses the bound below fails on the
+        // helper, which then releases everything without delivering.
+        let (ready_tx, ready_rx) = mpsc::sync_channel::<AudioResult<()>>(0);
 
-        // Helper thread: owns the receiver + the user handler. Pops events and
-        // invokes `on_event` off the COM thread. Exits when the shutdown flag is
-        // set (teardown) or the channel disconnects.
-        let mut on_event = on_event;
-        let notify_thread = std::thread::Builder::new()
+        let helper = std::thread::Builder::new()
             .name("rsac-wasapi-device-watch".to_string())
-            .spawn(move || loop {
-                match rx.recv_timeout(NOTIFY_THREAD_POLL_INTERVAL) {
-                    Ok(event) => on_event(event),
-                    Err(mpsc::RecvTimeoutError::Timeout) => {
-                        if thread_shutdown.load(Ordering::Acquire) {
-                            break;
-                        }
-                    }
-                    Err(mpsc::RecvTimeoutError::Disconnected) => break,
-                }
-            })
-            .map_err(|e| {
-                // Spawn failed — unregister so we do not leave a dangling COM
-                // callback registered with no consumer.
-                // SAFETY: same valid enumerator + client as the registration.
-                let _ = unsafe {
-                    self.enumerator
-                        .UnregisterEndpointNotificationCallback(&client)
-                };
-                AudioError::BackendError {
-                    backend: "wasapi".to_string(),
-                    operation: "spawn_device_watch_thread".to_string(),
-                    message: format!("Failed to spawn device-watch helper thread: {}", e),
-                    context: None,
-                }
+            .spawn(move || device_watch_thread_main(ready_tx, thread_shutdown, on_event))
+            .map_err(|e| AudioError::BackendError {
+                backend: "wasapi".to_string(),
+                operation: "spawn_device_watch_thread".to_string(),
+                message: format!("Failed to spawn device-watch helper thread: {}", e),
+                context: None,
             })?;
 
-        // The watcher can outlive this enumerator. Keep the registered client
-        // and a separate MTA pin until unregister and helper-thread join finish.
-        let teardown_state = SendWatcherTeardown {
-            enumerator: self.enumerator.clone(),
-            client,
-            com_initializer: self.com_initializer.clone(),
-        };
+        match ready_rx.recv_timeout(WATCH_REGISTRATION_TIMEOUT) {
+            Ok(Ok(())) => {}
+            Ok(Err(e)) => {
+                // The helper has released its COM objects and only returns now.
+                let _ = helper.join();
+                return Err(e);
+            }
+            Err(mpsc::RecvTimeoutError::Timeout) => {
+                // COM calls are not cancellable; do not join a stuck one. Dropping
+                // `ready_rx` on return fails the helper's report, so it unregisters
+                // (if it registered) and exits without calling the handler.
+                return Err(AudioError::Timeout {
+                    operation: "WASAPI device-watch registration".to_string(),
+                    duration: WATCH_REGISTRATION_TIMEOUT,
+                });
+            }
+            Err(mpsc::RecvTimeoutError::Disconnected) => {
+                let _ = helper.join();
+                return Err(AudioError::BackendError {
+                    backend: "wasapi".to_string(),
+                    operation: "spawn_device_watch_thread".to_string(),
+                    message: "device-watch helper thread exited without reporting registration"
+                        .to_string(),
+                    context: None,
+                });
+            }
+        }
 
+        // Captures only the flag and the join handle; it holds no COM object.
         let teardown = Box::new(move || {
-            // 1. Stop new events: unregister the COM callback first, so no further
-            //    OnDevice* fires after this returns. Best-effort — a failed
-            //    unregister must not panic in Drop.
-            // SAFETY: This is the registered client pointer, but the thread
-            // dropping the watcher may be in another apartment (#105).
-            let _ = unsafe {
-                teardown_state
-                    .enumerator
-                    .UnregisterEndpointNotificationCallback(&teardown_state.client)
-            };
-            // 2. Signal the helper thread to exit, then join. Setting the flag
-            //    plus dropping nothing else: the sender lives inside `client`,
-            //    which is dropped when `teardown_state` drops at end of closure;
-            //    the recv_timeout loop notices the flag within one poll interval.
             shutdown.store(true, Ordering::Release);
-            // Join: bounded by NOTIFY_THREAD_POLL_INTERVAL after the flag is set.
-            // Ignore a poisoned-thread join error — never panic in Drop.
-            let _ = notify_thread.join();
-            // `teardown_state` (enumerator + client + com_initializer, holding the
-            // SyncSender) drops here, after the consumer thread has been joined —
-            // so the COM apartment is released only after Unregister + join, never
-            // before.
-            drop(teardown_state);
+            if helper.thread().id() == std::thread::current().id() {
+                // Dropped from inside the handler, on the helper itself, which
+                // cannot join itself. The helper checks the flag before every
+                // handler call and runs its teardown once the handler returns.
+                return;
+            }
+            // Bounded by one poll interval after the flag is set, plus a handler
+            // call in progress and the helper's unregister and release. A
+            // panicked helper surfaces only as a join error; never panic in Drop.
+            let _ = helper.join();
         });
 
         Ok(DeviceWatcher::from_teardown(teardown))
     }
 }
 
-/// Holds the original registration pair until [`DeviceWatcher`] teardown.
-struct SendWatcherTeardown {
-    enumerator: IMMDeviceEnumerator,
-    client: IMMNotificationClient,
-    /// Holds the MTA pin through unregister and helper-thread join. Dropped
-    /// after the interface fields; it does not set the Drop thread's apartment.
-    #[allow(dead_code)]
-    com_initializer: Arc<ComInitializer>,
+/// COM initialised as MTA on the current thread for as long as the value lives.
+///
+/// `Drop` calls `CoUninitialize`; the type is `!Send`, so that runs on the
+/// thread that initialised COM.
+struct MtaApartment {
+    _not_send: PhantomData<*const ()>,
 }
 
-// SAFETY: Only the enumerator's original acquisition is checked for MTA
-// membership. We retain the exact pointer required for unregister; neither
-// unregistering with it nor releasing these references on an STA teardown
-// thread is established safe (#105).
-unsafe impl Send for SendWatcherTeardown {}
+impl MtaApartment {
+    fn enter() -> AudioResult<Self> {
+        // SAFETY: No pointer arguments. A successful return (S_OK or S_FALSE) is
+        // balanced by exactly one `CoUninitialize`, in `Drop`, on this thread.
+        unsafe { CoInitializeEx(None, COINIT_MULTITHREADED) }
+            .ok()
+            .map_err(|err| AudioError::BackendError {
+                backend: "wasapi".to_string(),
+                operation: "com_init".to_string(),
+                message: format!(
+                    "CoInitializeEx(COINIT_MULTITHREADED) failed (HRESULT: {:?})",
+                    err
+                ),
+                context: Some(wasapi_backend_context_err(&err)),
+            })?;
+        Ok(Self {
+            _not_send: PhantomData,
+        })
+    }
+}
+
+impl Drop for MtaApartment {
+    fn drop(&mut self) {
+        // SAFETY: Balances the successful `CoInitializeEx` in `enter`, on the
+        // thread that made it (`MtaApartment` is `!Send`).
+        unsafe { CoUninitialize() };
+    }
+}
+
+/// A notification client registered with an enumerator, both created on the
+/// device-watch helper thread.
+///
+/// Its COM fields make it `!Send`, so it never leaves that thread. Dropping it,
+/// including during an unwind from a panicking handler, unregisters the same
+/// client pointer and then releases both interfaces, on that thread.
+struct EndpointRegistration {
+    enumerator: IMMDeviceEnumerator,
+    client: IMMNotificationClient,
+}
+
+impl EndpointRegistration {
+    fn register(tx: mpsc::SyncSender<WatchNotice>) -> AudioResult<Self> {
+        let enumerator = create_imm_device_enumerator()?;
+        let client: IMMNotificationClient = WatcherNotificationClient { tx }.into();
+        // SAFETY: `enumerator` and `client` are live interfaces created above on
+        // this thread. From here on COM may invoke `client` on its notification
+        // thread.
+        unsafe { enumerator.RegisterEndpointNotificationCallback(&client) }.map_err(|hr| {
+            AudioError::BackendError {
+                backend: "wasapi".to_string(),
+                operation: "register_endpoint_notification_callback".to_string(),
+                message: format!(
+                    "RegisterEndpointNotificationCallback failed (HRESULT: {:?})",
+                    hr
+                ),
+                context: Some(wasapi_backend_context_err(&hr)),
+            }
+        })?;
+        Ok(Self { enumerator, client })
+    }
+}
+
+impl Drop for EndpointRegistration {
+    fn drop(&mut self) {
+        // SAFETY: `self.client` is the pointer registered with `self.enumerator`
+        // in `register`; both are live and owned by this value. Best-effort: a
+        // failed unregister must not panic in `Drop`.
+        let _ = unsafe {
+            self.enumerator
+                .UnregisterEndpointNotificationCallback(&self.client)
+        };
+    }
+}
+
+/// Body of the `rsac-wasapi-device-watch` helper thread: the one thread on
+/// which a watcher's COM objects are created, used and released.
+///
+/// Reports the registration outcome on `ready`, a zero-capacity channel whose
+/// `send` returns `Ok` only once `watch()` has taken the report. When `watch()`
+/// has stopped waiting, the helper releases everything without ever calling
+/// `on_event`. Otherwise it delivers until `shutdown` is set, checking the flag
+/// before every handler call.
+fn device_watch_thread_main(
+    ready: mpsc::SyncSender<AudioResult<()>>,
+    shutdown: Arc<AtomicBool>,
+    mut on_event: DeviceEventHandler,
+) {
+    // Declared first, so it drops last: every interface below is released before
+    // COM is uninitialised on this thread.
+    let _apartment = match MtaApartment::enter() {
+        Ok(apartment) => apartment,
+        Err(e) => {
+            let _ = ready.send(Err(e));
+            return;
+        }
+    };
+    let (tx, rx) = mpsc::sync_channel::<WatchNotice>(DEVICE_EVENT_CHANNEL_BOUND);
+    // Drops before `rx` and `_apartment`: unregister, then release.
+    let registration = match EndpointRegistration::register(tx) {
+        Ok(registration) => registration,
+        Err(e) => {
+            let _ = ready.send(Err(e));
+            return;
+        }
+    };
+    if ready.send(Ok(())).is_err() {
+        return;
+    }
+    drop(ready);
+
+    while !shutdown.load(Ordering::Acquire) {
+        let notice = match rx.recv_timeout(NOTIFY_THREAD_POLL_INTERVAL) {
+            Ok(notice) => notice,
+            Err(mpsc::RecvTimeoutError::Timeout) => continue,
+            Err(mpsc::RecvTimeoutError::Disconnected) => break,
+        };
+        let event = match notice {
+            WatchNotice::Event(event) => event,
+            WatchNotice::Added(id) => {
+                let (name, kind) = resolve_added_device(&registration.enumerator, &id.0);
+                DeviceEvent::DeviceAdded { id, name, kind }
+            }
+        };
+        // A teardown that began during the wait sees no further handler call.
+        if shutdown.load(Ordering::Acquire) {
+            break;
+        }
+        on_event(event);
+    }
+}
 
 /// Information about an active audio session associated with an application.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -1307,38 +1494,6 @@ fn wasapi_bits_to_sample_format(
         (32, _) => SampleFormat::F32,
         _ => SampleFormat::F32, // Fallback
     }
-}
-
-/// Find a wasapi-rs `Device` by its Windows device ID string.
-///
-/// Uses [`wasapi::DeviceEnumerator::get_device`], which wraps
-/// `IMMDeviceEnumerator::GetDevice` and resolves the endpoint directly from
-/// its ID — no manual render/capture collection scan needed. Falls back to the
-/// default render device if the ID lookup fails (empty ID, stale ID, or an
-/// endpoint that has since disappeared).
-fn find_wasapi_device_by_id(
-    enumerator: &wasapi::DeviceEnumerator,
-    device_id: &str,
-) -> AudioResult<wasapi::Device> {
-    // Direct ID resolution via IMMDeviceEnumerator::GetDevice.
-    if !device_id.is_empty() {
-        if let Ok(device) = enumerator.get_device(device_id) {
-            return Ok(device);
-        }
-    }
-
-    // Fall back to default render device.
-    enumerator
-        .get_default_device(wasapi::Direction::Render)
-        .map_err(|e| AudioError::BackendError {
-            backend: "wasapi".to_string(),
-            operation: "find_wasapi_device_by_id".to_string(),
-            message: format!(
-                "Device '{}' not found, and default device unavailable: {}",
-                device_id, e
-            ),
-            context: None,
-        })
 }
 
 /// Resolves a process name from its PID by opening the process handle and querying
@@ -1403,6 +1558,10 @@ fn parse_session_identifier(session_id: &str) -> String {
 /// Sessions with a process ID of 0 (often system sounds or non-application sessions)
 /// are typically filtered out.
 ///
+/// Works on any thread, whatever its COM apartment: it pins the MTA without an
+/// apartment check and creates, uses and releases every COM object within the
+/// call, on the calling thread.
+///
 /// # Returns
 ///
 /// * `Ok(Vec<ApplicationAudioSessionInfo>)` - A vector of structs, each containing
@@ -1448,7 +1607,8 @@ pub fn enumerate_application_audio_sessions() -> AudioResult<Vec<ApplicationAudi
     use windows::Win32::System::ProcessStatus::K32GetModuleFileNameExW;
     use windows::Win32::System::Threading::{OpenProcess, PROCESS_QUERY_LIMITED_INFORMATION};
 
-    let _com_initializer = ComInitializer::new()?;
+    // Declared before the interfaces below, so they are released first.
+    let _pin = MtaUsagePin::new()?;
 
     let mut sessions_info: Vec<ApplicationAudioSessionInfo> = Vec::new();
 
@@ -2293,11 +2453,10 @@ mod tests {
     /// Dropping the `WindowsDeviceEnumerator` while its `DeviceWatcher` is still
     /// alive must remain sound. This is the `get_enumerator()?.watch(h)?`
     /// pattern: `watch(&self)` is dispatched on a borrowed enumerator, so the
-    /// enumerator (and its `Arc<ComInitializer>`) drops as soon as `watch`
-    /// returns. The watcher pins its own `Arc<ComInitializer>` clone, so the COM
-    /// apartment stays initialized until the watcher's teardown (Unregister +
-    /// join) completes. Regression guard for the apartment-lifetime fix; before
-    /// it, this would `CoUninitialize()` with a live registered callback.
+    /// enumerator (and its MTA pin) drops as soon as `watch` returns. The
+    /// watcher's COM objects live on its helper thread, which keeps its own MTA
+    /// initialised until it has unregistered and released them, so the
+    /// enumerator's lifetime does not bound the watcher's.
     #[test]
     fn test_watch_outlives_enumerator_drop() {
         let watcher = {
@@ -2305,8 +2464,8 @@ mod tests {
             let w = enumerator
                 .watch(Box::new(|_event: DeviceEvent| {}))
                 .expect("watch() should succeed");
-            // `enumerator` drops HERE, at end of block — its Arc<ComInitializer>
-            // refcount decrements but the watcher holds another clone.
+            // `enumerator` drops HERE, at end of block; the watcher does not
+            // depend on it.
             w
         };
 
@@ -2316,5 +2475,186 @@ mod tests {
         // Clean teardown after the enumerator is already gone: no panic, no hang,
         // no use-after-CoUninitialize.
         drop(watcher);
+    }
+
+    /// The MTA usage pin makes no apartment check: it succeeds on an STA thread
+    /// and leaves that thread in its STA.
+    #[test]
+    fn test_mta_usage_pin_keeps_sta_apartment() {
+        std::thread::spawn(|| {
+            // SAFETY: Initialize this fresh thread as STA and balance the
+            // successful call on this same thread before any assertion.
+            unsafe { CoInitializeEx(None, COINIT_APARTMENTTHREADED) }
+                .ok()
+                .expect("initialize STA");
+            let pin = MtaUsagePin::new();
+            let mut apartment = APTTYPE_CURRENT;
+            let mut qualifier = APTTYPEQUALIFIER_NONE;
+            // SAFETY: Both out-pointers refer to live, writable stack variables.
+            let query = unsafe { CoGetApartmentType(&mut apartment, &mut qualifier) };
+            let pinned = pin.is_ok();
+            drop(pin);
+            // SAFETY: Balances the successful CoInitializeEx above.
+            unsafe { CoUninitialize() };
+
+            assert!(pinned, "the MTA usage pin must not reject an STA caller");
+            query.expect("CoGetApartmentType");
+            assert!(
+                matches!(apartment, APTTYPE_STA | APTTYPE_MAINSTA),
+                "the MTA usage pin must leave the thread in its STA, got {apartment:?}"
+            );
+        })
+        .join()
+        .expect("STA thread panicked");
+    }
+
+    // ── #105 structural guards (no audio endpoint needed) ────────────
+
+    // `WindowsAudioDevice` and `WindowsDeviceEnumerator` are `Send + Sync`
+    // through the auto traits; no `unsafe impl` names them (see the allowlist).
+    const _: () = {
+        const fn assert_send_sync<T: Send + Sync>() {}
+        assert_send_sync::<WindowsAudioDevice>();
+        assert_send_sync::<WindowsDeviceEnumerator>();
+    };
+
+    /// Every `.rs` file under `src/audio/windows/`, embedded at compile time.
+    const BACKEND_SOURCES: &[(&str, &str)] = &[
+        ("apartment_tests.rs", include_str!("apartment_tests.rs")),
+        ("mod.rs", include_str!("mod.rs")),
+        ("thread.rs", include_str!("thread.rs")),
+        ("wasapi.rs", include_str!("wasapi.rs")),
+    ];
+
+    /// The only `unsafe impl` items allowed under `src/audio/windows/` (#105),
+    /// as `(file, item line with whitespace normalised)`.
+    const ALLOWED_UNSAFE_IMPLS: &[(&str, &str)] = &[
+        // The MTA usage pin, the only holder of a `CO_MTA_USAGE_COOKIE`.
+        ("wasapi.rs", "unsafe impl Send for MtaUsagePin {}"),
+        ("wasapi.rs", "unsafe impl Sync for MtaUsagePin {}"),
+        // Deprecated legacy type, left unchanged; it is removed, with this
+        // entry, at the 0.5.0 cutover.
+        (
+            "wasapi.rs",
+            "unsafe impl Send for WindowsApplicationCapture {}",
+        ),
+    ];
+
+    /// Each `unsafe impl` item in `source`: its first line, whitespace
+    /// normalised, and whether a `// SAFETY:` line is in the comment block
+    /// directly above it.
+    fn scan_unsafe_impls(source: &str) -> Vec<(String, bool)> {
+        let lines: Vec<&str> = source.lines().collect();
+        let mut items = Vec::new();
+        for (index, line) in lines.iter().enumerate() {
+            let tokens: Vec<&str> = line.split_whitespace().collect();
+            let is_unsafe_impl = tokens.first() == Some(&"unsafe")
+                && tokens
+                    .get(1)
+                    .is_some_and(|token| *token == "impl" || token.starts_with("impl<"));
+            if !is_unsafe_impl {
+                continue;
+            }
+            let has_safety = lines[..index]
+                .iter()
+                .rev()
+                .map(|line| line.trim_start())
+                .take_while(|line| line.starts_with("//"))
+                .any(|line| line.starts_with("// SAFETY:"));
+            items.push((tokens.join(" "), has_safety));
+        }
+        items
+    }
+
+    /// The allowlist violations in `source`, read from `file`: items not on
+    /// the allowlist, and allowed items without a `// SAFETY:` comment.
+    fn unsafe_impl_violations(file: &str, source: &str) -> Vec<String> {
+        scan_unsafe_impls(source)
+            .into_iter()
+            .filter_map(|(item, has_safety)| {
+                let allowed = ALLOWED_UNSAFE_IMPLS
+                    .iter()
+                    .any(|&(allowed_file, allowed_item)| {
+                        allowed_file == file && allowed_item == item
+                    });
+                if !allowed {
+                    Some(format!("{file}: `{item}` is not on the #105 allowlist"))
+                } else if !has_safety {
+                    Some(format!(
+                        "{file}: `{item}` lacks a `// SAFETY:` comment directly above it"
+                    ))
+                } else {
+                    None
+                }
+            })
+            .collect()
+    }
+
+    #[test]
+    fn unsafe_impl_allowlist() {
+        // Negative controls: the scanner flags an item outside the allowlist even
+        // with a SAFETY comment, and an allowed item without one.
+        let foreign = "struct Foo;\n// SAFETY: synthetic.\nunsafe impl Send for Foo {}\n";
+        assert_eq!(
+            unsafe_impl_violations("wasapi.rs", foreign),
+            vec!["wasapi.rs: `unsafe impl Send for Foo {}` is not on the #105 allowlist"],
+        );
+        let uncommented = "struct Foo;\nunsafe impl Send for MtaUsagePin {}\n";
+        assert_eq!(
+            unsafe_impl_violations("wasapi.rs", uncommented),
+            vec![
+                "wasapi.rs: `unsafe impl Send for MtaUsagePin {}` lacks a `// SAFETY:` \
+                 comment directly above it"
+            ],
+        );
+
+        // The embedded sources are exactly the `.rs` files in the directory.
+        let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src/audio/windows");
+        let mut on_disk: Vec<String> = std::fs::read_dir(&dir)
+            .unwrap_or_else(|e| panic!("read {}: {e}", dir.display()))
+            .map(|entry| {
+                entry
+                    .expect("read directory entry")
+                    .file_name()
+                    .to_string_lossy()
+                    .into_owned()
+            })
+            .filter(|name| name.ends_with(".rs"))
+            .collect();
+        on_disk.sort();
+        let mut embedded: Vec<String> = BACKEND_SOURCES
+            .iter()
+            .map(|(name, _)| name.to_string())
+            .collect();
+        embedded.sort();
+        assert_eq!(
+            on_disk, embedded,
+            "BACKEND_SOURCES must embed every .rs file under src/audio/windows/"
+        );
+
+        let mut violations = Vec::new();
+        let mut found = Vec::new();
+        for &(file, source) in BACKEND_SOURCES {
+            violations.extend(unsafe_impl_violations(file, source));
+            found.extend(
+                scan_unsafe_impls(source)
+                    .into_iter()
+                    .map(|(item, _)| (file.to_string(), item)),
+            );
+        }
+        assert!(
+            violations.is_empty(),
+            "unsafe impl allowlist violations: {violations:#?}"
+        );
+        let mut expected: Vec<(String, String)> = ALLOWED_UNSAFE_IMPLS
+            .iter()
+            .map(|&(file, item)| (file.to_string(), item.to_string()))
+            .collect();
+        found.sort();
+        expected.sort();
+        assert_eq!(
+            found, expected,
+            "every allowlisted item must appear exactly once"
+        );
     }
 }
