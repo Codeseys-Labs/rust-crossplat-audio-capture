@@ -1184,10 +1184,21 @@ mod tests {
     fn readable_buffers_never_waits_for_a_reader_holding_the_consumer() {
         let (mut producer, stream) = create_test_stream();
         producer.push(test_buffer(0.1)).unwrap();
+        let stream = Arc::new(stream);
 
-        // As a parked blocking read does.
+        // As a parked blocking read does. The query runs on a worker and is
+        // awaited with a timeout, so one that waits for the consumer fails
+        // here instead of hanging on the lock this thread holds.
         let held = stream.consumer.lock().unwrap();
-        assert_eq!(stream.readable_buffers(), None, "unknown, not awaited");
+        let (counted_tx, counted_rx) = std::sync::mpsc::channel();
+        let querier = Arc::clone(&stream);
+        std::thread::spawn(move || {
+            let _ = counted_tx.send(querier.readable_buffers());
+        });
+        let counted = counted_rx
+            .recv_timeout(Duration::from_secs(5))
+            .expect("readable_buffers() waited for the reader holding the consumer");
+        assert_eq!(counted, None, "unknown, not awaited");
         drop(held);
         assert_eq!(stream.readable_buffers(), Some(1));
     }

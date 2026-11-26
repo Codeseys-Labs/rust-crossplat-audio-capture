@@ -40,6 +40,11 @@
 //! `stop()`, or after an absent-device wait gave up on it, is disposed
 //! (stopped and dropped) by the helper itself.
 //!
+//! Nor does the supervisor log under the `machine` lock: a transition
+//! journals its messages, and they are emitted once the lock is released, so
+//! a `log::Log` implementation may re-enter the capture (its `stop()` takes
+//! that lock too).
+//!
 //! # Recovery contract
 //!
 //! Recovery is break-before-make: the helper stops and releases the old stream
@@ -147,9 +152,14 @@ type StreamFactory = Box<dyn Fn() -> AudioResult<Box<dyn CapturingStream>> + Sen
 /// `machine` lock is released (see [`Retired`]).
 type Doomed = Vec<Arc<dyn CapturingStream>>;
 
+/// What a [`Disposer`] hands back when it cannot move resources off the read
+/// path: the resources, untouched, and why.
+type Refused = (Retired, std::io::Error);
+
 /// Moves what a poll retired off the read path, or hands it back when it
-/// cannot (see [`spawn_disposal`]).
-type Disposer = Box<dyn Fn(Retired) -> Result<(), Retired> + Send + Sync>;
+/// cannot (see [`spawn_disposal`]). It runs under the `machine` lock, so it
+/// reports a refusal to its caller instead of logging it.
+type Disposer = Box<dyn Fn(Retired) -> Result<(), Refused> + Send + Sync>;
 
 /// Starts the helper thread that runs one reopen attempt (see
 /// [`spawn_reopen_helper`]).
@@ -633,9 +643,10 @@ impl Retired {
 }
 
 /// Releases `retired` on a short-lived `rsac-recovery-dispose` thread. When no
-/// thread can be spawned, hands `retired` back untouched: the caller must not
-/// release it on the read path.
-fn spawn_disposal(retired: Retired) -> Result<(), Retired> {
+/// thread can be spawned, hands `retired` back untouched with the spawn error:
+/// the caller must not release it on the read path, and logs the refusal
+/// once it holds no lock.
+fn spawn_disposal(retired: Retired) -> Result<(), Refused> {
     // Shared, so the resources are recoverable when the spawn fails and drops
     // the closure.
     let pending = Arc::new(Mutex::new(Some(retired)));
@@ -651,12 +662,8 @@ fn spawn_disposal(retired: Retired) -> Result<(), Retired> {
     match spawned {
         Ok(_) => Ok(()),
         Err(e) => {
-            log::warn!(
-                "auto-recovery: cannot spawn the disposal helper ({e}); keeping the retired \
-                 resources for the capture's stop()"
-            );
             let retired = lock(&pending).take();
-            retired.map_or(Ok(()), Err)
+            retired.map_or(Ok(()), |retired| Err((retired, e)))
         }
     }
 }
@@ -900,6 +907,69 @@ impl Machine {
     }
 }
 
+/// Log records of one critical section of the `machine` lock, emitted in
+/// order once [`MachineLock::with`] has released the lock. Transitions record
+/// here and never call the logging macros themselves: a `log::Log`
+/// implementation may re-enter the capture, and `stop()` takes that lock.
+#[derive(Default)]
+struct Journal {
+    records: Vec<(log::Level, String)>,
+}
+
+impl Journal {
+    /// Records `message` at `level`, unless the level checks the logging
+    /// macros make would discard it; neither check calls the logger.
+    fn record(&mut self, level: log::Level, message: std::fmt::Arguments<'_>) {
+        if level <= log::STATIC_MAX_LEVEL && level <= log::max_level() {
+            self.records.push((level, std::fmt::format(message)));
+        }
+    }
+
+    /// Emits the records in order, under this module's log target. Runs with
+    /// no lock of this module held.
+    fn emit(self) {
+        for (level, message) in self.records {
+            log::log!(level, "{message}");
+        }
+    }
+}
+
+/// The supervisor state behind the `machine` lock. The lock is taken only by
+/// [`MachineLock::with`], which emits what the critical section journalled
+/// after releasing it, so nothing logs while it is held.
+mod machine_lock {
+    use super::{lock, Journal, Machine};
+    use std::sync::Mutex;
+
+    pub(super) struct MachineLock(Mutex<Machine>);
+
+    impl MachineLock {
+        pub(super) fn new(machine: Machine) -> Self {
+            Self(Mutex::new(machine))
+        }
+
+        /// Runs `critical` under the lock with a fresh [`Journal`], then
+        /// releases the lock, and only then emits the journal.
+        pub(super) fn with<R>(&self, critical: impl FnOnce(&mut Machine, &mut Journal) -> R) -> R {
+            let mut journal = Journal::default();
+            let result = {
+                let mut guard = lock(&self.0);
+                critical(&mut guard, &mut journal)
+            };
+            journal.emit();
+            result
+        }
+
+        /// Whether some thread holds the lock at this instant.
+        #[cfg(test)]
+        pub(super) fn is_held(&self) -> bool {
+            matches!(self.0.try_lock(), Err(std::sync::TryLockError::WouldBlock))
+        }
+    }
+}
+
+use machine_lock::MachineLock;
+
 /// Outcome of one non-blocking read of the installed stream.
 enum Read {
     Buffer(AudioBuffer),
@@ -922,8 +992,9 @@ struct RecoveryStream {
     /// Delivery format generation 0 reported; the fallback for `format()`
     /// while no stream is installed.
     expected_format: AudioFormat,
-    /// Never held across backend work: see the module docs.
-    machine: Mutex<Machine>,
+    /// Never held across backend work, and nothing logs while it is held: see
+    /// the module docs and [`MachineLock`].
+    machine: MachineLock,
     /// Set once stopped or exhausted, always under the machine lock: by
     /// `begin_stop` right after the tail is preserved, or by `exhaust`. Backs
     /// `is_running()`.
@@ -939,7 +1010,8 @@ struct RecoveryStream {
     /// with [`AudioError::Timeout`]; [`READ_TIMEOUT`] outside tests.
     read_timeout: Duration,
     /// How a poll moves what it retired off the read path: [`spawn_disposal`]
-    /// outside tests. Called with the machine lock held.
+    /// outside tests. Called with the machine lock held, so a refusal comes
+    /// back to the poll to be journalled.
     disposer: Disposer,
     /// How `start_reopen` starts its helper thread: [`spawn_reopen_helper`]
     /// outside tests.
@@ -993,7 +1065,7 @@ impl RecoveryStream {
             }),
             trigger,
             watcher: Mutex::new(watcher),
-            machine: Mutex::new(Machine {
+            machine: MachineLock::new(Machine {
                 phase: Phase::Running,
                 generation: 0,
                 attempt: 0,
@@ -1048,14 +1120,21 @@ impl RecoveryStream {
     /// error. Runs on the polling consumer thread with the `machine` lock held,
     /// so it must never call backend `stop()`, the factory, or any other
     /// potentially slow backend operation: streams to retire go into `doomed`
-    /// (stopped off the read path) and the reopen runs on a helper thread.
-    fn advance(&self, m: &mut Machine, doomed: &mut Doomed) -> AudioResult<Option<AudioBuffer>> {
+    /// (stopped off the read path) and the reopen runs on a helper thread. Nor
+    /// does it log: its messages go into `journal`, emitted once the lock is
+    /// released.
+    fn advance(
+        &self,
+        m: &mut Machine,
+        doomed: &mut Doomed,
+        journal: &mut Journal,
+    ) -> AudioResult<Option<AudioBuffer>> {
         let settle = self.hub.config.settle_delay;
         loop {
             if self.core.stop_requested.load(Ordering::Acquire)
                 && !matches!(m.phase, Phase::Exhausted { .. })
             {
-                return self.read_after_stop(m, doomed);
+                return self.read_after_stop(m, doomed, journal);
             }
             let now = Instant::now();
             match m.phase {
@@ -1076,10 +1155,10 @@ impl RecoveryStream {
                         };
                         continue;
                     }
-                    match self.read_active(m, now, doomed)? {
+                    match self.read_active(m, now, doomed, journal)? {
                         Read::Buffer(buffer) => return Ok(Some(buffer)),
                         Read::Empty => return Ok(None),
-                        Read::Lost(reason) => self.on_lost(m, reason, now),
+                        Read::Lost(reason) => self.on_lost(m, reason, now, journal),
                     }
                 }
                 Phase::Settling { deadline } => {
@@ -1104,7 +1183,7 @@ impl RecoveryStream {
                         Some(backlog)
                     };
                     if tail_left != Some(0) {
-                        match self.read_active(m, now, doomed)? {
+                        match self.read_active(m, now, doomed, journal)? {
                             Read::Buffer(buffer) => {
                                 if let Some(left) = m.settle_tail.as_mut() {
                                     *left = left.saturating_sub(1);
@@ -1118,7 +1197,7 @@ impl RecoveryStream {
                                 // premature death, charged like any other loss.
                                 // The reopen still waits for the deadline so it
                                 // binds the new default, not a transient one.
-                                self.on_lost(m, reason, now);
+                                self.on_lost(m, reason, now, journal);
                                 if let Phase::Backoff { ref mut until } = m.phase {
                                     *until = (*until).max(deadline);
                                 }
@@ -1138,7 +1217,7 @@ impl RecoveryStream {
                             "generation {} stream ended during the settle window",
                             m.generation
                         );
-                        self.on_lost(m, reason, now);
+                        self.on_lost(m, reason, now, journal);
                         continue;
                     }
                     // Quiet period over and the tail drained: break before make.
@@ -1171,7 +1250,7 @@ impl RecoveryStream {
                     // Expiry wins over a due probe, so a zero `max_backoff` or a
                     // late poll can never open a device past the wait.
                     if now >= deadline {
-                        self.give_up_waiting(m);
+                        self.give_up_waiting(m, journal);
                         continue;
                     }
                     if now >= next_probe {
@@ -1193,7 +1272,7 @@ impl RecoveryStream {
                         // The wait ran out first; the helper disposes of
                         // whatever the probe still produces.
                         None => {
-                            self.give_up_waiting(m);
+                            self.give_up_waiting(m, journal);
                             continue;
                         }
                         // A result published past the deadline is as late as
@@ -1205,11 +1284,18 @@ impl RecoveryStream {
                             if let Outcome::Opened(stream) = late.outcome {
                                 doomed.push(Arc::from(stream));
                             }
-                            self.give_up_waiting(m);
+                            self.give_up_waiting(m, journal);
                             continue;
                         }
                         Some(reopened) => {
-                            self.finish_reopen(m, reopened, wait_deadline, uncharged, doomed);
+                            self.finish_reopen(
+                                m,
+                                reopened,
+                                wait_deadline,
+                                uncharged,
+                                doomed,
+                                journal,
+                            );
                             match m.phase {
                                 // Keep going: read the new stream, or surface the end.
                                 Phase::Running | Phase::Exhausted { .. } => continue,
@@ -1236,9 +1322,10 @@ impl RecoveryStream {
         &self,
         m: &mut Machine,
         doomed: &mut Doomed,
+        journal: &mut Journal,
     ) -> AudioResult<Option<AudioBuffer>> {
         if let Some(buffer) = m.tail.pop_front() {
-            return self.accept(m, buffer, doomed).map(Some);
+            return self.accept(m, buffer, doomed, journal).map(Some);
         }
         let live = matches!(m.phase, Phase::Running | Phase::Settling { .. });
         if m.tail_preserved {
@@ -1259,7 +1346,7 @@ impl RecoveryStream {
             return Ok(None);
         };
         match stream.try_read_chunk() {
-            Ok(Some(buffer)) => self.accept(m, buffer, doomed).map(Some),
+            Ok(Some(buffer)) => self.accept(m, buffer, doomed, journal).map(Some),
             Ok(None) => Ok(None),
             // A loss racing the stop is not reported: the stop ends the
             // session, and `begin_stop` publishes that end.
@@ -1273,14 +1360,20 @@ impl RecoveryStream {
     /// (with a buffer or empty) while it still reports itself running is
     /// evidence the generation is alive at `now`; a stopped generation's
     /// draining tail is delivered but proves nothing.
-    fn read_active(&self, m: &mut Machine, now: Instant, doomed: &mut Doomed) -> AudioResult<Read> {
+    fn read_active(
+        &self,
+        m: &mut Machine,
+        now: Instant,
+        doomed: &mut Doomed,
+        journal: &mut Journal,
+    ) -> AudioResult<Read> {
         // `Running`/`Settling` always have a stream installed; an empty slot
         // reads as empty.
         let Some(stream) = self.core.active_stream() else {
             return Ok(Read::Empty);
         };
         let read = match stream.try_read_chunk() {
-            Ok(Some(buffer)) => Read::Buffer(self.accept(m, buffer, doomed)?),
+            Ok(Some(buffer)) => Read::Buffer(self.accept(m, buffer, doomed, journal)?),
             Ok(None) => Read::Empty,
             Err(e) if e.is_fatal() => return Ok(Read::Lost(e.to_string())),
             // Recoverable read errors pass through unchanged, as unsupervised.
@@ -1301,6 +1394,7 @@ impl RecoveryStream {
         m: &mut Machine,
         buffer: AudioBuffer,
         doomed: &mut Doomed,
+        journal: &mut Journal,
     ) -> AudioResult<AudioBuffer> {
         let observed = (buffer.sample_rate(), buffer.channels());
         match m.gate.authoritative {
@@ -1312,7 +1406,7 @@ impl RecoveryStream {
                     m.generation
                 );
                 doomed.extend(self.core.detach_active());
-                self.exhaust(m, detail, FORMAT_CHANGED_REASON.to_string());
+                self.exhaust(m, detail, FORMAT_CHANGED_REASON.to_string(), journal);
                 return Err(AudioError::StreamEnded {
                     reason: FORMAT_CHANGED_REASON.to_string(),
                 });
@@ -1341,10 +1435,13 @@ impl RecoveryStream {
     /// spending budget (a generation seen alive through `stable_period` already
     /// had the budget restored by [`note_alive`](Self::note_alive)). The dead
     /// stream is retired by the reopen helper right before the open.
-    fn on_lost(&self, m: &mut Machine, reason: String, now: Instant) {
-        log::warn!(
-            "auto-recovery: generation {} stream invalidated: {reason}",
-            m.generation
+    fn on_lost(&self, m: &mut Machine, reason: String, now: Instant, journal: &mut Journal) {
+        journal.record(
+            log::Level::Warn,
+            format_args!(
+                "auto-recovery: generation {} stream invalidated: {reason}",
+                m.generation
+            ),
         );
         self.emit(RecoveryEvent::DeviceInvalidated {
             session: self.session,
@@ -1352,7 +1449,7 @@ impl RecoveryStream {
             reason: reason.clone(),
         });
         self.begin_outage(m, now);
-        self.schedule_retry(m, reason, now);
+        self.schedule_retry(m, reason, now, journal);
     }
 
     /// Opens the outage window. The earliest start is kept until a replacement
@@ -1367,14 +1464,14 @@ impl RecoveryStream {
         );
     }
 
-    fn schedule_retry(&self, m: &mut Machine, reason: String, now: Instant) {
+    fn schedule_retry(&self, m: &mut Machine, reason: String, now: Instant, journal: &mut Journal) {
         let attempt = m.attempt.saturating_add(1);
         if attempt > self.hub.config.max_attempts {
             let reason = format!(
                 "auto-recovery exhausted after {} failed attempt(s): {reason}",
                 m.attempt
             );
-            self.exhaust(m, reason.clone(), reason);
+            self.exhaust(m, reason.clone(), reason, journal);
             return;
         }
         m.attempt = attempt;
@@ -1382,7 +1479,10 @@ impl RecoveryStream {
         m.phase = Phase::Backoff {
             until: deadline_after(now, delay),
         };
-        log::warn!("auto-recovery: reopen attempt {attempt} in {delay:?} ({reason})");
+        journal.record(
+            log::Level::Warn,
+            format_args!("auto-recovery: reopen attempt {attempt} in {delay:?} ({reason})"),
+        );
         self.publish(RecoveryState::Recovering { attempt }, m.generation, attempt);
         self.emit(RecoveryEvent::RetryScheduled {
             session: self.session,
@@ -1425,20 +1525,24 @@ impl RecoveryStream {
         wait_deadline: Option<Instant>,
         uncharged: bool,
         doomed: &mut Doomed,
+        journal: &mut Journal,
     ) {
         let Reopened {
             outcome,
             published_at: now,
         } = reopened;
         match outcome {
-            Outcome::Opened(stream) => self.adopt(m, stream, now, doomed),
+            Outcome::Opened(stream) => self.adopt(m, stream, now, doomed, journal),
             Outcome::FormatMismatch { detail } => {
-                self.exhaust(m, detail, FORMAT_CHANGED_REASON.to_string());
+                self.exhaust(m, detail, FORMAT_CHANGED_REASON.to_string(), journal);
             }
             Outcome::Failed(AudioError::DeviceNotFound { device_id }) => {
                 // Nothing to open yet: wait for a device without spending
                 // budget, re-probing on device events and every `max_backoff`.
-                log::info!("auto-recovery: no capture device present ({device_id}); waiting");
+                journal.record(
+                    log::Level::Info,
+                    format_args!("auto-recovery: no capture device present ({device_id}); waiting"),
+                );
                 let deadline = wait_deadline
                     .unwrap_or_else(|| deadline_after(now, self.hub.config.device_wait_timeout));
                 m.phase = Phase::WaitingForDevice {
@@ -1452,14 +1556,14 @@ impl RecoveryStream {
                 let reason = format!(
                     "auto-recovery gave up: reopen failed with a non-retryable error: {error}"
                 );
-                self.exhaust(m, reason.clone(), reason);
+                self.exhaust(m, reason.clone(), reason, journal);
             }
             Outcome::Failed(error) => {
                 if uncharged {
                     // A failed proactive open is a real failed attempt.
                     m.attempt = m.attempt.saturating_add(1);
                 }
-                self.schedule_retry(m, error.to_string(), now);
+                self.schedule_retry(m, error.to_string(), now, journal);
             }
         }
     }
@@ -1473,6 +1577,7 @@ impl RecoveryStream {
         stream: Box<dyn CapturingStream>,
         opened: Instant,
         doomed: &mut Doomed,
+        journal: &mut Journal,
     ) {
         if !self.core.install(Arc::from(stream), doomed) {
             return;
@@ -1486,9 +1591,12 @@ impl RecoveryStream {
         m.generation += 1;
         m.healthy_since = Some(Instant::now());
         m.phase = Phase::Running;
-        log::info!(
-            "auto-recovery: generation {} running after a {outage:?} outage",
-            m.generation
+        journal.record(
+            log::Level::Info,
+            format_args!(
+                "auto-recovery: generation {} running after a {outage:?} outage",
+                m.generation
+            ),
         );
         self.hub
             .record_recovery(self.session, m.generation, m.attempt);
@@ -1500,18 +1608,27 @@ impl RecoveryStream {
     }
 
     /// Ends an absent-device wait whose deadline passed.
-    fn give_up_waiting(&self, m: &mut Machine) {
+    fn give_up_waiting(&self, m: &mut Machine, journal: &mut Journal) {
         let reason = format!(
             "auto-recovery gave up: no capture device appeared within {:?}",
             self.hub.config.device_wait_timeout
         );
-        self.exhaust(m, reason.clone(), reason);
+        self.exhaust(m, reason.clone(), reason, journal);
     }
 
-    fn exhaust(&self, m: &mut Machine, detail: String, terminal_reason: String) {
-        log::error!(
-            "auto-recovery: giving up at generation {}: {detail}",
-            m.generation
+    fn exhaust(
+        &self,
+        m: &mut Machine,
+        detail: String,
+        terminal_reason: String,
+        journal: &mut Journal,
+    ) {
+        journal.record(
+            log::Level::Error,
+            format_args!(
+                "auto-recovery: giving up at generation {}: {detail}",
+                m.generation
+            ),
         );
         m.phase = Phase::Exhausted {
             reason: terminal_reason,
@@ -1536,6 +1653,39 @@ impl RecoveryStream {
         })
     }
 
+    /// The first step of [`stop`](CapturingStream::stop): raises the sticky
+    /// request every poll checks first. It does not end the session: until
+    /// [`complete_stop`](Self::complete_stop) has preserved the tail,
+    /// `is_running()` stays true and a poll with nothing to deliver returns
+    /// `Ok(None)`.
+    fn raise_stop(&self) {
+        self.core.stop_requested.store(true, Ordering::SeqCst);
+    }
+
+    /// The rest of [`stop`](CapturingStream::stop), once
+    /// [`raise_stop`](Self::raise_stop) has run: seals the snapshot, ends the
+    /// session with its tail preserved ([`begin_stop`](Self::begin_stop)),
+    /// and releases everything the session still holds, with no lock held.
+    fn complete_stop(&self) -> AudioResult<()> {
+        self.hub.mark_stopped(self.session);
+        let (active, teardown) = self.begin_stop();
+        // A result the helper posted before it saw the flag is ours to dispose.
+        let late = lock(&self.core.mailbox).take();
+        if let Some(Reopened { outcome, .. }) = late {
+            dispose(outcome);
+        }
+        let result = match active {
+            Some(stream) => stream.stop(),
+            None => Ok(()),
+        };
+        teardown.release();
+        // Last, and with no lock held: the helper's reentrant wake may call
+        // `stop()` again.
+        #[cfg(feature = "async-stream")]
+        self.poll_waker.shutdown();
+        result
+    }
+
     /// The part of `stop()` that runs under the machine lock: preserves the
     /// tail and raises `terminal` in one critical section, so a poll that
     /// finds the tail preserved also finds the stream stopped, and no poll can
@@ -1546,17 +1696,18 @@ impl RecoveryStream {
     /// so nothing is caught in between; whatever a poll retires afterwards is
     /// the installed stream returned here, which `stop()` stops. Idempotent.
     fn begin_stop(&self) -> (Option<Arc<dyn CapturingStream>>, Retired) {
-        let mut machine = lock(&self.machine);
-        let active = self.core.active_stream();
-        self.preserve_tail(&mut machine, active.as_deref());
-        self.terminal.store(true, Ordering::Release);
-        let mut teardown = std::mem::take(&mut *lock(&self.retained));
-        let watcher = lock(&self.watcher).take();
-        teardown.absorb(Retired {
-            streams: Doomed::new(),
-            watcher,
-        });
-        (active, teardown)
+        self.machine.with(|machine, _journal| {
+            let active = self.core.active_stream();
+            self.preserve_tail(machine, active.as_deref());
+            self.terminal.store(true, Ordering::Release);
+            let mut teardown = std::mem::take(&mut *lock(&self.retained));
+            let watcher = lock(&self.watcher).take();
+            teardown.absorb(Retired {
+                streams: Doomed::new(),
+                watcher,
+            });
+            (active, teardown)
+        })
     }
 
     /// Moves the backlog the installed stream holds as `stop()` lands into the
@@ -1587,11 +1738,18 @@ impl RecoveryStream {
     /// disposal thread can start: a poll never releases it itself. `_held`
     /// is the poll's machine guard, proof that the handoff happens in the same
     /// critical section as the detach (see [`begin_stop`](Self::begin_stop)).
-    fn retire(&self, _held: &mut Machine, retired: Retired) {
+    fn retire(&self, _held: &mut Machine, retired: Retired, journal: &mut Journal) {
         if retired.is_empty() {
             return;
         }
-        if let Err(retired) = (self.disposer)(retired) {
+        if let Err((retired, e)) = (self.disposer)(retired) {
+            journal.record(
+                log::Level::Warn,
+                format_args!(
+                    "auto-recovery: cannot spawn the disposal helper ({e}); keeping the retired \
+                     resources for the capture's stop()"
+                ),
+            );
             lock(&self.retained).absorb(retired);
         }
     }
@@ -1599,41 +1757,44 @@ impl RecoveryStream {
     /// One supervised poll. Teardown never runs here: the streams it retired,
     /// and the watcher of a session it ended, leave the read path — handed off
     /// before the machine lock is released, so `stop()` never misses them.
+    /// What the poll logs is emitted only after that release.
     fn poll(&self) -> Polled {
-        let mut machine = lock(&self.machine);
-        let mut doomed = Doomed::new();
-        let result = self.advance(&mut machine, &mut doomed);
-        // An exhausted session keeps no backend: a stream still installed —
-        // one a failed reopen spawn never retired — leaves with the rest.
-        if matches!(machine.phase, Phase::Exhausted { .. }) {
-            doomed.extend(self.core.detach_active());
-        }
-        // The one place a buffer reaches the caller (`try_read_chunk` and
-        // `read_chunk` both return this poll's result).
-        if matches!(result, Ok(Some(_))) {
-            self.delivered.fetch_add(1, Ordering::Relaxed);
-        }
-        let observed_at = Instant::now();
-        let running = matches!(machine.phase, Phase::Running)
-            && !self.core.stop_requested.load(Ordering::Acquire);
-        let watcher = if self.terminal.load(Ordering::Acquire) {
-            lock(&self.watcher).take()
-        } else {
-            None
-        };
-        let quiet = running.then_some(machine.generation);
-        self.retire(
-            &mut machine,
-            Retired {
-                streams: doomed,
-                watcher,
-            },
-        );
-        Polled {
-            result,
-            quiet,
-            observed_at,
-        }
+        self.machine.with(|machine, journal| {
+            let mut doomed = Doomed::new();
+            let result = self.advance(machine, &mut doomed, journal);
+            // An exhausted session keeps no backend: a stream still installed —
+            // one a failed reopen spawn never retired — leaves with the rest.
+            if matches!(machine.phase, Phase::Exhausted { .. }) {
+                doomed.extend(self.core.detach_active());
+            }
+            // The one place a buffer reaches the caller (`try_read_chunk` and
+            // `read_chunk` both return this poll's result).
+            if matches!(result, Ok(Some(_))) {
+                self.delivered.fetch_add(1, Ordering::Relaxed);
+            }
+            let observed_at = Instant::now();
+            let running = matches!(machine.phase, Phase::Running)
+                && !self.core.stop_requested.load(Ordering::Acquire);
+            let watcher = if self.terminal.load(Ordering::Acquire) {
+                lock(&self.watcher).take()
+            } else {
+                None
+            };
+            let quiet = running.then_some(machine.generation);
+            self.retire(
+                machine,
+                Retired {
+                    streams: doomed,
+                    watcher,
+                },
+                journal,
+            );
+            Polled {
+                result,
+                quiet,
+                observed_at,
+            }
+        })
     }
 }
 
@@ -1737,24 +1898,8 @@ impl CapturingStream for RecoveryStream {
     /// keeps polling, receives that tail, and then sees the stop as the end of
     /// the stream, never as an error.
     fn stop(&self) -> AudioResult<()> {
-        self.core.stop_requested.store(true, Ordering::SeqCst);
-        self.hub.mark_stopped(self.session);
-        let (active, teardown) = self.begin_stop();
-        // A result the helper posted before it saw the flag is ours to dispose.
-        let late = lock(&self.core.mailbox).take();
-        if let Some(Reopened { outcome, .. }) = late {
-            dispose(outcome);
-        }
-        let result = match active {
-            Some(stream) => stream.stop(),
-            None => Ok(()),
-        };
-        teardown.release();
-        // Last, and with no lock held: the helper's reentrant wake may call
-        // `stop()` again.
-        #[cfg(feature = "async-stream")]
-        self.poll_waker.shutdown();
-        result
+        self.raise_stop();
+        self.complete_stop()
     }
 
     fn format(&self) -> AudioFormat {
@@ -1907,8 +2052,9 @@ impl PollWaker {
                 true
             }
             Err(e) => {
-                log::warn!("auto-recovery: cannot spawn the async poll waker: {e}");
                 drop(thread);
+                // Logged with no guard held: a logger may re-enter the capture.
+                log::warn!("auto-recovery: cannot spawn the async poll waker: {e}");
                 drop(self.shared.take_pending());
                 false
             }
@@ -1947,6 +2093,7 @@ mod tests {
     use super::*;
     use crate::api::{AudioCapture, AudioCaptureBuilder};
     use crate::core::config::{AudioCaptureConfig, SampleFormat};
+    use std::cell::{Cell, RefCell};
     use std::collections::VecDeque;
     use std::sync::atomic::AtomicUsize;
 
@@ -2081,8 +2228,10 @@ mod tests {
         refills: AtomicBool,
     }
 
-    /// Scripted backend stream: serves its steps in order, then stays live and
-    /// empty (or ends, once stopped and drained).
+    /// Scripted backend stream: serves its steps in order, then stays empty.
+    /// Stopped, it drains like a `Stopping` bridge — its queued steps, then
+    /// `Ok(None)` — or, made strict, rejects every read like a `Stopped` one.
+    /// Only a [`Step::End`] or [`kill`](Self::kill) is a fatal error.
     #[derive(Clone)]
     struct MockStream {
         format: AudioFormat,
@@ -2200,9 +2349,6 @@ mod tests {
                         reason: reason.to_string(),
                     })
                 }
-                None if self.stopped() => Err(AudioError::StreamEnded {
-                    reason: "mock stopped".to_string(),
-                }),
                 None => Ok(None),
             }
         }
@@ -2377,6 +2523,63 @@ mod tests {
         while !condition() {
             assert!(Instant::now() < deadline, "condition not met within 5 s");
             std::thread::sleep(POLL_INTERVAL);
+        }
+    }
+
+    /// Runs `f` on the supervisor state under its lock, as a poll does.
+    fn with_machine<R>(stream: &RecoveryStream, f: impl FnOnce(&mut Machine) -> R) -> R {
+        stream.machine.with(|m, _| f(m))
+    }
+
+    /// A `stop()` on its own thread, held between its two steps: when
+    /// [`start`](Self::start) returns it has raised the stop request, and it
+    /// preserves the tail and ends the session only once released. Both sides
+    /// wait on channels, never on a deadline; a test that fails first drops
+    /// the release, which lets the stop finish.
+    struct HeldStop {
+        release: mpsc::Sender<()>,
+        stopping: std::thread::JoinHandle<AudioResult<()>>,
+    }
+
+    impl HeldStop {
+        fn start(stream: &Arc<RecoveryStream>) -> Self {
+            let stopper = Arc::clone(stream);
+            let (requested_tx, requested_rx) = mpsc::channel::<()>();
+            let (release_tx, release_rx) = mpsc::channel::<()>();
+            let stopping = std::thread::spawn(move || {
+                // The two steps `stop()` consists of, with the handshake
+                // between them.
+                stopper.raise_stop();
+                let _ = requested_tx.send(());
+                let _ = release_rx.recv();
+                stopper.complete_stop()
+            });
+            requested_rx
+                .recv()
+                .expect("the stopper raised the stop request");
+            Self {
+                release: release_tx,
+                stopping,
+            }
+        }
+
+        fn thread_id(&self) -> std::thread::ThreadId {
+            self.stopping.thread().id()
+        }
+
+        /// Lets the stop run on.
+        fn release(&self) {
+            let _ = self.release.send(());
+        }
+
+        fn is_finished(&self) -> bool {
+            self.stopping.is_finished()
+        }
+
+        /// Releases the stop, unless already released, and returns its result.
+        fn finish(self) -> AudioResult<()> {
+            self.release();
+            self.stopping.join().expect("stopper thread")
         }
     }
 
@@ -2746,11 +2949,13 @@ mod tests {
 
     #[test]
     fn a_healthy_stable_period_restores_the_budget() {
+        // Too long to pass by itself: the test ages the generation instead.
+        let stable = Duration::from_secs(60);
         let old = MockStream::new(stereo(RATE), vec![Step::End("device unplugged")]);
         let new = MockStream::new(stereo(RATE), vec![Step::Buffer(buffer(0))]);
         let opener = Opener::new(vec![Ok(new)]);
         let h = Harness::new(
-            fast_policy().with_stable_period(ms(20)),
+            fast_policy().with_stable_period(stable),
             &old,
             opener.factory(),
         );
@@ -2761,7 +2966,15 @@ mod tests {
             1,
             "the recovery spent one attempt"
         );
-        std::thread::sleep(ms(30));
+        // Generation 1 has now been installed for its whole stable period.
+        with_machine(&h.stream, |m| {
+            let installed = m.healthy_since.expect("generation 1 is installed");
+            m.healthy_since = Some(
+                installed
+                    .checked_sub(stable)
+                    .expect("the clock reaches back one stable period"),
+            );
+        });
         assert!(matches!(h.stream.try_read_chunk(), Ok(None)));
         assert_eq!(h.hub.snapshot().attempt, 0);
     }
@@ -3374,38 +3587,64 @@ mod tests {
 
     #[test]
     fn a_stream_dying_during_settle_is_charged_against_the_budget() {
-        // Uncounted, the death is seen while reading. Counted with an empty
-        // ring, the cutoff finds nothing to drain: the first poll after the
-        // death comes after the settle deadline and must still see the loss.
+        // Uncounted, the death is seen while reading, inside the settle
+        // window. Counted with an empty ring, the cutoff finds nothing to
+        // drain: the first poll after the death comes after the settle
+        // deadline and must still see the loss. Neither the settle period nor
+        // the shorter backoff ends by itself here: the test moves both
+        // deadlines explicitly.
         for counted in [false, true] {
-            let policy = fast_policy().with_settle_delay(ms(60));
+            let policy = fast_policy()
+                .with_settle_delay(Duration::from_secs(3600))
+                .with_initial_backoff(Duration::from_secs(60))
+                .with_max_backoff(Duration::from_secs(60));
             let old = MockStream::new(stereo(RATE), vec![]);
             let old = if counted { old.counted() } else { old };
             let new = MockStream::new(stereo(RATE), vec![Step::Buffer(buffer(0))]);
             let opener = Opener::new(vec![Ok(new)]);
             let h = Harness::new(policy, &old, opener.factory());
 
-            let started = Instant::now();
             h.trigger.trigger_default_change();
             assert!(
                 matches!(h.stream.try_read_chunk(), Ok(None)),
                 "counted: {counted}"
             );
+            let settling = with_machine(&h.stream, |m| match m.phase {
+                Phase::Settling { deadline } => deadline,
+                _ => panic!("counted: {counted}: the switch is settling"),
+            });
             old.kill("device unplugged");
-            if counted {
-                let deadline = match lock(&h.stream.machine).phase {
-                    Phase::Settling { deadline } => deadline,
-                    _ => panic!("counted: the switch is settling"),
+            let deadline = if counted {
+                let cutoff = Instant::now();
+                with_machine(&h.stream, |m| {
+                    m.phase = Phase::Settling { deadline: cutoff };
+                });
+                cutoff
+            } else {
+                settling
+            };
+            assert!(
+                matches!(h.stream.try_read_chunk(), Ok(None)),
+                "counted: {counted}"
+            );
+
+            let retry_at = with_machine(&h.stream, |m| match m.phase {
+                Phase::Backoff { until } => until,
+                _ => panic!("counted: {counted}: the loss schedules a retry"),
+            });
+            assert!(
+                retry_at >= deadline,
+                "counted: {counted}: the reopen still waits out the settle deadline"
+            );
+            assert_eq!(opener.calls(), 0, "counted: {counted}");
+            with_machine(&h.stream, |m| {
+                m.phase = Phase::Backoff {
+                    until: Instant::now(),
                 };
-                wait_for(|| Instant::now() >= deadline);
-            }
+            });
             let buffers = read_n(&h.stream, 1);
 
             assert_eq!(buffers[0].stream_generation(), 1, "counted: {counted}");
-            assert!(
-                started.elapsed() >= ms(60),
-                "counted: {counted}: the reopen still waits out the settle deadline"
-            );
             match h.events().as_slice() {
                 [RecoveryEvent::DefaultChanged { generation: 0, .. }, RecoveryEvent::DeviceInvalidated { generation: 0, .. }, RecoveryEvent::RetryScheduled { attempt: 1, .. }, RecoveryEvent::Recovered { generation: 1, .. }] =>
                     {}
@@ -3618,10 +3857,10 @@ mod tests {
         let mut deadline = None;
         wait_for(|| {
             let _ = stream.try_read_chunk();
-            deadline = match lock(&stream.machine).phase {
+            deadline = with_machine(stream, |m| match m.phase {
                 Phase::Reopening { wait_deadline, .. } => wait_deadline,
                 _ => None,
-            };
+            });
             deadline.is_some()
         });
         deadline.expect("an absent-device probe is in flight")
@@ -3659,14 +3898,13 @@ mod tests {
     /// Moves the in-flight probe's device-wait deadline to `deadline`, so the
     /// test decides when it passes instead of racing a clock.
     fn set_wait_deadline(stream: &RecoveryStream, deadline: Instant) {
-        let mut m = lock(&stream.machine);
-        match &mut m.phase {
+        with_machine(stream, |m| match &mut m.phase {
             Phase::Reopening {
                 wait_deadline: Some(wait),
                 ..
             } => *wait = deadline,
             _ => panic!("no absent-device probe is in flight"),
-        }
+        });
     }
 
     /// A 10 ms mono buffer: a channel count no stereo session accepts.
@@ -3683,6 +3921,11 @@ mod tests {
     /// runtime format gate rejects it on its first buffer.
     fn mono_impostor() -> MockStream {
         MockStream::new(stereo(RATE), vec![Step::Buffer(mono_buffer())])
+    }
+
+    /// A disposer for which no disposal thread can be spawned.
+    fn refuse_disposal(retired: Retired) -> Result<(), Refused> {
+        Err((retired, std::io::Error::other("no disposal thread")))
     }
 
     #[test]
@@ -4035,13 +4278,12 @@ mod tests {
 
         // As if `short_lived` were a replacement that spent the only attempt:
         // installed now, it dies before any read finds it alive.
-        let installed = {
-            let mut m = lock(&h.stream.machine);
+        let installed = with_machine(&h.stream, |m| {
             m.attempt = 1;
             let installed = Instant::now();
             m.healthy_since = Some(installed);
             installed
-        };
+        });
         short_lived.kill("device unplugged again");
         // The reader comes back only after its stable period would have passed;
         // a longer pause only makes the loss later.
@@ -4184,11 +4426,18 @@ mod tests {
         let mut a = QuietClock::new(timeout);
 
         // Reader A's clock starts on a quiet generation 0; A polls it quiet
-        // once more and is descheduled right after that poll returns.
+        // once more and is descheduled right after that poll returns. The
+        // instants it is judged at are set here rather than read off the
+        // clock: that poll observed the stream half a timeout after the clock
+        // started, and A resumes a full timeout after it.
         let first = h.stream.poll();
-        assert!(!a.expired(first.quiet, first.observed_at));
+        assert_eq!(first.quiet, Some(0));
+        let started = first.observed_at;
+        assert!(!a.expired(first.quiet, started));
         let last = h.stream.poll();
         assert_eq!(last.quiet, Some(0));
+        let observed = started + timeout / 2;
+        let resumed = started + timeout;
 
         // Reader B sees the loss and starts a recovery.
         old.kill("device unplugged");
@@ -4198,24 +4447,23 @@ mod tests {
             RecoveryState::Recovering { .. }
         ));
 
-        // A resumes after its timeout. Judged at the resume instant, as before,
-        // its stale poll would time out on a stream that is recovering...
-        let resumed = first.observed_at + timeout;
+        // Judged at the resume instant, as before, A's stale poll would time
+        // out on a stream that is recovering...
         let mut judged_at_resume = QuietClock {
             timeout,
             since: a.since,
         };
         assert!(judged_at_resume.expired(last.quiet, resumed));
-        // ...but it is judged at the instant it observed the stream, which was
-        // quiet for far less than the timeout.
+        // ...but it is judged at the instant it observed the stream, which
+        // had been quiet for half the timeout.
         assert!(
-            !a.expired(last.quiet, last.observed_at),
+            !a.expired(last.quiet, observed),
             "a stale poll cannot charge later recovery time to the generation"
         );
         // A's next poll sees the recovery, which restarts the clock.
         let next = h.stream.poll();
         assert_eq!(next.quiet, None);
-        assert!(!a.expired(next.quiet, next.observed_at));
+        assert!(!a.expired(next.quiet, resumed));
         h.stream.stop().expect("stop");
     }
 
@@ -4380,7 +4628,7 @@ mod tests {
                 Opener::new(vec![Ok(new.clone())]).factory(),
                 RecoveryTrigger::default(),
                 // As if no disposal thread could be spawned.
-                |stream| stream.disposer = Box::new(Err::<(), Retired>),
+                |stream| stream.disposer = Box::new(refuse_disposal),
             );
             *lock(&h.stream.watcher) = Some(watcher);
 
@@ -4436,12 +4684,12 @@ mod tests {
                 // No disposal thread can be spawned, and finding that out is
                 // held at a gate.
                 move |stream| {
-                    stream.disposer = Box::new(move |retired: Retired| -> Result<(), Retired> {
+                    stream.disposer = Box::new(move |retired: Retired| {
                         let held = lock(&handoff).take();
                         if let Some(held) = held {
                             held.pass();
                         }
-                        Err(retired)
+                        refuse_disposal(retired)
                     })
                 },
             );
@@ -4449,17 +4697,17 @@ mod tests {
             let reading =
                 std::thread::spawn(move || (std::thread::current().id(), read_until_err(&reader)));
             in_handoff.wait_reached();
-            let stopper = Arc::clone(&h.stream);
-            let stopping =
-                std::thread::spawn(move || (std::thread::current().id(), stopper.stop()));
-            wait_for(|| h.stream.core.stop_requested.load(Ordering::SeqCst));
+            // stop() has raised its request and runs on, but cannot finish
+            // while the reader's handoff holds the machine lock.
+            let stop = HeldStop::start(&h.stream);
+            let stopper_id = stop.thread_id();
+            stop.release();
             assert!(
-                !stopping.is_finished(),
+                !stop.is_finished(),
                 "handoff first: stop() waits for the handoff in progress"
             );
             in_handoff.open();
-            let (stopper_id, stopped) = stopping.join().expect("stopper thread");
-            stopped.expect("stop");
+            stop.finish().expect("stop");
 
             assert!(
                 new.stopped(),
@@ -4494,7 +4742,7 @@ mod tests {
                 &old,
                 Opener::new(vec![Ok(new.clone())]).factory(),
                 RecoveryTrigger::default(),
-                |stream| stream.disposer = Box::new(Err::<(), Retired>),
+                |stream| stream.disposer = Box::new(refuse_disposal),
             );
             assert_eq!(read_n(&h.stream, 1)[0].stream_generation(), 0);
             wait_for(|| {
@@ -4584,29 +4832,35 @@ mod tests {
         let opener = Opener::new(vec![Ok(spare)]);
         let h = Harness::new(policy, &draining, opener.factory());
 
-        // As if `draining` were a replacement that spent the only attempt.
-        let installed = {
-            let mut m = lock(&h.stream.machine);
+        // As if `draining` were a replacement that spent the only attempt,
+        // installed longer than its stable period ago.
+        with_machine(&h.stream, |m| {
             m.attempt = 1;
-            let installed = Instant::now();
+            let installed = Instant::now()
+                .checked_sub(stable * 2)
+                .expect("the clock reaches back two stable periods");
             m.healthy_since = Some(installed);
-            installed
-        };
+        });
         // The backend stops on its own (a `Stopping` bridge) with two buffers
-        // still queued, and is read only after its stable period.
+        // still queued.
         draining.stop().expect("backend stop");
         assert!(!draining.is_running());
-        wait_for(|| Instant::now() >= installed + stable * 2);
 
         let tail = read_n(&h.stream, 2);
 
         assert_eq!(tail[0].timestamp(), Some(ms(0)), "the tail is delivered");
         assert_eq!(tail[1].timestamp(), Some(ms(10)));
+        // Drained, it stays readable and empty, as a `Stopping` bridge does.
+        assert!(matches!(h.stream.try_read_chunk(), Ok(None)));
         assert_eq!(
-            lock(&h.stream.machine).attempt,
+            with_machine(&h.stream, |m| m.attempt),
             1,
             "draining a stopped generation is no evidence it stayed healthy"
         );
+
+        // Only the backend's fatal error ends it, and the spent budget was
+        // never restored.
+        draining.push(Step::End("device unplugged"));
         let (buffers, err) = read_until_err(&h.stream);
         assert!(buffers.is_empty());
         match err {
@@ -4629,12 +4883,9 @@ mod tests {
         let mut cx = Context::from_waker(Waker::noop());
         let mut reader = AsyncAudioStream::new(h.stream.as_ref());
 
-        // stop() is requested and then held before it preserves the tail:
-        // its next step takes the hub's status lock, held here.
-        let held = lock(&h.hub.status);
-        let stopper = Arc::clone(&h.stream);
-        let stopping = std::thread::spawn(move || stopper.stop());
-        wait_for(|| h.stream.core.stop_requested.load(Ordering::SeqCst));
+        // stop() has raised its request and is held before it preserves the
+        // tail.
+        let stop = HeldStop::start(&h.stream);
 
         // The async reader finds the backend empty. The stream does not report
         // itself stopped yet, so the reader keeps polling instead of ending.
@@ -4644,8 +4895,7 @@ mod tests {
         ));
         // A buffer arrives before stop() reaches the tail; then stop() runs on.
         live.push(Step::Buffer(buffer(0)));
-        drop(held);
-        stopping.join().expect("stopper thread").expect("stop");
+        stop.finish().expect("stop");
 
         match Pin::new(&mut reader).poll_next(&mut cx) {
             Poll::Ready(Some(Ok(preserved))) => assert_eq!(preserved.timestamp(), Some(ms(0))),
@@ -4665,10 +4915,10 @@ mod tests {
         let lost = MockStream::new(stereo(RATE), vec![Step::End("device unplugged")]);
         let h = Harness::new(policy, &lost, Opener::new(vec![]).factory());
         assert!(matches!(h.stream.try_read_chunk(), Ok(None)));
-        assert!(matches!(
-            lock(&h.stream.machine).phase,
+        assert!(with_machine(&h.stream, |m| matches!(
+            m.phase,
             Phase::Backoff { .. }
-        ));
+        )));
         h
     }
 
@@ -4676,20 +4926,16 @@ mod tests {
     fn a_read_racing_a_stop_during_recovery_ends_only_once_the_stream_reports_itself_stopped() {
         let h = backing_off();
 
-        // stop() is requested and then held before it ends the session: its
-        // next step takes the hub's status lock, held here.
-        let held = lock(&h.hub.status);
-        let stopper = Arc::clone(&h.stream);
-        let stopping = std::thread::spawn(move || stopper.stop());
-        wait_for(|| h.stream.core.stop_requested.load(Ordering::SeqCst));
+        // stop() has raised its request and is held before it ends the
+        // session.
+        let stop = HeldStop::start(&h.stream);
 
         assert!(
             matches!(h.stream.try_read_chunk(), Ok(None)),
             "no end is reported while the stream still reports itself running"
         );
         assert!(h.stream.is_running());
-        drop(held);
-        stopping.join().expect("stopper thread").expect("stop");
+        stop.finish().expect("stop");
 
         match h.stream.try_read_chunk() {
             Err(AudioError::StreamEnded { reason }) => {
@@ -4712,12 +4958,9 @@ mod tests {
         let mut cx = Context::from_waker(Waker::noop());
         let mut reader = AsyncAudioStream::new(h.stream.as_ref());
 
-        // stop() is requested and then held before it ends the session: its
-        // next step takes the hub's status lock, held here.
-        let held = lock(&h.hub.status);
-        let stopper = Arc::clone(&h.stream);
-        let stopping = std::thread::spawn(move || stopper.stop());
-        wait_for(|| h.stream.core.stop_requested.load(Ordering::SeqCst));
+        // stop() has raised its request and is held before it ends the
+        // session.
+        let stop = HeldStop::start(&h.stream);
 
         // The stream still reports itself running, so an end read here would
         // reach the reader as an error item.
@@ -4725,12 +4968,242 @@ mod tests {
             Poll::Pending => {}
             other => panic!("expected Pending while stop() is in progress, got {other:?}"),
         }
-        drop(held);
-        stopping.join().expect("stopper thread").expect("stop");
+        stop.finish().expect("stop");
 
         assert!(matches!(
             Pin::new(&mut reader).poll_next(&mut cx),
             Poll::Ready(None)
         ));
+    }
+
+    // ── Logging under the supervisor lock ───────────────────────────────
+
+    /// One record a probed thread logged.
+    #[derive(Clone, Debug)]
+    struct Logged {
+        level: log::Level,
+        target: String,
+        message: String,
+        /// Whether the supervisor's `machine` lock was free as it was logged.
+        lock_free: bool,
+    }
+
+    /// What a probed thread's records find of `stream`, and whether the next
+    /// one stops it from inside the logger.
+    struct LogProbe {
+        stream: Arc<RecoveryStream>,
+        stop_on_next: AtomicBool,
+        records: Mutex<Vec<Logged>>,
+        /// What each `stop()` called from inside a record returned.
+        stops: Mutex<Vec<AudioResult<()>>>,
+    }
+
+    impl LogProbe {
+        fn new(stream: &Arc<RecoveryStream>) -> Arc<Self> {
+            Arc::new(Self {
+                stream: Arc::clone(stream),
+                stop_on_next: AtomicBool::new(false),
+                records: Mutex::new(Vec::new()),
+                stops: Mutex::new(Vec::new()),
+            })
+        }
+
+        fn records(&self) -> Vec<Logged> {
+            lock(&self.records).clone()
+        }
+    }
+
+    thread_local! {
+        /// Whether this thread's records reach its probe. A `Cell<bool>` needs
+        /// no destructor, so the check every other test's records make
+        /// allocates and registers nothing.
+        static PROBED: Cell<bool> = const { Cell::new(false) };
+        /// This thread's probe; set only while `PROBED` is.
+        static PROBE: RefCell<Option<Arc<LogProbe>>> = const { RefCell::new(None) };
+    }
+
+    /// The logger of this test binary. A record from a thread that did not
+    /// arm it goes no further than one thread-local flag check, so installing
+    /// it changes nothing the tests running in parallel can observe. On an
+    /// armed thread it notes whether the supervisor lock is free and may
+    /// re-enter the capture's `stop()`, as an application logger may; while
+    /// the lock is held, re-entering would deadlock the thread, so it only
+    /// records that.
+    struct ReentrantLogger;
+
+    impl log::Log for ReentrantLogger {
+        fn enabled(&self, _: &log::Metadata<'_>) -> bool {
+            PROBED.get()
+        }
+
+        fn log(&self, record: &log::Record<'_>) {
+            if !PROBED.get() {
+                return;
+            }
+            let Some(probe) = PROBE.with_borrow(Option::clone) else {
+                return;
+            };
+            // Only this thread polls the probed stream, so a held lock is held
+            // by this very thread, logging from inside it.
+            let lock_free = !probe.stream.machine.is_held();
+            lock(&probe.records).push(Logged {
+                level: record.level(),
+                target: record.target().to_string(),
+                message: record.args().to_string(),
+                lock_free,
+            });
+            if lock_free && probe.stop_on_next.swap(false, Ordering::SeqCst) {
+                let stopped = probe.stream.stop();
+                lock(&probe.stops).push(stopped);
+            }
+        }
+
+        fn flush(&self) {}
+    }
+
+    static REENTRANT_LOGGER: ReentrantLogger = ReentrantLogger;
+
+    /// Routes this thread's log records to a probe until dropped.
+    struct Armed;
+
+    impl Armed {
+        fn new(probe: &Arc<LogProbe>) -> Self {
+            static INSTALL: std::sync::Once = std::sync::Once::new();
+            INSTALL.call_once(|| {
+                log::set_logger(&REENTRANT_LOGGER)
+                    .expect("no other logger is installed in the unit-test binary");
+                log::set_max_level(log::LevelFilter::Trace);
+            });
+            PROBE.set(Some(Arc::clone(probe)));
+            PROBED.set(true);
+            Self
+        }
+    }
+
+    impl Drop for Armed {
+        fn drop(&mut self) {
+            PROBED.set(false);
+            drop(PROBE.take());
+        }
+    }
+
+    #[test]
+    fn the_supervisor_logs_only_once_its_machine_lock_is_released() {
+        let old = MockStream::new(
+            stereo(RATE),
+            vec![Step::Buffer(buffer(0)), Step::End("device unplugged")],
+        );
+        let opener = Opener::new(vec![Err(not_found()), Ok(mono_impostor())]);
+        let h = Harness::build(
+            absence_policy(),
+            &old,
+            opener.factory(),
+            RecoveryTrigger::default(),
+            // No disposal thread can be spawned, so keeping what the session
+            // retired is logged too.
+            |stream| stream.disposer = Box::new(refuse_disposal),
+        );
+        let probe = LogProbe::new(&h.stream);
+        let armed = Armed::new(&probe);
+
+        // A loss, its retry, an absent device, a recovery, a format change
+        // that ends the session, and a handoff no thread takes: every message
+        // the supervisor logs.
+        let (buffers, err) = read_until_err(&h.stream);
+        drop(armed);
+
+        assert_eq!(buffers.len(), 1);
+        assert!(
+            matches!(err, AudioError::StreamEnded { ref reason } if reason == FORMAT_CHANGED_REASON),
+            "{err:?}"
+        );
+        let records = probe.records();
+        assert!(
+            records.iter().all(|record| record.lock_free),
+            "logged while the machine lock was held: {records:?}"
+        );
+        let target = module_path!()
+            .strip_suffix("::tests")
+            .expect("the recovery module's tests");
+        assert!(
+            records.iter().all(|record| record.target == target),
+            "logged under another target: {records:?}"
+        );
+        let logged: Vec<(log::Level, &str)> = records
+            .iter()
+            .map(|record| (record.level, record.message.as_str()))
+            .collect();
+        match logged.as_slice() {
+            [(log::Level::Warn, invalidated), (log::Level::Warn, retry), (log::Level::Info, waiting), (log::Level::Info, running), (log::Level::Error, giving_up), (log::Level::Warn, kept)] =>
+            {
+                assert!(
+                    invalidated.starts_with("auto-recovery: generation 0 stream invalidated: ")
+                        && invalidated.contains("device unplugged"),
+                    "{invalidated}"
+                );
+                assert!(
+                    retry.starts_with("auto-recovery: reopen attempt 1 in "),
+                    "{retry}"
+                );
+                assert_eq!(
+                    *waiting,
+                    "auto-recovery: no capture device present (default_render); waiting"
+                );
+                assert!(
+                    running.starts_with("auto-recovery: generation 1 running after a ")
+                        && running.ends_with(" outage"),
+                    "{running}"
+                );
+                assert_eq!(
+                    *giving_up,
+                    "auto-recovery: giving up at generation 1: reconnected device changed \
+                     format: negotiated (48000, 2) (rate, channels), generation 1 delivered \
+                     (48000, 1)"
+                );
+                assert_eq!(
+                    *kept,
+                    "auto-recovery: cannot spawn the disposal helper (no disposal thread); \
+                     keeping the retired resources for the capture's stop()"
+                );
+            }
+            other => panic!("unexpected records: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn a_logger_that_stops_the_capture_from_a_supervisor_record_does_not_deadlock() {
+        let policy = fast_policy()
+            .with_initial_backoff(Duration::from_secs(30))
+            .with_max_backoff(Duration::from_secs(30));
+        let lost = MockStream::new(stereo(RATE), vec![Step::End("device unplugged")]);
+        let h = Harness::new(policy, &lost, Opener::new(vec![]).factory());
+        let probe = LogProbe::new(&h.stream);
+        probe.stop_on_next.store(true, Ordering::SeqCst);
+        let armed = Armed::new(&probe);
+
+        // The poll that notices the loss logs it, and the logger stops the
+        // capture from inside that record, on the polling thread.
+        let read = h.stream.try_read_chunk();
+        drop(armed);
+
+        assert!(matches!(read, Ok(None)), "{read:?}");
+        let records = probe.records();
+        assert!(
+            !records.is_empty() && records.iter().all(|record| record.lock_free),
+            "logged while the machine lock was held: {records:?}"
+        );
+        match lock(&probe.stops).as_slice() {
+            [Ok(())] => {}
+            other => panic!("the logger's stop() did not run to completion: {other:?}"),
+        }
+        assert!(!h.stream.is_running(), "stopped from inside the record");
+        assert!(lost.stopped());
+        assert_eq!(h.hub.snapshot().state, RecoveryState::Stopped);
+        match h.stream.try_read_chunk() {
+            Err(AudioError::StreamEnded { reason }) => {
+                assert_eq!(reason, STOPPED_DURING_RECOVERY_REASON)
+            }
+            other => panic!("expected StreamEnded, got {other:?}"),
+        }
     }
 }
