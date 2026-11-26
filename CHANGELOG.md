@@ -30,8 +30,10 @@ Releases with no ABI change omit the subsection (or state "No C ABI changes").
   (`secrets` job).
 - **Unified runtime pins (`.tool-versions`)** — single source of truth for Bun, Node,
   Go, and Python shared between `mise` and GitHub Actions workflows.
-- **One-shot Blacksmith Windows audio probe** (`.github/workflows/probe-blacksmith-windows-audio.yml`)
-  to verify `Server-Media-Foundation` + `LABSN/sound-ci-helpers` on `blacksmith-4vcpu-windows-2025`.
+- **Blacksmith Windows audio re-probed** — a one-shot probe (run 45738685950, workflow
+  removed afterwards) found the image is now Desktop Experience with `AudioSrv` running
+  and a usable VB-CABLE endpoint; recorded in `AGENTS.md`. Windows audio integration
+  stays on GitHub-hosted `windows-latest` (free and proven).
 - **Audit & planning records** — `docs/audit/2026-11-25-codebase-ci-market-audit.md`,
   `docs/DESKTOP_REFINEMENT.md`, and `docs/designs/0019-hotplug-auto-recovery.md`.
 

@@ -445,8 +445,10 @@ and Linux.
 ### CI infrastructure: hybrid runners
 
 CI uses Blacksmith for normal compile lanes and GitHub-hosted Windows and macOS
-for audio integration because the Blacksmith Windows image lacks a usable audio
-stack.
+for audio integration: those runners are free for this public repository and
+are where the audio suite is proven. (The Blacksmith Windows image has had an
+audio stack since at least the 2026-11-26 probe below, but has never run the
+suite.)
 
 **CI is manually dispatched (cost control — the full matrix is expensive).** No
 build/test workflow fires on `pull_request` or on a branch push. Run what a
@@ -475,12 +477,12 @@ implying green. See [desktop refinement](docs/DESKTOP_REFINEMENT.md#d5--desktop-
 | **Windows (audio)** | `windows-latest` (GitHub-hosted) | GitHub-hosted runner with full audio stack (VB-CABLE via `LABSN/sound-ci-helpers@v1`) |
 | **macOS** | `blacksmith-6vcpu-macos-15` | 6 vCPU, 24 GB RAM, macOS 15 Sequoia, Apple Silicon M4 |
 
-**Blacksmith audio device probe results** (run 2026-04-13; Windows re-verified live 2026-07-17, run 29545897122, rootfs `windows25-full-x64-251112`):
+**Blacksmith audio device probe results** (run 2026-04-13; Windows re-verified live 2026-07-17, run 29545897122, rootfs `windows25-full-x64-251112`; Windows re-probed 2026-11-26, run 45738685950):
 
 | Platform | Virtual Audio Available? | Details |
 |---|---|---|
 | **Linux** | ✅ Working | PipeWire launched manually (not via systemd) with a **private session `dbus-daemon`** — wireplumber 0.4 exits without a bus, and without the session manager no stream ever links (root cause of the historical "SystemDefault yields 0 buffers"; fixed in PR #43). Virtual null sink via `pactl load-module module-null-sink`; the routing gate (`scripts/ci-linux-audio-route.sh`) proves the route end-to-end and flips `RSAC_CI_AUDIO_DETERMINISTIC=1`. Requires `pulseaudio-utils` for `pactl`, and `XDG_RUNTIME_DIR` setup. |
-| **Windows** | ❌ No audio stack (**SKU-structural**) | **Root cause (2026-07-17 re-probe): the image is Windows Server 2025 build 26100, `WindowsInstallationType: Server Core`** — Server Core strips the desktop audio stack *by design*, independent of Firecracker; image updates alone won't close the gap. Confirmed still absent: `AudioSrv`/`AudioEndpointBuilder` services, `AudioSes.dll`/`AudioEndpointBuilder.dll`/`Audiodg.exe`/`AudioEng.dll` in System32, `MMDevices\Audio\Render|Capture` registry keys (`MMDevAPI.dll` *is* present — an API shim with nothing behind it). VB-CABLE (LABSN) installs "successfully" and its **PnP device node now registers** (`Win32_SoundDevice`/`Get-PnpDevice` show "VB-Audio Virtual Cable") **but with `Status: Error`** — enumerable, never functional; `Get-AudioDevice -List` returns empty. `Get-WindowsFeature Server-Media-Foundation` now reports `Available` (disabled, not "unavailable" as the 2026-04 probe recorded) — untested whether installing it provisions `AudioSrv`; do not assume it's a recovery path. Windows audio integration tests run on GitHub-hosted `windows-latest` instead. **Probe-script gotcha:** broad `Get-Service` (no `-Name` filter) hard-aborts the pwsh pipeline on this image (`MDCoreSvc` PermissionDenied) — filter by name or wrap in try/catch. |
+| **Windows** | ✅ Audio stack present (**`ci_audio` never run here**) | **2026-11-26 probe (run 45738685950; one-shot workflow, since deleted): the image is now `Windows Server 2025 Standard Evaluation`, `InstallationType: Server` (Desktop Experience), build 26100.33296.** At baseline, before anything was installed: `AudioSrv` and `AudioEndpointBuilder` Running, the `MMDevices\Audio\Render` key present, `AudioSes.dll`/`AudioEndpointBuilder.dll`/`Audiodg.exe`/`AudioEng.dll`/`MMDevAPI.dll` present. `LABSN/sound-ci-helpers` then installed VB-CABLE and the probe verdict was `AUDIO_STACK_USABLE` (audio services running, VB-CABLE PnP status OK, at least one playback endpoint). `Install-WindowsFeature Server-Media-Foundation` succeeded with no restart needed, but it is not what changed — the services were already running. **Not proven:** a WASAPI loopback capture, or the `ci_audio` windows tier, on this runner. **History:** the 2026-04-13 and 2026-07-17 probes found `InstallationType: Server Core` with no `AudioSrv`/`AudioEndpointBuilder`, no audio DLLs, and VB-CABLE's PnP node in `Status: Error`; the conclusion drawn then ("SKU-structural, image updates alone won't close the gap") was wrong — Blacksmith changed the image SKU. Windows audio integration still runs on GitHub-hosted `windows-latest`: free on a public repository and proven, whereas Blacksmith Windows bills at 4× and has queued for up to ~57 minutes. **Probe-script gotcha (seen on the 2026-07 image):** broad `Get-Service` (no `-Name` filter) hard-aborts the pwsh pipeline (`MDCoreSvc` PermissionDenied) — filter by name or wrap in try/catch. |
 | **macOS** | ✅ Working | BlackHole 2ch installs via `brew`, CoreAudio daemon running, virtual 48kHz stereo device as default I/O. Apple Silicon M4 hardware (not a VM). |
 
 **SSH debugging:** Blacksmith supports SSH access to running jobs using your GitHub SSH keys. Enable in [Blacksmith Settings > Features](https://app.blacksmith.sh/settings?tab=features). Connection info appears in the "Setup runner" step of each job. Add a sleep step on failure to keep the VM alive for debugging.

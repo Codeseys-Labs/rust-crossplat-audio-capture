@@ -262,9 +262,9 @@ the expensive virtual-audio and mobile runtime workflows run only when someone
 dispatches them, plus stable release tags. A PR without a dispatched run has no
 CI evidence, and a skipped hardware-gated test is not runtime evidence.
 
-CI is hybrid: ordinary desktop lanes use Blacksmith runners; Windows audio
-integration uses GitHub-hosted Windows because the Blacksmith Windows image
-has no usable audio stack. macOS Process Tap tests additionally require TCC
+CI is hybrid: ordinary desktop lanes use Blacksmith runners; Windows and macOS
+audio integration use GitHub-hosted runners, which are free for a public
+repository and where the suite is proven. macOS Process Tap tests additionally require TCC
 permission. See [CI audio testing](docs/CI_AUDIO_TESTING.md) and the
 [v0.5 release bar](docs/DESKTOP_REFINEMENT.md#v05-desktop-bar).
 

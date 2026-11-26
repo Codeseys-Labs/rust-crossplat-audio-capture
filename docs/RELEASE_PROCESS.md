@@ -69,11 +69,11 @@ token. A one-time Trusted Publisher must be configured per registry (see
    `blacksmith-4vcpu-windows-2025`, and `blacksmith-6vcpu-macos-15`, each
    building all targets and running `cargo test --lib` against its platform
    feature **plus `compose`** (`feat_<os>,compose`). Mirrors the `test-*`
-   jobs in `ci.yml`, including the Windows "no audio subsystem" handling:
+   jobs in `ci.yml`, including the Windows "no audio endpoint" handling:
    the Windows `--lib` suite is **partitioned**, not blanket-tolerated —
    the platform-independent + non-audio tests hard-fail, and only the
-   device-touching WASAPI subset (which needs Audiosrv + a real endpoint,
-   absent on Blacksmith Windows runners) is `--skip`ped into a separate
+   device-touching WASAPI subset (which needs a real audio endpoint, absent
+   on the Blacksmith Windows unit-test legs) is `--skip`ped into a separate
    `continue-on-error` step. See
    [§ What `ci.yml` now gates](#what-ciyml-now-gates-architecture-critique-closures)
    for the same partition on the CI side.

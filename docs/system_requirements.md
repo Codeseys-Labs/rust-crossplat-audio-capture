@@ -223,8 +223,8 @@ capture) is exercised by the `ci_audio` integration suite; see
 
 ### CI/CD Considerations
 - **Windows**: audio integration tests run on GitHub-hosted `windows-latest`
-  with VB-CABLE (the Blacksmith Windows image has no audio subsystem, so it is
-  compile/unit-only). See [`ci-audio-tests.yml`](../.github/workflows/ci-audio-tests.yml).
+  with VB-CABLE (free on a public repository and proven; the Blacksmith Windows
+  legs are compile/unit-only). See [`ci-audio-tests.yml`](../.github/workflows/ci-audio-tests.yml).
 - **Linux**: Ubuntu 24.04 (`blacksmith-4vcpu-ubuntu-2404`) with PipeWire packages.
 - **macOS**: `blacksmith-6vcpu-macos-15`; Process Tap paths skip early on managed
   runners because `kTCCServiceAudioCapture` cannot be granted non-interactively.

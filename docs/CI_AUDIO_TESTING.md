@@ -258,11 +258,11 @@ review § "Key learnings" for the full post-mortem.
 
 | Issue | Status | Notes |
 |---|---|---|
-| **rsac#26** — macOS device-path hang | open | `macos-audio` now runs on GitHub-hosted `macos-15` with BlackHole as default I/O; the first run shows whether AUHAL `.start()` still hangs. |
+| **rsac#26** — macOS device-path hang | not reproduced on GitHub-hosted | `macos-audio` runs on GitHub-hosted `macos-15` with BlackHole as default I/O. First run (45738663823, 2026-11-26): the Device tier captured 94 buffers / 48,128 frames, no AUHAL hang. The hang was only ever seen on the Blacksmith macOS image. |
 | **rsac#21** — failing-test signalling | requires opt-in PR | User-driven. |
 | **rsac#19** — Alpine musl + PipeWire runtime | blocked on infra session | 4-6h Alpine Docker + audio. |
 | **rsac#16** — docs.rs post-publish spot-check | gated on first `cargo publish` | `scripts/verify-docs-rs.sh` is ready. |
-| Blacksmith Windows audio stack | probe pending | One-shot [`probe-blacksmith-windows-audio.yml`](../.github/workflows/probe-blacksmith-windows-audio.yml). Keep the hybrid (Blacksmith compile/unit, `windows-latest` audio) unless `AudioSrv` exists after the probe. |
+| Blacksmith Windows audio stack | probed 2026-11-26: `AUDIO_STACK_USABLE` | Run 45738685950: the image is now Desktop Experience with `AudioSrv` running and a VB-CABLE playback endpoint (details in AGENTS.md §6). The hybrid stays because GitHub-hosted `windows-latest` is free and proven; the `ci_audio` windows tier has never run on Blacksmith. |
 
 ## 8. Related docs
 

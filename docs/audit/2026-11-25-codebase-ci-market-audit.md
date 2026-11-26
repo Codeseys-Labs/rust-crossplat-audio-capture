@@ -215,7 +215,7 @@ onboarding (`mise install && mise run setup`) already provides.
 | `ci-audio-tests.yml` | Triggers: `workflow_dispatch` (input `platform`) and `v*.*.*` tags; no push or `pull_request`. `macos-audio` moved to GitHub-hosted `macos-15` with BlackHole pinned as default output and input |
 | `ci-ios-sim.yml`, `ci-android-emu.yml` | Dispatch only |
 | `ci-audio-macos-tcc.yml` | Weekly cron removed; dispatch only |
-| `probe-blacksmith-windows-audio.yml` | New one-shot probe (below) |
+| `probe-blacksmith-windows-audio.yml` | One-shot probe: added, run once (2026-11-26), then removed. Result in §5.1 |
 
 ## 5. Can Blacksmith be the only runner? LABSN outside GitHub-hosted
 
@@ -236,13 +236,19 @@ onboarding (`mise install && mise run setup`) already provides.
 - `Server-Media-Foundation` is listed as Available. It installs Media
   Foundation libraries, not the Core Audio service graph [INFERENCE], and
   may need a reboot a CI job cannot take.
-- The one-shot
-  [`probe-blacksmith-windows-audio.yml`](../../.github/workflows/probe-blacksmith-windows-audio.yml)
-  installs it, starts the services, runs LABSN and reports
+- The one-shot `probe-blacksmith-windows-audio.yml` (removed after its run)
+  installed it, started the services, ran LABSN and reported one of
   `AUDIO_STACK_USABLE`, `PARTIAL`, `RESTART_REQUIRED_UNTESTABLE` or
   `NO_CHANGE`. The verdict needs a running `AudioSrv`, a VB-CABLE PnP node
   with status OK and at least one playback endpoint, not just LABSN exiting
-  0. Expected: `NO_CHANGE`. Not run yet.
+  0. Expected: `NO_CHANGE`.
+- **Result (2026-11-26, run 45738685950): `AUDIO_STACK_USABLE`.** The
+  expectation was wrong because its premise was stale. The image is now
+  `InstallationType: Server` (Desktop Experience), build 26100.33296, and
+  `AudioSrv` and `AudioEndpointBuilder` were already Running at baseline,
+  before the feature install. The first three bullets above describe the image
+  as probed in April and July, not today's. Blacksmith Windows can host an
+  audio stack; whether rsac's WASAPI tiers pass there is untested.
 - LABSN should work on any runner whose Windows image is Desktop
   Experience [INFERENCE: not run outside GitHub-hosted]. GitHub's
   `windows-2025` builds from `2025-Datacenter-g2`
@@ -265,8 +271,11 @@ GitHub-hosted TCC grants are in
 
 Keep the hybrid: Blacksmith for Linux and for Windows/macOS compile and
 unit work; GitHub-hosted `windows-latest` for WASAPI E2E and `macos-15`
-for macOS E2E, both free on this repository. Revisit only if the probe
-reports `AUDIO_STACK_USABLE`, or if the repository goes private.
+for macOS E2E, both free on this repository. The probe did report
+`AUDIO_STACK_USABLE` (§5.1), so Blacksmith Windows is now a possible home for
+`windows-audio`. That is a cost and queue-time trade (4× billing, waits of up
+to ~57 minutes), no longer a capability gap. Revisit if the repository goes
+private or GitHub-hosted Windows audio regresses.
 
 ## 6. Runner vendors
 
@@ -276,7 +285,7 @@ linked below; not re-verified in this pass.
 | Provider | Windows with an audio stack | macOS | Price notes | Verdict |
 |---|---|---|---|---|
 | GitHub-hosted standard | Yes, proven (`windows-latest`, 3 of 3 WASAPI tiers deterministic) | `macos-15`; Microphone pre-granted to the agent, no Audio Capture | $0 on public repositories | Use for audio E2E |
-| [Blacksmith](https://docs.blacksmith.sh/blacksmith-runners/overview) (current) | No: Server Core image, Windows in public beta | M4; no Audio Capture; Device tier hung | 3,000 free 2-vCPU-equivalent min/month; macOS 20×, Windows 4× | Keep for Linux and compile/unit |
+| [Blacksmith](https://docs.blacksmith.sh/blacksmith-runners/overview) (current) | Yes as of 2026-11-26 (probe `AUDIO_STACK_USABLE`; rsac's suite not run there). Server Core in the April and July probes. Windows in public beta | M4; no Audio Capture; Device tier hung | 3,000 free 2-vCPU-equivalent min/month; macOS 20×, Windows 4× | Keep for Linux and compile/unit; possible Windows-audio fallback |
 | BuildJet | — | — | Shut down 2026-03-31 | Out |
 | [Ubicloud](https://www.ubicloud.com/docs/github-actions-integration/price-performance) | No Windows runners | No macOS runners | Cheap Linux | Out: cannot fix Windows or macOS |
 | [Depot](https://depot.dev/docs/github-actions/runner-types) | Likely [INFERENCE] | No Audio Capture | $20/month base plus per-minute | Out: replaces a $0 job with a paid one |
@@ -319,12 +328,14 @@ Top five harvest items, all small and needing no bump:
 
 ## 8. Open items and what would change these conclusions
 
-- Run the Blacksmith Windows probe once; `AUDIO_STACK_USABLE` would reopen
-  moving `windows-audio` to Blacksmith.
-- First `macos-audio` run on `macos-15`: if the Device tier delivers
-  frames, the truth table goes to 7 of 9. If AUHAL still hangs with
-  BlackHole as default output and the agent's Microphone grant, neither
-  current explanation holds and rsac#26 needs a new diagnosis.
+- The Blacksmith Windows probe ran once and reported `AUDIO_STACK_USABLE`
+  (§5.1). Moving `windows-audio` to Blacksmith is possible but unproven: no
+  rsac capture has run there.
+- First `macos-audio` run on GitHub-hosted `macos-15` (2026-11-26, run
+  45738663823): the Device tier delivered frames (94 buffers, 48,128 frames
+  from BlackHole 2ch in 2.25 s), so AUHAL does not hang there and the truth
+  table is 7 of 9. System and Process Tap tiers still skip on the Audio
+  Capture TCC gate. rsac#26 is specific to the Blacksmith macOS image.
 - Consider a macOS leg for the MSRV job.
 - Land the three dependency bumps as separate commits; re-run
   `tests/rt_alloc.rs`, the bridge tests, the Windows and Linux audio tiers.

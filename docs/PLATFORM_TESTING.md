@@ -43,10 +43,11 @@ Runs on all three platforms plus bindings and supporting gates:
 | Binding / Go / docs / supply-chain / DAG gates | `blacksmith-4vcpu-ubuntu-2404` (+ Go matrix on all 3) | FFI/Python/Node/Go bindings, `cargo doc`, `cargo-deny`, module-DAG guard, version lockstep |
 
 Windows unit tests run on the **Blacksmith Windows** runner (compile + unit
-logic only). That runner's Firecracker microVM has **no audio subsystem at all**
-(`AudioSrv`, `AudioEndpointBuilder`, `AudioSes.dll` are absent — see AGENTS.md
-§6), so device-touching WASAPI unit tests are split out via `--skip` and re-run
-as a tolerated (`continue-on-error`) step; the pure-logic tests hard-fail.
+logic only). No audio endpoint exists there: the image gained an audio service
+stack by the 2026-11-26 probe (see AGENTS.md §6), but this job installs no
+virtual device. Device-touching WASAPI unit tests are therefore split out via
+`--skip` and re-run as a tolerated (`continue-on-error`) step; the pure-logic
+tests hard-fail.
 
 #### `ci-audio-tests.yml` — audio integration tests
 
