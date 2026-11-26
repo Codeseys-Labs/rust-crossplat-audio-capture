@@ -76,6 +76,10 @@ on:
         type: choice
         options: [all, linux, windows, macos, bindings]
         default: all
+      release_evidence:
+        description: Require the complete audio matrix as release evidence
+        type: boolean
+        default: false
 
 env:
   CARGO_TERM_COLOR: always
@@ -277,6 +281,135 @@ jobs:
           if-no-files-found: ignore
 
   # ===========================================================================
+  # Linux recovery and sink-format tier (#94, #102, #104) — its own job and its
+  # own PipeWire session: the last test kills the PipeWire daemon, so nothing
+  # may run after it, and the default-switch tests create and remove sinks.
+  # ===========================================================================
+  linux-hotplug:
+    name: "Linux Audio (recovery + sink format)"
+    runs-on: blacksmith-4vcpu-ubuntu-2404
+    if: github.event_name != 'workflow_dispatch' || inputs.platform == 'all' || inputs.platform == 'linux'
+    timeout-minutes: 40
+    defaults:
+      run:
+        shell: bash
+    outputs:
+      tier_wav: ${{ steps.record.outputs.tier_wav }}
+      tier_switch: ${{ steps.record.outputs.tier_switch }}
+      tier_daemon: ${{ steps.record.outputs.tier_daemon }}
+    steps:
+      - uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5
+        with:
+          persist-credentials: false
+      - uses: ./.github/actions/rust-setup
+        with:
+          cache-key: linux-hotplug
+
+      - name: Set up PipeWire + prove deterministic routing (hard gate)
+        uses: ./.github/actions/pipewire-setup
+        with:
+          daemon: "true"
+
+      - name: Build ci_audio test binary (compile once)
+        run: cargo test --test ci_audio --no-run --no-default-features --features feat_linux,compose,sink-wav,hotplug-recovery
+
+      # #104: a WAV sink built from the first delivered buffer matches the
+      # delivered audio, whatever PipeWire negotiated for a 44.1 kHz mono
+      # request. (This proves header == delivered format; it does not prove
+      # that the delivered format differed from the request.)
+      - name: Sink format tier
+        id: tier_wav
+        continue-on-error: true
+        timeout-minutes: 10
+        env:
+          RSAC_TEST_CAPTURE_TIMEOUT_SECS: "15"
+        run: |
+          cargo test --test ci_audio wav_sink_format \
+            --no-default-features --features feat_linux,compose,sink-wav,hotplug-recovery \
+            -- --test-threads=1 --nocapture 2>&1 | tee ci-audio-wav.log
+          # A filter that matches no test passes vacuously.
+          grep -Eq 'test result: ok\. [1-9][0-9]* passed' ci-audio-wav.log || {
+            echo "FAIL: wav_sink_format ran no test"
+            exit 1
+          }
+
+      # #94: one session held open while the default sink changes; an explicit
+      # device target that must not follow and must end when its node goes.
+      # A skipped test is not evidence, so the three lines are counted.
+      - name: Default-switch tier
+        id: tier_switch
+        continue-on-error: true
+        timeout-minutes: 10
+        env:
+          RSAC_HOTPLUG_LINUX: "1"
+          RUST_LOG: rsac=debug
+          RUST_BACKTRACE: "1"
+        run: |
+          cargo test --test ci_audio \
+            --no-default-features --features feat_linux,compose,sink-wav,hotplug-recovery \
+            -- hotplug_linux:: \
+            --skip hotplug_linux::hotplug_linux_daemon_stop_spends_the_retry_budget \
+            --test-threads=1 --nocapture 2>&1 | tee ci-audio-hotplug-switch.log
+          n=$(grep -c 'HOTPLUG-EVIDENCE test=hotplug_linux_[a-z_]* result=pass' ci-audio-hotplug-switch.log || true)
+          if [ "$n" -ne 3 ]; then
+            echo "FAIL: expected 3 HOTPLUG-EVIDENCE lines, found $n"
+            exit 1
+          fi
+          if grep -q 'HOTPLUG-RESTORE-FAILED' ci-audio-hotplug-switch.log; then
+            echo "FAIL: the audio fixture was not restored"
+            exit 1
+          fi
+
+      # #102: with the daemon gone, a supervised capture spends its retry
+      # budget (a failed lookup), it does not sit in the absent-device wait.
+      # LAST step that touches audio: it kills PipeWire.
+      - name: Daemon-stop tier (kills PipeWire)
+        id: tier_daemon
+        continue-on-error: true
+        timeout-minutes: 10
+        env:
+          RSAC_HOTPLUG_LINUX_DAEMON_STOP: "1"
+          RUST_LOG: rsac=debug
+          RUST_BACKTRACE: "1"
+        run: |
+          cargo test --test ci_audio \
+            --no-default-features --features feat_linux,compose,sink-wav,hotplug-recovery \
+            -- hotplug_linux::hotplug_linux_daemon_stop_spends_the_retry_budget \
+            --exact --test-threads=1 --nocapture 2>&1 | tee ci-audio-hotplug-daemon.log
+          grep -q 'HOTPLUG-EVIDENCE test=hotplug_linux_daemon_stop_spends_the_retry_budget result=pass' ci-audio-hotplug-daemon.log || {
+            echo "FAIL: no HOTPLUG-EVIDENCE line for the daemon-stop test"
+            exit 1
+          }
+
+      - name: Record tier outcomes
+        id: record
+        if: always()
+        run: |
+          {
+            echo "tier_wav=${{ steps.tier_wav.outcome }}"
+            echo "tier_switch=${{ steps.tier_switch.outcome }}"
+            echo "tier_daemon=${{ steps.tier_daemon.outcome }}"
+          } >> "$GITHUB_OUTPUT"
+
+      - name: Diagnostics on failure
+        if: ${{ failure() || steps.tier_wav.outcome == 'failure' || steps.tier_switch.outcome == 'failure' || steps.tier_daemon.outcome == 'failure' }}
+        run: |
+          pactl get-default-sink || true
+          pactl list short sinks || true
+          wpctl status || true
+          pw-link -l || true
+          pgrep -a pipewire || true
+
+      - name: Upload logs
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: linux-hotplug-logs
+          path: ci-audio-*.log
+          retention-days: 14
+          if-no-files-found: ignore
+
+  # ===========================================================================
   # Windows tiers — VB-CABLE virtual audio driver — FIRST-CLASS (hard-gated)
   # NOTE: these tiers run on GitHub-hosted windows-latest: free for a public
   # repository and proven with VB-CABLE. The Blacksmith Windows image gained an
@@ -301,6 +434,7 @@ jobs:
       tier_system: ${{ steps.record.outputs.tier_system }}
       tier_device: ${{ steps.record.outputs.tier_device }}
       tier_process: ${{ steps.record.outputs.tier_process }}
+      tier_hotplug: ${{ steps.record.outputs.tier_hotplug }}
     steps:
       - uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5
         with:
@@ -367,6 +501,20 @@ jobs:
             -- --test-threads=1 --nocapture `
             2>&1 | Tee-Object -FilePath ci-audio-system-terminal.log
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          # #104: a WAV sink built from the first delivered buffer matches the
+          # delivered audio even when the request (44.1 kHz mono) is not what
+          # the device delivers. Needs sink-wav; the hotplug tier below reuses
+          # this second build of the test binary.
+          cargo test --test ci_audio wav_sink_format `
+            --no-default-features --features feat_windows,compose,sink-wav,hotplug-recovery `
+            -- --test-threads=1 --nocapture `
+            2>&1 | Tee-Object -FilePath ci-audio-system-wav.log
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          # A filter that matches no test passes vacuously.
+          if (-not (Select-String -Path ci-audio-system-wav.log -Pattern 'test result: ok\. [1-9]\d* passed' -Quiet)) {
+            Write-Error "wav_sink_format ran no test — module rename or feature-gating regression"
+            exit 1
+          }
           # Composed multi-source capture on the deterministic VB-CABLE default
           # endpoint — first HARD tone-content verification of the compose engine.
           cargo test --test ci_audio "compose::" `
@@ -480,6 +628,48 @@ jobs:
             2>&1 | Tee-Object -FilePath ci-audio-process-appbyname.log
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
 
+      # ── Hotplug recovery tier (#94) ─────────────────────────────────────
+      # Runs LAST: it takes away the only render endpoint mid-capture, and a
+      # restore that failed must not take the other tiers with it. The
+      # default-SWITCH tests need two render endpoints and this runner has
+      # one, so they print HOTPLUG-SKIP here and run on a workstation (the
+      # result is docs/evidence/windows-default-switch.md). The loss tests
+      # run twice: once hiding the endpoint (what "Disable" in the Sound
+      # panel does) and once disabling its device node (what an unplug does).
+      - name: Hotplug recovery tier (endpoint loss)
+        id: tier_hotplug
+        continue-on-error: true
+        timeout-minutes: 20
+        shell: pwsh
+        env:
+          RSAC_HOTPLUG_LOSS: "1"
+        run: |
+          $cable = Get-PnpDevice -Class MEDIA -PresentOnly -ErrorAction SilentlyContinue |
+            Where-Object { $_.FriendlyName -match 'VB-Audio' } | Select-Object -First 1
+          if (-not $cable) { Write-Error "VB-CABLE device node not found"; exit 1 }
+          Write-Host "VB-CABLE device node: $($cable.InstanceId)"
+          foreach ($mode in @('visibility', 'pnp')) {
+            $env:RSAC_HOTPLUG_LOSS_MODE = $mode
+            $env:RSAC_HOTPLUG_PNP_INSTANCE_ID = $cable.InstanceId
+            $log = "ci-audio-hotplug-$mode.log"
+            cargo test --test ci_audio hotplug_ `
+              --no-default-features --features feat_windows,compose,sink-wav,hotplug-recovery `
+              -- --test-threads=1 --nocapture `
+              2>&1 | Tee-Object -FilePath $log
+            if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+            # A skipped test is not evidence: both loss tests must have
+            # printed their line, and nothing may have been left disabled.
+            $evidence = @(Select-String -Path $log -Pattern 'HOTPLUG-EVIDENCE test=hotplug_loss_\w+ result=pass').Count
+            if ($evidence -ne 2) {
+              Write-Error "mode ${mode}: expected 2 HOTPLUG-EVIDENCE lines for the loss tests, found $evidence"
+              exit 1
+            }
+            if (Select-String -Path $log -Pattern 'HOTPLUG-RESTORE-FAILED' -Quiet) {
+              Write-Error "mode ${mode}: an endpoint or a default was not restored"
+              exit 1
+            }
+          }
+
       - name: Record tier outcomes
         id: record
         if: always()
@@ -489,10 +679,11 @@ jobs:
             echo "tier_system=${{ steps.tier_system.outcome }}"
             echo "tier_device=${{ steps.tier_device.outcome }}"
             echo "tier_process=${{ steps.tier_process.outcome }}"
+            echo "tier_hotplug=${{ steps.tier_hotplug.outcome }}"
           } >> "$GITHUB_OUTPUT"
 
       - name: Diagnostics on failure
-        if: ${{ failure() || steps.tier_system.outcome == 'failure' || steps.tier_device.outcome == 'failure' || steps.tier_process.outcome == 'failure' }}
+        if: ${{ failure() || steps.tier_system.outcome == 'failure' || steps.tier_device.outcome == 'failure' || steps.tier_process.outcome == 'failure' || steps.tier_hotplug.outcome == 'failure' }}
         shell: pwsh
         run: |
           Get-Service -Name "AudioSrv", "AudioEndpointBuilder" -ErrorAction SilentlyContinue | Format-List Name, Status
@@ -540,9 +731,8 @@ jobs:
     # `cargo test … | tee log` pipe reports tee's exit 0 and MASKS a real test
     # panic/build break — which would silently defeat this job's summary gate
     # (rsac-fba6 makes macOS gating). pipefail makes genuine failures propagate;
-    # the device tier below explicitly tolerates the one KNOWN environmental
-    # hang (AUHAL `.start()` on BlackHole, killed by gtimeout) so pipefail does
-    # not turn that documented timeout into a spurious RED.
+    # the device tier below tolerates the known AUHAL timeout only outside
+    # release evidence mode.
     defaults:
       run:
         shell: bash
@@ -640,14 +830,14 @@ jobs:
       # ── Device tier ─────────────────────────────────────────────────────
       # rsac#26: AUHAL `.start()` on BlackHole-as-input hung 10-11 min before
       # erroring on the Blacksmith runner; test code handles the error gracefully
-      # and `gtimeout 120` caps the hang. On GitHub-hosted macos-15 with
-      # BlackHole pinned as the default I/O (step above) it may now deliver real
-      # frames — UNVERIFIED until observed; the tolerance below stays either way.
+      # and `gtimeout 120` caps the hang. Release evidence must fail on the
+      # timeout; other runs retain the existing tolerance.
       - name: Device capture tier
         id: tier_device
         timeout-minutes: 10
         env:
           RSAC_TEST_CAPTURE_TIMEOUT_SECS: "15"
+          RELEASE_EVIDENCE: ${{ inputs.release_evidence && 'true' || 'false' }}
         run: |
           # device_capture drives a real `.start()` on the BlackHole input
           # device (supports_device_selection=true on macOS, so the
@@ -656,10 +846,9 @@ jobs:
           # the 120s boundary (observed: runs 29564636523 / 29564289847). Under
           # the job's `-eo pipefail` shell that gtimeout kill would otherwise
           # abort the step and — now that macOS is a summary gate — flip every
-          # PR red. So tolerate ONLY exit 124 via PIPESTATUS: WITHOUT
-          # --preserve-status gtimeout reports its own timeout as exactly 124,
-          # so a real signal death (unrelated SIGTERM/SIGKILL → 143/137) or a
-          # test failure/panic still propagates and fails the tier.
+          # PR red. Outside release evidence mode tolerate ONLY exit 124 via
+          # PIPESTATUS: WITHOUT --preserve-status gtimeout reports its own
+          # timeout as exactly 124; signal deaths and test failures still fail.
           set +e
           gtimeout 120 \
             cargo test --test ci_audio device_capture \
@@ -670,6 +859,10 @@ jobs:
           case "$rc" in
             0) ;;
             124)
+              if [ "$RELEASE_EVIDENCE" = "true" ]; then
+                echo "::error::device_capture timed out; release evidence requires the Device tier to complete."
+                exit "$rc"
+              fi
               echo "::notice::device_capture hit the documented gtimeout kill (rc=$rc) — tolerated (AUHAL .start() hang on headless BlackHole).";;
             *)
               echo "::error::device_capture failed with exit $rc (not a gtimeout kill) — real regression."
@@ -932,6 +1125,7 @@ jobs:
     if: always()
     needs:
       - linux-audio
+      - linux-hotplug
       - windows-audio
       - macos-audio
       - linux-audio-bindings
@@ -940,10 +1134,14 @@ jobs:
         env:
           LINUX_SYSTEM: ${{ needs.linux-audio.outputs.tier_system }}
           LINUX_DEVICE: ${{ needs.linux-audio.outputs.tier_device }}
+          LINUX_WAV: ${{ needs.linux-hotplug.outputs.tier_wav }}
+          LINUX_SWITCH: ${{ needs.linux-hotplug.outputs.tier_switch }}
+          LINUX_DAEMON: ${{ needs.linux-hotplug.outputs.tier_daemon }}
           LINUX_PROCESS: ${{ needs.linux-audio.outputs.tier_process }}
           WINDOWS_SYSTEM: ${{ needs.windows-audio.outputs.tier_system }}
           WINDOWS_DEVICE: ${{ needs.windows-audio.outputs.tier_device }}
           WINDOWS_PROCESS: ${{ needs.windows-audio.outputs.tier_process }}
+          WINDOWS_HOTPLUG: ${{ needs.windows-audio.outputs.tier_hotplug }}
           MACOS_SYSTEM: ${{ needs.macos-audio.outputs.tier_system }}
           MACOS_DEVICE: ${{ needs.macos-audio.outputs.tier_device }}
           MACOS_PROCESS: ${{ needs.macos-audio.outputs.tier_process }}
@@ -964,9 +1162,13 @@ jobs:
           | Linux system | ${LINUX_SYSTEM:-n/a} |
           | Linux device | ${LINUX_DEVICE:-n/a} |
           | Linux process | ${LINUX_PROCESS:-n/a} |
+          | Linux sink format | ${LINUX_WAV:-n/a} |
+          | Linux default switch | ${LINUX_SWITCH:-n/a} |
+          | Linux daemon stop | ${LINUX_DAEMON:-n/a} |
           | Windows system | ${WINDOWS_SYSTEM:-n/a} |
           | Windows device | ${WINDOWS_DEVICE:-n/a} |
           | Windows process | ${WINDOWS_PROCESS:-n/a} |
+          | Windows hotplug (endpoint loss) | ${WINDOWS_HOTPLUG:-n/a} |
           | macOS system | ${MACOS_SYSTEM:-n/a} |
           | macOS device | ${MACOS_DEVICE:-n/a} |
           | macOS process | ${MACOS_PROCESS:-n/a} |
@@ -992,8 +1194,13 @@ jobs:
           LINUX_SYSTEM: ${{ needs.linux-audio.outputs.tier_system }}
           LINUX_DEVICE: ${{ needs.linux-audio.outputs.tier_device }}
           LINUX_PROCESS: ${{ needs.linux-audio.outputs.tier_process }}
+          LINUX_HOTPLUG_RESULT: ${{ needs.linux-hotplug.result }}
+          LINUX_WAV: ${{ needs.linux-hotplug.outputs.tier_wav }}
+          LINUX_SWITCH: ${{ needs.linux-hotplug.outputs.tier_switch }}
+          LINUX_DAEMON: ${{ needs.linux-hotplug.outputs.tier_daemon }}
           WINDOWS_RESULT: ${{ needs.windows-audio.result }}
           WINDOWS_SYSTEM: ${{ needs.windows-audio.outputs.tier_system }}
+          WINDOWS_HOTPLUG: ${{ needs.windows-audio.outputs.tier_hotplug }}
           WINDOWS_DEVICE: ${{ needs.windows-audio.outputs.tier_device }}
           WINDOWS_PROCESS: ${{ needs.windows-audio.outputs.tier_process }}
           MACOS_RESULT: ${{ needs.macos-audio.result }}
@@ -1015,11 +1222,16 @@ jobs:
           echo "  System Capture:  ${LINUX_SYSTEM:-n/a}"
           echo "  Device Capture:  ${LINUX_DEVICE:-n/a}"
           echo "  Process Capture: ${LINUX_PROCESS:-n/a}"
+          echo "Linux recovery + sink format (job=${LINUX_HOTPLUG_RESULT}):"
+          echo "  Sink format:     ${LINUX_WAV:-n/a}"
+          echo "  Default switch:  ${LINUX_SWITCH:-n/a}"
+          echo "  Daemon stop:     ${LINUX_DAEMON:-n/a}"
           echo ""
           echo "Windows (VB-CABLE, first-class — job=${WINDOWS_RESULT}):"
           echo "  System Capture:  ${WINDOWS_SYSTEM:-n/a}"
           echo "  Device Capture:  ${WINDOWS_DEVICE:-n/a}"
           echo "  Process Capture: ${WINDOWS_PROCESS:-n/a}"
+          echo "  Hotplug (loss):  ${WINDOWS_HOTPLUG:-n/a}"
           echo ""
           echo "macOS (BlackHole, gated — job=${MACOS_RESULT}):"
           echo "  System Capture:  ${MACOS_SYSTEM:-n/a}"
@@ -1055,6 +1267,22 @@ jobs:
             done
           fi
 
+          # The recovery and sink-format job gates like the Linux job above.
+          if [ "${LINUX_HOTPLUG_RESULT}" = "skipped" ]; then
+            echo "Linux recovery job skipped (workflow_dispatch platform subset) — allowed."
+          elif [ "${LINUX_HOTPLUG_RESULT}" != "success" ]; then
+            echo "FAILED: Linux recovery job result '${LINUX_HOTPLUG_RESULT}' (setup/infra failure)"
+            FAILED=1
+          else
+            for pair in "sink-format:${LINUX_WAV}" "default-switch:${LINUX_SWITCH}" "daemon-stop:${LINUX_DAEMON}"; do
+              name="${pair%%:*}"; res="${pair#*:}"
+              if [ "$res" != "success" ]; then
+                echo "FAILED: Linux $name tier returned '${res:-<empty>}'"
+                FAILED=1
+              fi
+            done
+          fi
+
           # Windows is a first-class tier. A whole-job 'skipped' (dispatch
           # platform subset excluded it) is allowed; a setup failure or any
           # failing tier is a real regression.
@@ -1064,7 +1292,7 @@ jobs:
             echo "FAILED: Windows audio job result '${WINDOWS_RESULT}' (setup/infra failure)"
             FAILED=1
           else
-            for pair in "system:${WINDOWS_SYSTEM}" "device:${WINDOWS_DEVICE}" "process:${WINDOWS_PROCESS}"; do
+            for pair in "system:${WINDOWS_SYSTEM}" "device:${WINDOWS_DEVICE}" "process:${WINDOWS_PROCESS}" "hotplug:${WINDOWS_HOTPLUG}"; do
               name="${pair%%:*}"; res="${pair#*:}"
               if [ "$res" != "success" ] && [ "$res" != "skipped" ]; then
                 echo "FAILED: Windows $name tier returned '${res:-<empty>}'"
@@ -1126,3 +1354,55 @@ jobs:
           name: ci-audio-gap-report-seed
           path: ci-audio-gap-report.md
           retention-days: 30
+
+  # Add every new workflow job to this needs list; the CI drift guard only checks ci.yml.
+  # Hosted macOS System and Process Tap tiers can pass through TCC permission
+  # skips; those successes show the matrix ran, not capture or recovery evidence.
+  release-evidence:
+    name: Audio Release Evidence
+    if: ${{ always() && inputs.release_evidence }}
+    needs: [linux-audio, linux-hotplug, windows-audio, macos-audio, linux-audio-bindings, summary]
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: Check jobs and tier results
+        shell: bash
+        env:
+          PLATFORM: ${{ inputs.platform }}
+          NEEDS: ${{ toJSON(needs) }}
+        run: |
+          set -euo pipefail
+          echo "macOS System and Process Tap tiers: TCC permission skips on hosted runners; not capture or recovery evidence" >> "$GITHUB_STEP_SUMMARY"
+          failed=0
+          if [ "$PLATFORM" != all ]; then
+            echo "::error::release evidence requires platform=all"
+            failed=1
+          fi
+          while read -r job result; do
+            printf 'job %s: %s\n' "$job" "$result"
+            if [ "$result" != success ]; then failed=1; fi
+          done < <(jq -r 'to_entries[] | "\(.key) \(.value.result)"' <<< "$NEEDS")
+          while read -r job tier; do
+            result="$(jq -r --arg job "$job" --arg tier "$tier" '.[$job].outputs[$tier] // ""' <<< "$NEEDS")"
+            printf '%s %s: %s\n' "$job" "$tier" "${result:-<empty>}"
+            if [ "$result" != success ]; then failed=1; fi
+          done <<'TIERS'
+          linux-audio tier_system
+          linux-audio tier_device
+          linux-audio tier_process
+          linux-hotplug tier_wav
+          linux-hotplug tier_switch
+          linux-hotplug tier_daemon
+          windows-audio tier_system
+          windows-audio tier_device
+          windows-audio tier_process
+          windows-audio tier_hotplug
+          macos-audio tier_system
+          macos-audio tier_device
+          macos-audio tier_process
+          linux-audio-bindings binding_python
+          linux-audio-bindings binding_node
+          linux-audio-bindings binding_go
+          linux-audio-bindings binding_go_race
+          TIERS
+          exit "$failed"

@@ -1152,7 +1152,7 @@ fn create_imm_device_enumerator() -> AudioResult<IMMDeviceEnumerator> {
 /// Maps a failed `GetDefaultAudioEndpoint` call for the default render
 /// endpoint. `E_NOTFOUND` (no such endpoint) is [`AudioError::DeviceNotFound`]
 /// for `default_render`; any other failure goes to `other`.
-fn default_render_endpoint_error(
+pub(super) fn default_render_endpoint_error(
     err: windows::core::Error,
     other: impl FnOnce(windows::core::Error) -> AudioError,
 ) -> AudioError {
