@@ -74,6 +74,8 @@
 //! - `async-stream` — enables [`AudioCapture::audio_data_stream`] returning
 //!   a [`futures_core::Stream`].
 //! - `sink-wav` — enables [`WavFileSink`].
+//! - `hotplug-recovery` — opt-in recovery of desktop `SystemDefault` capture
+//!   when the default device changes or is invalidated.
 //! - `test-utils` — exposes shared test helpers used by integration tests
 //!   and the binding crates.
 //!
@@ -131,6 +133,10 @@ pub use crate::core::error::{
 pub use crate::core::interface::{
     AudioDevice, CapturingStream, DeviceEnumerator, DeviceEvent, DeviceEventHandler, DeviceInfo,
     DeviceKind, DeviceWatcher,
+};
+#[cfg(feature = "hotplug-recovery")]
+pub use crate::core::recovery::{
+    AutoRecoveryConfig, RecoveryEvent, RecoverySnapshot, RecoveryState,
 };
 
 // Audio module re-exports

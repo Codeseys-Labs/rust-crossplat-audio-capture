@@ -514,7 +514,7 @@ impl AudioDevice for MacosAudioDevice {
         let target = config.capture_target.clone();
 
         // 3. Create the ring buffer bridge
-        let capacity = calculate_capacity(None, 4);
+        let capacity = calculate_capacity(config.buffer_size, 4);
         let (producer, consumer) = create_bridge(capacity, format.clone());
 
         // 4. Transition bridge state Created → Running

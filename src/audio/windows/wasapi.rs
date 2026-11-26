@@ -17,7 +17,6 @@ use std::sync::{
 use std::time::Duration;
 
 use sysinfo::{ProcessesToUpdate, System};
-use wasapi::{self, initialize_mta};
 
 // --- New BridgeStream Architecture Imports ---
 use super::thread::{WindowsCaptureConfig, WindowsCaptureThread, WindowsPlatformStream};
@@ -34,6 +33,7 @@ use windows::Win32::UI::Shell::PropertiesSystem::IPropertyStore;
 
 // Constants
 const E_NOTFOUND: windows::core::HRESULT = windows::core::HRESULT(-2147024894i32); // 0x80070002
+#[cfg(test)]
 const RPC_E_CHANGED_MODE: windows::core::HRESULT = windows::core::HRESULT(-2147417850i32); // 0x80010106
 const VT_LPWSTR: u16 = 31;
 
@@ -45,6 +45,7 @@ const VT_LPWSTR: u16 = 31;
 /// reading the code back can reinterpret as `u32` / `0x{:08X}` if they want the
 /// conventional hex `HRESULT` rendering. The human-readable message from the
 /// `windows` crate is attached when available.
+#[cfg(test)]
 fn wasapi_backend_context(hr: windows::core::HRESULT) -> BackendContext {
     BackendContext {
         backend_name: "WASAPI".to_string(),
@@ -95,8 +96,12 @@ fn wasapi_backend_context_err(err: &windows::core::Error) -> BackendContext {
 pub struct WindowsApplicationCapture {
     process_id: u32,
     include_tree: bool,
-    // Use wasapi-rs AudioClient for simpler implementation
+    // Use wasapi-rs AudioClient for simpler implementation (declared BEFORE
+    // `com_initializer` so Rust drops the COM client before decrementing MTA usage).
     audio_client: Option<wasapi::AudioClient>,
+    // Process-wide MTA guard acquired on `initialize()` and released on Drop.
+    #[allow(dead_code)]
+    com_initializer: Option<ComInitializer>,
     // Shared flag to signal capture loop to stop
     should_stop: Arc<AtomicBool>,
 }
@@ -130,6 +135,7 @@ impl WindowsApplicationCapture {
             process_id,
             include_tree,
             audio_client: None,
+            com_initializer: None,
             should_stop: Arc::new(AtomicBool::new(false)),
         })
     }
@@ -138,13 +144,10 @@ impl WindowsApplicationCapture {
     ///
     /// This uses wasapi-rs AudioClient::new_application_loopback_client for simplicity
     pub fn initialize(&mut self) -> std::result::Result<(), Box<dyn std::error::Error>> {
-        // Initialize COM using wasapi-rs (0.22.0: returns HRESULT, not Result).
-        // S_OK (0) and S_FALSE (1) are both success. Only fail on actual errors.
-        let hr = initialize_mta();
-        if hr.is_err() && hr != windows::core::HRESULT(1) {
-            return Err(format!("COM initialization failed: HRESULT {:?}", hr).into());
-        }
-
+        // Pin the process-wide COM MTA for the lifetime of this capture handle
+        // using the thread-agnostic `ComInitializer` (`CoIncrementMTAUsage` /
+        // `CoDecrementMTAUsage`), avoiding unpaired per-thread `CoInitializeEx`.
+        let com_initializer = ComInitializer::new()?;
         // Create wasapi-rs AudioClient for application loopback
         let mut audio_client = wasapi::AudioClient::new_application_loopback_client(
             self.process_id,
@@ -153,7 +156,7 @@ impl WindowsApplicationCapture {
 
         // Initialize the audio client with a standard format.
         let desired_format =
-            wasapi::WaveFormat::new(32, 32, &wasapi::SampleType::Float, 48000, 2, None);
+            wasapi::WaveFormat::new(32, 32, wasapi::SampleType::Float, 48000, 2, None);
         // C1 fix: this is a process-loopback client (created via
         // new_application_loopback_client → ActivateAudioInterfaceAsync with
         // AUDIOCLIENT_ACTIVATION_TYPE_PROCESS_LOOPBACK). That activation path
@@ -168,11 +171,12 @@ impl WindowsApplicationCapture {
             buffer_duration_hns: 0,
         };
 
-        audio_client.initialize_client(&desired_format, &wasapi::Direction::Capture, &mode)?;
+        audio_client.initialize_client(&desired_format, wasapi::Direction::Capture, mode, None)?;
 
-        // Store the initialized client
+        // Store the initialized client and its MTA guard (field order guarantees
+        // `audio_client` drops before `com_initializer`).
         self.audio_client = Some(audio_client);
-
+        self.com_initializer = Some(com_initializer);
         Ok(())
     }
 
@@ -367,12 +371,11 @@ impl WindowsApplicationCapture {
 
 // SAFETY: `WindowsApplicationCapture` wraps a `wasapi::AudioClient`, which holds
 // COM interfaces the `windows`/`wasapi` crates conservatively mark `!Send`. rsac
-// only ever constructs and initializes this client after `initialize_mta()`
-// (see `initialize()`), i.e. in a Multi-Threaded Apartment where COM objects are
-// free-threaded and may legally be used from any thread. That MTA guarantee is
-// what makes moving the handle across threads sound — NOT "single-threaded use"
-// (which would contradict `Send`). This mirrors the identical MTA rationale on
-// `WindowsAudioDevice` / `WindowsDeviceEnumerator` below.
+// only ever constructs and initializes this client after acquiring a process-wide
+// `ComInitializer` (`CoIncrementMTAUsage`, see `initialize()`), so the COM
+// objects live in the Multi-Threaded Apartment where they are free-threaded and
+// may legally be used or dropped from any thread. This mirrors the identical MTA
+// rationale on `WindowsAudioDevice` / `WindowsDeviceEnumerator` below.
 //
 // NOTE: this type is legacy/RT-unsafe (see the type-level `audit L13` docs); the
 // canonical capture path is `WindowsCaptureThread`, whose WASAPI objects never
@@ -412,59 +415,44 @@ impl Drop for ProcessHandle {
     }
 }
 
-/// Ensures COM is initialized for the current thread and uninitializes it when dropped.
+/// Ensures the process-wide COM Multi-Threaded Apartment (MTA) stays alive
+/// while held and decrements the MTA usage count when dropped.
 ///
-/// This RAII guard should be held by any type that makes COM calls, such as
-/// device enumerators or audio streams that interact directly with WASAPI.
+/// Uses Win32 `CoIncrementMTAUsage` / `CoDecrementMTAUsage` (Windows 8+), which
+/// Microsoft documents as thread-agnostic: an `Arc<ComInitializer>` may safely
+/// outlive its creating thread and drop on any thread (including an STA UI
+/// thread) without disturbing that thread's apartment.
 #[derive(Debug)]
-pub struct ComInitializer;
+pub struct ComInitializer {
+    cookie: CO_MTA_USAGE_COOKIE,
+}
+
+// SAFETY: Win32 `CO_MTA_USAGE_COOKIE` is an opaque process-wide MTA usage token
+// documented as safe to release via `CoDecrementMTAUsage` from any thread.
+unsafe impl Send for ComInitializer {}
+unsafe impl Sync for ComInitializer {}
 
 impl ComInitializer {
-    /// Initializes COM for the current thread using `COINIT_MULTITHREADED`.
+    /// Increments the process-wide COM MTA usage count.
     ///
-    /// Returns `Ok(Self)` on success, or an `AudioError::BackendError`
-    /// if COM initialization fails.
-    ///
-    /// Both `S_OK` and `S_FALSE` are treated as success:
-    /// - `S_OK` means COM was freshly initialized.
-    /// - `S_FALSE` means COM was already initialized with MTA on this thread.
-    ///
-    /// In both cases, `CoUninitialize` must be called (handled by `Drop`).
+    /// Returns `Ok(Self)` on success, or an `AudioError::BackendError` if
+    /// `CoIncrementMTAUsage` fails.
     pub fn new() -> AudioResult<Self> {
-        // SAFETY: CoInitializeEx is safe to call. We check the HRESULT.
-        let hr = unsafe { CoInitializeEx(None, COINIT_MULTITHREADED) };
-
-        // S_OK (0) = freshly initialized, S_FALSE (1) = already initialized in MTA.
-        // Both are success — CoUninitialize must be called for each successful call.
-        if hr.is_ok() || hr == windows::core::HRESULT(1) {
-            Ok(ComInitializer)
-        } else if hr == RPC_E_CHANGED_MODE {
-            // COM was already initialized with a different concurrency model (STA).
-            Err(AudioError::BackendError {
-                backend: "wasapi".to_string(),
-                operation: "com_init".to_string(),
-                message: format!(
-                    "Already initialized with a different concurrency model (HRESULT: {:?})",
-                    hr
-                ),
-                context: Some(wasapi_backend_context(hr)),
-            })
-        } else {
-            Err(AudioError::BackendError {
-                backend: "wasapi".to_string(),
-                operation: "com_init".to_string(),
-                message: format!("COM initialization failed (HRESULT: {:?})", hr),
-                context: Some(wasapi_backend_context(hr)),
-            })
-        }
+        let cookie = unsafe { CoIncrementMTAUsage() }.map_err(|err| AudioError::BackendError {
+            backend: "wasapi".to_string(),
+            operation: "com_init".to_string(),
+            message: format!("CoIncrementMTAUsage failed (HRESULT: {:?})", err),
+            context: Some(wasapi_backend_context_err(&err)),
+        })?;
+        Ok(Self { cookie })
     }
 }
 
 impl Drop for ComInitializer {
     fn drop(&mut self) {
-        // SAFETY: CoUninitialize is safe to call if CoInitializeEx was successful.
-        // This is ensured by the RAII pattern.
-        unsafe { CoUninitialize() };
+        // SAFETY: `self.cookie` was returned by a matching `CoIncrementMTAUsage`
+        // call and is released exactly once here. Safe from any thread.
+        let _ = unsafe { CoDecrementMTAUsage(self.cookie) };
     }
 }
 
@@ -693,7 +681,7 @@ impl WindowsAudioDevice {
         ];
 
         for &rate in common_rates {
-            for &(bits, valid_bits, ref sample_type) in probe_formats {
+            for &(bits, valid_bits, sample_type) in probe_formats {
                 let wave_fmt = wasapi::WaveFormat::new(
                     bits,
                     valid_bits,
@@ -705,7 +693,7 @@ impl WindowsAudioDevice {
 
                 // is_supported returns Ok(None) if directly supported,
                 // Ok(Some(closest)) if a close match exists, Err if unsupported.
-                match audio_client.is_supported(&wave_fmt, &wasapi::ShareMode::Shared) {
+                match audio_client.is_supported(&wave_fmt, wasapi::ShareMode::Shared) {
                     Ok(None) => {
                         // Format is directly supported
                         let sf = wasapi_bits_to_sample_format(bits as u16, valid_bits as u16);
@@ -1037,8 +1025,10 @@ impl IMMNotificationClient_Impl for WatcherNotificationClient_Impl {
 /// Enumerates audio devices available on a Windows system using WASAPI.
 #[derive(Debug)]
 pub struct WindowsDeviceEnumerator {
-    com_initializer: Arc<ComInitializer>,
+    // Declared BEFORE `com_initializer`: Rust drops struct fields in declaration
+    // order, so `IMMDeviceEnumerator::Release` must run while the MTA is pinned.
     enumerator: IMMDeviceEnumerator,
+    com_initializer: Arc<ComInitializer>,
 }
 
 impl WindowsDeviceEnumerator {
@@ -1061,8 +1051,8 @@ impl WindowsDeviceEnumerator {
         })?;
 
         Ok(Self {
-            com_initializer,
             enumerator,
+            com_initializer,
         })
     }
 }
@@ -1332,7 +1322,7 @@ fn wasapi_bits_to_sample_format(
 
 /// Find a wasapi-rs `Device` by its Windows device ID string.
 ///
-/// Uses wasapi 0.23's [`DeviceEnumerator::get_device`], which wraps
+/// Uses [`wasapi::DeviceEnumerator::get_device`], which wraps
 /// `IMMDeviceEnumerator::GetDevice` and resolves the endpoint directly from
 /// its ID — no manual render/capture collection scan needed. Falls back to the
 /// default render device if the ID lookup fails (empty ID, stale ID, or an
@@ -1350,7 +1340,7 @@ fn find_wasapi_device_by_id(
 
     // Fall back to default render device.
     enumerator
-        .get_default_device(&wasapi::Direction::Render)
+        .get_default_device(wasapi::Direction::Render)
         .map_err(|e| AudioError::BackendError {
             backend: "wasapi".to_string(),
             operation: "find_wasapi_device_by_id".to_string(),

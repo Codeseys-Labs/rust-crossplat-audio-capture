@@ -2,11 +2,9 @@
 name = "rsac"
 version = "0.4.4"
 edition = "2021"
-# Explicit MSRV floor. wasapi 0.23 bumps its own MSRV to 1.76; declaring it here
-# makes the minimum supported Rust version visible (under the pinned 1.95
-# toolchain). Floor is 1.87: wasapi 0.23 needs 1.76, and the codebase uses
-# `u64::is_multiple_of` (stable 1.87). Bump if a dependency/feature requires more.
-rust-version = "1.87"
+# sysinfo 0.38.4 already requires Rust 1.88 on Windows and macOS; the
+# previous Linux-only MSRV check did not compile that dependency.
+rust-version = "1.88"
 build = "build.rs"
 autobins = false
 description = "Cross-platform audio capture library with per-application process taps (macOS), WASAPI (Windows), and PipeWire (Linux)"
@@ -49,7 +47,6 @@ exclude = [
     "/*.ps1",
     "/*.bat",
     "/slate.json",
-    "/Makefile",
     "/AGENTS.md",
 ]
 
@@ -79,6 +76,8 @@ test-utils = [] # Feature to enable test utilities
 # Streaming/data-plane features
 async-stream = ["dep:atomic-waker"]  # Async Stream support (adds atomic-waker for async notification)
 sink-wav = []                        # WavFileSink sink adapter (hound is always available)
+# ADR-0019: opt-in device-hotplug auto-recovery for desktop SystemDefault capture.
+hotplug-recovery = []
 # rsac-624c: opt-in structured instrumentation. Default OFF — with the feature
 # off, rsac_event!/rsac_span! fall back to `log::` (behavior-identical, no extra
 # deps). With it on, they emit tracing events/spans and `install_default_tracing`
@@ -109,7 +108,7 @@ macos-tcc-spi = []
 [dependencies]
 # Core dependencies
 futures-core = "0.3.32"
-rtrb = "0.3.4"                                               # Lock-free SPSC ring buffer for the audio data bridge (AudioBuffer + free-list return rings)
+rtrb = "0.4.1"                                               # Lock-free SPSC ring buffer for the audio data bridge (AudioBuffer + free-list return rings)
 atomic-waker = { version = "1.1.2", optional = true }           # Async waker for ring buffer notification (behind async-stream feature)
 thiserror = "2.0.18"                                       # For error handling
 log = "0.4.29"                                                 # For logging
@@ -125,7 +124,7 @@ libc = "0.2.183"
 env_logger = { version = "0.11.11", optional = true }
 
 # compose-only deps (behind the `compose` feature; ADR-0011). rubato v3 MSRV is
-# 1.85 — under our 1.87 floor; the CI `msrv` job is the tripwire if a future
+# 1.85 — under our 1.88 floor; the CI `msrv` job is the tripwire if a future
 # bump raises it. audioadapter-buffers is pinned to the same major rubato 3.x
 # itself consumes (its `Adapter`/`AdapterMut` traits must come from the SAME
 # crate version rubato's `process_into_buffer` expects, or the impls mismatch).
@@ -143,7 +142,7 @@ serde_json = "1.0.150"
 
 # Platform-specific audio capture
 [target.'cfg(target_os = "windows")'.dependencies]
-wasapi = "0.23.0"  # WASAPI bindings for Process Loopback (0.23: safe parse_from_blob_bytes, get_device)
+wasapi = "0.27.0"  # Zeroes SILENT packets; Copy enums passed by value; compatible with windows 0.62.2
 windows = { version = "0.62.2", features = [
     "Foundation",                 # For basic Windows types like HRESULT, BOOL, HANDLE
     "Win32_Foundation",           # For basic Windows types like HRESULT, BOOL, HANDLE

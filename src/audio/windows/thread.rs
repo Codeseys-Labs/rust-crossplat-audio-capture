@@ -22,7 +22,11 @@
 #![cfg(target_os = "windows")]
 
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::mpsc::RecvTimeoutError;
 use std::sync::{Arc, Mutex};
+use std::time::Duration;
+
+use super::wasapi::ComInitializer;
 
 use crate::bridge::ring_buffer::BridgeProducer;
 use crate::bridge::stream::PlatformStream;
@@ -77,14 +81,14 @@ impl WindowsCaptureThread {
     /// 2. Creates the appropriate WASAPI audio client based on `config.target`
     /// 3. Runs an event-driven capture loop, pushing audio data via `producer`
     ///
-    /// The call **blocks** until the thread reports that WASAPI initialization
-    /// has succeeded (or failed). This ensures that `create_stream()` can
-    /// synchronously report WASAPI init failures.
+    /// The call waits up to five seconds for the thread to report its
+    /// initialization result.
     ///
     /// # Errors
     ///
     /// - [`AudioError::BackendInitializationFailed`] if the thread cannot be spawned
     ///   or if WASAPI initialization fails on the dedicated thread.
+    /// - [`AudioError::Timeout`] if initialization does not finish within five seconds.
     pub fn spawn(config: WindowsCaptureConfig, producer: BridgeProducer) -> AudioResult<Self> {
         let stop_flag = Arc::new(AtomicBool::new(false));
         let is_active = Arc::new(AtomicBool::new(true));
@@ -111,11 +115,24 @@ impl WindowsCaptureThread {
                 reason: format!("Failed to spawn WASAPI capture thread: {}", e),
             })?;
 
-        // Block until the thread reports init success or failure.
-        match init_rx.recv() {
+        let timeout = Duration::from_secs(5);
+        match init_rx.recv_timeout(timeout) {
             Ok(Ok(())) => { /* WASAPI initialized successfully */ }
-            Ok(Err(e)) => return Err(e),
-            Err(_) => {
+            Ok(Err(e)) => {
+                let _ = thread_handle.join();
+                return Err(e);
+            }
+            Err(RecvTimeoutError::Timeout) => {
+                // COM activation is not cancellable. Do not join a stuck OS call;
+                // the worker owns its resources and will tear down when it returns.
+                stop_flag.store(true, Ordering::SeqCst);
+                return Err(AudioError::Timeout {
+                    operation: "WASAPI capture thread initialization".to_string(),
+                    duration: timeout,
+                });
+            }
+            Err(RecvTimeoutError::Disconnected) => {
+                let _ = thread_handle.join();
                 return Err(AudioError::BackendInitializationFailed {
                     backend: "wasapi".to_string(),
                     reason: "WASAPI capture thread dropped init channel without sending status"
@@ -300,19 +317,21 @@ fn wasapi_capture_thread_main(
 ) {
     // ── Step 1: Initialize COM (MTA) ─────────────────────────────────
     //
-    // wasapi-rs 0.22.0 `initialize_mta()` returns an HRESULT directly
-    // (no guard). We must call `wasapi::deinitialize()` at thread exit.
-    let hr = wasapi::initialize_mta();
-    if hr.is_err() {
-        log::error!("WASAPI thread: COM initialization failed: {:?}", hr);
-        let _ = init_tx.send(Err(AudioError::BackendInitializationFailed {
-            backend: "wasapi".to_string(),
-            reason: format!("COM initialization failed: HRESULT {:?}", hr),
-        }));
-        is_active.store(false, Ordering::SeqCst);
-        producer.signal_done();
-        return;
-    }
+    // Declare the apartment guard before any clients so early returns and
+    // unwinds also release every interface before uninitializing COM.
+    let apartment = match ComInitializer::new() {
+        Ok(apartment) => apartment,
+        Err(e) => {
+            log::error!("WASAPI thread: COM initialization failed: {}", e);
+            let _ = init_tx.send(Err(AudioError::BackendInitializationFailed {
+                backend: "wasapi".to_string(),
+                reason: e.to_string(),
+            }));
+            is_active.store(false, Ordering::SeqCst);
+            producer.signal_done();
+            return;
+        }
+    };
 
     log::debug!(
         "WASAPI thread: COM initialized, target={:?}, {}Hz, {}ch",
@@ -359,7 +378,7 @@ fn wasapi_capture_thread_main(
     let desired_format = wasapi::WaveFormat::new(
         32, // bits per sample
         32, // valid bits per sample
-        &wasapi::SampleType::Float,
+        wasapi::SampleType::Float,
         config.sample_rate as usize,
         config.channels as usize,
         None, // channel mask (auto)
@@ -390,7 +409,7 @@ fn wasapi_capture_thread_main(
     };
 
     if let Err(e) =
-        audio_client.initialize_client(&desired_format, &wasapi::Direction::Capture, &mode)
+        audio_client.initialize_client(&desired_format, wasapi::Direction::Capture, mode, None)
     {
         log::error!("WASAPI thread: audio client initialization failed: {}", e);
         let _ = init_tx.send(Err(AudioError::BackendInitializationFailed {
@@ -432,6 +451,13 @@ fn wasapi_capture_thread_main(
         }
     };
 
+    // The caller may have timed out while a WASAPI initialization call was blocked.
+    if stop_flag.load(Ordering::SeqCst) {
+        is_active.store(false, Ordering::SeqCst);
+        producer.signal_done();
+        return;
+    }
+
     // Start the audio stream.
     if let Err(e) = audio_client.start_stream() {
         log::error!("WASAPI thread: failed to start stream: {}", e);
@@ -445,8 +471,16 @@ fn wasapi_capture_thread_main(
     }
 
     // ── Init complete — signal success ────────────────────────────────
-    let _ = init_tx.send(Ok(()));
-
+    if init_tx.send(Ok(())).is_err() || stop_flag.load(Ordering::SeqCst) {
+        let _ = audio_client.stop_stream();
+        is_active.store(false, Ordering::SeqCst);
+        producer.signal_done();
+        drop(capture_client);
+        drop(h_event);
+        drop(audio_client);
+        drop(apartment);
+        return;
+    }
     log::debug!("WASAPI thread: capture stream started, entering event loop");
 
     // ── Step 4: Event-driven capture loop ────────────────────────────
@@ -638,7 +672,12 @@ fn wasapi_capture_thread_main(
                 // The valid region is exactly `frames_read` whole frames. Slicing to
                 // it keeps the conversion exact even if WASAPI delivered fewer frames
                 // than `get_next_packet_size` predicted.
-                let valid = &byte_buf[..frames_read * bytes_per_frame];
+                let valid = &mut byte_buf[..frames_read * bytes_per_frame];
+                if buffer_info.flags.silent {
+                    // A SILENT packet's payload is unspecified. Never forward
+                    // stale audio from this reused buffer, even if the driver does.
+                    valid.fill(0);
+                }
 
                 // Reinterpret the F32LE bytes as `&[f32]` in one bulk operation
                 // instead of a per-sample `from_le_bytes` loop, mirroring the
@@ -730,9 +769,6 @@ fn wasapi_capture_thread_main(
     }
 
     // ── Cleanup ──────────────────────────────────────────────────────
-    //
-    // Stop the WASAPI stream. In wasapi 0.22.0, initialize_mta() does not
-    // return a guard, so we must call deinitialize() explicitly.
 
     let _ = audio_client.stop_stream();
     is_active.store(false, Ordering::SeqCst);
@@ -748,7 +784,10 @@ fn wasapi_capture_thread_main(
     } else {
         producer.signal_done();
     }
-    wasapi::deinitialize();
+    drop(capture_client);
+    drop(h_event);
+    drop(audio_client);
+    drop(apartment); // Calls wasapi::deinitialize() after the last interface release.
     if fatal_error {
         log::debug!("WASAPI thread: exited after fatal error (device loss or contained panic)");
     } else {
@@ -794,7 +833,7 @@ fn create_audio_client(config: &WindowsCaptureConfig) -> AudioResult<wasapi::Aud
                     context: None,
                 })?;
             let device = enumerator
-                .get_default_device(&wasapi::Direction::Render)
+                .get_default_device(wasapi::Direction::Render)
                 .map_err(|e| AudioError::BackendError {
                     backend: "wasapi".to_string(),
                     operation: "get_default_device".to_string(),
@@ -820,10 +859,6 @@ fn create_audio_client(config: &WindowsCaptureConfig) -> AudioResult<wasapi::Aud
                 device_id.0
             );
 
-            // wasapi-rs provides get_default_device but not get_device_by_id directly.
-            // For device-specific capture, we enumerate devices and match by ID.
-            // For now, if the ID matches "default" or is empty, use default device.
-            // Otherwise, enumerate and find the matching device.
             let device = find_device_by_id(&device_id.0)?;
             device
                 .get_iaudioclient()
@@ -930,8 +965,8 @@ fn create_audio_client(config: &WindowsCaptureConfig) -> AudioResult<wasapi::Aud
 
 /// Find a WASAPI device by its ID string.
 ///
-/// Resolves the endpoint directly via wasapi 0.23's
-/// [`DeviceEnumerator::get_device`] (wrapping `IMMDeviceEnumerator::GetDevice`)
+/// Resolves the endpoint directly via [`wasapi::DeviceEnumerator::get_device`]
+/// (wrapping `IMMDeviceEnumerator::GetDevice`)
 /// instead of scanning the render collection by hand. Falls back to the
 /// default render device if the ID is empty or `"default"`.
 fn find_device_by_id(device_id: &str) -> AudioResult<wasapi::Device> {
@@ -944,7 +979,7 @@ fn find_device_by_id(device_id: &str) -> AudioResult<wasapi::Device> {
 
     if device_id.is_empty() || device_id.eq_ignore_ascii_case("default") {
         return enumerator
-            .get_default_device(&wasapi::Direction::Render)
+            .get_default_device(wasapi::Direction::Render)
             .map_err(|e| AudioError::BackendError {
                 backend: "wasapi".to_string(),
                 operation: "get_default_device".to_string(),
@@ -1568,9 +1603,7 @@ mod tests {
     /// Test system default capture target creates an audio client.
     #[test]
     fn test_create_audio_client_system_default() {
-        // Initialize COM for this test thread.
-        // wasapi 0.22.0: initialize_mta() returns HRESULT, not Result
-        let _hr = wasapi::initialize_mta();
+        let _apartment = ComInitializer::new().expect("initialize COM");
 
         let config = WindowsCaptureConfig {
             target: CaptureTarget::SystemDefault,
@@ -1588,8 +1621,7 @@ mod tests {
     /// Test that ApplicationByName with a nonexistent process returns ApplicationNotFound.
     #[test]
     fn test_create_audio_client_app_by_name_not_found() {
-        // wasapi 0.22.0: initialize_mta() returns HRESULT, not Result
-        let _hr = wasapi::initialize_mta();
+        let _apartment = ComInitializer::new().expect("initialize COM");
 
         let config = WindowsCaptureConfig {
             target: CaptureTarget::ApplicationByName("nonexistent_app_xyz".to_string()),
@@ -1617,8 +1649,7 @@ mod tests {
     /// Test that Application target with invalid PID returns appropriate error.
     #[test]
     fn test_create_audio_client_invalid_pid() {
-        // wasapi 0.22.0: initialize_mta() returns HRESULT, not Result
-        let _hr = wasapi::initialize_mta();
+        let _apartment = ComInitializer::new().expect("initialize COM");
 
         let config = WindowsCaptureConfig {
             target: CaptureTarget::Application(ApplicationId("not_a_number".to_string())),
@@ -1638,8 +1669,7 @@ mod tests {
     /// Test that Device target with "default" ID uses default device.
     #[test]
     fn test_create_audio_client_device_default_id() {
-        // wasapi 0.22.0: initialize_mta() returns HRESULT, not Result
-        let _hr = wasapi::initialize_mta();
+        let _apartment = ComInitializer::new().expect("initialize COM");
 
         let config = WindowsCaptureConfig {
             target: CaptureTarget::Device(DeviceId("default".to_string())),
@@ -1657,8 +1687,7 @@ mod tests {
     /// Test that Device target with empty ID uses default device.
     #[test]
     fn test_create_audio_client_device_empty_id() {
-        // wasapi 0.22.0: initialize_mta() returns HRESULT, not Result
-        let _hr = wasapi::initialize_mta();
+        let _apartment = ComInitializer::new().expect("initialize COM");
 
         let config = WindowsCaptureConfig {
             target: CaptureTarget::Device(DeviceId(String::new())),
@@ -1673,15 +1702,14 @@ mod tests {
         );
     }
 
-    /// Test that `find_device_by_id` resolves a real device ID via the wasapi
-    /// 0.23 `get_device` path (round-trips the default render device's ID).
+    /// `find_device_by_id` round-trips the default render device's ID.
     #[test]
     fn test_find_device_by_id_roundtrip_real_id() {
-        let _hr = wasapi::initialize_mta();
+        let _apartment = ComInitializer::new().expect("initialize COM");
 
         let enumerator = wasapi::DeviceEnumerator::new().expect("create enumerator");
         let default_dev = enumerator
-            .get_default_device(&wasapi::Direction::Render)
+            .get_default_device(wasapi::Direction::Render)
             .expect("get default render device");
         let real_id = default_dev.get_id().expect("get device id");
 
@@ -1698,8 +1726,7 @@ mod tests {
     /// Test that Device target with non-existent ID returns DeviceNotFound.
     #[test]
     fn test_create_audio_client_device_not_found() {
-        // wasapi 0.22.0: initialize_mta() returns HRESULT, not Result
-        let _hr = wasapi::initialize_mta();
+        let _apartment = ComInitializer::new().expect("initialize COM");
 
         let config = WindowsCaptureConfig {
             target: CaptureTarget::Device(DeviceId("nonexistent-device-id-12345".to_string())),

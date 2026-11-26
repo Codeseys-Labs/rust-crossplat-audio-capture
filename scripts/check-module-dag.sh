@@ -55,8 +55,9 @@
 #                                            # reverse edge (CI-5 regression guard)
 #   scripts/check-module-dag.sh -h|--help
 #
-# Exit status: 0 = clean (only allowlisted edges remain); 1 = NEW violation(s);
-#              2 = usage / environment error.
+# Exit status: 0 = clean (only allowlisted edges remain); 1 = NEW violation(s),
+#              or a layer source root is missing (a moved layer must never
+#              silently drop out of the scan); 2 = usage / environment error.
 #
 set -euo pipefail
 
@@ -130,7 +131,7 @@ fi
 #   contains a drive-letter colon ("E:/…") that would corrupt the "file:line:col"
 #   field split below. Relative paths have no such colon.
 scan_layer() {
-  local target="$1"      # repo-relative dir (e.g. src/core) OR file (src/api.rs)
+  local target="$1"      # repo-relative layer directory (e.g. src/core)
   local alt="$2"         # e.g. "audio|api|sink"
   # CI-5: match BOTH the symbol form `crate::audio::Foo` AND the bare
   # module-level form `crate::audio` (e.g. `use crate::audio;` / `crate::audio::`)
@@ -242,15 +243,15 @@ echo "    tool : $([[ ${have_rg} -eq 1 ]] && echo 'ripgrep' || echo 'grep -rn')"
 echo
 
 # ── The forbidden-edge scans (one per layer that has things above it) ─────────
-# Layer source roots are REPO-RELATIVE (see scan_layer for why). NOTE: api/ is
-# the file src/api.rs, every other layer is a directory. compose/ (ADR-0011) is
-# top-of-chain so it is never a source scanned here; api/ and sink/ gained a
-# forbidden edge (compose) when it landed above them.
+# Layer source roots are REPO-RELATIVE (see scan_layer for why); every layer,
+# api/ included, is a directory. compose/ (ADR-0011) is top-of-chain so it is
+# never a source scanned here; api/ and sink/ gained a forbidden edge (compose)
+# when it landed above them.
 declare -a SCAN_TARGETS=(
   "core::src/core::bridge|audio|api|sink|compose"
   "bridge::src/bridge::audio|api|sink|compose"
   "audio::src/audio::api|sink|compose"
-  "api::src/api.rs::compose"
+  "api::src/api::compose"
   "sink::src/sink::compose"
 )
 
@@ -263,9 +264,12 @@ for spec in "${SCAN_TARGETS[@]}"; do
   target="${rest%%::*}"
   alt="${rest#*::}"
 
+  # A missing root is a hard failure, never a skip: renaming or moving a layer
+  # (e.g. the src/api.rs -> src/api/ split) must update SCAN_TARGETS rather
+  # than silently disable that layer's guard.
   if [[ ! -e "${REPO_ROOT}/${target}" ]]; then
-    echo "warning: ${layer} source root missing, skipping: ${target}" >&2
-    continue
+    echo "error: ${layer} source root missing: ${target} — update SCAN_TARGETS in $(basename "${BASH_SOURCE[0]}")" >&2
+    exit 1
   fi
 
   while IFS= read -r hit; do
