@@ -35,6 +35,10 @@ not guidance. Entry points (⭐) are the places to start.
 
 ## Contributing & operating
 
+Track current work in [GitHub Issues](https://github.com/Codeseys-Labs/rust-crossplat-audio-capture/issues). Look up past
+`rsac-xxxx` IDs in the [Seeds archive](history/seeds/README.md) or find
+their migrated issues in the [mapping table](history/seeds/SEEDS_TO_ISSUES.md).
+
 | Doc | What it covers |
 |---|---|
 | ⭐ [`CONTRIBUTING.md`](CONTRIBUTING.md) | Onboarding (mise + lefthook), the local gate, test suites, PR checklist |

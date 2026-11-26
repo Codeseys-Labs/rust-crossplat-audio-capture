@@ -519,30 +519,26 @@ recorded as ADRs in [`docs/designs/`](docs/designs/); add a new ADR when you
 make one. If you spot a design doc that contradicts the code, fix the doc (or
 note the divergence in its banner) rather than changing the code to match it.
 
-### Task management — seeds (`sd` CLI)
+### Task management with GitHub Issues
 
-The backlog is **git-native**: issues live in [`.seeds/issues.jsonl`](.seeds/)
-and are managed exclusively through the [`sd` CLI](https://github.com/jayminwest/seeds)
-(the full command reference is the tool-managed block in
-[`CLAUDE.md`](CLAUDE.md); run `sd prime` at session start for agent context).
-The working loop:
+The backlog lives in [GitHub Issues](https://github.com/Codeseys-Labs/rust-crossplat-audio-capture/issues).
+Search open issues for related work and check each issue's blockers before starting.
+Record progress on the issue and link the delivery PR. When closing the issue,
+record the commit or PR and the verification evidence.
 
-```bash
-sd ready                          # unblocked work (dependency-aware)
-sd update <id> --status in_progress
-sd close <id> --reason "…"        # close with the evidence (commit SHA, verification)
-sd create --title "…" --type task --priority 2 --labels "…"
-sd dep add <id> <depends-on>      # blockers; epics depend on their child seeds
-sd sync                           # stage+commit .seeds/ before pushing
-```
+Include acceptance criteria and end new issue descriptions with an
+`(effort: … | verify: … | wave: N)` footer. Include the wave when the work is
+part of a wave. Apply the relevant type, priority, and area labels. An epic
+owns its work through GitHub sub-issues. Give the epic enough context for
+someone to resume it and use GitHub issue dependencies to record blockers.
+The mobile umbrella [#85](https://github.com/Codeseys-Labs/rust-crossplat-audio-capture/issues/85)
+owns the Android [#82](https://github.com/Codeseys-Labs/rust-crossplat-audio-capture/issues/82),
+iOS [#83](https://github.com/Codeseys-Labs/rust-crossplat-audio-capture/issues/83),
+and framework delivery [#84](https://github.com/Codeseys-Labs/rust-crossplat-audio-capture/issues/84) epics.
 
-Conventions this repo layers on top: seed descriptions end with an
-`(effort: … | verify: … | wave: N)` footer plus acceptance criteria; epics
-(e.g. the mobile push: umbrella `rsac-0991` → `rsac-5823`/`rsac-57cb`/`rsac-71d2`)
-carry resume-context in their descriptions and depend on their children, so
-`sd ready` surfaces exactly the unblocked entry points. **Never hand-edit
-`.seeds/issues.jsonl`** — the CLI maintains timestamps/`closedAt`/dependency
-integrity (`sd doctor` catches drift).
+Look up historical `rsac-xxxx` IDs in the [Seeds archive](docs/history/seeds/README.md)
+and use the [migration table](docs/history/seeds/SEEDS_TO_ISSUES.md) to find the
+GitHub issue for an active seed.
 
 ### Git commit conventions
 
@@ -634,7 +630,7 @@ Full playbook (when to stack vs parallel PRs, exact commands, pitfalls):
      (otherwise CodeRabbit refuses the base; the file is read from PR *head*
      branches, so every layer cut from the release branch inherits it).
 3. **Cut layers just-in-time**, one domain per PR, bottom-up along the module
-   DAG: *library → bindings → CI/DevEx → docs/seeds → platform tails*. Each
+   DAG: *library → bindings → CI/DevEx → docs → platform tails*. Each
    layer: new `stack/<ver>-<n>-<name>` branch **from the current release
    branch** in a **separate `git worktree`** (never switch a shared checkout),
    `git checkout <frozen-sha> -- <layer paths>`, apply the documented
@@ -642,21 +638,20 @@ Full playbook (when to stack vs parallel PRs, exact commands, pitfalls):
    push, open the PR against `release/X.Y.Z`.
 4. **Review every layer**: a dispatched full CI matrix + CodeRabbit (nudge with
    `@coderabbitai full review` if it doesn't auto-start) + any other reviewer.
-   Triage per §6 dispositions with one addition — the **identity-preserving
-   policy**: while the stack is in flight, valid findings become seeds worked
-   *after* the stack completes; nothing lands in a layer that the frozen
-   source didn't carry (otherwise "functionally identical to the source"
-   becomes unverifiable). Post the disposition table on the PR.
+   Follow the §6 dispositions and file valid findings as GitHub issues for
+   work *after* the stack completes. Limit each layer to changes carried by the
+   frozen source so reviewers can verify that the assembled release is
+   "functionally identical to the source."
+   Post the disposition table on the PR.
 5. **Squash-merge bottom-up** (`gh pr merge --squash --delete-branch`), close
-   the layer's seed with evidence, then cut the next layer from the updated
-   release branch. Just-in-time cutting avoids the squash-rebase recovery
+   the layer's tracking issue with evidence, then cut the next layer from the
+   updated release branch. Just-in-time cutting avoids the squash-rebase recovery
    hazard of true parent-based stacks entirely.
    **PR-vs-direct rule:** every *content* commit (anything originating from
    the frozen source) goes through a layer PR. Direct pushes to the release
    branch are reserved for (a) the step-2 bootstrap infrastructure (which
-   cannot review itself), (b) post-merge bookkeeping (seeds sync, retro-log
-   docs), and (c) identity-restoring sweeps of already-reviewed content —
-   each small, with the justification in the commit message. Add branch
+   cannot review itself), (b) post-merge retro-log updates, and (c) identity-restoring
+   sweeps of already-reviewed content. Justify each small commit in its message. Add branch
    protection on `release/**` if policy alone stops being enough.
 6. **Finish**: diff the release branch against the frozen SHA and account for
    every delta (expected: the trigger/CodeRabbit commits, documented manifest
@@ -681,7 +676,7 @@ Full playbook (when to stack vs parallel PRs, exact commands, pitfalls):
   their pinned foreign sources into the same layer as the tests.
 - Shared files (`Cargo.toml`, `Cargo.lock`, `ci.yml`) need **documented
   per-layer hand-adjustments** (workspace members, `[[example]]` entries,
-  stripped-then-restored CI jobs); write the adjustment into the layer seed
+  stripped-then-restored CI jobs); write the adjustment into the layer issue
   *and* the manifest comment.
 - A **regenerated lockfile silently reverts advisory fixes** — after cutting
   a layer, re-check `cargo deny`-relevant pins against the source branch
@@ -731,7 +726,7 @@ Full playbook (when to stack vs parallel PRs, exact commands, pitfalls):
 | Import from `src/audio/core.rs` | File was deleted in Phase 0 |
 | Add `Co-Authored-By:` trailers or tool bylines to commit messages | This repo requires plain commit messages — no co-author trailers, no "Generated with …" lines (see §6 Git commit conventions; the lefthook commit-msg hook rejects them) |
 | Let a review comment be deferred/rejected with no tracking issue | Every non-fixed review finding must be captured in a GitHub issue before the PR merges, or it silently disappears (see §6 Code review dispositions) |
-| Hand-edit `.seeds/issues.jsonl` | The backlog is CLI-managed — `sd create`/`update`/`close`/`dep` keep timestamps, `closedAt`, and dependency integrity; hand edits trip `sd doctor` (see §6 Task management) |
+| Track new work in the Seeds archive | The archive preserves the frozen backlog. File and update work in GitHub Issues (see §6 Task management) |
 | Push without running the gate | `mise run gate` (or `bash scripts/gate.sh`) is the ci.yml lint-job replica — CI is manually dispatched, so skipping it means nothing checks the push until someone starts a run (see §6 Local DevEx) |
 
 ---
@@ -808,7 +803,7 @@ Full playbook (when to stack vs parallel PRs, exact commands, pitfalls):
 - macOS 15 (Sequoia) testing on real hardware (expected to work via Path 2, untested)
 - **Compose follow-ups:** channel-position-aware layouts remain future work;
   Python/Node/Go composition and live gain/mute have shipped.
-- **Blacksmith Windows audio (optional)** — the image has had an audio stack since the 2026-11-26 probe, but the `ci_audio` windows tier has never run there. Worth a trial run only if the repository goes private or GitHub-hosted Windows audio regresses (seed `rsac-07778d`; see §6 runner labels)
+- **Blacksmith Windows audio (optional)** — the image has had an audio stack since the 2026-11-26 probe, but the `ci_audio` windows tier has never run there. Worth a trial run only if the repository goes private or GitHub-hosted Windows audio regresses ([#100](https://github.com/Codeseys-Labs/rust-crossplat-audio-capture/issues/100), see §6 runner labels)
 
 ---
 

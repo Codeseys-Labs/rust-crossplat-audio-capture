@@ -106,7 +106,7 @@ pipeline.
   stream position, not wall-clock time — periods where the OS delivers
   nothing do not advance it. An upgrade to per-backend device clocks (WASAPI
   `GetPosition`, PipeWire `pw_time`, CoreAudio `mSampleTime`) remains tracked
-  (rsac-ec25).
+  in [#78](https://github.com/Codeseys-Labs/rust-crossplat-audio-capture/issues/78).
 - The default hot path is **alloc-free in steady state** (the producer reuses
   ring slots via a free-list return ring — see
   [`docs/designs/0001-rt-allocation-guarantee.md`](docs/designs/0001-rt-allocation-guarantee.md)),

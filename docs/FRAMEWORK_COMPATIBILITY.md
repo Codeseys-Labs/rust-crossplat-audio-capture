@@ -189,8 +189,7 @@ honest version:
 
 ## Long tail (no commitments)
 
-Brief honest paragraphs; **no seeds are filed for these** — they ride on the
-same rsac-ffi / direct-dep paths as the frameworks above.
+These frameworks use the rsac-ffi and direct-dependency paths described above.
 
 - **Rust-native GUIs (egui, Iced, Slint, GPUI):** trivially supported on
   desktop — rsac is a plain Rust crate with no UI assumptions; use the builder
@@ -220,13 +219,15 @@ recipes in this document and flip the 🟢 markers to ✅ from their verified
 results — we don't run speculative verification ourselves. (The original
 wave-2 verification seeds were closed as not-planned with this rationale.)
 
-The committed backlog is the **mobile push**, tracked as `sd` epics:
-umbrella `rsac-0991` → Android backend `rsac-5823` (wave 3), iOS backend
-`rsac-57cb` (wave 4), framework delivery / `tauri-plugin-rsac` `rsac-71d2`
-(wave 5). The core consent surface (rsac-82d4) and the rsac-napi per-target
+The **mobile push** is tracked in the umbrella epic [#85](https://github.com/Codeseys-Labs/rust-crossplat-audio-capture/issues/85)
+and its Android backend [#82](https://github.com/Codeseys-Labs/rust-crossplat-audio-capture/issues/82) (wave 3),
+iOS backend [#83](https://github.com/Codeseys-Labs/rust-crossplat-audio-capture/issues/83) (wave 4),
+and framework delivery [#84](https://github.com/Codeseys-Labs/rust-crossplat-audio-capture/issues/84) (wave 5) sub-issues.
+The core consent surface (rsac-82d4) and the rsac-napi per-target
 dependency migration (rsac-e8a3) are already landed. The wave-5
 `tauri-plugin-rsac` **skeleton landed compile-proof** (rsac-f21c,
 `integrations/`) — desktop builds/clippies in CI, `android/`+`ios/` are
 source-shipped, and derived-data-by-default is enforced via the permission set
-(raw opt-in); framework **runtime** verification remains guidance-on-demand and
-mobile runtime stays blocked on rsac-e6d3 / rsac-97c8.
+(raw opt-in). Framework **runtime** verification remains guidance-on-demand.
+The remaining iOS hardware verification is tracked in [#89](https://github.com/Codeseys-Labs/rust-crossplat-audio-capture/issues/89).
+The Android Tauri end-to-end example is tracked in [#91](https://github.com/Codeseys-Labs/rust-crossplat-audio-capture/issues/91).

@@ -309,12 +309,12 @@ Staged, honest about what each stage proves:
    (`tests/ios_sim_smoke.rs`, env-gated on `RSAC_CI_IOS_SIM=1`). Results are
    labelled **simulator-verified** only — the simulator is not a device; the
    physical-device pass, interleaved-delivery fast path, and
-   start-failure-rollback verification remain seeded (needs-real-device).
+   start-failure-rollback verification are tracked in [#89](https://github.com/Codeseys-Labs/rust-crossplat-audio-capture/issues/89).
    **Do not claim "tested on Android/iOS" until these are green** —
    same discipline as the desktop verification table in AGENTS.md §6.
-3. **Stage 3 — seeded (delivery):** real Android device enumeration/selection
+3. **Stage 3 — delivery:** real Android device enumeration/selection
    (`rsac-ad8a`), glue distribution — Maven AAR + SwiftPM guidance
-   (`rsac-05b6`), and rsac-ffi mobile-triple cross-checks for Flutter/C
+   ([#86](https://github.com/Codeseys-Labs/rust-crossplat-audio-capture/issues/86)), and rsac-ffi mobile-triple cross-checks for Flutter/C
    consumers (`rsac-7a18`).
 
 ## Risks & open questions (tracked, not hidden)
