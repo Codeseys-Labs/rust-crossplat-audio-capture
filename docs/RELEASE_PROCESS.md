@@ -488,8 +488,12 @@ writes to `master`.
 Treat the `release: vX.Y.Z` PR like any other PR: review the manifest
 diff and the CHANGELOG rotation. CI is manually dispatched, so **dispatch it on
 the release branch and wait for green before merging**
-(`gh workflow run ci.yml --ref release/vX.Y.Z -f full=true`; without
-`full=true` the run is scoped by the branch diff). Dispatch with the branch up
+(`gh workflow run ci.yml --ref release/vX.Y.Z -f full=true -f semver=true`;
+without `full=true` the run is scoped by the branch diff, and without both
+inputs the `Release Readiness` job is skipped). Merge only when that job is
+green on the PR head. `release-tag.yml` does not look at the run: it checks the
+version lockstep only, so on this path the rule is yours to apply
+([#119](https://github.com/Codeseys-Labs/rust-crossplat-audio-capture/issues/119)). Dispatch with the branch up
 to date with `master`, then merge that exact commit before `master` advances
 again: the PR head at merge time must be the run's `headSha`
 (`gh run view <run-id> --json headSha,conclusion`), and a later commit on the
@@ -498,7 +502,8 @@ commit as soon as it lands, so that commit is covered only if its tree is the
 tree the run tested. Its **`version-lockstep` gate**
 cross-checks that all **nine** manifests
 (root `Cargo.toml`, the rsac-ffi / rsac-napi / rsac-python `Cargo.toml`s, the
-napi `package.json`, the python `pyproject.toml`, and the Android native shim)
+napi `package.json`, the python `pyproject.toml`, the Android native shim, and
+the Tauri plugin's `Cargo.toml` and `guest-js/package.json`)
 carry the same version (a skew only warns on a dispatched run, so read the job
 output), and a `release/vX.Y.Z` dispatch also runs the semver gate. The hard
 gates are automatic: `release-tag.yml` runs the same nine-manifest lockstep
