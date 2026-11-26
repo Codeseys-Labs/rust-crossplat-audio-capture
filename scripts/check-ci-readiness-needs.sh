@@ -51,6 +51,9 @@ extract() {
       in_list = 0
       next
     }
+    # Any other key at job indentation (a quoted id, a space before the colon,
+    # an anchor) is a job this scan cannot name: fail closed, never skip it.
+    in_jobs && /^  [^ #[:space:]]/ { exit 2 }
     in_jobs && in_readiness && /^    needs:[[:space:]]*/ {
       found_needs++
       value = $0; sub(/^    needs:[[:space:]]*/, "", value)
@@ -103,9 +106,11 @@ if [[ "$self_test" -eq 1 ]]; then
   trap 'rm -rf "$tmpdir"' EXIT
   awk -v remaining="$remaining" '
     { sub(/\r$/, "") }
+    /^[^ #[:space:]]/ || /^  [^ #[:space:]]/ { in_readiness = 0 }
     /^  release-readiness:[[:space:]]*(#.*)?$/ { in_readiness = 1 }
     in_readiness && /^    needs:[[:space:]]*/ {
-      block = ($0 !~ /\[/)
+      value = $0; sub(/^    needs:[[:space:]]*/, "", value)
+      block = (value !~ /^\[/)
       print "    needs: [" remaining "]"
       next
     }

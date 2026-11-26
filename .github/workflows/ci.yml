@@ -1552,6 +1552,10 @@ jobs:
         run: for t in scripts/tests/*.test.sh; do bash "$t" || exit 1; done
 
   # ── Full manual release gate ────────────────────────────────────────
+  # `needs.<matrix job>.result` can read `success` when a matrix leg was
+  # cancelled before a runner picked it up, so this job alone is not the whole
+  # gate: scripts/tag-release.sh also requires the run's overall conclusion to
+  # be `success`.
   release-readiness:
     name: Release Readiness
     if: ${{ always() && github.event_name == 'workflow_dispatch' && inputs.full && inputs.semver }}
@@ -1598,9 +1602,9 @@ jobs:
           done <<< "$results"
           exit "$failed"
       - uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5
-        if: always()
+        if: ${{ !cancelled() }}
         with:
           persist-credentials: false
       - name: Check readiness needs match CI jobs
-        if: always()
+        if: ${{ !cancelled() }}
         run: bash scripts/check-ci-readiness-needs.sh
