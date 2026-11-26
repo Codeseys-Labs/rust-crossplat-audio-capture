@@ -106,9 +106,30 @@ Releases with no ABI change omit the subsection (or state "No C ABI changes").
   `audio_client`) before `wasapi::deinitialize()`, and bound the WASAPI init handshake
   to 5 seconds (`recv_timeout`). The device enumerator now holds COM alive with an MTA
   usage cookie, which may be released from any thread, instead of a per-thread
-  `CoInitializeEx`/`CoUninitialize` pair. Callers whose thread is already in a non-MTA
-  COM apartment (for example an STA UI thread) are still refused with
-  `RPC_E_CHANGED_MODE`, as before.
+  `CoInitializeEx`/`CoUninitialize` pair.
+- **Windows WASAPI (device handles and STA callers):** `WindowsDeviceEnumerator` and
+  `WindowsAudioDevice` stored COM interface pointers behind `unsafe impl Send + Sync`
+  that nothing backed, so a handle moved to another thread could use or release the
+  pointer in the wrong apartment. They now hold plain data: every COM object is
+  created, used and released inside one call on the calling thread, and the device
+  watcher's COM objects live on its helper thread. Callers on an STA thread (GUI main
+  threads) are no longer refused by the enumerator, the device watcher or
+  `list_audio_applications()`; before, they got `RPC_E_CHANGED_MODE`. Visible changes:
+  `is_default()` reports the default render endpoint (it was always `false`);
+  `id()`, `name()` and `kind()` return what was read at enumeration;
+  `supported_formats()` for an endpoint that no longer exists returns the default
+  format, never another device's formats; a device watcher may be dropped from inside
+  its own handler; `watch()` returns `AudioError::Timeout` if the OS has not confirmed
+  the registration within five seconds (the handler is then never called); and
+  `enumerate_devices()` / `default_device()` can return the enumerator-creation error
+  that only construction returned before. A handler must not wait synchronously for
+  the thread that drops the watcher (ADR-0020). The deprecated
+  `WindowsApplicationCapture` is unchanged and is removed at the 0.5.0 cutover.
+- **Windows WASAPI (no default endpoint):** a missing default render endpoint is now
+  recognised by the HRESULT the API documents (`E_NOTFOUND`, `0x80070490`) and
+  reported as `DeviceNotFound`. It was compared against `0x80070002`, so losing the
+  last endpoint surfaced as a backend error, and `hotplug-recovery` spent its retry
+  budget instead of waiting for a device.
 - **Linux PipeWire:** fixed multi-byte UTF-8 slicing panic in `.exe` suffix stripping,
   normalized cyclic SPA chunk offsets with whole-frame clamping, and added
   `StreamFlags::DONT_RECONNECT` on explicit serial targets so vanished app/device
