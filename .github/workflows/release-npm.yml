@@ -447,7 +447,10 @@ jobs:
           INPUT_VERSION: ${{ inputs.version }}
         run: |
           set -euo pipefail
-          if [[ "$GITHUB_REF" == refs/tags/v* ]]; then
+          if [[ "$GITHUB_REF_TYPE" == tag ]]; then
+            [[ "$GITHUB_REF_NAME" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]] || {
+              echo "::error::tag ref must be a stable vX.Y.Z release tag"; exit 1;
+            }
             tag="$GITHUB_REF_NAME"
           else
             tag="v$INPUT_VERSION"
@@ -474,3 +477,29 @@ jobs:
       # --provenance flag is no longer required (harmless to omit).
       - name: Publish main package (sub-packages already published above)
         run: npm publish --access public --ignore-scripts
+
+  # A tag-targeted rehearsal must also notice a tag moved during its build.
+  verify-tag-rehearsal:
+    name: Verify tag for npm rehearsal
+    needs: verify-napi-build
+    if: ${{ always() && github.event_name == 'workflow_dispatch' && !inputs.publish && github.ref_type == 'tag' }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5
+        with:
+          persist-credentials: false
+      - name: Verify release tag still points to this commit
+        shell: bash
+        timeout-minutes: 2
+        run: |
+          set -euo pipefail
+          [[ "$GITHUB_REF_NAME" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]] || {
+            echo "::error::tag ref must be a stable vX.Y.Z release tag"; exit 1;
+          }
+          ref="$GITHUB_REF"
+          refs="$(git ls-remote --exit-code --tags origin "$ref" "$ref^{}")"
+          commit="$(awk -v ref="$ref" '$2 == ref { base=$1 } $2 == ref "^{}" { peeled=$1 } END { if (base != "") print (peeled != "" ? peeled : base) }' <<< "$refs")"
+          [[ -n "$commit" && "$commit" == "$GITHUB_SHA" ]] || {
+            echo "::error::remote tag $GITHUB_REF_NAME is missing or does not resolve to $GITHUB_SHA"; exit 1;
+          }

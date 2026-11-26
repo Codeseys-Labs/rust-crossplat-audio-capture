@@ -4,8 +4,9 @@
 #
 # Written from the release-tooling contract ONLY: section 4 describes the script, section 7 these
 # tests, the revision notes r2 and r3 amend section 4, and the release-gate contract amends it
-# again: revision 4 (clauses R4.1 to R4.6; R4.11 describes these tests) and its Revision 5
-# (R5.1 to R5.5, R5.7), which overrides revision 4 where it differs. The script under test was
+# again: revision 4 (clauses R4.1 to R4.6; R4.11 describes these tests), its Revision 5
+# (R5.1 to R5.5, R5.7) and its Revision 6 (R6.1 to R6.4; R6.4 describes these tests), each of
+# which overrides the one before where it differs. The script under test was
 # not read while writing them. Every expectation names the contract clause it comes from. A
 # failing case stays failing: never weaken an expectation to match observed output; fix the script
 # or report the contract problem. A case whose contract text can be read two ways carries an
@@ -268,6 +269,18 @@ rc=0
 exit "$rc"
 EOF
 
+# Gate stub for the lockstep script inside a RELEASE_GATE_DIR (R6.1): logs its arguments AND its
+# working directory (tab-separated; R6.1a: the gate's script runs with the commit's checkout as
+# cwd), and exits with $FAKE_DIR/gate-lockstep.rc (default 0).
+cat > "$WORK/bin/gate-lockstep-stub.sh" <<'EOF'
+#!/usr/bin/env bash
+d="${FAKE_DIR:?FAKE_DIR not set}"
+printf '%s\t%s\n' "$PWD" "$*" >> "$d/gate-lockstep.log"
+rc=0
+[ -f "$d/gate-lockstep.rc" ] && rc="$(cat "$d/gate-lockstep.rc")"
+exit "$rc"
+EOF
+
 # gpg replacement that always fails (used to make `git tag -a` fail).
 cat > "$WORK/bin/failing-gpg" <<'EOF'
 #!/usr/bin/env bash
@@ -415,6 +428,8 @@ new_sandbox() {
   git -C "$REPO" remote set-url origin "$REMOTE" || harness_die "set-url"
   SHA="$(git -C "$REPO" rev-parse HEAD)"
   RC=""
+  unset RELEASE_GATE_DIR # R6.1: the trusted gate directory; a case that wants one calls use_gate_dir
+  GATE_DIR=""
   RSAC_PROXY_REPO="$REMOTE"
   FAKE_EXPECT_REPO="$TEST_REPO"
   RELEASE_REPO="$TEST_REPO" # R3.1 seam: the throwaway remote is a local path, not a GitHub URL
@@ -617,6 +632,31 @@ world_with() { # <key=spec>...: these keys as given, every other key green
 #   ios-sim      4545   <HEAD sha> completed success workflow_dispatch success CI iOS Simulator
 #   issues: none
 arrange_green() { world ci=green audio=green android-emu=green ios-sim=green; }
+
+# R6.1: a RELEASE_GATE_DIR holds the gate's own scripts/check-version-lockstep.sh and .github/workflows/.
+# <key>=<name> names that key's workflow name in the gate directory; NONE = the gate's file has no
+# `name:` line; MISSING = the gate directory has no such file at all. Without arguments the gate
+# names the same workflows as the commit (the template's own names).
+use_gate_dir() { # [<key>=<name | NONE | MISSING>]...
+  local k name kv
+  GATE_DIR="$SB/gate"
+  mkdir -p "$GATE_DIR/scripts" "$GATE_DIR/.github/workflows" || { fail "harness: mkdir $GATE_DIR"; return 1; }
+  cp "$WORK/bin/gate-lockstep-stub.sh" "$GATE_DIR/scripts/check-version-lockstep.sh" || return 1
+  for k in $KEYS; do
+    name="$(key_wfname "$k")"
+    for kv in "$@"; do
+      if [ "${kv%%=*}" = "$k" ]; then name="${kv#*=}"; fi
+    done
+    [ "$name" = MISSING ] && continue
+    if [ "$name" = NONE ]; then
+      printf 'on:\n  workflow_dispatch:\n' > "$GATE_DIR/.github/workflows/$(key_file "$k")" || return 1
+    else
+      printf 'name: %s\n\non:\n  workflow_dispatch:\n' "$name" > "$GATE_DIR/.github/workflows/$(key_file "$k")" || return 1
+    fi
+  done
+  RELEASE_GATE_DIR="$GATE_DIR"
+  export RELEASE_GATE_DIR
+}
 
 # ── running the script under test ───────────────────────────────────────────
 snapshot_tags() { # <before|after>: "<refname> <object>" per tag, local and per bare remote
@@ -922,7 +962,9 @@ assert_waived_lines() { # <clause> <key=N>...: exactly these lines, each after t
 assert_no_waived_lines() { # <clause>
   if grep -q 'WAIVED' "$SB/stderr"; then fail "a WAIVED line was printed: $(grep 'WAIVED' "$SB/stderr" | tr '\n' '|') [$1]"; fi
 }
-# R4.6: the message `--dry-run` would write is on stderr: the first line and then the body lines, in order.
+# R4.6 / R6.4: the message `--dry-run` would write is on stderr: the first line and then the body lines,
+# in order, each compared as a WHOLE line (an `Evidence: ci=4242` expectation must not accept
+# `Evidence: ci=42420`).
 assert_message_printed() { # <clause> <first line>
   local clause="$1" want ln last=0 k v
   local -a wants=("$2")
@@ -938,12 +980,40 @@ assert_message_printed() { # <clause> <first line>
   done
   stderr_lf > "$SB/stderr.lf"
   for want in "${wants[@]}"; do
-    ln="$(grep -nF -- "$want" "$SB/stderr.lf" | awk -F: -v l="$last" '$1 > l { print $1; exit }')"
+    ln="$(grep -nFx -- "$want" "$SB/stderr.lf" | awk -F: -v l="$last" '$1 > l { print $1; exit }')"
     if [ -z "$ln" ]; then
-      fail "stderr lacks '$want' after line $last (the message --dry-run would write, in order) [$clause]"
+      fail "stderr lacks the whole line '$want' after line $last (the message --dry-run would write, in order) [$clause]"
       return 0
     fi
     last="$ln"
+  done
+}
+# R6.4: the two-tag dry run asserts the complete Go annotation block as well as the crate block. Both
+# blocks carry the same body (R4.6), so each block's lines are checked whole-line and in order; which of
+# the two messages comes first is not pinned (the contract does not order them).
+assert_dry_run_messages() { # <clause>
+  assert_message_printed "$1" "rsac $VER"
+  assert_message_printed "$1" "rsac-go $VER"
+}
+# R6.4: --no-go-tag prints no Go annotation block: no whole line 'rsac-go X.Y.Z', and each body line of
+# the crate message exactly once (a second block would double it).
+assert_no_go_block_printed() { # <clause>
+  local clause="$1" k v n
+  stderr_lf > "$SB/stderr.lf"
+  if grep -qFx -- "rsac-go $VER" "$SB/stderr.lf"; then
+    fail "a whole line 'rsac-go $VER' was printed although --no-go-tag [$clause]"
+  fi
+  for k in $KEYS windows-switch; do
+    v="$(ev_get "$k")"
+    [ -z "$v" ] && continue
+    n="$(grep -cFx -- "Evidence: $k=$v" "$SB/stderr.lf")"
+    [ "$n" = 1 ] || fail "$n whole lines 'Evidence: $k=$v': the crate block prints it once, a Go block would double it [$clause]"
+  done
+  for k in android-emu ios-sim windows-switch; do
+    v="$(wv_get "$k")"
+    [ -z "$v" ] && continue
+    n="$(grep -cFx -- "Waived: $k=#$v" "$SB/stderr.lf")"
+    [ "$n" = 1 ] || fail "$n whole lines 'Waived: $k=#$v' [$clause]"
   done
 }
 
@@ -955,6 +1025,36 @@ gh_view_prefix() { # <id>: the start of the inspection call as logged (R3.1, R3.
 }
 gh_issue_form() { # <N>: the waiver verification call of R4.4 as logged
   echo "issue view $1 --repo $EXP_REPO --json state,labels --jq [.state, ([.labels[].name] | index(\"release-waiver\") != null)] | join(\" \")"
+}
+
+realdir() { ( cd "$1" 2>/dev/null && pwd ) || echo missing; } # <path>: one canonical spelling
+# R6.1a: in RELEASE_GATE_DIR mode the gate's lockstep script is invoked as
+#   bash "$RELEASE_GATE_DIR/scripts/check-version-lockstep.sh" --root <absolute working directory> --expect X.Y.Z
+# (arguments in exactly that order). The gate stub observes its arguments and its working directory; both
+# must be the commit's checkout (R6.1: the gate's script still reads the commit's manifests).
+assert_gate_lockstep_call() { # <clause>
+  local clause="$1" line stub_pwd args root
+  if [ ! -s "$FAKE_DIR/gate-lockstep.log" ]; then
+    fail "the gate's lockstep stub was never called [$clause]"
+    return 0
+  fi
+  line="$(head -n 1 "$FAKE_DIR/gate-lockstep.log")"
+  stub_pwd="${line%%$'\t'*}"
+  args="${line#*$'\t'}"
+  set -- $args
+  if [ "${1:-}" != --root ]; then
+    fail "the gate's lockstep call is '$args', expected it to start with --root [R6.1a, $clause]"
+    return 0
+  fi
+  root="$2"
+  if [ "${3:-}" != --expect ]; then
+    fail "the gate's lockstep call is '$args', expected --expect right after --root <dir> [R6.1a, $clause]"
+    return 0
+  fi
+  assert_eq "$4" "$VER" "the gate's lockstep --expect value [R6.1a, $clause]"
+  [ "$#" = 4 ] || fail "the gate's lockstep call is '$args', expected exactly '--root <dir> --expect X.Y.Z' [R6.1a, $clause]"
+  assert_eq "$(realdir "$stub_pwd")" "$(realdir "$REPO")" "the working directory of the gate's script [R6.1: the commit's checkout]"
+  assert_eq "$(realdir "${root:-}")" "$(realdir "$REPO")" "the --root value [R6.1a: the commit's checkout, absolute]"
 }
 assert_gh_calls_name_repo() { # <repo> <clause>: every logged gh call has `--repo <repo>` (R3.1)
   local total=0 named=0
@@ -1335,18 +1435,54 @@ case_repo_url_rejected() { # <remote url>
   assert_not_called "R3.1: check 2 fails before anything else runs" lockstep cargo gh
 }
 case_repo_env_overrides_url() {
-  # Changed by R4.1: with RELEASE_REPO set, a push URL that parses as a GitHub URL must name REPO, so the push URL is
-  # pinned to x/y here; the FETCH URL still names another repository (o/n) and RELEASE_REPO wins over it (R3.1).
-  RELEASE_REPO="x/y" # R3.1: a non-empty RELEASE_REPO is used as REPO
+  # Changed by R6.2 (this combination passed under R3.1/R4.1): RELEASE_REPO is x/y and the push URL names
+  # x/y, but the FETCH URL names o/n — with RELEASE_REPO set a fetch URL that parses as a GitHub URL must
+  # name REPO too: exit 11.
+  RELEASE_REPO="x/y"
   FAKE_EXPECT_REPO="x/y"
-  EXP_REPO="x/y"
   export RELEASE_REPO FAKE_EXPECT_REPO
   use_remote_url origin "https://github.com/o/n.git" "$REMOTE" || return 0
   must git -C "$REPO" config remote.origin.pushurl "https://github.com/x/y.git" || return 0
   arrange_green
   run_tag "$VER"
-  expect_both_tagged_full "R3.1: RELEASE_REPO wins over the fetch URL (R4.1: the push URL names REPO)"
-  assert_gh_calls_name_repo "x/y" "R3.1: --repo is RELEASE_REPO, not the URL's o/n"
+  expect_failure 11 "R6.2: fetch o/n, push x/y, RELEASE_REPO=x/y: the fetch URL names a different repository"
+  assert_stderr_has "fetch URL names a different repository" "R6.2: the message of exit 11"
+  assert_not_called "R6.2: check 2 fails before anything else runs" lockstep cargo gh
+  assert_no_evidence_lines "R6.2"
+}
+case_repo_env_matching_fetch_url() {
+  # R6.2: the same world with the fetch URL naming RELEASE_REPO passes; RELEASE_REPO still decides the
+  # repository (R3.1), and the push URL (the same GitHub-form URL) names it (R4.1).
+  RELEASE_REPO="x/y"
+  FAKE_EXPECT_REPO="x/y"
+  EXP_REPO="x/y"
+  export RELEASE_REPO FAKE_EXPECT_REPO
+  use_remote_url origin "https://github.com/x/y.git" "$REMOTE" || return 0
+  arrange_green
+  run_tag "$VER"
+  expect_both_tagged_full "R6.2: RELEASE_REPO=x/y and the fetch URL names x/y"
+  assert_gh_calls_name_repo "x/y" "R3.1: --repo is RELEASE_REPO, not anything parsed from the URL"
+}
+case_fetch_url_unparsed_with_repo() { # <seam|no-seam>
+  # R6.2: a fetch URL that does not parse (the default world: RELEASE_REPO set, local-path remote URL) is
+  # accepted only under RELEASE_ALLOW_UNPARSED_PUSH_URL=1 — the same seam as R5.3, which new_sandbox sets
+  # for exactly this shape; here the variable is the subject.
+  if [ "$1" = no-seam ]; then
+    unset RELEASE_ALLOW_UNPARSED_PUSH_URL
+  else
+    RELEASE_ALLOW_UNPARSED_PUSH_URL=1
+    export RELEASE_ALLOW_UNPARSED_PUSH_URL
+  fi
+  arrange_green
+  run_tag "$VER"
+  if [ "$1" = seam ]; then
+    expect_both_tagged_full "R6.2: an unparsed fetch URL with RELEASE_REPO is accepted under the seam variable"
+  else
+    expect_failure 11 "R6.2: an unparsed fetch URL with RELEASE_REPO and no seam variable"
+    assert_stderr_has "cannot determine the GitHub repository" "R6.2: the message of exit 11"
+    assert_not_called "R6.2: check 2 fails before anything else runs" lockstep cargo gh
+    assert_no_evidence_lines "R6.2"
+  fi
 }
 case_repo_env_with_push_url_of_other_repo() {
   # R4.1 (replaces the old reading of this setup as a success): RELEASE_REPO is x/y and the push URL parses as a
@@ -1610,6 +1746,100 @@ case_wf_name_unusable() { # <key> <no-name-line|empty-name|file-missing> <clause
   if [ "$2" != file-missing ]; then assert_hints "$3" "$k"; fi
 }
 
+# ── R6.1: the gate's own files come from a trusted directory (RELEASE_GATE_DIR) ──
+case_gate_dir_same_names() {
+  # World: arrange_green; the gate directory names the same workflows as the commit and holds a passing
+  # lockstep stub. R6.1: gate mode is otherwise as before.
+  use_gate_dir || return 0
+  arrange_green
+  run_tag "$VER"
+  expect_both_tagged_full "R6.1: a gate directory with the commit's own names passes"
+  assert_gate_lockstep_call "R6.1a: the gate's lockstep call"
+  assert_not_called "R6.1: the commit's own lockstep stub is not called in gate mode" lockstep
+}
+case_gate_dir_empty() {
+  RELEASE_GATE_DIR="" # R6.1: "When unset or empty, both come from the working directory as before"
+  export RELEASE_GATE_DIR
+  arrange_green
+  run_tag "$VER"
+  expect_both_tagged_full "R6.1: an empty RELEASE_GATE_DIR behaves as unset"
+  assert_eq "$(log_text lockstep)" "--expect $VER|" \
+    "R6.1a: without RELEASE_GATE_DIR the call stays 'bash scripts/check-version-lockstep.sh --expect X.Y.Z'"
+  assert_not_called "R6.1: no gate script ran" gate-lockstep
+}
+case_gate_dir_bad() { # <missing|no-lockstep|a-file>
+  case "$1" in
+    missing) RELEASE_GATE_DIR="$SB/does-not-exist" ;;
+    no-lockstep)
+      RELEASE_GATE_DIR="$SB/gate-incomplete"
+      mkdir -p "$RELEASE_GATE_DIR/.github/workflows" # a directory that lacks the lockstep script
+      ;;
+    a-file) RELEASE_GATE_DIR="$SB/a-file"; : > "$RELEASE_GATE_DIR" ;;
+  esac
+  export RELEASE_GATE_DIR
+  arrange_green
+  run_tag "$VER"
+  expect_failure 2 "R6.1: RELEASE_GATE_DIR $1: exit 2"
+  assert_stderr_has "RELEASE_GATE_DIR" "R6.1: the message of exit 2 names the variable"
+  assert_not_called "R6.1: exit 2 precedes every check" lockstep gate-lockstep cargo gh
+  assert_no_evidence_lines "R6.1"
+}
+case_gate_wf_name() { # <key> <gate name | NONE | MISSING> <commit's own name> <run's workflow name> <qualifies|fail> <clause> [phrase]
+  # World: arrange_green, the run of <key> reporting <4>; the gate directory names <2> for <key> and the
+  # commit's own workflow file says <3>, so only the gate's file can decide.
+  local k="$1" phrase="${7:-}"
+  use_gate_dir "$k=$2" || return 0
+  set_workflow_file "$(key_file "$k")" "$(workflow_file_with "name: $3")" || return 0
+  arrange_green
+  arrange_run "$(key_id "$k")" "$SHA completed success workflow_dispatch success $4"
+  run_tag "$VER"
+  if [ "$5" = qualifies ]; then
+    expect_both_tagged_full "$6"
+    assert_gate_lockstep_call "R6.1a"
+  else
+    expect_failure 16 "$6"
+    phrase="${phrase//@FILE@/$(key_file "$k")}"
+    assert_only_missing "$6" "$k" "$phrase"
+    assert_hints "$6" "$k"
+  fi
+}
+case_gate_lockstep() { # <gate rc> <commit rc> <pass|fail> <clause>
+  # World: arrange_green; the gate directory's lockstep stub exits <1>, the commit's own stub <2>.
+  use_gate_dir || return 0
+  set_rc gate-lockstep "$1"
+  set_rc lockstep "$2"
+  arrange_green
+  run_tag "$VER"
+  assert_gate_lockstep_call "R6.1a: --root <absolute working directory> --expect X.Y.Z, in that order"
+  assert_not_called "R6.1: the commit's own lockstep stub is not called in gate mode" lockstep
+  if [ "$3" = pass ]; then
+    expect_both_tagged_full "$4"
+  else
+    expect_failure 13 "$4"
+    assert_not_called "§4 check order: nothing after check 4 runs" cargo gh
+  fi
+}
+case_gate_changelog_of_commit() {
+  # R6.1: "Everything that describes the COMMIT ... is still read from the commit being tagged": the gate
+  # directory has no CHANGELOG.md; the commit's entry decides.
+  use_gate_dir || return 0
+  set_changelog $'# Changelog\n\n## [Unreleased]\n'
+  arrange_green
+  run_tag "$VER"
+  expect_failure 15 "R6.1 / §4 check 6: the CHANGELOG.md of the commit decides in gate mode"
+  assert_not_called "§4 check order: nothing after check 6 runs" gh
+  assert_no_evidence_lines "R6.1"
+}
+case_gate_note_of_commit() {
+  use_gate_dir || return 0
+  remove_note || return 0
+  arrange_green
+  run_tag "$VER"
+  expect_failure 20 "R6.1 / R4.5: the evidence note of the commit decides in gate mode"
+  assert_stderr_has "Tested-SHA" "R4.5 / R5.1: the message of exit 20"
+  assert_evidence_lines "R6.1 / R4.5" ci=ok:4242 audio=ok:4343 android-emu=ok:4444 ios-sim=ok:4545 windows-switch=missing:
+}
+
 # ── §4 check 3 (R4.2): tags must not exist → exit 12 ───────────────────────
 case_tag_exists() { # <local|remote> <tag> <clause> [extra args...]
   make_tag "$1" "$2"
@@ -1642,6 +1872,67 @@ case_tag_exists_on_chosen_remote() { # <tag>
   expect_failure 12 "§4 check 3: the tag exists on the chosen remote"
   assert_stderr_has "exists on upstream" "R4.2: the message names the remote that has the tag"
   assert_stderr_lacks "exists locally" "R4.2: nothing was imported locally"
+}
+
+# R6.3 WITHDRAWN: the lookup stays `git ls-remote --tags <remote>` (R4.2), which sees the fetch side; by
+# R4.1 and R6.2 the fetch and push URLs name the same GitHub repository, so a separate push destination
+# exists only under the R5.3 seam (RELEASE_ALLOW_UNPARSED_PUSH_URL=1, set by new_sandbox). Recorded
+# behaviour under the seam, named here because the clause is withdrawn: a tag that exists only at the
+# separate push destination is invisible to check 3 -- `--dry-run` passes; a real run's atomic push is
+# refused (the destination already has that tag; a tag update without --force is rejected), the local
+# tags are removed, nothing is tagged at either place, exit 17, and the pre-existing tag at the push
+# destination is unchanged.
+case_tag_at_push_destination() { # <pushurl> <tag> [extra args...]
+  # (Only `remote.<name>.pushurl` routes the script's by-name push to a separate destination: a URL
+  # rewritten by `url.<base>.pushInsteadOf` is bypassed by the harness's vcs helper, which serves
+  # every by-name operation from the fetch side. The rewrite itself is covered by the
+  # `pushinsteadof-*` cases of the R4.1 push-URL section.)
+  local dry=0 a before
+  for a in "${@:3}"; do [ "$a" = --dry-run ] && dry=1; done
+  must git init -q --bare "$UPSTREAM" || return 0
+  must git -C "$REPO" config remote.origin.pushurl "$UPSTREAM" || return 0
+  must git -C "$REPO" tag "$2" || return 0
+  must git -C "$REPO" push -q "$UPSTREAM" "refs/tags/$2" || return 0 # straight to the push destination's bare repo ...
+  must git -C "$REPO" tag -d "$2" || return 0                 # ... the fetch side never does, and it is not local
+  before="$(git -C "$UPSTREAM" rev-parse "refs/tags/$2")"
+  arrange_green
+  run_tag "$VER" "${@:3}"
+  if [ "$dry" = 1 ]; then
+    # R6.3 WITHDRAWN: --dry-run cannot see a tag at a separate push destination and passes.
+    assert_rc 0 "R6.3 WITHDRAWN: --dry-run passes although $2 exists at the push destination ($1)"
+    assert_last_stdout "dry-run ok $CRATE_TAG at $SHA" "§4: last stdout line for --dry-run"
+    assert_nothing_created "R6.3 WITHDRAWN: --dry-run creates and pushes nothing"
+  else
+    # R6.3 WITHDRAWN: a real run tags, is refused, cleans up after itself and exits 17.
+    expect_failure 17 "R6.3 WITHDRAWN: a real run is refused because $2 exists at the push destination ($1)"
+    assert_tag_absent local "$CRATE_TAG" "R6.3 WITHDRAWN: the local tags created in step 8 are removed"
+    assert_tag_absent local "$GO_TAG" "R6.3 WITHDRAWN: the local tags created in step 8 are removed"
+  fi
+  # Nothing is tagged at either place, and the pre-existing tag at the push destination is unchanged.
+  assert_eq "$(git -C "$UPSTREAM" rev-parse "refs/tags/$2" 2>/dev/null)" "$before" \
+    "the pre-existing tag at the push destination [R6.3 WITHDRAWN: unchanged]"
+  assert_eq "$(git -C "$UPSTREAM" for-each-ref --format='%(refname:short)' refs/tags | sort | tr '\n' ' ')" "$2 " \
+    "tags at the push destination [R6.3 WITHDRAWN: only the pre-existing one; no new tag lands]"
+  assert_eq "$(git -C "$REMOTE" for-each-ref --format='%(refname:short)' refs/tags)" "" \
+    "tags on the fetch side [R6.3 WITHDRAWN: nothing is tagged there either]"
+}
+case_tag_on_fetch_side_found() {
+  # R4.2 (the lookup restored by the withdrawn R6.3): `git ls-remote --tags <remote>` sees the FETCH side,
+  # so a tag that exists only there is found: exit 12, `exists on <remote>`, and nothing after check 3 runs
+  # (the push destination, a separate bare repository under the R5.3 seam, does not have it).
+  must git init -q --bare "$UPSTREAM" || return 0
+  must git -C "$REPO" config remote.origin.pushurl "$UPSTREAM" || return 0
+  must git -C "$REPO" tag "$CRATE_TAG" || return 0
+  must git -C "$REPO" push -q "$REMOTE" "refs/tags/$CRATE_TAG" || return 0 # straight to the fetch-side bare repo
+  must git -C "$REPO" tag -d "$CRATE_TAG" || return 0
+  arrange_green
+  run_tag "$VER"
+  expect_failure 12 "R4.2: $CRATE_TAG exists on the fetch side, which the by-remote-name lookup sees"
+  assert_stderr_has "exists on origin" "R4.2: the message names the remote"
+  assert_stderr_lacks "exists locally" "R4.2: the fetch imported nothing, so it is not local"
+  assert_not_called "§4 check order: nothing after check 3 runs" lockstep cargo gh
+  assert_eq "$(git -C "$UPSTREAM" for-each-ref --format='%(refname:short)' refs/tags)" "" \
+    "the push destination stays empty [R4.2: the tag is on the fetch side only]"
 }
 case_no_go_tag_ignores_go_tag() { # <local|remote>
   make_tag "$1" "$GO_TAG"
@@ -2244,8 +2535,11 @@ case_check_tool_forms() {
   arrange_green
   run_tag "$VER"
   assert_rc 0 "§4 checks 4 and 5"
-  assert_eq "$(log_text lockstep)" "--expect $VER|" "§4 check 4: bash scripts/check-version-lockstep.sh --expect X.Y.Z"
+  # R6.1a: without RELEASE_GATE_DIR the call stays `bash scripts/check-version-lockstep.sh --expect X.Y.Z`
+  # (the relative path means the commit's checkout is the working directory).
+  assert_eq "$(log_text lockstep)" "--expect $VER|" "§4 check 4 / R6.1a: bash scripts/check-version-lockstep.sh --expect X.Y.Z"
   assert_eq "$(log_text cargo)" "metadata --locked --format-version 1|" "§4 check 5: cargo metadata --locked --format-version 1"
+  assert_not_called "R6.1: no gate script runs without RELEASE_GATE_DIR" gate-lockstep
 }
 
 # ── R4.3: --run-id <key>=<N> | <N> ─────────────────────────────────────────
@@ -2452,7 +2746,7 @@ case_waive_dry_run() {
   assert_nothing_created "R4.6: --dry-run creates nothing"
   assert_evidence_state "R4.3/R4.4"
   assert_waived_lines "R4.4: the WAIVED lines are printed in --dry-run too" android-emu=11 windows-switch=33
-  assert_message_printed "R4.6: --dry-run prints the message it would write" "rsac $VER"
+  assert_dry_run_messages "R6.4 / R4.6: --dry-run prints the complete crate and Go messages"
 }
 case_waive_with_run_id() {
   # World: ios-sim=none (waived, issue 5); ci run 1001 given with --run-id; the others green
@@ -2467,6 +2761,8 @@ case_waive_with_run_id() {
 
 # ── R4.6: dry-run prints the message and leaves nothing ────────────────────
 case_dry_run_leaves_no_tag() { # [extra args...]
+  local no_go=0 a
+  for a in "$@"; do [ "$a" = --no-go-tag ] && no_go=1; done
   arrange_green
   run_tag "$VER" --dry-run "$@"
   assert_rc 0 "§4 --dry-run"
@@ -2480,7 +2776,13 @@ case_dry_run_leaves_no_tag() { # [extra args...]
   assert_eq "$(wc -l < "$SB/tags.after.remote" | tr -d ' ')" 0 "remote tags after --dry-run"
   assert_evidence_state "R4.3: --dry-run reports the evidence"
   assert_repository_line "R4.1"
-  assert_message_printed "R4.6: --dry-run prints the message it would write to stderr" "rsac $VER"
+  if [ "$no_go" = 1 ]; then
+    # R6.4: --no-go-tag prints no Go annotation block; the crate message is printed, whole lines.
+    assert_message_printed "R6.4: with --no-go-tag the crate message is printed" "rsac $VER"
+    assert_no_go_block_printed "R6.4: --no-go-tag prints no Go annotation block"
+  else
+    assert_dry_run_messages "R6.4 / R4.6: --dry-run prints the complete crate AND Go messages, whole lines"
+  fi
   assert_stdout_unprefixed "§4: every message goes to stderr"
 }
 
@@ -2514,9 +2816,9 @@ case_success_dry_run() {
   assert_nothing_created "§4 --dry-run creates and pushes nothing"
   assert_eq "$(wc -l < "$SB/tags.after.local" | tr -d ' ')" 0 "local tags after --dry-run [§4 --dry-run]"
   assert_eq "$(wc -l < "$SB/tags.after.remote" | tr -d ' ')" 0 "remote tags after --dry-run [§4 --dry-run]"
-  # R4.6: --dry-run prints the message it would write to stderr (assert_message_printed checks its lines
-  # in order); the Go tag name is in that message, so it shows up in stdout or stderr.
-  assert_output_has "$GO_TAG" "§4 --dry-run prints what it would tag"
+  # R6.4 / R4.6: --dry-run prints both complete messages (whole lines, in order; assert_dry_run_messages
+  # checks the crate block and the Go block).
+  assert_dry_run_messages "R6.4: --dry-run prints what it would tag: both messages"
   assert_stdout_unprefixed "§4: every message goes to stderr"
   # §4 --dry-run runs checks 0 to 7: the evidence was inspected (R4.3: one inspection per requirement)
   assert_eq "$(gh_count 'run view ')" 4 "gh run view calls [§4 --dry-run runs check 7; R4.3: four requirements]"
@@ -2527,7 +2829,8 @@ case_success_dry_run_no_go_tag() {
   assert_rc 0 "§4 --dry-run with --no-go-tag"
   assert_last_stdout "dry-run ok $CRATE_TAG at $SHA" "§4: last stdout line for --dry-run"
   assert_nothing_created "§4 --dry-run creates and pushes nothing"
-  assert_message_printed "R4.6: --dry-run prints the message it would write" "rsac $VER"
+  assert_message_printed "R6.4: the crate message is printed, whole lines" "rsac $VER"
+  assert_no_go_block_printed "R6.4: --no-go-tag prints no Go annotation block"
 }
 case_push_rejected_by_remote() {
   install_hook pre-receive 'cat >> "$(dirname "$0")/../hooklog"; echo "rejected by test hook" >&2; exit 1'
@@ -2715,6 +3018,35 @@ EOF
   expect_assertion_fails assert_no_waived_lines "c"
   expect_assertion_passes assert_stderr_after_evidence "gh workflow run" "c"
   expect_assertion_fails assert_stderr_after_evidence "repository" "c"
+  # R6.4: whole-line comparison — an `Evidence: ci=4242` expectation must not accept `Evidence: ci=42420`.
+  cat > "$SB/stderr" <<EOF
+rsac $VER
+
+Evidence: ci=42420
+Evidence: audio=4343
+Evidence: android-emu=4444
+Evidence: ios-sim=4545
+Evidence: windows-switch=$TESTED_SHA
+EOF
+  expect_assertion_fails assert_message_printed "c" "rsac $VER"
+  cat > "$SB/stderr" <<EOF
+rsac $VER
+
+Evidence: ci=4242
+Evidence: audio=4343
+Evidence: android-emu=4444
+Evidence: ios-sim=4545
+Evidence: windows-switch=$TESTED_SHA
+EOF
+  expect_assertion_passes assert_message_printed "c" "rsac $VER"
+  expect_assertion_passes assert_no_go_block_printed "c"
+  cat >> "$SB/stderr" <<EOF
+rsac-go $VER
+
+Evidence: ci=4242
+EOF
+  expect_assertion_fails assert_no_go_block_printed "c"
+
   EXP_REPO="other/repo"
   expect_assertion_fails assert_repository_line "c"
 }
@@ -2831,7 +3163,10 @@ run_case repo-url-missing-name-rejected case_repo_url_rejected "https://github.c
 run_case repo-url-extra-path-rejected case_repo_url_rejected "https://github.com/o/n/extra"
 run_case repo-url-ssh-without-git-user-rejected case_repo_url_rejected "ssh://github.com/o/n.git"
 run_case repo-url-scp-other-host-rejected case_repo_url_rejected "git@gitlab.com:o/n.git"
-run_case repo-env-overrides-url case_repo_env_overrides_url
+run_case repo-env-fetch-names-other-repository case_repo_env_overrides_url
+run_case repo-env-matching-fetch-url-passes case_repo_env_matching_fetch_url
+run_case repo-fetch-url-unparsed-seam-passes case_fetch_url_unparsed_with_repo seam
+run_case repo-fetch-url-unparsed-no-seam-fails case_fetch_url_unparsed_with_repo no-seam
 run_case repo-empty-env-uses-url case_repo_empty_env_uses_url
 run_case repo-from-chosen-remote case_repo_from_chosen_remote
 
@@ -2878,8 +3213,8 @@ run_case pushurl-local-path case_push_url unset o/n "https://github.com/o/n.git"
   "cannot determine the GitHub repository" "$PU: a local path does not parse (RELEASE_REPO unset)"
 run_case pushurl-parses-but-fetch-url-does-not case_push_url unset o/n "@REMOTE@" "https://github.com/o/n.git" 11 \
   "cannot determine the GitHub repository" "$PU: the fetch URL must parse as well (RELEASE_REPO unset)"
-run_case release-repo-pushurl-names-repo-other-case case_push_url "$TEST_REPO" "$TEST_REPO" "https://github.com/o/n.git" \
-  "https://github.com/RSAC-TEST-OWNER/RSAC-TEST-NAME.git" ok "" "$PU: RELEASE_REPO set, a parsing push URL names REPO case-insensitively"
+run_case release-repo-pushurl-names-repo-other-case case_push_url "$TEST_REPO" "$TEST_REPO" "https://github.com/$TEST_REPO.git" \
+  "https://github.com/RSAC-TEST-OWNER/RSAC-TEST-NAME.git" ok "" "$PU / R6.2: RELEASE_REPO set, a parsing push URL names REPO case-insensitively (the fetch URL names REPO too, as R6.2 requires)"
 run_case release-repo-pushurl-other-repository case_push_url "$TEST_REPO" "$TEST_REPO" "https://github.com/$TEST_REPO.git" \
   "https://github.com/o/n.git" 11 "push URL names a different repository" "$PU / R5.3: the seam variable is set (new_sandbox) and a parsing push URL naming another repository still exits 11"
 run_case release-repo-pushurl-unparseable-host-accepted case_push_url "$TEST_REPO" "$TEST_REPO" "https://github.com/$TEST_REPO.git" \
@@ -2949,6 +3284,33 @@ done
 run_case ci-name-unusable-file-missing case_wf_name_unusable ci file-missing "$N / R5.7: a missing workflow file is 'cannot determine workflow name'"
 run_case audio-name-unusable-file-missing case_wf_name_unusable audio file-missing "$N / R5.7: a missing workflow file is 'cannot determine workflow name'"
 
+# R6.1: the gate's own files come from a trusted directory (RELEASE_GATE_DIR)
+run_case gate-dir-same-names-passes case_gate_dir_same_names
+run_case gate-dir-empty-behaves-as-unset case_gate_dir_empty
+run_case gate-dir-missing case_gate_dir_bad missing
+run_case gate-dir-without-lockstep-script case_gate_dir_bad no-lockstep
+run_case gate-dir-is-a-file case_gate_dir_bad a-file
+for k in $KEYS; do
+  run_case "gate-name-$k-run-named-like-gate-qualifies" case_gate_wf_name "$k" "Gate $(key_wfname "$k")" \
+    "Commit $(key_wfname "$k")" "Gate $(key_wfname "$k")" qualifies \
+    "R6.1: the run is judged by the GATE directory's name, not the commit's ($k)"
+  run_case "gate-name-$k-run-named-like-commit-fails" case_gate_wf_name "$k" "Gate $(key_wfname "$k")" \
+    "Commit $(key_wfname "$k")" "Commit $(key_wfname "$k")" fail \
+    "R6.1: a run named like the COMMIT's workflow does not qualify ($k)" "not the @FILE@ workflow"
+  run_case "gate-name-$k-gate-file-no-name-line" case_gate_wf_name "$k" NONE "Whatever $(key_wfname "$k")" \
+    "Whatever" fail "R6.1: the gate directory's file has no usable name ($k)" "cannot determine workflow name"
+  run_case "gate-name-$k-gate-file-missing" case_gate_wf_name "$k" MISSING "Whatever $(key_wfname "$k")" \
+    "Whatever" fail "R6.1 / R5.7: the gate directory has no $(key_file "$k") at all ($k)" "cannot determine workflow name"
+done
+run_case gate-name-commit-file-unusable-passes case_gate_wf_name ci "Gate CI" "" "Gate CI" qualifies \
+  "R6.1: the commit's own file (empty name here) does not matter; the gate directory's name decides"
+run_case gate-lockstep-gate-fails-commit-passes-refused case_gate_lockstep 1 0 fail \
+  "R6.1: the commit's own always-passing lockstep script does not save it: the GATE directory's script decides (exit 13)"
+run_case gate-lockstep-commit-fails-gate-passes case_gate_lockstep 0 1 pass \
+  "R6.1: the commit's failing lockstep script does not block: the GATE directory's script decides"
+run_case gate-changelog-of-commit-decides case_gate_changelog_of_commit
+run_case gate-note-of-commit-decides case_gate_note_of_commit
+
 # §4 check 3, R4.2: where the tag was found
 run_case tag-exists-local-crate case_tag_exists local "$CRATE_TAG" "§4 check 3 / R4.2: vX.Y.Z exists locally"
 run_case tag-exists-local-go case_tag_exists local "$GO_TAG" "§4 check 3 / R4.2: bindings/rsac-go/vX.Y.Z exists locally"
@@ -2966,6 +3328,13 @@ run_case similar-tags-local-do-not-block case_similar_tags_do_not_block local
 run_case similar-tags-remote-do-not-block case_similar_tags_do_not_block remote
 run_case tags-check-precedes-lockstep case_tags_before_lockstep
 run_case fetch-check-precedes-tags case_fetch_before_tags
+
+# R6.3 WITHDRAWN: the lookup stays on the remote name (R4.2); the cases record the behaviour under the
+# R5.3 seam (a separate push destination): --dry-run passes, a real run is refused and exits 17.
+run_case tag-at-pushurl-destination-crate case_tag_at_push_destination pushurl "$CRATE_TAG"
+run_case tag-at-pushurl-destination-go case_tag_at_push_destination pushurl "$GO_TAG"
+run_case tag-at-pushurl-destination-crate-dry-run case_tag_at_push_destination pushurl "$CRATE_TAG" --dry-run
+run_case tag-on-fetch-side-found-exit-12 case_tag_on_fetch_side_found
 
 # R3.4: the Go module path must carry /vN for a major of 2 or more
 G="R3.4"

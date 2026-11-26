@@ -307,11 +307,17 @@ gh workflow run ci-android-emu.yml --repo "$repo" --ref master -f release_eviden
 gh workflow run ci-ios-sim.yml --repo "$repo" --ref master -f release_evidence=true
 ```
 
-Wait for the runs. In order, the required jobs are **Release Readiness**,
+Wait for each run and check its commit against the SHA from step 1, for
+example with `gh run view RUN_ID --repo "$repo" --json headSha`. In order,
+the required jobs are **Release Readiness**,
 **Audio Release Evidence**, **Android Release Evidence** and **iOS Release
 Evidence**. Each must succeed in a completed, successful manual run of its
 own workflow on the exact release SHA. A green PR run is not evidence for
 the squash commit. Later advances of `master` do not invalidate existing runs.
+
+If `master` moved before a dispatch, create and push a branch at the recorded
+merge SHA. Dispatch the missing evidence workflows with `--ref` pointing at
+that branch and the same inputs as above. Record their run IDs for step 3.
 
 **3. Dispatch the tag workflow on `master`.** Set the shell variable `sha`
 to the full 40-character lower-case SHA recorded in step 1 and substitute
@@ -321,13 +327,27 @@ the stable version for `X.Y.Z`:
 gh workflow run release-tag.yml --repo "$repo" --ref master -f version=X.Y.Z -f sha="$sha"
 ```
 
-`release-tag.yml` checks out that SHA and runs `scripts/tag-release.sh`. The
-gate binds its GitHub queries to the release remote's fetch and single push
-repository. `RELEASE_REPO=owner/name` cannot override a different recognized
-GitHub push target. For a test remote whose push URL cannot be parsed, both
-`RELEASE_REPO` and `RELEASE_ALLOW_UNPARSED_PUSH_URL=1` must be set. The script
-needs a clean tracked tree, fetches only the branch (no tags), and checks that
-`HEAD` is on its history and neither intended tag exists locally or remotely.
+If you collected evidence on another branch, add the `run_ids` input to
+that command, for example `-f run_ids='ci=123 audio=124 android-emu=125 ios-sim=126'`
+(substitute the actual IDs; supply only the keys that need them). Dispatch
+**`release-tag.yml` itself on `master`**, regardless of where evidence ran.
+
+`release-tag.yml` runs its own revision's `scripts/tag-release.sh` from the
+requested commit's checkout. It sets `RELEASE_GATE_DIR` to the separate,
+trusted workflow checkout: the lockstep script and workflow names come from
+there, but the manifests and other release evidence belong to the commit
+being tagged. Locally, leaving `RELEASE_GATE_DIR` unset or empty reads the
+gate files from the current checkout instead.
+
+`RELEASE_REPO=owner/name` cannot override a different recognized GitHub
+fetch or push target. For a test remote whose fetch or push URL cannot be
+parsed, both `RELEASE_REPO` and `RELEASE_ALLOW_UNPARSED_PUSH_URL=1` must
+be set. The gate requires one push URL and a clean tracked tree. It fetches
+only the branch (no tags), checks `HEAD` is on that branch's history, and
+rejects tags that already exist locally or on the named remote. If the test
+seam points pushes elsewhere, a tag present only at that destination is not
+seen in dry-run. A real atomic push rejects the conflict (exit 17): neither
+remote tag changes, and the script removes the local tags it created.
 It verifies manifest lockstep, the committed lockfile (`cargo metadata --locked`),
 the dated changelog heading, and the Go module path for major versions ≥2
 (see [the Go tag convention](#c-rsac-go-tag-convention)).

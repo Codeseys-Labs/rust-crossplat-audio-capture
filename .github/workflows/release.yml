@@ -347,14 +347,17 @@ jobs:
         if: ${{ !(github.event_name == 'workflow_dispatch' && inputs.dry_run) }}
         uses: rust-lang/crates-io-auth-action@c6f97d42243bad5fab37ca0427f495c86d5b1a18 # v1.0.5
       - name: Verify release tag still points to this commit
-        if: ${{ !(github.event_name == 'workflow_dispatch' && inputs.dry_run) }}
+        if: ${{ github.ref_type == 'tag' || !(github.event_name == 'workflow_dispatch' && inputs.dry_run) }}
         shell: bash
         timeout-minutes: 2
         env:
           INPUT_VERSION: ${{ inputs.version }}
         run: |
           set -euo pipefail
-          if [[ "$GITHUB_REF" == refs/tags/v* ]]; then
+          if [[ "$GITHUB_REF_TYPE" == tag ]]; then
+            [[ "$GITHUB_REF_NAME" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]] || {
+              echo "::error::tag ref must be a stable vX.Y.Z release tag"; exit 1;
+            }
             tag="$GITHUB_REF_NAME"
           else
             tag="v$INPUT_VERSION"
@@ -433,7 +436,7 @@ jobs:
   github-release:
     name: Create GitHub Release
     needs: publish
-    if: github.repository == 'Codeseys-Labs/rust-crossplat-audio-capture'
+    if: github.repository == 'Codeseys-Labs/rust-crossplat-audio-capture' && !(github.event_name == 'workflow_dispatch' && inputs.dry_run)
     runs-on: blacksmith-4vcpu-ubuntu-2404
     permissions:
       contents: write
@@ -446,9 +449,15 @@ jobs:
         id: version
         env:
           GITHUB_REF_NAME_SAFE: ${{ github.ref_name }}
+          INPUT_VERSION: ${{ inputs.version }}
         run: |
-          TAG="$GITHUB_REF_NAME_SAFE"
-          VERSION="${TAG#v}"
+          if [[ "$GITHUB_REF_TYPE" == tag ]]; then
+            TAG="$GITHUB_REF_NAME_SAFE"
+            VERSION="${TAG#v}"
+          else
+            VERSION="$INPUT_VERSION"
+            TAG="v$VERSION"
+          fi
           echo "tag=${TAG}" >> "$GITHUB_OUTPUT"
           echo "version=${VERSION}" >> "$GITHUB_OUTPUT"
 
@@ -469,13 +478,18 @@ jobs:
           echo "---- release_body.md ----"
           cat release_body.md
 
-      - name: Create GitHub Release
-        # Pinned in lockstep with release-tag.yml (the primary release path) so
-        # both Release-creating workflows run the identical action commit (#33).
-        uses: softprops/action-gh-release@c95fe1489396fe8a9eb87c0abf8aa5b2ef267fda # v2.0.8
-        with:
-          tag_name: ${{ steps.version.outputs.tag }}
-          name: rsac ${{ steps.version.outputs.version }}
-          body_path: release_body.md
-          draft: false
-          prerelease: false
+      # gh release create fails rather than updating an existing Release, even
+      # if another process creates it between the check and this step.
+      - name: Create GitHub Release if absent
+        shell: bash
+        env:
+          TAG: ${{ steps.version.outputs.tag }}
+          VERSION: ${{ steps.version.outputs.version }}
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          if gh release view "$TAG" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+            echo "GitHub Release $TAG already exists; leaving its body unchanged."
+          else
+            gh release create "$TAG" --repo "$GITHUB_REPOSITORY" --verify-tag --title "rsac $VERSION" --notes-file release_body.md
+          fi

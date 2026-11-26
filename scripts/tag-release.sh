@@ -11,8 +11,10 @@
 # Defaults: origin, master, first qualifying run among the newest 20 per workflow, both tags.
 # --dry-run performs every pre-tag check without creating or pushing the tags.
 # GH_BIN and CARGO_BIN override the gh and cargo executables respectively.
-# RELEASE_REPO overrides GitHub owner/name discovery, not a known push target.
-# An unparsed push URL also requires RELEASE_ALLOW_UNPARSED_PUSH_URL=1 (test seam).
+# RELEASE_GATE_DIR selects a trusted checkout for the lockstep script and workflow names.
+# If unset or empty, those files are read from the commit's checkout.
+# RELEASE_REPO overrides discovery, not a known GitHub fetch or push target.
+# Unparsed URLs also require RELEASE_ALLOW_UNPARSED_PUSH_URL=1 (test seam).
 #
 # Exit: 0 success; 2 usage; 10 dirty tree; 11 repository/fetch/ancestry;
 # 12 tag conflict or lookup failure; 13 manifest lockstep; 14 lockfile;
@@ -75,6 +77,14 @@ done
 for i in "${!run_ids[@]}"; do
     [[ -z ${run_ids[i]} || -z ${waivers[i]} ]] || die 2 "cannot specify both --run-id and --waive for ${keys[i]}"
 done
+gate_prefix=${RELEASE_GATE_DIR:+$RELEASE_GATE_DIR/}
+lockstep="${gate_prefix}scripts/check-version-lockstep.sh"
+lockstep_args=(--expect "$version")
+if [[ -n $gate_prefix ]]; then
+    [[ -d $RELEASE_GATE_DIR && -f $lockstep && -r $lockstep ]] ||
+        die 2 'RELEASE_GATE_DIR must be a directory containing a readable scripts/check-version-lockstep.sh'
+    lockstep_args=(--root "$PWD" --expect "$version")
+fi
 GH_BIN=${GH_BIN:-gh}
 CARGO_BIN=${CARGO_BIN:-cargo}
 tag=v$version
@@ -112,9 +122,14 @@ repo_pattern='^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$'
 capture_output git remote get-url --push --all "$remote" &&
     [[ -n $output && $output != *$'\n'* ]] || die 11 "cannot determine the GitHub repository: expected exactly one push URL for $remote"
 push_url=$output
-if [[ -z $REPO ]]; then
-    capture_output git remote get-url "$remote" && REPO=$(github_repo "$output") ||
-        die 11 "cannot determine the GitHub repository for $remote; set RELEASE_REPO=owner/name"
+capture_output git remote get-url "$remote" && [[ -n $output && $output != *$'\n'* ]] ||
+    die 11 "cannot determine the GitHub repository for the fetch URL of $remote"
+if fetch_repo=$(github_repo "$output"); then
+    if [[ -z $REPO ]]; then REPO=$fetch_repo
+    else same_repo "$REPO" "$fetch_repo" || die 11 "fetch URL names a different repository: $fetch_repo (expected $REPO)"
+    fi
+elif [[ -z $REPO || ${RELEASE_ALLOW_UNPARSED_PUSH_URL:-} != 1 ]]; then
+    die 11 "cannot determine the GitHub repository for the fetch URL of $remote"
 fi
 if push_repo=$(github_repo "$push_url"); then
     same_repo "$REPO" "$push_repo" || die 11 "push URL names a different repository: $push_repo (expected $REPO)"
@@ -160,7 +175,7 @@ major=${version%%.*}
 if ((go_tag)) && [[ ! $major =~ ^0*[01]$ ]] && ! has_go_major; then
     die 18 "bindings/rsac-go/go.mod needs a module path ending in /v$major; use --no-go-tag to omit the Go tag"
 fi
-bash scripts/check-version-lockstep.sh --expect "$version" >/dev/null 2>&1 || die 13 "manifest lockstep check failed for $version"
+bash "$lockstep" "${lockstep_args[@]}" >/dev/null 2>&1 || die 13 "manifest lockstep check failed for $version"
 "$CARGO_BIN" metadata --locked --format-version 1 >/dev/null 2>&1 || die 14 'cargo metadata --locked failed; check the committed Cargo.lock'
 
 has_changelog_heading() {
@@ -174,7 +189,7 @@ has_changelog_heading() {
 has_changelog_heading || die 15 "missing dated heading for [$version] in CHANGELOG.md"
 
 workflow_name() {
-    local file=.github/workflows/$1 line name
+    local file="${gate_prefix}.github/workflows/$1" line name
     [[ -f $file && -r $file ]] || return 1
     while IFS= read -r line || [[ -n $line ]]; do
         [[ $line == name:* ]] || continue

@@ -1,12 +1,12 @@
 # Windows: `hotplug-recovery` follows a live default-device switch
 
-Tested-SHA: e86e8bae59441988178c28cfa116888acf0492ba
+Tested-SHA: 7c3b0a0d0a576bd75a187bdff8a08f1774a86169
 
 This note is workstation evidence that the hosted Windows runner cannot produce: the runner has one render endpoint, and a switch needs two. The release gate (`scripts/tag-release.sh`) reads the line above from the commit being tagged and refuses to tag if any of these paths changed since that commit: `src/api/recovery.rs`, `src/core/recovery.rs`, `src/audio/windows`, `tests/ci_audio/hotplug_common.rs`, `tests/ci_audio/hotplug_windows.rs`. When they change, run the tests again on the new commit and update this note.
 
 ## What was run
 
-Windows 11 (10.0.22631.6199), Rust 1.95.0, 2026-11-26. The tests are `tests/ci_audio/hotplug_windows.rs`; the watched paths in the working tree were identical to the tested commit.
+Windows 11 (10.0.22631.6199), Rust 1.95.0, 2026-11-26, with the tested commit checked out. The tests are `tests/ci_audio/hotplug_windows.rs`.
 
 ```
 RSAC_HOTPLUG_SWITCH=1 \
@@ -22,13 +22,13 @@ Endpoint ids are the ones `rsac list` prints. A was `CABLE Input (VB-Audio Virtu
 
 | Test | Result |
 |---|---|
-| `hotplug_switch_follows_default_with_recovery` | One `SystemDefault` session with auto-recovery, held open across A→B→A. Stream generations 0, 1, 2; `DefaultChanged` then `Recovered` after each switch; B audio 520 ms after the first switch, A audio 537 ms after the second. Worst tone dominance in a counted window: 48.8 dB (the threshold is 20 dB over five consecutive 200 ms windows). |
+| `hotplug_switch_follows_default_with_recovery` | One `SystemDefault` session with auto-recovery, held open across A→B→A. Stream generations 0, 1, 2; `DefaultChanged` then `Recovered` after each switch; B audio 520 ms after the first switch, A audio 466 ms after the second. Worst tone dominance in a counted window: 48.6 dB (the threshold is 20 dB over five consecutive 200 ms windows). |
 | `hotplug_switch_without_recovery_stays_on_old_endpoint` | The same switch without auto-recovery: 15 of 15 windows after the switch on A, none on B, generation 0. Recovery is what moves the capture. |
 | `hotplug_communications_role_switch_is_ignored` | Changing only the communications default: no recovery event, no new generation, 15 of 15 windows on A. |
 
 The machine's defaults were as before after the run.
 
-Earlier runs of the same tests on the pull-request branch also passed between a 48 kHz stereo endpoint and a 96 kHz eight-channel one (recovery 620 ms and 450 ms).
+The same three tests passed with near-identical numbers on `e86e8ba` (520 ms and 537 ms, 48.8 dB), before the 0.5.0 breaking batch removed `WindowsApplicationCapture`; this note was rerun because that batch changed files under `src/audio/windows`. Earlier runs on the pull-request branch also passed between a 48 kHz stereo endpoint and a 96 kHz eight-channel one (recovery 620 ms and 450 ms).
 
 ## The check can fail
 

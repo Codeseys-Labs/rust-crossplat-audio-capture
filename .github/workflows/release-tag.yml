@@ -22,6 +22,11 @@ on:
         type: string
         required: false
         default: ''
+      run_ids:
+        description: Optional space-separated evidence key=run-id items
+        type: string
+        required: false
+        default: ''
       dry_run:
         description: Check the release without creating tags
         type: boolean
@@ -48,6 +53,7 @@ jobs:
           VERSION: ${{ inputs.version }}
           SHA: ${{ inputs.sha }}
           WAIVE: ${{ inputs.waive }}
+          RUN_IDS: ${{ inputs.run_ids }}
           DISPATCH_REF: ${{ github.ref }}
         run: |
           set -euo pipefail
@@ -61,16 +67,35 @@ jobs:
               echo "::error::invalid waiver: $waiver"; exit 1;
             }
           done
+          [[ "$RUN_IDS" != *$'\n'* && "$RUN_IDS" != *$'\r'* ]] || { echo "::error::run ids must be space-separated"; exit 1; }
+          read -r -a run_ids <<< "$RUN_IDS"
+          for run_id in "${run_ids[@]}"; do
+            [[ "$run_id" =~ ^(ci|audio|android-emu|ios-sim)=[0-9]+$ ]] || {
+              echo "::error::invalid run id: $run_id"; exit 1;
+            }
+          done
 
-      # Unlike read-only workflows, credentials must persist: the gate script
-      # fetches the branch and pushes both tags to origin.
-      - uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5
+      # The gate code comes from the workflow revision, not the requested SHA.
+      - name: Check out workflow revision
+        uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5
+        with:
+          ref: ${{ github.sha }}
+          path: gate
+          persist-credentials: false
+
+      # The requested checkout is data for the trusted gate. Credentials must
+      # persist here because the gate fetches the branch and pushes both tags.
+      - name: Check out requested commit
+        uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5
         with:
           ref: ${{ inputs.sha }}
+          path: release-commit
           fetch-depth: 0
           persist-credentials: true
 
       - name: Verify checkout and set bot identity
+        id: checkout
+        working-directory: release-commit
         shell: bash
         env:
           SHA: ${{ inputs.sha }}
@@ -79,17 +104,37 @@ jobs:
           [[ "$(git rev-parse HEAD)" == "$SHA" ]] || { echo "::error::checkout SHA mismatch"; exit 1; }
           git config user.name "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          # Cargo must not execute a compiler or credential helper selected by
+          # a config file from the commit being checked.
+          for config in .cargo/config .cargo/config.toml; do
+            if [[ -e "$config" || -L "$config" ]]; then
+              echo "::error::requested commit contains $config; refusing to execute its Cargo configuration"
+              exit 1
+            fi
+          done
+          toolchain="$(awk -F '"' '/^channel[[:space:]]*=/ { print $2; exit }' "$GITHUB_WORKSPACE/gate/rust-toolchain.toml")"
+          [[ -n "$toolchain" ]] || { echo "::error::trusted toolchain channel is missing"; exit 1; }
+          echo "toolchain=$toolchain" >> "$GITHUB_OUTPUT"
 
-      # The checkout's rust-toolchain.toml selects the pinned channel for cargo.
-      - uses: dtolnay/rust-toolchain@e081816240890017053eacbb1bdf337761dc5582 # 1.95.0
+      # Use the trusted revision's pin, not the requested commit's override.
+      - name: Install trusted Rust toolchain
+        shell: bash
+        timeout-minutes: 5
+        env:
+          TOOLCHAIN: ${{ steps.checkout.outputs.toolchain }}
+        run: rustup toolchain install "$TOOLCHAIN" --profile minimal --no-self-update
 
       - name: Gate and tag release
         id: tag
         shell: bash
+        working-directory: release-commit
         timeout-minutes: 15
         env:
           VERSION: ${{ inputs.version }}
           WAIVE: ${{ inputs.waive }}
+          RUN_IDS: ${{ inputs.run_ids }}
+          RELEASE_GATE_DIR: ${{ github.workspace }}/gate
+          RUSTUP_TOOLCHAIN: ${{ steps.checkout.outputs.toolchain }}
           DRY_RUN: ${{ inputs.dry_run }}
           GH_TOKEN: ${{ github.token }}
         run: |
@@ -98,7 +143,51 @@ jobs:
           if [[ "$DRY_RUN" == true ]]; then args+=(--dry-run); fi
           read -r -a waivers <<< "$WAIVE"
           for waiver in "${waivers[@]}"; do args+=(--waive "$waiver"); done
-          bash scripts/tag-release.sh "${args[@]}"
+          read -r -a run_ids <<< "$RUN_IDS"
+          for run_id in "${run_ids[@]}"; do args+=(--run-id "$run_id"); done
+          bash "$RELEASE_GATE_DIR/scripts/tag-release.sh" "${args[@]}"
+
+      - name: Report remote tags after gate failure
+        if: ${{ failure() && steps.tag.outcome == 'failure' }}
+        working-directory: release-commit
+        shell: bash
+        timeout-minutes: 2
+        env:
+          VERSION: ${{ inputs.version }}
+          SHA: ${{ inputs.sha }}
+        run: |
+          set -u
+          both_match=true
+          {
+            echo "## Remote tags after gate failure"
+            for tag in "v$VERSION" "bindings/rsac-go/v$VERSION"; do
+              ref="refs/tags/$tag"
+              if ! refs="$(git ls-remote --tags origin "$ref" "$ref^{}")"; then
+                echo "- $tag: remote lookup failed"
+                both_match=false
+                continue
+              fi
+              commit="$(awk -v ref="$ref" '$2 == ref { base=$1 } $2 == ref "^{}" { peeled=$1 } END { if (base != "") print (peeled != "" ? peeled : base) }' <<< "$refs")"
+              if [[ -z "$commit" ]]; then
+                echo "- $tag: absent"
+                both_match=false
+              else
+                echo "- $tag: $commit"
+                [[ "$commit" == "$SHA" ]] || both_match=false
+              fi
+            done
+            if [[ "$both_match" == true ]]; then
+              echo "Both tags point to the requested commit. Prepare release-notes.md from its CHANGELOG section and tag evidence."
+              echo "If no Release exists, create it:"
+              echo '```sh'
+              printf 'gh release create "v%s" --repo Codeseys-Labs/rust-crossplat-audio-capture --verify-tag --title "rsac %s" --notes-file release-notes.md\n' "$VERSION" "$VERSION"
+              echo '```'
+              echo "If a draft exists, publish it instead:"
+              echo '```sh'
+              printf 'gh release edit "v%s" --repo Codeseys-Labs/rust-crossplat-audio-capture --draft=false --title "rsac %s" --notes-file release-notes.md\n' "$VERSION" "$VERSION"
+              echo '```'
+            fi
+          } | tee -a "$GITHUB_STEP_SUMMARY"
 
       # A failed API request can leave the Release created despite its response.
       # Recheck before each attempt; if all attempts fail, the gated tags remain
@@ -106,6 +195,7 @@ jobs:
       - name: Create GitHub Release
         id: release
         if: ${{ !inputs.dry_run }}
+        working-directory: release-commit
         shell: bash
         timeout-minutes: 5
         env:
@@ -123,11 +213,18 @@ jobs:
           git for-each-ref --format='%(contents)' "refs/tags/v$VERSION" |
             grep -E '^(Evidence|Waived): ' >> release-notes.md
           for attempt in 1 2 3; do
-            if gh release view "v$VERSION" >/dev/null 2>&1; then
-              echo "GitHub Release v$VERSION already exists."
-              exit 0
-            fi
-            if gh release create "v$VERSION" --verify-tag --title "rsac $VERSION" --notes-file release-notes.md; then
+            if draft="$(gh release view "v$VERSION" --json isDraft --jq .isDraft)"; then
+              if [[ "$draft" == false ]]; then
+                echo "GitHub Release v$VERSION is already published."
+                exit 0
+              elif [[ "$draft" == true ]]; then
+                if gh release edit "v$VERSION" --draft=false --title "rsac $VERSION" --notes-file release-notes.md; then
+                  exit 0
+                fi
+              else
+                echo "::warning::unexpected Release draft status: $draft"
+              fi
+            elif gh release create "v$VERSION" --verify-tag --title "rsac $VERSION" --notes-file release-notes.md; then
               exit 0
             fi
             if (( attempt < 3 )); then sleep 5; fi
@@ -143,10 +240,14 @@ jobs:
         run: |
           {
             echo "## GitHub Release requires manual recovery"
-            echo "The gated tags were pushed. Check whether the Release already exists; if not, create it by hand."
-            echo "Prepare release-notes.md from this version's CHANGELOG section followed by the tag's Evidence: and Waived: lines, then run:"
+            echo "The gated tags were pushed. Prepare release-notes.md from this version's CHANGELOG section followed by the tag's Evidence: and Waived: lines."
+            echo "If no Release exists, create it:"
             echo '```sh'
-            printf 'gh release create "v%s" --verify-tag --title "rsac %s" --notes-file release-notes.md\n' "$VERSION" "$VERSION"
+            printf 'gh release create "v%s" --repo Codeseys-Labs/rust-crossplat-audio-capture --verify-tag --title "rsac %s" --notes-file release-notes.md\n' "$VERSION" "$VERSION"
+            echo '```'
+            echo "If a draft exists, publish it instead:"
+            echo '```sh'
+            printf 'gh release edit "v%s" --repo Codeseys-Labs/rust-crossplat-audio-capture --draft=false --title "rsac %s" --notes-file release-notes.md\n' "$VERSION" "$VERSION"
             echo '```'
           } >> "$GITHUB_STEP_SUMMARY"
 

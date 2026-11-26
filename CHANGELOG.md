@@ -135,9 +135,13 @@ Releases with no ABI change omit the subsection (or state "No C ABI changes").
   can be waived only by naming an open `release-waiver` issue, which is written into the
   tag message and the GitHub Release. The script reads CI from the repository the tags
   are pushed to (the push URL, not only the fetch URL), fetches no tags, and validates
-  `RELEASE_REPO`. The tags are pushed with the workflow token, so no tag-triggered run
-  starts. The publish workflows check, right before an upload, that the release tag
-  still points at the commit they run on.
+  `RELEASE_REPO`. The workflow runs the gate script of its own revision, never the copy
+  in the commit being tagged, so an old commit cannot be tagged under an older gate; the
+  commit is only data (`RELEASE_GATE_DIR`, and `check-version-lockstep.sh --root`). The
+  tags are pushed with the workflow token, so no tag-triggered run starts. The publish
+  workflows check, right before an upload, that the stable `vX.Y.Z` tag still points at
+  the commit they run on, and no longer rewrite the body of a GitHub Release that
+  already exists.
 
 ### Deprecated
 
