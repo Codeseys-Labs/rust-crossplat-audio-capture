@@ -878,6 +878,87 @@ mod async_stream_tests {
         }
     }
 
+    /// A backend a `stop()` reaches mid-poll: the read after waker
+    /// registration finds nothing, and right after it returns the stop lands,
+    /// ending production and preserving one buffer — as a supervised stream's
+    /// stop moves a just-arrived buffer into its tail. Once that buffer is
+    /// taken, reads report the end.
+    struct StopLandsAfterRead {
+        reads: AtomicU32,
+        tail: std::sync::Mutex<Option<AudioBuffer>>,
+        producing: AtomicBool,
+    }
+
+    impl CapturingStream for StopLandsAfterRead {
+        fn read_chunk(&self) -> AudioResult<AudioBuffer> {
+            Err(AudioError::StreamReadError {
+                reason: "blocking read not supported by StopLandsAfterRead".into(),
+            })
+        }
+
+        fn try_read_chunk(&self) -> AudioResult<Option<AudioBuffer>> {
+            let preserved = self.tail.lock().unwrap().take();
+            if preserved.is_some() {
+                return Ok(preserved);
+            }
+            if !self.producing.load(Ordering::SeqCst) {
+                return Err(AudioError::StreamEnded {
+                    reason: "stopped".into(),
+                });
+            }
+            // The second read is the one after waker registration.
+            if self.reads.fetch_add(1, Ordering::SeqCst) == 1 {
+                *self.tail.lock().unwrap() = Some(test_buffer(0.75));
+                self.producing.store(false, Ordering::SeqCst);
+            }
+            Ok(None)
+        }
+
+        fn stop(&self) -> AudioResult<()> {
+            self.producing.store(false, Ordering::SeqCst);
+            Ok(())
+        }
+
+        fn format(&self) -> AudioFormat {
+            test_format()
+        }
+
+        fn is_running(&self) -> bool {
+            self.producing.load(Ordering::SeqCst)
+        }
+
+        fn register_waker(&self, _waker: &Waker) -> bool {
+            true
+        }
+
+        fn is_stream_producing(&self) -> bool {
+            self.producing.load(Ordering::SeqCst)
+        }
+    }
+
+    /// A buffer that becomes readable between the post-registration read and
+    /// the producing check is still yielded before the stream ends.
+    #[test]
+    fn test_a_buffer_preserved_after_the_last_read_is_yielded_before_the_end() {
+        let backend = StopLandsAfterRead {
+            reads: AtomicU32::new(0),
+            tail: std::sync::Mutex::new(None),
+            producing: AtomicBool::new(true),
+        };
+        let (waker, _test_waker) = make_test_waker();
+        let mut cx = Context::from_waker(&waker);
+        let mut async_stream = AsyncAudioStream::new(&backend);
+
+        match Pin::new(&mut async_stream).poll_next(&mut cx) {
+            Poll::Ready(Some(Ok(buf))) => assert_eq!(buf.data()[0], 0.75),
+            other => panic!("Expected the preserved buffer, got {:?}", other),
+        }
+        match Pin::new(&mut async_stream).poll_next(&mut cx) {
+            Poll::Ready(None) => {}
+            other => panic!("Expected stream end (None), got {:?}", other),
+        }
+    }
+
     /// FH-5: an EMPTY non-waking backend that still claims to be producing must
     /// NOT park on a waker that will never fire. `poll_next` must self-wake so
     /// the executor re-polls — proven here by the registered waker actually

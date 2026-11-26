@@ -23,11 +23,13 @@
 //! `Reopening` phase is the in-flight guard). A poll only *collects* the
 //! helper's result and returns `Ok(None)` while an open is in flight. What a
 //! poll itself retires — a replacement the runtime format gate rejects, a probe
-//! result that came too late, an open that raced `stop()`, and the
-//! device-change watcher of a session that just ended — is released (streams
-//! stopped, the watcher's notify thread joined) on a short-lived
-//! `rsac-recovery-dispose` thread. When no such thread can be spawned the
-//! resources are kept, and the capture's own `stop()` or drop releases them;
+//! result that came too late, an open that raced `stop()`, a stream still
+//! installed when the session exhausts (one a failed reopen spawn never
+//! retired), and the device-change watcher of a session that just ended — is
+//! released (streams stopped, the watcher's notify thread joined) on a
+//! short-lived `rsac-recovery-dispose` thread. When no such thread can be
+//! spawned the resources are kept, and the capture's own `stop()` or drop
+//! releases them;
 //! the poll never does. The detach and that handoff happen in one critical
 //! section of the `machine` lock, which `stop()` takes too, so `stop()` finds
 //! every retired stream still installed, handed off, or kept — never in
@@ -146,6 +148,10 @@ type Doomed = Vec<Arc<dyn CapturingStream>>;
 /// Moves what a poll retired off the read path, or hands it back when it
 /// cannot (see [`spawn_disposal`]).
 type Disposer = Box<dyn Fn(Retired) -> Result<(), Retired> + Send + Sync>;
+
+/// Starts the helper thread that runs one reopen attempt (see
+/// [`spawn_reopen_helper`]).
+type ReopenSpawner = fn(Box<dyn FnOnce() + Send>) -> std::io::Result<()>;
 
 /// Locks `mutex`, recovering the guard when a previous holder panicked: every
 /// value guarded in this module is plain state that stays valid across a panic.
@@ -653,6 +659,14 @@ fn spawn_disposal(retired: Retired) -> Result<(), Retired> {
     }
 }
 
+/// Runs one reopen attempt on a short-lived `rsac-recovery-open` thread.
+fn spawn_reopen_helper(attempt: Box<dyn FnOnce() + Send>) -> std::io::Result<()> {
+    std::thread::Builder::new()
+        .name("rsac-recovery-open".into())
+        .spawn(attempt)
+        .map(drop)
+}
+
 impl Core {
     fn active_stream(&self) -> Option<Arc<dyn CapturingStream>> {
         lock(&self.slot).stream.clone()
@@ -922,6 +936,9 @@ struct RecoveryStream {
     /// How a poll moves what it retired off the read path: [`spawn_disposal`]
     /// outside tests. Called with the machine lock held.
     disposer: Disposer,
+    /// How `start_reopen` starts its helper thread: [`spawn_reopen_helper`]
+    /// outside tests.
+    spawn_reopen: ReopenSpawner,
     /// What a poll retired but could not hand off; released by `stop()` or on
     /// drop, never by a poll.
     retained: Mutex<Retired>,
@@ -993,6 +1010,7 @@ impl RecoveryStream {
             ring_slots,
             read_timeout: READ_TIMEOUT,
             disposer: Box::new(spawn_disposal),
+            spawn_reopen: spawn_reopen_helper,
             retained: Mutex::new(Retired::default()),
             #[cfg(feature = "async-stream")]
             poll_waker: PollWaker::default(),
@@ -1361,9 +1379,7 @@ impl RecoveryStream {
         };
         let core = Arc::clone(&self.core);
         let gate = m.gate;
-        let spawned = std::thread::Builder::new()
-            .name("rsac-recovery-open".into())
-            .spawn(move || core.run_reopen(gate));
+        let spawned = (self.spawn_reopen)(Box::new(move || core.run_reopen(gate)));
         if let Err(e) = spawned {
             let mut mailbox = lock(&self.core.mailbox);
             *mailbox = Some(Reopened {
@@ -1559,6 +1575,11 @@ impl RecoveryStream {
         let mut machine = lock(&self.machine);
         let mut doomed = Doomed::new();
         let result = self.advance(&mut machine, &mut doomed);
+        // An exhausted session keeps no backend: a stream still installed —
+        // one a failed reopen spawn never retired — leaves with the rest.
+        if matches!(machine.phase, Phase::Exhausted { .. }) {
+            doomed.extend(self.core.detach_active());
+        }
         // The one place a buffer reaches the caller (`try_read_chunk` and
         // `read_chunk` both return this poll's result).
         if matches!(result, Ok(Some(_))) {
@@ -4473,5 +4494,44 @@ mod tests {
                 "stop first: never by the reader"
             );
         }
+    }
+
+    #[test]
+    fn a_session_exhausted_by_a_failed_reopen_spawn_retires_the_stream_still_installed() {
+        // A proactive switch whose reopen helper cannot be spawned, with no
+        // budget left after it: no helper ever retires the old, still live
+        // stream.
+        let old = MockStream::new(stereo(RATE), vec![]);
+        let opener = Opener::new(vec![]);
+        let h = Harness::build(
+            fast_policy()
+                .with_max_attempts(1)
+                .with_settle_delay(Duration::ZERO),
+            &old,
+            opener.factory(),
+            RecoveryTrigger::default(),
+            |stream| {
+                stream.spawn_reopen = |_| Err(std::io::Error::other("no thread for the reopen"))
+            },
+        );
+        h.trigger.trigger_default_change();
+
+        let (buffers, err) = read_until_err(&h.stream);
+
+        assert!(buffers.is_empty());
+        match err {
+            AudioError::StreamEnded { reason } => assert!(reason.contains("exhausted"), "{reason}"),
+            other => panic!("expected StreamEnded, got {other:?}"),
+        }
+        assert_eq!(opener.calls(), 0, "no reopen helper ever ran");
+        assert_eq!(h.hub.snapshot().state, RecoveryState::Exhausted);
+        // Without any stop(): the exhausted session hands the stream to the
+        // disposal thread.
+        wait_for(|| old.stopped());
+        assert_ne!(
+            old.stopped_by(),
+            Some(std::thread::current().id()),
+            "stopped off the read path"
+        );
     }
 }
