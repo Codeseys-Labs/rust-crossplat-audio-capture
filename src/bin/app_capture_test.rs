@@ -216,29 +216,38 @@ fn test_platform_specific() -> Result<(), Box<dyn std::error::Error>> {
     println!("🖥️  Testing platform-specific features...");
 
     // Windows: application discovery goes through the cross-platform public
-    // API (`list_audio_applications` + the builder). Those items exist
-    // whatever backend features are enabled, so no `feature` gate is needed
-    // here.
+    // API. Those items exist whatever backend features are enabled, so no
+    // `feature` gate is needed here.
     #[cfg(target_os = "windows")]
     {
         println!("  Windows platform detected");
-        match rsac::list_audio_applications() {
-            Ok(applications) => {
-                println!("    Found {} audio applications", applications.len());
-                // Resolve the first listed application by name through the
-                // builder — the canonical application-capture path
-                // (`CaptureTarget::ApplicationByName`).
-                if let Some(app) = applications.first() {
-                    match rsac::AudioCaptureBuilder::new()
-                        .with_target(rsac::CaptureTarget::ApplicationByName(app.name.clone()))
-                        .build()
-                    {
-                        Ok(_) => println!("    ✅ Process discovery working"),
-                        Err(_) => println!("    ⚠️  Process discovery may have issues"),
-                    }
+        // Scope-aware listing, so a failed WASAPI session query is reported
+        // as a failure instead of passing as a zero count (which is what
+        // `list_audio_applications` would swallow). Name resolution is
+        // deliberately not exercised: it happens at capture start, not at
+        // listing, so a builder `build()` here would prove nothing.
+        match rsac::list_audio_applications_scoped() {
+            Ok(enumeration) => {
+                let scope = enumeration.scope;
+                println!(
+                    "    Found {} audio application(s), scope: {:?}",
+                    enumeration.applications.len(),
+                    scope
+                );
+                if matches!(scope, rsac::ApplicationScope::EnumerationFailed) {
+                    // The (empty) list is incomplete, not "no applications".
+                    return Err(
+                        "Application enumeration failed (ApplicationScope::EnumerationFailed)"
+                            .into(),
+                    );
                 }
+                // A successful listing — including an empty one — is the
+                // meaningful check of the public application-discovery API.
+                println!("    ✅ Application enumeration working");
             }
-            Err(e) => println!("    ⚠️  Could not list audio applications: {e}"),
+            Err(e) => {
+                return Err(format!("Application enumeration failed: {e}").into());
+            }
         }
     }
 
