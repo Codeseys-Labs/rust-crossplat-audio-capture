@@ -1107,7 +1107,9 @@ jobs:
         # Build doctests with the same feature set so doc examples that touch
         # async-stream / sink-wav / compose APIs are exercised too — the compose
         # module docs carry a `no_run` doctest that must COMPILE here.
-        run: cargo test --doc --no-default-features --features feat_linux,async-stream,sink-wav,test-utils,compose
+        # `hotplug-recovery` exposes the recovery types, whose doctests would
+        # otherwise run only on the Windows and macOS legs.
+        run: cargo test --doc --no-default-features --features feat_linux,async-stream,sink-wav,test-utils,compose,hotplug-recovery
 
   # ── Feature powerset (cargo-hack, Linux) ───────────────────────────
   # The hand-picked feature-combo-doctests job above checks ONE combination;
