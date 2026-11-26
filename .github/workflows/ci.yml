@@ -1096,10 +1096,12 @@ jobs:
 
       # rsac-86c7: async-stream unit tests are clippy'd above but were never
       # EXECUTED by any `--lib` leg. Run them here — this job already isolates
-      # the optional-feature build.
-      - name: Run unit tests (async-stream)
+      # the optional-feature build. `hotplug-recovery` is added for this step
+      # only: the per-OS unit jobs enable it without `async-stream`, so the
+      # recovery tests gated on `async-stream` would otherwise run nowhere.
+      - name: Run unit tests (async-stream + hotplug-recovery)
         run: |
-          cargo test --lib --no-default-features --features feat_linux,async-stream,sink-wav,test-utils,compose
+          cargo test --lib --no-default-features --features feat_linux,async-stream,sink-wav,test-utils,compose,hotplug-recovery
 
       - name: Run doctests
         # Build doctests with the same feature set so doc examples that touch
