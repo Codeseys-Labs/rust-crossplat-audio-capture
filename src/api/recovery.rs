@@ -109,7 +109,8 @@ const RECOVERY_EVENT_CHANNEL_CAPACITY: usize = 32;
 /// Terminal reason when a replacement stream delivers a different format.
 const FORMAT_CHANGED_REASON: &str = "reconnected device changed format";
 
-/// Terminal reason when `stop()` lands while no stream is installed.
+/// Terminal reason when `stop()` lands while recovery is under way: no
+/// generation is running or settling.
 const STOPPED_DURING_RECOVERY_REASON: &str = "capture stopped while auto-recovery was reopening";
 
 /// Terminal reason once the tail `stop()` preserved has been delivered.
@@ -862,7 +863,8 @@ struct Machine {
     tail: VecDeque<AudioBuffer>,
     /// Set once `stop()` has preserved the tail: from then on the backend is
     /// never read again, so reads end with the tail instead of waiting for (or
-    /// timing out on) the backend's teardown.
+    /// timing out on) the backend's teardown. `terminal` is raised in the same
+    /// critical section.
     tail_preserved: bool,
     /// Buffers of the old stream still to deliver after the settle cutoff:
     /// the backlog readable at that cutoff. `None` before the cutoff.
@@ -922,7 +924,9 @@ struct RecoveryStream {
     expected_format: AudioFormat,
     /// Never held across backend work: see the module docs.
     machine: Mutex<Machine>,
-    /// Set once stopped or exhausted; backs `is_running()`.
+    /// Set once stopped or exhausted, always under the machine lock: by
+    /// `begin_stop` right after the tail is preserved, or by `exhaust`. Backs
+    /// `is_running()`.
     terminal: AtomicBool,
     /// Buffers handed to the caller, counted where a poll returns one; backs
     /// `buffers_captured()`.
@@ -1219,9 +1223,15 @@ impl RecoveryStream {
         }
     }
 
-    /// After `stop()`: serve the tail `stop()` preserved, then end the session.
-    /// Before `stop()` has reached the tail, the still-running stream serves
-    /// reads. Never opens anything, and never waits for the backend's teardown.
+    /// After `stop()` is requested: serve the tail `stop()` preserved, then end
+    /// the session. The stop's own `StreamEnded` comes only once `begin_stop`
+    /// has preserved the tail and raised `terminal` (one critical section of
+    /// the machine lock held here); until then the still-installed stream
+    /// serves reads and a poll with nothing to deliver returns `Ok(None)`. A
+    /// buffer the format gate rejects in that window still exhausts the
+    /// session at once; `exhaust` raises `terminal` itself, so every
+    /// `StreamEnded` a poll returns finds `is_running()` already false. Never
+    /// opens anything, and never waits for the backend's teardown.
     fn read_after_stop(
         &self,
         m: &mut Machine,
@@ -1230,23 +1240,32 @@ impl RecoveryStream {
         if let Some(buffer) = m.tail.pop_front() {
             return self.accept(m, buffer, doomed).map(Some);
         }
-        let stopped_during_recovery = || AudioError::StreamEnded {
-            reason: STOPPED_DURING_RECOVERY_REASON.to_string(),
-        };
-        if !matches!(m.phase, Phase::Running | Phase::Settling { .. }) {
-            return Err(stopped_during_recovery());
-        }
+        let live = matches!(m.phase, Phase::Running | Phase::Settling { .. });
         if m.tail_preserved {
+            let reason = if live {
+                STOPPED_REASON
+            } else {
+                STOPPED_DURING_RECOVERY_REASON
+            };
             return Err(AudioError::StreamEnded {
-                reason: STOPPED_REASON.to_string(),
+                reason: reason.to_string(),
             });
         }
-        match self.core.active_stream() {
-            Some(stream) => match stream.try_read_chunk()? {
-                Some(buffer) => self.accept(m, buffer, doomed).map(Some),
-                None => Ok(None),
-            },
-            None => Err(stopped_during_recovery()),
+        // `stop()` has not reached the tail yet: the session has not ended.
+        if !live {
+            return Ok(None);
+        }
+        let Some(stream) = self.core.active_stream() else {
+            return Ok(None);
+        };
+        match stream.try_read_chunk() {
+            Ok(Some(buffer)) => self.accept(m, buffer, doomed).map(Some),
+            Ok(None) => Ok(None),
+            // A loss racing the stop is not reported: the stop ends the
+            // session, and `begin_stop` publishes that end.
+            Err(e) if e.is_fatal() => Ok(None),
+            // Recoverable read errors pass through, as on the live path.
+            Err(e) => Err(e),
         }
     }
 
@@ -1518,16 +1537,19 @@ impl RecoveryStream {
     }
 
     /// The part of `stop()` that runs under the machine lock: preserves the
-    /// tail, then takes what `stop()` must release — the installed stream,
-    /// whatever polls kept because no disposal thread could be spawned, and
-    /// the watcher. A poll detaches and hands off (or keeps) what it retires
-    /// under this same lock, so nothing is caught in between; whatever a poll
-    /// retires afterwards is the installed stream returned here, which
-    /// `stop()` stops. Idempotent.
+    /// tail and raises `terminal` in one critical section, so a poll that
+    /// finds the tail preserved also finds the stream stopped, and no poll can
+    /// end the session while `is_running()` is still true. Then takes what
+    /// `stop()` must release — the installed stream, whatever polls kept
+    /// because no disposal thread could be spawned, and the watcher. A poll
+    /// detaches and hands off (or keeps) what it retires under this same lock,
+    /// so nothing is caught in between; whatever a poll retires afterwards is
+    /// the installed stream returned here, which `stop()` stops. Idempotent.
     fn begin_stop(&self) -> (Option<Arc<dyn CapturingStream>>, Retired) {
         let mut machine = lock(&self.machine);
         let active = self.core.active_stream();
         self.preserve_tail(&mut machine, active.as_deref());
+        self.terminal.store(true, Ordering::Release);
         let mut teardown = std::mem::take(&mut *lock(&self.retained));
         let watcher = lock(&self.watcher).take();
         teardown.absorb(Retired {
@@ -1708,14 +1730,16 @@ impl CapturingStream for RecoveryStream {
     /// this teardown. Never waits for a reopen helper or for a reader.
     ///
     /// The stream reports itself stopped (`is_running()`, and so
-    /// `is_stream_producing()`, turn false) only once the tail is preserved:
-    /// an async reader that just found the backend empty keeps polling and
-    /// receives that tail instead of ending before it exists.
+    /// `is_stream_producing()`, turn false) only once `begin_stop` has
+    /// preserved the tail, and the stop does not end a read before that: from
+    /// the request until then, a poll with nothing to deliver returns
+    /// `Ok(None)`. An async reader that just found the backend empty therefore
+    /// keeps polling, receives that tail, and then sees the stop as the end of
+    /// the stream, never as an error.
     fn stop(&self) -> AudioResult<()> {
         self.core.stop_requested.store(true, Ordering::SeqCst);
         self.hub.mark_stopped(self.session);
         let (active, teardown) = self.begin_stop();
-        self.terminal.store(true, Ordering::Release);
         // A result the helper posted before it saw the flag is ours to dispose.
         let late = lock(&self.core.mailbox).take();
         if let Some(Reopened { outcome, .. }) = late {
@@ -4627,6 +4651,83 @@ mod tests {
             Poll::Ready(Some(Ok(preserved))) => assert_eq!(preserved.timestamp(), Some(ms(0))),
             other => panic!("expected the preserved buffer, got {other:?}"),
         }
+        assert!(matches!(
+            Pin::new(&mut reader).poll_next(&mut cx),
+            Poll::Ready(None)
+        ));
+    }
+
+    /// A supervisor that lost generation 0 and is now in a 30 s backoff.
+    fn backing_off() -> Harness {
+        let policy = fast_policy()
+            .with_initial_backoff(Duration::from_secs(30))
+            .with_max_backoff(Duration::from_secs(30));
+        let lost = MockStream::new(stereo(RATE), vec![Step::End("device unplugged")]);
+        let h = Harness::new(policy, &lost, Opener::new(vec![]).factory());
+        assert!(matches!(h.stream.try_read_chunk(), Ok(None)));
+        assert!(matches!(
+            lock(&h.stream.machine).phase,
+            Phase::Backoff { .. }
+        ));
+        h
+    }
+
+    #[test]
+    fn a_read_racing_a_stop_during_recovery_ends_only_once_the_stream_reports_itself_stopped() {
+        let h = backing_off();
+
+        // stop() is requested and then held before it ends the session: its
+        // next step takes the hub's status lock, held here.
+        let held = lock(&h.hub.status);
+        let stopper = Arc::clone(&h.stream);
+        let stopping = std::thread::spawn(move || stopper.stop());
+        wait_for(|| h.stream.core.stop_requested.load(Ordering::SeqCst));
+
+        assert!(
+            matches!(h.stream.try_read_chunk(), Ok(None)),
+            "no end is reported while the stream still reports itself running"
+        );
+        assert!(h.stream.is_running());
+        drop(held);
+        stopping.join().expect("stopper thread").expect("stop");
+
+        match h.stream.try_read_chunk() {
+            Err(AudioError::StreamEnded { reason }) => {
+                assert_eq!(reason, STOPPED_DURING_RECOVERY_REASON)
+            }
+            other => panic!("expected StreamEnded, got {other:?}"),
+        }
+        assert!(!h.stream.is_running());
+    }
+
+    #[cfg(feature = "async-stream")]
+    #[test]
+    fn an_async_reader_sees_a_stop_during_recovery_as_the_end_of_the_stream_not_an_error() {
+        use crate::bridge::AsyncAudioStream;
+        use futures_core::Stream;
+        use std::pin::Pin;
+        use std::task::{Context, Poll, Waker};
+
+        let h = backing_off();
+        let mut cx = Context::from_waker(Waker::noop());
+        let mut reader = AsyncAudioStream::new(h.stream.as_ref());
+
+        // stop() is requested and then held before it ends the session: its
+        // next step takes the hub's status lock, held here.
+        let held = lock(&h.hub.status);
+        let stopper = Arc::clone(&h.stream);
+        let stopping = std::thread::spawn(move || stopper.stop());
+        wait_for(|| h.stream.core.stop_requested.load(Ordering::SeqCst));
+
+        // The stream still reports itself running, so an end read here would
+        // reach the reader as an error item.
+        match Pin::new(&mut reader).poll_next(&mut cx) {
+            Poll::Pending => {}
+            other => panic!("expected Pending while stop() is in progress, got {other:?}"),
+        }
+        drop(held);
+        stopping.join().expect("stopper thread").expect("stop");
+
         assert!(matches!(
             Pin::new(&mut reader).poll_next(&mut cx),
             Poll::Ready(None)
