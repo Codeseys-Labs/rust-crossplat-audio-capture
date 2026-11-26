@@ -1,7 +1,7 @@
 [package]
 name = "rsac-ffi"
 # In lockstep with the workspace version (rsac + napi + python) — ci.yml's
-# version-lockstep gate and scripts/bump-version.sh treat all seven manifests as
+# version-lockstep gate and scripts/bump-version.sh treat all nine manifests as
 # one version.
 version = "0.4.4"
 edition = "2021"

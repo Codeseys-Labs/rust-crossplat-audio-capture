@@ -256,18 +256,30 @@ Plus `CHANGELOG.md` (it rotates the `[Unreleased]` section into a dated
 heading and re-seeds an empty `[Unreleased]`).
 
 ```bash
-# Substitute the target version for X.Y.Z (e.g. the current release is 0.4.1).
+# Substitute the target version for X.Y.Z.
 # `mise run release:bump -- X.Y.Z` is the same command via the task runner.
 bash scripts/bump-version.sh X.Y.Z --dry-run   # preview
 bash scripts/bump-version.sh X.Y.Z             # apply
 git diff                                        # review
-git add -A && git commit -m "release: vX.Y.Z"   # subject triggers release-tag.yml
-# (release-tag.yml then tags + creates the GitHub Release; see RELEASE_PROCESS.md)
 ```
 
-Pushing the tag triggers `release.yml` (crates.io), `release-npm.yml`
-(npm) and `release-pypi.yml` (PyPI). Full procedure including pre-flight
-checks and post-publish verification is in
+Then follow
+[Using the automated flow](RELEASE_PROCESS.md#using-the-automated-flow) in
+`docs/RELEASE_PROCESS.md`: commit the bump as `rsac X.Y.Z` (tracked files
+only, `git add -u`), dispatch `ci.yml` with `-f full=true -f semver=true`, and
+when that run is green run `bash scripts/tag-release.sh X.Y.Z`
+(`mise run release:tag -- X.Y.Z`). The script refuses to tag a commit without
+that run and pushes the crate tag and the Go module tag together.
+
+Do not give a hand-made commit the subject `release: vX.Y.Z`. That subject is
+reserved for the pull request the Release Prepare workflow opens:
+`release-tag.yml` tags any commit on `master` that carries it after checking
+only the version lockstep, not the CI run
+([#119](https://github.com/Codeseys-Labs/rust-crossplat-audio-capture/issues/119)).
+
+A tag pushed by a person triggers `release.yml` (crates.io),
+`release-npm.yml` (npm) and `release-pypi.yml` (PyPI). The full procedure,
+including pre-flight checks and post-publish verification, is in
 [`docs/RELEASE_PROCESS.md`](RELEASE_PROCESS.md).
 
 ## 8. Pull request checklist

@@ -153,7 +153,7 @@ are now **resolved** in 0.3.0; recorded here so the history is clear:
 - **C FFI `rsac_version()` reports the real version (was BFFI-04 — RESOLVED
   0.3.0).** It now returns `concat!(env!("CARGO_PKG_VERSION"), "\0")` and
   `rsac-ffi` is in version lockstep with the workspace (enforced by the
-  `version-lockstep` CI gate across all seven manifests).
+  `version-lockstep` CI gate across all nine manifests).
 - **Go `ReadBuffer`/`TryReadBuffer` concurrent-`Close()` is safe (was BFFI-02 /
   #28 — RESOLVED 0.3.0).** `Close()` sets a `closing` flag, calls
   `rsac_capture_request_stop` to unblock a parked read, and drains a
