@@ -66,7 +66,8 @@ Releases with no ABI change omit the subsection (or state "No C ABI changes").
   emulator/simulator workflows and `bench.yml` no longer run on `pull_request`, branch
   pushes or cron; start them with `gh workflow run <workflow> --ref <branch>`. A `ci.yml`
   branch dispatch scopes itself by the branch's diff against `master` (`-f full=true`
-  forces every job). Still automatic: the PR changelog guard, the weekly non-Rust
+  forces the whole matrix; the release semver gate is a separate `-f semver=true`).
+  Still automatic: the PR changelog guard, the weekly non-Rust
   supply-chain scan, and stable `v*.*.*` tags.
 - **CI cost & coverage changes** — split `changelog-guard` into its own workflow so PR
   label edits re-run only that job; moved `macos-audio` to GitHub-hosted `macos-15` with
@@ -99,6 +100,9 @@ Releases with no ABI change omit the subsection (or state "No C ABI changes").
   The FFI, Go and Node bindings surface this as their device-not-found error code.
 - **macOS CoreAudio:** honored `StreamConfig::buffer_size` in
   `CoreAudioDevice::create_stream` (closing the last backend parity gap).
+- **Async stream (`async-stream`):** a buffer that became readable while the stream was
+  stopping, between the last read and the end-of-stream check, is now yielded before
+  the stream ends instead of being dropped.
 - **`lefthook.yml` on Windows:** routed hooks through `mise run` instead of bare `bash`
   to avoid resolving WSL's `System32/bash.exe`.
 

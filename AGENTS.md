@@ -456,12 +456,15 @@ change needs from the Actions tab or with `gh workflow run <workflow> --ref
 <branch>`; check runs attach to the dispatched commit, so they show on that
 commit's open PR. The only automatic runs are the PR changelog guard, the
 weekly non-Rust supply-chain scan, and stable `v*.*.*` tags (the release gate).
+The tag runs start only for a tag pushed by a person or with the release App
+token: a tag `release-tag.yml` pushes with the default `GITHUB_TOKEN` starts no
+workflow, so dispatch `ci.yml` and `ci-audio-tests.yml` on that tag by hand.
 **A PR with no dispatched run has no CI evidence** — say so in the PR instead of
 implying green. See [desktop refinement](docs/DESKTOP_REFINEMENT.md#d5--desktop-release-and-mobile-freeze).
 
 | Workflow | Runs on | Purpose |
 |---|---|---|
-| [`ci.yml`](.github/workflows/ci.yml) | manual dispatch, stable tags | Desktop lint and unit tests, MSRV, feature and binding checks. A branch dispatch scopes itself by the branch's diff against `master` (docs-only → no matrix; mobile legs only for mobile-relevant paths); `-f full=true` forces every job including coverage, `-f semver=true` adds the release semver gate. Rust MSRV is **1.88**; the pinned development toolchain can be newer. |
+| [`ci.yml`](.github/workflows/ci.yml) | manual dispatch, stable tags | Desktop lint and unit tests, MSRV, feature and binding checks. A branch dispatch scopes itself by the branch's diff against `master` (docs-only → no matrix; mobile legs only for mobile-relevant paths); `-f full=true` forces the whole matrix including coverage, and `-f semver=true` separately adds the release semver gate. Rust MSRV is **1.88**; the pinned development toolchain can be newer. |
 | [`ci-audio-tests.yml`](.github/workflows/ci-audio-tests.yml) | manual dispatch (`-f platform=all\|linux\|windows\|macos\|bindings`), stable tags | Virtual-audio integration on real audio stacks. |
 | [`changelog-guard.yml`](.github/workflows/changelog-guard.yml) | every PR (automatic) | Independent PR changelog guard, including label changes. |
 | [`supply-chain.yml`](.github/workflows/supply-chain.yml) | weekly cron (automatic), manual dispatch | Non-Rust dependency and license audit. |

@@ -849,7 +849,7 @@ The `BridgeStream` design is validated by all reference projects:
 **Platform-specific constraints**:
 - **Windows**: Process loopback requires Win10+, shared mode only, autoconvert required, use parent PID for tree capture
 - **Linux**: Virtual sink strategy requires creating/managing PipeWire objects dynamically; Strategy A is simpler for single-app capture
-- **macOS**: Requires macOS 14.4+ (rsac floor; the tap API is documented from 14.2), `com.apple.security.device.audio-input` entitlement, TCC `kTCCServiceAudioCapture` permission
+- **macOS**: the Process Tap paths (`SystemDefault`, `Application*`, `ProcessTree`) require macOS 14.4+ (rsac floor; the tap API is documented from 14.2) and the System Audio Recording TCC service (`kTCCServiceAudioCapture`). `Device` capture goes through AUHAL instead and requires the Microphone TCC service (`kTCCServiceMicrophone`), with the `com.apple.security.device.audio-input` entitlement for sandboxed or hardened-runtime apps. Neither grant implies the other (see the permission table in §Permissions above)
 
 ### 5.4 Error Taxonomy Cross-Reference
 

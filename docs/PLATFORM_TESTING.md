@@ -29,6 +29,13 @@ Two workflows carry it. Both are **manually dispatched**
 (`gh workflow run <workflow> --ref <branch>`) and also run on stable `v*.*.*`
 tags; nothing runs automatically on a push or PR except the changelog guard.
 
+The tag runs have one exception. If the release App credentials are absent,
+`release-tag.yml` pushes the tag with the default `GITHUB_TOKEN`, and GitHub
+starts no workflow from such a push. Neither workflow runs for that tag, so
+dispatch both on it by hand (`gh workflow run ci.yml --ref vX.Y.Z -f full=true`,
+`gh workflow run ci-audio-tests.yml --ref vX.Y.Z`) before treating the release
+as CI-verified.
+
 #### `ci.yml` — lint, unit tests, cross-compile checks
 
 Runs on all three platforms plus bindings and supporting gates:

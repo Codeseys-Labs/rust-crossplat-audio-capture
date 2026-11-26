@@ -8,15 +8,16 @@ on:
   # control): there is no `pull_request` trigger and no branch `push` trigger.
   # Run it from the Actions tab, or:
   #   gh workflow run ci.yml --ref <branch>               # diff-scoped (see `changes`)
-  #   gh workflow run ci.yml --ref <branch> -f full=true  # everything
+  #   gh workflow run ci.yml --ref <branch> -f full=true  # whole matrix (semver gate: add -f semver=true)
   # Check runs attach to the dispatched commit, so they still show on that
   # commit's open PR. The only automatic PR check is changelog-guard.yml.
   workflow_dispatch:
     inputs:
       full:
         description: >-
-          Run every job (mobile legs and advisory coverage included) regardless
-          of which paths the branch changed. Default: scope the run by the
+          Run the whole matrix (mobile legs and advisory coverage included)
+          regardless of which paths the branch changed. Does not include the
+          release semver gate; see `semver`. Default: scope the run by the
           branch's diff against the default branch.
         type: boolean
         default: false

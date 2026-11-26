@@ -123,17 +123,22 @@ impl RunningCapture {
     /// # fn main() -> Result<(), Box<dyn std::error::Error>> {
     /// use rsac::{AudioCaptureBuilder, CaptureTarget};
     /// use rsac::core::config::{AudioFormat, SampleFormat};
-    /// use rsac::sink::WavFileSink;
+    /// use rsac::sink::{AudioSink, WavFileSink};
     ///
     /// let capture = AudioCaptureBuilder::new()
     ///     .with_target(CaptureTarget::SystemDefault)
     ///     .start()?;
-    /// let format = capture.format().unwrap_or(AudioFormat {
-    ///     sample_rate: 48000,
-    ///     channels: 2,
+    /// // Build the sink from the first DELIVERED buffer. Right after `start()`
+    /// // a backend may not have published its negotiated format yet, and
+    /// // `WavFileSink` rejects a buffer that does not match its header.
+    /// let first = capture.read_buffer_blocking()?;
+    /// let format = AudioFormat {
+    ///     sample_rate: first.sample_rate(),
+    ///     channels: first.channels(),
     ///     sample_format: SampleFormat::F32,
-    /// });
-    /// let sink = WavFileSink::new("capture.wav", &format)?;
+    /// };
+    /// let mut sink = WavFileSink::new("capture.wav", &format)?;
+    /// sink.write(&first)?;
     /// let drain = capture.drain_to(sink)?;
     /// std::thread::sleep(std::time::Duration::from_secs(2));
     /// drain.shutdown(); // flushes + closes the sink, joins the thread

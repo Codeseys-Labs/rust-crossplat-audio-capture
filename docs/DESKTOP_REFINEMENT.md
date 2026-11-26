@@ -22,7 +22,7 @@ Split the API facade first, then the Linux thread module, preserving public path
 
 ### D4 — Ring sizing and clocks
 
-All five backends honor explicit `StreamConfig::buffer_size` as a ring-slot count; the macOS production path is fixed. `calculate_capacity_for_period` remains unwired until effective negotiated periods are available before allocation and validated per backend ([ADR-0007 status](designs/0007-capacity-period-sizing.md#status-addendum--2026-11-25)). Do not add a selector whose period argument is always absent.
+All five backends — Windows, Linux, macOS, Android and iOS — honor explicit `StreamConfig::buffer_size` as a requested ring-slot count, not a frame count; the macOS production path is fixed. The static `calculate_capacity` policy remains in use. This is the current implementation status: [ADR-0007](designs/0007-capacity-period-sizing.md) records the original decision, and its Windows-only statements describe that decision, not today's code. `calculate_capacity_for_period` remains unwired until each backend exposes and validates its effective negotiated callback period early enough to size the ring; preferred buffer sizes or maximum slice sizes alone do not establish that period. Do not add a selector whose period argument is always absent.
 
 Keep `AudioBuffer::timestamp()` as stream position. Optional Windows device-clock metadata is later work, after the wasapi update and virtual-device validation; invalid timestamp metadata and unvalidated process-loopback positions must not be presented as valid. Do not change compose alignment on that basis.
 

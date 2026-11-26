@@ -467,6 +467,10 @@ check with `--expect X.Y.Z` on the merge commit and refuses to create the tag
 on any mismatch; at tag time `release.yml` re-checks the tag against the root
 `Cargo.toml`, and `ci.yml` fires on the `v*.*.*` tag push — its `on:` block
 keeps a `tags: ['v*.*.*', '!v*-*']` trigger — and hard-fails on drift.
+Those tag-time runs need a tag push that can start workflows. A tag pushed by
+hand or with the release App token does; a tag `release-tag.yml` pushes with the
+default `GITHUB_TOKEN` (no App credentials) starts none, so dispatch `ci.yml`
+and `ci-audio-tests.yml` on the tag yourself in that case.
 
 > **Merge it as a SQUASH merge, and do NOT edit the commit subject.** The
 > tag automation in step 3 keys on the squash-merge commit *subject* being
@@ -671,6 +675,8 @@ gate), and `ci.yml` runs its full nine-manifest lockstep on the `v*.*.*` tag
 push too (its `on:` block has a `tags: ['v*.*.*', '!v*-*']` trigger), so the
 lockstep gate covers the tagging step *and* tag time. A mismatched
 manifest must never reach a registry.
+(As above: a `GITHUB_TOKEN`-pushed tag starts no workflow, so those tag-time
+runs must be dispatched by hand.)
 
 > Mid-cycle skew is tolerated by CI (warning only) so a binding can lag
 > the root crate between releases, but it must be reconciled before
@@ -859,7 +865,7 @@ RUSTDOCFLAGS="-D warnings" cargo doc --no-deps --all-features
 ```
 
 Then dispatch CI on the commit you intend to tag
-(`gh workflow run ci.yml --ref <branch> -f full=true`, plus
+(`gh workflow run ci.yml --ref <branch> -f full=true -f semver=true`, plus
 `ci-audio-tests.yml` for the audio matrix) and confirm **every platform is
 green** — CI is manual, so no run exists until you start one.
 The workflows live in `.github/workflows/` (`ci.yml`,

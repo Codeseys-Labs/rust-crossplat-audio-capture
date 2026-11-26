@@ -247,7 +247,7 @@ they are documented above as part of the in-scope surface:
 - **Period-aware ring sizing** — `calculate_capacity_for_period` is implemented
   but unwired pending effective per-backend period negotiation before allocation.
   Explicit slot requests already work on Windows, Linux, macOS, Android and iOS
-  ([ADR-0007](docs/designs/0007-capacity-period-sizing.md#status-addendum--2026-11-25)).
+  ([desktop refinement D4](docs/DESKTOP_REFINEMENT.md#d4--ring-sizing-and-clocks); original decision in [ADR-0007](docs/designs/0007-capacity-period-sizing.md)).
 
 Each of these is tracked on `Codeseys-Labs/rust-crossplat-audio-capture` and/or
 in [`docs/reviews/`](docs/reviews/).

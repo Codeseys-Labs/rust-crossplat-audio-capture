@@ -171,7 +171,7 @@ review, run what the change needs and link the run in the PR:
 
 ```bash
 gh workflow run ci.yml --ref <branch>                # scoped by the branch's diff against master
-gh workflow run ci.yml --ref <branch> -f full=true   # every job, incl. mobile legs + coverage
+gh workflow run ci.yml --ref <branch> -f full=true   # whole matrix, incl. mobile legs + coverage; add -f semver=true for the release semver gate
 gh workflow run ci-audio-tests.yml --ref <branch> -f platform=linux   # real-audio E2E, one platform
 ```
 

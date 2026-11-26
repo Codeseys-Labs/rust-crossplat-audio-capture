@@ -7,7 +7,7 @@ The canonical loop retrospective is
 [`docs/reviews/ci-audio-final-status-2026-04-25.md`](reviews/ci-audio-final-status-2026-04-25.md);
 this document distills the durable facts from it.
 
-## 1. Truth table (6 of 9 cells REAL)
+## 1. Truth table (7 of 9 cells REAL)
 
 Each cell is one tier (a step group) of the per-platform job in
 [`.github/workflows/ci-audio-tests.yml`](../.github/workflows/ci-audio-tests.yml).
@@ -15,29 +15,32 @@ Each cell is one tier (a step group) of the per-platform job in
 |  | **Linux** (PipeWire) | **Windows** (WASAPI) | **macOS** (CoreAudio) |
 |---|---|---|---|
 | **System capture** | REAL | REAL (VB-CABLE) | SKIP-EARLY (TCC) |
-| **Device capture** | REAL | REAL (VB-CABLE) | ERRORS-GRACEFULLY (AUHAL) |
+| **Device capture** | REAL | REAL (VB-CABLE) | REAL on GitHub-hosted (BlackHole; content check is soft) |
 | **Process capture** | REAL | REAL (Process Loopback) | SKIP-EARLY (TCC) |
 
 The two Process Tap gaps (System, Process) are platform-security
 constraints: managed headless runners cannot grant the TCC service they
-need. The Device gap is an environment hang that was observed on Blacksmith
-macOS. Since `macos-audio` moved to GitHub-hosted `macos-15` with BlackHole
-pinned as the default output and input, that cell is unverified; the first
-run there decides whether it becomes REAL (7 of 9). All three macOS paths are
+need. The Device cell was an environment hang on Blacksmith macOS. Since
+`macos-audio` moved to GitHub-hosted `macos-15` with BlackHole pinned as the
+default output and input, the first run there (45738663823, 2026-11-26)
+captured 94 buffers / 48,128 frames with a non-silent first buffer, which makes
+it 7 of 9. One caveat: the macOS job does not set
+`RSAC_CI_AUDIO_DETERMINISTIC`, so silence in that cell would warn, not fail.
+All three macOS paths are
 verified on real hardware by manual QA before each release (see
 [`VISION.md`](../VISION.md) § "How We Verify the Vision").
 
 ### What "REAL" means
 
-For the six REAL cells, every CI run:
+For the REAL cells, every dispatched run:
 
 1. Installs the platform's audio stack (PipeWire for Linux, VB-CABLE for
-   Windows, BlackHole for the macOS device path, which is not yet REAL;
-   see below).
+   Windows, BlackHole for the macOS device path).
 2. Routes a 440 Hz test tone through the OS's default output.
 3. Captures through the rsac public API.
 4. Asserts the captured `AudioBuffer` has non-silent data (`max
-   amplitude > 0.001`) and measurable RMS energy.
+   amplitude > 0.001`) and measurable RMS energy. This is a hard assertion on
+   the six Linux and Windows cells and a warning on the macOS Device cell.
 
 Reference evidence: Linux runs capture >40 K frames per test; Windows
 reports ~137 buffers at RMS 0.570 from VB-CABLE loopback.
@@ -50,7 +53,8 @@ reports ~137 buffers at RMS 0.570 from VB-CABLE loopback.
   env var set, the test returns immediately with a diagnostic banner
   rather than blocking 10–18 minutes inside
   `AudioHardwareCreateProcessTap`.
-- **ERRORS-GRACEFULLY:** on `blacksmith-6vcpu-macos-15`, macOS Device
+- **ERRORS-GRACEFULLY (historical, Blacksmith only):** on
+  `blacksmith-6vcpu-macos-15`, macOS Device
   capture targeting BlackHole hit `AUHAL.start()`, which hung ~11 minutes
   and then failed with `OSStatus 2003332927`. That value is `0x77686F3F`,
   the FourCC `'who?'`, which is `kAudioHardwareUnknownPropertyError` (the
