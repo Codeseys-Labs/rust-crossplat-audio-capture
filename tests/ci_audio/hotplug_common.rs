@@ -1518,7 +1518,12 @@ mod tests {
     fn machine_lock_survives_a_test_that_panicked_holding_it() {
         let poisoner = std::thread::spawn(|| {
             let _guard = machine_lock();
-            panic!("intentional: a failed evidence test panics while holding the lock");
+            // `resume_unwind` unwinds (and so poisons the lock) without
+            // running the panic hook: no "panicked at" line and backtrace in
+            // the log of a run where nothing went wrong.
+            std::panic::resume_unwind(Box::new(
+                "intentional: a failed evidence test unwinds while holding the lock",
+            ));
         });
         assert!(poisoner.join().is_err());
         drop(machine_lock());

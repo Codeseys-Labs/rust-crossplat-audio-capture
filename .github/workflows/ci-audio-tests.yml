@@ -634,8 +634,10 @@ jobs:
       # default-SWITCH tests need two render endpoints and this runner has
       # one, so they print HOTPLUG-SKIP here and run on a workstation (the
       # result is docs/evidence/windows-default-switch.md). The loss tests
-      # run twice: once hiding the endpoint (what "Disable" in the Sound
-      # panel does) and once disabling its device node (what an unplug does).
+      # hide the endpoint (what "Disable" in the Sound panel does). Disabling
+      # the device node instead (RSAC_HOTPLUG_LOSS_MODE=pnp) is not possible
+      # here: Disable-PnpDevice fails with "Generic failure" on the
+      # root-enumerated VB-CABLE node (run 45896704998).
       - name: Hotplug recovery tier (endpoint loss)
         id: tier_hotplug
         continue-on-error: true
@@ -643,31 +645,23 @@ jobs:
         shell: pwsh
         env:
           RSAC_HOTPLUG_LOSS: "1"
+          RSAC_HOTPLUG_LOSS_MODE: visibility
         run: |
-          $cable = Get-PnpDevice -Class MEDIA -PresentOnly -ErrorAction SilentlyContinue |
-            Where-Object { $_.FriendlyName -match 'VB-Audio' } | Select-Object -First 1
-          if (-not $cable) { Write-Error "VB-CABLE device node not found"; exit 1 }
-          Write-Host "VB-CABLE device node: $($cable.InstanceId)"
-          foreach ($mode in @('visibility', 'pnp')) {
-            $env:RSAC_HOTPLUG_LOSS_MODE = $mode
-            $env:RSAC_HOTPLUG_PNP_INSTANCE_ID = $cable.InstanceId
-            $log = "ci-audio-hotplug-$mode.log"
-            cargo test --test ci_audio hotplug_ `
-              --no-default-features --features feat_windows,compose,sink-wav,hotplug-recovery `
-              -- --test-threads=1 --nocapture `
-              2>&1 | Tee-Object -FilePath $log
-            if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
-            # A skipped test is not evidence: both loss tests must have
-            # printed their line, and nothing may have been left disabled.
-            $evidence = @(Select-String -Path $log -Pattern 'HOTPLUG-EVIDENCE test=hotplug_loss_\w+ result=pass').Count
-            if ($evidence -ne 2) {
-              Write-Error "mode ${mode}: expected 2 HOTPLUG-EVIDENCE lines for the loss tests, found $evidence"
-              exit 1
-            }
-            if (Select-String -Path $log -Pattern 'HOTPLUG-RESTORE-FAILED' -Quiet) {
-              Write-Error "mode ${mode}: an endpoint or a default was not restored"
-              exit 1
-            }
+          cargo test --test ci_audio hotplug_ `
+            --no-default-features --features feat_windows,compose,sink-wav,hotplug-recovery `
+            -- --test-threads=1 --nocapture `
+            2>&1 | Tee-Object -FilePath ci-audio-hotplug.log
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          # A skipped test is not evidence: both loss tests must have printed
+          # their line, and nothing may have been left disabled.
+          $evidence = @(Select-String -Path ci-audio-hotplug.log -Pattern 'HOTPLUG-EVIDENCE test=hotplug_loss_\w+ result=pass').Count
+          if ($evidence -ne 2) {
+            Write-Error "expected 2 HOTPLUG-EVIDENCE lines for the loss tests, found $evidence"
+            exit 1
+          }
+          if (Select-String -Path ci-audio-hotplug.log -Pattern 'HOTPLUG-RESTORE-FAILED' -Quiet) {
+            Write-Error "an endpoint or a default was not restored"
+            exit 1
           }
 
       - name: Record tier outcomes
