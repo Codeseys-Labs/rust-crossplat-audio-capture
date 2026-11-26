@@ -329,14 +329,16 @@ release (see §2 for the pre-release checklist):
 # Bump the version + promote CHANGELOG entries under a dated heading.
 # scripts/bump-version.sh rewrites all nine lockstep manifests + rotates
 # the CHANGELOG — see §2 "CHANGELOG promotion" and §3 "Version bump".
-git add -A
-git commit -m "rsac X.Y.Z"
-git push origin master
-
-# Tag and push — this is the workflow trigger. Nothing checks a hand-made tag
-# before it exists, so run the lockstep check first; `&&` stops the paste
-# before `git tag` if the check fails.
-bash scripts/check-version-lockstep.sh --expect X.Y.Z &&
+#
+# Then commit, push, check and tag as ONE `&&` chain: a failure at any step
+# stops the paste. Without it, a failed commit would still let the lockstep
+# check pass on the uncommitted manifests and tag the pre-bump HEAD. Nothing
+# else checks a hand-made tag before it exists; pushing it is the workflow
+# trigger.
+git add -A &&
+  git commit -m "rsac X.Y.Z" &&
+  git push origin master &&
+  bash scripts/check-version-lockstep.sh --expect X.Y.Z &&
   git tag -a vX.Y.Z -m "rsac X.Y.Z" &&
   git push origin vX.Y.Z
 ```
