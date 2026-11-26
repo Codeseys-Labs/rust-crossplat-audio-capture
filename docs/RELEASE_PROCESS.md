@@ -399,7 +399,10 @@ sub-packages before the main package, so the main package's page can look
 clean after a partial publish. If **no** package on any registry has `X.Y.Z`,
 delete the tag locally and remotely
 (`git tag -d vX.Y.Z && git push --delete origin vX.Y.Z`), fix the underlying
-issue, and re-tag. If **any** package already has it, or you cannot establish
+issue, and tag again through the checked sequence above. A fix that needs a
+new commit needs its own green dispatched run: push it, set `BUMP_SHA` to it,
+dispatch `ci.yml` as in block 1, then run blocks 2 and 3. The earlier run
+covered the old commit only. If **any** package already has it, or you cannot establish
 that for every package, leave the tag where it is and ship the fix as a new
 version: re-tagging would make the same version name point at different
 commits across registries. crates.io publishes are
@@ -866,14 +869,19 @@ before uploading.
 
 Once the RC is validated, promote it through the checked sequence in
 [Using the automated flow](#using-the-automated-flow); do not tag by hand
-outside its block 3. The commit to tag must be the head of `master` and carry
-the stable version in all nine manifests: if it does not yet, bump as in §3
-(block 1). If it already does, skip block 1's commit, set
-`BUMP_SHA="$(git rev-parse HEAD)"` and dispatch `ci.yml` on `master`
+outside its block 3. The commit to tag must be on `master`, be its head when
+CI is dispatched (`--ref master` tests the head) and carry the stable version
+in all nine manifests: if it does not yet, bump as in §3 (block 1). If it
+already does, skip block 1's commit, set `BUMP_SHA="$(git rev-parse HEAD)"`
+and dispatch `ci.yml` on `master`
 (`gh workflow run ci.yml --ref master -f full=true -f semver=true`) unless a
-`ci.yml` run dispatched on `master` already exists for that commit. Block 2
-looks only there: a run on an RC branch for the same commit does not count.
-Then run blocks 2 and 3.
+`ci.yml` run dispatched on `master` with `full=true` and `semver=true` already
+exists for that commit. Block 2 looks only on `master` and cannot tell which
+inputs a run had: a run on an RC branch for the same commit does not count,
+and neither does a default dispatch, which is scoped by the diff and skips the
+semver gate. When unsure, dispatch again. Then run blocks 2 and 3. A commit
+that lands on `master` after the dispatch does not invalidate the run: block 3
+tags `$BUMP_SHA`, the commit the run tested, not the branch head.
 
 The tag push triggers all three registry workflows in parallel, and nothing
 else checks the commit first.
