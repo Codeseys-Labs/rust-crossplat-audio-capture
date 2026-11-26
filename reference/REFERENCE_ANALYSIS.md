@@ -2,6 +2,8 @@
 
 > Comprehensive analysis of 10 reference repositories mapped to rsac's architecture.
 > This document provides actionable implementation guidance for each platform backend.
+>
+> Sections 1–6 are the original analysis. Current pins, upstream deltas and the ranked harvest list are in [Reference Delta & Harvest (2026-11-25)](#reference-delta--harvest-2026-11-25). Where that section contradicts an older one, the newer section wins.
 
 ## Executive Summary
 
@@ -47,6 +49,8 @@ This document compiles the analysis of 10 reference repositories spanning three 
   - [5.4 Error Taxonomy Cross-Reference](#54-error-taxonomy-cross-reference)
   - [5.5 Capability Matrix](#55-capability-matrix)
 - [6. Key Takeaways for rsac Implementation](#6-key-takeaways-for-rsac-implementation)
+- [Reference Delta & Unadopted Techniques (2026-05-29)](#reference-delta--unadopted-techniques-2026-05-29)
+- [Reference Delta & Harvest (2026-11-25)](#reference-delta--harvest-2026-11-25)
 
 ---
 
@@ -56,7 +60,7 @@ This document compiles the analysis of 10 reference repositories spanning three 
 
 #### Architecture Overview
 
-The `wasapi-rs` crate (v0.22.0) is a thin, idiomatic Rust wrapper around the Windows WASAPI COM APIs. It uses the `windows` crate (v0.62) for FFI bindings and exposes a module structure of:
+The `wasapi-rs` crate (analysed at v0.22.0; the pin is now v0.27.0, whose signature changes are listed in the [2026-11-25 delta](#reference-delta--harvest-2026-11-25)) is a thin, idiomatic Rust wrapper around the Windows WASAPI COM APIs. It uses the `windows` crate (v0.62) for FFI bindings and exposes a module structure of:
 
 - [`src/lib.rs`](reference/wasapi-rs/src/lib.rs:1) — Re-exports all public types from submodules
 - [`src/api.rs`](reference/wasapi-rs/src/api.rs:1) — Core API: `DeviceEnumerator`, `Device`, `AudioClient`, `AudioCaptureClient`, `AudioRenderClient`, `Handle`, plus stream mode/share mode enums
@@ -430,24 +434,38 @@ PID → AudioObjectID via `kAudioHardwarePropertyTranslatePIDToProcessObject`. `
 
 ### 3.3 screencapturekit-rs — ScreenCaptureKit Bindings
 
-#### ObjC FFI Patterns from Rust
-1. **Swift Bridge with C ABI**: Compiles Swift Package, links static library
-2. **Opaque Pointer + Ref Counting**: `*const c_void` with explicit retain/release
-3. **Context Pointer for Callbacks**: Heap-allocated context passed through FFI as `*mut c_void`
-4. **Packed FFI Structs**: Offset+length for batch string data
+Pinned at `v12.0.0` (`0d8e0f1`). rsac does not depend on it. It is the reference for a possible ScreenCaptureKit (SCK) path.
 
-#### Audio Capture via ScreenCaptureKit
-`SCStream` provides audio alongside screen capture. Config: `set_captures_audio(true)`, `set_sample_rate(48000)`, `set_channel_count(2)`. Different from Process Tap — requires screen recording permission.
+#### FFI structure (v12)
+1. **Swift bridge with C ABI** (`swift-bridge/`) for SCK calls. Core Graphics, Core Media and Core Video types come from `apple-cf 0.12`.
+2. **Opaque pointer + ref counting**: `*const c_void` with explicit retain/release.
+3. **Context pointer for callbacks**. Completion and picker callbacks are tokenized (v9) and run outside locks behind panic barriers.
+4. **Read-only sample buffers**: since v11, audio comes from `apple-cf`'s checked `CMSampleBuffer::audio_buffer_list() -> Result<_, i32>`. The crate's own Swift audio-buffer bridge is gone.
+
+#### Audio capture via ScreenCaptureKit
+`SCStream` delivers audio alongside screen capture (`with_captures_audio(true)`, plus sample rate and channel count on the stream configuration). Availability is split:
+- App inclusion in `SCContentFilter` (`with_including_applications`): macOS 12.3. It is display-scoped, not a PID or process-tree contract.
+- Audio capture (`capturesAudio`): macOS 13.0.
+- `SCShareableContent::current_process()`: macOS 14.4. Since v9 it reports unavailable below 14.4 instead of widening to system-wide enumeration.
+
+#### Permissions
+Three separate TCC services matter on macOS. None implies another.
+
+| Path | TCC service | Used by |
+|---|---|---|
+| SCK stream | Screen Recording (`kTCCServiceScreenCapture`) | screencapturekit-rs |
+| Core Audio Process Tap | System Audio Recording (`kTCCServiceAudioCapture`) | rsac `SystemDefault`, `Application*`, `ProcessTree` |
+| Input device (AUHAL) | Microphone (`kTCCServiceMicrophone`) | rsac `Device` |
 
 #### Error Handling
-21 error variants in `SCError`, 21 Apple-defined `SCStreamErrorCode` values (-3801 to -3821).
+`SCError` (`src/utils/error.rs`) plus the Apple-defined `SCStreamErrorCode` values (-3801 to -3821).
 
 ---
 
 ### 3.4 Key Patterns for rsac macOS Backend
 
 #### Process Tap Implementation Strategy
-Use CoreAudio Process Tap (not ScreenCaptureKit): no screen recording permission, lower latency, per-process targeting, macOS 14.0+.
+Use CoreAudio Process Tap (not ScreenCaptureKit): no Screen Recording permission, lower latency, per-process targeting. Apple documents the tap API from macOS 14.2; rsac's supported floor is 14.4.
 
 Sequence: translate PID → AudioObjectID → CATapDescription → AudioHardwareCreateProcessTap → aggregate device → AudioDeviceCreateIOProcID → AudioDeviceStart.
 
@@ -458,8 +476,8 @@ Option B recommended: Direct CoreAudio C API + minimal ObjC for `CATapDescriptio
 
 | rsac CaptureTarget | macOS Mapping |
 |---|---|
-| `SystemDefault` | Standard AUHAL capture (no tap) |
-| `Device(DeviceId)` | Standard CoreAudio device capture |
+| `SystemDefault` | Global Process Tap (`initStereoGlobalTapButExcludeProcesses:`) + private aggregate device |
+| `Device(DeviceId)` | AUHAL on an input-capable device (Microphone TCC) |
 | `Application(ApplicationId)` | PID → AudioObjectID → CATapDescription |
 | `ApplicationByName(String)` | Enumerate → find → same |
 | `ProcessTree(ProcessId)` | PID → AudioObjectID → CATapDescription (accepts array) |
@@ -474,7 +492,7 @@ Option B recommended: Direct CoreAudio C API + minimal ObjC for `CATapDescriptio
 | PID not in audio system | `TargetNotAvailable` | Recoverable |
 
 #### Capability Reporting
-Application capture: true (macOS 14.0+), process tree: true, mute on capture: true, requires entitlement: true, requires TCC permission: true.
+Application capture: true (macOS 14.4+ in rsac), process tree: true (snapshot of descendants at start), mute on capture: true, requires entitlement: true, requires TCC permission: true (System Audio Recording for taps, Microphone for `Device`).
 
 ---
 
@@ -484,7 +502,7 @@ Application capture: true (macOS 14.0+), process tree: true, mute on capture: tr
 
 #### Overview
 
-cpal (v0.18.0) is the de facto standard Rust crate for cross-platform audio I/O. It provides a unified `Host → Device → Stream` abstraction spanning 10+ backends: WASAPI, ALSA, PipeWire, PulseAudio, CoreAudio, AAudio, JACK, ASIO, WebAudio, and AudioWorklet.
+cpal (analysed at v0.18.0; the pin is now master `44ba7ad`, Cargo version 0.19.0, unreleased) is the de facto standard Rust crate for cross-platform audio I/O. It provides a unified `Host → Device → Stream` abstraction spanning 10+ backends: WASAPI, ALSA, PipeWire, PulseAudio, CoreAudio, AAudio, JACK, ASIO, WebAudio, and AudioWorklet.
 
 **Key dependency**: `dasp_sample = "0.11"` for sample type conversions. Platform-specific dependencies include `windows` (WASAPI), `alsa` (Linux), `coreaudio-rs` + `objc2-core-audio` (macOS), `pipewire` (Linux, optional), `ndk` (Android).
 
@@ -542,6 +560,7 @@ pub trait StreamTrait {
 ```
 - Minimal interface — streams are controlled externally
 - cpal asserts `Stream: Send + Sync` at compile time via macros ([`assert_stream_send!()`](reference/cpal/src/traits.rs:320), [`assert_stream_sync!()`](reference/cpal/src/traits.rs:340))
+- On master `44ba7ad`, `play` is renamed `start`, `StreamTrait` itself requires `Send + Sync`, and `ErrorKind::Xrun` is gone in favour of in-band `CallbackInfo::xrun()`
 
 #### Platform Backend Dispatch
 
@@ -611,7 +630,7 @@ cpal's error types in [`src/error.rs`](reference/cpal/src/error.rs:1) follow a h
 
 #### Overview
 
-rtrb (v0.3.3) is a realtime-safe single-producer single-consumer (SPSC) ring buffer. It is the lock-free bridge that rsac's `BridgeStream` uses to transfer audio data from OS callback threads to consumer threads.
+rtrb (analysed at v0.3.3; the pin is now 0.4.1 while rsac's dependency is still 0.3.4) is a realtime-safe single-producer single-consumer (SPSC) ring buffer. It is the lock-free bridge that rsac's `BridgeStream` uses to transfer audio data from OS callback threads to consumer threads.
 
 **Key properties**:
 - **Zero dependencies** (beyond `alloc` and `core`) — `no_std` compatible
@@ -633,7 +652,7 @@ let (mut producer, mut consumer) = RingBuffer::<f32>::new(capacity);
 - [`slots()`](reference/rtrb/src/lib.rs:361) — number of available write slots (reads atomic head)
 - [`cached_slots()`](reference/rtrb/src/lib.rs:372) — fast path using cached head (no atomic read)
 - [`is_full()`](reference/rtrb/src/lib.rs:414) — quick check
-- [`is_abandoned()`](reference/rtrb/src/lib.rs:462) — returns `true` if `Consumer` was dropped (via `Arc::strong_count`)
+- [`is_abandoned()`](reference/rtrb/src/lib.rs:462) — returns `true` if `Consumer` was dropped (0.3.x: via `Arc::strong_count`; 0.4 replaces `Arc` with an internal `ArcRingBuffer` so the check synchronizes across threads again)
 - `Send` but not `Sync` — can move between threads but only one thread can write
 
 **Consumer** ([`src/lib.rs:514`](reference/rtrb/src/lib.rs:514)):
@@ -821,7 +840,7 @@ The `BridgeStream` design is validated by all reference projects:
 
 | rsac CaptureTarget | Windows (WASAPI) | Linux (PipeWire) | macOS (CoreAudio) |
 |---|---|---|---|
-| `SystemDefault` | Default render device + loopback flag | Default sink monitor (metadata lookup) | Standard AUHAL capture |
+| `SystemDefault` | Default render device + loopback flag | Default sink monitor (metadata lookup) | Global Process Tap |
 | `Device(DeviceId)` | Direct device capture via IMMDevice ID | Node by serial/name | CoreAudio device by AudioObjectID |
 | `Application(ApplicationId)` | `new_application_loopback_client(pid, false)` | Strategy A: `TARGET_OBJECT = <serial>` | PID → AudioObjectID → CATapDescription |
 | `ApplicationByName(String)` | sysinfo → PID → process loopback | Strategy B: Virtual sink + name matching | Enumerate processes → find → tap |
@@ -830,7 +849,7 @@ The `BridgeStream` design is validated by all reference projects:
 **Platform-specific constraints**:
 - **Windows**: Process loopback requires Win10+, shared mode only, autoconvert required, use parent PID for tree capture
 - **Linux**: Virtual sink strategy requires creating/managing PipeWire objects dynamically; Strategy A is simpler for single-app capture
-- **macOS**: Requires macOS 14.0+, `com.apple.security.device.audio-input` entitlement, TCC `kTCCServiceAudioCapture` permission
+- **macOS**: Requires macOS 14.4+ (rsac floor; the tap API is documented from 14.2), `com.apple.security.device.audio-input` entitlement, TCC `kTCCServiceAudioCapture` permission
 
 ### 5.4 Error Taxonomy Cross-Reference
 
@@ -856,7 +875,7 @@ The `BridgeStream` design is validated by all reference projects:
 
 | Capability | Windows | Linux | macOS |
 |---|---|---|---|
-| System audio capture | ✅ (loopback) | ✅ (sink monitor) | ✅ (AUHAL) |
+| System audio capture | ✅ (loopback) | ✅ (sink monitor) | ✅ (global Process Tap) |
 | Device selection | ✅ | ✅ | ✅ |
 | Application capture | ✅ (Win10+) | ✅ (PipeWire) | ✅ (macOS 14+) |
 | Application by name | ✅ (via sysinfo) | ✅ (node properties) | ✅ (process enumeration) |
@@ -868,7 +887,7 @@ The `BridgeStream` design is validated by all reference projects:
 | Dynamic reconnection | ⚠️ (session events) | ✅ (registry callbacks) | ⚠️ (property listeners) |
 | Exclusive mode | ✅ (not for process loopback) | ✅ (PW stream flags) | ❌ |
 | Requires special permission | ❌ | ❌ | ✅ (entitlement + TCC) |
-| Min OS version for app capture | Win10 2004+ | Any with PipeWire | macOS 14.0+ |
+| Min OS version for app capture | Win10 2004+ | Any with PipeWire | macOS 14.4+ (rsac floor) |
 
 This maps directly to rsac's `PlatformCapabilities` struct — each cell becomes a boolean field.
 
@@ -983,6 +1002,8 @@ This section appends per-repo NEW unadopted techniques and upstream-vs-pinned de
 
 **Upstream delta:** rsac pin `0.9.2` is current; upstream exposes feature flags `v0_3_44..v0_3_57` (+ `v1_1` in dev). `v0.3.50` adds `Time::buffered/queued_buffers/avail_buffers`. API stable, no breaking changes across 0.9.x. rsac uses only `v0_3_44`.
 
+**Correction (2026-11-25):** the submodule was at `5dd5dfa` = `v0.10.0`, not 0.9.2, so the reference code was already ahead of the dependency. See [Reference Delta & Harvest (2026-11-25)](#reference-delta--harvest-2026-11-25).
+
 **NEW unadopted techniques (capture-relevant):**
 - In-process `Registry::add_listener_local` discovery (`registry/mod.rs:67-72`) — replaces `pw-dump`/`pw-cli` subprocess enumeration. *Relevance:* `LinuxDeviceEnumerator`; large. (PR-1.)
 - `Metadata::add_listener_local` default sink/source proxy (`metadata.rs:46-95`) — in-process default discovery + change notifications vs `pw-metadata`. *Relevance:* `get_pipewire_default_device`; medium.
@@ -994,7 +1015,7 @@ This section appends per-repo NEW unadopted techniques and upstream-vs-pinned de
 - `AttachedReceiver::deattach()` (`channel.rs:119-138`) — pause/resume listening without recreation. *Relevance:* start/stop caching; medium.
 - INFORMATIONAL: `io_changed`/`control_info`/`Stream::time()` (`stream/mod.rs:54-140,382-413`) — buffer/latency/position metadata; useful for timestamping but currently no rsac consumer.
 
-### obs-pipewire-audio-capture (C; vendored at HEAD, no canonical upstream)
+### obs-pipewire-audio-capture (C; upstream [dimtpap/obs-pipewire-audio-capture](https://github.com/dimtpap/obs-pipewire-audio-capture))
 
 **Upstream delta:** No version churn — uses stable PipeWire 0.3.x registry/metadata/`spa_io_position` APIs. No breaking changes vs rsac's `pipewire-rs 0.9.2`; techniques adoptable without a version bump.
 
@@ -1038,6 +1059,8 @@ This section appends per-repo NEW unadopted techniques and upstream-vs-pinned de
 
 **Pin bump addendum (rsac-62bb, 2026-07-17):** the reference pin was bumped `185e39c` (`v6.1.0`-ish) → `744cf43` (`v8.0.0`-ish) because `docs/reviews/rsac-ux-enhancement-backlog.md` still actively cites this crate's version-gated feature pattern. The 16 intervening commits include a `v7.0.0`→`v8.0.0` async-API rework (`AsyncSCStream`, multi-output support) that changes the exact API surface that backlog doc cites. A full re-analysis of the v6.1.0→v8.0.0 delta against the bullets below is **out of scope for this triage** — flagged as a follow-up doc-drift item; the bullets below still describe the v0.2→v6.1.0-era API and may not reflect v8.0.0 exactly. Reference pins are read-only research checkouts, not vendored dependencies — they should be re-fetched and the delta re-analyzed whenever the citing doc (`rsac-ux-enhancement-backlog.md`) is next revised, rather than left to silently drift; this repo has no automated staleness check for `reference/` submodules today.
 
+**Superseded (2026-11-25):** the pin is now `v12.0.0` and §3.3 describes the v12 API. The bullets below are v6-era; the v9–v12 changes are in [Reference Delta & Harvest (2026-11-25)](#reference-delta--harvest-2026-11-25).
+
 **NEW unadopted techniques (capture-relevant, mostly INFORMATIONAL given rsac's Process-Tap scope):**
 - Version-gated Cargo features `macos_13_0..macos_26_0` (`Cargo.toml`) — pattern for honest sub-14.4 capability gating. *Relevance:* `PlatformCapabilities` macOS reporting; medium. (PR-2.)
 - `catch_unwind` panic-safety at the FFI/C ABI boundary + RwLock poison recovery (`sc_stream.rs:145-150`, `panic_safe.rs`) — prevents one callback panic from breaking the stream. *Relevance:* rsac's ring producer has no panic guard at the OS callback edge; small. **Genuinely applicable RT-safety hardening.**
@@ -1051,6 +1074,8 @@ This section appends per-repo NEW unadopted techniques and upstream-vs-pinned de
 **Upstream delta (0.3.3 → 0.3.4):** Purely additive/UX, **no breaking changes, no new functions of substance**: added `#[must_use]` to `push_partial_slice`/`pop_partial_slice`/`pop_partial_slice_uninit` (`chunks.rs:280,404,491`); added `ReadChunkIntoIter::iterated()` to track partial consumption (`chunks.rs:1037-1062`); doc improvements. Low-risk bump. rsac's `Cargo.toml` dependency has since moved to `0.3.4` (matching this delta), so this section header is updated to reflect that — no action item remains here.
 
 **Pin triage (rsac-62bb, 2026-07-17):** the `reference/rtrb` submodule pin (`f5d14ec`) is **exactly** the `0.3.4` tag commit (`git describe --tags` confirms zero drift) — it already matches the shipped `rtrb = "0.3.4"` dependency precisely. No bump needed. If `rtrb`'s Cargo.toml version is ever bumped past 0.3.4, bump this reference pin in lockstep at that time, same commit, per the existing `Cargo.toml` comment discipline.
+
+**Superseded (2026-11-25):** the pin now leads the dependency at `0.4.1` (`5596032`). Moving `Cargo.toml` to 0.4.1 is a separate change.
 
 **NEW unadopted techniques (capture-relevant):**
 - Zero-copy `write_chunk_uninit()` + `CopyToUninit` (`lib.rs:788-813`, `chunks.rs:702-721`) — write f32 directly into `MaybeUninit` slots, eliminating the `Vec` intermediate in `BridgeProducer::push_samples_or_drop` (`ring_buffer.rs:288-344`). **Strengthens ADR-0001's RT-allocation guarantee** by removing the Vec entirely. *Relevance:* high-value, small.
@@ -1074,3 +1099,93 @@ This section appends per-repo NEW unadopted techniques and upstream-vs-pinned de
 - Compile-time `assert_stream_send!`/`assert_stream_sync!` (`wasapi/stream.rs:243-244`) — rsac claims `CapturingStream: Send` but doesn't statically assert it. *Relevance:* small, high-confidence safety net.
 - `ResultExt::context()` error-context chaining (`error.rs:209-222`) and `RealtimeDenied`/`PermissionDenied`/`HostUnavailable` taxonomy (`error.rs:10-86`). *Relevance:* OBS-4 user-message mapping; small.
 - `RateListener` async sample-rate confirmation (`coreaudio/macos/device.rs:161-200`). *Relevance:* macOS format-change sync; medium.
+
+---
+
+## Reference Delta & Harvest (2026-11-25)
+
+Sources: two read-only upstream reviews (wasapi-rs, rtrb, pipewire-rs and cpal; OBS, wiremix and screencapturekit-rs) that read the submodule git metadata, GitHub/GitLab compare APIs and raw files at exact SHAs. Commit counts were re-checked locally with `git log --oneline <old>..<new>`. Nothing here was compiled or run on audio hardware. Line references are at rsac `eac7056`. The wider audit that produced this section is [`docs/audit/2026-11-25-codebase-ci-market-audit.md`](../docs/audit/2026-11-25-codebase-ci-market-audit.md).
+
+### Pins
+
+| Submodule | Old pin | New pin | Commits | rsac dependency (`Cargo.toml`) | Upstream MSRV at new pin |
+|---|---|---|---|---|---|
+| wasapi-rs | `ce77ae1` v0.23.0 | `13cbc80` v0.27.0 | 79 | `wasapi = "0.23.0"` | 1.85 for the library; 1.88 for its examples/tests (`sysinfo 0.38`) |
+| rtrb | `f5d14ec` 0.3.4 | `5596032` 0.4.1 | 21 | `rtrb = "0.3.4"` | 1.38 |
+| pipewire-rs | `5dd5dfa` v0.10.0 | `70b20f0` v0.10.1 | 3 | `pipewire`, `libspa`, `libspa-sys = "0.9.2"` | 1.80 |
+| cpal | `0ecb418` (2026-07-13) | `44ba7ad` master (Cargo 0.19.0, unreleased) | 242 | none | 1.85 |
+| obs-pipewire-audio-capture | `abb4bd0` | `cc5a661` 1.2.2 | 7 | none | — |
+| screencapturekit-rs | `744cf43` (v8.0.0 + 1) | `0d8e0f1` v12.0.0 | 55 | none | 1.82 |
+| wiremix | `6a6cf7c` | unchanged | — | none | — |
+| AudioCap, audio-rec, camilladsp | unchanged | unchanged | — | none | — |
+
+Pin policy:
+- The wasapi-rs, rtrb and pipewire-rs pins now **lead** `Cargo.toml`. They show the versions the planned dependency bumps target: rtrb first, then wasapi, then pipewire, as separate commits. Until those land, rsac compiles against the older APIs in the dependency column. pipewire-rs was already ahead before this bump (v0.10.0 against 0.9.2).
+- wiremix stays at `6a6cf7c`, one commit before `v0.11.0` (`9f113c1`), because it is the PipeWire 0.9.2 reference that matches what rsac compiles today. `v0.11.0` adds only release metadata. Post-release `main` (`1319307`) moves to pipewire 0.10.1 and Rust 1.88. Revisit it together with the pipewire bump.
+- screencapturekit-rs is pinned to the tag, not `main` (`791102a`). The three post-tag commits touch Clippy config, a test clone and the README.
+- `/reference` is excluded from the published package and no workflow checks out submodules, so moving a pin costs nothing at build time.
+
+### Upstream deltas that matter to rsac
+
+**wasapi-rs 0.23 → 0.27, plus unreleased 0.28 on master**
+- Breaking for rsac: `initialize_client(&fmt, Direction, StreamMode, Option<GUID>)` replaces `(&fmt, &Direction, &StreamMode)`. `get_default_device`, `is_supported` and `WaveFormat::new` take their enums by value (`ce63629`). About ten call sites in `src/audio/windows/{thread,wasapi}.rs` change.
+- `2f10077` (0.27) writes zeros for packets flagged `AUDCLNT_BUFFERFLAGS_SILENT`, and the deque read returns the release error instead of panicking.
+- `cb5bbe1` (0.26) adds IAudioClient2/3. `e03e5f3` and `90d8058` add `AudioClient::from_iaudioclient` and raw accessors. `02d544d` (0.27) adds `get_stream_latency`. `d0220fe` makes `Handle` `Send + Sync`.
+- Master `feccb8a` adds `AudioClient::new_default_device_client`, activated through `DEVINTERFACE_AUDIO_*` so the stream follows default-device changes. Master `647bac6` makes `deinitialize` `unsafe`: every COM object created in the apartment must be dropped first.
+- Edition 2024 and MSRV 1.85 from 0.25. `windows ^0.62.2` matches rsac.
+
+**rtrb 0.3.4 → 0.4.1**
+- `9dfc2b8` (0.4.0) replaces `Arc` with an internal `ArcRingBuffer`, so `is_abandoned()` synchronizes across threads again. This is the semver-major part.
+- `af31057` (0.4.0) makes `ReadChunk::commit` panic-safe (double free). `9b0b6a7` (0.4.1, also in 0.3.6) fixes a double free when a `ReadChunkIntoIter` is forgotten. `new()` gains a `capacity * 2` overflow assert.
+- rsac uses only `RingBuffer::new`, `push`, `pop`, `slots`, `PushError::Full` and `PopError::Empty` (`src/bridge/ring_buffer.rs`). The push/pop hot paths are not in the diff, so ADR-0001 is unaffected.
+
+**pipewire-rs 0.9.2 (compiled) → 0.10.1 (pin)**
+- Breaking: `Loop::iterate` takes a `Timeout` enum instead of a `Duration`. rsac has six `iterate(Duration::from_millis(..))` calls in `src/audio/linux/thread.rs`.
+- Added: `Stream::time()`, which wraps `pw_stream_get_time_n` and is documented RT-safe; SPA meta wrappers and `find_meta`.
+- Changed: nix replaced by rustix; thiserror and once_cell dropped. 0.10.1 (`9b54509`) moves bindgen's clang-macro fallback build dir to `OUT_DIR`, which fixes sandboxed builds, so target 0.10.1 rather than 0.10.0.
+- `libspa` and `libspa-sys` must move in lockstep with `pipewire`, because rsac mixes `pipewire::spa::*` with direct `libspa::*` types.
+
+**cpal `0ecb418` → master `44ba7ad` (reference only)**
+- API: `play` is renamed `start`; `StreamTrait` requires `Send + Sync`; callback info types merge into `CallbackInfo`; `ErrorKind::Xrun` is removed in favour of in-band `CallbackInfo::xrun()` (`01e07ee`).
+- Patterns rsac lacks: PipeWire chunk offset handling (`91d56f9`); WASAPI default-output loopback that follows the default device (`DeviceHandle::DefaultOutput` + `DefaultDeviceMonitor`, `DeviceChanged` semantics in `25cb19b`); MMCSS registration (`68f6f75`); PipeWire `node.latency`/`node.rate` hints (`ec35008`).
+- `docs/MOBILE_BACKEND_DESIGN.md` cites cpal's AAudio host; re-check those citations against master when that doc is next revised.
+
+**obs-pipewire-audio-capture `abb4bd0` → 1.2.2**
+- One capture-code change: `10c7bd8` checks the numeric SPA AUX channel range before stringifying positions. The other six commits are README/Flathub text, the OBS 33 install layout (`d3ae22d`) and CI.
+- The fixes worth adopting were already in the old pin: channel count and positions from `SPA_PARAM_EnumFormat` (`1ae28d3`), waiting for a new default node's params before reconnecting (`eca1deb`), and a consistent `FL,FR` fallback (`6b188ed`). The project is GPL-2.0-or-later: borrow the design, not the code.
+
+**screencapturekit-rs v8 → v12.0.0**
+- v9 (`ee46556`): tokenized completion and picker callbacks, callbacks outside locks behind panic barriers, `current_process()` unavailable below 14.4 instead of widening.
+- v10 (`bd08091`): immutable audio descriptors; `CMTime` flags and epoch preserved; the stream synchronization clock is transferred with an owned retain.
+- v11 (`92dee6f`): read-only `CMSampleBuffer::audio_buffer_list()` via `apple-cf`; fallible constructors; the 12.3 bridge floor is separated from the 13.0 audio floor (`2aa9261`); a late native start is stopped after timeout (`f84bb79`).
+- v12 (`0d8e0f1`): public CG/CM/CV types move to `apple-cf 0.12`; Rust 1.82.
+
+**wiremix (not bumped)**: `27a3567` on `main` lets a stream return to the session default by writing `-1` to its `target.object`/`target.node`. `aaf4955` moves to pipewire 0.10.1. `d0a41f0` changes `EventFd::arm()` to `write(1)` alongside the nix bump.
+
+### Harvest ranking
+
+Effort: S < 1 h, M = half a day to 2 days, L > 2 days.
+
+| # | Item | Source | rsac location | Effort | Value | Needs a bump |
+|---|---|---|---|---|---|---|
+| 1 | Zero packets flagged SILENT; WASAPI says their contents must be ignored, and rsac copies them | wasapi `2f10077` | `src/audio/windows/thread.rs` ~629 (checks only `data_discontinuity`) | S | High | No |
+| 2 | Drop `audio_client`, `capture_client` and `h_event` before `wasapi::deinitialize()` | wasapi `647bac6` safety contract | `src/audio/windows/thread.rs` ~735–751 | S | High (UB in principle) | No |
+| 3 | PipeWire chunk offset: take `offset % maxsize` and clamp to whole frames, instead of dropping the whole buffer when `offset` lands past the mapped region | cpal `91d56f9` | `src/audio/linux/thread.rs` ~2167–2187 | S | Medium | No |
+| 4 | Match `Stream/Output/Audio` only (today any `media.class` containing `"Stream"`), exclude capture-owned nodes, reconcile with client properties by `client.id`; fix the UTF-8 boundary panic in `.exe` stripping (`base[cut..]` when `cut` splits a code point) | OBS matching, wiremix | `src/audio/linux/thread.rs` ~1753, ~1131–1134 | S–M | High | No |
+| 5 | rtrb → 0.4.1 | `d1f3a2e`, `5596032` | `Cargo.toml` | S | Low–medium | Yes |
+| 6 | wasapi → 0.27 | deltas above | ~10 call sites | M | High (unlocks 7 and 9) | Yes |
+| 7 | Default loopback that follows the default device, with a recoverable `DeviceChanged` | wasapi `feccb8a` (0.28) or `from_iaudioclient` (≥ 0.26); cpal `DefaultDeviceMonitor` | `create_audio_client` + existing watcher | M | High | Yes |
+| 8 | PipeWire default tracking by `node.name`; reconcile when metadata or the node arrives; only `SystemDefault` follows a new default | OBS `eca1deb`, wiremix metadata handling | Linux watcher in `thread.rs` | M | High | No |
+| 9 | Hardware timestamps: WASAPI QPC from `BufferInfo.timestamp` + `get_stream_latency`; PipeWire `Stream::time()`; CoreAudio `AudioTimeStamp` | cpal `input_timestamp`, pipewire-rs `Stream::time()` | all three backends | M | Medium–high | PipeWire part needs 0.10 |
+| 10 | In-band xrun telemetry, not an `AudioError` (matches ADR-0003) | cpal `cc9a2c2`, `01e07ee`, `9c4338e` | all three backends | M | Medium | No |
+| 11 | Multi-node `ProcessTree` on Linux: capture-owned virtual sink + `link-factory` links mapped by SPA channel position | OBS graph pattern | `src/audio/linux/` | L | Medium–high | No |
+| 12 | Gate macOS `supports_system_capture` on the tap path; document `NSAudioCaptureUsageDescription` | Apple docs; SCK availability split | `src/core/capabilities.rs` (`macos()`), `src/audio/macos/thread.rs` | S | Medium (honest capabilities) | No |
+| 13 | PipeWire period hints `node.latency` and `node.rate` (ADR-0007) | cpal `ec35008` | Linux stream setup | S–M | Medium | No |
+| 14 | CI: wasapi-rs's VB-Cable installer (pinned SHA256, no third-party action, `-Instances n`) plus the `LetAppsAccessMicrophone` policy | wasapi-rs `.github/scripts/install_vbcable.ps1` | `ci-audio-tests.yml` Windows job | S–M | Medium | No |
+| 15 | Optional MMCSS registration for the WASAPI capture thread | cpal `68f6f75` | `src/audio/windows/thread.rs` | S | Low–medium | No |
+| 16 | Session peak meters to pick the active PID for `ApplicationByName` | wasapi `62dcace` | `src/audio/windows/wasapi.rs` | M | Low | 0.24+ |
+
+Not adopted:
+- ScreenCaptureKit as a macOS fallback. Its app filter is display-scoped, needs a different permission and has no PID or process-tree contract. Keep Process Tap, and never widen a failed filter to broader capture.
+- wiremix's blanket PipeWire error suppression and its writes to other apps' routing metadata.
+- IAudioClient3 low-latency periods: not available for loopback or autoconvert streams, so not for rsac's main targets.

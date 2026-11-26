@@ -20,15 +20,64 @@ Releases with no ABI change omit the subsection (or state "No C ABI changes").
 
 ### Added
 
+- **Opt-in `hotplug-recovery` feature (`ADR-0019`)** — default-off, zero-dependency
+  device-hotplug auto-recovery for desktop `SystemDefault` capture via
+  `AudioCaptureBuilder::with_auto_recovery(AutoRecoveryConfig)`, `RecoveryState`,
+  `RecoverySnapshot`, `RecoveryEvent`, `AudioCapture::recovery_snapshot()`,
+  `AudioCapture::subscribe_recovery_events()`, and `AudioBuffer::stream_generation()`.
+- **Secret scanning (`betterleaks`)** — pinned `betterleaks` 1.10.1 via `mise.toml`
+  and `.betterleaks.toml`, wired into `lefthook.yml` (`pre-commit`) and `ci.yml`
+  (`secrets` job).
+- **Unified runtime pins (`.tool-versions`)** — single source of truth for Bun, Node,
+  Go, and Python shared between `mise` and GitHub Actions workflows.
+- **One-shot Blacksmith Windows audio probe** (`.github/workflows/probe-blacksmith-windows-audio.yml`)
+  to verify `Server-Media-Foundation` + `LABSN/sound-ci-helpers` on `blacksmith-4vcpu-windows-2025`.
+- **Audit & planning records** — `docs/audit/2026-11-25-codebase-ci-market-audit.md`,
+  `docs/DESKTOP_REFINEMENT.md`, and `docs/designs/0019-hotplug-auto-recovery.md`.
+
 ### Changed
+
+- **MSRV raised to `1.88`** (`Cargo.toml` and `ci.yml` Linux + Windows MSRV legs) to
+  reflect `sysinfo 0.38.4`'s actual Rust 1.88 requirement on Windows/macOS.
+- **Dependencies upgraded:** `rtrb` `0.3.4` → `0.4.1`, `wasapi` `0.23.0` → `0.27.0`
+  (Windows).
+- **Modularized `src/api/`** — split the 5,365-line `src/api.rs` into focused submodules
+  with identical public re-exports and hardened `scripts/check-module-dag.sh` to fail
+  closed on missing scan roots.
+- **CI cost & trigger optimization** — split `changelog-guard` into its own workflow so
+  PR label edits no longer re-trigger the full CI matrix; moved `macos-audio` to
+  GitHub-hosted `macos-15` with `SwitchAudioSource` + BlackHole 2ch; made full
+  `ci-audio-tests.yml` manual/post-merge/tag-triggered; narrowed mobile emulator/simulator
+  PR path triggers; removed the dead weekly cron on `ci-audio-macos-tcc.yml`.
+- **Reference submodules updated** — bumped `wasapi-rs` (v0.27.0), `rtrb` (0.4.1),
+  `pipewire-rs` (v0.10.1), `obs-pipewire-audio-capture` (1.2.2),
+  `screencapturekit-rs` (v12.0.0), and `cpal` (`44ba7ad`).
 
 ### Deprecated
 
 ### Removed
 
+- Root `Makefile` (superseded by `mise.toml`, including `mise run check:cross`;
+  `bindings/rsac-go/Makefile` is kept).
+
 ### Fixed
 
+- **Windows WASAPI (`SILENT` packets & COM teardown):** explicitly zero packets flagged
+  `AUDCLNT_BUFFERFLAGS_SILENT`, drop COM interfaces (`capture_client`, `h_event`,
+  `audio_client`) before `wasapi::deinitialize()`, and bound the WASAPI init handshake
+  to 5 seconds (`recv_timeout`).
+- **Linux PipeWire:** fixed multi-byte UTF-8 slicing panic in `.exe` suffix stripping,
+  normalized cyclic SPA chunk offsets with whole-frame clamping, and added
+  `StreamFlags::DONT_RECONNECT` on explicit serial targets so vanished app/device
+  streams cannot silently fall back to capturing system audio.
+- **macOS CoreAudio:** honored `StreamConfig::buffer_size` in
+  `CoreAudioDevice::create_stream` (closing the last backend parity gap).
+- **`lefthook.yml` on Windows:** routed hooks through `mise run` instead of bare `bash`
+  to avoid resolving WSL's `System32/bash.exe`.
+
 ### Security
+
+- Added `betterleaks` v1.10.1 secret scanning in pre-commit hooks and CI.
 
 ## [0.4.4] - 2026-07-21
 

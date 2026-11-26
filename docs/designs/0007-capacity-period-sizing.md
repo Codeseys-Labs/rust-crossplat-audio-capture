@@ -200,3 +200,17 @@ production default. The following details are recorded as load-bearing:
 - Backend call sites: `src/audio/windows/wasapi.rs` (`calculate_capacity(config.buffer_size, 4)`),
   `src/audio/linux/mod.rs`, `src/audio/macos/thread.rs`, `src/audio/macos/coreaudio.rs`
   (all `calculate_capacity(None, 4)`).
+
+## Status addendum — 2026-11-25
+
+The Windows-only statements above describe the original decision, not the
+current implementation. All five backends — Windows, Linux, macOS, Android and
+iOS — now honor `StreamConfig::buffer_size` as a requested ring-slot count,
+not a frame count; the macOS production path has been fixed. The static
+`calculate_capacity` policy remains in use.
+
+`calculate_capacity_for_period` remains unwired in production. Adoption waits
+for each backend to expose and validate its effective negotiated callback
+period early enough to size the ring; preferred buffer sizes or maximum slice
+sizes alone do not establish that period. See the
+[desktop refinement decision](../DESKTOP_REFINEMENT.md#d4--ring-sizing-and-clocks).

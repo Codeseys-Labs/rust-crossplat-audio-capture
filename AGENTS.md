@@ -143,14 +143,17 @@ All ten identified gaps have been closed:
 | **ProcessTree** | ✅ process loopback | ✅ PID → PipeWire node | ✅ Process Tap |
 | **Device selection** | ✅ | ✅ | ✅ |
 
-**Mobile (in progress — ADR-0012/0013, [`docs/MOBILE_BACKEND_DESIGN.md`](docs/MOBILE_BACKEND_DESIGN.md)):**
-the mobile backends are implemented and **compile-checked only** (`aarch64-linux-android` /
-`aarch64-apple-ios` check+clippy green; **no runtime verification on any device yet** —
-do not claim "tested on Android/iOS"). First-party glue (`mobile/android` AAR Kotlin,
-`mobile/ios` SwiftPM incl. the canonical broadcast-ring contract) **builds in CI**
-(the `mobile-android` / `mobile-ios` ci.yml jobs: cross-target check+clippy, real
-Gradle AAR + xcodebuild SwiftPM builds incl. `librsac.so` in jniLibs with its
-`JNI_OnLoad` export asserted — compile-proof only).
+**Mobile (experimental and parked — ADR-0012/0013, [`docs/MOBILE_BACKEND_DESIGN.md`](docs/MOBILE_BACKEND_DESIGN.md)):**
+Android and iOS remain in the default feature set, with cross-target compile
+and packaging coverage. Selected Android modes have emulator evidence and the
+iOS microphone has simulator evidence, as detailed below. These do not prove
+physical-device behavior; iOS ReplayKit and other cells remain unverified.
+
+**Freeze rule:** preserve mobile code, bindings and harnesses; limit changes to
+shared-layer correctness, security, build/packaging maintenance and regression
+coverage. Do not add mobile feature scope until the affected platform has the
+evidence and explicit unfreeze decision in the
+[desktop refinement checklist](docs/DESKTOP_REFINEMENT.md#mobile-freeze-and-unfreeze).
 
 | Capture Mode | Android (AAudio + AudioPlaybackCapture) | iOS (AVAudioEngine) |
 |---|---|---|
@@ -166,7 +169,14 @@ Gradle AAR + xcodebuild SwiftPM builds incl. `librsac.so` in jniLibs with its
 ```
 src/
 ├── lib.rs                  # Public API exports
-├── api.rs                  # AudioCaptureBuilder, AudioCapture
+├── api/                    # Public facade (AudioCaptureBuilder, AudioCapture, RunningCapture)
+│   ├── mod.rs              # Module root + public re-exports
+│   ├── builder.rs          # AudioCaptureBuilder
+│   ├── capture.rs          # AudioCapture lifecycle, pull/push delivery, callback pump
+│   ├── running.rs          # RunningCapture RAII guard
+│   ├── delivery.rs         # Drain + subscribe pump threads
+│   ├── negotiation.rs      # Device-format negotiation
+│   └── recovery.rs         # Auto-recovery supervisor (hotplug-recovery)
 ├── main.rs                 # CLI demo (info, list, capture, record subcommands)
 ├── core/                   # Core types, traits, errors
 │   ├── mod.rs
@@ -272,13 +282,14 @@ docker/                     # Linux devcontainer + optional native VM lab; legac
   - `feat_windows` — Windows/WASAPI backend
   - `feat_linux` — Linux/PipeWire backend
   - `feat_macos` — macOS/CoreAudio backend
-  - `feat_android` — Android AAudio + AudioPlaybackCapture backend (compile-checked, runtime-unverified)
-  - `feat_ios` — iOS AVAudioEngine + ReplayKit backend (compile-checked, runtime-unverified)
+  - `feat_android` — experimental, parked Android backend; see §3 for mode-specific evidence
+  - `feat_ios` — experimental, parked iOS backend; see §3 for mode-specific evidence
   - `async-stream` — Async `Stream` support (adds `atomic-waker`)
   - `sink-wav` — `WavFileSink` adapter
   - `test-utils` — Test utility exports
   - `tracing` — Optional `tracing` facade integration for internal instrumentation
   - `compose` — Multi-source channel composition (`src/compose/`; adds `rubato` + `audioadapter-buffers`) — ADR-0011
+  - `hotplug-recovery` — default-off desktop default-device recovery (ADR-0019)
   - `cli` — Demo binaries' deps (`clap`, `color-eyre`, `ctrlc`, `env_logger`); NOT in defaults, so library consumers don't pull them
   - `macos-tcc-spi` — real `check_audio_capture_permission()` preflight via the private `TCCAccessPreflight` SPI, `dlopen`'d at runtime (ADR-0015); off by default so the published artifact carries no private-symbol usage
 
@@ -292,7 +303,7 @@ docker/                     # Linux devcontainer + optional native VM lab; legac
 
 ### Patterns
 
-- **Builder pattern** for capture configuration ([`AudioCaptureBuilder`](src/api.rs))
+- **Builder pattern** for capture configuration ([`AudioCaptureBuilder`](src/api/builder.rs))
 - **Interior mutability** (`Mutex`, `Arc`) inside `AudioCapture` for `&self` methods
 - **Lock-free ring buffers** (`rtrb`) for bridging OS callback threads to consumer threads
 - **[`PlatformStream`](src/bridge/stream.rs:47) trait** — internal contract for platform-specific stop/active-check; wrapped by `BridgeStream<S>`
@@ -302,7 +313,7 @@ docker/                     # Linux devcontainer + optional native VM lab; legac
 
 ### Naming
 
-- Public API types live in [`src/api.rs`](src/api.rs) and [`src/core/`](src/core/mod.rs)
+- Public API types live in [`src/api/`](src/api/mod.rs) and [`src/core/`](src/core/mod.rs)
 - Bridge types live in [`src/bridge/`](src/bridge/mod.rs)
 - Sink adapters live in [`src/sink/`](src/sink/mod.rs)
 - Platform backends live in `src/audio/{platform}/`
@@ -321,8 +332,9 @@ rsac-61ce). The pieces and how to use them:
 
 ```bash
 # Rust comes from rustup + rust-toolchain.toml (pinned 1.95.0) — automatic.
-# Everything else (bun / node / go / python / lefthook) is pinned in mise.toml:
-mise install        # install the pinned polyglot toolchain
+# Bun / Node / Go / Python versions live in .tool-versions.
+# mise.toml pins betterleaks + lefthook and defines tasks:
+mise install        # install the pinned polyglot toolchain and dev tools
 mise run setup      # install the git hooks (lefthook install)
 ```
 
@@ -342,6 +354,7 @@ mise run gate:linux    # feat_linux lint-leg replica (clippy -D warnings + fmt) 
                        #   is absent; macOS has no equivalent local leg (CI-only blind spot)
 mise run test        # just the CI test-job replica for the host OS
 mise run test:audio  # ci_audio integration suite on this machine (all 3 tiers)
+mise run secrets     # betterleaks full-history scan; staged diff: mise run secrets:staged
 mise run release:bump -- X.Y.Z [--dry-run]  # seven-manifest lockstep bump + CHANGELOG rotation
 mise run release:verify-docs                # post-publish docs.rs spot-check
 ```
@@ -393,9 +406,9 @@ mise is a convenience, not a requirement — every task is a thin alias over
 `scripts/gate.sh`, which runs directly under bash (Git bash on Windows).
 
 **Git hooks** ([`lefthook.yml`](lefthook.yml), opt-in per clone, CI is the
-backstop): pre-commit = rustfmt check (only when `.rs` staged); commit-msg =
-rejects `Co-Authored-By:` trailers and tool bylines (§6 conventions,
-enforced mechanically); pre-push = the gate. Escape hatch: `--no-verify`.
+backstop): pre-commit checks staged Rust formatting and scans staged changes for
+secrets; commit-msg rejects `Co-Authored-By:` trailers and tool bylines (§6);
+pre-push runs the gate. Escape hatch: `--no-verify`.
 
 **Other DevEx surfaces:**
 
@@ -429,14 +442,20 @@ See the [Local Testing Guide](docs/LOCAL_TESTING_GUIDE.md) for comprehensive ins
 on testing system capture, application capture, and process tree capture on macOS, Windows,
 and Linux.
 
-### CI infrastructure: Blacksmith runners
+### CI infrastructure: hybrid runners
 
-All CI runs on [Blacksmith](https://blacksmith.sh/) runners — a drop-in replacement for GitHub-hosted runners with 2x faster hardware and co-located caching. Workflows are in [`.github/workflows/`](.github/workflows/).
+CI uses Blacksmith for normal compile lanes and GitHub-hosted Windows for audio
+integration because the Blacksmith Windows image lacks a usable audio stack.
+Workflow files in [`.github/workflows/`](.github/workflows/) define active
+triggers; audio and mobile runtime lanes are cost-controlled, not assumed to run
+on every PR. See [desktop refinement](docs/DESKTOP_REFINEMENT.md#d5--desktop-release-and-mobile-freeze).
 
 | Workflow | Purpose |
 |---|---|
-| [`ci.yml`](.github/workflows/ci.yml) | Lint, unit tests (3 platforms), MSRV, feature powerset, ARM64 cross-compile, binding runtime smokes (Python import + napi `node --test`). A `changes` gate job skips the whole compile matrix on docs-only PRs (skipped jobs count as passing for required checks); pushes/tags/dispatch always run everything. |
-| [`ci-audio-tests.yml`](.github/workflows/ci-audio-tests.yml) | Audio integration tests (9 platform x tier jobs) |
+| [`ci.yml`](.github/workflows/ci.yml) | Desktop lint and unit tests, MSRV, feature and binding checks; change filters can skip unrelated PR jobs. Rust MSRV is **1.88**; the pinned development toolchain can be newer. |
+| [`ci-audio-tests.yml`](.github/workflows/ci-audio-tests.yml) | Cost-controlled virtual-audio integration; supports manual dispatch. |
+| [`changelog-guard.yml`](.github/workflows/changelog-guard.yml) | Independent PR changelog guard, including label changes. |
+| Mobile runtime workflows | Emulator/simulator runs are separate from compile checks; inspect workflow triggers and record actual results. |
 
 **Runner labels:**
 
@@ -549,9 +568,10 @@ see the outcome and resolve the thread.
 
 The 0.4.1 release shipped incomplete notes because PRs #41-#49 fixed real code
 but never touched `CHANGELOG.md`'s `[Unreleased]` section — caught only by a
-manual post-release audit (rsac-7437). A CI job (`changelog-guard` in
-[`ci.yml`](.github/workflows/ci.yml)) now fails any PR that touches `src/` or
-`bindings/` without a corresponding `[Unreleased]` edit. If the change has no
+manual post-release audit (rsac-7437). The independent
+[`changelog-guard.yml`](.github/workflows/changelog-guard.yml) workflow fails
+PRs that touch `src/` or `bindings/` without a corresponding `[Unreleased]` edit.
+If the change has no
 user-facing effect (test-only, CI-only, an internal refactor), apply the
 `changelog-not-needed` label instead of adding a hollow entry. Release-stacking
 layer PRs (see below) should default to this label per-layer, with the actual
@@ -717,8 +737,8 @@ Full playbook (when to stack vs parallel PRs, exact commands, pitfalls):
 - ✅ Windows WASAPI: application capture (`ApplicationByName` via `sysinfo` PID resolution) + process tree capture (process loopback)
 - ✅ Linux PipeWire: application capture (`ApplicationByName` via `pw-dump` node resolution) + process tree capture (PID → PipeWire node mapping)
 - ✅ macOS CoreAudio: application capture + process tree capture (both via Process Tap)
-- ✅ [`subscribe()`](src/api.rs:463) method on `AudioCapture` — push-based `mpsc` channel delivery
-- ✅ [`overrun_count()`](src/api.rs:514) on `AudioCapture` and [`CapturingStream`](src/core/interface.rs:122) — ring buffer overflow monitoring
+- ✅ [`subscribe()`](src/api/capture.rs) method on `AudioCapture` — push-based `mpsc` channel delivery
+- ✅ [`overrun_count()`](src/api/capture.rs) on `AudioCapture` and [`CapturingStream`](src/core/interface.rs:122) — ring buffer overflow monitoring
 - ✅ Full [`PlatformCapabilities`](src/core/capabilities.rs) reporting with `supports_process_tree_capture` field
 - ✅ Device enumeration rewritten against real platform APIs (PipeWire `pw-cli`/`pw-dump` on Linux, WASAPI on Windows, CoreAudio on macOS) — mock data removed
 - ✅ `get_device_enumerator()` and `DeviceKind` exposed in public API ([`src/lib.rs`](src/lib.rs))
@@ -747,9 +767,9 @@ Full playbook (when to stack vs parallel PRs, exact commands, pitfalls):
   - Comprehensive docs: [macOS Version Compatibility](docs/MACOS_VERSION_COMPATIBILITY.md), [macOS 26 Process Tap Fix](docs/MACOS26_PROCESS_TAP_FIX.md)
 
 **Recently completed:**
-- ✅ **Multi-source channel composition (`compose` feature, ADR-0011)** — `CompositionBuilder`/`Composition` in `src/compose/`: groups of `CaptureTarget`s mixed to Mono/Stereo (per-source gain) or kept as native channels, appended into one interleaved multi-channel `CapturingStream`; rubato resampling to the session rate; master-clock pacing with silence-pad/trim stats. 30+ unit tests (scripted-source engine harness) + `compose::` ci_audio integration module + `examples/composed_capture.rs`.
+- ✅ **Multi-source channel composition (`compose`, ADR-0011)** — groups, rate alignment, live per-source gain/mute and group gain; composition is exposed through C, Python, Node and Go bindings.
 - ✅ **`cli` feature** — clap/color-eyre/ctrlc/env_logger no longer unconditional; demo bins/examples declare `required-features = ["cli"]`; library consumers' dep tree is lean.
-- ✅ **CI hardening** — `msrv` (1.87) job, `feature-powerset` (cargo-hack, depth 2), `cargo-semver-checks` release gate, stale audio-probe workflow deleted, ARM64 grep gates replaced with exit-code-authoritative checks.
+- ✅ **CI hardening** — MSRV 1.88, feature-powerset, cargo-semver-checks release gate, and exit-code-authoritative cross-target checks.
 - ✅ **`#![warn(missing_docs)]`** enforced; rustdoc gaps filled (ErrorKind variants, AudioError fields, platform enumerator items).
 - ✅ **`cocoa`/`objc` → `objc2` migration** — Phase 1 (coreaudio.rs, 12 sites) + Phase 2 (tap.rs, ~65 sites) complete. `cocoa` and `objc` crates fully removed from dependencies. See §9.1.
 - ✅ **Cross-language bindings** — C FFI (`bindings/rsac-ffi/`, 56 functions), Python (`bindings/rsac-python/`, PyO3), Node.js/TS (`bindings/rsac-napi/`, napi-rs), Go (`bindings/rsac-go/`, CGo). All compile.
@@ -758,15 +778,19 @@ Full playbook (when to stack vs parallel PRs, exact commands, pitfalls):
 - ✅ **Audio-graph migrated** to use `rsac::list_audio_sources()` — replaced ~120 lines of per-platform `#[cfg]` code.
 
 **Remaining:**
-- **Mobile — the playback-capture tiers are code-complete** (what `SystemDefault` means on mobile, ADR-0013): Android `AudioPlaybackCapture` + JNI ingest landed (rsac-77f1: all four tiers via the AAR Kotlin loop, `src/audio/android/{jni,playback}.rs`; `librsac.so` packaging rsac-0aa9) and iOS `SystemDefault` is compiled (rsac-b3aa: ReplayKit ring consumer mirroring the canonical `mobile/ios` RingLayout v1 contract) — both pending runtime proof
-- **Mobile — runtime verification** (the honest gap has materially closed): Android mic + SystemDefault playback are emulator-verified and iOS mic is simulator-verified (PRs #66/#67 — see the matrix cells above for run citations). Still open: Android UID-filtered playback tiers, iOS ReplayKit playback (rsac-b3aa), and every real-DEVICE cell (rsac-e6d3 device half, rsac-97c8)
-- **Mobile — delivery**: real Android device enumeration (rsac-ad8a), AAR Maven + SwiftPM distribution (rsac-05b6), `tauri-plugin-rsac` (rsac-f21c) + the audio-graph decision (rsac-0ac9, ADR-0014) — the rsac-ffi mobile-triple cross-checks landed (rsac-7a18)
-- Additional sink adapters
+- **Mobile is parked:** emulator/simulator evidence and physical-device gaps are
+  listed in §3. Further feature work requires the
+  [unfreeze checklist](docs/DESKTOP_REFINEMENT.md#mobile-freeze-and-unfreeze).
+- **Desktop refinement:** default-device recovery, backend fixes and release
+  verification are tracked in [the v0.5 bar](docs/DESKTOP_REFINEMENT.md#v05-desktop-bar).
+- **Period-derived sizing and hardware clocks:** effective negotiated periods
+  and device-clock metadata require platform validation; explicit ring-slot
+  requests already work across all five backends.
+- Additional sink adapters belong downstream or in companion crates.
 - Performance benchmarking and optimization — the SampleRing-vs-AudioBuffer A/B (ADR-0006) resolved to REMOVE on 2026-07-20: the zero-copy `SampleRing` producer plane lost end-to-end in every measured environment and was deleted; `benches/bridge.rs` keeps the default-plane groups (push/roundtrip/capacity/wasapi-decode)
 - macOS 15 (Sequoia) testing on real hardware (expected to work via Path 2, untested)
-- **Linux `ApplicationByName` happy-path integration test** — Windows has `application_by_name_windows`; the Linux happy path (pinned `pw-dump` node name) is still absent and macOS's is `#[ignore]`d behind TCC
-- **First crates.io publish** — the crate is not yet on crates.io; source/git dependency snippets are canonical until the registry publish lane is re-enabled
-- **Compose follow-ups** — Python/Node/Go bindings exposure (C FFI shipped; rsac-fba7), live per-source gain/mute (rsac-5a2d), v2 layouts (rsac-7c93)
+- **Compose follow-ups:** channel-position-aware layouts remain future work;
+  Python/Node/Go composition and live gain/mute have shipped.
 - **Blacksmith Windows audio support** — request Blacksmith add audio subsystem to Windows Server images (see §6 runner labels)
 
 ---
