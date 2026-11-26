@@ -322,8 +322,12 @@ GitHub. Owner: `Codeseys-Labs`; repository:
 
 ### Using the automated flow
 
-From a clean `master` with CI already green on the commit you intend to
-release (see §2 for the pre-release checklist):
+From a clean `master` with CI already green on the commit you are about to bump
+(see §2 for the pre-release checklist). The version-bump commit this block
+creates is tagged without a CI run of its own: it differs from the verified
+commit only by version strings and the CHANGELOG rotation, the lockstep check in
+the chain validates those, and the tag-time `ci.yml` run plus `release.yml`'s
+`verify` job are the gate for the tagged commit before anything is published.
 
 ```bash
 # Bump the version + promote CHANGELOG entries under a dated heading.
@@ -866,10 +870,15 @@ cargo fmt --all -- --check
 RUSTDOCFLAGS="-D warnings" cargo doc --no-deps --all-features
 ```
 
-Then dispatch CI on the commit you intend to tag
+Then dispatch CI on the commit you are about to bump
 (`gh workflow run ci.yml --ref <branch> -f full=true -f semver=true`, plus
 `ci-audio-tests.yml` for the audio matrix) and confirm **every platform is
-green** — CI is manual, so no run exists until you start one.
+green** — CI is manual, so no run exists until you start one. That pre-bump run
+is the only pre-tag CI requirement in the manual path: the bump commit that
+actually gets tagged is covered by the lockstep check and then by tag-time CI
+and `release.yml`'s `verify` job, which gate publishing (see "Using the
+automated flow"). In the release-prepare flow the dispatched run on the release
+branch already covers the bumped tree.
 The workflows live in `.github/workflows/` (`ci.yml`,
 `ci-audio-tests.yml`, and the platform-specific splits). Check the Actions
 tab — do not rely solely on local results, since Linux PipeWire, Windows
