@@ -1152,7 +1152,7 @@ fn create_imm_device_enumerator() -> AudioResult<IMMDeviceEnumerator> {
 /// Maps a failed `GetDefaultAudioEndpoint` call for the default render
 /// endpoint. `E_NOTFOUND` (no such endpoint) is [`AudioError::DeviceNotFound`]
 /// for `default_render`; any other failure goes to `other`.
-fn default_render_endpoint_error(
+pub(super) fn default_render_endpoint_error(
     err: windows::core::Error,
     other: impl FnOnce(windows::core::Error) -> AudioError,
 ) -> AudioError {
@@ -1532,6 +1532,9 @@ fn deliver_notices(
                 DeviceEvent::DeviceAdded { id, name, kind }
             }
         };
+        // On the helper thread, never on the MMDevice thread: the one place
+        // that shows whether the OS delivered a notification at all.
+        log::debug!("wasapi: device watcher delivering {event:?}");
         on_event(event);
         if shutdown.load(Ordering::Acquire) {
             return;

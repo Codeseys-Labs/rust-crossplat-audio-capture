@@ -79,6 +79,42 @@ Deferred past v0.5 and kept open (6 of 7 for deferring; the challenger recommend
 
 Stateless handles (3 of 4; one panelist preferred a dedicated owner thread): the enumerator and device handles store plain data and an MTA usage pin, every COM object is created, used and released inside one call on the calling thread, and the device watcher's COM objects live on its one helper thread. Measured on the workstation: `MMDeviceEnumerator` is registered `ThreadingModel=both`, so STA callers get the object in their own apartment without a proxy. STA callers therefore work, where today they are refused.
 
+## Deliberation record: panel 2, the recovery and release-gate decisions (2026-11-26)
+
+Six decisions were open after pull requests #109 to #112. Panelists (one memo each, none saw another's): Opus, Sol, Gemini 4 Carbon, Kimi, GLM and DeepSeek. A Sonnet agent tallied five memos (the Gemini memo finished late); a Fable agent that was not a panelist folded in the sixth, checked the tally against the memos and the source, and proposed amended resolutions. The orchestrator made the final calls below. Three of them overrule the panel's majority, each because of a fact a minority measured in the code. Not used: `gpt6.1luna`, `v41flash1017` and `gemini4neon` (no registered agent under those names) and Haiku 5.5.
+
+### P1 — A failed device-watcher registration (#114)
+
+Votes: keep running, retry and expose a degraded state 4; fail `start()` 1 (Gemini); warn and continue 1 (Sol). **Decided: `start()` fails where the watcher is the only trigger for a default switch (Windows; macOS when enabled). Linux warns once and continues; a backend with no notifications continues as before.** The majority option needed a late registration to repair the unwatched interval, and the supervisor cannot do that honestly: the OS replays no missed switch, and the only available repair (forcing a default-change trigger) closes and reopens a healthy stream, emits a false `DefaultChanged` and counts a recovery. Failing the start adds no public surface and can be relaxed later without a break; new snapshot fields and events could never be removed. The error is transient: retry `start()`, or build without auto-recovery.
+
+### P2 — Which macOS selector `SystemDefault` follows (#107)
+
+Votes: the ordinary default-output selector for both the watcher and the aggregate, 6 of 6; change now 4, wait for an attended run 2 (Opus, Sol). **Decided: the default-output selector, scoped to the system tap (the application and process-tree taps share the helper and keep the system-output selector), and not merged until an attended run exists.** The change alters plain `SystemDefault` capture for every macOS user, hosted CI sees only permission skips, and under P6 the mismatch cannot be reached in 0.5.0. The attended run also records whether audio simply continues across a switch with recovery off: the tap is global, so macOS may need no reopen at all.
+
+### P3 — Gating the workflow tag path (#119)
+
+Votes: remove tagging on merge and keep one script path 4; a dispatched workflow that runs the script 1 (Sol); verify the pull request head's tree 1 (Gemini). A pull-request ruleset on `master`: 6 of 6, split 3 to 3 on a bypass. **Decided: `release-tag.yml` becomes dispatch-only and runs `scripts/tag-release.sh`, which is the only code that creates tags; it pushes with the workflow token.** A tag pushed by a person starts the full CI matrix, the audio matrix and the three publish workflows on the tag: paid runs that add nothing once the evidence is on the commit, and red publish runs while publishing is off. A tag pushed with the workflow token starts none. The workflow checks out the requested commit instead of requiring it to be the tip of `master` (the orchestrator's amendment: a later merge must not strand a release candidate). The local script remains for emergencies.
+
+The ruleset: pull requests required on `master`, no approvals, squash only, no force-push or deletion, no required checks (CI never starts by itself), no bypass. It is applied only after the release procedure no longer pushes the bump commit directly.
+
+### P4 — Evidence the tag gate requires
+
+Votes: runs on the exact commit 5, on a tree-equal commit 1; mobile runs required 4, advisory or required once 2; a scripted waiver 3, none or ADR-only 3. **Decided: four dispatched runs on the exact commit, each with a terminal evidence job that fails on any skip** (`ci.yml` `Release Readiness`; `ci-audio-tests.yml` `Audio Release Evidence`; `ci-android-emu.yml` `Android Release Evidence`; `ci-ios-sim.yml` `iOS Release Evidence`). A green run alone proves little: today a runner without KVM, a missing simulator runtime or a skipped audio tier all stay green. D5 already requires the mobile runs, so they stay required; the two mobile requirements can be waived by an open `release-waiver` issue named on the command line and written into the tag message and the Release notes. A waiver committed to the repository would change the commit and repeat every paid run. The macOS System and Process Tap tiers count as "the matrix ran", never as capture or recovery evidence.
+
+### P5 — Windows evidence for `hotplug-recovery` (#94)
+
+Votes: the workstation switch plus hosted endpoint loss is enough, and no second virtual endpoint on the hosted runner, 6 of 6. **Decided as proposed**: one session across A→B→A between two virtual endpoints with endpoint-pinned 440 Hz and 997 Hz tones, the same switch with recovery off as the control, and endpoint loss on the hosted runner. The claim is scoped to virtual endpoints. The result is a note under `docs/evidence/` with the tested commit, and the tag gate fails if the recovery or WASAPI sources changed since that commit. A second hosted endpoint is deferred past 0.5.
+
+### P6 — `hotplug-recovery` on macOS in 0.5.0
+
+Votes: ship with a recorded waiver and a caveat 4; refuse the opt-in on macOS until evidence exists 2 (Opus, Sol). **Decided: refuse.** In 0.5.0 a macOS build that sets `with_auto_recovery` fails `preflight()` and `build()` with `PlatformNotSupported`. Shipping with a caveat is coherent only with changing the selector now (P2), and with the mismatch a switch can report `Recovered` on an aggregate still clocked by the alerts device, which fails W3's own identity test. The feature has never been released, so refusing breaks nothing and enabling it later is additive. ADR-0021 records this, P1 and the attended runbook. Plain capture and the device watcher on macOS are unchanged.
+
+### What the reviews of this wave changed
+
+- W2 said `format()` "reports the requested format until the first delivered buffer". The cross-family review showed the code promises less: the value changes when the backend publishes the negotiated format, which is not tied to the first delivery, and off Linux `build()` may already have replaced the request. The rule for callers is unchanged (build format-dependent consumers from the first delivered buffer); the documentation now says only what is true.
+- The first version of the Windows evidence harness passed on the workstation, and a review then showed nine ways it could have passed without proving its claim (an event from before the switch, windows collected before the read-back, an outage that was never verified, a restore that was reported but skipped). The harness was hardened before any result was recorded as evidence, and a deliberate break of the product (no reopen on a default change) makes the switch test fail.
+- The Linux registry change could not be compiled on the development host. A reviewer from another model family traced it against the pinned `pipewire` sources as the compile check, and the Linux evidence tests were type-checked on Windows by widening their `cfg` gate in a scratch copy.
+
 ## v0.5 desktop bar
 
 - Honest Rust 1.88 MSRV, including Windows coverage for platform-only dependencies; semver checks on the public platform-specific APIs, including macOS.

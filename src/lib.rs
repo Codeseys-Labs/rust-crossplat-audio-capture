@@ -75,7 +75,9 @@
 //!   a [`futures_core::Stream`].
 //! - `sink-wav` — enables [`WavFileSink`].
 //! - `hotplug-recovery` — opt-in recovery of desktop `SystemDefault` capture
-//!   when the default device changes or is invalidated.
+//!   when the default device changes or is invalidated: Windows and Linux in
+//!   0.5.0, withheld on macOS (ADR-0021). On Windows, `start()` fails when
+//!   the device-change registration fails.
 //! - `test-utils` — exposes shared test helpers used by integration tests
 //!   and the binding crates.
 //!

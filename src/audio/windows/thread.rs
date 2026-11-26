@@ -26,7 +26,7 @@ use std::sync::mpsc::RecvTimeoutError;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
-use super::wasapi::ComInitializer;
+use super::wasapi::{default_render_endpoint_error, ComInitializer};
 
 use crate::bridge::ring_buffer::BridgeProducer;
 use crate::bridge::stream::PlatformStream;
@@ -832,14 +832,7 @@ fn create_audio_client(config: &WindowsCaptureConfig) -> AudioResult<wasapi::Aud
                     message: format!("Failed to create DeviceEnumerator: {}", e),
                     context: None,
                 })?;
-            let device = enumerator
-                .get_default_device(wasapi::Direction::Render)
-                .map_err(|e| AudioError::BackendError {
-                    backend: "wasapi".to_string(),
-                    operation: "get_default_device".to_string(),
-                    message: format!("Failed to get default render device: {}", e),
-                    context: None,
-                })?;
+            let device = default_render_device(&enumerator)?;
 
             device
                 .get_iaudioclient()
@@ -978,14 +971,7 @@ fn find_device_by_id(device_id: &str) -> AudioResult<wasapi::Device> {
     })?;
 
     if device_id.is_empty() || device_id.eq_ignore_ascii_case("default") {
-        return enumerator
-            .get_default_device(wasapi::Direction::Render)
-            .map_err(|e| AudioError::BackendError {
-                backend: "wasapi".to_string(),
-                operation: "get_default_device".to_string(),
-                message: format!("Failed to get default render device: {}", e),
-                context: None,
-            });
+        return default_render_device(&enumerator);
     }
 
     // Direct ID resolution via IMMDeviceEnumerator::GetDevice. A failed lookup
@@ -995,6 +981,37 @@ fn find_device_by_id(device_id: &str) -> AudioResult<wasapi::Device> {
         .map_err(|_| AudioError::DeviceNotFound {
             device_id: device_id.to_string(),
         })
+}
+
+/// Looks up the default render endpoint, which `SystemDefault` and the default
+/// `Device` ids capture from. No default endpoint at all (`E_NOTFOUND`) is
+/// [`AudioError::DeviceNotFound`], so auto-recovery waits for a device to
+/// appear instead of spending its retry budget on an open that cannot succeed;
+/// any other failure is a `get_default_device` backend error.
+fn default_render_device(enumerator: &wasapi::DeviceEnumerator) -> AudioResult<wasapi::Device> {
+    enumerator
+        .get_default_device(wasapi::Direction::Render)
+        .map_err(default_render_device_error)
+}
+
+/// Classifies a failed default render lookup for [`default_render_device`].
+/// Only a Windows error carries an `HRESULT` the endpoint classifier can
+/// recognise; every other wasapi failure is a backend error.
+fn default_render_device_error(err: wasapi::WasapiError) -> AudioError {
+    fn backend_error(err: wasapi::WasapiError) -> AudioError {
+        AudioError::BackendError {
+            backend: "wasapi".to_string(),
+            operation: "get_default_device".to_string(),
+            message: format!("Failed to get default render device: {}", err),
+            context: None,
+        }
+    }
+    match err {
+        wasapi::WasapiError::Windows(err) => default_render_endpoint_error(err, |err| {
+            backend_error(wasapi::WasapiError::Windows(err))
+        }),
+        other => backend_error(other),
+    }
 }
 
 // ── Process Name Resolution Helper ───────────────────────────────────────
@@ -1740,6 +1757,44 @@ mod tests {
                 assert_eq!(device_id, "nonexistent-device-id-12345");
             }
             other => panic!("Expected DeviceNotFound, got: {:?}", other),
+        }
+    }
+
+    /// A default render lookup that fails with `E_NOTFOUND` (0x80070490, "no
+    /// endpoint has this flow and role", `um/mmdeviceapi.h`) means there is no
+    /// device to capture from: it must be `DeviceNotFound`, which auto-recovery
+    /// waits on, not a backend error that spends its retry budget. Any other
+    /// failure stays a `get_default_device` backend error. Device-free.
+    #[test]
+    fn default_render_device_error_classifies_missing_endpoint() {
+        let not_found = windows::core::HRESULT(0x8007_0490_u32 as i32);
+        let err = default_render_device_error(wasapi::WasapiError::Windows(
+            windows::core::Error::from_hresult(not_found),
+        ));
+        match err {
+            AudioError::DeviceNotFound { device_id } => assert_eq!(device_id, "default_render"),
+            other => panic!("E_NOTFOUND must map to DeviceNotFound, got: {other:?}"),
+        }
+
+        // E_ACCESSDENIED: a real failure of an endpoint that exists.
+        let denied = windows::core::HRESULT(0x8007_0005_u32 as i32);
+        let err = default_render_device_error(wasapi::WasapiError::Windows(
+            windows::core::Error::from_hresult(denied),
+        ));
+        match err {
+            AudioError::BackendError { operation, .. } => {
+                assert_eq!(operation, "get_default_device");
+            }
+            other => panic!("E_ACCESSDENIED must stay a backend error, got: {other:?}"),
+        }
+
+        // A wasapi failure without an HRESULT is never DeviceNotFound.
+        let err = default_render_device_error(wasapi::WasapiError::ClientNotInit);
+        match err {
+            AudioError::BackendError { operation, .. } => {
+                assert_eq!(operation, "get_default_device");
+            }
+            other => panic!("ClientNotInit must stay a backend error, got: {other:?}"),
         }
     }
 }

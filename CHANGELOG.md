@@ -20,8 +20,9 @@ Releases with no ABI change omit the subsection (or state "No C ABI changes").
 
 ### Added
 
-- **Opt-in `hotplug-recovery` feature (`ADR-0019`)** — default-off, zero-dependency
-  device-hotplug auto-recovery for desktop `SystemDefault` capture via
+- **Opt-in `hotplug-recovery` feature (`ADR-0019`, `ADR-0021`)** — default-off,
+  zero-dependency device-hotplug auto-recovery for `SystemDefault` capture on Windows
+  and Linux via
   `AudioCaptureBuilder::with_auto_recovery(AutoRecoveryConfig)`, `RecoveryState`,
   `RecoverySnapshot`, `RecoveryEvent`, `AudioCapture::recovery_snapshot()`,
   `AudioCapture::subscribe_recovery_events()`, and `AudioBuffer::stream_generation()`.
@@ -31,12 +32,30 @@ Releases with no ABI change omit the subsection (or state "No C ABI changes").
   reads, as an unsupervised one does. The supervisor emits no log record while it holds
   its internal state lock, so a logger that calls back into the capture cannot deadlock
   on that lock. A logger must still not hold a lock of its own across such a call:
-  stopping joins helper threads that may log.
+  stopping joins helper threads that may log. On Windows, `start()` returns the error
+  (`Timeout` or `BackendError`, both transient) if the device-change watcher cannot be
+  registered, and opens no stream: the watcher is the only thing that notices a
+  default-device switch there, so a capture that started is being watched. On Linux,
+  where PipeWire moves the stream itself, a failed registration is logged once and the
+  capture starts. **Withheld on macOS in this release:** a build that sets
+  `with_auto_recovery` fails `preflight()` and `build()` with `PlatformNotSupported`
+  until the macOS path has been observed on hardware (ADR-0021); plain capture and the
+  device watcher on macOS are unchanged. When the wait for an absent device expires,
+  the supervisor runs one final lookup before it gives up. Observed on real audio
+  stacks (`tests/ci_audio/hotplug_*.rs`): on Windows, a live default-device switch
+  between two virtual endpoints on a workstation and the loss and return of the only
+  endpoint on the hosted runner; on Linux (audio run 45896704998), a live default-sink
+  switch that the stream follows without a reopen, an explicit device target that does
+  not follow, and a stopped daemon. Physical devices and macOS are not covered.
 - **`CapturingStream::readable_buffers()`** — provided method (default `None`) reporting
   how many buffers are queued and readable right now. It never blocks: `BridgeStream`
   returns `None` while another reader holds the stream and `Some(0)` once queued data is
   no longer readable. Auto-recovery uses it to drain exactly the backlog present when it
   retires a stream.
+- **`examples/probe_activity.rs`** — a recipe, built only from the public API, for a
+  bounded "is this target producing audio" probe: one capture session, a wall-clock
+  window, exit status 0 (active), 1 (silent), 2 (no audio delivered) or 3 (error). Its
+  header states the limits; it is not a library API.
 - **Secret scanning (`betterleaks`)** — pinned `betterleaks` 1.10.1 via `mise.toml`
   and `.betterleaks.toml`, wired into `lefthook.yml` (`pre-commit`) and `ci.yml`
   (`secrets` job).
@@ -47,7 +66,8 @@ Releases with no ABI change omit the subsection (or state "No C ABI changes").
   and a usable VB-CABLE endpoint; recorded in `AGENTS.md`. Windows audio integration
   stays on GitHub-hosted `windows-latest` (free and proven).
 - **Audit & planning records** — `docs/audit/2026-11-25-codebase-ci-market-audit.md`,
-  `docs/DESKTOP_REFINEMENT.md`, and `docs/designs/0019-hotplug-auto-recovery.md`.
+  `docs/DESKTOP_REFINEMENT.md`, `docs/designs/0019-hotplug-auto-recovery.md` and
+  `docs/designs/0021-hotplug-recovery-0.5-scope.md`.
 
 ### Changed
 
@@ -84,13 +104,25 @@ Releases with no ABI change omit the subsection (or state "No C ABI changes").
   it was `true` on every macOS version; it is now `true` only on macOS 14.4 and later,
   like `supports_application_capture` and `supports_process_tree_capture`, because
   system capture uses the same Process Tap path. A `true` capability does not mean the
-  TCC permission is granted. `AudioCaptureBuilder::preflight()` still checks only
-  application and process-tree targets: a `SystemDefault` request below 14.4 is
-  reported as unsupported here and fails when the capture starts.
+  TCC permission is granted. `AudioCaptureBuilder::preflight()` (and so `build()`) now
+  refuses a `SystemDefault` target with `PlatformNotSupported` whenever the platform
+  reports system capture as unsupported, as it already did for application and
+  process-tree targets; before, such a build passed preflight and failed in the backend.
 - **Recovery variants are `#[non_exhaustive]`** — the field-carrying variants of
   `RecoveryEvent` and `RecoveryState::Recovering` (new in this release) must be matched
   with `..` outside the crate, so fields can be added to them later without a breaking
   change.
+- **`AudioCapture::format()` right after `start()`** — documented for what it is: it
+  can still be the requested format, and when the backend publishes the negotiated one
+  is backend timing (on Linux, after `start()` returns). The format of each delivered
+  `AudioBuffer` is authoritative, so a `WavFileSink` or any other format-dependent
+  consumer is built from the first delivered buffer. `start()` does not wait. The
+  `rsac record` command and `examples/record_to_file.rs` now do this: the WAV header
+  comes from the first delivered buffer, no file is written when no audio arrives, and
+  a recording cut short by a format change or a write error is finalised, reported as
+  partial and ends with a non-zero exit status. `docs/API.md`, `docs/INTEROP.md` and
+  the `README.md` composition example were corrected to match (two of them called
+  methods `Composition` does not have).
 
 ### Deprecated
 
@@ -129,19 +161,33 @@ Releases with no ABI change omit the subsection (or state "No C ABI changes").
   recognised by the HRESULT the API documents (`E_NOTFOUND`, `0x80070490`) and
   reported as `DeviceNotFound`. It was compared against `0x80070002`, so losing the
   last endpoint surfaced as a backend error, and `hotplug-recovery` spent its retry
-  budget instead of waiting for a device.
+  budget instead of waiting for a device. The capture worker's own default lookup had
+  the same gap and is classified the same way now.
 - **Linux PipeWire:** fixed multi-byte UTF-8 slicing panic in `.exe` suffix stripping,
   normalized cyclic SPA chunk offsets with whole-frame clamping, and added
   `StreamFlags::DONT_RECONNECT` on explicit serial targets so vanished app/device
-  streams cannot silently fall back to capturing system audio. `default_device()` now
-  returns `DeviceNotFound` (was `BackendError`) when the PipeWire registry lists audio
-  devices but none of the requested kind; an empty registry still reports `BackendError`.
-  The FFI, Go and Node bindings surface this as their device-not-found error code.
+  streams cannot silently fall back to capturing system audio. Registry snapshots now
+  report an incomplete roundtrip: a failed `core.sync`, or no matching `done` within
+  five seconds, is a `BackendError`, and only a completed roundtrip is trusted.
+  `default_device()` returns `DeviceNotFound` when a completed snapshot has no device
+  of the requested kind, including an empty one (an empty snapshot was a
+  `BackendError`, so `hotplug-recovery` spent its retry budget when every sink
+  disappeared), and no longer accepts a metadata default of the other kind.
+  `enumerate_devices()` returns `Ok(vec![])` for a completed empty registry (was
+  `BackendError`); `watch()` fails if its first roundtrip does not complete; resolving
+  a capture target no longer falls back to `pw-dump` after a failed native roundtrip.
+  The FFI, Go and Node bindings surface `DeviceNotFound` as their device-not-found
+  error code.
 - **macOS CoreAudio:** honored `StreamConfig::buffer_size` in
   `CoreAudioDevice::create_stream` (closing the last backend parity gap).
 - **Async stream (`async-stream`):** a buffer that became readable while the stream was
   stopping, between the last read and the end-of-stream check, is now yielded before
   the stream ends instead of being dropped.
+- **`AudioCapture::start()` after a late failure:** when the callback pump could not be
+  started after the stream had opened, `start()` returned the error but left the
+  capture running, and a retry reported success without a pump. `start()` now checks
+  what can fail before it opens the stream and releases a stream it cannot finish
+  starting, so a failed `start()` leaves the handle stopped and startable again.
 - **`lefthook.yml` on Windows:** routed hooks through `mise run` instead of bare `bash`
   to avoid resolving WSL's `System32/bash.exe`.
 

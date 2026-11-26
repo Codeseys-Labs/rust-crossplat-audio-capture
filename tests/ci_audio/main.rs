@@ -20,6 +20,11 @@ mod compose;
 mod device_capture;
 mod device_enumeration;
 mod device_watch;
+// The hotplug modules gate themselves: `hotplug_common` on `hotplug-recovery`,
+// the platform modules on their OS and backend feature as well.
+mod hotplug_common;
+mod hotplug_linux;
+mod hotplug_windows;
 mod lifecycle_terminal;
 mod multi_source;
 mod overrun;
@@ -29,3 +34,5 @@ mod process_tree_capture;
 mod stream_lifecycle;
 mod subscribe;
 mod system_capture;
+// Self-gated on the `sink-wav` feature.
+mod wav_sink_format;

@@ -22,7 +22,7 @@
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc as std_mpsc;
 use std::sync::{Arc, Mutex};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use crate::bridge::ring_buffer::{BridgeProducer, BridgeShared};
 use crate::bridge::state::StreamState;
@@ -30,15 +30,7 @@ use crate::bridge::stream::PlatformStream;
 use crate::core::config::CaptureTarget;
 use crate::core::error::{AudioError, AudioResult};
 
-/// Upper bound on how long a caller will block waiting for the PipeWire thread
-/// to complete a registry/metadata *snapshot* (device enumeration / default
-/// resolution).
-///
-/// Unlike the capture handshake, a snapshot requires a `core.sync()`/`done`
-/// roundtrip with the daemon so the initial registry dump can settle before we
-/// read it. The roundtrip is normally a few event-loop iterations (≪1 s); the
-/// bounded wait turns a wedged daemon into [`AudioError::Timeout`] rather than
-/// an unbounded hang (mirrors `HANDSHAKE_TIMEOUT`).
+/// Time allowed for all daemon sync/done exchanges that settle one snapshot.
 const SNAPSHOT_TIMEOUT: Duration = Duration::from_secs(5);
 
 /// Upper bound on how long a caller will block waiting for the PipeWire thread
@@ -50,6 +42,77 @@ const SNAPSHOT_TIMEOUT: Duration = Duration::from_secs(5);
 /// thread surfaces as [`AudioError::Timeout`] instead of hanging the caller
 /// on an unbounded `recv()`.
 const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(5);
+
+/// Leave time for command dispatch and delivery of the loop's own timeout error.
+const SNAPSHOT_REPLY_TIMEOUT: Duration = SNAPSHOT_TIMEOUT.saturating_add(HANDSHAKE_TIMEOUT);
+
+fn snapshot_deadline() -> Instant {
+    Instant::now() + SNAPSHOT_TIMEOUT
+}
+
+/// Settle requests posted before `sync`. An unrelated `done` is not an acknowledgement.
+fn pump_sync(
+    core: &pipewire::core::Core,
+    loop_: &pipewire::loop_::Loop,
+    deadline: Instant,
+) -> AudioResult<()> {
+    use std::{cell::Cell, rc::Rc};
+
+    let pending = core.sync(0).map_err(|e| AudioError::BackendError {
+        backend: "PipeWire".into(),
+        operation: "core.sync".into(),
+        message: format!("Failed to request a PipeWire snapshot roundtrip: {e}"),
+        context: None,
+    })?;
+    let done = Rc::new(Cell::new(false));
+    let done_cb = Rc::clone(&done);
+    let _listener = core
+        .add_listener_local()
+        .done(move |id, seq| {
+            if id == pipewire::core::PW_ID_CORE && seq == pending && Instant::now() < deadline {
+                done_cb.set(true);
+            }
+        })
+        .register();
+    while !done.get() {
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        if remaining.is_zero() {
+            return Err(AudioError::BackendError {
+                backend: "PipeWire".into(),
+                operation: "core.done".into(),
+                message: format!(
+                    "Snapshot timed out waiting for matching done ({})",
+                    pending.seq()
+                ),
+                context: None,
+            });
+        }
+        let _ = loop_.iterate(remaining);
+    }
+    Ok(())
+}
+
+fn receive_snapshot<T>(
+    response_rx: std_mpsc::Receiver<AudioResult<T>>,
+    operation: &str,
+) -> AudioResult<T> {
+    response_rx
+        .recv_timeout(SNAPSHOT_REPLY_TIMEOUT)
+        .map_err(|e| {
+            let message = match e {
+                std_mpsc::RecvTimeoutError::Timeout => "Timed out waiting for the snapshot reply",
+                std_mpsc::RecvTimeoutError::Disconnected => {
+                    "PipeWire thread exited before replying"
+                }
+            };
+            AudioError::BackendError {
+                backend: "PipeWire".into(),
+                operation: operation.into(),
+                message: message.into(),
+                context: None,
+            }
+        })?
+}
 
 // ── CaptureConfig ────────────────────────────────────────────────────────
 
@@ -255,8 +318,8 @@ pub(crate) enum PipeWireCommand {
     /// Snapshot the current set of audio nodes from the native registry.
     ///
     /// The handler waits for a `core.sync()`/`done` roundtrip so the initial
-    /// registry dump has settled before replying — otherwise it would race an
-    /// empty registry and report "no devices" on a healthy system.
+    /// registry dump has settled. `Ok(vec![])` means that the completed
+    /// snapshot contains no audio devices; an incomplete roundtrip is an error.
     SnapshotDevices {
         response_tx: std_mpsc::Sender<AudioResult<Vec<PwDeviceSnapshot>>>,
     },
@@ -677,20 +740,18 @@ impl PipeWireThread {
     /// Snapshot the current audio nodes from the native PipeWire registry.
     ///
     /// Sends a [`SnapshotDevices`](PipeWireCommand::SnapshotDevices) command and
-    /// blocks (bounded by [`SNAPSHOT_TIMEOUT`]) for the reply. The PipeWire
+    /// blocks (bounded by [`SNAPSHOT_REPLY_TIMEOUT`]) for the reply. The PipeWire
     /// thread waits for a `core.sync()`/`done` roundtrip before replying so the
-    /// initial registry dump has settled — the returned list is therefore the
-    /// real device set, never a racy empty snapshot.
+    /// initial registry dump has settled. `Ok(vec![])` means the completed
+    /// snapshot contained no audio devices.
     ///
     /// Only owned [`PwDeviceSnapshot`] values cross the channel; the registry
     /// callbacks themselves run on the PipeWire loop thread.
     ///
     /// # Errors
     ///
-    /// - [`AudioError::BackendError`] if the PipeWire thread is not running or
-    ///   exits without replying.
-    /// - [`AudioError::Timeout`] if the snapshot does not complete within
-    ///   [`SNAPSHOT_TIMEOUT`].
+    /// - [`AudioError::BackendError`] if the sync/done roundtrip fails or
+    ///   times out, or the PipeWire thread cannot reply.
     pub fn snapshot_devices(&self) -> AudioResult<Vec<PwDeviceSnapshot>> {
         let (response_tx, response_rx) = std_mpsc::channel();
 
@@ -703,36 +764,22 @@ impl PipeWireThread {
                 context: None,
             })?;
 
-        match response_rx.recv_timeout(SNAPSHOT_TIMEOUT) {
-            Ok(result) => result,
-            Err(std_mpsc::RecvTimeoutError::Timeout) => Err(AudioError::Timeout {
-                operation: "PipeWire SnapshotDevices roundtrip".to_string(),
-                duration: SNAPSHOT_TIMEOUT,
-            }),
-            Err(std_mpsc::RecvTimeoutError::Disconnected) => Err(AudioError::BackendError {
-                backend: "PipeWire".to_string(),
-                operation: "snapshot_devices".to_string(),
-                message: "PipeWire thread exited before responding to SnapshotDevices".to_string(),
-                context: None,
-            }),
-        }
+        receive_snapshot(response_rx, "snapshot_devices")
     }
 
     /// Snapshot the default sink/source node names from PipeWire `default`
     /// metadata.
     ///
     /// Sends a [`SnapshotDefault`](PipeWireCommand::SnapshotDefault) command and
-    /// blocks (bounded by [`SNAPSHOT_TIMEOUT`]) for the reply, which the
-    /// PipeWire thread only sends after a sync/done roundtrip. The returned
+    /// blocks (bounded by [`SNAPSHOT_REPLY_TIMEOUT`]) for the reply. Only a
+    /// completed sync/done roundtrip returns a snapshot. The returned
     /// names are node *names*; the caller resolves them to a round-trippable
     /// `object.serial` against the device snapshot.
     ///
     /// # Errors
     ///
-    /// - [`AudioError::BackendError`] if the PipeWire thread is not running or
-    ///   exits without replying.
-    /// - [`AudioError::Timeout`] if the snapshot does not complete within
-    ///   [`SNAPSHOT_TIMEOUT`].
+    /// - [`AudioError::BackendError`] if the sync/done roundtrip fails or
+    ///   times out, or the PipeWire thread cannot reply.
     pub fn snapshot_default(&self) -> AudioResult<PwDefaultSnapshot> {
         let (response_tx, response_rx) = std_mpsc::channel();
 
@@ -745,26 +792,14 @@ impl PipeWireThread {
                 context: None,
             })?;
 
-        match response_rx.recv_timeout(SNAPSHOT_TIMEOUT) {
-            Ok(result) => result,
-            Err(std_mpsc::RecvTimeoutError::Timeout) => Err(AudioError::Timeout {
-                operation: "PipeWire SnapshotDefault roundtrip".to_string(),
-                duration: SNAPSHOT_TIMEOUT,
-            }),
-            Err(std_mpsc::RecvTimeoutError::Disconnected) => Err(AudioError::BackendError {
-                backend: "PipeWire".to_string(),
-                operation: "snapshot_default".to_string(),
-                message: "PipeWire thread exited before responding to SnapshotDefault".to_string(),
-                context: None,
-            }),
-        }
+        receive_snapshot(response_rx, "snapshot_default")
     }
 
     /// Snapshot the audio-producing applications from the native PipeWire
     /// registry (H4 part 2 / `rsac-8ebb`).
     ///
     /// Sends a [`SnapshotApplications`](PipeWireCommand::SnapshotApplications)
-    /// command and blocks (bounded by [`SNAPSHOT_TIMEOUT`]) for the reply. The
+    /// command and blocks (bounded by [`SNAPSHOT_REPLY_TIMEOUT`]) for the reply. The
     /// PipeWire thread waits for a `core.sync()`/`done` roundtrip before
     /// replying so the initial registry dump has settled — the returned list is
     /// therefore the real application set, never a racy empty snapshot, and it
@@ -775,10 +810,8 @@ impl PipeWireThread {
     ///
     /// # Errors
     ///
-    /// - [`AudioError::BackendError`] if the PipeWire thread is not running or
-    ///   exits without replying.
-    /// - [`AudioError::Timeout`] if the snapshot does not complete within
-    ///   [`SNAPSHOT_TIMEOUT`].
+    /// - [`AudioError::BackendError`] if the sync/done roundtrip fails or
+    ///   times out, or the PipeWire thread cannot reply.
     pub fn snapshot_applications(&self) -> AudioResult<Vec<PwAppSnapshot>> {
         let (response_tx, response_rx) = std_mpsc::channel();
 
@@ -791,37 +824,22 @@ impl PipeWireThread {
                 context: None,
             })?;
 
-        match response_rx.recv_timeout(SNAPSHOT_TIMEOUT) {
-            Ok(result) => result,
-            Err(std_mpsc::RecvTimeoutError::Timeout) => Err(AudioError::Timeout {
-                operation: "PipeWire SnapshotApplications roundtrip".to_string(),
-                duration: SNAPSHOT_TIMEOUT,
-            }),
-            Err(std_mpsc::RecvTimeoutError::Disconnected) => Err(AudioError::BackendError {
-                backend: "PipeWire".to_string(),
-                operation: "snapshot_applications".to_string(),
-                message: "PipeWire thread exited before responding to SnapshotApplications"
-                    .to_string(),
-                context: None,
-            }),
-        }
+        receive_snapshot(response_rx, "snapshot_applications")
     }
 
     /// Resolve a capture [`TargetQuery`] to a node `object.serial` using the
     /// **native** registry snapshot (H4 part 3 / `rsac-nat1`) — no `pw-dump`.
     ///
     /// Sends a [`ResolveTarget`](PipeWireCommand::ResolveTarget) command and
-    /// blocks (bounded by [`SNAPSHOT_TIMEOUT`]) for the reply. The PipeWire
+    /// blocks (bounded by [`SNAPSHOT_REPLY_TIMEOUT`]) for the reply. The PipeWire
     /// thread waits for a `core.sync()`/`done` roundtrip so the registry has
     /// settled before matching. `Ok(None)` means the registry settled but held
     /// no matching node (the caller may then fall back to the `pw-dump` path).
     ///
     /// # Errors
     ///
-    /// - [`AudioError::BackendError`] if the PipeWire thread is not running or
-    ///   exits without replying.
-    /// - [`AudioError::Timeout`] if resolution does not complete within
-    ///   [`SNAPSHOT_TIMEOUT`].
+    /// - [`AudioError::BackendError`] if the sync/done roundtrip fails or
+    ///   times out, or the PipeWire thread cannot reply.
     pub fn resolve_target(&self, query: TargetQuery) -> AudioResult<Option<String>> {
         let (response_tx, response_rx) = std_mpsc::channel();
 
@@ -834,19 +852,7 @@ impl PipeWireThread {
                 context: None,
             })?;
 
-        match response_rx.recv_timeout(SNAPSHOT_TIMEOUT) {
-            Ok(result) => result,
-            Err(std_mpsc::RecvTimeoutError::Timeout) => Err(AudioError::Timeout {
-                operation: "PipeWire ResolveTarget roundtrip".to_string(),
-                duration: SNAPSHOT_TIMEOUT,
-            }),
-            Err(std_mpsc::RecvTimeoutError::Disconnected) => Err(AudioError::BackendError {
-                backend: "PipeWire".to_string(),
-                operation: "resolve_target".to_string(),
-                message: "PipeWire thread exited before responding to ResolveTarget".to_string(),
-                context: None,
-            }),
-        }
+        receive_snapshot(response_rx, "resolve_target")
     }
 
     /// Enumerate the audio formats a node advertises via its
@@ -854,7 +860,7 @@ impl PipeWireThread {
     ///
     /// Sends an [`EnumNodeFormats`](PipeWireCommand::EnumNodeFormats) command for
     /// the node whose `object.serial` is `serial` and blocks (bounded by
-    /// [`SNAPSHOT_TIMEOUT`]) for the reply. The PipeWire thread binds the node,
+    /// [`SNAPSHOT_REPLY_TIMEOUT`]) for the reply. The PipeWire thread binds the node,
     /// fires `enum_params`, and waits for a `core.sync()`/`done` roundtrip so the
     /// emitted `param` events have settled before replying.
     ///
@@ -869,10 +875,8 @@ impl PipeWireThread {
     ///
     /// # Errors
     ///
-    /// - [`AudioError::BackendError`] if the PipeWire thread is not running or
-    ///   exits without replying.
-    /// - [`AudioError::Timeout`] if the enumeration does not complete within
-    ///   [`SNAPSHOT_TIMEOUT`].
+    /// - [`AudioError::BackendError`] if either discovery or parameter
+    ///   enumeration fails to complete a roundtrip, or the thread cannot reply.
     pub fn enum_node_formats(
         &self,
         serial: &str,
@@ -891,19 +895,7 @@ impl PipeWireThread {
                 context: None,
             })?;
 
-        match response_rx.recv_timeout(SNAPSHOT_TIMEOUT) {
-            Ok(result) => result,
-            Err(std_mpsc::RecvTimeoutError::Timeout) => Err(AudioError::Timeout {
-                operation: "PipeWire EnumNodeFormats roundtrip".to_string(),
-                duration: SNAPSHOT_TIMEOUT,
-            }),
-            Err(std_mpsc::RecvTimeoutError::Disconnected) => Err(AudioError::BackendError {
-                backend: "PipeWire".to_string(),
-                operation: "enum_node_formats".to_string(),
-                message: "PipeWire thread exited before responding to EnumNodeFormats".to_string(),
-                context: None,
-            }),
-        }
+        receive_snapshot(response_rx, "enum_node_formats")
     }
 
     /// Returns `true` if the PipeWire thread is still alive.
@@ -1561,9 +1553,9 @@ fn resolve_capture_target(target: &CaptureTarget) -> AudioResult<ResolvedTarget>
 ///    [`resolve_target`](PipeWireThread::resolve_target) `query` against the
 ///    settled registry snapshot. A `Some(serial)` wins immediately — no
 ///    subprocess is ever run.
-/// 2. If the native path returns `Ok(None)` (registry settled, no match) or an
-///    `Err` (thread spawn/roundtrip failure), fall back to
-///    [`find_pipewire_node_serial`] with `lookup`.
+/// 2. If the registry settled without a match, or the native thread could not
+///    start, try [`find_pipewire_node_serial`]. Propagate a failed roundtrip:
+///    it is not evidence that the target is absent.
 ///
 /// The subprocess fallback preserves the historical error taxonomy
 /// (`DeviceNotFound` / `ApplicationNotFound` / `BackendError`) so callers and
@@ -1573,23 +1565,17 @@ fn resolve_serial_native_or_subprocess(
     lookup: &PwNodeLookup<'_>,
 ) -> AudioResult<String> {
     match PipeWireThread::spawn() {
-        Ok(pw_thread) => match pw_thread.resolve_target(query) {
-            Ok(Some(serial)) => {
+        Ok(pw_thread) => match pw_thread.resolve_target(query)? {
+            Some(serial) => {
                 log::debug!(
                     "PipeWire: native registry resolution matched serial={}",
                     serial
                 );
                 return Ok(serial);
             }
-            Ok(None) => {
+            None => {
                 log::debug!(
                     "PipeWire: native registry settled with no match; trying pw-dump fallback"
-                );
-            }
-            Err(e) => {
-                log::debug!(
-                    "PipeWire: native registry resolution failed ({}); trying pw-dump fallback",
-                    e
                 );
             }
         },
@@ -1856,50 +1842,21 @@ fn pw_thread_main(
     // daemon has finished its initial dump. `core.sync()` posts a sequence to
     // the server; when the matching `done` event comes back, every `global`
     // (and metadata `property`) event posted before it has already been
-    // delivered. We register a one-shot `done` listener, fire `sync`, and pump
-    // the loop until the sequence completes (bounded by `SNAPSHOT_TIMEOUT`).
+    // delivered. Only read registry state after both roundtrips complete.
     //
     // Sequence: roundtrip (settle the registry dump so the `default` metadata
     // global's id is known) → bind the metadata proxy → second roundtrip (settle
     // its `property` callbacks) → read. Binding before the first roundtrip raced
     // and left the default unresolved on the first call (rsac-bfd8).
-    let run_snapshot_roundtrip = |default_metadata: &mut Option<(Metadata, MetadataListener)>| {
-        // Pump one `core.sync()` roundtrip: post a sequence and iterate the loop
-        // until the matching `done` arrives (every `global`/metadata `property`
-        // event posted before it is then guaranteed delivered), bounded by
-        // SNAPSHOT_TIMEOUT.
-        let pump_sync = || {
-            let done = Rc::new(std::cell::Cell::new(false));
-            let pending = match core.sync(0) {
-                Ok(seq) => seq.seq(),
-                Err(e) => {
-                    log::debug!("PipeWire: core.sync failed: {}", e);
-                    return;
-                }
-            };
-            let done_cb = Rc::clone(&done);
-            let core_listener = core
-                .add_listener_local()
-                .done(move |id, seq| {
-                    if id == pipewire::core::PW_ID_CORE && seq.seq() >= pending {
-                        done_cb.set(true);
-                    }
-                })
-                .register();
-            let deadline = std::time::Instant::now() + SNAPSHOT_TIMEOUT;
-            while !done.get() && std::time::Instant::now() < deadline {
-                let _ = main_loop.loop_().iterate(Duration::from_millis(50));
-            }
-            drop(core_listener);
-        };
-
+    let run_snapshot_roundtrip = |default_metadata: &mut Option<(Metadata, MetadataListener)>,
+                                  deadline: Instant| {
         // ORDER MATTERS (rsac-bfd8 fix): on the first call `pending_default_meta_id`
         // is unknown until the registry's initial dump has been delivered. So:
         // (1) settle the registry dump so the `default` metadata global appears and
         // its id is recorded; (2) THEN bind the metadata proxy; (3) THEN a second
         // roundtrip so the proxy's `property` callbacks fire before we read.
         // Binding before any roundtrip raced and left the default unresolved.
-        pump_sync();
+        pump_sync(&core, main_loop.loop_(), deadline)?;
 
         // Bind the default metadata proxy (once) so its property callback can
         // populate default sink/source. Binding happens here on the loop thread
@@ -1947,7 +1904,7 @@ fn pw_thread_main(
 
         // Second roundtrip: now that the metadata proxy is bound, settle its
         // `property` callbacks (default sink/source) before the snapshot is read.
-        pump_sync();
+        pump_sync(&core, main_loop.loop_(), deadline)
     };
 
     // ── Step 4: Enter the event loop ─────────────────────────────────
@@ -2456,7 +2413,10 @@ fn pw_thread_main(
                 log::debug!("PipeWire thread: SnapshotDevices received");
                 // Settle the registry dump before reading (else we race an
                 // empty registry and report "no devices" on a healthy system).
-                run_snapshot_roundtrip(&mut default_metadata);
+                if let Err(e) = run_snapshot_roundtrip(&mut default_metadata, snapshot_deadline()) {
+                    let _ = response_tx.send(Err(e));
+                    continue;
+                }
                 let devices: Vec<PwDeviceSnapshot> =
                     snapshot.borrow().devices.values().cloned().collect();
                 log::debug!(
@@ -2471,7 +2431,10 @@ fn pw_thread_main(
                 log::debug!("PipeWire thread: SnapshotDefault received");
                 // Same settle: also gives the `default` metadata property
                 // callbacks a chance to fire after the proxy is bound.
-                run_snapshot_roundtrip(&mut default_metadata);
+                if let Err(e) = run_snapshot_roundtrip(&mut default_metadata, snapshot_deadline()) {
+                    let _ = response_tx.send(Err(e));
+                    continue;
+                }
                 let default = snapshot.borrow().default.clone();
                 let _ = response_tx.send(Ok(default));
             }
@@ -2481,7 +2444,10 @@ fn pw_thread_main(
                 // Settle the registry dump before reading (else we race an
                 // empty registry and report "no applications" on a host that is
                 // actively playing audio).
-                run_snapshot_roundtrip(&mut default_metadata);
+                if let Err(e) = run_snapshot_roundtrip(&mut default_metadata, snapshot_deadline()) {
+                    let _ = response_tx.send(Err(e));
+                    continue;
+                }
                 // PID-deduplicate: an application may own several stream nodes
                 // (each a distinct registry global), but it is a single source.
                 // The first node seen for a PID wins, mirroring the old
@@ -2506,7 +2472,10 @@ fn pw_thread_main(
                 log::debug!("PipeWire thread: ResolveTarget received ({:?})", query);
                 // Settle the registry dump before matching (else we race an
                 // empty registry and report "no match" on a healthy system).
-                run_snapshot_roundtrip(&mut default_metadata);
+                if let Err(e) = run_snapshot_roundtrip(&mut default_metadata, snapshot_deadline()) {
+                    let _ = response_tx.send(Err(e));
+                    continue;
+                }
                 // Build owned, PID-deduplicated snapshots exactly as the
                 // SnapshotDevices / SnapshotApplications arms do, then match
                 // natively (pure function, no subprocess).
@@ -2550,7 +2519,11 @@ fn pw_thread_main(
                 // Settle the registry's initial dump first so the serial →
                 // global-id resolution below sees every audio node (the same
                 // race SnapshotDevices guards against).
-                run_snapshot_roundtrip(&mut default_metadata);
+                let deadline = snapshot_deadline();
+                if let Err(e) = run_snapshot_roundtrip(&mut default_metadata, deadline) {
+                    let _ = response_tx.send(Err(e));
+                    continue;
+                }
 
                 // Resolve the requested object.serial to its registry global id.
                 // The device snapshot keys nodes by global id and stores the
@@ -2652,29 +2625,10 @@ fn pw_thread_main(
                 // Kick off enumeration of ALL EnumFormat params, then settle.
                 node.enum_params(0, Some(ParamType::EnumFormat), 0, u32::MAX);
 
-                // Pump a `core.sync()`/`done` roundtrip so every `param` event
-                // posted by `enum_params` is delivered before we read (bounded
-                // by SNAPSHOT_TIMEOUT — a wedged daemon yields an empty list, not
-                // a hang). Mirrors the snapshot roundtrip's `pump_sync`.
-                {
-                    let done = Rc::new(std::cell::Cell::new(false));
-                    if let Ok(seq) = core.sync(0) {
-                        let pending = seq.seq();
-                        let done_cb = Rc::clone(&done);
-                        let core_listener = core
-                            .add_listener_local()
-                            .done(move |id, seq| {
-                                if id == pipewire::core::PW_ID_CORE && seq.seq() >= pending {
-                                    done_cb.set(true);
-                                }
-                            })
-                            .register();
-                        let deadline = std::time::Instant::now() + SNAPSHOT_TIMEOUT;
-                        while !done.get() && std::time::Instant::now() < deadline {
-                            let _ = main_loop.loop_().iterate(Duration::from_millis(50));
-                        }
-                        drop(core_listener);
-                    }
+                // Don't publish a partial format list if the final sync fails.
+                if let Err(e) = pump_sync(&core, main_loop.loop_(), deadline) {
+                    let _ = response_tx.send(Err(e));
+                    continue;
                 }
 
                 // Drop the node listener before the node proxy (the C listener
@@ -2682,7 +2636,7 @@ fn pw_thread_main(
                 // the end of the arm, but make the order explicit for parity
                 // with the stream listener/stream teardown ordering.
                 drop(_node_listener);
-                let result: Vec<crate::core::config::AudioFormat> = formats.borrow().clone();
+                let result = std::mem::take(&mut *formats.borrow_mut());
                 drop(node);
                 log::debug!(
                     "PipeWire thread: EnumNodeFormats serial={} → {} format(s)",
@@ -2786,7 +2740,7 @@ fn signal_session_graceful_end(shared: Option<Arc<BridgeShared>>) {
 /// Upper bound on how long [`spawn_device_watcher`] blocks waiting for the
 /// watch thread to report PipeWire init success or failure (mirrors the
 /// `PipeWireThread::spawn` init handshake).
-const WATCH_INIT_TIMEOUT: Duration = Duration::from_secs(5);
+const WATCH_INIT_TIMEOUT: Duration = SNAPSHOT_REPLY_TIMEOUT;
 
 /// Spawn a persistent PipeWire registry + `default` metadata listener thread
 /// and return a [`DeviceWatcher`] whose `Drop` tears it down (M10 Linux arm /
@@ -2820,6 +2774,8 @@ const WATCH_INIT_TIMEOUT: Duration = Duration::from_secs(5);
 ///
 /// - [`AudioError::BackendInitializationFailed`] if the thread cannot be
 ///   spawned or PipeWire initialization fails on it.
+/// - [`AudioError::BackendError`] if the initial registry or metadata
+///   roundtrip fails or times out.
 /// - [`AudioError::Timeout`] if init does not complete within
 ///   [`WATCH_INIT_TIMEOUT`] (a wedged daemon surfaces as an error, never a
 ///   hang).
@@ -3102,32 +3058,11 @@ fn watch_thread_main(
     // NOTE: the initial dump's `global` events fire DeviceAdded for every device
     // already present when watch() is called — i.e. the watcher reports the
     // current device set as it comes up, then live changes thereafter.
-    let pump_sync = |main_loop: &MainLoopBox| {
-        let done = Rc::new(std::cell::Cell::new(false));
-        let pending = match core.sync(0) {
-            Ok(seq) => seq.seq(),
-            Err(e) => {
-                log::debug!("PipeWire watch: core.sync failed: {}", e);
-                return;
-            }
-        };
-        let done_cb = Rc::clone(&done);
-        let core_listener = core
-            .add_listener_local()
-            .done(move |id, seq| {
-                if id == pipewire::core::PW_ID_CORE && seq.seq() >= pending {
-                    done_cb.set(true);
-                }
-            })
-            .register();
-        let deadline = std::time::Instant::now() + SNAPSHOT_TIMEOUT;
-        while !done.get() && std::time::Instant::now() < deadline {
-            let _ = main_loop.loop_().iterate(Duration::from_millis(50));
-        }
-        drop(core_listener);
-    };
-
-    pump_sync(&main_loop);
+    let deadline = snapshot_deadline();
+    if let Err(e) = pump_sync(&core, main_loop.loop_(), deadline) {
+        let _ = init_tx.send(Err(e));
+        return;
+    }
 
     // Bind the `default` metadata proxy (once) on the loop thread. Its property
     // callback emits DefaultChanged whenever default.audio.sink/source changes.
@@ -3186,7 +3121,10 @@ fn watch_thread_main(
 
     // Settle the metadata proxy's initial `property` callbacks (so the current
     // default is reflected) before we report init success.
-    pump_sync(&main_loop);
+    if let Err(e) = pump_sync(&core, main_loop.loop_(), deadline) {
+        let _ = init_tx.send(Err(e));
+        return;
+    }
 
     // Init done — tell the caller we are live. If the caller is already gone
     // (dropped the watcher synchronously), stop now.
@@ -3896,12 +3834,12 @@ mod tests {
         // Mirror of test_snapshot_devices_when_spawn_fails_is_backend_error for
         // the application path: in a sandbox without a daemon, spawn fails with
         // BackendInitializationFailed; when it succeeds, snapshot_applications
-        // must return Ok (possibly empty) or a bounded Timeout/BackendError —
+        // must return Ok (possibly empty) or a bounded BackendError —
         // never a panic.
         match PipeWireThread::spawn() {
             Ok(thread) => match thread.snapshot_applications() {
                 Ok(_apps) => {}
-                Err(AudioError::Timeout { .. }) | Err(AudioError::BackendError { .. }) => {}
+                Err(AudioError::BackendError { .. }) => {}
                 Err(e) => panic!("Unexpected snapshot_applications error: {:?}", e),
             },
             Err(AudioError::BackendInitializationFailed { backend, .. }) => {
@@ -3918,11 +3856,11 @@ mod tests {
         // We can't spawn a thread without a daemon in many CI sandboxes; if
         // spawn fails it's a BackendInitializationFailed. If it succeeds,
         // snapshot_devices must return Ok (possibly empty) or a bounded
-        // Timeout/BackendError — never a panic.
+        // BackendError — never a panic.
         match PipeWireThread::spawn() {
             Ok(thread) => match thread.snapshot_devices() {
                 Ok(_devices) => {}
-                Err(AudioError::Timeout { .. }) | Err(AudioError::BackendError { .. }) => {}
+                Err(AudioError::BackendError { .. }) => {}
                 Err(e) => panic!("Unexpected snapshot_devices error: {:?}", e),
             },
             Err(AudioError::BackendInitializationFailed { backend, .. }) => {
@@ -4111,7 +4049,7 @@ mod tests {
         // empty Vec, never a fabricated format. In a sandbox without a daemon,
         // spawn fails with BackendInitializationFailed; when it succeeds, asking
         // for a serial that is not in the registry must return Ok(vec![]) (or a
-        // bounded Timeout/BackendError) — never a panic, never a guess.
+        // bounded BackendError) — never a panic, never a guess.
         match PipeWireThread::spawn() {
             Ok(thread) => match thread.enum_node_formats("rsac-no-such-serial") {
                 Ok(formats) => assert!(
@@ -4119,7 +4057,7 @@ mod tests {
                     "unknown serial must enumerate to an empty advisory list, got {:?}",
                     formats
                 ),
-                Err(AudioError::Timeout { .. }) | Err(AudioError::BackendError { .. }) => {}
+                Err(AudioError::BackendError { .. }) => {}
                 Err(e) => panic!("Unexpected enum_node_formats error: {:?}", e),
             },
             Err(AudioError::BackendInitializationFailed { backend, .. }) => {

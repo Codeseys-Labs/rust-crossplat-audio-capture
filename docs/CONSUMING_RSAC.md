@@ -134,8 +134,9 @@ cargo run --features cli -- capture --app Firefox
 cargo run --features cli -- record out.wav --duration 10
 ```
 
-Examples (`cargo run --example <name> --features <req>`): `basic_capture` and
-`verify_audio` need `cli`; `record_to_file` needs `cli sink-wav`; `list_devices`
+Examples (`cargo run --example <name> --features <req>`): `basic_capture`,
+`verify_audio` and `probe_activity` (a bounded "is this target producing audio"
+recipe) need `cli`; `record_to_file` needs `cli sink-wav`; `list_devices`
 needs no extra feature; `async_capture` needs `async-stream`; `composed_capture`
 needs `compose`.
 

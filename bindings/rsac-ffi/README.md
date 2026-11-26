@@ -205,8 +205,12 @@ if (rsac_capture_format(capture, &fmt) == RSAC_OK) {
 `rsac_capture_stream_stats()` works at any time: before the stream starts (or
 after it stops) it reports an all-zero snapshot with `is_running == 0`.
 `rsac_capture_format()` returns `RSAC_ERROR_STREAM_FAILED` until a stream has
-been created (the negotiated format is only known once the backend opens it),
-so call it after `rsac_capture_start()`.
+been created, so call it after `rsac_capture_start()`. `start` does not wait for
+the backend's negotiated format, so the value can still be the *requested*
+format right after start (when the negotiated one is published is backend
+timing); take the format of a format-dependent consumer (a WAV writer, an
+encoder) from the first delivered buffer
+(`rsac_audio_buffer_sample_rate()` / `rsac_audio_buffer_channels()`) instead.
 
 `rsac_capture_stream_stats()` exposes **lifetime** counters (cumulative since
 the stream opened). A third out-parameter accessor,

@@ -28,4 +28,5 @@ its Scope says so.
 | [ADR-0018](0018-audio-graph-mobile-adoption.md) | audio-graph mobile adoption: defer, keep desktop-only, record re-evaluation triggers | Accepted | 2026-07-20 |
 | [ADR-0019](0019-hotplug-auto-recovery.md) | Opt-in `hotplug-recovery` feature for `SystemDefault` device-change auto-recovery | Accepted | 2026-11-25 |
 | [ADR-0020](0020-windows-watcher-com-ownership.md) | Windows device-watcher COM objects live on its helper thread; control-plane handles store no COM pointer | Accepted | 2026-11-26 |
+| [ADR-0021](0021-hotplug-recovery-0.5-scope.md) | `hotplug-recovery` in 0.5.0: a failed watcher registration fails `start()`, and macOS is withheld | Accepted | 2026-11-26 |
 | [abi3-decision](abi3-decision.md) | abi3 vs per-version Python wheels | Accepted | 2026-04-17 |

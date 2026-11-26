@@ -216,7 +216,7 @@ let mut session = CompositionBuilder::new()
 session.start()?;
 let map = session.channel_map().unwrap(); // e.g. 3 channels: voice, sysL, sysR
 loop {
-    match session.read_buffer() {
+    match session.read_chunk_nonblocking() {
         Ok(Some(buffer)) => { /* interleaved f32, map.channels() wide */ }
         Ok(None) => std::thread::sleep(std::time::Duration::from_millis(1)), // no data *yet*
         Err(e) if e.is_fatal() => break, // composition ended and drained
@@ -267,6 +267,15 @@ cargo run --features cli -- capture --app firefox
 # Record to WAV file (output path is a positional argument)
 cargo run --features cli -- record recording.wav --duration 30
 ```
+
+### Examples
+
+Runnable programs live in [`examples/`](examples/):
+
+- `basic_capture` — pull loop with a live level readout (`--features cli`)
+- `record_to_file` — record to WAV with `WavFileSink`, owning the write loop (read → write → check) so a failed or shortened recording is reported as such; the WAV header comes from the first delivered buffer (`--features "cli sink-wav"`)
+- `probe_activity` — a bounded activity-probe recipe: one capture session, a wall-clock window over the read loop, peak/RMS, exit code 0/1/2/3. A recipe over the public API, not a library API; see [docs/API.md](docs/API.md#activity-probe-recipe) for its limits (`--features cli`)
+- `list_devices`, `async_capture` (`async-stream`), `composed_capture` (`compose`), `verify_audio` (`cli`)
 
 ## Capture Mode Support
 

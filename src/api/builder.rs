@@ -187,12 +187,14 @@ impl AudioCaptureBuilder {
     ///
     /// The started stream is supervised: each [`AudioCapture::start`] that
     /// opens a stream opens the default device current at that moment (not the
-    /// one `build()` resolved; a `start()` on a running capture is a no-op),
-    /// and a default-device change (coalesced over
-    /// [`settle_delay`](AutoRecoveryConfig::settle_delay)) or a terminal
-    /// backend error closes the old stream **before** opening a replacement on
-    /// the current default device, retrying with capped exponential backoff per
-    /// `config`. Delivered buffers keep a monotonic timeline across reopens and
+    /// one `build()` resolved; a `start()` on a running capture is a no-op).
+    /// Stream invalidation triggers recovery on both supported platforms.
+    /// On Windows, a default-device change also triggers recovery after
+    /// [`settle_delay`](AutoRecoveryConfig::settle_delay); on Linux it only
+    /// wakes a device wait and does not interrupt a healthy stream. Recovery
+    /// closes the old stream **before** opening a replacement on the current
+    /// default device, retrying with capped exponential backoff per `config`.
+    /// Delivered buffers keep a monotonic timeline across reopens and
     /// carry the [`stream_generation`](crate::core::buffer::AudioBuffer::stream_generation)
     /// that produced them; observe progress via
     /// [`AudioCapture::recovery_snapshot`] and
@@ -202,17 +204,31 @@ impl AudioCaptureBuilder {
     /// delivered. A blocking read of a running but quiet stream still fails
     /// with [`AudioError::Timeout`] after the ordinary read timeout; time spent
     /// recovering does not count against it. After
-    /// [`request_stop`](AudioCapture::request_stop), and for readers that
-    /// already hold the stream (a subscription or sink-drain thread) when
-    /// [`stop`](AudioCapture::stop) lands, reads deliver the
-    /// preserved tail and then end with [`AudioError::StreamEnded`]. The owning
-    /// `stop()` releases the handle's stream, so a read through the handle
-    /// afterwards returns the recoverable not-initialized
-    /// [`AudioError::StreamReadError`] instead.
+    /// [`request_stop`](AudioCapture::request_stop),
+    /// [`read_chunk_nonblocking`](AudioCapture::read_chunk_nonblocking) and
+    /// [`read_chunk_blocking`](AudioCapture::read_chunk_blocking) deliver the
+    /// preserved tail, then return [`AudioError::StreamEnded`]. In contrast,
+    /// [`read_buffer`](AudioCapture::read_buffer) and
+    /// [`read_buffer_blocking`](AudioCapture::read_buffer_blocking) return a
+    /// recoverable [`AudioError::StreamReadError`] when called on a stopped
+    /// stream. Readers already holding the stream (a subscription or sink-drain
+    /// thread) can also drain its tail after [`stop`](AudioCapture::stop).
+    /// `stop()` releases the handle's stream, so new reads through the handle
+    /// return the recoverable not-initialized [`AudioError::StreamReadError`].
     ///
-    /// Only [`CaptureTarget::SystemDefault`] on desktop platforms is supported;
-    /// [`preflight`](Self::preflight) (and therefore [`build`](Self::build) /
-    /// [`start`](Self::start)) rejects every other combination.
+    /// Only [`CaptureTarget::SystemDefault`] on Windows and Linux is supported
+    /// in 0.5.0. [`preflight`](Self::preflight) (and therefore [`build`](Self::build)
+    /// and [`start`](Self::start)) rejects other targets and platforms. On macOS,
+    /// recovery is withheld until the device selector is fixed and verified on
+    /// hardware (ADR-0021).
+    ///
+    /// On Windows, a failed device-change registration fails
+    /// [`AudioCapture::start`] before it opens a stream. This error is transient:
+    /// retry `start()` on the capture, or build without auto-recovery. On Linux,
+    /// capture starts despite a failed registration: PipeWire follows the
+    /// default device natively. If the backend reports
+    /// [`AudioError::PlatformNotSupported`] for device notifications, capture
+    /// starts on either platform and recovery still reacts to stream invalidation.
     #[cfg(feature = "hotplug-recovery")]
     pub fn with_auto_recovery(mut self, config: AutoRecoveryConfig) -> Self {
         self.auto_recovery = Some(config);
@@ -327,21 +343,29 @@ impl AudioCaptureBuilder {
     ///
     /// # Errors
     ///
-    /// - [`AudioError::PlatformNotSupported`] when the target is
+    /// - [`AudioError::PlatformNotSupported`] when the platform's
+    ///   [`PlatformCapabilities`] do not cover the target: the target is
+    ///   [`SystemDefault`](CaptureTarget::SystemDefault) but the platform reports
+    ///   `!supports_system_capture` (for example macOS earlier than 14.4, or a
+    ///   build with no backend feature compiled in), the target is
     ///   [`Application`](CaptureTarget::Application) /
     ///   [`ApplicationByName`](CaptureTarget::ApplicationByName) but the platform
-    ///   reports `!supports_application_capture`, or
+    ///   reports `!supports_application_capture`, or the target is
     ///   [`ProcessTree`](CaptureTarget::ProcessTree) but
-    ///   `!supports_process_tree_capture`.
+    ///   `!supports_process_tree_capture`. A
+    ///   [`Device`](CaptureTarget::Device) target is not gated by these flags.
     /// - [`AudioError::InvalidParameter`] (`param == "sample_rate"`) when the
     ///   sample rate is not one of the supported rates
     ///   (22050, 32000, 44100, 48000, 88200, 96000).
     /// - [`AudioError::ConfigurationError`] when the channel count is `0` or
     ///   exceeds the maximum (32).
     /// - *(feature `hotplug-recovery`)* [`AudioError::PlatformNotSupported`]
-    ///   when `with_auto_recovery` is set on Android or iOS, and
-    ///   [`AudioError::ConfigurationError`] when it is set with any target other
-    ///   than [`CaptureTarget::SystemDefault`].
+    ///   when `with_auto_recovery` is set on Android or iOS, or on macOS in
+    ///   0.5.0 (recovery is withheld there until the device selector is fixed
+    ///   and verified on hardware, ADR-0021). This check precedes target
+    ///   validation. On other platforms the recovery gate returns
+    ///   [`AudioError::ConfigurationError`] for any target other than
+    ///   [`CaptureTarget::SystemDefault`].
     ///
     /// # Example
     ///
@@ -366,23 +390,7 @@ impl AudioCaptureBuilder {
 
         // ── Validate target against platform capabilities ────────────
         let caps = PlatformCapabilities::query();
-        match &self.target {
-            CaptureTarget::Application(_) | CaptureTarget::ApplicationByName(_)
-                if !caps.supports_application_capture =>
-            {
-                return Err(AudioError::PlatformNotSupported {
-                    feature: "application capture".to_string(),
-                    platform: caps.backend_name.to_string(),
-                });
-            }
-            CaptureTarget::ProcessTree(_) if !caps.supports_process_tree_capture => {
-                return Err(AudioError::PlatformNotSupported {
-                    feature: "process tree capture".to_string(),
-                    platform: caps.backend_name.to_string(),
-                });
-            }
-            _ => {}
-        }
+        check_target_supported(&self.target, &caps)?;
 
         // ── Validate sample rate ────────────────────────────────────
         // Parameter validation runs BEFORE the consent preflights below: an
@@ -491,6 +499,16 @@ impl AudioCaptureBuilder {
     /// channel-count checks), then resolves the device and negotiates the
     /// format. The device-independent validations are single-sourced in
     /// `preflight()` so the two entry points cannot drift apart.
+    ///
+    /// # Errors
+    ///
+    /// Any error from [`preflight`](Self::preflight) (the target is not
+    /// supported by the platform, including
+    /// [`SystemDefault`](CaptureTarget::SystemDefault) where the platform reports
+    /// `!supports_system_capture`; out-of-range sample rate or channel count;
+    /// missing mobile consent artifact), then any error from device resolution
+    /// ([`AudioError::DeviceEnumerationError`] / [`AudioError::DeviceNotFound`])
+    /// or format negotiation ([`AudioError::UnsupportedFormat`]).
     pub fn build(self) -> AudioResult<AudioCapture> {
         // ── Device-independent validation (single-sourced) ──────────
         self.preflight()?;
@@ -638,8 +656,13 @@ impl AudioCaptureBuilder {
     /// - **Linux (PipeWire):** the delivered format is negotiated at
     ///   **stream-open** (in the `param_changed` callback), *after* `build()`,
     ///   so it cannot be known pre-build. This method returns
-    ///   [`AudioError::PlatformNotSupported`] there; query
-    ///   [`AudioCapture::format`] after [`start`](AudioCapture::start) instead.
+    ///   [`AudioError::PlatformNotSupported`] there. Reading
+    ///   [`AudioCapture::format`] right after [`start`](AudioCapture::start)
+    ///   is no substitute: that can still report the *requested* format, and
+    ///   when the backend publishes the negotiated one is backend timing. The
+    ///   first delivered buffer's own
+    ///   [`format`](crate::AudioBuffer::format) is authoritative — build
+    ///   format-dependent consumers from it.
     ///
     /// # Errors
     ///
@@ -683,7 +706,8 @@ impl AudioCaptureBuilder {
         {
             Err(AudioError::PlatformNotSupported {
                 feature: "pre-build negotiated_format query (Linux negotiates at \
-                          stream-open; read AudioCapture::format() after start())"
+                          stream-open; the first delivered buffer's format is \
+                          authoritative)"
                     .to_string(),
                 platform: "linux".to_string(),
             })
@@ -738,5 +762,118 @@ impl AudioCaptureBuilder {
         // stream that was created, so we never leak a half-started capture.
         capture.start()?;
         Ok(RunningCapture(capture))
+    }
+}
+
+/// Refuses a capture target the platform's `caps` say it cannot capture.
+///
+/// The target-versus-capabilities half of [`AudioCaptureBuilder::preflight`],
+/// split out so it can be tested against hand-built [`PlatformCapabilities`]
+/// rather than only the host's. A [`CaptureTarget::Device`] target is never
+/// refused here: device selection is resolved against real hardware later.
+///
+/// # Errors
+///
+/// [`AudioError::PlatformNotSupported`] naming the unsupported feature and
+/// `caps.backend_name`.
+fn check_target_supported(target: &CaptureTarget, caps: &PlatformCapabilities) -> AudioResult<()> {
+    match target {
+        CaptureTarget::SystemDefault if !caps.supports_system_capture => {
+            Err(AudioError::PlatformNotSupported {
+                feature: "system audio capture".to_string(),
+                platform: caps.backend_name.to_string(),
+            })
+        }
+        CaptureTarget::Application(_) | CaptureTarget::ApplicationByName(_)
+            if !caps.supports_application_capture =>
+        {
+            Err(AudioError::PlatformNotSupported {
+                feature: "application capture".to_string(),
+                platform: caps.backend_name.to_string(),
+            })
+        }
+        CaptureTarget::ProcessTree(_) if !caps.supports_process_tree_capture => {
+            Err(AudioError::PlatformNotSupported {
+                feature: "process tree capture".to_string(),
+                platform: caps.backend_name.to_string(),
+            })
+        }
+        _ => Ok(()),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::core::config::{ApplicationId, DeviceId, ProcessId};
+
+    /// Capabilities for the gate under test, independent of the host: the
+    /// `query()` baseline with only the three capture flags under test (and
+    /// the backend name the assertions match) overridden, so a new
+    /// `PlatformCapabilities` field — or a future `#[non_exhaustive]` on
+    /// the struct — cannot break these tests.
+    fn caps(system: bool, application: bool, process_tree: bool) -> PlatformCapabilities {
+        let mut caps = PlatformCapabilities::query();
+        caps.supports_system_capture = system;
+        caps.supports_application_capture = application;
+        caps.supports_process_tree_capture = process_tree;
+        caps.backend_name = "TestBackend";
+        caps
+    }
+
+    fn assert_not_supported(result: AudioResult<()>, expected_feature: &str) {
+        match result {
+            Err(AudioError::PlatformNotSupported { feature, platform }) => {
+                assert_eq!(feature, expected_feature);
+                assert_eq!(platform, "TestBackend");
+            }
+            other => panic!("expected PlatformNotSupported({expected_feature}), got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn system_default_refused_when_system_capture_unsupported() {
+        let result =
+            check_target_supported(&CaptureTarget::SystemDefault, &caps(false, true, true));
+        assert_not_supported(result, "system audio capture");
+    }
+
+    #[test]
+    fn system_default_accepted_when_system_capture_supported() {
+        // Application and process-tree support are irrelevant to this target.
+        assert!(
+            check_target_supported(&CaptureTarget::SystemDefault, &caps(true, false, false))
+                .is_ok()
+        );
+    }
+
+    #[test]
+    fn device_target_ignores_every_capture_capability() {
+        let target = CaptureTarget::Device(DeviceId("default".to_string()));
+        assert!(check_target_supported(&target, &caps(false, false, false)).is_ok());
+        assert!(check_target_supported(&target, &caps(true, true, true)).is_ok());
+    }
+
+    #[test]
+    fn application_targets_still_gated_by_application_capture() {
+        let by_id = CaptureTarget::Application(ApplicationId("1234".to_string()));
+        let by_name = CaptureTarget::ApplicationByName("VLC".to_string());
+        for target in [&by_id, &by_name] {
+            assert_not_supported(
+                check_target_supported(target, &caps(true, false, true)),
+                "application capture",
+            );
+            assert!(check_target_supported(target, &caps(false, true, false)).is_ok());
+        }
+    }
+
+    #[test]
+    fn process_tree_still_gated_by_process_tree_capture() {
+        let target = CaptureTarget::ProcessTree(ProcessId(42));
+        assert_not_supported(
+            check_target_supported(&target, &caps(true, true, false)),
+            "process tree capture",
+        );
+        assert!(check_target_supported(&target, &caps(false, false, true)).is_ok());
     }
 }

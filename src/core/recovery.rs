@@ -1,8 +1,14 @@
-//! Policy and observability for automatic recovery of desktop default-device capture.
+//! Policy and observability for automatic recovery of `SystemDefault` capture.
+//!
+//! Auto-recovery is available on Windows and Linux. It is withheld on macOS in 0.5.0
+//! pending the selector fix and an attended hardware run (ADR-0021).
 
 use std::time::Duration;
 
 /// Policy controlling automatic recovery when a capture device changes or is invalidated.
+///
+/// Used by `AudioCaptureBuilder::with_auto_recovery` for `SystemDefault` capture on
+/// Windows and Linux.
 #[derive(Debug, Clone, PartialEq, Eq)]
 #[non_exhaustive]
 pub struct AutoRecoveryConfig {
@@ -19,9 +25,10 @@ pub struct AutoRecoveryConfig {
     pub stable_period: Duration,
     /// Debounce window for coalescing rapid device-change notifications (default: 200 ms).
     pub settle_delay: Duration,
-    /// Maximum time to wait for a device to reappear when none is present (default: 30 s).
-    /// It also bounds a probe still in flight when it expires: a probe whose result is
-    /// published after the deadline is discarded and the wait ends.
+    /// Deadline for waiting for a device to reappear when none is present (default: 30 s).
+    /// If no probe is in flight at expiry, one final probe runs; if that probe also finds
+    /// no device, the wait ends. A regular probe already in flight at expiry is not given
+    /// extra time: its result must have been published before the deadline to be applied.
     pub device_wait_timeout: Duration,
 }
 
@@ -155,10 +162,10 @@ pub enum RecoveryState {
 pub struct RecoverySnapshot {
     /// Capture session the snapshot describes: `0` before any session opened, then a
     /// new id for each newly opened capture session — an `AudioCapture::start()` that
-    /// opens a stream. A `start()` on a running handle is a no-op and a failed open
-    /// starts no session; neither changes the id. Events carry the id of the session
-    /// that emitted them, so events a previous session left queued before a restart
-    /// can be told apart from the current session's.
+    /// opens a stream. A `start()` on a running handle is a no-op; a start that
+    /// fails before the stream opens also leaves the id unchanged. Events carry
+    /// the id of the session that emitted them, so events a previous session left
+    /// queued before a restart can be told apart from the current session's.
     pub session: u64,
     /// Supervisor state when the snapshot was taken.
     pub state: RecoveryState,
