@@ -44,7 +44,7 @@ plus a comprehensive reference analysis:
 | [API Design](docs/architecture/API_DESIGN.md) | Original public API *design* (historical — see banner) |
 | [Error & Capability Design](docs/architecture/ERROR_CAPABILITY_DESIGN.md) | Error taxonomy + platform capabilities *design* (historical) |
 | [Backend Contract](docs/architecture/BACKEND_CONTRACT.md) | Internal backend traits + module architecture (design) |
-| [ADRs](docs/designs/) | Architecture Decision Records (0001–0016, indexed in [docs/designs/README.md](docs/designs/README.md)) — accepted decisions |
+| [ADRs](docs/designs/) | Architecture Decision Records (0001–0020, indexed in [docs/designs/README.md](docs/designs/README.md)) — accepted decisions |
 | [Reference Analysis](reference/REFERENCE_ANALYSIS.md) | Analysis of 10 reference repos mapped to rsac's architecture |
 | [Local Testing Guide](docs/LOCAL_TESTING_GUIDE.md) | How to test on physical macOS, Windows, and Linux machines |
 | [macOS Version Compatibility](docs/MACOS_VERSION_COMPATIBILITY.md) | macOS API compatibility matrix, version-specific fallbacks, known issues |
@@ -356,6 +356,8 @@ mise run test        # just the CI test-job replica for the host OS
 mise run test:audio  # ci_audio integration suite on this machine (all 3 tiers)
 mise run secrets     # betterleaks full-history scan; staged diff: mise run secrets:staged
 mise run release:bump -- X.Y.Z [--dry-run]  # seven-manifest lockstep bump + CHANGELOG rotation
+mise run release:tag -- X.Y.Z [--dry-run]   # refuses to tag unless the commit has a green full+semver run (Release Readiness); pushes the crate and Go tags atomically
+mise run release:check-published -- X.Y.Z   # after a failed verify: may the tag be replaced? (Go tag, runs in flight, crates.io, PyPI, npm)
 mise run release:verify-docs                # post-publish docs.rs spot-check
 ```
 
