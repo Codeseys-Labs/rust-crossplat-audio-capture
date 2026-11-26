@@ -1475,10 +1475,20 @@ jobs:
   # bump branch, HEAD^ is master's tip before the bump commit, and the previous
   # stable v*.*.* tag is reachable from there.
   semver-checks-release:
-    name: Semver Gate (release branch)
+    name: Semver Gate (release branch, ${{ matrix.os }})
     if: "github.event_name == 'workflow_dispatch' && (inputs.semver || startsWith(github.ref_name, 'release/v'))"
     timeout-minutes: 20
-    runs-on: blacksmith-4vcpu-ubuntu-2404
+    runs-on: ${{ matrix.runner }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: linux
+            runner: blacksmith-4vcpu-ubuntu-2404
+          - os: windows
+            runner: windows-latest
+          - os: macos
+            runner: macos-15
     steps:
       - uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5
         with:
@@ -1491,6 +1501,7 @@ jobs:
       # cargo-semver-checks builds the crate, so build.rs needs libpipewire —
       # same dev-headers install release.yml's semver-checks job uses.
       - name: Install PipeWire dev libraries
+        if: matrix.os == 'linux'
         uses: ./.github/actions/pipewire-setup
 
       - name: Install cargo-semver-checks
@@ -1520,4 +1531,74 @@ jobs:
         if: steps.baseline.outputs.prev_tag != ''
         env:
           PREV_TAG: ${{ steps.baseline.outputs.prev_tag }}
+        shell: bash
         run: cargo semver-checks check-release -p rsac --baseline-rev "$PREV_TAG"
+
+  # ── Release tooling self-tests ──────────────────────────────────────
+  release-scripts:
+    name: Release Scripts (self-tests)
+    needs: lint
+    runs-on: blacksmith-4vcpu-ubuntu-2404
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5
+        with:
+          persist-credentials: false
+      - name: Test readiness needs guard
+        run: bash scripts/check-ci-readiness-needs.sh --self-test
+      - name: Test release scripts
+        run: for t in scripts/tests/*.test.sh; do bash "$t" || exit 1; done
+
+  # ── Full manual release gate ────────────────────────────────────────
+  release-readiness:
+    name: Release Readiness
+    if: ${{ always() && github.event_name == 'workflow_dispatch' && inputs.full && inputs.semver }}
+    needs:
+      - changes
+      - lint
+      - test-linux
+      - test-windows
+      - test-macos
+      - cross-compile-linux-arm64
+      - mobile-android
+      - mobile-ios
+      - check-bindings
+      - go-bindings
+      - go-bindings-arm64-check
+      - feature-combo-doctests
+      - feature-powerset
+      - coverage
+      - msrv
+      - docs
+      - module-dag
+      - secrets
+      - supply-chain
+      - version-lockstep
+      - semver-checks-release
+      - release-scripts
+    runs-on: blacksmith-4vcpu-ubuntu-2404
+    timeout-minutes: 5
+    steps:
+      - name: Check needed job results
+        shell: bash
+        env:
+          NEEDS: ${{ toJSON(needs) }}
+          ADVISORY_JOBS: coverage
+        run: |
+          set -euo pipefail
+          results="$(jq -r 'to_entries[] | "\(.key) \(.value.result)"' <<< "$NEEDS")"
+          failed=0
+          while read -r job result; do
+            printf '%s %s\n' "$job" "$result"
+            if [[ " $ADVISORY_JOBS " != *" $job "* && "$result" != success ]]; then
+              failed=1
+            fi
+          done <<< "$results"
+          exit "$failed"
+      - uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5
+        if: always()
+        with:
+          persist-credentials: false
+      - name: Check readiness needs match CI jobs
+        if: always()
+        run: bash scripts/check-ci-readiness-needs.sh
