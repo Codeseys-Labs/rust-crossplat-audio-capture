@@ -389,14 +389,19 @@ can publish even though `verify` failed, and a run that has already started
 uploads what it built from the old commit without rechecking the tag. So first
 wait for every run the tag started (`release.yml`, `release-npm.yml`,
 `release-pypi.yml`) to finish, or cancel it and confirm it is cancelled. Only
-then check whether anything was published for `X.Y.Z`
-(<https://www.npmjs.com/package/@rsac/audio>,
-<https://pypi.org/project/rsac/>, <https://crates.io/crates/rsac>). If **no**
-registry has `X.Y.Z`, delete the tag locally and remotely
+then check whether anything was published for `X.Y.Z`: `rsac` on crates.io
+(<https://crates.io/crates/rsac>), `rsac` on PyPI
+(<https://pypi.org/project/rsac/>), and on npm both `@rsac/audio`
+(<https://www.npmjs.com/package/@rsac/audio>) **and every platform
+sub-package** (`@rsac/audio-<platform>`). An npm run publishes the
+sub-packages before the main package, so the main package's page can look
+clean after a partial publish. If **no** package on any registry has `X.Y.Z`,
+delete the tag locally and remotely
 (`git tag -d vX.Y.Z && git push --delete origin vX.Y.Z`), fix the underlying
-issue, and re-tag. If **any** registry already has it, leave the tag where it
-is and ship the fix as a new version: re-tagging would make the same version
-name point at different commits across registries. crates.io publishes are
+issue, and re-tag. If **any** package already has it, or you cannot establish
+that for every package, leave the tag where it is and ship the fix as a new
+version: re-tagging would make the same version name point at different
+commits across registries. crates.io publishes are
 irrevocable,
 so `publish` is gated behind a successful `verify` + `semver-checks` — but a failure
 inside `publish` (e.g. transient network, token rotation) is not safe
