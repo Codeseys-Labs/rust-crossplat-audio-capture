@@ -28,7 +28,9 @@ Releases with no ABI change omit the subsection (or state "No C ABI changes").
   Events and snapshots carry a `session` id that changes with each newly opened capture
   session, so an event left queued by an earlier session is distinguishable after a
   restart. A quiet supervised stream still returns `AudioError::Timeout` from blocking
-  reads, as an unsupervised one does.
+  reads, as an unsupervised one does. The supervisor writes its log records only after
+  releasing its internal lock, so a `log::Log` implementation may call back into the
+  capture (for example `stop()`) from inside a record.
 - **`CapturingStream::readable_buffers()`** — provided method (default `None`) reporting
   how many buffers are queued and readable right now. It never blocks: `BridgeStream`
   returns `None` while another reader holds the stream and `Some(0)` once queued data is
