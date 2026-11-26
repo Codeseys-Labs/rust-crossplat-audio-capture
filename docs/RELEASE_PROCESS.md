@@ -365,9 +365,17 @@ gh run view <run-id> --json headSha,conclusion   # headSha must equal $BUMP_SHA
   git push origin vX.Y.Z
 ```
 
-Watch the Actions tab. If `verify` fails, delete the tag locally and
-remotely (`git tag -d vX.Y.Z && git push --delete origin vX.Y.Z`), fix
-the underlying issue, and re-tag. crates.io publishes are irrevocable,
+Watch the Actions tab. If `verify` fails, first check whether anything was
+published for `X.Y.Z`: `release-npm.yml` and `release-pypi.yml` run in parallel
+with `release.yml` and can publish even though `verify` failed
+(<https://www.npmjs.com/package/@rsac/audio>,
+<https://pypi.org/project/rsac/>, <https://crates.io/crates/rsac>). If **no**
+registry has `X.Y.Z`, delete the tag locally and remotely
+(`git tag -d vX.Y.Z && git push --delete origin vX.Y.Z`), fix the underlying
+issue, and re-tag. If **any** registry already has it, leave the tag where it
+is and ship the fix as a new version: re-tagging would make the same version
+name point at different commits across registries. crates.io publishes are
+irrevocable,
 so `publish` is gated behind a successful `verify` + `semver-checks` — but a failure
 inside `publish` (e.g. transient network, token rotation) is not safe
 to re-run blindly if `cargo publish` already succeeded. Inspect
