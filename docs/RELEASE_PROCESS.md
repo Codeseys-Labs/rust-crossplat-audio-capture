@@ -338,19 +338,29 @@ dispatched run before the tag is the one that matters.
 # scripts/bump-version.sh rewrites all nine lockstep manifests + rotates
 # the CHANGELOG — see §2 "CHANGELOG promotion" and §3 "Version bump".
 #
-# 1. Commit, push and dispatch CI on the bump commit, as ONE `&&` chain so a
-#    failed commit or push stops the paste.
+# 1. Commit, push and dispatch CI, as ONE `&&` chain so a failed commit or
+#    push stops the paste. BUMP_SHA pins the bump commit for the steps below.
 git add -A &&
   git commit -m "rsac X.Y.Z" &&
+  BUMP_SHA="$(git rev-parse HEAD)" &&
   git push origin master &&
   gh workflow run ci.yml --ref master -f full=true -f semver=true
 
-# 2. Wait for that run to finish green (dispatch ci-audio-tests.yml as well for
-#    the audio matrix). Only then check and tag, again as one chain: nothing
-#    else checks a hand-made tag before it exists, and pushing it is the
-#    workflow trigger.
-bash scripts/check-version-lockstep.sh --expect X.Y.Z &&
-  git tag -a vX.Y.Z -m "rsac X.Y.Z" &&
+# 2. When the run has finished (dispatch ci-audio-tests.yml as well for the
+#    audio matrix), confirm it is green AND that it tested the bump commit.
+#    `--ref master` resolves when the dispatch is queued, so a commit that
+#    landed on master in between would have been tested instead:
+gh run view <run-id> --json headSha,conclusion   # headSha must equal $BUMP_SHA
+
+# 3. Check and tag the bump commit, again as one chain. The tree must be clean
+#    and still on the bump commit: the lockstep check reads files on disk, so
+#    an uncommitted fix would pass it while the tag records the committed
+#    mismatch. Nothing else checks a hand-made tag before it exists, and
+#    pushing it is the workflow trigger.
+[ "$(git rev-parse HEAD)" = "$BUMP_SHA" ] &&
+  git diff --quiet && git diff --cached --quiet &&
+  bash scripts/check-version-lockstep.sh --expect X.Y.Z &&
+  git tag -a vX.Y.Z -m "rsac X.Y.Z" "$BUMP_SHA" &&
   git push origin vX.Y.Z
 ```
 
@@ -469,7 +479,10 @@ writes to `master`.
 Treat the `release: vX.Y.Z` PR like any other PR: review the manifest
 diff and the CHANGELOG rotation. CI is manually dispatched, so **dispatch it on
 the release branch and wait for green before merging**
-(`gh workflow run ci.yml --ref release/vX.Y.Z`). Its **`version-lockstep` gate**
+(`gh workflow run ci.yml --ref release/vX.Y.Z`). Dispatch with the branch up to
+date with `master`, and merge before `master` advances again: `release-tag.yml`
+tags the squash-merge commit as soon as it lands, so that commit is covered only
+if its tree is the tree the run tested. Its **`version-lockstep` gate**
 cross-checks that all **nine** manifests
 (root `Cargo.toml`, the rsac-ffi / rsac-napi / rsac-python `Cargo.toml`s, the
 napi `package.json`, the python `pyproject.toml`, and the Android native shim)
@@ -883,8 +896,12 @@ not here. Dispatching on the pre-bump commit as well
 (`gh workflow run ci.yml --ref <branch> -f full=true -f semver=true`, plus
 `ci-audio-tests.yml` for the audio matrix) is optional: it catches a red
 matrix before you bump. CI is manual, so no run exists until you start one.
-In the release-prepare flow the dispatched run on the release branch already
-covers the bumped tree.
+In the release-prepare flow the dispatched run covers the release-branch tree
+only, and `release-tag.yml` tags the squash-merge commit as soon as it lands,
+so that commit cannot be dispatched before its tag exists. Keep the release
+branch up to date with `master` when you dispatch and when you merge, so the
+merge commit's tree is the tree that was tested; if `master` advanced in
+between, update the branch and dispatch again before merging.
 The workflows live in `.github/workflows/` (`ci.yml`,
 `ci-audio-tests.yml`, and the platform-specific splits). Check the Actions
 tab — do not rely solely on local results, since Linux PipeWire, Windows
@@ -991,8 +1008,10 @@ Push, then dispatch CI on the bump commit
 (`gh workflow run ci.yml --ref master -f full=true -f semver=true`, plus
 `ci-audio-tests.yml` for the audio matrix) and wait for every platform to be
 green before proceeding. CI is manual, so no run exists until you start one,
-and this is the commit that gets tagged. `version-lockstep` only warns on a
-dispatched run, so read its output; the hard check is
+and this is the commit that gets tagged: confirm the run's `headSha` is the
+bump commit (`gh run view <run-id> --json headSha,conclusion`), because
+`--ref master` resolves when the dispatch is queued. `version-lockstep` only
+warns on a dispatched run, so read its output; the hard check is
 `check-version-lockstep.sh --expect` in §4.
 
 ---
@@ -1009,9 +1028,11 @@ Annotated tags only — do not use lightweight tags. The tag name is
 `v<semver>`; pushing it is the event all three publish workflows key on.
 
 ```bash
-# The manual path has no automatic pre-tag check: run it yourself. `&&`
-# stops the paste before `git tag` if the check fails.
-bash scripts/check-version-lockstep.sh --expect 0.2.0 &&
+# The manual path has no automatic pre-tag check: run it yourself, on a clean
+# tree (the check reads files on disk, not the commit being tagged). `&&`
+# stops the paste before `git tag` if anything fails.
+git diff --quiet && git diff --cached --quiet &&
+  bash scripts/check-version-lockstep.sh --expect 0.2.0 &&
   git tag -a v0.2.0 -m "rsac 0.2.0" &&
   git push origin v0.2.0
 ```
