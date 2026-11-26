@@ -81,15 +81,16 @@ jobs:
           - os: blacksmith-4vcpu-windows-2025
             features: feat_windows,compose
             install_deps: false
-            # Blacksmith Windows runners lack an audio subsystem (see
-            # AGENTS.md §6). Only the WASAPI tests that actually open an
-            # audio client/device need a device; those are isolated below
-            # into a SEPARATE tolerated step. Everything else hard-fails.
+            # This job installs no audio device and the Blacksmith Windows
+            # image ships none (AGENTS.md §6: the audio service is present
+            # since the 2026-11-26 probe, an endpoint only after VB-CABLE).
+            # Only the WASAPI tests that actually open an audio client/device
+            # need one; those are isolated below into a SEPARATE tolerated
+            # step. Everything else hard-fails.
             # Space-separated substrings matching the device-dependent unit
             # tests that open a real WASAPI client / default endpoint /
-            # IMMNotificationClient (need Audiosrv + an endpoint, ABSENT on the
-            # Blacksmith Windows runner — they fail RPC-unavailable 0x800706BA /
-            # service-not-installed 0x80070424). MUST stay in lockstep with
+            # IMMNotificationClient (need Audiosrv + an endpoint). MUST stay in
+            # lockstep with
             # ci.yml's test-windows DEVICE_SKIPS. Everything not listed here is
             # pure logic and hard-fails.
             device_test_filter: 'enumerate default_device device_enumeration device_id device_supported_formats audio_device_ create_stream find_device watch_ create_audio_client'

@@ -258,7 +258,7 @@ review § "Key learnings" for the full post-mortem.
 
 | Issue | Status | Notes |
 |---|---|---|
-| **rsac#26** — macOS device-path hang | not reproduced on GitHub-hosted | `macos-audio` runs on GitHub-hosted `macos-15` with BlackHole as default I/O. First run (45738663823, 2026-11-26): the Device tier captured 94 buffers / 48,128 frames, no AUHAL hang. The hang was only ever seen on the Blacksmith macOS image. |
+| **rsac#26** — macOS device-path hang | not reproduced on GitHub-hosted | `macos-audio` runs on GitHub-hosted `macos-15` with BlackHole as default I/O. First run (45738663823, 2026-11-26): `device_capture` exited 0 in 2.25 s and its log shows a first non-silent buffer (RMS 0.57) and 94 buffers / 48,128 frames, so AUHAL did not hang. That is log evidence, not an assertion: the macOS job does not set `RSAC_CI_AUDIO_DETERMINISTIC`, so silence would only have warned. The hang was only ever seen on the Blacksmith macOS image. |
 | **rsac#21** — failing-test signalling | requires opt-in PR | User-driven. |
 | **rsac#19** — Alpine musl + PipeWire runtime | blocked on infra session | 4-6h Alpine Docker + audio. |
 | **rsac#16** — docs.rs post-publish spot-check | gated on first `cargo publish` | `scripts/verify-docs-rs.sh` is ready. |

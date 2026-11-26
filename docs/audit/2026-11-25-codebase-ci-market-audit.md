@@ -154,7 +154,7 @@ Gaps at `eac7056` and their resolution:
 | Gap | Resolution in this pass |
 |---|---|
 | `lefthook.yml` ran bare `bash scripts/...`; on Windows with WSL that can resolve to `System32\bash.exe` (wrong OS, no `cargo`) | Every hook now runs `mise run <task>`; mise's `run_windows` routes through `scripts/run-bash.ps1` (Git bash by absolute path) |
-| Runtime pins duplicated across `mise.toml` and five workflows, already drifted (Node 20 in `release-npm.yml` vs 22 elsewhere; Bun `1` vs `1.3.14`) | New `.tool-versions` (`bun 1.3.14`, `nodejs 22`, `golang 1.22`, `python 3.12`) read by mise and by the `setup-*` actions; `supply-chain.yml` keeps `go-version: stable` for govulncheck |
+| Runtime pins duplicated across `mise.toml` and five workflows, already drifted (Node 20 in `release-npm.yml` vs 22 elsewhere; Bun `1` vs `1.3.14`) | New `.tool-versions` (`bun 1.3.14`, `nodejs 22`, `golang 1.22`, `python 3.12`) read by mise and by `setup-node`, `setup-bun` and `setup-python`. The pinned `setup-go` (v5.1.0) cannot parse it, so the Go jobs read `bindings/rsac-go/go.mod`; `supply-chain.yml` keeps `go-version: stable` for govulncheck |
 | Root `Makefile` duplicated mise tasks and pointed at nonexistent targets | Deleted; `mise run check:cross` replaces its one caller |
 
 Trade-off: hooks now require mise on `PATH`, which the documented

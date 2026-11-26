@@ -278,10 +278,10 @@ jobs:
 
   # ===========================================================================
   # Windows tiers — VB-CABLE virtual audio driver — FIRST-CLASS (hard-gated)
-  # NOTE: Blacksmith Windows VMs (Firecracker) have no audio subsystem at all
-  # (AudioSrv, AudioEndpointBuilder, AudioSes.dll are all absent).
-  # We use GitHub-hosted windows-latest for audio integration tests, which
-  # has a full Windows audio stack. Blacksmith handles compilation/unit tests.
+  # NOTE: these tiers run on GitHub-hosted windows-latest: free for a public
+  # repository and proven with VB-CABLE. The Blacksmith Windows image gained an
+  # audio stack by the 2026-11-26 probe (AGENTS.md §6) but has never run this
+  # suite; Blacksmith handles compilation/unit tests.
   #
   # rsac M5: Windows is a first-class tier. Every tier step's real pass/fail is
   # exported as a job output and gated by the summary job. The shared endpoint

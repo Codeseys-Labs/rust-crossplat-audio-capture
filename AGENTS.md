@@ -805,7 +805,7 @@ Full playbook (when to stack vs parallel PRs, exact commands, pitfalls):
 - macOS 15 (Sequoia) testing on real hardware (expected to work via Path 2, untested)
 - **Compose follow-ups:** channel-position-aware layouts remain future work;
   Python/Node/Go composition and live gain/mute have shipped.
-- **Blacksmith Windows audio support** — request Blacksmith add audio subsystem to Windows Server images (see §6 runner labels)
+- **Blacksmith Windows audio (optional)** — the image has had an audio stack since the 2026-11-26 probe, but the `ci_audio` windows tier has never run there. Worth a trial run only if the repository goes private or GitHub-hosted Windows audio regresses (seed `rsac-07778d`; see §6 runner labels)
 
 ---
 

@@ -19,6 +19,15 @@ version = 2
 # this fails CI: pin/replace the dep, or (only with a documented reason) add a
 # time-boxed exception here and cite it.
 yanked = "deny"
+# Scope "unmaintained" notices to crates a workspace member depends on
+# DIRECTLY. cargo-deny changed this default from "all" to "workspace" in
+# 0.22.0, while CI's installer still resolves 0.19.x, so the scope is pinned
+# here to keep every version on one policy. An unmaintained notice on a
+# transitive dependency has no fix in this repository (today: unic-* and
+# proc-macro-error under tauri's tree, in the graph since CI checks
+# `--workspace`), and it is not a vulnerability. Vulnerability advisories and
+# yanked crates still fail on the whole tree.
+unmaintained = "workspace"
 
 [licenses]
 version = 2
