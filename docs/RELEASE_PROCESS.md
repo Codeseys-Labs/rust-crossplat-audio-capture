@@ -333,7 +333,9 @@ git add -A
 git commit -m "rsac X.Y.Z"
 git push origin master
 
-# Tag and push — this is the workflow trigger.
+# Tag and push — this is the workflow trigger. Nothing checks a hand-made tag
+# before it exists, so run the lockstep check yourself first.
+bash scripts/check-version-lockstep.sh --expect X.Y.Z
 git tag -a vX.Y.Z -m "rsac X.Y.Z"
 git push origin vX.Y.Z
 ```
@@ -658,7 +660,10 @@ CHANGELOG rotation. The
 release branch before merging the release PR. The merge commit gets no CI run
 of its own; instead `release-tag.yml` hard-checks the same nine-manifest
 lockstep (`--expect X.Y.Z`) before it creates the tag, so a mismatched manifest
-never reaches the tag.
+never reaches a tag that workflow creates. It is the only pre-tag gate: a
+hand-made tag (§4) has no automatic check, so run
+`bash scripts/check-version-lockstep.sh --expect X.Y.Z` before `git tag`;
+otherwise drift is caught only after the tag exists.
 At *tag* time, `release.yml`'s `verify` job independently re-checks the pushed
 tag against the root `Cargo.toml` before publishing (a second, registry-side
 gate), and `ci.yml` runs its full nine-manifest lockstep on the `v*.*.*` tag
@@ -975,6 +980,8 @@ Annotated tags only — do not use lightweight tags. The tag name is
 `v<semver>`; pushing it is the event all three publish workflows key on.
 
 ```bash
+# The manual path has no automatic pre-tag check: run it yourself.
+bash scripts/check-version-lockstep.sh --expect 0.2.0
 git tag -a v0.2.0 -m "rsac 0.2.0"
 git push origin v0.2.0
 ```
