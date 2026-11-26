@@ -361,10 +361,11 @@ cargo update --workspace &&
 # it. `--commit` matters: `--ref master` resolves when the dispatch is queued,
 # so a commit that landed on master in between would have been tested instead,
 # and this lookup then finds nothing. A run takes a few seconds to appear; if
-# the lookup fails right after block 1, run this block again. Dispatch
+# RUN_ID comes back empty right after block 1, run this block again. Dispatch
 # ci-audio-tests.yml as well for the audio matrix.
 RUN_ID="$(gh run list --workflow ci.yml --branch master --event workflow_dispatch \
     --commit "$BUMP_SHA" --limit 1 --json databaseId --jq '.[0].databaseId')" &&
+  [ -n "$RUN_ID" ] &&
   gh run watch "$RUN_ID" --exit-status
 ```
 
@@ -868,8 +869,11 @@ Once the RC is validated, promote it through the checked sequence in
 outside its block 3. The commit to tag must be the head of `master` and carry
 the stable version in all nine manifests: if it does not yet, bump as in §3
 (block 1). If it already does, skip block 1's commit, set
-`BUMP_SHA="$(git rev-parse HEAD)"` and dispatch `ci.yml` on it unless a
-dispatched run on that commit already exists. Then run blocks 2 and 3.
+`BUMP_SHA="$(git rev-parse HEAD)"` and dispatch `ci.yml` on `master`
+(`gh workflow run ci.yml --ref master -f full=true -f semver=true`) unless a
+`ci.yml` run dispatched on `master` already exists for that commit. Block 2
+looks only there: a run on an RC branch for the same commit does not count.
+Then run blocks 2 and 3.
 
 The tag push triggers all three registry workflows in parallel, and nothing
 else checks the commit first.
@@ -1043,15 +1047,16 @@ Commit, push and dispatch CI with **block 1** of
 [Using the automated flow](#using-the-automated-flow), then wait for the run
 with **block 2**. Use a normal subject for a manual/major release (for the
 worked example, `chore: release 0.2.0`); reserve the `release: vX.Y.Z` subject
-for the automated PR, since `release-tag.yml` auto-tags any `release:` squash
-commit.
+for the automated PR, since `release-tag.yml` auto-tags a commit on `master`
+whose subject is exactly `release: vX.Y.Z`, optionally followed by ` (#N)`.
 
 Block 1 also runs `cargo update --workspace`: `bump-version.sh` never touches
 `Cargo.lock`, and both the dispatched CI (the MSRV job's `cargo check
 --locked`) and `cargo publish --locked` read the committed lockfile. CI is
 manual, so no run exists until block 1 dispatches one, and the run must be on
 the bump commit, which is the commit that gets tagged; block 2 looks the run up
-by that commit. `version-lockstep` only warns on a dispatched run, so read its
+by that commit. A version mismatch only warns in `version-lockstep` on a
+dispatched run (a manifest it cannot read still fails the job), so read its
 output; the hard check is `check-version-lockstep.sh --expect` in block 3.
 
 ---
