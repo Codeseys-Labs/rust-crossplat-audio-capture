@@ -67,7 +67,9 @@ The numeric thresholds (20 dB dominance over consecutive 200 ms windows) are pro
 
 ### W4 — `#[non_exhaustive]`
 
-`PlatformCapabilities` and `ApplicationEnumeration` become `#[non_exhaustive]` only in the 0.5.0 cutover, so `master` stays releasable as a 0.4.x patch until then (7 of 7 for the attribute; the timing is the challenger's amendment). The recovery types already carry the type-level attribute; their field-carrying variants get the variant-level attribute now, which breaks nothing because they are absent from v0.4.4. The same rule moves the removal of the deprecated `WindowsApplicationCapture` out of #105 and into the cutover.
+`PlatformCapabilities` and `ApplicationEnumeration` become `#[non_exhaustive]` only in the 0.5.0 cutover, as one reviewed batch of breaking changes (7 of 7 for the attribute; the timing is the challenger's amendment, argued as keeping `master` releasable as a 0.4.x patch). The recovery types already carry the type-level attribute; their field-carrying variants get the variant-level attribute now, which breaks nothing because they are absent from v0.4.4. The same rule moves the removal of the deprecated `WindowsApplicationCapture` out of #105 and into the cutover.
+
+Measured afterwards: the first run of the Windows semver leg (CI 45810052216) showed `master` is already not releasable as a 0.4.x patch. PR #77 turned the public unit struct `ComInitializer` into a struct with a field, which the Linux-only gate could not see. The Linux and macOS legs are clean. The batch rule stands, and the next release is 0.5.0.
 
 ### W5 — The activity probe (#76)
 
