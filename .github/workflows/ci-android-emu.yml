@@ -23,9 +23,9 @@ name: Android Emulator Runtime Leg
 #
 # KVM: hardware acceleration is mandatory for a usable x86_64 emulator.
 # Blacksmith (blacksmith-4vcpu-ubuntu-2404) KVM support is UNVERIFIED — the
-# probe step below SKIPS the whole payload with a loud step summary when
-# /dev/kvm is absent (a skipped leg that says why beats a red X). If the
-# probe shows Blacksmith lacks KVM, flip `runs-on` to ubuntu-latest
+# probe step below skips the payload with a loud step summary when /dev/kvm
+# is absent; release evidence mode fails instead.
+# If Blacksmith lacks KVM, flip `runs-on` to ubuntu-latest
 # (GH-hosted runners expose KVM after the udev rule below).
 #
 # Test-harness mechanism: libtest binaries are cross-built for
@@ -98,6 +98,10 @@ on:
           has proven the synthetic-mic route is reliable).
         type: boolean
         default: false
+      release_evidence:
+        description: Require emulator and instrumented microphone and playback frame evidence
+        type: boolean
+        default: false
   # Manual dispatch only (CI cost policy): this leg boots an AVD (35m cap).
   # ci.yml's `mobile-android` job covers Android COMPILATION whenever a
   # dispatched branch touches mobile-relevant paths; dispatch this workflow
@@ -128,6 +132,10 @@ jobs:
         # bash keyword shell => -eo pipefail (a `cargo … | tee` pipe cannot
         # mask a failure behind tee's exit 0).
         shell: bash
+    outputs:
+      kvm: ${{ steps.kvm.outputs.available }}
+      emulator: ${{ steps.emu.outcome }}
+      frames: ${{ steps.evidence.outputs.frames }}
     steps:
       - uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5
         with:
@@ -403,6 +411,25 @@ jobs:
         env:
           REQUIRE_FRAMES: ${{ github.event_name == 'workflow_dispatch' && inputs.require_frames && '1' || '0' }}
 
+      # The shell-uid smoke has a separate log and remains advisory. Reject
+      # instrumented skips and require positive frame results for every tier.
+      - name: Require instrumented frame evidence
+        id: evidence
+        if: inputs.release_evidence && steps.kvm.outputs.available == 'true'
+        timeout-minutes: 1
+        run: |
+          set -euo pipefail
+          test -s instrumented-logcat.log
+          if grep -Fq 'SKIP-WITH-SUMMARY:' instrumented-logcat.log; then
+            echo "::error::instrumented tests reported a skip"
+            exit 1
+          fi
+          grep -E 'RsacFramesTest.*frames delivered via shipped C ABI.*buffers=[1-9][0-9]* frames=[1-9][0-9]*' instrumented-logcat.log
+          for tier in systemDefault application applicationByName processTree; do
+            grep -E "RsacPlaybackTest.*\\[$tier\\] playback frames delivered via public API.*buffers=[1-9][0-9]* frames=[1-9][0-9]*" instrumented-logcat.log
+          done
+          echo "frames=success" >> "$GITHUB_OUTPUT"
+
       - name: Summarize
         if: steps.kvm.outputs.available == 'true' && always()
         run: |
@@ -442,3 +469,26 @@ jobs:
             mobile/android/build/reports/androidTests/**
           if-no-files-found: ignore
           retention-days: 14
+
+  # Add every new workflow job to this needs list; the CI drift guard only checks ci.yml.
+  release-evidence:
+    name: Android Release Evidence
+    if: ${{ always() && inputs.release_evidence }}
+    needs: [android-emu]
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: Check jobs and runtime proof
+        shell: bash
+        env:
+          NEEDS: ${{ toJSON(needs) }}
+          KVM: ${{ needs.android-emu.outputs.kvm }}
+          EMULATOR: ${{ needs.android-emu.outputs.emulator }}
+          FRAMES: ${{ needs.android-emu.outputs.frames }}
+        run: |
+          set -euo pipefail
+          jq -r 'to_entries[] | "\(.key) \(.value.result)"' <<< "$NEEDS"
+          jq -e 'all(.[]; .result == "success")' <<< "$NEEDS" > /dev/null
+          [[ "$KVM" == true ]] || { echo "::error::KVM unavailable"; exit 1; }
+          [[ "$EMULATOR" == success ]] || { echo "::error::emulator did not complete"; exit 1; }
+          [[ "$FRAMES" == success ]] || { echo "::error::instrumented frame evidence missing"; exit 1; }

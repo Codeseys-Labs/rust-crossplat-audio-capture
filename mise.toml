@@ -68,7 +68,7 @@ run = "bash scripts/bump-version.sh"
 run_windows = "pwsh -NoProfile -ExecutionPolicy Bypass -File scripts/run-bash.ps1 scripts/bump-version.sh"
 
 [tasks."release:tag"]
-description = "Check release readiness and push the annotated tags: mise run release:tag -- X.Y.Z [--dry-run]"
+description = "Emergency local release: check workflow and Windows switch evidence, then push the annotated tags: mise run release:tag -- X.Y.Z [--dry-run]"
 run = "bash scripts/tag-release.sh"
 run_windows = "pwsh -NoProfile -ExecutionPolicy Bypass -File scripts/run-bash.ps1 scripts/tag-release.sh"
 

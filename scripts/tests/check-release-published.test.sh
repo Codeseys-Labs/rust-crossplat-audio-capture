@@ -3,7 +3,8 @@
 # check-release-published.test.sh — contract tests for scripts/check-release-published.sh
 #
 # Written from the release-tooling contract ONLY (section 5 describes the script,
-# section 7 describes these tests, revision note r3 amends section 5); the script
+# section 7 describes these tests, revision note r3 and clause R4.1 of the release-gate
+# contract, revision 4, amend section 5); the script
 # under test was not read while writing them. Every expectation names the contract
 # clause it comes from. A failing case stays failing: never weaken an expectation to
 # match observed output; fix the script or report the contract problem.
@@ -709,6 +710,43 @@ case_repo_from_chosen_remote() {
   assert_gh_calls_name_repo "up/stream" "R3.1: --repo is parsed from the URL of the remote chosen with --remote"
 }
 
+# ── R4.1: RELEASE_REPO must look like <owner>/<name> ─────────────────────────
+# R4.1: "`RELEASE_REPO`, when set and non-empty, must match `^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$`. Otherwise
+# ... `check-release-published.sh` reports the three workflow probes `indeterminate`." The other probes
+# (Go tag, registries) do not depend on the repository and still run and report normally.
+case_release_repo_invalid() { # <RELEASE_REPO value>
+  RELEASE_REPO="$1"
+  export RELEASE_REPO
+  run_crp "$VER"
+  expect_indeterminate "R4.1: RELEASE_REPO '$1' does not match the owner/name pattern: the three workflow probes are indeterminate"
+  assert_report clean release.yml=indeterminate release-npm.yml=indeterminate release-pypi.yml=indeterminate
+  # No repository, no GitHub CLI call (the fake gh would also reject a call naming the invalid value).
+  assert_no_calls "R4.1: an invalid RELEASE_REPO makes no GitHub CLI call" gh
+  assert_all_urls_requested "R4.1: the registry probes still run"
+}
+case_release_repo_invalid_no_url_fallback() {
+  # R4.1 ("Otherwise ... indeterminate"): an invalid RELEASE_REPO is not replaced by the repository parsed
+  # from the remote URL; R3.1 falls back to the URL only when RELEASE_REPO is unset or empty.
+  RELEASE_REPO="not a repository"
+  FAKE_EXPECT_REPO="o/n"
+  export RELEASE_REPO FAKE_EXPECT_REPO
+  use_remote_url origin "https://github.com/o/n.git" "$REMOTE" || return 0
+  run_crp "$VER"
+  expect_indeterminate "R4.1: invalid RELEASE_REPO with a parseable remote URL: still indeterminate, no fallback"
+  assert_report clean release.yml=indeterminate release-npm.yml=indeterminate release-pypi.yml=indeterminate
+  assert_no_calls "R4.1: no GitHub CLI call" gh
+}
+case_release_repo_valid() { # <RELEASE_REPO value>
+  RELEASE_REPO="$1"
+  FAKE_EXPECT_REPO="$1"
+  export RELEASE_REPO FAKE_EXPECT_REPO
+  run_crp "$VER"
+  expect_clean "R4.1: '$1' matches ^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+\$"
+  assert_report clean
+  assert_gh_calls_name_repo "$1" "R4.1: --repo is the RELEASE_REPO value"
+  assert_all_workflows_queried "R4.1: the three probes ask about $1" "$1"
+}
+
 # ── usage: exit 2 ──────────────────────────────────────────────────────────
 case_usage() { # <clause> <args...>
   local clause="$1"
@@ -907,6 +945,27 @@ run_case repo-url-scp-other-host-rejected case_repo_url_rejected "git@gitlab.com
 run_case repo-env-overrides-url case_repo_env_overrides_url
 run_case repo-empty-env-uses-url case_repo_empty_env_uses_url
 run_case repo-from-chosen-remote case_repo_from_chosen_remote
+run_case repo-valid-all-allowed-characters case_release_repo_valid "A_b.c-d/E.f_g-h"
+run_case repo-valid-digits-and-single-characters case_release_repo_valid "0/9"
+run_case repo-invalid-no-slash case_release_repo_invalid "owner"
+run_case repo-invalid-two-slashes case_release_repo_invalid "o/n/x"
+run_case repo-invalid-empty-owner case_release_repo_invalid "/n"
+run_case repo-invalid-empty-name case_release_repo_invalid "o/"
+run_case repo-invalid-space-in-owner case_release_repo_invalid "o w/n"
+run_case repo-invalid-space-in-name case_release_repo_invalid "o/n x"
+run_case repo-invalid-leading-space case_release_repo_invalid " o/n"
+run_case repo-invalid-trailing-space case_release_repo_invalid "o/n "
+run_case repo-invalid-semicolon case_release_repo_invalid "o/n;id"
+run_case repo-invalid-command-substitution case_release_repo_invalid 'o/$(id)'
+run_case repo-invalid-backtick case_release_repo_invalid 'o/`id`'
+run_case repo-invalid-url-form case_release_repo_invalid "https://github.com/o/n"
+run_case repo-invalid-at-sign case_release_repo_invalid "o/n@x"
+run_case repo-invalid-colon case_release_repo_invalid "o:x/n"
+run_case repo-invalid-backslash case_release_repo_invalid 'o\x/n'
+run_case repo-invalid-non-ascii case_release_repo_invalid $'\xc3\xb6/n'
+run_case repo-invalid-trailing-newline case_release_repo_invalid $'o/n\n'
+run_case repo-invalid-embedded-newline case_release_repo_invalid $'o/n\nx/y'
+run_case repo-invalid-no-url-fallback case_release_repo_invalid_no_url_fallback
 
 U="§5 usage: exit 2"
 run_case usage-no-version case_usage "$U (a version is required)"

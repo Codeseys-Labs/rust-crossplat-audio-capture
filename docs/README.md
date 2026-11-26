@@ -24,7 +24,7 @@ not guidance. Entry points (⭐) are the places to start.
 |---|---|
 | ⭐ [`ARCHITECTURE.md`](ARCHITECTURE.md) | Accurate 3-layer architecture overview (start here) |
 | [`PERFORMANCE.md`](PERFORMANCE.md) | RT-safety story, ring sizing, backpressure diagnostics |
-| [`DESKTOP_REFINEMENT.md`](DESKTOP_REFINEMENT.md) | Desktop-first v0.5 bar, D1–D5 multi-model deliberation record, mobile freeze/unfreeze checklist |
+| [`DESKTOP_REFINEMENT.md`](DESKTOP_REFINEMENT.md) | Desktop-first v0.5 bar, the multi-model deliberation records (D1–D5, W1–W6, panel 2), mobile freeze/unfreeze checklist |
 | [`MOBILE_BACKEND_DESIGN.md`](MOBILE_BACKEND_DESIGN.md) | Android/iOS backend design (experimental/parked; emulator/simulator-verified, physical devices pending) |
 | [`MACOS_VERSION_COMPATIBILITY.md`](MACOS_VERSION_COMPATIBILITY.md) | macOS 14.4–26 API compatibility matrix |
 | [`MACOS26_PROCESS_TAP_FIX.md`](MACOS26_PROCESS_TAP_FIX.md) | Dated fix record: the 3-path Process Tap fallback |
@@ -43,6 +43,7 @@ their migrated issues in the [mapping table](history/seeds/SEEDS_TO_ISSUES.md).
 |---|---|
 | ⭐ [`CONTRIBUTING.md`](CONTRIBUTING.md) | Onboarding (mise + lefthook), the local gate, test suites, PR checklist |
 | [`CI_AUDIO_TESTING.md`](CI_AUDIO_TESTING.md) | The 9-cell audio-test truth table, gate macros, workflow knobs |
+| [`evidence/windows-default-switch.md`](evidence/windows-default-switch.md) | Workstation evidence for the Windows default-device switch under `hotplug-recovery`; the release gate reads its `Tested-SHA` |
 | [`LOCAL_TESTING_GUIDE.md`](LOCAL_TESTING_GUIDE.md) | Manual verification on physical Windows/macOS/Linux machines |
 | [`PLATFORM_TESTING.md`](PLATFORM_TESTING.md) | Map of the verification layers |
 | [`DOCKER_TESTING.md`](DOCKER_TESTING.md) | Retired Docker test matrix; current devcontainer/native-VM notes |

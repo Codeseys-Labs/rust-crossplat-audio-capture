@@ -211,11 +211,13 @@ jobs:
       # in pyproject.toml before publishing to PyPI. Tag events only.
       - name: Verify requested version matches pyproject.toml version
         shell: bash
+        env:
+          INPUT_VERSION: ${{ inputs.version }}
         run: |
           if [[ "${GITHUB_REF:-}" == refs/tags/v* ]]; then
             VERSION="${GITHUB_REF_NAME#v}"
           else
-            VERSION='${{ inputs.version }}'
+            VERSION="$INPUT_VERSION"
           fi
           if [ -z "${VERSION}" ]; then
             echo "::error::Manual PyPI publish requires the workflow_dispatch version input"
@@ -245,6 +247,25 @@ jobs:
         with:
           path: dist-all
           merge-multiple: true
+
+      - name: Verify release tag still points to this commit
+        shell: bash
+        timeout-minutes: 2
+        env:
+          INPUT_VERSION: ${{ inputs.version }}
+        run: |
+          set -euo pipefail
+          if [[ "$GITHUB_REF" == refs/tags/v* ]]; then
+            tag="$GITHUB_REF_NAME"
+          else
+            tag="v$INPUT_VERSION"
+          fi
+          ref="refs/tags/$tag"
+          refs="$(git ls-remote --exit-code --tags origin "$ref" "$ref^{}")"
+          commit="$(awk -v ref="$ref" '$2 == ref { base=$1 } $2 == ref "^{}" { peeled=$1 } END { if (base != "") print (peeled != "" ? peeled : base) }' <<< "$refs")"
+          [[ -n "$commit" && "$commit" == "$GITHUB_SHA" ]] || {
+            echo "::error::remote tag $tag is missing or does not resolve to $GITHUB_SHA"; exit 1;
+          }
 
       # Upload via the official PyPA action using Trusted Publishing.
       # No password/token input: it uses the OIDC id-token granted above.

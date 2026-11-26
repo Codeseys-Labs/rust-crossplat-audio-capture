@@ -310,11 +310,13 @@ jobs:
       - name: Verify tag matches package.json version
         working-directory: bindings/rsac-napi
         shell: bash
+        env:
+          INPUT_VERSION: ${{ inputs.version }}
         run: |
           if [[ "${GITHUB_REF:-}" == refs/tags/v* ]]; then
             VERSION="${GITHUB_REF_NAME#v}"
           else
-            VERSION='${{ inputs.version }}'
+            VERSION="$INPUT_VERSION"
           fi
           if [ -z "${VERSION}" ]; then
             echo "::error::Manual npm publish requires the workflow_dispatch version input"
@@ -438,6 +440,25 @@ jobs:
       # `prepublishOnly` lifecycle hook) so we control --skip-gh-release —
       # GitHub Releases are created by release-tag.yml/release.yml, and this
       # job's token has no contents:write scope anyway.
+      - name: Verify release tag still points to this commit
+        shell: bash
+        timeout-minutes: 2
+        env:
+          INPUT_VERSION: ${{ inputs.version }}
+        run: |
+          set -euo pipefail
+          if [[ "$GITHUB_REF" == refs/tags/v* ]]; then
+            tag="$GITHUB_REF_NAME"
+          else
+            tag="v$INPUT_VERSION"
+          fi
+          ref="refs/tags/$tag"
+          refs="$(git ls-remote --exit-code --tags origin "$ref" "$ref^{}")"
+          commit="$(awk -v ref="$ref" '$2 == ref { base=$1 } $2 == ref "^{}" { peeled=$1 } END { if (base != "") print (peeled != "" ? peeled : base) }' <<< "$refs")"
+          [[ -n "$commit" && "$commit" == "$GITHUB_SHA" ]] || {
+            echo "::error::remote tag $tag is missing or does not resolve to $GITHUB_SHA"; exit 1;
+          }
+
       - name: napi prepublish (publish platform sub-packages)
         run: bunx @napi-rs/cli prepublish -t npm --skip-gh-release
 
