@@ -1346,11 +1346,10 @@ jobs:
         run: bash scripts/check-module-dag.sh --self-test
 
   # ── Secret scan (betterleaks) ───────────────────────────────────────
-  # Independent of `changes`/`lint` on purpose: a docs-only PR (where the
+  # Independent of `changes`/`lint` on purpose: a docs-only branch (where the
   # compile matrix is skipped) is exactly where a pasted token lands, so it
-  # must always be scanned. PRs scan only their own commits (merge-base..head,
-  # the same precedent as the CHANGELOG guard); pushes, tags and dispatch scan
-  # the full history. Rules and allowlist: .betterleaks.toml. The scanner
+  # must always be scanned. Every run scans the full history (seconds on this
+  # repo). Rules and allowlist: .betterleaks.toml. The scanner
   # version is pinned once, in mise.toml (jdx/mise-action installs just
   # betterleaks). --redact keeps matched values out of the public logs; never
   # pass -v/--validation (sends findings to provider APIs).
@@ -1431,7 +1430,7 @@ jobs:
       # with the three registry publish workflows — no logic is duplicated in
       # YAML anymore). On a `vX.Y.Z` tag push we pass `--expect <tag-version>`,
       # which HARD-FAILS on any manifest that does not equal the tag — the
-      # point of no return. On ordinary pushes / PRs we pass `--warn-only`, so a
+      # point of no return. On a manual dispatch we pass `--warn-only`, so a
       # deliberate mid-cycle skew (a binding lagging the root crate between
       # releases) only warns and does not block day-to-day CI. An
       # unextractable version is a hard failure regardless (the script

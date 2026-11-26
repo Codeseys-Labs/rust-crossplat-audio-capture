@@ -457,12 +457,13 @@ the release branch and wait for green before merging**
 cross-checks that all **nine** manifests
 (root `Cargo.toml`, the rsac-ffi / rsac-napi / rsac-python `Cargo.toml`s, the
 napi `package.json`, the python `pyproject.toml`, and the Android native shim)
-carry the same version, and a `release/vX.Y.Z` dispatch also runs the semver
-gate. Nothing re-runs CI on the merge commit that `release-tag.yml` tags; the
-automatic backstop is tag time: `release.yml` re-checks the tag matches the root
+carry the same version (a skew only warns on a dispatched run, so read the job
+output), and a `release/vX.Y.Z` dispatch also runs the semver gate. The hard
+gates are automatic: `release-tag.yml` runs the same nine-manifest lockstep
+check with `--expect X.Y.Z` on the merge commit and refuses to create the tag
+on any mismatch; at tag time `release.yml` re-checks the tag against the root
 `Cargo.toml`, and `ci.yml` fires on the `v*.*.*` tag push — its `on:` block
-keeps a `tags: ['v*.*.*', '!v*-*']` trigger — so the full nine-manifest lockstep
-gate hard-fails at the tag if a manifest drifted.
+keeps a `tags: ['v*.*.*', '!v*-*']` trigger — and hard-fails on drift.
 
 > **Merge it as a SQUASH merge, and do NOT edit the commit subject.** The
 > tag automation in step 3 keys on the squash-merge commit *subject* being
@@ -654,13 +655,15 @@ in one shot — including `bindings/rsac-ffi/Cargo.toml` and its internal
 CHANGELOG rotation. The
 `version-lockstep` CI job re-checks all nine values on every `ci.yml` run
 (warning on a mid-cycle skew). CI is manually dispatched, so dispatch it on the
-release branch and require green before merging the release PR; the merge
-commit that `release-tag.yml` then tags gets no CI run of its own.
+release branch before merging the release PR. The merge commit gets no CI run
+of its own; instead `release-tag.yml` hard-checks the same nine-manifest
+lockstep (`--expect X.Y.Z`) before it creates the tag, so a mismatched manifest
+never reaches the tag.
 At *tag* time, `release.yml`'s `verify` job independently re-checks the pushed
 tag against the root `Cargo.toml` before publishing (a second, registry-side
 gate), and `ci.yml` runs its full nine-manifest lockstep on the `v*.*.*` tag
 push too (its `on:` block has a `tags: ['v*.*.*', '!v*-*']` trigger), so the
-lockstep gate covers the dispatched release branch *and* tag time. A mismatched
+lockstep gate covers the tagging step *and* tag time. A mismatched
 manifest must never reach a registry.
 
 > Mid-cycle skew is tolerated by CI (warning only) so a binding can lag
