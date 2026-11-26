@@ -71,6 +71,14 @@ Releases with no ABI change omit the subsection (or state "No C ABI changes").
 
 ### Changed
 
+- **Breaking: `PlatformCapabilities` and `ApplicationEnumeration` are
+  `#[non_exhaustive]`.** Get a value from `PlatformCapabilities::query()` or
+  `list_audio_applications_scoped()` and read its fields by name. Outside the crate a
+  struct literal of either type no longer compiles and a pattern needs `..`. In
+  exchange, a field can be added in a minor release.
+- **Breaking (Windows): `ComInitializer` is no longer a unit struct.** It carries state
+  since the COM ownership change in this release; obtain one with
+  `let guard = ComInitializer::new()?;` (the constructor returns `AudioResult<Self>`).
 - **MSRV raised to `1.88`** (`Cargo.toml` and `ci.yml` Linux + Windows MSRV legs) to
   reflect `sysinfo 0.38.4`'s actual Rust 1.88 requirement on Windows/macOS.
 - **Dependencies upgraded:** `rtrb` `0.3.4` → `0.4.1`, `wasapi` `0.23.0` → `0.27.0`
@@ -149,6 +157,22 @@ Releases with no ABI change omit the subsection (or state "No C ABI changes").
 
 - Root `Makefile` (superseded by `mise.toml`, including `mise run check:cross`;
   `bindings/rsac-go/Makefile` is kept).
+- **Breaking (Windows): the legacy `rsac::audio::windows::WindowsApplicationCapture`**
+  is removed with all its methods (`new`, `initialize`, `start_capture`,
+  `start_capture_with_stop_flag`, `stop_capture`, `is_capturing`, `stop`,
+  `find_process_by_name`, `list_audio_processes`). Only the two `start_capture*`
+  methods carried `#[deprecated]`; the rest goes without a prior warning. Its
+  `unsafe impl Send` was the last one under `src/audio/windows` that nothing backed
+  (ADR-0020). What replaces what:
+  - `new(pid, true)` (capture one process tree): `AudioCaptureBuilder` with
+    `CaptureTarget::Application`, `ApplicationByName` or `ProcessTree`.
+  - `new(pid, false)` captured everything **except** that process tree. The builder's
+    targets all capture **only** the target, so there is no replacement for the
+    excluding mode in this release (#127).
+  - `list_audio_processes()` listed every process and `find_process_by_name()` looked
+    one up by name; `rsac::list_audio_applications()` and
+    `list_audio_applications_scoped()` list the applications that have an audio session,
+    which is a narrower set.
 
 ### Fixed
 
@@ -175,7 +199,7 @@ Releases with no ABI change omit the subsection (or state "No C ABI changes").
   `enumerate_devices()` / `default_device()` can return the enumerator-creation error
   that only construction returned before. A handler must not wait synchronously for
   the thread that drops the watcher (ADR-0020). The deprecated
-  `WindowsApplicationCapture` is unchanged and is removed at the 0.5.0 cutover.
+  `WindowsApplicationCapture` is removed in this release (see Removed).
 - **Windows WASAPI (no default endpoint):** a missing default render endpoint is now
   recognised by the HRESULT the API documents (`E_NOTFOUND`, `0x80070490`) and
   reported as `DeviceNotFound`. It was compared against `0x80070002`, so losing the
