@@ -2130,7 +2130,8 @@ case_ws_sha_is_head() {
   # tree, never from the working tree, and a committed note can never name HEAD itself (the note is
   # committed after the test ran). A note naming HEAD therefore exists only in the working tree:
   # untracked (check 1 allows untracked files), not in HEAD's tree → missing → exit 20.
-  remove_note || return 0
+  remove_note || return 0 # also removes the emptied docs/evidence directory
+  mkdir -p "$(dirname "$REPO/$NOTE_PATH")" # recreate it: the untracked note must exist for the case to mean "the gate ignores the working tree"
   printf '# note\n\nTested-SHA: %s\n' "$SHA" > "$REPO/$NOTE_PATH" # untracked: present in the working tree only
   arrange_green
   run_tag "$VER"
@@ -2166,8 +2167,8 @@ case_ws_stale_note_fresh_modified_copy() {
   assert_no_evidence_lines "R5.1"
 }
 case_ws_note_only_in_working_tree() {
-  # R5.1: a note that is not in HEAD's tree is missing, whatever the working tree contains.
-  remove_note || return 0
+  remove_note || return 0 # also removes the emptied docs/evidence directory
+  mkdir -p "$(dirname "$REPO/$NOTE_PATH")" # recreate it: the untracked note must exist for the case to mean "missing whatever the working tree contains"
   printf '# fresh\n\nTested-SHA: %s\n' "$SHA" > "$REPO/$NOTE_PATH" # untracked (check 1 allows it)
   arrange_green
   run_tag "$VER"

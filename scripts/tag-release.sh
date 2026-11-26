@@ -319,8 +319,10 @@ go_message="rsac-go $version"$'\n'"$body"
 
 if ((dry_run)); then
     log "would tag $sha and push ${tags[*]} to $remote atomically"
-    log "$crate_message"
-    if ((go_tag)); then log "$go_message"; fi
+    # The annotations are printed verbatim, without the log prefix, so what a
+    # dry run shows is exactly what the tags would carry.
+    printf '%s\n' "$crate_message" >&2
+    if ((go_tag)); then printf '%s\n' "$go_message" >&2; fi
     printf 'dry-run ok %s at %s\n' "$tag" "$sha"
     exit 0
 fi
