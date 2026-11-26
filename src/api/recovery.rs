@@ -73,9 +73,10 @@
 //! after): a result published before the deadline is applied even when
 //! collected later, and one published after it — or none at all by the
 //! deadline — ends the wait. The retry budget is restored only once a read
-//! finds a generation alive `stable_period` after it was installed (adopted
-//! from the helper by a poll; generation 0 when the session opened) — a loss a
-//! reader notices late is no evidence that the generation lived that long. A
+//! finds a generation still running `stable_period` after it was installed
+//! (adopted from the helper by a poll; generation 0 when the session opened) —
+//! a loss a reader notices late, or the tail a stopped generation still
+//! drains, is no evidence that the generation lived that long. A
 //! blocking [`read_chunk`](CapturingStream::read_chunk) keeps the backends'
 //! ordinary read timeout while one running generation stays quiet, judged at
 //! the instant each poll observed the stream (under the `machine` lock), never
@@ -1250,7 +1251,9 @@ impl RecoveryStream {
     }
 
     /// One non-blocking read of the installed stream. A read the stream answers
-    /// (with a buffer or empty) is evidence the generation is alive at `now`.
+    /// (with a buffer or empty) while it still reports itself running is
+    /// evidence the generation is alive at `now`; a stopped generation's
+    /// draining tail is delivered but proves nothing.
     fn read_active(&self, m: &mut Machine, now: Instant, doomed: &mut Doomed) -> AudioResult<Read> {
         // `Running`/`Settling` always have a stream installed; an empty slot
         // reads as empty.
@@ -1264,7 +1267,9 @@ impl RecoveryStream {
             // Recoverable read errors pass through unchanged, as unsupervised.
             Err(e) => return Err(e),
         };
-        self.note_alive(m, now);
+        if stream.is_running() {
+            self.note_alive(m, now);
+        }
         Ok(read)
     }
 
@@ -1298,10 +1303,11 @@ impl RecoveryStream {
         Ok(m.stamp(buffer))
     }
 
-    /// The installed generation answered a read at `now`. Seen alive a full
-    /// `stable_period` after it was installed, it has proven stable and the
-    /// retry budget is restored. Only such a read counts: a loss a reader
-    /// notices late is no evidence that the generation lived that long.
+    /// The installed generation answered a read at `now` and still reports
+    /// itself running. Seen so a full `stable_period` after it was installed,
+    /// it has proven stable and the retry budget is restored. Only such a read
+    /// counts: a loss a reader notices late, or a tail a stopped generation
+    /// still drains, is no evidence that the generation lived that long.
     fn note_alive(&self, m: &mut Machine, now: Instant) {
         let stable = m.healthy_since.is_some_and(|since| {
             now.saturating_duration_since(since) >= self.hub.config.stable_period
@@ -1700,11 +1706,16 @@ impl CapturingStream for RecoveryStream {
     /// readers, stops it, and guarantees no replacement is installed
     /// afterwards. Readers end once the tail is delivered, without waiting for
     /// this teardown. Never waits for a reopen helper or for a reader.
+    ///
+    /// The stream reports itself stopped (`is_running()`, and so
+    /// `is_stream_producing()`, turn false) only once the tail is preserved:
+    /// an async reader that just found the backend empty keeps polling and
+    /// receives that tail instead of ending before it exists.
     fn stop(&self) -> AudioResult<()> {
         self.core.stop_requested.store(true, Ordering::SeqCst);
-        self.terminal.store(true, Ordering::Release);
         self.hub.mark_stopped(self.session);
         let (active, teardown) = self.begin_stop();
+        self.terminal.store(true, Ordering::Release);
         // A result the helper posted before it saw the flag is ours to dispose.
         let late = lock(&self.core.mailbox).take();
         if let Some(Reopened { outcome, .. }) = late {
@@ -4533,5 +4544,92 @@ mod tests {
             Some(std::thread::current().id()),
             "stopped off the read path"
         );
+    }
+
+    #[test]
+    fn a_stopped_but_draining_generation_delivers_its_tail_without_restoring_the_budget() {
+        let stable = ms(20);
+        let policy = fast_policy()
+            .with_max_attempts(1)
+            .with_stable_period(stable);
+        let draining = MockStream::new(
+            stereo(RATE),
+            vec![Step::Buffer(buffer(0)), Step::Buffer(buffer(10))],
+        );
+        let spare = MockStream::new(stereo(RATE), vec![Step::Buffer(buffer(0))]);
+        let opener = Opener::new(vec![Ok(spare)]);
+        let h = Harness::new(policy, &draining, opener.factory());
+
+        // As if `draining` were a replacement that spent the only attempt.
+        let installed = {
+            let mut m = lock(&h.stream.machine);
+            m.attempt = 1;
+            let installed = Instant::now();
+            m.healthy_since = Some(installed);
+            installed
+        };
+        // The backend stops on its own (a `Stopping` bridge) with two buffers
+        // still queued, and is read only after its stable period.
+        draining.stop().expect("backend stop");
+        assert!(!draining.is_running());
+        wait_for(|| Instant::now() >= installed + stable * 2);
+
+        let tail = read_n(&h.stream, 2);
+
+        assert_eq!(tail[0].timestamp(), Some(ms(0)), "the tail is delivered");
+        assert_eq!(tail[1].timestamp(), Some(ms(10)));
+        assert_eq!(
+            lock(&h.stream.machine).attempt,
+            1,
+            "draining a stopped generation is no evidence it stayed healthy"
+        );
+        let (buffers, err) = read_until_err(&h.stream);
+        assert!(buffers.is_empty());
+        match err {
+            AudioError::StreamEnded { reason } => assert!(reason.contains("exhausted"), "{reason}"),
+            other => panic!("expected StreamEnded, got {other:?}"),
+        }
+        assert_eq!(opener.calls(), 0, "the spent budget was not restored");
+    }
+
+    #[cfg(feature = "async-stream")]
+    #[test]
+    fn an_async_reader_receives_the_tail_a_stop_preserves_after_its_empty_read() {
+        use crate::bridge::AsyncAudioStream;
+        use futures_core::Stream;
+        use std::pin::Pin;
+        use std::task::{Context, Poll, Waker};
+
+        let live = MockStream::new(stereo(RATE), vec![]);
+        let h = Harness::new(fast_policy(), &live, Opener::new(vec![]).factory());
+        let mut cx = Context::from_waker(Waker::noop());
+        let mut reader = AsyncAudioStream::new(h.stream.as_ref());
+
+        // stop() is requested and then held before it preserves the tail:
+        // its next step takes the hub's status lock, held here.
+        let held = lock(&h.hub.status);
+        let stopper = Arc::clone(&h.stream);
+        let stopping = std::thread::spawn(move || stopper.stop());
+        wait_for(|| h.stream.core.stop_requested.load(Ordering::SeqCst));
+
+        // The async reader finds the backend empty. The stream does not report
+        // itself stopped yet, so the reader keeps polling instead of ending.
+        assert!(matches!(
+            Pin::new(&mut reader).poll_next(&mut cx),
+            Poll::Pending
+        ));
+        // A buffer arrives before stop() reaches the tail; then stop() runs on.
+        live.push(Step::Buffer(buffer(0)));
+        drop(held);
+        stopping.join().expect("stopper thread").expect("stop");
+
+        match Pin::new(&mut reader).poll_next(&mut cx) {
+            Poll::Ready(Some(Ok(preserved))) => assert_eq!(preserved.timestamp(), Some(ms(0))),
+            other => panic!("expected the preserved buffer, got {other:?}"),
+        }
+        assert!(matches!(
+            Pin::new(&mut reader).poll_next(&mut cx),
+            Poll::Ready(None)
+        ));
     }
 }
