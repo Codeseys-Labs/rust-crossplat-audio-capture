@@ -18,7 +18,8 @@
 //! COM never initialised, and may be moved, shared and dropped across threads.
 //! [`enumerate_application_audio_sessions`] works the same way. The device
 //! watcher's COM objects live and die on its own MTA helper thread
-//! (`rsac-wasapi-device-watch`).
+//! (`rsac-wasapi-device-watch`). ADR-0020
+//! (`docs/designs/0020-windows-watcher-com-ownership.md`) records this model.
 //!
 //! ## Capture strategy
 //!

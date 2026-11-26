@@ -12,7 +12,7 @@ use crate::core::interface::{
 use std::ffi::OsStr;
 use std::marker::PhantomData;
 use std::sync::{
-    atomic::{AtomicBool, Ordering},
+    atomic::{AtomicBool, AtomicUsize, Ordering},
     mpsc, Arc,
 };
 use std::time::Duration;
@@ -33,7 +33,11 @@ use windows::Win32::Devices::Properties::DEVPKEY_Device_FriendlyName as PKEY_Dev
 use windows::Win32::UI::Shell::PropertiesSystem::IPropertyStore;
 
 // Constants
-const E_NOTFOUND: windows::core::HRESULT = windows::core::HRESULT(-2147024894i32); // 0x80070002
+/// `E_NOTFOUND`, which `IMMDeviceEnumerator::GetDefaultAudioEndpoint` returns
+/// when no endpoint has the requested flow and role. The Windows SDK defines it
+/// as `HRESULT_FROM_WIN32(ERROR_NOT_FOUND)` (`um/mmdeviceapi.h`), 0x80070490.
+const E_NOTFOUND: windows::core::HRESULT =
+    windows::core::HRESULT::from_win32(windows::Win32::Foundation::ERROR_NOT_FOUND.0);
 const VT_LPWSTR: u16 = 31;
 
 /// Build a [`BackendContext`] carrying the WASAPI `HRESULT` as the structured
@@ -882,27 +886,28 @@ fn read_device_kind(device: &IMMDevice) -> std::result::Result<DeviceKind, KindR
 // risks deadlock and COM re-entrancy.
 //
 // Hand-off pattern (the canonical Windows/macOS design in the M10 surface): the
-// COM callback only *translates* the event and pushes it into a bounded channel
-// — alloc/lock on this thread is permitted (it is NOT the real-time audio
-// callback thread), but it never runs user code, makes no COM call and holds no
-// COM pointer, only the sender.
+// COM callback only copies the event data and `try_send`s it onto a bounded
+// channel. It runs no user code (not even the logger), makes no COM call, never
+// blocks, and holds no COM pointer, only the sender and an overflow counter: a
+// notice dropped on a full channel is counted there and logged by the helper.
 //
-// Ownership: one helper thread per watcher (`rsac-wasapi-device-watch`) creates,
-// uses and releases every COM object of that watcher. It initialises COM as MTA,
-// creates its own enumerator and the notification client, registers, reports the
-// outcome to `watch()`, pops events (resolving a `DeviceAdded` name and kind with
-// its own enumerator) and invokes the user handler. On shutdown it unregisters
-// the same client pointer and releases both interfaces before uninitialising
-// COM, all on that thread. The `DeviceWatcher` teardown only sets a flag and
-// joins the helper — no leak, no hang.
+// Ownership (ADR-0020): one helper thread per watcher (`rsac-wasapi-device-watch`)
+// creates, uses and releases every COM object of that watcher. It initialises COM
+// as MTA, creates its own enumerator and the notification client, registers,
+// reports the outcome to `watch()`, pops events (resolving a `DeviceAdded` name
+// and kind with its own enumerator) and invokes the user handler. On shutdown it
+// unregisters the same client pointer and releases both interfaces before
+// uninitialising COM, all on that thread. The `DeviceWatcher` teardown only sets
+// a flag and joins the helper; `watch()` documents when that join deadlocks.
 
 /// Bound on the channel between the COM notification thread and the helper
 /// thread that runs the user handler.
 ///
 /// Device-change events are rare (hot-plug, default switch), so a small bound is
 /// ample. If the user handler stalls and the buffer fills, the COM callback drops
-/// the oldest-unqueued event rather than block the system notification thread —
-/// dropping a redundant notification is far better than deadlocking COM.
+/// each new notice and counts it rather than block the system notification
+/// thread; the helper logs the count. Dropping a redundant notification is far
+/// better than deadlocking COM.
 const DEVICE_EVENT_CHANNEL_BOUND: usize = 64;
 
 /// How long the helper thread blocks waiting for the next event before
@@ -989,39 +994,34 @@ enum WatchNotice {
 ///
 /// Created and registered on the device-watch helper thread with
 /// `IMMDeviceEnumerator::RegisterEndpointNotificationCallback`. Its methods run
-/// on the MMDevice system notification thread; they only translate and enqueue
-/// (never run user code, never call COM) — see the module comment above for the
-/// deadlock rationale. It holds no COM pointer, only the sender.
+/// on the MMDevice system notification thread; they only copy the event data
+/// and `try_send` it (never run user code or the logger, never call COM, never
+/// block) — see the module comment above for the deadlock rationale. It holds
+/// no COM pointer, only the sender and the overflow counter.
 #[implement(IMMNotificationClient)]
 struct WatcherNotificationClient {
     /// Bounded sender to the helper thread. `try_send` so a stalled consumer can
     /// never block the COM notification thread.
     tx: mpsc::SyncSender<WatchNotice>,
+    /// Notices dropped on a full channel since the helper last reported them.
+    dropped: Arc<AtomicUsize>,
 }
 
 impl WatcherNotificationClient {
-    /// Enqueue a notice without ever blocking the COM notification thread.
-    /// A full buffer means the consumer is behind; we drop the notice (a device
-    /// change is idempotent — the consumer can re-enumerate) rather than stall
-    /// COM. A disconnected receiver means the watcher is being torn down.
+    /// Enqueue a notice without blocking the COM notification thread. A full
+    /// channel means the helper is behind: the notice is dropped (a device
+    /// change is idempotent — the consumer can re-enumerate) and counted, and
+    /// the helper logs the count. A disconnected channel means the watcher is
+    /// being torn down and is not counted.
     fn emit(&self, notice: WatchNotice) {
-        match self.tx.try_send(notice) {
-            Ok(()) => {}
-            Err(mpsc::TrySendError::Full(notice)) => {
-                log::warn!(
-                    "wasapi: device-event channel full, dropping notification: {:?}",
-                    notice
-                );
-            }
-            Err(mpsc::TrySendError::Disconnected(_)) => {
-                // Helper thread tearing down — nothing to do.
-            }
+        if let Err(mpsc::TrySendError::Full(_)) = self.tx.try_send(notice) {
+            self.dropped.fetch_add(1, Ordering::Relaxed);
         }
     }
 }
 
-// The MMDevice notification callbacks. Each maps a WASAPI endpoint change to a
-// `DeviceEvent` and enqueues it. They must return `Ok(())` quickly.
+// The MMDevice notification callbacks. Each copies a WASAPI endpoint change into
+// a `WatchNotice` and enqueues it, nothing else, and returns `Ok(())`.
 #[allow(non_snake_case)]
 impl IMMNotificationClient_Impl for WatcherNotificationClient_Impl {
     fn OnDeviceStateChanged(
@@ -1149,6 +1149,22 @@ fn create_imm_device_enumerator() -> AudioResult<IMMDeviceEnumerator> {
     })
 }
 
+/// Maps a failed `GetDefaultAudioEndpoint` call for the default render
+/// endpoint. `E_NOTFOUND` (no such endpoint) is [`AudioError::DeviceNotFound`]
+/// for `default_render`; any other failure goes to `other`.
+fn default_render_endpoint_error(
+    err: windows::core::Error,
+    other: impl FnOnce(windows::core::Error) -> AudioError,
+) -> AudioError {
+    if err.code() == E_NOTFOUND {
+        AudioError::DeviceNotFound {
+            device_id: "default_render".to_string(),
+        }
+    } else {
+        other(err)
+    }
+}
+
 /// New canonical `DeviceEnumerator` trait implementation for `WindowsDeviceEnumerator`.
 ///
 /// Returns `Box<dyn AudioDevice>` instead of concrete types, matching the
@@ -1218,51 +1234,72 @@ impl DeviceEnumerator for WindowsDeviceEnumerator {
                 device.is_default = true;
                 Ok(Box::new(device))
             }
-            Err(hr) if hr.code() == E_NOTFOUND => Err(AudioError::DeviceNotFound {
-                device_id: "default_render".to_string(),
-            }),
-            Err(hr) => Err(AudioError::DeviceEnumerationError {
-                reason: format!("Failed to get default audio endpoint (HRESULT: {:?})", hr),
-                context: Some(wasapi_backend_context_err(&hr)),
-            }),
+            Err(hr) => Err(default_render_endpoint_error(hr, |hr| {
+                AudioError::DeviceEnumerationError {
+                    reason: format!("Failed to get default audio endpoint (HRESULT: {:?})", hr),
+                    context: Some(wasapi_backend_context_err(&hr)),
+                }
+            })),
         }
     }
 
     /// Subscribe to WASAPI device hot-plug / default-change notifications
-    /// (M10 `watch()` — rsac-e360).
+    /// (M10 `watch()` — rsac-e360). ADR-0020
+    /// (`docs/designs/0020-windows-watcher-com-ownership.md`) records the
+    /// ownership and teardown model.
     ///
     /// Callable on any thread, whatever its COM apartment: the caller makes no
     /// COM call. A dedicated helper thread (`rsac-wasapi-device-watch`) owns
     /// every COM object of the subscription: it initialises COM as MTA, creates
     /// its own `IMMDeviceEnumerator` and an [`IMMNotificationClient`], registers
     /// the client via `RegisterEndpointNotificationCallback`, and reports the
-    /// outcome, which `watch` waits for (at most five seconds). The COM callbacks
-    /// (run on the MMDevice system notification thread) only translate each
-    /// change and push it onto a bounded channel; the helper pops it, resolves a
-    /// `DeviceAdded` name and kind with its own enumerator, and invokes
-    /// `on_event`. The user handler therefore **never** runs on the COM
-    /// notification thread, avoiding COM re-entrancy / deadlock (see the
-    /// module-level notes by `WatcherNotificationClient`, the crate-private COM
-    /// callback object).
+    /// outcome, which `watch` waits for. The COM callbacks (run on the MMDevice
+    /// system notification thread) only copy each change onto a bounded
+    /// channel; the helper pops it, resolves a `DeviceAdded` name and kind with
+    /// its own enumerator, and invokes `on_event`. The user handler therefore
+    /// **never** runs on the COM notification thread (see the module-level
+    /// notes by `WatcherNotificationClient`, the crate-private COM callback
+    /// object).
     ///
-    /// Dropping the [`DeviceWatcher`], on any thread, signals the helper and
-    /// joins it; the helper stops delivery, unregisters the client it
-    /// registered, and releases its COM objects before it exits. After `drop`
-    /// returns, `on_event` is guaranteed not to be called again. Dropping the
-    /// watcher from inside `on_event` returns without joining (the helper cannot
-    /// join itself): `on_event` is not called again, and the helper finishes the
-    /// same teardown once the handler returns.
+    /// # Dropping the watcher
+    ///
+    /// Dropping the [`DeviceWatcher`] sets a shutdown flag. On any thread other
+    /// than the helper it then joins the helper, which stops delivery,
+    /// unregisters the client it registered and releases its COM objects before
+    /// it exits: once `drop` returns, no `on_event` call is running and none
+    /// starts. The join takes up to one 100 ms poll interval after the flag is
+    /// set, plus any `on_event` call or `DeviceAdded` resolution already
+    /// running, plus the unregister and release.
+    ///
+    /// Dropping the watcher from inside `on_event` is the one supported
+    /// re-entrant case: `drop` returns while that call is still running, no new
+    /// call starts afterwards, and the helper finishes the same teardown once
+    /// the handler returns.
+    ///
+    /// Because `drop` joins the helper, it deadlocks when the helper is waiting
+    /// on the dropping thread: a handler that synchronously waits on that
+    /// thread (for example `SendMessage` to a window owned by the STA thread
+    /// that is dropping the watcher, or any work marshalled to it and awaited),
+    /// or two watchers whose handlers each drop the other. GUI callers: from the
+    /// handler, post work to the UI thread (for example with `PostMessage` or a
+    /// channel) and do not wait for it.
     ///
     /// # Errors
     ///
+    /// Once the helper has started, it owns its cleanup on every error and
+    /// `watch()` does not join it: `on_event` is never called and is dropped on
+    /// the helper, possibly after `watch()` has returned.
+    ///
     /// - [`AudioError::BackendError`] when the helper thread cannot be spawned
-    ///   (operation `spawn_device_watch_thread`), COM cannot be initialised on it
-    ///   (`com_init`), its enumerator cannot be created
-    ///   (`create_device_enumerator`), or registration fails
-    ///   (`register_endpoint_notification_callback`).
-    /// - [`AudioError::Timeout`] when the helper does not report within five
-    ///   seconds. The helper then exits on its own once it can, unregistering
-    ///   if it registered, without calling `on_event`.
+    ///   or exits without reporting (operation `spawn_device_watch_thread`), COM
+    ///   cannot be initialised on it (`com_init`), its enumerator cannot be
+    ///   created (`create_device_enumerator`), or registration fails
+    ///   (`register_endpoint_notification_callback`). A reported failure is
+    ///   returned as soon as the helper reports it.
+    /// - [`AudioError::Timeout`] when the helper has not reported within
+    ///   `WATCH_REGISTRATION_TIMEOUT` (five seconds). The helper then cleans up
+    ///   on its own: once its COM calls return it unregisters if it registered,
+    ///   releases everything and exits, and it never calls `on_event`.
     fn watch(&self, on_event: DeviceEventHandler) -> AudioResult<DeviceWatcher> {
         let shutdown = Arc::new(AtomicBool::new(false));
         let thread_shutdown = Arc::clone(&shutdown);
@@ -1281,24 +1318,22 @@ impl DeviceEnumerator for WindowsDeviceEnumerator {
                 context: None,
             })?;
 
+        // No failure path joins the helper: it owns its cleanup and has no
+        // delivery path, and a join would also wait for `on_event`'s destructor,
+        // which may wait on this thread.
         match ready_rx.recv_timeout(WATCH_REGISTRATION_TIMEOUT) {
             Ok(Ok(())) => {}
-            Ok(Err(e)) => {
-                // The helper has released its COM objects and only returns now.
-                let _ = helper.join();
-                return Err(e);
-            }
+            Ok(Err(e)) => return Err(e),
             Err(mpsc::RecvTimeoutError::Timeout) => {
-                // COM calls are not cancellable; do not join a stuck one. Dropping
-                // `ready_rx` on return fails the helper's report, so it unregisters
-                // (if it registered) and exits without calling the handler.
+                // COM calls are not cancellable. Dropping `ready_rx` on return
+                // fails the helper's report, so it unregisters (if it
+                // registered) and exits without calling the handler.
                 return Err(AudioError::Timeout {
                     operation: "WASAPI device-watch registration".to_string(),
                     duration: WATCH_REGISTRATION_TIMEOUT,
                 });
             }
             Err(mpsc::RecvTimeoutError::Disconnected) => {
-                let _ = helper.join();
                 return Err(AudioError::BackendError {
                     backend: "wasapi".to_string(),
                     operation: "spawn_device_watch_thread".to_string(),
@@ -1314,14 +1349,15 @@ impl DeviceEnumerator for WindowsDeviceEnumerator {
             shutdown.store(true, Ordering::Release);
             if helper.thread().id() == std::thread::current().id() {
                 // Dropped from inside the handler, on the helper itself, which
-                // cannot join itself. The helper checks the flag before every
-                // handler call and runs its teardown once the handler returns.
+                // cannot join itself. The helper reads the flag when the
+                // handler returns and tears down then.
                 return;
             }
-            // Bounded by one poll interval after the flag is set, plus a handler
-            // call in progress and the helper's unregister and release. A
-            // panicked helper surfaces only as a join error; never panic in Drop.
-            let _ = helper.join();
+            // A panicked helper surfaces as a join error whose payload is user
+            // data; it is disposed of without unwinding out of `Drop`.
+            if let Err(payload) = helper.join() {
+                dispose_panic_payload(payload);
+            }
         });
 
         Ok(DeviceWatcher::from_teardown(teardown))
@@ -1377,9 +1413,9 @@ struct EndpointRegistration {
 }
 
 impl EndpointRegistration {
-    fn register(tx: mpsc::SyncSender<WatchNotice>) -> AudioResult<Self> {
+    fn register(tx: mpsc::SyncSender<WatchNotice>, dropped: Arc<AtomicUsize>) -> AudioResult<Self> {
         let enumerator = create_imm_device_enumerator()?;
-        let client: IMMNotificationClient = WatcherNotificationClient { tx }.into();
+        let client: IMMNotificationClient = WatcherNotificationClient { tx, dropped }.into();
         // SAFETY: `enumerator` and `client` are live interfaces created above on
         // this thread. From here on COM may invoke `client` on its notification
         // thread.
@@ -1416,8 +1452,7 @@ impl Drop for EndpointRegistration {
 /// Reports the registration outcome on `ready`, a zero-capacity channel whose
 /// `send` returns `Ok` only once `watch()` has taken the report. When `watch()`
 /// has stopped waiting, the helper releases everything without ever calling
-/// `on_event`. Otherwise it delivers until `shutdown` is set, checking the flag
-/// before every handler call.
+/// `on_event`. Otherwise it runs [`deliver_notices`] until `shutdown` is set.
 fn device_watch_thread_main(
     ready: mpsc::SyncSender<AudioResult<()>>,
     shutdown: Arc<AtomicBool>,
@@ -1432,9 +1467,10 @@ fn device_watch_thread_main(
             return;
         }
     };
+    let dropped = Arc::new(AtomicUsize::new(0));
     let (tx, rx) = mpsc::sync_channel::<WatchNotice>(DEVICE_EVENT_CHANNEL_BOUND);
     // Drops before `rx` and `_apartment`: unregister, then release.
-    let registration = match EndpointRegistration::register(tx) {
+    let registration = match EndpointRegistration::register(tx, Arc::clone(&dropped)) {
         Ok(registration) => registration,
         Err(e) => {
             let _ = ready.send(Err(e));
@@ -1446,24 +1482,75 @@ fn device_watch_thread_main(
     }
     drop(ready);
 
-    while !shutdown.load(Ordering::Acquire) {
-        let notice = match rx.recv_timeout(NOTIFY_THREAD_POLL_INTERVAL) {
+    deliver_notices(
+        &rx,
+        &shutdown,
+        &dropped,
+        |id| resolve_added_device(&registration.enumerator, id),
+        &mut on_event,
+    );
+}
+
+/// The helper's delivery loop: pops notices, resolves each `DeviceAdded` with
+/// `resolve_added` (a COM call on the helper), and passes every event to
+/// `on_event`, until `shutdown` is set or the channel closes.
+///
+/// The flag is read after every wake, before any resolution or handler call;
+/// again after a resolution, which can take time; and after every handler
+/// call, so a drop from inside the handler ends delivery when it returns.
+/// Notices the callback dropped on a full channel are logged here, on the
+/// helper, never on the MMDevice thread.
+fn deliver_notices(
+    rx: &mpsc::Receiver<WatchNotice>,
+    shutdown: &AtomicBool,
+    dropped: &AtomicUsize,
+    mut resolve_added: impl FnMut(&str) -> (String, DeviceKind),
+    mut on_event: impl FnMut(DeviceEvent),
+) {
+    loop {
+        let received = rx.recv_timeout(NOTIFY_THREAD_POLL_INTERVAL);
+        report_dropped_notices(dropped);
+        if shutdown.load(Ordering::Acquire) {
+            return;
+        }
+        let notice = match received {
             Ok(notice) => notice,
             Err(mpsc::RecvTimeoutError::Timeout) => continue,
-            Err(mpsc::RecvTimeoutError::Disconnected) => break,
+            Err(mpsc::RecvTimeoutError::Disconnected) => return,
         };
         let event = match notice {
             WatchNotice::Event(event) => event,
             WatchNotice::Added(id) => {
-                let (name, kind) = resolve_added_device(&registration.enumerator, &id.0);
+                let (name, kind) = resolve_added(&id.0);
+                if shutdown.load(Ordering::Acquire) {
+                    return;
+                }
                 DeviceEvent::DeviceAdded { id, name, kind }
             }
         };
-        // A teardown that began during the wait sees no further handler call.
-        if shutdown.load(Ordering::Acquire) {
-            break;
-        }
         on_event(event);
+        if shutdown.load(Ordering::Acquire) {
+            return;
+        }
+    }
+}
+
+/// Logs how many notices the callback dropped on a full channel since the last
+/// report, and restarts the count. Runs on the helper thread.
+fn report_dropped_notices(dropped: &AtomicUsize) {
+    let count = dropped.swap(0, Ordering::Relaxed);
+    if count > 0 {
+        log::warn!("wasapi: device-event channel full, dropped {count} notification(s)");
+    }
+}
+
+/// Drops a joined thread's panic payload without letting a panic escape. The
+/// payload is user data (the handler panicked with it), so its destructor may
+/// itself panic; the payload of that second panic is leaked, not dropped.
+fn dispose_panic_payload(payload: Box<dyn std::any::Any + Send>) {
+    let disposal = std::panic::catch_unwind(std::panic::AssertUnwindSafe(move || drop(payload)));
+    if let Err(secondary) = disposal {
+        std::mem::forget(secondary);
     }
 }
 
@@ -1629,18 +1716,12 @@ pub fn enumerate_application_audio_sessions() -> AudioResult<Vec<ApplicationAudi
         let default_device: IMMDevice = device_enumerator
             .GetDefaultAudioEndpoint(eRender, eConsole)
             .map_err(|hr| {
-                if hr.code() == E_NOTFOUND {
-                    AudioError::DeviceNotFound {
-                        device_id: "default_render".to_string(),
-                    }
-                } else {
-                    AudioError::BackendError {
-                        backend: "wasapi".to_string(),
-                        operation: "enumerate_audio_sessions".to_string(),
-                        message: format!("GetDefaultAudioEndpoint failed (HRESULT: {:?})", hr),
-                        context: Some(wasapi_backend_context_err(&hr)),
-                    }
-                }
+                default_render_endpoint_error(hr, |hr| AudioError::BackendError {
+                    backend: "wasapi".to_string(),
+                    operation: "enumerate_audio_sessions".to_string(),
+                    message: format!("GetDefaultAudioEndpoint failed (HRESULT: {:?})", hr),
+                    context: Some(wasapi_backend_context_err(&hr)),
+                })
             })?;
 
         let session_manager: IAudioSessionManager2 = default_device
@@ -1842,7 +1923,7 @@ mod tests {
     /// `wasapi_backend_context` carries the raw HRESULT as `os_error_code`.
     #[test]
     fn test_wasapi_backend_context_carries_hresult() {
-        // E_NOTFOUND = 0x80070002, which as i32 is negative.
+        // E_NOTFOUND = 0x80070490, which as i32 is negative.
         let ctx = wasapi_backend_context(E_NOTFOUND);
         assert_eq!(ctx.backend_name, "WASAPI");
         assert_eq!(ctx.os_error_code, Some(E_NOTFOUND.0 as i64));
@@ -2508,6 +2589,225 @@ mod tests {
         .expect("STA thread panicked");
     }
 
+    // ── Device-watch delivery and teardown helpers (no audio endpoint) ─────
+
+    fn removed(id: &str) -> DeviceEvent {
+        DeviceEvent::DeviceRemoved {
+            id: DeviceId(id.to_string()),
+        }
+    }
+
+    /// The MMDevice callback only copies and `try_send`s: on a full channel it
+    /// counts the dropped notice (the helper logs the count) instead of
+    /// blocking; a closed channel (teardown) is not counted.
+    #[test]
+    fn test_notice_overflow_is_counted_in_the_callback() {
+        let (tx, rx) = mpsc::sync_channel(1);
+        let client = WatcherNotificationClient {
+            tx,
+            dropped: Arc::new(AtomicUsize::new(0)),
+        };
+        client.emit(WatchNotice::Event(removed("first")));
+        client.emit(WatchNotice::Event(removed("second")));
+        client.emit(WatchNotice::Added(DeviceId("third".to_string())));
+        assert_eq!(client.dropped.load(Ordering::Relaxed), 2);
+        match rx.try_recv() {
+            Ok(WatchNotice::Event(event)) => assert_eq!(event, removed("first")),
+            other => panic!("expected the first notice, got {other:?}"),
+        }
+        drop(rx);
+        client.emit(WatchNotice::Event(removed("late")));
+        assert_eq!(
+            client.dropped.load(Ordering::Relaxed),
+            2,
+            "a closed channel is teardown, not overflow"
+        );
+    }
+
+    /// Runs the delivery loop over `notices`, queued on a channel that is then
+    /// closed, so the loop never waits. `on_resolve` runs inside each
+    /// resolution. Returns the ids resolved and the events delivered.
+    fn deliver_queued(
+        notices: Vec<WatchNotice>,
+        shutdown: &AtomicBool,
+        dropped: &AtomicUsize,
+        on_resolve: impl Fn(),
+    ) -> (Vec<String>, Vec<DeviceEvent>) {
+        let (tx, rx) = mpsc::sync_channel(notices.len().max(1));
+        for notice in notices {
+            tx.try_send(notice).expect("queue notice");
+        }
+        drop(tx);
+        let mut resolved = Vec::new();
+        let mut delivered = Vec::new();
+        deliver_notices(
+            &rx,
+            shutdown,
+            dropped,
+            |id| {
+                resolved.push(id.to_string());
+                on_resolve();
+                (format!("name of {id}"), DeviceKind::Output)
+            },
+            |event| delivered.push(event),
+        );
+        (resolved, delivered)
+    }
+
+    /// The helper delivers queued events in order and resolves an added
+    /// endpoint's name and kind before delivering it.
+    #[test]
+    fn test_delivery_resolves_added_notices_in_order() {
+        let shutdown = AtomicBool::new(false);
+        let dropped = AtomicUsize::new(0);
+        let (resolved, delivered) = deliver_queued(
+            vec![
+                WatchNotice::Event(removed("gone")),
+                WatchNotice::Added(DeviceId("new".to_string())),
+            ],
+            &shutdown,
+            &dropped,
+            || {},
+        );
+        assert_eq!(resolved, ["new"]);
+        assert_eq!(
+            delivered,
+            vec![
+                removed("gone"),
+                DeviceEvent::DeviceAdded {
+                    id: DeviceId("new".to_string()),
+                    name: "name of new".to_string(),
+                    kind: DeviceKind::Output,
+                },
+            ]
+        );
+    }
+
+    /// A notice dequeued after a teardown was requested starts no resolution
+    /// (a COM call on the helper) and no handler call.
+    #[test]
+    fn test_delivery_after_shutdown_starts_no_resolution() {
+        let shutdown = AtomicBool::new(true);
+        let dropped = AtomicUsize::new(0);
+        let (resolved, delivered) = deliver_queued(
+            vec![
+                WatchNotice::Added(DeviceId("new".to_string())),
+                WatchNotice::Event(removed("gone")),
+            ],
+            &shutdown,
+            &dropped,
+            || {},
+        );
+        assert!(resolved.is_empty(), "resolved after shutdown: {resolved:?}");
+        assert!(
+            delivered.is_empty(),
+            "delivered after shutdown: {delivered:?}"
+        );
+    }
+
+    /// A teardown requested while an added endpoint is being resolved sees no
+    /// further handler call.
+    #[test]
+    fn test_delivery_shutdown_during_resolution_skips_the_handler() {
+        let shutdown = AtomicBool::new(false);
+        let dropped = AtomicUsize::new(0);
+        let (resolved, delivered) = deliver_queued(
+            vec![
+                WatchNotice::Added(DeviceId("new".to_string())),
+                WatchNotice::Event(removed("gone")),
+            ],
+            &shutdown,
+            &dropped,
+            || shutdown.store(true, Ordering::Release),
+        );
+        assert_eq!(resolved, ["new"]);
+        assert!(
+            delivered.is_empty(),
+            "delivered after shutdown: {delivered:?}"
+        );
+    }
+
+    /// Notices the callback dropped on a full channel are taken (and logged) by
+    /// the helper when it next wakes, and the count restarts.
+    #[test]
+    fn test_delivery_reports_and_resets_the_overflow_count() {
+        let shutdown = AtomicBool::new(false);
+        let dropped = AtomicUsize::new(3);
+        let (_, delivered) = deliver_queued(
+            vec![WatchNotice::Event(removed("gone"))],
+            &shutdown,
+            &dropped,
+            || {},
+        );
+        assert_eq!(delivered, vec![removed("gone")]);
+        assert_eq!(
+            dropped.load(Ordering::Relaxed),
+            0,
+            "the helper must take the count it reports"
+        );
+    }
+
+    /// A panic payload whose destructor panics, with a second payload whose
+    /// destructor panics too, is disposed of without unwinding: the teardown
+    /// that joins a panicked helper never panics inside `DeviceWatcher::drop`.
+    #[test]
+    fn test_panic_payload_disposal_never_unwinds() {
+        /// Panics when dropped, with a payload one level lower.
+        struct PanicsOnDrop(u8);
+        impl Drop for PanicsOnDrop {
+            fn drop(&mut self) {
+                if self.0 > 0 {
+                    std::panic::panic_any(PanicsOnDrop(self.0 - 1));
+                }
+            }
+        }
+
+        let outcome = std::panic::catch_unwind(|| dispose_panic_payload(Box::new(PanicsOnDrop(2))));
+        // Leak an escaped payload so the assertion's own unwind cannot drop it.
+        let escaped = match outcome {
+            Ok(()) => false,
+            Err(payload) => {
+                std::mem::forget(payload);
+                true
+            }
+        };
+        assert!(!escaped, "disposing a panic payload must not unwind");
+    }
+
+    /// `GetDefaultAudioEndpoint` reports "no endpoint" as `E_NOTFOUND`, which
+    /// the Windows SDK defines as `HRESULT_FROM_WIN32(ERROR_NOT_FOUND)`; that
+    /// maps to `DeviceNotFound`. `HRESULT_FROM_WIN32(ERROR_FILE_NOT_FOUND)`,
+    /// which the API does not document, is an ordinary failure.
+    #[test]
+    fn test_no_default_endpoint_hresult_maps_to_not_found() {
+        // HRESULT_FROM_WIN32: severity bit, FACILITY_WIN32 (7), low 16 bits.
+        let from_win32 =
+            |code: u32| windows::core::HRESULT(((code & 0xFFFF) | (7 << 16) | 0x8000_0000) as i32);
+
+        let not_found = from_win32(windows::Win32::Foundation::ERROR_NOT_FOUND.0);
+        assert_eq!(not_found.0 as u32, 0x8007_0490);
+        let mapped = default_render_endpoint_error(windows::core::Error::from(not_found), |err| {
+            panic!("E_NOTFOUND must not reach the fallback: {err:?}")
+        });
+        assert!(
+            matches!(&mapped, AudioError::DeviceNotFound { device_id } if device_id == "default_render"),
+            "got {mapped:?}"
+        );
+
+        let file_not_found = from_win32(windows::Win32::Foundation::ERROR_FILE_NOT_FOUND.0);
+        let mapped =
+            default_render_endpoint_error(windows::core::Error::from(file_not_found), |err| {
+                AudioError::DeviceEnumerationError {
+                    reason: "fallback".to_string(),
+                    context: Some(wasapi_backend_context_err(&err)),
+                }
+            });
+        assert!(
+            matches!(mapped, AudioError::DeviceEnumerationError { .. }),
+            "got {mapped:?}"
+        );
+    }
+
     // ── #105 structural guards (no audio endpoint needed) ────────────
 
     // `WindowsAudioDevice` and `WindowsDeviceEnumerator` are `Send + Sync`
@@ -2518,7 +2818,9 @@ mod tests {
         assert_send_sync::<WindowsDeviceEnumerator>();
     };
 
-    /// Every `.rs` file under `src/audio/windows/`, embedded at compile time.
+    /// Every `.rs` file under `src/audio/windows/`, at any depth, embedded at
+    /// compile time and keyed by its `/`-separated path relative to that
+    /// directory.
     const BACKEND_SOURCES: &[(&str, &str)] = &[
         ("apartment_tests.rs", include_str!("apartment_tests.rs")),
         ("mod.rs", include_str!("mod.rs")),
@@ -2527,47 +2829,165 @@ mod tests {
     ];
 
     /// The only `unsafe impl` items allowed under `src/audio/windows/` (#105),
-    /// as `(file, item line with whitespace normalised)`.
+    /// as `(file, header)`. A header is the item's code from `unsafe` to its
+    /// first `{` or `;`, comments removed and whitespace collapsed.
     const ALLOWED_UNSAFE_IMPLS: &[(&str, &str)] = &[
         // The MTA usage pin, the only holder of a `CO_MTA_USAGE_COOKIE`.
-        ("wasapi.rs", "unsafe impl Send for MtaUsagePin {}"),
-        ("wasapi.rs", "unsafe impl Sync for MtaUsagePin {}"),
+        ("wasapi.rs", "unsafe impl Send for MtaUsagePin"),
+        ("wasapi.rs", "unsafe impl Sync for MtaUsagePin"),
         // Deprecated legacy type, left unchanged; it is removed, with this
         // entry, at the 0.5.0 cutover.
         (
             "wasapi.rs",
-            "unsafe impl Send for WindowsApplicationCapture {}",
+            "unsafe impl Send for WindowsApplicationCapture",
         ),
     ];
 
-    /// Each `unsafe impl` item in `source`: its first line, whitespace
-    /// normalised, and whether a `// SAFETY:` line is in the comment block
-    /// directly above it.
+    /// `source` as characters, with every comment (line, block, nested block),
+    /// string literal (plain, byte, C, raw) and character literal replaced by
+    /// spaces. Newlines are kept, so every character keeps its line number;
+    /// lifetimes and labels are kept.
+    fn blank_comments_and_literals(source: &str) -> Vec<char> {
+        let chars: Vec<char> = source.chars().collect();
+        let mut code = chars.clone();
+        let is_ident = |c: char| c.is_alphanumeric() || c == '_';
+        let at = |i: usize| chars.get(i).copied();
+        let mut i = 0;
+        while i < chars.len() {
+            let start = i;
+            match (chars[i], at(i + 1)) {
+                ('/', Some('/')) => {
+                    while at(i).is_some_and(|c| c != '\n') {
+                        i += 1;
+                    }
+                }
+                ('/', Some('*')) => {
+                    let mut depth = 0usize;
+                    while i < chars.len() {
+                        if chars[i] == '/' && at(i + 1) == Some('*') {
+                            depth += 1;
+                            i += 2;
+                        } else if chars[i] == '*' && at(i + 1) == Some('/') {
+                            depth -= 1;
+                            i += 2;
+                            if depth == 0 {
+                                break;
+                            }
+                        } else {
+                            i += 1;
+                        }
+                    }
+                }
+                ('"', _) => {
+                    i += 1;
+                    while at(i).is_some_and(|c| c != '"') {
+                        i += if chars[i] == '\\' { 2 } else { 1 };
+                    }
+                    i += 1;
+                }
+                ('\'', Some('\\')) => {
+                    // An escaped character literal: `'\n'`, `'\''`, `'\u{..}'`.
+                    i += 3;
+                    while at(i).is_some_and(|c| c != '\'') {
+                        i += 1;
+                    }
+                    i += 1;
+                }
+                ('\'', Some(_)) if at(i + 2) == Some('\'') => i += 3,
+                (c, _) if is_ident(c) => {
+                    while at(i).is_some_and(is_ident) {
+                        i += 1;
+                    }
+                    let word: String = chars[start..i].iter().collect();
+                    let hashes = chars[i..].iter().take_while(|&&c| c == '#').count();
+                    let raw_string =
+                        matches!(word.as_str(), "r" | "br" | "cr") && at(i + hashes) == Some('"');
+                    if !raw_string {
+                        continue;
+                    }
+                    // Ends at a `"` followed by as many `#` as it opened with.
+                    i += hashes + 1;
+                    while i < chars.len()
+                        && !(chars[i] == '"' && (1..=hashes).all(|k| at(i + k) == Some('#')))
+                    {
+                        i += 1;
+                    }
+                    i += 1 + hashes;
+                }
+                _ => {
+                    i += 1;
+                    continue;
+                }
+            }
+            let end = i.min(chars.len());
+            for c in &mut code[start..end] {
+                if *c != '\n' {
+                    *c = ' ';
+                }
+            }
+            i = end;
+        }
+        code
+    }
+
+    /// Each `unsafe impl` item in `source`, found as the keyword `unsafe`
+    /// followed, across whitespace only, by the keyword `impl`, anywhere outside
+    /// comments and literals (attributes, macro bodies and comments between the
+    /// keywords included). Yields the item's header and whether a `// SAFETY:`
+    /// line is in the comment block directly above the line where `unsafe`
+    /// stands.
     fn scan_unsafe_impls(source: &str) -> Vec<(String, bool)> {
+        let code = blank_comments_and_literals(source);
         let lines: Vec<&str> = source.lines().collect();
+        let is_ident = |c: char| c.is_alphanumeric() || c == '_';
+        let mut words: Vec<(usize, usize)> = Vec::new();
+        let mut i = 0;
+        while i < code.len() {
+            if is_ident(code[i]) {
+                let start = i;
+                while i < code.len() && is_ident(code[i]) {
+                    i += 1;
+                }
+                words.push((start, i));
+            } else {
+                i += 1;
+            }
+        }
+        let text = |start: usize, end: usize| code[start..end].iter().collect::<String>();
         let mut items = Vec::new();
-        for (index, line) in lines.iter().enumerate() {
-            let tokens: Vec<&str> = line.split_whitespace().collect();
-            let is_unsafe_impl = tokens.first() == Some(&"unsafe")
-                && tokens
-                    .get(1)
-                    .is_some_and(|token| *token == "impl" || token.starts_with("impl<"));
-            if !is_unsafe_impl {
+        for pair in words.windows(2) {
+            let ((first_start, first_end), (second_start, second_end)) = (pair[0], pair[1]);
+            if text(first_start, first_end) != "unsafe"
+                || text(second_start, second_end) != "impl"
+                || !code[first_end..second_start]
+                    .iter()
+                    .all(|c| c.is_whitespace())
+            {
                 continue;
             }
-            let has_safety = lines[..index]
+            let end = code[first_start..]
+                .iter()
+                .position(|&c| c == '{' || c == ';')
+                .map_or(code.len(), |offset| first_start + offset);
+            let header = text(first_start, end)
+                .split_whitespace()
+                .collect::<Vec<_>>()
+                .join(" ");
+            let line = code[..first_start].iter().filter(|&&c| c == '\n').count();
+            let has_safety = lines[..line.min(lines.len())]
                 .iter()
                 .rev()
                 .map(|line| line.trim_start())
                 .take_while(|line| line.starts_with("//"))
                 .any(|line| line.starts_with("// SAFETY:"));
-            items.push((tokens.join(" "), has_safety));
+            items.push((header, has_safety));
         }
         items
     }
 
     /// The allowlist violations in `source`, read from `file`: items not on
-    /// the allowlist, and allowed items without a `// SAFETY:` comment.
+    /// the allowlist for that file, and allowed items without a `// SAFETY:`
+    /// comment.
     fn unsafe_impl_violations(file: &str, source: &str) -> Vec<String> {
         scan_unsafe_impls(source)
             .into_iter()
@@ -2590,46 +3010,145 @@ mod tests {
             .collect()
     }
 
+    /// The `.rs` files under `dir` at any depth, as sorted `/`-separated paths
+    /// relative to `dir`.
+    fn rs_files_under(dir: &std::path::Path) -> Vec<String> {
+        fn walk(dir: &std::path::Path, prefix: &str, files: &mut Vec<String>) {
+            let entries =
+                std::fs::read_dir(dir).unwrap_or_else(|e| panic!("read {}: {e}", dir.display()));
+            for entry in entries {
+                let entry = entry.expect("read directory entry");
+                let name = format!("{prefix}{}", entry.file_name().to_string_lossy());
+                if entry.file_type().expect("read file type").is_dir() {
+                    walk(&entry.path(), &format!("{name}/"), files);
+                } else if name.ends_with(".rs") {
+                    files.push(name);
+                }
+            }
+        }
+        let mut files = Vec::new();
+        walk(dir, "", &mut files);
+        files.sort();
+        files
+    }
+
     #[test]
     fn unsafe_impl_allowlist() {
-        // Negative controls: the scanner flags an item outside the allowlist even
-        // with a SAFETY comment, and an allowed item without one.
-        let foreign = "struct Foo;\n// SAFETY: synthetic.\nunsafe impl Send for Foo {}\n";
+        let not_allowed =
+            |item: &str| vec![format!("wasapi.rs: `{item}` is not on the #105 allowlist")];
+
+        // Negative controls: an item outside the allowlist is flagged, even with
+        // a SAFETY comment, wherever the two keywords stand in code.
         assert_eq!(
-            unsafe_impl_violations("wasapi.rs", foreign),
-            vec!["wasapi.rs: `unsafe impl Send for Foo {}` is not on the #105 allowlist"],
+            unsafe_impl_violations(
+                "wasapi.rs",
+                "struct Foo;\n// SAFETY: synthetic.\nunsafe impl Send for Foo {}\n"
+            ),
+            not_allowed("unsafe impl Send for Foo"),
+            "plain item"
         );
-        let uncommented = "struct Foo;\nunsafe impl Send for MtaUsagePin {}\n";
         assert_eq!(
-            unsafe_impl_violations("wasapi.rs", uncommented),
+            unsafe_impl_violations(
+                "wasapi.rs",
+                "// SAFETY: synthetic.\n#[allow(dead_code)] unsafe impl Send for Foo {}\n"
+            ),
+            not_allowed("unsafe impl Send for Foo"),
+            "attribute on the same line"
+        );
+        assert_eq!(
+            unsafe_impl_violations(
+                "wasapi.rs",
+                "// SAFETY: synthetic.\nunsafe /* between */ impl Send for Foo {}\n"
+            ),
+            not_allowed("unsafe impl Send for Foo"),
+            "comment between the keywords"
+        );
+        assert_eq!(
+            unsafe_impl_violations(
+                "wasapi.rs",
+                concat!(
+                    "macro_rules! send {\n",
+                    "    ($t:ty) => {\n",
+                    "        // SAFETY: synthetic.\n",
+                    "        unsafe impl Send for $t {}\n",
+                    "    };\n",
+                    "}\n",
+                )
+            ),
+            not_allowed("unsafe impl Send for $t"),
+            "macro body"
+        );
+        // The allowlist is per file: an allowed item in a nested file is flagged.
+        assert_eq!(
+            unsafe_impl_violations(
+                "extra/mod.rs",
+                "// SAFETY: synthetic.\nunsafe impl Send for MtaUsagePin {}\n"
+            ),
+            vec!["extra/mod.rs: `unsafe impl Send for MtaUsagePin` is not on the #105 allowlist"],
+            "nested file"
+        );
+        // An allowed item needs its SAFETY comment; a same-line attribute does
+        // not hide the comment above it.
+        assert_eq!(
+            unsafe_impl_violations(
+                "wasapi.rs",
+                "struct Foo;\nunsafe impl Send for MtaUsagePin {}\n"
+            ),
             vec![
-                "wasapi.rs: `unsafe impl Send for MtaUsagePin {}` lacks a `// SAFETY:` \
+                "wasapi.rs: `unsafe impl Send for MtaUsagePin` lacks a `// SAFETY:` \
                  comment directly above it"
             ],
         );
-
-        // The embedded sources are exactly the `.rs` files in the directory.
-        let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src/audio/windows");
-        let mut on_disk: Vec<String> = std::fs::read_dir(&dir)
-            .unwrap_or_else(|e| panic!("read {}: {e}", dir.display()))
-            .map(|entry| {
-                entry
-                    .expect("read directory entry")
-                    .file_name()
-                    .to_string_lossy()
-                    .into_owned()
-            })
-            .filter(|name| name.ends_with(".rs"))
-            .collect();
-        on_disk.sort();
-        let mut embedded: Vec<String> = BACKEND_SOURCES
-            .iter()
-            .map(|(name, _)| name.to_string())
-            .collect();
-        embedded.sort();
         assert_eq!(
-            on_disk, embedded,
-            "BACKEND_SOURCES must embed every .rs file under src/audio/windows/"
+            unsafe_impl_violations(
+                "wasapi.rs",
+                "// SAFETY: synthetic.\n#[allow(dead_code)] unsafe impl Send for MtaUsagePin {}\n"
+            ),
+            Vec::<String>::new(),
+        );
+        // Comments and literals are not code, and each one ends where it should:
+        // the item after them is still found.
+        let mixed = concat!(
+            "// unsafe impl Send for A {}\n",
+            "/* unsafe impl Send for B {} /* nested */ unsafe impl Send for B2 {} */\n",
+            "const C: &str = \"\\\" unsafe impl Send for C {}\";\n",
+            "const D: &str = r#\"\" unsafe impl Send for D {} \"#;\n",
+            "const E: char = '\"';\n",
+            "fn f<'a>(_: &'a str) {}\n",
+            "// SAFETY: synthetic.\n",
+            "unsafe impl Send for F {}\n",
+        );
+        assert_eq!(
+            scan_unsafe_impls(mixed),
+            vec![("unsafe impl Send for F".to_string(), true)]
+        );
+
+        // The listing descends into subdirectories, so a nested file left out
+        // of BACKEND_SOURCES fails the comparison below.
+        let scratch =
+            std::env::temp_dir().join(format!("rsac-unsafe-impl-allowlist-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&scratch);
+        std::fs::create_dir_all(scratch.join("extra").join("deeper")).expect("create scratch tree");
+        for file in [
+            "top.rs",
+            "extra/mod.rs",
+            "extra/notes.txt",
+            "extra/deeper/leaf.rs",
+        ] {
+            std::fs::write(scratch.join(file), "").expect("write scratch file");
+        }
+        let listed = rs_files_under(&scratch);
+        let _ = std::fs::remove_dir_all(&scratch);
+        assert_eq!(listed, ["extra/deeper/leaf.rs", "extra/mod.rs", "top.rs"]);
+
+        // The embedded sources are exactly the `.rs` files under the directory.
+        let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src/audio/windows");
+        let mut embedded: Vec<&str> = BACKEND_SOURCES.iter().map(|&(name, _)| name).collect();
+        embedded.sort_unstable();
+        assert_eq!(
+            rs_files_under(&dir),
+            embedded,
+            "BACKEND_SOURCES must embed every .rs file under src/audio/windows/, at any depth"
         );
 
         let mut violations = Vec::new();

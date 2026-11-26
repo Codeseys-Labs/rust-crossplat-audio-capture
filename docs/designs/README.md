@@ -27,4 +27,5 @@ its Scope says so.
 | [ADR-0017](0017-windows-application-capture-include-tree.md) | Windows `Application(pid)` capture routes through process-loopback INCLUDE-tree | Accepted | 2026-07-18 |
 | [ADR-0018](0018-audio-graph-mobile-adoption.md) | audio-graph mobile adoption: defer, keep desktop-only, record re-evaluation triggers | Accepted | 2026-07-20 |
 | [ADR-0019](0019-hotplug-auto-recovery.md) | Opt-in `hotplug-recovery` feature for `SystemDefault` device-change auto-recovery | Accepted | 2026-11-25 |
+| [ADR-0020](0020-windows-watcher-com-ownership.md) | Windows device-watcher COM objects live on its helper thread; control-plane handles store no COM pointer | Accepted | 2026-11-26 |
 | [abi3-decision](abi3-decision.md) | abi3 vs per-version Python wheels | Accepted | 2026-04-17 |

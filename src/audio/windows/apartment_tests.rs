@@ -1,17 +1,19 @@
 use super::wasapi::{
     enumerate_application_audio_sessions, ComInitializer, WindowsDeviceEnumerator,
 };
+use crate::core::config::{CaptureTarget, StreamConfig};
 use crate::core::error::AudioError;
 use crate::core::interface::{AudioDevice, DeviceEnumerator, DeviceKind};
 use std::os::windows::io::AsRawHandle;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{mpsc, Arc};
+use std::sync::{mpsc, Arc, Condvar, Mutex, Once};
 use std::thread::{self, JoinHandle};
 use std::time::Duration;
 use windows::Win32::Foundation::{HANDLE, WAIT_OBJECT_0};
 use windows::Win32::System::Com::{
-    CoGetApartmentType, CoInitializeEx, CoUninitialize, APTTYPE, APTTYPEQUALIFIER, APTTYPE_MAINSTA,
-    APTTYPE_MTA, APTTYPE_STA, COINIT_APARTMENTTHREADED, COINIT_MULTITHREADED,
+    CoGetApartmentType, CoInitializeEx, CoUninitialize, APTTYPE, APTTYPEQUALIFIER,
+    APTTYPEQUALIFIER_NONE, APTTYPE_MAINSTA, APTTYPE_MTA, APTTYPE_STA, COINIT_APARTMENTTHREADED,
+    COINIT_MULTITHREADED,
 };
 use windows::Win32::System::Threading::WaitForSingleObject;
 
@@ -26,12 +28,12 @@ enum Apartment {
 
 use Apartment::{Mta, Plain, Sta};
 
-fn apartment_type() -> windows::core::Result<APTTYPE> {
+fn apartment_type() -> windows::core::Result<(APTTYPE, APTTYPEQUALIFIER)> {
     let mut ty = APTTYPE::default();
     let mut qualifier = APTTYPEQUALIFIER::default();
     // SAFETY: Both output pointers refer to live, distinct, writable locals.
     unsafe { CoGetApartmentType(&mut ty, &mut qualifier) }?;
-    Ok(ty)
+    Ok((ty, qualifier))
 }
 
 impl Apartment {
@@ -47,10 +49,45 @@ impl Apartment {
     }
 }
 
+// COM requires the first STA to outlive later STAs. Keep this fixture's STA initialized
+// until process exit so that a short-lived helper never has to own that lifetime.
+fn ensure_process_sta() {
+    static START: Once = Once::new();
+    static READY: (Mutex<bool>, Condvar) = (Mutex::new(false), Condvar::new());
+
+    START.call_once(|| {
+        thread::spawn(|| {
+            // SAFETY: The reserved argument is null and this fresh thread requests a single model.
+            let initialized = unsafe { CoInitializeEx(None, COINIT_APARTMENTTHREADED) };
+            // B1/B2: Publish readiness only after confirming the fixture really owns an STA.
+            initialized.ok().expect("initialize process STA fixture");
+            let (ty, _) = apartment_type().expect("read process STA fixture's apartment");
+            assert!(matches!(ty, APTTYPE_MAINSTA | APTTYPE_STA));
+            *READY.0.lock().unwrap() = true;
+            READY.1.notify_all();
+            loop {
+                thread::park();
+            }
+        });
+    });
+    // B1/B2: Each observer has its own deadline, including callers racing the initial setup.
+    let (ready, _) = READY
+        .1
+        .wait_timeout_while(READY.0.lock().unwrap(), TIMEOUT, |ready| !*ready)
+        .unwrap();
+    assert!(
+        *ready,
+        "process STA fixture was not ready within five seconds"
+    );
+}
+
 fn spawn_on<T: Send + 'static>(
     apartment: Apartment,
     f: impl FnOnce() -> T + Send + 'static,
 ) -> JoinHandle<T> {
+    if matches!(apartment, Sta) {
+        ensure_process_sta();
+    }
     thread::spawn(move || {
         let model = match apartment {
             // B1: A plain thread makes no CoInitializeEx call, even if an implicit MTA exists.
@@ -73,8 +110,8 @@ fn spawn_on<T: Send + 'static>(
         // B1/B2: Verify the fixture independently of the backend, before invoking it.
         let actual = apartment_type().expect("read initialized apartment");
         match apartment {
-            Mta => assert_eq!(actual, APTTYPE_MTA),
-            Sta => assert!(matches!(actual, APTTYPE_STA | APTTYPE_MAINSTA)),
+            Mta => assert_eq!(actual, (APTTYPE_MTA, APTTYPEQUALIFIER_NONE)),
+            Sta => assert!(matches!(actual.0, APTTYPE_STA | APTTYPE_MAINSTA)),
             Plain => unreachable!(),
         }
         f()
@@ -160,6 +197,60 @@ fn read_kind(apartment: Apartment, device: &dyn AudioDevice) -> Option<DeviceKin
 }
 
 #[test]
+fn default_device_flags_survive_creator_exit() {
+    let (default, renders) = on(Plain, || {
+        let enumerator = new_enumerator(Plain);
+        // B4: A handle obtained directly for the default must identify itself as such.
+        let default = enumerator
+            .default_device()
+            .expect("get default render endpoint");
+        let default_id = default.id();
+        assert!(
+            default.is_default(),
+            "default device {default_id} is not marked default"
+        );
+
+        // B3/B4: The two public lookup paths must agree about which render endpoint is default.
+        let devices = enumerator
+            .enumerate_devices()
+            .expect("enumerate render endpoints");
+        let mut renders = Vec::new();
+        let mut default_count = 0;
+        for device in devices {
+            if read_kind(Plain, device.as_ref()) != Some(DeviceKind::Output) {
+                continue;
+            }
+            let id = device.id();
+            let is_default = device.is_default();
+            // B4: A different render endpoint must not inherit the default endpoint's flag.
+            assert_eq!(
+                is_default,
+                id == default_id,
+                "incorrect default flag for {id}"
+            );
+            default_count += usize::from(is_default);
+            renders.push((device, is_default));
+        }
+        // B4: An empty list, missing default, or duplicate default must not pass this check.
+        assert_eq!(
+            default_count, 1,
+            "expected default render ID {default_id} exactly once in the list"
+        );
+        (default, renders)
+    });
+    on(Sta, move || {
+        // B2/B4: Read the very same handles after the creating thread exited; do not re-enumerate.
+        assert!(
+            Sta.call(|| default.is_default()),
+            "default handle lost its flag on STA"
+        );
+        for (device, was_default) in renders {
+            assert_eq!(Sta.call(|| device.is_default()), was_default);
+        }
+    });
+}
+
+#[test]
 fn enumerate_on_sta_then_use_devices_after_its_exit() {
     let enumerator = on(Plain, || new_enumerator(Plain));
     let mut devices = on(Sta, move || {
@@ -186,8 +277,11 @@ fn enumerate_on_sta_then_use_devices_after_its_exit() {
                 assert_eq!(&caller.call(|| device.id()), id);
                 assert_eq!(&caller.call(|| device.name()), name);
                 assert_eq!(&read_kind(caller, &**device), kind);
-                // B4/B5: Formats are live; the contract does not freeze a mix format at enumeration.
-                caller.call(|| device.supported_formats());
+                // B4/B5: The current mix formats or the fallback must be available on this caller.
+                assert!(
+                    !caller.call(|| device.supported_formats()).is_empty(),
+                    "no supported formats for {id} on {caller:?}"
+                );
                 caller.call(|| device.is_default());
                 let info = caller.call(|| device.describe());
                 // B4: The snapshot still identifies this endpoint.
@@ -204,6 +298,36 @@ fn enumerate_on_sta_then_use_devices_after_its_exit() {
     }
     // B10: The last owner drops all devices on another STA before the bounded wait returns.
     on(Sta, move || Sta.call(|| drop(devices)));
+}
+
+#[test]
+fn enumerate_render_endpoint_then_stop_its_stream_on_plain() {
+    let render = on(Plain, || {
+        // B3/B6: Select by a real render ID, preferring a non-default endpoint when available.
+        new_enumerator(Plain)
+            .enumerate_devices()
+            .expect("enumerate endpoints for explicit capture")
+            .into_iter()
+            .filter(|device| read_kind(Plain, device.as_ref()) == Some(DeviceKind::Output))
+            .min_by_key(|device| device.is_default())
+            .expect("an enumerated render endpoint is required")
+    });
+    let stream = on(Sta, move || {
+        let config = StreamConfig {
+            capture_target: CaptureTarget::Device(Sta.call(|| render.id())),
+            ..StreamConfig::default()
+        };
+        // B2/B6: Request this particular endpoint from an STA, not SystemDefault.
+        Sta.call(|| render.create_stream(&config))
+            .expect("construct endpoint-targeted stream")
+    });
+    on(Plain, move || {
+        // B6: Stop and release on a different thread kind, within the observer's five-second wait.
+        stream
+            .stop()
+            .expect("stop endpoint-targeted stream on plain thread");
+        drop(stream);
+    });
 }
 
 #[test]
@@ -232,8 +356,8 @@ fn subscription_lifetime(register_on: Apartment, drop_on: Apartment) {
         let handler = Box::new(move |_| {
             let late = returned_in_handler.load(Ordering::SeqCst);
             let named_helper = thread::current().name() == Some("rsac-wasapi-device-watch");
-            let mta = matches!(apartment_type(), Ok(APTTYPE_MTA));
-            let _ = delivery.send((late, named_helper, mta));
+            let apartment = apartment_type().ok();
+            let _ = delivery.send((late, named_helper, apartment));
         });
         // B2/B7: Registration succeeds before watch returns on the requested caller.
         register_on
@@ -243,11 +367,16 @@ fn subscription_lifetime(register_on: Apartment, drop_on: Apartment) {
 
     let handler_state = move || loop {
         match events.try_recv() {
-            Ok((late, named_helper, mta)) => {
+            Ok((late, named_helper, apartment)) => {
                 // B7: Check every observed invocation, including those queued during teardown.
                 assert!(!late, "handler invoked after drop returned");
                 assert!(named_helper, "event delivered outside the watcher thread");
-                assert!(mta, "delivery thread is not in an MTA");
+                // B7: An implicit MTA supplied by another thread's pin does not qualify.
+                assert_eq!(
+                    apartment,
+                    Some((APTTYPE_MTA, APTTYPEQUALIFIER_NONE)),
+                    "delivery thread did not explicitly initialize its MTA"
+                );
             }
             Err(state) => break state,
         }
