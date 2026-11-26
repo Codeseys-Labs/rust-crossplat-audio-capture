@@ -41,7 +41,15 @@ self_test() {
     [[ -f $path && -r $path ]] || { log "cannot read $path"; return 1; }
     manifest=$(<"$path")
     # Read the manifest's flat string array, including inline or reflowed rows.
-    # Fail closed if its layout or any element is no longer recognizable.
+    # Fail closed if its layout or any element is no longer recognizable, or if
+    # a key repeats: a JSON parser takes the last duplicate, this reads the first.
+    local rest key key_re
+    for key in napi additional; do
+        key_re="\"$key\"[[:space:]]*:"
+        [[ $manifest =~ $key_re ]] || continue
+        rest=${manifest#*"${BASH_REMATCH[0]}"}
+        [[ ! $rest =~ $key_re ]] || { log "key \"$key\" occurs more than once in $path"; return 1; }
+    done
     [[ $manifest =~ $array_re ]] || { log "cannot find napi.triples.additional in $path"; return 1; }
     triples=${BASH_REMATCH[1]}
     for triple in x86_64-pc-windows-msvc x86_64-apple-darwin x86_64-unknown-linux-gnu; do

@@ -45,8 +45,12 @@ if ((go_tag)); then tags+=("bindings/rsac-go/$tag"); fi
 
 git diff --quiet 2>/dev/null && git diff --cached --quiet 2>/dev/null ||
     die 10 'tracked files must be clean (including the index)'
-git fetch --tags "$remote" "$branch" >/dev/null 2>&1 || die 11 "cannot fetch $branch and tags from $remote"
-git merge-base --is-ancestor HEAD "$remote/$branch" 2>/dev/null || die 11 "HEAD is not on $remote/$branch"
+# Fetch into the fully qualified tracking ref and test against that ref: the
+# short name `<remote>/<branch>` can be shadowed by a local branch or tag, and
+# a remote without a fetch refspec would leave the tracking ref stale.
+tracking=refs/remotes/$remote/$branch
+git fetch --tags "$remote" "+refs/heads/$branch:$tracking" >/dev/null 2>&1 || die 11 "cannot fetch $branch and tags from $remote"
+git merge-base --is-ancestor HEAD "$tracking" 2>/dev/null || die 11 "HEAD is not on $remote/$branch"
 sha=$(git rev-parse HEAD 2>/dev/null) || die 11 'cannot resolve HEAD'
 for name in "${tags[@]}"; do
     if git rev-parse -q --verify "refs/tags/$name" >/dev/null 2>&1; then die 12 "local tag $name already exists"; fi
