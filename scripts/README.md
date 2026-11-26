@@ -11,7 +11,7 @@ deleted in the 2026-07-05 rot cleanup (rsac-a3c4) — recover via
 | `gate.sh` | The local gate — replica of ci.yml's `lint` job for the host OS, including the docsrs `cargo doc` step (`--full` adds lib tests/doctests/module-DAG guard) | `mise run gate`, lefthook pre-push, humans |
 | `gate.ps1` | PowerShell wrapper for `gate.sh` (delegates via `run-bash.ps1`) | `mise run gate` on Windows, lefthook pre-push |
 | `gate-bindings.sh` | Local replica of ci.yml's `check-bindings` job — rsac-ffi/napi/python check+clippy+test, header drift, napi + python runtime smokes. Each leg skips gracefully if its toolchain is missing (`--strict` hard-fails instead) | `mise run gate:bindings`, humans |
-| `run-bash.ps1` | Generic Windows wrapper: finds Git bash (avoids WSL bash) and runs any repo bash script with args | `gate.ps1`, the Windows legs of `mise run release:bump` / `release:verify-docs` |
+| `run-bash.ps1` | Generic Windows wrapper: finds Git bash (avoids WSL bash) and runs any repo bash script with args | `gate.ps1`, Windows `mise run release:*` tasks |
 | `hooks/commit-msg.sh` | Rejects `Co-Authored-By:` trailers / tool bylines (AGENTS.md §6) | lefthook commit-msg hook |
 | `test-audio-linux.sh` / `test-audio-macos.sh` / `test-audio-windows.ps1` | Run the `ci_audio` integration suite (all 3 capture tiers) on a physical machine | `mise run test:audio` (host-OS dispatch), humans (see `docs/LOCAL_TESTING_GUIDE.md`) |
 | `install-pipewire-deps.sh` | Distro-detecting install of the Linux PipeWire build deps | humans |
@@ -27,6 +27,9 @@ deleted in the 2026-07-05 rot cleanup (rsac-a3c4) — recover via
 | `ci-linux-audio-route.sh` | Deterministic PipeWire routing gate: pins `ci_test_sink` as default, proves the tone→monitor route end-to-end (sox RMS + frequency), then exports `RSAC_CI_AUDIO_DETERMINISTIC=1` (rsac-b106/rsac-6efb) | ci-audio-tests.yml `linux-system`/`linux-device`/`linux-process`, humans on a Linux box |
 | `ci-windows-audio-default.ps1` | Deterministic VB-CABLE endpoint gate: sets + hard-verifies the default playback endpoint, then exports `RSAC_CI_AUDIO_DETERMINISTIC=1` (rsac-0f33) | ci-audio-tests.yml `windows-system`/`windows-device`/`windows-process` |
 | `bump-version.sh` | Bumps the seven version-bearing manifests + rotates CHANGELOG | release-prepare.yml, `mise run release:bump -- X.Y.Z`, humans (see CONTRIBUTING §7) |
+| `tag-release.sh` | Gate a manual stable release on the checked-out commit and atomically push its annotated tags | `mise run release:tag -- X.Y.Z`, maintainers, release script tests |
+| `check-release-published.sh` | Check the Go tag, in-flight workflows and registries before reusing a version | `mise run release:check-published -- X.Y.Z`, maintainers after a failed release, release script tests |
+| `check-ci-readiness-needs.sh` | Check that Release Readiness depends on every other CI job | ci.yml `release-readiness` and `release-scripts` jobs |
 | `verify-docs-rs.sh` | Post-publish docs.rs rendering spot-check | `mise run release:verify-docs`, humans (see RELEASE_PROCESS.md) |
 
 ## Cross-compilation helpers

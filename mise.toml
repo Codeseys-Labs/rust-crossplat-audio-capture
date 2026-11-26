@@ -67,6 +67,16 @@ description = "Bump the seven lockstep manifests + rotate CHANGELOG: mise run re
 run = "bash scripts/bump-version.sh"
 run_windows = "pwsh -NoProfile -ExecutionPolicy Bypass -File scripts/run-bash.ps1 scripts/bump-version.sh"
 
+[tasks."release:tag"]
+description = "Check release readiness and push the annotated tags: mise run release:tag -- X.Y.Z [--dry-run]"
+run = "bash scripts/tag-release.sh"
+run_windows = "pwsh -NoProfile -ExecutionPolicy Bypass -File scripts/run-bash.ps1 scripts/tag-release.sh"
+
+[tasks."release:check-published"]
+description = "Check whether a failed release version can be reused: mise run release:check-published -- X.Y.Z"
+run = "bash scripts/check-release-published.sh"
+run_windows = "pwsh -NoProfile -ExecutionPolicy Bypass -File scripts/run-bash.ps1 scripts/check-release-published.sh"
+
 [tasks."release:verify-docs"]
 description = "Post-publish docs.rs rendering spot-check: mise run release:verify-docs [-- X.Y.Z]"
 run = "bash scripts/verify-docs-rs.sh"

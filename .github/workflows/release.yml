@@ -73,13 +73,15 @@ jobs:
           - os: blacksmith-4vcpu-ubuntu-2404
             # rsac-0a1f: `,compose` mirrors ci.yml's per-OS unit-test legs so
             # the platform-independent compose unit tests also gate a release.
-            features: feat_linux,compose
+            # `,hotplug-recovery` does the same for the recovery supervisor's
+            # unit tests (the three legs below carry it too).
+            features: feat_linux,compose,hotplug-recovery
             install_deps: true
             # device_test_filter is empty on platforms whose unit tests are
             # fully runnable in CI — the whole --lib suite hard-fails.
             device_test_filter: ''
           - os: blacksmith-4vcpu-windows-2025
-            features: feat_windows,compose
+            features: feat_windows,compose,hotplug-recovery
             install_deps: false
             # This job installs no audio device and the Blacksmith Windows
             # image ships none (AGENTS.md §6: the audio service is present
@@ -95,7 +97,7 @@ jobs:
             # pure logic and hard-fails.
             device_test_filter: 'enumerate default_device device_enumeration device_id device_supported_formats audio_device_ create_stream find_device watch_ create_audio_client'
           - os: blacksmith-6vcpu-macos-15
-            features: feat_macos,compose
+            features: feat_macos,compose,hotplug-recovery
             install_deps: false
             device_test_filter: ''
     runs-on: ${{ matrix.os }}
@@ -162,8 +164,18 @@ jobs:
   # never delete/skip the gate) is documented in docs/RELEASE_PROCESS.md
   # §"Semver gate (cargo-semver-checks)".
   semver-checks:
-    name: Semver Gate (cargo-semver-checks)
-    runs-on: blacksmith-4vcpu-ubuntu-2404
+    name: Semver Gate (cargo-semver-checks, ${{ matrix.os }})
+    runs-on: ${{ matrix.runner }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: linux
+            runner: blacksmith-4vcpu-ubuntu-2404
+          - os: windows
+            runner: windows-latest
+          - os: macos
+            runner: macos-15
     steps:
       - uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5
         with:
@@ -171,10 +183,11 @@ jobs:
           # Full history + tags: the baseline is resolved from the previous
           # v*.*.* tag, which the default shallow clone cannot see.
           fetch-depth: 0
-      - uses: dtolnay/rust-toolchain@e081816240890017053eacbb1bdf337761dc5582 # 1.95.0
-      - uses: useblacksmith/rust-cache@81d053bdb0871dcd3f10763c8cc60d0adc41762b # v1 branch head (no v1 tag exists upstream)
+      - uses: ./.github/actions/rust-setup
 
       - name: Install PipeWire dev libraries
+        if: matrix.os == 'linux'
+        shell: bash
         run: |
           sudo add-apt-repository ppa:pipewire-debian/pipewire-upstream -y
           sudo apt-get update
@@ -210,6 +223,7 @@ jobs:
         if: steps.baseline.outputs.prev_tag != ''
         env:
           PREV_TAG: ${{ steps.baseline.outputs.prev_tag }}
+        shell: bash
         run: cargo semver-checks check-release -p rsac --baseline-rev "$PREV_TAG"
 
   # ── Publish: cargo publish to crates.io ─────────────────────────────
