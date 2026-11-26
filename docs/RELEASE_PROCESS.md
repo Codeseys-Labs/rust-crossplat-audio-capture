@@ -383,9 +383,13 @@ RUN_ID="$(gh run list --workflow ci.yml --branch master --event workflow_dispatc
   git push origin vX.Y.Z
 ```
 
-Watch the Actions tab. If `verify` fails, first check whether anything was
-published for `X.Y.Z`: `release-npm.yml` and `release-pypi.yml` run in parallel
-with `release.yml` and can publish even though `verify` failed
+Watch the Actions tab. If `verify` fails, do not touch the tag yet.
+`release-npm.yml` and `release-pypi.yml` run in parallel with `release.yml` and
+can publish even though `verify` failed, and a run that has already started
+uploads what it built from the old commit without rechecking the tag. So first
+wait for every run the tag started (`release.yml`, `release-npm.yml`,
+`release-pypi.yml`) to finish, or cancel it and confirm it is cancelled. Only
+then check whether anything was published for `X.Y.Z`
 (<https://www.npmjs.com/package/@rsac/audio>,
 <https://pypi.org/project/rsac/>, <https://crates.io/crates/rsac>). If **no**
 registry has `X.Y.Z`, delete the tag locally and remotely
