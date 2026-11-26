@@ -43,9 +43,7 @@ pub(crate) mod thread;
 pub mod wasapi;
 
 // Re-export public types from wasapi module
-pub use wasapi::{
-    ComInitializer, WindowsApplicationCapture, WindowsAudioDevice, WindowsDeviceEnumerator,
-};
+pub use wasapi::{ComInitializer, WindowsAudioDevice, WindowsDeviceEnumerator};
 
 // Re-export application session types from wasapi (canonical definitions)
 pub use wasapi::enumerate_application_audio_sessions;

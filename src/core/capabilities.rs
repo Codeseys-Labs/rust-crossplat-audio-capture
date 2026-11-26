@@ -67,10 +67,19 @@ use super::config::SampleFormat;
 ///     // grant, handled when build()/start() is called.
 /// }
 /// ```
+///
+/// # Stability
+///
+/// This struct is `#[non_exhaustive]`: new capability fields may be added in a
+/// minor release. Obtain a value via [`query`](Self::query) and read the fields
+/// by name (or destructure with `..` inside a match); struct-literal
+/// construction and exhaustive destructuring are not available outside the
+/// crate.
 // Every field is mirrored by hand in each binding surface; the `binding_lockstep`
 // tests at the end of this file fail until each surface declares a new field or the
 // pair is listed as omitted there.
 #[derive(Debug, Clone)]
+#[non_exhaustive]
 pub struct PlatformCapabilities {
     /// Whether system-wide audio capture is supported.
     ///

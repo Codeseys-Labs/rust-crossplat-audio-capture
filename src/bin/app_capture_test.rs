@@ -215,25 +215,30 @@ fn test_capture_lifecycle() -> Result<(), Box<dyn std::error::Error>> {
 fn test_platform_specific() -> Result<(), Box<dyn std::error::Error>> {
     println!("🖥️  Testing platform-specific features...");
 
-    // Gate on the FEATURE too, not just target_os: rsac::audio::windows only
-    // exists when feat_windows is enabled. Under `--no-default-features` on a
-    // Windows host, target_os is true but the module is absent (E0432), so the
-    // block must compile to empty there (matches the library's own gating).
-    #[cfg(all(target_os = "windows", feature = "feat_windows"))]
+    // Windows: application discovery goes through the cross-platform public
+    // API (`list_audio_applications` + the builder). Those items exist
+    // whatever backend features are enabled, so no `feature` gate is needed
+    // here.
+    #[cfg(target_os = "windows")]
     {
         println!("  Windows platform detected");
-        use rsac::audio::windows::WindowsApplicationCapture;
-
-        let processes = WindowsApplicationCapture::list_audio_processes();
-        println!("    Found {} Windows processes", processes.len());
-
-        if let Some((_pid, name)) = processes.first() {
-            let found_pid = WindowsApplicationCapture::find_process_by_name(name, false);
-            if found_pid.is_some() {
-                println!("    ✅ Process discovery working");
-            } else {
-                println!("    ⚠️  Process discovery may have issues");
+        match rsac::list_audio_applications() {
+            Ok(applications) => {
+                println!("    Found {} audio applications", applications.len());
+                // Resolve the first listed application by name through the
+                // builder — the canonical application-capture path
+                // (`CaptureTarget::ApplicationByName`).
+                if let Some(app) = applications.first() {
+                    match rsac::AudioCaptureBuilder::new()
+                        .with_target(rsac::CaptureTarget::ApplicationByName(app.name.clone()))
+                        .build()
+                    {
+                        Ok(_) => println!("    ✅ Process discovery working"),
+                        Err(_) => println!("    ⚠️  Process discovery may have issues"),
+                    }
+                }
             }
+            Err(e) => println!("    ⚠️  Could not list audio applications: {e}"),
         }
     }
 
