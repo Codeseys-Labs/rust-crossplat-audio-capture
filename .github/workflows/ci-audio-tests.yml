@@ -41,11 +41,12 @@ name: Audio Integration Tests
 #                           same as Linux and Windows. BlackHole 2ch is installed
 #                           and pinned as the default output AND input
 #                           (SwitchAudioSource, mirroring ci-ios-sim.yml) so the
-#                           Device tier has a real HAL endpoint; whether AUHAL
-#                           `.start()` now delivers frames on the hosted image
-#                           (it hung on Blacksmith — the Microphone TCC grant is
-#                           the suspected difference) is UNVERIFIED until the first
-#                           run. Full Process Tap validation still requires real
+#                           Device tier has a real HAL endpoint. On the hosted
+#                           image AUHAL `.start()` delivers frames (run
+#                           45738663823: 94 buffers / 48128 frames from
+#                           BlackHole in 2.25 s); it hung on Blacksmith macOS,
+#                           the Microphone TCC grant being the suspected
+#                           difference. Full Process Tap validation still requires real
 #                           hardware or a self-hosted, pre-consented macOS runner
 #                           (ci-audio-macos-tcc.yml, manual dispatch only).
 #
@@ -798,9 +799,12 @@ jobs:
       - uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6 # v2
         with:
           bun-version-file: .tool-versions
+      # go.mod, not .tool-versions: this setup-go pin (v5.1.0) reads the whole
+      # .tool-versions file as one version string (support arrived in v6.1.0).
+      # The module's own `go` directive is the version CI builds against.
       - uses: actions/setup-go@41dfa10bad2bb2ae585af6ee5bb4d7d973ad74ed # v5
         with:
-          go-version-file: .tool-versions
+          go-version-file: bindings/rsac-go/go.mod
 
       # daemon:true installs the full audio stack + dev headers (libpipewire/
       # libspa/libclang), bootstraps PipeWire, creates ci_test_sink, and runs

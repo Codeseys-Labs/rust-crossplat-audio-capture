@@ -963,9 +963,11 @@ jobs:
         with:
           persist-credentials: false
       - uses: ./.github/actions/rust-setup
+      # go.mod, not .tool-versions: this setup-go pin (v5.1.0) reads the whole
+      # .tool-versions file as one version string (support arrived in v6.1.0).
       - uses: actions/setup-go@41dfa10bad2bb2ae585af6ee5bb4d7d973ad74ed # v5
         with:
-          go-version-file: .tool-versions
+          go-version-file: bindings/rsac-go/go.mod
 
       - name: Install PipeWire dev libraries (Linux)
         if: runner.os == 'Linux'

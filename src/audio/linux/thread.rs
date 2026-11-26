@@ -1649,7 +1649,7 @@ fn pw_thread_main(
     use pipewire::node::Node;
     use pipewire::properties::properties;
     use pipewire::registry::Listener as RegistryListener;
-    use pipewire::stream::{StreamBox, StreamFlags, StreamListener};
+    use pipewire::stream::{StreamBox, StreamListener};
     // PipeWire's own stream-state enum (the `.state_changed` callback arg),
     // aliased to avoid clashing with the bridge's `StreamState`
     // (`crate::bridge::state::StreamState`) used by the clean-exit teardown
