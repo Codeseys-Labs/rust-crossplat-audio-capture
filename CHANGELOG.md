@@ -20,6 +20,20 @@ Releases with no ABI change omit the subsection (or state "No C ABI changes").
 
 ### Added
 
+### Changed
+
+### Deprecated
+
+### Removed
+
+### Fixed
+
+### Security
+
+## [0.5.0] - 2026-11-27
+
+### Added
+
 - **Opt-in `hotplug-recovery` feature (`ADR-0019`, `ADR-0021`)** — default-off,
   zero-dependency device-hotplug auto-recovery for `SystemDefault` capture on Windows
   and Linux via
