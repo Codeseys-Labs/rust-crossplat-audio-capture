@@ -3223,7 +3223,7 @@ dependencies = [
 
 [[package]]
 name = "rsac"
-version = "0.4.4"
+version = "0.5.0"
 dependencies = [
  "atomic-waker",
  "audioadapter-buffers",
@@ -3271,7 +3271,7 @@ dependencies = [
 
 [[package]]
 name = "rsac-android-native"
-version = "0.4.4"
+version = "0.5.0"
 dependencies = [
  "rsac",
 ]
@@ -3286,7 +3286,7 @@ dependencies = [
 
 [[package]]
 name = "rsac-ffi"
-version = "0.4.4"
+version = "0.5.0"
 dependencies = [
  "cbindgen",
  "log",
@@ -3295,7 +3295,7 @@ dependencies = [
 
 [[package]]
 name = "rsac-napi"
-version = "0.4.4"
+version = "0.5.0"
 dependencies = [
  "napi",
  "napi-build",
@@ -3308,7 +3308,7 @@ dependencies = [
 
 [[package]]
 name = "rsac-python"
-version = "0.4.4"
+version = "0.5.0"
 dependencies = [
  "pyo3",
  "rsac",
@@ -4012,7 +4012,7 @@ dependencies = [
 
 [[package]]
 name = "tauri-plugin-rsac"
-version = "0.4.4"
+version = "0.5.0"
 dependencies = [
  "log",
  "rsac",
