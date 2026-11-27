@@ -74,8 +74,13 @@ Releases with no ABI change omit the subsection (or state "No C ABI changes").
 - **Breaking: `PlatformCapabilities` and `ApplicationEnumeration` are
   `#[non_exhaustive]`.** Get a value from `PlatformCapabilities::query()` or
   `list_audio_applications_scoped()` and read its fields by name. Outside the crate a
-  struct literal of either type no longer compiles and a pattern needs `..`. In
-  exchange, a field can be added in a minor release.
+  struct literal of either type no longer compiles (`E0639`) and a pattern needs `..`.
+  Code that built a value with chosen fields, typically a test fixture, starts from
+  `query()` and assigns the public fields it cares about:
+  `let mut caps = PlatformCapabilities::query(); caps.supports_device_selection = false;`.
+  In exchange, a field can be added in a minor release. (This was the only change the
+  downstream `audio-graph` needed to compile against this release on Windows: one test
+  fixture.)
 - **Breaking (Windows): `ComInitializer` is no longer a unit struct.** It carries state
   since the COM ownership change in this release; obtain one with
   `let guard = ComInitializer::new()?;` (the constructor returns `AudioResult<Self>`).
