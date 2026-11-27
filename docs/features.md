@@ -2,6 +2,10 @@
 
 This document enumerates every Cargo feature exposed by `rsac`, what it enables, and what host dependencies it requires. Features are declared in [`Cargo.toml`](../Cargo.toml).
 
+For support versus runtime evidence by capture target and optional feature, see
+the [README support matrix](../README.md#capture-mode-support) and
+[optional-feature coverage](../README.md#cargo-features).
+
 ## Summary Table
 
 | Feature | In `default`? | Platforms | Enables | Requires |
@@ -23,7 +27,7 @@ This document enumerates every Cargo feature exposed by `rsac`, what it enables,
 
 ## Platform-feature semantics
 
-The platform `feat_*` flags are a two-way gate: a backend is compiled only when both `target_os` and its feature match. Android and iOS remain experimental and parked, with distinct compile, emulator/simulator and physical-device evidence; see [AGENTS.md §3](../AGENTS.md#3-current-state) and the [unfreeze checklist](DESKTOP_REFINEMENT.md#mobile-freeze-and-unfreeze).
+The platform `feat_*` flags are a two-way gate: a backend is compiled only when both `target_os` and its feature match. Android and iOS remain experimental and parked. Emulator and simulator capture evidence covers only the modes listed in the [support matrix](../README.md#mobile-experimental); it is not physical-device verification. See the [unfreeze checklist](DESKTOP_REFINEMENT.md#mobile-freeze-and-unfreeze).
 
 ### PipeWire crate version gate (`v0_3_65`)
 
@@ -43,7 +47,7 @@ Consequences:
 
 - Building on Linux with `--no-default-features --features feat_windows` compiles nothing from `src/audio/windows/` (the `target_os` check fails), so `get_device_enumerator()` will return `AudioError::PlatformNotSupported`.
 - Cross-compiling to a target without the matching feature enabled produces the same error.
-- On the correct host, disabling all three feature flags yields a library that compiles but cannot enumerate or capture — `get_device_enumerator()` always errors. This is only useful for doc/test builds.
+- Disabling the matching platform feature yields a library that compiles but cannot enumerate or capture — `get_device_enumerator()` returns `PlatformNotSupported`.
 
 ## Data-plane and observability features
 

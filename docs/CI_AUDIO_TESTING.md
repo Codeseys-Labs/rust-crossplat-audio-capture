@@ -15,7 +15,7 @@ Each cell is one tier (a step group) of the per-platform job in
 |  | **Linux** (PipeWire) | **Windows** (WASAPI) | **macOS** (CoreAudio) |
 |---|---|---|---|
 | **System capture** | REAL | REAL (VB-CABLE) | SKIP-EARLY (TCC) |
-| **Device capture** | REAL | REAL (VB-CABLE) | REAL on GitHub-hosted (BlackHole; content check is soft) |
+| **Device capture** | REAL | REAL (VB-CABLE) | REAL on GitHub-hosted (BlackHole; release evidence requires non-silent audio) |
 | **Process capture** | REAL | REAL (Process Loopback) | SKIP-EARLY (TCC) |
 
 The two Process Tap gaps (System, Process) are platform-security
@@ -24,11 +24,14 @@ need. The Device cell was an environment hang on Blacksmith macOS. Since
 `macos-audio` moved to GitHub-hosted `macos-15` with BlackHole pinned as the
 default output and input, the first run there (45738663823, 2026-11-26)
 captured 94 buffers / 48,128 frames with a non-silent first buffer, which makes
-it 7 of 9. One caveat: the macOS job does not set
-`RSAC_CI_AUDIO_DETERMINISTIC`, so silence in that cell would warn, not fail.
-All three macOS paths are
-verified on real hardware by manual QA before each release (see
-[`VISION.md`](../VISION.md) § "How We Verify the Vision").
+it 7 of 9. Ordinary macOS CI warns on silence and tolerates a Device-tier
+timeout. With `release_evidence=true`, a timeout fails and the tier must
+report positive buffer and frame counts, a non-silent buffer, and no read
+error. The [0.5.0 evidence run](https://github.com/Codeseys-Labs/rust-crossplat-audio-capture/actions/runs/45914624405)
+passed those checks.
+
+For what has been verified outside hosted CI (including attended macOS
+Process Tap and mobile), see the [capture support matrix](../README.md#capture-mode-support).
 
 ### What "REAL" means
 
@@ -38,9 +41,9 @@ For the REAL cells, every dispatched run:
    Windows, BlackHole for the macOS device path).
 2. Routes a 440 Hz test tone through the OS's default output.
 3. Captures through the rsac public API.
-4. Asserts the captured `AudioBuffer` has non-silent data (`max
-   amplitude > 0.001`) and measurable RMS energy. This is a hard assertion on
-   the six Linux and Windows cells and a warning on the macOS Device cell.
+4. Checks the captured `AudioBuffer` for non-silent data (`max amplitude >
+   0.001`) and measurable RMS energy. The six Linux and Windows cells
+   hard-fail on silence; the macOS Device cell only does so in release-evidence mode.
 
 Reference evidence: Linux runs capture >40 K frames per test; Windows
 reports ~137 buffers at RMS 0.570 from VB-CABLE loopback.
