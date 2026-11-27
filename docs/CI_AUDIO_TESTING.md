@@ -26,9 +26,8 @@ default output and input, the first run there (45738663823, 2026-11-26)
 captured 94 buffers / 48,128 frames with a non-silent first buffer, which makes
 it 7 of 9. One caveat: the macOS job does not set
 `RSAC_CI_AUDIO_DETERMINISTIC`, so silence in that cell would warn, not fail.
-All three macOS paths are
-verified on real hardware by manual QA before each release (see
-[`VISION.md`](../VISION.md) § "How We Verify the Vision").
+For what has been verified outside hosted CI (including attended macOS
+Process Tap and mobile), see the [capture support matrix](../README.md#capture-mode-support).
 
 ### What "REAL" means
 

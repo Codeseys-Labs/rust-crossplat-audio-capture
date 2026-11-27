@@ -4,7 +4,7 @@ A streaming-first audio capture library for Rust. Captures system audio, per-app
 
 ## Why rsac?
 
-`cpal` and `portaudio-rs` expose device-level primitives — open an input, read f32 samples — but cannot capture a single application's audio on any platform without virtual-cable workarounds. rsac wraps WASAPI Process Loopback, CoreAudio Process Tap, and PipeWire node monitors behind one unified `AudioCaptureBuilder → AudioCapture` API, so per-app and per-process-tree capture work the same way on Windows, macOS, and Linux.
+`cpal` and `portaudio-rs` expose device-level primitives — open an input, read f32 samples — but cannot capture a single application's audio on any platform without virtual-cable workarounds. rsac wraps WASAPI Process Loopback, CoreAudio Process Tap, and PipeWire node monitors behind one `AudioCaptureBuilder → AudioCapture` API. [Capture scope and test coverage vary by backend](#capture-mode-support).
 
 | Capability | rsac | cpal | portaudio-rs |
 |---|---|---|---|
@@ -40,13 +40,10 @@ workflow, per-OS jobs — Linux/Windows/macOS statuses live in the
 
 ### Audio Integration Tests
 
-| | System | Device | Process |
-|---|---|---|---|
-| **Linux** (PipeWire) | `linux-system` | `linux-device` | `linux-process` |
-| **Windows** (VB-CABLE) | `windows-system` | `windows-device` | `windows-process` |
-| **macOS** (BlackHole) | `macos-system` | `macos-device` | `macos-process` |
-
-Each cell is a separate CI job visible in the [Actions tab](https://github.com/Codeseys-Labs/rust-crossplat-audio-capture/actions/workflows/ci-audio-tests.yml). Linux and Windows are first-class, hard-gated tiers (the summary job fails on any Linux or Windows job failure); only the macOS system and process tiers run with `continue-on-error`, because Process Tap capture needs a `kTCCServiceAudioCapture` grant that cannot be issued on managed runners.
+See [Capture Mode Support](#capture-mode-support) for runtime evidence by target.
+The [CI audio testing guide](docs/CI_AUDIO_TESTING.md) explains the runner setup
+and which tests can skip. A green job is not itself proof of capture: hosted
+macOS skips live Process Tap tests because it cannot grant System Audio Recording permission.
 
 ## Features
 
@@ -279,19 +276,50 @@ Runnable programs live in [`examples/`](examples/):
 
 ## Capture Mode Support
 
-| Mode | Windows (WASAPI) | Linux (PipeWire) | macOS (CoreAudio) |
+**0.5.0** · 🟢 Supported and tested · 🟡 Supported, not runtime-verified for the stated scope · 🔴 Not supported.
+For capture, **tested** means a run delivered audio on the named OS or test environment.
+Compile checks, device enumeration, and skipped tests do not count as capture evidence.
+The matching Cargo backend must be enabled. Call `PlatformCapabilities::query()` to
+check the current build and host; capability is not permission.
+
+### Desktop
+
+| Target | Windows · WASAPI | Linux · PipeWire | macOS · CoreAudio |
 |---|---|---|---|
-| System default | Yes | Yes | Yes |
-| Application (PID) | Process loopback | pw-dump node | Process Tap (14.4+) |
-| ApplicationByName | sysinfo PID resolve | pw-dump node serial | Process Tap (14.4+) |
-| Process tree | Process loopback | PID node mapping | Process Tap (14.4+) |
-| Device selection | Yes | Yes | Yes |
+| Default output (`SystemDefault`) | 🟢 CI · endpoint loopback | 🟢 CI · default sink monitor | 🟢 Attended macOS 26 · Process Tap |
+| Application by PID (`Application`) | 🟢 CI · PID and descendants | 🟢 CI · matching stream node | 🟢 Attended macOS 26 · Process Tap |
+| Application by name (`ApplicationByName`) | 🟢 CI · name → PID and descendants | 🟢 CI · matching stream node | 🟢 Attended macOS 26 · Process Tap |
+| Process tree (`ProcessTree`) | 🟢 CI · PID and descendants | 🟢 CI · selects a node from the tree, not a mix of every descendant | 🟢 Attended macOS 26 · Process Tap |
+| Selected device (`Device`) | 🟢 CI · render loopback | 🟢 CI · selected PipeWire node | 🟢 CI · input-capable device (BlackHole); 🔴 output-only devices |
+
+- [0.5.0 desktop audio evidence](https://github.com/Codeseys-Labs/rust-crossplat-audio-capture/actions/runs/45914624405): Windows and Linux exercise live system, device, and process targets. Hosted macOS verifies `Device` on macOS 15; its Process Tap tests skip.
+- The [attended macOS 26 record](AGENTS.md#phase-5-progress) and [Process Tap results](docs/MACOS26_PROCESS_TAP_FIX.md#test-results) predate 0.5.0. Process Tap needs **System Audio Recording** permission. On macOS **14.4–15** it is 🟡 supported without live capture evidence; below 14.4 it is 🔴 unsupported. Input-device capture does not use Process Tap.
+- Windows application and tree targets require WASAPI Process Loopback (build 20348+). Linux requires PipeWire. See [platform requirements](docs/system_requirements.md) for setup.
+
+### Mobile (experimental)
+
+| Target | Android · AAudio / AudioPlaybackCapture | iOS · AVAudioEngine / ReplayKit |
+|---|---|---|
+| Default microphone (`Device("default")`) | 🟢 Instrumented emulator · shipped C ABI | 🟢 Simulator · Rust API and app-hosted C ABI |
+| System playback (`SystemDefault`) | 🟢 Emulator · test app's eligible playback | 🟡 ReplayKit broadcast · compile-checked, no frame evidence |
+| Application (`Application`) | 🟢 Emulator · own UID; 🟡 other apps | 🔴 No supported per-app audio API |
+| Application by name (`ApplicationByName`) | 🟢 Emulator · own package → UID; 🟡 other apps | 🔴 No supported per-app audio API |
+| Process tree (`ProcessTree`) | 🟢 Emulator · own PID → UID; 🟡 other apps. UID filtering, not a descendant walk. | 🔴 No supported process-tree audio API |
+| Select an input by device ID (`Device(id)`) | 🟡 AAR-backed selection; emulator enumerates IDs but does not capture by ID | 🔴 Input is routed by the audio session |
+
+Android playback needs API 29+, MediaProjection consent, the foreground
+service, and audio that the source app allows to be captured. iOS playback
+needs an App Group, an embedded broadcast extension, and a user-started
+broadcast. Green mobile cells apply only to the
+[Android emulator](https://github.com/Codeseys-Labs/rust-crossplat-audio-capture/actions/runs/45914627247)
+or [iOS simulator](https://github.com/Codeseys-Labs/rust-crossplat-audio-capture/actions/runs/45914630577)
+run; **no mobile path is verified on a physical device**. No other OS has a capture backend.
 
 ### macOS Enumeration Scope
 
 On **macOS 14.4+**, `list_audio_sources()` / `list_audio_applications()` return apps that are **actually producing audio**: the implementation intersects the `NSWorkspace.runningApplications` list (for the localized name + bundle id) with the set of PIDs CoreAudio reports as live audio processes via `kAudioHardwarePropertyProcessObjectList`, filtering out the large mass of GUI apps that aren't currently playing audio. On **macOS &lt; 14.4** (where the audio-process-object API and Process Taps are unavailable) it transparently falls back to the full, unfiltered `NSWorkspace` list. This matches Windows (WASAPI session enumeration) and Linux (PipeWire stream nodes via the native in-process registry listener, with `pw-dump` only as a fallback), which also report only endpoints with an active audio session — so on supported OS versions all three platforms surface a "currently producing audio" set.
 
-Device enumeration on macOS (`enumerate_devices()`) lists all CoreAudio output devices the process can see, which is comparable to the other platforms. What is *not* enumerable from rsac on macOS: the live per-process audio signal graph (which PIDs are routing to which device at this instant) — that information is not exposed outside Core Audio, and Process Tap attachment is the only way to observe per-app audio. Screen Recording permission (TCC) is required at capture time; `check_audio_capture_permission()` returns `NotDetermined` until the OS prompt has been answered, because macOS does not expose a reliable pre-flight query on supported versions.
+`enumerate_devices()` is not a guarantee that each device can be captured: use an input-capable device for direct capture. Process Tap requires **System Audio Recording**, not Screen Recording; direct AUHAL input uses the Microphone permission. `check_audio_capture_permission()` returns `NotDetermined` by default on macOS; the optional `macos-tcc-spi` feature enables a best-effort preflight.
 
 ## Installation
 
@@ -304,17 +332,26 @@ rsac = { git = "https://github.com/Codeseys-Labs/rust-crossplat-audio-capture" }
 
 ### Cargo Features
 
-| Feature | Default | Adds |
+The default feature set enables the five backend flags (`feat_windows`,
+`feat_linux`, `feat_macos`, `feat_android`, `feat_ios`); only the one matching
+the target OS takes effect. The features below are **off by default**.
+Test evidence is scoped: a unit test of a shared library feature does not
+imply live capture on every backend.
+
+| Optional feature | Support | Test evidence |
 |---|---|---|
-| `feat_windows` / `feat_linux` / `feat_macos` | ✅ | Desktop platform backends (Tier 1) |
-| `feat_android` / `feat_ios` | ✅ | Mobile backends (experimental/parked: emulator/simulator-verified, physical devices pending) |
-| `hotplug-recovery` | — | Opt-in `SystemDefault` device-change auto-recovery (zero deps; ADR-0019) |
-| `compose` | — | Multi-source channel composition (`rubato` + `audioadapter-buffers`) |
-| `cli` | — | The `rsac` demo binary's deps (`clap`, `color-eyre`, `ctrlc`, `env_logger`) — library consumers don't pay for them |
-| `async-stream` | — | `futures_core::Stream` support (`atomic-waker`) |
-| `sink-wav` | — | `WavFileSink` |
-| `tracing` | — | Structured `tracing` events/spans (facade only) |
-See [`docs/features.md`](docs/features.md) for the full matrix.
+| `hotplug-recovery` | Windows and Linux, `SystemDefault` only | 🟢 [Windows workstation default switch](docs/evidence/windows-default-switch.md), Windows loss/return and Linux routing/outage in [audio CI](https://github.com/Codeseys-Labs/rust-crossplat-audio-capture/actions/runs/45914624405). 🔴 macOS in 0.5.0, mobile, and non-default targets. |
+| `compose` | Shared multi-source channel composition | 🟢 Live capture on Windows/Linux and desktop engine unit tests. 🟡 Live composition on macOS and mobile. |
+| `async-stream` | Shared `futures_core::Stream` reader | 🟢 Async delivery and terminal behavior in [Linux feature-combination tests](https://github.com/Codeseys-Labs/rust-crossplat-audio-capture/actions/runs/45914621283); not an OS capture test. |
+| `sink-wav` | Shared `WavFileSink` adapter | 🟢 WAV unit tests and Linux live first-buffer format test in the audio matrix. |
+| `cli` | Demo binary and examples | 🟢 `rsac list` exercised on Windows; Linux/macOS builds checked. No mobile CLI runtime verification. |
+| `tracing` | Shared structured events and spans; defaults to `log` without the flag | 🟢 Subscriber installation unit test on Windows. |
+| `macos-tcc-spi` | macOS-only, private SPI for permission preflight | 🟢 macOS CI smoke test calls preflight. 🟡 Grant/deny accuracy is not established by that smoke test. |
+| `test-utils` | Shared synthetic capture and test helpers | 🟢 Linux feature-combination tests; no device needed. |
+
+See [Cargo features and dependencies](docs/features.md) for the complete
+feature reference. Period-derived ring sizing and hardware clock metadata
+are [not shipped in 0.5.0](docs/DESKTOP_REFINEMENT.md#d4--ring-sizing-and-clocks).
 
 ### Platform Dependencies
 
@@ -332,7 +369,7 @@ sudo pacman -S pipewire pkgconf clang
 
 **Windows** — Rust toolchain only (WASAPI is built-in).
 
-**macOS** — Xcode Command Line Tools. Screen Recording permission required. Process Tap requires macOS 14.4+.
+**macOS** — Xcode Command Line Tools. Process Tap requires macOS 14.4+ and System Audio Recording permission; direct input uses the Microphone permission.
 
 ## Documentation
 
